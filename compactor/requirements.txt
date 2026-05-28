@@ -1,4 +1,10 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-httpx==0.28.1
-transformers==4.47.1
+# All four packages are already transitive deps of vllm; listed here
+# to make the compactor's direct dependencies explicit. DO NOT pin
+# versions — vllm pins specific versions of fastapi/uvicorn/httpx/
+# transformers, and overriding those breaks vllm at import time
+# (see the v1.9 -> v1.9.1 incident where transformers==4.47.1 lacked
+# Gemma3Config which modern vllm imports unconditionally).
+fastapi
+uvicorn[standard]
+httpx
+transformers
