@@ -81,7 +81,9 @@ RUN chmod +x /entrypoint.sh
 # =============================================================================
 ENV MODEL_REPO="anthracite-org/magnum-v4-22b"
 ENV HF_HOME="/data/models"
-ENV TRANSFORMERS_CACHE="/data/models"
+# Note: TRANSFORMERS_CACHE was removed in v1.9.1 — deprecated in transformers
+# v5, HF_HOME is the modern equivalent and is read by both transformers
+# and huggingface_hub.
 
 # vLLM server settings
 ENV VLLM_HOST="0.0.0.0"
