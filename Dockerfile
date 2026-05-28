@@ -28,16 +28,28 @@ RUN mkdir -p /data
 
 ENV VLLM_VENV=/opt/vllm-venv
 
+# vLLM version pin. The latest vLLM (0.21+) ships PyTorch wheels built
+# against CUDA 13, which requires NVIDIA driver 580+. Most RunPod hosts
+# (including A40s) are still on driver 570 (CUDA 12.8 max) — those pods
+# would crash at vLLM startup with "NVIDIA driver too old (found 12080)".
+# 0.11.0 ships cu128 wheels, so it runs on any driver supporting CUDA 12.8+.
+# Bump this when RunPod broadly rolls out driver 580+.
+ARG VLLM_VERSION=0.11.0
+
 # =============================================================================
 # vLLM venv + compactor python deps — installed, stripped, and cache-cleared
 # in a SINGLE layer so unstripped libs and .pyc caches never get committed.
+# --extra-index-url pulls PyTorch from the CUDA 12.8 channel explicitly to
+# prevent pip from resolving to cu130 wheels.
 # COPY just the requirements file (not full compactor/) so editing main.py
 # later doesn't bust this expensive layer.
 # =============================================================================
 COPY compactor/requirements.txt /opt/compactor/requirements.txt
 RUN python3 -m venv /opt/vllm-venv && \
     /opt/vllm-venv/bin/pip install --no-cache-dir --upgrade pip && \
-    /opt/vllm-venv/bin/pip install --no-cache-dir vllm && \
+    /opt/vllm-venv/bin/pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cu128 \
+        vllm==${VLLM_VERSION} && \
     /opt/vllm-venv/bin/pip install --no-cache-dir -r /opt/compactor/requirements.txt && \
     find /opt/vllm-venv -type f \( -name "*.so" -o -name "*.so.*" \) \
         -exec strip --strip-unneeded {} + 2>/dev/null || true && \
