@@ -101,6 +101,20 @@ def test_env_defaults_applied():
     assert_eq(main.KEEP_RECENT_TURNS, 2, "KEEP_RECENT_TURNS from env")
 
 
+def test_env_empty_string_uses_default():
+    print("\n[test] empty-string env vars fall back to defaults (v1.9.2 regression)")
+    # _env_int must treat "" the same as unset — this is what .env files
+    # produce when a key is left blank, and the v1.9.x compactor crashed
+    # with ValueError because int() doesn't accept "".
+    assert_eq(main._env_int("__NEVER_SET__", 42), 42, "unset var -> default")
+    os.environ["__BLANK__"] = ""
+    assert_eq(main._env_int("__BLANK__", 42), 42, "empty string -> default")
+    os.environ["__BLANK__"] = "   "
+    assert_eq(main._env_int("__BLANK__", 42), 42, "whitespace-only -> default")
+    os.environ["__NUMERIC__"] = "7"
+    assert_eq(main._env_int("__NUMERIC__", 42), 7, "valid integer parsed")
+
+
 if __name__ == "__main__":
     test_message_text_handles_multimodal()
     test_count_tokens_fallback_estimator()
@@ -109,4 +123,5 @@ if __name__ == "__main__":
     test_compact_no_op_when_under_budget()
     test_app_routes_registered()
     test_env_defaults_applied()
+    test_env_empty_string_uses_default()
     print("\nAll smoke tests passed.")

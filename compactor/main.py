@@ -16,14 +16,21 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+def _env_int(name: str, default: int) -> int:
+    """os.environ.get returns '' (not the default) when the var is set to an
+    empty string, which is what .env files do for opt-in blanks. Treat empty
+    as 'use the default'.
+    """
+    v = os.environ.get(name, "")
+    return int(v) if v.strip() else default
+
+
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8000").rstrip("/")
 MODEL_REPO = os.environ.get("MODEL_REPO")
-MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "32768"))
-TARGET_TOKENS = int(
-    os.environ.get("COMPACTOR_TARGET_TOKENS", str(int(MAX_MODEL_LEN * 0.75)))
-)
-KEEP_RECENT_TURNS = int(os.environ.get("COMPACTOR_KEEP_RECENT_TURNS", "4"))
-SUMMARY_MAX_TOKENS = int(os.environ.get("COMPACTOR_SUMMARY_MAX_TOKENS", "1024"))
+MAX_MODEL_LEN = _env_int("MAX_MODEL_LEN", 32768)
+TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(MAX_MODEL_LEN * 0.75))
+KEEP_RECENT_TURNS = _env_int("COMPACTOR_KEEP_RECENT_TURNS", 4)
+SUMMARY_MAX_TOKENS = _env_int("COMPACTOR_SUMMARY_MAX_TOKENS", 1024)
 
 logging.basicConfig(
     level=logging.INFO,
