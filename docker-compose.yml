@@ -18,14 +18,13 @@ services:
               capabilities: [gpu]
 
     ports:
-      - "3000:3000"   # OpenWebUI
-      - "8080:8080"   # llama.cpp API (OpenAI-compatible)
+      - "3000:3000"   # OpenWebUI (user-facing)
+      - "8080:8080"   # context-compactor (OpenAI-compatible API)
 
     volumes:
-      # Persist models (avoid re-downloading)
-      - ./models:/models
-      # Persist OpenWebUI data (chat history, settings)
-      - ./data:/app/data
+      # Single persistent volume — holds model weights AND OpenWebUI state.
+      # On RunPod, attach a Network Volume here; locally this is a bind mount.
+      - ./data:/data
 
     env_file:
       - .env
@@ -39,5 +38,4 @@ services:
       start_period: 180s
 
 volumes:
-  models:
   data:
