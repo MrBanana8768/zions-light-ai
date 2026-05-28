@@ -1,10 +1,16 @@
-# All four packages are already transitive deps of vllm; listed here
-# to make the compactor's direct dependencies explicit. DO NOT pin
-# versions — vllm pins specific versions of fastapi/uvicorn/httpx/
-# transformers, and overriding those breaks vllm at import time
-# (see the v1.9 -> v1.9.1 incident where transformers==4.47.1 lacked
-# Gemma3Config which modern vllm imports unconditionally).
+# Most of these are vllm transitive deps; listed here to make the
+# compactor's direct dependencies explicit. Be VERY careful with pins:
+#
+#   v1.9     pinned everything (transformers==4.47.1) — too old, missing
+#            Gemma3Config that modern vLLM imports unconditionally.
+#   v1.9.1/2 unpinned everything — pip resolved transformers to 5.9.0
+#            which removed `all_special_tokens_extended` that vLLM 0.11
+#            still calls. Tokenizer init crashes with AttributeError.
+#   v1.9.4   keep fastapi/uvicorn/httpx unpinned (we don't care which
+#            version, as long as vllm and compactor agree), but pin
+#            transformers to the 4.5x line that vLLM 0.11 was tested
+#            against. Bump the upper bound when bumping VLLM_VERSION.
 fastapi
 uvicorn[standard]
 httpx
-transformers
+transformers>=4.50,<5
