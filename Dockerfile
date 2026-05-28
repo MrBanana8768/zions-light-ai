@@ -8,17 +8,26 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-# Runtime dependencies (+ binutils for strip during install layers, kept ~10MB)
+# Runtime dependencies.
+# binutils: for strip during the install/cleanup layers (~10 MB).
+# build-essential + python3-dev: required at runtime by Triton's JIT,
+# which compiles per-kernel C source (Python C extensions, hence Python.h)
+# during CUDA graph capture. Without them vLLM crashes at startup:
+#   - "Failed to find C compiler" (no gcc)
+#   - or "Python.h: No such file or directory" (no python3-dev)
+# ~200 MB total — necessary tax for vLLM on a slim base.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
+    python3-dev \
     curl \
     wget \
     git \
     libgomp1 \
     supervisor \
     binutils \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Persistent data root — mounted as a single network volume in production.
