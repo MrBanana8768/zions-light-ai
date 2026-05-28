@@ -1,34 +1,50 @@
 # Dockerfile for vLLM + context-compactor + OpenWebUI on Runpod
-# Optimized for NVIDIA A40 (48GB VRAM) and larger
-# CUDA 12.6.3 runtime on Ubuntu 24.04 (Python 3.12)
+# Optimized for NVIDIA A40 (48GB VRAM) and larger.
+#
+# CUDA base + torch wheels are parametric via build args so the same
+# Dockerfile can build cu128 (default, RunPod driver 570 compatible) and
+# cu130 variants without source changes:
+#
+#   docker build .                                       # cu128 default
+#   docker build --build-arg CUDA_BASE_IMAGE=nvidia/cuda:12.9.1-runtime-ubuntu24.04 \
+#                --build-arg TORCH_CUDA=cu128 .          # newer CUDA runtime, same wheels
+#   docker build --build-arg CUDA_BASE_IMAGE=nvidia/cuda:13.0.0-runtime-ubuntu24.04 \
+#                --build-arg TORCH_CUDA=cu130 \
+#                --build-arg VLLM_VERSION=0.21.0 .       # full cu130 variant (driver 580+)
 
-FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+ARG CUDA_BASE_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04
+FROM ${CUDA_BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 # Runtime dependencies.
-# binutils: for strip during the install/cleanup layers (~10 MB).
-# build-essential + python3-dev: required at runtime by Triton's JIT,
-# which compiles per-kernel C source (Python C extensions, hence Python.h)
-# during CUDA graph capture. Without them vLLM crashes at startup:
-#   - "Failed to find C compiler" (no gcc)
-#   - or "Python.h: No such file or directory" (no python3-dev)
+# - binutils: for strip during the install/cleanup layers (~10 MB).
+# - build-essential + python3-dev: required at runtime by Triton's JIT,
+#   which compiles per-kernel C source during CUDA graph capture.
+# - apt-get upgrade pulls in CVE patches for the base image's installed
+#   packages (gnupg2 etc.). One layer, picks up any patched versions
+#   released since the base image was published.
+# - apt-get clean + autoremove + lists prune keeps the layer slim.
 # ~200 MB total — necessary tax for vLLM on a slim base.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    python3-venv \
-    python3-dev \
-    curl \
-    wget \
-    git \
-    libgomp1 \
-    supervisor \
-    binutils \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        python3-venv \
+        python3-dev \
+        curl \
+        wget \
+        git \
+        libgomp1 \
+        supervisor \
+        binutils \
+        build-essential && \
+    apt-get autoremove -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Persistent data root — mounted as a single network volume in production.
 # Holds both the model cache (/data/models -> HF_HOME) and OpenWebUI state
@@ -37,27 +53,29 @@ RUN mkdir -p /data
 
 ENV VLLM_VENV=/opt/vllm-venv
 
-# vLLM version pin. The latest vLLM (0.21+) ships PyTorch wheels built
-# against CUDA 13, which requires NVIDIA driver 580+. Most RunPod hosts
-# (including A40s) are still on driver 570 (CUDA 12.8 max) — those pods
-# would crash at vLLM startup with "NVIDIA driver too old (found 12080)".
-# 0.11.0 ships cu128 wheels, so it runs on any driver supporting CUDA 12.8+.
-# Bump this when RunPod broadly rolls out driver 580+.
-ARG VLLM_VERSION=0.11.0
+# vLLM + torch CUDA target. Both parametric so the cu130 variant can be
+# built from the same source. Defaults aligned for RunPod's driver-570
+# fleet (CUDA 12.8 max). CVE-2026-22778 (Critical 9.8) requires vllm >=
+# 0.14.1. Bump VLLM_VERSION + TORCH_CUDA together when RunPod rolls out
+# driver 580+.
+ARG VLLM_VERSION=0.14.1
+ARG TORCH_CUDA=cu128
 
 # =============================================================================
 # vLLM venv + compactor python deps — installed, stripped, and cache-cleared
 # in a SINGLE layer so unstripped libs and .pyc caches never get committed.
-# --extra-index-url pulls PyTorch from the CUDA 12.8 channel explicitly to
-# prevent pip from resolving to cu130 wheels.
+# --extra-index-url pulls PyTorch from the chosen CUDA channel explicitly to
+# keep pip from resolving torch to a different cu variant.
 # COPY just the requirements file (not full compactor/) so editing main.py
 # later doesn't bust this expensive layer.
+# Also bumps pip/setuptools/wheel as part of the same layer — both resolve
+# Scout-flagged Highs (CVE in setuptools 68.x and wheel 0.42.x).
 # =============================================================================
 COPY compactor/requirements.txt /opt/compactor/requirements.txt
 RUN python3 -m venv /opt/vllm-venv && \
-    /opt/vllm-venv/bin/pip install --no-cache-dir --upgrade pip && \
+    /opt/vllm-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
     /opt/vllm-venv/bin/pip install --no-cache-dir \
-        --extra-index-url https://download.pytorch.org/whl/cu128 \
+        --extra-index-url https://download.pytorch.org/whl/${TORCH_CUDA} \
         vllm==${VLLM_VERSION} && \
     /opt/vllm-venv/bin/pip install --no-cache-dir -r /opt/compactor/requirements.txt && \
     find /opt/vllm-venv -type f \( -name "*.so" -o -name "*.so.*" \) \
@@ -68,11 +86,12 @@ RUN python3 -m venv /opt/vllm-venv && \
 
 # =============================================================================
 # OpenWebUI venv — kept isolated from vLLM's pytorch pin. Same install+strip
-# atomic pattern.
+# atomic pattern. Also bumps pip/setuptools/wheel here (Scout-flagged Highs
+# live in both venvs since each has its own copy).
 # =============================================================================
 WORKDIR /app
 RUN python3 -m venv /app/venv && \
-    /app/venv/bin/pip install --no-cache-dir --upgrade pip && \
+    /app/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
     /app/venv/bin/pip install --no-cache-dir open-webui && \
     find /app/venv -type f \( -name "*.so" -o -name "*.so.*" \) \
         -exec strip --strip-unneeded {} + 2>/dev/null || true && \

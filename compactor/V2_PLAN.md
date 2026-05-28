@@ -2,6 +2,19 @@
 
 > Status: design proposal. Not yet implemented. v1 (the current `main.py`)
 > stays in production until v2 is ready to swap in.
+>
+> **V2 is split into two releases:**
+> - **V2.0** — Memory architecture foundation (this document's main spec).
+>   Build the right substrate first; nothing else matters if it isn't solid.
+> - **V2.1** — User control, portability, observability layered *on top* of
+>   V2.0. See the [V2.1 section](#v21--user-control-portability-observability)
+>   near the bottom. Will not start until V2.0 is shipped and stable.
+>
+> This split is deliberate. The memory architecture has subtle correctness
+> requirements (storage layout, conv_id stability, summarization fidelity).
+> Stacking UX features on top of a still-shifting substrate is how
+> projects accumulate tech debt. Lock the foundation, then build the
+> control surface against it.
 
 ## Why v2
 
@@ -76,26 +89,38 @@ A 200 GB volume holds tens of thousands of conversations.
 spec doesn't include a conversation ID. OpenWebUI manages conversations
 client-side and just resends the full message history each turn.
 
-**Strategy:** derive a stable conversation ID by hashing the conversation's
-*opening fingerprint*:
+**Strategy: header-first, hash as fallback.**
+
+V2.0 will require an OpenWebUI Pipeline filter that injects an
+`X-Conversation-Id` header derived from OpenWebUI's internal conversation
+primary key. The compactor reads that header as the authoritative conv_id.
 
 ```python
-def conv_id(messages: list[dict]) -> str:
+def conv_id(request_headers: dict, messages: list[dict]) -> str:
+    # Authoritative: OpenWebUI Pipeline filter sets this from its DB key
+    if hdr := request_headers.get("x-conversation-id"):
+        return hdr
+
+    # Fallback: derive from opening fingerprint (for clients that don't
+    # set the header — direct API users, third-party tools, etc.)
     system = next((m["content"] for m in messages if m["role"] == "system"), "")
     first_user = next((m["content"] for m in messages if m["role"] == "user"), "")
     fingerprint = f"{system}|||{first_user[:512]}"
     return hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
 ```
 
-The opening doesn't change as the conversation grows, so the ID is stable for
-the whole life of one conversation. Two different conversations that happen to
-start identically would collide, but the 512-char window over the first user
-message makes that extremely unlikely in practice.
+**Why header-first (decision made up front, not deferred):**
+The hash fallback works but has subtle failure modes — two conversations
+opening identically would collide, and edits to the system prompt mid-
+conversation would invalidate the ID. A real ID from OpenWebUI's DB
+sidesteps both issues. Implementing it from day one of V2.0 means we
+never accumulate hash-derived memory that has to be retroactively
+re-keyed when the header arrives.
 
-**Future improvement:** OpenWebUI supports custom request headers via its
-function/filter system. A small OpenWebUI filter could inject
-`X-Conversation-Id` from its internal conversation primary key, eliminating
-the hash heuristic. Worth doing if we hit collision issues.
+**Implementation:** Phase 1 of V2.0 includes both the compactor-side
+header reader AND the OpenWebUI Pipeline filter (~30 lines of Python
+each). The Pipeline filter ships with the project so deployments don't
+require user configuration.
 
 ## Per-request flow
 
@@ -346,7 +371,7 @@ Total image growth: **~280 MB** added to current ~14 GB image (~2% increase).
 - `supervisord.conf` — no new processes; everything runs in the compactor
 - vLLM, OpenWebUI, entrypoint.sh
 
-## Phased rollout
+## V2.0 phased rollout
 
 Build incrementally — each phase is independently shippable and useful:
 
@@ -423,13 +448,303 @@ Each phase ships with:
   5 are still respected at turn 250 (would fail under v1 today)
 - Manual verification on RunPod with the Magnum 22B production setup
 
-## What this does NOT solve
+## What V2.0 does NOT solve
 
 - **Cross-conversation memory.** Each conv_id is isolated. The model won't
   remember the user across separate conversations. Adding cross-conversation
-  user memory (à la ChatGPT's "memory" feature) is a v3 feature.
-- **Multi-user isolation.** v2 assumes single-tenant or that users share
+  user memory (à la ChatGPT's "memory" feature) is a V3 feature.
+- **Multi-user isolation.** V2 assumes single-tenant or that users share
   trust. If OpenWebUI ever runs multi-user with separate accounts, the
   conv_id hash needs to incorporate user identity to prevent leakage.
-- **Voice / vision modalities.** Pure-text v2. Extending to multimodal would
-  require multimodal embeddings and adjusted fact extraction.
+- **Voice / vision modalities.** Pure-text V2. Extending to multimodal would
+  require multimodal embeddings and adjusted fact extraction (V3).
+- **User-facing control of memory.** V2.0 ships memory that "just works"
+  — the user has no way to inspect, edit, or reset it. **That's V2.1's
+  job** (see next section). V2.0 deliberately omits this so we ship the
+  substrate before we ship the controls for it.
+
+---
+
+# V2.1 — User control, portability, observability
+
+> Status: scoped, not started. Will not begin until V2.0 is shipped and
+> stable in production. V2.1 is **additive** to V2.0 — it adds endpoints,
+> chat commands, and an OpenWebUI Pipeline plugin, but does not change
+> V2.0's storage layout or per-request flow.
+
+## Why V2.1 exists
+
+V2.0 gives the model a memory. V2.1 gives the *user* a memory: the ability
+to see what the model is remembering, fix it when it's wrong, and carry
+it across deployments. Without V2.1, V2.0 feels like magic that occasionally
+betrays you. With V2.1, it feels like a tool you control.
+
+## Themes
+
+### Theme 1 — User control of memory (highest UX value)
+
+Chat-level commands the user can type, intercepted by the compactor before
+forwarding to vLLM:
+
+| Command | Behavior |
+|---|---|
+| `/list-facts` | Replies with the current facts memory for this conversation |
+| `/forget <thing>` | Removes a matching fact ("model has Lyra's age wrong, fix it") |
+| `/remember <thing>` | Manually adds a fact ("never use the word 'suddenly' in my prose") |
+| `/why-did-you-say-that` | Debug: returns the retrieved turns + facts that informed the last response |
+
+Implementation: ~150 lines of pattern matching at the top of
+`chat_completions()`. Commands short-circuit before token counting.
+
+### Theme 2 — Conversation portability
+
+Self-hosted users will lose data without these:
+
+- **Export bundle** — single JSON containing message history + facts +
+  summary state + ChromaDB embeddings for one conversation
+- **Import bundle** — restore a conversation on a different pod / after a wipe
+- **Conversation fork** — duplicate a conversation at turn N with all memory
+  intact (lets user explore alternative continuations)
+- **Cross-pod backup** — could rsync `/data/openwebui/compactor/` between
+  pods for redundancy
+
+Implementation: ~100 lines + a CLI script. Mostly serialization plumbing.
+
+### Theme 3 — Observability
+
+Make compaction visible instead of hidden:
+
+- **`/health/full`** endpoint reporting per-conversation memory size, last
+  compaction time, retrieval hit rates, fact count
+- **OpenWebUI Pipeline plugin** that shows inline "↪ compacted (45 turns →
+  1 summary, 12K tokens saved)" hints in chat
+- **Retrieval highlighting** — when RAG finds an old turn relevant to the
+  current query, mark it in the response ("this is what you said in turn
+  47 about Lyra's backstory")
+- **Memory metrics** endpoint — daily/weekly stats on memory growth rate,
+  retrieval quality, summary cost
+
+Implementation: ~200 lines, mostly endpoints + an OpenWebUI Pipeline plugin.
+
+### Theme 4 — Quality maintenance
+
+Over time memory accumulates noise. V2.1 includes the maintenance loop:
+
+- **Periodic deduplication** — async background job: ask the LLM to merge
+  redundant facts ("Lyra is a half-elf" + "Lyra is half elven" → one canonical
+  fact)
+- **Conflict resolution** — when retrieved turns or facts contradict each
+  other, mark contradictions for user review (surfaced via `/list-facts`)
+- **Stale-fact archival** — facts not retrieved in N months get moved to
+  cold storage (still recoverable, not in active context budget)
+- **Memory size budgets** — cap per-conversation facts at ~150 entries to
+  prevent unbounded growth
+
+Implementation: ~300 lines, plus the right cron-like scheduling pattern.
+
+### Theme 5 — Personas as first-class
+
+OpenWebUI lets users save personas (long system prompts) but they currently
+count against the active token budget. V2.1 treats them specially:
+
+- **Persona-aware compaction** — persona text never gets summarized or evicted
+- **Persona library** — facts memory could automatically extract a persona
+  profile across conversations
+- **Persona inheritance** — new conversations can opt to inherit facts from
+  a "base persona" conversation
+
+Implementation: ~150 lines. Touches the layer-2 (facts) and layer-3
+(summary) construction.
+
+## V2.1 phased rollout
+
+| Phase | Themes | Effort |
+|---|---|---|
+| **5** — Chat command surface | Theme 1 (must-have) | ~1-2 days |
+| **6** — Export / import + observability endpoints | Themes 2 + 3 | ~2-3 days |
+| **7** — Quality maintenance background jobs | Theme 4 | ~2-3 days |
+| **8** — Personas as first-class memory | Theme 5 | ~1-2 days |
+
+Total V2.1 effort: ~6-10 dev-days, on top of V2.0's ~10-12 dev-days.
+
+## V2.1 ruthless-minimum scope (if shipping under time pressure)
+
+If V2.1 has to ship lean, these three items alone deliver most of the
+user-facing value:
+
+1. **`/list-facts`** + **`/forget`** + **`/remember`** (Theme 1) — agency
+2. **Export bundle** (Theme 2) — table-stakes data backup
+3. **`/health/full`** (Theme 3) — sanity check / debug
+
+Everything else is V2.2 / V2.3 polish that can ship incrementally without
+breaking anything.
+
+---
+
+## Build & runtime optimization roadmap
+
+Captured from the v1.9.x build review. The current 1.9.5 image is
+**functional but not yet world-class**. Ordered by impact-to-effort ratio:
+do the top items first, lower items as polish.
+
+### Tier 1 — High impact, low/medium effort
+
+**1. Persist vLLM's torch.compile cache to `/data`** *(big cold-start win)*
+- vLLM caches compiled CUDA graphs at
+  `/root/.cache/vllm/torch_compile_cache/` (container ephemeral disk).
+- Every pod restart re-runs the 60-120s graph capture even though the
+  cache key would have hit.
+- Fix: symlink in entrypoint.sh — `ln -s /data/vllm-compile-cache /root/.cache/vllm`,
+  `mkdir -p /data/vllm-compile-cache` first.
+- Cuts cold start from ~3-5 min → ~1-2 min on warm volume.
+
+**2. BuildKit pip cache mount** *(dev iteration win)*
+- Currently every Dockerfile rebuild that bumps `requirements.txt` or vllm
+  pin re-downloads ~5 GB of wheels.
+- Fix: add `# syntax=docker/dockerfile:1.4` and use
+  `RUN --mount=type=cache,target=/root/.cache/pip pip install ...`
+- Build cache is keyed per-image-build but persists across `docker build`
+  runs. Re-builds drop from ~15 min to ~3-5 min.
+
+**3. Preflight check in entrypoint.sh** *(diagnostics win, no perf cost)*
+- Before launching supervisord, run quick checks and fail loudly with
+  *actionable* messages instead of letting vLLM crash 2 minutes in:
+    - `nvidia-smi` runs cleanly → GPU visible
+    - CUDA driver version ≥ what `torch.version.cuda` needs (would have
+      caught the driver-too-old issue in seconds)
+    - `/data` is writable
+    - `MODEL_REPO` resolves (a quick `huggingface-cli` head request)
+- ~30 lines of bash. Pays for itself the first time it catches a
+  config mismatch before a 5-minute crash loop.
+
+**4. Pre-quantized model release** *(better than runtime FP8)*
+- If `anthracite-org/magnum-v4-22b-AWQ` or `-FP8` exists on HF, use it
+  directly instead of vLLM's runtime fp8 quantization.
+- AWQ on Ampere is *faster* than runtime-FP8 because Marlin can do INT4
+  weight-only with better arithmetic intensity than FP8-on-FP16-ALUs.
+- Image stays the same — just an env var change for users (`MODEL_REPO`).
+- Worth a one-time community search before committing to vLLM-side
+  quantization.
+
+**5. README.md at repo root** *(onboarding win)*
+- Currently the only top-level doc is RUNPOD_DEPLOY.md. New visitors hit
+  the GitHub page and see no orientation.
+- ~80 lines: project goal, architecture diagram (vLLM → compactor →
+  OpenWebUI), pointer to RUNPOD_DEPLOY.md and V2_PLAN.md, image tag table.
+
+**6. CHANGELOG.md tracking the 1.9.x line** *(release hygiene)*
+- 1.9 → 1.9.5 had five hotfixes in one day. Future contributors deserve a
+  narrative of why each version exists.
+- Pattern: keepachangelog.com format.
+
+### Tier 2 — Medium impact, medium effort
+
+**7. Pre-compiled Triton kernels at build time** *(image-size + cold-start)*
+- The reason we needed build-essential + python3-dev (~200 MB) is Triton
+  JIT-compiling at runtime.
+- vLLM has `vllm.entrypoints.openai.api_server --compile-once-and-quit`
+  pattern (or similar) that warms the cache, then exits.
+- Build-time: spin up a dummy CUDA context (PyTorch CPU-only stub?), pre-
+  compile common kernels, commit them to the image.
+- Lets us drop build-essential from runtime → saves ~150 MB.
+- Worth investigating; vLLM's "ahead of time compilation" docs.
+
+**8. GitHub Actions: build + push on tag** *(CI/CD)*
+- Currently every release is a manual `docker compose build` + `docker
+  push` from a laptop. Slow, error-prone, easy to forget.
+- Workflow: on `git tag v1.9.x` push → GH Actions builds → pushes to
+  `angreg/zions-light-ai:v1.9.x` + `:latest` → posts release notes from
+  CHANGELOG.
+- Eliminates the "did I remember to update :latest" class of bug.
+
+**9. Smarter healthchecks** *(observability)*
+- Current healthcheck just `curl http://localhost:3000/` (OpenWebUI).
+- OpenWebUI can be UP while vLLM is FATAL — the pod looks healthy but
+  chats time out.
+- Fix: have the compactor expose `/health/full` that checks both itself
+  and vLLM's `/v1/models`, and point the Docker healthcheck at that.
+- Then `docker ps` / RunPod's status reflect actual functional state.
+
+**10. Reduce image size to ~12-13 GB** *(deploy speed)*
+- Current 17.8 GB has duplicates between `/opt/vllm-venv` and `/app/venv`:
+  both contain pydantic, starlette, anyio, click, certifi, etc.
+- Approach A: install OpenWebUI into the vLLM venv (if version compat
+  holds) → saves ~3 GB but couples upgrade cycles.
+- Approach B: extract shared deps to a third venv and PYTHONPATH both →
+  more complex, marginal savings.
+- Approach C: strip more aggressively (find unused locale files, remove
+  test data, remove .pyi stubs) → ~500 MB.
+- Realistic floor for this stack: ~12 GB.
+
+**11. Structured (JSON) logging** *(observability)*
+- vLLM logs are unstructured text. Compactor uses Python logging with
+  basic format.
+- Standardize on JSON output: vLLM has `--log-format json`, compactor can
+  use python-json-logger.
+- Makes log aggregation / grep tractable; required for any future
+  Grafana/Loki setup.
+
+**12. docker-compose.override.yml for local dev** *(dev velocity)*
+- Currently every change to `compactor/main.py` requires `docker compose
+  build` (~30s for cached layers, ~5 min if requirements change).
+- Override file with `volumes: - ./compactor:/opt/compactor` lets the
+  compactor reload from disk via uvicorn's `--reload` flag.
+- vLLM and OpenWebUI stay containerized; only compactor iterates fast.
+
+### Tier 3 — Nice to have
+
+**13. FlashInfer install** *(small perf)*
+- vLLM warns: `FlashInfer is not available. Falling back to PyTorch-native
+  top-p & top-k sampling.`
+- Install adds ~50 MB and modest sampling speedup.
+- Easy win once we've decided to bump the image size budget elsewhere.
+
+**14. Pin EVERY apt package version** *(reproducibility)*
+- `apt-get install -y build-essential` could resolve differently as
+  Ubuntu's archive updates.
+- True reproducibility would pin `build-essential=12.10ubuntu1` etc.
+- High effort, low payoff in practice — distro packages are pretty stable.
+
+**15. SBOM generation** *(supply chain hygiene)*
+- `docker scout sbom` or syft → ship a software bill of materials per
+  release for security audits.
+- Nice for compliance, irrelevant for personal use.
+
+**16. ARG-ify more pins** *(config hygiene)*
+- Currently `VLLM_VERSION` is the only ARG. Could expose
+  `TRANSFORMERS_CEILING=5`, `PYTORCH_CUDA=cu128`, etc. so future bumps
+  are single-line.
+
+**17. Per-service resource limits in docker-compose** *(safety)*
+- OpenWebUI shouldn't be able to eat all RAM. Add `mem_limit: 512m` etc.
+- Mostly cosmetic on RunPod (you pay per pod, not per process), but
+  matters if anyone deploys this locally on a shared machine.
+
+### Tier 4 — Architectural, save for later
+
+**18. Replace supervisord with s6-overlay or dumb-init + scripts**
+- Supervisord's eventlistener and PID-1 quirks have bitten us
+  (`kill -HUP 1` issue). s6-overlay is the modern "supervise multiple
+  processes inside a container" choice. Larger refactor.
+
+**19. Split into multi-pod architecture**
+- Already analyzed (see earlier discussion): doesn't save money on
+  RunPod for single-user, adds operational complexity. Keep in mind if
+  scaling to multi-user.
+
+**20. Replace OpenWebUI**
+- LibreChat / LobeChat / Big-AGI all exist as alternatives. Only
+  worth doing if OpenWebUI specifically fails us (currently it's fine
+  and OpenAI-compatible just works).
+
+### Suggested first-sprint pick
+
+If we get one focused day of optimization work, do **1 + 2 + 3 + 5**:
+- Persist torch.compile cache (kills the cold-start tax)
+- Pip cache mount (kills dev rebuild time)
+- Preflight check (kills mystery crash time)
+- README (kills the "what is this" tax for anyone landing on the repo)
+
+All four are <100 lines of changes total, no new dependencies, no
+behavior changes. Cumulative effect: deploys feel "world-class" without
+touching the vLLM/compactor architecture at all.
