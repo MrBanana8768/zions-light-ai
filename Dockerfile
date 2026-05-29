@@ -101,8 +101,11 @@ RUN python3 -m venv /app/venv && \
     mkdir -p /app/data /app/data/uploads /app/data/cache
 
 # Compactor sources copied AFTER the expensive install layer so editing
-# main.py doesn't invalidate the vllm install cache.
+# the Python files doesn't invalidate the vllm install cache. List each
+# runtime module explicitly to avoid pulling test_*.py and V2_PLAN.md
+# into the production image.
 COPY compactor/main.py /opt/compactor/main.py
+COPY compactor/memory.py /opt/compactor/memory.py
 
 # =============================================================================
 # Supervisor

@@ -13,8 +13,17 @@ import os
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+
+from memory import (
+    ensure_storage_layout,
+    list_known_conv_ids,
+    resolve_conv_id,
+    storage_summary,
+)
+
 
 def _env_int(name: str, default: int) -> int:
     """os.environ.get returns '' (not the default) when the var is set to an
@@ -31,6 +40,14 @@ MAX_MODEL_LEN = _env_int("MAX_MODEL_LEN", 32768)
 TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(MAX_MODEL_LEN * 0.75))
 KEEP_RECENT_TURNS = _env_int("COMPACTOR_KEEP_RECENT_TURNS", 4)
 SUMMARY_MAX_TOKENS = _env_int("COMPACTOR_SUMMARY_MAX_TOKENS", 1024)
+
+# V2.0 Phase 1: admin endpoint binding. Default "127.0.0.1" rejects any
+# non-localhost client at the dependency layer (we still bind the FastAPI
+# socket to 0.0.0.0 because uvicorn doesn't support dual-listen, but the
+# admin paths return 403 unless the client IP is localhost). Set this to
+# "0.0.0.0" to expose admin endpoints externally — only safe if you have
+# auth/firewall in front.
+ADMIN_BIND = os.environ.get("COMPACTOR_ADMIN_BIND", "127.0.0.1").strip()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -142,13 +159,54 @@ async def compact_if_needed(messages: list[dict]) -> list[dict]:
     return new_messages
 
 
-app = FastAPI(title="context-compactor")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup: ensure /data/openwebui/compactor/{facts,summaries,chromadb}/
+    exist. Idempotent. Shutdown: nothing yet (Phase 3 will close ChromaDB).
+    """
+    try:
+        ensure_storage_layout()
+        logger.info("storage layout ready")
+    except Exception as e:
+        logger.warning(f"could not initialize storage layout: {e}")
+    yield
+
+
+app = FastAPI(title="context-compactor", lifespan=lifespan)
+
+
+def _require_localhost(request: Request) -> None:
+    """FastAPI dependency: gate admin endpoints to localhost unless
+    COMPACTOR_ADMIN_BIND is explicitly set to something other than 127.0.0.1.
+    """
+    if ADMIN_BIND != "127.0.0.1":
+        return  # operator opted in to external admin access
+    client_host = request.client.host if request.client else None
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "admin endpoints are localhost-only by default; "
+                "set COMPACTOR_ADMIN_BIND=0.0.0.0 to expose externally"
+            ),
+        )
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Any:
     body = await request.json()
     messages = body.get("messages", [])
+
+    # V2.0 Phase 1: resolve conv_id for observability. No memory operations
+    # yet — Phase 2 wires this into facts injection, Phase 3 into RAG, etc.
+    try:
+        conv_id, source = resolve_conv_id(
+            dict(request.headers), messages, body=body
+        )
+        logger.info(f"conv_id={conv_id} source={source} msgs={len(messages)}")
+    except Exception as e:
+        logger.warning(f"conv_id resolution failed: {e}")
+
     try:
         body["messages"] = await compact_if_needed(messages)
     except Exception as e:
@@ -187,3 +245,32 @@ async def models():
 @app.get("/health")
 async def health():
     return {"status": "ok", "vllm_url": VLLM_URL, "target_tokens": TARGET_TOKENS}
+
+
+# ---------------------------------------------------------------------------
+# V2.0 Phase 1: admin/observability endpoints
+# ---------------------------------------------------------------------------
+# Localhost-only by default. Read-only at this phase (writes land in Phase 2).
+# These exist so operators can answer "what conv_ids has the compactor seen?"
+# from a pod shell without poking around in /data manually.
+
+from fastapi import Depends  # noqa: E402 (kept local to the admin block)
+
+
+@app.get("/admin/conversations", dependencies=[Depends(_require_localhost)])
+async def admin_list_conversations():
+    """List every conv_id that has any V2 state on disk. Phase 1 always
+    returns [] because nothing writes yet — establishes the endpoint shape.
+    """
+    return {"conversations": list_known_conv_ids()}
+
+
+@app.get(
+    "/admin/conversations/{conv_id}",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_conversation_summary(conv_id: str):
+    """Per-conv inventory: which files exist, sizes. Phase 2/3/4 will add
+    content shape (fact count, message count, etc.).
+    """
+    return storage_summary(conv_id)
