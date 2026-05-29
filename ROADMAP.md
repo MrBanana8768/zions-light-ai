@@ -234,6 +234,43 @@ mostly separate code paths.
 
 ---
 
+## Alternative inference backend (V1.10 candidate or V2-parallel)
+
+**Trigger for considering:** sustained pain with vLLM's VRAM footprint on
+A40-class hardware, or wanting a meaningfully smaller image.
+
+**Switch to TabbyAPI + ExLlamaV2 (EXL2 quants)** rather than vLLM:
+
+| | vLLM (current) | TabbyAPI + EXL2 |
+|---|---|---|
+| Backend image footprint | ~17 GB | ~3-5 GB |
+| OpenAI-compat API | Native | Yes (TabbyAPI) |
+| Magnum 22B quality at ~16 GB | AWQ 4-bit (Marlin) | **EXL2 5.0bpw** (usually higher quality) |
+| Single-stream throughput on Ampere | Good | **Often faster** |
+| Multi-user batching | Excellent | Weaker (n/a for single-user deploys) |
+| Model architecture coverage | Very broad incl. VLMs | Llama-family solid, some lag |
+
+For Zion's Light AI's profile (single user, creative writing, Magnum-family
+models, A40), TabbyAPI + EXL2 is a credible better fit than vLLM. Reason
+we're on vLLM is path-dependent from the original migration.
+
+**Cost of the swap (when we eventually do it):**
+- Dockerfile rewrite (replace vLLM install with TabbyAPI + exllamav2 wheels)
+- `supervisord.conf` `[program:vllm]` becomes `[program:tabby]`
+- `entrypoint.sh` preflight stays useful (same CUDA driver checks)
+- compactor: NO changes — it's backend-agnostic, talks pure OpenAI-compat
+- OpenWebUI: NO changes
+- Default model: switch to an EXL2 variant (e.g. `LoneStriker/magnum-v4-22b-5.0bpw-h6-exl2`)
+- Effort: ~1 day for Dockerfile + supervisord + entrypoint adjustments, ~1
+  day for testing both single-user chat flow and compactor compaction
+  against the new backend
+
+**This is a worthwhile evaluation but not urgent.** V2 memory architecture
+is more user-visibly valuable than a backend swap. Revisit after V2.0
+ships, or sooner if vLLM keeps causing VRAM-shape problems.
+
+---
+
 ## Beyond V3 — speculative roadmap
 
 These are directions worth keeping in mind but not committing to until V2
