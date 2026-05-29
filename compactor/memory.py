@@ -17,12 +17,15 @@ system prompt and immune to opening-fingerprint collisions. The hash
 fallback works but is documented as the lower-quality path.
 """
 
+import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
+import tempfile
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 logger = logging.getLogger("compactor.memory")
 
@@ -158,15 +161,109 @@ def list_known_conv_ids() -> list[str]:
     """For the /admin/conversations endpoint. Returns every conv_id that
     has *either* a facts file or a summary file (or eventually a ChromaDB
     collection). Sorted for stable output.
+
+    Skips sidecar files like `<conv>.backfill.json` (Phase 2 lazy
+    backfill state) so they don't show up as fake conversations.
     """
     ids: set[str] = set()
     for sub in ("facts", "summaries"):
         d = STORAGE_ROOT / sub
         if d.exists():
             for f in d.glob("*.json"):
+                # Skip files whose name has a second extension (sidecars).
+                # facts/<id>.json    → stem="<id>"        → keep
+                # facts/<id>.backfill.json → stem="<id>.backfill" → skip
+                if "." in f.stem:
+                    continue
                 ids.add(f.stem)
     return sorted(ids)
 
+
+def storage_root() -> Path:
+    """Expose STORAGE_ROOT as a function for modules that need to compute
+    sidecar paths (e.g. backfill state). Stays a function so tests that
+    set COMPACTOR_STORAGE_ROOT mid-test can observe the change.
+    """
+    return STORAGE_ROOT
+
+
+# ---------------------------------------------------------------------------
+# Foundational I/O primitives (used by facts.py, backfill.py, summarizer.py)
+# ---------------------------------------------------------------------------
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    """Crash-safe JSON write: serialize to a NamedTemporaryFile in the same
+    directory, fsync, then os.replace (atomic on POSIX).
+
+    Why this matters: a torn write (crash mid-write) leaves the destination
+    file half-written. Subsequent reads see invalid JSON, the model loses
+    its memory of that conversation, and we have no good way to recover.
+    The temp+rename pattern guarantees readers see either the old contents
+    or the new contents, never a torn state.
+
+    Orphan *.tmp files left by a crash mid-write are ignored by
+    list_known_conv_ids() since it globs for *.json specifically.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=path.name + ".",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        # Best-effort cleanup of orphan temp file; don't shadow the
+        # original exception if cleanup also fails.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def read_json(path: Path, default: Any = None) -> Any:
+    """Convenience read with default-on-missing. Returns the default if
+    the file doesn't exist OR if it's corrupted (logs warning on corrupt).
+    """
+    if not path.is_file():
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"corrupted or unreadable {path}: {e}; returning default")
+        return default
+
+
+# Per-conv asyncio locks for serializing concurrent writers (e.g., the
+# post-response fact-extraction tail vs. an active backfill on the same
+# conv). Created lazily on first request. Lives for the lifetime of the
+# process — fine because each conv_id's lock is tiny and the count is
+# bounded by user-visible conversation count.
+_conv_locks: dict[str, asyncio.Lock] = {}
+
+
+def conv_lock(conv_id: str) -> asyncio.Lock:
+    """Get-or-create the asyncio.Lock for this conv_id.
+
+    Safe under single-threaded asyncio (default uvicorn shape) — dict
+    operations are atomic under CPython's GIL and we're not in a thread
+    pool here. If we ever go multi-threaded, this needs a meta-lock.
+    """
+    if conv_id not in _conv_locks:
+        _conv_locks[conv_id] = asyncio.Lock()
+    return _conv_locks[conv_id]
+
+
+# ---------------------------------------------------------------------------
+# Per-conv inventory (used by /admin/conversations/<id>)
+# ---------------------------------------------------------------------------
 
 def storage_summary(conv_id: str) -> dict:
     """Per-conv inventory: which files exist + their sizes. Useful for

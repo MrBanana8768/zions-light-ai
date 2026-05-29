@@ -106,6 +106,8 @@ RUN python3 -m venv /app/venv && \
 # into the production image.
 COPY compactor/main.py /opt/compactor/main.py
 COPY compactor/memory.py /opt/compactor/memory.py
+COPY compactor/facts.py /opt/compactor/facts.py
+COPY compactor/backfill.py /opt/compactor/backfill.py
 
 # =============================================================================
 # Supervisor
