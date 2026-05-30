@@ -110,6 +110,7 @@ COPY compactor/main.py /opt/compactor/main.py
 COPY compactor/memory.py /opt/compactor/memory.py
 COPY compactor/facts.py /opt/compactor/facts.py
 COPY compactor/backfill.py /opt/compactor/backfill.py
+COPY compactor/retrieval.py /opt/compactor/retrieval.py
 
 # =============================================================================
 # Supervisor
@@ -146,6 +147,19 @@ ENV COMPACTOR_TARGET_TOKENS=""
 ENV COMPACTOR_KEEP_RECENT_TURNS="4"
 ENV COMPACTOR_SUMMARY_MAX_TOKENS="1024"
 ENV VLLM_URL="http://localhost:8000"
+
+# V2.0 Phase 2 — facts memory
+ENV COMPACTOR_FACTS_EXTRACTION="true"
+ENV COMPACTOR_MAX_FACTS_TOKENS="1500"
+ENV COMPACTOR_ADMIN_BIND="127.0.0.1"
+
+# V2.0 Phase 3 — episodic memory (RAG). Embedding model baked into the
+# image at /opt/embeddings; FASTEMBED_CACHE_PATH points there so no
+# runtime download. RAG can be disabled with COMPACTOR_RAG_ENABLED=false.
+ENV COMPACTOR_RAG_ENABLED="true"
+ENV COMPACTOR_RAG_TOP_K="5"
+ENV COMPACTOR_EMBEDDING_MODEL="BAAI/bge-small-en-v1.5"
+ENV FASTEMBED_CACHE_PATH="/opt/embeddings"
 
 # OpenWebUI settings — points at the compactor, not vLLM directly
 ENV OPENWEBUI_PORT="3000"

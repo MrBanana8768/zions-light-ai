@@ -45,6 +45,7 @@ from typing import Any
 import httpx
 
 import facts as facts_module
+import retrieval
 from memory import (
     atomic_write_json,
     conv_lock,

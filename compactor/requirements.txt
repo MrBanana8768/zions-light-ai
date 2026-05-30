@@ -1,23 +1,24 @@
-# Most of these are vllm transitive deps; listed here to make the
-# compactor's direct dependencies explicit.
+# Compactor venv requirements (V2.0 Phase 3+).
 #
-# DO NOT pin tight versions here — let vllm own its dep graph and we
-# trust whatever it resolves. Hard-won lessons from the 1.9.x line:
+# As of Phase 3 the compactor runs in its OWN venv (/opt/compactor-venv),
+# fully separate from vLLM. That means these deps can resolve freely
+# WITHOUT risk of disturbing vLLM's torch/transformers pins — the
+# dependency-coupling bug class that caused the 1.9.x fire drills is now
+# structurally impossible.
 #
-#   v1.9     pinned everything (transformers==4.47.1) — too old, missing
-#            Gemma3Config that modern vLLM imports unconditionally.
-#   v1.9.1/2 unpinned everything — pip resolved transformers to 5.9.0
-#            which removed `all_special_tokens_extended` that vLLM 0.11
-#            still called. Tokenizer init crashed with AttributeError.
-#   v1.9.4   pinned transformers to `>=4.50,<5` for vllm 0.11 compat.
-#   v1.9.6   bumped vllm to 0.14.1 (CVE fix). 0.14.x was written against
-#            transformers 5.x — lifted the `<5` ceiling. Leaving only the
-#            `>=4.50` floor in case anyone downgrades vllm later.
+# Deliberately torch-free: fastembed uses ONNX runtime, and transformers
+# is used tokenizer-only (AutoTokenizer works without a torch backend for
+# fast/rust tokenizers). Keeps the compactor venv lean.
 #
-# The compactor itself uses transformers ONLY for AutoTokenizer.
-# AutoTokenizer's API is stable across the 4.50 → 5.x boundary, so
-# either version range works for our code.
+# transformers floor stays at 4.50 (Gemma3Config + stable tokenizer API);
+# no upper bound needed here since vLLM no longer shares this venv.
+
+# --- proxy / API ---
 fastapi
 uvicorn[standard]
 httpx
 transformers>=4.50
+
+# --- V2.0 Phase 3: episodic memory ---
+chromadb            # persistent vector store (embedded, sqlite-backed)
+fastembed           # BAAI/bge-small-en-v1.5 embeddings via ONNX (no torch)

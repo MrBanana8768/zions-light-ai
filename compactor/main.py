@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 import backfill
 import facts
+import retrieval
 from memory import (
     conv_lock,
     ensure_storage_layout,
@@ -174,24 +175,25 @@ async def compact_if_needed(messages: list[dict]) -> list[dict]:
 # V2.0 Phase 2: facts injection
 # ---------------------------------------------------------------------------
 
-def inject_facts_block(messages: list[dict], facts_block: str) -> list[dict]:
-    """Insert a facts block as a system message immediately after the
-    leading run of original system messages (or at position 0 if none).
+def inject_system_block(messages: list[dict], content: str) -> list[dict]:
+    """Insert a synthetic system message immediately after the leading run
+    of system messages (or at position 0 if none).
 
-    Order matters for the model: original system prompts come first
-    (highest priority), then the persistent facts (medium-priority
-    context), then summaries / retrieved turns, then the recent
-    conversation. Phase 2 only handles facts; Phase 3 will slot
-    retrieval results after this, Phase 4 will slot the summary stack.
+    Order matters for the model. Injecting in this sequence each request:
+      original system → facts → retrieved exchanges → (Phase 4: summary)
+      → recent conversation
+    Because each call inserts after the *current* leading system run, and
+    the previous injection has become part of that run, calling this for
+    facts then retrieval yields [system, facts, retrieved, conversation].
     """
-    fact_msg = {"role": "system", "content": facts_block}
+    sys_msg = {"role": "system", "content": content}
     insert_at = 0
     for i, m in enumerate(messages):
         if m.get("role") == "system":
             insert_at = i + 1
         else:
             break
-    return messages[:insert_at] + [fact_msg] + messages[insert_at:]
+    return messages[:insert_at] + [sys_msg] + messages[insert_at:]
 
 
 def _extract_last_user_text(messages: list[dict]) -> str:
@@ -277,20 +279,36 @@ def _fire_and_forget(coro) -> None:
     task.add_done_callback(_log_exception)
 
 
-async def _async_tail_facts(
+async def _async_tail(
     conv_id: str,
     touched_facts: list[dict],
     last_user_text: str,
     assistant_text: str,
     turn_index: int,
 ) -> None:
-    """The post-response work: extract new facts from the just-completed
-    exchange, merge with already-touched facts (preserving LRU timestamps),
-    prune to budget, write atomically.
+    """Post-response work, fired after the assistant's reply is fully
+    streamed/received. Two independent jobs:
 
-    Serialized per-conv via the conv_lock so a concurrent backfill on the
-    same conv can't tear writes.
+      1. Episodic indexing (Phase 3): embed this exchange into ChromaDB so
+         it's retrievable later. Runs regardless of facts settings.
+      2. Facts extraction (Phase 2): pull new persistent facts from the
+         exchange, merge + prune + save.
+
+    Both degrade to no-ops on failure — never affects the user response.
+    Facts writes are serialized per-conv via conv_lock.
     """
+    # --- 1. Episodic indexing (independent of facts) ---
+    if assistant_text and last_user_text:
+        try:
+            indexed = retrieval.index_exchange(
+                conv_id, turn_index, last_user_text, assistant_text
+            )
+            if indexed:
+                logger.info(f"conv={conv_id}: indexed exchange (turn ~{turn_index})")
+        except Exception as e:
+            logger.warning(f"conv={conv_id}: episodic indexing failed: {e}")
+
+    # --- 2. Facts extraction ---
     if not facts.extraction_enabled():
         # Even with extraction off, save the touched state so LRU
         # tracking persists across restarts.
@@ -399,6 +417,14 @@ async def chat_completions(request: Request) -> Any:
     except Exception as e:
         logger.warning(f"conv_id resolution failed: {e}")
 
+    # The latest user message — used both as the RAG retrieval query and,
+    # later, as the exchange's user half for the async indexing/facts tail.
+    # Computed from the ORIGINAL messages (compaction preserves the last
+    # user turn, but we want the pristine text here).
+    last_user_text = _extract_last_user_text(messages)
+    # Turn index ≈ position of the assistant reply we're about to produce.
+    turn_index = len(messages) + 1
+
     # V1 compaction
     try:
         body["messages"] = await compact_if_needed(messages)
@@ -414,12 +440,30 @@ async def chat_completions(request: Request) -> Any:
                 facts.touch_facts(touched_facts)
                 block = facts.format_facts_block(touched_facts)
                 if block:
-                    body["messages"] = inject_facts_block(body["messages"], block)
+                    body["messages"] = inject_system_block(body["messages"], block)
                     logger.info(
                         f"conv={conv_id}: injected {len(touched_facts)} fact(s)"
                     )
         except Exception as e:
             logger.warning(f"conv={conv_id}: facts injection failed (non-fatal): {e}")
+
+        # V2.0 Phase 3: RAG retrieval. Embed the latest user message, pull
+        # the top-K most-similar past exchanges, inject them after facts.
+        # exclude_turns_from drops retrieved turns that are already present
+        # verbatim in the recent window (no point spending budget twice).
+        try:
+            recent_cutoff = max(0, turn_index - (KEEP_RECENT_TURNS * 2))
+            hits = retrieval.retrieve(
+                conv_id, last_user_text, exclude_turns_from=recent_cutoff
+            )
+            rblock = retrieval.format_retrieval_block(hits)
+            if rblock:
+                body["messages"] = inject_system_block(body["messages"], rblock)
+                logger.info(
+                    f"conv={conv_id}: injected {len(hits)} retrieved exchange(s)"
+                )
+        except Exception as e:
+            logger.warning(f"conv={conv_id}: retrieval injection failed (non-fatal): {e}")
 
         # Lazy backfill: if this is an existing V1 conv that has no facts
         # file yet, kick off a background extraction over its full history.
@@ -441,14 +485,6 @@ async def chat_completions(request: Request) -> Any:
     stream = bool(body.get("stream", False))
     client = httpx.AsyncClient(timeout=None)
 
-    # Capture the user message that's about to be answered, for the async
-    # fact-extraction tail. Use the request's *original* messages (not the
-    # compacted ones) since the last user message is preserved by compact.
-    last_user_text = _extract_last_user_text(messages)
-    # Turn index = total messages including the assistant response we're
-    # about to receive. Adding 1 accounts for that.
-    turn_index = len(messages) + 1
-
     if stream:
         accumulator = SseAccumulator()
 
@@ -465,7 +501,7 @@ async def chat_completions(request: Request) -> Any:
                 # Fire-and-forget fact extraction once the stream is done.
                 if conv_id:
                     _fire_and_forget(
-                        _async_tail_facts(
+                        _async_tail(
                             conv_id,
                             touched_facts,
                             last_user_text,
@@ -557,16 +593,21 @@ async def admin_get_facts(conv_id: str):
     dependencies=[Depends(_require_localhost)],
 )
 async def admin_forget_facts(conv_id: str):
-    """Forget all facts for a conversation (V2.0 granularity: all-or-nothing).
-    Targeted forgetting — single fact by substring — is V2.1.
-
-    Implemented as: acquire per-conv lock, save empty facts list, return
-    the count that was forgotten. Read-back is safe immediately after.
+    """Forget all memory for a conversation (V2.0 granularity: all-or-
+    nothing). Clears BOTH the persistent facts AND the episodic embeddings
+    — a full memory reset for when the model is stuck on something wrong.
+    Targeted forgetting (single fact by substring) is V2.1.
     """
     async with conv_lock(conv_id):
         existing = facts.load_facts(conv_id)
-        n = len(existing)
-        if n > 0:
+        n_facts = len(existing)
+        if n_facts > 0:
             facts.save_facts(conv_id, [])
-            logger.info(f"conv={conv_id}: admin forgot {n} fact(s)")
-    return {"conv_id": conv_id, "forgotten": n}
+        # Episodic memory lives in ChromaDB, not the facts file — clear it too.
+        n_episodic = retrieval.forget_conversation(conv_id)
+        if n_facts or n_episodic:
+            logger.info(
+                f"conv={conv_id}: admin forgot {n_facts} fact(s) "
+                f"+ {n_episodic} indexed exchange(s)"
+            )
+    return {"conv_id": conv_id, "forgotten_facts": n_facts, "forgotten_episodic": n_episodic}

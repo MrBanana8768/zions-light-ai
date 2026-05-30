@@ -84,11 +84,13 @@ See [CHANGELOG.md](CHANGELOG.md) for full version history.
 │   ├── memory.py           # conv_id resolution, storage layout, atomic I/O, locks
 │   ├── facts.py            # V2.0 persistent facts: extract / prune / inject
 │   ├── backfill.py         # V2.0 lazy backfill of pre-V2 conversations
+│   ├── retrieval.py        # V2.0 episodic memory: embeddings + ChromaDB RAG
 │   ├── requirements.txt    # pip deps
 │   ├── test_smoke.py       # Tier-1 unit tests (CPU-only)
 │   ├── test_memory.py      # Tier-1 unit tests (CPU-only)
 │   ├── test_facts.py       # Tier-1 unit tests (CPU-only)
 │   ├── test_backfill.py    # Tier-1 unit tests (CPU-only)
+│   ├── test_retrieval.py   # Tier-1 unit tests (CPU-only)
 │   └── V2_PLAN.md          # V2 architecture spec (memory: RAG + facts + tiered summary)
 ├── pipelines/              # OpenWebUI Functions
 │   └── conversation_id_header.py  # Propagates chat_id → compactor conv_id
