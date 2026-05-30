@@ -182,6 +182,91 @@ and V2.1 too.
 
 ---
 
+## V2.3 — Resilience & Stability
+
+**Goal:** Make the system *survive failure gracefully* and *protect
+irreplaceable data*, so it can run unattended in a production-shaped
+environment without the owner babysitting logs. This is the
+"quality-and-stability-over-speed" release: every item is something whose
+absence only hurts when it's 2am and something has already gone wrong.
+
+**Philosophy (explicit, by owner's direction):** ship slowly and
+deliberately. Each item below is "done" only when it has been *deliberately
+failure-tested* — not when the happy path works. Better to spend weeks
+locking one item down than to ship five half-proven ones. The whole
+point of V2.3 is that the things it adds must themselves be trustworthy,
+because they're the safety net the rest of the system leans on.
+
+### Theme 1 — Data durability (the only *unrecoverable* failure class)
+
+The `/data` volume holds two things that cannot be regenerated if lost:
+OpenWebUI's `webui.db` (chat history) and `compactor/` (facts JSON +
+ChromaDB vectors). Everything else (models, torch.compile cache) is
+re-downloadable. Today a corrupted volume = total memory loss, no recovery.
+
+- **Scheduled backups** of `webui.db` + `compactor/` to a second cheap
+  Network Volume or object store (tar + timestamp, retain N). Runs as a
+  supervised periodic sidecar (pairs with V2.2's selftest process model).
+- **Backup verification** — a backup that can't be restored is not a
+  backup. The job restores its own latest archive into a scratch dir and
+  asserts the SQLite opens + the facts JSON parses, before declaring success.
+- **Documented restore runbook** — exact commands to recover from a wiped
+  volume, in RUNPOD_DEPLOY.md. Tested at least once for real.
+- **Atomic-write audit** — confirm every writer on the hot path already
+  uses `memory.atomic_write_json` (facts ✓, backfill state ✓); extend to
+  Phase 4 summaries.
+
+### Theme 2 — Graceful degradation under partial failure
+
+The system is already designed so memory failures never break chat
+(retrieval/facts degrade to no-ops). V2.3 makes that a *verified guarantee*
+and extends it:
+
+- **Chaos checks** — a Tier-3 suite that deliberately breaks each
+  dependency (kill vLLM mid-request, corrupt a facts file, fill the disk,
+  make ChromaDB unwritable) and asserts the user-visible behavior is
+  "degraded but functional," never a hard 500 or a crash loop.
+- **Disk-pressure handling** — detect low free space on `/data` and stop
+  *writing* new memory (keep serving) rather than crashing on a failed
+  write. Surface it in `/health/full`.
+- **vLLM restart resilience** — confirm the compactor rides out a vLLM
+  restart (502s become a clean "model is restarting" rather than a thrash).
+
+### Theme 3 — Process & resource stability
+
+- **Memory/FD leak watch** — long-soak test (multi-day) watching the
+  compactor's RSS and file-descriptor count for slow leaks (httpx clients,
+  ChromaDB handles, the background-task set).
+- **Bounded background work** — cap concurrent async tails; if extraction
+  falls behind under load, shed/queue rather than spawning unboundedly.
+- **supervisord restart policy review** — make sure a genuinely-broken
+  service enters FATAL and stays visible, instead of fast-restart-looping
+  and masking the root cause (a lesson from the V1.9.x cascade).
+
+### Theme 4 — Operational confidence
+
+- **Runbook** (`OPERATIONS.md`) — what each log line means, how to read
+  `/health/full`, how to recover from each known failure mode, how to roll
+  back a bad image (the `:latest` → `:1.9.6` escape hatch, generalized).
+- **Structured logging** — JSON logs (vLLM `--log-format json`, compactor
+  via python-json-logger) so failures are greppable/aggregatable.
+- **Alerting hook (optional)** — a single configurable webhook the
+  selftest/backup jobs POST to on failure, so the owner finds out before
+  the user does.
+
+**Prerequisite:** ships after V2.2 (it builds directly on V2.2's selftest
+process model, `/health/full`, and Tier-3 harness). Some Theme-1 backup
+work could be pulled forward if data volume grows valuable before then —
+data durability is the one item whose failure mode is *unrecoverable*, so
+it's the natural candidate for early promotion.
+
+**V2.3 effort: deliberately unbounded.** Estimated ~2-4 weeks of elapsed
+time, but the explicit standard is *correctness and failure-tested
+confidence over calendar speed*. An item is not "done" until its failure
+path has been exercised on purpose.
+
+---
+
 ## Cross-cutting infrastructure (no version — ongoing)
 
 Not tied to a specific feature version. These support every release and

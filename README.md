@@ -105,9 +105,11 @@ See [CHANGELOG.md](CHANGELOG.md) for full version history.
 
 See [ROADMAP.md](ROADMAP.md) for the full plan. High-level:
 
-- **V1.9.6** *(current)* — final V1 release: vLLM bumped to 0.14.1 (CVE fix), parametric CUDA build args, persistent torch.compile cache, preflight checks
-- **V2.0** *(next major)* — memory architecture: RAG over conversation history, extracted persistent facts, hierarchical summarization. See [compactor/V2_PLAN.md](compactor/V2_PLAN.md)
+- **V1.9.6** — final V1 release: vLLM bumped to 0.14.1 (CVE fix), parametric CUDA build args, persistent torch.compile cache, preflight checks
+- **V2.0** *(in progress)* — memory architecture: persistent facts, RAG over conversation history (ChromaDB), hierarchical summarization. See [compactor/V2_PLAN.md](compactor/V2_PLAN.md)
 - **V2.1** — user control of memory: chat commands (`/list-facts`, `/forget`, `/remember`), conversation export/import, observability endpoints
+- **V2.2** — testing & observability: boot self-test harness, `/health/full`, integration suite (standard already in force, see [TESTING.md](TESTING.md))
+- **V2.3** — resilience & stability: data-durability backups + verified restore, graceful-degradation chaos tests, operational runbook. *Quality over speed — failure-tested before shipped.*
 - **V3** — multimodal: vision (VLM swap), speech-to-text (Whisper), text-to-speech (Kokoro/XTTS)
 - **Beyond V3** — agentic tools, fine-tuning pipeline, multi-user
 
