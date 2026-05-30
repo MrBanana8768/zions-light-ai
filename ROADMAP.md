@@ -141,6 +141,47 @@ the user-facing layer on top.
 
 ---
 
+## V2.2 — Testing & Observability
+
+**Goal:** Make "is this deploy actually working?" answerable automatically
+and repeatably, and codify a testing standard every future feature must
+follow. Pairs naturally with V2.1's observability theme.
+
+**Prerequisite:** ships after V2.0 (memory) is complete through Phase 4 —
+we don't interrupt the in-flight memory work. The *standard* (TESTING.md),
+however, is in force now and governs the code written in V2.0 Phases 3/4
+and V2.1 too.
+
+**Full standard:** [TESTING.md](TESTING.md). Three test tiers:
+
+| Tier | Scope | Where | GPU |
+|---|---|---|---|
+| 1 — Unit/logic | pure functions, I/O, parsers, state machines | `compactor/test_*.py` (CI on every PR) | No |
+| 2 — Boot self-test | live-stack health: round-trip + facts I/O, runs post-boot | `compactor/selftest.py` | Yes (pod) |
+| 3 — Integration | end-to-end scenarios (e.g. facts persistence over 300 turns) | `tests/integration/` | Yes |
+
+**What V2.2 builds:**
+- `compactor/selftest.py` — boot-time validation battery (vLLM model
+  loaded, compactor health, real 1-token chat round-trip, facts
+  write/read/delete against a `__selftest__` sentinel conv, admin
+  localhost gating). Auto-runs post-boot as a non-blocking one-shot
+  supervisord program (`COMPACTOR_SELFTEST_ON_BOOT=true`), logs to
+  `/var/log/supervisor/selftest.log`. Also on-demand.
+- `GET /admin/selftest` — on-demand self-test, JSON report, localhost-only.
+- `GET /health/full` — deeper than `/health`: probes vLLM reachability +
+  memory-store stats. Becomes the Docker `HEALTHCHECK` target so the pod
+  reports unhealthy when vLLM is down (today's `curl :3000` check passes
+  even when vLLM is FATAL). Satisfies the V2.1 observability `/health/full`
+  item.
+- `tests/integration/` — Tier-3 suite (starts with facts persistence),
+  run against a live pod via `ZIONS_TEST_BASE_URL`.
+- `compactor/test_selftest.py` — Tier-1 coverage for the harness itself
+  (mocked HTTP).
+
+**V2.2 effort: ~3-4 dev-days.**
+
+---
+
 ## Cross-cutting infrastructure (no version — ongoing)
 
 Not tied to a specific feature version. These support every release and

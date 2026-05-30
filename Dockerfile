@@ -97,8 +97,10 @@ RUN python3 -m venv /app/venv && \
         -exec strip --strip-unneeded {} + 2>/dev/null || true && \
     find /app/venv -name "*.pyc" -delete && \
     find /app/venv -name "__pycache__" -type d -exec rm -rf {} + && \
-    rm -rf /root/.cache /tmp/* /var/tmp/* && \
-    mkdir -p /app/data /app/data/uploads /app/data/cache
+    rm -rf /root/.cache /tmp/* /var/tmp/*
+# Note: OpenWebUI data lives at DATA_DIR=/data/openwebui (on the persistent
+# volume), created by entrypoint.sh at boot. No /app/data dirs needed —
+# that was the pre-single-volume layout (removed in V2.2 cleanup).
 
 # Compactor sources copied AFTER the expensive install layer so editing
 # the Python files doesn't invalidate the vllm install cache. List each
