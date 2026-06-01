@@ -62,26 +62,47 @@ ARG VLLM_VERSION=0.14.1
 ARG TORCH_CUDA=cu128
 
 # =============================================================================
-# vLLM venv + compactor python deps — installed, stripped, and cache-cleared
-# in a SINGLE layer so unstripped libs and .pyc caches never get committed.
-# --extra-index-url pulls PyTorch from the chosen CUDA channel explicitly to
-# keep pip from resolving torch to a different cu variant.
-# COPY just the requirements file (not full compactor/) so editing main.py
-# later doesn't bust this expensive layer.
-# Also bumps pip/setuptools/wheel as part of the same layer — both resolve
-# Scout-flagged Highs (CVE in setuptools 68.x and wheel 0.42.x).
+# vLLM venv — ONLY vLLM. As of V2.0 Phase 3 the compactor has its OWN venv
+# (below), so the compactor's deps (chromadb, fastembed, etc.) can NEVER
+# disturb vLLM's torch/transformers pins. This permanently closes the
+# dependency-coupling bug class that caused the V1.9.x fire drills.
+# Installed + stripped + cache-cleared in one layer so unstripped libs and
+# .pyc caches never get committed. --extra-index-url pins the torch CUDA
+# channel. pip/setuptools/wheel bumped here too (Scout-flagged Highs).
 # =============================================================================
-COPY compactor/requirements.txt /opt/compactor/requirements.txt
 RUN python3 -m venv /opt/vllm-venv && \
     /opt/vllm-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
     /opt/vllm-venv/bin/pip install --no-cache-dir \
         --extra-index-url https://download.pytorch.org/whl/${TORCH_CUDA} \
         vllm==${VLLM_VERSION} && \
-    /opt/vllm-venv/bin/pip install --no-cache-dir -r /opt/compactor/requirements.txt && \
     find /opt/vllm-venv -type f \( -name "*.so" -o -name "*.so.*" \) \
         -exec strip --strip-unneeded {} + 2>/dev/null || true && \
     find /opt/vllm-venv -name "*.pyc" -delete && \
     find /opt/vllm-venv -name "__pycache__" -type d -exec rm -rf {} + && \
+    rm -rf /root/.cache /tmp/* /var/tmp/*
+
+# =============================================================================
+# Compactor venv — fully decoupled from vLLM. Holds fastapi/uvicorn/httpx
+# (proxy), transformers (tokenizer-only, no torch), chromadb (vector store)
+# and fastembed (bge-small embeddings via ONNX runtime — no torch, keeps
+# this venv lean). COPY requirements separately so editing the Python
+# sources later doesn't bust this layer.
+# =============================================================================
+COPY compactor/requirements.txt /opt/compactor/requirements.txt
+RUN python3 -m venv /opt/compactor-venv && \
+    /opt/compactor-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    /opt/compactor-venv/bin/pip install --no-cache-dir -r /opt/compactor/requirements.txt && \
+    find /opt/compactor-venv -type f \( -name "*.so" -o -name "*.so.*" \) \
+        -exec strip --strip-unneeded {} + 2>/dev/null || true && \
+    find /opt/compactor-venv -name "*.pyc" -delete && \
+    find /opt/compactor-venv -name "__pycache__" -type d -exec rm -rf {} + && \
+    rm -rf /root/.cache /tmp/* /var/tmp/*
+
+# Pre-download the bge-small ONNX embedding model into the image so the
+# first request pays no download. Static weights belong in the image, not
+# on the /data volume. FASTEMBED_CACHE_PATH (ENV section below) points here.
+RUN /opt/compactor-venv/bin/python -c \
+    "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5', cache_dir='/opt/embeddings')" && \
     rm -rf /root/.cache /tmp/* /var/tmp/*
 
 # =============================================================================
