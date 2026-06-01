@@ -46,6 +46,7 @@ import httpx
 
 import facts as facts_module
 import retrieval
+import summarizer
 from memory import (
     atomic_write_json,
     conv_lock,
@@ -248,6 +249,19 @@ async def _run_backfill(
         async with conv_lock(conv_id):
             kept, dropped = facts_module.prune_facts(accumulated)
             facts_module.save_facts(conv_id, kept)
+
+        # V2.0 Phase 4: also build hierarchical summary state for this conv,
+        # so the model gets continuity-of-narrative on the *next* request
+        # rather than having to wait for natural rollups (which require new
+        # turns to accumulate). maybe_rollup drains as many L1→L2→L3 layers
+        # as the existing message history justifies. Failure is non-fatal:
+        # facts backfill is still considered complete.
+        try:
+            if summarizer.enabled():
+                await summarizer.maybe_rollup(conv_id, messages, vllm_url, model)
+        except Exception as e:
+            logger.warning(f"conv={conv_id}: backfill summary rollup failed (non-fatal): {e}")
+
         _write_state(conv_id, {
             "state": "complete",
             "started_at": started_at,

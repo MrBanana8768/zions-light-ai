@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import backfill
 import facts
 import retrieval
+import summarizer
 from memory import (
     conv_lock,
     ensure_storage_layout,
@@ -285,17 +286,24 @@ async def _async_tail(
     last_user_text: str,
     assistant_text: str,
     turn_index: int,
+    original_messages: list[dict],
 ) -> None:
     """Post-response work, fired after the assistant's reply is fully
-    streamed/received. Two independent jobs:
+    streamed/received. Three independent jobs:
 
       1. Episodic indexing (Phase 3): embed this exchange into ChromaDB so
          it's retrievable later. Runs regardless of facts settings.
       2. Facts extraction (Phase 2): pull new persistent facts from the
          exchange, merge + prune + save.
+      3. Hierarchical rollup (Phase 4): if enough new turns have accumulated
+         since the last summarization, roll L0→L1, L1→L2, L2→L3 as needed.
 
-    Both degrade to no-ops on failure — never affects the user response.
-    Facts writes are serialized per-conv via conv_lock.
+    All degrade to no-ops on failure — never affects the user response.
+    Facts and summary writes are serialized per-conv via conv_lock.
+
+    `original_messages` is the request's messages list (pre-compaction); we
+    append the just-completed assistant turn before passing to the rollup so
+    it sees the full conversation when computing turn ranges.
     """
     # --- 1. Episodic indexing (independent of facts) ---
     if assistant_text and last_user_text:
@@ -349,6 +357,32 @@ async def _async_tail(
                 )
         except Exception as e:
             logger.exception(f"conv={conv_id}: async fact tail failed: {e}")
+
+    # --- 3. Hierarchical summary rollup (Phase 4) ---
+    # Runs OUTSIDE the facts lock since maybe_rollup acquires its own
+    # conv_lock internally — nesting the same lock would deadlock.
+    if summarizer.enabled() and assistant_text:
+        try:
+            full_messages = list(original_messages) + [
+                {"role": "assistant", "content": assistant_text}
+            ]
+            before = summarizer.load_state(conv_id)
+            state = await summarizer.maybe_rollup(
+                conv_id, full_messages, VLLM_URL, MODEL_REPO or ""
+            )
+            if (
+                len(state.get("l1") or []) != len(before.get("l1") or [])
+                or len(state.get("l2") or []) != len(before.get("l2") or [])
+                or (state.get("l3") is not None) != (before.get("l3") is not None)
+            ):
+                logger.info(
+                    f"conv={conv_id}: rollup → L1={len(state.get('l1') or [])} "
+                    f"L2={len(state.get('l2') or [])} "
+                    f"L3={'y' if state.get('l3') else 'n'} "
+                    f"last_turn={state.get('last_summarized_turn', 0)}"
+                )
+        except Exception as e:
+            logger.exception(f"conv={conv_id}: async rollup failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +499,24 @@ async def chat_completions(request: Request) -> Any:
         except Exception as e:
             logger.warning(f"conv={conv_id}: retrieval injection failed (non-fatal): {e}")
 
+        # V2.0 Phase 4: hierarchical summary stack. Loads the conv's L1+L2+L3
+        # state and injects it as one more system block. State only grows
+        # via the async tail (rollups happen post-response), so this read
+        # is purely local — no LLM call on the hot path.
+        try:
+            sstate = summarizer.load_state(conv_id)
+            sblock = summarizer.format_summary_block(sstate)
+            if sblock:
+                body["messages"] = inject_system_block(body["messages"], sblock)
+                logger.info(
+                    f"conv={conv_id}: injected summary stack "
+                    f"(L1={len(sstate.get('l1') or [])} "
+                    f"L2={len(sstate.get('l2') or [])} "
+                    f"L3={'y' if sstate.get('l3') else 'n'})"
+                )
+        except Exception as e:
+            logger.warning(f"conv={conv_id}: summary injection failed (non-fatal): {e}")
+
         # Lazy backfill: if this is an existing V1 conv that has no facts
         # file yet, kick off a background extraction over its full history.
         # Doesn't block this request — current request just degrades to
@@ -498,7 +550,7 @@ async def chat_completions(request: Request) -> Any:
                         accumulator.feed(chunk)
             finally:
                 await client.aclose()
-                # Fire-and-forget fact extraction once the stream is done.
+                # Fire-and-forget post-response work once the stream is done.
                 if conv_id:
                     _fire_and_forget(
                         _async_tail(
@@ -507,6 +559,7 @@ async def chat_completions(request: Request) -> Any:
                             last_user_text,
                             accumulator.text(),
                             turn_index,
+                            messages,  # original request messages, for rollup
                         )
                     )
 
@@ -529,12 +582,13 @@ async def chat_completions(request: Request) -> Any:
             pass
         if conv_id:
             _fire_and_forget(
-                _async_tail_facts(
+                _async_tail(
                     conv_id,
                     touched_facts,
                     last_user_text,
                     assistant_text,
                     turn_index,
+                    messages,  # original request messages, for rollup
                 )
             )
         return JSONResponse(content=response_json, status_code=r.status_code)
@@ -569,13 +623,28 @@ async def admin_list_conversations():
     dependencies=[Depends(_require_localhost)],
 )
 async def admin_conversation_summary(conv_id: str):
-    """Per-conv inventory: which files exist, sizes. Phase 2 adds fact_count."""
+    """Per-conv inventory: file presence + sizes + per-layer memory stats.
+    Phase 2 adds facts count, Phase 3 adds episodic doc count, Phase 4 adds
+    the hierarchical summary state shape.
+    """
     info = storage_summary(conv_id)
-    # Augment with fact_count if facts file exists
+    # Facts (Phase 2)
     try:
         info["facts"]["count"] = len(facts.load_facts(conv_id))
     except Exception:
         info["facts"]["count"] = None
+    # Episodic memory (Phase 3)
+    try:
+        info["episodic"] = {
+            "indexed_exchanges": retrieval.conversation_doc_count(conv_id),
+        }
+    except Exception:
+        info["episodic"] = {"indexed_exchanges": None}
+    # Hierarchical summary (Phase 4)
+    try:
+        info["summary"] = summarizer.state_summary(summarizer.load_state(conv_id))
+    except Exception:
+        info["summary"] = None
     return info
 
 
@@ -593,21 +662,48 @@ async def admin_get_facts(conv_id: str):
     dependencies=[Depends(_require_localhost)],
 )
 async def admin_forget_facts(conv_id: str):
-    """Forget all memory for a conversation (V2.0 granularity: all-or-
-    nothing). Clears BOTH the persistent facts AND the episodic embeddings
-    — a full memory reset for when the model is stuck on something wrong.
-    Targeted forgetting (single fact by substring) is V2.1.
+    """Forget ALL memory for a conversation (V2.0 granularity: all-or-
+    nothing). Clears persistent facts (Phase 2), episodic embeddings
+    (Phase 3), AND the hierarchical summary state (Phase 4) — a full
+    three-layer memory reset for when the model is stuck on something
+    wrong. Targeted forgetting (single fact by substring) is V2.1.
     """
     async with conv_lock(conv_id):
         existing = facts.load_facts(conv_id)
         n_facts = len(existing)
         if n_facts > 0:
             facts.save_facts(conv_id, [])
-        # Episodic memory lives in ChromaDB, not the facts file — clear it too.
+        # Episodic memory lives in ChromaDB.
         n_episodic = retrieval.forget_conversation(conv_id)
-        if n_facts or n_episodic:
+        # Hierarchical summary state on disk.
+        summary_deleted = False
+        try:
+            sp = summarizer.summary_path(conv_id)
+            if sp.is_file():
+                sp.unlink()
+                summary_deleted = True
+        except Exception as e:
+            logger.warning(f"conv={conv_id}: summary delete failed: {e}")
+        if n_facts or n_episodic or summary_deleted:
             logger.info(
                 f"conv={conv_id}: admin forgot {n_facts} fact(s) "
-                f"+ {n_episodic} indexed exchange(s)"
+                f"+ {n_episodic} indexed exchange(s) "
+                f"+ summary={'cleared' if summary_deleted else 'absent'}"
             )
-    return {"conv_id": conv_id, "forgotten_facts": n_facts, "forgotten_episodic": n_episodic}
+    return {
+        "conv_id": conv_id,
+        "forgotten_facts": n_facts,
+        "forgotten_episodic": n_episodic,
+        "forgotten_summary": summary_deleted,
+    }
+
+
+@app.get(
+    "/admin/conversations/{conv_id}/summary",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_get_summary(conv_id: str):
+    """Return the current hierarchical summary state (L1/L2/L3) for
+    debugging. Localhost-only.
+    """
+    return summarizer.load_state(conv_id)
