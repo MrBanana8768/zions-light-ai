@@ -133,6 +133,7 @@ COPY compactor/facts.py /opt/compactor/facts.py
 COPY compactor/backfill.py /opt/compactor/backfill.py
 COPY compactor/retrieval.py /opt/compactor/retrieval.py
 COPY compactor/summarizer.py /opt/compactor/summarizer.py
+COPY compactor/health.py /opt/compactor/health.py
 
 # =============================================================================
 # Supervisor
@@ -199,7 +200,12 @@ ENV WEBUI_AUTH="true"
 # 8000 — vLLM (internal; can also be exposed for direct API access)
 EXPOSE 8000 8080 3000
 
+# V2.1 Phase 6: switch from `curl :3000` (OpenWebUI login page) to the
+# compactor's /health/full deep probe. The old check stayed "healthy"
+# even when vLLM was FATAL because OpenWebUI's login page kept serving;
+# /health/full returns 503 when storage breaks and reports degraded
+# status when vLLM is unreachable. start-period=300s covers model load.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
-    CMD curl -f http://localhost:3000/ || exit 1
+    CMD curl -f http://localhost:8080/health/full || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]

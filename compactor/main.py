@@ -21,11 +21,12 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import backfill
 import facts
+import health
 import retrieval
 import summarizer
 from memory import (
@@ -618,8 +619,28 @@ async def models():
 
 
 @app.get("/health")
-async def health():
+async def health_liveness():
+    """Cheap liveness probe — no I/O, no dependencies. For load balancers
+    and quick `is-this-process-up` checks. Use /health/full for the deep
+    probe that actually walks vLLM + storage.
+    """
     return {"status": "ok", "vllm_url": VLLM_URL, "target_tokens": TARGET_TOKENS}
+
+
+@app.get("/health/full")
+async def health_full(response: Response):
+    """V2.1 Phase 6: deep health probe.
+
+    Walks vLLM reachability + storage writability + memory store stats.
+    Returns 200 for ok/degraded, 503 for down. After this phase, the
+    Docker HEALTHCHECK targets /health/full so the container goes
+    unhealthy when vLLM is FATAL (today's `curl :3000` check stays
+    healthy even when vLLM is dead, because OpenWebUI keeps serving
+    its login page).
+    """
+    report = await health.gather_health_full(VLLM_URL, TARGET_TOKENS)
+    response.status_code = health.status_to_http_code(report["status"])
+    return report
 
 
 # ---------------------------------------------------------------------------
