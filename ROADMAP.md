@@ -141,6 +141,289 @@ the user-facing layer on top.
 
 ---
 
+## V2.2 — Testing & Observability
+
+**Goal:** Make "is this deploy actually working?" answerable automatically
+and repeatably, and codify a testing standard every future feature must
+follow. Pairs naturally with V2.1's observability theme.
+
+**Prerequisite:** ships after V2.0 (memory) is complete through Phase 4 —
+we don't interrupt the in-flight memory work. The *standard* (TESTING.md),
+however, is in force now and governs the code written in V2.0 Phases 3/4
+and V2.1 too.
+
+**Full standard:** [TESTING.md](TESTING.md). Three test tiers:
+
+| Tier | Scope | Where | GPU |
+|---|---|---|---|
+| 1 — Unit/logic | pure functions, I/O, parsers, state machines | `compactor/test_*.py` (CI on every PR) | No |
+| 2 — Boot self-test | live-stack health: round-trip + facts I/O, runs post-boot | `compactor/selftest.py` | Yes (pod) |
+| 3 — Integration | end-to-end scenarios (e.g. facts persistence over 300 turns) | `tests/integration/` | Yes |
+
+**What V2.2 builds:**
+- `compactor/selftest.py` — boot-time validation battery (vLLM model
+  loaded, compactor health, real 1-token chat round-trip, facts
+  write/read/delete against a `__selftest__` sentinel conv, admin
+  localhost gating). Auto-runs post-boot as a non-blocking one-shot
+  supervisord program (`COMPACTOR_SELFTEST_ON_BOOT=true`), logs to
+  `/var/log/supervisor/selftest.log`. Also on-demand.
+- `GET /admin/selftest` — on-demand self-test, JSON report, localhost-only.
+- `GET /health/full` — deeper than `/health`: probes vLLM reachability +
+  memory-store stats. Becomes the Docker `HEALTHCHECK` target so the pod
+  reports unhealthy when vLLM is down (today's `curl :3000` check passes
+  even when vLLM is FATAL). Satisfies the V2.1 observability `/health/full`
+  item.
+- `tests/integration/` — Tier-3 suite (starts with facts persistence),
+  run against a live pod via `ZIONS_TEST_BASE_URL`.
+- `compactor/test_selftest.py` — Tier-1 coverage for the harness itself
+  (mocked HTTP).
+
+**V2.2 effort: ~3-4 dev-days.**
+
+---
+
+## V2.3 — Resilience & Stability
+
+**Goal:** Make the system *survive failure gracefully* and *protect
+irreplaceable data*, so it can run unattended in a production-shaped
+environment without the owner babysitting logs. This is the
+"quality-and-stability-over-speed" release: every item is something whose
+absence only hurts when it's 2am and something has already gone wrong.
+
+**Philosophy (explicit, by owner's direction):** ship slowly and
+deliberately. Each item below is "done" only when it has been *deliberately
+failure-tested* — not when the happy path works. Better to spend weeks
+locking one item down than to ship five half-proven ones. The whole
+point of V2.3 is that the things it adds must themselves be trustworthy,
+because they're the safety net the rest of the system leans on.
+
+### Theme 1 — Data durability (the only *unrecoverable* failure class)
+
+The `/data` volume holds two things that cannot be regenerated if lost:
+OpenWebUI's `webui.db` (chat history) and `compactor/` (facts JSON +
+ChromaDB vectors). Everything else (models, torch.compile cache) is
+re-downloadable. Today a corrupted volume = total memory loss, no recovery.
+
+- **Scheduled backups** of `webui.db` + `compactor/` to a second cheap
+  Network Volume or object store (tar + timestamp, retain N). Runs as a
+  supervised periodic sidecar (pairs with V2.2's selftest process model).
+- **Backup verification** — a backup that can't be restored is not a
+  backup. The job restores its own latest archive into a scratch dir and
+  asserts the SQLite opens + the facts JSON parses, before declaring success.
+- **Documented restore runbook** — exact commands to recover from a wiped
+  volume, in RUNPOD_DEPLOY.md. Tested at least once for real.
+- **Atomic-write audit** — confirm every writer on the hot path already
+  uses `memory.atomic_write_json` (facts ✓, backfill state ✓); extend to
+  Phase 4 summaries.
+
+### Theme 2 — Graceful degradation under partial failure
+
+The system is already designed so memory failures never break chat
+(retrieval/facts degrade to no-ops). V2.3 makes that a *verified guarantee*
+and extends it:
+
+- **Chaos checks** — a Tier-3 suite that deliberately breaks each
+  dependency (kill vLLM mid-request, corrupt a facts file, fill the disk,
+  make ChromaDB unwritable) and asserts the user-visible behavior is
+  "degraded but functional," never a hard 500 or a crash loop.
+- **Disk-pressure handling** — detect low free space on `/data` and stop
+  *writing* new memory (keep serving) rather than crashing on a failed
+  write. Surface it in `/health/full`.
+- **vLLM restart resilience** — confirm the compactor rides out a vLLM
+  restart (502s become a clean "model is restarting" rather than a thrash).
+
+### Theme 3 — Process & resource stability
+
+- **Memory/FD leak watch** — long-soak test (multi-day) watching the
+  compactor's RSS and file-descriptor count for slow leaks (httpx clients,
+  ChromaDB handles, the background-task set).
+- **Bounded background work** — cap concurrent async tails; if extraction
+  falls behind under load, shed/queue rather than spawning unboundedly.
+- **supervisord restart policy review** — make sure a genuinely-broken
+  service enters FATAL and stays visible, instead of fast-restart-looping
+  and masking the root cause (a lesson from the V1.9.x cascade).
+
+### Theme 4 — Operational confidence
+
+- **Runbook** (`OPERATIONS.md`) — what each log line means, how to read
+  `/health/full`, how to recover from each known failure mode, how to roll
+  back a bad image (the `:latest` → `:1.9.6` escape hatch, generalized).
+- **Structured logging** — JSON logs (vLLM `--log-format json`, compactor
+  via python-json-logger) so failures are greppable/aggregatable.
+- **Alerting hook (optional)** — a single configurable webhook the
+  selftest/backup jobs POST to on failure, so the owner finds out before
+  the user does.
+
+**Prerequisite:** ships after V2.2 (it builds directly on V2.2's selftest
+process model, `/health/full`, and Tier-3 harness). Some Theme-1 backup
+work could be pulled forward if data volume grows valuable before then —
+data durability is the one item whose failure mode is *unrecoverable*, so
+it's the natural candidate for early promotion.
+
+**V2.3 effort: deliberately unbounded.** Estimated ~2-4 weeks of elapsed
+time, but the explicit standard is *correctness and failure-tested
+confidence over calendar speed*. An item is not "done" until its failure
+path has been exercised on purpose.
+
+---
+
+## Cross-cutting infrastructure (no version — ongoing)
+
+Not tied to a specific feature version. These support every release and
+should be picked up whenever they unblock something or address pain.
+
+### CI/CD automation
+
+**Current state (V1.9.x):** every release was hand-rolled — local `docker
+compose build`, `docker tag`, `docker push`, manual scout scan, manual
+git tag + branch + PR. This worked at the bug-fix cadence we were running
+but it's not sustainable, and "did I remember to update `:latest`?" is
+the kind of footgun that bites at the worst time.
+
+**Phased rollout:**
+
+| Phase | What ships | Trigger |
+|---|---|---|
+| **CI Phase 1 — PR validation** | `.github/workflows/pr-validate.yml` runs CPU smoke tests (`test_smoke.py`, `test_memory.py`, etc.) and a Dockerfile syntax lint (`hadolint`) on every PR | After V2.0 Phase 1 lands (small surface to test against first) |
+| **CI Phase 2 — Tag-triggered build + push + scan gate** | `.github/workflows/build-and-push.yml` triggered on `v*.*.*` tag push: builds image, runs `docker scout cves --exit-on-vuln critical`, on success tags + pushes `:vX.Y.Z` and `:latest` to Docker Hub | After V2.0 ships, so the build-push pattern is stable |
+| **CI Phase 3 — Scheduled re-scan** | `.github/workflows/scout-recheck.yml` cron-weekly: re-scan the current `:latest` for new CVEs that have been published since release. Opens a GitHub issue if Critical found. | Optional polish, after CI Phase 2 |
+| **CI Phase 4 — Multi-variant matrix** | Build matrix expands to cu128 + cu130 (and future variants) using the parametric Dockerfile args we already shipped in 1.9.6 | When RunPod broadly rolls out driver 580+ |
+
+**Vulnerability gating policy (CI Phase 2):**
+
+| Severity | Action |
+|---|---|
+| Critical | **Block push.** Build fails, no tag pushed, no `:latest` update. |
+| High | Warn in build summary; don't block. Manual review during release. |
+| Medium / Low | No action — noise for our deployment shape (single-user, behind RunPod proxy). |
+
+Override: if a Critical is in an upstream dep with no fix yet, add
+`[scout-allow-critical: CVE-ID]` to the tag's commit message. Workflow
+scans the message and exempts that specific CVE. Logged in release notes.
+
+**Required GitHub Secrets** (one-time setup):
+- `DOCKERHUB_USERNAME=angreg`
+- `DOCKERHUB_TOKEN=<personal access token from Hub>`
+
+No HF_TOKEN needed in CI — we don't pre-warm models at build time.
+
+**Workflow file layout:**
+```
+.github/workflows/
+├── pr-validate.yml      # On PR: smoke tests + hadolint
+├── build-and-push.yml   # On tag v*.*.*: build → scout gate → push
+└── scout-recheck.yml    # On weekly cron: re-scan :latest for new CVEs
+```
+
+**Effort: ~1 day per phase.** No new tools to introduce — Docker Scout
+CLI is already what we use, just runs in Actions instead of locally.
+
+### Orchestration evolution
+
+You're correct that today's "everything in one container" shape has a
+ceiling. The path forward is **trigger-based**, not version-based — we
+move when a trigger fires, not on a schedule. Keep things integrated as
+long as the integration costs less than the split would.
+
+**Tier 0 — Current shape (V1.x, V2.x)**
+```
+[ single pod, single container ]
+  ├── vLLM (GPU)
+  ├── compactor (CPU, JSON files on /data)
+  └── OpenWebUI (CPU, SQLite on /data)
+[ one Network Volume holds all persistence ]
+```
+**Holds until:** ~10k conversations, single user, no need for multi-device
+sync via direct DB access, single model serving.
+
+**Tier 1 — Multi-container, single pod (V3 likely)**
+```
+[ one pod, docker-compose orchestrates ]
+  ├── vllm (GPU)
+  ├── compactor (CPU)
+  ├── whisper-stt (CPU or shared GPU) ← V3.2 brings this
+  ├── kokoro-tts (CPU)                 ← V3.3 brings this
+  └── openwebui (CPU)
+```
+**Trigger:** V3 multimodal naturally splits the image — STT and TTS want
+to be separate processes (different deps, different scaling characteristics).
+Once we have 2+ supplementary services, splitting the main image into
+multiple compose services is a no-cost organizational improvement.
+
+**Effort:** moderate. RunPod's default pod is single-container; need a
+custom entrypoint that runs `docker-compose up` inside the pod, OR use
+RunPod's "Pods with docker-compose" template if/when available.
+
+**Tier 2 — External memory store (V3+, only if a trigger fires)**
+```
+[ inference pod (GPU) ]     [ memory pod or managed DB ]
+  ├── vLLM                    ├── PostgreSQL + pgvector
+  └── compactor (stateless) ──►   (or Redis + ChromaDB server)
+                              └── persistent volume / managed backups
+[ frontend (anywhere) ]
+  └── OpenWebUI or replacement
+```
+**Triggers (any one):**
+- Cross-device direct DB sync required (laptop AND phone reading same
+  memory in real time — OpenWebUI's web sync covers most of this today
+  via shared backend, see "Frontend replacement triggers" below)
+- Multi-user (each user's memory isolated but shared infrastructure)
+- Need memory durability stronger than Network Volume backups (managed
+  Postgres on Neon/Supabase has HA + point-in-time recovery built in)
+- >10k conversations or need SQL queries over memory contents
+- Multiple compactor instances need shared memory state (horizontal scale)
+
+**Effort:** significant. Compactor becomes stateless; JSON files become
+DB rows; embedded ChromaDB → ChromaDB server or pgvector. **~1-2 weeks**
+of work plus DB provisioning. Major architectural milestone.
+
+**Tier 3 — Full microservices on Kubernetes (almost certainly never)**
+```
+Kubernetes cluster (RunPod K8s or elsewhere):
+  ├── inference Deployment (GPU node pool, vertical autoscale)
+  ├── compactor Deployment (CPU, horizontal autoscale)
+  ├── memory StatefulSet (Postgres + pgvector)
+  ├── frontend Deployment (could be Vercel/Cloudflare Pages)
+  └── ingress + auth provider + observability stack
+```
+**Trigger:** Enterprise SaaS shape — >100 active users, SLAs, multi-region.
+**Almost certainly never relevant for this project.** Captured for
+completeness, not because it's on the path.
+
+### Repository structure: monorepo until a real reason to split
+
+**Decision: stay monorepo.** Multi-repo overhead (separate CI/CD pipelines,
+coordinated releases, harder cross-service refactors) only pays off when:
+- Different teams own different services
+- Different release cadences (compactor ships twice a week, vLLM image
+  ships once a month)
+- Different security/compliance boundaries (frontend public, backend not)
+
+None apply for this project. As the project grows, the repo evolves
+in-place:
+
+```
+zions-light-ai/
+├── compactor/                  (will become its own service eventually)
+├── pipelines/                  (OpenWebUI Functions)
+├── whisper/                    (V3.2 — new service directory)
+├── tts/                        (V3.3 — new service directory)
+└── deploy/
+    ├── docker-compose.yml          (local dev — current single-container)
+    ├── docker-compose.split.yml    (multi-container, V3 era)
+    ├── runpod/
+    │   ├── single-pod.template     (current)
+    │   └── multi-pod/              (V3+ era, when we split)
+    └── kubernetes/                 (if we ever get to Tier 3)
+```
+
+When a split eventually IS required, `git filter-repo` extracts a
+directory with its full history into a new repo trivially. The cost of
+NOT splitting prematurely is zero. The cost of splitting prematurely is
+weeks of toolchain rework you didn't need to do yet.
+
+---
+
 ## V3 — Multimodal (vision + voice)
 
 **Goal:** Move from "text-only chatbot" to "AI assistant that can see and
@@ -231,6 +514,83 @@ audio player.
 
 Comparable to V2. Could be done in parallel with V2 since they touch
 mostly separate code paths.
+
+---
+
+## Alternative inference backend (V1.10 candidate or V2-parallel)
+
+**Trigger for considering:** sustained pain with vLLM's VRAM footprint on
+A40-class hardware, or wanting a meaningfully smaller image.
+
+**Switch to TabbyAPI + ExLlamaV2 (EXL2 quants)** rather than vLLM:
+
+| | vLLM (current) | TabbyAPI + EXL2 |
+|---|---|---|
+| Backend image footprint | ~17 GB | ~3-5 GB |
+| OpenAI-compat API | Native | Yes (TabbyAPI) |
+| Magnum 22B quality at ~16 GB | AWQ 4-bit (Marlin) | **EXL2 5.0bpw** (usually higher quality) |
+| Single-stream throughput on Ampere | Good | **Often faster** |
+| Multi-user batching | Excellent | Weaker (n/a for single-user deploys) |
+| Model architecture coverage | Very broad incl. VLMs | Llama-family solid, some lag |
+
+For Zion's Light AI's profile (single user, creative writing, Magnum-family
+models, A40), TabbyAPI + EXL2 is a credible better fit than vLLM. Reason
+we're on vLLM is path-dependent from the original migration.
+
+**Cost of the swap (when we eventually do it):**
+- Dockerfile rewrite (replace vLLM install with TabbyAPI + exllamav2 wheels)
+- `supervisord.conf` `[program:vllm]` becomes `[program:tabby]`
+- `entrypoint.sh` preflight stays useful (same CUDA driver checks)
+- compactor: NO changes — it's backend-agnostic, talks pure OpenAI-compat
+- OpenWebUI: NO changes
+- Default model: switch to an EXL2 variant (e.g. `LoneStriker/magnum-v4-22b-5.0bpw-h6-exl2`)
+- Effort: ~1 day for Dockerfile + supervisord + entrypoint adjustments, ~1
+  day for testing both single-user chat flow and compactor compaction
+  against the new backend
+
+**This is a worthwhile evaluation but not urgent.** V2 memory architecture
+is more user-visibly valuable than a backend swap. Revisit after V2.0
+ships, or sooner if vLLM keeps causing VRAM-shape problems.
+
+---
+
+## Frontend replacement triggers — when to consider replacing OpenWebUI
+
+**Default position: don't.** OpenWebUI already covers what matters for
+this project:
+- ✅ Cross-device sync (web-based — phone, desktop, tablet all hit the
+  same backend)
+- ✅ Auth + user accounts
+- ✅ Image upload (V3.1-ready)
+- ✅ Voice input/output configurable hooks (V3.2/V3.3-ready)
+- ✅ Function/tool calling UI
+- ✅ Pipelines/Functions plugin system for custom behavior
+- ✅ Active development, large community
+
+Replacement is **only** worth considering when a specific trigger fires.
+Listed by likelihood of relevance to this project:
+
+| Trigger | Why it would force a replacement | Replacement effort |
+|---|---|---|
+| **Offline-first mode** | OpenWebUI is web — needs network. A native client could queue messages locally and sync when online. *(Realistic for "I'm on a plane with no wifi" use cases.)* | Large — full native app (Electron/Tauri/SwiftUI) |
+| **OS-level integration** (system tray, global shortcuts, screen-context awareness) | Web app can't read your screen or own a tray icon. Wraps in a native shell. | Moderate — wrap OpenWebUI in Electron/Tauri, add OS hooks |
+| **Push notifications** | "Model finished long generation, here's the result on your phone." Web push exists but OpenWebUI doesn't implement it. | Small-moderate — could be added as an OpenWebUI Function rather than replacement |
+| **Branded product** (selling to others, distinct visual identity, app store presence) | OpenWebUI's branding shows through; deep customization is fork-territory. | Large — full UI rewrite |
+| **Features OpenWebUI rejects** (you submit a PR, it's declined, you can't live without it) | Fork point. | Moderate — fork + maintain |
+| **Bypassing OpenWebUI's auth model** (different identity provider, custom RBAC) | OpenWebUI's auth is opinionated. | Moderate |
+| **OpenWebUI gets abandoned** | Maintained fork would be the natural answer first; only replace if no maintained fork emerges. | Variable |
+
+**Cross-device sync is NOT a trigger** — that's the most common
+misconception. OpenWebUI's web-based shared backend already gives you
+"open a chat on desktop, continue it on phone" out of the box. You're
+already getting that.
+
+The realistic future trigger for this project is probably **offline-first
+mode** if you ever travel with no connectivity, or **OS-level
+integration** if you want screen-context awareness (model can see what
+you're looking at). Both are V3+ at the earliest, and both could
+plausibly be addressed by writing a thin native shell around OpenWebUI
+rather than replacing it wholesale.
 
 ---
 

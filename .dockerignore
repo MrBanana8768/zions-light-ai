@@ -1,0 +1,59 @@
+# Files NEVER copied into the Docker build context.
+#
+# The Dockerfile already uses explicit COPY for each runtime file (no
+# `COPY . .`), so most of these are belt-and-suspenders. But .dockerignore
+# also keeps these out of the *build context* sent to the Docker daemon,
+# which speeds up builds (less to hash) and prevents accidents if anyone
+# ever adds a wildcard COPY later.
+
+# Tier-3 integration validation suite — explicitly out-of-image by design.
+# Hits the deployed compactor as a black box; lives in git for versioning
+# but must never end up at /opt/* in the running container.
+tests/
+
+# Build / push / scout logs from local rebuilds.
+*.log
+build-*.log
+push-*.log
+scout-*.log
+
+# Git, dev env, CI metadata.
+.git/
+.github/
+.gitignore
+.gitattributes
+.editorconfig
+
+# Local env files — secrets live here.
+.env
+.env.local
+.venv/
+.test-venv/
+
+# Throwaway verification scripts (compactor/_verify_*.py)
+compactor/_verify_*.py
+
+# Python caches.
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE.
+.vscode/
+.idea/
+*.swp
+
+# OS junk.
+.DS_Store
+Thumbs.db
+
+# Docs that don't belong in the image.
+README.md
+ROADMAP.md
+CHANGELOG.md
+TESTING.md
+RUNPOD_DEPLOY.md
+compactor/V2_PLAN.md
