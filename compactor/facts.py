@@ -207,24 +207,25 @@ def touch_facts(facts: list[dict], now: int | None = None) -> list[dict]:
 # Extraction — async LLM call against vLLM
 # ---------------------------------------------------------------------------
 
-_EXTRACTION_SYSTEM_PROMPT = """You are extracting persistent facts from a conversation exchange.
+_EXTRACTION_SYSTEM_PROMPT = """You extract persistent facts from a conversation exchange so they can be remembered for the rest of the conversation.
 
-Your job: identify facts from the LATEST EXCHANGE that should be remembered for the rest of this conversation. Examples of memorable facts:
-- User preferences ("write in third-person past tense", "never use the word 'suddenly'")
-- Named entities (characters, locations, projects, organizations)
-- World/setting details (rules, magic systems, technologies, factions)
-- Decisions made (story choices, design choices, plot directions)
-- Constraints stated ("avoid romance subplots", "PG-13 violence only")
+DEFAULT BEHAVIOR: extract every concrete piece of information the USER stated. Bias toward extracting. The cost of missing a fact is high; the cost of a slightly trivial fact is low.
 
-Output rules:
-- One fact per line, prefixed with "- "
-- Each fact must be ONE concise sentence (under 20 words ideally)
+Extract:
+- Named entities the user introduced (characters, places, items, factions, projects, names)
+- User preferences or instructions ("write in past tense", "avoid romance subplots")
+- World/setting/story details the user established (magic systems, rules, technologies)
+- Decisions the user made (story choices, plot directions, design choices)
+- Constraints the user set (genre, tone, content limits)
+
+OUTPUT FORMAT — STRICT:
+- One fact per line, each line prefixed with "- "
+- Each fact: ONE concise sentence under 20 words
+- Output ONLY bullets — no preamble, no commentary, no headings, no closing remark
 - Do NOT restate facts already in the EXISTING FACTS list below
-- Do NOT include conversational filler ("user said hello", "assistant agreed")
-- Do NOT speculate beyond what the exchange actually said
-- If there are no new memorable facts, output exactly: NONE
+- Do NOT extract things the assistant invented; only what the user stated or confirmed
 
-Output nothing except bullets or NONE — no preamble, no explanation."""
+ONLY return the literal word NONE (no other characters) when the user's message contained zero concrete information — e.g. just "ok", "thanks", "continue", or a one-word reaction. If the user named anything, expressed any preference, or stated any detail, extract it. When in doubt, extract."""
 
 
 def _build_extraction_messages(
@@ -298,7 +299,11 @@ async def extract_facts_from_exchange(
         "model": model,
         "messages": _build_extraction_messages(user_msg, assistant_msg, existing_facts),
         "max_tokens": _EXTRACTION_MAX_TOKENS,
-        "temperature": 0.2,
+        # temp 0.0: extraction is structured-output, not creative writing.
+        # We want the same input to always produce the same facts. The
+        # previous 0.2 produced ~35% NONE rate on Magnum-12B with fact-rich
+        # prompts — pure model variance, not a real "no facts" signal.
+        "temperature": 0.0,
         "stream": False,
     }
     try:
