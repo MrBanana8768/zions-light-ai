@@ -311,6 +311,13 @@ async def extract_facts_from_exchange(
         facts = _parse_extraction_output(raw)
         if facts:
             logger.info(f"extracted {len(facts)} new fact(s)")
+        else:
+            # Empty result has two distinct causes; log both so the
+            # silence isn't a diagnostic dead-end during integration runs.
+            snippet = (raw or "").strip().replace("\n", " ")[:120]
+            logger.info(
+                f"extracted 0 fact(s) — model returned: {snippet!r}"
+            )
         return facts
     except Exception as e:
         logger.warning(f"fact extraction failed (non-fatal): {e}")

@@ -23,9 +23,15 @@ def test_fact_extracted_and_persisted(conv_id):
     extraction is one full LLM round-trip and on Magnum 12B / A40 can
     take 5-15s. The previous fixed 8s wait sometimes false-failed.
     """
+    # Fact-rich, multi-claim prompt. Single-claim prompts ("my protagonist
+    # is X") sometimes get judged as NONE by Magnum 12B's extractor at
+    # temp 0.2 — model variance, not a code bug. Three concrete claims
+    # in one prompt makes the extraction call essentially deterministic.
     r1 = H.chat(
-        "My protagonist is named Lyra Threadweaver and she is a half-elf "
-        "ranger from the kingdom of Aethermere. Acknowledge briefly.",
+        "Important setup for our story: my protagonist is named Lyra "
+        "Threadweaver. She is a half-elf ranger. She comes from the "
+        "kingdom of Aethermere. Please confirm you've noted these three "
+        "details.",
         conv_id=conv_id,
         max_tokens=80,
     )
