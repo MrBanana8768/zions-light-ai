@@ -135,6 +135,7 @@ COPY compactor/retrieval.py /opt/compactor/retrieval.py
 COPY compactor/summarizer.py /opt/compactor/summarizer.py
 COPY compactor/health.py /opt/compactor/health.py
 COPY compactor/selftest.py /opt/compactor/selftest.py
+COPY compactor/portability.py /opt/compactor/portability.py
 
 # =============================================================================
 # Supervisor

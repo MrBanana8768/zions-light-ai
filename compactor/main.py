@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import backfill
 import facts
 import health
+import portability
 import retrieval
 import selftest as selftest_module
 import summarizer
@@ -743,6 +744,81 @@ async def admin_get_summary(conv_id: str):
     debugging. Localhost-only.
     """
     return summarizer.load_state(conv_id)
+
+
+# V2.1 Phase 6 Step 3: portability — export / import / fork.
+@app.get(
+    "/admin/conversations/{conv_id}/export",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_export_conversation(conv_id: str):
+    """Snapshot one conv's full V2 state (facts + summary + episodic) as
+    a single JSON bundle. Use for backup, cross-pod migration, or
+    feeding a /admin/conversations/import on a different deploy.
+    """
+    return portability.export_conversation(conv_id)
+
+
+@app.post(
+    "/admin/conversations/import",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_import_conversation(request: Request):
+    """Restore a conversation from a previously-exported bundle.
+
+    Body JSON:
+        {
+          "bundle":          <bundle dict>,        // required
+          "target_conv_id":  "<str>" | null,       // optional override
+          "overwrite":       true | false (default)
+        }
+
+    Refuses if target conv has existing state unless overwrite=true —
+    prevents accidental wipe of an active conversation.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+    bundle = body.get("bundle")
+    if bundle is None:
+        raise HTTPException(status_code=400, detail="missing required field: 'bundle'")
+    try:
+        result = portability.import_conversation(
+            bundle,
+            target_conv_id=body.get("target_conv_id"),
+            overwrite=bool(body.get("overwrite", False)),
+        )
+    except portability.ImportError_ as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return result
+
+
+@app.post(
+    "/admin/conversations/{conv_id}/fork",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_fork_conversation(conv_id: str, request: Request):
+    """Clone src conv's full state into a new conv_id. Original
+    untouched. Body is optional:
+        {"new_conv_id": "<str>" | null}
+    If omitted, the fork's id is `<src>__fork_<6hex>`.
+    """
+    # Body is optional — accept empty or missing.
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        return portability.fork_conversation(
+            conv_id, new_conv_id=body.get("new_conv_id")
+        )
+    except portability.ImportError_ as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/admin/selftest", dependencies=[Depends(_require_localhost)])
