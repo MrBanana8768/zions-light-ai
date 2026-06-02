@@ -218,23 +218,58 @@ async def _check_admin_localhost(client: httpx.AsyncClient) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 async def wait_for_vllm_ready(timeout_s: float = WAIT_FOR_READY_TIMEOUT_S) -> bool:
-    """Poll vLLM /v1/models until it responds 200 or timeout. Returns True
-    if vLLM is up within the window.
+    """Two-phase readiness probe — declare vLLM ready only when it can
+    actually serve a completion, not just bind a port.
 
-    Used on boot — vLLM model load takes 1-5 minutes; we don't want the
-    self-test's chat_round_trip to false-fail because it ran before the
-    model finished loading.
+    Phase 1: GET /v1/models 200 with a non-empty model list. Cheap, no
+        GPU work — confirms the API server has come up.
+    Phase 2: POST /v1/chat/completions with max_tokens=1. Confirms the
+        engine is past weight-load + KV-cache init + CUDA graph capture
+        and can actually generate. This is the bit that catches the
+        boot race: on a cold start, vLLM's API server registers
+        /v1/models early but completions return 503 (or hang) until the
+        engine finishes loading the model to GPU.
+
+    Without Phase 2, the post-boot self-test's chat_round_trip would
+    eventually succeed via its 180s timeout, but flaky one-shot results
+    undermine the whole point of the self-test as a deploy canary.
     """
     deadline = time.monotonic() + timeout_s
+    models_ready = False
     async with httpx.AsyncClient(timeout=10.0) as c:
         while time.monotonic() < deadline:
-            try:
-                r = await c.get(f"{VLLM_URL}/v1/models")
-                if r.status_code == 200:
-                    logger.info(f"vLLM ready after {timeout_s - (deadline - time.monotonic()):.0f}s")
-                    return True
-            except Exception:
-                pass
+            # Phase 1 — API server listing the model
+            if not models_ready:
+                try:
+                    r = await c.get(f"{VLLM_URL}/v1/models")
+                    if r.status_code == 200 and (r.json().get("data") or []):
+                        models_ready = True
+                        logger.info("vLLM /v1/models responding — probing engine readiness")
+                except Exception:
+                    pass
+
+            # Phase 2 — engine actually completing
+            if models_ready:
+                try:
+                    probe = await c.post(
+                        f"{VLLM_URL}/v1/chat/completions",
+                        json={
+                            "model": MODEL_REPO or "default",
+                            "messages": [{"role": "user", "content": "ok"}],
+                            "max_tokens": 1,
+                            "stream": False,
+                        },
+                        timeout=30.0,
+                    )
+                    if probe.status_code == 200:
+                        elapsed = timeout_s - (deadline - time.monotonic())
+                        logger.info(f"vLLM fully ready (completions live) after {elapsed:.0f}s")
+                        return True
+                    # 503 / 5xx → engine still warming. Keep polling.
+                except Exception:
+                    # Network errors during warmup are expected — keep polling.
+                    pass
+
             await asyncio.sleep(WAIT_FOR_READY_POLL_INTERVAL_S)
     logger.warning(f"vLLM did not become ready within {timeout_s}s")
     return False

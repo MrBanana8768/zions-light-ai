@@ -276,6 +276,110 @@ def test_run_selftest_inner_exception_becomes_ok_false():
 
 
 # ---------------------------------------------------------------------------
+# wait_for_vllm_ready — two-phase readiness probe (V2.1 Phase 6.1)
+# ---------------------------------------------------------------------------
+
+def test_wait_for_vllm_ready_succeeds_when_both_phases_pass():
+    print("\n[test] wait_for_vllm_ready: /v1/models 200 + chat 200 → ready")
+
+    models_resp = MagicMock(status_code=200)
+    models_resp.json = MagicMock(return_value={"data": [{"id": "x"}]})
+    chat_resp = MagicMock(status_code=200)
+
+    async def go():
+        with patch("selftest.httpx.AsyncClient") as MockClient, \
+             patch.object(selftest, "WAIT_FOR_READY_POLL_INTERVAL_S", 0.01):
+            instance = MockClient.return_value.__aenter__.return_value
+            instance.get = AsyncMock(return_value=models_resp)
+            instance.post = AsyncMock(return_value=chat_resp)
+            return await selftest.wait_for_vllm_ready(timeout_s=5.0)
+
+    ready = asyncio.run(go())
+    assert_eq(ready, True, "returns True when both phases pass")
+
+
+def test_wait_for_vllm_ready_keeps_polling_when_models_404():
+    print("\n[test] wait_for_vllm_ready: /v1/models 404 → keep polling, timeout=False")
+
+    models_resp = MagicMock(status_code=404)
+
+    async def go():
+        with patch("selftest.httpx.AsyncClient") as MockClient, \
+             patch.object(selftest, "WAIT_FOR_READY_POLL_INTERVAL_S", 0.01):
+            instance = MockClient.return_value.__aenter__.return_value
+            instance.get = AsyncMock(return_value=models_resp)
+            instance.post = AsyncMock()  # should never be called
+            ready = await selftest.wait_for_vllm_ready(timeout_s=0.2)
+            # Verify Phase 2 was never even attempted
+            instance.post.assert_not_called()
+            return ready
+
+    ready = asyncio.run(go())
+    assert_eq(ready, False, "returns False on Phase 1 timeout")
+
+
+def test_wait_for_vllm_ready_keeps_polling_when_chat_503():
+    print("\n[test] wait_for_vllm_ready: /v1/models 200 + chat 503 → keep polling")
+
+    models_resp = MagicMock(status_code=200)
+    models_resp.json = MagicMock(return_value={"data": [{"id": "x"}]})
+    chat_503 = MagicMock(status_code=503)
+
+    async def go():
+        with patch("selftest.httpx.AsyncClient") as MockClient, \
+             patch.object(selftest, "WAIT_FOR_READY_POLL_INTERVAL_S", 0.01):
+            instance = MockClient.return_value.__aenter__.return_value
+            instance.get = AsyncMock(return_value=models_resp)
+            instance.post = AsyncMock(return_value=chat_503)
+            ready = await selftest.wait_for_vllm_ready(timeout_s=0.2)
+            # Phase 2 should have been called multiple times
+            assert_true(instance.post.call_count >= 1, "Phase 2 attempted at least once")
+            return ready
+
+    ready = asyncio.run(go())
+    assert_eq(ready, False, "returns False when chat keeps 503-ing")
+
+
+def test_wait_for_vllm_ready_succeeds_after_engine_warmup():
+    print("\n[test] wait_for_vllm_ready: chat 503 then 200 → ready after warmup")
+
+    models_resp = MagicMock(status_code=200)
+    models_resp.json = MagicMock(return_value={"data": [{"id": "x"}]})
+    chat_responses = [MagicMock(status_code=503), MagicMock(status_code=200)]
+
+    async def go():
+        with patch("selftest.httpx.AsyncClient") as MockClient, \
+             patch.object(selftest, "WAIT_FOR_READY_POLL_INTERVAL_S", 0.01):
+            instance = MockClient.return_value.__aenter__.return_value
+            instance.get = AsyncMock(return_value=models_resp)
+            instance.post = AsyncMock(side_effect=chat_responses)
+            return await selftest.wait_for_vllm_ready(timeout_s=5.0)
+
+    ready = asyncio.run(go())
+    assert_eq(ready, True, "returns True once engine recovers from 503")
+
+
+def test_wait_for_vllm_ready_empty_model_list_keeps_polling():
+    print("\n[test] wait_for_vllm_ready: /v1/models 200 + empty list → keep polling")
+
+    models_resp = MagicMock(status_code=200)
+    models_resp.json = MagicMock(return_value={"data": []})
+
+    async def go():
+        with patch("selftest.httpx.AsyncClient") as MockClient, \
+             patch.object(selftest, "WAIT_FOR_READY_POLL_INTERVAL_S", 0.01):
+            instance = MockClient.return_value.__aenter__.return_value
+            instance.get = AsyncMock(return_value=models_resp)
+            instance.post = AsyncMock()
+            ready = await selftest.wait_for_vllm_ready(timeout_s=0.2)
+            instance.post.assert_not_called()  # never advance to Phase 2
+            return ready
+
+    ready = asyncio.run(go())
+    assert_eq(ready, False, "empty model list does NOT advance to Phase 2")
+
+
+# ---------------------------------------------------------------------------
 # Report rendering
 # ---------------------------------------------------------------------------
 
@@ -377,6 +481,11 @@ def _all_tests():
         test_run_selftest_one_failure_flips_status,
         test_run_selftest_skip_round_trip,
         test_run_selftest_inner_exception_becomes_ok_false,
+        test_wait_for_vllm_ready_succeeds_when_both_phases_pass,
+        test_wait_for_vllm_ready_keeps_polling_when_models_404,
+        test_wait_for_vllm_ready_keeps_polling_when_chat_503,
+        test_wait_for_vllm_ready_succeeds_after_engine_warmup,
+        test_wait_for_vllm_ready_empty_model_list_keeps_polling,
         test_format_report_human_includes_check_names,
         test_format_report_human_marks_failures,
         test_cli_exits_0_on_pass,
