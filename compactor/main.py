@@ -28,6 +28,7 @@ import backfill
 import facts
 import health
 import retrieval
+import selftest as selftest_module
 import summarizer
 from memory import (
     conv_lock,
@@ -742,3 +743,21 @@ async def admin_get_summary(conv_id: str):
     debugging. Localhost-only.
     """
     return summarizer.load_state(conv_id)
+
+
+@app.get("/admin/selftest", dependencies=[Depends(_require_localhost)])
+async def admin_selftest(response: Response, round_trip: bool = True):
+    """V2.1 Phase 6 Step 2: on-demand live-stack self-test.
+
+    Runs the same check battery as the supervisord boot one-shot, but
+    skips wait-for-ready (the stack is assumed up). Returns the JSON
+    report. HTTP 503 if any check failed; 200 if all passed — so this
+    endpoint is itself suitable as a deep healthcheck target for
+    external monitoring.
+
+    Query: ?round_trip=false to skip the real LLM call (useful for
+    quick smoke checks that don't want to wait on inference).
+    """
+    report = await selftest_module.run_selftest(do_round_trip=round_trip)
+    response.status_code = 200 if report["status"] == "pass" else 503
+    return report
