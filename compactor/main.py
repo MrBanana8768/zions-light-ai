@@ -465,24 +465,33 @@ async def chat_completions(request: Request) -> Any:
     except Exception as e:
         logger.exception(f"compaction failed; forwarding original messages: {e}")
 
-    # V2.0 Phase 2: facts injection + lazy backfill detection
+    # V2.0 memory injection. ALL three layers (facts, RAG, summary) are
+    # collected into a SINGLE combined system message and injected in one
+    # shot. This matters because Mistral-family chat templates (Mistral-
+    # Nemo, Mistral-Small, and therefore Magnum v4 12B/22B) enforce
+    # "at most one system message before strict user/assistant alternation"
+    # and reject requests with multiple consecutive system messages with a
+    # 400 "must alternate user/assistant" error. Combining is the
+    # template-portable form: one system block holds all three sections
+    # internally, separated by blank lines and labeled by each module's
+    # block header (so the model still parses them as distinct contexts).
     touched_facts: list[dict] = []
+    injected_blocks: list[str] = []
+    log_parts: list[str] = []
     if conv_id:
+        # --- Facts (Phase 2) ---
         try:
             touched_facts = facts.load_facts(conv_id)
             if touched_facts:
                 facts.touch_facts(touched_facts)
                 block = facts.format_facts_block(touched_facts)
                 if block:
-                    body["messages"] = inject_system_block(body["messages"], block)
-                    logger.info(
-                        f"conv={conv_id}: injected {len(touched_facts)} fact(s)"
-                    )
+                    injected_blocks.append(block)
+                    log_parts.append(f"{len(touched_facts)}fact(s)")
         except Exception as e:
-            logger.warning(f"conv={conv_id}: facts injection failed (non-fatal): {e}")
+            logger.warning(f"conv={conv_id}: facts load failed (non-fatal): {e}")
 
-        # V2.0 Phase 3: RAG retrieval. Embed the latest user message, pull
-        # the top-K most-similar past exchanges, inject them after facts.
+        # --- RAG retrieval (Phase 3) ---
         # exclude_turns_from drops retrieved turns that are already present
         # verbatim in the recent window (no point spending budget twice).
         try:
@@ -492,30 +501,35 @@ async def chat_completions(request: Request) -> Any:
             )
             rblock = retrieval.format_retrieval_block(hits)
             if rblock:
-                body["messages"] = inject_system_block(body["messages"], rblock)
-                logger.info(
-                    f"conv={conv_id}: injected {len(hits)} retrieved exchange(s)"
-                )
+                injected_blocks.append(rblock)
+                log_parts.append(f"{len(hits)}retr")
         except Exception as e:
-            logger.warning(f"conv={conv_id}: retrieval injection failed (non-fatal): {e}")
+            logger.warning(f"conv={conv_id}: retrieval load failed (non-fatal): {e}")
 
-        # V2.0 Phase 4: hierarchical summary stack. Loads the conv's L1+L2+L3
-        # state and injects it as one more system block. State only grows
-        # via the async tail (rollups happen post-response), so this read
-        # is purely local — no LLM call on the hot path.
+        # --- Hierarchical summary stack (Phase 4) ---
+        # State only grows via the async tail (rollups post-response),
+        # so this is a purely local read — no LLM call on the hot path.
         try:
             sstate = summarizer.load_state(conv_id)
             sblock = summarizer.format_summary_block(sstate)
             if sblock:
-                body["messages"] = inject_system_block(body["messages"], sblock)
-                logger.info(
-                    f"conv={conv_id}: injected summary stack "
-                    f"(L1={len(sstate.get('l1') or [])} "
-                    f"L2={len(sstate.get('l2') or [])} "
-                    f"L3={'y' if sstate.get('l3') else 'n'})"
+                injected_blocks.append(sblock)
+                log_parts.append(
+                    f"sum(L1={len(sstate.get('l1') or [])}"
+                    f"/L2={len(sstate.get('l2') or [])}"
+                    f"/L3={'y' if sstate.get('l3') else 'n'})"
                 )
         except Exception as e:
-            logger.warning(f"conv={conv_id}: summary injection failed (non-fatal): {e}")
+            logger.warning(f"conv={conv_id}: summary load failed (non-fatal): {e}")
+
+        # Single inject point — preserves Mistral template compatibility.
+        if injected_blocks:
+            combined = "\n\n".join(injected_blocks)
+            try:
+                body["messages"] = inject_system_block(body["messages"], combined)
+                logger.info(f"conv={conv_id}: injected memory [{' '.join(log_parts)}]")
+            except Exception as e:
+                logger.warning(f"conv={conv_id}: memory injection failed (non-fatal): {e}")
 
         # Lazy backfill: if this is an existing V1 conv that has no facts
         # file yet, kick off a background extraction over its full history.

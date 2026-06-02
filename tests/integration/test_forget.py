@@ -24,7 +24,9 @@ def test_forget_clears_facts_and_episodic(conv_id):
         conv_id=conv_id,
         max_tokens=30,
     )
-    H.wait_for_async_tail()
+    # Poll for fact extraction (slowest tail step). If facts landed,
+    # episodic indexing (faster, runs first) is definitely done too.
+    H.wait_for_facts(conv_id, min_count=1, max_wait=30)
 
     before = H.admin_conv_summary(conv_id)
     facts_before = before.get("facts", {}).get("count", 0) or 0
@@ -55,7 +57,8 @@ def test_forget_response_shape(conv_id):
     H.skip_if_no_admin()
     H.chat("Just a quick test message, please reply briefly.",
            conv_id=conv_id, max_tokens=20)
-    H.wait_for_async_tail()
+    # Episodic indexing is enough here — we just need SOME state to delete.
+    H.wait_for_indexed_exchanges(conv_id, min_count=1, max_wait=30)
 
     result = H.admin_forget(conv_id)
     for key in ("conv_id", "forgotten_facts", "forgotten_episodic",
@@ -71,7 +74,7 @@ def test_forget_is_idempotent(conv_id):
     nothing to delete, returns zeros)."""
     H.skip_if_no_admin()
     H.chat("brief msg", conv_id=conv_id, max_tokens=10)
-    H.wait_for_async_tail()
+    H.wait_for_indexed_exchanges(conv_id, min_count=1, max_wait=30)
 
     H.admin_forget(conv_id)  # first call wipes
     second = H.admin_forget(conv_id)  # second call should be a no-op

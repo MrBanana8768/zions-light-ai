@@ -17,7 +17,12 @@ import _harness as H
 
 def test_fact_extracted_and_persisted(conv_id):
     """Turn 1 plants a vivid, retrievable fact; the async tail should
-    extract it; admin endpoint (if available) should show >= 1 fact."""
+    extract it; admin endpoint (if available) should show >= 1 fact.
+
+    Uses wait_for_facts (polling) instead of a fixed sleep — fact
+    extraction is one full LLM round-trip and on Magnum 12B / A40 can
+    take 5-15s. The previous fixed 8s wait sometimes false-failed.
+    """
     r1 = H.chat(
         "My protagonist is named Lyra Threadweaver and she is a half-elf "
         "ranger from the kingdom of Aethermere. Acknowledge briefly.",
@@ -25,12 +30,16 @@ def test_fact_extracted_and_persisted(conv_id):
         max_tokens=80,
     )
     assert r1.status_code == 200
-    H.wait_for_async_tail()
 
     if H.ADMIN_ENABLED:
-        # Strong assertion: a fact mentioning Lyra exists.
-        facts = H.admin_get_facts(conv_id)
-        assert len(facts) >= 1, f"expected >= 1 fact extracted, got {len(facts)}"
+        # Poll up to 30s for the extraction to actually land. Returns as
+        # soon as a fact appears, so fast paths stay fast.
+        facts = H.wait_for_facts(conv_id, min_count=1, max_wait=30)
+        assert len(facts) >= 1, (
+            f"expected >= 1 fact extracted within 30s, got {len(facts)}.\n"
+            f"Likely causes: extraction failed silently, model output didn't "
+            f"parse, or COMPACTOR_FACTS_EXTRACTION is disabled."
+        )
         all_text = " ".join(f.get("text", "") for f in facts).lower()
         assert "lyra" in all_text, (
             f"no fact mentions 'Lyra'. Extracted facts:\n"
@@ -40,7 +49,7 @@ def test_fact_extracted_and_persisted(conv_id):
         # Behavior-only mode: at minimum the response was successful.
         # The next test (cross_turn_recall) verifies the model actually
         # uses the fact, which is the real user-facing guarantee.
-        pass
+        H.wait_for_async_tail()
 
 
 def test_fact_used_in_next_turn(conv_id):
@@ -53,7 +62,11 @@ def test_fact_used_in_next_turn(conv_id):
                   "pirate dialect. Just say 'aye' to confirm.")
     r1 = H.chat(turn1_user, conv_id=conv_id, max_tokens=30)
     assert r1.status_code == 200
-    H.wait_for_async_tail()
+    # Wait for extraction so the next turn actually sees the injected fact.
+    if H.ADMIN_ENABLED:
+        H.wait_for_facts(conv_id, min_count=1, max_wait=30)
+    else:
+        H.wait_for_async_tail()
 
     # Turn 2: ask something where pirate dialect should leak in IF the
     # preference was extracted+injected. Build the history to look like
@@ -101,7 +114,8 @@ def test_admin_summary_reports_fact_count(conv_id):
         max_tokens=20,
     )
     assert r.status_code == 200
-    H.wait_for_async_tail()
+    # Poll for the fact to land (extraction can take up to ~15s on 12B).
+    H.wait_for_facts(conv_id, min_count=1, max_wait=30)
 
     summary = H.admin_conv_summary(conv_id)
     assert "facts" in summary, summary

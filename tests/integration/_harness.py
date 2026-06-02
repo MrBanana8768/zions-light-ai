@@ -208,14 +208,85 @@ def extend_history(
 
 
 def wait_for_async_tail(seconds: float | None = None) -> None:
-    """The compactor's post-response work (fact extraction, episodic
-    indexing, summary rollup) runs as fire-and-forget tasks AFTER the
-    chat response is sent. Tests that assert "X was saved" need to wait.
+    """Coarse fallback: just sleep for `seconds` (or TAIL_WAIT default).
 
-    Polling the admin endpoint would be more elegant, but requires
-    ADMIN_ENABLED — this simple sleep works in both modes.
+    Use this for tests that can't observe completion through admin
+    endpoints (i.e. when ADMIN_ENABLED is False). For admin-mode tests,
+    prefer the deterministic polling helpers below — they return as soon
+    as the expected state appears AND give the work up to `max_wait`
+    seconds rather than a fixed sleep.
     """
     time.sleep(seconds if seconds is not None else TAIL_WAIT)
+
+
+def wait_for_facts(
+    conv_id: str,
+    *,
+    min_count: int = 1,
+    max_wait: float = 30.0,
+    poll_interval: float = 2.0,
+) -> list[dict]:
+    """Poll /admin/conversations/<id>/facts until at least `min_count`
+    facts are persisted, or `max_wait` seconds elapse. Returns the final
+    fact list (which may still be shorter than min_count if the timeout
+    fired — the caller's assertion then fails with a clear message).
+
+    Why polling beats a fixed sleep: fact extraction is a real LLM call
+    against the model. On Magnum 12B / A40 it's typically ~5-15s but can
+    spike under load. A fixed 8s sleep was sometimes catching the admin
+    GET BEFORE extraction finished writing — false negative. Polling
+    returns as soon as the expected state arrives (so fast paths stay
+    fast) AND gives slow paths a generous ceiling.
+
+    Falls back to a coarse sleep when admin endpoints aren't reachable
+    (otherwise we'd be looping uselessly against 403s).
+    """
+    if not ADMIN_ENABLED:
+        time.sleep(max_wait if max_wait > TAIL_WAIT else TAIL_WAIT)
+        return []
+    deadline = time.monotonic() + max_wait
+    facts: list[dict] = []
+    while True:
+        try:
+            facts = admin_get_facts(conv_id)
+        except Exception:
+            facts = []
+        if len(facts) >= min_count or time.monotonic() >= deadline:
+            return facts
+        time.sleep(poll_interval)
+
+
+def wait_for_indexed_exchanges(
+    conv_id: str,
+    *,
+    min_count: int = 1,
+    max_wait: float = 30.0,
+    poll_interval: float = 2.0,
+) -> int:
+    """Poll /admin/conversations/<id> until episodic.indexed_exchanges
+    reaches `min_count`, or `max_wait` elapses. Returns the final count.
+
+    Episodic indexing (one embedding generated, one ChromaDB upsert) is
+    typically faster than fact extraction (no LLM call) — usually <1s —
+    but on a cold pod the first embedding can take longer because
+    fastembed lazy-loads the ONNX model. Polling handles both ends.
+
+    Falls back to a coarse sleep when admin endpoints aren't reachable.
+    """
+    if not ADMIN_ENABLED:
+        time.sleep(TAIL_WAIT)
+        return 0
+    deadline = time.monotonic() + max_wait
+    count = 0
+    while True:
+        try:
+            summary = admin_conv_summary(conv_id)
+            count = int((summary.get("episodic") or {}).get("indexed_exchanges") or 0)
+        except Exception:
+            count = 0
+        if count >= min_count or time.monotonic() >= deadline:
+            return count
+        time.sleep(poll_interval)
 
 
 # ---------------------------------------------------------------------------

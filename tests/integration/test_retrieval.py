@@ -25,13 +25,13 @@ def test_exchange_gets_indexed(conv_id):
         max_tokens=40,
     )
     assert r.status_code == 200
-    H.wait_for_async_tail()
-
-    summary = H.admin_conv_summary(conv_id)
-    indexed = summary.get("episodic", {}).get("indexed_exchanges")
-    assert isinstance(indexed, int) and indexed >= 1, (
-        f"expected indexed_exchanges >= 1, got {indexed!r}\n"
-        f"full admin summary: {summary}"
+    # Episodic indexing is cheap (no LLM call, just an embedding + upsert)
+    # but on a cold pod fastembed lazy-loads the ONNX model on first use.
+    indexed = H.wait_for_indexed_exchanges(conv_id, min_count=1, max_wait=30)
+    assert indexed >= 1, (
+        f"expected indexed_exchanges >= 1 within 30s, got {indexed}.\n"
+        f"Likely causes: indexing failed silently, fastembed init failed, "
+        f"or COMPACTOR_RAG_ENABLED is disabled."
     )
 
 
@@ -48,7 +48,9 @@ def test_distinctive_content_retrieved_later(conv_id):
     )
     r1 = H.chat(plant, conv_id=conv_id, max_tokens=40)
     assert r1.status_code == 200
-    H.wait_for_async_tail()
+    # Make sure turn 1 is indexed before we move on — otherwise the
+    # probe later might race against the planted turn still being indexed.
+    H.wait_for_indexed_exchanges(conv_id, min_count=1, max_wait=30)
 
     # Turns 2-5: filler exchanges on unrelated topics so the plant turn
     # is no longer in the immediate "recent N" window and would only be
@@ -68,7 +70,9 @@ def test_distinctive_content_retrieved_later(conv_id):
         # one turn can overlap with the next request; that's a designed
         # property of the async tail.
 
-    H.wait_for_async_tail()  # one wait before the assertion query
+    # Wait until all 5 turns have been indexed before the probe, so the
+    # plant turn (#1) is reliably in the vector store and retrievable.
+    H.wait_for_indexed_exchanges(conv_id, min_count=5, max_wait=30)
 
     # The probe query: ask about the planted content using semantically
     # related wording. RAG should pull turn-1 back.
