@@ -42,9 +42,47 @@ The harness reads its connection settings from env vars (or `--base-url`
 | `ZIONS_TEST_TIMEOUT` | No | HTTP timeout in seconds (default 120) |
 | `ZIONS_TEST_TAIL_WAIT` | No | How long to wait for the async post-response work to finish before assertions (default 8s) |
 
-## Three modes of running
+## Four modes of running
 
-### 1. Basic — chat round-trip only (works from anywhere)
+### 1. On-pod (recommended for post-deploy validation)
+
+The simplest path — clone the branch, install deps, run. Because requests
+originate from `127.0.0.1`, admin endpoints work without any tunneling
+or any change to `COMPACTOR_ADMIN_BIND` (which stays safely at `127.0.0.1`).
+
+Open the RunPod **Web Terminal** (or `runpodctl ssh`) and paste:
+
+```bash
+# One-time setup: clone the suite onto the network volume so it
+# survives pod restarts (~50KB, depth=1).
+rm -rf /data/integration-tests && \
+git clone --depth=1 --branch master \
+    https://github.com/MrBanana8768/zions-light-ai.git /data/integration-tests && \
+cd /data/integration-tests/tests/integration && \
+python3 -m venv .venv && \
+source .venv/bin/activate && \
+pip install -q -r requirements.txt
+
+# Run the suite — both URLs are localhost since we're inside the pod.
+ZIONS_TEST_BASE_URL=http://localhost:8080 \
+ZIONS_TEST_ADMIN_URL=http://localhost:8080 \
+pytest -v
+```
+
+For subsequent runs on the same pod, just:
+```bash
+cd /data/integration-tests/tests/integration && \
+source .venv/bin/activate && \
+ZIONS_TEST_BASE_URL=http://localhost:8080 \
+ZIONS_TEST_ADMIN_URL=http://localhost:8080 \
+pytest -v
+```
+
+To validate a pre-release branch (e.g. `v2.0-phase4.2` candidate before
+merge), swap `--branch master` for `--branch <branch-name>` in the clone
+step.
+
+### 2. Basic — chat round-trip only (works from anywhere)
 
 The minimum confidence-builder. Hits public endpoints only; no admin
 access needed. Validates that chat completes end-to-end and that the
@@ -58,10 +96,12 @@ pytest tests/integration/ -v
 Admin-requiring tests show as `SKIPPED: admin endpoint required` — that
 is expected and not a failure.
 
-### 2. Full — with admin endpoint access (recommended)
+### 3. Full from off-pod — with admin endpoint access
 
-The real regression net. Adds storage-level assertions that prove the
-state files actually got written, not just that the response was 200.
+The same regression net as Mode 1, but driven from your laptop or CI
+instead of the pod's Web Terminal. Useful when CI orchestrates the
+validation, or when you want to exercise the public proxy URL end-to-end
+including TLS / RunPod's proxy layer.
 
 **Option A — SSH tunnel** (most secure; what production environments should use):
 ```bash
@@ -89,7 +129,7 @@ pytest tests/integration/ -v
 **Revert `COMPACTOR_ADMIN_BIND` to `127.0.0.1` afterwards** — the admin
 endpoints have no auth.
 
-### 3. Full + slow — including the summary-rollup tests
+### 4. Full + slow — including the summary-rollup tests
 
 The hierarchical-summarizer tests drive ≥ 20 real chat turns each (because
 that's the default L1 rollup threshold). That takes 5-15 minutes of real
