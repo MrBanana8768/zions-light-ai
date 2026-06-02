@@ -44,7 +44,7 @@ CPU container minimal). Mock the HTTP layer with `unittest.mock` when a
 function calls vLLM. Redirect storage to a tempdir via
 `COMPACTOR_STORAGE_ROOT` **before** importing the module under test.
 
-**Current Tier-1 suites:**
+**Current Tier-1 suites** (all green as of V2.0 Phase 4):
 - `compactor/test_smoke.py` — core compactor logic (token counting, split,
   compaction no-op, route registration, env defaults)
 - `compactor/test_memory.py` — conv_id resolution, storage layout, admin
@@ -53,20 +53,22 @@ function calls vLLM. Redirect storage to a tempdir via
   extraction parser, extraction with mocked vLLM
 - `compactor/test_backfill.py` — state machine, stale detection, pair
   extraction, needs_backfill decision matrix, end-to-end with mock vLLM
+- `compactor/test_retrieval.py` — graceful degradation (deps missing),
+  index/retrieve/forget with mock embedder + ChromaDB collection,
+  conv-isolation via metadata filter
+- `compactor/test_summarizer.py` — state I/O, threshold detection per
+  tier, L1→L2→L3 cascade with shrunk thresholds + mock LLM, no-op when
+  below threshold, exception-swallowing when LLM fails
 
-**Run them:**
-```powershell
-# All Tier-1 suites in a clean CPU container (Windows PowerShell)
-docker run --rm -v "${PWD}\compactor:/work" -w /work python:3.12-slim bash -c `
-  "pip install --quiet fastapi 'uvicorn[standard]' httpx && `
-   python test_smoke.py && python test_memory.py && `
-   python test_facts.py && python test_backfill.py"
-```
+**Run them** (Linux/macOS — Windows users invoke under `MSYS_NO_PATHCONV=1`
+to avoid Git Bash's `/opt/...` path-mangling trap):
 ```bash
-# Same, Linux/macOS
-docker run --rm -v "$PWD/compactor:/work" -w /work python:3.12-slim bash -c \
-  "pip install --quiet fastapi 'uvicorn[standard]' httpx && \
-   for t in test_smoke test_memory test_facts test_backfill; do python \$t.py || exit 1; done"
+docker run --rm -v "$PWD/compactor:/work" -w /work python:3.12-slim bash -lc '
+  pip install --quiet fastapi "uvicorn[standard]" httpx 2>/dev/null
+  for t in test_smoke test_memory test_facts test_backfill test_retrieval test_summarizer; do
+    python $t.py 2>&1 | tail -2
+  done
+'
 ```
 
 ## Tier 2 — Boot self-test  *(harness lands in V2.2)*
@@ -94,21 +96,44 @@ cat /var/log/supervisor/selftest.log              # boot result
 curl -s http://localhost:8080/admin/selftest | jq # on-demand
 ```
 
-## Tier 3 — Integration tests  *(suite lands in V2.2)*
+## Tier 3 — Integration tests
 
 **What it is:** deliberate end-to-end scenarios run against a live
-deployment, exercising behavior that only emerges at scale. The flagship
-is facts persistence: inject a fact early in a conversation, drive it
-through hundreds of turns past multiple compactions, and assert the fact
-is still honored — the exact thing V1's flat summarization would lose.
+deployment, exercising behavior that only emerges at scale. Hits the
+compactor as a **black box** — never imports project code, never runs
+inside the shipped image (excluded by `.dockerignore`).
 
-**How it runs:** points at a live pod via `ZIONS_TEST_BASE_URL`. Never
-runs inside the shipped image; run it manually after a deploy, or in CI
-against an ephemeral GPU pod gated to release candidates.
+**Suite lives at** `tests/integration/` — see
+[`tests/integration/README.md`](tests/integration/README.md) for the full
+walkthrough.
 
+**Current coverage** (16 tests, plus 2 `slow` for the summarizer rollups):
+- `test_00_smoke.py` — health, models listed, basic chat round-trip
+- `test_facts.py` — facts extracted, persisted, used in next turn
+- `test_retrieval.py` — exchanges indexed, distinctive content retrieved
+  back via RAG
+- `test_summarizer.py` — L1 rollup fires after threshold *(slow: drives
+  20+ real chat turns; opt in with `-m slow`)*
+- `test_forget.py` — DELETE clears facts + episodic + summary together;
+  idempotent
+- `test_degraded.py` — hash-fallback conv_id, empty system prompts,
+  multimodal content arrays — compactor stays up
+
+**Modes** (admin-requiring tests skip cleanly when `ZIONS_TEST_ADMIN_URL`
+is unset, so a basic confidence run works from anywhere):
 ```bash
+# Basic — no admin access needed
 ZIONS_TEST_BASE_URL=https://{POD_ID}-8080.proxy.runpod.net \
-  pytest tests/integration/
+  pytest tests/integration/ -v
+
+# Full — with admin access via SSH tunnel or pod-side bind flip
+ZIONS_TEST_BASE_URL=https://{POD_ID}-8080.proxy.runpod.net \
+ZIONS_TEST_ADMIN_URL=http://localhost:8081 \
+  pytest tests/integration/ -v
+
+# Including the slow summarizer rollup tests
+ZIONS_TEST_BASE_URL=... ZIONS_TEST_ADMIN_URL=... \
+  pytest tests/integration/ -v -m "slow or not slow"
 ```
 
 ## The standard — what every feature PR must do

@@ -1,0 +1,14 @@
+# Dependencies for the Tier-3 integration suite. Deliberately tiny —
+# the suite hits the deployed compactor as a black box, so all it needs
+# is an HTTP client and a test runner.
+#
+# NEVER baked into the Docker image (this directory is excluded by
+# .dockerignore). Install in a separate venv on the dev/CI machine:
+#
+#     python -m venv .test-venv
+#     ./.test-venv/bin/pip install -r tests/integration/requirements.txt
+#
+# Or with uv: `uv pip install -r tests/integration/requirements.txt`.
+
+pytest>=8
+httpx>=0.27
