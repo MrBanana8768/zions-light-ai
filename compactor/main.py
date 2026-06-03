@@ -21,12 +21,15 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import backfill
 import facts
+import health
+import portability
 import retrieval
+import selftest as selftest_module
 import summarizer
 from memory import (
     conv_lock,
@@ -618,8 +621,28 @@ async def models():
 
 
 @app.get("/health")
-async def health():
+async def health_liveness():
+    """Cheap liveness probe — no I/O, no dependencies. For load balancers
+    and quick `is-this-process-up` checks. Use /health/full for the deep
+    probe that actually walks vLLM + storage.
+    """
     return {"status": "ok", "vllm_url": VLLM_URL, "target_tokens": TARGET_TOKENS}
+
+
+@app.get("/health/full")
+async def health_full(response: Response):
+    """V2.1 Phase 6: deep health probe.
+
+    Walks vLLM reachability + storage writability + memory store stats.
+    Returns 200 for ok/degraded, 503 for down. After this phase, the
+    Docker HEALTHCHECK targets /health/full so the container goes
+    unhealthy when vLLM is FATAL (today's `curl :3000` check stays
+    healthy even when vLLM is dead, because OpenWebUI keeps serving
+    its login page).
+    """
+    report = await health.gather_health_full(VLLM_URL, TARGET_TOKENS)
+    response.status_code = health.status_to_http_code(report["status"])
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -721,3 +744,96 @@ async def admin_get_summary(conv_id: str):
     debugging. Localhost-only.
     """
     return summarizer.load_state(conv_id)
+
+
+# V2.1 Phase 6 Step 3: portability — export / import / fork.
+@app.get(
+    "/admin/conversations/{conv_id}/export",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_export_conversation(conv_id: str):
+    """Snapshot one conv's full V2 state (facts + summary + episodic) as
+    a single JSON bundle. Use for backup, cross-pod migration, or
+    feeding a /admin/conversations/import on a different deploy.
+    """
+    return portability.export_conversation(conv_id)
+
+
+@app.post(
+    "/admin/conversations/import",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_import_conversation(request: Request):
+    """Restore a conversation from a previously-exported bundle.
+
+    Body JSON:
+        {
+          "bundle":          <bundle dict>,        // required
+          "target_conv_id":  "<str>" | null,       // optional override
+          "overwrite":       true | false (default)
+        }
+
+    Refuses if target conv has existing state unless overwrite=true —
+    prevents accidental wipe of an active conversation.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+    bundle = body.get("bundle")
+    if bundle is None:
+        raise HTTPException(status_code=400, detail="missing required field: 'bundle'")
+    try:
+        result = portability.import_conversation(
+            bundle,
+            target_conv_id=body.get("target_conv_id"),
+            overwrite=bool(body.get("overwrite", False)),
+        )
+    except portability.ImportError_ as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return result
+
+
+@app.post(
+    "/admin/conversations/{conv_id}/fork",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_fork_conversation(conv_id: str, request: Request):
+    """Clone src conv's full state into a new conv_id. Original
+    untouched. Body is optional:
+        {"new_conv_id": "<str>" | null}
+    If omitted, the fork's id is `<src>__fork_<6hex>`.
+    """
+    # Body is optional — accept empty or missing.
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        return portability.fork_conversation(
+            conv_id, new_conv_id=body.get("new_conv_id")
+        )
+    except portability.ImportError_ as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/admin/selftest", dependencies=[Depends(_require_localhost)])
+async def admin_selftest(response: Response, round_trip: bool = True):
+    """V2.1 Phase 6 Step 2: on-demand live-stack self-test.
+
+    Runs the same check battery as the supervisord boot one-shot, but
+    skips wait-for-ready (the stack is assumed up). Returns the JSON
+    report. HTTP 503 if any check failed; 200 if all passed — so this
+    endpoint is itself suitable as a deep healthcheck target for
+    external monitoring.
+
+    Query: ?round_trip=false to skip the real LLM call (useful for
+    quick smoke checks that don't want to wait on inference).
+    """
+    report = await selftest_module.run_selftest(do_round_trip=round_trip)
+    response.status_code = 200 if report["status"] == "pass" else 503
+    return report

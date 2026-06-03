@@ -332,6 +332,80 @@ def admin_forget(conv_id: str) -> dict:
         return r.json()
 
 
+# V2.1 Phase 6 — health / selftest / portability helpers.
+
+def health_full() -> tuple[int, dict]:
+    """GET /health/full → (status_code, json_body). Status code is part
+    of the contract (200 ok/degraded, 503 down), so we return it not
+    just the body. No admin URL required — /health/full is public.
+    """
+    with _client(BASE_URL) as c:
+        r = c.get("/health/full")
+        # Don't raise_for_status — 503 is a valid value here.
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        return r.status_code, body
+
+
+def admin_selftest(round_trip: bool = True) -> tuple[int, dict]:
+    """GET /admin/selftest → (status_code, report). 200=pass, 503=fail.
+    Skip-friendly: returns (0, {}) when admin not configured."""
+    if not ADMIN_ENABLED:
+        return 0, {}
+    with _client(ADMIN_URL) as c:
+        r = c.get(
+            "/admin/selftest",
+            params={"round_trip": "true" if round_trip else "false"},
+            timeout=300.0,
+        )
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        return r.status_code, body
+
+
+def admin_export(conv_id: str) -> dict:
+    """GET /admin/conversations/<id>/export → full bundle."""
+    assert ADMIN_URL, "admin_export requires ZIONS_TEST_ADMIN_URL"
+    with _client(ADMIN_URL) as c:
+        r = c.get(f"/admin/conversations/{conv_id}/export")
+        r.raise_for_status()
+        return r.json()
+
+
+def admin_import(bundle: dict, *, target_conv_id: str | None = None,
+                 overwrite: bool = False) -> tuple[int, dict]:
+    """POST /admin/conversations/import → (status_code, json_body).
+    Status is part of contract (400 = malformed bundle / refused overwrite,
+    200 = success)."""
+    assert ADMIN_URL, "admin_import requires ZIONS_TEST_ADMIN_URL"
+    body: dict = {"bundle": bundle, "overwrite": overwrite}
+    if target_conv_id is not None:
+        body["target_conv_id"] = target_conv_id
+    with _client(ADMIN_URL) as c:
+        r = c.post("/admin/conversations/import", json=body)
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+        return r.status_code, data
+
+
+def admin_fork(conv_id: str, *, new_conv_id: str | None = None) -> dict:
+    """POST /admin/conversations/<id>/fork → result dict."""
+    assert ADMIN_URL, "admin_fork requires ZIONS_TEST_ADMIN_URL"
+    body: dict = {}
+    if new_conv_id is not None:
+        body["new_conv_id"] = new_conv_id
+    with _client(ADMIN_URL) as c:
+        r = c.post(f"/admin/conversations/{conv_id}/fork", json=body)
+        r.raise_for_status()
+        return r.json()
+
+
 def admin_safe_forget(conv_id: str) -> None:
     """Best-effort cleanup — used in test teardown. Swallows errors so
     a teardown failure doesn't mask the real test failure. No-op when

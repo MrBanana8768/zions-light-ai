@@ -258,6 +258,73 @@ def conversation_doc_count(conv_id: str) -> int:
         return 0
 
 
+def export_indexed_exchanges(conv_id: str) -> list[dict]:
+    """V2.1 portability: dump every indexed exchange for one conv as
+    [{"turn_index": int, "document": str}, ...] sorted by turn_index.
+
+    Used by compactor/portability.py to round-trip a conversation
+    into / out of a single JSON bundle. Embeddings are deliberately
+    NOT exported — they'd couple the bundle to the bge-small ONNX
+    model. import_indexed_exchange re-embeds on the destination side,
+    which works across any embedding model swap.
+
+    Returns [] on any failure or if retrieval is unavailable — never
+    raises, so export still produces a partial bundle.
+    """
+    if not _try_init() or _chroma_collection is None:
+        return []
+    try:
+        existing = _chroma_collection.get(where={"conv_id": conv_id})
+        if not existing:
+            return []
+        ids = existing.get("ids", []) or []
+        docs = existing.get("documents", []) or []
+        metas = existing.get("metadatas", []) or []
+        out: list[dict] = []
+        for i, _doc_id in enumerate(ids):
+            meta = metas[i] if i < len(metas) else {}
+            ti = int((meta or {}).get("turn_index", -1))
+            out.append({
+                "turn_index": ti,
+                "document": docs[i] if i < len(docs) else "",
+            })
+        return sorted(out, key=lambda d: d["turn_index"])
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: export_indexed_exchanges failed: {e}")
+        return []
+
+
+def import_indexed_exchange(conv_id: str, turn_index: int, document: str) -> bool:
+    """V2.1 portability: re-embed a pre-formatted exchange document and
+    upsert into the vector store. Used by compactor/portability.py on
+    bundle import.
+
+    `document` is the canonical "[user]: ...\\n[assistant]: ..." string
+    as produced by _exchange_doc — same format the embedding model saw
+    originally, so semantic neighborhoods carry across the round-trip.
+
+    Returns True on success, False on any failure. Never raises.
+    """
+    if not _try_init() or _chroma_collection is None:
+        return False
+    if not document:
+        return False
+    vecs = _embed([document])
+    if not vecs:
+        return False
+    try:
+        _chroma_collection.upsert(
+            ids=[_doc_id(conv_id, turn_index)],
+            embeddings=vecs,
+            documents=[document],
+            metadatas=[{"conv_id": conv_id, "turn_index": int(turn_index)}],
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: import_indexed_exchange failed: {e}")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Injection block
 # ---------------------------------------------------------------------------
