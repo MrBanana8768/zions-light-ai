@@ -25,6 +25,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import backfill
+import dedup
 import facts
 import health
 import portability
@@ -344,13 +345,35 @@ async def _async_tail(
                     assistant_text,
                     touched_facts,
                 )
-            from facts import _now_unix
-            now = _now_unix()
-            new_entries = [
-                {"text": s, "added_turn": turn_index, "last_used": now}
-                for s in new_strs
-            ]
-            combined = touched_facts + new_entries
+                from facts import _now_unix
+                now = _now_unix()
+                new_entries = [
+                    {"text": s, "added_turn": turn_index, "last_used": now}
+                    for s in new_strs
+                ]
+                combined = touched_facts + new_entries
+
+                # V2.1 Phase 7: hybrid dedup BEFORE pruning. Embedding
+                # filter is cheap (no LLM call when no candidate clusters
+                # — the common case after a single-fact extraction); LLM
+                # verification only runs on actual candidates. Failures
+                # degrade to no-op (returns input unchanged) so dedup
+                # never affects the user chat path.
+                if new_entries and len(combined) >= 2:
+                    try:
+                        combined, removed = await dedup.dedup_facts(
+                            client, VLLM_URL, MODEL_REPO or "", combined
+                        )
+                        if removed > 0:
+                            logger.info(
+                                f"conv={conv_id}: dedup merged {removed} "
+                                f"duplicate fact(s)"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"conv={conv_id}: inline dedup failed (no-op): {e}"
+                        )
+
             kept, dropped = facts.prune_facts(combined)
             facts.save_facts(conv_id, kept)
             if new_entries or dropped:
@@ -744,6 +767,105 @@ async def admin_get_summary(conv_id: str):
     debugging. Localhost-only.
     """
     return summarizer.load_state(conv_id)
+
+
+# V2.1 Phase 7 Step 2: stale-fact archival endpoints.
+@app.get(
+    "/admin/conversations/{conv_id}/archive",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_get_archive(conv_id: str):
+    """Return the archived (cold-storage) facts for a conv. Useful for
+    auditing what got demoted and deciding whether to restore."""
+    return {"conv_id": conv_id, "archived": facts.load_archive(conv_id)}
+
+
+@app.post(
+    "/admin/conversations/{conv_id}/archive",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_archive_stale(conv_id: str, older_than_days: int | None = None):
+    """Trigger a stale-fact archival pass for one conv. Moves facts whose
+    last_used is older than the cutoff to the archive sidecar.
+
+    Query: ?older_than_days=N (default 90, env-overridable).
+    """
+    days = older_than_days if older_than_days is not None else facts.ARCHIVE_DEFAULT_DAYS
+    async with conv_lock(conv_id):
+        kept, archived = facts.archive_stale_facts(conv_id, older_than_days=days)
+    return {
+        "conv_id": conv_id,
+        "older_than_days": days,
+        "kept": kept,
+        "archived": archived,
+    }
+
+
+@app.post(
+    "/admin/conversations/{conv_id}/restore",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_restore_from_archive(conv_id: str, request: Request):
+    """Move archived facts back to active storage.
+
+    Body JSON (all fields optional):
+        {"text_substring": "<substring filter>" | null}
+
+    Omit body or pass {} to restore ALL archived facts.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    substring = body.get("text_substring")
+    async with conv_lock(conv_id):
+        restored = facts.restore_from_archive(
+            conv_id, text_substring=substring,
+        )
+    return {
+        "conv_id": conv_id,
+        "restored": restored,
+        "filter": substring,
+    }
+
+
+# V2.1 Phase 7 Step 1: on-demand semantic deduplication.
+@app.post(
+    "/admin/conversations/{conv_id}/dedup",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_dedup(conv_id: str):
+    """Run a full hybrid (embedding + LLM) dedup pass on the conv's facts.
+
+    Returns counters for the response body:
+        {"conv_id", "before": int, "after": int, "removed": int}
+
+    Inline dedup runs automatically after every fact extraction (cheap
+    when no candidate clusters); this endpoint is for manual cleanup
+    of conversations that pre-date Phase 7 or accumulated dupes via
+    backfill/import.
+    """
+    async with conv_lock(conv_id):
+        before = facts.load_facts(conv_id)
+        if len(before) < 2:
+            return {
+                "conv_id": conv_id, "before": len(before),
+                "after": len(before), "removed": 0,
+            }
+        async with httpx.AsyncClient() as client:
+            after, removed = await dedup.dedup_facts(
+                client, VLLM_URL, MODEL_REPO or "", before
+            )
+        if removed > 0:
+            facts.save_facts(conv_id, after)
+        return {
+            "conv_id": conv_id,
+            "before": len(before),
+            "after": len(after),
+            "removed": removed,
+        }
 
 
 # V2.1 Phase 6 Step 3: portability — export / import / fork.

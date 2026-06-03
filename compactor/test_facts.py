@@ -329,6 +329,138 @@ def test_record_facts_end_to_end():
 
 
 # ---------------------------------------------------------------------------
+# V2.1 Phase 7 Step 2 — stale-fact archival
+# ---------------------------------------------------------------------------
+
+def test_archive_no_facts_is_noop():
+    print("\n[test] archive_stale_facts: empty conv → (0, 0)")
+    _wipe_storage()
+    kept, archived = facts.archive_stale_facts("empty", older_than_days=30)
+    assert_eq(kept, 0, "kept=0")
+    assert_eq(archived, 0, "archived=0")
+
+
+def test_archive_all_facts_fresh_is_noop():
+    print("\n[test] archive_stale_facts: all facts fresh → 0 archived")
+    _wipe_storage()
+    now = int(time.time())
+    facts.save_facts("fresh-conv", [
+        {"text": "still-warm", "added_turn": 1, "last_used": now},
+        {"text": "also-warm", "added_turn": 2, "last_used": now - 10},
+    ])
+    kept, archived = facts.archive_stale_facts("fresh-conv", older_than_days=30)
+    assert_eq(kept, 2, "both kept")
+    assert_eq(archived, 0, "none archived")
+    assert_eq(len(facts.load_archive("fresh-conv")), 0, "archive empty")
+
+
+def test_archive_moves_stale_facts_to_sidecar():
+    print("\n[test] archive_stale_facts: stale facts moved to .archive.json")
+    _wipe_storage()
+    now = int(time.time())
+    stale_ts = now - (100 * 86400)  # 100 days old
+    facts.save_facts("mixed", [
+        {"text": "fresh", "added_turn": 1, "last_used": now},
+        {"text": "ancient", "added_turn": 2, "last_used": stale_ts},
+    ])
+    kept, archived = facts.archive_stale_facts("mixed", older_than_days=30)
+    assert_eq(kept, 1, "1 fresh kept")
+    assert_eq(archived, 1, "1 stale archived")
+    active = facts.load_facts("mixed")
+    assert_eq(len(active), 1, "active has 1 fact")
+    assert_eq(active[0]["text"], "fresh", "fresh fact remains active")
+    archived_list = facts.load_archive("mixed")
+    assert_eq(len(archived_list), 1, "archive has 1 fact")
+    assert_eq(archived_list[0]["text"], "ancient", "ancient fact archived")
+    assert_true(archived_list[0]["archived_at"] > 0, "archived_at stamped")
+
+
+def test_archive_accumulates_across_passes():
+    print("\n[test] archive_stale_facts: subsequent passes append to archive")
+    _wipe_storage()
+    now = int(time.time())
+    old1 = now - (100 * 86400)
+    facts.save_facts("accum", [{"text": "old-A", "added_turn": 1, "last_used": old1}])
+    facts.archive_stale_facts("accum", older_than_days=30)
+    # Second pass with a new stale fact
+    facts.save_facts("accum", [{"text": "old-B", "added_turn": 2, "last_used": old1}])
+    kept, archived = facts.archive_stale_facts("accum", older_than_days=30)
+    assert_eq(archived, 1, "one new archived")
+    a = facts.load_archive("accum")
+    assert_eq(len(a), 2, "archive has both A and B (accumulated)")
+
+
+def test_archive_is_idempotent():
+    print("\n[test] archive_stale_facts: re-running with same cutoff is a no-op")
+    _wipe_storage()
+    now = int(time.time())
+    old = now - (100 * 86400)
+    facts.save_facts("idem", [{"text": "ancient", "added_turn": 0, "last_used": old}])
+    facts.archive_stale_facts("idem", older_than_days=30)
+    k2, a2 = facts.archive_stale_facts("idem", older_than_days=30)
+    assert_eq(a2, 0, "second pass archives 0")
+
+
+def test_restore_all_from_archive():
+    print("\n[test] restore_from_archive: no filter → restores everything")
+    _wipe_storage()
+    now = int(time.time())
+    old = now - (100 * 86400)
+    facts.save_facts("restore-all", [{"text": "ancient", "added_turn": 0, "last_used": old}])
+    facts.archive_stale_facts("restore-all", older_than_days=30)
+    assert_eq(len(facts.load_facts("restore-all")), 0, "prep: active empty after archive")
+    restored = facts.restore_from_archive("restore-all")
+    assert_eq(restored, 1, "1 restored")
+    active = facts.load_facts("restore-all")
+    assert_eq(len(active), 1, "active has 1 fact again")
+    assert_eq(active[0]["text"], "ancient", "text preserved")
+    assert_true(active[0]["last_used"] > old, "last_used refreshed (no immediate re-archive)")
+    assert_true("archived_at" not in active[0], "archived_at dropped on restore")
+    assert_eq(len(facts.load_archive("restore-all")), 0, "archive empty after full restore")
+
+
+def test_restore_with_substring_filter():
+    print("\n[test] restore_from_archive: substring filter is case-insensitive")
+    _wipe_storage()
+    now = int(time.time())
+    old = now - (100 * 86400)
+    facts.save_facts("filt", [
+        {"text": "Lyra is a ranger", "added_turn": 1, "last_used": old},
+        {"text": "Aethermere is a kingdom", "added_turn": 2, "last_used": old},
+        {"text": "Hippogriffs exist", "added_turn": 3, "last_used": old},
+    ])
+    facts.archive_stale_facts("filt", older_than_days=30)
+    n = facts.restore_from_archive("filt", text_substring="LYRA")
+    assert_eq(n, 1, "1 restored matching 'LYRA' (case-insensitive)")
+    active = facts.load_facts("filt")
+    assert_eq(len(active), 1, "1 active")
+    assert_eq(active[0]["text"], "Lyra is a ranger", "right fact restored")
+    assert_eq(len(facts.load_archive("filt")), 2, "two remain archived")
+
+
+def test_restore_substring_no_match_returns_zero():
+    print("\n[test] restore_from_archive: no matches → 0, archive untouched")
+    _wipe_storage()
+    now = int(time.time())
+    old = now - (100 * 86400)
+    facts.save_facts("nomatch", [{"text": "x", "added_turn": 0, "last_used": old}])
+    facts.archive_stale_facts("nomatch", older_than_days=30)
+    n = facts.restore_from_archive("nomatch", text_substring="not-present")
+    assert_eq(n, 0, "0 restored")
+    assert_eq(len(facts.load_archive("nomatch")), 1, "archive still has the fact")
+
+
+def test_archive_path_is_sidecar_not_facts_file():
+    print("\n[test] archive sidecar isn't mistaken for a separate conv by listing")
+    _wipe_storage()
+    now = int(time.time())
+    facts.save_facts("L", [{"text": "x", "added_turn": 0, "last_used": now}])
+    facts.save_archive("L", [{"text": "old", "added_turn": 0, "last_used": 0, "archived_at": 0}])
+    ids = memory.list_known_conv_ids()
+    assert_eq(ids, ["L"], "only one conv listed (sidecar excluded)")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -360,6 +492,17 @@ if __name__ == "__main__":
         test_extract_facts_from_exchange_empty_inputs_short_circuit()
 
         test_record_facts_end_to_end()
+
+        # V2.1 Phase 7 Step 2 — stale-fact archival
+        test_archive_no_facts_is_noop()
+        test_archive_all_facts_fresh_is_noop()
+        test_archive_moves_stale_facts_to_sidecar()
+        test_archive_accumulates_across_passes()
+        test_archive_is_idempotent()
+        test_restore_all_from_archive()
+        test_restore_with_substring_filter()
+        test_restore_substring_no_match_returns_zero()
+        test_archive_path_is_sidecar_not_facts_file()
 
         print("\nAll facts smoke tests passed.")
     finally:

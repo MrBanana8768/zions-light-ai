@@ -36,7 +36,13 @@ from typing import Any
 
 import httpx
 
-from memory import atomic_write_json, conv_lock, facts_path, read_json
+from memory import (
+    atomic_write_json,
+    conv_lock,
+    facts_archive_path,
+    facts_path,
+    read_json,
+)
 
 logger = logging.getLogger("compactor.facts")
 
@@ -123,6 +129,136 @@ def save_facts(conv_id: str, facts: list[dict]) -> None:
         "facts": facts,
     }
     atomic_write_json(facts_path(conv_id), data)
+
+
+# ---------------------------------------------------------------------------
+# Stale-fact archival (V2.1 Phase 7 Step 2)
+# ---------------------------------------------------------------------------
+#
+# The LRU budget in prune_facts evicts purely on storage pressure. Archival
+# is the time-based companion: facts not retrieved-and-injected in N days
+# get moved to a cold-storage sidecar file. They're still recoverable via
+# restore_from_archive — the user just doesn't pay context-window cost for
+# old facts that the model hasn't needed.
+#
+# Why a separate file vs a flag on the existing record: a flag would still
+# count against prune_facts's token budget and would still appear in
+# /admin/facts listings. Moving to a sidecar keeps the active set lean and
+# makes the cold/hot distinction obvious in any tooling that walks storage.
+
+ARCHIVE_DEFAULT_DAYS = int(
+    os.environ.get("COMPACTOR_ARCHIVE_DEFAULT_DAYS", "90") or 90
+)
+
+
+def load_archive(conv_id: str) -> list[dict]:
+    """Return the archived facts list for a conv. Empty if no archive yet."""
+    data = read_json(facts_archive_path(conv_id), default={})
+    archived = data.get("facts", []) if isinstance(data, dict) else []
+    valid: list[dict] = []
+    for f in archived:
+        if (
+            isinstance(f, dict)
+            and isinstance(f.get("text"), str)
+            and f["text"].strip()
+        ):
+            valid.append({
+                "text": f["text"],
+                "added_turn": int(f.get("added_turn", 0)),
+                "last_used": int(f.get("last_used", 0)),
+                "archived_at": int(f.get("archived_at", 0)),
+            })
+    return valid
+
+
+def save_archive(conv_id: str, facts: list[dict]) -> None:
+    """Persist the archive sidecar. Atomic — readers always see coherent state."""
+    data = {
+        "conv_id": conv_id,
+        "updated_at": _now_iso(),
+        "facts": facts,
+    }
+    atomic_write_json(facts_archive_path(conv_id), data)
+
+
+def archive_stale_facts(
+    conv_id: str, *, older_than_days: int = ARCHIVE_DEFAULT_DAYS
+) -> tuple[int, int]:
+    """Move facts with `last_used` older than the cutoff from active storage
+    to the archive sidecar. Returns (kept_count, archived_count).
+
+    Callers should serialize via conv_lock — concurrent extraction tail
+    could otherwise see torn state mid-move. Idempotent: running twice with
+    the same cutoff archives the same set on first call, zero on second.
+    """
+    if older_than_days < 0:
+        return len(load_facts(conv_id)), 0
+    cutoff = _now_unix() - (older_than_days * 86400)
+    active = load_facts(conv_id)
+    if not active:
+        return 0, 0
+    stale = [f for f in active if f.get("last_used", 0) < cutoff]
+    if not stale:
+        return len(active), 0
+    fresh = [f for f in active if f.get("last_used", 0) >= cutoff]
+    # Stamp archived_at so restore can tell when each fact was retired.
+    archive_ts = _now_unix()
+    archived_entries = [
+        {**f, "archived_at": archive_ts} for f in stale
+    ]
+    # Merge with any existing archive — accumulating, not overwriting.
+    existing_archive = load_archive(conv_id)
+    save_archive(conv_id, existing_archive + archived_entries)
+    save_facts(conv_id, fresh)
+    logger.info(
+        f"conv={conv_id}: archived {len(stale)} stale fact(s) "
+        f"(cutoff: {older_than_days}d)"
+    )
+    return len(fresh), len(stale)
+
+
+def restore_from_archive(
+    conv_id: str, *, text_substring: str | None = None
+) -> int:
+    """Move matching archive entries back to active facts. Returns the
+    number restored.
+
+      text_substring=None — restore all archived facts
+      text_substring="..."  — restore only facts whose text contains the
+                              substring (case-insensitive)
+
+    Caller serializes via conv_lock. Restored facts get their `last_used`
+    bumped to now so they don't immediately re-archive on the next pass.
+    The `archived_at` field is dropped (the fact is hot again).
+    """
+    archived = load_archive(conv_id)
+    if not archived:
+        return 0
+    if text_substring:
+        needle = text_substring.lower()
+        to_restore = [f for f in archived if needle in f.get("text", "").lower()]
+        remaining = [f for f in archived if needle not in f.get("text", "").lower()]
+    else:
+        to_restore = list(archived)
+        remaining = []
+    if not to_restore:
+        return 0
+    now = _now_unix()
+    refreshed = [
+        {
+            "text": f["text"],
+            "added_turn": f.get("added_turn", 0),
+            "last_used": now,
+        }
+        for f in to_restore
+    ]
+    active = load_facts(conv_id)
+    save_facts(conv_id, active + refreshed)
+    save_archive(conv_id, remaining)
+    logger.info(
+        f"conv={conv_id}: restored {len(refreshed)} fact(s) from archive"
+    )
+    return len(refreshed)
 
 
 async def with_facts_lock(conv_id: str, fn):
