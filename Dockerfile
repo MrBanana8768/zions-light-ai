@@ -137,6 +137,8 @@ COPY compactor/health.py /opt/compactor/health.py
 COPY compactor/selftest.py /opt/compactor/selftest.py
 COPY compactor/portability.py /opt/compactor/portability.py
 COPY compactor/dedup.py /opt/compactor/dedup.py
+COPY compactor/commands.py /opt/compactor/commands.py
+COPY compactor/persona.py /opt/compactor/persona.py
 
 # =============================================================================
 # Supervisor

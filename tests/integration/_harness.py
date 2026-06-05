@@ -453,6 +453,66 @@ def admin_restore_from_archive(
         return r.json()
 
 
+# V2.1 Phase 8 — persona helpers.
+
+def admin_get_persona(conv_id: str) -> dict | None:
+    """GET /admin/conversations/<id>/persona → record or None on 404."""
+    assert ADMIN_URL, "admin_get_persona requires ZIONS_TEST_ADMIN_URL"
+    with _client(ADMIN_URL) as c:
+        r = c.get(f"/admin/conversations/{conv_id}/persona")
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+
+
+def admin_set_persona(conv_id: str, text: str) -> tuple[int, dict]:
+    """POST /admin/conversations/<id>/persona body: {text} → (status, body)."""
+    assert ADMIN_URL, "admin_set_persona requires ZIONS_TEST_ADMIN_URL"
+    with _client(ADMIN_URL) as c:
+        r = c.post(
+            f"/admin/conversations/{conv_id}/persona", json={"text": text},
+        )
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        return r.status_code, body
+
+
+def admin_delete_persona(conv_id: str) -> dict:
+    """DELETE /admin/conversations/<id>/persona → {deleted, ...}."""
+    assert ADMIN_URL, "admin_delete_persona requires ZIONS_TEST_ADMIN_URL"
+    with _client(ADMIN_URL) as c:
+        r = c.delete(f"/admin/conversations/{conv_id}/persona")
+        r.raise_for_status()
+        return r.json()
+
+
+def admin_list_personas() -> list[dict]:
+    """GET /admin/personas → library."""
+    assert ADMIN_URL, "admin_list_personas requires ZIONS_TEST_ADMIN_URL"
+    with _client(ADMIN_URL) as c:
+        r = c.get("/admin/personas")
+        r.raise_for_status()
+        return r.json().get("personas", [])
+
+
+def admin_inherit_persona(target_conv_id: str, source_conv_id: str) -> tuple[int, dict]:
+    """POST /admin/conversations/<id>/inherit-persona → (status, body)."""
+    assert ADMIN_URL, "admin_inherit_persona requires ZIONS_TEST_ADMIN_URL"
+    with _client(ADMIN_URL) as c:
+        r = c.post(
+            f"/admin/conversations/{target_conv_id}/inherit-persona",
+            json={"source_conv_id": source_conv_id},
+        )
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        return r.status_code, body
+
+
 def admin_safe_forget(conv_id: str) -> None:
     """Best-effort cleanup — used in test teardown. Swallows errors so
     a teardown failure doesn't mask the real test failure. No-op when

@@ -145,6 +145,14 @@ def facts_archive_path(conv_id: str) -> Path:
     return STORAGE_ROOT / "facts" / f"{conv_id}.archive.json"
 
 
+def persona_path(conv_id: str) -> Path:
+    """V2.1 Phase 8: persona text storage. Separate subdir so conversations
+    that have facts but no persona don't pollute the persona listing,
+    and vice versa.
+    """
+    return STORAGE_ROOT / "personas" / f"{conv_id}.json"
+
+
 def summary_path(conv_id: str) -> Path:
     return STORAGE_ROOT / "summaries" / f"{conv_id}.json"
 
@@ -160,7 +168,7 @@ def ensure_storage_layout() -> None:
     Idempotent — safe to call on every request, though main.py calls it
     once at startup. Required because the volume is empty on first attach.
     """
-    for sub in ("facts", "summaries", "chromadb"):
+    for sub in ("facts", "summaries", "chromadb", "personas"):
         (STORAGE_ROOT / sub).mkdir(parents=True, exist_ok=True)
 
 

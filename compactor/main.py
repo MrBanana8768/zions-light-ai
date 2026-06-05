@@ -25,9 +25,11 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import backfill
+import commands
 import dedup
 import facts
 import health
+import persona
 import portability
 import retrieval
 import selftest as selftest_module
@@ -485,6 +487,48 @@ async def chat_completions(request: Request) -> Any:
     # Turn index ≈ position of the assistant reply we're about to produce.
     turn_index = len(messages) + 1
 
+    # V2.1 Phase 5: chat command short-circuit. If the user typed a
+    # recognized slash command (/list-facts, /forget, /remember, etc.),
+    # handle it inside the compactor and return a synthetic completion.
+    # vLLM never sees the request — zero token cost, instant response.
+    # Detection is permissive: messages starting with `/` whose first
+    # token is NOT a recognized command pass through unchanged.
+    cmd_name, cmd_arg = commands.parse_command(last_user_text)
+    if cmd_name and conv_id:
+        try:
+            cmd_text = await commands.handle_command(
+                cmd_name, cmd_arg, conv_id,
+                ctx={
+                    "turn_index": turn_index,
+                    "clear_all_memory": lambda cid: _clear_all_memory(cid, source="chat-command"),
+                    "persona_text": persona.get_persona_text(conv_id),
+                },
+            )
+        except Exception as e:
+            logger.exception(f"command handling failed: {e}")
+            cmd_text = f"Command failed: {type(e).__name__}: {e}"
+        logger.info(
+            f"conv={conv_id}: handled /{cmd_name} (arg_len={len(cmd_arg)})"
+        )
+        stream_flag = bool(body.get("stream", False))
+        if stream_flag:
+            chunks = commands.build_synthetic_completion_stream(
+                cmd_text, body.get("model") or MODEL_REPO or "",
+            )
+
+            async def cmd_stream():
+                for chunk in chunks:
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(cmd_stream(), media_type="text/event-stream")
+        return JSONResponse(
+            content=commands.build_synthetic_completion(
+                cmd_text, body.get("model") or MODEL_REPO or "",
+            ),
+            status_code=200,
+        )
+
     # V1 compaction
     try:
         body["messages"] = await compact_if_needed(messages)
@@ -505,6 +549,26 @@ async def chat_completions(request: Request) -> Any:
     injected_blocks: list[str] = []
     log_parts: list[str] = []
     if conv_id:
+        # --- Persona (Phase 8) ---
+        # Two paths feed the persona layer:
+        #   1. Auto-capture: when the request's first system message is
+        #      long enough (≥ AUTO_DETECT_MIN_CHARS) we save it for
+        #      portability/library/diagnostics. No injection needed —
+        #      vLLM already sees the text via messages[0].
+        #   2. Admin/inherited: persona stored without being in this
+        #      request's messages. text_to_inject returns it so the
+        #      combined system block carries it.
+        # The hash-match check in text_to_inject prevents double-injection.
+        try:
+            persona.auto_capture_persona(conv_id, messages)
+            ptext = persona.text_to_inject(conv_id, messages)
+            pblock = persona.format_persona_block(ptext)
+            if pblock:
+                injected_blocks.append(pblock)
+                log_parts.append(f"persona({len(ptext)}ch)")
+        except Exception as e:
+            logger.warning(f"conv={conv_id}: persona handling failed (non-fatal): {e}")
+
         # --- Facts (Phase 2) ---
         try:
             touched_facts = facts.load_facts(conv_id)
@@ -705,6 +769,16 @@ async def admin_conversation_summary(conv_id: str):
         info["summary"] = summarizer.state_summary(summarizer.load_state(conv_id))
     except Exception:
         info["summary"] = None
+    # Persona (V2.1 Phase 8)
+    try:
+        prec = persona.load_persona(conv_id)
+        info["persona"] = {
+            "present": prec is not None,
+            "length": len(prec["persona_text"]) if prec else 0,
+            "source": prec["source"] if prec else None,
+        }
+    except Exception:
+        info["persona"] = {"present": False, "length": 0, "source": None}
     return info
 
 
@@ -728,6 +802,15 @@ async def admin_forget_facts(conv_id: str):
     three-layer memory reset for when the model is stuck on something
     wrong. Targeted forgetting (single fact by substring) is V2.1.
     """
+    return await _clear_all_memory(conv_id, source="admin")
+
+
+# V2.1 Phase 5: shared full-clear used by /admin/forget AND the /forget
+# chat command. Holding conv_lock here serializes against any in-flight
+# extraction tail that might otherwise re-save state we just cleared.
+async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
+    """Wipe every memory layer for a conv. Returns counters for the
+    response body. `source` is just for log labeling."""
     async with conv_lock(conv_id):
         existing = facts.load_facts(conv_id)
         n_facts = len(existing)
@@ -744,17 +827,25 @@ async def admin_forget_facts(conv_id: str):
                 summary_deleted = True
         except Exception as e:
             logger.warning(f"conv={conv_id}: summary delete failed: {e}")
-        if n_facts or n_episodic or summary_deleted:
+        # V2.1 Phase 8: persona is a memory layer too — full forget clears it.
+        persona_deleted = False
+        try:
+            persona_deleted = persona.clear_persona(conv_id)
+        except Exception as e:
+            logger.warning(f"conv={conv_id}: persona delete failed: {e}")
+        if n_facts or n_episodic or summary_deleted or persona_deleted:
             logger.info(
-                f"conv={conv_id}: admin forgot {n_facts} fact(s) "
+                f"conv={conv_id}: {source} forgot {n_facts} fact(s) "
                 f"+ {n_episodic} indexed exchange(s) "
-                f"+ summary={'cleared' if summary_deleted else 'absent'}"
+                f"+ summary={'cleared' if summary_deleted else 'absent'} "
+                f"+ persona={'cleared' if persona_deleted else 'absent'}"
             )
     return {
         "conv_id": conv_id,
         "forgotten_facts": n_facts,
         "forgotten_episodic": n_episodic,
         "forgotten_summary": summary_deleted,
+        "forgotten_persona": persona_deleted,
     }
 
 
@@ -767,6 +858,94 @@ async def admin_get_summary(conv_id: str):
     debugging. Localhost-only.
     """
     return summarizer.load_state(conv_id)
+
+
+# V2.1 Phase 8: persona endpoints (localhost-only).
+@app.get(
+    "/admin/personas",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_list_personas():
+    """Library view: list every conv that has a persona, with length
+    and metadata. Does NOT include the full text — fetch per-conv for
+    that. Useful for browsing "what persona was used in which conv?".
+    """
+    return {"personas": persona.list_personas()}
+
+
+@app.get(
+    "/admin/conversations/{conv_id}/persona",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_get_persona(conv_id: str):
+    """Return the persona record (full text + metadata) for one conv.
+    404 if no persona stored."""
+    rec = persona.load_persona(conv_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="no persona for this conversation")
+    return rec
+
+
+@app.post(
+    "/admin/conversations/{conv_id}/persona",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_set_persona(conv_id: str, request: Request):
+    """Set or replace the persona for a conv.
+
+    Body: {"text": "<persona text>"}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=400, detail="missing required field: 'text' (non-empty string)")
+    try:
+        return persona.save_persona(conv_id, text, source="admin")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete(
+    "/admin/conversations/{conv_id}/persona",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_delete_persona(conv_id: str):
+    """Clear the persona for a conv. Idempotent — returns deleted=False
+    if no persona was stored."""
+    deleted = persona.clear_persona(conv_id)
+    return {"conv_id": conv_id, "deleted": deleted}
+
+
+@app.post(
+    "/admin/conversations/{conv_id}/inherit-persona",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_inherit_persona(conv_id: str, request: Request):
+    """Copy a persona from another conv (typically a 'base persona' conv)
+    into this one. Useful for spinning up new conversations that should
+    start with the same role/voice context as an existing one.
+
+    Body: {"source_conv_id": "<conv_id to copy from>"}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+    src = body.get("source_conv_id")
+    if not isinstance(src, str) or not src.strip():
+        raise HTTPException(status_code=400, detail="missing required field: 'source_conv_id'")
+    src_rec = persona.load_persona(src)
+    if not src_rec:
+        raise HTTPException(status_code=404, detail=f"no persona stored for source_conv_id={src!r}")
+    saved = persona.save_persona(conv_id, src_rec["persona_text"], source="inherited")
+    return {"conv_id": conv_id, "inherited_from": src, "persona": saved}
 
 
 # V2.1 Phase 7 Step 2: stale-fact archival endpoints.
