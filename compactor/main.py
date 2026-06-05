@@ -25,6 +25,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import backfill
+import commands
 import dedup
 import facts
 import health
@@ -485,6 +486,47 @@ async def chat_completions(request: Request) -> Any:
     # Turn index ≈ position of the assistant reply we're about to produce.
     turn_index = len(messages) + 1
 
+    # V2.1 Phase 5: chat command short-circuit. If the user typed a
+    # recognized slash command (/list-facts, /forget, /remember, etc.),
+    # handle it inside the compactor and return a synthetic completion.
+    # vLLM never sees the request — zero token cost, instant response.
+    # Detection is permissive: messages starting with `/` whose first
+    # token is NOT a recognized command pass through unchanged.
+    cmd_name, cmd_arg = commands.parse_command(last_user_text)
+    if cmd_name and conv_id:
+        try:
+            cmd_text = await commands.handle_command(
+                cmd_name, cmd_arg, conv_id,
+                ctx={
+                    "turn_index": turn_index,
+                    "clear_all_memory": lambda cid: _clear_all_memory(cid, source="chat-command"),
+                },
+            )
+        except Exception as e:
+            logger.exception(f"command handling failed: {e}")
+            cmd_text = f"Command failed: {type(e).__name__}: {e}"
+        logger.info(
+            f"conv={conv_id}: handled /{cmd_name} (arg_len={len(cmd_arg)})"
+        )
+        stream_flag = bool(body.get("stream", False))
+        if stream_flag:
+            chunks = commands.build_synthetic_completion_stream(
+                cmd_text, body.get("model") or MODEL_REPO or "",
+            )
+
+            async def cmd_stream():
+                for chunk in chunks:
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(cmd_stream(), media_type="text/event-stream")
+        return JSONResponse(
+            content=commands.build_synthetic_completion(
+                cmd_text, body.get("model") or MODEL_REPO or "",
+            ),
+            status_code=200,
+        )
+
     # V1 compaction
     try:
         body["messages"] = await compact_if_needed(messages)
@@ -728,6 +770,15 @@ async def admin_forget_facts(conv_id: str):
     three-layer memory reset for when the model is stuck on something
     wrong. Targeted forgetting (single fact by substring) is V2.1.
     """
+    return await _clear_all_memory(conv_id, source="admin")
+
+
+# V2.1 Phase 5: shared full-clear used by /admin/forget AND the /forget
+# chat command. Holding conv_lock here serializes against any in-flight
+# extraction tail that might otherwise re-save state we just cleared.
+async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
+    """Wipe every memory layer for a conv. Returns counters for the
+    response body. `source` is just for log labeling."""
     async with conv_lock(conv_id):
         existing = facts.load_facts(conv_id)
         n_facts = len(existing)
@@ -746,7 +797,7 @@ async def admin_forget_facts(conv_id: str):
             logger.warning(f"conv={conv_id}: summary delete failed: {e}")
         if n_facts or n_episodic or summary_deleted:
             logger.info(
-                f"conv={conv_id}: admin forgot {n_facts} fact(s) "
+                f"conv={conv_id}: {source} forgot {n_facts} fact(s) "
                 f"+ {n_episodic} indexed exchange(s) "
                 f"+ summary={'cleared' if summary_deleted else 'absent'}"
             )
