@@ -138,6 +138,13 @@ def facts_path(conv_id: str) -> Path:
     return STORAGE_ROOT / "facts" / f"{conv_id}.json"
 
 
+def facts_archive_path(conv_id: str) -> Path:
+    """V2.1 Phase 7 Step 2: cold-storage sidecar for archived facts.
+    Sits next to the active facts file; list_known_conv_ids skips it
+    (its stem has a dot, so the sidecar filter excludes it)."""
+    return STORAGE_ROOT / "facts" / f"{conv_id}.archive.json"
+
+
 def summary_path(conv_id: str) -> Path:
     return STORAGE_ROOT / "summaries" / f"{conv_id}.json"
 

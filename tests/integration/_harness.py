@@ -406,6 +406,53 @@ def admin_fork(conv_id: str, *, new_conv_id: str | None = None) -> dict:
         return r.json()
 
 
+# V2.1 Phase 7 — dedup + archival helpers.
+
+def admin_dedup(conv_id: str) -> dict:
+    """POST /admin/conversations/<id>/dedup → {conv_id, before, after, removed}."""
+    assert ADMIN_URL, "admin_dedup requires ZIONS_TEST_ADMIN_URL"
+    with _client(ADMIN_URL) as c:
+        # Dedup can call the LLM N times; generous timeout.
+        r = c.post(f"/admin/conversations/{conv_id}/dedup", timeout=300.0)
+        r.raise_for_status()
+        return r.json()
+
+
+def admin_archive_stale(conv_id: str, older_than_days: int | None = None) -> dict:
+    """POST /admin/conversations/<id>/archive → {kept, archived, ...}."""
+    assert ADMIN_URL, "admin_archive_stale requires ZIONS_TEST_ADMIN_URL"
+    params = {}
+    if older_than_days is not None:
+        params["older_than_days"] = older_than_days
+    with _client(ADMIN_URL) as c:
+        r = c.post(f"/admin/conversations/{conv_id}/archive", params=params)
+        r.raise_for_status()
+        return r.json()
+
+
+def admin_get_archive(conv_id: str) -> list[dict]:
+    """GET /admin/conversations/<id>/archive → list of archived facts."""
+    assert ADMIN_URL, "admin_get_archive requires ZIONS_TEST_ADMIN_URL"
+    with _client(ADMIN_URL) as c:
+        r = c.get(f"/admin/conversations/{conv_id}/archive")
+        r.raise_for_status()
+        return r.json().get("archived", [])
+
+
+def admin_restore_from_archive(
+    conv_id: str, text_substring: str | None = None
+) -> dict:
+    """POST /admin/conversations/<id>/restore → {restored, filter, ...}."""
+    assert ADMIN_URL, "admin_restore_from_archive requires ZIONS_TEST_ADMIN_URL"
+    body: dict = {}
+    if text_substring is not None:
+        body["text_substring"] = text_substring
+    with _client(ADMIN_URL) as c:
+        r = c.post(f"/admin/conversations/{conv_id}/restore", json=body)
+        r.raise_for_status()
+        return r.json()
+
+
 def admin_safe_forget(conv_id: str) -> None:
     """Best-effort cleanup — used in test teardown. Swallows errors so
     a teardown failure doesn't mask the real test failure. No-op when
