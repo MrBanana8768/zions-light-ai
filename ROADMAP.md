@@ -141,16 +141,25 @@ the user-facing layer on top.
 
 ---
 
-## V2.2 — Testing & Observability
+## V2.2 — Testing & Observability  ✅ Complete
 
 **Goal:** Make "is this deploy actually working?" answerable automatically
 and repeatably, and codify a testing standard every future feature must
 follow. Pairs naturally with V2.1's observability theme.
 
-**Prerequisite:** ships after V2.0 (memory) is complete through Phase 4 —
-we don't interrupt the in-flight memory work. The *standard* (TESTING.md),
-however, is in force now and governs the code written in V2.0 Phases 3/4
-and V2.1 too.
+**Status: ✅ Complete.** All deliverables shipped *inside the V2.1 image
+line* — there is no separate V2.2 image. Part A (the TESTING.md standard,
+this ROADMAP entry, the `/app/data` Dockerfile cleanup) landed before
+V2.0 Phase 3. Part B (the boot self-test harness) shipped as V2.1 Phase 6
+Step 2, with the two-phase vLLM readiness probe added in Phase 6.1.
+`/health/full` shipped as Phase 6 Step 1; the Tier-3 integration suite
+began in V2.0 Phase 4 and grew across every V2.1 phase. See the
+[1.9.6 → 2.2] CHANGELOG entries.
+
+**Prerequisite (met):** shipped after V2.0 (memory) was complete through
+Phase 4 — we didn't interrupt the in-flight memory work. The *standard*
+(TESTING.md) was in force from Part A and governed the code written in
+V2.0 Phases 3/4 and all of V2.1.
 
 **Full standard:** [TESTING.md](TESTING.md). Three test tiers:
 
@@ -160,25 +169,28 @@ and V2.1 too.
 | 2 — Boot self-test | live-stack health: round-trip + facts I/O, runs post-boot | `compactor/selftest.py` | Yes (pod) |
 | 3 — Integration | end-to-end scenarios (e.g. facts persistence over 300 turns) | `tests/integration/` | Yes |
 
-**What V2.2 builds:**
-- `compactor/selftest.py` — boot-time validation battery (vLLM model
+**What V2.2 built (all shipped):**
+- ✅ `compactor/selftest.py` — boot-time validation battery (vLLM model
   loaded, compactor health, real 1-token chat round-trip, facts
   write/read/delete against a `__selftest__` sentinel conv, admin
   localhost gating). Auto-runs post-boot as a non-blocking one-shot
   supervisord program (`COMPACTOR_SELFTEST_ON_BOOT=true`), logs to
-  `/var/log/supervisor/selftest.log`. Also on-demand.
-- `GET /admin/selftest` — on-demand self-test, JSON report, localhost-only.
-- `GET /health/full` — deeper than `/health`: probes vLLM reachability +
-  memory-store stats. Becomes the Docker `HEALTHCHECK` target so the pod
-  reports unhealthy when vLLM is down (today's `curl :3000` check passes
-  even when vLLM is FATAL). Satisfies the V2.1 observability `/health/full`
-  item.
-- `tests/integration/` — Tier-3 suite (starts with facts persistence),
-  run against a live pod via `ZIONS_TEST_BASE_URL`.
-- `compactor/test_selftest.py` — Tier-1 coverage for the harness itself
-  (mocked HTTP).
+  `/var/log/supervisor/selftest.log`. Also on-demand. Two-phase vLLM
+  readiness probe (Phase 6.1) waits for actual completion capability,
+  not just an open port.
+- ✅ `GET /admin/selftest` — on-demand self-test, JSON report, localhost-only.
+- ✅ `GET /health/full` — deeper than `/health`: probes vLLM reachability +
+  storage writability + memory-store stats. Is now the Docker `HEALTHCHECK`
+  target so the pod reports unhealthy when vLLM is down (the old
+  `curl :3000` check passed even when vLLM was FATAL). Satisfies the V2.1
+  observability `/health/full` item.
+- ✅ `tests/integration/` — Tier-3 suite, 58 fast + 2 slow tests, run
+  against a live pod via `ZIONS_TEST_BASE_URL`. On-pod mode documented in
+  `tests/integration/README.md`.
+- ✅ `compactor/test_selftest.py` — Tier-1 coverage for the harness itself
+  (mocked HTTP), including the two-phase readiness probe.
 
-**V2.2 effort: ~3-4 dev-days.**
+**V2.2 effort: ~3-4 dev-days (actual: folded into V2.1 Phase 6 + 6.1).**
 
 ---
 
