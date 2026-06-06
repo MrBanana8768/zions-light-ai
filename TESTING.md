@@ -1,10 +1,11 @@
 # Testing Standard
 
 How Zion's Light AI is tested, and what every contributor (human or agent)
-must do when adding a feature. This standard is **in force now** — even
-though some of the automation it describes (the boot self-test harness,
-the integration suite) lands in V2.2. Write to the standard regardless of
-which tooling exists yet.
+must do when adding a feature. This standard is **in force** and the
+tooling that backs it is **fully built** as of V2.2: all three tiers exist
+— Tier-1 unit suites, the Tier-2 boot self-test harness, and the Tier-3
+integration suite. Every new feature must extend the relevant tiers (see
+"The standard" at the bottom).
 
 ## Why three tiers
 
@@ -44,13 +45,14 @@ CPU container minimal). Mock the HTTP layer with `unittest.mock` when a
 function calls vLLM. Redirect storage to a tempdir via
 `COMPACTOR_STORAGE_ROOT` **before** importing the module under test.
 
-**Current Tier-1 suites** (all green as of V2.0 Phase 4):
+**Current Tier-1 suites** (all green as of V2.1; 12 suites, ~400+ asserts):
 - `compactor/test_smoke.py` — core compactor logic (token counting, split,
   compaction no-op, route registration, env defaults)
 - `compactor/test_memory.py` — conv_id resolution, storage layout, admin
   route registration
 - `compactor/test_facts.py` — facts I/O, atomic writes, LRU pruning,
-  extraction parser, extraction with mocked vLLM
+  extraction parser, extraction with mocked vLLM, stale-fact archival +
+  restore (V2.1 Phase 7)
 - `compactor/test_backfill.py` — state machine, stale detection, pair
   extraction, needs_backfill decision matrix, end-to-end with mock vLLM
 - `compactor/test_retrieval.py` — graceful degradation (deps missing),
@@ -59,19 +61,34 @@ function calls vLLM. Redirect storage to a tempdir via
 - `compactor/test_summarizer.py` — state I/O, threshold detection per
   tier, L1→L2→L3 cascade with shrunk thresholds + mock LLM, no-op when
   below threshold, exception-swallowing when LLM fails
+- `compactor/test_health.py` — vLLM/storage probes, memory-stats
+  aggregation, ok/degraded/down status derivation, HTTP-code mapping
+- `compactor/test_selftest.py` — every check with mocked HTTP, real
+  tmpdir facts round-trip, two-phase vLLM readiness probe, report
+  rendering, CLI exit-code mapping
+- `compactor/test_portability.py` — export/import/fork round-trips,
+  overwrite refusal, version + schema validation
+- `compactor/test_dedup.py` — embedding clustering, LLM merge/KEEP,
+  metadata merging, LLM-call cap, no-op degradation
+- `compactor/test_commands.py` — slash-command parsing + aliases, every
+  handler, pass-through guard, synthetic completion shape
+- `compactor/test_persona.py` — persona I/O, auto-detection, double-
+  injection guard, library listing, inheritance
 
 **Run them** (Linux/macOS — Windows users invoke under `MSYS_NO_PATHCONV=1`
 to avoid Git Bash's `/opt/...` path-mangling trap):
 ```bash
 docker run --rm -v "$PWD/compactor:/work" -w /work python:3.12-slim bash -lc '
   pip install --quiet fastapi "uvicorn[standard]" httpx 2>/dev/null
-  for t in test_smoke test_memory test_facts test_backfill test_retrieval test_summarizer; do
-    python $t.py 2>&1 | tail -2
+  for t in test_smoke test_memory test_facts test_backfill test_retrieval \
+           test_summarizer test_health test_selftest test_portability \
+           test_dedup test_commands test_persona; do
+    echo "=== $t ==="; python $t.py 2>&1 | tail -1
   done
 '
 ```
 
-## Tier 2 — Boot self-test  *(harness lands in V2.2)*
+## Tier 2 — Boot self-test
 
 **What it is:** a validation battery that runs *inside the container after
 services start*, proving the deployment actually works — not just that
@@ -107,7 +124,7 @@ inside the shipped image (excluded by `.dockerignore`).
 [`tests/integration/README.md`](tests/integration/README.md) for the full
 walkthrough.
 
-**Current coverage** (16 tests, plus 2 `slow` for the summarizer rollups):
+**Current coverage** (58 tests, plus 2 `slow` for the summarizer rollups):
 - `test_00_smoke.py` — health, models listed, basic chat round-trip
 - `test_facts.py` — facts extracted, persisted, used in next turn
 - `test_retrieval.py` — exchanges indexed, distinctive content retrieved
@@ -118,6 +135,20 @@ walkthrough.
   idempotent
 - `test_degraded.py` — hash-fallback conv_id, empty system prompts,
   multimodal content arrays — compactor stays up
+- `test_health.py` — `/health/full` schema, healthy-pod assertion, vLLM
+  models reported, storage writable *(V2.1 Phase 6)*
+- `test_selftest.py` — `/admin/selftest` quick + full passes, check
+  inventory, per-check field shape *(V2.1 Phase 6)*
+- `test_portability.py` — export shape, import round-trip, overwrite
+  refusal, wrong-version reject, fork isolation *(V2.1 Phase 6)*
+- `test_dedup.py` — endpoint no-op <2 facts, merges seeded duplicates,
+  preserves unrelated facts *(V2.1 Phase 7)*
+- `test_archive.py` — archive moves stale facts, restore round-trip,
+  substring filter, idempotence *(V2.1 Phase 7)*
+- `test_commands.py` — `/help`, `/remember`+`/list-facts`, `/forget`
+  (selective + full), `/why`, slash pass-through *(V2.1 Phase 5)*
+- `test_persona.py` — set/get/delete, full-forget clears persona,
+  library, inheritance, behavioral injection *(V2.1 Phase 8)*
 
 **Modes** (admin-requiring tests skip cleanly when `ZIONS_TEST_ADMIN_URL`
 is unset, so a basic confidence run works from anywhere):

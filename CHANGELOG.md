@@ -9,6 +9,141 @@ on Docker Hub.
 
 ---
 
+## [2.2] — Testing & Observability
+
+**Goal:** make "is this deploy actually working?" answerable automatically,
+and codify a testing standard every future feature must follow. No separate
+image — all V2.2 code shipped inside the V2.1 image line; this release is
+the standard + its tooling reaching completeness.
+
+Image: folded into `angreg/zions-light-ai:v2.1` (and the `:v2.1-phase6`/
+`6.1` tags specifically).
+
+### Added
+- **Tier-2 boot self-test** (`compactor/selftest.py`) — post-boot validation
+  battery run as a non-blocking one-shot supervisord program
+  (`COMPACTOR_SELFTEST_ON_BOOT=true`, logs to
+  `/var/log/supervisor/selftest.log`). Checks: `/data` writable, vLLM lists
+  the model, compactor `/health`, a real 1-token chat round-trip, a facts
+  write/read/delete against a `__selftest__` sentinel, admin localhost
+  gating. Also on-demand via `GET /admin/selftest`.
+- **Two-phase vLLM readiness probe** — `--wait-for-ready` waits for an
+  actual completion (`/v1/chat/completions` 200), not just an open
+  `/v1/models` port, so the boot self-test can't false-fail during the
+  1-5 minute cold model load.
+- **`GET /health/full`** — deep probe (vLLM reachability + storage
+  writability + memory-store stats). Now the Docker `HEALTHCHECK` target,
+  replacing `curl :3000` which stayed green even when vLLM was FATAL.
+- **`TESTING.md`** — the three-tier testing standard (Tier-1 unit / Tier-2
+  boot self-test / Tier-3 integration), the per-PR requirements, and the
+  exact run commands for each tier.
+
+### Changed
+- Docker `HEALTHCHECK` target switched from `http://localhost:3000/`
+  (OpenWebUI login page) to `http://localhost:8080/health/full`.
+- Removed dead `/app/data` mkdir cruft from the Dockerfile (pre-single-
+  volume layout leftover).
+
+---
+
+## [2.1] — User control, portability, observability, quality
+
+**Goal:** give the *user* agency over memory and make the system operable.
+V2.0 gave the model memory; V2.1 lets the user inspect, edit, export,
+deduplicate, and shape it — plus the observability surface to run it.
+
+Images: `angreg/zions-light-ai:v2.1-phase6.1` (observability),
+`:v2.1-phase7` (quality), `:v2.1-phase8` / `:v2.1-complete` (commands +
+personas). Rolling tag: `:v2.1`.
+
+### Added — Phase 5: chat commands
+- In-chat slash commands intercepted by the compactor (zero LLM cost,
+  instant, model never sees them): `/help`, `/list-facts`, `/list-archive`,
+  `/remember <text>`, `/forget [substring]`, `/why`. Streaming and
+  non-streaming response paths both synthesize an OpenAI-shaped completion.
+  Conservative detection — non-command slash messages pass through to vLLM.
+
+### Added — Phase 6: observability + portability
+- `GET /health/full`, `GET /admin/selftest`, boot self-test (documented
+  under [2.2] — they pair).
+- **Conversation portability** — `GET /admin/conversations/<id>/export`,
+  `POST /admin/conversations/import`, `POST /admin/conversations/<id>/fork`.
+  Single JSON bundle per conv (facts + summary state + episodic exchanges);
+  embeddings re-derived on import so bundles survive embedding-model swaps.
+
+### Added — Phase 7: quality maintenance
+- **Hybrid semantic deduplication** (`compactor/dedup.py`) — embedding
+  clustering filters candidates, an LLM verification call (KEEP-on-doubt,
+  temp 0.0) confirms merges. Runs inline after every fact extraction
+  (0 LLM calls when no candidate clusters) and on-demand via
+  `POST /admin/conversations/<id>/dedup`.
+- **Stale-fact archival** — facts unused for N days (default 90) move to a
+  cold-storage sidecar; recoverable via restore. `GET`/`POST
+  …/archive` + `POST …/restore`.
+
+### Added — Phase 8: personas as first-class memory
+- Persona (long durable system prompt) recognized as its own memory layer:
+  auto-detected from a long first system message, stored separately, exempt
+  from summarizer rollup and LRU fact eviction, injected as a labeled block
+  (with a double-injection guard). `GET /admin/personas` library, full
+  GET/POST/DELETE per conv, and `POST …/inherit-persona` to clone across
+  conversations.
+
+### Changed
+- `/admin/forget` (and the `/forget` chat command) now clear the persona
+  layer too — a full memory wipe is truly full.
+- `/admin/conversations/<id>` summary now reports persona presence.
+
+---
+
+## [2.0] — Three-layer persistent memory
+
+**Goal:** give long creative-writing conversations memory that survives the
+context window and pod restarts. A FastAPI "compactor" middleware sits
+between OpenWebUI and vLLM and maintains per-conversation memory on the
+network volume.
+
+Image: `angreg/zions-light-ai:v2.0` (final: `:v2.0-phase4.3`,
+`sha256:d142bf0a`).
+
+### Added
+- **Conversation identity** (`compactor/memory.py`) — resolved from an
+  `X-Conversation-Id` header (set by a bundled OpenWebUI Pipeline filter),
+  falling back to `body.metadata.chat_id`, then a SHA-256 fingerprint.
+  Atomic JSON writes (temp + fsync + rename) and a per-conv `asyncio.Lock`
+  manager serialize concurrent writers.
+- **Layer 1 — facts** (`compactor/facts.py`, Phase 2) — a side LLM call
+  after each turn distills durable facts; LRU-pruned to a token budget;
+  injected on subsequent turns. Lazy backfill (`compactor/backfill.py`)
+  extracts facts from pre-existing V1 conversations on first sight.
+- **Layer 2 — RAG** (`compactor/retrieval.py`, Phase 3) — every exchange
+  embedded (bge-small ONNX) into ChromaDB and retrieved by semantic
+  similarity for later turns. Runs in a dedicated torch-free
+  `compactor-venv` isolated from vLLM's torch stack; bge-small prebaked
+  into the image.
+- **Layer 3 — hierarchical summaries** (`compactor/summarizer.py`,
+  Phase 4) — rolling L1→L2→L3 cascade so even very long conversations get
+  a coherent context block.
+- **Admin/observability endpoints** — `GET /admin/conversations`,
+  `GET /admin/conversations/<id>`, `GET`/`DELETE
+  /admin/conversations/<id>/facts`, all localhost-gated.
+- **Tier-3 integration suite** (`tests/integration/`) — black-box
+  pytest+httpx scenarios against a live pod.
+
+### Fixed
+- **Mistral chat-template rejection** (Phase 4.1) — the three memory layers
+  were injected as three separate system messages, which Mistral-family
+  templates (Magnum v4 12B/22B) reject once ≥2 layers populate. Combined
+  into a single system message.
+- **Fact extraction NONE-bias** (Phase 4.3) — Magnum-12B returned the
+  literal `NONE` for ~65% of fact-rich prompts at temp 0.2. Rewrote the
+  extraction prompt to bias toward extraction and dropped temperature to
+  0.0; extraction is now reliable.
+- Test reliability: replaced fixed async-tail sleeps with polling helpers
+  (`wait_for_facts`, `wait_for_indexed_exchanges`).
+
+---
+
 ## [1.9.6] — Final V1 release
 
 **Goal:** close V1 cleanly. CVE remediation, parametric build foundation,
