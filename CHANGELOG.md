@@ -9,6 +9,32 @@ on Docker Hub.
 
 ---
 
+## [2.2.1] — A40-safe default model
+
+**Goal:** make the out-of-the-box image actually boot on the most common
+RunPod card (the A40, 48 GB) without reading the docs first.
+
+Image: `angreg/zions-light-ai:v2.2.1` (and `:latest`).
+
+### Changed
+- **Dockerfile `ENV MODEL_REPO` default flipped** from
+  `anthracite-org/magnum-v4-22b` to `anthracite-org/magnum-v4-12b`. The 22B
+  default OOMed on an A40 at startup during vLLM's runtime FP8 *marlin repack*
+  (peak VRAM exceeds 48 GB before serving) — even with `--quantization fp8`.
+  The 12B runs in FP16 at 32K context on a single A40 with no quantization, so
+  the default now "just works" on the common card. The 22B remains supported
+  as an A100-class option via `MODEL_REPO`.
+
+### Docs
+- `README.md` (default-model bullet, quick-start A40 step, image-tags table,
+  tech-stack default, license note) and `RUNPOD_DEPLOY.md` (pre-warm download,
+  GPU-sizing table, env-var table `MODEL_REPO`/`VLLM_EXTRA_ARGS` rows, API
+  example) reconciled to the 12B default. Added an explicit warning not to run
+  the 22B on an A40. Corrected the `VLLM_EXTRA_ARGS` documented default to
+  match the image (empty, not `--quantization fp8`).
+
+---
+
 ## [2.2] — Testing & Observability
 
 **Goal:** make "is this deploy actually working?" answerable automatically,

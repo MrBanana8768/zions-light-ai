@@ -51,7 +51,7 @@ cache before paying GPU prices:
    export HF_HOME=/data/models
    # For gated models (Llama, Mistral):
    # export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-   huggingface-cli download anthracite-org/magnum-v4-22b
+   huggingface-cli download anthracite-org/magnum-v4-12b
    ```
 4. When the download completes, terminate the CPU pod. Your weights and any
    OpenWebUI state stay on the volume.
@@ -116,15 +116,19 @@ runpod pod create \
 | Model | Quant | VRAM | Suggested Runpod GPU |
 |---|---|---|---|
 | Qwen2.5-1.5B-Instruct | FP16 | ~6 GB | RTX 3090 / 4090 |
-| anthracite-org/magnum-v4-12b | FP16 | ~24 GB | A40 |
-| **anthracite-org/magnum-v4-22b** *(default)* | **FP8** | **~24 GB** | **A40** |
-| anthracite-org/magnum-v4-22b | FP16 | ~44 GB | A40 (tight) / A100 |
+| **anthracite-org/magnum-v4-12b** *(default)* | **FP16** | **~24 GB** | **A40** |
+| anthracite-org/magnum-v4-22b | FP16 | ~44 GB | A100 / A100 80GB |
 | Qwen2.5-32B-Instruct | FP16 | ~64 GB | A100 80GB |
 | Llama-3.3-70B-Instruct | FP16 | ~140 GB | 2× A100 80GB |
 
-The default uses FP8 weight quantization via `VLLM_EXTRA_ARGS=--quantization fp8` —
-halves VRAM usage with ~99% quality retention. Drop the flag if you have VRAM
-headroom and want pure FP16.
+The default (`magnum-v4-12b`) runs in **FP16 on a single A40** (48 GB) at 32K
+context — no quantization flag needed.
+
+⚠️ **Do not run the 22B on an A40.** Its FP16 weights are ~44 GB, and even with
+`--quantization fp8` it OOMs on an A40 during vLLM's runtime FP8 *marlin repack*
+at startup (peak VRAM exceeds the A40's 48 GB before the model is even serving).
+The 22B is an A100-class model. Use `VLLM_EXTRA_ARGS=--quantization fp8` only to
+add headroom on a card where the chosen model already fits in FP16.
 
 ## Access Your Deployment
 
@@ -139,10 +143,10 @@ Override these in your Runpod template if needed:
 
 | Variable | Default | Description |
 |---|---|---|
-| `MODEL_REPO` | `anthracite-org/magnum-v4-22b` | Any vLLM-compatible HuggingFace repo |
+| `MODEL_REPO` | `anthracite-org/magnum-v4-12b` | Any vLLM-compatible HuggingFace repo. Default fits an A40 in FP16; the 22B needs an A100-class GPU |
 | `MAX_MODEL_LEN` | `32768` | vLLM context window (tokens) |
 | `GPU_MEMORY_UTILIZATION` | `0.90` | Fraction of VRAM vLLM may use |
-| `VLLM_EXTRA_ARGS` | `--quantization fp8` | Extra flags appended to the vLLM command line (quantization, tensor-parallel, etc.) |
+| `VLLM_EXTRA_ARGS` | *(empty)* | Extra flags appended to the vLLM command line (quantization, tensor-parallel, etc.). The default 12B needs none on an A40 |
 | `COMPACTOR_TARGET_TOKENS` | *75% of `MAX_MODEL_LEN`* | When request exceeds this, older turns get summarized |
 | `COMPACTOR_KEEP_RECENT_TURNS` | `4` | Recent turns preserved verbatim during compaction |
 | `COMPACTOR_SUMMARY_MAX_TOKENS` | `1024` | Max length of the summary the compactor generates |
@@ -157,7 +161,7 @@ The compactor exposes an OpenAI-compatible API at port 8080:
 curl https://{POD_ID}-8080.proxy.runpod.net/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "anthracite-org/magnum-v4-22b",
+    "model": "anthracite-org/magnum-v4-12b",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 

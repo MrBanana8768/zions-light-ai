@@ -150,12 +150,15 @@ RUN chmod +x /entrypoint.sh
 
 # =============================================================================
 # Model configuration — override via .env or Runpod template
-# Default: anthracite-org/magnum-v4-22b (creative writing fine-tune, lightly
-# aligned). On A40 use VLLM_EXTRA_ARGS="--quantization fp8" to fit 32K context;
-# without quantization, drop MAX_MODEL_LEN to 8192.
+# Default: anthracite-org/magnum-v4-12b (creative writing fine-tune, lightly
+# aligned). Runs in FP16 at 32K context on a single A40 (48 GB) with NO
+# quantization — the safe out-of-the-box default for the common RunPod A40.
+# For the larger 22B sibling (anthracite-org/magnum-v4-22b) use an A100-class
+# GPU: its FP16 weights are ~44 GB, and on an A40 even --quantization fp8 OOMs
+# during vLLM's runtime FP8 marlin repack (peak startup VRAM exceeds 48 GB).
 # Any HuggingFace causal-LM repo that vLLM supports works here.
 # =============================================================================
-ENV MODEL_REPO="anthracite-org/magnum-v4-22b"
+ENV MODEL_REPO="anthracite-org/magnum-v4-12b"
 ENV HF_HOME="/data/models"
 # Note: TRANSFORMERS_CACHE was removed in v1.9.1 — deprecated in transformers
 # v5, HF_HOME is the modern equivalent and is read by both transformers

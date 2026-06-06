@@ -27,7 +27,7 @@ Packaged as a single Docker image for one-click deploy to
 ## What it does
 
 - **Conversational chat** with any vLLM-supported HuggingFace causal-LM
-- **Default model:** [`anthracite-org/magnum-v4-22b`](https://huggingface.co/anthracite-org/magnum-v4-22b) — creative writing fine-tune of Mistral-Small, lightly aligned, trained to mimic Claude's prose style
+- **Default model:** [`anthracite-org/magnum-v4-12b`](https://huggingface.co/anthracite-org/magnum-v4-12b) — creative writing fine-tune, lightly aligned, trained to mimic Claude's prose style; runs in FP16 at 32K context on a single A40 with no quantization. (The larger [`magnum-v4-22b`](https://huggingface.co/anthracite-org/magnum-v4-22b) is an A100-class option — see [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md#gpu-sizing).)
 - **Auto-summarization** when conversations approach the model's max length, so the model doesn't "forget" early context
 - **OpenAI-compatible API** (`/v1/chat/completions`, `/v1/models`) — works with any OpenAI client
 - **Single Network Volume** holds both model weights and chat history; survives pod terminations
@@ -42,7 +42,7 @@ See [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md) for the 5-step deploy. TL;DR:
 1. Create a 200 GB Network Volume named `zions-data`
 2. Pre-warm the model on a cheap CPU pod (one-time, optional)
 3. Deploy a GPU pod from the [Docker Hub image](https://hub.docker.com/r/angreg/zions-light-ai) with the volume attached at `/data`
-4. Set `VLLM_EXTRA_ARGS=--quantization fp8` in template env vars (required for A40-class GPUs)
+4. Leave `MODEL_REPO` at its default (`magnum-v4-12b`) — it runs on an A40 out of the box, no quantization needed. Only switch to a larger model (e.g. 22B) if you have an A100-class GPU.
 
 ### Local (dev / testing)
 
@@ -64,9 +64,11 @@ Pin to a specific version for reproducible deploys:
 
 | Tag | Status |
 |---|---|
-| `:1.9.6` | Latest — V1 final release, CVE-clean, parametric CUDA |
+| `:v2.2.1` | Latest — A40-safe default: image `MODEL_REPO` default is now `magnum-v4-12b` (fits an A40 in FP16). Earlier images defaulted to the 22B, which OOMs on an A40 at startup. |
+| `:v2.1` | V2.1 / V2.2 line (memory architecture, testing harness); shipped with the old 22B default |
+| `:1.9.6` | V1 final release, CVE-clean, parametric CUDA |
 | `:1.9.5` | Last 1.9.x with the broken vllm 0.11 pin (do not use) |
-| `:latest` | Currently points at `:1.9.6` |
+| `:latest` | Currently points at `:v2.2.1` |
 
 See [CHANGELOG.md](CHANGELOG.md) for full version history.
 
@@ -122,14 +124,14 @@ See [ROADMAP.md](ROADMAP.md) for the full plan. High-level:
 | Context compactor | Custom FastAPI middleware, single file (`compactor/main.py`) |
 | Process supervision | supervisord |
 | Container base | `nvidia/cuda:12.6.3-runtime-ubuntu24.04` (parametric — can swap to 12.8/13.0) |
-| Default model | Magnum v4 22B (or any vLLM-supported HF causal-LM via env var) |
+| Default model | Magnum v4 12B (A40-safe; 22B available for A100-class GPUs, or any vLLM-supported HF causal-LM via env var) |
 
 ## License
 
 Inherits project license — see LICENSE file (if present).
 
 Bundled software has its own licenses: vLLM (Apache 2.0), OpenWebUI (MIT),
-Magnum v4 22B and base models (each repo's HF license).
+Magnum v4 (12B default / 22B optional) and base models (each repo's HF license).
 
 ## Contributing
 
