@@ -513,6 +513,43 @@ def admin_inherit_persona(target_conv_id: str, source_conv_id: str) -> tuple[int
         return r.status_code, body
 
 
+# V2.3 Theme 1 — backup helpers.
+
+def admin_list_backups() -> dict:
+    """GET /admin/backups → {backups: [...], info: {...}}."""
+    assert ADMIN_URL, "admin_list_backups requires ZIONS_TEST_ADMIN_URL"
+    with _client(ADMIN_URL) as c:
+        r = c.get("/admin/backups")
+        r.raise_for_status()
+        return r.json()
+
+
+def admin_run_backup() -> tuple[int, dict]:
+    """POST /admin/backups → (status_code, report). 200 ok / 503 fail.
+    Generous timeout — a real backup snapshots the db + tars + verifies."""
+    assert ADMIN_URL, "admin_run_backup requires ZIONS_TEST_ADMIN_URL"
+    with _client(ADMIN_URL) as c:
+        r = c.post("/admin/backups", timeout=300.0)
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        return r.status_code, body
+
+
+def admin_verify_backup(name: str | None = None) -> tuple[int, dict]:
+    """GET /admin/backups/verify[?name=] → (status_code, body)."""
+    assert ADMIN_URL, "admin_verify_backup requires ZIONS_TEST_ADMIN_URL"
+    params = {"name": name} if name else {}
+    with _client(ADMIN_URL) as c:
+        r = c.get("/admin/backups/verify", params=params, timeout=120.0)
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        return r.status_code, body
+
+
 def admin_safe_forget(conv_id: str) -> None:
     """Best-effort cleanup — used in test teardown. Swallows errors so
     a teardown failure doesn't mask the real test failure. No-op when
