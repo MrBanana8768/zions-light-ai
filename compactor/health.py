@@ -182,6 +182,14 @@ async def gather_health_full(vllm_url: str, target_tokens: int) -> dict:
     else:
         status = "ok"
 
+    # V2.3 Theme 1: surface backup durability status (best-effort).
+    backup_info: dict[str, Any]
+    try:
+        import backup as backup_module
+        backup_info = backup_module.latest_backup_info()
+    except Exception as e:
+        backup_info = {"count": None, "latest": None, "error": f"{type(e).__name__}: {e}"}
+
     return {
         "status": status,
         "checks": {
@@ -189,6 +197,7 @@ async def gather_health_full(vllm_url: str, target_tokens: int) -> dict:
             "storage": storage,
         },
         "stats": stats,
+        "backups": backup_info,
         "config": {
             "vllm_url": vllm_url,
             "target_tokens": target_tokens,
