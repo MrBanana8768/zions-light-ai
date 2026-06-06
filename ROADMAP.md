@@ -216,17 +216,30 @@ OpenWebUI's `webui.db` (chat history) and `compactor/` (facts JSON +
 ChromaDB vectors). Everything else (models, torch.compile cache) is
 re-downloadable. Today a corrupted volume = total memory loss, no recovery.
 
-- **Scheduled backups** of `webui.db` + `compactor/` to a second cheap
-  Network Volume or object store (tar + timestamp, retain N). Runs as a
-  supervised periodic sidecar (pairs with V2.2's selftest process model).
-- **Backup verification** — a backup that can't be restored is not a
-  backup. The job restores its own latest archive into a scratch dir and
-  asserts the SQLite opens + the facts JSON parses, before declaring success.
-- **Documented restore runbook** — exact commands to recover from a wiped
-  volume, in RUNPOD_DEPLOY.md. Tested at least once for real.
-- **Atomic-write audit** — confirm every writer on the hot path already
-  uses `memory.atomic_write_json` (facts ✓, backfill state ✓); extend to
-  Phase 4 summaries.
+- ✅ **Scheduled backups** of `webui.db` + `compactor/` (tar + timestamp,
+  retain N). Shipped as `compactor/backup.py` + the `[program:backup]`
+  supervised daemon (pairs with V2.2's selftest process model).
+- ✅ **Backup verification** — a backup that can't be restored is not a
+  backup. `run_once` restores its own archive into a scratch dir and asserts
+  SQLite `PRAGMA integrity_check` + every memory JSON parses *before*
+  publishing; an unverifiable archive is discarded and the cycle reports
+  FAILURE.
+- ✅ **Documented restore runbook** — [OPERATIONS.md](OPERATIONS.md) has the
+  exact recover-from-wiped-volume commands.
+- ✅ **Atomic-write audit** — confirmed every durable writer (facts,
+  facts-archive, **Phase 4 summaries**, personas, backfill) routes through
+  `memory.atomic_write_json`. No gap.
+- ⏳ **Off-volume disaster recovery (future work — migration needed).** The
+  shipped backups are **local to the same volume**: they protect against
+  corruption / accidental delete / torn writes, but NOT total volume loss.
+  True DR requires an off-volume target (S3-compatible object store) — a
+  provider choice, credentials, and a real uploader (boto3 or rclone). The
+  `upload_hook` seam + `COMPACTOR_BACKUP_REMOTE` env are already wired as
+  the integration point; turning them on is a follow-up that will involve a
+  **migration** (moving/duplicating existing local archives off-volume and
+  validating restore-from-remote). Until then, the operational mitigation
+  (documented in OPERATIONS.md) is to periodically copy the newest
+  `/data/backups/` archive off the pod.
 
 ### Theme 2 — Graceful degradation under partial failure
 
