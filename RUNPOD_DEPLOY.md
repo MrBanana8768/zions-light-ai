@@ -6,10 +6,14 @@ compression, and OpenWebUI on Runpod.
 ## Stack
 
 - **vLLM** — OpenAI-compatible inference server (HuggingFace-native, paged attention, prefix caching)
-- **context-compactor** — middleware proxy that auto-summarizes older turns when the conversation approaches the context limit
+- **context-compactor** — memory middleware: persistent facts, RAG over past turns, hierarchical summaries, personas, chat commands; auto-summarizes older turns near the context limit
 - **OpenWebUI** — chat frontend
 
 Request flow: `OpenWebUI :3000` → `compactor :8080` → `vLLM :8000`
+
+> For *using* the deployed assistant (memory, slash commands, admin
+> endpoints), see [USER_GUIDE.md](USER_GUIDE.md). This document is about
+> standing it up.
 
 ## Quick Start
 
@@ -24,8 +28,14 @@ on a $2/hr GPU.
 **Volume layout:**
 ```
 /data/
-├── models/       # vLLM cache (HF_HOME) — 30-150 GB depending on model
-└── openwebui/    # OpenWebUI SQLite, uploads, settings — usually <1 GB
+├── models/                  # vLLM cache (HF_HOME) — 30-150 GB depending on model
+└── openwebui/
+    ├── (OpenWebUI SQLite, uploads, settings — usually <1 GB)
+    └── compactor/           # V2 memory — facts, summaries, chromadb, personas
+        ├── facts/           #   per-conv facts + archive sidecars
+        ├── summaries/       #   per-conv L1/L2/L3 summary state
+        ├── chromadb/        #   episodic RAG vector store
+        └── personas/        #   per-conv persona text
 ```
 
 ### Step 1: Create the Network Volume
@@ -51,7 +61,10 @@ cache before paying GPU prices:
    export HF_HOME=/data/models
    # For gated models (Llama, Mistral):
    # export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-   huggingface-cli download anthracite-org/magnum-v4-22b
+   # 12B is the recommended A40 model (see GPU sizing):
+   huggingface-cli download anthracite-org/magnum-v4-12b
+   # On A100-class cards you can use the 22B instead:
+   # huggingface-cli download anthracite-org/magnum-v4-22b
    ```
 4. When the download completes, terminate the CPU pod. Your weights and any
    OpenWebUI state stay on the volume.
@@ -61,14 +74,16 @@ volume — vLLM picks whichever one matches `MODEL_REPO` at runtime.
 
 ### Step 3: Build and push the image
 
-Pre-built images are published at `angreg/zions-light-ai` on Docker Hub. To
-pull a pinned version use `angreg/zions-light-ai:1.9` (recommended for
-reproducibility); to always grab the newest use `angreg/zions-light-ai:latest`.
+Pre-built images are published at `angreg/zions-light-ai` on Docker Hub.
+Pin a version for reproducibility (e.g. `angreg/zions-light-ai:v2.1`) or use
+`:latest` for the newest validated release. See the
+[image-tags table in the README](README.md#image-tags) for what each tag
+contains.
 
 To build and publish your own:
 ```bash
-docker build -t angreg/zions-light-ai:1.9 -t angreg/zions-light-ai:latest .
-docker push angreg/zions-light-ai:1.9
+docker build -t angreg/zions-light-ai:v2.1 -t angreg/zions-light-ai:latest .
+docker push angreg/zions-light-ai:v2.1
 docker push angreg/zions-light-ai:latest
 ```
 
@@ -77,12 +92,14 @@ docker push angreg/zions-light-ai:latest
 Go to [Runpod Templates](https://www.runpod.io/console/user/templates) → New Template:
 
 - **Template Name:** `zions-light-ai`
-- **Container Image:** `angreg/zions-light-ai:1.9` *(or `:latest`)*
+- **Container Image:** `angreg/zions-light-ai:v2.1` *(or `:latest`)*
 - **Container Disk:** `60 GB` (room for the image, supervisor logs, scratch)
 - **Volume Mount Path:** `/data` (← this is where the Network Volume attaches)
 - **Expose HTTP Ports:** `3000, 8080`
 - **Docker Command:** (leave empty)
-- **Environment Variables:** (see table below — at minimum set `MODEL_REPO` if different from default)
+- **Environment Variables:** (see table below) — **on an A40, set
+  `MODEL_REPO=anthracite-org/magnum-v4-12b`.** The image default is the 22B
+  model, which does not fit an A40 (see GPU sizing).
 
 ### Step 5: Deploy the Pod
 
@@ -105,9 +122,10 @@ runpod config
 
 runpod pod create \
   --gpu-type "NVIDIA A40" \
-  --image "angreg/zions-light-ai:1.9" \
+  --image "angreg/zions-light-ai:v2.1" \
   --disk-size 60 \
   --network-volume-id "<your-volume-id>" \
+  --env MODEL_REPO=anthracite-org/magnum-v4-12b \
   --ports "3000/http,8080/http"
 ```
 
@@ -116,38 +134,83 @@ runpod pod create \
 | Model | Quant | VRAM | Suggested Runpod GPU |
 |---|---|---|---|
 | Qwen2.5-1.5B-Instruct | FP16 | ~6 GB | RTX 3090 / 4090 |
-| anthracite-org/magnum-v4-12b | FP16 | ~24 GB | A40 |
-| **anthracite-org/magnum-v4-22b** *(default)* | **FP8** | **~24 GB** | **A40** |
-| anthracite-org/magnum-v4-22b | FP16 | ~44 GB | A40 (tight) / A100 |
+| **anthracite-org/magnum-v4-12b** *(recommended on A40)* | **FP16** | **~24 GB** | **A40** |
+| anthracite-org/magnum-v4-22b | FP16 | ~44 GB | A100 (40/80 GB) |
 | Qwen2.5-32B-Instruct | FP16 | ~64 GB | A100 80GB |
 | Llama-3.3-70B-Instruct | FP16 | ~140 GB | 2× A100 80GB |
 
-The default uses FP8 weight quantization via `VLLM_EXTRA_ARGS=--quantization fp8` —
-halves VRAM usage with ~99% quality retention. Drop the flag if you have VRAM
-headroom and want pure FP16.
+> **⚠️ Do not run 22B with `--quantization fp8` on an A40.** Runtime FP8
+> quantization needs the *full FP16 weights resident in VRAM first* to do
+> the marlin repack, then frees them — so peak memory exceeds 44 GB and the
+> A40's 48 GB doesn't leave enough headroom; it OOMs during startup. FP8
+> only helps if you have an offline-quantized FP8 checkpoint, which removes
+> the repack step. On an A40, **run the 12B in FP16** (the default
+> `VLLM_EXTRA_ARGS` is empty — no quantization flag needed). Reserve the
+> 22B for A100-class cards in FP16.
+
+The image's built-in `MODEL_REPO` default is the 22B for historical
+reasons; **override it to `anthracite-org/magnum-v4-12b` on A40-class
+hardware.**
 
 ## Access Your Deployment
 
 Once deployed, access via Runpod's proxy URLs:
 
 - **OpenWebUI:** `https://{POD_ID}-3000.proxy.runpod.net`
-- **API (with compaction):** `https://{POD_ID}-8080.proxy.runpod.net`
+- **API (with memory + compaction):** `https://{POD_ID}-8080.proxy.runpod.net`
+- **Deep health:** `https://{POD_ID}-8080.proxy.runpod.net/health/full`
+
+Admin endpoints (`/admin/*` — facts, personas, export/import, dedup) are
+**localhost-only by default** and intentionally *not* reachable over the
+proxy. Use them from the RunPod Web Terminal (`curl localhost:8080/...`).
+See [USER_GUIDE.md](USER_GUIDE.md#power-user-admin-endpoints).
 
 ## Environment Variables
 
 Override these in your Runpod template if needed:
 
+**Core (model + inference):**
+
 | Variable | Default | Description |
 |---|---|---|
-| `MODEL_REPO` | `anthracite-org/magnum-v4-22b` | Any vLLM-compatible HuggingFace repo |
+| `MODEL_REPO` | `anthracite-org/magnum-v4-22b` | Any vLLM-compatible HF repo. **Set to `…-12b` on A40.** |
 | `MAX_MODEL_LEN` | `32768` | vLLM context window (tokens) |
 | `GPU_MEMORY_UTILIZATION` | `0.90` | Fraction of VRAM vLLM may use |
-| `VLLM_EXTRA_ARGS` | `--quantization fp8` | Extra flags appended to the vLLM command line (quantization, tensor-parallel, etc.) |
-| `COMPACTOR_TARGET_TOKENS` | *75% of `MAX_MODEL_LEN`* | When request exceeds this, older turns get summarized |
-| `COMPACTOR_KEEP_RECENT_TURNS` | `4` | Recent turns preserved verbatim during compaction |
-| `COMPACTOR_SUMMARY_MAX_TOKENS` | `1024` | Max length of the summary the compactor generates |
+| `VLLM_EXTRA_ARGS` | *(empty)* | Extra flags appended to the vLLM command line (tensor-parallel, offline-FP8 checkpoint, etc.). **Leave empty for FP16** — do not add `--quantization fp8` on A40 (see GPU sizing). |
 | `WEBUI_AUTH` | `true` | Require OpenWebUI login |
 | `HF_TOKEN` | *(unset)* | Needed for gated models (Llama, Mistral, etc.) |
+
+**Compaction (V1 summarization):**
+
+| Variable | Default | Description |
+|---|---|---|
+| `COMPACTOR_TARGET_TOKENS` | *75% of `MAX_MODEL_LEN`* | When a request exceeds this, older turns get summarized |
+| `COMPACTOR_KEEP_RECENT_TURNS` | `4` | Recent turns preserved verbatim during compaction |
+| `COMPACTOR_SUMMARY_MAX_TOKENS` | `1024` | Max length of a generated summary |
+
+**Memory (V2 — all enabled by default):**
+
+| Variable | Default | Description |
+|---|---|---|
+| `COMPACTOR_FACTS_EXTRACTION` | `true` | Extract durable facts after each turn. Set `false` to disable. |
+| `COMPACTOR_MAX_FACTS_TOKENS` | `1500` | Token budget for the facts block (LRU-evicted past this) |
+| `COMPACTOR_RAG_ENABLED` | `true` | Episodic RAG over past turns (ChromaDB). Set `false` to disable. |
+| `COMPACTOR_RAG_TOP_K` | `5` | How many past exchanges to retrieve per turn |
+| `COMPACTOR_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (prebaked ONNX in the image) |
+| `COMPACTOR_HIERARCHICAL_SUMMARY` | `true` | L1→L2→L3 rolling summaries. Set `false` to disable. |
+| `COMPACTOR_DEDUP_SIMILARITY` | `0.75` | Cosine threshold for fact-dedup candidate clustering |
+| `COMPACTOR_DEDUP_MAX_LLM_CALLS` | `10` | Cap on LLM merge calls per dedup pass |
+| `COMPACTOR_ARCHIVE_DEFAULT_DAYS` | `90` | Default staleness cutoff for fact archival |
+| `COMPACTOR_PERSONA_ENABLED` | `true` | Persona detection + injection. Set `false` for V2.0 behavior. |
+| `COMPACTOR_PERSONA_AUTO_DETECT_MIN_CHARS` | `200` | Min first-system-message length to auto-capture as a persona |
+| `COMPACTOR_STORAGE_ROOT` | `/data/openwebui/compactor` | Where memory state is written |
+
+**Ops (observability + safety):**
+
+| Variable | Default | Description |
+|---|---|---|
+| `COMPACTOR_SELFTEST_ON_BOOT` | `true` | Run the live-stack self-test after boot, logging to `/var/log/supervisor/selftest.log` |
+| `COMPACTOR_ADMIN_BIND` | `127.0.0.1` | Admin-endpoint bind address. **Keep localhost** unless you have auth/firewall in front — admin endpoints are unauthenticated. |
 
 ## API Usage
 
@@ -157,29 +220,53 @@ The compactor exposes an OpenAI-compatible API at port 8080:
 curl https://{POD_ID}-8080.proxy.runpod.net/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "anthracite-org/magnum-v4-22b",
+    "model": "anthracite-org/magnum-v4-12b",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 
 curl https://{POD_ID}-8080.proxy.runpod.net/v1/models
 ```
 
-Long conversations are automatically compacted — no client changes needed.
+Long conversations are automatically compacted and memory is maintained
+per-conversation — no client changes needed. To get stable per-conversation
+memory through OpenWebUI, the bundled `pipelines/conversation_id_header.py`
+filter propagates the chat ID; direct API callers can set an
+`X-Conversation-Id` header (otherwise the compactor falls back to a content
+hash). See [USER_GUIDE.md](USER_GUIDE.md).
 
 ## Troubleshooting
+
+### Is the deploy healthy?
+```bash
+# Deep health probe (200 = ok/degraded, 503 = storage down)
+curl -s http://localhost:8080/health/full | jq
+
+# Post-boot self-test result — runs automatically on every start
+cat /var/log/supervisor/selftest.log
+# Expect: "=== N/N passed, 0 failed ==="
+
+# On-demand self-test (real chat round-trip + facts read/write)
+curl -s http://localhost:8080/admin/selftest | jq
+```
 
 ### Check Logs
 ```bash
 # Via Runpod web terminal
 cat /var/log/supervisor/vllm.log         # inference engine
-cat /var/log/supervisor/compactor.log    # compaction events
+cat /var/log/supervisor/compactor.log    # memory + compaction events
 cat /var/log/supervisor/openwebui.log    # frontend
+cat /var/log/supervisor/selftest.log     # boot self-test
 ```
 
-### Watch compaction in real time
+### Watch memory in real time
 ```bash
 tail -f /var/log/supervisor/compactor.log
-# Look for: "compacted: summarized N messages, X -> Y tokens"
+# Look for, per conversation:
+#   "injected memory [persona(...) Nfact(s) Mretr sum(L1=.../L2=.../L3=...)]"
+#   "extracted N new fact(s)"  /  "extracted 0 fact(s) — model returned: ..."
+#   "indexed exchange (turn ~N)"
+#   "rollup → L1=.. L2=.. L3=.."
+#   "dedup merged N duplicate fact(s)"
 ```
 
 ### Model download is slow / failed

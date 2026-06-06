@@ -529,6 +529,47 @@ mostly separate code paths.
 
 ---
 
+## V4 — Agentic tool use
+
+**Goal:** give the model *agency* — the ability to call tools and
+(sandboxed) run commands, not just produce text. Sequenced after V3.
+**Full design spec: [compactor/V4_PLAN.md](compactor/V4_PLAN.md).**
+
+**Core architecture:** vLLM parses tool calls but never executes them, so
+the **compactor** hosts the tool-execution loop (ReAct-style: model emits
+`tool_calls` → compactor runs the tool → appends results → re-calls vLLM →
+loops to a `MAX_TOOL_STEPS` cap). No new service — it extends the existing
+request-interception point. The V2 memory layer is the agent's persistent
+substrate.
+
+**Three tool tiers, strictly increasing risk:**
+- **A — pure-Python tools** (memory query, math, allowlisted fetch) — no
+  sandbox needed, ship first.
+- **B — OpenWebUI Tools/Functions** — UI-triggered, user-in-the-loop.
+- **C — command-line execution** — *non-negotiably gated on a sandbox*
+  (no `/data` mount, no network unless allowlisted, resource caps,
+  ephemeral FS, command allowlist) plus human-in-the-loop approval for
+  mutations. A sandbox escape here is catastrophic — exactly where the V2.3
+  "failure-tested before shipped" stance is load-bearing.
+
+**The harness question — when do we build a purpose-built agent-run engine?**
+*Not for the first step, unavoidably for the second.* Phase 1 (a bounded
+single-request tool loop) needs no harness. A harness is **forced** the
+moment any of these become requirements: (1) runs outlive a single HTTP
+request, (2) human-in-the-loop pause/resume, (3) shell execution at scale
+needs a sandbox pool, (4) multi-agent, (5) cross-run observability/cost.
+The harness is then: a durable run/event store + sandbox-runner pool +
+approval state machine + agent console (the point where OpenWebUI stops
+sufficing). Build it around the trigger that actually bites — don't
+speculate. Adopt off-the-shelf sandboxing/queues; keep custom only the
+run-store + approval + memory glue.
+
+**Proposed phasing:** V4.0 tool loop + Tier-A (no harness) → V4.1 read-only
+sandboxed commands (sandbox only) → V4.2 mutating commands + approval
+(harness begins) → V4.3+ durable run store, sandbox pool, agent console.
+
+---
+
 ## Alternative inference backend (V1.10 candidate or V2-parallel)
 
 **Trigger for considering:** sustained pain with vLLM's VRAM footprint on
@@ -612,13 +653,14 @@ These are directions worth keeping in mind but not committing to until V2
 and V3 prove the architecture handles them. **Order does not imply priority.**
 
 ### Agentic capabilities (tool use / function calling)
-- vLLM 0.11+ supports OpenAI-format tool calling natively
-- Need: a tool registry, secure execution sandbox, OpenWebUI tool UI
-- Effort: substantial; this is a whole sub-project
+- **Promoted to a committed line — see [V4 — Agentic tool use](#v4--agentic-tool-use)
+  above and [compactor/V4_PLAN.md](compactor/V4_PLAN.md).** No longer
+  speculative; the design (compactor-hosted tool loop, three tool tiers,
+  sandbox boundary, the harness-trigger analysis) is captured.
 
 ### Code execution
-- "Run this snippet" inside chat — requires sandbox (Jupyter kernel, e2b, etc.)
-- Pairs naturally with agentic tools
+- "Run this snippet" inside chat — the Tier-C sandboxed-command path of V4
+  (see V4_PLAN.md). Requires the sandbox runner; never ships unsandboxed.
 
 ### Multi-user with per-user memory
 - V2's conv_id hash would need user-identity scoping

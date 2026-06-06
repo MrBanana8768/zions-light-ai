@@ -1,74 +1,120 @@
 # Zion's Light AI
 
-Self-hosted creative writing assistant. OpenAI-compatible chat backend with
-**auto-summarizing context preservation** — long conversations don't hit
-the model's context wall, they get intelligently compressed by an
-LLM-summarization middleware that preserves narrative continuity.
+A self-hosted creative-writing assistant that **remembers**. An
+OpenAI-compatible chat backend with a custom memory middleware that gives
+long conversations persistent, structured recall — facts, semantic
+retrieval over past turns, hierarchical summaries, and durable personas —
+so the model doesn't lose the thread as a story or project grows past the
+context window.
 
 Packaged as a single Docker image for one-click deploy to
 [RunPod](https://www.runpod.io/), but runs locally on any NVIDIA GPU host.
 
 ```
-┌────────────┐    ┌──────────────────┐    ┌─────────┐
-│ OpenWebUI  │ →  │ context-compactor│ →  │  vLLM   │
-│  :3000     │    │      :8080       │    │  :8000  │
-│ (user UI)  │    │  (OpenAI-compat, │    │ (model) │
-│            │    │   summarizes     │    │         │
-│            │    │   when over      │    │         │
-│            │    │   token budget)  │    │         │
-└────────────┘    └──────────────────┘    └─────────┘
-                                                ↓
-                                          /data/models
-                                          (HF cache,
-                                           persistent
-                                           Network Volume)
+┌────────────┐    ┌────────────────────┐    ┌─────────┐
+│ OpenWebUI  │ →  │  context-compactor │ →  │  vLLM   │
+│  :3000     │    │       :8080        │    │  :8000  │
+│ (user UI)  │    │  OpenAI-compatible │    │ (model) │
+│            │    │  memory + summary  │    │         │
+└────────────┘    └────────────────────┘    └─────────┘
+                            │                     │
+                            ▼                     ▼
+                  /data/openwebui/compactor   /data/models
+                  (facts, RAG, summaries,     (HF weights cache)
+                   personas — per conv)
+                            │
+                            ▼
+                  single RunPod Network Volume at /data
+                  (survives pod terminations)
 ```
 
-## What it does
+## Features
 
-- **Conversational chat** with any vLLM-supported HuggingFace causal-LM
-- **Default model:** [`anthracite-org/magnum-v4-22b`](https://huggingface.co/anthracite-org/magnum-v4-22b) — creative writing fine-tune of Mistral-Small, lightly aligned, trained to mimic Claude's prose style
-- **Auto-summarization** when conversations approach the model's max length, so the model doesn't "forget" early context
-- **OpenAI-compatible API** (`/v1/chat/completions`, `/v1/models`) — works with any OpenAI client
-- **Single Network Volume** holds both model weights and chat history; survives pod terminations
-- **Configurable model & inference flags** via environment variables — swap models without rebuilding
+**Conversation**
+- OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`) — works with any OpenAI client, streaming or not
+- Any vLLM-supported HuggingFace causal-LM, swappable via one env var
+
+**Memory** (the point of the project — see [USER_GUIDE.md](USER_GUIDE.md))
+- **Facts** — durable claims the model extracts and re-injects each turn
+- **RAG** — every exchange embedded into ChromaDB and semantically retrieved later
+- **Hierarchical summaries** — rolling L1→L2→L3 compression so 1000-turn chats still fit
+- **Personas** — long role/voice system prompts stored as a first-class layer, exempt from summarization and eviction
+- **Semantic dedup** — near-duplicate facts merged automatically (embedding + LLM verify) so you never see the same thing three ways
+- All memory is **per-conversation**, persisted to the Network Volume, and survives restarts
+
+**User control** (chat slash-commands — [full reference](USER_GUIDE.md#slash-commands))
+- `/list-facts`, `/remember <text>`, `/forget [substring]`, `/why`, `/help` — inspect and steer what the model knows, with zero LLM cost
+
+**Portability & ops**
+- Export / import / fork a conversation's entire memory as one JSON bundle
+- `GET /health/full` deep healthcheck + post-boot self-test that proves the deploy actually works
+- Single Network Volume holds weights *and* memory; pre-warm once, attach forever
 
 ## Quick start
 
 ### RunPod (production)
 
-See [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md) for the 5-step deploy. TL;DR:
+Full walkthrough in [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md). TL;DR:
 
-1. Create a 200 GB Network Volume named `zions-data`
+1. Create a ~200 GB Network Volume named `zions-data`
 2. Pre-warm the model on a cheap CPU pod (one-time, optional)
-3. Deploy a GPU pod from the [Docker Hub image](https://hub.docker.com/r/angreg/zions-light-ai) with the volume attached at `/data`
-4. Set `VLLM_EXTRA_ARGS=--quantization fp8` in template env vars (required for A40-class GPUs)
+3. Deploy a GPU pod from the [Docker Hub image](https://hub.docker.com/r/angreg/zions-light-ai) with the volume attached at `/data`, ports `3000, 8080` exposed
+4. **Pick a model that fits your GPU** — see the warning below
+
+> **⚠️ A40 users: set `MODEL_REPO=anthracite-org/magnum-v4-12b`.** The image's
+> built-in default is the 22B model, which **does not fit an A40** — runtime
+> FP8 quantization OOMs during the marlin repack step. The 12B model runs
+> comfortably in FP16 at 32K context on an A40. Reserve the 22B for A100-class
+> cards in FP16. See [GPU sizing](RUNPOD_DEPLOY.md#gpu-sizing).
 
 ### Local (dev / testing)
 
-Requires NVIDIA GPU + Docker Desktop with WSL2 backend (Windows) or
-native Docker + nvidia-container-toolkit (Linux).
+Requires NVIDIA GPU + Docker Desktop with WSL2 (Windows) or Docker +
+nvidia-container-toolkit (Linux).
 
 ```bash
 cp .env.example .env
-# Edit .env if you want a smaller model for local testing:
-#   MODEL_REPO=Qwen/Qwen2.5-1.5B-Instruct  (fits 8GB consumer GPUs)
+# For consumer GPUs, edit .env to a small model:
+#   MODEL_REPO=Qwen/Qwen2.5-1.5B-Instruct   (fits 8 GB)
 docker compose up --build
-# OpenWebUI at http://localhost:3000
+# OpenWebUI → http://localhost:3000
 ```
+
+## Using the assistant
+
+Once it's running, **[USER_GUIDE.md](USER_GUIDE.md)** is the place to start —
+it explains the memory model in plain language, documents every slash
+command, shows how to set up a persona, and lists the admin endpoints for
+inspecting or backing up a conversation's memory.
 
 ## Image tags
 
 Published at [`angreg/zions-light-ai`](https://hub.docker.com/r/angreg/zions-light-ai).
-Pin to a specific version for reproducible deploys:
+Pin a specific version for reproducible deploys.
 
-| Tag | Status |
+| Tag | Contents |
 |---|---|
-| `:1.9.6` | Latest — V1 final release, CVE-clean, parametric CUDA |
-| `:1.9.5` | Last 1.9.x with the broken vllm 0.11 pin (do not use) |
-| `:latest` | Currently points at `:1.9.6` |
+| `:v2.1` | Rolling V2.1 — full memory + user control + observability |
+| `:v2.1-phase8` / `:v2.1-complete` | V2.1 final: chat commands + personas |
+| `:v2.1-phase7` | + semantic dedup + stale-fact archival |
+| `:v2.1-phase6.1` | + observability (`/health/full`, boot self-test) |
+| `:v2.0` | Three-layer memory (facts + RAG + hierarchical summaries) |
+| `:1.9.6` | Final V1 — auto-summarization only, no persistent memory |
+| `:latest` | Promoted to the newest validated release |
 
 See [CHANGELOG.md](CHANGELOG.md) for full version history.
+
+## Documentation
+
+| Doc | For | Covers |
+|---|---|---|
+| [USER_GUIDE.md](USER_GUIDE.md) | **Users** | Memory model, slash commands, personas, admin endpoints, FAQ |
+| [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md) | **Operators** | RunPod deploy, GPU sizing, env vars, troubleshooting |
+| [CHANGELOG.md](CHANGELOG.md) | Everyone | Per-version history |
+| [ROADMAP.md](ROADMAP.md) | Contributors | V1 → V4 forward plan |
+| [TESTING.md](TESTING.md) | Contributors | Three-tier testing standard + run commands |
+| [compactor/V2_PLAN.md](compactor/V2_PLAN.md) | Contributors | Memory architecture design spec |
+| [compactor/V4_PLAN.md](compactor/V4_PLAN.md) | Contributors | Agentic / tool-use design spec |
 
 ## Project structure
 
@@ -76,42 +122,46 @@ See [CHANGELOG.md](CHANGELOG.md) for full version history.
 .
 ├── Dockerfile              # Multi-process image (parametric CUDA build args)
 ├── docker-compose.yml      # Local dev / single-host orchestration
-├── supervisord.conf        # Runs vllm + compactor + openwebui inside one container
+├── supervisord.conf        # Runs vllm + compactor + openwebui + boot self-test
 ├── entrypoint.sh           # Preflight checks, then hands off to supervisord
-├── .env.example            # Configurable knobs (model, context, quantization, compactor budgets)
-├── compactor/              # The summarization + memory middleware (FastAPI)
-│   ├── main.py             # Request flow: compaction + facts injection + async tail
+├── .env.example            # Every configurable knob, documented
+├── compactor/              # The memory + summarization middleware (FastAPI)
+│   ├── main.py             # Request flow: commands → compaction → memory inject → proxy → async tail
 │   ├── memory.py           # conv_id resolution, storage layout, atomic I/O, locks
-│   ├── facts.py            # V2.0 persistent facts: extract / prune / inject
-│   ├── backfill.py         # V2.0 lazy backfill of pre-V2 conversations
-│   ├── retrieval.py        # V2.0 episodic memory: embeddings + ChromaDB RAG
-│   ├── requirements.txt    # pip deps
-│   ├── test_smoke.py       # Tier-1 unit tests (CPU-only)
-│   ├── test_memory.py      # Tier-1 unit tests (CPU-only)
-│   ├── test_facts.py       # Tier-1 unit tests (CPU-only)
-│   ├── test_backfill.py    # Tier-1 unit tests (CPU-only)
-│   ├── test_retrieval.py   # Tier-1 unit tests (CPU-only)
-│   └── V2_PLAN.md          # V2 architecture spec (memory: RAG + facts + tiered summary)
+│   ├── facts.py            # Facts: extract / prune / inject / archive (Phase 2 + 7)
+│   ├── retrieval.py        # Episodic RAG: embeddings + ChromaDB (Phase 3)
+│   ├── summarizer.py       # Hierarchical L1→L2→L3 summaries (Phase 4)
+│   ├── backfill.py         # Lazy backfill of pre-V2 conversations
+│   ├── dedup.py            # Hybrid embedding+LLM fact deduplication (Phase 7)
+│   ├── commands.py         # Chat slash-command surface (Phase 5)
+│   ├── persona.py          # Personas as first-class memory (Phase 8)
+│   ├── health.py           # /health/full deep probe (Phase 6)
+│   ├── selftest.py         # Post-boot live-stack self-test (Phase 6)
+│   ├── portability.py      # Export / import / fork bundles (Phase 6)
+│   ├── test_*.py           # 12 Tier-1 unit suites (CPU-only)
+│   └── V2_PLAN.md          # Memory architecture spec
 ├── pipelines/              # OpenWebUI Functions
 │   └── conversation_id_header.py  # Propagates chat_id → compactor conv_id
+├── tests/integration/      # Tier-3 black-box suite (run against a live pod)
 ├── README.md               # This file
-├── TESTING.md              # Testing standard (3-tier taxonomy + run commands)
+├── USER_GUIDE.md           # End-user guide
+├── RUNPOD_DEPLOY.md        # RunPod deploy walkthrough
+├── TESTING.md              # Testing standard
 ├── CHANGELOG.md            # Per-version history
-├── ROADMAP.md              # V1 → V2 → V3 forward plan
-└── RUNPOD_DEPLOY.md        # RunPod-specific deploy walkthrough
+└── ROADMAP.md              # Forward plan
 ```
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for the full plan. High-level:
+See [ROADMAP.md](ROADMAP.md). High-level:
 
-- **V1.9.6** — final V1 release: vLLM bumped to 0.14.1 (CVE fix), parametric CUDA build args, persistent torch.compile cache, preflight checks
-- **V2.0** *(in progress)* — memory architecture: persistent facts, RAG over conversation history (ChromaDB), hierarchical summarization. See [compactor/V2_PLAN.md](compactor/V2_PLAN.md)
-- **V2.1** — user control of memory: chat commands (`/list-facts`, `/forget`, `/remember`), conversation export/import, observability endpoints
-- **V2.2** — testing & observability: boot self-test harness, `/health/full`, integration suite (standard already in force, see [TESTING.md](TESTING.md))
-- **V2.3** — resilience & stability: data-durability backups + verified restore, graceful-degradation chaos tests, operational runbook. *Quality over speed — failure-tested before shipped.*
+- **V1.9.6** ✅ — final V1: vLLM 0.14.1 (CVE fix), parametric CUDA, persistent compile cache, preflight checks
+- **V2.0** ✅ — memory architecture: persistent facts, RAG (ChromaDB), hierarchical summarization
+- **V2.1** ✅ — user control: chat commands, personas, export/import, dedup, archival, observability
+- **V2.2** ✅ — testing & observability: boot self-test, `/health/full`, three-tier standard ([TESTING.md](TESTING.md))
+- **V2.3** — resilience & stability: durable backups + verified restore, chaos tests, operational runbook *(quality over speed)*
 - **V3** — multimodal: vision (VLM swap), speech-to-text (Whisper), text-to-speech (Kokoro/XTTS)
-- **Beyond V3** — agentic tools, fine-tuning pipeline, multi-user
+- **V4** — agentic: model tool-use via a compactor tool-loop, sandboxed command execution, eventual agent-run harness ([compactor/V4_PLAN.md](compactor/V4_PLAN.md))
 
 ## Tech stack
 
@@ -119,19 +169,20 @@ See [ROADMAP.md](ROADMAP.md) for the full plan. High-level:
 |---|---|
 | Inference engine | [vLLM](https://github.com/vllm-project/vllm) 0.14.1 (cu128 wheels for RunPod A40 compat) |
 | Chat frontend | [OpenWebUI](https://github.com/open-webui/open-webui) |
-| Context compactor | Custom FastAPI middleware, single file (`compactor/main.py`) |
+| Memory middleware | Custom FastAPI compactor (`compactor/`, torch-free venv) |
+| Embeddings | BAAI/bge-small-en-v1.5 (ONNX, prebaked) via fastembed + ChromaDB |
 | Process supervision | supervisord |
-| Container base | `nvidia/cuda:12.6.3-runtime-ubuntu24.04` (parametric — can swap to 12.8/13.0) |
-| Default model | Magnum v4 22B (or any vLLM-supported HF causal-LM via env var) |
+| Container base | `nvidia/cuda` runtime (parametric build args — cu128 default) |
+| Recommended model | Magnum v4 **12B** on A40 / 22B on A100 (or any vLLM HF causal-LM) |
 
 ## License
 
-Inherits project license — see LICENSE file (if present).
-
-Bundled software has its own licenses: vLLM (Apache 2.0), OpenWebUI (MIT),
-Magnum v4 22B and base models (each repo's HF license).
+See LICENSE file (if present). Bundled software keeps its own licenses:
+vLLM (Apache 2.0), OpenWebUI (MIT), Magnum v4 and base models (each repo's
+HF license).
 
 ## Contributing
 
-This is currently a personal/single-user project. If you've found it
-useful and want to contribute, open an issue or PR.
+Currently a personal/single-user project. Every code change follows the
+[testing standard](TESTING.md) (Tier-1 in the same PR; green before merge).
+Found it useful? Open an issue or PR.
