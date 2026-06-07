@@ -25,6 +25,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import backfill
+import backup as backup_module
 import commands
 import dedup
 import facts
@@ -1138,3 +1139,42 @@ async def admin_selftest(response: Response, round_trip: bool = True):
     report = await selftest_module.run_selftest(do_round_trip=round_trip)
     response.status_code = 200 if report["status"] == "pass" else 503
     return report
+
+
+# V2.3 Theme 1: data-durability backup endpoints (localhost-only).
+@app.get("/admin/backups", dependencies=[Depends(_require_localhost)])
+async def admin_list_backups():
+    """List existing backup archives (newest first) + latest-backup summary."""
+    return {
+        "backups": backup_module.list_backups(),
+        "info": backup_module.latest_backup_info(),
+    }
+
+
+@app.post("/admin/backups", dependencies=[Depends(_require_localhost)])
+async def admin_run_backup(response: Response):
+    """Trigger one backup cycle now (create → verify → publish → prune).
+    Returns the report. HTTP 200 if the backup was created AND verified;
+    503 if it failed (so this is a usable monitoring signal). Runs in a
+    thread — the cycle is blocking I/O (sqlite snapshot, tar, verify)."""
+    report = await asyncio.to_thread(backup_module.run_once)
+    response.status_code = 200 if report.get("ok") else 503
+    return report
+
+
+@app.get("/admin/backups/verify", dependencies=[Depends(_require_localhost)])
+async def admin_verify_backup(response: Response, name: str | None = None):
+    """Verify an existing archive (default: the newest). Restores it to a
+    scratch dir and runs the integrity checks. 200 ok / 503 fail / 404 none."""
+    if name:
+        from pathlib import Path
+        target = Path(backup_module.BACKUP_DIR) / name
+    else:
+        archives = backup_module.list_backups()
+        if not archives:
+            raise HTTPException(status_code=404, detail="no backups to verify")
+        from pathlib import Path
+        target = Path(archives[0]["path"])
+    ok, detail = await asyncio.to_thread(backup_module.verify_backup, target)
+    response.status_code = 200 if ok else 503
+    return {"archive": target.name, "ok": ok, "detail": detail}

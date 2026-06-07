@@ -139,6 +139,7 @@ COPY compactor/portability.py /opt/compactor/portability.py
 COPY compactor/dedup.py /opt/compactor/dedup.py
 COPY compactor/commands.py /opt/compactor/commands.py
 COPY compactor/persona.py /opt/compactor/persona.py
+COPY compactor/backup.py /opt/compactor/backup.py
 
 # =============================================================================
 # Supervisor
@@ -174,6 +175,9 @@ ENV COMPACTOR_PORT="8080"
 # V2.1 Phase 6 Step 2: post-boot self-test auto-runs as a supervisord
 # one-shot. Disable per-pod (e.g. for CI containers) by setting to "false".
 ENV COMPACTOR_SELFTEST_ON_BOOT="true"
+# V2.3 Theme 1: periodic data-durability backup daemon. Disable per-pod
+# (e.g. CI containers) by setting to "false".
+ENV COMPACTOR_BACKUP_ENABLED="true"
 ENV COMPACTOR_TARGET_TOKENS=""
 ENV COMPACTOR_KEEP_RECENT_TURNS="4"
 ENV COMPACTOR_SUMMARY_MAX_TOKENS="1024"
