@@ -194,7 +194,7 @@ V2.0 Phases 3/4 and all of V2.1.
 
 ---
 
-## V2.3 — Resilience & Stability
+## V2.3 — Resilience & Stability  ✅ Code-complete
 
 **Goal:** Make the system *survive failure gracefully* and *protect
 irreplaceable data*, so it can run unattended in a production-shaped
@@ -283,25 +283,31 @@ and extends it:
 
 ### Theme 4 — Operational confidence
 
-- **Runbook** (`OPERATIONS.md`) — what each log line means, how to read
-  `/health/full`, how to recover from each known failure mode, how to roll
-  back a bad image (the `:latest` → `:1.9.6` escape hatch, generalized).
-- **Structured logging** — JSON logs (vLLM `--log-format json`, compactor
-  via python-json-logger) so failures are greppable/aggregatable.
-- **Alerting hook (optional)** — a single configurable webhook the
-  selftest/backup jobs POST to on failure, so the owner finds out before
-  the user does.
+- ✅ **Runbook** (`OPERATIONS.md`) — log-line reference, how to read
+  `/health/full`, recovery for each known failure mode (incl. FATAL
+  services), backups/restore, and image rollback. Landed in Theme 1, grew
+  across the later themes.
+- ✅ **Structured logging** — `compactor/logsetup.py`: `COMPACTOR_LOG_FORMAT`
+  switches the compactor + selftest + backup between human `text` (default)
+  and `json` (one object/line, greppable/aggregatable). Tiny stdlib JSON
+  formatter — no python-json-logger dependency. (vLLM's own log format is
+  left to `VLLM_EXTRA_ARGS` for operators who want it.)
+- ✅ **Alerting hook (optional)** — `compactor/alert.py`: a single
+  `COMPACTOR_ALERT_WEBHOOK` the boot self-test + backup daemon POST to on
+  failure (Slack/Discord/generic). Off by default; best-effort (never
+  blocks the job it watches).
 
-**Prerequisite:** ships after V2.2 (it builds directly on V2.2's selftest
-process model, `/health/full`, and Tier-3 harness). Some Theme-1 backup
-work could be pulled forward if data volume grows valuable before then —
-data durability is the one item whose failure mode is *unrecoverable*, so
-it's the natural candidate for early promotion.
+**Prerequisite (met):** shipped after V2.2 — builds on V2.2's selftest
+process model, `/health/full`, and Tier-3 harness. Theme 1 (data
+durability) was promoted first since its failure mode is the only
+*unrecoverable* one.
 
-**V2.3 effort: deliberately unbounded.** Estimated ~2-4 weeks of elapsed
-time, but the explicit standard is *correctness and failure-tested
-confidence over calendar speed*. An item is not "done" until its failure
-path has been exercised on purpose.
+**V2.3 status: ✅ code-complete.** All four themes shipped (PRs #15, #17,
+#18, + this one). The explicit standard was *failure-tested confidence over
+speed* — Tier-1 covers every new module's failure paths, and three
+"prove-it-on-the-pod-for-real" gates remain the operator's to run: a live
+**restore** rehearsal (Theme 1), a **chaos** run (Theme 2), and a multi-day
+**soak** (Theme 3). The instruments for all three are built + documented.
 
 ---
 
