@@ -141,6 +141,7 @@ COPY compactor/commands.py /opt/compactor/commands.py
 COPY compactor/persona.py /opt/compactor/persona.py
 COPY compactor/backup.py /opt/compactor/backup.py
 COPY compactor/degrade.py /opt/compactor/degrade.py
+COPY compactor/bgwork.py /opt/compactor/bgwork.py
 
 # =============================================================================
 # Supervisor

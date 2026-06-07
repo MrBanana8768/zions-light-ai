@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 import backfill
 import backup as backup_module
+import bgwork
 import commands
 import dedup
 import degrade
@@ -266,27 +267,13 @@ class SseAccumulator:
         return "".join(self._parts)
 
 
-# Module-level set keeps task references alive so they don't get garbage-
-# collected before completing. Standard asyncio fire-and-forget gotcha.
-_background_tasks: set[asyncio.Task] = set()
-
-
 def _fire_and_forget(coro) -> None:
-    """Spawn an async task without awaiting it. Keeps the reference so the
-    GC doesn't kill it; logs any exception that escapes.
+    """Spawn post-response background work through the bounded pool
+    (V2.3 Theme 3). The pool caps concurrency and sheds beyond a hard
+    outstanding ceiling rather than spawning unboundedly under load. Task
+    references are kept alive by the pool; exceptions are logged there.
     """
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-
-    def _log_exception(t: asyncio.Task) -> None:
-        _background_tasks.discard(t)
-        if t.cancelled():
-            return
-        exc = t.exception()
-        if exc is not None:
-            logger.exception(f"background task raised: {exc!r}")
-
-    task.add_done_callback(_log_exception)
+    bgwork.pool.submit(coro)
 
 
 async def _async_tail(
@@ -440,16 +427,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"could not initialize storage layout: {e}")
     yield
-    # Graceful: give in-flight fact extractions a moment to finish
-    if _background_tasks:
-        logger.info(f"waiting for {len(_background_tasks)} background task(s) to finish")
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*_background_tasks, return_exceptions=True),
-                timeout=10.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("background tasks didn't finish in 10s; abandoning")
+    # Graceful: give in-flight background work (fact extraction, indexing,
+    # rollup, backfill) a moment to finish via the bounded pool.
+    await bgwork.pool.drain(timeout=10.0)
 
 
 app = FastAPI(title="context-compactor", lifespan=lifespan)

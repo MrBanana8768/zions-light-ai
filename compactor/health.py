@@ -184,6 +184,13 @@ async def gather_health_full(vllm_url: str, target_tokens: int) -> dict:
     except Exception as e:
         writes = {"new_memory_writes": "unknown", "error": f"{type(e).__name__}: {e}"}
 
+    # V2.3 Theme 3: bounded-background-work pool stats (outstanding/shed).
+    try:
+        import bgwork
+        bg = bgwork.pool.stats()
+    except Exception as e:
+        bg = {"error": f"{type(e).__name__}: {e}"}
+
     if not storage["ok"]:
         status = "down"
     elif not vllm["ok"] or writes.get("new_memory_writes") == "paused":
@@ -208,6 +215,7 @@ async def gather_health_full(vllm_url: str, target_tokens: int) -> dict:
         "stats": stats,
         "backups": backup_info,
         "memory_writes": writes,
+        "background_work": bg,
         "config": {
             "vllm_url": vllm_url,
             "target_tokens": target_tokens,
