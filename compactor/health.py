@@ -175,9 +175,18 @@ async def gather_health_full(vllm_url: str, target_tokens: int) -> dict:
     storage = probe_storage()
     stats = gather_memory_stats()
 
+    # V2.3 Theme 2: disk-pressure write state. "paused" means we're still
+    # serving but no longer persisting new memory — a degraded condition the
+    # operator needs to see.
+    try:
+        import degrade
+        writes = degrade.write_state()
+    except Exception as e:
+        writes = {"new_memory_writes": "unknown", "error": f"{type(e).__name__}: {e}"}
+
     if not storage["ok"]:
         status = "down"
-    elif not vllm["ok"]:
+    elif not vllm["ok"] or writes.get("new_memory_writes") == "paused":
         status = "degraded"
     else:
         status = "ok"
@@ -198,6 +207,7 @@ async def gather_health_full(vllm_url: str, target_tokens: int) -> dict:
         },
         "stats": stats,
         "backups": backup_info,
+        "memory_writes": writes,
         "config": {
             "vllm_url": vllm_url,
             "target_tokens": target_tokens,

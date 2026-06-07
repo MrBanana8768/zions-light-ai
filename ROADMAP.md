@@ -247,15 +247,23 @@ The system is already designed so memory failures never break chat
 (retrieval/facts degrade to no-ops). V2.3 makes that a *verified guarantee*
 and extends it:
 
-- **Chaos checks** — a Tier-3 suite that deliberately breaks each
-  dependency (kill vLLM mid-request, corrupt a facts file, fill the disk,
-  make ChromaDB unwritable) and asserts the user-visible behavior is
-  "degraded but functional," never a hard 500 or a crash loop.
-- **Disk-pressure handling** — detect low free space on `/data` and stop
-  *writing* new memory (keep serving) rather than crashing on a failed
-  write. Surface it in `/health/full`.
-- **vLLM restart resilience** — confirm the compactor rides out a vLLM
-  restart (502s become a clean "model is restarting" rather than a thrash).
+- ✅ **Chaos checks** — `tests/chaos/run_chaos.py` deliberately breaks each
+  dependency (kill vLLM mid-request, corrupt a facts file, make ChromaDB
+  unwritable, fill the disk) and asserts "degraded but functional," never a
+  hard 500 or crash loop. Guarded + pod-local (needs fs + supervisorctl),
+  refuses without `ZIONS_CHAOS_CONFIRM`, each scenario self-restores. See
+  [tests/chaos/README.md](tests/chaos/README.md). *(Run on the pod to fully
+  exercise — the safe shape is built + unit-verified.)*
+- ✅ **Disk-pressure handling** — `compactor/degrade.py`: when free space on
+  `/data` drops below `COMPACTOR_MIN_FREE_MB_WRITES` (200), new-memory
+  growth (extraction/indexing/rollup/persona-autocapture) pauses while chat
+  + explicit user writes keep working. Surfaced in `/health/full`
+  (`memory_writes`) and reflected in `status=degraded`. Fails OPEN.
+- ✅ **vLLM restart resilience** — the compactor rides out a vLLM restart:
+  unreachable-vLLM now returns a clean **503** (`model_unavailable`,
+  retryable) on the non-stream + `/v1/models` paths, and a visible
+  "model is starting/restarting" assistant message on the stream path,
+  instead of an opaque 500 / dead stream.
 
 ### Theme 3 — Process & resource stability
 
