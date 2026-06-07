@@ -143,6 +143,7 @@ COPY compactor/backup.py /opt/compactor/backup.py
 COPY compactor/degrade.py /opt/compactor/degrade.py
 COPY compactor/bgwork.py /opt/compactor/bgwork.py
 COPY compactor/logsetup.py /opt/compactor/logsetup.py
+COPY compactor/alert.py /opt/compactor/alert.py
 
 # =============================================================================
 # Supervisor

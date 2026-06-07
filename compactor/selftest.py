@@ -373,6 +373,19 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(_format_report_human(report))
 
+    # V2.3 Theme 4: alert on failure (no-op unless COMPACTOR_ALERT_WEBHOOK set).
+    if report["status"] != "pass":
+        failed = [c["name"] for c in report.get("checks", []) if not c["ok"]]
+        try:
+            import alert
+            alert.notify(
+                "selftest", "fail",
+                f"{label} self-test failed: {', '.join(failed) or 'unknown'}",
+                extra={"summary": report.get("summary")},
+            )
+        except Exception:
+            pass
+
     return 0 if report["status"] == "pass" else 1
 
 
