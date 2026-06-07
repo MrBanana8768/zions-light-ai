@@ -267,14 +267,19 @@ and extends it:
 
 ### Theme 3 — Process & resource stability
 
-- **Memory/FD leak watch** — long-soak test (multi-day) watching the
-  compactor's RSS and file-descriptor count for slow leaks (httpx clients,
-  ChromaDB handles, the background-task set).
-- **Bounded background work** — cap concurrent async tails; if extraction
-  falls behind under load, shed/queue rather than spawning unboundedly.
-- **supervisord restart policy review** — make sure a genuinely-broken
-  service enters FATAL and stays visible, instead of fast-restart-looping
-  and masking the root cause (a lesson from the V1.9.x cascade).
+- ✅ **Bounded background work** — `compactor/bgwork.py`: a pool caps
+  concurrent async tails (`COMPACTOR_MAX_CONCURRENT_TAILS`, 4) and **sheds**
+  beyond a hard outstanding ceiling (`COMPACTOR_MAX_OUTSTANDING_TAILS`, 64)
+  rather than spawning unboundedly under load. Shed coroutines are closed
+  (no leak); stats in `/health/full` (`background_work`).
+- ✅ **supervisord restart policy review** — confirmed (and documented) that
+  autorestart + startretries + startsecs send a genuinely-broken service to
+  FATAL (visible) instead of fast-restart-looping. Policy intent commented
+  in `supervisord.conf`; FATAL spot-and-recover runbook in OPERATIONS.md.
+- ✅ **Memory/FD leak watch** — `tests/soak/soak_monitor.py`: samples the
+  compactor's RSS + FD count over time (optional self-driven load) and flags
+  monotonic growth. *(The instrument is built + verified; a real multi-day
+  soak is the run-on-pod gate.)*
 
 ### Theme 4 — Operational confidence
 
