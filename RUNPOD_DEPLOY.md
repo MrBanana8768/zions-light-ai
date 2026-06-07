@@ -211,6 +211,10 @@ Override these in your Runpod template if needed:
 |---|---|---|
 | `COMPACTOR_SELFTEST_ON_BOOT` | `true` | Run the live-stack self-test after boot, logging to `/var/log/supervisor/selftest.log` |
 | `COMPACTOR_ADMIN_BIND` | `127.0.0.1` | Admin-endpoint bind address. **Keep localhost** unless you have auth/firewall in front — admin endpoints are unauthenticated. |
+| `COMPACTOR_BACKUP_ENABLED` | `true` | Run the periodic verified-backup daemon (V2.3) |
+| `COMPACTOR_MIN_FREE_MB_WRITES` | `200` | Pause new-memory writes (keep serving) below this free space on `/data` (V2.3) |
+| `COMPACTOR_LOG_FORMAT` | `text` | `text` (human) or `json` (one object/line for aggregation) |
+| `COMPACTOR_ALERT_WEBHOOK` | *(unset)* | If set, self-test + backup POST a failure alert here (Slack/Discord/generic) |
 
 ## API Usage
 

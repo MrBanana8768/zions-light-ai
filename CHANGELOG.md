@@ -9,6 +9,65 @@ on Docker Hub.
 
 ---
 
+## [2.3] — Resilience & Stability
+
+**Goal:** survive failure gracefully and protect irreplaceable data, so the
+pod can run unattended. The "quality and failure-tested confidence over
+speed" release — every item's failure path is exercised on purpose (Tier-1
+covers the unit failure modes; live restore/chaos/soak rehearsals are the
+operator's on-pod gates).
+
+Image: `angreg/zions-light-ai:v2.3` (phases `:v2.3-phase1..4`).
+
+### Added — data durability (Theme 1)
+- **Verified backups** (`compactor/backup.py` + `[program:backup]` daemon) —
+  timestamped tar.gz of `webui.db` (via the SQLite online-backup API, so a
+  live db isn't captured mid-write) + the `compactor/` memory store. Each
+  archive is **verified before it's trusted** (`PRAGMA integrity_check` +
+  JSON parse); an unverifiable archive is discarded and the cycle reports
+  failure. Retention pruning, a min-free-disk guard, a gated destructive
+  restore, and admin endpoints (`GET/POST /admin/backups`,
+  `/admin/backups/verify`). Local-volume only for now — off-volume DR is
+  flagged future work.
+- **OPERATIONS.md** runbook — health interpretation, log-line reference,
+  failure recovery, the restore procedure, FATAL-service handling, rollback.
+
+### Added — graceful degradation (Theme 2)
+- **Disk-pressure write-gating** (`compactor/degrade.py`) — below
+  `COMPACTOR_MIN_FREE_MB_WRITES` (200), new-memory growth pauses while chat
+  + explicit user writes keep working. Fails open; surfaced in
+  `/health/full`.
+- **vLLM-restart resilience** — an unreachable vLLM yields a clean 503
+  (`model_unavailable`) on the non-stream + `/v1/models` paths and a visible
+  "model is starting/restarting" message on the stream path, instead of an
+  opaque 500.
+- **Chaos suite** (`tests/chaos/`) — guarded, self-restoring runner that
+  breaks each dependency (kill vLLM, corrupt facts, unwritable ChromaDB,
+  fill disk) and asserts degraded-but-functional.
+
+### Added — process & resource stability (Theme 3)
+- **Bounded background work** (`compactor/bgwork.py`) — the async tail pool
+  caps concurrency and sheds beyond a hard ceiling instead of spawning
+  unboundedly under load. Stats in `/health/full`.
+- **supervisord restart-policy review** — documented the
+  boot-loop→FATAL-visible property; FATAL spot/recover runbook.
+- **Soak monitor** (`tests/soak/`) — RSS/FD leak watch over time.
+
+### Added — operational confidence (Theme 4)
+- **Structured logging** (`compactor/logsetup.py`) — `COMPACTOR_LOG_FORMAT`
+  switches the compactor + sidecars between `text` (default) and `json`.
+- **Optional failure-alert webhook** (`compactor/alert.py`) —
+  `COMPACTOR_ALERT_WEBHOOK`; the boot self-test + backup daemon POST a
+  Slack/Discord/generic alert on failure. Off by default, best-effort.
+
+### Notes
+- Atomic-write audit confirmed every durable writer already routes through
+  `memory.atomic_write_json` (no torn-write gap).
+- Tier-1 grew to 18 CPU suites; new pod-local tooling under `tests/chaos/`
+  and `tests/soak/` (guarded, never auto-run).
+
+---
+
 ## [2.2] — Testing & Observability
 
 **Goal:** make "is this deploy actually working?" answerable automatically,

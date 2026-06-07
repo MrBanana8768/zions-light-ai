@@ -333,6 +333,7 @@ def run_once(backup_dir: Path | None = None) -> dict:
                 pass
             report["detail"] = f"VERIFICATION FAILED: {detail}"
             logger.error(f"backup verification failed, archive discarded: {detail}")
+            _alert_failure(report["detail"])
             return report
         # Publish atomically: drop the .partial suffix.
         final = partial.with_suffix("")  # strips ".partial" → ...tar.gz
@@ -357,7 +358,17 @@ def run_once(backup_dir: Path | None = None) -> dict:
                 pass
         report["detail"] = f"{type(e).__name__}: {e}"
         logger.error(f"backup failed: {report['detail']}")
+        _alert_failure(report["detail"])
         return report
+
+
+def _alert_failure(detail: str) -> None:
+    """Best-effort failure alert (V2.3 Theme 4). No-op if no webhook set."""
+    try:
+        import alert
+        alert.notify("backup", "fail", detail)
+    except Exception:
+        pass
 
 
 def latest_backup_info(backup_dir: Path | None = None) -> dict:
@@ -457,7 +468,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help="Machine-readable output.")
     args = p.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    import logsetup
+    logsetup.configure()  # honors COMPACTOR_LOG_FORMAT (text/json)
 
     if args.list:
         archives = list_backups()

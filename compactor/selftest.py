@@ -355,10 +355,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
+    import logsetup
+    logsetup.configure()  # honors COMPACTOR_LOG_FORMAT (text/json)
 
     label = "ON-BOOT" if args.on_boot else "ON-DEMAND"
     logger.info(f"selftest starting ({label})")
@@ -374,6 +372,19 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2))
     else:
         print(_format_report_human(report))
+
+    # V2.3 Theme 4: alert on failure (no-op unless COMPACTOR_ALERT_WEBHOOK set).
+    if report["status"] != "pass":
+        failed = [c["name"] for c in report.get("checks", []) if not c["ok"]]
+        try:
+            import alert
+            alert.notify(
+                "selftest", "fail",
+                f"{label} self-test failed: {', '.join(failed) or 'unknown'}",
+                extra={"summary": report.get("summary")},
+            )
+        except Exception:
+            pass
 
     return 0 if report["status"] == "pass" else 1
 

@@ -191,6 +191,35 @@ supervisorctl start compactor openwebui backup
 
 ---
 
+## Logs: text vs JSON
+
+`COMPACTOR_LOG_FORMAT` controls the compactor + sidecar (selftest, backup)
+log format:
+- `text` (default) — human-readable, what `tail -f` has always shown.
+- `json` — one JSON object per line (`ts`/`level`/`logger`/`message`, plus
+  `exc` on errors). Set this when shipping logs to an aggregator or when you
+  want to `jq` them:
+  ```bash
+  tail -f /var/log/supervisor/compactor.log | jq 'select(.level=="WARNING")'
+  ```
+
+## Failure alerts (optional)
+
+Set `COMPACTOR_ALERT_WEBHOOK` to a URL and the **boot self-test** and the
+**backup daemon** will POST a JSON alert there on failure — so you hear
+about a broken deploy or a failed backup before a user does. Off by default.
+
+The payload carries structured fields (`service`, `status`, `detail`,
+`host`, `ts`) plus `text`/`content` so the same URL works with a Slack or
+Discord incoming webhook, or any generic receiver. Alerting is best-effort:
+a slow or broken webhook is logged and ignored, never blocking the job.
+
+```bash
+# quick test: point it at a request-bin style URL, then force a failing
+# self-test (e.g. with vLLM stopped) and watch the POST arrive
+COMPACTOR_ALERT_WEBHOOK=https://hooks.example/zions ...
+```
+
 ## Rolling back a bad release
 
 Image tags are immutable snapshots (see
