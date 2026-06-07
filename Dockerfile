@@ -140,6 +140,7 @@ COPY compactor/dedup.py /opt/compactor/dedup.py
 COPY compactor/commands.py /opt/compactor/commands.py
 COPY compactor/persona.py /opt/compactor/persona.py
 COPY compactor/backup.py /opt/compactor/backup.py
+COPY compactor/degrade.py /opt/compactor/degrade.py
 
 # =============================================================================
 # Supervisor

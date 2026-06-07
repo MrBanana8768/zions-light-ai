@@ -28,6 +28,7 @@ import backfill
 import backup as backup_module
 import commands
 import dedup
+import degrade
 import facts
 import health
 import persona
@@ -312,6 +313,15 @@ async def _async_tail(
     append the just-completed assistant turn before passing to the rollup so
     it sees the full conversation when computing turn ranges.
     """
+    # V2.3 Theme 2: under disk pressure, stop GROWING memory but keep
+    # serving. The chat response already went out; this tail is pure
+    # persistence, so skipping it entirely is the correct degraded
+    # behavior. Explicit user writes (/remember, admin) are gated
+    # separately and still allowed.
+    if not degrade.guard("async memory tail"):
+        logger.info(f"conv={conv_id}: skipped memory tail (disk pressure)")
+        return
+
     # --- 1. Episodic indexing (independent of facts) ---
     if assistant_text and last_user_text:
         try:
@@ -561,7 +571,11 @@ async def chat_completions(request: Request) -> Any:
         #      combined system block carries it.
         # The hash-match check in text_to_inject prevents double-injection.
         try:
-            persona.auto_capture_persona(conv_id, messages)
+            # Auto-capture writes a new persona file — gate it under disk
+            # pressure (it's automatic growth). Injection of an already-
+            # stored persona below is a read and always proceeds.
+            if degrade.guard("persona auto-capture"):
+                persona.auto_capture_persona(conv_id, messages)
             ptext = persona.text_to_inject(conv_id, messages)
             pblock = persona.format_persona_block(ptext)
             if pblock:
