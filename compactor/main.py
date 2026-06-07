@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -472,6 +473,49 @@ def _require_localhost(request: Request) -> None:
 
 
 # ---------------------------------------------------------------------------
+# V2.3 Theme 2 — vLLM-restart resilience
+# ---------------------------------------------------------------------------
+# When vLLM is down/restarting, a request to it raises httpx.RequestError
+# (connection refused, read error mid-restart, etc.). Without handling, that
+# surfaces as an opaque 500 / "Exception in ASGI application". Instead we
+# return a clean 503 with a friendly, retryable message so the client (and
+# the user watching OpenWebUI) sees "the model is starting" rather than a
+# crash.
+
+MODEL_RESTART_MESSAGE = (
+    "⏳ The model backend is starting up or restarting. Please retry in a "
+    "few moments."
+)
+
+
+def _vllm_unreachable_body(detail: str) -> dict:
+    """OpenAI-error-shaped body for a 503 when vLLM can't be reached."""
+    return {
+        "error": {
+            "message": MODEL_RESTART_MESSAGE,
+            "type": "service_unavailable",
+            "code": "model_unavailable",
+            "detail": detail,
+        }
+    }
+
+
+def _vllm_unreachable_stream_chunks(model: str) -> list[dict]:
+    """SSE chunks that show the friendly message as an assistant reply, so a
+    streaming client degrades visibly rather than getting a dead stream."""
+    cid = f"chatcmpl-unavail-{int(time.time() * 1000):x}"
+    created = int(time.time())
+    base = {"id": cid, "object": "chat.completion.chunk", "created": created,
+            "model": model or "compactor"}
+    return [
+        {**base, "choices": [{"index": 0,
+                              "delta": {"role": "assistant", "content": MODEL_RESTART_MESSAGE},
+                              "finish_reason": None}]},
+        {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Main request flow
 # ---------------------------------------------------------------------------
 
@@ -660,17 +704,33 @@ async def chat_completions(request: Request) -> Any:
         accumulator = SseAccumulator()
 
         async def event_stream():
+            vllm_failed = False
             try:
-                async with client.stream(
-                    "POST", f"{VLLM_URL}/v1/chat/completions", json=body
-                ) as r:
-                    async for chunk in r.aiter_raw():
-                        yield chunk
-                        accumulator.feed(chunk)
+                try:
+                    stream_cm = client.stream(
+                        "POST", f"{VLLM_URL}/v1/chat/completions", json=body
+                    )
+                    async with stream_cm as r:
+                        async for chunk in r.aiter_raw():
+                            yield chunk
+                            accumulator.feed(chunk)
+                except httpx.RequestError as e:
+                    # V2.3 Theme 2: vLLM unreachable mid-stream (down /
+                    # restarting). Degrade visibly — emit the friendly
+                    # message as an assistant reply rather than a dead stream.
+                    vllm_failed = True
+                    logger.warning(f"vLLM unreachable (stream): {type(e).__name__}: {e}")
+                    for chunk in _vllm_unreachable_stream_chunks(
+                        body.get("model") or MODEL_REPO or ""
+                    ):
+                        yield f"data: {json.dumps(chunk)}\n\n".encode()
+                    yield b"data: [DONE]\n\n"
             finally:
                 await client.aclose()
                 # Fire-and-forget post-response work once the stream is done.
-                if conv_id:
+                # Skip it when vLLM failed — there's no real assistant turn
+                # to extract/index from.
+                if conv_id and not vllm_failed:
                     _fire_and_forget(
                         _async_tail(
                             conv_id,
@@ -686,7 +746,16 @@ async def chat_completions(request: Request) -> Any:
 
     # Non-streaming path
     try:
-        r = await client.post(f"{VLLM_URL}/v1/chat/completions", json=body)
+        try:
+            r = await client.post(f"{VLLM_URL}/v1/chat/completions", json=body)
+        except httpx.RequestError as e:
+            # V2.3 Theme 2: vLLM unreachable (down / restarting). Clean 503,
+            # not an opaque 500. No async tail — there's no assistant turn.
+            logger.warning(f"vLLM unreachable (non-stream): {type(e).__name__}: {e}")
+            return JSONResponse(
+                content=_vllm_unreachable_body(f"{type(e).__name__}: {e}"),
+                status_code=503,
+            )
         response_json = r.json()
         # Extract assistant text for fact extraction
         assistant_text = ""
@@ -718,7 +787,15 @@ async def chat_completions(request: Request) -> Any:
 @app.get("/v1/models")
 async def models():
     async with httpx.AsyncClient() as client:
-        r = await client.get(f"{VLLM_URL}/v1/models", timeout=30.0)
+        try:
+            r = await client.get(f"{VLLM_URL}/v1/models", timeout=30.0)
+        except httpx.RequestError as e:
+            # V2.3 Theme 2: clean 503 when vLLM is down/restarting.
+            logger.warning(f"vLLM unreachable (/v1/models): {type(e).__name__}: {e}")
+            return JSONResponse(
+                content=_vllm_unreachable_body(f"{type(e).__name__}: {e}"),
+                status_code=503,
+            )
         return JSONResponse(content=r.json(), status_code=r.status_code)
 
 
