@@ -33,6 +33,7 @@ import dedup
 import degrade
 import facts
 import health
+import logsetup
 import persona
 import portability
 import retrieval
@@ -72,10 +73,7 @@ SUMMARY_MAX_TOKENS = _env_int("COMPACTOR_SUMMARY_MAX_TOKENS", 1024)
 # auth/firewall in front.
 ADMIN_BIND = os.environ.get("COMPACTOR_ADMIN_BIND", "127.0.0.1").strip()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-)
+logsetup.configure()  # V2.3 Theme 4: text (default) or JSON via COMPACTOR_LOG_FORMAT
 logger = logging.getLogger("compactor")
 
 _tokenizer = None

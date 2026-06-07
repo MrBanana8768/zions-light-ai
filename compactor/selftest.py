@@ -355,10 +355,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
+    import logsetup
+    logsetup.configure()  # honors COMPACTOR_LOG_FORMAT (text/json)
 
     label = "ON-BOOT" if args.on_boot else "ON-DEMAND"
     logger.info(f"selftest starting ({label})")

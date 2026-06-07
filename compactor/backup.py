@@ -457,7 +457,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help="Machine-readable output.")
     args = p.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    import logsetup
+    logsetup.configure()  # honors COMPACTOR_LOG_FORMAT (text/json)
 
     if args.list:
         archives = list_backups()
