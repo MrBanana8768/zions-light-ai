@@ -65,6 +65,27 @@ What the compactor lines mean:
 
 ## Failure mode → recovery
 
+### A service is FATAL (supervisord gave up restarting it)
+`supervisorctl status` shows each program's state. `RUNNING` is healthy;
+`FATAL` means it failed to start `startretries` times and supervisord
+**stopped trying** — by design, so a genuinely-broken service stays visible
+instead of fast-restart-looping and hiding the cause.
+
+```bash
+supervisorctl status
+# vllm    FATAL     Exited too quickly (process log may have details)
+```
+
+1. Read that service's log: `tail -100 /var/log/supervisor/<name>.log`.
+2. Fix the root cause (see below for vLLM).
+3. Clear FATAL and retry: `supervisorctl start <name>` (or
+   `supervisorctl restart <name>`).
+
+The background-work pool and disk-pressure state are visible in
+`/health/full` (`background_work`, `memory_writes`); a FATAL *vLLM* shows as
+`status: degraded` there, and a FATAL *compactor* makes `/health/full`
+itself unreachable (so "curl refused on :8080" == compactor down).
+
 ### vLLM won't start / keeps restarting
 1. `tail -100 /var/log/supervisor/vllm.log` — look for the real error.
 2. **CUDA OOM during startup** is the most common. Cause: model too big for
