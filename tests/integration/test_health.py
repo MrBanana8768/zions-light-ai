@@ -19,7 +19,7 @@ def test_health_full_returns_structured_report():
     # we just check the shape, then assert ok separately.
     assert status in (200, 503), f"unexpected HTTP {status}: {body!r}"
     assert isinstance(body, dict) and body, f"empty/non-dict body: {body!r}"
-    for top in ("status", "checks", "stats", "config"):
+    for top in ("status", "checks", "stats", "config", "memory_writes"):
         assert top in body, f"missing top-level key {top!r}: {body!r}"
     assert body["status"] in ("ok", "degraded", "down"), body["status"]
     for sub in ("vllm", "storage"):
@@ -27,6 +27,17 @@ def test_health_full_returns_structured_report():
         assert "ok" in body["checks"][sub], f"missing checks.{sub}.ok"
     for stat in ("conversations", "facts_total", "indexed_exchanges_total"):
         assert stat in body["stats"], f"missing stats.{stat}"
+    # V2.3 Theme 2: disk-pressure write state must be reported.
+    mw = body["memory_writes"]
+    assert mw.get("new_memory_writes") in ("allowed", "paused", "unknown"), mw
+
+
+def test_health_full_memory_writes_allowed_on_healthy_deploy():
+    """A healthy pod has ample disk → new-memory writes allowed."""
+    status, body = H.health_full()
+    assert body.get("memory_writes", {}).get("new_memory_writes") == "allowed", (
+        f"expected writes allowed on a healthy deploy: {body.get('memory_writes')!r}"
+    )
 
 
 def test_health_full_is_ok_on_healthy_deploy():
