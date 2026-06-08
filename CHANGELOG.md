@@ -9,6 +9,37 @@ on Docker Hub.
 
 ---
 
+## [3.1] — Vision (image understanding)
+
+**Goal:** make the assistant able to *see* — and make the compactor handle
+images correctly so a vision-language model is safe to run. Vision is an
+opt-in `MODEL_REPO` swap to a VLM, not the default (the best creative-writing
+and the best vision models are not the same model today).
+
+Image: folded into the current image line; enable by setting a VLM
+`MODEL_REPO` (presets in `.env.example`).
+
+### Added
+- **Image-aware token budgeting** — `count_tokens` adds a per-image estimate
+  (`COMPACTOR_IMAGE_TOKENS`, default 768) so VLM requests don't silently
+  overflow the real context window.
+- **Image-preserving compaction** — `compact_if_needed` keeps image-bearing
+  turns verbatim and summarizes only text-only older turns; collapsing an
+  image turn to text would destroy the image permanently. If every older
+  turn carries an image, compaction is skipped (logged) rather than dropping
+  them.
+- `_message_image_count` / `_message_has_image` helpers; `test_vision.py`
+  Tier-1 coverage.
+- Docs: VLM presets + GPU sizing (Qwen2-VL-7B, Pixtral-12B, Llama-3.2-Vision)
+  in `.env.example` / RUNPOD_DEPLOY.md; user-facing image note in USER_GUIDE.
+
+### Notes
+- Facts, RAG, injection, and streaming already degraded safely on multimodal
+  content; this release closes the two real gaps (budget under-count and
+  compaction discarding images).
+
+---
+
 ## [2.3] — Resilience & Stability
 
 **Goal:** survive failure gracefully and protect irreplaceable data, so the

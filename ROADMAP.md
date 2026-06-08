@@ -473,7 +473,16 @@ weeks of toolchain rework you didn't need to do yet.
 **Goal:** Move from "text-only chatbot" to "AI assistant that can see and
 hear." Three independent capabilities that can ship as separate sub-versions.
 
-### V3.1 — Vision (image understanding)
+### V3.1 — Vision (image understanding)  ✅ Compactor-ready
+
+**Status:** the compactor is vision-ready — `count_tokens` budgets for image
+tokens (`COMPACTOR_IMAGE_TOKENS`) and `compact_if_needed` preserves
+image-bearing turns verbatim instead of summarizing them away
+(`compactor/test_vision.py`). Enabling vision is now an **opt-in `MODEL_REPO`
+swap to a VLM** (presets + GPU sizing in `.env.example` / RUNPOD_DEPLOY.md);
+image upload via OpenWebUI works with no further changes. Actual VLM
+inference is the operator's on-pod validation gate.
+
 
 **What it adds:** User can upload images in chat; model sees them; can
 describe, OCR, answer questions about them, etc. ("What's in this photo?",

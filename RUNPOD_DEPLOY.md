@@ -138,6 +138,9 @@ runpod pod create \
 | anthracite-org/magnum-v4-22b | FP16 | ~44 GB | A100 (40/80 GB) |
 | Qwen2.5-32B-Instruct | FP16 | ~64 GB | A100 80GB |
 | Llama-3.3-70B-Instruct | FP16 | ~140 GB | 2× A100 80GB |
+| **Vision (V3.1) — Qwen2-VL-7B-Instruct** | FP16 | ~16 GB | A40 |
+| Vision — Pixtral-12B-2409 | FP16 | ~24 GB | A40 (tight) / A100 |
+| Vision — Llama-3.2-11B-Vision-Instruct *(gated)* | FP16 | ~24 GB | A40 (tight) / A100 |
 
 > **⚠️ Do not run 22B with `--quantization fp8` on an A40.** Runtime FP8
 > quantization needs the *full FP16 weights resident in VRAM first* to do
@@ -151,6 +154,24 @@ runpod pod create \
 The image's built-in `MODEL_REPO` default is the 22B for historical
 reasons; **override it to `anthracite-org/magnum-v4-12b` on A40-class
 hardware.**
+
+### Vision (V3.1) — enabling image understanding
+
+Set `MODEL_REPO` to a vision-language model (see presets in `.env.example`)
+and image upload in OpenWebUI works with no other changes — it sends images
+in OpenAI's standard multimodal format, vLLM serves them on the same API, and
+the compactor handles them correctly:
+
+- **Image turns survive compaction** — they're kept verbatim rather than
+  summarized to text (which would lose the image), so the model can still see
+  an image many turns later.
+- **Image tokens are budgeted** — `COMPACTOR_IMAGE_TOKENS` (default 768) is
+  added per image so long, image-heavy threads don't overflow the context
+  window. Raise it if the model errors on big image threads.
+
+Most VLMs want `--limit-mm-per-prompt image=N` in `VLLM_EXTRA_ARGS`; some
+(Pixtral) want `--tokenizer-mode mistral`. The creative-writing models and the
+best vision models are not the same model today, so this is an opt-in swap.
 
 ## Access Your Deployment
 
