@@ -116,6 +116,7 @@ See [CHANGELOG.md](CHANGELOG.md) for full version history.
 | [TESTING.md](TESTING.md) | Contributors | Three-tier testing standard + run commands |
 | [compactor/V2_PLAN.md](compactor/V2_PLAN.md) | Contributors | Memory architecture design spec |
 | [compactor/V4_PLAN.md](compactor/V4_PLAN.md) | Contributors | Agentic / tool-use design spec |
+| [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md) | Contributors | North star — the stateless→stateful arc, faculties, and the honesty/reverence principles |
 
 ## Project structure
 
