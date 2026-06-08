@@ -258,3 +258,13 @@ Yes. All memory lives on the Network Volume at
 **Is any of this sent to a third party?**
 No. Everything — inference, embeddings, memory — runs inside your own pod.
 Embeddings are computed locally with a prebaked ONNX model.
+
+**Can it see images? (V3.1)**
+Only if it's running a *vision* model. When the operator has set a
+vision-language model (see [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md#vision-v31--enabling-image-understanding)),
+you can upload an image in OpenWebUI and ask about it — "what's in this
+photo?", "read this receipt", "critique this mockup." The assistant also
+*remembers* images sensibly: an image you shared earlier is kept intact as
+the conversation grows (it isn't summarized away), so you can refer back to
+it many turns later. With a text-only model, image upload won't work —
+that's a deployment choice, not a bug.

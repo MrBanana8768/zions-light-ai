@@ -64,6 +64,13 @@ MAX_MODEL_LEN = _env_int("MAX_MODEL_LEN", 32768)
 TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(MAX_MODEL_LEN * 0.75))
 KEEP_RECENT_TURNS = _env_int("COMPACTOR_KEEP_RECENT_TURNS", 4)
 SUMMARY_MAX_TOKENS = _env_int("COMPACTOR_SUMMARY_MAX_TOKENS", 1024)
+# V3.1 (Vision): a single image in a VLM request costs far more than its
+# text — hundreds to a couple thousand tokens depending on resolution and
+# the model's vision encoder. The text-only token estimate misses this
+# entirely, so we add a flat per-image estimate to the budget. Conservative
+# default keeps us from overflowing the model's real context window; tune
+# per VLM if needed.
+IMAGE_TOKEN_ESTIMATE = _env_int("COMPACTOR_IMAGE_TOKENS", 768)
 
 # V2.0 Phase 1: admin endpoint binding. Default "127.0.0.1" rejects any
 # non-localhost client at the dependency layer (we still bind the FastAPI
@@ -98,24 +105,50 @@ def get_tokenizer():
 
 
 def _message_text(m: dict) -> str:
+    """Plain-text view of a message. OpenAI multimodal content is a list of
+    parts; only text parts contribute (image parts have no 'text'), so this
+    safely ignores images for budgeting/summarization/fact-extraction."""
     content = m.get("content") or ""
     if isinstance(content, list):
         return " ".join(c.get("text", "") for c in content if isinstance(c, dict))
     return str(content)
 
 
+def _message_image_count(m: dict) -> int:
+    """How many image (non-text) parts a message carries. V3.1: OpenAI
+    multimodal content arrays use parts like {"type": "image_url", ...}."""
+    content = m.get("content")
+    if not isinstance(content, list):
+        return 0
+    n = 0
+    for c in content:
+        if not isinstance(c, dict):
+            continue
+        t = c.get("type")
+        if t in ("image_url", "image", "input_image") or "image_url" in c:
+            n += 1
+    return n
+
+
+def _message_has_image(m: dict) -> bool:
+    return _message_image_count(m) > 0
+
+
 def count_tokens(messages: list[dict]) -> int:
+    # V3.1: images cost tokens the text estimate can't see — add a flat
+    # per-image estimate so VLM requests don't quietly overflow the budget.
+    image_tokens = sum(_message_image_count(m) for m in messages) * IMAGE_TOKEN_ESTIMATE
     tok = get_tokenizer()
     if tok is not None:
         try:
             text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            return len(tok.encode(text))
+            return len(tok.encode(text)) + image_tokens
         except Exception:
             total = 0
             for m in messages:
                 total += len(tok.encode(_message_text(m))) + 4
-            return total
-    return sum(len(_message_text(m)) // 4 + 4 for m in messages)
+            return total + image_tokens
+    return sum(len(_message_text(m)) // 4 + 4 for m in messages) + image_tokens
 
 
 SUMMARY_PROMPT = """You are summarizing an earlier portion of a conversation so it can be compressed into context.
@@ -166,16 +199,31 @@ async def compact_if_needed(messages: list[dict]) -> list[dict]:
             f"over budget ({current}>{TARGET_TOKENS}) but no older turns to summarize"
         )
         return messages
+    # V3.1 (Vision): never summarize an image-bearing turn — collapsing it to
+    # text destroys the image permanently, and the model could never see it
+    # again. Keep image turns verbatim (in chronological order); summarize
+    # only the text-only older turns.
+    preserved_images = [m for m in to_summarize if _message_has_image(m)]
+    text_only = [m for m in to_summarize if not _message_has_image(m)]
+    if not text_only:
+        logger.info(
+            f"compaction skipped: all {len(to_summarize)} older turn(s) carry "
+            f"images — kept verbatim (still over budget: {current}>{TARGET_TOKENS})"
+        )
+        return messages
     async with httpx.AsyncClient() as client:
-        summary = await summarize(client, to_summarize)
+        summary = await summarize(client, text_only)
     summary_msg = {
         "role": "system",
         "content": f"[Summary of earlier conversation]\n{summary}",
     }
-    new_messages = system_msgs + [summary_msg] + keep_recent
+    # Order: system → summary-of-old-text → preserved image turns → recent.
+    new_messages = system_msgs + [summary_msg] + preserved_images + keep_recent
     new_count = count_tokens(new_messages)
     logger.info(
-        f"compacted: summarized {len(to_summarize)} messages, {current} -> {new_count} tokens"
+        f"compacted: summarized {len(text_only)} text turn(s), "
+        f"preserved {len(preserved_images)} image turn(s), "
+        f"{current} -> {new_count} tokens"
     )
     return new_messages
 
