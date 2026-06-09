@@ -106,6 +106,32 @@ RUN /opt/compactor-venv/bin/python -c \
     rm -rf /root/.cache /tmp/* /var/tmp/*
 
 # =============================================================================
+# Whisper (STT) venv — V3.2. Fully decoupled from vLLM AND the compactor:
+# faster-whisper pulls ctranslate2 + av + onnxruntime into its OWN venv, so its
+# deps can never disturb vLLM's torch pins or the compactor's. av ships ffmpeg
+# in its wheel, so no apt ffmpeg is needed. Same install+strip+clean atomic
+# pattern as the other venvs.
+# =============================================================================
+COPY stt/requirements.txt /opt/stt/requirements.txt
+RUN python3 -m venv /opt/whisper-venv && \
+    /opt/whisper-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    /opt/whisper-venv/bin/pip install --no-cache-dir -r /opt/stt/requirements.txt && \
+    find /opt/whisper-venv -type f \( -name "*.so" -o -name "*.so.*" \) \
+        -exec strip --strip-unneeded {} + 2>/dev/null || true && \
+    find /opt/whisper-venv -name "*.pyc" -delete && \
+    find /opt/whisper-venv -name "__pycache__" -type d -exec rm -rf {} + && \
+    rm -rf /root/.cache /tmp/* /var/tmp/*
+
+# Pre-download the default Whisper model ("base") into the image so the first
+# transcription pays no download — static small models belong in the image, not
+# on /data (same principle as the bge embeddings). Bigger models (small/medium/
+# large-v3) and a persistent /data root are configurable via WHISPER_MODEL /
+# WHISPER_DOWNLOAD_ROOT. Built on CPU (no GPU at build time), int8 weights.
+RUN /opt/whisper-venv/bin/python -c \
+    "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8', download_root='/opt/whisper-models')" && \
+    rm -rf /root/.cache /tmp/* /var/tmp/*
+
+# =============================================================================
 # OpenWebUI venv — kept isolated from vLLM's pytorch pin. Same install+strip
 # atomic pattern. Also bumps pip/setuptools/wheel here (Scout-flagged Highs
 # live in both venvs since each has its own copy).
@@ -144,6 +170,9 @@ COPY compactor/degrade.py /opt/compactor/degrade.py
 COPY compactor/bgwork.py /opt/compactor/bgwork.py
 COPY compactor/logsetup.py /opt/compactor/logsetup.py
 COPY compactor/alert.py /opt/compactor/alert.py
+
+# V3.2 — STT service source (copied late, after its venv, for cache efficiency).
+COPY stt/server.py /opt/stt/server.py
 
 # =============================================================================
 # Supervisor
@@ -200,6 +229,19 @@ ENV COMPACTOR_RAG_TOP_K="5"
 ENV COMPACTOR_EMBEDDING_MODEL="BAAI/bge-small-en-v1.5"
 ENV FASTEMBED_CACHE_PATH="/opt/embeddings"
 
+# V3.2 — Speech-to-text (Whisper) service. Runs in its own venv on STT_PORT.
+# CPU by default so it never competes with vLLM for VRAM. Default model "base"
+# is prebaked at /opt/whisper-models; swap via WHISPER_MODEL (+ WHISPER_DEVICE=
+# cuda and/or a /data WHISPER_DOWNLOAD_ROOT for larger persistent models).
+# Disable the whole service per-pod with STT_ENABLED=false.
+ENV STT_ENABLED="true"
+ENV WHISPER_MODEL="base"
+ENV WHISPER_DEVICE="cpu"
+ENV WHISPER_DOWNLOAD_ROOT="/opt/whisper-models"
+ENV WHISPER_MODEL_ID="whisper-1"
+ENV STT_HOST="0.0.0.0"
+ENV STT_PORT="9000"
+
 # OpenWebUI settings — points at the compactor, not vLLM directly
 ENV OPENWEBUI_PORT="3000"
 ENV WEBUI_SECRET_KEY=""
@@ -211,10 +253,18 @@ ENV ENABLE_OPENAI_API="true"
 ENV DATA_DIR="/data/openwebui"
 ENV WEBUI_AUTH="true"
 
+# V3.2 — wire OpenWebUI's STT to the local Whisper service (OpenAI engine).
+# Disable voice input per-pod by setting AUDIO_STT_ENGINE="" (empty).
+ENV AUDIO_STT_ENGINE="openai"
+ENV AUDIO_STT_OPENAI_API_BASE_URL="http://localhost:9000/v1"
+ENV AUDIO_STT_OPENAI_API_KEY="not-needed"
+ENV AUDIO_STT_MODEL="whisper-1"
+
 # 3000 — OpenWebUI (user-facing)
 # 8080 — context-compactor (OpenAI-compatible, what OpenWebUI talks to)
 # 8000 — vLLM (internal; can also be exposed for direct API access)
-EXPOSE 8000 8080 3000
+# 9000 — STT / Whisper (OpenAI audio API; OpenWebUI talks here for voice input)
+EXPOSE 8000 8080 3000 9000
 
 # V2.1 Phase 6: switch from `curl :3000` (OpenWebUI login page) to the
 # compactor's /health/full deep probe. The old check stayed "healthy"

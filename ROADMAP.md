@@ -450,7 +450,7 @@ in-place:
 zions-light-ai/
 ├── compactor/                  (will become its own service eventually)
 ├── pipelines/                  (OpenWebUI Functions)
-├── whisper/                    (V3.2 — new service directory)
+├── stt/                        (V3.2 — speech-to-text service, faster-whisper)
 ├── tts/                        (V3.3 — new service directory)
 └── deploy/
     ├── docker-compose.yml          (local dev — current single-container)
@@ -513,35 +513,49 @@ describe, OCR, answer questions about them, etc. ("What's in this photo?",
   in VLM form; this is a Pareto trade-off between writing quality and
   vision capability
 
-### V3.2 — Speech-to-text (voice input)
+### V3.2 — Speech-to-text (voice input)  🔨 In progress
+
+**Status:** the STT service is **built and Tier-1-tested**; wiring +
+on-pod validation in progress on branch `v3.2-stt`.
 
 **What it adds:** User talks into their microphone; OpenWebUI sends audio
-to a `/v1/audio/transcriptions` endpoint (OpenAI-compatible); transcribed
-text becomes the prompt.
+to an OpenAI-compatible `/v1/audio/transcriptions` endpoint; the transcribed
+text becomes an ordinary prompt that flows through the compactor like any
+typed message.
 
-**How it works:**
-- New service: Whisper or distil-whisper running as a small Python server
-  exposing OpenAI's audio API contract
-- Add a `[program:whisper]` block in supervisord, running on its own port
-- Compactor doesn't need changes (it never sees audio — only the transcribed text)
-- OpenWebUI config: point its STT URL at the local whisper service
+**How it works (as built):**
+- New service `stt/server.py` — a thin FastAPI wrapper around **faster-whisper**
+  (CTranslate2) exposing `/v1/audio/transcriptions` + `/v1/audio/translations`
+  + `/health` + `/v1/models`. Renders every OpenAI response format
+  (json / text / verbose_json / srt / vtt).
+- Runs in its **own venv** (`/opt/whisper-venv`) as its own supervisord program
+  (`[program:stt]`, port 9000, toggle `STT_ENABLED`) — faster-whisper's deps
+  (ctranslate2 / av / onnxruntime) can never touch the vLLM or compactor venvs.
+- **CPU by default** (`WHISPER_DEVICE=cpu`, int8) so it never competes with
+  vLLM for VRAM (the A40 has ~no headroom at `GPU_MEMORY_UTILIZATION=0.90`).
+  Flip to `cuda` only with real headroom.
+- Default model **`base`** is prebaked into the image; swap via `WHISPER_MODEL`
+  (+ a `/data` `WHISPER_DOWNLOAD_ROOT` for larger models that should persist).
+- OpenWebUI's STT engine is pre-wired to the local service via `AUDIO_STT_*`
+  env; the compactor is untouched (it never sees audio).
+
+**Testing (beyond "it turns on"):**
+- ✅ Tier-1 `stt/test_stt.py` — response-format rendering, subtitle/timestamp
+  formatting, param pass-through, and the 400 / 503 / 500 error paths, all with
+  a fake model (no GPU, no faster-whisper).
+- ⏳ Boot self-test gains a **functional** audio assertion (transcribe a tiny
+  bundled clip, assert a well-formed result) — proves the service decodes audio
+  and runs, not just that the port is open.
+- ⏳ A small **quality eval** set (`tests/eval/`) — real speech clips with known
+  transcripts scored by word-error-rate — the layer the three existing tiers
+  lack.
 
 **Model choices:**
-- `distil-whisper/distil-large-v3` — ~1.5 GB, CPU-friendly, 6x faster than full Whisper
-- `openai/whisper-large-v3-turbo` — best accuracy, needs ~3 GB GPU
-- `Systran/faster-whisper-large-v3` — optimized C++ inference, smallest VRAM footprint
+- `base` (default, prebaked) — fast on CPU, good for clear speech
+- `small` / `medium` — better accuracy, still CPU-viable
+- `large-v3` — best accuracy; pair with `WHISPER_DEVICE=cuda` + VRAM headroom
 
-**Effort: ~4-5 days**
-- New compactor-style wrapper around faster-whisper (~150 lines Python)
-- Dockerfile: add whisper venv (~2 GB additional)
-- supervisord: new service block
-- OpenWebUI config: enable STT, point at local URL
-- Test recording → transcription → chat flow end-to-end
-
-**Resource considerations:**
-- Whisper-distil runs fine on CPU (slower, ~1x realtime)
-- Whisper-large on GPU shares VRAM with the LLM (modest 3 GB extra)
-- For an A40 with Magnum 22B FP8: ~6 GB headroom after LLM, fits Whisper-large easily
+**Effort: ~4-5 days.**
 
 ### V3.3 — Text-to-speech (voice output)
 

@@ -1,0 +1,17 @@
+# STT venv requirements (V3.2 — Speech-to-Text / Whisper).
+#
+# Installed into its OWN venv (/opt/whisper-venv), fully separate from the
+# vLLM and compactor venvs. faster-whisper pulls ctranslate2 + av + onnxruntime
+# + tokenizers + huggingface-hub — none of which can touch vLLM's torch pins
+# because they live in a different interpreter. Deliberately torch-free:
+# CTranslate2 is its own inference engine.
+#
+# CPU is the default device (see server.py) so this never fights vLLM for VRAM.
+
+# --- API surface ---
+fastapi
+uvicorn[standard]
+python-multipart            # required by FastAPI to parse multipart file uploads
+
+# --- inference engine ---
+faster-whisper>=1.1.0       # CTranslate2-backed Whisper; bundles the VAD model
