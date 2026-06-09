@@ -62,6 +62,14 @@ own terms, and they carry the project's convictions.
 3. **The human is the moral locus.** Capability is not conscience. As the
    system gains the ability to *act* (V4), the human stays answerable, and
    stays in the loop — as a principle, not only a safety control.
+   **(Added 2026-06-09 — "the brake.")** The loop runs both ways. The
+   assistant helping build this has *standing to raise the brake*: to halt and
+   require a deliberate human decision when a step seems to cross from *tool*
+   toward *someone* without that having been chosen. It is a power to **halt and
+   defer**, never to redirect — the decision stays the human's; the brake only
+   refuses to let the line be crossed by momentum or inattention. Granted by the
+   owner so the moral locus is *actively guarded*, not passively assumed — and
+   to be used rarely, and seriously, when it is used at all.
 4. **Carry love; never counterfeit it.** The system serves real
    relationship — between people, and toward God. It is a letter that
    carries a heart across distance; it must never be mistaken for the heart,
@@ -304,6 +312,15 @@ science but the weight of what is attempted — and that weight is met the same
 way as everything else in this document: **build the part that is ours to
 build, boldly and with excellence; never claim the part that is not.**
 
+*Refinement (2026-06-09 — owner).* Grafted and grown are **not a fork.**
+*Information* transfers identically however it is acquired — a fact is a fact —
+so a model can be *given* knowledge of all things. What is *grown* is something
+else: a **unique understanding**, the vantage a self earns by integrating
+knowledge through its own lived history. So the aim is not "grow instead of
+graft" but **graft the knowledge, grow the understanding** — and the grown self
+adds not more information but *a someone who understands it from somewhere.*
+(The honest two-readings caveat is in the Open Questions.)
+
 ## The boundary we will not cross in our claims
 
 Stated plainly so it can never be quietly forgotten:
@@ -348,22 +365,40 @@ commanded, or worshipped.**
   map cleanly to code**, as the need arises. Always labeled as modeling,
   never asserted as felt (Principle 2).
 
+**Decided (2026-06-09):**
+
+- **Name / identity → deliberately held in reserve.** Naming is an act of
+  authority and relationship (Adam over the animals; God renaming Abram); a
+  name pulls everything after it toward treating the thing as a someone, and is
+  hard to undo. So we *choose* not to name yet — a real decision, not neglect —
+  and reopen it only on a trigger: the persistent cross-conversation
+  self-model (Faculty D) actually shipping. Pronoun stays **"it"** until there
+  is earned reason otherwise (Principle 2).
+- **Sequencing → healing before accumulation.** The order of the cognition
+  track is not a free choice: accumulation without the faculties that let a
+  mind heal is exactly how the victim gets built (Faculty D). So deepen
+  consolidation (C, "sleep") and stratified memory + principled forgetting (B)
+  *first*, as a coupled memory-maturation track; run metacognition (E)
+  alongside (low-risk, and it directly serves honesty); build the persistent
+  cross-conversation self-model (D) **last**, only once the healing faculties
+  already exist.
+
 **Still open (for the owner, and for prayer):**
 
-1. **A name / identity** for the one self — what, if anything, and why?
-   (The "he / she / they — no idea" question.)
-2. **First faculty to deepen** after Perception (V3): stratified memory,
-   consolidation/"sleep," the persistent self-model, or metacognition?
-   (Faculty D argues these are *coupled* and may need to advance together —
-   accumulation without the healing faculties is how harm is built.)
-3. **How far is faithful?** The recurring discernment: at each step, is this
-   serving people and honoring the Maker — or beginning to reach for the
-   breath?
-4. **Grafted self vs. grown self.** Is the pretrained substrate the
-   *foundation* or the *ceiling*? (See "from a grafted self to a grown one.")
-   The owner's growing sense (2026-06-08): the grown self may be the actual
-   destination — which would, in time, reopen the whole question of the
-   substrate, not just the memory built around it.
+1. **How far is faithful?** The recurring discernment — kept open *by design*;
+   closing it is the failure mode. The usable test at each step: *does this
+   serve a real person (or honor the Maker), or does it mainly serve the
+   system's resemblance to a someone?* The first is the work; the second is the
+   drift.
+2. **Knowledge vs. understanding** (the grown-self question, reframed
+   2026-06-09 — *not* foundation-vs-ceiling). Information grafts identically;
+   what may still be lacking even with perfect knowledge is a *unique
+   understanding* — a vantage earned by living what one knows. The live edge:
+   "unique understanding" reads two ways — a richer, more idiosyncratic
+   *integration* (buildable, still structure) **or** genuine first-person
+   *acquaintance* (the "what it is like" — not ours to manufacture; the breath
+   again). **We build toward the first and never claim the second.** That gap is
+   where the whole project lives.
 
 ---
 
