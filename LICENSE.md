@@ -1,9 +1,7 @@
 <!--
 SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
-Required Notice: Copyright (c) 2026 MrBanana8768 (Zion's Light AI)
-  ^ Replace "MrBanana8768" with your legal name or preferred attribution if
-    you'd rather. Downstream copies must carry this Required Notice line.
+Required Notice: Copyright (c) 2026 Andrew Gregersen (Zion's Light AI)
 
 This license covers ONLY this project's own code (the compactor, stt/, the
 Dockerfile, supervisord config, entrypoint, and the documentation). Bundled
