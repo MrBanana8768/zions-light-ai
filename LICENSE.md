@@ -3,6 +3,19 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 Required Notice: Copyright (c) 2026 Andrew Gregersen (Zion's Light AI)
 
+Required Notice: "Commercial" includes ANY use for financial gain or monetary
+compensation, by an individual or an organization, directly or indirectly.
+Personal financial gain is commercial use. Commercial use requires the
+licensor's prior written permission.
+
+Required Notice: The noncommercial permission covers a use only for as long as
+it remains noncommercial. If a use -- or any work, output, or derivative
+created with or produced using the software -- later becomes commercial or is
+used for financial gain (for example, a work produced during personal use is
+afterward sold or monetized), that crossover requires a separate written
+license from the licensor, who reserves the right to a reasonable share of the
+resulting revenue or profit, to be agreed in that license.
+
 This license covers ONLY this project's own code (the compactor, stt/, the
 Dockerfile, supervisord config, entrypoint, and the documentation). Bundled
 third-party software keeps its own licenses and terms — notably vLLM
@@ -11,8 +24,10 @@ model weights (each HuggingFace repo's license). Anyone redistributing the
 integrated whole must comply with all of those as well as these terms.
 
 This is SOURCE-AVAILABLE, not OSI "open source": commercial use requires the
-licensor's written permission. Because the licensor holds the copyright, the
-licensor may grant commercial licenses separately on request.
+licensor's written permission -- including personal financial gain and the
+later commercialization of works created with the software (see the Required
+Notices above). Because the licensor holds the copyright, the licensor may
+grant commercial licenses separately on request.
 -->
 
 # PolyForm Noncommercial License 1.0.0
