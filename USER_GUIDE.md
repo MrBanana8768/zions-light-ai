@@ -268,3 +268,14 @@ photo?", "read this receipt", "critique this mockup." The assistant also
 the conversation grows (it isn't summarized away), so you can refer back to
 it many turns later. With a text-only model, image upload won't work —
 that's a deployment choice, not a bug.
+
+**Can it hear me? (V3.2)**
+Yes — if the deployment includes the speech service (it's on by default). Click
+the microphone in OpenWebUI, speak, and your words are transcribed and sent as
+your message — handy for long dictation or hands-free use. Transcription runs
+locally on a bundled Whisper model (nothing leaves your pod); the text then
+flows through memory exactly like anything you type. Accuracy depends on the
+Whisper model the operator chose — the default is fast and good for clear
+speech, and larger models are more accurate (see
+[RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md#speech-to-text-v32--voice-input)). Voice can
+be turned off per-deployment.

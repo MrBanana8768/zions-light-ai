@@ -173,6 +173,34 @@ Most VLMs want `--limit-mm-per-prompt image=N` in `VLLM_EXTRA_ARGS`; some
 (Pixtral) want `--tokenizer-mode mistral`. The creative-writing models and the
 best vision models are not the same model today, so this is an opt-in swap.
 
+### Speech-to-text (V3.2) — voice input
+
+A bundled **Whisper** service (faster-whisper) exposes the OpenAI audio API on
+port `9000`, and OpenWebUI's STT engine is pre-wired to it — so the microphone
+button in the UI works out of the box, with nothing leaving the pod. The
+compactor isn't involved (audio → text only; the transcript then flows through
+memory like any typed message).
+
+- **Runs on CPU by default** (`WHISPER_DEVICE=cpu`, int8) so it never competes
+  with vLLM for VRAM — the A40 has almost none to spare at
+  `GPU_MEMORY_UTILIZATION=0.90`. The default `base` model is prebaked into the
+  image.
+- **Swap the model** with `WHISPER_MODEL` (`base` → `small` / `medium` /
+  `large-v3`): bigger = more accurate + slower. For `large-v3` you'll usually
+  want `WHISPER_DEVICE=cuda` **and** real VRAM headroom (a bigger card, or a
+  lowered `GPU_MEMORY_UTILIZATION`), plus
+  `WHISPER_DOWNLOAD_ROOT=/data/whisper-models` so a non-default model persists
+  across pod recreation instead of re-downloading on each cold start.
+- **Turn it off** per-pod with `STT_ENABLED=false` (and/or `AUDIO_STT_ENGINE=""`
+  to hide voice in the UI while leaving the service running).
+- Port `9000` does **not** need external exposure for the UI mic to work
+  (OpenWebUI reaches it over localhost). Expose it only to hit the audio API
+  directly — e.g. to run the `tests/eval/` WER quality eval against the pod.
+
+The boot self-test confirms the service actually transcribes (not just that the
+port is open); transcription *accuracy* is measured by the `tests/eval/` WER
+harness with your own audio clips.
+
 ## Access Your Deployment
 
 Once deployed, access via Runpod's proxy URLs:

@@ -9,6 +9,44 @@ on Docker Hub.
 
 ---
 
+## [3.2] — Speech-to-text (voice input)
+
+**Goal:** let the assistant *hear* — bundle a local speech-to-text service so
+microphone input in OpenWebUI "just works," with nothing leaving the pod. STT is
+independent of the memory pipeline (audio → text; the transcript then flows
+through the compactor like any typed message).
+
+Image: folded into the current image line; the Whisper service is on by default
+(`STT_ENABLED=true`), and runs on CPU by default so it never competes with vLLM
+for VRAM.
+
+### Added
+- **STT service** (`stt/server.py`) — a thin FastAPI wrapper around
+  **faster-whisper** (CTranslate2) exposing the OpenAI audio API:
+  `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `GET /health`,
+  `GET /v1/models`. Renders every OpenAI response format (json / text /
+  verbose_json / srt / vtt). Own venv (`/opt/whisper-venv`), own supervisord
+  program (`[program:stt]`, port 9000), default `base` model prebaked at
+  `/opt/whisper-models`.
+- **OpenWebUI wiring** — the STT engine is pre-pointed at the local service
+  (`AUDIO_STT_*`); the microphone button works with no further setup.
+- **Boot self-test STT probe** (`selftest.py` `_check_stt`) — transcribes a tiny
+  generated WAV on boot and asserts a well-formed response, catching the
+  "service up but broken" failure a port check misses. Gated on `STT_ENABLED`.
+- **Quality eval** (`tests/eval/`, excluded from the image) — a word-error-rate
+  metric (`wer.py`, Tier-1-tested) + `stt_eval.py`, which scores transcription
+  accuracy against operator-supplied speech clips through the live service.
+- Config (`.env.example`) + docs (RUNPOD_DEPLOY / USER_GUIDE / ROADMAP):
+  `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_DOWNLOAD_ROOT`, `STT_ENABLED`,
+  CPU-vs-GPU guidance.
+
+### Notes
+- CPU-by-default is deliberate: vLLM reserves ~90% of the GPU, so transcribing
+  on-GPU would fight it for VRAM (the A40 OOM lesson). faster-whisper is fast
+  enough on CPU for the small/base models.
+
+---
+
 ## [3.1] — Vision (image understanding)
 
 **Goal:** make the assistant able to *see* — and make the compactor handle
