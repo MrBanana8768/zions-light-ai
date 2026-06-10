@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import logging
 import os
@@ -77,6 +78,18 @@ WAIT_FOR_READY_POLL_INTERVAL_S = 5.0
 ROUND_TRIP_TIMEOUT_S = float(
     os.environ.get("COMPACTOR_SELFTEST_ROUND_TRIP_TIMEOUT_S", "180.0")
 )
+
+# V3.2 — STT (Whisper) service probe. Gated on STT_ENABLED so the check is only
+# added when the speech service is actually part of the deployment: the image
+# sets STT_ENABLED=true, while unit tests and STT-disabled pods leave it
+# unset/false, so run_selftest keeps its original check count. STT_URL/STT_PORT
+# are inherited from the container env.
+STT_URL = (
+    os.environ.get("STT_URL")
+    or f"http://127.0.0.1:{os.environ.get('STT_PORT', '9000')}"
+).rstrip("/")
+STT_ENABLED = os.environ.get("STT_ENABLED", "false").strip().lower() == "true"
+STT_TIMEOUT_S = float(os.environ.get("COMPACTOR_SELFTEST_STT_TIMEOUT_S", "30.0"))
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +226,50 @@ async def _check_admin_localhost(client: httpx.AsyncClient) -> tuple[bool, str]:
     return False, f"HTTP {r.status_code}: {r.text[:120]}"
 
 
+def _tiny_wav_bytes(seconds: float = 0.3, rate: int = 16000) -> bytes:
+    """A short silent mono 16-bit PCM WAV — valid for ffmpeg/Whisper to decode.
+    Silence transcribes to empty text; the STT check asserts the response is
+    *well-formed* (HTTP 200 + a string `text` field), which proves the service
+    decodes audio and runs the model end-to-end — not just that the port is
+    open. (Quality, as opposed to liveness, is measured by the tests/eval set.)
+    """
+    buf = io.BytesIO()
+    import wave  # stdlib, only needed here
+    w = wave.open(buf, "wb")
+    w.setnchannels(1)
+    w.setsampwidth(2)
+    w.setframerate(rate)
+    w.writeframes(b"\x00\x00" * int(seconds * rate))
+    w.close()
+    return buf.getvalue()
+
+
+async def _check_stt(client: httpx.AsyncClient) -> tuple[bool, str]:
+    """Functional STT probe: POST a tiny WAV to the Whisper service and assert a
+    well-formed OpenAI transcription response. Catches the 'service running but
+    broken' failure mode that a port/health check alone would miss. (STT loads a
+    small model in seconds; vLLM readiness — which gates the boot self-test —
+    takes far longer, so STT is reliably up by the time this runs.)
+    """
+    files = {"file": ("probe.wav", _tiny_wav_bytes(), "audio/wav")}
+    form = {"model": "whisper-1", "response_format": "json"}
+    r = await client.post(
+        f"{STT_URL}/v1/audio/transcriptions",
+        files=files,
+        data=form,
+        timeout=STT_TIMEOUT_S,
+    )
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code}: {r.text[:160]}"
+    try:
+        body = r.json()
+    except Exception as e:
+        return False, f"malformed response: {e}"
+    if not isinstance(body, dict) or not isinstance(body.get("text"), str):
+        return False, f"missing 'text' field: {str(body)[:120]}"
+    return True, f"transcribed probe ok (text_len={len(body['text'])})"
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -294,6 +351,10 @@ async def run_selftest(*, do_round_trip: bool = True) -> dict:
         checks.append(await _timed_async(
             "admin_localhost", lambda: _check_admin_localhost(client)
         ))
+        if STT_ENABLED:
+            checks.append(await _timed_async(
+                "stt", lambda: _check_stt(client)
+            ))
         if do_round_trip:
             checks.append(await _timed_async(
                 "chat_round_trip", lambda: _check_chat_round_trip(client)

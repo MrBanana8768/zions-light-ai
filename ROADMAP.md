@@ -543,12 +543,17 @@ typed message.
 - ✅ Tier-1 `stt/test_stt.py` — response-format rendering, subtitle/timestamp
   formatting, param pass-through, and the 400 / 503 / 500 error paths, all with
   a fake model (no GPU, no faster-whisper).
-- ⏳ Boot self-test gains a **functional** audio assertion (transcribe a tiny
-  bundled clip, assert a well-formed result) — proves the service decodes audio
-  and runs, not just that the port is open.
-- ⏳ A small **quality eval** set (`tests/eval/`) — real speech clips with known
-  transcripts scored by word-error-rate — the layer the three existing tiers
-  lack.
+- ✅ Boot self-test gained a **functional** audio assertion (`selftest.py`
+  `_check_stt`): on boot it POSTs a tiny generated WAV to the STT service and
+  asserts a well-formed OpenAI response — proving the service decodes audio and
+  runs, not just that the port is open. Gated on `STT_ENABLED` so it's only run
+  where STT is deployed.
+- ✅ A **quality eval** harness (`tests/eval/`): `wer.py` (word-error-rate
+  metric, Tier-1-tested in `test_wer.py`) + `stt_eval.py`, which transcribes
+  operator-supplied speech clips through the live service and scores WER against
+  known transcripts — the "is it actually accurate?" layer the three standard
+  tiers don't cover. Real clips are operator-supplied (synthetic silence can't
+  measure accuracy).
 
 **Model choices:**
 - `base` (default, prebaked) — fast on CPU, good for clear speech
