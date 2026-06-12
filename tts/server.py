@@ -164,17 +164,24 @@ def _encode(wav_bytes: bytes, response_format: str):
 
 def _synthesize_wav(text: str, *, speed: float = 1.0) -> bytes:
     """Render `text` to 16-bit PCM WAV bytes via Piper. Engine call isolated
-    here so Tier-1 can mock it without Piper installed. `speed` maps to Piper's
-    length_scale (higher length_scale = slower), so length_scale = 1/speed."""
+    here so Tier-1 can mock it without Piper installed.
+
+    Piper's `synthesize_wav(text, wav_file, syn_config=...)` writes a complete
+    WAV to an open `wave.Wave_write`. `speed` maps to `SynthesisConfig.length_scale`
+    (higher = slower), so length_scale = 1/speed. (Verified against piper-tts
+    1.4.2 in the built image.)
+    """
     voice = get_engine()
-    length_scale = (1.0 / speed) if speed and speed > 0 else 1.0
+    syn_config = None
+    if speed and speed > 0 and speed != 1.0:
+        try:
+            from piper import SynthesisConfig
+            syn_config = SynthesisConfig(length_scale=1.0 / speed)
+        except Exception:
+            syn_config = None  # speed is best-effort; never break synthesis over it
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wav_file:
-        try:
-            voice.synthesize(text, wav_file, length_scale=length_scale)
-        except TypeError:
-            # Older/newer Piper signatures that don't accept length_scale here.
-            voice.synthesize(text, wav_file)
+        voice.synthesize_wav(text, wav_file, syn_config=syn_config)
     return buf.getvalue()
 
 
