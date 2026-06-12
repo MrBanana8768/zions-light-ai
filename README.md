@@ -179,9 +179,33 @@ See [ROADMAP.md](ROADMAP.md). High-level:
 
 ## License
 
-See LICENSE file (if present). Bundled software keeps its own licenses:
-vLLM (Apache 2.0), OpenWebUI (MIT), Magnum v4 and base models (each repo's
-HF license).
+This project's **own code** (the compactor, `stt/`, Dockerfile, supervisord
+config, entrypoint, and docs) is licensed under the **PolyForm Noncommercial
+License 1.0.0** — see [LICENSE.md](LICENSE.md) (SPDX:
+`PolyForm-Noncommercial-1.0.0`).
+
+- ✅ **Free for any noncommercial use** — personal, research, nonprofit,
+  educational, hobby, religious.
+- 💼 **Commercial use requires the author's written permission.** The author
+  holds the copyright and can grant commercial licenses on request — just ask.
+- 💵 **Personal financial gain counts as commercial.** Using this to make
+  money — a paid service, business/freelance/consulting work, or any
+  revenue-generating activity, individual *or* company — requires a commercial
+  license.
+- 🔄 **Commercialized outputs cross the line too.** If a work made during
+  personal use is *later* sold or monetized (e.g. a story written with the app
+  and then sold), that use becomes commercial and requires a license; the
+  author reserves the right to a reasonable share of the proceeds, agreed in
+  that license.
+
+This is **source-available**, not OSI "open source" (open-source licenses
+can't restrict commercial use). That's deliberate.
+
+Bundled third-party software keeps its own licenses and terms — notably
+**vLLM** (Apache-2.0), **OpenWebUI** (its own license, including branding
+terms), and the **model weights** (each HuggingFace repo's license). Those are
+unaffected by this project's license; anyone redistributing the integrated
+whole must comply with all of them as well.
 
 ## Contributing
 
