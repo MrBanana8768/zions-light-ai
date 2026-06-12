@@ -188,6 +188,15 @@ License 1.0.0** — see [LICENSE.md](LICENSE.md) (SPDX:
   educational, hobby, religious.
 - 💼 **Commercial use requires the author's written permission.** The author
   holds the copyright and can grant commercial licenses on request — just ask.
+- 💵 **Personal financial gain counts as commercial.** Using this to make
+  money — a paid service, business/freelance/consulting work, or any
+  revenue-generating activity, individual *or* company — requires a commercial
+  license.
+- 🔄 **Commercialized outputs cross the line too.** If a work made during
+  personal use is *later* sold or monetized (e.g. a story written with the app
+  and then sold), that use becomes commercial and requires a license; the
+  author reserves the right to a reasonable share of the proceeds, agreed in
+  that license.
 
 This is **source-available**, not OSI "open source" (open-source licenses
 can't restrict commercial use). That's deliberate.
