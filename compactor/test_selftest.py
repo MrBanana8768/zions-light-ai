@@ -184,6 +184,96 @@ def test_admin_localhost_403_fails():
 
 
 # ---------------------------------------------------------------------------
+# STT functional probe (V3.2)
+# ---------------------------------------------------------------------------
+
+def test_stt_check_200_well_formed():
+    print("\n[test] _check_stt: 200 + {'text': ...} → ok")
+
+    async def go():
+        client = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json = MagicMock(return_value={"text": "hello"})
+        client.post = AsyncMock(return_value=resp)
+        return await selftest._check_stt(client)
+
+    ok, detail = asyncio.run(go())
+    assert_eq(ok, True, "ok=True on well-formed transcription")
+    assert_true("text_len=" in detail, "reports text length")
+
+
+def test_stt_check_empty_text_still_ok():
+    print("\n[test] _check_stt: 200 + {'text': ''} (silence) → still ok")
+
+    async def go():
+        client = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json = MagicMock(return_value={"text": ""})
+        client.post = AsyncMock(return_value=resp)
+        return await selftest._check_stt(client)
+
+    ok, _ = asyncio.run(go())
+    assert_eq(ok, True, "empty transcription is a valid well-formed response")
+
+
+def test_stt_check_503_fails():
+    print("\n[test] _check_stt: 503 (model loading) → fail")
+
+    async def go():
+        client = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 503
+        resp.text = "model not ready"
+        client.post = AsyncMock(return_value=resp)
+        return await selftest._check_stt(client)
+
+    ok, detail = asyncio.run(go())
+    assert_eq(ok, False, "ok=False on 503")
+    assert_true("503" in detail, "detail mentions code")
+
+
+def test_stt_check_malformed_fails():
+    print("\n[test] _check_stt: 200 but no 'text' field → fail")
+
+    async def go():
+        client = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json = MagicMock(return_value={"oops": 1})
+        client.post = AsyncMock(return_value=resp)
+        return await selftest._check_stt(client)
+
+    ok, detail = asyncio.run(go())
+    assert_eq(ok, False, "ok=False when 'text' missing")
+    assert_true("text" in detail.lower(), "detail explains missing field")
+
+
+def test_run_selftest_includes_stt_when_enabled():
+    print("\n[test] run_selftest adds the stt check only when STT_ENABLED")
+
+    async def go():
+        with patch.object(selftest, "STT_ENABLED", True), \
+             patch.object(selftest, "_check_vllm_models",
+                          new=AsyncMock(return_value=(True, "ok"))), \
+             patch.object(selftest, "_check_compactor_health",
+                          new=AsyncMock(return_value=(True, "ok"))), \
+             patch.object(selftest, "_check_admin_localhost",
+                          new=AsyncMock(return_value=(True, "ok"))), \
+             patch.object(selftest, "_check_stt",
+                          new=AsyncMock(return_value=(True, "ok"))), \
+             patch.object(selftest, "_check_chat_round_trip",
+                          new=AsyncMock(return_value=(True, "ok"))):
+            return await selftest.run_selftest(do_round_trip=True)
+
+    report = asyncio.run(go())
+    names = [c["name"] for c in report["checks"]]
+    assert_true("stt" in names, "stt check present when enabled")
+    assert_eq(report["summary"]["total"], 7, "7 checks (6 core + stt)")
+
+
+# ---------------------------------------------------------------------------
 # run_selftest — aggregate
 # ---------------------------------------------------------------------------
 
@@ -477,6 +567,11 @@ def _all_tests():
         test_chat_round_trip_malformed_response,
         test_admin_localhost_200,
         test_admin_localhost_403_fails,
+        test_stt_check_200_well_formed,
+        test_stt_check_empty_text_still_ok,
+        test_stt_check_503_fails,
+        test_stt_check_malformed_fails,
+        test_run_selftest_includes_stt_when_enabled,
         test_run_selftest_all_passing,
         test_run_selftest_one_failure_flips_status,
         test_run_selftest_skip_round_trip,
