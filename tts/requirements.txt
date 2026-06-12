@@ -1,0 +1,16 @@
+# TTS venv requirements (V3.3 — Text-to-Speech / Piper).
+#
+# Installed into its OWN venv (/opt/tts-venv), fully separate from the vLLM and
+# compactor venvs. piper-tts pulls onnxruntime + piper-phonemize — deliberately
+# torch-free (Piper is onnxruntime-based), so this venv stays lean and the
+# service runs entirely on CPU without ever touching vLLM's VRAM or torch pins.
+#
+# Higher-quality alternative (not used): Kokoro-82M sounds better but pulls
+# torch; if ever wanted it would go in this venv as a swap, accepting the size.
+
+# --- API surface ---
+fastapi
+uvicorn[standard]
+
+# --- synthesis engine ---
+piper-tts>=1.2.0            # onnxruntime-backed neural TTS; CPU, torch-free
