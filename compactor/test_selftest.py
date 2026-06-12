@@ -274,6 +274,83 @@ def test_run_selftest_includes_stt_when_enabled():
 
 
 # ---------------------------------------------------------------------------
+# TTS functional probe (V3.3)
+# ---------------------------------------------------------------------------
+
+def test_tts_check_200_audio():
+    print("\n[test] _check_tts: 200 + audio/* + bytes → ok")
+
+    async def go():
+        client = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-type": "audio/wav"}
+        resp.content = b"RIFF....WAVE...."
+        client.post = AsyncMock(return_value=resp)
+        return await selftest._check_tts(client)
+
+    ok, detail = asyncio.run(go())
+    assert_eq(ok, True, "ok=True on well-formed audio response")
+    assert_true("bytes=" in detail, "reports audio byte count")
+
+
+def test_tts_check_non_audio_content_type_fails():
+    print("\n[test] _check_tts: 200 but content-type not audio/* → fail")
+
+    async def go():
+        client = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-type": "application/json"}
+        resp.content = b'{"error":"x"}'
+        client.post = AsyncMock(return_value=resp)
+        return await selftest._check_tts(client)
+
+    ok, detail = asyncio.run(go())
+    assert_eq(ok, False, "ok=False on non-audio content type")
+    assert_true("content-type" in detail.lower(), "detail explains the mismatch")
+
+
+def test_tts_check_503_fails():
+    print("\n[test] _check_tts: 503 (voice loading) → fail")
+
+    async def go():
+        client = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 503
+        resp.text = "voice not ready"
+        client.post = AsyncMock(return_value=resp)
+        return await selftest._check_tts(client)
+
+    ok, detail = asyncio.run(go())
+    assert_eq(ok, False, "ok=False on 503")
+    assert_true("503" in detail, "detail mentions code")
+
+
+def test_run_selftest_includes_tts_when_enabled():
+    print("\n[test] run_selftest adds the tts check only when TTS_ENABLED")
+
+    async def go():
+        with patch.object(selftest, "TTS_ENABLED", True), \
+             patch.object(selftest, "_check_vllm_models",
+                          new=AsyncMock(return_value=(True, "ok"))), \
+             patch.object(selftest, "_check_compactor_health",
+                          new=AsyncMock(return_value=(True, "ok"))), \
+             patch.object(selftest, "_check_admin_localhost",
+                          new=AsyncMock(return_value=(True, "ok"))), \
+             patch.object(selftest, "_check_tts",
+                          new=AsyncMock(return_value=(True, "ok"))), \
+             patch.object(selftest, "_check_chat_round_trip",
+                          new=AsyncMock(return_value=(True, "ok"))):
+            return await selftest.run_selftest(do_round_trip=True)
+
+    report = asyncio.run(go())
+    names = [c["name"] for c in report["checks"]]
+    assert_true("tts" in names, "tts check present when enabled")
+    assert_eq(report["summary"]["total"], 7, "7 checks (6 core + tts)")
+
+
+# ---------------------------------------------------------------------------
 # run_selftest — aggregate
 # ---------------------------------------------------------------------------
 
@@ -572,6 +649,10 @@ def _all_tests():
         test_stt_check_503_fails,
         test_stt_check_malformed_fails,
         test_run_selftest_includes_stt_when_enabled,
+        test_tts_check_200_audio,
+        test_tts_check_non_audio_content_type_fails,
+        test_tts_check_503_fails,
+        test_run_selftest_includes_tts_when_enabled,
         test_run_selftest_all_passing,
         test_run_selftest_one_failure_flips_status,
         test_run_selftest_skip_round_trip,

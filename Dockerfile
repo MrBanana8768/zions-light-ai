@@ -132,6 +132,31 @@ RUN /opt/whisper-venv/bin/python -c \
     rm -rf /root/.cache /tmp/* /var/tmp/*
 
 # =============================================================================
+# TTS (Piper) venv — V3.3. Own venv, torch-free (Piper is onnxruntime-based),
+# CPU only — never competes with vLLM for VRAM and keeps the image lean. Same
+# install+strip+clean atomic pattern as the other venvs.
+# =============================================================================
+COPY tts/requirements.txt /opt/tts/requirements.txt
+RUN python3 -m venv /opt/tts-venv && \
+    /opt/tts-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    /opt/tts-venv/bin/pip install --no-cache-dir -r /opt/tts/requirements.txt && \
+    find /opt/tts-venv -type f \( -name "*.so" -o -name "*.so.*" \) \
+        -exec strip --strip-unneeded {} + 2>/dev/null || true && \
+    find /opt/tts-venv -name "*.pyc" -delete && \
+    find /opt/tts-venv -name "__pycache__" -type d -exec rm -rf {} + && \
+    rm -rf /root/.cache /tmp/* /var/tmp/*
+
+# Pre-download the default Piper voice (en_US-lessac-medium, ~63 MB) into the
+# image so the first speech pays no download — a static model belongs in the
+# image (same principle as the bge + whisper models). Swap via TTS_VOICE (+ a
+# /data TTS_VOICE_DIR for other voices). Voices: huggingface.co/rhasspy/piper-voices.
+RUN mkdir -p /opt/tts-voices && \
+    wget -q -O /opt/tts-voices/en_US-lessac-medium.onnx \
+      https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx && \
+    wget -q -O /opt/tts-voices/en_US-lessac-medium.onnx.json \
+      https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
+
+# =============================================================================
 # OpenWebUI venv — kept isolated from vLLM's pytorch pin. Same install+strip
 # atomic pattern. Also bumps pip/setuptools/wheel here (Scout-flagged Highs
 # live in both venvs since each has its own copy).
@@ -173,6 +198,9 @@ COPY compactor/alert.py /opt/compactor/alert.py
 
 # V3.2 — STT service source (copied late, after its venv, for cache efficiency).
 COPY stt/server.py /opt/stt/server.py
+
+# V3.3 — TTS service source (copied late, after its venv, for cache efficiency).
+COPY tts/server.py /opt/tts/server.py
 
 # =============================================================================
 # Supervisor
@@ -242,6 +270,17 @@ ENV WHISPER_MODEL_ID="whisper-1"
 ENV STT_HOST="0.0.0.0"
 ENV STT_PORT="9000"
 
+# V3.3 — Text-to-speech (Piper) service. Own venv on TTS_PORT, CPU + torch-free.
+# Default voice en_US-lessac-medium is prebaked at /opt/tts-voices; swap via
+# TTS_VOICE (+ a /data TTS_VOICE_DIR for other voices). Disable per-pod with
+# TTS_ENABLED=false.
+ENV TTS_ENABLED="true"
+ENV TTS_VOICE="en_US-lessac-medium"
+ENV TTS_VOICE_DIR="/opt/tts-voices"
+ENV TTS_MODEL_ID="tts-1"
+ENV TTS_HOST="0.0.0.0"
+ENV TTS_PORT="9001"
+
 # OpenWebUI settings — points at the compactor, not vLLM directly
 ENV OPENWEBUI_PORT="3000"
 ENV WEBUI_SECRET_KEY=""
@@ -260,11 +299,21 @@ ENV AUDIO_STT_OPENAI_API_BASE_URL="http://localhost:9000/v1"
 ENV AUDIO_STT_OPENAI_API_KEY="not-needed"
 ENV AUDIO_STT_MODEL="whisper-1"
 
+# V3.3 — wire OpenWebUI's TTS to the local Piper service (OpenAI engine).
+# Disable voice output per-pod by setting AUDIO_TTS_ENGINE="" (empty). The voice
+# field is sent by OpenWebUI but ignored by the service (it uses TTS_VOICE).
+ENV AUDIO_TTS_ENGINE="openai"
+ENV AUDIO_TTS_OPENAI_API_BASE_URL="http://localhost:9001/v1"
+ENV AUDIO_TTS_OPENAI_API_KEY="not-needed"
+ENV AUDIO_TTS_MODEL="tts-1"
+ENV AUDIO_TTS_VOICE="alloy"
+
 # 3000 — OpenWebUI (user-facing)
 # 8080 — context-compactor (OpenAI-compatible, what OpenWebUI talks to)
 # 8000 — vLLM (internal; can also be exposed for direct API access)
 # 9000 — STT / Whisper (OpenAI audio API; OpenWebUI talks here for voice input)
-EXPOSE 8000 8080 3000 9000
+# 9001 — TTS / Piper (OpenAI audio API; OpenWebUI talks here for voice output)
+EXPOSE 8000 8080 3000 9000 9001
 
 # V2.1 Phase 6: switch from `curl :3000` (OpenWebUI login page) to the
 # compactor's /health/full deep probe. The old check stayed "healthy"

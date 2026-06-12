@@ -279,3 +279,11 @@ Whisper model the operator chose — the default is fast and good for clear
 speech, and larger models are more accurate (see
 [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md#speech-to-text-v32--voice-input)). Voice can
 be turned off per-deployment.
+
+**Can it talk back? (V3.3)**
+Yes — if the deployment includes the speech-output service (on by default). Use
+OpenWebUI's "read aloud" control on a reply and the assistant speaks it, in a
+local neural voice (Piper) with nothing leaving your pod. It's independent of
+the memory pipeline — just the spoken rendering of the reply it already wrote.
+The voice, and whether it's on, are deployment choices (see
+[RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md#text-to-speech-v33--voice-output)).

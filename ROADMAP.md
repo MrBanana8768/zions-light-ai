@@ -386,7 +386,7 @@ sync via direct DB access, single model serving.
   ├── vllm (GPU)
   ├── compactor (CPU)
   ├── whisper-stt (CPU or shared GPU) ← V3.2 brings this
-  ├── kokoro-tts (CPU)                 ← V3.3 brings this
+  ├── piper-tts (CPU)                  ← V3.3 brings this
   └── openwebui (CPU)
 ```
 **Trigger:** V3 multimodal naturally splits the image — STT and TTS want
@@ -562,25 +562,37 @@ typed message.
 
 **Effort: ~4-5 days.**
 
-### V3.3 — Text-to-speech (voice output)
+### V3.3 — Text-to-speech (voice output)  🔨 In progress
 
-**What it adds:** Model's text responses get spoken aloud by OpenWebUI's
-audio player.
+**Status:** the TTS service is **built and Tier-1-tested**, with the wiring +
+boot self-test probe in place; on-pod validation pending. Stacked on V3.2
+(branch `v3.3-tts`).
 
-**How it works:**
-- New service exposing `/v1/audio/speech` (OpenAI TTS API contract)
-- OpenWebUI streams generated audio chunks as the model produces text
+**What it adds:** the model's text responses get spoken aloud by OpenWebUI's
+audio player — the mirror of V3.2 (synthesis instead of transcription).
 
-**Model choices:**
-- `hexgrad/Kokoro-82M` — tiny, runs anywhere, surprisingly good quality
-- `coqui/XTTS-v2` — voice cloning, multilingual, larger (~2 GB)
-- `rhasspy/piper-tts` — extremely fast CPU inference, less natural
+**How it works (as built):**
+- New service `tts/server.py` — a thin FastAPI wrapper around **Piper**
+  (onnxruntime, CPU, **torch-free**) exposing the OpenAI audio API
+  (`POST /v1/audio/speech`) + `/health` + `/v1/models`. WAV native (+ pcm);
+  mp3/opus/aac/flac if ffmpeg is present, else a graceful WAV fallback.
+- Own venv (`/opt/tts-venv`), own supervisord program (`[program:tts]`, port
+  9001, toggle `TTS_ENABLED`), default voice `en_US-lessac-medium` prebaked.
+  OpenWebUI's TTS engine is pre-wired (`AUDIO_TTS_*`); the compactor is untouched.
+- **CPU by default** — Piper is fast on CPU and torch-free, so it never competes
+  with vLLM for VRAM and keeps the image lean.
 
-**Effort: ~3-4 days**
-- Similar pattern to STT: wrapper service + supervisord block + OpenWebUI config
-- TTS is generally simpler than STT (no audio decoding, just synthesis)
-- Streaming is critical for UX — user shouldn't wait for full response
-  before audio starts
+**Testing (beyond "it turns on"):**
+- ✅ Tier-1 `tts/test_tts.py` — wav↔pcm, format encode/fallback, and the
+  `/v1/audio/speech` core (200 / 400 / 503 / 500), with a fake engine (no Piper).
+- ✅ Boot self-test `_check_tts` — POSTs a tiny text and asserts non-empty audio
+  with an `audio/*` content type (gated on `TTS_ENABLED`).
+
+**Model choice:** **Piper** (onnxruntime) keeps the lean, torch-free, CPU pattern
+of the rest of the stack. `hexgrad/Kokoro-82M` sounds better but pulls torch —
+documented as an optional quality swap, not the default.
+
+**Effort: ~3-4 days.**
 
 ### V3 total estimated effort: ~10-12 dev-days
 

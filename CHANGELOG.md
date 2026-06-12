@@ -9,6 +9,39 @@ on Docker Hub.
 
 ---
 
+## [3.3] — Text-to-speech (voice output)
+
+**Goal:** let the assistant *speak* — bundle a local TTS service so OpenWebUI's
+"read aloud" works, with nothing leaving the pod. The mirror of V3.2 (synthesis
+instead of transcription); independent of the memory pipeline.
+
+Image: folded into the current image line; the Piper service is on by default
+(`TTS_ENABLED=true`), CPU + torch-free.
+
+### Added
+- **TTS service** (`tts/server.py`) — a thin FastAPI wrapper around **Piper**
+  (onnxruntime, CPU) exposing the OpenAI audio API: `POST /v1/audio/speech`,
+  `GET /health`, `GET /v1/models`. WAV native (+ pcm); mp3/opus/aac/flac via
+  ffmpeg if present, else a graceful WAV fallback. Own venv (`/opt/tts-venv`),
+  own supervisord program (`[program:tts]`, port 9001), default voice
+  `en_US-lessac-medium` prebaked at `/opt/tts-voices`.
+- **OpenWebUI wiring** — the TTS engine is pre-pointed at the local service
+  (`AUDIO_TTS_*`); the read-aloud control works with no further setup.
+- **Boot self-test TTS probe** (`selftest.py` `_check_tts`) — POSTs a tiny text
+  and asserts non-empty audio with an `audio/*` content type. Gated on
+  `TTS_ENABLED`.
+- Tier-1 `tts/test_tts.py` — wav↔pcm helpers, format encode/fallback, and the
+  `/v1/audio/speech` core (200 / 400 / 503 / 500) with a fake engine.
+- Config (`.env.example`) + docs (RUNPOD_DEPLOY / USER_GUIDE / ROADMAP).
+
+### Notes
+- Piper (onnxruntime) chosen over Kokoro-82M to keep the aux-venv pattern
+  torch-free and CPU-only; Kokoro is documented as an optional quality swap.
+- ffmpeg is deliberately not bundled (keeps the image lean); WAV is what
+  OpenWebUI plays, so it isn't needed for the default flow.
+
+---
+
 ## [3.2] — Speech-to-text (voice input)
 
 **Goal:** let the assistant *hear* — bundle a local speech-to-text service so

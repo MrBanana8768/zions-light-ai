@@ -91,6 +91,16 @@ STT_URL = (
 STT_ENABLED = os.environ.get("STT_ENABLED", "false").strip().lower() == "true"
 STT_TIMEOUT_S = float(os.environ.get("COMPACTOR_SELFTEST_STT_TIMEOUT_S", "30.0"))
 
+# V3.3 — TTS (Piper) service probe. Same gating discipline as STT: only added
+# when the speech-output service is part of the deployment (image sets
+# TTS_ENABLED=true; unit tests / TTS-disabled pods leave it unset/false).
+TTS_URL = (
+    os.environ.get("TTS_URL")
+    or f"http://127.0.0.1:{os.environ.get('TTS_PORT', '9001')}"
+).rstrip("/")
+TTS_ENABLED = os.environ.get("TTS_ENABLED", "false").strip().lower() == "true"
+TTS_TIMEOUT_S = float(os.environ.get("COMPACTOR_SELFTEST_TTS_TIMEOUT_S", "30.0"))
+
 
 # ---------------------------------------------------------------------------
 # CheckResult helpers
@@ -270,6 +280,25 @@ async def _check_stt(client: httpx.AsyncClient) -> tuple[bool, str]:
     return True, f"transcribed probe ok (text_len={len(body['text'])})"
 
 
+async def _check_tts(client: httpx.AsyncClient) -> tuple[bool, str]:
+    """Functional TTS probe: POST a tiny text to the Piper service and assert it
+    returns non-empty audio with an audio/* content type. Catches the 'service
+    running but broken' failure a port/health check alone would miss."""
+    r = await client.post(
+        f"{TTS_URL}/v1/audio/speech",
+        json={"model": "tts-1", "input": "ok", "response_format": "wav"},
+        timeout=TTS_TIMEOUT_S,
+    )
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code}: {r.text[:160]}"
+    ctype = r.headers.get("content-type", "")
+    if not ctype.startswith("audio/"):
+        return False, f"non-audio content-type: {ctype!r}"
+    if not r.content:
+        return False, "empty audio body"
+    return True, f"synthesized probe ok (bytes={len(r.content)}, {ctype})"
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -354,6 +383,10 @@ async def run_selftest(*, do_round_trip: bool = True) -> dict:
         if STT_ENABLED:
             checks.append(await _timed_async(
                 "stt", lambda: _check_stt(client)
+            ))
+        if TTS_ENABLED:
+            checks.append(await _timed_async(
+                "tts", lambda: _check_tts(client)
             ))
         if do_round_trip:
             checks.append(await _timed_async(

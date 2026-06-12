@@ -201,6 +201,31 @@ The boot self-test confirms the service actually transcribes (not just that the
 port is open); transcription *accuracy* is measured by the `tests/eval/` WER
 harness with your own audio clips.
 
+### Text-to-speech (V3.3) — voice output
+
+A bundled **Piper** service (onnxruntime, CPU) exposes the OpenAI audio API on
+port `9001`, and OpenWebUI's TTS engine is pre-wired to it — so the "read aloud"
+control speaks replies out of the box, with nothing leaving the pod. The
+compactor isn't involved (text → audio only).
+
+- **CPU + torch-free** — Piper is fast on CPU, so like the STT service it never
+  competes with vLLM for VRAM and adds almost nothing to the image. The default
+  voice **`en_US-lessac-medium`** is prebaked.
+- **Swap the voice** with `TTS_VOICE` (any Piper voice from
+  [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices)); set
+  `TTS_VOICE_DIR=/data/tts-voices` so a non-default voice persists across pod
+  recreation.
+- **Output format:** the service produces **WAV** natively (what OpenWebUI
+  plays). mp3/opus/aac/flac work only if `ffmpeg` is present (not bundled, to
+  keep the image lean); without it, those requests gracefully return WAV.
+- **Turn it off** per-pod with `TTS_ENABLED=false` (and/or `AUDIO_TTS_ENGINE=""`
+  to hide the read-aloud control while leaving the service running).
+- Port `9001` does **not** need external exposure for the UI to work (OpenWebUI
+  reaches it over localhost).
+
+The boot self-test confirms the service actually synthesizes audio, not just
+that the port is open.
+
 ## Access Your Deployment
 
 Once deployed, access via Runpod's proxy URLs:
