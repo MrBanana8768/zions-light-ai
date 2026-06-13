@@ -34,3 +34,6 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Generated documents (roadmap / spec artifacts — delivered to Desktop, not the repo)
+*.docx
