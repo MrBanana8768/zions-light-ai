@@ -117,6 +117,7 @@ See [CHANGELOG.md](CHANGELOG.md) for full version history.
 | [compactor/V2_PLAN.md](compactor/V2_PLAN.md) | Contributors | Memory architecture design spec |
 | [compactor/V4_PLAN.md](compactor/V4_PLAN.md) | Contributors | Agentic / tool-use design spec |
 | [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md) | Contributors | North star — the stateless→stateful arc, faculties, and the honesty/reverence principles |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Contributors | System shape — layering tiers, networking/trust boundaries, scaling, and the V4-era split decisions |
 
 ## Project structure
 
