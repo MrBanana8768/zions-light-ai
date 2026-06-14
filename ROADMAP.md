@@ -369,6 +369,13 @@ ceiling. The path forward is **trigger-based**, not version-based — we
 move when a trigger fires, not on a schedule. Keep things integrated as
 long as the integration costs less than the split would.
 
+> **The locked decisions for this evolution now live in
+> [ARCHITECTURE.md](ARCHITECTURE.md)** (2026-06-09): vertical-GPU /
+> right-sized-card, split the front end out first (→ GPU scale-to-zero),
+> compactor-as-protected-core with a published authenticated API, the
+> state-home decision, the networking/trust tiers, and the trigger-sequenced
+> V4 foundation. The tiers below remain the background evolution model.
+
 **Tier 0 — Current shape (V1.x, V2.x)**
 ```
 [ single pod, single container ]
@@ -465,6 +472,11 @@ When a split eventually IS required, `git filter-repo` extracts a
 directory with its full history into a new repo trivially. The cost of
 NOT splitting prematurely is zero. The cost of splitting prematurely is
 weeks of toolchain rework you didn't need to do yet.
+
+**First anticipated split: the front end → its own repo**, when the custom UI
+replaces OpenWebUI (cleaner separation, independent cadence, likely a different
+stack for native/offline use). The compactor's published API contract (see
+[ARCHITECTURE.md](ARCHITECTURE.md)) is what makes that a *swap*, not a rewrite.
 
 ---
 
