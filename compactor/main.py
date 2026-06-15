@@ -25,6 +25,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+import apiauth
 import backfill
 import backup as backup_module
 import bgwork
@@ -479,6 +480,29 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="context-compactor", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _api_key_guard(request: Request, call_next):
+    """V4 foundation: optional API-key gate on the public surface. No-op when
+    COMPACTOR_API_KEY is unset (the current single-container deploy). Only
+    `/v1/*` is gated; `/health*` stay open; `/admin/*` keep their localhost
+    gate (`_require_localhost`). See compactor/apiauth.py + ARCHITECTURE.md.
+    """
+    if apiauth.path_requires_auth(request.url.path) and not apiauth.key_ok(
+        request.headers.get("authorization")
+    ):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "message": "missing or invalid API key",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            },
+        )
+    return await call_next(request)
 
 
 def _require_localhost(request: Request) -> None:

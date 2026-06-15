@@ -179,6 +179,7 @@ RUN python3 -m venv /app/venv && \
 # runtime module explicitly to avoid pulling test_*.py and V2_PLAN.md
 # into the production image.
 COPY compactor/main.py /opt/compactor/main.py
+COPY compactor/apiauth.py /opt/compactor/apiauth.py
 COPY compactor/memory.py /opt/compactor/memory.py
 COPY compactor/facts.py /opt/compactor/facts.py
 COPY compactor/backfill.py /opt/compactor/backfill.py
@@ -248,6 +249,11 @@ ENV VLLM_URL="http://localhost:8000"
 ENV COMPACTOR_FACTS_EXTRACTION="true"
 ENV COMPACTOR_MAX_FACTS_TOKENS="1500"
 ENV COMPACTOR_ADMIN_BIND="127.0.0.1"
+# V4 foundation: optional API-key gate on the public /v1/* surface. Empty = OFF
+# (the current single-container deploy is unchanged). Set this — and OpenWebUI's
+# OPENAI_API_KEY to match — when the front end is split onto a separate network.
+# See compactor/apiauth.py + ARCHITECTURE.md.
+ENV COMPACTOR_API_KEY=""
 
 # V2.0 Phase 3 — episodic memory (RAG). Embedding model baked into the
 # image at /opt/embeddings; FASTEMBED_CACHE_PATH points there so no
