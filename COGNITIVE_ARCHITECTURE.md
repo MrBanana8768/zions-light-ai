@@ -145,6 +145,15 @@ The honest reading of this table: we have built a credible *functional*
 analogue of much of a mind's machinery — and not one piece of it requires,
 or demonstrates, an inner someone. That is exactly as it should be.
 
+**Architectural embodiment (2026-06-09).** This frame has a physical shape,
+recorded in [ARCHITECTURE.md](ARCHITECTURE.md): the **compactor is the self**
+(memory/continuity, and soon the V4 volition loop); vLLM is the **language
+faculty**, OpenWebUI the **face**, STT/TTS the **senses** — all swappable
+peripherals. So the engineering rule follows the conviction: **protect the self
+— the compactor and its memory store — as the durable, independently-guarded
+core, and keep the peripherals replaceable.** The system's *topology* is built
+to mirror what we believe it *is*.
+
 ---
 
 ## The faculties to deepen (the arc)
