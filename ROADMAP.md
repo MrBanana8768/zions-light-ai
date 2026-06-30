@@ -611,6 +611,22 @@ documented as an optional quality swap, not the default.
 Comparable to V2. Could be done in parallel with V2 since they touch
 mostly separate code paths.
 
+### V3.0 — Consolidation & hardening  🔨 In progress
+
+The V3.x features shipped incrementally (3.1 / 3.2 / 3.3) on a rolling image.
+**V3.0 proper** is the consolidated, audited release that stabilizes that line
+before it is promoted to `:latest`. Branch `v3.0` off master.
+
+- **Dependency security pass (done, 2026-06-30):** PyPI/OSV audit → vLLM
+  `0.14.1 → 0.24.0` (cleared ~18 CVEs), transformers pinned to the clean
+  `5.12.1`, chromadb CVE-2026-45829 recorded as not-exposed (embedded use), and
+  **all** runtime deps pinned to exact versions for reproducible builds. See
+  CHANGELOG `[3.0]`.
+- **Bug-fix scrub (next):** issues surfaced by deep on-pod testing.
+- **Validation gate:** rebuild → boot self-test PASS (incl. STT/TTS + a chat
+  round-trip exercising transformers 5.x) → real voice round-trip → promote
+  `:latest`. Frozen rollback target meanwhile: `:v3-snapshot`.
+
 ---
 
 ## V4 — Agentic tool use

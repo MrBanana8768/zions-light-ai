@@ -9,8 +9,9 @@
 #   docker build --build-arg CUDA_BASE_IMAGE=nvidia/cuda:12.9.1-runtime-ubuntu24.04 \
 #                --build-arg TORCH_CUDA=cu128 .          # newer CUDA runtime, same wheels
 #   docker build --build-arg CUDA_BASE_IMAGE=nvidia/cuda:13.0.0-runtime-ubuntu24.04 \
-#                --build-arg TORCH_CUDA=cu130 \
-#                --build-arg VLLM_VERSION=0.21.0 .       # full cu130 variant (driver 580+)
+#                --build-arg TORCH_CUDA=cu130 .          # full cu130 variant (driver 580+);
+#                                                        # default VLLM_VERSION pins torch 2.11,
+#                                                        # which ships cu130 wheels too
 
 ARG CUDA_BASE_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04
 FROM ${CUDA_BASE_IMAGE}
@@ -55,10 +56,15 @@ ENV VLLM_VENV=/opt/vllm-venv
 
 # vLLM + torch CUDA target. Both parametric so the cu130 variant can be
 # built from the same source. Defaults aligned for RunPod's driver-570
-# fleet (CUDA 12.8 max). CVE-2026-22778 (Critical 9.8) requires vllm >=
-# 0.14.1. Bump VLLM_VERSION + TORCH_CUDA together when RunPod rolls out
-# driver 580+.
-ARG VLLM_VERSION=0.14.1
+# fleet (CUDA 12.8 max); cu128 wheels run on driver 570 AND 580.
+# Security floor (V3.0, audited 2026-06-30 via PyPI/OSV): the previous
+# 0.14.1 pin had accumulated ~18 CVEs + ~17 GHSAs since it was set (it only
+# ever fixed CVE-2026-22778); 0.24.0 is the first release with no known
+# advisories. It pins torch==2.11.0 (pulled from the cu128 channel) and
+# requires Python >=3.10,<3.15 — both satisfied by this base. Re-audit and
+# bump before each release. Move to cu130/TORCH_CUDA only when RunPod's
+# fleet requires driver 580+.
+ARG VLLM_VERSION=0.24.0
 ARG TORCH_CUDA=cu128
 
 # =============================================================================
@@ -164,7 +170,7 @@ RUN mkdir -p /opt/tts-voices && \
 WORKDIR /app
 RUN python3 -m venv /app/venv && \
     /app/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    /app/venv/bin/pip install --no-cache-dir open-webui && \
+    /app/venv/bin/pip install --no-cache-dir open-webui==0.10.1 && \
     find /app/venv -type f \( -name "*.so" -o -name "*.so.*" \) \
         -exec strip --strip-unneeded {} + 2>/dev/null || true && \
     find /app/venv -name "*.pyc" -delete && \

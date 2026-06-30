@@ -1,4 +1,4 @@
-# Compactor venv requirements (V2.0 Phase 3+).
+# Compactor venv requirements (V2.0 Phase 3+ · pins audited V3.0, 2026-06-30).
 #
 # As of Phase 3 the compactor runs in its OWN venv (/opt/compactor-venv),
 # fully separate from vLLM. That means these deps can resolve freely
@@ -10,15 +10,24 @@
 # is used tokenizer-only (AutoTokenizer works without a torch backend for
 # fast/rust tokenizers). Keeps the compactor venv lean.
 #
-# transformers floor stays at 4.50 (Gemma3Config + stable tokenizer API);
-# no upper bound needed here since vLLM no longer shares this venv.
+# Versions pinned EXACTLY for reproducible builds (V3.0). Re-audit against
+# PyPI/OSV before each release and bump deliberately. transformers moved
+# 4.x -> 5.x here: the last 4.x (4.57.6) carries open CVEs fixed only in
+# 5.x, and we use it tokenizer-only on a known model, so 5.12.1 is both the
+# clean and the correct choice — but the 4->5 major is the thing the rebuild
+# boot self-test must confirm (fallback: transformers==4.57.6).
 
 # --- proxy / API ---
-fastapi
-uvicorn[standard]
-httpx
-transformers>=4.50
+fastapi==0.138.2
+uvicorn[standard]==0.49.0
+httpx==0.28.1
+transformers==5.12.1
 
 # --- V2.0 Phase 3: episodic memory ---
-chromadb            # persistent vector store (embedded, sqlite-backed)
-fastembed           # BAAI/bge-small-en-v1.5 embeddings via ONNX (no torch)
+# chromadb runs EMBEDDED (in-process, sqlite-backed) — we do NOT run the
+# Chroma HTTP server, so CVE-2026-45829 (pre-auth code injection via the
+# server's /api/v2 collections endpoint with trust_remote_code) is not
+# exposed. Affects all 1.x with no fix yet; bump to the patched release once
+# published. Recorded as known/accepted in CHANGELOG [3.0].
+chromadb==1.5.9
+fastembed==0.8.0           # BAAI/bge-small-en-v1.5 embeddings via ONNX (no torch)

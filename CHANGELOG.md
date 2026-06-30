@@ -9,6 +9,50 @@ on Docker Hub.
 
 ---
 
+## [3.0] — V3 consolidation & dependency hardening (in progress)
+
+**Goal:** stabilize the V3.x line (vision + STT + TTS, shipped incrementally as
+3.1 / 3.2 / 3.3 on a rolling image) into one audited, reproducible release. This
+entry is the dependency-security pass; a bug-fix scrub follows before the image
+is rebuilt and promoted to `:latest`.
+
+Image: **rebuild required** (vLLM bump). Until it is validated on-pod, the last
+functional V3 build is frozen at `angreg/zions-light-ai:v3-snapshot` (= the 3.3
+image, digest `sha256:9cb7293d…`) as the easy deploy/rollback target. Note the
+snapshot still carries the pre-audit vLLM, so it is a convenience target, not the
+secure release.
+
+### Security (PyPI/OSV audit, 2026-06-30)
+- **vLLM `0.14.1` → `0.24.0`.** The 0.14.1 pin had accumulated ~18 CVEs + ~17
+  GHSAs since it was set (it only ever fixed CVE-2026-22778); 0.24.0 is the first
+  release with no known advisories. cu128 / torch 2.11.0 retained (runs on driver
+  570 and 580), so it is a one-line bump with no CUDA-base change. vLLM binds to
+  localhost behind the compactor, which bounded exposure in the meantime.
+- **transformers `>=4.50` → `==5.12.1`.** The unbounded floor was silently
+  resolving to a 5.x major already; the last 4.x (4.57.6) carries open CVEs fixed
+  only in 5.x. Pinned to the clean 5.12.1 (used tokenizer-only on a known model).
+  The 4→5 major is the item the rebuild **boot self-test must confirm**; fallback
+  is `transformers==4.57.6`.
+- **chromadb — known/accepted, not exposed.** CVE-2026-45829 (pre-auth code
+  injection) affects all 1.x with no fix yet, but only via the Chroma **HTTP
+  server**; we run chromadb **embedded** (in-process, sqlite-backed), so the
+  vulnerable endpoint is not present. Pinned `==1.5.9`; bump when patched.
+
+### Changed
+- **All runtime Python deps pinned to exact, audited versions** for reproducible
+  builds (the Dockerfile was otherwise non-reproducible — only vLLM was pinned):
+  `compactor/`, `stt/`, `tts/` requirements + `open-webui==0.10.1` in the
+  Dockerfile. Pins: fastapi 0.138.2, uvicorn 0.49.0, httpx 0.28.1,
+  python-multipart 0.0.32, faster-whisper 1.2.1, piper-tts 1.4.2, fastembed
+  0.8.0, transformers 5.12.1, chromadb 1.5.9, open-webui 0.10.1.
+
+### Validation gate (operator — before rebuild is promoted to `:latest`)
+- Rebuild the image; **boot self-test must PASS** — including the STT + TTS
+  probes and a chat round-trip that exercises the transformers tokenizer on 5.x.
+- Real voice round-trip works; vLLM 0.24.0 serves the configured model on the A40.
+
+---
+
 ## [3.3] — Text-to-speech (voice output)
 
 **Goal:** let the assistant *speak* — bundle a local TTS service so OpenWebUI's
