@@ -64,6 +64,11 @@ COMPACTOR_URL = os.environ.get("COMPACTOR_URL", "http://127.0.0.1:8080").rstrip(
 VLLM_URL = os.environ.get("VLLM_URL", "http://127.0.0.1:8000").rstrip("/")
 MODEL_REPO = os.environ.get("MODEL_REPO", "").strip()
 
+# V4: if the compactor's API-key gate is enabled (apiauth), the self-test's own
+# /v1 chat round-trip must carry the key or it'd get a 401. Unset = no header
+# (the current single-container deploy, where auth is off).
+COMPACTOR_API_KEY = os.environ.get("COMPACTOR_API_KEY", "").strip()
+
 # Sentinel conv_id for the facts round-trip. Never touched by real
 # traffic, cleaned up at the end of each run.
 SELFTEST_CONV_ID = "__selftest__"
@@ -175,6 +180,8 @@ async def _check_chat_round_trip(client: httpx.AsyncClient) -> tuple[bool, str]:
         "stream": False,
     }
     headers = {"X-Conversation-Id": one_shot_conv}
+    if COMPACTOR_API_KEY:
+        headers["Authorization"] = f"Bearer {COMPACTOR_API_KEY}"
     r = await client.post(
         f"{COMPACTOR_URL}/v1/chat/completions",
         json=payload,
