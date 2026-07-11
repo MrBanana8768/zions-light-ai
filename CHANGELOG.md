@@ -25,9 +25,18 @@ secure release.
 ### Security (PyPI/OSV audit, 2026-06-30)
 - **vLLM `0.14.1` → `0.24.0`.** The 0.14.1 pin had accumulated ~18 CVEs + ~17
   GHSAs since it was set (it only ever fixed CVE-2026-22778); 0.24.0 is the first
-  release with no known advisories. cu128 / torch 2.11.0 retained (runs on driver
-  570 and 580), so it is a one-line bump with no CUDA-base change. vLLM binds to
-  localhost behind the compactor, which bounded exposure in the meantime.
+  release with no known advisories. vLLM binds to localhost behind the compactor,
+  which bounded exposure in the meantime.
+  **Correction (rc1 → rc2):** the original note here claimed 0.24.0 kept cu128
+  with "no CUDA-base change" — that was wrong. 0.24.0 ships **CUDA-13** kernels
+  (rc1 failed on the CUDA-12 image with `ImportError: libcudart.so.13`), so the
+  default build moved to a **CUDA 13 base (`13.0.0-runtime`) + cu130** torch
+  channel and now requires a host **driver ≥580** (Ampere/A40 is supported on
+  580 — the gate is the host, not the card). A documented **CUDA-12 fallback**
+  profile (base `12.6.3` + cu128 + vLLM **0.19.0**, the last CUDA-12 release,
+  ~32 advisories) is provided for driver-570 hosts. The three build args
+  (base / `TORCH_CUDA` / `VLLM_VERSION`) are now a matched set — see the
+  Dockerfile header.
 - **transformers `>=4.50` → `==5.12.1`.** The unbounded floor was silently
   resolving to a 5.x major already; the last 4.x (4.57.6) carries open CVEs fixed
   only in 5.x. Pinned to the clean 5.12.1 (used tokenizer-only on a known model).
@@ -49,7 +58,9 @@ secure release.
 ### Validation gate (operator — before rebuild is promoted to `:latest`)
 - Rebuild the image; **boot self-test must PASS** — including the STT + TTS
   probes and a chat round-trip that exercises the transformers tokenizer on 5.x.
-- Real voice round-trip works; vLLM 0.24.0 serves the configured model on the A40.
+- Real voice round-trip works; vLLM 0.24.0 serves the configured model on a
+  **driver ≥580** host (A40 or newer). On a driver-570 host, use the CUDA-12
+  fallback profile (vLLM 0.19.0) instead.
 
 ---
 

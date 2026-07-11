@@ -622,6 +622,10 @@ before it is promoted to `:latest`. Branch `v3.0` off master.
   `5.12.1`, chromadb CVE-2026-45829 recorded as not-exposed (embedded use), and
   **all** runtime deps pinned to exact versions for reproducible builds. See
   CHANGELOG `[3.0]`.
+- **Platform (rc1 → rc2 finding):** vLLM 0.24.0 ships **CUDA-13** kernels, so the
+  default image now builds on a **CUDA 13 base + cu130** and needs a host
+  **driver ≥580** (the A40 works — the gate is the host, not the card). Driver-570
+  hosts use the documented **CUDA-12 fallback** (vLLM 0.19.0, ~32 advisories).
 - **Bug-fix scrub (next):** issues surfaced by deep on-pod testing.
 - **Validation gate:** rebuild → boot self-test PASS (incl. STT/TTS + a chat
   round-trip exercising transformers 5.x) → real voice round-trip → promote

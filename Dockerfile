@@ -1,19 +1,27 @@
 # Dockerfile for vLLM + context-compactor + OpenWebUI on Runpod
 # Optimized for NVIDIA A40 (48GB VRAM) and larger.
 #
-# CUDA base + torch wheels are parametric via build args so the same
-# Dockerfile can build cu128 (default, RunPod driver 570 compatible) and
-# cu130 variants without source changes:
+# CUDA base + torch channel + vLLM version are parametric build args, but
+# they are NOT independent — they must move together as ONE of two coherent
+# profiles. vLLM's compiled kernels are linked against a specific CUDA major,
+# so a mismatched base/torch fails at RUNTIME with
+# "ImportError: libcudart.so.NN: cannot open shared object file" (this bit
+# v3.0-rc1: CUDA-13 vLLM on a CUDA-12 base). The two supported profiles:
 #
-#   docker build .                                       # cu128 default
-#   docker build --build-arg CUDA_BASE_IMAGE=nvidia/cuda:12.9.1-runtime-ubuntu24.04 \
-#                --build-arg TORCH_CUDA=cu128 .          # newer CUDA runtime, same wheels
-#   docker build --build-arg CUDA_BASE_IMAGE=nvidia/cuda:13.0.0-runtime-ubuntu24.04 \
-#                --build-arg TORCH_CUDA=cu130 .          # full cu130 variant (driver 580+);
-#                                                        # default VLLM_VERSION pins torch 2.11,
-#                                                        # which ships cu130 wheels too
+#   # DEFAULT — CUDA 13 / driver 580+ / clean vLLM 0.24.0 (recommended):
+#   docker build .
+#
+#   # FALLBACK — CUDA 12.8 / driver 570 / legacy vLLM 0.19.0 (less secure):
+#   docker build \
+#     --build-arg CUDA_BASE_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04 \
+#     --build-arg TORCH_CUDA=cu128 \
+#     --build-arg VLLM_VERSION=0.19.0 .
+#
+# Never mix a CUDA-12 base/torch with a CUDA-13 vLLM (or vice versa). Ampere
+# cards (e.g. the A40) run CUDA 13 fine — the gate is the HOST driver (>=580),
+# not the GPU model.
 
-ARG CUDA_BASE_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04
+ARG CUDA_BASE_IMAGE=nvidia/cuda:13.0.0-runtime-ubuntu24.04
 FROM ${CUDA_BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -54,18 +62,21 @@ RUN mkdir -p /data
 
 ENV VLLM_VENV=/opt/vllm-venv
 
-# vLLM + torch CUDA target. Both parametric so the cu130 variant can be
-# built from the same source. Defaults aligned for RunPod's driver-570
-# fleet (CUDA 12.8 max); cu128 wheels run on driver 570 AND 580.
-# Security floor (V3.0, audited 2026-06-30 via PyPI/OSV): the previous
-# 0.14.1 pin had accumulated ~18 CVEs + ~17 GHSAs since it was set (it only
-# ever fixed CVE-2026-22778); 0.24.0 is the first release with no known
-# advisories. It pins torch==2.11.0 (pulled from the cu128 channel) and
-# requires Python >=3.10,<3.15 — both satisfied by this base. Re-audit and
-# bump before each release. Move to cu130/TORCH_CUDA only when RunPod's
-# fleet requires driver 580+.
+# vLLM + torch CUDA target — see the profile note at the top of this file:
+# CUDA_BASE_IMAGE, TORCH_CUDA and VLLM_VERSION must form ONE coherent CUDA
+# generation, because vLLM's compiled kernels are CUDA-major-specific.
+# Security floor (V3.0, audited 2026-06-30 via PyPI/OSV): 0.14.1 had
+# accumulated ~18 CVEs + ~17 GHSAs since it was set; 0.24.0 is the first
+# release with NO known advisories, so it is the default. BUT 0.24.0 ships
+# CUDA-13 kernels (needs libcudart.so.13) and pins torch==2.11.0 — hence the
+# default base is CUDA 13 + the cu130 torch channel, and it requires a host
+# driver >=580 (Ampere/A40 is supported on 580; the gate is the host, not
+# the card). CUDA-12 / driver-570 hosts must use the fallback profile: vLLM
+# 0.19.0 is the last CUDA-12 release (torch 2.10) and still carries ~32
+# advisories — an accepted trade for legacy-driver compatibility. Re-audit
+# and bump before each release.
 ARG VLLM_VERSION=0.24.0
-ARG TORCH_CUDA=cu128
+ARG TORCH_CUDA=cu130
 
 # =============================================================================
 # vLLM venv — ONLY vLLM. As of V2.0 Phase 3 the compactor has its OWN venv
