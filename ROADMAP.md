@@ -626,7 +626,10 @@ before it is promoted to `:latest`. Branch `v3.0` off master.
   default image now builds on a **CUDA 13 base + cu130** and needs a host
   **driver ≥580** (the A40 works — the gate is the host, not the card). Driver-570
   hosts use the documented **CUDA-12 fallback** (vLLM 0.19.0, ~32 advisories).
-- **Bug-fix scrub (next):** issues surfaced by deep on-pod testing.
+- **Bug-fix scrub (in progress):** landed — CRLF→LF entrypoint fix +
+  build-arg-aware driver preflight, and open-webui 0.10.1→0.11.0 (fixes the
+  auto-discovered-model chat crash, clears 17 advisories). More as on-pod
+  testing surfaces them.
 - **Validation gate:** rebuild → boot self-test PASS (incl. STT/TTS + a chat
   round-trip exercising transformers 5.x) → real voice round-trip → promote
   `:latest`. Frozen rollback target meanwhile: `:v3-snapshot`.

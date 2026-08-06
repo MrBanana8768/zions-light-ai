@@ -163,19 +163,19 @@ See [ROADMAP.md](ROADMAP.md). High-level:
 - **V2.1** ✅ — user control: chat commands, personas, export/import, dedup, archival, observability
 - **V2.2** ✅ — testing & observability: boot self-test, `/health/full`, three-tier standard ([TESTING.md](TESTING.md))
 - **V2.3** — resilience & stability: durable backups + verified restore, chaos tests, operational runbook *(quality over speed)*
-- **V3** — multimodal: vision (VLM swap), speech-to-text (Whisper), text-to-speech (Kokoro/XTTS)
+- **V3** — multimodal: vision (VLM swap), speech-to-text (Whisper), text-to-speech (Piper; Kokoro optional swap)
 - **V4** — agentic: model tool-use via a compactor tool-loop, sandboxed command execution, eventual agent-run harness ([compactor/V4_PLAN.md](compactor/V4_PLAN.md))
 
 ## Tech stack
 
 | Layer | Component |
 |---|---|
-| Inference engine | [vLLM](https://github.com/vllm-project/vllm) 0.14.1 (cu128 wheels for RunPod A40 compat) |
+| Inference engine | [vLLM](https://github.com/vllm-project/vllm) 0.24.0 — cu130/CUDA 13 default (driver ≥580); cu128 + vLLM 0.19.0 CUDA-12 fallback (driver-570 hosts) |
 | Chat frontend | [OpenWebUI](https://github.com/open-webui/open-webui) |
 | Memory middleware | Custom FastAPI compactor (`compactor/`, torch-free venv) |
 | Embeddings | BAAI/bge-small-en-v1.5 (ONNX, prebaked) via fastembed + ChromaDB |
 | Process supervision | supervisord |
-| Container base | `nvidia/cuda` runtime (parametric build args — cu128 default) |
+| Container base | `nvidia/cuda` runtime (parametric — cu130/CUDA 13 default, cu128/CUDA 12 fallback) |
 | Recommended model | Magnum v4 **12B** on A40 / 22B on A100 (or any vLLM HF causal-LM) |
 
 ## License

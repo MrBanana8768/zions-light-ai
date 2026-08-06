@@ -11,7 +11,7 @@
 #   # DEFAULT — CUDA 13 / driver 580+ / clean vLLM 0.24.0 (recommended):
 #   docker build .
 #
-#   # FALLBACK — CUDA 12.8 / driver 570 / legacy vLLM 0.19.0 (less secure):
+#   # FALLBACK — CUDA 12 (cu128) / driver >=525 / legacy vLLM 0.19.0 (less secure):
 #   docker build \
 #     --build-arg CUDA_BASE_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04 \
 #     --build-arg TORCH_CUDA=cu128 \

@@ -60,10 +60,25 @@ secure release.
   `None` for a model auto-discovered from an OpenAI connection (our vLLM) —
   crashing every chat with `'NoneType' object has no attribute 'get'`
   (`main:process_chat:1504`). Fixed in 0.10.2; **0.11.0** both fixes it *and*
-  clears all **34** known advisories that 0.10.1/0.10.2 carry (→ **0**). 0.11.0
+  clears all **17** known advisories that 0.10.1/0.10.2 each carry (→ **0**). 0.11.0
   migrates the OpenWebUI DB schema forward (rollback to 0.10.x is unsupported
   without a DB reset — the compactor's own memory store is unaffected). Lesson
   logged: do not pin a fast-moving UI to its bleeding-edge release un-validated.
+
+### Fixed
+- **CRLF line endings baked a broken container entrypoint.** On Windows
+  (`core.autocrlf=true`, no `.gitattributes`), `entrypoint.sh` and
+  `supervisord.conf` checked out CRLF, so `docker build` baked a `#!/bin/bash\r`
+  shebang and the container failed at start with "not found" / "bad
+  interpreter" — this broke v2.2.1 and every image built on Windows. Added
+  `.gitattributes` (`* text=auto eol=lf` + explicit `eol=lf` for
+  `*.sh`/`entrypoint.sh`/`*.conf`/`Dockerfile`/`*.py`) and renormalized the tree
+  to LF (verified byte-accurately: CR=0 across all image-copied files).
+- **Driver preflight is now build-arg-aware and fails closed.** `entrypoint.sh`
+  Check 3 reads the baked-in `TORCH_CUDA` and requires driver ≥580 for cu130
+  (CUDA 13) vs ≥525 for cu128/cu126 — instead of hardcoding cu128/≥525, which
+  would have let a CUDA-13 default image false-pass a driver-570 host and then
+  crash. A missing/unknown channel now defaults to the strictest floor.
 
 ### Validation gate (operator — before rebuild is promoted to `:latest`)
 - Rebuild the image; **boot self-test must PASS** — including the STT + TTS

@@ -48,11 +48,13 @@ echo "      GPU: ${GPU_NAME} (${GPU_MEM} MiB), driver ${DRIVER}"
 # actionable message rather than letting torch/vLLM crash later with "NVIDIA
 # driver too old" or "libcudart.so.NN: cannot open shared object file".
 DRIVER_MAJOR=$(echo "${DRIVER}" | cut -d. -f1)
-case "${TORCH_CUDA:-cu128}" in
+# Fail CLOSED on a missing/unknown channel: default to the strictest floor
+# (cu130 -> driver 580) so a mis-built image can't silently pass an under-spec host.
+case "${TORCH_CUDA:-cu130}" in
     cu130) MIN_DRIVER=580; CUDA_LABEL="CUDA 13 (cu130)" ;;
     cu128) MIN_DRIVER=525; CUDA_LABEL="CUDA 12.8 (cu128)" ;;
     cu126) MIN_DRIVER=525; CUDA_LABEL="CUDA 12.6 (cu126)" ;;
-    *)     MIN_DRIVER=525; CUDA_LABEL="${TORCH_CUDA:-unknown}" ;;
+    *)     MIN_DRIVER=580; CUDA_LABEL="${TORCH_CUDA:-unset} (unrecognized — requiring newest)" ;;
 esac
 if [ "${DRIVER_MAJOR}" -lt "${MIN_DRIVER}" ] 2>/dev/null; then
     echo "      ERROR: Driver ${DRIVER} is too old for this image (${CUDA_LABEL})."
