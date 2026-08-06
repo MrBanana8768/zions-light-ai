@@ -185,7 +185,7 @@ RUN mkdir -p /opt/tts-voices && \
 WORKDIR /app
 RUN python3 -m venv /app/venv && \
     /app/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    /app/venv/bin/pip install --no-cache-dir open-webui==0.10.1 && \
+    /app/venv/bin/pip install --no-cache-dir open-webui==0.11.0 && \
     find /app/venv -type f \( -name "*.so" -o -name "*.so.*" \) \
         -exec strip --strip-unneeded {} + 2>/dev/null || true && \
     find /app/venv -name "*.pyc" -delete && \

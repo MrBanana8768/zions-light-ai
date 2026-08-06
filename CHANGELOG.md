@@ -50,14 +50,28 @@ secure release.
 ### Changed
 - **All runtime Python deps pinned to exact, audited versions** for reproducible
   builds (the Dockerfile was otherwise non-reproducible — only vLLM was pinned):
-  `compactor/`, `stt/`, `tts/` requirements + `open-webui==0.10.1` in the
+  `compactor/`, `stt/`, `tts/` requirements + `open-webui==0.11.0` in the
   Dockerfile. Pins: fastapi 0.138.2, uvicorn 0.49.0, httpx 0.28.1,
   python-multipart 0.0.32, faster-whisper 1.2.1, piper-tts 1.4.2, fastembed
-  0.8.0, transformers 5.12.1, chromadb 1.5.9, open-webui 0.10.1.
+  0.8.0, transformers 5.12.1, chromadb 1.5.9, open-webui 0.11.0.
+- **open-webui `0.10.1` → `0.11.0` (rc3 → rc4).** rc3 pinned 0.10.1 (latest at
+  audit time), which carries a **regression** (open-webui issue #20565): the
+  0.10.x memory feature calls `.get()` on a model's `capabilities`, which is
+  `None` for a model auto-discovered from an OpenAI connection (our vLLM) —
+  crashing every chat with `'NoneType' object has no attribute 'get'`
+  (`main:process_chat:1504`). Fixed in 0.10.2; **0.11.0** both fixes it *and*
+  clears all **34** known advisories that 0.10.1/0.10.2 carry (→ **0**). 0.11.0
+  migrates the OpenWebUI DB schema forward (rollback to 0.10.x is unsupported
+  without a DB reset — the compactor's own memory store is unaffected). Lesson
+  logged: do not pin a fast-moving UI to its bleeding-edge release un-validated.
 
 ### Validation gate (operator — before rebuild is promoted to `:latest`)
 - Rebuild the image; **boot self-test must PASS** — including the STT + TTS
   probes and a chat round-trip that exercises the transformers tokenizer on 5.x.
+- **OpenWebUI chat works end-to-end** — the 0.10.1 `capabilities`-None crash is
+  fixed by the 0.11.0 pin (rc3 hit it; confirmed via the model-re-save
+  workaround before the pin fix). No native-tools/`tool_choice` error (leave
+  Function Calling = Default; tool calling is a V4 feature).
 - Real voice round-trip works; vLLM 0.24.0 serves the configured model on a
   **driver ≥580** host (A40 or newer). On a driver-570 host, use the CUDA-12
   fallback profile (vLLM 0.19.0) instead.
