@@ -78,6 +78,10 @@ ENV VLLM_VENV=/opt/vllm-venv
 ARG VLLM_VERSION=0.24.0
 ARG TORCH_CUDA=cu130
 
+# Bake the CUDA channel into the image so entrypoint.sh's driver preflight
+# knows which minimum driver to require (cu130 -> 580, cu128/cu126 -> 525).
+ENV TORCH_CUDA=${TORCH_CUDA}
+
 # =============================================================================
 # vLLM venv — ONLY vLLM. As of V2.0 Phase 3 the compactor has its OWN venv
 # (below), so the compactor's deps (chromadb, fastembed, etc.) can NEVER
