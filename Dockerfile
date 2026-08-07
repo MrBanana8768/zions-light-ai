@@ -231,6 +231,12 @@ COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Operator tool: reclaim volume space by removing stale HuggingFace model
+# caches (old MODEL_REPO weights linger on the Network Volume). Not on the
+# startup path — run on demand: docker exec <container> /opt/clean-models.sh
+COPY clean-models.sh /opt/clean-models.sh
+RUN chmod +x /opt/clean-models.sh
+
 # =============================================================================
 # Model configuration — override via .env or Runpod template
 # Default: anthracite-org/magnum-v4-22b (creative writing fine-tune, lightly

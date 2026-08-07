@@ -110,12 +110,65 @@ du -sh /data/* | sort -h
 - The backup daemon **refuses to run** below `COMPACTOR_BACKUP_MIN_FREE_MB`
   (500 MB) rather than filling the disk — you'll see that in `backup.log`.
 - Model weights under `/data/models` are the usual space hog; remove unused
-  ones.
+  ones with `/opt/clean-models.sh` (see
+  [Cleaning up old model weights](#cleaning-up-old-model-weights-on-the-volume)).
 
 ### Memory looks wrong for one conversation
 See [USER_GUIDE.md](USER_GUIDE.md). Quick: `/why` in the chat,
 `/list-facts`, `/forget <substring>`, or full reset
 `curl -X DELETE localhost:8080/admin/conversations/<id>/facts`.
+
+---
+
+## Cleaning up old model weights on the volume
+
+When you change `MODEL_REPO` (e.g. `anthracite-org/magnum-v4-12b` → a
+Cydonia-24B), vLLM downloads the new weights but the **old** ones stay cached
+on the Network Volume under `HF_HOME` (`/data/models/hub/models--<org>--<name>/`).
+Each model is 10–50 GB, so a few swaps can fill the volume. `df -h /data` /
+`du -sh /data/* | sort -h` will show it.
+
+The image ships `/opt/clean-models.sh` for exactly this. It is **safe by
+default**: with no flags it only *lists* what's cached and marks the ACTIVE
+model — nothing is deleted. The active model (derived from `$MODEL_REPO`) is
+**always protected**, even if you name it explicitly. Deletion needs an
+explicit `--yes` or a `y` at the confirmation prompt, and it prints the space
+it freed.
+
+```bash
+# 1. See what's cached and which model is active (dry run — deletes nothing)
+/opt/clean-models.sh
+
+#   5.0G   models--TheDrummer--Cydonia-24B-v2   <== ACTIVE (protected)
+#  23G    models--anthracite-org--magnum-v4-12b
+
+# 2. Delete ONE specific old model (accepts "org/name" or the hub dir name)
+/opt/clean-models.sh --delete anthracite-org/magnum-v4-12b        # prompts y/N
+/opt/clean-models.sh --delete anthracite-org/magnum-v4-12b --yes  # no prompt
+
+# 3. Keep only the active model, remove everything else
+/opt/clean-models.sh --prune-others          # prompts, lists exactly what goes
+/opt/clean-models.sh --prune-others --yes    # for scripts / non-interactive
+
+# 4. Also clear vLLM's torch.compile cache (/data/vllm-compile-cache).
+#    It's a REGENERABLE perf cache — safe to delete, but the next cold start
+#    re-captures CUDA graphs and is 60–120s slower that one time.
+/opt/clean-models.sh --compile-cache               # compile cache only
+/opt/clean-models.sh --prune-others --compile-cache --yes   # both at once
+```
+
+Safety notes:
+- **Dry-run default** — running it with no flag never deletes anything.
+- **Active model is protected** — `--delete <active>` is refused, and
+  `--prune-others` always keeps it. `--prune-others` also refuses to run if
+  `MODEL_REPO` is unset (it wouldn't know what to keep).
+- **Bounded deletes** — it only ever `rm -rf`s real directories named
+  `models--*` directly under `$HF_HOME/hub`; it will never touch `/`, the cache
+  root, or an arbitrary path.
+- Run it from the pod's **Web Terminal**, or from outside with
+  `docker exec <container> /opt/clean-models.sh`.
+- Removing a model is harmless: if you switch `MODEL_REPO` back to it later,
+  vLLM just re-downloads it on the next start.
 
 ---
 
