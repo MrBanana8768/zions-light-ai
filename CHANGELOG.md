@@ -79,6 +79,17 @@ secure release.
   (CUDA 13) vs ≥525 for cu128/cu126 — instead of hardcoding cu128/≥525, which
   would have let a CUDA-13 default image false-pass a driver-570 host and then
   crash. A missing/unknown channel now defaults to the strictest floor.
+- **OpenWebUI SQLite hardened for the network volume.** OpenWebUI's DB
+  (`/data/openwebui/webui.db`) sits on the RunPod network volume, and 0.11.0
+  defaults to **WAL** journal mode — which needs an mmap'd `-shm` shared-memory
+  index that network filesystems don't support, so WAL was *causing* the
+  `database is locked` errors seen in rc3 testing. Baked env: `DATABASE_ENABLE_SQLITE_WAL=false`
+  (rollback journal — no `-shm`/mmap), `DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT=10000`
+  (10s lock-wait; not higher, which would just mask real deadlocks), and
+  `DATABASE_SQLITE_PRAGMA_MMAP_SIZE=0` (DB mmap also unreliable over network FS).
+  `synchronous` stays at OWUI's `NORMAL` default — `FULL` would lengthen writes
+  on slow network storage and worsen contention. All overridable via env
+  (documented in `.env.example`).
 
 ### Validation gate (operator — before rebuild is promoted to `:latest`)
 - Rebuild the image; **boot self-test must PASS** — including the STT + TTS

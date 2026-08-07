@@ -313,6 +313,20 @@ ENV ENABLE_OPENAI_API="true"
 ENV DATA_DIR="/data/openwebui"
 ENV WEBUI_AUTH="true"
 
+# SQLite hardening for OpenWebUI's DB, which lives on the RunPod NETWORK volume
+# (/data/openwebui/webui.db). OpenWebUI 0.11.0 defaults to WAL journal mode, but
+# SQLite's WAL needs an mmap'd shared-memory (-shm) index that network
+# filesystems don't support reliably — on a network volume WAL *causes* the
+# "database is locked" errors it's meant to avoid. So: fall back to rollback
+# (DELETE) journal, which needs no -shm/mmap; raise the lock-wait modestly (10s,
+# not 30s+ which would just hide a real deadlock); and drop the DB mmap (also
+# unreliable over network FS). synchronous stays at OWUI's NORMAL default on
+# purpose — FULL would lengthen writes on slow network storage and worsen
+# contention. Inherited by the openwebui program like the AUDIO_* vars above.
+ENV DATABASE_ENABLE_SQLITE_WAL="false"
+ENV DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT="10000"
+ENV DATABASE_SQLITE_PRAGMA_MMAP_SIZE="0"
+
 # V3.2 — wire OpenWebUI's STT to the local Whisper service (OpenAI engine).
 # Disable voice input per-pod by setting AUDIO_STT_ENGINE="" (empty).
 ENV AUDIO_STT_ENGINE="openai"
