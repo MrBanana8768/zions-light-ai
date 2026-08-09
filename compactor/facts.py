@@ -363,6 +363,27 @@ OUTPUT FORMAT — STRICT:
 
 ONLY return the literal word NONE (no other characters) when the user's message contained zero concrete information — e.g. just "ok", "thanks", "continue", or a one-word reaction. If the user named anything, expressed any preference, or stated any detail, extract it. When in doubt, extract."""
 
+# --- tier-1 memory-verify experiment (Self-Correction Blind Spot mitigation) ----
+# The same model that GENERATED a reply also extracts facts from the exchange —
+# squarely in the measured "self-correction blind spot" (an LLM misses ~64.5% of
+# errors in its own output that it would catch from an external source;
+# Self-Correction Bench, arXiv:2507.02778). Gated + DEFAULT-OFF so it's a clean
+# A/B toggle (flip COMPACTOR_MEMORY_VERIFY on the pod; no rebuild). When on, append
+# a draft-then-verify step so the model re-grounds each bullet against the source
+# before committing it — the cheap prompt-level test before tier-2 (a separate
+# judge model). Note the axis: the base prompt biases toward extraction (recall,
+# "when in doubt extract" = trivial-vs-important); this filters on groundedness
+# (precision, drop fabricated) — complementary, not contradictory.
+_MEMORY_VERIFY = os.environ.get("COMPACTOR_MEMORY_VERIFY", "false").lower() == "true"
+_VERIFY_CLAUSE_FACTS = (
+    "\n\nVERIFY BEFORE OUTPUT: draft your bullets, then re-read the exchange and "
+    "drop any bullet you cannot point to in what the USER actually wrote. Do not "
+    "record inferred, assumed, or embellished details as facts — a wrong \"memory\" "
+    "is worse than a missing one. Output only the verified bullets."
+)
+if _MEMORY_VERIFY:
+    _EXTRACTION_SYSTEM_PROMPT += _VERIFY_CLAUSE_FACTS
+
 
 def _build_extraction_messages(
     user_msg: str, assistant_msg: str, existing_facts: list[dict]

@@ -252,6 +252,19 @@ _PROMPT_L1 = """Summarize the following conversation excerpt for long-term recal
 - Plot/story beats if this is creative writing.
 Do not greet, editorialize, or hedge. Output the summary only."""
 
+# tier-1 memory-verify experiment (see facts.py). DEFAULT-OFF, env-gated. When on,
+# the raw-transcript L1 summary gets a grounding check so the summarizer doesn't
+# invent details it can't point to in the excerpt (the Self-Correction Blind Spot;
+# arXiv:2507.02778). L1 is the raw-source rollup, so it's the highest-confabulation
+# path; L2/L3 summarize already-summarized content and are left as-is for now.
+_MEMORY_VERIFY = os.environ.get("COMPACTOR_MEMORY_VERIFY", "false").lower() == "true"
+if _MEMORY_VERIFY:
+    _PROMPT_L1 += (
+        "\n\nVERIFY: include only details actually present in the excerpt above; "
+        "do not invent, infer, or embellish. When unsure whether something was "
+        "stated, leave it out."
+    )
+
 _PROMPT_L2 = """You are summarizing several earlier per-scene summaries into one "chapter-level" summary. Preserve continuity at the chapter scale: characters, settings, decisions, ongoing threads. Drop scene-by-scene minutiae but keep names and concrete decisions. Output the chapter summary only — no preamble, no hedging."""
 
 _PROMPT_L3 = """You are producing the whole-conversation "theme" summary from a list of chapter-level summaries. Capture the high-level arc, the user's overarching goals, persistent constraints, and the cast of named entities. This will be injected on every future request, so be concise but never vague. Output the theme summary only."""
