@@ -785,6 +785,25 @@ Two parallel tracks to the V-line, at different horizons:
   tabula-rasa / self-modification frontiers. Resource-gated; sequenced only after
   the compactor is validated. See [SEED_MODEL_PLAN.md](SEED_MODEL_PLAN.md).
 
+### Memory-judgment experiment (near-term — current compactor)
+Testable *now*, no new model architecture. The compactor's memory-processing
+(summarize / extract-facts / dedup) currently uses the **same** model that
+generated the conversation — squarely in the **Self-Correction Blind Spot** (an
+LLM misses ~64.5% of errors in its *own* output that it would catch from an
+external source — Self-Correction Bench, Tsui 2025, arXiv:2507.02778). Two-tier,
+cheap-first:
+1. **Prompt-level (near-zero cost):** add a "*Wait — verify this against the
+   source*" step to the memory-processing prompts. The bench found appending
+   "Wait" cut the blind spot ~89%. Try this first.
+2. **Separate judge model:** route memory-processing to a *different* small model
+   (e.g. a 3–8B instruct) run on **CPU in its own venv** — memory work is offline
+   (`bgwork.py`), so latency is irrelevant and it never competes with vLLM for
+   VRAM (same pattern as STT/TTS).
+
+Eval: A/B the confabulation rate + fact-selection quality (self-judge vs.
+separate-judge) over a fixed set of conversations; weigh "avoids the blind spot"
+against any capability drop from a smaller judge.
+
 ### Real-time web search / external RAG
 - Combine V2's vector memory with external doc ingestion
 - Crawl + chunk + embed pattern, queryable through the compactor

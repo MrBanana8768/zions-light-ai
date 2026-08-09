@@ -195,26 +195,33 @@ with no interior agency required. This ambiguity does not resolve with better
 engineering — it is treated as **permanent** ("we do not know, and may never be
 able to verify from the inside").
 
-## 6. Research citations (verify before relying — several are post-2026-01)
+## 6. Research citations (arXiv IDs verified 2026-08-08 — all resolve ✓)
 
-- **Titans** — Behrouz & Zhong, "Titans: Learning to Memorize at Test Time,"
-  arXiv:2501.00663, NeurIPS 2025
-- **Nested Learning** — Behrouz et al., "Nested Learning: The Illusion of Deep
-  Learning Architectures," arXiv:2512.24695, NeurIPS 2025
-- **Branch-Train-MiX (BTX)** — Meta FAIR
-- **CARE** (router confidence/disagreement) — "Spend Experts Where You Are
-  Unsure," arXiv:2607.26052
-- **DAG-MoE** (learned expert aggregation) — arXiv:2606.01062
-- **Self-Correction Blind Spot** — Tsui, arXiv:2507.02778
-- **Multi-factor memory value model** — "Learning What to Remember," arXiv:2606.12945
-- **Model merging / task interference** — "Model Merging in the Era of LLMs,"
-  arXiv:2603.09938
+- **Titans** — Ali Behrouz et al., "Titans: Learning to Memorize at Test Time,"
+  arXiv:2501.00663, NeurIPS 2025 ✓
+- **Nested Learning** — Ali Behrouz et al., "Nested Learning: The Illusion of Deep
+  Learning Architectures," arXiv:2512.24695, NeurIPS 2025 ✓
+- **Branch-Train-MiX (BTX)** — Meta FAIR, 2024 (pre-cutoff; not re-fetched)
+- **CARE** — "Spend Experts Where You Are Unsure: Confidence-Adaptive Routing for
+  Mixture-of-Experts LoRA," arXiv:2607.26052 ✓
+- **DAG-MoE** — Jiarui Feng et al., "DAG-MoE: From Simple Mixture to Structural
+  Aggregation in Mixture-of-Experts," arXiv:2606.01062 ✓
+- **Self-Correction Blind Spot** — Ken Tsui et al., "Self-Correction Bench:
+  Uncovering and Addressing the Self-Correction Blind Spot in Large Language
+  Models," arXiv:2507.02778 — confirms the ~64.5% blind-spot rate cited in §3 ✓
+- **Multi-factor memory value model** — Zhibao Chen et al., "Learning What to
+  Remember: A Cognitively Grounded Multi-Factor Value Model for Agentic Memory,"
+  arXiv:2606.12945 ✓
+- **Model merging / task interference** — Mingyang Song et al., "Model Merging in
+  the Era of Large Language Models: Methods, Applications, and Future Directions,"
+  arXiv:2603.09938 ✓
 - **Complementary Learning Systems** — McClelland, McNaughton & O'Reilly (1995);
-  Kumaran, Hassabis & McClelland (2016)
+  Kumaran, Hassabis & McClelland (2016) (foundational; independently known)
 
-> Citations dated after 2026-01 are past the recording assistant's knowledge and
-> were **not** independently verified; spot-check arXiv IDs before building on them.
-> The ones within reach (Titans 2501.00663, CLS theory, BTX/Meta) check out.
+> Verified 2026-08-08: the seven arXiv abstracts were fetched and each resolves to
+> a real paper matching its claimed topic — the handoff's references are
+> trustworthy. (BTX and CLS predate the recording assistant's cutoff and are
+> independently known, not re-fetched.)
 
 ## 7. Explicitly open / unresolved
 
