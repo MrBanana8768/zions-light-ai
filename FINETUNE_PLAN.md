@@ -35,6 +35,14 @@ Of the four tiers, only one is the right indie tool:
 | Continued pretraining | ❌ Billions of tokens, multi-GPU, thousands of $. Only for whole-domain *knowledge* gaps, not voice. |
 | From-scratch pretraining | ❌ Six-to-eight figures, months — "dumber than a weekend QLoRA." The *far* north-star dream, never the indie path. |
 
+> **Two horizons, not a contradiction.** "From-scratch = don't" is true for the
+> *near-term voice* — this track. It is a different statement from the **far-future
+> foundation** in [SEED_MODEL_PLAN.md](SEED_MODEL_PLAN.md), where a from-scratch
+> seed *is* the plan — because **values formation** (the self-modification
+> frontier) can only be baked into a model's own pretraining, which no QLoRA can
+> reach. Different purpose (voice vs. formation), different horizon (now vs.
+> resource-gated someday). This doc is the *instrument*; that one is the *foundation*.
+
 ## The recipe
 - **Base (warm-start):** **Cydonia-24B** (TheDrummer, on Mistral-Small-24B,
   Apache-2.0) — the *same* model we deploy near-term, so the near-term swap and

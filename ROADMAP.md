@@ -775,12 +775,15 @@ and V3 prove the architecture handles them. **Order does not imply priority.**
   enforce user isolation in memory store)
 - Multi-tenant Network Volume layout
 
-### Fine-tuning pipeline
-- Personalize Magnum (or any model) on the user's own writing samples
-- Use vLLM's LoRA adapter support to swap personality without reloading
-  base weights
-- Requires a training pipeline (out of vLLM's scope), but inference becomes
-  cheap once adapters exist
+### Custom-model tracks — now scoped in their own docs
+Two parallel tracks to the V-line, at different horizons:
+- **Voice (near-term):** a QLoRA style-LoRA to give the model *our* prose,
+  uncensored by default — achievable on the A40 (vLLM LoRA-adapter serving keeps
+  inference cheap once trained). See [FINETUNE_PLAN.md](FINETUNE_PLAN.md).
+- **Foundation (far-future):** a from-scratch MoE seed (Branch-Train-MiX) with
+  values baked into its *own* pretraining — the concrete architecture for the
+  tabula-rasa / self-modification frontiers. Resource-gated; sequenced only after
+  the compactor is validated. See [SEED_MODEL_PLAN.md](SEED_MODEL_PLAN.md).
 
 ### Real-time web search / external RAG
 - Combine V2's vector memory with external doc ingestion
