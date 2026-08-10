@@ -74,6 +74,32 @@ secure release.
   `.gitattributes` (`* text=auto eol=lf` + explicit `eol=lf` for
   `*.sh`/`entrypoint.sh`/`*.conf`/`Dockerfile`/`*.py`) and renormalized the tree
   to LF (verified byte-accurately: CR=0 across all image-copied files).
+- **Dependency-boundary hardening (rc5, from a full architecture audit).** The
+  recurring failure class this release kept hitting — our code trusting a
+  dependency's output shape — swept systematically:
+  - **Silent fact loss (data integrity).** The async tail wrote facts built on a
+    snapshot read *outside* `conv_lock`, so two overlapping turns on one
+    conversation could lose a fact permanently (the lock serialized the writes
+    but not the read). Facts are now re-read under the lock and reconciled via
+    `_merge_touched`: disk is authoritative for membership (a `/forget` is never
+    resurrected), the snapshot contributes only LRU touches, and `last_used`
+    only ever moves forward.
+  - **Opaque 500 on a non-JSON vLLM reply** (HTML 502, truncated body):
+    `r.json()` is guarded → friendly 502 instead of an unhandled decode error.
+  - **Garbled stream on a vLLM 4xx/5xx:** the streaming path relayed vLLM's JSON
+    error body raw into an SSE channel; it now checks status and degrades to the
+    same friendly chunks the connection-error branch uses.
+  - **Consecutive system messages** (V1 compaction summary + injected memory
+    block) could trip Mistral-family templates' 400 — collapsed into one just
+    before forwarding, with multimodal (image) content left intact.
+  - **Unbounded proxy timeout:** `timeout=None` also removed the *connect*
+    timeout, so a stalled vLLM socket hung a request forever. Connect/write/pool
+    are now bounded; read stays unbounded for long generations.
+  - **`atomic_write_json` now fsyncs the parent directory**, so the rename itself
+    is durable — the previous "atomic on POSIX" claim was weaker than it read on
+    a distributed network volume.
+  - Tier-1 `compactor/test_concurrency_guards.py` covers both new helpers,
+    including the lost-update and Mistral-400 scenarios.
 - **Driver preflight is now build-arg-aware and fails closed.** `entrypoint.sh`
   Check 3 reads the baked-in `TORCH_CUDA` and requires driver ≥580 for cu130
   (CUDA 13) vs ≥525 for cu128/cu126 — instead of hardcoding cu128/≥525, which

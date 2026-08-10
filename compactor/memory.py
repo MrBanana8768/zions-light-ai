@@ -232,6 +232,20 @@ def atomic_write_json(path: Path, data: Any) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
+        # fsync the PARENT DIRECTORY so the rename itself is durable, not just
+        # the file contents. Without this the replace can still be lost on a
+        # crash/host failure — and this state lives on a distributed network
+        # volume (MooseFS), where rename/fsync guarantees are weaker than local
+        # POSIX. Best-effort: a filesystem that refuses O_DIRECTORY fsync must
+        # not fail the write we just completed successfully.
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
     except Exception:
         # Best-effort cleanup of orphan temp file; don't shadow the
         # original exception if cleanup also fails.

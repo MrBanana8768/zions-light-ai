@@ -259,6 +259,36 @@ def inject_system_block(messages: list[dict], content: str) -> list[dict]:
     return messages[:insert_at] + [sys_msg] + messages[insert_at:]
 
 
+def _merge_adjacent_system_messages(messages: list[dict]) -> list[dict]:
+    """Collapse each run of consecutive system messages into a single one.
+
+    Mistral-family templates (Magnum, Cydonia — anything built on
+    Mistral-Small) reject multiple consecutive system messages with a 400.
+    Memory injection is careful to emit ONE combined block, but V1 compaction
+    prepends its own summary system message independently, so the two together
+    can still produce a run. Applied just before forwarding, this makes the
+    invariant hold no matter which layers fired.
+
+    Image-bearing system messages (list content) are left alone rather than
+    string-joined — collapsing them would destroy the image parts.
+    """
+    if not isinstance(messages, list) or len(messages) < 2:
+        return messages
+    out: list[dict] = []
+    for m in messages:
+        mergeable = (
+            isinstance(m, dict)
+            and m.get("role") == "system"
+            and isinstance(m.get("content"), str)
+        )
+        if mergeable and out and out[-1].get("role") == "system" and isinstance(out[-1].get("content"), str):
+            prev = out[-1]
+            out[-1] = {**prev, "content": f"{prev['content']}\n\n{m['content']}"}
+        else:
+            out.append(m)
+    return out
+
+
 def _extract_last_user_text(messages: list[dict]) -> str:
     """The user message that prompted the just-completed assistant response,
     for fact extraction. Walks from the end to find the most recent
@@ -328,6 +358,39 @@ def _fire_and_forget(coro) -> None:
     bgwork.pool.submit(coro)
 
 
+def _merge_touched(fresh: list[dict], touched: list[dict]) -> list[dict]:
+    """Reconcile a freshly-read facts list with an older in-flight snapshot.
+
+    The request path loads facts and bumps their `last_used` (LRU touch) long
+    before the async tail runs, so the tail holds a stale snapshot. Writing
+    that snapshot back would erase anything another tail persisted in between
+    (a classic lost update — the per-conv lock serializes the *writes*, but the
+    *read* happened before the lock was taken).
+
+    So: `fresh` (read under the lock) is authoritative for membership, and the
+    snapshot only contributes its LRU touches. Facts the snapshot has but
+    `fresh` no longer does were deliberately pruned/forgotten — they stay gone.
+    """
+    if not touched:
+        return list(fresh)
+    touched_at = {
+        f.get("text"): f.get("last_used")
+        for f in touched
+        if isinstance(f, dict) and f.get("last_used") is not None
+    }
+    merged = []
+    for f in fresh:
+        if not isinstance(f, dict):
+            continue
+        t = touched_at.get(f.get("text"))
+        # Only ever move last_used forward — never backdate a fact that a
+        # concurrent request touched more recently than our snapshot did.
+        if t is not None and t > (f.get("last_used") or 0):
+            f = {**f, "last_used": t}
+        merged.append(f)
+    return merged
+
+
 async def _async_tail(
     conv_id: str,
     touched_facts: list[dict],
@@ -376,10 +439,11 @@ async def _async_tail(
     # --- 2. Facts extraction ---
     if not facts.extraction_enabled():
         # Even with extraction off, save the touched state so LRU
-        # tracking persists across restarts.
+        # tracking persists across restarts. Re-read under the lock (see
+        # _merge_touched) so we don't clobber a concurrent tail's writes.
         async with conv_lock(conv_id):
             try:
-                facts.save_facts(conv_id, touched_facts)
+                facts.save_facts(conv_id, _merge_touched(facts.load_facts(conv_id), touched_facts))
             except Exception as e:
                 logger.warning(f"conv={conv_id}: touched-save failed: {e}")
         return
@@ -404,7 +468,12 @@ async def _async_tail(
                     {"text": s, "added_turn": turn_index, "last_used": now}
                     for s in new_strs
                 ]
-                combined = touched_facts + new_entries
+                # Re-read INSIDE the lock. `touched_facts` was loaded back in
+                # the request path (outside any lock), so building on it would
+                # silently drop facts written by a tail that finished in the
+                # meantime — the lock serializes writers but cannot prevent a
+                # lost update when the read happened before it was acquired.
+                combined = _merge_touched(facts.load_facts(conv_id), touched_facts) + new_entries
 
                 # V2.1 Phase 7: hybrid dedup BEFORE pruning. Embedding
                 # filter is cheap (no LLM call when no candidate clusters
@@ -753,8 +822,22 @@ async def chat_completions(request: Request) -> Any:
         except Exception as e:
             logger.warning(f"conv={conv_id}: backfill kickoff failed (non-fatal): {e}")
 
+    # Mistral-family chat templates (Magnum, Cydonia — anything on
+    # Mistral-Small) reject multiple consecutive system messages with a 400.
+    # Memory injection deliberately builds ONE combined block, but V1
+    # compaction independently prepends its own summary system message, so a
+    # long conversation that trips compaction can still emit a run of them.
+    # Collapse any adjacent run into one, as the last thing before forwarding.
+    body["messages"] = _merge_adjacent_system_messages(body["messages"])
+
     stream = bool(body.get("stream", False))
-    client = httpx.AsyncClient(timeout=None)
+    # read=None keeps long generations from being cut off, but connect/write/
+    # pool stay bounded: an unqualified timeout=None also removes the CONNECT
+    # timeout, so a vLLM socket that accepts and then stalls (or a half-open
+    # connection after a restart) would hang the request forever.
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+    )
 
     if stream:
         accumulator = SseAccumulator()
@@ -767,9 +850,26 @@ async def chat_completions(request: Request) -> Any:
                         "POST", f"{VLLM_URL}/v1/chat/completions", json=body
                     )
                     async with stream_cm as r:
-                        async for chunk in r.aiter_raw():
-                            yield chunk
-                            accumulator.feed(chunk)
+                        if r.status_code >= 400:
+                            # vLLM rejected the request (e.g. a 400 from chat-
+                            # template validation). Relaying its JSON error body
+                            # raw into a text/event-stream gives the UI a garbled
+                            # reply; degrade visibly instead, like the
+                            # connection-error branch below.
+                            vllm_failed = True
+                            err_body = (await r.aread()).decode("utf-8", "replace")[:300]
+                            logger.warning(
+                                f"vLLM HTTP {r.status_code} on stream: {err_body!r}"
+                            )
+                            for chunk in _vllm_unreachable_stream_chunks(
+                                body.get("model") or MODEL_REPO or ""
+                            ):
+                                yield f"data: {json.dumps(chunk)}\n\n".encode()
+                            yield b"data: [DONE]\n\n"
+                        else:
+                            async for chunk in r.aiter_raw():
+                                yield chunk
+                                accumulator.feed(chunk)
                 except httpx.RequestError as e:
                     # V2.3 Theme 2: vLLM unreachable mid-stream (down /
                     # restarting). Degrade visibly — emit the friendly
@@ -812,7 +912,23 @@ async def chat_completions(request: Request) -> Any:
                 content=_vllm_unreachable_body(f"{type(e).__name__}: {e}"),
                 status_code=503,
             )
-        response_json = r.json()
+        try:
+            response_json = r.json()
+        except ValueError as e:
+            # vLLM (or something in front of it) returned a non-JSON body — an
+            # HTML 502, a truncated response, a plain-text 5xx. Without this
+            # guard the JSONDecodeError escapes as an opaque 500; httpx's
+            # RequestError above only covers connection-level faults.
+            body_head = (r.text or "")[:200]
+            logger.warning(
+                f"vLLM returned non-JSON (HTTP {r.status_code}): {type(e).__name__}: {body_head!r}"
+            )
+            return JSONResponse(
+                content=_vllm_unreachable_body(
+                    f"non-JSON response (HTTP {r.status_code}): {body_head}"
+                ),
+                status_code=502,
+            )
         # Extract assistant text for fact extraction
         assistant_text = ""
         try:
