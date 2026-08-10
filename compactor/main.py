@@ -178,7 +178,13 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
     }
     r = await client.post(f"{VLLM_URL}/v1/chat/completions", json=payload, timeout=300.0)
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+    data = r.json()
+    choices = data.get("choices") or []
+    if not choices:
+        # A 200 with no choices (or an error-shaped body) must not become an
+        # opaque IndexError — callers catch ValueError and degrade gracefully.
+        raise ValueError(f"vLLM returned no choices for summarize: {str(data)[:200]}")
+    return (choices[0].get("message") or {}).get("content", "").strip()
 
 
 def split_messages(messages: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
@@ -549,6 +555,30 @@ def _vllm_unreachable_stream_chunks(model: str) -> list[dict]:
 async def chat_completions(request: Request) -> Any:
     body = await request.json()
     messages = body.get("messages", [])
+
+    # Guard: never forward an empty/invalid messages list to vLLM — its chat
+    # templating raises an opaque "list index out of range" (IndexError on
+    # conversation[0]) that surfaces in the UI as a broken reply. Seen from
+    # OpenWebUI 0.11 background/task-style calls. Log enough to identify the
+    # sender, then return a clean OpenAI-shaped 400.
+    if not isinstance(messages, list) or not messages:
+        logger.warning(
+            "rejected chat request with empty/invalid messages: "
+            f"ua={request.headers.get('user-agent', '?')!r} "
+            f"referer={request.headers.get('referer', '?')!r} "
+            f"body_keys={sorted(body.keys())} model={body.get('model')!r} "
+            f"stream={body.get('stream')!r} metadata={str(body.get('metadata'))[:200]!r}"
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "messages must be a non-empty list",
+                    "type": "invalid_request_error",
+                    "code": "empty_messages",
+                }
+            },
+        )
 
     # V2.0 Phase 1: conv_id resolution
     conv_id: str | None = None
