@@ -627,9 +627,19 @@ before it is promoted to `:latest`. Branch `v3.0` off master.
   **driver ≥580** (the A40 works — the gate is the host, not the card). Driver-570
   hosts use the documented **CUDA-12 fallback** (vLLM 0.19.0, ~32 advisories).
 - **Bug-fix scrub (in progress):** landed — CRLF→LF entrypoint fix +
-  build-arg-aware driver preflight, and open-webui 0.10.1→0.11.0 (fixes the
-  auto-discovered-model chat crash, clears 17 advisories). More as on-pod
-  testing surfaces them.
+  build-arg-aware driver preflight, open-webui 0.10.1→0.11.0 (fixes the
+  auto-discovered-model chat crash, clears 17 advisories), and an
+  empty-`messages` guard in the chat proxy (rc4 on-pod: OpenWebUI 0.11
+  background/task calls can send `messages: []`, which crashed vLLM's chat
+  templating with an opaque "list index out of range"; now a clean 400 +
+  sender-identifying log). More as on-pod testing surfaces them.
+- **Ops learning (2026-08-10):** the network volume (MooseFS) threw
+  `disk I/O error` under `webui.db` → transient "malformed database" outage
+  (file survived; V2.3 backups stood ready). Mitigation now:
+  `COMPACTOR_BACKUP_INTERVAL_HOURS=6` on the pod. Architectural fix decided:
+  **Postgres sidecar as the state home** (PGDATA on local disk, pg_dump to the
+  volume) — see ARCHITECTURE.md Decision 4. SQLite/Chroma stay only until that
+  brick lands.
 - **Validation gate:** rebuild → boot self-test PASS (incl. STT/TTS + a chat
   round-trip exercising transformers 5.x) → real voice round-trip → promote
   `:latest`. Frozen rollback target meanwhile: `:v3-snapshot`.

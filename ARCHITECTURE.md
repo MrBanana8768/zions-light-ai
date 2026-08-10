@@ -139,6 +139,21 @@ edge** — and that assumption must be replaced *before* anything is exposed:
    self's memory a durable, independent home (an external store / pgvector is
    the likely target; interacts with the ~V5 memory rewrite). Do not scatter
    state during the split.
+   **Decided (2026-08-10, forced by a production incident):** the RunPod network
+   volume (a distributed MooseFS) threw `disk I/O error` under OpenWebUI's
+   SQLite `webui.db`, presenting as "database disk image is malformed" and
+   taking the UI down (the file itself survived; the V2.3 backup daemon stood
+   ready — but the failure class is real, and ChromaDB puts the *memory store*
+   in the same class). SQLite-on-network-FS is architecturally wrong for
+   write-hot state. **The state home is Postgres (+ pgvector), run as a
+   pod-local sidecar: `PGDATA` on the pod's local disk, with `pg_dump`
+   archives to the network volume via the existing backup daemon and
+   restore-at-boot in the entrypoint.** The volume's job narrows to what a
+   distributed FS is good at — model caches and backup archives — and both
+   OpenWebUI (`DATABASE_URL`, native support, proven env path) and the memory
+   store (pgvector, replacing embedded ChromaDB at the ~V5 rewrite) converge
+   on one crash-safe engine. Sequenced as a V4-foundation brick (step 2 of the
+   sequence below), not an rc patch.
 5. **Networking:** compactor is the single front door; everything else on a
    private network; **auth + TLS before any exposure**; sandbox network-isolated.
 6. **V4 foundation is trigger-sequenced** — front-end split + V4.0 (no new
