@@ -64,6 +64,16 @@ MAX_MODEL_LEN = _env_int("MAX_MODEL_LEN", 32768)
 TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(MAX_MODEL_LEN * 0.75))
 KEEP_RECENT_TURNS = _env_int("COMPACTOR_KEEP_RECENT_TURNS", 4)
 SUMMARY_MAX_TOKENS = _env_int("COMPACTOR_SUMMARY_MAX_TOKENS", 1024)
+# Slack left inside MAX_MODEL_LEN when budgeting a summarization call's INPUT
+# (covers the system prompt, the wrapper text, and chat-template overhead).
+SUMMARY_INPUT_RESERVE = _env_int("COMPACTOR_SUMMARY_INPUT_RESERVE", 2048)
+# Hard ceiling for what we will forward to vLLM. Anything above this is a
+# guaranteed 400, so the guard sheds content rather than letting the request
+# fail. The reserve leaves the model room to actually generate a reply.
+GENERATION_RESERVE = _env_int("COMPACTOR_GENERATION_RESERVE", 2048)
+# Clamped to MAX_MODEL_LEN: a bare floor could sit ABOVE the model's own window
+# on a small-context model, which would defeat the entire point of the guard.
+HARD_INPUT_LIMIT = min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - GENERATION_RESERVE))
 # V3.1 (Vision): a single image in a VLM request costs far more than its
 # text — hundreds to a couple thousand tokens depending on resolution and
 # the model's vision encoder. The text-only token estimate misses this
@@ -162,9 +172,10 @@ Produce a concise but comprehensive summary that preserves:
 Do not editorialize. Do not greet. Output only the summary."""
 
 
-async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
+async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
+    """One summarization call. Caller guarantees `turns` fits the input budget."""
     transcript = "\n\n".join(
-        f"[{m.get('role', 'unknown')}]: {_message_text(m)}" for m in to_summarize
+        f"[{m.get('role', 'unknown')}]: {_message_text(m)}" for m in turns
     )
     payload = {
         "model": MODEL_REPO,
@@ -185,6 +196,70 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
         # opaque IndexError — callers catch ValueError and degrade gracefully.
         raise ValueError(f"vLLM returned no choices for summarize: {str(data)[:200]}")
     return (choices[0].get("message") or {}).get("content", "").strip()
+
+
+def _chunk_to_budget(turns: list[dict], budget: int) -> list[list[dict]]:
+    """Split turns into consecutive batches that each fit `budget` tokens.
+
+    A single turn larger than the budget still gets its own batch — we never
+    drop content here; `_summarize_once` would fail on it and the caller
+    degrades. (Truncating a turn silently would be a quieter kind of lying.)
+    """
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    current_tokens = 0
+    for m in turns:
+        t = count_tokens([m])
+        if current and current_tokens + t > budget:
+            batches.append(current)
+            current, current_tokens = [], 0
+        current.append(m)
+        current_tokens += t
+    if current:
+        batches.append(current)
+    return batches
+
+
+async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
+    """Summarize older turns, MAP-REDUCE style so the summarization request
+    can never itself exceed the model's context window.
+
+    This bit us in production (2026-08-13): a long conversation packed every
+    older turn into ONE prompt, the summarize call blew past MAX_MODEL_LEN, the
+    400 propagated up, compaction "degraded" by forwarding the *original*
+    oversized messages, and the real chat request then 400'd too. The context
+    manager overflowed the context. So the input is now budgeted explicitly.
+    """
+    # Room for the system prompt, the wrapper text, and the model's own output.
+    # Clamped for the same reason as HARD_INPUT_LIMIT: a bare floor could exceed
+    # the model's own window and reintroduce the overflow this method prevents.
+    budget = min(
+        MAX_MODEL_LEN,
+        max(256, MAX_MODEL_LEN - SUMMARY_MAX_TOKENS - SUMMARY_INPUT_RESERVE),
+    )
+    batches = _chunk_to_budget(to_summarize, budget)
+    if len(batches) == 1:
+        return await _summarize_once(client, batches[0])
+
+    logger.info(
+        f"summarize: {len(to_summarize)} turns exceed the {budget}-token input "
+        f"budget — map-reduce over {len(batches)} batches"
+    )
+    parts: list[str] = []
+    for i, batch in enumerate(batches, 1):
+        parts.append(await _summarize_once(client, batch))
+    combined = "\n\n".join(p for p in parts if p)
+
+    # Reduce step: if the concatenated partials are themselves large, fold them
+    # into one summary. Bounded to a single pass — if it still doesn't fit we
+    # return the concatenation and let the hard-budget guard downstream trim.
+    as_msg = [{"role": "user", "content": combined}]
+    if count_tokens(as_msg) > budget:
+        try:
+            return await _summarize_once(client, as_msg)
+        except Exception as e:
+            logger.warning(f"summarize reduce-step failed, using concatenation: {e}")
+    return combined
 
 
 def split_messages(messages: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
@@ -287,6 +362,62 @@ def _merge_adjacent_system_messages(messages: list[dict]) -> list[dict]:
         else:
             out.append(m)
     return out
+
+
+def _enforce_hard_budget(messages: list[dict]) -> list[dict]:
+    """Last line of defense: never forward a request that vLLM must reject.
+
+    Everything upstream (compaction, facts, RAG, summary injection) is
+    best-effort and can individually fail or overshoot. On 2026-08-13 they
+    compounded: summarization 400'd, compaction "degraded" by forwarding the
+    ORIGINAL oversized messages, and memory injection then piled 100 facts +
+    retrieved exchanges on top — so the user got a hard 400 from the component
+    whose whole job is to keep requests inside the window.
+
+    Shedding order is by value: oldest turns first (already summarized, and the
+    memory layers exist precisely to carry that content forward), then the
+    injected memory blocks, trimmed largest-first. The newest turn is never
+    dropped — losing the message the user just typed is worse than any
+    truncation. Returns the input untouched in the common case.
+    """
+    total = count_tokens(messages)
+    if total <= HARD_INPUT_LIMIT:
+        return messages
+
+    msgs = list(messages)
+    dropped = 0
+    while count_tokens(msgs) > HARD_INPUT_LIMIT:
+        idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+        if len(idxs) <= 1:
+            break  # always keep the most recent turn
+        del msgs[idxs[0]]
+        dropped += 1
+
+    trimmed = 0
+    while count_tokens(msgs) > HARD_INPUT_LIMIT and trimmed < 32:
+        big = [
+            i for i, m in enumerate(msgs)
+            if m.get("role") == "system"
+            and isinstance(m.get("content"), str)
+            and len(m["content"]) > 400
+        ]
+        if not big:
+            break
+        i = max(big, key=lambda j: len(msgs[j]["content"]))
+        c = msgs[i]["content"]
+        msgs[i] = {
+            **msgs[i],
+            "content": c[: len(c) // 2].rstrip() + "\n[...trimmed to fit the context budget]",
+        }
+        trimmed += 1
+
+    final = count_tokens(msgs)
+    logger.warning(
+        f"hard budget enforced: {total} -> {final} tokens "
+        f"(limit {HARD_INPUT_LIMIT}); dropped {dropped} old turn(s), "
+        f"trimmed {trimmed} injected block(s)"
+    )
+    return msgs
 
 
 def _extract_last_user_text(messages: list[dict]) -> str:
@@ -601,19 +732,34 @@ def _vllm_unreachable_body(detail: str) -> dict:
     }
 
 
-def _vllm_unreachable_stream_chunks(model: str) -> list[dict]:
-    """SSE chunks that show the friendly message as an assistant reply, so a
-    streaming client degrades visibly rather than getting a dead stream."""
+def _vllm_unreachable_stream_chunks(model: str, message: str | None = None) -> list[dict]:
+    """SSE chunks that show a friendly message as an assistant reply, so a
+    streaming client degrades visibly rather than getting a dead stream.
+
+    `message` defaults to the backend-restarting text. Pass an explicit one for
+    cases where that would be FALSE — a 4xx means the backend is healthy and
+    rejected *our* request, and telling the user "the model is starting up" is
+    the system bearing false witness about its own state (see
+    COGNITIVE_ARCHITECTURE.md: degrade honestly, claim nothing unearned).
+    """
     cid = f"chatcmpl-unavail-{int(time.time() * 1000):x}"
     created = int(time.time())
     base = {"id": cid, "object": "chat.completion.chunk", "created": created,
             "model": model or "compactor"}
     return [
         {**base, "choices": [{"index": 0,
-                              "delta": {"role": "assistant", "content": MODEL_RESTART_MESSAGE},
+                              "delta": {"role": "assistant",
+                                        "content": message or MODEL_RESTART_MESSAGE},
                               "finish_reason": None}]},
         {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
     ]
+
+
+REQUEST_REJECTED_MESSAGE = (
+    "That request couldn't be processed — the model backend rejected it "
+    "(this is a problem on my side, not yours). The conversation is safe; "
+    "trying again, or starting a new chat if it keeps happening, should work."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -713,7 +859,10 @@ async def chat_completions(request: Request) -> Any:
     try:
         body["messages"] = await compact_if_needed(messages)
     except Exception as e:
-        logger.exception(f"compaction failed; forwarding original messages: {e}")
+        logger.exception(
+            f"compaction failed; falling through with the original messages — "
+            f"the hard-budget guard will shed content if they don't fit: {e}"
+        )
 
     # V2.0 memory injection. ALL three layers (facts, RAG, summary) are
     # collected into a SINGLE combined system message and injected in one
@@ -830,6 +979,11 @@ async def chat_completions(request: Request) -> Any:
     # Collapse any adjacent run into one, as the last thing before forwarding.
     body["messages"] = _merge_adjacent_system_messages(body["messages"])
 
+    # FINAL pre-flight. Compaction, facts, RAG and summary injection are each
+    # best-effort and can individually fail or overshoot; this is the one place
+    # that guarantees what leaves here fits the model's window.
+    body["messages"] = _enforce_hard_budget(body["messages"])
+
     stream = bool(body.get("stream", False))
     # read=None keeps long generations from being cut off, but connect/write/
     # pool stay bounded: an unqualified timeout=None also removes the CONNECT
@@ -862,7 +1016,15 @@ async def chat_completions(request: Request) -> Any:
                                 f"vLLM HTTP {r.status_code} on stream: {err_body!r}"
                             )
                             for chunk in _vllm_unreachable_stream_chunks(
-                                body.get("model") or MODEL_REPO or ""
+                                body.get("model") or MODEL_REPO or "",
+                                # A 4xx means the backend is HEALTHY and refused
+                                # our request; only 5xx/unreachable justifies the
+                                # "starting up or restarting" message.
+                                message=(
+                                    REQUEST_REJECTED_MESSAGE
+                                    if r.status_code < 500
+                                    else None
+                                ),
                             ):
                                 yield f"data: {json.dumps(chunk)}\n\n".encode()
                             yield b"data: [DONE]\n\n"
