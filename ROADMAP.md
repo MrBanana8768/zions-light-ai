@@ -790,10 +790,17 @@ Two parallel tracks to the V-line, at different horizons:
 - **Voice (near-term):** a QLoRA style-LoRA to give the model *our* prose,
   uncensored by default — achievable on the A40 (vLLM LoRA-adapter serving keeps
   inference cheap once trained). See [FINETUNE_PLAN.md](FINETUNE_PLAN.md).
-- **Foundation (far-future):** a from-scratch MoE seed (Branch-Train-MiX) with
-  values baked into its *own* pretraining — the concrete architecture for the
-  tabula-rasa / self-modification frontiers. Resource-gated; sequenced only after
-  the compactor is validated. See [SEED_MODEL_PLAN.md](SEED_MODEL_PLAN.md).
+- **Foundation (far-future):** a from-scratch seed with values baked into its
+  *own* pretraining — the concrete architecture for the tabula-rasa /
+  self-modification frontiers. Resource-gated; sequenced only after the compactor
+  is validated. See [SEED_MODEL_PLAN.md](SEED_MODEL_PLAN.md).
+  **Partly superseded:** a later round dropped the MoE / Branch-Train-MiX
+  pipeline in favour of a ~1.5B dense seed with memory layers, and moved the
+  authoritative seed + corpus plan to `MrBanana8768/zions-light-corpus`
+  (private). The notice at the top of SEED_MODEL_PLAN.md itemizes what changed.
+  The headline finding from that round: **compute is not the constraint** — the
+  training run is ~1.3 days and under $700, while compiling the corpus in front
+  of it is 6–10 weeks, and it gates everything.
 
 ### Memory-judgment experiment (near-term — current compactor)
 Testable *now*, no new model architecture. The compactor's memory-processing
