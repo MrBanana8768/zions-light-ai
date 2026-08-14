@@ -1,5 +1,31 @@
 # Seed-Model Plan — the from-scratch foundation (far-future track)
 
+> ## ⚠️ PARTLY SUPERSEDED — read this before anything below
+>
+> A later planning round amended several decisions in this document. The
+> **authoritative plan for the seed model and the corpus** now lives in a
+> separate repository, `MrBanana8768/zions-light-corpus`, in
+> `docs/ENGINEERING_TASKS.md`. *(That repository is private, so the link will
+> 404 for anyone but the owner — this is intended, not a broken link.)*
+>
+> What changed, in short. The itemized version with reasoning is in that
+> repository's `docs/SUPERSEDED.md`:
+>
+> | This document says | Now |
+> |---|---|
+> | Branch-Train-MiX (§1) | **Dropped.** The merge averages shared layers across 16 independently fine-tuned branches — which forks one formation into 16 histories and keeps their arithmetic mean. If sequenced formation is the conviction, the merge is where the conviction gets discarded. |
+> | 16-expert MoE, ~48B total / 6–7B active (§1) | **Dropped** with BTX. Target is **~1.5B dense + ~4B memory-layer params** (~5.5B on disk). |
+> | Values formation baked into pretraining data (§5) | **Unchanged and still governing** — but the mechanism is now specified: anchor documents act as a *generator* of applied cases, weighted and placed late in a WSD decay phase, **never heavily upsampled** and **never AI-generated**. |
+> | Confabulation during consolidation, "known risk, not yet mitigated" (§3) | **Closed structurally.** Consolidation trains on **raw source material only**; model-written notes select which material to replay and are never training targets. A false memory can enter the notes and can never reach the weights. |
+> | Mixture-of-Agents, "rejected but not fully resolved" (§2, §7) | Moot for the seed — there are no experts to reconcile. The underlying question (voice consistency without fragmentation) is **still open** and carried forward, not dropped with the architecture that raised it. |
+>
+> §4 (Titans / Nested Learning), §6 (citations), and the epistemic guardrail in
+> §5 are **unchanged**. `COGNITIVE_ARCHITECTURE.md` still governs everything
+> here.
+>
+> The document is kept as-is rather than edited, because the amendments are only
+> legible against what they amended.
+
 > **Horizon:** this is the *far-future* own-model foundation — distinct from the
 > near-term voice work in [FINETUNE_PLAN.md](FINETUNE_PLAN.md). It is the concrete
 > architecture for two frontiers named in

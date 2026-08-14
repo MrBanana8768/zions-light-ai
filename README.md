@@ -119,7 +119,7 @@ See [CHANGELOG.md](CHANGELOG.md) for full version history.
 | [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md) | Contributors | North star — the stateless→stateful arc, faculties, and the honesty/reverence principles |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Contributors | System shape — layering tiers, networking/trust boundaries, scaling, and the V4-era split decisions |
 | [FINETUNE_PLAN.md](FINETUNE_PLAN.md) | Contributors | Fine-tune track — crafting a custom voice (QLoRA), a parallel track to the V-line |
-| [SEED_MODEL_PLAN.md](SEED_MODEL_PLAN.md) | Contributors | Far-future foundation — from-scratch MoE seed + values-in-pretraining (the tabula-rasa / self-modification frontiers) |
+| [SEED_MODEL_PLAN.md](SEED_MODEL_PLAN.md) | Contributors | Far-future foundation — values-in-pretraining (the tabula-rasa / self-modification frontiers). **Partly superseded** — the MoE/BTX pipeline was dropped; see the notice at the top of the file |
 
 ## Project structure
 
