@@ -45,7 +45,10 @@ CPU container minimal). Mock the HTTP layer with `unittest.mock` when a
 function calls vLLM. Redirect storage to a tempdir via
 `COMPACTOR_STORAGE_ROOT` **before** importing the module under test.
 
-**Current Tier-1 suites** (all green as of V2.1; 12 suites, ~400+ asserts):
+**Current Tier-1 suites** — the authoritative list is `compactor/test_*.py`
+on disk (21 suites as of V3.0; the run command below globs them so new suites
+are never silently skipped — the rc6 review found this list frozen at 12 while
+the suites covering the incident-response fixes went unlisted). Highlights:
 - `compactor/test_smoke.py` — core compactor logic (token counting, split,
   compaction no-op, route registration, env defaults)
 - `compactor/test_memory.py` — conv_id resolution, storage layout, admin
@@ -80,10 +83,8 @@ to avoid Git Bash's `/opt/...` path-mangling trap):
 ```bash
 docker run --rm -v "$PWD/compactor:/work" -w /work python:3.12-slim bash -lc '
   pip install --quiet fastapi "uvicorn[standard]" httpx 2>/dev/null
-  for t in test_smoke test_memory test_facts test_backfill test_retrieval \
-           test_summarizer test_health test_selftest test_portability \
-           test_dedup test_commands test_persona; do
-    echo "=== $t ==="; python $t.py 2>&1 | tail -1
+  for t in test_*.py; do
+    echo "=== $t ==="; python "$t" 2>&1 | tail -1
   done
 '
 ```

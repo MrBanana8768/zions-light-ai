@@ -117,9 +117,57 @@ secure release.
   on slow network storage and worsen contention. All overridable via env
   (documented in `.env.example`).
 
+### Fixed (rc5 → rc7 — on-pod incidents + two audit rounds)
+- **Empty-`messages` guard (rc5).** OpenWebUI 0.11 background/task calls can
+  send `messages: []`, which crashed vLLM's chat templating with an opaque
+  "list index out of range." Now a clean OpenAI-shaped 400
+  (`code=empty_messages`) with a sender-identifying log; hardened in rc7 to
+  also reject non-dict items.
+- **Dependency-boundary fixes (rc5, from the first audit):** lost-update fix in
+  the async facts tail (`_merge_touched`), guarded `r.json()` on the chat path,
+  stream 4xx handling, adjacent-system-message merge, bounded
+  connect/write/pool timeouts, parent-dir fsync in `atomic_write_json`.
+- **Context-overflow cascade (rc6, the 2026-08-13 outage).** The summarize call
+  itself exceeded the model window; compaction "degraded" by forwarding the
+  original oversized messages; injection piled on more → hard 400. Fixed with
+  a map-reduce summarizer (`_chunk_to_budget`) + `_enforce_hard_budget` final
+  pre-flight + honest 4xx degradation (a healthy backend's rejection is no
+  longer reported as "the model is restarting"). New env:
+  `COMPACTOR_SUMMARY_INPUT_RESERVE`, `COMPACTOR_GENERATION_RESERVE`.
+- **Promotion-review round (rc7) — 18 confirmed findings, the critical ones:**
+  - **BLOCKER: compaction emitted assistant-first conversations.** With even
+    `KEEP_RECENT_TURNS` and a real request's odd non-system count, every
+    *successful* compaction violated the Mistral-family template's user-first
+    rule → deterministic 400, conversation dead. Latent since V1; shielded by
+    the summarize-overflow bug, exposed the moment rc6 fixed it.
+    `split_messages` now aligns the keep window to a user turn.
+  - `_enforce_hard_budget` could stop shedding mid-pair (assistant-first — the
+    same 400 it prevents) and re-tokenized the entire list per dropped message
+    (O(N²) blocking the event loop + healthchecks). Now: alternation-preserving
+    shedding, per-message token arithmetic with bounded verify recounts, a
+    cheap prescreen, and the whole guard runs in a threadpool.
+  - The guard now honors the request's own `max_tokens` (vLLM enforces
+    prompt + completion ≤ window; a fixed reserve alone wasn't enough).
+  - Map-reduce summarize batches run **concurrently** (were sequential —
+    multi-minute stalls) and the reduce step no longer violates its own input
+    budget (hierarchical fold).
+  - Text-only content-parts system messages are flattened before the
+    adjacent-system merge; `/v1/models` got the same non-JSON-body guard as
+    the chat path; a client disconnect mid-stream no longer memorizes the
+    half-reply (facts/RAG/summaries skip incomplete streams).
+- **`clean-models.sh` (rc4/rc5 era, previously unlogged):** operator tool to
+  reclaim volume space from stale model caches — dry-run by default, active
+  model always protected. Bundled at `/opt/clean-models.sh`.
+
 ### Validation gate (operator — before rebuild is promoted to `:latest`)
 - Rebuild the image; **boot self-test must PASS** — including the STT + TTS
   probes and a chat round-trip that exercises the transformers tokenizer on 5.x.
+- **Known gap (acknowledged):** the boot self-test's chat round-trip is far
+  below the compaction/budget thresholds, so the guard paths above are
+  validated only by Tier-1 (`test_budget_guard.py`, `test_concurrency_guards.py`)
+  — promotion additionally requires a **manual long-conversation check** on the
+  pod (drive a conversation past `COMPACTOR_TARGET_TOKENS` and confirm a 200 +
+  the `compacted:` log line, not a 400).
 - **OpenWebUI chat works end-to-end** — the 0.10.1 `capabilities`-None crash is
   fixed by the 0.11.0 pin (rc3 hit it; confirmed via the model-re-save
   workaround before the pin fix). No native-tools/`tool_choice` error (leave

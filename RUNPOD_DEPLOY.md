@@ -75,16 +75,24 @@ volume — vLLM picks whichever one matches `MODEL_REPO` at runtime.
 ### Step 3: Build and push the image
 
 Pre-built images are published at `angreg/zions-light-ai` on Docker Hub.
-Pin a version for reproducibility (e.g. `angreg/zions-light-ai:v2.1`) or use
-`:latest` for the newest validated release. See the
+**The current deploy target is named in [runpod.env.template](runpod.env.template)'s
+header — that file is the single source of truth for the image tag and every
+env var.** Pin a version for reproducibility (e.g.
+`angreg/zions-light-ai:v3.0-rc7-cu12`); `:latest` is only ever promoted to a
+*validated* release, so during an rc cycle it lags behind. See the
 [image-tags table in the README](README.md#image-tags) for what each tag
 contains.
 
-To build and publish your own:
+To build and publish your own (CUDA-12 profile — runs on any A40 host; see
+the Dockerfile header for the CUDA-13 default profile):
 ```bash
-docker build -t angreg/zions-light-ai:v2.1 -t angreg/zions-light-ai:latest .
-docker push angreg/zions-light-ai:v2.1
-docker push angreg/zions-light-ai:latest
+docker build \
+  --build-arg CUDA_BASE_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04 \
+  --build-arg TORCH_CUDA=cu128 \
+  --build-arg VLLM_VERSION=0.19.0 \
+  -t angreg/zions-light-ai:v3.0-rc7-cu12 .
+docker push angreg/zions-light-ai:v3.0-rc7-cu12
+# :latest is promoted ONLY after the on-pod validation gate (see CHANGELOG).
 ```
 
 ### Step 4: Create the Runpod Template
@@ -92,14 +100,18 @@ docker push angreg/zions-light-ai:latest
 Go to [Runpod Templates](https://www.runpod.io/console/user/templates) → New Template:
 
 - **Template Name:** `zions-light-ai`
-- **Container Image:** `angreg/zions-light-ai:v2.1` *(or `:latest`)*
+- **Container Image:** the tag named in [runpod.env.template](runpod.env.template)
+  (currently `angreg/zions-light-ai:v3.0-rc7-cu12`)
 - **Container Disk:** `60 GB` (room for the image, supervisor logs, scratch)
 - **Volume Mount Path:** `/data` (← this is where the Network Volume attaches)
 - **Expose HTTP Ports:** `3000, 8080`
 - **Docker Command:** (leave empty)
-- **Environment Variables:** (see table below) — **on an A40, set
-  `MODEL_REPO=anthracite-org/magnum-v4-12b`.** The image default is the 22B
-  model, which does not fit an A40 (see GPU sizing).
+- **Environment Variables:** paste the block from
+  [runpod.env.template](runpod.env.template) — it carries all 42 vars and marks
+  the four that MUST be overridden. On an A40 the production config is
+  `MODEL_REPO=coder3101/Cydonia-24B-v4.3-heretic-v4` +
+  `VLLM_EXTRA_ARGS=--quantization fp8` (the image's built-in 22B default does
+  not fit an A40 — see GPU sizing).
 
 ### Step 5: Deploy the Pod
 
@@ -120,12 +132,16 @@ chat history survives pod terminations.
 pip install runpod
 runpod config
 
+# Image tag + full env set: see runpod.env.template (the source of truth).
 runpod pod create \
   --gpu-type "NVIDIA A40" \
-  --image "angreg/zions-light-ai:v2.1" \
+  --image "angreg/zions-light-ai:v3.0-rc7-cu12" \
   --disk-size 60 \
   --network-volume-id "<your-volume-id>" \
-  --env MODEL_REPO=anthracite-org/magnum-v4-12b \
+  --env MODEL_REPO=coder3101/Cydonia-24B-v4.3-heretic-v4 \
+  --env VLLM_EXTRA_ARGS="--quantization fp8" \
+  --env WEBUI_SECRET_KEY="<openssl rand -hex 32>" \
+  --env COMPACTOR_BACKUP_INTERVAL_HOURS=6 \
   --ports "3000/http,8080/http"
 ```
 
@@ -134,7 +150,8 @@ runpod pod create \
 | Model | Quant | VRAM | Suggested Runpod GPU |
 |---|---|---|---|
 | Qwen2.5-1.5B-Instruct | FP16 | ~6 GB | RTX 3090 / 4090 |
-| **anthracite-org/magnum-v4-12b** *(recommended on A40)* | **FP16** | **~24 GB** | **A40** |
+| **coder3101/Cydonia-24B-v4.3-heretic-v4** *(production config)* | **FP8 (runtime)** | **~43 GB incl. KV** | **A40** |
+| anthracite-org/magnum-v4-12b *(A40 fallback, no quant flag)* | FP16 | ~24 GB | A40 |
 | anthracite-org/magnum-v4-22b | FP16 | ~44 GB | A100 (40/80 GB) |
 | Qwen2.5-32B-Instruct | FP16 | ~64 GB | A100 80GB |
 | Llama-3.3-70B-Instruct | FP16 | ~140 GB | 2× A100 80GB |
@@ -142,18 +159,23 @@ runpod pod create \
 | Vision — Pixtral-12B-2409 | FP16 | ~24 GB | A40 (tight) / A100 |
 | Vision — Llama-3.2-11B-Vision-Instruct *(gated)* | FP16 | ~24 GB | A40 (tight) / A100 |
 
-> **⚠️ Do not run 22B with `--quantization fp8` on an A40.** Runtime FP8
-> quantization needs the *full FP16 weights resident in VRAM first* to do
-> the marlin repack, then frees them — so peak memory exceeds 44 GB and the
-> A40's 48 GB doesn't leave enough headroom; it OOMs during startup. FP8
-> only helps if you have an offline-quantized FP8 checkpoint, which removes
-> the repack step. On an A40, **run the 12B in FP16** (the default
-> `VLLM_EXTRA_ARGS` is empty — no quantization flag needed). Reserve the
-> 22B for A100-class cards in FP16.
+> **⚠️ Runtime FP8 on an A40 — what's actually validated.** The
+> **production-validated A40 config is Cydonia-24B + `--quantization fp8`**
+> on the V3.0 image (vLLM 0.19): it boots, repacks, and serves at ~43 GB
+> including KV cache — this is what the rc5/rc6 pods ran through the
+> 2026-08-13 incident testing. An earlier version of this warning said
+> runtime FP8 of a ~22B could OOM during the marlin repack (peak needs the
+> FP16 weights resident before freeing them); that was observed on the
+> vLLM 0.14-era image and is kept here as a caution: **if a 22–24B + fp8
+> boot OOMs on your host, fall back to `anthracite-org/magnum-v4-12b` in
+> FP16** (empty `VLLM_EXTRA_ARGS`) — it always fits — or use an
+> offline-quantized FP8 checkpoint, which removes the repack peak
+> entirely. Watch the first boot's vLLM log either way.
 
 The image's built-in `MODEL_REPO` default is the 22B for historical
-reasons; **override it to `anthracite-org/magnum-v4-12b` on A40-class
-hardware.**
+reasons; **on an A40 always override it** — to the production config
+(Cydonia-24B + fp8, per [runpod.env.template](runpod.env.template)) or the
+12B FP16 fallback.
 
 ### Vision (V3.1) — enabling image understanding
 

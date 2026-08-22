@@ -61,11 +61,13 @@ Full walkthrough in [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md). TL;DR:
 3. Deploy a GPU pod from the [Docker Hub image](https://hub.docker.com/r/angreg/zions-light-ai) with the volume attached at `/data`, ports `3000, 8080` exposed
 4. **Pick a model that fits your GPU** — see the warning below
 
-> **⚠️ A40 users: set `MODEL_REPO=anthracite-org/magnum-v4-12b`.** The image's
-> built-in default is the 22B model, which **does not fit an A40** — runtime
-> FP8 quantization OOMs during the marlin repack step. The 12B model runs
-> comfortably in FP16 at 32K context on an A40. Reserve the 22B for A100-class
-> cards in FP16. See [GPU sizing](RUNPOD_DEPLOY.md#gpu-sizing).
+> **⚠️ A40 users: override the model.** The image's built-in default is the
+> 22B, which **does not fit an A40**. The production-validated A40 config is
+> `MODEL_REPO=coder3101/Cydonia-24B-v4.3-heretic-v4` with
+> `VLLM_EXTRA_ARGS=--quantization fp8` (per
+> [runpod.env.template](runpod.env.template)); the always-fits fallback is
+> `anthracite-org/magnum-v4-12b` in FP16 (empty `VLLM_EXTRA_ARGS`). See
+> [GPU sizing](RUNPOD_DEPLOY.md#gpu-sizing).
 
 ### Local (dev / testing)
 
@@ -94,6 +96,10 @@ Pin a specific version for reproducible deploys.
 
 | Tag | Contents |
 |---|---|
+| `:v3.0-rc7-cu12` | **Current deploy target** (see [runpod.env.template](runpod.env.template)) — V3.0 consolidation: audited dep pins, OpenWebUI 0.11, SQLite network-volume hardening, chat-proxy guards; CUDA-12 profile (any A40 host) |
+| `:v3.0-rc5-cu12` / `:v3.0-rc6-cu12` | Superseded rcs — rc5 lacks the overflow fix; rc6 lacks the rc7 review fixes (compaction alternation blocker) |
+| `:v3-snapshot` | Frozen last-known-good V3.3 image (= `:v3.3-tts`) — rollback target |
+| `:v3.3-tts` / `:v3.2-stt` / `:v3.1-vision` | The V3.x feature line as shipped incrementally |
 | `:v2.1` | Rolling V2.1 — full memory + user control + observability |
 | `:v2.1-phase8` / `:v2.1-complete` | V2.1 final: chat commands + personas |
 | `:v2.1-phase7` | + semantic dedup + stale-fact archival |

@@ -24,6 +24,7 @@ from typing import Any
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 import backfill
 import backup as backup_module
@@ -245,21 +246,35 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
         f"summarize: {len(to_summarize)} turns exceed the {budget}-token input "
         f"budget — map-reduce over {len(batches)} batches"
     )
-    parts: list[str] = []
-    for i, batch in enumerate(batches, 1):
-        parts.append(await _summarize_once(client, batch))
-    combined = "\n\n".join(p for p in parts if p)
+    # Map: batches run CONCURRENTLY (vLLM batches fine), bounded by a small
+    # semaphore so a huge history can't monopolize the engine. Sequential
+    # batches added multi-minute latency on long conversations (rc6 review).
+    sem = asyncio.Semaphore(4)
 
-    # Reduce step: if the concatenated partials are themselves large, fold them
-    # into one summary. Bounded to a single pass — if it still doesn't fit we
-    # return the concatenation and let the hard-budget guard downstream trim.
-    as_msg = [{"role": "user", "content": combined}]
-    if count_tokens(as_msg) > budget:
+    async def _bounded(batch: list[dict]) -> str:
+        async with sem:
+            return await _summarize_once(client, batch)
+
+    parts = [p for p in await asyncio.gather(*(_bounded(b) for b in batches)) if p]
+
+    # Reduce: fold the partials hierarchically, never handing _summarize_once
+    # an input over its budget (its documented contract — the first cut of
+    # this code violated it whenever the reduce step actually fired). Each
+    # round groups the partials to the budget and summarizes each group;
+    # bounded rounds, and any failure degrades to plain concatenation.
+    rounds = 0
+    while len(parts) > 1 and rounds < 3:
+        rounds += 1
+        part_msgs = [{"role": "user", "content": p} for p in parts]
+        groups = _chunk_to_budget(part_msgs, budget)
+        if all(len(g) == 1 for g in groups):
+            break  # nothing can be folded further without breaking the budget
         try:
-            return await _summarize_once(client, as_msg)
+            parts = [p for p in await asyncio.gather(*(_bounded(g) for g in groups)) if p]
         except Exception as e:
-            logger.warning(f"summarize reduce-step failed, using concatenation: {e}")
-    return combined
+            logger.warning(f"summarize reduce round {rounds} failed, using concatenation: {e}")
+            break
+    return "\n\n".join(parts)
 
 
 def split_messages(messages: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
@@ -267,7 +282,24 @@ def split_messages(messages: list[dict]) -> tuple[list[dict], list[dict], list[d
     non_system = [m for m in messages if m.get("role") != "system"]
     if len(non_system) <= KEEP_RECENT_TURNS:
         return system_msgs, [], non_system
-    return system_msgs, non_system[:-KEEP_RECENT_TURNS], non_system[-KEEP_RECENT_TURNS:]
+    to_summarize = non_system[:-KEEP_RECENT_TURNS]
+    keep_recent = non_system[-KEEP_RECENT_TURNS:]
+    # Mistral-family templates require the first non-system message to be a
+    # USER turn. A real request has an ODD number of non-system messages
+    # (user/assistant pairs plus the new user turn), so an even
+    # KEEP_RECENT_TURNS slice always started on an assistant turn — meaning
+    # every *successful* compaction emitted a template-invalid conversation
+    # and vLLM 400'd it. (Latent since V1; shielded by the summarize-overflow
+    # bug aborting compaction early, exposed when that was fixed. Found in the
+    # rc6 promotion review.) Align the boundary: leading non-user turns move
+    # into the summarized portion instead.
+    while keep_recent and keep_recent[0].get("role") != "user":
+        to_summarize.append(keep_recent.pop(0))
+    if not keep_recent:
+        # Degenerate tail with no user turn at all — fall back to the plain
+        # slice rather than summarizing away the entire recent window.
+        return system_msgs, non_system[:-KEEP_RECENT_TURNS], non_system[-KEEP_RECENT_TURNS:]
+    return system_msgs, to_summarize, keep_recent
 
 
 async def compact_if_needed(messages: list[dict]) -> list[dict]:
@@ -344,13 +376,24 @@ def _merge_adjacent_system_messages(messages: list[dict]) -> list[dict]:
     can still produce a run. Applied just before forwarding, this makes the
     invariant hold no matter which layers fired.
 
-    Image-bearing system messages (list content) are left alone rather than
-    string-joined — collapsing them would destroy the image parts.
+    Image-bearing system messages are left alone rather than string-joined —
+    collapsing them would destroy the image parts. But TEXT-ONLY list content
+    (OpenAI content-parts form, no images) is flattened to a plain string
+    first, so clients that send system prompts as parts still get merged —
+    otherwise the adjacent-system run this exists to prevent survives intact
+    (rc6 review finding).
     """
     if not isinstance(messages, list) or len(messages) < 2:
         return messages
     out: list[dict] = []
     for m in messages:
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "system"
+            and isinstance(m.get("content"), list)
+            and _message_image_count(m) == 0
+        ):
+            m = {**m, "content": _message_text(m)}
         mergeable = (
             isinstance(m, dict)
             and m.get("role") == "system"
@@ -364,7 +407,13 @@ def _merge_adjacent_system_messages(messages: list[dict]) -> list[dict]:
     return out
 
 
-def _enforce_hard_budget(messages: list[dict]) -> list[dict]:
+def _fast_token_estimate(messages: list[dict]) -> int:
+    """char/4 estimate + per-image cost — no tokenizer, O(total chars)."""
+    image_tokens = sum(_message_image_count(m) for m in messages) * IMAGE_TOKEN_ESTIMATE
+    return sum(len(_message_text(m)) // 4 + 4 for m in messages) + image_tokens
+
+
+def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list[dict]:
     """Last line of defense: never forward a request that vLLM must reject.
 
     Everything upstream (compaction, facts, RAG, summary injection) is
@@ -378,43 +427,95 @@ def _enforce_hard_budget(messages: list[dict]) -> list[dict]:
     memory layers exist precisely to carry that content forward), then the
     injected memory blocks, trimmed largest-first. The newest turn is never
     dropped — losing the message the user just typed is worse than any
-    truncation. Returns the input untouched in the common case.
+    truncation. After shedding, role alternation is REPAIRED (first non-system
+    message must be a user turn) — the first cut of this guard could stop
+    mid-pair and hand the Mistral template an assistant-first conversation,
+    manufacturing the very 400 it exists to prevent (rc6 review).
+
+    Cost discipline (rc6 review): the first cut re-ran the full chat-template
+    tokenization of the ENTIRE list once per dropped message — O(N²) blocking
+    CPU exactly in the overload scenario. Now: one cheap prescreen, one full
+    count, per-message counts for the shedding arithmetic, and a bounded
+    number of full-count verification rounds.
     """
+    if limit is None:
+        limit = HARD_INPUT_LIMIT
+
+    # Prescreen: skip the (expensive) full tokenization when the char-based
+    # estimate is far under the limit. The estimate can undercount token-dense
+    # text, so the margin is 2x; a pathological miss just means the request
+    # reaches vLLM and gets the 400 this guard would otherwise have prevented —
+    # degraded, not corrupted.
+    if _fast_token_estimate(messages) <= limit // 2:
+        return messages
+
     total = count_tokens(messages)
-    if total <= HARD_INPUT_LIMIT:
+    if total <= limit:
         return messages
 
     msgs = list(messages)
+    # Per-message costs, computed ONCE. Sum-of-parts differs from the templated
+    # whole by per-message template overhead, so shedding aims below the limit
+    # on arithmetic and then verifies with a real count — bounded rounds.
+    per = [count_tokens([m]) for m in msgs]
+    running = total
     dropped = 0
-    while count_tokens(msgs) > HARD_INPUT_LIMIT:
-        idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
-        if len(idxs) <= 1:
-            break  # always keep the most recent turn
-        del msgs[idxs[0]]
-        dropped += 1
-
     trimmed = 0
-    while count_tokens(msgs) > HARD_INPUT_LIMIT and trimmed < 32:
-        big = [
-            i for i, m in enumerate(msgs)
-            if m.get("role") == "system"
-            and isinstance(m.get("content"), str)
-            and len(m["content"]) > 400
-        ]
-        if not big:
-            break
-        i = max(big, key=lambda j: len(msgs[j]["content"]))
-        c = msgs[i]["content"]
-        msgs[i] = {
-            **msgs[i],
-            "content": c[: len(c) // 2].rstrip() + "\n[...trimmed to fit the context budget]",
-        }
-        trimmed += 1
 
-    final = count_tokens(msgs)
+    for _round in range(6):
+        # --- shed oldest non-system turns (arithmetic only) ---
+        while running > limit:
+            idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+            if len(idxs) <= 1:
+                break  # always keep the most recent turn
+            running -= per[idxs[0]]
+            del msgs[idxs[0]]
+            del per[idxs[0]]
+            dropped += 1
+
+        # --- repair the template invariant broken by mid-pair stops ---
+        idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+        while len(idxs) > 1 and msgs[idxs[0]].get("role") != "user":
+            running -= per[idxs[0]]
+            del msgs[idxs[0]]
+            del per[idxs[0]]
+            dropped += 1
+            idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+
+        # --- trim the largest injected system block if turns weren't enough ---
+        while running > limit and trimmed < 32:
+            big = [
+                i for i, m in enumerate(msgs)
+                if m.get("role") == "system"
+                and isinstance(m.get("content"), str)
+                and len(m["content"]) > 400
+            ]
+            if not big:
+                break
+            i = max(big, key=lambda j: len(msgs[j]["content"]))
+            c = msgs[i]["content"]
+            msgs[i] = {
+                **msgs[i],
+                "content": c[: len(c) // 2].rstrip()
+                + "\n[...trimmed to fit the context budget]",
+            }
+            running -= per[i]
+            per[i] = count_tokens([msgs[i]])  # recount ONLY the trimmed block
+            running += per[i]
+            trimmed += 1
+
+        # --- verify with a real full count; loop only if template overhead
+        #     pushed us back over (each round does exactly ONE full count) ---
+        running = count_tokens(msgs)
+        if running <= limit:
+            break
+        idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+        if len(idxs) <= 1 and trimmed >= 32:
+            break  # nothing left to shed; forward best effort
+
     logger.warning(
-        f"hard budget enforced: {total} -> {final} tokens "
-        f"(limit {HARD_INPUT_LIMIT}); dropped {dropped} old turn(s), "
+        f"hard budget enforced: {total} -> {running} tokens "
+        f"(limit {limit}); dropped {dropped} old turn(s), "
         f"trimmed {trimmed} injected block(s)"
     )
     return msgs
@@ -452,6 +553,7 @@ class SseAccumulator:
     def __init__(self) -> None:
         self._buffer: str = ""
         self._parts: list[str] = []
+        self._complete: bool = False
 
     def feed(self, chunk: bytes) -> None:
         try:
@@ -464,11 +566,17 @@ class SseAccumulator:
                 if not line.startswith("data: "):
                     continue
                 payload = line[6:].strip()
-                if not payload or payload == "[DONE]":
+                if not payload:
+                    continue
+                if payload == "[DONE]":
+                    self._complete = True
                     continue
                 try:
                     obj = json.loads(payload)
-                    delta = obj.get("choices", [{}])[0].get("delta", {})
+                    choice = obj.get("choices", [{}])[0]
+                    if choice.get("finish_reason"):
+                        self._complete = True
+                    delta = choice.get("delta", {})
                     content = delta.get("content")
                     if isinstance(content, str) and content:
                         self._parts.append(content)
@@ -478,6 +586,14 @@ class SseAccumulator:
 
     def text(self) -> str:
         return "".join(self._parts)
+
+    def complete(self) -> bool:
+        """True once a finish_reason or [DONE] was observed — i.e. the model
+        actually FINISHED the reply. A client disconnect mid-stream leaves
+        this False, and the async tail must not memorize the half-reply as if
+        the model said it (rc6 review: truncated text was being fact-extracted
+        and rolled into summaries as a completed assistant turn)."""
+        return self._complete
 
 
 def _fire_and_forget(coro) -> None:
@@ -757,8 +873,9 @@ def _vllm_unreachable_stream_chunks(model: str, message: str | None = None) -> l
 
 REQUEST_REJECTED_MESSAGE = (
     "That request couldn't be processed — the model backend rejected it "
-    "(this is a problem on my side, not yours). The conversation is safe; "
-    "trying again, or starting a new chat if it keeps happening, should work."
+    "(this is a problem on my side, not yours). The conversation and its "
+    "memory are safe. If this keeps happening on the same message, the "
+    "operator should check the compactor logs for the rejection reason."
 )
 
 
@@ -776,7 +893,11 @@ async def chat_completions(request: Request) -> Any:
     # conversation[0]) that surfaces in the UI as a broken reply. Seen from
     # OpenWebUI 0.11 background/task-style calls. Log enough to identify the
     # sender, then return a clean OpenAI-shaped 400.
-    if not isinstance(messages, list) or not messages:
+    if (
+        not isinstance(messages, list)
+        or not messages
+        or not all(isinstance(m, dict) for m in messages)
+    ):
         logger.warning(
             "rejected chat request with empty/invalid messages: "
             f"ua={request.headers.get('user-agent', '?')!r} "
@@ -971,18 +1092,35 @@ async def chat_completions(request: Request) -> Any:
         except Exception as e:
             logger.warning(f"conv={conv_id}: backfill kickoff failed (non-fatal): {e}")
 
-    # Mistral-family chat templates (Magnum, Cydonia — anything on
-    # Mistral-Small) reject multiple consecutive system messages with a 400.
-    # Memory injection deliberately builds ONE combined block, but V1
-    # compaction independently prepends its own summary system message, so a
-    # long conversation that trips compaction can still emit a run of them.
-    # Collapse any adjacent run into one, as the last thing before forwarding.
+    # FINAL pre-flight, two steps in a deliberate order (rc6 review):
+    #
+    # 1. _enforce_hard_budget runs FIRST, while the system blocks are still
+    #    separate — so a trim hits the largest individual block (usually the
+    #    injected memory) instead of a pre-merged mega-block where halving
+    #    would chew into the persona. It also accounts for the request's OWN
+    #    max_tokens: vLLM enforces prompt + max_tokens <= window, so a fixed
+    #    reserve alone leaves a client asking for a big completion still 400able.
+    # 2. _merge_adjacent_system_messages runs LAST, collapsing every remaining
+    #    run — including any adjacency the budget guard created by deleting a
+    #    turn that sat between two system messages.
+    try:
+        req_max_tokens = int(body.get("max_tokens") or 0)
+    except (TypeError, ValueError):
+        req_max_tokens = 0
+    if req_max_tokens > MAX_MODEL_LEN // 2:
+        # Pair with the reserve cap below so prompt+completion always fits.
+        req_max_tokens = MAX_MODEL_LEN // 2
+        body["max_tokens"] = req_max_tokens
+    effective_limit = min(
+        MAX_MODEL_LEN,
+        max(256, MAX_MODEL_LEN - max(GENERATION_RESERVE, req_max_tokens)),
+    )
+    # Pure CPU (tokenizer) work — off the event loop so a shedding pass on a
+    # huge conversation can't stall every other request and the healthchecks.
+    body["messages"] = await run_in_threadpool(
+        _enforce_hard_budget, body["messages"], effective_limit
+    )
     body["messages"] = _merge_adjacent_system_messages(body["messages"])
-
-    # FINAL pre-flight. Compaction, facts, RAG and summary injection are each
-    # best-effort and can individually fail or overshoot; this is the one place
-    # that guarantees what leaves here fits the model's window.
-    body["messages"] = _enforce_hard_budget(body["messages"])
 
     stream = bool(body.get("stream", False))
     # read=None keeps long generations from being cut off, but connect/write/
@@ -1046,9 +1184,18 @@ async def chat_completions(request: Request) -> Any:
             finally:
                 await client.aclose()
                 # Fire-and-forget post-response work once the stream is done.
-                # Skip it when vLLM failed — there's no real assistant turn
-                # to extract/index from.
-                if conv_id and not vllm_failed:
+                # Skip it when vLLM failed — there's no real assistant turn to
+                # extract/index from — and when the stream never COMPLETED
+                # (client hit Stop / tab closed mid-reply): memorizing a
+                # half-sentence as though the model said it plants false
+                # "memories" in facts/RAG/summaries (rc6 review).
+                if conv_id and not vllm_failed and not accumulator.complete():
+                    logger.info(
+                        f"conv={conv_id}: stream ended without completion "
+                        f"({len(accumulator.text())} chars accumulated) — "
+                        f"skipping memory tail for the partial reply"
+                    )
+                if conv_id and not vllm_failed and accumulator.complete():
                     _fire_and_forget(
                         _async_tail(
                             conv_id,
@@ -1130,7 +1277,23 @@ async def models():
                 content=_vllm_unreachable_body(f"{type(e).__name__}: {e}"),
                 status_code=503,
             )
-        return JSONResponse(content=r.json(), status_code=r.status_code)
+        try:
+            models_body = r.json()
+        except ValueError as e:
+            # Same non-JSON-body class as the chat path (rc6 review): an HTML
+            # 502 or truncated body must not escape as an opaque 500.
+            body_head = (r.text or "")[:200]
+            logger.warning(
+                f"vLLM returned non-JSON (/v1/models, HTTP {r.status_code}): "
+                f"{type(e).__name__}: {body_head!r}"
+            )
+            return JSONResponse(
+                content=_vllm_unreachable_body(
+                    f"non-JSON response (HTTP {r.status_code}): {body_head}"
+                ),
+                status_code=502,
+            )
+        return JSONResponse(content=models_body, status_code=r.status_code)
 
 
 @app.get("/health")

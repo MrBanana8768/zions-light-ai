@@ -101,15 +101,27 @@ def test_merge_adjacent_system_messages():
     ]
     assert_eq(len(main._merge_adjacent_system_messages(msgs)), 3, "separated systems kept")
 
-    print("\n[test] _merge_adjacent_system_messages — image content not string-joined")
-    # A multimodal (list) content message must not be collapsed — that would
-    # destroy the image parts (V3.1 vision).
+    print("\n[test] _merge_adjacent_system_messages — text-only list content is flattened")
+    # rc6 review: OpenAI content-parts system prompts with NO images must be
+    # flattened and merged — leaving them unmerged preserves the adjacent-
+    # system run this function exists to prevent.
     msgs = [
         {"role": "system", "content": "text"},
         {"role": "system", "content": [{"type": "text", "text": "part"}]},
     ]
     out = main._merge_adjacent_system_messages(msgs)
-    assert_eq(len(out), 2, "list-content system message preserved separately")
+    assert_eq(len(out), 1, "text-only parts system merged into the run")
+    assert_true("part" in out[0]["content"], "flattened text preserved")
+
+    print("\n[test] _merge_adjacent_system_messages — image content not string-joined")
+    # A genuinely image-bearing system message must NOT be collapsed — that
+    # would destroy the image parts (V3.1 vision).
+    msgs = [
+        {"role": "system", "content": "text"},
+        {"role": "system", "content": [{"type": "image_url", "image_url": {"url": "x"}}]},
+    ]
+    out = main._merge_adjacent_system_messages(msgs)
+    assert_eq(len(out), 2, "image-bearing system message preserved separately")
 
     print("\n[test] _merge_adjacent_system_messages — passthroughs")
     assert_eq(main._merge_adjacent_system_messages([]), [], "empty list")
