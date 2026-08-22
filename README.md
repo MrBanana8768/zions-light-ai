@@ -110,6 +110,7 @@ See [CHANGELOG.md](CHANGELOG.md) for full version history.
 |---|---|---|
 | [USER_GUIDE.md](USER_GUIDE.md) | **Users** | Memory model, slash commands, personas, admin endpoints, FAQ |
 | [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md) | **Operators** | RunPod deploy, GPU sizing, env vars, troubleshooting |
+| [runpod.env.template](runpod.env.template) | **Operators** | Paste-ready RunPod pod template — every env var, pod settings, and the four that must be overridden |
 | [OPERATIONS.md](OPERATIONS.md) | **Operators** | Runbook: health, log reference, failure recovery, backups/restore, rollback |
 | [CHANGELOG.md](CHANGELOG.md) | Everyone | Per-version history |
 | [ROADMAP.md](ROADMAP.md) | Contributors | V1 → V4 forward plan |
