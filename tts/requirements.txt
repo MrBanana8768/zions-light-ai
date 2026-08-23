@@ -1,4 +1,4 @@
-# TTS venv requirements (V3.3 — Text-to-Speech / Piper).
+# TTS venv requirements (V3.3 — Text-to-Speech / Piper · pins audited V3.0).
 #
 # Installed into its OWN venv (/opt/tts-venv), fully separate from the vLLM and
 # compactor venvs. piper-tts pulls onnxruntime + piper-phonemize — deliberately
@@ -7,10 +7,14 @@
 #
 # Higher-quality alternative (not used): Kokoro-82M sounds better but pulls
 # torch; if ever wanted it would go in this venv as a swap, accepting the size.
+#
+# Versions pinned EXACTLY for reproducible builds; re-audit before each release.
+# piper-tts==1.4.2 is the version the server.py synthesize_wav / SynthesisConfig
+# API was written and verified against.
 
 # --- API surface ---
-fastapi
-uvicorn[standard]
+fastapi==0.138.2
+uvicorn[standard]==0.49.0
 
 # --- synthesis engine ---
-piper-tts>=1.2.0            # onnxruntime-backed neural TTS; CPU, torch-free
+piper-tts==1.4.2            # onnxruntime-backed neural TTS; CPU, torch-free

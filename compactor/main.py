@@ -24,6 +24,7 @@ from typing import Any
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 import backfill
 import backup as backup_module
@@ -64,6 +65,16 @@ MAX_MODEL_LEN = _env_int("MAX_MODEL_LEN", 32768)
 TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(MAX_MODEL_LEN * 0.75))
 KEEP_RECENT_TURNS = _env_int("COMPACTOR_KEEP_RECENT_TURNS", 4)
 SUMMARY_MAX_TOKENS = _env_int("COMPACTOR_SUMMARY_MAX_TOKENS", 1024)
+# Slack left inside MAX_MODEL_LEN when budgeting a summarization call's INPUT
+# (covers the system prompt, the wrapper text, and chat-template overhead).
+SUMMARY_INPUT_RESERVE = _env_int("COMPACTOR_SUMMARY_INPUT_RESERVE", 2048)
+# Hard ceiling for what we will forward to vLLM. Anything above this is a
+# guaranteed 400, so the guard sheds content rather than letting the request
+# fail. The reserve leaves the model room to actually generate a reply.
+GENERATION_RESERVE = _env_int("COMPACTOR_GENERATION_RESERVE", 2048)
+# Clamped to MAX_MODEL_LEN: a bare floor could sit ABOVE the model's own window
+# on a small-context model, which would defeat the entire point of the guard.
+HARD_INPUT_LIMIT = min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - GENERATION_RESERVE))
 # V3.1 (Vision): a single image in a VLM request costs far more than its
 # text — hundreds to a couple thousand tokens depending on resolution and
 # the model's vision encoder. The text-only token estimate misses this
@@ -162,9 +173,10 @@ Produce a concise but comprehensive summary that preserves:
 Do not editorialize. Do not greet. Output only the summary."""
 
 
-async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
+async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
+    """One summarization call. Caller guarantees `turns` fits the input budget."""
     transcript = "\n\n".join(
-        f"[{m.get('role', 'unknown')}]: {_message_text(m)}" for m in to_summarize
+        f"[{m.get('role', 'unknown')}]: {_message_text(m)}" for m in turns
     )
     payload = {
         "model": MODEL_REPO,
@@ -178,7 +190,91 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
     }
     r = await client.post(f"{VLLM_URL}/v1/chat/completions", json=payload, timeout=300.0)
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+    data = r.json()
+    choices = data.get("choices") or []
+    if not choices:
+        # A 200 with no choices (or an error-shaped body) must not become an
+        # opaque IndexError — callers catch ValueError and degrade gracefully.
+        raise ValueError(f"vLLM returned no choices for summarize: {str(data)[:200]}")
+    return (choices[0].get("message") or {}).get("content", "").strip()
+
+
+def _chunk_to_budget(turns: list[dict], budget: int) -> list[list[dict]]:
+    """Split turns into consecutive batches that each fit `budget` tokens.
+
+    A single turn larger than the budget still gets its own batch — we never
+    drop content here; `_summarize_once` would fail on it and the caller
+    degrades. (Truncating a turn silently would be a quieter kind of lying.)
+    """
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    current_tokens = 0
+    for m in turns:
+        t = count_tokens([m])
+        if current and current_tokens + t > budget:
+            batches.append(current)
+            current, current_tokens = [], 0
+        current.append(m)
+        current_tokens += t
+    if current:
+        batches.append(current)
+    return batches
+
+
+async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
+    """Summarize older turns, MAP-REDUCE style so the summarization request
+    can never itself exceed the model's context window.
+
+    This bit us in production (2026-08-13): a long conversation packed every
+    older turn into ONE prompt, the summarize call blew past MAX_MODEL_LEN, the
+    400 propagated up, compaction "degraded" by forwarding the *original*
+    oversized messages, and the real chat request then 400'd too. The context
+    manager overflowed the context. So the input is now budgeted explicitly.
+    """
+    # Room for the system prompt, the wrapper text, and the model's own output.
+    # Clamped for the same reason as HARD_INPUT_LIMIT: a bare floor could exceed
+    # the model's own window and reintroduce the overflow this method prevents.
+    budget = min(
+        MAX_MODEL_LEN,
+        max(256, MAX_MODEL_LEN - SUMMARY_MAX_TOKENS - SUMMARY_INPUT_RESERVE),
+    )
+    batches = _chunk_to_budget(to_summarize, budget)
+    if len(batches) == 1:
+        return await _summarize_once(client, batches[0])
+
+    logger.info(
+        f"summarize: {len(to_summarize)} turns exceed the {budget}-token input "
+        f"budget — map-reduce over {len(batches)} batches"
+    )
+    # Map: batches run CONCURRENTLY (vLLM batches fine), bounded by a small
+    # semaphore so a huge history can't monopolize the engine. Sequential
+    # batches added multi-minute latency on long conversations (rc6 review).
+    sem = asyncio.Semaphore(4)
+
+    async def _bounded(batch: list[dict]) -> str:
+        async with sem:
+            return await _summarize_once(client, batch)
+
+    parts = [p for p in await asyncio.gather(*(_bounded(b) for b in batches)) if p]
+
+    # Reduce: fold the partials hierarchically, never handing _summarize_once
+    # an input over its budget (its documented contract — the first cut of
+    # this code violated it whenever the reduce step actually fired). Each
+    # round groups the partials to the budget and summarizes each group;
+    # bounded rounds, and any failure degrades to plain concatenation.
+    rounds = 0
+    while len(parts) > 1 and rounds < 3:
+        rounds += 1
+        part_msgs = [{"role": "user", "content": p} for p in parts]
+        groups = _chunk_to_budget(part_msgs, budget)
+        if all(len(g) == 1 for g in groups):
+            break  # nothing can be folded further without breaking the budget
+        try:
+            parts = [p for p in await asyncio.gather(*(_bounded(g) for g in groups)) if p]
+        except Exception as e:
+            logger.warning(f"summarize reduce round {rounds} failed, using concatenation: {e}")
+            break
+    return "\n\n".join(parts)
 
 
 def split_messages(messages: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
@@ -186,7 +282,24 @@ def split_messages(messages: list[dict]) -> tuple[list[dict], list[dict], list[d
     non_system = [m for m in messages if m.get("role") != "system"]
     if len(non_system) <= KEEP_RECENT_TURNS:
         return system_msgs, [], non_system
-    return system_msgs, non_system[:-KEEP_RECENT_TURNS], non_system[-KEEP_RECENT_TURNS:]
+    to_summarize = non_system[:-KEEP_RECENT_TURNS]
+    keep_recent = non_system[-KEEP_RECENT_TURNS:]
+    # Mistral-family templates require the first non-system message to be a
+    # USER turn. A real request has an ODD number of non-system messages
+    # (user/assistant pairs plus the new user turn), so an even
+    # KEEP_RECENT_TURNS slice always started on an assistant turn — meaning
+    # every *successful* compaction emitted a template-invalid conversation
+    # and vLLM 400'd it. (Latent since V1; shielded by the summarize-overflow
+    # bug aborting compaction early, exposed when that was fixed. Found in the
+    # rc6 promotion review.) Align the boundary: leading non-user turns move
+    # into the summarized portion instead.
+    while keep_recent and keep_recent[0].get("role") != "user":
+        to_summarize.append(keep_recent.pop(0))
+    if not keep_recent:
+        # Degenerate tail with no user turn at all — fall back to the plain
+        # slice rather than summarizing away the entire recent window.
+        return system_msgs, non_system[:-KEEP_RECENT_TURNS], non_system[-KEEP_RECENT_TURNS:]
+    return system_msgs, to_summarize, keep_recent
 
 
 async def compact_if_needed(messages: list[dict]) -> list[dict]:
@@ -253,6 +366,161 @@ def inject_system_block(messages: list[dict], content: str) -> list[dict]:
     return messages[:insert_at] + [sys_msg] + messages[insert_at:]
 
 
+def _merge_adjacent_system_messages(messages: list[dict]) -> list[dict]:
+    """Collapse each run of consecutive system messages into a single one.
+
+    Mistral-family templates (Magnum, Cydonia — anything built on
+    Mistral-Small) reject multiple consecutive system messages with a 400.
+    Memory injection is careful to emit ONE combined block, but V1 compaction
+    prepends its own summary system message independently, so the two together
+    can still produce a run. Applied just before forwarding, this makes the
+    invariant hold no matter which layers fired.
+
+    Image-bearing system messages are left alone rather than string-joined —
+    collapsing them would destroy the image parts. But TEXT-ONLY list content
+    (OpenAI content-parts form, no images) is flattened to a plain string
+    first, so clients that send system prompts as parts still get merged —
+    otherwise the adjacent-system run this exists to prevent survives intact
+    (rc6 review finding).
+    """
+    if not isinstance(messages, list) or len(messages) < 2:
+        return messages
+    out: list[dict] = []
+    for m in messages:
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "system"
+            and isinstance(m.get("content"), list)
+            and _message_image_count(m) == 0
+        ):
+            m = {**m, "content": _message_text(m)}
+        mergeable = (
+            isinstance(m, dict)
+            and m.get("role") == "system"
+            and isinstance(m.get("content"), str)
+        )
+        if mergeable and out and out[-1].get("role") == "system" and isinstance(out[-1].get("content"), str):
+            prev = out[-1]
+            out[-1] = {**prev, "content": f"{prev['content']}\n\n{m['content']}"}
+        else:
+            out.append(m)
+    return out
+
+
+def _fast_token_estimate(messages: list[dict]) -> int:
+    """char/4 estimate + per-image cost — no tokenizer, O(total chars)."""
+    image_tokens = sum(_message_image_count(m) for m in messages) * IMAGE_TOKEN_ESTIMATE
+    return sum(len(_message_text(m)) // 4 + 4 for m in messages) + image_tokens
+
+
+def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list[dict]:
+    """Last line of defense: never forward a request that vLLM must reject.
+
+    Everything upstream (compaction, facts, RAG, summary injection) is
+    best-effort and can individually fail or overshoot. On 2026-08-13 they
+    compounded: summarization 400'd, compaction "degraded" by forwarding the
+    ORIGINAL oversized messages, and memory injection then piled 100 facts +
+    retrieved exchanges on top — so the user got a hard 400 from the component
+    whose whole job is to keep requests inside the window.
+
+    Shedding order is by value: oldest turns first (already summarized, and the
+    memory layers exist precisely to carry that content forward), then the
+    injected memory blocks, trimmed largest-first. The newest turn is never
+    dropped — losing the message the user just typed is worse than any
+    truncation. After shedding, role alternation is REPAIRED (first non-system
+    message must be a user turn) — the first cut of this guard could stop
+    mid-pair and hand the Mistral template an assistant-first conversation,
+    manufacturing the very 400 it exists to prevent (rc6 review).
+
+    Cost discipline (rc6 review): the first cut re-ran the full chat-template
+    tokenization of the ENTIRE list once per dropped message — O(N²) blocking
+    CPU exactly in the overload scenario. Now: one cheap prescreen, one full
+    count, per-message counts for the shedding arithmetic, and a bounded
+    number of full-count verification rounds.
+    """
+    if limit is None:
+        limit = HARD_INPUT_LIMIT
+
+    # Prescreen: skip the (expensive) full tokenization when the char-based
+    # estimate is far under the limit. The estimate can undercount token-dense
+    # text, so the margin is 2x; a pathological miss just means the request
+    # reaches vLLM and gets the 400 this guard would otherwise have prevented —
+    # degraded, not corrupted.
+    if _fast_token_estimate(messages) <= limit // 2:
+        return messages
+
+    total = count_tokens(messages)
+    if total <= limit:
+        return messages
+
+    msgs = list(messages)
+    # Per-message costs, computed ONCE. Sum-of-parts differs from the templated
+    # whole by per-message template overhead, so shedding aims below the limit
+    # on arithmetic and then verifies with a real count — bounded rounds.
+    per = [count_tokens([m]) for m in msgs]
+    running = total
+    dropped = 0
+    trimmed = 0
+
+    for _round in range(6):
+        # --- shed oldest non-system turns (arithmetic only) ---
+        while running > limit:
+            idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+            if len(idxs) <= 1:
+                break  # always keep the most recent turn
+            running -= per[idxs[0]]
+            del msgs[idxs[0]]
+            del per[idxs[0]]
+            dropped += 1
+
+        # --- repair the template invariant broken by mid-pair stops ---
+        idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+        while len(idxs) > 1 and msgs[idxs[0]].get("role") != "user":
+            running -= per[idxs[0]]
+            del msgs[idxs[0]]
+            del per[idxs[0]]
+            dropped += 1
+            idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+
+        # --- trim the largest injected system block if turns weren't enough ---
+        while running > limit and trimmed < 32:
+            big = [
+                i for i, m in enumerate(msgs)
+                if m.get("role") == "system"
+                and isinstance(m.get("content"), str)
+                and len(m["content"]) > 400
+            ]
+            if not big:
+                break
+            i = max(big, key=lambda j: len(msgs[j]["content"]))
+            c = msgs[i]["content"]
+            msgs[i] = {
+                **msgs[i],
+                "content": c[: len(c) // 2].rstrip()
+                + "\n[...trimmed to fit the context budget]",
+            }
+            running -= per[i]
+            per[i] = count_tokens([msgs[i]])  # recount ONLY the trimmed block
+            running += per[i]
+            trimmed += 1
+
+        # --- verify with a real full count; loop only if template overhead
+        #     pushed us back over (each round does exactly ONE full count) ---
+        running = count_tokens(msgs)
+        if running <= limit:
+            break
+        idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+        if len(idxs) <= 1 and trimmed >= 32:
+            break  # nothing left to shed; forward best effort
+
+    logger.warning(
+        f"hard budget enforced: {total} -> {running} tokens "
+        f"(limit {limit}); dropped {dropped} old turn(s), "
+        f"trimmed {trimmed} injected block(s)"
+    )
+    return msgs
+
+
 def _extract_last_user_text(messages: list[dict]) -> str:
     """The user message that prompted the just-completed assistant response,
     for fact extraction. Walks from the end to find the most recent
@@ -285,6 +553,7 @@ class SseAccumulator:
     def __init__(self) -> None:
         self._buffer: str = ""
         self._parts: list[str] = []
+        self._complete: bool = False
 
     def feed(self, chunk: bytes) -> None:
         try:
@@ -297,11 +566,17 @@ class SseAccumulator:
                 if not line.startswith("data: "):
                     continue
                 payload = line[6:].strip()
-                if not payload or payload == "[DONE]":
+                if not payload:
+                    continue
+                if payload == "[DONE]":
+                    self._complete = True
                     continue
                 try:
                     obj = json.loads(payload)
-                    delta = obj.get("choices", [{}])[0].get("delta", {})
+                    choice = obj.get("choices", [{}])[0]
+                    if choice.get("finish_reason"):
+                        self._complete = True
+                    delta = choice.get("delta", {})
                     content = delta.get("content")
                     if isinstance(content, str) and content:
                         self._parts.append(content)
@@ -312,6 +587,14 @@ class SseAccumulator:
     def text(self) -> str:
         return "".join(self._parts)
 
+    def complete(self) -> bool:
+        """True once a finish_reason or [DONE] was observed — i.e. the model
+        actually FINISHED the reply. A client disconnect mid-stream leaves
+        this False, and the async tail must not memorize the half-reply as if
+        the model said it (rc6 review: truncated text was being fact-extracted
+        and rolled into summaries as a completed assistant turn)."""
+        return self._complete
+
 
 def _fire_and_forget(coro) -> None:
     """Spawn post-response background work through the bounded pool
@@ -320,6 +603,39 @@ def _fire_and_forget(coro) -> None:
     references are kept alive by the pool; exceptions are logged there.
     """
     bgwork.pool.submit(coro)
+
+
+def _merge_touched(fresh: list[dict], touched: list[dict]) -> list[dict]:
+    """Reconcile a freshly-read facts list with an older in-flight snapshot.
+
+    The request path loads facts and bumps their `last_used` (LRU touch) long
+    before the async tail runs, so the tail holds a stale snapshot. Writing
+    that snapshot back would erase anything another tail persisted in between
+    (a classic lost update — the per-conv lock serializes the *writes*, but the
+    *read* happened before the lock was taken).
+
+    So: `fresh` (read under the lock) is authoritative for membership, and the
+    snapshot only contributes its LRU touches. Facts the snapshot has but
+    `fresh` no longer does were deliberately pruned/forgotten — they stay gone.
+    """
+    if not touched:
+        return list(fresh)
+    touched_at = {
+        f.get("text"): f.get("last_used")
+        for f in touched
+        if isinstance(f, dict) and f.get("last_used") is not None
+    }
+    merged = []
+    for f in fresh:
+        if not isinstance(f, dict):
+            continue
+        t = touched_at.get(f.get("text"))
+        # Only ever move last_used forward — never backdate a fact that a
+        # concurrent request touched more recently than our snapshot did.
+        if t is not None and t > (f.get("last_used") or 0):
+            f = {**f, "last_used": t}
+        merged.append(f)
+    return merged
 
 
 async def _async_tail(
@@ -370,10 +686,11 @@ async def _async_tail(
     # --- 2. Facts extraction ---
     if not facts.extraction_enabled():
         # Even with extraction off, save the touched state so LRU
-        # tracking persists across restarts.
+        # tracking persists across restarts. Re-read under the lock (see
+        # _merge_touched) so we don't clobber a concurrent tail's writes.
         async with conv_lock(conv_id):
             try:
-                facts.save_facts(conv_id, touched_facts)
+                facts.save_facts(conv_id, _merge_touched(facts.load_facts(conv_id), touched_facts))
             except Exception as e:
                 logger.warning(f"conv={conv_id}: touched-save failed: {e}")
         return
@@ -398,7 +715,12 @@ async def _async_tail(
                     {"text": s, "added_turn": turn_index, "last_used": now}
                     for s in new_strs
                 ]
-                combined = touched_facts + new_entries
+                # Re-read INSIDE the lock. `touched_facts` was loaded back in
+                # the request path (outside any lock), so building on it would
+                # silently drop facts written by a tail that finished in the
+                # meantime — the lock serializes writers but cannot prevent a
+                # lost update when the read happened before it was acquired.
+                combined = _merge_touched(facts.load_facts(conv_id), touched_facts) + new_entries
 
                 # V2.1 Phase 7: hybrid dedup BEFORE pruning. Embedding
                 # filter is cheap (no LLM call when no candidate clusters
@@ -526,19 +848,35 @@ def _vllm_unreachable_body(detail: str) -> dict:
     }
 
 
-def _vllm_unreachable_stream_chunks(model: str) -> list[dict]:
-    """SSE chunks that show the friendly message as an assistant reply, so a
-    streaming client degrades visibly rather than getting a dead stream."""
+def _vllm_unreachable_stream_chunks(model: str, message: str | None = None) -> list[dict]:
+    """SSE chunks that show a friendly message as an assistant reply, so a
+    streaming client degrades visibly rather than getting a dead stream.
+
+    `message` defaults to the backend-restarting text. Pass an explicit one for
+    cases where that would be FALSE — a 4xx means the backend is healthy and
+    rejected *our* request, and telling the user "the model is starting up" is
+    the system bearing false witness about its own state (see
+    COGNITIVE_ARCHITECTURE.md: degrade honestly, claim nothing unearned).
+    """
     cid = f"chatcmpl-unavail-{int(time.time() * 1000):x}"
     created = int(time.time())
     base = {"id": cid, "object": "chat.completion.chunk", "created": created,
             "model": model or "compactor"}
     return [
         {**base, "choices": [{"index": 0,
-                              "delta": {"role": "assistant", "content": MODEL_RESTART_MESSAGE},
+                              "delta": {"role": "assistant",
+                                        "content": message or MODEL_RESTART_MESSAGE},
                               "finish_reason": None}]},
         {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
     ]
+
+
+REQUEST_REJECTED_MESSAGE = (
+    "That request couldn't be processed — the model backend rejected it "
+    "(this is a problem on my side, not yours). The conversation and its "
+    "memory are safe. If this keeps happening on the same message, the "
+    "operator should check the compactor logs for the rejection reason."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +887,34 @@ def _vllm_unreachable_stream_chunks(model: str) -> list[dict]:
 async def chat_completions(request: Request) -> Any:
     body = await request.json()
     messages = body.get("messages", [])
+
+    # Guard: never forward an empty/invalid messages list to vLLM — its chat
+    # templating raises an opaque "list index out of range" (IndexError on
+    # conversation[0]) that surfaces in the UI as a broken reply. Seen from
+    # OpenWebUI 0.11 background/task-style calls. Log enough to identify the
+    # sender, then return a clean OpenAI-shaped 400.
+    if (
+        not isinstance(messages, list)
+        or not messages
+        or not all(isinstance(m, dict) for m in messages)
+    ):
+        logger.warning(
+            "rejected chat request with empty/invalid messages: "
+            f"ua={request.headers.get('user-agent', '?')!r} "
+            f"referer={request.headers.get('referer', '?')!r} "
+            f"body_keys={sorted(body.keys())} model={body.get('model')!r} "
+            f"stream={body.get('stream')!r} metadata={str(body.get('metadata'))[:200]!r}"
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "messages must be a non-empty list",
+                    "type": "invalid_request_error",
+                    "code": "empty_messages",
+                }
+            },
+        )
 
     # V2.0 Phase 1: conv_id resolution
     conv_id: str | None = None
@@ -614,7 +980,10 @@ async def chat_completions(request: Request) -> Any:
     try:
         body["messages"] = await compact_if_needed(messages)
     except Exception as e:
-        logger.exception(f"compaction failed; forwarding original messages: {e}")
+        logger.exception(
+            f"compaction failed; falling through with the original messages — "
+            f"the hard-budget guard will shed content if they don't fit: {e}"
+        )
 
     # V2.0 memory injection. ALL three layers (facts, RAG, summary) are
     # collected into a SINGLE combined system message and injected in one
@@ -723,8 +1092,44 @@ async def chat_completions(request: Request) -> Any:
         except Exception as e:
             logger.warning(f"conv={conv_id}: backfill kickoff failed (non-fatal): {e}")
 
+    # FINAL pre-flight, two steps in a deliberate order (rc6 review):
+    #
+    # 1. _enforce_hard_budget runs FIRST, while the system blocks are still
+    #    separate — so a trim hits the largest individual block (usually the
+    #    injected memory) instead of a pre-merged mega-block where halving
+    #    would chew into the persona. It also accounts for the request's OWN
+    #    max_tokens: vLLM enforces prompt + max_tokens <= window, so a fixed
+    #    reserve alone leaves a client asking for a big completion still 400able.
+    # 2. _merge_adjacent_system_messages runs LAST, collapsing every remaining
+    #    run — including any adjacency the budget guard created by deleting a
+    #    turn that sat between two system messages.
+    try:
+        req_max_tokens = int(body.get("max_tokens") or 0)
+    except (TypeError, ValueError):
+        req_max_tokens = 0
+    if req_max_tokens > MAX_MODEL_LEN // 2:
+        # Pair with the reserve cap below so prompt+completion always fits.
+        req_max_tokens = MAX_MODEL_LEN // 2
+        body["max_tokens"] = req_max_tokens
+    effective_limit = min(
+        MAX_MODEL_LEN,
+        max(256, MAX_MODEL_LEN - max(GENERATION_RESERVE, req_max_tokens)),
+    )
+    # Pure CPU (tokenizer) work — off the event loop so a shedding pass on a
+    # huge conversation can't stall every other request and the healthchecks.
+    body["messages"] = await run_in_threadpool(
+        _enforce_hard_budget, body["messages"], effective_limit
+    )
+    body["messages"] = _merge_adjacent_system_messages(body["messages"])
+
     stream = bool(body.get("stream", False))
-    client = httpx.AsyncClient(timeout=None)
+    # read=None keeps long generations from being cut off, but connect/write/
+    # pool stay bounded: an unqualified timeout=None also removes the CONNECT
+    # timeout, so a vLLM socket that accepts and then stalls (or a half-open
+    # connection after a restart) would hang the request forever.
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+    )
 
     if stream:
         accumulator = SseAccumulator()
@@ -737,9 +1142,34 @@ async def chat_completions(request: Request) -> Any:
                         "POST", f"{VLLM_URL}/v1/chat/completions", json=body
                     )
                     async with stream_cm as r:
-                        async for chunk in r.aiter_raw():
-                            yield chunk
-                            accumulator.feed(chunk)
+                        if r.status_code >= 400:
+                            # vLLM rejected the request (e.g. a 400 from chat-
+                            # template validation). Relaying its JSON error body
+                            # raw into a text/event-stream gives the UI a garbled
+                            # reply; degrade visibly instead, like the
+                            # connection-error branch below.
+                            vllm_failed = True
+                            err_body = (await r.aread()).decode("utf-8", "replace")[:300]
+                            logger.warning(
+                                f"vLLM HTTP {r.status_code} on stream: {err_body!r}"
+                            )
+                            for chunk in _vllm_unreachable_stream_chunks(
+                                body.get("model") or MODEL_REPO or "",
+                                # A 4xx means the backend is HEALTHY and refused
+                                # our request; only 5xx/unreachable justifies the
+                                # "starting up or restarting" message.
+                                message=(
+                                    REQUEST_REJECTED_MESSAGE
+                                    if r.status_code < 500
+                                    else None
+                                ),
+                            ):
+                                yield f"data: {json.dumps(chunk)}\n\n".encode()
+                            yield b"data: [DONE]\n\n"
+                        else:
+                            async for chunk in r.aiter_raw():
+                                yield chunk
+                                accumulator.feed(chunk)
                 except httpx.RequestError as e:
                     # V2.3 Theme 2: vLLM unreachable mid-stream (down /
                     # restarting). Degrade visibly — emit the friendly
@@ -754,9 +1184,18 @@ async def chat_completions(request: Request) -> Any:
             finally:
                 await client.aclose()
                 # Fire-and-forget post-response work once the stream is done.
-                # Skip it when vLLM failed — there's no real assistant turn
-                # to extract/index from.
-                if conv_id and not vllm_failed:
+                # Skip it when vLLM failed — there's no real assistant turn to
+                # extract/index from — and when the stream never COMPLETED
+                # (client hit Stop / tab closed mid-reply): memorizing a
+                # half-sentence as though the model said it plants false
+                # "memories" in facts/RAG/summaries (rc6 review).
+                if conv_id and not vllm_failed and not accumulator.complete():
+                    logger.info(
+                        f"conv={conv_id}: stream ended without completion "
+                        f"({len(accumulator.text())} chars accumulated) — "
+                        f"skipping memory tail for the partial reply"
+                    )
+                if conv_id and not vllm_failed and accumulator.complete():
                     _fire_and_forget(
                         _async_tail(
                             conv_id,
@@ -782,7 +1221,23 @@ async def chat_completions(request: Request) -> Any:
                 content=_vllm_unreachable_body(f"{type(e).__name__}: {e}"),
                 status_code=503,
             )
-        response_json = r.json()
+        try:
+            response_json = r.json()
+        except ValueError as e:
+            # vLLM (or something in front of it) returned a non-JSON body — an
+            # HTML 502, a truncated response, a plain-text 5xx. Without this
+            # guard the JSONDecodeError escapes as an opaque 500; httpx's
+            # RequestError above only covers connection-level faults.
+            body_head = (r.text or "")[:200]
+            logger.warning(
+                f"vLLM returned non-JSON (HTTP {r.status_code}): {type(e).__name__}: {body_head!r}"
+            )
+            return JSONResponse(
+                content=_vllm_unreachable_body(
+                    f"non-JSON response (HTTP {r.status_code}): {body_head}"
+                ),
+                status_code=502,
+            )
         # Extract assistant text for fact extraction
         assistant_text = ""
         try:
@@ -822,7 +1277,23 @@ async def models():
                 content=_vllm_unreachable_body(f"{type(e).__name__}: {e}"),
                 status_code=503,
             )
-        return JSONResponse(content=r.json(), status_code=r.status_code)
+        try:
+            models_body = r.json()
+        except ValueError as e:
+            # Same non-JSON-body class as the chat path (rc6 review): an HTML
+            # 502 or truncated body must not escape as an opaque 500.
+            body_head = (r.text or "")[:200]
+            logger.warning(
+                f"vLLM returned non-JSON (/v1/models, HTTP {r.status_code}): "
+                f"{type(e).__name__}: {body_head!r}"
+            )
+            return JSONResponse(
+                content=_vllm_unreachable_body(
+                    f"non-JSON response (HTTP {r.status_code}): {body_head}"
+                ),
+                status_code=502,
+            )
+        return JSONResponse(content=models_body, status_code=r.status_code)
 
 
 @app.get("/health")

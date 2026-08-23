@@ -61,11 +61,14 @@ Full walkthrough in [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md). TL;DR:
 3. Deploy a GPU pod from the [Docker Hub image](https://hub.docker.com/r/angreg/zions-light-ai) with the volume attached at `/data`, ports `3000, 8080` exposed
 4. **Pick a model that fits your GPU** — see the warning below
 
-> **⚠️ A40 users: set `MODEL_REPO=anthracite-org/magnum-v4-12b`.** The image's
-> built-in default is the 22B model, which **does not fit an A40** — runtime
-> FP8 quantization OOMs during the marlin repack step. The 12B model runs
-> comfortably in FP16 at 32K context on an A40. Reserve the 22B for A100-class
-> cards in FP16. See [GPU sizing](RUNPOD_DEPLOY.md#gpu-sizing).
+> **A40 users: the defaults just work (rc8+).** The image's built-in default
+> is the production-validated A40 config — Cydonia-24B with runtime fp8 —
+> so a bare deploy boots out of the box. If a 24B + fp8 boot ever OOMs on
+> your host, the always-fits fallback is `anthracite-org/magnum-v4-12b` in
+> FP16 (empty `VLLM_EXTRA_ARGS`). On images **older than rc8** the default
+> was a 22B that did *not* fit an A40 — override per
+> [runpod.env.template](runpod.env.template). See
+> [GPU sizing](RUNPOD_DEPLOY.md#gpu-sizing).
 
 ### Local (dev / testing)
 
@@ -94,6 +97,10 @@ Pin a specific version for reproducible deploys.
 
 | Tag | Contents |
 |---|---|
+| `:v3.0-cu12` = `:v3.0` | **Current release** (= the validated rc8 build) — V3.0 consolidation: audited dep pins, OpenWebUI 0.11, SQLite network-volume hardening, chat-proxy guards; CUDA-12 profile (any A40 host) |
+| `:v3.0-rc5-cu12` / `:v3.0-rc6-cu12` / `:v3.0-rc7-cu12` | Superseded rcs — rc5 lacks the overflow fix; rc6 lacks the rc7 review fixes (compaction alternation blocker); rc7 is code-identical to rc8 but ships the old unbootable-on-A40 22B default |
+| `:v3-snapshot` | Frozen last-known-good V3.3 image (= `:v3.3-tts`) — rollback target |
+| `:v3.3-tts` / `:v3.2-stt` / `:v3.1-vision` | The V3.x feature line as shipped incrementally |
 | `:v2.1` | Rolling V2.1 — full memory + user control + observability |
 | `:v2.1-phase8` / `:v2.1-complete` | V2.1 final: chat commands + personas |
 | `:v2.1-phase7` | + semantic dedup + stale-fact archival |
@@ -110,6 +117,7 @@ See [CHANGELOG.md](CHANGELOG.md) for full version history.
 |---|---|---|
 | [USER_GUIDE.md](USER_GUIDE.md) | **Users** | Memory model, slash commands, personas, admin endpoints, FAQ |
 | [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md) | **Operators** | RunPod deploy, GPU sizing, env vars, troubleshooting |
+| [runpod.env.template](runpod.env.template) | **Operators** | Paste-ready RunPod pod template — every env var, the pod settings, and which ones actually matter |
 | [OPERATIONS.md](OPERATIONS.md) | **Operators** | Runbook: health, log reference, failure recovery, backups/restore, rollback |
 | [CHANGELOG.md](CHANGELOG.md) | Everyone | Per-version history |
 | [ROADMAP.md](ROADMAP.md) | Contributors | V1 → V4 forward plan |
@@ -118,6 +126,8 @@ See [CHANGELOG.md](CHANGELOG.md) for full version history.
 | [compactor/V4_PLAN.md](compactor/V4_PLAN.md) | Contributors | Agentic / tool-use design spec |
 | [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md) | Contributors | North star — the stateless→stateful arc, faculties, and the honesty/reverence principles |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Contributors | System shape — layering tiers, networking/trust boundaries, scaling, and the V4-era split decisions |
+| [FINETUNE_PLAN.md](FINETUNE_PLAN.md) | Contributors | Fine-tune track — crafting a custom voice (QLoRA), a parallel track to the V-line |
+| [SEED_MODEL_PLAN.md](SEED_MODEL_PLAN.md) | Contributors | Far-future foundation — values-in-pretraining (the tabula-rasa / self-modification frontiers). **Partly superseded** — the MoE/BTX pipeline was dropped; see the notice at the top of the file |
 
 ## Project structure
 
@@ -163,19 +173,19 @@ See [ROADMAP.md](ROADMAP.md). High-level:
 - **V2.1** ✅ — user control: chat commands, personas, export/import, dedup, archival, observability
 - **V2.2** ✅ — testing & observability: boot self-test, `/health/full`, three-tier standard ([TESTING.md](TESTING.md))
 - **V2.3** — resilience & stability: durable backups + verified restore, chaos tests, operational runbook *(quality over speed)*
-- **V3** — multimodal: vision (VLM swap), speech-to-text (Whisper), text-to-speech (Kokoro/XTTS)
+- **V3** — multimodal: vision (VLM swap), speech-to-text (Whisper), text-to-speech (Piper; Kokoro optional swap)
 - **V4** — agentic: model tool-use via a compactor tool-loop, sandboxed command execution, eventual agent-run harness ([compactor/V4_PLAN.md](compactor/V4_PLAN.md))
 
 ## Tech stack
 
 | Layer | Component |
 |---|---|
-| Inference engine | [vLLM](https://github.com/vllm-project/vllm) 0.14.1 (cu128 wheels for RunPod A40 compat) |
+| Inference engine | [vLLM](https://github.com/vllm-project/vllm) 0.24.0 — cu130/CUDA 13 default (driver ≥580); cu128 + vLLM 0.19.0 CUDA-12 fallback (driver-570 hosts) |
 | Chat frontend | [OpenWebUI](https://github.com/open-webui/open-webui) |
 | Memory middleware | Custom FastAPI compactor (`compactor/`, torch-free venv) |
 | Embeddings | BAAI/bge-small-en-v1.5 (ONNX, prebaked) via fastembed + ChromaDB |
 | Process supervision | supervisord |
-| Container base | `nvidia/cuda` runtime (parametric build args — cu128 default) |
+| Container base | `nvidia/cuda` runtime (parametric — cu130/CUDA 13 default, cu128/CUDA 12 fallback) |
 | Recommended model | Magnum v4 **12B** on A40 / 22B on A100 (or any vLLM HF causal-LM) |
 
 ## License

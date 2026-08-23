@@ -611,6 +611,39 @@ documented as an optional quality swap, not the default.
 Comparable to V2. Could be done in parallel with V2 since they touch
 mostly separate code paths.
 
+### V3.0 — Consolidation & hardening  ✅ Complete (released 2026-08-23)
+
+The V3.x features shipped incrementally (3.1 / 3.2 / 3.3) on a rolling image.
+**V3.0 proper** is the consolidated, audited release that stabilizes that line
+before it is promoted to `:latest`. Branch `v3.0` off master.
+
+- **Dependency security pass (done, 2026-06-30):** PyPI/OSV audit → vLLM
+  `0.14.1 → 0.24.0` (cleared ~18 CVEs), transformers pinned to the clean
+  `5.12.1`, chromadb CVE-2026-45829 recorded as not-exposed (embedded use), and
+  **all** runtime deps pinned to exact versions for reproducible builds. See
+  CHANGELOG `[3.0]`.
+- **Platform (rc1 → rc2 finding):** vLLM 0.24.0 ships **CUDA-13** kernels, so the
+  default image now builds on a **CUDA 13 base + cu130** and needs a host
+  **driver ≥580** (the A40 works — the gate is the host, not the card). Driver-570
+  hosts use the documented **CUDA-12 fallback** (vLLM 0.19.0, ~32 advisories).
+- **Bug-fix scrub (in progress):** landed — CRLF→LF entrypoint fix +
+  build-arg-aware driver preflight, open-webui 0.10.1→0.11.0 (fixes the
+  auto-discovered-model chat crash, clears 17 advisories), and an
+  empty-`messages` guard in the chat proxy (rc4 on-pod: OpenWebUI 0.11
+  background/task calls can send `messages: []`, which crashed vLLM's chat
+  templating with an opaque "list index out of range"; now a clean 400 +
+  sender-identifying log). More as on-pod testing surfaces them.
+- **Ops learning (2026-08-10):** the network volume (MooseFS) threw
+  `disk I/O error` under `webui.db` → transient "malformed database" outage
+  (file survived; V2.3 backups stood ready). Mitigation now:
+  `COMPACTOR_BACKUP_INTERVAL_HOURS=6` on the pod. Architectural fix decided:
+  **Postgres sidecar as the state home** (PGDATA on local disk, pg_dump to the
+  volume) — see ARCHITECTURE.md Decision 4. SQLite/Chroma stay only until that
+  brick lands.
+- **Validation gate:** rebuild → boot self-test PASS (incl. STT/TTS + a chat
+  round-trip exercising transformers 5.x) → real voice round-trip → promote
+  `:latest`. Frozen rollback target meanwhile: `:v3-snapshot`.
+
 ---
 
 ## V4 — Agentic tool use
@@ -752,12 +785,41 @@ and V3 prove the architecture handles them. **Order does not imply priority.**
   enforce user isolation in memory store)
 - Multi-tenant Network Volume layout
 
-### Fine-tuning pipeline
-- Personalize Magnum (or any model) on the user's own writing samples
-- Use vLLM's LoRA adapter support to swap personality without reloading
-  base weights
-- Requires a training pipeline (out of vLLM's scope), but inference becomes
-  cheap once adapters exist
+### Custom-model tracks — now scoped in their own docs
+Two parallel tracks to the V-line, at different horizons:
+- **Voice (near-term):** a QLoRA style-LoRA to give the model *our* prose,
+  uncensored by default — achievable on the A40 (vLLM LoRA-adapter serving keeps
+  inference cheap once trained). See [FINETUNE_PLAN.md](FINETUNE_PLAN.md).
+- **Foundation (far-future):** a from-scratch seed with values baked into its
+  *own* pretraining — the concrete architecture for the tabula-rasa /
+  self-modification frontiers. Resource-gated; sequenced only after the compactor
+  is validated. See [SEED_MODEL_PLAN.md](SEED_MODEL_PLAN.md).
+  **Partly superseded:** a later round dropped the MoE / Branch-Train-MiX
+  pipeline in favour of a ~1.5B dense seed with memory layers, and moved the
+  authoritative seed + corpus plan to `MrBanana8768/zions-light-corpus`
+  (private). The notice at the top of SEED_MODEL_PLAN.md itemizes what changed.
+  The headline finding from that round: **compute is not the constraint** — the
+  training run is ~1.3 days and under $700, while compiling the corpus in front
+  of it is 6–10 weeks, and it gates everything.
+
+### Memory-judgment experiment (near-term — current compactor)
+Testable *now*, no new model architecture. The compactor's memory-processing
+(summarize / extract-facts / dedup) currently uses the **same** model that
+generated the conversation — squarely in the **Self-Correction Blind Spot** (an
+LLM misses ~64.5% of errors in its *own* output that it would catch from an
+external source — Self-Correction Bench, Tsui 2025, arXiv:2507.02778). Two-tier,
+cheap-first:
+1. **Prompt-level (near-zero cost):** add a "*Wait — verify this against the
+   source*" step to the memory-processing prompts. The bench found appending
+   "Wait" cut the blind spot ~89%. Try this first.
+2. **Separate judge model:** route memory-processing to a *different* small model
+   (e.g. a 3–8B instruct) run on **CPU in its own venv** — memory work is offline
+   (`bgwork.py`), so latency is irrelevant and it never competes with vLLM for
+   VRAM (same pattern as STT/TTS).
+
+Eval: A/B the confabulation rate + fact-selection quality (self-judge vs.
+separate-judge) over a fixed set of conversations; weigh "avoids the blind spot"
+against any capability drop from a smaller judge.
 
 ### Real-time web search / external RAG
 - Combine V2's vector memory with external doc ingestion

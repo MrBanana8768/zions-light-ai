@@ -23,6 +23,7 @@ scout-*.log
 .gitignore
 .gitattributes
 .editorconfig
+.claude/
 
 # Local env files — secrets live here.
 .env

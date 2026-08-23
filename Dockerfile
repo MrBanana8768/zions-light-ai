@@ -1,18 +1,27 @@
 # Dockerfile for vLLM + context-compactor + OpenWebUI on Runpod
 # Optimized for NVIDIA A40 (48GB VRAM) and larger.
 #
-# CUDA base + torch wheels are parametric via build args so the same
-# Dockerfile can build cu128 (default, RunPod driver 570 compatible) and
-# cu130 variants without source changes:
+# CUDA base + torch channel + vLLM version are parametric build args, but
+# they are NOT independent — they must move together as ONE of two coherent
+# profiles. vLLM's compiled kernels are linked against a specific CUDA major,
+# so a mismatched base/torch fails at RUNTIME with
+# "ImportError: libcudart.so.NN: cannot open shared object file" (this bit
+# v3.0-rc1: CUDA-13 vLLM on a CUDA-12 base). The two supported profiles:
 #
-#   docker build .                                       # cu128 default
-#   docker build --build-arg CUDA_BASE_IMAGE=nvidia/cuda:12.9.1-runtime-ubuntu24.04 \
-#                --build-arg TORCH_CUDA=cu128 .          # newer CUDA runtime, same wheels
-#   docker build --build-arg CUDA_BASE_IMAGE=nvidia/cuda:13.0.0-runtime-ubuntu24.04 \
-#                --build-arg TORCH_CUDA=cu130 \
-#                --build-arg VLLM_VERSION=0.21.0 .       # full cu130 variant (driver 580+)
+#   # DEFAULT — CUDA 13 / driver 580+ / clean vLLM 0.24.0 (recommended):
+#   docker build .
+#
+#   # FALLBACK — CUDA 12 (cu128) / driver >=525 / legacy vLLM 0.19.0 (less secure):
+#   docker build \
+#     --build-arg CUDA_BASE_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04 \
+#     --build-arg TORCH_CUDA=cu128 \
+#     --build-arg VLLM_VERSION=0.19.0 .
+#
+# Never mix a CUDA-12 base/torch with a CUDA-13 vLLM (or vice versa). Ampere
+# cards (e.g. the A40) run CUDA 13 fine — the gate is the HOST driver (>=580),
+# not the GPU model.
 
-ARG CUDA_BASE_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04
+ARG CUDA_BASE_IMAGE=nvidia/cuda:13.0.0-runtime-ubuntu24.04
 FROM ${CUDA_BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -53,13 +62,25 @@ RUN mkdir -p /data
 
 ENV VLLM_VENV=/opt/vllm-venv
 
-# vLLM + torch CUDA target. Both parametric so the cu130 variant can be
-# built from the same source. Defaults aligned for RunPod's driver-570
-# fleet (CUDA 12.8 max). CVE-2026-22778 (Critical 9.8) requires vllm >=
-# 0.14.1. Bump VLLM_VERSION + TORCH_CUDA together when RunPod rolls out
-# driver 580+.
-ARG VLLM_VERSION=0.14.1
-ARG TORCH_CUDA=cu128
+# vLLM + torch CUDA target — see the profile note at the top of this file:
+# CUDA_BASE_IMAGE, TORCH_CUDA and VLLM_VERSION must form ONE coherent CUDA
+# generation, because vLLM's compiled kernels are CUDA-major-specific.
+# Security floor (V3.0, audited 2026-06-30 via PyPI/OSV): 0.14.1 had
+# accumulated ~18 CVEs + ~17 GHSAs since it was set; 0.24.0 is the first
+# release with NO known advisories, so it is the default. BUT 0.24.0 ships
+# CUDA-13 kernels (needs libcudart.so.13) and pins torch==2.11.0 — hence the
+# default base is CUDA 13 + the cu130 torch channel, and it requires a host
+# driver >=580 (Ampere/A40 is supported on 580; the gate is the host, not
+# the card). CUDA-12 / driver-570 hosts must use the fallback profile: vLLM
+# 0.19.0 is the last CUDA-12 release (torch 2.10) and still carries ~32
+# advisories — an accepted trade for legacy-driver compatibility. Re-audit
+# and bump before each release.
+ARG VLLM_VERSION=0.24.0
+ARG TORCH_CUDA=cu130
+
+# Bake the CUDA channel into the image so entrypoint.sh's driver preflight
+# knows which minimum driver to require (cu130 -> 580, cu128/cu126 -> 525).
+ENV TORCH_CUDA=${TORCH_CUDA}
 
 # =============================================================================
 # vLLM venv — ONLY vLLM. As of V2.0 Phase 3 the compactor has its OWN venv
@@ -164,7 +185,7 @@ RUN mkdir -p /opt/tts-voices && \
 WORKDIR /app
 RUN python3 -m venv /app/venv && \
     /app/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    /app/venv/bin/pip install --no-cache-dir open-webui && \
+    /app/venv/bin/pip install --no-cache-dir open-webui==0.11.0 && \
     find /app/venv -type f \( -name "*.so" -o -name "*.so.*" \) \
         -exec strip --strip-unneeded {} + 2>/dev/null || true && \
     find /app/venv -name "*.pyc" -delete && \
@@ -210,14 +231,23 @@ COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Operator tool: reclaim volume space by removing stale HuggingFace model
+# caches (old MODEL_REPO weights linger on the Network Volume). Not on the
+# startup path — run on demand: docker exec <container> /opt/clean-models.sh
+COPY clean-models.sh /opt/clean-models.sh
+RUN chmod +x /opt/clean-models.sh
+
 # =============================================================================
 # Model configuration — override via .env or Runpod template
-# Default: anthracite-org/magnum-v4-22b (creative writing fine-tune, lightly
-# aligned). On A40 use VLLM_EXTRA_ARGS="--quantization fp8" to fit 32K context;
-# without quantization, drop MAX_MODEL_LEN to 8192.
+# Default: Cydonia 24B (heretic) + runtime fp8 — the PRODUCTION-VALIDATED A40
+# config (V3.0 rc line): boots and serves at ~43GB incl. KV on a 48GB card.
+# The two defaults move TOGETHER: a 24B without the fp8 flag will not fit an
+# A40. (The previous default, magnum-v4-22b with no quant flag, could not boot
+# on the A40 at all — the out-of-the-box trap PR #16 flagged; changed rc8.)
+# On 80GB-class cards, clear VLLM_EXTRA_ARGS for full FP16 quality.
 # Any HuggingFace causal-LM repo that vLLM supports works here.
 # =============================================================================
-ENV MODEL_REPO="anthracite-org/magnum-v4-22b"
+ENV MODEL_REPO="coder3101/Cydonia-24B-v4.3-heretic-v4"
 ENV HF_HOME="/data/models"
 # Note: TRANSFORMERS_CACHE was removed in v1.9.1 — deprecated in transformers
 # v5, HF_HOME is the modern equivalent and is read by both transformers
@@ -228,7 +258,9 @@ ENV VLLM_HOST="0.0.0.0"
 ENV VLLM_PORT="8000"
 ENV MAX_MODEL_LEN="32768"
 ENV GPU_MEMORY_UTILIZATION="0.90"
-ENV VLLM_EXTRA_ARGS=""
+# Paired with the Cydonia-24B default above — a 24B on a 48GB card requires
+# runtime fp8. Clear this when swapping to a 12B-class model or an 80GB card.
+ENV VLLM_EXTRA_ARGS="--quantization fp8"
 
 # context-compactor settings (port 8080 — what OpenWebUI talks to)
 ENV COMPACTOR_HOST="0.0.0.0"
@@ -291,6 +323,20 @@ ENV ENABLE_OLLAMA_API="false"
 ENV ENABLE_OPENAI_API="true"
 ENV DATA_DIR="/data/openwebui"
 ENV WEBUI_AUTH="true"
+
+# SQLite hardening for OpenWebUI's DB, which lives on the RunPod NETWORK volume
+# (/data/openwebui/webui.db). OpenWebUI 0.11.0 defaults to WAL journal mode, but
+# SQLite's WAL needs an mmap'd shared-memory (-shm) index that network
+# filesystems don't support reliably — on a network volume WAL *causes* the
+# "database is locked" errors it's meant to avoid. So: fall back to rollback
+# (DELETE) journal, which needs no -shm/mmap; raise the lock-wait modestly (10s,
+# not 30s+ which would just hide a real deadlock); and drop the DB mmap (also
+# unreliable over network FS). synchronous stays at OWUI's NORMAL default on
+# purpose — FULL would lengthen writes on slow network storage and worsen
+# contention. Inherited by the openwebui program like the AUDIO_* vars above.
+ENV DATABASE_ENABLE_SQLITE_WAL="false"
+ENV DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT="10000"
+ENV DATABASE_SQLITE_PRAGMA_MMAP_SIZE="0"
 
 # V3.2 — wire OpenWebUI's STT to the local Whisper service (OpenAI engine).
 # Disable voice input per-pod by setting AUDIO_STT_ENGINE="" (empty).

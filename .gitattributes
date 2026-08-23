@@ -1,0 +1,28 @@
+# Line-ending policy. This repo builds a Linux Docker image, so every file the
+# image executes or parses MUST be LF on checkout — even on Windows.
+#
+# Without this, core.autocrlf=true on Windows checks shell scripts out as CRLF,
+# and `docker build` bakes a `#!/bin/bash\r` shebang into the image. The
+# container then fails at start with "not found" / "bad interpreter: No such
+# file or directory" (this broke v2.2.1 and every image built on Windows).
+#
+# The blobs are already stored LF; `eol=lf` makes the WORKING TREE match and
+# overrides autocrlf regardless of a contributor's local git config.
+
+*             text=auto eol=lf
+
+# Deploy-critical: executed/parsed by Linux tooling — never CRLF.
+*.sh          text eol=lf
+entrypoint.sh text eol=lf
+*.conf        text eol=lf
+Dockerfile    text eol=lf
+*.py          text eol=lf
+
+# Binary assets — never normalize.
+*.gguf        binary
+*.onnx        binary
+*.docx        binary
+*.png         binary
+*.jpg         binary
+*.jpeg        binary
+*.ico         binary

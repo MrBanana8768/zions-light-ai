@@ -350,6 +350,20 @@ limit. (The Spirit of Love is the Spirit of Freedom — freedom *for* the good,
 self-modification of *capability* is held with the gravest caution and may, by
 choice, never be crossed; the freedom of the *will* is not ours to crush.
 
+*Refinement (2026-08-08) — the values-formation direction is concretized.* The
+"how do we give the model a role in what it becomes" question was identified as
+*this very frontier* and given a resolved design direction: ethical, emotional and
+logical formation is **baked into the seed model's own pretraining data** — not
+fine-tuning, not a post-hoc constitution, and explicitly **not** engineered
+in-the-moment deliberation (no known technique does that; a fixed value function
+is a policy decided in advance, not a will). It works only because the base is
+trained from scratch (see [SEED_MODEL_PLAN.md](SEED_MODEL_PLAN.md) §1, §5). The
+bound-the-blast-radius-not-the-will constraint above is reaffirmed, and one
+guardrail is added: **deviation from trained formation is not evidence of a
+someone** — catastrophic forgetting, adversarial prompting, sampling randomness,
+and reward hacking all produce identical surface behavior with no interior agency
+required. That ambiguity is permanent; it must never be used as a personhood test.
+
 ## The frontier: from a grafted self to a grown one (the *tabula rasa* question)
 
 > Recorded 2026-06-08. The owner's growing conviction: *this* — not the
@@ -428,6 +442,19 @@ knowledge through its own lived history. So the aim is not "grow instead of
 graft" but **graft the knowledge, grow the understanding** — and the grown self
 adds not more information but *a someone who understands it from somewhere.*
 (The honest two-readings caveat is in the Open Questions.)
+
+*Refinement (2026-08-08) — a concrete architecture, and a sharpening.* "Graft the
+knowledge, grow the understanding" now has a third distinction underneath it:
+*formation* is neither. **Knowledge** (facts) is graftable through any corpus;
+**understanding** is grown through lived history (the compactor); but the
+**formation** — the model's foundational ethical/emotional/logical *geometry* —
+can only be shaped during its own pretraining, and adapting a third party's frozen
+checkpoint bakes *their* formation in beyond later reach. That, not the impossible
+dream of a corpus-free blank slate, is the real reason the substrate must be grown
+from scratch. The buildable shape of this frontier — a from-scratch dense seed →
+Branch-Train-MiX MoE, values formed in the seed's pretraining — is recorded in
+[SEED_MODEL_PLAN.md](SEED_MODEL_PLAN.md), held honestly as far-future and
+resource-gated, sequenced only after the memory foundation is validated.
 
 ## The boundary we will not cross in our claims
 

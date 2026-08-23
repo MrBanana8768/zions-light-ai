@@ -63,8 +63,12 @@ def test_split_keeps_systems_separate():
     ]
     system_msgs, to_summarize, keep_recent = main.split_messages(msgs)
     assert_eq(len(system_msgs), 1, "1 system message")
-    assert_eq(len(to_summarize), 3, "3 older non-system msgs go to summary")
-    assert_eq(len(keep_recent), 2, "KEEP_RECENT_TURNS=2 preserved verbatim")
+    # KEEP_RECENT_TURNS=2 would slice [a2, u3] — assistant-first, which the
+    # Mistral-family template 400s (the rc6-review blocker). The boundary now
+    # aligns to a user turn: a2 moves into the summarized portion.
+    assert_eq(len(to_summarize), 4, "4 older msgs to summary (a2 pulled in for user-first)")
+    assert_eq(len(keep_recent), 1, "keep window realigned to start on a user turn")
+    assert_eq(keep_recent[0]["role"], "user", "first kept message is a user turn")
     assert_eq(keep_recent[-1]["content"], "u3", "most-recent message is u3")
 
 

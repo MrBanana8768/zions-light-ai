@@ -42,18 +42,34 @@ GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | he
 DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits | head -1)
 echo "      GPU: ${GPU_NAME} (${GPU_MEM} MiB), driver ${DRIVER}"
 
-# Check 3: driver version satisfies what our torch wheel needs.
-# This image ships torch cu128, which requires driver >= 525 minimum
-# (>= 555 recommended). Bail with an actionable message rather than
-# letting torch crash later with "NVIDIA driver too old".
+# Check 3: driver version satisfies what our torch/vLLM wheels need. The CUDA
+# channel this image was built against is baked in as ${TORCH_CUDA}; CUDA 13
+# (cu130) needs a much newer driver than CUDA 12 (cu128/cu126). Bail with an
+# actionable message rather than letting torch/vLLM crash later with "NVIDIA
+# driver too old" or "libcudart.so.NN: cannot open shared object file".
 DRIVER_MAJOR=$(echo "${DRIVER}" | cut -d. -f1)
-if [ "${DRIVER_MAJOR}" -lt 525 ] 2>/dev/null; then
-    echo "      ERROR: Driver ${DRIVER} is too old for torch cu128."
-    echo "             Need >= 525 (>= 555 recommended for CUDA 12.8 wheels)."
-    echo "             Pick a RunPod GPU with a newer driver, or build the"
-    echo "             cu126 variant: --build-arg TORCH_CUDA=cu126"
+# Fail CLOSED on a missing/unknown channel: default to the strictest floor
+# (cu130 -> driver 580) so a mis-built image can't silently pass an under-spec host.
+case "${TORCH_CUDA:-cu130}" in
+    cu130) MIN_DRIVER=580; CUDA_LABEL="CUDA 13 (cu130)" ;;
+    cu128) MIN_DRIVER=525; CUDA_LABEL="CUDA 12.8 (cu128)" ;;
+    cu126) MIN_DRIVER=525; CUDA_LABEL="CUDA 12.6 (cu126)" ;;
+    *)     MIN_DRIVER=580; CUDA_LABEL="${TORCH_CUDA:-unset} (unrecognized — requiring newest)" ;;
+esac
+if [ "${DRIVER_MAJOR}" -lt "${MIN_DRIVER}" ] 2>/dev/null; then
+    echo "      ERROR: Driver ${DRIVER} is too old for this image (${CUDA_LABEL})."
+    echo "             Need driver >= ${MIN_DRIVER}."
+    if [ "${MIN_DRIVER}" -ge 580 ]; then
+        echo "             This is the CUDA-13 build; it needs a driver-580+ host."
+        echo "             Deploy on a newer host, or build the CUDA-12 fallback:"
+        echo "               --build-arg CUDA_BASE_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04 \\"
+        echo "               --build-arg TORCH_CUDA=cu128 --build-arg VLLM_VERSION=0.19.0"
+    else
+        echo "             Pick a RunPod GPU/host with a newer driver."
+    fi
     exit 1
 fi
+echo "      driver ${DRIVER} OK for ${CUDA_LABEL} (needs >= ${MIN_DRIVER})"
 
 # Symlink vLLM's torch.compile cache onto the persistent volume. Without
 # this, every cold start re-runs the 60-120s CUDA graph capture even

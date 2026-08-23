@@ -9,6 +9,184 @@ on Docker Hub.
 
 ---
 
+## [3.0] — V3 consolidation & dependency hardening — **released 2026-08-23**
+
+**Goal:** stabilize the V3.x line (vision + STT + TTS, shipped incrementally as
+3.1 / 3.2 / 3.3 on a rolling image) into one audited, reproducible release:
+the dependency-security pass plus the bug-fix scrub that followed (eight rcs,
+two production incidents, two adversarial audit rounds — see "Fixed" below).
+
+**Released as:** `angreg/zions-light-ai:v3.0-cu12` = `:v3.0` = `:latest`
+(promoted from the validated `:v3.0-rc8-cu12` build; git tag `v3.0`).
+Rollback targets: `:v3.0-rc7-cu12` (pre-Cydonia-default, code-identical) and
+`:v3-snapshot` (the pre-audit 3.3 image — functional but carries the
+pre-audit vLLM; last resort only). Patch releases (v3.0.x) will carry any
+post-release fixes.
+
+### Security (PyPI/OSV audit, 2026-06-30)
+- **vLLM `0.14.1` → `0.24.0`.** The 0.14.1 pin had accumulated ~18 CVEs + ~17
+  GHSAs since it was set (it only ever fixed CVE-2026-22778); 0.24.0 is the first
+  release with no known advisories. vLLM binds to localhost behind the compactor,
+  which bounded exposure in the meantime.
+  **Correction (rc1 → rc2):** the original note here claimed 0.24.0 kept cu128
+  with "no CUDA-base change" — that was wrong. 0.24.0 ships **CUDA-13** kernels
+  (rc1 failed on the CUDA-12 image with `ImportError: libcudart.so.13`), so the
+  default build moved to a **CUDA 13 base (`13.0.0-runtime`) + cu130** torch
+  channel and now requires a host **driver ≥580** (Ampere/A40 is supported on
+  580 — the gate is the host, not the card). A documented **CUDA-12 fallback**
+  profile (base `12.6.3` + cu128 + vLLM **0.19.0**, the last CUDA-12 release,
+  ~32 advisories) is provided for driver-570 hosts. The three build args
+  (base / `TORCH_CUDA` / `VLLM_VERSION`) are now a matched set — see the
+  Dockerfile header.
+- **transformers `>=4.50` → `==5.12.1`.** The unbounded floor was silently
+  resolving to a 5.x major already; the last 4.x (4.57.6) carries open CVEs fixed
+  only in 5.x. Pinned to the clean 5.12.1 (used tokenizer-only on a known model).
+  The 4→5 major is the item the rebuild **boot self-test must confirm**; fallback
+  is `transformers==4.57.6`.
+- **chromadb — known/accepted, not exposed.** CVE-2026-45829 (pre-auth code
+  injection) affects all 1.x with no fix yet, but only via the Chroma **HTTP
+  server**; we run chromadb **embedded** (in-process, sqlite-backed), so the
+  vulnerable endpoint is not present. Pinned `==1.5.9`; bump when patched.
+
+### Changed
+- **All runtime Python deps pinned to exact, audited versions** for reproducible
+  builds (the Dockerfile was otherwise non-reproducible — only vLLM was pinned):
+  `compactor/`, `stt/`, `tts/` requirements + `open-webui==0.11.0` in the
+  Dockerfile. Pins: fastapi 0.138.2, uvicorn 0.49.0, httpx 0.28.1,
+  python-multipart 0.0.32, faster-whisper 1.2.1, piper-tts 1.4.2, fastembed
+  0.8.0, transformers 5.12.1, chromadb 1.5.9, open-webui 0.11.0.
+- **open-webui `0.10.1` → `0.11.0` (rc3 → rc4).** rc3 pinned 0.10.1 (latest at
+  audit time), which carries a **regression** (open-webui issue #20565): the
+  0.10.x memory feature calls `.get()` on a model's `capabilities`, which is
+  `None` for a model auto-discovered from an OpenAI connection (our vLLM) —
+  crashing every chat with `'NoneType' object has no attribute 'get'`
+  (`main:process_chat:1504`). Fixed in 0.10.2; **0.11.0** both fixes it *and*
+  clears all **17** known advisories that 0.10.1/0.10.2 each carry (→ **0**). 0.11.0
+  migrates the OpenWebUI DB schema forward (rollback to 0.10.x is unsupported
+  without a DB reset — the compactor's own memory store is unaffected). Lesson
+  logged: do not pin a fast-moving UI to its bleeding-edge release un-validated.
+
+### Fixed
+- **CRLF line endings baked a broken container entrypoint.** On Windows
+  (`core.autocrlf=true`, no `.gitattributes`), `entrypoint.sh` and
+  `supervisord.conf` checked out CRLF, so `docker build` baked a `#!/bin/bash\r`
+  shebang and the container failed at start with "not found" / "bad
+  interpreter" — this broke v2.2.1 and every image built on Windows. Added
+  `.gitattributes` (`* text=auto eol=lf` + explicit `eol=lf` for
+  `*.sh`/`entrypoint.sh`/`*.conf`/`Dockerfile`/`*.py`) and renormalized the tree
+  to LF (verified byte-accurately: CR=0 across all image-copied files).
+- **Dependency-boundary hardening (rc5, from a full architecture audit).** The
+  recurring failure class this release kept hitting — our code trusting a
+  dependency's output shape — swept systematically:
+  - **Silent fact loss (data integrity).** The async tail wrote facts built on a
+    snapshot read *outside* `conv_lock`, so two overlapping turns on one
+    conversation could lose a fact permanently (the lock serialized the writes
+    but not the read). Facts are now re-read under the lock and reconciled via
+    `_merge_touched`: disk is authoritative for membership (a `/forget` is never
+    resurrected), the snapshot contributes only LRU touches, and `last_used`
+    only ever moves forward.
+  - **Opaque 500 on a non-JSON vLLM reply** (HTML 502, truncated body):
+    `r.json()` is guarded → friendly 502 instead of an unhandled decode error.
+  - **Garbled stream on a vLLM 4xx/5xx:** the streaming path relayed vLLM's JSON
+    error body raw into an SSE channel; it now checks status and degrades to the
+    same friendly chunks the connection-error branch uses.
+  - **Consecutive system messages** (V1 compaction summary + injected memory
+    block) could trip Mistral-family templates' 400 — collapsed into one just
+    before forwarding, with multimodal (image) content left intact.
+  - **Unbounded proxy timeout:** `timeout=None` also removed the *connect*
+    timeout, so a stalled vLLM socket hung a request forever. Connect/write/pool
+    are now bounded; read stays unbounded for long generations.
+  - **`atomic_write_json` now fsyncs the parent directory**, so the rename itself
+    is durable — the previous "atomic on POSIX" claim was weaker than it read on
+    a distributed network volume.
+  - Tier-1 `compactor/test_concurrency_guards.py` covers both new helpers,
+    including the lost-update and Mistral-400 scenarios.
+- **Driver preflight is now build-arg-aware and fails closed.** `entrypoint.sh`
+  Check 3 reads the baked-in `TORCH_CUDA` and requires driver ≥580 for cu130
+  (CUDA 13) vs ≥525 for cu128/cu126 — instead of hardcoding cu128/≥525, which
+  would have let a CUDA-13 default image false-pass a driver-570 host and then
+  crash. A missing/unknown channel now defaults to the strictest floor.
+- **OpenWebUI SQLite hardened for the network volume.** OpenWebUI's DB
+  (`/data/openwebui/webui.db`) sits on the RunPod network volume, and 0.11.0
+  defaults to **WAL** journal mode — which needs an mmap'd `-shm` shared-memory
+  index that network filesystems don't support, so WAL was *causing* the
+  `database is locked` errors seen in rc3 testing. Baked env: `DATABASE_ENABLE_SQLITE_WAL=false`
+  (rollback journal — no `-shm`/mmap), `DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT=10000`
+  (10s lock-wait; not higher, which would just mask real deadlocks), and
+  `DATABASE_SQLITE_PRAGMA_MMAP_SIZE=0` (DB mmap also unreliable over network FS).
+  `synchronous` stays at OWUI's `NORMAL` default — `FULL` would lengthen writes
+  on slow network storage and worsen contention. All overridable via env
+  (documented in `.env.example`).
+
+### Fixed (rc5 → rc8 — on-pod incidents + two audit rounds)
+- **Default model is now bootable (rc8).** The image's built-in default was
+  `magnum-v4-22b` with no quantization flag — a combination that **cannot boot
+  on the A40** the image is documented for (the out-of-the-box trap PR #16
+  flagged back in V1). The default is now the production-validated pair:
+  `MODEL_REPO=coder3101/Cydonia-24B-v4.3-heretic-v4` +
+  `VLLM_EXTRA_ARGS="--quantization fp8"` (changed **together** — a 24B without
+  fp8 is a boot OOM). Every real deploy still pins both via
+  `runpod.env.template`, so this only changes bare-default behavior.
+- **Empty-`messages` guard (rc5).** OpenWebUI 0.11 background/task calls can
+  send `messages: []`, which crashed vLLM's chat templating with an opaque
+  "list index out of range." Now a clean OpenAI-shaped 400
+  (`code=empty_messages`) with a sender-identifying log; hardened in rc7 to
+  also reject non-dict items.
+- **Dependency-boundary fixes (rc5, from the first audit):** lost-update fix in
+  the async facts tail (`_merge_touched`), guarded `r.json()` on the chat path,
+  stream 4xx handling, adjacent-system-message merge, bounded
+  connect/write/pool timeouts, parent-dir fsync in `atomic_write_json`.
+- **Context-overflow cascade (rc6, the 2026-08-13 outage).** The summarize call
+  itself exceeded the model window; compaction "degraded" by forwarding the
+  original oversized messages; injection piled on more → hard 400. Fixed with
+  a map-reduce summarizer (`_chunk_to_budget`) + `_enforce_hard_budget` final
+  pre-flight + honest 4xx degradation (a healthy backend's rejection is no
+  longer reported as "the model is restarting"). New env:
+  `COMPACTOR_SUMMARY_INPUT_RESERVE`, `COMPACTOR_GENERATION_RESERVE`.
+- **Promotion-review round (rc7) — 18 confirmed findings, the critical ones:**
+  - **BLOCKER: compaction emitted assistant-first conversations.** With even
+    `KEEP_RECENT_TURNS` and a real request's odd non-system count, every
+    *successful* compaction violated the Mistral-family template's user-first
+    rule → deterministic 400, conversation dead. Latent since V1; shielded by
+    the summarize-overflow bug, exposed the moment rc6 fixed it.
+    `split_messages` now aligns the keep window to a user turn.
+  - `_enforce_hard_budget` could stop shedding mid-pair (assistant-first — the
+    same 400 it prevents) and re-tokenized the entire list per dropped message
+    (O(N²) blocking the event loop + healthchecks). Now: alternation-preserving
+    shedding, per-message token arithmetic with bounded verify recounts, a
+    cheap prescreen, and the whole guard runs in a threadpool.
+  - The guard now honors the request's own `max_tokens` (vLLM enforces
+    prompt + completion ≤ window; a fixed reserve alone wasn't enough).
+  - Map-reduce summarize batches run **concurrently** (were sequential —
+    multi-minute stalls) and the reduce step no longer violates its own input
+    budget (hierarchical fold).
+  - Text-only content-parts system messages are flattened before the
+    adjacent-system merge; `/v1/models` got the same non-JSON-body guard as
+    the chat path; a client disconnect mid-stream no longer memorizes the
+    half-reply (facts/RAG/summaries skip incomplete streams).
+- **`clean-models.sh` (rc4/rc5 era, previously unlogged):** operator tool to
+  reclaim volume space from stale model caches — dry-run by default, active
+  model always protected. Bundled at `/opt/clean-models.sh`.
+
+### Validation gate (operator — before rebuild is promoted to `:latest`)
+- Rebuild the image; **boot self-test must PASS** — including the STT + TTS
+  probes and a chat round-trip that exercises the transformers tokenizer on 5.x.
+- **Known gap (acknowledged):** the boot self-test's chat round-trip is far
+  below the compaction/budget thresholds, so the guard paths above are
+  validated only by Tier-1 (`test_budget_guard.py`, `test_concurrency_guards.py`)
+  — promotion additionally requires a **manual long-conversation check** on the
+  pod (drive a conversation past `COMPACTOR_TARGET_TOKENS` and confirm a 200 +
+  the `compacted:` log line, not a 400).
+- **OpenWebUI chat works end-to-end** — the 0.10.1 `capabilities`-None crash is
+  fixed by the 0.11.0 pin (rc3 hit it; confirmed via the model-re-save
+  workaround before the pin fix). No native-tools/`tool_choice` error (leave
+  Function Calling = Default; tool calling is a V4 feature).
+- Real voice round-trip works; vLLM 0.24.0 serves the configured model on a
+  **driver ≥580** host (A40 or newer). On a driver-570 host, use the CUDA-12
+  fallback profile (vLLM 0.19.0) instead.
+
+---
+
 ## [3.3] — Text-to-speech (voice output)
 
 **Goal:** let the assistant *speak* — bundle a local TTS service so OpenWebUI's
