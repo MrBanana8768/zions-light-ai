@@ -239,12 +239,15 @@ RUN chmod +x /opt/clean-models.sh
 
 # =============================================================================
 # Model configuration — override via .env or Runpod template
-# Default: anthracite-org/magnum-v4-22b (creative writing fine-tune, lightly
-# aligned). On A40 use VLLM_EXTRA_ARGS="--quantization fp8" to fit 32K context;
-# without quantization, drop MAX_MODEL_LEN to 8192.
+# Default: Cydonia 24B (heretic) + runtime fp8 — the PRODUCTION-VALIDATED A40
+# config (V3.0 rc line): boots and serves at ~43GB incl. KV on a 48GB card.
+# The two defaults move TOGETHER: a 24B without the fp8 flag will not fit an
+# A40. (The previous default, magnum-v4-22b with no quant flag, could not boot
+# on the A40 at all — the out-of-the-box trap PR #16 flagged; changed rc8.)
+# On 80GB-class cards, clear VLLM_EXTRA_ARGS for full FP16 quality.
 # Any HuggingFace causal-LM repo that vLLM supports works here.
 # =============================================================================
-ENV MODEL_REPO="anthracite-org/magnum-v4-22b"
+ENV MODEL_REPO="coder3101/Cydonia-24B-v4.3-heretic-v4"
 ENV HF_HOME="/data/models"
 # Note: TRANSFORMERS_CACHE was removed in v1.9.1 — deprecated in transformers
 # v5, HF_HOME is the modern equivalent and is read by both transformers
@@ -255,7 +258,9 @@ ENV VLLM_HOST="0.0.0.0"
 ENV VLLM_PORT="8000"
 ENV MAX_MODEL_LEN="32768"
 ENV GPU_MEMORY_UTILIZATION="0.90"
-ENV VLLM_EXTRA_ARGS=""
+# Paired with the Cydonia-24B default above — a 24B on a 48GB card requires
+# runtime fp8. Clear this when swapping to a 12B-class model or an 80GB card.
+ENV VLLM_EXTRA_ARGS="--quantization fp8"
 
 # context-compactor settings (port 8080 — what OpenWebUI talks to)
 ENV COMPACTOR_HOST="0.0.0.0"

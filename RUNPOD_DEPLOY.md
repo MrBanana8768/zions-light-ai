@@ -61,10 +61,10 @@ cache before paying GPU prices:
    export HF_HOME=/data/models
    # For gated models (Llama, Mistral):
    # export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-   # 12B is the recommended A40 model (see GPU sizing):
-   huggingface-cli download anthracite-org/magnum-v4-12b
-   # On A100-class cards you can use the 22B instead:
-   # huggingface-cli download anthracite-org/magnum-v4-22b
+   # Production A40 model (the image default since rc8):
+   huggingface-cli download coder3101/Cydonia-24B-v4.3-heretic-v4
+   # Always-fits A40 fallback:
+   # huggingface-cli download anthracite-org/magnum-v4-12b
    ```
 4. When the download completes, terminate the CPU pod. Your weights and any
    OpenWebUI state stay on the volume.
@@ -78,7 +78,7 @@ Pre-built images are published at `angreg/zions-light-ai` on Docker Hub.
 **The current deploy target is named in [runpod.env.template](runpod.env.template)'s
 header — that file is the single source of truth for the image tag and every
 env var.** Pin a version for reproducibility (e.g.
-`angreg/zions-light-ai:v3.0-rc7-cu12`); `:latest` is only ever promoted to a
+`angreg/zions-light-ai:v3.0-rc8-cu12`); `:latest` is only ever promoted to a
 *validated* release, so during an rc cycle it lags behind. See the
 [image-tags table in the README](README.md#image-tags) for what each tag
 contains.
@@ -90,8 +90,8 @@ docker build \
   --build-arg CUDA_BASE_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04 \
   --build-arg TORCH_CUDA=cu128 \
   --build-arg VLLM_VERSION=0.19.0 \
-  -t angreg/zions-light-ai:v3.0-rc7-cu12 .
-docker push angreg/zions-light-ai:v3.0-rc7-cu12
+  -t angreg/zions-light-ai:v3.0-rc8-cu12 .
+docker push angreg/zions-light-ai:v3.0-rc8-cu12
 # :latest is promoted ONLY after the on-pod validation gate (see CHANGELOG).
 ```
 
@@ -101,17 +101,18 @@ Go to [Runpod Templates](https://www.runpod.io/console/user/templates) → New T
 
 - **Template Name:** `zions-light-ai`
 - **Container Image:** the tag named in [runpod.env.template](runpod.env.template)
-  (currently `angreg/zions-light-ai:v3.0-rc7-cu12`)
+  (currently `angreg/zions-light-ai:v3.0-rc8-cu12`)
 - **Container Disk:** `60 GB` (room for the image, supervisor logs, scratch)
 - **Volume Mount Path:** `/data` (← this is where the Network Volume attaches)
 - **Expose HTTP Ports:** `3000, 8080`
 - **Docker Command:** (leave empty)
 - **Environment Variables:** paste the block from
-  [runpod.env.template](runpod.env.template) — it carries all 42 vars and marks
-  the four that MUST be overridden. On an A40 the production config is
-  `MODEL_REPO=coder3101/Cydonia-24B-v4.3-heretic-v4` +
-  `VLLM_EXTRA_ARGS=--quantization fp8` (the image's built-in 22B default does
-  not fit an A40 — see GPU sizing).
+  [runpod.env.template](runpod.env.template) — it carries all 42 vars with
+  the ones that matter marked. As of rc8 the image's built-in default IS the
+  production A40 config (Cydonia-24B + runtime fp8), so the only var that
+  strictly MUST be set is `WEBUI_SECRET_KEY`; the template pins the model
+  vars explicitly anyway so a future default change can never surprise a
+  deploy (see GPU sizing for alternatives).
 
 ### Step 5: Deploy the Pod
 
@@ -135,7 +136,7 @@ runpod config
 # Image tag + full env set: see runpod.env.template (the source of truth).
 runpod pod create \
   --gpu-type "NVIDIA A40" \
-  --image "angreg/zions-light-ai:v3.0-rc7-cu12" \
+  --image "angreg/zions-light-ai:v3.0-rc8-cu12" \
   --disk-size 60 \
   --network-volume-id "<your-volume-id>" \
   --env MODEL_REPO=coder3101/Cydonia-24B-v4.3-heretic-v4 \
@@ -172,10 +173,10 @@ runpod pod create \
 > offline-quantized FP8 checkpoint, which removes the repack peak
 > entirely. Watch the first boot's vLLM log either way.
 
-The image's built-in `MODEL_REPO` default is the 22B for historical
-reasons; **on an A40 always override it** — to the production config
-(Cydonia-24B + fp8, per [runpod.env.template](runpod.env.template)) or the
-12B FP16 fallback.
+As of **rc8** the image's built-in defaults are the production A40 config
+(Cydonia-24B + runtime fp8) — a bare deploy boots correctly out of the box.
+On images older than rc8 the built-in default was the 22B (unbootable on an
+A40): always override per [runpod.env.template](runpod.env.template).
 
 ### Vision (V3.1) — enabling image understanding
 

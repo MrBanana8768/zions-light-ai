@@ -117,7 +117,15 @@ secure release.
   on slow network storage and worsen contention. All overridable via env
   (documented in `.env.example`).
 
-### Fixed (rc5 → rc7 — on-pod incidents + two audit rounds)
+### Fixed (rc5 → rc8 — on-pod incidents + two audit rounds)
+- **Default model is now bootable (rc8).** The image's built-in default was
+  `magnum-v4-22b` with no quantization flag — a combination that **cannot boot
+  on the A40** the image is documented for (the out-of-the-box trap PR #16
+  flagged back in V1). The default is now the production-validated pair:
+  `MODEL_REPO=coder3101/Cydonia-24B-v4.3-heretic-v4` +
+  `VLLM_EXTRA_ARGS="--quantization fp8"` (changed **together** — a 24B without
+  fp8 is a boot OOM). Every real deploy still pins both via
+  `runpod.env.template`, so this only changes bare-default behavior.
 - **Empty-`messages` guard (rc5).** OpenWebUI 0.11 background/task calls can
   send `messages: []`, which crashed vLLM's chat templating with an opaque
   "list index out of range." Now a clean OpenAI-shaped 400
