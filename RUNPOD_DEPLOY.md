@@ -78,7 +78,7 @@ Pre-built images are published at `angreg/zions-light-ai` on Docker Hub.
 **The current deploy target is named in [runpod.env.template](runpod.env.template)'s
 header — that file is the single source of truth for the image tag and every
 env var.** Pin a version for reproducibility (e.g.
-`angreg/zions-light-ai:v3.0-rc8-cu12`); `:latest` is only ever promoted to a
+`angreg/zions-light-ai:v3.0-cu12`); `:latest` is only ever promoted to a
 *validated* release, so during an rc cycle it lags behind. See the
 [image-tags table in the README](README.md#image-tags) for what each tag
 contains.
@@ -90,8 +90,8 @@ docker build \
   --build-arg CUDA_BASE_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04 \
   --build-arg TORCH_CUDA=cu128 \
   --build-arg VLLM_VERSION=0.19.0 \
-  -t angreg/zions-light-ai:v3.0-rc8-cu12 .
-docker push angreg/zions-light-ai:v3.0-rc8-cu12
+  -t angreg/zions-light-ai:v3.0-cu12 .
+docker push angreg/zions-light-ai:v3.0-cu12
 # :latest is promoted ONLY after the on-pod validation gate (see CHANGELOG).
 ```
 
@@ -101,7 +101,7 @@ Go to [Runpod Templates](https://www.runpod.io/console/user/templates) → New T
 
 - **Template Name:** `zions-light-ai`
 - **Container Image:** the tag named in [runpod.env.template](runpod.env.template)
-  (currently `angreg/zions-light-ai:v3.0-rc8-cu12`)
+  (currently `angreg/zions-light-ai:v3.0-cu12`)
 - **Container Disk:** `60 GB` (room for the image, supervisor logs, scratch)
 - **Volume Mount Path:** `/data` (← this is where the Network Volume attaches)
 - **Expose HTTP Ports:** `3000, 8080`
@@ -136,7 +136,7 @@ runpod config
 # Image tag + full env set: see runpod.env.template (the source of truth).
 runpod pod create \
   --gpu-type "NVIDIA A40" \
-  --image "angreg/zions-light-ai:v3.0-rc8-cu12" \
+  --image "angreg/zions-light-ai:v3.0-cu12" \
   --disk-size 60 \
   --network-volume-id "<your-volume-id>" \
   --env MODEL_REPO=coder3101/Cydonia-24B-v4.3-heretic-v4 \

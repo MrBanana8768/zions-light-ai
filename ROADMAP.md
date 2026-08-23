@@ -611,7 +611,7 @@ documented as an optional quality swap, not the default.
 Comparable to V2. Could be done in parallel with V2 since they touch
 mostly separate code paths.
 
-### V3.0 — Consolidation & hardening  🔨 In progress
+### V3.0 — Consolidation & hardening  ✅ Complete (released 2026-08-23)
 
 The V3.x features shipped incrementally (3.1 / 3.2 / 3.3) on a rolling image.
 **V3.0 proper** is the consolidated, audited release that stabilizes that line

@@ -9,18 +9,19 @@ on Docker Hub.
 
 ---
 
-## [3.0] — V3 consolidation & dependency hardening (in progress)
+## [3.0] — V3 consolidation & dependency hardening — **released 2026-08-23**
 
 **Goal:** stabilize the V3.x line (vision + STT + TTS, shipped incrementally as
-3.1 / 3.2 / 3.3 on a rolling image) into one audited, reproducible release. This
-entry is the dependency-security pass; a bug-fix scrub follows before the image
-is rebuilt and promoted to `:latest`.
+3.1 / 3.2 / 3.3 on a rolling image) into one audited, reproducible release:
+the dependency-security pass plus the bug-fix scrub that followed (eight rcs,
+two production incidents, two adversarial audit rounds — see "Fixed" below).
 
-Image: **rebuild required** (vLLM bump). Until it is validated on-pod, the last
-functional V3 build is frozen at `angreg/zions-light-ai:v3-snapshot` (= the 3.3
-image, digest `sha256:9cb7293d…`) as the easy deploy/rollback target. Note the
-snapshot still carries the pre-audit vLLM, so it is a convenience target, not the
-secure release.
+**Released as:** `angreg/zions-light-ai:v3.0-cu12` = `:v3.0` = `:latest`
+(promoted from the validated `:v3.0-rc8-cu12` build; git tag `v3.0`).
+Rollback targets: `:v3.0-rc7-cu12` (pre-Cydonia-default, code-identical) and
+`:v3-snapshot` (the pre-audit 3.3 image — functional but carries the
+pre-audit vLLM; last resort only). Patch releases (v3.0.x) will carry any
+post-release fixes.
 
 ### Security (PyPI/OSV audit, 2026-06-30)
 - **vLLM `0.14.1` → `0.24.0`.** The 0.14.1 pin had accumulated ~18 CVEs + ~17

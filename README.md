@@ -97,7 +97,7 @@ Pin a specific version for reproducible deploys.
 
 | Tag | Contents |
 |---|---|
-| `:v3.0-rc8-cu12` | **Current deploy target** (see [runpod.env.template](runpod.env.template)) — V3.0 consolidation: audited dep pins, OpenWebUI 0.11, SQLite network-volume hardening, chat-proxy guards; CUDA-12 profile (any A40 host) |
+| `:v3.0-cu12` = `:v3.0` | **Current release** (= the validated rc8 build) — V3.0 consolidation: audited dep pins, OpenWebUI 0.11, SQLite network-volume hardening, chat-proxy guards; CUDA-12 profile (any A40 host) |
 | `:v3.0-rc5-cu12` / `:v3.0-rc6-cu12` / `:v3.0-rc7-cu12` | Superseded rcs — rc5 lacks the overflow fix; rc6 lacks the rc7 review fixes (compaction alternation blocker); rc7 is code-identical to rc8 but ships the old unbootable-on-A40 22B default |
 | `:v3-snapshot` | Frozen last-known-good V3.3 image (= `:v3.3-tts`) — rollback target |
 | `:v3.3-tts` / `:v3.2-stt` / `:v3.1-vision` | The V3.x feature line as shipped incrementally |
