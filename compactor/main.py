@@ -81,7 +81,16 @@ HARD_INPUT_LIMIT = min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - GENERATION_RESERV
 # entirely, so we add a flat per-image estimate to the budget. Conservative
 # default keeps us from overflowing the model's real context window; tune
 # per VLM if needed.
-IMAGE_TOKEN_ESTIMATE = _env_int("COMPACTOR_IMAGE_TOKENS", 768)
+IMAGE_TOKEN_ESTIMATE = _env_int("COMPACTOR_IMAGE_TOKENS", 1536)
+# v3.0.2: cap how many image turns compaction carries forward. Images are
+# deliberately never summarized (that would destroy them), and clients re-send
+# full history every message — so without a cap they accumulate FOREVER in a
+# conversation, and each one costs KV-cache and vision-encoder VRAM on top of
+# tokens. On a 48GB card serving a 24B VLM that headroom is thin, and the
+# failure mode is a stall rather than a clean error. Keep the N most recent
+# images verbatim; older ones become a short text note so the conversation
+# still remembers a picture was shared. 0 = unlimited (pre-v3.0.2 behavior).
+MAX_RETAINED_IMAGES = _env_int("COMPACTOR_MAX_RETAINED_IMAGES", 3)
 
 # V2.0 Phase 1: admin endpoint binding. Default "127.0.0.1" rejects any
 # non-localhost client at the dependency layer (we still bind the FastAPI
@@ -113,6 +122,98 @@ def get_tokenizer():
         logger.warning(f"could not load tokenizer for {MODEL_REPO}: {e}; using char/4 estimator")
         _tokenizer = None
     return _tokenizer
+
+
+# ---------------------------------------------------------------------------
+# Backend modality (v3.0.1). One uploaded image PERMANENTLY poisoned a
+# conversation on a text-only backend: OpenWebUI re-sends the full history
+# (image included) with every message, V3.1 compaction deliberately preserves
+# image turns, and vLLM 400s each request ("is not a multimodal model") — so
+# every later message in that conversation failed, forever. The compactor was
+# forwarding content the backend cannot accept: an unverified modality
+# boundary. When the backend is text-only, image parts are replaced with an
+# honest placeholder instead of being forwarded.
+#
+# COMPACTOR_BACKEND_MULTIMODAL: "auto" (default — read MODEL_REPO's HF config
+# and look for a vision tower), or "true"/"false" to override.
+# ---------------------------------------------------------------------------
+
+_BACKEND_MULTIMODAL_ENV = os.environ.get("COMPACTOR_BACKEND_MULTIMODAL", "auto").strip().lower()
+_backend_multimodal: bool | None = (
+    True if _BACKEND_MULTIMODAL_ENV == "true"
+    else False if _BACKEND_MULTIMODAL_ENV == "false"
+    else None
+)
+
+
+def backend_is_multimodal() -> bool:
+    """Whether the served model can accept image input. Cached for process
+    life; unknown resolves to True (no stripping — the reactive backstop in
+    the 4xx handlers flips it if vLLM says otherwise)."""
+    global _backend_multimodal
+    if _backend_multimodal is not None:
+        return _backend_multimodal
+    if not MODEL_REPO:
+        _backend_multimodal = True
+        return True
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(MODEL_REPO)
+        _backend_multimodal = getattr(cfg, "vision_config", None) is not None
+        logger.info(
+            f"backend modality for {MODEL_REPO}: "
+            f"{'multimodal' if _backend_multimodal else 'TEXT-ONLY (image parts will be stripped)'}"
+        )
+    except Exception as e:
+        logger.warning(
+            f"could not resolve modality for {MODEL_REPO} ({e}); assuming "
+            f"multimodal — the 4xx backstop will correct this if vLLM disagrees"
+        )
+        _backend_multimodal = True
+    return _backend_multimodal
+
+
+def _note_backend_rejection(err_body: str) -> None:
+    """Reactive backstop: if vLLM rejects a request because the model is not
+    multimodal, remember that — the NEXT request strips image parts and the
+    conversation heals instead of staying poisoned."""
+    global _backend_multimodal
+    if "not a multimodal model" in (err_body or "") and _backend_multimodal is not False:
+        _backend_multimodal = False
+        logger.warning(
+            "backend declared itself text-only via a 400; image parts will be "
+            "stripped from subsequent requests (set COMPACTOR_BACKEND_MULTIMODAL "
+            "to override)"
+        )
+
+
+_IMAGE_PLACEHOLDER = (
+    "[The user attached {n} here. The current model is text-only and cannot "
+    "see {pron} — if the content matters, ask the user to describe {pron}.]"
+)
+
+
+def _strip_image_parts(messages: list[dict]) -> tuple[list[dict], int]:
+    """Replace image parts with an honest text placeholder, preserving all
+    text parts. Returns (new_messages, images_stripped). Honesty over
+    silence: the model is TOLD an image existed and that it cannot see it,
+    rather than the image quietly vanishing from the conversation."""
+    out: list[dict] = []
+    stripped = 0
+    for m in messages:
+        n = _message_image_count(m)
+        if n == 0:
+            out.append(m)
+            continue
+        text = _message_text(m).strip()
+        note = _IMAGE_PLACEHOLDER.format(
+            n="an image" if n == 1 else f"{n} images",
+            pron="it" if n == 1 else "them",
+        )
+        out.append({**m, "content": f"{text}\n\n{note}" if text else note})
+        stripped += n
+    return out, stripped
 
 
 def _message_text(m: dict) -> str:
@@ -316,8 +417,40 @@ async def compact_if_needed(messages: list[dict]) -> list[dict]:
     # text destroys the image permanently, and the model could never see it
     # again. Keep image turns verbatim (in chronological order); summarize
     # only the text-only older turns.
-    preserved_images = [m for m in to_summarize if _message_has_image(m)]
-    text_only = [m for m in to_summarize if not _message_has_image(m)]
+    # v3.0.2: bound the accumulation. Images are never summarized (that would
+    # destroy them) and clients re-send full history, so without a cap every
+    # image ever uploaded rides along in every request forever — each costing
+    # KV-cache and vision-encoder VRAM, which stalls the engine rather than
+    # erroring cleanly. Keep the N most RECENT image turns verbatim; demote
+    # older ones to a text note (summarized with the rest, so the conversation
+    # still remembers a picture was shared — it just can't be looked at again).
+    #
+    # Single ordered pass, by INDEX: the demoted entries are modified copies,
+    # so any identity/equality-based re-sort would misplace them.
+    img_idxs = [i for i, m in enumerate(to_summarize) if _message_has_image(m)]
+    keep_idxs = (
+        set(img_idxs[-MAX_RETAINED_IMAGES:])
+        if MAX_RETAINED_IMAGES > 0
+        else set(img_idxs)
+    )
+    preserved_images: list[dict] = []
+    text_only: list[dict] = []
+    demoted = 0
+    for i, m in enumerate(to_summarize):
+        if i in keep_idxs:
+            preserved_images.append(m)
+        elif i in set(img_idxs):
+            txt = _message_text(m).strip()
+            note = "[an image shared earlier in this conversation]"
+            text_only.append({**m, "content": f"{txt}\n\n{note}" if txt else note})
+            demoted += 1
+        else:
+            text_only.append(m)
+    if demoted:
+        logger.info(
+            f"image retention: kept {len(preserved_images)} most-recent image "
+            f"turn(s), demoted {demoted} to text (cap {MAX_RETAINED_IMAGES})"
+        )
     if not text_only:
         logger.info(
             f"compaction skipped: all {len(to_summarize)} older turn(s) carry "
@@ -411,6 +544,79 @@ def _fast_token_estimate(messages: list[dict]) -> int:
     """char/4 estimate + per-image cost — no tokenizer, O(total chars)."""
     image_tokens = sum(_message_image_count(m) for m in messages) * IMAGE_TOKEN_ESTIMATE
     return sum(len(_message_text(m)) // 4 + 4 for m in messages) + image_tokens
+
+
+def _memorable_user_text(messages: list[dict], last_user_text: str) -> str:
+    """Give an image-only turn something the memory layers can hold onto.
+
+    A bare upload (no caption) has NO text, so both memory layers correctly
+    skip it — index_exchange and the facts tail each refuse empty input. But
+    that leaves the conversation with no durable trace a picture was ever
+    shared: images live only in the live window, and once they age out (or are
+    demoted by the retention cap) the memory system cannot remember it was
+    shown anything.
+
+    Substituting a marker makes the exchange memorable, and the PAIRING is what
+    matters: the assistant's description becomes the durable fact, so what was
+    in the picture survives the picture itself.
+    """
+    if last_user_text.strip():
+        return last_user_text
+    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    if last_user is None:
+        return last_user_text
+    n = _message_image_count(last_user)
+    if not n:
+        return last_user_text
+    return f"[shared {n} image{'s' if n > 1 else ''}]"
+
+
+def _merge_consecutive_same_role(messages: list[dict]) -> list[dict]:
+    """Collapse consecutive non-system messages that share a role.
+
+    Mistral-family templates require strict user/assistant alternation, and
+    several layers can independently break it. The one that bit us (v3.0.2):
+    compaction hoists image-bearing turns out of chronological order to sit
+    just before the recent window (they must never be summarized away), so
+    an image turn landing next to the window's leading user turn produces
+    user-then-user and vLLM 400s the request — every time, once an
+    image-bearing conversation crosses the compaction threshold.
+
+    Merging (rather than dropping) is lossless: text is joined, and if either
+    side carries image parts both are kept as a parts list, so the picture
+    still reaches the model.
+    """
+    if not isinstance(messages, list) or len(messages) < 2:
+        return messages
+
+    def as_parts(m: dict) -> list[dict]:
+        c = m.get("content")
+        if isinstance(c, list):
+            return [p for p in c if isinstance(p, dict)]
+        return [{"type": "text", "text": str(c or "")}]
+
+    out: list[dict] = []
+    for m in messages:
+        prev = out[-1] if out else None
+        if (
+            prev is not None
+            and isinstance(m, dict)
+            and m.get("role") == prev.get("role")
+            and m.get("role") in ("user", "assistant")
+        ):
+            if _message_image_count(m) or _message_image_count(prev):
+                out[-1] = {**prev, "content": as_parts(prev) + as_parts(m)}
+            else:
+                a, b = _message_text(prev).strip(), _message_text(m).strip()
+                out[-1] = {**prev, "content": f"{a}\n\n{b}".strip() if a or b else ""}
+        else:
+            out.append(m)
+    if len(out) != len(messages):
+        logger.info(
+            f"merged {len(messages) - len(out)} consecutive same-role turn(s) "
+            f"to preserve template alternation"
+        )
+    return out
 
 
 def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list[dict]:
@@ -794,6 +1000,16 @@ async def lifespan(app: FastAPI):
         logger.info("storage layout ready")
     except Exception as e:
         logger.warning(f"could not initialize storage layout: {e}")
+    # v3.0.3: resolve backend modality HERE rather than lazily on the first
+    # chat. AutoConfig.from_pretrained can touch the network (an HF HEAD
+    # request when the config is not cached), and the lazy path ran it inside
+    # the async request handler — blocking the event loop, and with a
+    # slow/unreachable HF hub it would stall the very first user's message.
+    # At startup a stall is invisible and the result is cached for process life.
+    try:
+        await run_in_threadpool(backend_is_multimodal)
+    except Exception as e:
+        logger.warning(f"modality probe failed at startup (will retry lazily): {e}")
     yield
     # Graceful: give in-flight background work (fact extraction, indexing,
     # rollup, backfill) a moment to finish via the bounded pool.
@@ -933,6 +1149,31 @@ async def chat_completions(request: Request) -> Any:
     last_user_text = _extract_last_user_text(messages)
     # Turn index ≈ position of the assistant reply we're about to produce.
     turn_index = len(messages) + 1
+
+    last_user_text = _memorable_user_text(messages, last_user_text)
+
+    # v3.0.1: a text-only backend must never receive image parts — vLLM 400s
+    # the whole request, and because clients re-send full history, a single
+    # uploaded image otherwise poisons its conversation permanently. Strip to
+    # honest placeholders before compaction/budgeting/injection, so the V3.1
+    # image-preserving paths simply never fire.
+    #
+    # v3.0.3: this MUST run AFTER conv_id resolution and last_user_text. The
+    # hash-fallback conv_id is sha256(system|||first_user[:512]) over TEXT
+    # parts only — deliberately, so it is stable across multimodal/text-only
+    # *client* variants (memory.py _message_text_for_hash). Stripping appends a
+    # placeholder to that text, so stripping first broke the invariant from the
+    # server side: swapping between a vision model and a text-only one changed
+    # the conv_id mid-conversation and orphaned every fact, summary and
+    # embedding under the old id. conv_id and the RAG query now derive from what
+    # the CLIENT sent; the strip only shapes what we forward.
+    if not backend_is_multimodal():
+        messages, _n_stripped = _strip_image_parts(messages)
+        if _n_stripped:
+            body["messages"] = messages
+            logger.info(
+                f"stripped {_n_stripped} image part(s) for the text-only backend"
+            )
 
     # V2.1 Phase 5: chat command short-circuit. If the user typed a
     # recognized slash command (/list-facts, /forget, /remember, etc.),
@@ -1121,6 +1362,9 @@ async def chat_completions(request: Request) -> Any:
         _enforce_hard_budget, body["messages"], effective_limit
     )
     body["messages"] = _merge_adjacent_system_messages(body["messages"])
+    # ...and non-system turns that ended up sharing a role (compaction hoists
+    # image turns out of chronological order, which lands user next to user).
+    body["messages"] = _merge_consecutive_same_role(body["messages"])
 
     stream = bool(body.get("stream", False))
     # read=None keeps long generations from being cut off, but connect/write/
@@ -1150,6 +1394,7 @@ async def chat_completions(request: Request) -> Any:
                             # connection-error branch below.
                             vllm_failed = True
                             err_body = (await r.aread()).decode("utf-8", "replace")[:300]
+                            _note_backend_rejection(err_body)
                             logger.warning(
                                 f"vLLM HTTP {r.status_code} on stream: {err_body!r}"
                             )
@@ -1260,6 +1505,8 @@ async def chat_completions(request: Request) -> Any:
                     messages,  # original request messages, for rollup
                 )
             )
+        if r.status_code >= 400:
+            _note_backend_rejection(str(response_json)[:300])
         return JSONResponse(content=response_json, status_code=r.status_code)
     finally:
         await client.aclose()

@@ -9,6 +9,37 @@ on Docker Hub.
 
 ---
 
+## [3.0.1] — patch: one image no longer poisons a conversation (2026-08-24)
+
+**The bug (found by the test user):** uploading a picture on a text-only
+backend broke the conversation *permanently* — even plain text messages after
+it failed. Mechanism: OpenWebUI re-sends the full history (image included)
+with every message; V3.1 compaction deliberately preserves image turns; and
+vLLM 400s each request (`"…is not a multimodal model"`). vLLM never crashed —
+every request carrying the image was cleanly rejected, forever. The compactor
+was forwarding content the backend cannot accept: an unverified modality
+boundary (the same bug class as the whole rc line).
+
+### Fixed
+- **Modality guard.** At startup the compactor resolves whether `MODEL_REPO`
+  can see (HF config `vision_config`; override with
+  `COMPACTOR_BACKEND_MULTIMODAL=auto|true|false`). On a text-only backend,
+  image parts are replaced with an **honest placeholder** — the model is told
+  an image was attached and that it cannot see it (degrade honestly, don't
+  silently vanish it) — text parts are preserved, and the V3.1
+  image-preserving paths simply never fire.
+- **Reactive backstop:** a vLLM `not a multimodal model` 400 flips the cached
+  modality, so even if startup detection is wrong the *next* message strips
+  and the conversation heals instead of staying poisoned. Already-poisoned
+  conversations recover automatically on their next message.
+- Tier-1 `test_modality.py` covers the strip semantics and the backstop.
+
+Operator note: pairing this with the OpenWebUI per-model **Vision** capability
+toggle (off for text-only models) prevents the UI from offering uploads at
+all; the guard protects any client regardless.
+
+---
+
 ## [3.0] — V3 consolidation & dependency hardening — **released 2026-08-23**
 
 **Goal:** stabilize the V3.x line (vision + STT + TTS, shipped incrementally as
