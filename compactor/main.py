@@ -115,6 +115,98 @@ def get_tokenizer():
     return _tokenizer
 
 
+# ---------------------------------------------------------------------------
+# Backend modality (v3.0.1). One uploaded image PERMANENTLY poisoned a
+# conversation on a text-only backend: OpenWebUI re-sends the full history
+# (image included) with every message, V3.1 compaction deliberately preserves
+# image turns, and vLLM 400s each request ("is not a multimodal model") — so
+# every later message in that conversation failed, forever. The compactor was
+# forwarding content the backend cannot accept: an unverified modality
+# boundary. When the backend is text-only, image parts are replaced with an
+# honest placeholder instead of being forwarded.
+#
+# COMPACTOR_BACKEND_MULTIMODAL: "auto" (default — read MODEL_REPO's HF config
+# and look for a vision tower), or "true"/"false" to override.
+# ---------------------------------------------------------------------------
+
+_BACKEND_MULTIMODAL_ENV = os.environ.get("COMPACTOR_BACKEND_MULTIMODAL", "auto").strip().lower()
+_backend_multimodal: bool | None = (
+    True if _BACKEND_MULTIMODAL_ENV == "true"
+    else False if _BACKEND_MULTIMODAL_ENV == "false"
+    else None
+)
+
+
+def backend_is_multimodal() -> bool:
+    """Whether the served model can accept image input. Cached for process
+    life; unknown resolves to True (no stripping — the reactive backstop in
+    the 4xx handlers flips it if vLLM says otherwise)."""
+    global _backend_multimodal
+    if _backend_multimodal is not None:
+        return _backend_multimodal
+    if not MODEL_REPO:
+        _backend_multimodal = True
+        return True
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(MODEL_REPO)
+        _backend_multimodal = getattr(cfg, "vision_config", None) is not None
+        logger.info(
+            f"backend modality for {MODEL_REPO}: "
+            f"{'multimodal' if _backend_multimodal else 'TEXT-ONLY (image parts will be stripped)'}"
+        )
+    except Exception as e:
+        logger.warning(
+            f"could not resolve modality for {MODEL_REPO} ({e}); assuming "
+            f"multimodal — the 4xx backstop will correct this if vLLM disagrees"
+        )
+        _backend_multimodal = True
+    return _backend_multimodal
+
+
+def _note_backend_rejection(err_body: str) -> None:
+    """Reactive backstop: if vLLM rejects a request because the model is not
+    multimodal, remember that — the NEXT request strips image parts and the
+    conversation heals instead of staying poisoned."""
+    global _backend_multimodal
+    if "not a multimodal model" in (err_body or "") and _backend_multimodal is not False:
+        _backend_multimodal = False
+        logger.warning(
+            "backend declared itself text-only via a 400; image parts will be "
+            "stripped from subsequent requests (set COMPACTOR_BACKEND_MULTIMODAL "
+            "to override)"
+        )
+
+
+_IMAGE_PLACEHOLDER = (
+    "[The user attached {n} here. The current model is text-only and cannot "
+    "see {pron} — if the content matters, ask the user to describe {pron}.]"
+)
+
+
+def _strip_image_parts(messages: list[dict]) -> tuple[list[dict], int]:
+    """Replace image parts with an honest text placeholder, preserving all
+    text parts. Returns (new_messages, images_stripped). Honesty over
+    silence: the model is TOLD an image existed and that it cannot see it,
+    rather than the image quietly vanishing from the conversation."""
+    out: list[dict] = []
+    stripped = 0
+    for m in messages:
+        n = _message_image_count(m)
+        if n == 0:
+            out.append(m)
+            continue
+        text = _message_text(m).strip()
+        note = _IMAGE_PLACEHOLDER.format(
+            n="an image" if n == 1 else f"{n} images",
+            pron="it" if n == 1 else "them",
+        )
+        out.append({**m, "content": f"{text}\n\n{note}" if text else note})
+        stripped += n
+    return out, stripped
+
+
 def _message_text(m: dict) -> str:
     """Plain-text view of a message. OpenAI multimodal content is a list of
     parts; only text parts contribute (image parts have no 'text'), so this
@@ -916,6 +1008,20 @@ async def chat_completions(request: Request) -> Any:
             },
         )
 
+    # v3.0.1: a text-only backend must never receive image parts — vLLM 400s
+    # the whole request, and because clients re-send full history, a single
+    # uploaded image otherwise poisons its conversation permanently. Strip to
+    # honest placeholders BEFORE anything else (compaction, budgeting and
+    # injection then all see the text-only view; the V3.1 image-preserving
+    # paths simply never fire).
+    if not backend_is_multimodal():
+        messages, _n_stripped = _strip_image_parts(messages)
+        if _n_stripped:
+            body["messages"] = messages
+            logger.info(
+                f"stripped {_n_stripped} image part(s) for the text-only backend"
+            )
+
     # V2.0 Phase 1: conv_id resolution
     conv_id: str | None = None
     try:
@@ -1150,6 +1256,7 @@ async def chat_completions(request: Request) -> Any:
                             # connection-error branch below.
                             vllm_failed = True
                             err_body = (await r.aread()).decode("utf-8", "replace")[:300]
+                            _note_backend_rejection(err_body)
                             logger.warning(
                                 f"vLLM HTTP {r.status_code} on stream: {err_body!r}"
                             )
@@ -1260,6 +1367,8 @@ async def chat_completions(request: Request) -> Any:
                     messages,  # original request messages, for rollup
                 )
             )
+        if r.status_code >= 400:
+            _note_backend_rejection(str(response_json)[:300])
         return JSONResponse(content=response_json, status_code=r.status_code)
     finally:
         await client.aclose()
