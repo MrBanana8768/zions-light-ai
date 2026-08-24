@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -81,7 +82,7 @@ HARD_INPUT_LIMIT = min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - GENERATION_RESERV
 # entirely, so we add a flat per-image estimate to the budget. Conservative
 # default keeps us from overflowing the model's real context window; tune
 # per VLM if needed.
-IMAGE_TOKEN_ESTIMATE = _env_int("COMPACTOR_IMAGE_TOKENS", 1536)
+IMAGE_TOKEN_ESTIMATE = _env_int("COMPACTOR_IMAGE_TOKENS", 4096)
 # How many of the most recent image-bearing turns keep their images. Older
 # image parts become a short text note.
 #
@@ -182,18 +183,49 @@ def backend_is_multimodal() -> bool:
     return _backend_multimodal
 
 
+# v3.0.5: learned budget correction. Our token count is an ESTIMATE — the flat
+# per-image cost especially so (a real photo tiles to 4-8k tokens on Mistral3
+# encoders; production showed a 6,859-token undercount past the guard). vLLM's
+# context-length 400 reports the TRUE count, so instead of guessing we learn:
+# parse it, tighten the effective limit by the observed overshoot, and the next
+# message heals — same self-healing pattern as the modality backstop. Sticky for
+# process life, monotonic (only ever tightens), capped so a pathological report
+# can't crush the window.
+_BUDGET_MARGIN = 0
+_CTX_OVERFLOW_RE = re.compile(r"prompt contains (?:at least )?(\d+) input tokens")
+
+
 def _note_backend_rejection(err_body: str) -> None:
-    """Reactive backstop: if vLLM rejects a request because the model is not
-    multimodal, remember that — the NEXT request strips image parts and the
-    conversation heals instead of staying poisoned."""
-    global _backend_multimodal
-    if "not a multimodal model" in (err_body or "") and _backend_multimodal is not False:
+    """Reactive backstop for vLLM 4xx bodies. Two lessons we can learn:
+    (1) the model is text-only -> strip images from subsequent requests;
+    (2) our token count undercounted -> tighten the budget by the observed gap.
+    Either way the conversation heals on its next message instead of staying
+    poisoned."""
+    global _backend_multimodal, _BUDGET_MARGIN
+    body = err_body or ""
+    if "not a multimodal model" in body and _backend_multimodal is not False:
         _backend_multimodal = False
         logger.warning(
             "backend declared itself text-only via a 400; image parts will be "
             "stripped from subsequent requests (set COMPACTOR_BACKEND_MULTIMODAL "
             "to override)"
         )
+    if "maximum context length" in body:
+        m = _CTX_OVERFLOW_RE.search(body)
+        if m:
+            actual = int(m.group(1))
+            overshoot = actual - HARD_INPUT_LIMIT
+            if overshoot > 0:
+                new_margin = min(overshoot + 512, MAX_MODEL_LEN // 4)
+                if new_margin > _BUDGET_MARGIN:
+                    _BUDGET_MARGIN = new_margin
+                    logger.warning(
+                        f"context calibration: vLLM counted {actual} tokens where "
+                        f"we budgeted <= {HARD_INPUT_LIMIT} — our estimate "
+                        f"undercounts (images are the usual cause). Tightening the "
+                        f"hard limit by {new_margin} for subsequent requests; the "
+                        f"next message in this conversation should succeed."
+                    )
 
 
 _IMAGE_PLACEHOLDER = (
@@ -660,6 +692,11 @@ def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list
     """
     if limit is None:
         limit = HARD_INPUT_LIMIT
+    # Learned correction (v3.0.5): if vLLM previously reported a true count
+    # above what we budgeted, tighten by the observed gap so the same
+    # conversation succeeds on its next message.
+    if _BUDGET_MARGIN:
+        limit = max(256, limit - _BUDGET_MARGIN)
 
     # Prescreen: skip the (expensive) full tokenization when the char-based
     # estimate is far under the limit. The estimate can undercount token-dense

@@ -236,10 +236,62 @@ def test_memorable_user_text():
     assert_eq(main._memorable_user_text(msgs, ""), "", "latest turn has no image -> no marker")
 
 
+
+
+def test_context_calibration():
+    print("\n[test] _note_backend_rejection — learns from a context-length 400")
+    # The production body, verbatim shape: vLLM counted 35510 where our guard
+    # budgeted <= HARD_INPUT_LIMIT. The margin must cover the observed gap.
+    orig_margin = main._BUDGET_MARGIN
+    orig_modal = main._backend_multimodal
+    try:
+        main._BUDGET_MARGIN = 0
+        main._backend_multimodal = True
+        overshoot_body = (
+            '{"error":{"message":"This model\'s maximum context length is 32768 tokens. '
+            'However, you requested 0 output tokens and your prompt contains '
+            + str(main.HARD_INPUT_LIMIT + 100)
+            + ' input tokens, for a total of ... (parameter=input_tokens)"}}'
+        )
+        main._note_backend_rejection(overshoot_body)
+        assert_true(main._BUDGET_MARGIN >= 100, f"margin covers the gap ({main._BUDGET_MARGIN})")
+        assert_true(main._BUDGET_MARGIN <= main.MAX_MODEL_LEN // 4, "margin is capped")
+        assert_eq(main._backend_multimodal, True, "modality untouched by a context 400")
+
+        print("\n[test] calibration is monotonic — a smaller report never loosens it")
+        prev = main._BUDGET_MARGIN
+        main._note_backend_rejection(
+            '{"error":{"message":"maximum context length is 32768 tokens ... prompt contains '
+            + str(main.HARD_INPUT_LIMIT + 50)
+            + ' input tokens"}}'
+        )
+        assert_eq(main._BUDGET_MARGIN, prev, "kept the larger learned margin")
+
+        print("\n[test] the guard applies the learned margin")
+        main._BUDGET_MARGIN = 300
+        msgs = [{"role": "system", "content": "S" * (200 * 4)}] + [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": "x" * (60 * 4)}
+            for i in range(9)
+        ]
+        out = main._enforce_hard_budget(msgs, 700)  # effective limit 400
+        assert_true(main.count_tokens(out) <= 400, "shed to the tightened limit")
+
+        print("\n[test] under-limit reports do nothing")
+        main._BUDGET_MARGIN = 0
+        main._note_backend_rejection(
+            '{"error":{"message":"maximum context length is 32768 tokens ... prompt contains 10 input tokens"}}'
+        )
+        assert_eq(main._BUDGET_MARGIN, 0, "no overshoot -> no margin")
+    finally:
+        main._BUDGET_MARGIN = orig_margin
+        main._backend_multimodal = orig_modal
+
+
 if __name__ == "__main__":
     test_strip_image_parts()
     test_modality_cache_and_backstop()
     test_merge_consecutive_same_role()
     test_image_retention()
     test_memorable_user_text()
+    test_context_calibration()
     print("\nAll vision-path tests passed.")
