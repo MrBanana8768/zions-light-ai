@@ -162,42 +162,47 @@ def test_merge_consecutive_same_role():
     assert_eq(len(main._merge_consecutive_same_role(sys2)), 2, "systems not merged here")
 
 
-def test_image_retention_cap():
-    print("\n[test] compact_if_needed — image retention cap bounds accumulation")
-    import asyncio
-
-    seen_turns = []
-
-    async def fake_summarize(client, turns):
-        seen_turns.extend(turns)
-        return "SUMMARY"
-
-    orig_sum, orig_keep, orig_cap = main.summarize, main.KEEP_RECENT_TURNS, main.MAX_RETAINED_IMAGES
-    orig_target = main.TARGET_TOKENS
-    main.summarize = fake_summarize
-    main.KEEP_RECENT_TURNS = 2
-    main.MAX_RETAINED_IMAGES = 2
-    main.TARGET_TOKENS = 1  # force compaction
+def test_image_retention():
+    print("\n[test] _apply_image_retention — bounds accumulation on EVERY request")
+    # v3.0.4: retention moved OUT of compact_if_needed (which only fired when a
+    # conversation exceeded TARGET_TOKENS) into the request path, so images are
+    # bounded even in short conversations — the gap that let uploads crush the
+    # text context.
+    orig = main.MAX_RETAINED_IMAGES
     try:
-        msgs = [{"role": "system", "content": "sys"}]
-        for i in range(5):  # 5 image turns + replies
+        msgs = []
+        for i in range(5):
             msgs.append({"role": "user", "content": [{"type": "text", "text": f"pic{i}"}, IMG]})
             msgs.append({"role": "assistant", "content": f"reply{i}"})
-        msgs.append({"role": "user", "content": "final"})
-        out = asyncio.run(main.compact_if_needed(msgs))
-        total_imgs = sum(main._message_image_count(m) for m in out)
-        assert_true(total_imgs <= 2, f"images capped at 2 (got {total_imgs})")
-        # The demoted note goes INTO the summarizer input (it is summarized with
-        # the rest), so the trace is verified there — not in the output, which a
-        # stubbed summarizer replaces with a fixed string.
-        summarized = " ".join(main._message_text(m) for m in seen_turns)
-        assert_true("image shared earlier" in summarized, "demoted images reach the summarizer as text")
-        assert_eq(out[-1].get("content"), "final", "newest turn preserved")
+
+        main.MAX_RETAINED_IMAGES = 1
+        out, demoted = main._apply_image_retention(msgs)
+        assert_eq(sum(main._message_image_count(m) for m in out), 1, "only newest image kept")
+        assert_eq(demoted, 4, "four older images demoted")
+        assert_eq(main._message_image_count(out[8]), 1, "the NEWEST image turn is the kept one")
+        assert_true("pic0" in main._message_text(out[0]), "demoted turn keeps its own text")
+        assert_true("shared earlier" in main._message_text(out[0]), "demoted turn notes the image")
+
+        main.MAX_RETAINED_IMAGES = 0
+        out, demoted = main._apply_image_retention(msgs)
+        assert_eq(sum(main._message_image_count(m) for m in out), 0, "0 keeps no images at all")
+        assert_eq(demoted, 5, "all five demoted")
+
+        main.MAX_RETAINED_IMAGES = -1
+        out, demoted = main._apply_image_retention(msgs)
+        assert_eq(demoted, 0, "-1 means unlimited (no demotion)")
+        assert_eq(out, msgs, "unlimited returns the input unchanged")
+
+        main.MAX_RETAINED_IMAGES = 3
+        out, demoted = main._apply_image_retention(msgs[:4])
+        assert_eq(demoted, 0, "under the cap is a no-op")
+
+        main.MAX_RETAINED_IMAGES = 1
+        before = [dict(m) for m in msgs]
+        main._apply_image_retention(msgs)
+        assert_eq(msgs, before, "input list is never mutated")
     finally:
-        main.summarize, main.KEEP_RECENT_TURNS = orig_sum, orig_keep
-        main.MAX_RETAINED_IMAGES, main.TARGET_TOKENS = orig_cap, orig_target
-
-
+        main.MAX_RETAINED_IMAGES = orig
 
 
 def test_memorable_user_text():
@@ -235,6 +240,6 @@ if __name__ == "__main__":
     test_strip_image_parts()
     test_modality_cache_and_backstop()
     test_merge_consecutive_same_role()
-    test_image_retention_cap()
+    test_image_retention()
     test_memorable_user_text()
     print("\nAll vision-path tests passed.")
