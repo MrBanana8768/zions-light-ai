@@ -81,7 +81,16 @@ HARD_INPUT_LIMIT = min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - GENERATION_RESERV
 # entirely, so we add a flat per-image estimate to the budget. Conservative
 # default keeps us from overflowing the model's real context window; tune
 # per VLM if needed.
-IMAGE_TOKEN_ESTIMATE = _env_int("COMPACTOR_IMAGE_TOKENS", 768)
+IMAGE_TOKEN_ESTIMATE = _env_int("COMPACTOR_IMAGE_TOKENS", 1536)
+# v3.0.2: cap how many image turns compaction carries forward. Images are
+# deliberately never summarized (that would destroy them), and clients re-send
+# full history every message — so without a cap they accumulate FOREVER in a
+# conversation, and each one costs KV-cache and vision-encoder VRAM on top of
+# tokens. On a 48GB card serving a 24B VLM that headroom is thin, and the
+# failure mode is a stall rather than a clean error. Keep the N most recent
+# images verbatim; older ones become a short text note so the conversation
+# still remembers a picture was shared. 0 = unlimited (pre-v3.0.2 behavior).
+MAX_RETAINED_IMAGES = _env_int("COMPACTOR_MAX_RETAINED_IMAGES", 3)
 
 # V2.0 Phase 1: admin endpoint binding. Default "127.0.0.1" rejects any
 # non-localhost client at the dependency layer (we still bind the FastAPI
@@ -408,8 +417,40 @@ async def compact_if_needed(messages: list[dict]) -> list[dict]:
     # text destroys the image permanently, and the model could never see it
     # again. Keep image turns verbatim (in chronological order); summarize
     # only the text-only older turns.
-    preserved_images = [m for m in to_summarize if _message_has_image(m)]
-    text_only = [m for m in to_summarize if not _message_has_image(m)]
+    # v3.0.2: bound the accumulation. Images are never summarized (that would
+    # destroy them) and clients re-send full history, so without a cap every
+    # image ever uploaded rides along in every request forever — each costing
+    # KV-cache and vision-encoder VRAM, which stalls the engine rather than
+    # erroring cleanly. Keep the N most RECENT image turns verbatim; demote
+    # older ones to a text note (summarized with the rest, so the conversation
+    # still remembers a picture was shared — it just can't be looked at again).
+    #
+    # Single ordered pass, by INDEX: the demoted entries are modified copies,
+    # so any identity/equality-based re-sort would misplace them.
+    img_idxs = [i for i, m in enumerate(to_summarize) if _message_has_image(m)]
+    keep_idxs = (
+        set(img_idxs[-MAX_RETAINED_IMAGES:])
+        if MAX_RETAINED_IMAGES > 0
+        else set(img_idxs)
+    )
+    preserved_images: list[dict] = []
+    text_only: list[dict] = []
+    demoted = 0
+    for i, m in enumerate(to_summarize):
+        if i in keep_idxs:
+            preserved_images.append(m)
+        elif i in set(img_idxs):
+            txt = _message_text(m).strip()
+            note = "[an image shared earlier in this conversation]"
+            text_only.append({**m, "content": f"{txt}\n\n{note}" if txt else note})
+            demoted += 1
+        else:
+            text_only.append(m)
+    if demoted:
+        logger.info(
+            f"image retention: kept {len(preserved_images)} most-recent image "
+            f"turn(s), demoted {demoted} to text (cap {MAX_RETAINED_IMAGES})"
+        )
     if not text_only:
         logger.info(
             f"compaction skipped: all {len(to_summarize)} older turn(s) carry "
@@ -503,6 +544,54 @@ def _fast_token_estimate(messages: list[dict]) -> int:
     """char/4 estimate + per-image cost — no tokenizer, O(total chars)."""
     image_tokens = sum(_message_image_count(m) for m in messages) * IMAGE_TOKEN_ESTIMATE
     return sum(len(_message_text(m)) // 4 + 4 for m in messages) + image_tokens
+
+
+def _merge_consecutive_same_role(messages: list[dict]) -> list[dict]:
+    """Collapse consecutive non-system messages that share a role.
+
+    Mistral-family templates require strict user/assistant alternation, and
+    several layers can independently break it. The one that bit us (v3.0.2):
+    compaction hoists image-bearing turns out of chronological order to sit
+    just before the recent window (they must never be summarized away), so
+    an image turn landing next to the window's leading user turn produces
+    user-then-user and vLLM 400s the request — every time, once an
+    image-bearing conversation crosses the compaction threshold.
+
+    Merging (rather than dropping) is lossless: text is joined, and if either
+    side carries image parts both are kept as a parts list, so the picture
+    still reaches the model.
+    """
+    if not isinstance(messages, list) or len(messages) < 2:
+        return messages
+
+    def as_parts(m: dict) -> list[dict]:
+        c = m.get("content")
+        if isinstance(c, list):
+            return [p for p in c if isinstance(p, dict)]
+        return [{"type": "text", "text": str(c or "")}]
+
+    out: list[dict] = []
+    for m in messages:
+        prev = out[-1] if out else None
+        if (
+            prev is not None
+            and isinstance(m, dict)
+            and m.get("role") == prev.get("role")
+            and m.get("role") in ("user", "assistant")
+        ):
+            if _message_image_count(m) or _message_image_count(prev):
+                out[-1] = {**prev, "content": as_parts(prev) + as_parts(m)}
+            else:
+                a, b = _message_text(prev).strip(), _message_text(m).strip()
+                out[-1] = {**prev, "content": f"{a}\n\n{b}".strip() if a or b else ""}
+        else:
+            out.append(m)
+    if len(out) != len(messages):
+        logger.info(
+            f"merged {len(messages) - len(out)} consecutive same-role turn(s) "
+            f"to preserve template alternation"
+        )
+    return out
 
 
 def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list[dict]:
@@ -1227,6 +1316,9 @@ async def chat_completions(request: Request) -> Any:
         _enforce_hard_budget, body["messages"], effective_limit
     )
     body["messages"] = _merge_adjacent_system_messages(body["messages"])
+    # ...and non-system turns that ended up sharing a role (compaction hoists
+    # image turns out of chronological order, which lands user next to user).
+    body["messages"] = _merge_consecutive_same_role(body["messages"])
 
     stream = bool(body.get("stream", False))
     # read=None keeps long generations from being cut off, but connect/write/
