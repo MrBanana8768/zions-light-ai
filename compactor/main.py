@@ -546,6 +546,31 @@ def _fast_token_estimate(messages: list[dict]) -> int:
     return sum(len(_message_text(m)) // 4 + 4 for m in messages) + image_tokens
 
 
+def _memorable_user_text(messages: list[dict], last_user_text: str) -> str:
+    """Give an image-only turn something the memory layers can hold onto.
+
+    A bare upload (no caption) has NO text, so both memory layers correctly
+    skip it — index_exchange and the facts tail each refuse empty input. But
+    that leaves the conversation with no durable trace a picture was ever
+    shared: images live only in the live window, and once they age out (or are
+    demoted by the retention cap) the memory system cannot remember it was
+    shown anything.
+
+    Substituting a marker makes the exchange memorable, and the PAIRING is what
+    matters: the assistant's description becomes the durable fact, so what was
+    in the picture survives the picture itself.
+    """
+    if last_user_text.strip():
+        return last_user_text
+    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    if last_user is None:
+        return last_user_text
+    n = _message_image_count(last_user)
+    if not n:
+        return last_user_text
+    return f"[shared {n} image{'s' if n > 1 else ''}]"
+
+
 def _merge_consecutive_same_role(messages: list[dict]) -> list[dict]:
     """Collapse consecutive non-system messages that share a role.
 
@@ -975,6 +1000,16 @@ async def lifespan(app: FastAPI):
         logger.info("storage layout ready")
     except Exception as e:
         logger.warning(f"could not initialize storage layout: {e}")
+    # v3.0.3: resolve backend modality HERE rather than lazily on the first
+    # chat. AutoConfig.from_pretrained can touch the network (an HF HEAD
+    # request when the config is not cached), and the lazy path ran it inside
+    # the async request handler — blocking the event loop, and with a
+    # slow/unreachable HF hub it would stall the very first user's message.
+    # At startup a stall is invisible and the result is cached for process life.
+    try:
+        await run_in_threadpool(backend_is_multimodal)
+    except Exception as e:
+        logger.warning(f"modality probe failed at startup (will retry lazily): {e}")
     yield
     # Graceful: give in-flight background work (fact extraction, indexing,
     # rollup, backfill) a moment to finish via the bounded pool.
@@ -1097,20 +1132,6 @@ async def chat_completions(request: Request) -> Any:
             },
         )
 
-    # v3.0.1: a text-only backend must never receive image parts — vLLM 400s
-    # the whole request, and because clients re-send full history, a single
-    # uploaded image otherwise poisons its conversation permanently. Strip to
-    # honest placeholders BEFORE anything else (compaction, budgeting and
-    # injection then all see the text-only view; the V3.1 image-preserving
-    # paths simply never fire).
-    if not backend_is_multimodal():
-        messages, _n_stripped = _strip_image_parts(messages)
-        if _n_stripped:
-            body["messages"] = messages
-            logger.info(
-                f"stripped {_n_stripped} image part(s) for the text-only backend"
-            )
-
     # V2.0 Phase 1: conv_id resolution
     conv_id: str | None = None
     try:
@@ -1128,6 +1149,31 @@ async def chat_completions(request: Request) -> Any:
     last_user_text = _extract_last_user_text(messages)
     # Turn index ≈ position of the assistant reply we're about to produce.
     turn_index = len(messages) + 1
+
+    last_user_text = _memorable_user_text(messages, last_user_text)
+
+    # v3.0.1: a text-only backend must never receive image parts — vLLM 400s
+    # the whole request, and because clients re-send full history, a single
+    # uploaded image otherwise poisons its conversation permanently. Strip to
+    # honest placeholders before compaction/budgeting/injection, so the V3.1
+    # image-preserving paths simply never fire.
+    #
+    # v3.0.3: this MUST run AFTER conv_id resolution and last_user_text. The
+    # hash-fallback conv_id is sha256(system|||first_user[:512]) over TEXT
+    # parts only — deliberately, so it is stable across multimodal/text-only
+    # *client* variants (memory.py _message_text_for_hash). Stripping appends a
+    # placeholder to that text, so stripping first broke the invariant from the
+    # server side: swapping between a vision model and a text-only one changed
+    # the conv_id mid-conversation and orphaned every fact, summary and
+    # embedding under the old id. conv_id and the RAG query now derive from what
+    # the CLIENT sent; the strip only shapes what we forward.
+    if not backend_is_multimodal():
+        messages, _n_stripped = _strip_image_parts(messages)
+        if _n_stripped:
+            body["messages"] = messages
+            logger.info(
+                f"stripped {_n_stripped} image part(s) for the text-only backend"
+            )
 
     # V2.1 Phase 5: chat command short-circuit. If the user typed a
     # recognized slash command (/list-facts, /forget, /remember, etc.),

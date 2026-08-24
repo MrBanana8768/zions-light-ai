@@ -198,9 +198,43 @@ def test_image_retention_cap():
         main.MAX_RETAINED_IMAGES, main.TARGET_TOKENS = orig_cap, orig_target
 
 
+
+
+def test_memorable_user_text():
+    print("\n[test] _memorable_user_text — image-only turn becomes memorable")
+    # A bare upload has no text, so index_exchange and the facts tail both
+    # refuse it (correctly) — leaving no durable trace a picture was shared.
+    msgs = [{"role": "user", "content": [IMG]}]
+    assert_eq(main._memorable_user_text(msgs, ""), "[shared 1 image]", "marker substituted")
+
+    print("\n[test] _memorable_user_text — plural wording")
+    assert_eq(
+        main._memorable_user_text([{"role": "user", "content": [IMG, IMG2]}], "   "),
+        "[shared 2 images]",
+        "plural marker (whitespace-only counts as empty)",
+    )
+
+    print("\n[test] _memorable_user_text — real caption always wins")
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "my dress"}, IMG]}]
+    assert_eq(main._memorable_user_text(msgs, "my dress"), "my dress", "caption preserved")
+
+    print("\n[test] _memorable_user_text — no images: empty stays empty")
+    assert_eq(main._memorable_user_text([{"role": "user", "content": ""}], ""), "", "no marker invented")
+    assert_eq(main._memorable_user_text([], ""), "", "empty conversation safe")
+
+    print("\n[test] _memorable_user_text — uses the LAST user turn")
+    msgs = [
+        {"role": "user", "content": [IMG]},
+        {"role": "assistant", "content": "nice"},
+        {"role": "user", "content": ""},
+    ]
+    assert_eq(main._memorable_user_text(msgs, ""), "", "latest turn has no image -> no marker")
+
+
 if __name__ == "__main__":
     test_strip_image_parts()
     test_modality_cache_and_backstop()
     test_merge_consecutive_same_role()
     test_image_retention_cap()
+    test_memorable_user_text()
     print("\nAll vision-path tests passed.")
