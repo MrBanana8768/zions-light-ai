@@ -237,6 +237,24 @@ not.
    refuse memory writes for them (§15). A one-message request has no
    user/assistant exchange to remember; today such calls hash to a stable
    conv_id and accumulate facts into a conversation that does not exist.
+9. **The store is authoritative; the front end can never overwrite history.**
+   This is a governing decision, not an implementation detail. The client's
+   in-memory view of a conversation is a *projection* of stored state and is
+   never a write source. Every write is an **atomic, per-message delta** —
+   append one message, update one message's state, move the leaf by
+   compare-and-swap — applied in a single transaction that either commits whole
+   or not at all. There is no operation, at any layer, that accepts a whole
+   conversation and replaces what is stored. A client whose view is stale loses
+   its own write and is told so; it never wins by being last.
+
+   The rule exists because the opposite was load-bearing in OpenWebUI and cost a
+   full day. Its client holds the chain in browser memory and writes it back
+   wholesale, so an open tab silently reverted two correct external repairs on
+   2026-08-24, and a repair verified in the database was undone by a browser that
+   had never been refreshed. **A history a browser tab can overwrite is not
+   stored history — it is a cache with delusions of durability.** §11.1 and §11.3
+   are the mechanical enforcement; this rule is the reason they are not
+   negotiable.
 
 ### 4.1 Message-chain and context-fidelity integrity (written 2026-08-24; revised the same day after the truncation finding)
 
@@ -457,6 +475,24 @@ continuously running dashboard.
 ---
 
 ## 8. Modality handling (the `.paint` lesson)
+
+> **Scoping decision, 2026-08-24: the near-term posture is text-only.**
+> Production runs with `COMPACTOR_MAX_RETAINED_IMAGES=0`, and the tester has been
+> asked not to send images. Images were the head of the incident chain — a
+> Mistral3 vision encoder tiles a photo into 4–8k tokens while v3.0.4 estimated
+> 1,536, producing context-length 400s that forked a message tree. v3.0.5 now
+> learns the true count from vLLM, but the *interaction* of real image cost with
+> retention, budget shedding, and the summary stack has not been characterized,
+> and characterizing it needs a dedicated pass rather than a patch cut.
+>
+> This section therefore specifies how images work **when they return**, not what
+> ships first. The requirement on the client is that text-only be a **runtime
+> posture, not an architectural assumption**: build the sniffing, content-parts,
+> retention-indicator and modality-detection paths, and ship with upload disabled
+> behind a single switch. A client that hard-codes text-only will have to be
+> reopened; one that treats vision as configuration will not. Whatever the
+> switch's state, item 3 below still applies — the user is told *why* upload is
+> unavailable, never left to discover it by failure.
 
 1. **Classify by content, never extension.** Sniff magic bytes (PNG `89 50 4E
    47`, JPEG `FF D8 FF`, GIF, WebP). A `.paint` file containing PNG bytes is an

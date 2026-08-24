@@ -726,6 +726,47 @@ ships, or sooner if vLLM keeps causing VRAM-shape problems.
 
 ## Frontend replacement triggers — when to consider replacing OpenWebUI
 
+> ### ⚠️ Superseded 2026-08-24 — triggers fired, decision reversed
+>
+> The default position below ("don't") no longer holds, and none of the triggers
+> that fired are in the table beneath it. What actually forced the decision was a
+> class of failure the table never anticipated: **a generic client silently
+> disagreeing with the backend about what a conversation is.**
+>
+> The specification is [FRONTEND_SPEC.md](FRONTEND_SPEC.md); it supersedes this
+> section. Two decisions from the incident are recorded here because they bind
+> the compactor as well as the client:
+>
+> **1. Client and stored history must be atomic — the front end can never
+> overwrite the backend.** OpenWebUI holds the message chain in browser memory
+> and writes it back wholesale, to *two* representations (a `chat.chat` JSON blob
+> and a `chat_message` table) that can disagree. On 2026-08-24 an open browser tab
+> silently reverted two correct external repairs, and a fix verified in the
+> database was undone by a page that had never been refreshed. Going forward every
+> write is an atomic per-message delta — append one message, update one message's
+> state, move the leaf by compare-and-swap — in a transaction that commits whole
+> or not at all. No operation anywhere accepts a whole conversation and replaces
+> what is stored; a stale client loses its own write and is told so. A history a
+> browser tab can overwrite is not stored history. See FRONTEND_SPEC §4 rule 9,
+> §11.1, §11.3.
+>
+> **2. Text-only for now; images deferred to a dedicated pass.** Images headed the
+> whole incident chain — a Mistral3 vision encoder tiles a photo into 4–8k tokens
+> against v3.0.4's 1,536-token estimate, producing the context-length 400s that
+> forked a message tree. v3.0.5 learns the true count from vLLM, but the
+> interaction of real image cost with retention, budget shedding and the summary
+> stack is uncharacterized, and that needs a deliberate deep-dive rather than a
+> patch cut. Production runs `COMPACTOR_MAX_RETAINED_IMAGES=0`. The vision work in
+> the V3 section below is **paused, not cancelled** — and the client must treat
+> text-only as a runtime posture behind one switch, never as an architectural
+> assumption. See FRONTEND_SPEC §8.
+>
+> The original analysis is kept below unedited. It was reasonable when written and
+> wrong in an instructive way: every trigger it lists is a *feature* the client
+> lacks, and the one that actually fired was a *correctness* disagreement about
+> stored state. Worth remembering the next time a "when would we replace X" table
+> gets written.
+
 **Default position: don't.** OpenWebUI already covers what matters for
 this project:
 - ✅ Cross-device sync (web-based — phone, desktop, tablet all hit the
