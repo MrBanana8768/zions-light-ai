@@ -126,6 +126,7 @@ See [CHANGELOG.md](CHANGELOG.md) for full version history.
 | [compactor/V4_PLAN.md](compactor/V4_PLAN.md) | Contributors | Agentic / tool-use design spec |
 | [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md) | Contributors | North star — the stateless→stateful arc, faculties, and the honesty/reverence principles |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Contributors | System shape — layering tiers, networking/trust boundaries, scaling, and the V4-era split decisions |
+| [FRONTEND_SPEC.md](FRONTEND_SPEC.md) | Contributors | Specification for the purpose-built replacement client — compactor-native data flow, memory as a UI surface, the north-star obligations on the interface |
 | [FINETUNE_PLAN.md](FINETUNE_PLAN.md) | Contributors | Fine-tune track — crafting a custom voice (QLoRA), a parallel track to the V-line |
 | [SEED_MODEL_PLAN.md](SEED_MODEL_PLAN.md) | Contributors | Far-future foundation — values-in-pretraining (the tabula-rasa / self-modification frontiers). **Partly superseded** — the MoE/BTX pipeline was dropped; see the notice at the top of the file |
 

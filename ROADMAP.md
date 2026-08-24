@@ -764,6 +764,45 @@ rather than replacing it wholesale.
 
 ---
 
+## ~V5 — Retrieval-on-demand memory (replace inject-everything)
+
+**Raised by the owner 2026-08-24, straight out of production pain.** Today every
+memory layer is *pushed* into the context on every single request: ~100 facts,
+top-K retrieved exchanges, and the whole summary stack, re-sent each turn. That
+design is the direct cause of most of the V3.0.x incident line — context
+crushing, the budget guard shedding 196 turns, the 400s that orphaned a user's
+message tree. The compactor spends the model's window on memory the model may
+not need for *this* turn.
+
+**The shift:** memory moves behind a **lookup interface** instead of a paste.
+The model receives a small, cheap *index* — a pointer/summary of what is
+available — and retrieves detail on demand.
+
+- **Storage:** a real database rather than per-conversation JSON + embedded
+  ChromaDB. Converges with the Postgres-sidecar state-home decision
+  (ARCHITECTURE.md Decision 4) — Postgres + pgvector holds facts, embeddings and
+  summaries with real queries, transactions and crash safety.
+- **Access:** a `recall(query)` capability. This is a natural fit for the **V4
+  tool loop** — memory becomes the first, safest tool the model is given: read-
+  only, local, no sandbox required, and immediately useful.
+- **What stays pushed:** the persona and a compact "what I know about you /
+  this conversation" digest. Identity and orientation are cheap and always
+  relevant; episodic detail is not.
+- **Why it matters beyond cost:** it is closer to how memory actually works.
+  A person does not hold every fact in working memory — they hold a sense of
+  *what they know* and reach for specifics when the moment calls. Pushing
+  everything is not just expensive, it is the wrong model of mind
+  (COGNITIVE_ARCHITECTURE.md, working vs long-term memory).
+
+**Sequencing:** needs the Postgres state home first, and lands naturally with or
+just after V4.0's tool loop. Large enough to be its own version line; folds into
+the ~V5 memory rewrite already anticipated in ARCHITECTURE.md Decision 4.
+
+**Open questions:** how does the model know what to ask for (index design)?
+Does a failed/empty recall degrade honestly? How does retrieval-on-demand
+interact with the compactor's role as "the subconscious" — is lookup an
+*automatic* pre-pass, a *deliberate* tool call, or both?
+
 ## Beyond V3 — speculative roadmap
 
 These are directions worth keeping in mind but not committing to until V2
