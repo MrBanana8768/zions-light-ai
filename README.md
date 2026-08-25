@@ -127,6 +127,8 @@ See [CHANGELOG.md](CHANGELOG.md) for full version history.
 | [COGNITIVE_ARCHITECTURE.md](COGNITIVE_ARCHITECTURE.md) | Contributors | North star — the stateless→stateful arc, faculties, and the honesty/reverence principles |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Contributors | System shape — layering tiers, networking/trust boundaries, scaling, and the V4-era split decisions |
 | [FRONTEND_SPEC.md](FRONTEND_SPEC.md) | Contributors | Specification for the purpose-built replacement client — compactor-native data flow, memory as a UI surface, the north-star obligations on the interface |
+| [REMEDIATION.md](REMEDIATION.md) | Contributors | **The v3.1 action list.** Findings from two independent codebase reviews, phased, with ordering constraints and verification steps. Start here to do the work |
+| [INCIDENT_2026-08-24.md](INCIDENT_2026-08-24.md) | Contributors | Incident report — the conversation-chain truncation, its fault tree, and what the diagnosis got wrong. Background for REMEDIATION.md |
 | [FINETUNE_PLAN.md](FINETUNE_PLAN.md) | Contributors | Fine-tune track — crafting a custom voice (QLoRA), a parallel track to the V-line |
 | [SEED_MODEL_PLAN.md](SEED_MODEL_PLAN.md) | Contributors | Far-future foundation — values-in-pretraining (the tabula-rasa / self-modification frontiers). **Partly superseded** — the MoE/BTX pipeline was dropped; see the notice at the top of the file |
 
