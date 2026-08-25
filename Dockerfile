@@ -247,7 +247,7 @@ RUN chmod +x /opt/clean-models.sh
 # On 80GB-class cards, clear VLLM_EXTRA_ARGS for full FP16 quality.
 # Any HuggingFace causal-LM repo that vLLM supports works here.
 # =============================================================================
-ENV MODEL_REPO="coder3101/Cydonia-24B-v4.3-heretic-v4"
+ENV MODEL_REPO="coder3101/Cydonia-24B-v4.3-vision-heretic"
 ENV HF_HOME="/data/models"
 # Note: TRANSFORMERS_CACHE was removed in v1.9.1 — deprecated in transformers
 # v5, HF_HOME is the modern equivalent and is read by both transformers

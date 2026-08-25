@@ -570,6 +570,18 @@ def _apply_image_retention(messages: list[dict]) -> tuple[list[dict], int]:
     cost (thousands of tokens per photo) crowds the actual conversation out of
     the window. Returns (messages, images_demoted); the input list is never
     mutated.
+
+    VALUES:  -1 = unlimited (no-op) · N > 0 = keep the N most recent image turns
+             0  = strip EVERY image, INCLUDING the one just uploaded.
+
+    The 0 case is easy to misread as "keep no history" — it is stronger than
+    that. `MAX_RETAINED_IMAGES` is falsy at 0, so `keep` below is the empty set
+    and the current turn's image is demoted with the rest: on a vision model the
+    user uploads a picture, sees it in their composer, and the model never
+    receives it. That is the intended production mitigation as of 2026-08-24
+    (see INCIDENT_2026-08-24.md), but it is silent — the UI has no affordance
+    telling the user their image was dropped. FRONTEND_SPEC.md §8 item 4 requires
+    one.
     """
     if MAX_RETAINED_IMAGES < 0:
         return messages, 0

@@ -726,6 +726,47 @@ ships, or sooner if vLLM keeps causing VRAM-shape problems.
 
 ## Frontend replacement triggers — when to consider replacing OpenWebUI
 
+> ### ⚠️ Superseded 2026-08-24 — triggers fired, decision reversed
+>
+> The default position below ("don't") no longer holds, and none of the triggers
+> that fired are in the table beneath it. What actually forced the decision was a
+> class of failure the table never anticipated: **a generic client silently
+> disagreeing with the backend about what a conversation is.**
+>
+> The specification is [FRONTEND_SPEC.md](FRONTEND_SPEC.md); it supersedes this
+> section. Two decisions from the incident are recorded here because they bind
+> the compactor as well as the client:
+>
+> **1. Client and stored history must be atomic — the front end can never
+> overwrite the backend.** OpenWebUI holds the message chain in browser memory
+> and writes it back wholesale, to *two* representations (a `chat.chat` JSON blob
+> and a `chat_message` table) that can disagree. On 2026-08-24 an open browser tab
+> silently reverted two correct external repairs, and a fix verified in the
+> database was undone by a page that had never been refreshed. Going forward every
+> write is an atomic per-message delta — append one message, update one message's
+> state, move the leaf by compare-and-swap — in a transaction that commits whole
+> or not at all. No operation anywhere accepts a whole conversation and replaces
+> what is stored; a stale client loses its own write and is told so. A history a
+> browser tab can overwrite is not stored history. See FRONTEND_SPEC §4 rule 9,
+> §11.1, §11.3.
+>
+> **2. Text-only for now; images deferred to a dedicated pass.** Images headed the
+> whole incident chain — a Mistral3 vision encoder tiles a photo into 4–8k tokens
+> against v3.0.4's 1,536-token estimate, producing the context-length 400s that
+> forked a message tree. v3.0.5 learns the true count from vLLM, but the
+> interaction of real image cost with retention, budget shedding and the summary
+> stack is uncharacterized, and that needs a deliberate deep-dive rather than a
+> patch cut. Production runs `COMPACTOR_MAX_RETAINED_IMAGES=0`. The vision work in
+> the V3 section below is **paused, not cancelled** — and the client must treat
+> text-only as a runtime posture behind one switch, never as an architectural
+> assumption. See FRONTEND_SPEC §8.
+>
+> The original analysis is kept below unedited. It was reasonable when written and
+> wrong in an instructive way: every trigger it lists is a *feature* the client
+> lacks, and the one that actually fired was a *correctness* disagreement about
+> stored state. Worth remembering the next time a "when would we replace X" table
+> gets written.
+
 **Default position: don't.** OpenWebUI already covers what matters for
 this project:
 - ✅ Cross-device sync (web-based — phone, desktop, tablet all hit the
@@ -763,6 +804,45 @@ plausibly be addressed by writing a thin native shell around OpenWebUI
 rather than replacing it wholesale.
 
 ---
+
+## ~V5 — Retrieval-on-demand memory (replace inject-everything)
+
+**Raised by the owner 2026-08-24, straight out of production pain.** Today every
+memory layer is *pushed* into the context on every single request: ~100 facts,
+top-K retrieved exchanges, and the whole summary stack, re-sent each turn. That
+design is the direct cause of most of the V3.0.x incident line — context
+crushing, the budget guard shedding 196 turns, the 400s that orphaned a user's
+message tree. The compactor spends the model's window on memory the model may
+not need for *this* turn.
+
+**The shift:** memory moves behind a **lookup interface** instead of a paste.
+The model receives a small, cheap *index* — a pointer/summary of what is
+available — and retrieves detail on demand.
+
+- **Storage:** a real database rather than per-conversation JSON + embedded
+  ChromaDB. Converges with the Postgres-sidecar state-home decision
+  (ARCHITECTURE.md Decision 4) — Postgres + pgvector holds facts, embeddings and
+  summaries with real queries, transactions and crash safety.
+- **Access:** a `recall(query)` capability. This is a natural fit for the **V4
+  tool loop** — memory becomes the first, safest tool the model is given: read-
+  only, local, no sandbox required, and immediately useful.
+- **What stays pushed:** the persona and a compact "what I know about you /
+  this conversation" digest. Identity and orientation are cheap and always
+  relevant; episodic detail is not.
+- **Why it matters beyond cost:** it is closer to how memory actually works.
+  A person does not hold every fact in working memory — they hold a sense of
+  *what they know* and reach for specifics when the moment calls. Pushing
+  everything is not just expensive, it is the wrong model of mind
+  (COGNITIVE_ARCHITECTURE.md, working vs long-term memory).
+
+**Sequencing:** needs the Postgres state home first, and lands naturally with or
+just after V4.0's tool loop. Large enough to be its own version line; folds into
+the ~V5 memory rewrite already anticipated in ARCHITECTURE.md Decision 4.
+
+**Open questions:** how does the model know what to ask for (index design)?
+Does a failed/empty recall degrade honestly? How does retrieval-on-demand
+interact with the compactor's role as "the subconscious" — is lookup an
+*automatic* pre-pass, a *deliberate* tool call, or both?
 
 ## Beyond V3 — speculative roadmap
 
