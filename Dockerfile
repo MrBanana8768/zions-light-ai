@@ -119,6 +119,16 @@ RUN python3 -m venv /opt/compactor-venv && \
     find /opt/compactor-venv -name "__pycache__" -type d -exec rm -rf {} + && \
     rm -rf /root/.cache /tmp/* /var/tmp/*
 
+# Fail the build if the chat-template path is unavailable. jinja2 is an
+# OPTIONAL transformers dependency that only apply_chat_template needs, so a
+# "tokenizer-only" install omits it and count_tokens silently degrades to
+# `encode(text) + 4` per message — losing ~22 tokens/message of Mistral
+# framing, undetectable until a long conversation overflows the window.
+# That shipped for months and surfaced as vLLM 400s on 2026-08-27.
+# This guard is cheap; the failure it prevents cost a production incident.
+RUN /opt/compactor-venv/bin/python -c \
+    "import jinja2; print('chat-template rendering available: jinja2', jinja2.__version__)"
+
 # Pre-download the bge-small ONNX embedding model into the image so the
 # first request pays no download. Static weights belong in the image, not
 # on the /data volume. FASTEMBED_CACHE_PATH (ENV section below) points here.

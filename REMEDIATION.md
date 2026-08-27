@@ -114,6 +114,65 @@ Ships in v3.1 like everything else, but these are the first commits, they are ne
 
 ---
 
+#### P0-0 · F60 — The accurate token counter has never run in production
+**S1.** `compactor/requirements.txt`, `main.py:296-302`, `main.py:131`
+
+**Found 2026-08-27, in production, three days after the incident.** Not from review — from a user hitting repeated vLLM 400s.
+
+`count_tokens` (`main.py:289`) has three tiers. Tier 1 applies the model's chat template and is exact. Tier 2 catches any exception and falls back to `len(tok.encode(text)) + 4` per message. Tier 3 is `char/4`. **Tier 1 has never executed.** Two independent causes, either sufficient alone, both silent:
+
+1. **jinja2 was not installed.** `apply_chat_template` renders a Jinja template; jinja2 is an *optional* transformers dependency. `compactor/requirements.txt` pinned `transformers==5.12.1` with the comment *"transformers is used tokenizer-only… Keeps the compactor venv lean."* That decision — correct in its own terms, isolating the compactor from vLLM's torch pins — removed chat templating without anything saying so. So tier 1 could not work for **any** model, ever.
+2. **The served model carries no chat template.** `coder3101/Cydonia-24B-v4.3-vision-heretic` has no `chat_template.jinja` — confirmed by a `.no_exist/` marker in the HF cache. The text-only variant it replaced *does* have one. `apply_chat_template` raises `ValueError: tokenizer.chat_template is not set` before jinja2 is reached, so cause 2 masked cause 1 during diagnosis. The tokenizer loads as `TokenizersBackend` converted from `tekken.json` — Mistral's native format — so vLLM is applying its template through mistral-common, entirely outside HF's `chat_template` attribute.
+
+**Consequence.** Every token count the system has ever produced omits chat-template framing — roughly **22 tokens per message** on Mistral. The error scales with *message count*, not content length, which is why a long conversation of short turns overflows while a short one of long turns does not. Observed live: a ~200-message conversation counted ~5,250 tokens light against a 32,768 window, producing repeated 400s.
+
+**Why it is S1 and not S2.** It is the input to every budget decision in the system: the hard-budget guard, the compaction trigger, and the shedding arithmetic all consume this number. The v3.0.5 calibration loop exists to correct it and cannot — see P0-0b.
+
+**Fixed in this commit:** `jinja2==3.1.6` added to `compactor/requirements.txt`, and a `RUN` guard added to the `Dockerfile` that fails the build if it is absent. **Necessary, not sufficient** — cause 2 remains open.
+
+**Still to do.**
+- Supply a chat template for the vision model. The sibling `Cydonia-24B-v4.3-heretic-v4` snapshot carries one at `/data/models/hub/models--coder3101--Cydonia-24B-v4.3-heretic-v4/snapshots/*/chat_template.jinja`; both are v4.3, so it is very likely correct — **verify against vLLM's `/tokenize` endpoint before trusting it.** Vendor it into the repo and pass it explicitly as `chat_template=`; do not depend on a sibling model staying in the cache.
+- **Log the tier-2 fallback.** `main.py:298` is a bare `except Exception:` with no log statement. Tier 3 at least warns (`main.py:131`). The tier that actually ran says nothing — a total loss of accuracy presenting as normal operation, in the component whose only job is to know how big things are. Log once per process at WARNING with the exception type.
+- **Assert tier 1 in the boot self-test** against the real `MODEL_REPO`, not just at build time. A build guard cannot see the served model.
+- Consider `/tokenize` on the vLLM server as ground truth for calibration. It is the exact number the budget guard is trying to estimate, and the calibration loop has been groping toward it by absorbing 400s.
+
+**Verify.** On the pod, after deploying:
+```bash
+/opt/compactor-venv/bin/python -c "
+import os; from transformers import AutoTokenizer
+t=AutoTokenizer.from_pretrained(os.environ['MODEL_REPO'])
+m=[{'role':'user','content':'hi'},{'role':'assistant','content':'hello'}]
+print(len(t.encode(t.apply_chat_template(m, tokenize=False, add_generation_prompt=True))))"
+```
+Must print a number. A `ValueError` or `ImportError` means tier 1 is still dead.
+
+**Interim mitigation in force:** `COMPACTOR_GENERATION_RESERVE=8192` (from 2048), dropping `HARD_INPUT_LIMIT` to 24,576. Costs ~6k of usable window and buys headroom the counter cannot currently provide. **Revert to 2048 only after tier 1 is verified working on the pod.**
+
+---
+
+#### P0-0b · C4 — The calibration loop cannot converge, observed live
+**S2.** `main.py:217-221`
+
+`overshoot = actual - HARD_INPUT_LIMIT` measures against the *original* limit, not the already-tightened one (`main.py:711` applies `limit - _BUDGET_MARGIN`). So the computed overshoot understates the true undercount by exactly `_BUDGET_MARGIN`, and the `if new_margin > _BUDGET_MARGIN` guard then refuses to advance unless the undercount roughly doubles.
+
+Observed on 2026-08-27 across three consecutive failures on one conversation:
+
+| Time | vLLM counted | Margin set |
+|---|---|---|
+| 05:53:46 | 32,836 | 2,628 |
+| 05:54:20 | 32,963 | 2,755 |
+| 06:00:30 | 33,090 | 2,882 |
+
+The margin advanced by exactly 127 each time — the conversation's own growth per turn — while the payload never shrank. It needed ~5,250 and was crawling there at 127/failure, i.e. **~19 more broken messages** for the user. It is a loop, not a retry.
+
+**Fix.** `overshoot = actual - (HARD_INPUT_LIMIT - _BUDGET_MARGIN)`. Rewrite `test_modality.py:261-268` first — it currently asserts the defective behaviour as correct, so the code change will fail a green test until the test is fixed.
+
+**Also.** `_BUDGET_MARGIN` is a module global (`main.py:194`), so every learned correction is lost on restart. Confirmed live: a pod recreate mid-diagnosis reset it to 0 and the climb started over. Persist it per conversation, or accept that the first long conversation after every restart eats a 400 — and say so in the log if so.
+
+**Ordering: P0-0 before P0-0b.** Fixing the arithmetic while the counter is blind only makes a wrong number converge faster.
+
+---
+
 #### P0-1 · F13(a) — There is no outbound failure signal of any kind
 **S2.** `runpod.env.template:130`, `alert.py:35`, `health.py:230`, `supervisord.conf:163,199-201`, `backup.py:336,361`
 

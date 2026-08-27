@@ -22,6 +22,15 @@ fastapi==0.138.2
 uvicorn[standard]==0.49.0
 httpx==0.28.1
 transformers==5.12.1
+# REQUIRED for tokenizer.apply_chat_template — an OPTIONAL transformers dep that
+# only chat templating needs, so "tokenizer-only" installs silently omit it.
+# Without it main.py:296 raises, count_tokens falls to `encode(text) + 4` per
+# message, and every token count in the system loses its chat-template framing
+# (~22 tokens/message on Mistral). Undetectable until a long conversation
+# overflows the context window: observed 2026-08-27 as repeated vLLM 400s on a
+# ~200-message conversation with a ~5,250-token undercount. See REMEDIATION.md.
+# NOT SUFFICIENT ALONE — the served model must also carry a chat_template.
+jinja2==3.1.6
 
 # --- V2.0 Phase 3: episodic memory ---
 # chromadb runs EMBEDDED (in-process, sqlite-backed) — we do NOT run the
