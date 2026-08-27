@@ -210,6 +210,63 @@ The margin advanced by exactly 127 each time — the conversation's own growth p
 
 ---
 
+#### P0-2b · F61 — Log sweep: 47 silent exception handlers, and a health check that cannot see the corruption it exists to catch
+**S2.** Whole compactor package. Inventory taken 2026-08-27.
+
+Every failure this project has spent a week diagnosing had the same shape: **a degraded mode indistinguishable from a healthy one.** P0-0 is the extreme case — the token counter lost its accuracy for months behind a bare `except Exception:` with no log statement. It is not one bad handler, it is a pattern, so this item sweeps them all rather than fixing them one incident at a time.
+
+**Method.** For every `except` block in `compactor/*.py` excluding tests, check whether its body contains a `logger.` call, a `raise`, or an alert. 47 do not. They fall into three classes and only the first needs code changes.
+
+**Class A — the failure vanishes. Fix these.**
+
+| File:line | Handler returns | What is lost |
+|---|---|---|
+| `main.py:298` | per-message `encode()+4` | **P0-0.** Total loss of token-counting accuracy. Already tracked |
+| `health.py:134` | `pass` | **The most important one here.** `/health/full` sums `load_facts(cid)` across conversations. An unreadable facts file — the exact F1/D33 scenario — is silently skipped, so `facts_total` simply reads lower while `status` stays `"ok"`. **The health endpoint cannot detect the corruption that would destroy memory.** It is the monitoring blind spot that pairs with the S1 |
+| `health.py:138` | `pass` | Same, for `conversation_doc_count` |
+| `health.py:146` | `pass` | Same, for summary state — a conversation with an unreadable summary file just stops being counted |
+| `retrieval.py:257` | `return 0` | ChromaDB unavailable is **indistinguishable from "no exchanges indexed"**. Compounds `health.py:138`: a dead vector store reports as an empty one |
+| `main.py:1669,1676,1681,1691` | `None` / empty dict | `/admin/conversations/{id}` reports `facts.count = None` and `episodic = None` on any read error. Reads as "this conversation has no memory" to anyone inspecting it — including during an incident |
+| `bgwork.py:62` | `pass` | A background task dying leaves no trace |
+| `commands.py:196,201` | `pass` | Slash-command side effects failing silently |
+| `main.py:830` | bare `return` | Async tail aborting with no record |
+| `main.py:1570` | `pass` | — |
+| `backup.py:370` | `pass` | `_alert_failure` swallowing its own failure. **The alert about a failure can fail silently.** Combined with P0-1 (no webhook configured at all), alerting is silent twice over |
+| `degrade.py:68` | `float("inf")` | Documented fail-open, and correct — but a permanently broken `disk_usage` makes the disk-pressure guard pass forever with nothing said. Log once per process, do not change the behaviour |
+| `backup.py:100` | `float("inf")` | Same shape, on the backup staleness check |
+
+**Class B — legitimate cleanup, leave the behaviour, add a DEBUG line.** `memory.py:247` (directory `fsync` after a successful write), `memory.py:254` (orphan temp-file cleanup that deliberately does not shadow the original `raise`), `backup.py:332,357` (deleting an unverifiable archive — the real error *is* logged and alerted), `selftest.py:197,225,334,480` (post-test cleanup, though see D10: this is one source of store pollution).
+
+**Class C — no change. The error is already propagated by return value** and surfaces to a caller: `selftest.py:123,133,189,276` return `(False, detail)`; `health.py:72,111,184,191,206` return error dicts that appear in `/health/full`; `backup.py:227,235,252,263` return `(False, msg)` from the verify path.
+
+**The rule to adopt, and to enforce in review.** A handler may swallow an exception only if it does exactly one of: logs it, re-raises it, or returns it to a caller that surfaces it. **"Returns a plausible-looking default" is none of those three.** That single rule is what P0-0 violated for months, and what `health.py:134` violates today in the one endpoint whose purpose is to notice.
+
+**Also worth fixing while in here.** Class-A handlers that fire on every request should log **once per process**, not per call, or the fix becomes its own denial of service. A module-level `_warned: set[str]` keyed by call site is enough.
+
+**Concrete change.** ~13 handlers in Class A get a `logger.warning` with the exception type and enough context to identify the conversation; ~8 in Class B get `logger.debug`. No control flow changes anywhere except `retrieval.py:257`, which must distinguish "unavailable" from "zero" — return `None` and let callers render it as `unknown` rather than `0`.
+
+**Verify.**
+```bash
+# 1. No Class-A handler is silent any more. Re-run the sweep; expect only Class B/C.
+python3 log-sweep.py                 # full listing, triage by hand
+python3 log-sweep.py --count         # baseline was 47 on 2026-08-27
+
+# 2. The health endpoint reports corruption instead of hiding it:
+mv /data/openwebui/compactor/facts/<some_conv>.json{,.bak}
+printf 'not json' > /data/openwebui/compactor/facts/<some_conv>.json
+curl -s localhost:8080/health/full | grep -iE 'status|unreadable|error'
+#    expect: a non-ok status or an explicit unreadable count — NOT a silently smaller facts_total
+mv /data/openwebui/compactor/facts/<some_conv>.json{.bak,}
+
+# 3. A dead vector store is distinguishable from an empty one:
+curl -s localhost:8080/admin/conversations/<conv> | grep episodic
+#    expect: null/"unknown" when Chroma is down, 0 only when genuinely empty
+```
+
+**Depends on:** nothing. **Blocks:** nothing. Do it in one sitting alongside P0-1 — the alert webhook is useless if the code never says anything worth alerting about.
+
+---
+
 #### P0-3 · F15 — Episodic retrieval is disabled entirely for any short or windowed client array
 **S2, and it was live during the incident.** `compactor/main.py:1358`, `compactor/retrieval.py:219`
 
