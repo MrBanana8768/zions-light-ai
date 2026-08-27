@@ -42,6 +42,7 @@ import retrieval
 import selftest as selftest_module
 import summarizer
 from memory import (
+    StoreUnreadable,
     conv_lock,
     ensure_storage_layout,
     facts_path,
@@ -214,14 +215,26 @@ def _note_backend_rejection(err_body: str) -> None:
         m = _CTX_OVERFLOW_RE.search(body)
         if m:
             actual = int(m.group(1))
-            overshoot = actual - HARD_INPUT_LIMIT
+            # v3.1 P0-0b: measure against the limit we ACTUALLY enforced, not
+            # the original one. _enforce_hard_budget has already shed to
+            # HARD_INPUT_LIMIT - _BUDGET_MARGIN, so measuring against
+            # HARD_INPUT_LIMIT understates the undercount by exactly the margin
+            # already in force — and the monotonic guard below then refuses to
+            # advance until the undercount roughly doubles. Observed live on
+            # 2026-08-27: three consecutive failures on one conversation moved
+            # the margin 2628 -> 2755 -> 2882, +127 each time (the
+            # conversation's own growth per turn) while it needed ~5250. That is
+            # a loop, not a retry: ~19 more broken messages for the user.
+            # The max(256, ...) mirrors the same clamp in _enforce_hard_budget.
+            effective_limit = max(256, HARD_INPUT_LIMIT - _BUDGET_MARGIN)
+            overshoot = actual - effective_limit
             if overshoot > 0:
                 new_margin = min(overshoot + 512, MAX_MODEL_LEN // 4)
                 if new_margin > _BUDGET_MARGIN:
                     _BUDGET_MARGIN = new_margin
                     logger.warning(
                         f"context calibration: vLLM counted {actual} tokens where "
-                        f"we budgeted <= {HARD_INPUT_LIMIT} — our estimate "
+                        f"we budgeted <= {effective_limit} — our estimate "
                         f"undercounts (images are the usual cause). Tightening the "
                         f"hard limit by {new_margin} for subsequent requests; the "
                         f"next message in this conversation should succeed."
@@ -295,7 +308,24 @@ def count_tokens(messages: list[dict]) -> int:
         try:
             text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             return len(tok.encode(text)) + image_tokens
-        except Exception:
+        except Exception as e:
+            # Tier 2, and until v3.1 it was the tier that always ran while
+            # saying nothing: jinja2 was missing from the venv and the served
+            # vision model carries no chat template, so tier 1 has never
+            # executed in production. The framing this drops is ~22 tokens per
+            # message on Mistral — an error that scales with MESSAGE COUNT, not
+            # content length, which is why a long conversation of short turns
+            # overflows and a short one of long turns does not. It cost ~5,250
+            # tokens against a 32,768 window on 2026-08-27. Once per process:
+            # this runs several times per request. (v3.1 P0-0 / F60.)
+            if logsetup.log_once("count_tokens.chat_template"):
+                logger.warning(
+                    f"could not apply the chat template for {MODEL_REPO} "
+                    f"({type(e).__name__}: {e}); using per-message encode()+4 — "
+                    f"every token count from this process UNDERCOUNTS by the "
+                    f"template's per-message framing, and every budget decision "
+                    f"downstream inherits that error"
+                )
             total = 0
             for m in messages:
                 total += len(tok.encode(_message_text(m))) + 4
@@ -827,7 +857,19 @@ class SseAccumulator:
     def feed(self, chunk: bytes) -> None:
         try:
             self._buffer += chunk.decode("utf-8", errors="replace")
-        except Exception:
+        except Exception as e:
+            # Dropping a chunk here does not fail the request — the user still
+            # sees the full reply, because the bytes are forwarded separately.
+            # What is lost is this accumulator's copy, so the memory tail
+            # extracts facts, embeds and summarizes a reply with a hole in it,
+            # and .complete() may still say the stream finished cleanly. Once
+            # per process: feed() runs per SSE chunk. (v3.1 P0-2b / F61.)
+            if logsetup.log_once("accumulator.feed.decode"):
+                logger.warning(
+                    f"stream accumulator dropped a chunk ({type(e).__name__}: "
+                    f"{e}); the assistant text memorized for this turn is "
+                    f"incomplete"
+                )
             return
         while "\n\n" in self._buffer:
             event, self._buffer = self._buffer.split("\n\n", 1)
@@ -959,7 +1001,18 @@ async def _async_tail(
         # _merge_touched) so we don't clobber a concurrent tail's writes.
         async with conv_lock(conv_id):
             try:
-                facts.save_facts(conv_id, _merge_touched(facts.load_facts(conv_id), touched_facts))
+                merged = _merge_touched(facts.load_facts(conv_id), touched_facts)
+                # Nothing to persist means nothing to write (v3.1 G2) — an
+                # empty write here creates a facts file for every background
+                # utility call the compactor ever sees, and list_known_conv_ids
+                # counts them forever.
+                if merged:
+                    facts.save_facts(conv_id, merged)
+            except StoreUnreadable as e:
+                logger.error(
+                    f"conv={conv_id}: facts file unreadable ({e}); skipped the "
+                    f"touched-save rather than writing over it"
+                )
             except Exception as e:
                 logger.warning(f"conv={conv_id}: touched-save failed: {e}")
         return
@@ -1013,12 +1066,29 @@ async def _async_tail(
                         )
 
             kept, dropped = facts.prune_facts(combined)
-            facts.save_facts(conv_id, kept)
+            # G2: no early return on empty extraction meant save_facts(conv_id,
+            # []) ran on EVERY exchange — the primary generator of the empty
+            # facts files D10 counts, and what made the F1a wipe re-fire every
+            # turn instead of occasionally. An empty `combined` is nothing to
+            # say, not a store to erase; a real prune down to zero still writes.
+            if combined:
+                facts.save_facts(conv_id, kept)
             if new_entries or dropped:
                 logger.info(
                     f"conv={conv_id}: +{len(new_entries)} facts, pruned {dropped}, "
                     f"total {len(kept)}"
                 )
+        except StoreUnreadable as e:
+            # The re-read above says the file is there and we can't read it,
+            # so `combined` is this exchange's facts and nothing else. Writing
+            # it is the 2026-08-24 shape: 105 facts atomically replaced by 1,
+            # logged as success. Skipping costs this one exchange's facts
+            # (v3.1 F1a).
+            logger.error(
+                f"conv={conv_id}: facts file unreadable ({e}); skipped the "
+                f"fact write to avoid overwriting the store with this "
+                f"exchange alone"
+            )
         except Exception as e:
             logger.exception(f"conv={conv_id}: async fact tail failed: {e}")
 
@@ -1073,6 +1143,21 @@ async def lifespan(app: FastAPI):
         await run_in_threadpool(backend_is_multimodal)
     except Exception as e:
         logger.warning(f"modality probe failed at startup (will retry lazily): {e}")
+    # v3.1 P0-0b: _BUDGET_MARGIN is a module global, so every correction the
+    # calibration loop ever learned is gone the moment this process restarts.
+    # Confirmed live on 2026-08-27 — a pod recreate mid-diagnosis reset it to 0
+    # and the climb started over with nothing in the log to say why. Persisting
+    # it is a larger change; until then the reset is at least announced, so the
+    # 400 the next long conversation eats is explained rather than mysterious.
+    # INFO, not WARNING: this fires on every clean boot, and a warning that is
+    # always present is a warning nobody reads — the exact habit that let the
+    # token-counter fallback run unnoticed for months.
+    logger.info(
+        f"context calibration starts at {_BUDGET_MARGIN} for this process — "
+        f"the learned budget margin does not survive a restart. The first "
+        f"conversation large enough to expose the token undercount will take "
+        f"one vLLM 400 before the margin is relearned."
+    )
     yield
     # Graceful: give in-flight background work (fact extraction, indexing,
     # rollup, backfill) a moment to finish via the bounded pool.
@@ -1267,6 +1352,19 @@ async def chat_completions(request: Request) -> Any:
                     "persona_text": persona.get_persona_text(conv_id),
                 },
             )
+        except StoreUnreadable as e:
+            # v3.1: a real person types these into a chat box. The operator
+            # needs the path and the exception; she needs to know the data is
+            # not gone and that she did nothing wrong. Full detail to the log,
+            # plain language to the reply.
+            logger.error(f"conv={conv_id}: /{cmd_name} failed — store unreadable: {e}")
+            cmd_text = (
+                "I couldn't read my stored memory for this conversation just "
+                "now, so I've made no changes rather than risk losing anything. "
+                "Nothing has been deleted. This is a problem on my side — "
+                "please try again in a moment, and mention it if it keeps "
+                "happening."
+            )
         except Exception as e:
             logger.exception(f"command handling failed: {e}")
             cmd_text = f"Command failed: {type(e).__name__}: {e}"
@@ -1336,6 +1434,17 @@ async def chat_completions(request: Request) -> Any:
             if pblock:
                 injected_blocks.append(pblock)
                 log_parts.append(f"persona({len(ptext)}ch)")
+        except StoreUnreadable as e:
+            # auto_capture_persona reads before it writes, so an unreadable
+            # record used to read as "no persona set" and get replaced by
+            # whatever this request's system message happened to be — on the
+            # request path, before vLLM is called (v3.1 F1c). It now raises
+            # here instead: nothing is written, and this turn goes out
+            # without the persona block rather than losing it.
+            logger.error(
+                f"conv={conv_id}: persona file unreadable ({e}); not captured, "
+                f"not injected, and NOT overwritten"
+            )
         except Exception as e:
             logger.warning(f"conv={conv_id}: persona handling failed (non-fatal): {e}")
 
@@ -1567,8 +1676,18 @@ async def chat_completions(request: Request) -> Any:
                 .get("content", "")
                 or ""
             )
-        except (IndexError, KeyError, TypeError):
-            pass
+        except (IndexError, KeyError, TypeError) as e:
+            # An unexpected response shape leaves assistant_text empty, and the
+            # tail below still fires — so the exchange is memorized as a user
+            # turn answered by nothing. Indistinguishable from a model that
+            # replied with silence unless we say so. Once per process: this is
+            # the request path. (v3.1 P0-2b / F61.)
+            if logsetup.log_once("nonstream.assistant_text"):
+                logger.warning(
+                    f"conv={conv_id}: could not read assistant text from the "
+                    f"vLLM response ({type(e).__name__}: {e}); this turn is "
+                    f"memorized without the model's reply"
+                )
         if conv_id:
             _fire_and_forget(
                 _async_tail(
@@ -1662,23 +1781,46 @@ async def admin_conversation_summary(conv_id: str):
     Phase 2 adds facts count, Phase 3 adds episodic doc count, Phase 4 adds
     the hierarchical summary state shape.
     """
+    # v3.1 P0-2b: every handler below reports a null/empty layer on a read
+    # error, which reads as "this conversation has no memory" to whoever is
+    # inspecting it — and the person inspecting it is, by definition, doing so
+    # during an incident. The response shape is unchanged (that is the D1/F5
+    # per-layer {ok,error} work); what changes is that the log now says the
+    # difference between empty and unreadable. Once per call site: the endpoint
+    # is per-request, and the JSON body carries the per-call signal.
     info = storage_summary(conv_id)
     # Facts (Phase 2)
     try:
         info["facts"]["count"] = len(facts.load_facts(conv_id))
-    except Exception:
+    except Exception as e:
+        if logsetup.log_once("admin.conv_summary.facts"):
+            logger.warning(
+                f"conv={conv_id}: facts unreadable ({type(e).__name__}: {e}); "
+                f"/admin/conversations reports count=null, which is NOT the "
+                f"same as zero facts"
+            )
         info["facts"]["count"] = None
     # Episodic memory (Phase 3)
     try:
         info["episodic"] = {
             "indexed_exchanges": retrieval.conversation_doc_count(conv_id),
         }
-    except Exception:
+    except Exception as e:
+        if logsetup.log_once("admin.conv_summary.episodic"):
+            logger.warning(
+                f"conv={conv_id}: episodic count unreadable "
+                f"({type(e).__name__}: {e}); reported as null, not zero"
+            )
         info["episodic"] = {"indexed_exchanges": None}
     # Hierarchical summary (Phase 4)
     try:
         info["summary"] = summarizer.state_summary(summarizer.load_state(conv_id))
-    except Exception:
+    except Exception as e:
+        if logsetup.log_once("admin.conv_summary.summary"):
+            logger.warning(
+                f"conv={conv_id}: summary state unreadable "
+                f"({type(e).__name__}: {e}); reported as null, not absent"
+            )
         info["summary"] = None
     # Persona (V2.1 Phase 8)
     try:
@@ -1688,7 +1830,13 @@ async def admin_conversation_summary(conv_id: str):
             "length": len(prec["persona_text"]) if prec else 0,
             "source": prec["source"] if prec else None,
         }
-    except Exception:
+    except Exception as e:
+        if logsetup.log_once("admin.conv_summary.persona"):
+            logger.warning(
+                f"conv={conv_id}: persona unreadable ({type(e).__name__}: "
+                f"{e}); reported as present=false, which is NOT the same as "
+                f"no persona stored"
+            )
         info["persona"] = {"present": False, "length": 0, "source": None}
     return info
 
@@ -1723,10 +1871,26 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
     """Wipe every memory layer for a conv. Returns counters for the
     response body. `source` is just for log labeling."""
     async with conv_lock(conv_id):
-        existing = facts.load_facts(conv_id)
-        n_facts = len(existing)
-        if n_facts > 0:
-            facts.save_facts(conv_id, [])
+        # v3.1: an unreadable facts file must not abort the whole wipe. The
+        # user asked for this data to be gone; refusing to clear the three
+        # layers we CAN read would leave more behind than clearing them does,
+        # and would report failure for work that partly succeeded. Clear what
+        # is readable, and say plainly which layer could not be.
+        unreadable: list[str] = []
+        try:
+            existing = facts.load_facts(conv_id)
+            n_facts = len(existing)
+            if n_facts > 0:
+                facts.save_facts(conv_id, [])
+        except StoreUnreadable as e:
+            n_facts = 0
+            unreadable.append("facts")
+            logger.error(
+                f"conv={conv_id}: {source} forget could not read the facts file "
+                f"({e}); the other memory layers were still cleared. The facts "
+                f"file is left in place — it cannot be safely rewritten from an "
+                f"unknown state."
+            )
         # Episodic memory lives in ChromaDB.
         n_episodic = retrieval.forget_conversation(conv_id)
         # Hierarchical summary state on disk.
@@ -1757,6 +1921,9 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
         "forgotten_episodic": n_episodic,
         "forgotten_summary": summary_deleted,
         "forgotten_persona": persona_deleted,
+        # Present only when a layer could not be read. Callers must not
+        # report a clean wipe when this is non-empty.
+        "unreadable": unreadable,
     }
 
 

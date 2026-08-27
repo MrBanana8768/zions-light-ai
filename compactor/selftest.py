@@ -194,8 +194,8 @@ async def _check_chat_round_trip(client: httpx.AsyncClient) -> tuple[bool, str]:
             f"{COMPACTOR_URL}/admin/conversations/{one_shot_conv}/facts",
             timeout=5.0,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"one-shot cleanup of {one_shot_conv} failed: {e}")
     return True, f"response_len={len(content)}"
 
 
@@ -222,8 +222,8 @@ def _check_facts_round_trip() -> tuple[bool, str]:
         # Cleanup — even on failure, leave no junk behind.
         try:
             facts.save_facts(SELFTEST_CONV_ID, [])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"selftest facts cleanup failed: {e}")
 
 
 async def _check_admin_localhost(client: httpx.AsyncClient) -> tuple[bool, str]:
@@ -331,8 +331,9 @@ async def wait_for_vllm_ready(timeout_s: float = WAIT_FOR_READY_TIMEOUT_S) -> bo
                     if r.status_code == 200 and (r.json().get("data") or []):
                         models_ready = True
                         logger.info("vLLM /v1/models responding — probing engine readiness")
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Expected while vLLM is still binding its port.
+                    logger.debug(f"vLLM /v1/models not up yet: {e}")
 
             # Phase 2 — engine actually completing
             if models_ready:
@@ -352,9 +353,9 @@ async def wait_for_vllm_ready(timeout_s: float = WAIT_FOR_READY_TIMEOUT_S) -> bo
                         logger.info(f"vLLM fully ready (completions live) after {elapsed:.0f}s")
                         return True
                     # 503 / 5xx → engine still warming. Keep polling.
-                except Exception:
+                except Exception as e:
                     # Network errors during warmup are expected — keep polling.
-                    pass
+                    logger.debug(f"vLLM completion probe not ready yet: {e}")
 
             await asyncio.sleep(WAIT_FOR_READY_POLL_INTERVAL_S)
     logger.warning(f"vLLM did not become ready within {timeout_s}s")
@@ -477,8 +478,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"{label} self-test failed: {', '.join(failed) or 'unknown'}",
                 extra={"summary": report.get("summary")},
             )
-        except Exception:
-            pass
+        except Exception as e:
+            # The report is already on stdout and the exit code is nonzero,
+            # so the failure itself is not lost — only the notification is.
+            logger.debug(f"selftest failure alert not sent: {e}")
 
     return 0 if report["status"] == "pass" else 1
 

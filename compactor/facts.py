@@ -37,11 +37,12 @@ from typing import Any
 import httpx
 
 from memory import (
+    StoreUnreadable,
     atomic_write_json,
     conv_lock,
     facts_archive_path,
     facts_path,
-    read_json,
+    read_json_strict,
 )
 
 logger = logging.getLogger("compactor.facts")
@@ -103,9 +104,15 @@ def _estimate_tokens(text: str) -> int:
 
 def load_facts(conv_id: str) -> list[dict]:
     """Return the current facts list for a conversation. Empty list if no
-    facts file exists yet (or if the file is corrupted — logged).
+    facts file exists yet.
+
+    Raises memory.StoreUnreadable if the file IS there and could not be
+    read. It used to return [] for that too, which every caller that then
+    saved read as "this conversation has no facts" and wrote back over the
+    real ones (v3.1 F1a). Callers that merely display or count facts should
+    catch it and say so; callers that write must abort.
     """
-    data = read_json(facts_path(conv_id), default={})
+    data = read_json_strict(facts_path(conv_id), default={})
     facts = data.get("facts", []) if isinstance(data, dict) else []
     # Defensive: ensure each entry has the expected shape; drop malformed.
     valid: list[dict] = []
@@ -152,8 +159,14 @@ ARCHIVE_DEFAULT_DAYS = int(
 
 
 def load_archive(conv_id: str) -> list[dict]:
-    """Return the archived facts list for a conv. Empty if no archive yet."""
-    data = read_json(facts_archive_path(conv_id), default={})
+    """Return the archived facts list for a conv. Empty if no archive yet.
+
+    Raises memory.StoreUnreadable on an unreadable sidecar, same contract
+    as load_facts. restore_from_archive reads BOTH halves and writes both
+    back, so a silent empty here lost the cold store and the active set in
+    one call (v3.1 F1e).
+    """
+    data = read_json_strict(facts_archive_path(conv_id), default={})
     archived = data.get("facts", []) if isinstance(data, dict) else []
     valid: list[dict] = []
     for f in archived:
@@ -506,6 +519,15 @@ async def record_facts_for_exchange(
                     f"conv={conv_id}: +{len(new_entries)} facts, pruned {dropped} oldest"
                 )
             return len(new_entries)
+        except StoreUnreadable as e:
+            # The existing store is there and we could not read it, so
+            # `existing` is unknown, not empty. Writing now would replace the
+            # whole store with this one exchange (v3.1 F1a).
+            logger.error(
+                f"conv={conv_id}: facts file unreadable ({e}); skipped the "
+                f"fact write rather than overwriting it"
+            )
+            return 0
         except Exception as e:
             logger.exception(f"record_facts_for_exchange failed (non-fatal): {e}")
             return 0

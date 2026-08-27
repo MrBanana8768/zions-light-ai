@@ -97,7 +97,18 @@ def _free_mb(path: Path) -> float:
         p = p.parent
     try:
         return shutil.disk_usage(str(p)).free / (1024 * 1024)
-    except Exception:
+    except Exception as e:
+        # Fail OPEN — a bad reading must not stop backups. Behaviour is
+        # deliberate and unchanged; the log is not. Silently returning inf
+        # left the min-free guard disabled forever with nothing said, so a
+        # permanently broken disk_usage looked exactly like a roomy disk.
+        # Once per process — this runs every cycle. (v3.1 P0-2b / F61.)
+        import logsetup
+        if logsetup.log_once("backup._free_mb"):
+            logger.warning(
+                f"could not read free space at {p} ({type(e).__name__}: {e}); "
+                f"the min-free backup guard is disabled for this process"
+            )
         return float("inf")  # can't tell → don't block
 
 
@@ -329,8 +340,8 @@ def run_once(backup_dir: Path | None = None) -> dict:
             # No false confidence — delete the unverifiable archive.
             try:
                 partial.unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                logger.debug(f"could not remove unverifiable {partial.name}: {e}")
             report["detail"] = f"VERIFICATION FAILED: {detail}"
             logger.error(f"backup verification failed, archive discarded: {detail}")
             _alert_failure(report["detail"])
@@ -354,8 +365,10 @@ def run_once(backup_dir: Path | None = None) -> dict:
         if partial and partial.exists():
             try:
                 partial.unlink()
-            except OSError:
-                pass
+            except OSError as unlink_err:
+                logger.debug(
+                    f"could not remove partial {partial.name}: {unlink_err}"
+                )
         report["detail"] = f"{type(e).__name__}: {e}"
         logger.error(f"backup failed: {report['detail']}")
         _alert_failure(report["detail"])
@@ -367,8 +380,16 @@ def _alert_failure(detail: str) -> None:
     try:
         import alert
         alert.notify("backup", "fail", detail)
-    except Exception:
-        pass
+    except Exception as e:
+        # The alert about a failure could itself vanish: this handler was a
+        # bare `pass`, so a broken webhook, a missing alert module or a DNS
+        # failure silently ate the only outbound signal the backup daemon
+        # has. Not once-per-process — it fires only on a backup that already
+        # failed, and every one of those is worth a line. (v3.1 P0-2b / F61.)
+        logger.error(
+            f"could not send backup failure alert ({type(e).__name__}: {e}); "
+            f"the failure it was reporting was: {detail}"
+        )
 
 
 def latest_backup_info(backup_dir: Path | None = None) -> dict:

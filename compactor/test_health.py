@@ -170,6 +170,84 @@ def test_gather_memory_stats_counts_across_convs():
     s = health.gather_memory_stats()
     assert_eq(s["conversations"], 2, "2 convs known")
     assert_eq(s["facts_total"], 3, "3 facts total across both")
+    assert_eq(s["unreadable"], {"facts": 0, "episodic": 0, "summaries": 0},
+              "nothing unreadable on a healthy store")
+
+
+# ---------------------------------------------------------------------------
+# gather_memory_stats — the corruption the health endpoint exists to catch
+# (v3.1 P0-2b / F61)
+# ---------------------------------------------------------------------------
+
+def test_unreadable_facts_are_counted_not_hidden():
+    """The defect this replaces: an unreadable facts file was skipped by a
+    bare `pass`, so facts_total simply read LOWER while status stayed "ok".
+    A silently smaller number is the failure mode — the total must come with
+    a count of what could not be read."""
+    print("\n[test] gather_memory_stats counts an unreadable facts file")
+    shutil.rmtree(_TMP_ROOT, ignore_errors=True)
+    os.makedirs(_TMP_ROOT, exist_ok=True)
+    memory.ensure_storage_layout()
+    facts.save_facts("readable", [{"text": "r1", "added_turn": 0, "last_used": 0}])
+    facts.save_facts("broken", [{"text": "b1", "added_turn": 0, "last_used": 0}])
+
+    real_load = facts.load_facts
+
+    def _load(cid):
+        if cid == "broken":
+            raise OSError(5, "Input/output error")
+        return real_load(cid)
+
+    facts.load_facts = _load
+    try:
+        s = health.gather_memory_stats()
+    finally:
+        facts.load_facts = real_load
+
+    assert_eq(s["conversations"], 2, "both convs still enumerated")
+    assert_eq(s["facts_total"], 1, "only the readable conv's fact counted")
+    assert_eq(s["unreadable"]["facts"], 1, "the unreadable one is COUNTED")
+
+
+def test_unreadable_summary_is_counted():
+    print("\n[test] gather_memory_stats counts an unreadable summary state")
+    real_load = summarizer.load_state
+
+    def _load(cid):
+        raise OSError(5, "Input/output error")
+
+    summarizer.load_state = _load
+    try:
+        s = health.gather_memory_stats()
+    finally:
+        summarizer.load_state = real_load
+
+    assert_eq(s["unreadable"]["summaries"], s["conversations"],
+              "every conv's summary counted as unreadable")
+    assert_eq(s["summaries_with_l1"], 0, "none counted as having l1")
+
+
+def test_dead_vector_store_is_not_reported_as_empty():
+    """conversation_doc_count returns None when Chroma is unavailable. If
+    NOTHING could be counted, indexed_exchanges_total must be None — a dead
+    vector store reporting `0` beside `"status": "ok"` is the blind spot."""
+    print("\n[test] dead vector store -> indexed_exchanges_total is None, not 0")
+    real_count = retrieval.conversation_doc_count
+    retrieval.conversation_doc_count = lambda cid: None
+    try:
+        s = health.gather_memory_stats()
+    finally:
+        retrieval.conversation_doc_count = real_count
+
+    assert_eq(s["indexed_exchanges_total"], None, "unknown, not 0")
+    assert_eq(s["unreadable"]["episodic"], s["conversations"], "all convs uncounted")
+
+
+def test_empty_vector_store_still_reports_zero():
+    print("\n[test] healthy but empty vector store still reports 0")
+    s = health.gather_memory_stats()
+    assert_eq(s["indexed_exchanges_total"], 0, "0 means genuinely empty")
+    assert_eq(s["unreadable"]["episodic"], 0, "nothing uncounted")
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +327,12 @@ def _all_tests():
         test_probe_storage_reports_disk_usage,
         test_gather_memory_stats_empty,
         test_gather_memory_stats_counts_across_convs,
+        # Order matters: the first of these reseeds the store with the two
+        # convs ("readable" / "broken") the rest of the group counts against.
+        test_unreadable_facts_are_counted_not_hidden,
+        test_unreadable_summary_is_counted,
+        test_dead_vector_store_is_not_reported_as_empty,
+        test_empty_vector_store_still_reports_zero,
         test_status_ok_when_all_pass,
         test_status_degraded_when_vllm_unreachable,
         test_status_down_when_storage_broken,

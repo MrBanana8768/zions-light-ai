@@ -238,34 +238,82 @@ def test_memorable_user_text():
 
 
 
+def ctx_400(actual_tokens):
+    """A vLLM context-length 400 body in the production shape."""
+    return (
+        '{"error":{"message":"This model\'s maximum context length is 32768 '
+        'tokens. However, you requested 0 output tokens and your prompt '
+        'contains ' + str(actual_tokens) + ' input tokens, for a total of ... '
+        '(parameter=input_tokens)"}}'
+    )
+
+
 def test_context_calibration():
-    print("\n[test] _note_backend_rejection — learns from a context-length 400")
-    # The production body, verbatim shape: vLLM counted 35510 where our guard
-    # budgeted <= HARD_INPUT_LIMIT. The margin must cover the observed gap.
+    # This test runs on a WIDER window than the rest of the file. The
+    # module-level MAX_MODEL_LEN=1000 cannot express P0-0b: it puts the margin
+    # cap (MAX_MODEL_LEN // 4 = 250) below the very first overshoot, so every
+    # report saturates at the cap and the arithmetic under test is
+    # unobservable — the defect and the fix produce identical numbers. Use the
+    # production values from 2026-08-27 instead: a 32768 window with the 2048
+    # generation reserve that was in force that day, giving HARD_INPUT_LIMIT
+    # 30720, which is the number the observed margins reconstruct to.
     orig_margin = main._BUDGET_MARGIN
     orig_modal = main._backend_multimodal
+    orig_max_len = main.MAX_MODEL_LEN
+    orig_limit = main.HARD_INPUT_LIMIT
     try:
+        main.MAX_MODEL_LEN = 32768
+        main.HARD_INPUT_LIMIT = 30720
         main._BUDGET_MARGIN = 0
         main._backend_multimodal = True
-        overshoot_body = (
-            '{"error":{"message":"This model\'s maximum context length is 32768 tokens. '
-            'However, you requested 0 output tokens and your prompt contains '
-            + str(main.HARD_INPUT_LIMIT + 100)
-            + ' input tokens, for a total of ... (parameter=input_tokens)"}}'
-        )
-        main._note_backend_rejection(overshoot_body)
-        assert_true(main._BUDGET_MARGIN >= 100, f"margin covers the gap ({main._BUDGET_MARGIN})")
-        assert_true(main._BUDGET_MARGIN <= main.MAX_MODEL_LEN // 4, "margin is capped")
+
+        print("\n[test] _note_backend_rejection — learns from a context-length 400")
+        # 05:53:46 on the day: vLLM counted 32836 against a 30720 budget.
+        main._note_backend_rejection(ctx_400(32836))
+        assert_eq(main._BUDGET_MARGIN, 2628, "first failure: 32836 - 30720, + 512 slack")
         assert_eq(main._backend_multimodal, True, "modality untouched by a context 400")
 
+        print("\n[test] the SECOND failure measures against the tightened limit")
+        # v3.1 P0-0b, the whole item. With a 2628 margin in force the guard shed
+        # to 30720 - 2628 = 28092, so vLLM's 32963 is a 4871-token undercount —
+        # not the 2243 you get by measuring against the untightened 30720. The
+        # defect computed 2755 here: +127, which is the conversation's own
+        # growth per turn, while the payload never shrank. It was a loop, not a
+        # retry.
+        main._note_backend_rejection(ctx_400(32963))
+        assert_eq(main._BUDGET_MARGIN, 5383, "32963 - (30720 - 2628), + 512 slack")
+        assert_true(main._BUDGET_MARGIN > 2755, "did not crawl by the defect's +127")
+
+        print("\n[test] two failures cover the real undercount, not nineteen")
+        # The true undercount was ~5250 tokens on a ~200-message conversation
+        # (chat-template framing, P0-0). At 127/failure the defect needed ~19
+        # more broken messages to get here. Converging is the point of the fix.
+        assert_true(main._BUDGET_MARGIN >= 5250, f"covers the ~5250 gap ({main._BUDGET_MARGIN})")
+
         print("\n[test] calibration is monotonic — a smaller report never loosens it")
+        # Genuinely the monotonic guard, not the cap: 5383 is well under
+        # MAX_MODEL_LEN // 4 = 8192. The effective limit is now 25337, so 26000
+        # overshoots by 663 and computes a 1175 margin, which must be discarded.
         prev = main._BUDGET_MARGIN
-        main._note_backend_rejection(
-            '{"error":{"message":"maximum context length is 32768 tokens ... prompt contains '
-            + str(main.HARD_INPUT_LIMIT + 50)
-            + ' input tokens"}}'
-        )
+        main._note_backend_rejection(ctx_400(26000))
         assert_eq(main._BUDGET_MARGIN, prev, "kept the larger learned margin")
+
+        print("\n[test] the margin is still capped")
+        # Measuring against the tightened limit produces larger overshoots, so
+        # the cap matters more than it did: a pathological report must not be
+        # able to crush the window.
+        main._note_backend_rejection(ctx_400(40000))
+        assert_eq(main._BUDGET_MARGIN, main.MAX_MODEL_LEN // 4, "capped at MAX_MODEL_LEN // 4")
+
+        print("\n[test] a report at exactly the tightened limit is not an overshoot")
+        main._BUDGET_MARGIN = 2628
+        main._note_backend_rejection(ctx_400(30720 - 2628))
+        assert_eq(main._BUDGET_MARGIN, 2628, "zero overshoot leaves the margin alone")
+
+        print("\n[test] under-limit reports do nothing")
+        main._BUDGET_MARGIN = 0
+        main._note_backend_rejection(ctx_400(10))
+        assert_eq(main._BUDGET_MARGIN, 0, "no overshoot -> no margin")
 
         print("\n[test] the guard applies the learned margin")
         main._BUDGET_MARGIN = 300
@@ -275,16 +323,11 @@ def test_context_calibration():
         ]
         out = main._enforce_hard_budget(msgs, 700)  # effective limit 400
         assert_true(main.count_tokens(out) <= 400, "shed to the tightened limit")
-
-        print("\n[test] under-limit reports do nothing")
-        main._BUDGET_MARGIN = 0
-        main._note_backend_rejection(
-            '{"error":{"message":"maximum context length is 32768 tokens ... prompt contains 10 input tokens"}}'
-        )
-        assert_eq(main._BUDGET_MARGIN, 0, "no overshoot -> no margin")
     finally:
         main._BUDGET_MARGIN = orig_margin
         main._backend_multimodal = orig_modal
+        main.MAX_MODEL_LEN = orig_max_len
+        main.HARD_INPUT_LIMIT = orig_limit
 
 
 if __name__ == "__main__":

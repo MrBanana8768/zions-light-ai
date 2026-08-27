@@ -131,11 +131,9 @@ def test_save_load_roundtrip():
     assert_eq(loaded["last_summarized_turn"], 4, "turn counter preserved")
 
 
-def test_load_state_drops_corrupt_chunks():
-    print("\n[test] load_state filters malformed l1/l2 entries")
-    _wipe()
-    cid = "bad"
-    raw = {
+def _unparseable_state(cid: str) -> dict:
+    """A summary file mixing chunks we understand with entries we do not."""
+    return {
         "conv_id": cid,
         "l1": [
             {"text": "ok", "first_turn": 1, "last_turn": 4},
@@ -144,13 +142,123 @@ def test_load_state_drops_corrupt_chunks():
             {"text": "no_turns"},                                # missing fields
             {"text": "also ok", "first_turn": 9, "last_turn": 12},
         ],
-        "l2": [],
+        "l2": [{"kind": "chapter-v2", "body": "a shape a newer build writes"}],
         "l3": None,
         "last_summarized_turn": 12,
     }
-    summarizer.summary_path(cid).write_text(json.dumps(raw))
+
+
+def test_load_state_parks_unrecognized_chunks():
+    print("\n[test] load_state keeps malformed l1/l2 entries out of the tiers")
+    _wipe()
+    cid = "bad"
+    summarizer.summary_path(cid).write_text(json.dumps(_unparseable_state(cid)))
     loaded = summarizer.load_state(cid)
     assert_eq(len(loaded["l1"]), 2, "filtered to 2 valid chunks")
+    # They are parked, not dropped — the tiers below never see them, and the
+    # next save_state puts them back (v3.1 F1b, change 4).
+    parked = loaded.get(summarizer._UNRECOGNIZED) or {}
+    assert_eq(len(parked.get("l1") or []), 3, "3 unrecognized l1 entries parked")
+    assert_eq(len(parked.get("l2") or []), 1, "1 unrecognized l2 entry parked")
+
+
+# ---------------------------------------------------------------------------
+# _unrecognized round-trip (v3.1 F1b, change 4)
+# ---------------------------------------------------------------------------
+#
+# The filter used to be silently destructive: load_state discarded whatever it
+# did not recognise and the next save_state persisted the filtered list, so a
+# schema change — or a single chunk written by a newer build — deleted
+# summaries nobody had asked to delete. save_state runs on every rollup, so one
+# read by an older build was enough. This shipped with no test: deleting the
+# fold-back in _for_disk left the whole suite green.
+
+def test_unrecognized_entries_survive_a_load_save_cycle():
+    print("\n[test] load_state → save_state does not delete what it could not parse")
+    _wipe()
+    cid = "round-trip"
+    summarizer.summary_path(cid).write_text(json.dumps(_unparseable_state(cid)))
+    state = summarizer.load_state(cid)
+    summarizer.save_state(cid, state)  # the destructive step, pre-v3.1
+
+    on_disk = json.loads(summarizer.summary_path(cid).read_text(encoding="utf-8"))
+    assert_eq(len(on_disk["l1"]), 5, "all 5 l1 entries back on disk")
+    assert_eq(len(on_disk["l2"]), 1, "the unrecognized l2 entry back on disk")
+    assert_true("not a dict" in on_disk["l1"], "the bare string survived verbatim")
+    assert_true({"text": "no_turns"} in on_disk["l1"], "the partial dict survived verbatim")
+    assert_true(on_disk["l2"][0]["kind"] == "chapter-v2", "the newer-build shape survived")
+    # The parking key is an in-memory detail; it must not leak into the file or
+    # the next reader parks the parked entries.
+    assert_true(summarizer._UNRECOGNIZED not in on_disk,
+                "no _unrecognized key written to disk")
+
+
+def test_unrecognized_entries_survive_repeated_cycles():
+    print("\n[test] the round-trip is stable — entries neither vanish nor duplicate")
+    _wipe()
+    cid = "round-trip-twice"
+    summarizer.summary_path(cid).write_text(json.dumps(_unparseable_state(cid)))
+    for _ in range(3):
+        summarizer.save_state(cid, summarizer.load_state(cid))
+    on_disk = json.loads(summarizer.summary_path(cid).read_text(encoding="utf-8"))
+    assert_eq(len(on_disk["l1"]), 5, "still 5 l1 entries after 3 cycles")
+    assert_eq(len(on_disk["l2"]), 1, "still 1 l2 entry after 3 cycles")
+    reloaded = summarizer.load_state(cid)
+    assert_eq(len(reloaded["l1"]), 2, "still 2 parseable chunks in the tier")
+
+
+def test_unrecognized_l3_restored_when_live_l3_is_none():
+    print("\n[test] an unparseable l3 is parked and folded back, not deleted")
+    _wipe()
+    cid = "l3-parked"
+    raw = _unparseable_state(cid)
+    raw["l3"] = {"summary": "an l3 shape this build does not understand"}
+    summarizer.summary_path(cid).write_text(json.dumps(raw))
+    state = summarizer.load_state(cid)
+    assert_eq(state["l3"], None, "the unparseable l3 does not enter the tier")
+    assert_eq((state.get(summarizer._UNRECOGNIZED) or {}).get("l3"), raw["l3"],
+              "it is parked instead")
+    summarizer.save_state(cid, state)
+    on_disk = json.loads(summarizer.summary_path(cid).read_text(encoding="utf-8"))
+    assert_eq(on_disk["l3"], raw["l3"], "folded back on save")
+
+
+def test_real_l3_is_not_reverted_to_the_parked_one():
+    print("\n[test] a rollup's real l3 is not overwritten by the parked one")
+    # The one asymmetry in the fold-back: content must be preserved, but a
+    # rollup that has since produced a real L3 must not be reverted to an
+    # unparseable predecessor.
+    _wipe()
+    cid = "l3-not-reverted"
+    raw = _unparseable_state(cid)
+    raw["l3"] = {"summary": "the old unparseable l3"}
+    summarizer.summary_path(cid).write_text(json.dumps(raw))
+    state = summarizer.load_state(cid)
+    state["l3"] = {"text": "a real L3 from a rollup", "first_turn": 1, "last_turn": 40}
+    summarizer.save_state(cid, state)
+    on_disk = json.loads(summarizer.summary_path(cid).read_text(encoding="utf-8"))
+    assert_eq(on_disk["l3"]["text"], "a real L3 from a rollup", "the real L3 stands")
+    assert_eq(summarizer.load_state(cid)["l3"]["text"], "a real L3 from a rollup",
+              "and reloads as the live L3")
+
+
+def test_clean_state_gains_no_unrecognized_key():
+    print("\n[test] a state where everything parses carries no parking key")
+    # Otherwise every caller that iterates or compares state dicts — and
+    # state_summary, and the admin summary endpoint — starts seeing a private
+    # key that was not there before.
+    _wipe()
+    cid = "all-clean"
+    summarizer.save_state(cid, {
+        "l1": [{"text": "Scene one.", "first_turn": 1, "last_turn": 20}],
+        "l2": [], "l3": None, "last_summarized_turn": 20,
+    })
+    loaded = summarizer.load_state(cid)
+    assert_true(summarizer._UNRECOGNIZED not in loaded,
+                "no parking key on a fully-parseable state")
+    on_disk = json.loads(summarizer.summary_path(cid).read_text(encoding="utf-8"))
+    assert_true(summarizer._UNRECOGNIZED not in on_disk, "none on disk either")
+    assert_eq(len(on_disk["l1"]), 1, "the one real chunk, not duplicated")
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +470,12 @@ if __name__ == "__main__":
     try:
         test_load_state_empty_when_no_file()
         test_save_load_roundtrip()
-        test_load_state_drops_corrupt_chunks()
+        test_load_state_parks_unrecognized_chunks()
+        test_unrecognized_entries_survive_a_load_save_cycle()
+        test_unrecognized_entries_survive_repeated_cycles()
+        test_unrecognized_l3_restored_when_live_l3_is_none()
+        test_real_l3_is_not_reverted_to_the_parked_one()
+        test_clean_state_gains_no_unrecognized_key()
         test_needs_l1_rollup_threshold()
         test_needs_l2_rollup_threshold()
         test_needs_l3_rollup_threshold()

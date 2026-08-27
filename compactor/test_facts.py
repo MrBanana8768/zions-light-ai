@@ -59,12 +59,23 @@ def test_load_facts_missing_file_returns_empty():
     assert_eq(facts.load_facts("never-seen"), [], "missing file -> []")
 
 
-def test_load_facts_corrupted_file_returns_empty():
-    print("\n[test] load_facts returns [] for a corrupted JSON file")
+def test_load_facts_corrupted_file_raises():
+    print("\n[test] load_facts raises StoreUnreadable for a corrupted JSON file")
+    # This test asserted `corrupt file -> []` until v3.1. That was the F1a
+    # contract written down as a requirement: every caller that saves read
+    # the [] as "no facts here" and wrote it back over the real store. An
+    # unreadable file must be distinguishable from an absent one — the test
+    # above covers absent, which still returns [] and always will.
     _wipe_storage()
     facts_path = memory.facts_path("corrupt")
     facts_path.write_text("{ not valid json")
-    assert_eq(facts.load_facts("corrupt"), [], "corrupt file -> [] (logged, not raised)")
+    try:
+        got = facts.load_facts("corrupt")
+    except memory.StoreUnreadable:
+        print("  ok   corrupt file -> StoreUnreadable")
+        return
+    print(f"FAIL corrupt file must not read as a fact store, got {got!r}")
+    sys.exit(1)
 
 
 def test_save_load_roundtrip():
@@ -467,7 +478,7 @@ def test_archive_path_is_sidecar_not_facts_file():
 if __name__ == "__main__":
     try:
         test_load_facts_missing_file_returns_empty()
-        test_load_facts_corrupted_file_returns_empty()
+        test_load_facts_corrupted_file_raises()
         test_save_load_roundtrip()
         test_save_facts_is_atomic_via_temp_file()
         test_load_facts_drops_malformed_entries()

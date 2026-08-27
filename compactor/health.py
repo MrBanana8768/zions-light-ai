@@ -32,6 +32,7 @@ from typing import Any
 import httpx
 
 import facts
+import logsetup
 import memory
 import retrieval
 import summarizer
@@ -121,36 +122,78 @@ def probe_storage() -> dict:
 
 def gather_memory_stats() -> dict:
     """Aggregate counters across every known conversation. Best-effort
-    per-conv: a single corrupted file doesn't poison the totals.
+    per-conv: a single corrupted file doesn't poison the totals — but it is
+    COUNTED, in `unreadable`, so the caller can see that the totals are
+    incomplete.
+
+    Before v3.1 each of these handlers was a bare `pass`. An unreadable
+    facts file — the exact corruption that destroys memory — was silently
+    skipped, so `facts_total` simply read lower while `status` stayed "ok".
+    The one endpoint whose purpose is to notice could not see the thing it
+    exists to catch. A silently smaller number is the defect, so a nonzero
+    `unreadable` count is the signal; the totals alone are not.
+    (v3.1 P0-2b / F61.)
     """
     conv_ids = memory.list_known_conv_ids()
     facts_total = 0
     indexed_total = 0
     summaries_with_l1 = 0
     summaries_with_l3 = 0
+    # Conversations whose layer could not be read at all. For episodic this
+    # also covers conversation_doc_count returning None (store unavailable),
+    # which is not an exception but is equally "we could not count this".
+    unreadable = {"facts": 0, "episodic": 0, "summaries": 0}
     for cid in conv_ids:
         try:
             facts_total += len(facts.load_facts(cid))
-        except Exception:
-            pass
+        except Exception as e:
+            unreadable["facts"] += 1
+            if logsetup.log_once("health.stats.facts"):
+                logger.warning(
+                    f"conv={cid}: facts unreadable during health scan "
+                    f"({type(e).__name__}: {e}); facts_total is incomplete — "
+                    f"see stats.unreadable.facts for the running count"
+                )
         try:
-            indexed_total += retrieval.conversation_doc_count(cid)
-        except Exception:
-            pass
+            n_indexed = retrieval.conversation_doc_count(cid)
+            if n_indexed is None:
+                unreadable["episodic"] += 1
+            else:
+                indexed_total += n_indexed
+        except Exception as e:
+            unreadable["episodic"] += 1
+            if logsetup.log_once("health.stats.episodic"):
+                logger.warning(
+                    f"conv={cid}: episodic count unreadable during health "
+                    f"scan ({type(e).__name__}: {e})"
+                )
         try:
             state = summarizer.load_state(cid)
             if state.get("l1"):
                 summaries_with_l1 += 1
             if state.get("l3"):
                 summaries_with_l3 += 1
-        except Exception:
-            pass
+        except Exception as e:
+            unreadable["summaries"] += 1
+            if logsetup.log_once("health.stats.summaries"):
+                logger.warning(
+                    f"conv={cid}: summary state unreadable during health scan "
+                    f"({type(e).__name__}: {e}); this conversation has stopped "
+                    f"being counted in summaries_with_l1/l3"
+                )
     return {
         "conversations": len(conv_ids),
         "facts_total": facts_total,
-        "indexed_exchanges_total": indexed_total,
+        # None, not 0, when nothing could be counted — a dead vector store
+        # must not report as an empty one (retrieval.conversation_doc_count).
+        "indexed_exchanges_total": (
+            None
+            if conv_ids and unreadable["episodic"] == len(conv_ids)
+            else indexed_total
+        ),
         "summaries_with_l1": summaries_with_l1,
         "summaries_with_l3": summaries_with_l3,
+        "unreadable": unreadable,
     }
 
 

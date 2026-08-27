@@ -27,6 +27,8 @@ import asyncio
 import logging
 import os
 
+import logsetup
+
 logger = logging.getLogger("compactor.bgwork")
 
 MAX_CONCURRENT = int(os.environ.get("COMPACTOR_MAX_CONCURRENT_TAILS", "4") or 4)
@@ -59,8 +61,18 @@ class BackgroundPool:
             # and so it releases anything it captured.
             try:
                 coro.close()
-            except Exception:
-                pass
+            except Exception as e:
+                # A close() that fails leaks whatever the coroutine
+                # captured — an httpx client, a message list — and it did so
+                # with no trace. Once per process: this is on the shedding
+                # path, which by definition fires in bursts.
+                # (v3.1 P0-2b / F61.)
+                if logsetup.log_once("bgwork.submit.coro_close"):
+                    logger.warning(
+                        f"shed coroutine would not close "
+                        f"({type(e).__name__}: {e}); it may be holding "
+                        f"resources for the life of the process"
+                    )
             if self._shed == 1 or self._shed % 25 == 0:
                 logger.warning(
                     f"background work shed (outstanding >= {self._max_outstanding}); "

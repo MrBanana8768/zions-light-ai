@@ -36,6 +36,7 @@ import time
 from typing import Any, Callable, Awaitable
 
 import facts as facts_module
+from memory import StoreUnreadable
 
 logger = logging.getLogger("compactor.commands")
 
@@ -176,6 +177,22 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
         parts.append(f"{result['forgotten_episodic']} indexed exchange(s)")
     if result.get("forgotten_summary"):
         parts.append("summary state")
+    # v3.1: main.py's _clear_all_memory states the contract in its return value
+    # — "callers must not report a clean wipe when `unreadable` is non-empty".
+    # This is that caller. A corrupt facts file is left on disk with unknown
+    # contents, and telling the user the conversation "had no stored memory"
+    # would be a degraded mode dressed as a healthy one, on the surface a real
+    # person types into.
+    unreadable = result.get("unreadable") or []
+    if unreadable:
+        cleared = ("Cleared " + ", ".join(parts) + ". ") if parts else ""
+        return (
+            f"{cleared}I could not read the stored "
+            f"{' and '.join(unreadable)} for this conversation, so I left "
+            f"{'it' if len(unreadable) == 1 else 'them'} untouched rather than "
+            f"overwrite something I can't see. Nothing was lost. Please "
+            f"mention this if it keeps happening."
+        )
     if not parts:
         return "Nothing to forget — this conversation had no stored memory."
     return "Forgot: " + ", ".join(parts) + "."
@@ -193,13 +210,24 @@ async def _handle_why(arg: str, conv_id: str, ctx: dict) -> str:
     try:
         import summarizer as summarizer_module
         summary_state = summarizer_module.load_state(conv_id)
-    except Exception:
-        pass
+    except Exception as e:
+        # /why is the user's only window into her own memory. A swallowed
+        # read error rendered as "(none)" tells her the layer is empty when
+        # it may be corrupt — the same lie the health endpoint told.
+        # (v3.1 P0-2b / F61.)
+        logger.warning(
+            f"conv={conv_id}: /why could not read summary state "
+            f"({type(e).__name__}: {e}); it renders as '(none)', which is "
+            f"indistinguishable from a conversation that has no summary yet"
+        )
     try:
         import retrieval as retrieval_module
         retrieval_count = retrieval_module.conversation_doc_count(conv_id)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(
+            f"conv={conv_id}: /why could not read episodic count "
+            f"({type(e).__name__}: {e}); reported as unavailable"
+        )
 
     lines = ["Memory state for this conversation:"]
     if facts:
@@ -252,6 +280,26 @@ async def handle_command(
         return f"Unknown command: {canonical!r}. Type /help for the list."
     try:
         return await handler(arg, conv_id, ctx or {})
+    except StoreUnreadable as e:
+        # v3.1: must be caught HERE, not only in main.py. This catch-all is a
+        # superclass handler sitting in front of it, so main.py's plain-language
+        # StoreUnreadable branch could never fire for anything raised inside a
+        # command — only for the persona text, which main.py evaluates eagerly
+        # while building ctx. Facts, archive, summary and retrieval all landed
+        # here and returned the leaky string below.
+        #
+        # StoreUnreadable.__str__ embeds an absolute filesystem path
+        # (memory.py:307). A non-technical user typed "/forget" into a chat box;
+        # she gets plain language, the operator gets the path in the log.
+        logger.error(
+            f"command {canonical!r} failed for conv={conv_id} — store unreadable: {e}"
+        )
+        return (
+            "I couldn't read my stored memory for this conversation just now, "
+            "so I've made no changes rather than risk losing anything. Nothing "
+            "has been deleted. This is a problem on my side — please try again "
+            "in a moment, and mention it if it keeps happening."
+        )
     except Exception as e:
         logger.exception(f"command {canonical!r} failed for conv={conv_id}: {e}")
         return f"Command failed: {type(e).__name__}: {e}"

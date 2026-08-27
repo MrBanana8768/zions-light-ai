@@ -30,6 +30,8 @@ import os
 import threading
 from typing import Any
 
+import logsetup
+
 logger = logging.getLogger("compactor.retrieval")
 
 # ---------------------------------------------------------------------------
@@ -245,17 +247,41 @@ def forget_conversation(conv_id: str) -> int:
         return 0
 
 
-def conversation_doc_count(conv_id: str) -> int:
+def conversation_doc_count(conv_id: str) -> int | None:
     """How many exchanges are indexed for a conv. For /admin + /health.
-    0 on failure/unavailable.
+
+    **None means "could not tell"; 0 means "genuinely nothing indexed".**
+    Until v3.1 this returned 0 for both, so a dead ChromaDB was
+    indistinguishable from an empty store: /health/full printed
+    `indexed_exchanges_total: 0` beside `"status": "ok"` and /admin reported
+    a conversation with hundreds of embedded exchanges as having none.
+    Callers must render None as "unknown", never fold it into a total.
+    (v3.1 P0-2b / F61.)
+
+    `COMPACTOR_RAG_ENABLED=false` returns **0, not None** — a deliberately
+    disabled store has genuinely nothing indexed, and that is knowledge, not
+    ignorance. Conflating the two broke import and fork outright: the
+    import pre-flight reads None as "cannot verify, refuse", so every import
+    and every fork 400'd in a supported configuration, including onto a
+    freshly-minted fork id that could not possibly be occupied.
     """
-    if not _try_init() or _chroma_collection is None:
+    if not RETRIEVAL_ENABLED:
         return 0
+    if not _try_init() or _chroma_collection is None:
+        return None
     try:
         existing = _chroma_collection.get(where={"conv_id": conv_id})
         return len(existing.get("ids", []) if existing else [])
-    except Exception:
-        return 0
+    except Exception as e:
+        # Once per process: /health/full calls this once per conversation
+        # every 30s, so a broken store must not write a line per probe.
+        if logsetup.log_once("retrieval.conversation_doc_count"):
+            logger.warning(
+                f"conv={conv_id}: conversation_doc_count failed "
+                f"({type(e).__name__}: {e}); episodic counts report unknown "
+                f"until this clears"
+            )
+        return None
 
 
 def export_indexed_exchanges(conv_id: str) -> list[dict]:

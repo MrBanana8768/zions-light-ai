@@ -19,6 +19,8 @@ Run inside the compactor image or any container with the requirements:
     python test_budget_guard.py
 """
 
+import io
+import logging
 import os
 import sys
 
@@ -30,6 +32,7 @@ os.environ["COMPACTOR_SUMMARY_MAX_TOKENS"] = "100"
 os.environ["COMPACTOR_SUMMARY_INPUT_RESERVE"] = "100"
 os.environ["COMPACTOR_KEEP_RECENT_TURNS"] = "4"      # even — the blocker's trigger
 
+import logsetup  # noqa: E402
 import main  # noqa: E402
 
 
@@ -188,6 +191,60 @@ def test_pathological_single_huge_turn():
     assert_true(out[-1]["role"] == "user", "the user's own turn survives")
 
 
+class NoChatTemplate:
+    """A tokenizer that loads fine and then refuses to template — the shape the
+    served model actually has. `coder3101/Cydonia-24B-v4.3-vision-heretic`
+    carries no chat_template.jinja, so apply_chat_template raises before jinja2
+    is even reached. encode() keeps this file's 4-chars-per-token convention."""
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        raise ValueError("tokenizer.chat_template is not set")
+
+    def encode(self, text):
+        return list(range(len(text) // 4))
+
+
+def test_tier2_fallback_is_not_silent():
+    print("\n[test] count_tokens — the tier-2 fallback announces itself")
+    # v3.1 P0-0 / F60. count_tokens has three tiers and tier 1 has never run in
+    # production: jinja2 was absent from the compactor venv AND the served
+    # model carries no chat template. Tier 2 caught that with a bare
+    # `except Exception:` and no log statement, so a total loss of counting
+    # accuracy presented as normal operation for months — in the component
+    # whose only job is to know how big things are. Tier 3 (:132) at least
+    # warned. This asserts tier 2 now does too.
+    orig_tok = main._tokenizer
+    root = logging.getLogger()
+    orig_stream = root.handlers[0].stream
+    buf = io.StringIO()
+    try:
+        logsetup._reset_log_once_for_tests()
+        main._tokenizer = NoChatTemplate()
+        root.handlers[0].stream = buf
+
+        msgs = [big("user", 40), big("assistant", 40), big("user", 40)]
+        n = main.count_tokens(msgs)
+        out = buf.getvalue()
+        assert_eq(n, 3 * (40 + 4), "still returns a usable per-message count")
+        assert_true("WARNING" in out, "reported at WARNING, matching tier 3")
+        assert_true("ValueError" in out, "names the exception type")
+        assert_true("UNDERCOUNT" in out.upper(), "names the consequence, not just the error")
+
+        print("\n[test] count_tokens — the tier-2 warning does not repeat")
+        # _enforce_hard_budget calls count_tokens once for the whole list and
+        # then once per message, so a line per call would make the fix its own
+        # denial of service. Once per process, via logsetup.log_once.
+        buf.truncate(0)
+        buf.seek(0)
+        for _ in range(5):
+            main.count_tokens(msgs)
+        assert_eq(buf.getvalue(), "", "silent after the first line")
+    finally:
+        main._tokenizer = orig_tok
+        root.handlers[0].stream = orig_stream
+        logsetup._reset_log_once_for_tests()
+
+
 def test_chunk_to_budget():
     print("\n[test] _chunk_to_budget — splits oversized input for the summarizer")
     turns = [big("user", 100) for _ in range(10)]   # ~1000 tokens total
@@ -218,5 +275,6 @@ if __name__ == "__main__":
     test_tokenization_cost_is_bounded()
     test_split_messages_keeps_user_first()
     test_pathological_single_huge_turn()
+    test_tier2_fallback_is_not_silent()
     test_chunk_to_budget()
     print("\nAll budget-guard tests passed.")

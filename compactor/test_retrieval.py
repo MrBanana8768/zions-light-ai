@@ -161,6 +161,35 @@ def test_degraded_forget_returns_zero():
     assert_eq(retrieval.forget_conversation("c"), 0, "no-op forget")
 
 
+def test_degraded_doc_count_returns_none_not_zero():
+    """v3.1 P0-2b / F61. Returning 0 for an unavailable store made a dead
+    ChromaDB indistinguishable from an empty one — /health/full printed
+    `indexed_exchanges_total: 0` beside `"status": "ok"`. None means
+    unknown; 0 must mean genuinely empty."""
+    print("\n[test] conversation_doc_count returns None (not 0) when unavailable")
+    _force_unavailable()
+    assert_eq(retrieval.conversation_doc_count("c"), None, "unavailable -> None")
+
+
+def test_doc_count_returns_none_on_query_failure():
+    print("\n[test] conversation_doc_count returns None when the store raises")
+    emb, col = _install_mocks()
+
+    def _boom(where):
+        raise RuntimeError("chroma is on fire")
+
+    col.get = _boom
+    assert_eq(retrieval.conversation_doc_count("conv1"), None, "raised -> None")
+
+
+def test_doc_count_zero_means_genuinely_empty():
+    print("\n[test] conversation_doc_count returns 0 for a healthy, empty conv")
+    emb, col = _install_mocks()
+    retrieval.index_exchange("populated", 2, "u", "a")
+    assert_eq(retrieval.conversation_doc_count("never-seen"), 0, "empty -> 0, not None")
+    assert_eq(retrieval.conversation_doc_count("populated"), 1, "one indexed exchange")
+
+
 # ---------------------------------------------------------------------------
 # Index / retrieve / forget with mock backends
 # ---------------------------------------------------------------------------
@@ -244,6 +273,9 @@ if __name__ == "__main__":
         test_degraded_index_returns_false()
         test_degraded_retrieve_returns_empty()
         test_degraded_forget_returns_zero()
+        test_degraded_doc_count_returns_none_not_zero()
+        test_doc_count_returns_none_on_query_failure()
+        test_doc_count_zero_means_genuinely_empty()
 
         test_index_exchange_upserts()
         test_index_exchange_skips_empty()

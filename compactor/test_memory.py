@@ -204,6 +204,48 @@ def test_storage_summary_reports_presence():
     assert_true(not info["summary"]["exists"], "no summary file yet")
 
 
+# ---------------------------------------------------------------------------
+# read_json_strict — absent vs unreadable (v3.1 F1)
+# ---------------------------------------------------------------------------
+#
+# The failure-injection suite for the callers lives in test_store_failures.py
+# (F32). These cover the primitive itself: the one distinction the whole
+# read_json family failed to make, and the by-design case that must not
+# regress with it.
+
+def test_read_json_strict_absent_returns_default():
+    print("\n[test] read_json_strict returns the default for an absent file")
+    memory.ensure_storage_layout()
+    p = memory.facts_path("no-such-conv")
+    assert_eq(memory.read_json_strict(p, default={}), {}, "absent -> default")
+
+
+def test_read_json_strict_raises_on_corrupt():
+    print("\n[test] read_json_strict raises StoreUnreadable for corrupt JSON")
+    memory.ensure_storage_layout()
+    p = memory.facts_path("corrupt-primitive")
+    p.write_text("{ not valid json", encoding="utf-8")
+    try:
+        memory.read_json_strict(p, default={})
+    except memory.StoreUnreadable as e:
+        assert_eq(e.path, p, "exception carries the path")
+        assert_true(isinstance(e.cause, json.JSONDecodeError), "cause preserved")
+        return
+    print("FAIL corrupt file did not raise")
+    sys.exit(1)
+
+
+def test_read_json_best_effort_still_swallows():
+    print("\n[test] read_json still returns the default for corrupt JSON")
+    # The best-effort wrapper is unchanged on purpose — backfill's state
+    # sidecar genuinely doesn't care. What changed is that the callers who
+    # write back no longer use it.
+    memory.ensure_storage_layout()
+    p = memory.facts_path("corrupt-best-effort")
+    p.write_text("{ not valid json", encoding="utf-8")
+    assert_eq(memory.read_json(p, default={}), {}, "corrupt -> default (logged)")
+
+
 if __name__ == "__main__":
     try:
         test_header_path_wins()
@@ -219,6 +261,9 @@ if __name__ == "__main__":
         test_list_known_conv_ids_picks_up_files()
         test_admin_routes_registered_in_main()
         test_storage_summary_reports_presence()
+        test_read_json_strict_absent_returns_default()
+        test_read_json_strict_raises_on_corrupt()
+        test_read_json_best_effort_still_swallows()
         print("\nAll memory smoke tests passed.")
     finally:
         # Clean up temp storage root

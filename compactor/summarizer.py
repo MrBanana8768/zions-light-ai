@@ -46,7 +46,7 @@ from typing import Any
 
 import httpx
 
-from memory import atomic_write_json, conv_lock, read_json, storage_root
+from memory import atomic_write_json, conv_lock, read_json_strict, storage_root
 
 logger = logging.getLogger("compactor.summarizer")
 
@@ -100,29 +100,72 @@ def _empty_state(conv_id: str) -> dict:
     }
 
 
+# Entries that fail _is_chunk are parked under this key by load_state and
+# folded back in by save_state, instead of being dropped. The filter used to
+# be silently destructive: load_state discarded whatever it didn't recognise
+# and the next save_state persisted the filtered list, so a schema change —
+# or a single chunk written by a newer build — deleted summaries nobody had
+# asked to delete. Round-tripping them verbatim costs nothing and the tiers
+# below never see them (v3.1 F1b, change 4).
+_UNRECOGNIZED = "_unrecognized"
+
+
 def load_state(conv_id: str) -> dict:
     """Return current summary state. Empty (but well-formed) skeleton if
-    no file exists or it's corrupt — failures are non-fatal."""
-    data = read_json(summary_path(conv_id), default=None)
+    no file exists.
+
+    Raises memory.StoreUnreadable if the file IS there and could not be
+    read. Handing back the skeleton for that case is what let one misread
+    replace an entire L1/L2/L3 hierarchy with a summary of the client's
+    current window — worse than the facts equivalent, because summaries are
+    replaced wholesale rather than merged (v3.1 F1b).
+    """
+    data = read_json_strict(summary_path(conv_id), default=None)
     if not isinstance(data, dict):
         return _empty_state(conv_id)
     # Defensive: ensure all top-level keys exist with the right types.
     state = _empty_state(conv_id)
-    if isinstance(data.get("l1"), list):
-        state["l1"] = [x for x in data["l1"] if _is_chunk(x)]
-    if isinstance(data.get("l2"), list):
-        state["l2"] = [x for x in data["l2"] if _is_chunk(x)]
+    parked: dict = {"l1": [], "l2": [], "l3": None}
+    for tier in ("l1", "l2"):
+        if isinstance(data.get(tier), list):
+            state[tier] = [x for x in data[tier] if _is_chunk(x)]
+            parked[tier] = [x for x in data[tier] if not _is_chunk(x)]
     if isinstance(data.get("l3"), dict) and _is_chunk(data["l3"]):
         state["l3"] = data["l3"]
+    elif data.get("l3") is not None:
+        parked["l3"] = data["l3"]
     if isinstance(data.get("last_summarized_turn"), int):
         state["last_summarized_turn"] = data["last_summarized_turn"]
+    if parked["l1"] or parked["l2"] or parked["l3"] is not None:
+        state[_UNRECOGNIZED] = parked
     return state
+
+
+def _for_disk(state: dict) -> dict:
+    """The on-disk form of `state`: parked entries folded back, private key
+    gone. They land after the chunks we do understand — position isn't
+    preserved, content is, which is what "don't delete what you can't
+    parse" actually requires. Nothing renders them either way.
+    """
+    parked = state.get(_UNRECOGNIZED)
+    out = {k: v for k, v in state.items() if k != _UNRECOGNIZED}
+    if not isinstance(parked, dict):
+        return out
+    for tier in ("l1", "l2"):
+        extra = parked.get(tier) or []
+        if extra:
+            out[tier] = list(out.get(tier) or []) + list(extra)
+    # Only restore a parked l3 if the live state still has none — a rollup
+    # that produced a real L3 must not be reverted to the unparseable one.
+    if parked.get("l3") is not None and out.get("l3") is None:
+        out["l3"] = parked["l3"]
+    return out
 
 
 def save_state(conv_id: str, state: dict) -> None:
     state["conv_id"] = conv_id
     state["updated_at"] = _now_iso()
-    atomic_write_json(summary_path(conv_id), state)
+    atomic_write_json(summary_path(conv_id), _for_disk(state))
 
 
 def _is_chunk(x: Any) -> bool:
@@ -378,8 +421,11 @@ async def maybe_rollup(
 ) -> dict:
     """Public entry point. Loads state, runs whichever tier(s) need work,
     saves atomically. Held under conv_lock so concurrent rollups can't tear
-    state. Returns the new state. Never raises (failures logged + state
-    returned best-effort).
+    state. Returns the new state. An LLM failure is logged and swallowed;
+    an unreadable state file propagates memory.StoreUnreadable, because the
+    one thing this function must never do is write a state it could not
+    read (v3.1 F1b/G3). The caller's tail already treats that as a
+    non-fatal skipped rollup.
 
     `messages` is the FULL message history (caller usually has the request's
     messages list right there), so L1 rollups can format the exact turns
@@ -413,14 +459,17 @@ async def maybe_rollup(
                 # L3 is at most one rollup per call (refresh, not stack).
                 if _needs_l3_rollup(state):
                     await _do_l3_rollup(client, vllm_url, model, state)
-        except Exception as e:
-            logger.exception(f"conv={conv_id}: rollup failed mid-flight: {e}")
 
-        # Save whatever we got, even partial — better than losing work.
-        try:
+            # The write lives INSIDE this try (v3.1 G3). It used to sit
+            # after it, guarded only by its own narrow try, so a rollup that
+            # died mid-flight still persisted whatever `state` happened to
+            # hold. Paired with a load that returned the empty skeleton on a
+            # misread, that wrote _empty_state over a real L1/L2/L3 stack
+            # with zero LLM involvement. Losing a partial rollup costs one
+            # cycle; the rollup re-triggers on the next turn.
             save_state(conv_id, state)
         except Exception as e:
-            logger.warning(f"conv={conv_id}: save_state failed: {e}")
+            logger.exception(f"conv={conv_id}: rollup failed mid-flight: {e}")
 
         return state
 

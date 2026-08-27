@@ -31,6 +31,8 @@ import shutil
 import time
 from pathlib import Path
 
+import logsetup
+
 logger = logging.getLogger("compactor.degrade")
 
 # Block new-memory writes when free space on the storage volume drops below
@@ -65,7 +67,19 @@ def _free_mb(path: str) -> float:
         p = p.parent
     try:
         return shutil.disk_usage(str(p)).free / (1024 * 1024)
-    except Exception:
+    except Exception as e:
+        # Fail open, unchanged — a broken probe must not stop all
+        # persistence. But it was silent, so a permanently broken
+        # disk_usage made the disk-pressure guard pass forever with nothing
+        # said, and write_state() reported free_mb=None as if that were
+        # normal. Once per process: guard() runs on the request path.
+        # (v3.1 P0-2b / F61.)
+        if logsetup.log_once("degrade._free_mb"):
+            logger.warning(
+                f"could not read free space at {p} ({type(e).__name__}: {e}); "
+                f"failing OPEN — the disk-pressure write guard is disabled "
+                f"for this process"
+            )
         return float("inf")
 
 
