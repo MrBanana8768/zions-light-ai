@@ -15,13 +15,20 @@ Storage shape on disk (one JSON file per conversation):
 
 Each fact is one short bullet extracted by the LLM from a single exchange
 (user message + assistant response). Facts are appended over time; LRU
-eviction by `last_used` keeps the total under COMPACTOR_MAX_FACTS_TOKENS.
+eviction by `last_used` keeps the injected block under
+COMPACTOR_MAX_FACTS_TOKENS. Eviction MOVES facts to the archive sidecar —
+it does not delete them (v3.1 F9).
 
 Lifecycle:
-  1. Request arrives → load_facts(conv_id) → inject into request as system block
-  2. Mark all loaded facts as `last_used = now` (LRU tracking)
+  1. Request arrives → load_facts(conv_id) → select_for_injection() → inject
+     the selected subset as a system block
+  2. Mark ONLY the injected subset as `last_used = now` (LRU tracking).
+     Touching the whole store is what made `last_used` uniform across every
+     fact, which collapsed the eviction sort key onto `added_turn` and made
+     "LRU" mean "drop the conversation's oldest, most foundational facts"
+     (v3.1 F9).
   3. After response streams back → extract_facts_from_exchange() in async tail
-  4. Append new facts → prune to budget → save_facts()
+  4. Append new facts → prune to budget (archiving the evictions) → save_facts()
 
 All file writes go through memory.atomic_write_json() for crash safety.
 All read/write pairs are serialized per-conv via memory.conv_lock().
@@ -81,6 +88,42 @@ def extraction_enabled() -> bool:
 # A fact is a dict — using TypedDict-style for clarity but plain dict for
 # JSON round-trip simplicity.
 #   { "text": str, "added_turn": int, "last_used": int (unix ts) }
+#
+# `last_used`: unix seconds, set by touch_facts() on the facts INJECTED into
+# a turn. One unit, one writer. Safe to compare across facts.
+#
+# `added_turn`: NOT one unit. Do not compare two facts' added_turn unless you
+# know they came from the same writer. Unifying it is the D1 identity work;
+# until that lands, the four writers and what each actually stores are:
+#
+#   main._async_tail          `turn_index`, which the chat handler computes as
+#                             `len(messages) + 1` — a count of MESSAGES in the
+#                             array THE CLIENT SENT, not turns and not the
+#                             conversation's true length. On 2026-08-24 the
+#                             client sent 7 of 241 messages, so facts extracted
+#                             late in a long conversation were stamped 8.
+#   commands._handle_remember `ctx.get("turn_index", 0)` — the same expression
+#                             handed through from the chat handler, so the same
+#                             message-count unit, except that the `.get`
+#                             default of 0 stamps a manually-remembered fact as
+#                             the oldest thing in the store if ctx ever lacks
+#                             the key.
+#   backfill._run_backfill    `i * 2`, where i is the 1-based index of the
+#                             user/assistant PAIR within the slice backfill
+#                             happened to be handed. Message-units by
+#                             construction, but numbered from that slice's
+#                             start rather than the conversation's.
+#   dedup._merge_metadata     `min(added_turn)` over the merged cluster — a
+#                             derived value, and the one place where the units
+#                             above get mixed into a single number.
+#
+# portability.import_conversation restores whatever a bundle carried, so an
+# imported conversation's added_turn values were minted by another
+# conversation's writers entirely. selftest writes a literal 0.
+#
+# Consequence for this module: added_turn is a stable tie-breaker and an
+# injection-order hint. It is NOT a recency signal, and prune_facts must
+# never be allowed to fall back onto it as one — see prune_facts.
 
 
 def _now_unix() -> int:
@@ -194,6 +237,36 @@ def save_archive(conv_id: str, facts: list[dict]) -> None:
     atomic_write_json(facts_archive_path(conv_id), data)
 
 
+def archive_facts(conv_id: str, entries: list[dict]) -> int:
+    """Move `entries` into the cold-storage sidecar. Returns how many landed.
+
+    The single way a fact leaves the active set without the user asking —
+    both the time-based sweep (archive_stale_facts) and the budget eviction
+    in prune_facts go through here, so "evicted" always means "recoverable
+    via restore_from_archive" and never "unlinked" (v3.1 F9).
+
+    Writes ONLY the sidecar. The caller still owns the active-set write, and
+    must do it AFTER this returns: a crash in between then leaves the fact in
+    both files, which restore_from_archive's caller can sort out. The other
+    order loses it outright.
+
+    Re-archiving a fact that is already in the sidecar replaces the old entry
+    rather than appending a second copy — a fact can be evicted, restored and
+    evicted again, and the sidecar should not grow a copy per round trip.
+    """
+    if not entries:
+        return 0
+    archive_ts = _now_unix()
+    incoming = [{**f, "archived_at": archive_ts} for f in entries]
+    incoming_texts = {f.get("text") for f in incoming}
+    existing = load_archive(conv_id)
+    save_archive(
+        conv_id,
+        [f for f in existing if f.get("text") not in incoming_texts] + incoming,
+    )
+    return len(incoming)
+
+
 def archive_stale_facts(
     conv_id: str, *, older_than_days: int = ARCHIVE_DEFAULT_DAYS
 ) -> tuple[int, int]:
@@ -214,14 +287,8 @@ def archive_stale_facts(
     if not stale:
         return len(active), 0
     fresh = [f for f in active if f.get("last_used", 0) >= cutoff]
-    # Stamp archived_at so restore can tell when each fact was retired.
-    archive_ts = _now_unix()
-    archived_entries = [
-        {**f, "archived_at": archive_ts} for f in stale
-    ]
-    # Merge with any existing archive — accumulating, not overwriting.
-    existing_archive = load_archive(conv_id)
-    save_archive(conv_id, existing_archive + archived_entries)
+    # Sidecar first, active set second — see archive_facts on the ordering.
+    archive_facts(conv_id, stale)
     save_facts(conv_id, fresh)
     logger.info(
         f"conv={conv_id}: archived {len(stale)} stale fact(s) "
@@ -287,22 +354,26 @@ async def with_facts_lock(conv_id: str, fn):
 # Pruning — LRU by last_used
 # ---------------------------------------------------------------------------
 
-def prune_facts(
-    facts: list[dict],
-    max_tokens: int = _MAX_FACTS_TOKENS,
-) -> tuple[list[dict], int]:
-    """Trim facts down to fit max_tokens. LRU eviction by `last_used`
-    (least-recently-used dropped first). Returns (kept, dropped_count).
+def _lru_split(
+    facts: list[dict], max_tokens: int
+) -> tuple[list[dict], list[dict]]:
+    """Split `facts` into (fits_the_budget, does_not) by LRU on `last_used`.
 
-    The eviction order is stable: facts with identical last_used preserve
-    insertion order, so manual /remember additions (V2.1) won't randomly
-    lose to extraction-time additions of the same timestamp.
+    The one place the budget order is decided, so injection and eviction can
+    never disagree about which facts are the working set: select_for_injection
+    takes the first half, prune_facts archives the second.
+
+    Both halves come back sorted by added_turn, which is an ordering hint
+    only — see the field notes above on why it is not a recency signal. The
+    tie-break on `last_used` keeps eviction deterministic between facts
+    touched in the same second (a manual /remember and an extraction landing
+    on the same turn), it does not decide recency.
     """
     if not facts:
-        return [], 0
+        return [], []
     total = sum(_estimate_tokens(f["text"]) for f in facts)
     if total <= max_tokens:
-        return facts, 0
+        return list(facts), []
 
     # Sort by last_used ascending (oldest first), then by added_turn for stability
     sorted_facts = sorted(facts, key=lambda f: (f["last_used"], f["added_turn"]))
@@ -314,9 +385,98 @@ def prune_facts(
         if running + cost <= max_tokens:
             kept_reversed.append(f)
             running += cost
+    kept_ids = {id(f) for f in kept_reversed}
     # Restore original-ish ordering by added_turn for stable injection
     kept = sorted(kept_reversed, key=lambda f: f["added_turn"])
-    return kept, len(facts) - len(kept)
+    evicted = sorted(
+        (f for f in facts if id(f) not in kept_ids), key=lambda f: f["added_turn"]
+    )
+    return kept, evicted
+
+
+def select_for_injection(
+    facts: list[dict],
+    max_tokens: int = _MAX_FACTS_TOKENS,
+) -> list[dict]:
+    """Return the subset of `facts` to inject into this turn's prompt.
+
+    Callers touch (and only touch) what this returns. That is what gives
+    `last_used` any signal at all: while the store fits the budget this is
+    the whole store and nothing is evicted anyway, but the moment it does
+    not — which is exactly when eviction starts choosing — the facts left
+    out stop being refreshed and become the eviction candidates, instead of
+    every fact carrying an identical timestamp and eviction falling through
+    to added_turn (v3.1 F9).
+
+    The returned dicts are the SAME objects as the ones passed in, so
+    touch_facts() on this subset updates them in the caller's full list too.
+    """
+    kept, _ = _lru_split(facts, max_tokens)
+    return kept
+
+
+def prune_facts(
+    facts: list[dict],
+    max_tokens: int = _MAX_FACTS_TOKENS,
+    *,
+    conv_id: str | None = None,
+) -> tuple[list[dict], int]:
+    """Trim facts down to fit max_tokens. LRU eviction by `last_used`
+    (least-recently-used dropped first). Returns (kept, dropped_count).
+
+    Pass `conv_id` and the evicted facts are moved to the archive sidecar
+    before this returns — recoverable with restore_from_archive. Without it
+    they are only reachable from this log line, because archive_stale_facts
+    and restore_from_archive are wired to admin endpoints and nothing calls
+    them on a schedule, so an eviction here was a permanent delete (v3.1 F9).
+    Every caller should pass it.
+
+    If the archive write fails, NOTHING is evicted: the store stays over
+    budget and the caller writes it back whole. Over budget is a soft cap on
+    a block select_for_injection bounds anyway; losing the facts is not
+    recoverable at all.
+    """
+    kept, evicted = _lru_split(facts, max_tokens)
+    if not evicted:
+        return kept, 0
+
+    if conv_id is None:
+        # No sidecar to write to. Preserve the pre-v3.1 behaviour rather than
+        # leaving the caller with an over-budget list it does not expect, but
+        # put the texts in the log so the eviction is at least forensically
+        # recoverable.
+        # Bounded deliberately. Dumping every text unbounded measured 40 KB per
+        # call on a 300-fact store — ~3.8 MB per hundred turns into the same
+        # log a human is meant to find this line in. A forensic record that
+        # buries the record is not one.
+        _SHOWN = 5
+        shown = "; ".join(repr(f["text"]) for f in evicted[:_SHOWN])
+        more = (
+            f" … and {len(evicted) - _SHOWN} more (not logged; pass conv_id to "
+            f"archive them instead)"
+            if len(evicted) > _SHOWN else ""
+        )
+        logger.warning(
+            f"prune_facts called without conv_id — {len(evicted)} fact(s) "
+            f"evicted with no archive to land in: {shown}{more}"
+        )
+        return kept, len(evicted)
+
+    try:
+        archive_facts(conv_id, evicted)
+    except Exception as e:
+        logger.error(
+            f"conv={conv_id}: could not archive {len(evicted)} evicted fact(s) "
+            f"({e}); kept them in the active store over budget rather than "
+            f"deleting them"
+        )
+        return list(facts), 0
+
+    logger.info(
+        f"conv={conv_id}: archived {len(evicted)} fact(s) evicted for budget "
+        f"({len(kept)} still active)"
+    )
+    return kept, len(evicted)
 
 
 # ---------------------------------------------------------------------------
@@ -342,9 +502,16 @@ def format_facts_block(facts: list[dict]) -> str | None:
 
 
 def touch_facts(facts: list[dict], now: int | None = None) -> list[dict]:
-    """Mark every fact as just-used (for LRU). Mutates the list in place
-    AND returns it for chaining. Call after injecting facts into a request
-    so the eviction order reflects actual usage.
+    """Mark every fact in the list you pass as just-used (for LRU). Mutates
+    in place AND returns the list for chaining.
+
+    Pass the INJECTED subset — what select_for_injection() returned — not the
+    whole store. Touching everything loaded is not LRU tracking; it stamps
+    every fact with the same second on every single request, which is how
+    eviction came to sort on added_turn and delete the conversation's
+    foundational facts (v3.1 F9). The subset shares its dicts with the full
+    list, so the untouched facts keep their real last_used and the caller can
+    still save the whole thing.
     """
     ts = now if now is not None else _now_unix()
     for f in facts:
@@ -512,11 +679,12 @@ async def record_facts_for_exchange(
                 for s in new_strs
             ]
             combined = existing + new_entries
-            kept, dropped = prune_facts(combined)
+            kept, dropped = prune_facts(combined, conv_id=conv_id)
             save_facts(conv_id, kept)
             if dropped:
                 logger.info(
-                    f"conv={conv_id}: +{len(new_entries)} facts, pruned {dropped} oldest"
+                    f"conv={conv_id}: +{len(new_entries)} facts, archived {dropped} "
+                    f"least-recently-used"
                 )
             return len(new_entries)
         except StoreUnreadable as e:

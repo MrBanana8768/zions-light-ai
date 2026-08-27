@@ -984,15 +984,27 @@ async def _async_tail(
         return
 
     # --- 1. Episodic indexing (independent of facts) ---
+    # v3.1 D49: this ran outside conv_lock. A prior review called it benign
+    # because _doc_id is (conv_id, turn_index) and the upsert is idempotent —
+    # true of two tails racing each other, and irrelevant to the case that
+    # matters. _clear_all_memory holds conv_lock while it calls
+    # retrieval.forget_conversation; an unlocked index_exchange lands after
+    # that delete and puts the exchange the user just asked to forget back in
+    # the vector store, where it is retrievable and injectable again. Its own
+    # acquisition rather than one lock over the whole tail: the facts block
+    # below holds the lock across a vLLM call, and the summary rollup takes
+    # conv_lock internally, so a single enclosing `async with` would either
+    # deadlock or stall this behind an LLM round trip.
     if assistant_text and last_user_text:
-        try:
-            indexed = retrieval.index_exchange(
-                conv_id, turn_index, last_user_text, assistant_text
-            )
-            if indexed:
-                logger.info(f"conv={conv_id}: indexed exchange (turn ~{turn_index})")
-        except Exception as e:
-            logger.warning(f"conv={conv_id}: episodic indexing failed: {e}")
+        async with conv_lock(conv_id):
+            try:
+                indexed = retrieval.index_exchange(
+                    conv_id, turn_index, last_user_text, assistant_text
+                )
+                if indexed:
+                    logger.info(f"conv={conv_id}: indexed exchange (turn ~{turn_index})")
+            except Exception as e:
+                logger.warning(f"conv={conv_id}: episodic indexing failed: {e}")
 
     # --- 2. Facts extraction ---
     if not facts.extraction_enabled():
@@ -1065,7 +1077,15 @@ async def _async_tail(
                             f"conv={conv_id}: inline dedup failed (no-op): {e}"
                         )
 
-            kept, dropped = facts.prune_facts(combined)
+            # conv_id is what routes an over-budget eviction into the archive
+            # sidecar instead of unlinking it (v3.1 F9). This call site is the
+            # one that matters: it is on the async tail, so it fires on EVERY
+            # exchange. Measured without it on a 300-fact store: dropped=263,
+            # archived=0, unrecoverable. That is F9 verbatim — "past
+            # COMPACTOR_MAX_FACTS_TOKENS every single turn silently deletes the
+            # oldest facts" — and the oldest facts are the conversation's
+            # foundational ones.
+            kept, dropped = facts.prune_facts(combined, conv_id=conv_id)
             # G2: no early return on empty extraction meant save_facts(conv_id,
             # []) ran on EVERY exchange — the primary generator of the empty
             # facts files D10 counts, and what made the F1a wipe re-fire every
@@ -1452,11 +1472,30 @@ async def chat_completions(request: Request) -> Any:
         try:
             touched_facts = facts.load_facts(conv_id)
             if touched_facts:
-                facts.touch_facts(touched_facts)
-                block = facts.format_facts_block(touched_facts)
+                # v3.1 F9: touch — and inject — only the budget-bounded subset,
+                # not everything on disk. Touching the whole store stamped every
+                # fact with the same second on every request, which left
+                # last_used carrying no signal and eviction falling through to
+                # added_turn, i.e. deleting the conversation's oldest and most
+                # foundational facts first. select_for_injection returns the SAME
+                # dict objects, so touched_facts still carries the touch and the
+                # tail below still writes the whole store back; the facts left
+                # out keep their real last_used and become the eviction
+                # candidates, which is the entire point.
+                injected = facts.select_for_injection(touched_facts)
+                facts.touch_facts(injected)
+                block = facts.format_facts_block(injected)
                 if block:
                     injected_blocks.append(block)
-                    log_parts.append(f"{len(touched_facts)}fact(s)")
+                    log_parts.append(
+                        f"{len(injected)}fact(s)"
+                        if len(injected) == len(touched_facts)
+                        # Only differ when the store is over budget — which
+                        # v3.1 F9 now allows to persist, because a failed
+                        # archive write keeps the facts rather than deleting
+                        # them. Worth seeing in the log when it happens.
+                        else f"{len(injected)}/{len(touched_facts)}fact(s)"
+                    )
         except Exception as e:
             logger.warning(f"conv={conv_id}: facts load failed (non-fatal): {e}")
 

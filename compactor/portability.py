@@ -143,6 +143,31 @@ def import_conversation(
     if not target:
         raise ImportError_("no target_conv_id provided and bundle has no source_conv_id")
 
+    # v3.1 D18: archive, restore and dedup all serialize on conv_lock; import
+    # — the one operation that clears three layers and rewrites them wholesale
+    # — did not. The hazard is not two concurrent importers. It is an
+    # extraction tail that read facts before the import ran, is parked on its
+    # vLLM call while holding conv_lock, and writes that pre-import snapshot
+    # back the moment it returns. The bundle is gone, with no error anywhere
+    # and `overwrote_existing: true` in the response.
+    #
+    # This function is a plain `def` called from an `async def` endpoint, so it
+    # runs to completion on the event loop without yielding: nothing can take
+    # conv_lock while it is running, and it cannot await to take the lock
+    # itself. locked() is therefore the whole of the mutual exclusion — held
+    # means a writer is parked mid-sequence and this import must not land
+    # underneath it. A refused import loses nothing and the operator retries;
+    # a clobbered one loses the bundle. Making this `async def` and awaiting
+    # the lock is the better shape and needs its two call sites in main.py
+    # (the import and fork endpoints) to await it.
+    if memory.conv_lock(target).locked():
+        raise ImportError_(
+            f"conv_id {target!r} has a memory write in flight (extraction tail, "
+            f"archive, restore or dedup). Refusing rather than import "
+            f"underneath it — that writer would overwrite the bundle on its "
+            f"next save. Retry in a moment."
+        )
+
     # Pre-flight: detect existing state to honor overwrite=False.
     #
     # v3.1: this guard exists to stop an import silently wiping a live

@@ -36,9 +36,18 @@ import time
 from typing import Any, Callable, Awaitable
 
 import facts as facts_module
-from memory import StoreUnreadable
+from memory import StoreUnreadable, conv_lock
 
 logger = logging.getLogger("compactor.commands")
+
+# v3.1 F22: the mutating handlers take conv_lock, the same per-conv asyncio
+# lock the extraction tail and the admin endpoints take. It is imported
+# directly rather than injected through ctx (as the remediation plan proposed,
+# to dodge an import cycle with main.py) because there is no cycle to dodge:
+# conv_lock is defined in memory.py, main.py only re-exports it via
+# `from memory import (...)`, and this module already imports from memory. The
+# lock object is therefore identical — memory._conv_locks is the one registry —
+# and a handler cannot end up unlocked because a caller forgot a ctx key.
 
 # Command name → handler. Handlers take (arg_string, conv_id, ctx) and
 # return the user-visible response text. ctx is a dict so handlers can
@@ -138,16 +147,24 @@ async def _handle_remember(arg: str, conv_id: str, ctx: dict) -> str:
     if len(arg) > 500:
         return f"Fact too long ({len(arg)} chars) — keep it under 500."
     now = int(time.time())
-    existing = facts_module.load_facts(conv_id)
-    new_fact = {
-        "text": arg,
-        "added_turn": ctx.get("turn_index", 0),
-        "last_used": now,
-    }
-    combined = existing + [new_fact]
-    kept, dropped = facts_module.prune_facts(combined)
-    facts_module.save_facts(conv_id, kept)
-    extra = f" (pruned {dropped} oldest to fit budget)" if dropped else ""
+    # v3.1 F22: load-modify-write, so it holds the per-conv lock for the whole
+    # sequence. Unlocked, this raced _async_tail's locked write in both
+    # directions: the tail re-reads facts inside its lock, so whichever write
+    # landed second won outright. The user watched the compactor confirm
+    # "Remembered: ..." and the fact was gone by her next turn.
+    async with conv_lock(conv_id):
+        existing = facts_module.load_facts(conv_id)
+        new_fact = {
+            "text": arg,
+            "added_turn": ctx.get("turn_index", 0),
+            "last_used": now,
+        }
+        combined = existing + [new_fact]
+        # conv_id makes an over-budget eviction here land in the archive
+        # sidecar instead of being deleted (v3.1 F9).
+        kept, dropped = facts_module.prune_facts(combined, conv_id=conv_id)
+        facts_module.save_facts(conv_id, kept)
+    extra = f" (archived {dropped} least-recently-used to fit budget)" if dropped else ""
     return f"Remembered: {arg!r}{extra}\nFacts now: {len(kept)}"
 
 
@@ -155,17 +172,30 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
     if arg:
         # Selective: remove facts whose text contains the substring
         # (case-insensitive). Other layers untouched.
-        existing = facts_module.load_facts(conv_id)
-        needle = arg.lower()
-        to_keep = [f for f in existing if needle not in f.get("text", "").lower()]
-        removed = len(existing) - len(to_keep)
-        if removed == 0:
-            return f"No facts matched {arg!r}."
-        facts_module.save_facts(conv_id, to_keep)
+        #
+        # v3.1 F22: same load-modify-write hazard as /remember, running the
+        # other way — unlocked, a tail holding a snapshot taken before this
+        # command wrote the just-forgotten facts straight back. _merge_touched
+        # treats disk as authoritative for membership precisely so a /forget
+        # is not undone, and that guarantee only holds if the /forget write
+        # happens inside the lock the tail's re-read is serialized against.
+        async with conv_lock(conv_id):
+            existing = facts_module.load_facts(conv_id)
+            needle = arg.lower()
+            to_keep = [f for f in existing if needle not in f.get("text", "").lower()]
+            removed = len(existing) - len(to_keep)
+            if removed == 0:
+                return f"No facts matched {arg!r}."
+            facts_module.save_facts(conv_id, to_keep)
         return f"Forgot {removed} fact(s) matching {arg!r}. {len(to_keep)} remaining."
 
     # No arg: full wipe — call into the shared clear-all-memory helper
     # provided via ctx (avoids import cycles with main.py).
+    #
+    # Deliberately NOT wrapped in conv_lock: main._clear_all_memory takes
+    # conv_lock itself and asyncio.Lock is not reentrant, so wrapping it
+    # here would deadlock the request forever — /forget would hang instead of
+    # answering, on the one command a user reaches for when something is wrong.
     clear_all = ctx.get("clear_all_memory")
     if not clear_all:
         return "ERROR: clear_all_memory helper not wired."

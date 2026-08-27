@@ -472,6 +472,190 @@ def test_archive_path_is_sidecar_not_facts_file():
 
 
 # ---------------------------------------------------------------------------
+# v3.1 F9 — "LRU" eviction was not LRU, and it deleted permanently
+# ---------------------------------------------------------------------------
+#
+# Two halves to the defect, so two halves to the coverage:
+#
+#   1. The request path loaded the whole store and touched the whole store,
+#      so last_used was the same second on every fact at all times. The sort
+#      key (last_used, added_turn) collapsed onto added_turn and eviction
+#      became "drop whatever was added earliest" — the conversation's
+#      foundational facts, every turn, past the token cap.
+#   2. Nothing calls archive_stale_facts automatically (admin endpoints
+#      only), so an eviction was an unlink with no cold-storage fallback.
+#
+# test_prune_facts_lru_eviction above still passes and always did; it
+# constructs the differentiated last_used values the live pipeline could
+# never produce. These tests drive the pipeline's own sequence instead.
+
+
+def _f(text, added_turn, last_used):
+    return {"text": text, "added_turn": added_turn, "last_used": last_used}
+
+
+def test_select_for_injection_is_the_whole_store_under_budget():
+    print("\n[test] select_for_injection returns everything when it fits")
+    items = [_f("x" * 100, i, 500) for i in range(3)]
+    selected = facts.select_for_injection(items, max_tokens=1000)
+    assert_eq(len(selected), 3, "all 3 selected")
+    assert_true(
+        all(a is b for a, b in zip(selected, items)),
+        "selection shares the caller's dicts (so touching it touches the store)",
+    )
+
+
+def test_turn_touches_only_the_injected_facts():
+    print("\n[test] a turn touches only the injected facts, not all 200")
+    _wipe_storage()
+    cid = "lru-200"
+    now = int(time.time())
+    stale = now - 10000
+    # The three the model has actually been using are the FOUNDATIONAL ones
+    # — added_turn 0-2, the ones the old sort key evicted first. Each fact is
+    # 100 chars ≈ 25 tokens, so a 75-token budget admits exactly three.
+    store = [_f("who she is " + "0" * 89, 0, now)]
+    store += [_f("where she lives " + "1" * 84, 1, now)]
+    store += [_f("what she wants " + "2" * 85, 2, now)]
+    store += [_f(f"passing detail {i:03d} " * 5, i, stale) for i in range(3, 200)]
+    assert_eq(len(store), 200, "prep: 200 facts")
+    facts.save_facts(cid, store)
+
+    # --- request path ---
+    on_disk = facts.load_facts(cid)
+    injected = facts.select_for_injection(on_disk, max_tokens=75)
+    assert_eq(len(injected), 3, "3 facts injected")
+    facts.touch_facts(injected, now=now + 500)
+    block = facts.format_facts_block(injected)
+    assert_true("who she is" in block, "the injected block carries the identity facts")
+
+    # The injected subset shares its dicts with the full list, so the touch
+    # lands in `on_disk` without touching the other 197. main.py's tail
+    # re-reads under the lock and carries these forward by text via
+    # _merge_touched, which only ever moves last_used forward — same result.
+    touched = [f for f in on_disk if f["last_used"] == now + 500]
+    untouched = [f for f in on_disk if f["last_used"] != now + 500]
+    assert_eq(len(touched), 3, "exactly 3 facts touched")
+    assert_eq(len(untouched), 197, "the other 197 keep their old last_used")
+    assert_true(
+        all(f["last_used"] == stale for f in untouched),
+        "untouched facts still carry the ORIGINAL last_used, not now",
+    )
+    assert_eq(
+        sorted(f["added_turn"] for f in touched), [0, 1, 2],
+        "the touched facts are the foundational ones the model is using",
+    )
+
+
+def test_eviction_archives_instead_of_deleting():
+    print("\n[test] over-budget eviction lands in the archive file, not /dev/null")
+    _wipe_storage()
+    cid = "lru-200"
+    now = int(time.time())
+    stale = now - 10000
+    store = [_f("who she is " + "0" * 89, 0, now)]
+    store += [_f("where she lives " + "1" * 84, 1, now)]
+    store += [_f("what she wants " + "2" * 85, 2, now)]
+    store += [_f(f"passing detail {i:03d} " * 5, i, stale) for i in range(3, 200)]
+    facts.save_facts(cid, store)
+
+    kept, dropped = facts.prune_facts(store, max_tokens=75, conv_id=cid)
+    facts.save_facts(cid, kept)
+    assert_eq(len(kept), 3, "3 facts survive the budget")
+    assert_eq(dropped, 197, "197 evicted")
+    assert_eq(
+        sorted(f["added_turn"] for f in kept), [0, 1, 2],
+        "recently-used foundational facts survive — NOT evicted as 'oldest'",
+    )
+
+    # Read the sidecar off disk, not through load_archive — the claim is
+    # that the facts are on the filesystem.
+    sidecar = memory.facts_archive_path(cid)
+    assert_true(sidecar.is_file(), "the archive sidecar exists after an eviction")
+    raw = json.loads(sidecar.read_text())
+    archived_texts = {f["text"] for f in raw["facts"]}
+    assert_eq(len(archived_texts), 197, "all 197 evicted facts are in the file")
+    evicted_texts = {f["text"] for f in store if f["added_turn"] >= 3}
+    assert_eq(archived_texts, evicted_texts, "the archive holds exactly the evicted set")
+    assert_true(
+        all(f["archived_at"] > 0 for f in raw["facts"]), "archived_at stamped"
+    )
+
+    # And they are recoverable the way the user would recover them.
+    restored = facts.restore_from_archive(cid, text_substring="passing detail 042")
+    assert_eq(restored, 1, "an evicted fact restores from cold storage")
+
+
+def test_eviction_without_conv_id_logs_the_texts():
+    print("\n[test] prune_facts with no conv_id warns and names what it dropped")
+    items = [_f("secret ingredient is nutmeg" + "y" * 70, 1, 100), _f("x" * 100, 2, 500)]
+    with patch.object(facts.logger, "warning") as warn:
+        kept, dropped = facts.prune_facts(items, max_tokens=25)
+    assert_eq(dropped, 1, "1 evicted")
+    assert_eq(len(kept), 1, "1 kept")
+    assert_true(warn.called, "the unarchivable eviction is logged at WARNING")
+    msg = warn.call_args[0][0]
+    assert_true("no archive to land in" in msg, "warning says why it could not archive")
+    assert_true("secret ingredient" in msg, "warning carries the dropped text verbatim")
+
+
+def test_eviction_keeps_facts_when_the_archive_write_fails():
+    print("\n[test] a failed archive write evicts NOTHING")
+    _wipe_storage()
+    cid = "archive-broken"
+    items = [_f("x" * 100, 1, 100), _f("y" * 100, 2, 500), _f("z" * 100, 3, 999)]
+    with patch.object(facts, "save_archive", side_effect=OSError("EIO")):
+        kept, dropped = facts.prune_facts(items, max_tokens=25, conv_id=cid)
+    assert_eq(dropped, 0, "nothing reported dropped")
+    assert_eq(len(kept), 3, "all 3 facts returned — over budget beats destroyed")
+    assert_eq(
+        [f["text"] for f in kept], [f["text"] for f in items],
+        "the caller gets its store back intact",
+    )
+
+
+def test_re_archiving_a_fact_replaces_rather_than_duplicates():
+    print("\n[test] archiving the same fact twice keeps one entry, not two")
+    _wipe_storage()
+    cid = "roundtrip"
+    # A fact evicted for budget, re-established by the user (or re-extracted
+    # from a later exchange), then evicted again — without a restore in
+    # between, so copy #1 is still sitting in the sidecar.
+    facts.archive_facts(cid, [_f("Lyra is a half-elf ranger", 1, 100)])
+    facts.archive_facts(cid, [_f("Lyra is a half-elf ranger", 1, 200)])
+    archived = facts.load_archive(cid)
+    assert_eq(len(archived), 1, "one entry, not one per eviction")
+    assert_eq(archived[0]["last_used"], 200, "the newer entry is the one kept")
+    # And a full restore brings back one copy, not N.
+    assert_eq(facts.restore_from_archive(cid), 1, "restores a single copy")
+
+
+def test_record_facts_for_exchange_archives_its_evictions():
+    print("\n[test] record_facts_for_exchange routes eviction to the archive")
+    _wipe_storage()
+    cid = "tail-evict"
+    now = int(time.time())
+    # 100 facts x ~100 chars = ~2500 tokens, well past the real 1500-token
+    # default. No patching: prune_facts binds _MAX_FACTS_TOKENS as a default
+    # argument at import, so a patched module attribute would not be read.
+    seeded = [_f(f"old fact {i:03d} " + "o" * 85, i, now - 10000) for i in range(100)]
+    facts.save_facts(cid, seeded)
+    client = _mock_client_returning("- Character Lyra is a ranger.")
+    n = asyncio.run(facts.record_facts_for_exchange(
+        cid, client, "http://fake", "fake-model",
+        user_msg="Who is Lyra?",
+        assistant_msg="A half-elf ranger.",
+        turn_index=99,
+    ))
+    assert_eq(n, 1, "1 new fact added")
+    active = facts.load_facts(cid)
+    archived = facts.load_archive(cid)
+    assert_true(len(active) < 101, "the store was pruned to the token budget")
+    assert_true(len(archived) > 0, "the evicted facts went to cold storage")
+    assert_eq(len(active) + len(archived), 101, "every fact is still somewhere")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -514,6 +698,15 @@ if __name__ == "__main__":
         test_restore_with_substring_filter()
         test_restore_substring_no_match_returns_zero()
         test_archive_path_is_sidecar_not_facts_file()
+
+        # v3.1 F9 — LRU eviction is not LRU, and it deletes permanently
+        test_select_for_injection_is_the_whole_store_under_budget()
+        test_turn_touches_only_the_injected_facts()
+        test_eviction_archives_instead_of_deleting()
+        test_eviction_without_conv_id_logs_the_texts()
+        test_eviction_keeps_facts_when_the_archive_write_fails()
+        test_re_archiving_a_fact_replaces_rather_than_duplicates()
+        test_record_facts_for_exchange_archives_its_evictions()
 
         print("\nAll facts smoke tests passed.")
     finally:

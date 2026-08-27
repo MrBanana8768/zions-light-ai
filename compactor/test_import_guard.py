@@ -61,6 +61,18 @@ import retrieval  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+# Latch retrieval unavailable EXPLICITLY rather than relying on chromadb and
+# fastembed being missing from the interpreter. Both are installed in the
+# production image, so the absent-dependency version of this fixture passed in a
+# bare venv and failed in the real one — the file went green or red depending on
+# where it ran, which is the same "passes for the wrong reason" trap the module
+# docstring warns about, one level up. RETRIEVAL_ENABLED stays true: `false`
+# returns 0 by design (v3.1), and 0 is not the value under test.
+# Mirrors test_retrieval._force_unavailable.
+retrieval._available = False
+retrieval._embedder = None
+retrieval._chroma_collection = None
+
 # client=127.0.0.1 so _require_localhost is satisfied without loosening
 # COMPACTOR_ADMIN_BIND — the gate stays genuinely under test.
 # raise_server_exceptions=False so an unhandled exception inside the endpoint
