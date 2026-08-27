@@ -215,7 +215,9 @@ The margin advanced by exactly 127 each time — the conversation's own growth p
 
 Every failure this project has spent a week diagnosing had the same shape: **a degraded mode indistinguishable from a healthy one.** P0-0 is the extreme case — the token counter lost its accuracy for months behind a bare `except Exception:` with no log statement. It is not one bad handler, it is a pattern, so this item sweeps them all rather than fixing them one incident at a time.
 
-**Method.** For every `except` block in `compactor/*.py` excluding tests, check whether its body contains a `logger.` call, a `raise`, or an alert. 47 do not. They fall into three classes and only the first needs code changes.
+**Method.** For every `except` block in `compactor/*.py` excluding tests, check whether its body contains a `logger.` call, a `raise`, an alert, or a `print()` to stderr. **46 do not** (`python3 log-sweep.py --count`, verified against `f106305`). They fall into three classes and only the first needs code changes.
+
+*A note on the count, so nobody re-derives it:* an earlier ad-hoc scan reported 47 because it did not treat `print()` as reporting. The one handler that separates the two figures is `backup.py:488`, the CLI restore entry point, which prints to stderr and returns 1 — that is surfacing the failure, so 46 is correct.
 
 **Class A — the failure vanishes. Fix these.**
 
@@ -249,7 +251,7 @@ Every failure this project has spent a week diagnosing had the same shape: **a d
 ```bash
 # 1. No Class-A handler is silent any more. Re-run the sweep; expect only Class B/C.
 python3 log-sweep.py                 # full listing, triage by hand
-python3 log-sweep.py --count         # baseline was 47 on 2026-08-27
+python3 log-sweep.py --count         # baseline: 46 at f106305, 2026-08-27
 
 # 2. The health endpoint reports corruption instead of hiding it:
 mv /data/openwebui/compactor/facts/<some_conv>.json{,.bak}

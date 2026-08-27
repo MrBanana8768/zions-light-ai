@@ -14,9 +14,14 @@ surfaces it. "Returns a plausible-looking default" is none of those three.
 
 This script finds handlers doing none of the first two. It cannot tell whether
 a returned value is surfaced by the caller, so it reports candidates; triage
-the output by hand. REMEDIATION.md P0-2b carries the triage as of 2026-08-27
-(47 candidates: ~13 genuinely silent, ~8 legitimate cleanup, ~26 propagating
-by return value).
+the output by hand. REMEDIATION.md P0-2b carries the triage as of 2026-08-27:
+46 candidates at f106305 — 13 genuinely silent (Class A, fix these), 8
+legitimate cleanup (Class B, add DEBUG), the rest already propagating the
+error by return value (Class C, no change).
+
+`print(` counts as accounted-for because the CLI entry points report failures
+to stderr, which is surfacing them. Dropping it from ACCOUNTED yields 47 by
+picking up backup.py:488; that is the only handler the two readings differ on.
 
 Usage:
     python3 log-sweep.py [path ...]        # default: compactor/
