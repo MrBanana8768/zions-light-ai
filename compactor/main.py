@@ -101,6 +101,13 @@ HARD_INPUT_LIMIT = min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - GENERATION_RESERV
 # hard limit leaves headroom for that discrepancy rather than pretending it is
 # zero. See count_tokens_exact and REMEDIATION P0-0c.
 TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(HARD_INPUT_LIMIT * 0.75))
+# The scale assumed when /tokenize cannot be reached and the summarizer must
+# size batches anyway. See the fallback in summarize() for why this is 2.0 and
+# not 1.0 — a counter you cannot check must be assumed wrong in the direction
+# that fails safe.
+_PESSIMISTIC_SUMMARY_SCALE = float(
+    os.environ.get("COMPACTOR_PESSIMISTIC_SUMMARY_SCALE", "2.0") or 2.0
+)
 # V3.1 (Vision): a single image in a VLM request costs far more than its
 # text — hundreds to a couple thousand tokens depending on resolution and
 # the model's vision encoder. The text-only token estimate misses this
@@ -597,7 +604,9 @@ def _note_tokenize_success() -> None:
     )
 
 
-def count_tokens_exact(messages: list[dict]) -> int | None:
+def count_tokens_exact(
+    messages: list[dict], add_generation_prompt: bool | None = None
+) -> int | None:
     """The number vLLM will actually charge, from its own /tokenize endpoint.
     None when unavailable — callers fall back to count_tokens.
 
@@ -637,7 +646,30 @@ def count_tokens_exact(messages: list[dict]) -> int | None:
     try:
         r = httpx.post(
             f"{VLLM_URL}/tokenize",
-            json={"model": MODEL_REPO, "messages": messages},
+            # add_generation_prompt: vLLM applies the chat template to answer
+            # this, and REFUSES with a 400 when the flag is True and the last
+            # message is from the assistant ("Consider using
+            # continue_final_message instead"). The guard measures a payload
+            # that ends on the user's new turn, so True is right there and the
+            # default has to stay True. The SUMMARIZER measures a slice of old
+            # turns, which routinely ends on an assistant reply — that 400 is
+            # what took compaction down on 2026-08-28 and again on 2026-08-29,
+            # because the caller then fell back to the local estimate and built
+            # batches that could not fit.
+            #
+            # Decided from the messages rather than left to the caller: every
+            # call site that measures a conversation slice would otherwise have
+            # to remember this, and the one that forgets fails silently by
+            # degrading to a worse counter.
+            json={
+                "model": MODEL_REPO,
+                "messages": messages,
+                "add_generation_prompt": (
+                    (messages[-1].get("role") != "assistant")
+                    if add_generation_prompt is None and messages
+                    else bool(add_generation_prompt)
+                ),
+            },
             timeout=httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0),
         )
         if r.status_code != 200:
@@ -795,7 +827,26 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
     # pre-v3.1 behaviour — if vLLM cannot answer.
     _local = count_tokens(to_summarize)
     _exact = await run_in_threadpool(count_tokens_exact, to_summarize)
-    _scale = (_exact / _local) if (_exact is not None and _local > 0) else 1.0
+    # Falls back PESSIMISTIC, not to 1.0.
+    #
+    # 1.0 was the pre-v3.1 behaviour and it is the bug, not a neutral default:
+    # it asserts the local tokenizer is right at the exact moment we have just
+    # discovered we cannot check it. Measured 2026-08-29 in production, four
+    # times in one session — /tokenize refused the request (see
+    # count_tokens_exact), this line chose 1.0, the batches were sized on an
+    # estimate reading up to 51% low, every batch 400'd, compaction fell
+    # through, and the guard shed 80-88 turns of her conversation per request.
+    #
+    # 2.0 is 1/(1-0.51) rounded down — the worst measured undercount on this
+    # model's assistant content. Over-splitting costs extra summarization
+    # calls on the background tail. Under-splitting costs the entire
+    # hierarchy, silently. summarizer.py:_WORST_TOKENS_PER_CHAR makes the
+    # same trade for the same reason.
+    _scale = (
+        (_exact / _local)
+        if (_exact is not None and _local > 0)
+        else _PESSIMISTIC_SUMMARY_SCALE
+    )
     # v3.1 A9: say WHICH counter sized these batches, unconditionally and on
     # both branches. This was the decisive half of the 2026-08-28 mechanism —
     # batches believed to be 29,696 tokens were really ~46,000, every batch
