@@ -20,6 +20,9 @@ Design choices (per V2.0 plan):
   for that conv forever.
 - **Idempotent.** Multiple concurrent calls to `maybe_start_backfill`
   for the same conv only start one task (lock + state check).
+- **Additive only.** A backfill never removes or rewrites a fact that is
+  already on disk. It refuses to run against a non-empty or unreadable
+  store, and merges rather than replaces at the end (v3.1 F3).
 
 Storage:
     /data/openwebui/compactor/facts/<conv_id>.backfill.json
@@ -48,6 +51,7 @@ import facts as facts_module
 import retrieval
 import summarizer
 from memory import (
+    StoreUnreadable,
     atomic_write_json,
     conv_lock,
     facts_path,
@@ -169,7 +173,13 @@ def needs_backfill(conv_id: str, messages: list[dict]) -> bool:
     if len(messages) < _MIN_MESSAGES_FOR_BACKFILL:
         return False  # too short to bother
     if facts_path(conv_id).is_file():
-        return False  # facts already exist — V2 took over from new
+        # Facts already exist — V2 took over from new. Advisory only: this
+        # runs at kickoff and the task starts later, so _run_backfill repeats
+        # the check with load_facts under the lock before it does any work
+        # (v3.1 F3). Kept as is_file() here because it is the cheaper answer
+        # and because an existing-but-empty facts file is still a store this
+        # module has no business reconstructing.
+        return False
     state = read_state(conv_id)
     if state is None:
         return True  # never attempted
@@ -186,6 +196,37 @@ def needs_backfill(conv_id: str, messages: list[dict]) -> bool:
 # The backfill itself
 # ---------------------------------------------------------------------------
 
+def _merge_backfilled(existing: list[dict], accumulated: list[dict]) -> list[dict]:
+    """Reconcile a backfill's extraction with the store as it stands NOW.
+
+    A backfill runs for minutes, off the request path, from a snapshot taken
+    before it started. Every `_async_tail` that lands in that window writes
+    facts the backfill has never seen, so persisting `accumulated` wholesale
+    erased them — atomically, silently, on any conversation long enough to
+    be worth backfilling (v3.1 F3). The per-conv lock never caught it because
+    it wrapped the write and the read that should have informed it never
+    happened.
+
+    Same asymmetry as main.py's `_merge_touched`: `existing` — read under the
+    lock, moments before the write — is authoritative for membership. The
+    backfill only ADDS texts the store does not already carry. It never drops
+    an existing fact and never rewrites one's `added_turn` or `last_used`,
+    because the store's copy was recorded from a real turn while the
+    backfill's is a reconstruction of one.
+    """
+    seen = {f.get("text") for f in existing if isinstance(f, dict)}
+    merged = list(existing)
+    for f in accumulated:
+        if not isinstance(f, dict):
+            continue
+        text = f.get("text")
+        if text in seen:
+            continue
+        seen.add(text)
+        merged.append(f)
+    return merged
+
+
 async def _run_backfill(
     conv_id: str,
     messages: list[dict],
@@ -198,25 +239,53 @@ async def _run_backfill(
     Errors during individual extractions are logged but don't fail the
     whole backfill — we keep going and save whatever we got.
     """
-    pairs = extract_user_assistant_pairs(messages)
-    if not pairs:
-        logger.info(f"conv={conv_id}: backfill skipped — no user/assistant pairs found")
-        return
-
     started_at = _now_iso()
-    _write_state(conv_id, {
-        "state": "in_progress",
-        "started_at": started_at,
-        "exchanges_done": 0,
-        "exchanges_total": len(pairs),
-        "error": None,
-    })
-    logger.info(f"conv={conv_id}: backfill starting over {len(pairs)} exchange(s)")
-
+    pairs: list[tuple[str, str]] = []
     accumulated: list[dict] = []
     now_unix = _now_unix()
 
     try:
+        # Refuse before spending minutes of GPU on it. Backfill exists to give
+        # a V1 conversation its FIRST facts; against a store that already has
+        # any, this whole function is a write over live user memory.
+        # needs_backfill checked at kickoff, but the task starts later, and
+        # main.py:1509 hands us the CLIENT's message array — under the
+        # 2026-08-24 7-of-241 condition a triggered backfill extracts from 7
+        # messages and saves that as the entire store (v3.1 F3).
+        async with conv_lock(conv_id):
+            try:
+                existing = facts_module.load_facts(conv_id)
+            except StoreUnreadable as e:
+                # The file is there and we cannot read it, so we cannot know
+                # what we would be replacing. Refusing costs this conversation
+                # its backfill; running would cost it its memory.
+                logger.error(
+                    f"conv={conv_id}: facts file unreadable ({e}); backfill "
+                    f"refused rather than replacing an unknown store with a "
+                    f"reconstruction"
+                )
+                return
+        if existing:
+            logger.info(
+                f"conv={conv_id}: backfill refused — {len(existing)} fact(s) "
+                f"already on disk; this is not a V1 store"
+            )
+            return
+
+        pairs = extract_user_assistant_pairs(messages)
+        if not pairs:
+            logger.info(f"conv={conv_id}: backfill skipped — no user/assistant pairs found")
+            return
+
+        _write_state(conv_id, {
+            "state": "in_progress",
+            "started_at": started_at,
+            "exchanges_done": 0,
+            "exchanges_total": len(pairs),
+            "error": None,
+        })
+        logger.info(f"conv={conv_id}: backfill starting over {len(pairs)} exchange(s)")
+
         async with httpx.AsyncClient() as client:
             for i, (user_text, asst_text) in enumerate(pairs, start=1):
                 try:
@@ -245,10 +314,40 @@ async def _run_backfill(
                     "error": None,
                 })
 
-        # Done iterating — prune to budget and persist as the facts file
+        # Done iterating. Re-read INSIDE the lock and merge: the store may
+        # have gained facts from any number of tails while we were running,
+        # and `accumulated` knows about none of them. The lock alone never
+        # protected this — it serializes writers, it cannot undo a read that
+        # happened minutes before it was taken (v3.1 F3).
         async with conv_lock(conv_id):
-            kept, dropped = facts_module.prune_facts(accumulated)
-            facts_module.save_facts(conv_id, kept)
+            try:
+                on_disk = facts_module.load_facts(conv_id)
+            except StoreUnreadable as e:
+                logger.error(
+                    f"conv={conv_id}: facts file unreadable ({e}); skipped the "
+                    f"backfill write rather than replacing the store with "
+                    f"{len(accumulated)} reconstructed fact(s)"
+                )
+                _write_state(conv_id, {
+                    "state": "failed",
+                    "started_at": started_at,
+                    "exchanges_done": len(pairs),
+                    "exchanges_total": len(pairs),
+                    "error": f"facts store unreadable at write time: {e}"[:500],
+                })
+                return
+            merged = _merge_backfilled(on_disk, accumulated)
+            added = len(merged) - len(on_disk)
+            # conv_id routes eviction to the archive sidecar rather than
+            # deleting (v3.1 F9). A backfill merges a whole conversation's
+            # history at once, so it is the single call most likely to go over
+            # budget — and the facts it would drop are the earliest ones.
+            kept, dropped = facts_module.prune_facts(merged, conv_id=conv_id)
+            # G2: an empty merge is nothing to say, not a store to erase. A
+            # backfill that extracted nothing must not leave an empty facts
+            # file behind for list_known_conv_ids to count forever.
+            if merged:
+                facts_module.save_facts(conv_id, kept)
 
         # V2.0 Phase 4: also build hierarchical summary state for this conv,
         # so the model gets continuity-of-narrative on the *next* request
@@ -269,11 +368,16 @@ async def _run_backfill(
             "exchanges_total": len(pairs),
             "facts_kept": len(kept),
             "facts_pruned": dropped,
+            # Distinguishes what the backfill contributed from what tails
+            # wrote underneath it while it ran — the two used to be
+            # indistinguishable because the second set was gone (v3.1 F3).
+            "facts_added": added,
             "error": None,
         })
         logger.info(
-            f"conv={conv_id}: backfill complete — {len(kept)} facts kept, "
-            f"{dropped} pruned, from {len(pairs)} exchanges"
+            f"conv={conv_id}: backfill complete — {added} fact(s) added to "
+            f"{len(on_disk)} already on disk, {len(kept)} kept, {dropped} "
+            f"pruned, from {len(pairs)} exchanges"
         )
     except Exception as e:
         logger.exception(f"conv={conv_id}: backfill aborted: {e}")

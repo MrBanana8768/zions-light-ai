@@ -28,6 +28,22 @@ echo "      /data is writable"
 # Create persistent subdirs on the volume (empty on first attach).
 mkdir -p "${HF_HOME}" "${DATA_DIR}" /data/vllm-compile-cache
 
+# Logs live on the volume, not in the container. A container-local log dies
+# with the container, so every redeploy, OOM-kill or pod recreate destroyed
+# the evidence for whatever prompted the redeploy. The 2026-08-27 context
+# overflows are unreconstructable for exactly this reason: the failing
+# container's logs went with it, and the investigation had to stop at
+# "probable". LOG_DIR is expanded by supervisord.conf; /data is already a
+# hard precondition above, so there is no fallback path to get wrong.
+export LOG_DIR="${LOG_DIR:-/data/logs}"
+mkdir -p "${LOG_DIR}"
+# A boot marker, because these files now span deployments and a reader needs
+# to know where one container's history ends and the next begins.
+printf '\n===== boot %s | container %s | image %s =====\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(cat /etc/hostname)" "${IMAGE_TAG:-unknown}" \
+    >> "${LOG_DIR}/boot.log"
+echo "      logs -> ${LOG_DIR} (persists across redeploys)"
+
 # Check 2: GPU is visible. nvidia-smi runs cleanly = host driver passthrough
 # is working. If this fails, the container was started without --gpus all
 # (or RunPod's equivalent).

@@ -1,0 +1,38 @@
+# Runs compactor/test_tokenizer_contract.py against the fixture server.
+#
+# Deliberately NOT the production image: that one carries CUDA, vLLM and the
+# model weights and takes tens of minutes to build. Measured 2026-08-28,
+# `import main` in compactor/ needs only fastapi, uvicorn, httpx, transformers
+# and jinja2 — every other compactor dependency is imported behind a guard. So
+# this runner is small enough to build on every CI run.
+#
+# The repo is MOUNTED, not copied, so editing a test does not rebuild an image.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/hf \
+    HF_HUB_DISABLE_TELEMETRY=1
+
+RUN pip install --no-cache-dir \
+      fastapi==0.138.2 \
+      "uvicorn[standard]==0.49.0" \
+      httpx==0.28.1 \
+      transformers==5.12.1 \
+      jinja2==3.1.6
+
+# A LOCAL tokenizer that is deliberately NOT the fixture server's.
+#
+# This is the point. On 2026-08-28 the compactor's local tokenizer and vLLM's
+# tokenizer priced the same bytes differently, and gpt2 vs SmolLM2 reproduces
+# that condition honestly. gpt2 also ships NO chat template, which drives
+# count_tokens into its tier-2 `encode()+4` branch — the branch main.py:414-421
+# records as the one that "has never executed" any other way in production.
+ARG LOCAL_TOKENIZER=gpt2
+RUN python -c "\
+from transformers import AutoTokenizer; \
+t = AutoTokenizer.from_pretrained('${LOCAL_TOKENIZER}'); \
+print('baked local tokenizer', '${LOCAL_TOKENIZER}', 'vocab', t.vocab_size)"
+
+WORKDIR /repo/compactor
+CMD ["python", "test_tokenizer_contract.py"]

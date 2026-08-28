@@ -1,0 +1,56 @@
+# Tokenizer-contract test stack. SEPARATE from docker-compose.yml (production,
+# GPU, model weights) on purpose — nothing here touches that file or its stack.
+#
+#   docker compose -f docker-compose.tokenizer-contract.yml up --build --exit-code-from contract-tests
+#
+# See testfixtures/tokenizer-contract/README.md for what this proves and, more
+# importantly, what it does not.
+
+services:
+  tokenize-fixture:
+    build:
+      context: ./testfixtures/tokenizer-contract
+      dockerfile: Dockerfile
+    container_name: zla-tokenize-fixture
+    environment:
+      # Small, byte-level BPE, carries a chat_template. NOT Cydonia's
+      # tokenizer — the absolute counts here mean nothing for production.
+      FIXTURE_TOKENIZER: HuggingFaceTB/SmolLM2-135M-Instruct
+      FIXTURE_SERVED_MODEL_NAME: fixture-model
+      FIXTURE_MAX_MODEL_LEN: "32768"
+      # "v010" = the wording vllm 0.10.0 actually emits (verified from the CPU
+      # release image). "legacy" = the older wording main._CTX_OVERFLOW_RE is
+      # written against. Both are tested; see test_tokenizer_contract.py.
+      FIXTURE_ERROR_STYLE: v010
+    ports:
+      # Published so the fixture can be curl'd by hand from the host during
+      # development. The test container talks to it over the compose network.
+      - "18000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  contract-tests:
+    build:
+      context: ./testfixtures/tokenizer-contract
+      dockerfile: Dockerfile.testrunner
+    container_name: zla-contract-tests
+    depends_on:
+      tokenize-fixture:
+        condition: service_healthy
+    environment:
+      VLLM_URL: http://tokenize-fixture:8000
+      MODEL_REPO: fixture-model
+      FIXTURE_URL: http://tokenize-fixture:8000
+      # The LOCAL tokenizer the compactor should use, distinct from the
+      # server's. Set to "" to test the char/4 estimator regime instead.
+      CONTRACT_LOCAL_TOKENIZER: gpt2
+      MAX_MODEL_LEN: "32768"
+      COMPACTOR_GENERATION_RESERVE: "16384"
+    volumes:
+      # Read-only: these tests must not be able to mutate the repo.
+      - ./:/repo:ro
+    working_dir: /repo/compactor

@@ -143,21 +143,94 @@ def import_conversation(
     if not target:
         raise ImportError_("no target_conv_id provided and bundle has no source_conv_id")
 
+    # v3.1 D18: archive, restore and dedup all serialize on conv_lock; import
+    # — the one operation that clears three layers and rewrites them wholesale
+    # — did not. The hazard is not two concurrent importers. It is an
+    # extraction tail that read facts before the import ran, is parked on its
+    # vLLM call while holding conv_lock, and writes that pre-import snapshot
+    # back the moment it returns. The bundle is gone, with no error anywhere
+    # and `overwrote_existing: true` in the response.
+    #
+    # This function is a plain `def` called from an `async def` endpoint, so it
+    # runs to completion on the event loop without yielding: nothing can take
+    # conv_lock while it is running, and it cannot await to take the lock
+    # itself. locked() is therefore the whole of the mutual exclusion — held
+    # means a writer is parked mid-sequence and this import must not land
+    # underneath it. A refused import loses nothing and the operator retries;
+    # a clobbered one loses the bundle. Making this `async def` and awaiting
+    # the lock is the better shape and needs its two call sites in main.py
+    # (the import and fork endpoints) to await it.
+    if memory.conv_lock(target).locked():
+        raise ImportError_(
+            f"conv_id {target!r} has a memory write in flight (extraction tail, "
+            f"archive, restore or dedup). Refusing rather than import "
+            f"underneath it — that writer would overwrite the bundle on its "
+            f"next save. Retry in a moment."
+        )
+
     # Pre-flight: detect existing state to honor overwrite=False.
-    pre_existing = (
-        len(facts.load_facts(target)) > 0
-        or retrieval.conversation_doc_count(target) > 0
-        or bool(summarizer.load_state(target).get("l1"))
-    )
+    #
+    # v3.1: this guard exists to stop an import silently wiping a live
+    # conversation, so "I could not check" must be treated as "occupied" — the
+    # opposite reading is how a safety check becomes a data-loss path. Two
+    # sources of not-knowing, both introduced by making failure visible rather
+    # than inventing a value:
+    #   - conversation_doc_count returns None when the vector store is
+    #     unavailable (0 now means genuinely empty, and only that)
+    #   - load_facts / load_state raise StoreUnreadable on a corrupt or
+    #     unreadable file
+    # Either way we refuse unless the caller has explicitly said overwrite.
+    # The message is operator-facing but travels out through an HTTP body, so
+    # the layer name goes in the reason and the underlying path stays in the log.
+    unverifiable: list[str] = []
+    pre_existing = False
+    try:
+        pre_existing = len(facts.load_facts(target)) > 0
+    except memory.StoreUnreadable as e:
+        unverifiable.append("facts (unreadable)")
+        logger.warning(f"conv={target}: import pre-flight could not read facts: {e}")
+    n_indexed = retrieval.conversation_doc_count(target)
+    if n_indexed is None:
+        unverifiable.append("episodic (vector store unavailable)")
+        logger.warning(f"conv={target}: import pre-flight could not reach the vector store")
+    elif n_indexed > 0:
+        pre_existing = True
+    try:
+        if summarizer.load_state(target).get("l1"):
+            pre_existing = True
+    except memory.StoreUnreadable as e:
+        unverifiable.append("summaries (unreadable)")
+        logger.warning(f"conv={target}: import pre-flight could not read summaries: {e}")
+
+    if unverifiable and not overwrite:
+        raise ImportError_(
+            f"cannot verify whether target conv_id {target!r} is empty — "
+            f"{'; '.join(unverifiable)}. Refusing rather than risk overwriting "
+            f"a live conversation; pass overwrite=true to import anyway"
+        )
     if pre_existing and not overwrite:
         raise ImportError_(
             f"target conv_id {target!r} has existing state; "
             f"pass overwrite=true to replace"
         )
 
+    if unverifiable and overwrite:
+        # Proceeding past a safety check that could not run is exactly the kind
+        # of thing that must leave a record — the operator chose this, but in
+        # six months the log is the only evidence the check was skipped rather
+        # than passed.
+        logger.warning(
+            f"conv={target}: importing with overwrite=true while unable to "
+            f"verify existing state ({'; '.join(unverifiable)}) — proceeding "
+            f"on the caller's explicit instruction"
+        )
+
     # If overwriting, clear first — guarantees we don't end up with a
-    # mix of old + new facts that confuses retrieval.
-    if pre_existing and overwrite:
+    # mix of old + new facts that confuses retrieval. `unverifiable` counts as
+    # "might be occupied": skipping the clear because we could not PROVE state
+    # exists is how stale episodic rows survive an overwrite and how
+    # overwrote_existing comes to under-report a real replacement.
+    if (pre_existing or unverifiable) and overwrite:
         facts.save_facts(target, [])
         retrieval.forget_conversation(target)
         # Summary state is overwritten wholesale by save_state, no clear needed.
@@ -194,7 +267,12 @@ def import_conversation(
             "episodic": episodic_imported,
             "summary": bool(bundle.get("summary_state")),
         },
-        "overwrote_existing": bool(pre_existing and overwrite),
+        # True when the clear step actually ran. `unverifiable` is included
+        # because we clear on it: reporting False there would tell the caller
+        # nothing was replaced while the file on disk had just been rewritten.
+        "overwrote_existing": bool((pre_existing or unverifiable) and overwrite),
+        # Non-empty when a layer could not be checked before importing.
+        "unverified_layers": list(unverifiable),
     }
 
 

@@ -8,6 +8,7 @@ Run: python test_bgwork.py
 """
 
 import asyncio
+import logging
 import os
 import sys
 
@@ -192,6 +193,136 @@ def test_outstanding_floor_at_least_concurrency():
     assert_true(p._max_outstanding >= p._max_concurrent, "ceiling >= concurrency")
 
 
+# ---------------------------------------------------------------------------
+# Shed recency — the field /health/full's status reads (v3.1 A11)
+#
+# The defect: stats() reported a cumulative `shed` count that nothing
+# consulted, so shedding was invisible to `status`. `shed` alone cannot drive
+# a status either — it never goes down, so it would pin the endpoint to
+# "degraded" until restart. These tests pin both halves: shedding is visible,
+# and it stops being visible on its own.
+# ---------------------------------------------------------------------------
+
+def _shed_once(pool):
+    """Fill `pool` to its ceiling and force one shed. Returns the gate the
+    caller must set before draining."""
+    gate = asyncio.Event()
+
+    async def blocker():
+        await gate.wait()
+
+    async def victim():
+        await asyncio.sleep(1)
+
+    for _ in range(pool._max_outstanding):
+        pool.submit(blocker())
+    pool.submit(victim(), label="conv=shed-me")
+    return gate
+
+
+def test_fresh_pool_reports_no_shed_recency():
+    print("\n[test] a pool that has never shed reports no recency at all")
+    s = bgwork.BackgroundPool(max_concurrent=1, max_outstanding=1).stats()
+    assert_eq(s["seconds_since_last_shed"], None, "None, not 0 — never happened")
+    assert_eq(s["shed_recently"], False, "not shedding")
+    assert_eq(s["at_capacity"], False, "empty pool is not at capacity")
+
+
+def test_shed_is_visible_in_stats():
+    print("\n[test] a shed sets shed_recently and the age clock")
+
+    async def go():
+        p = bgwork.BackgroundPool(max_concurrent=1, max_outstanding=1,
+                                  shed_window_s=300)
+        gate = _shed_once(p)
+        s = p.stats()
+        gate.set()
+        await p.drain()
+        return s
+
+    s = asyncio.run(go())
+    assert_eq(s["shed"], 1, "one shed counted")
+    assert_eq(s["shed_recently"], True, "shedding is VISIBLE, not just counted")
+    assert_true(s["seconds_since_last_shed"] is not None, "age reported")
+    assert_true(s["seconds_since_last_shed"] < 5.0, "age is recent")
+    assert_eq(s["at_capacity"], True, "ceiling full while the blocker holds it")
+
+
+def test_shed_recency_expires_but_the_count_does_not():
+    """The status must clear itself once the burst is over — nobody restarts a
+    box to silence a stale health warning. The cumulative counter stays, as the
+    historical record; only `shed_recently` ages out."""
+    print("\n[test] shed_recently ages out of the window; shed count persists")
+
+    async def go():
+        p = bgwork.BackgroundPool(max_concurrent=1, max_outstanding=1,
+                                  shed_window_s=0.05)
+        gate = _shed_once(p)
+        during = p.stats()
+        await asyncio.sleep(0.12)   # past the 0.05s window
+        after = p.stats()
+        gate.set()
+        await p.drain()
+        return during, after
+
+    during, after = asyncio.run(go())
+    assert_eq(during["shed_recently"], True, "degraded during the burst")
+    assert_eq(after["shed_recently"], False, "clears itself once the burst ages out")
+    assert_eq(after["shed"], 1, "the cumulative count is NOT reset")
+    assert_eq(after["shed_window_s"], 0.05, "window echoed for the reader")
+
+
+def test_shed_warning_names_the_caller_that_lost_its_tail():
+    """`submit` gets an opaque coroutine, so without a label the warning says
+    memory growth stopped for somebody and gives no way to find out who."""
+    print("\n[test] the shed warning names the label the caller passed")
+
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    async def go():
+        p = bgwork.BackgroundPool(max_concurrent=1, max_outstanding=1)
+        gate = _shed_once(p)   # the victim carries label="conv=shed-me"
+        gate.set()
+        await p.drain()
+
+    h = _Capture()
+    bgwork.logger.addHandler(h)
+    try:
+        asyncio.run(go())
+    finally:
+        bgwork.logger.removeHandler(h)
+
+    shed_lines = [m for m in records if "background work shed" in m]
+    assert_eq(len(shed_lines), 1, "the first shed logs exactly once")
+    assert_true("conv=shed-me" in shed_lines[0],
+                "the shed line names WHICH submission was dropped")
+
+
+def test_submit_still_accepts_a_bare_coroutine():
+    """`label` is optional — main.py's _fire_and_forget does not pass one yet,
+    and this must not become a TypeError on the shedding path."""
+    print("\n[test] submit(coro) with no label still works")
+
+    async def go():
+        p = bgwork.BackgroundPool(max_concurrent=1, max_outstanding=1)
+        ran = []
+
+        async def work():
+            ran.append(1)
+
+        accepted = p.submit(work())
+        await p.drain()
+        return accepted, ran
+
+    accepted, ran = asyncio.run(go())
+    assert_eq(accepted, True, "accepted without a label")
+    assert_eq(len(ran), 1, "and ran")
+
+
 def _all():
     return [
         test_accepts_and_runs_within_caps,
@@ -202,6 +333,12 @@ def _all():
         test_stats_shape_and_counters,
         test_drain_with_nothing_is_noop,
         test_outstanding_floor_at_least_concurrency,
+        # v3.1 A11 — shed recency, the field /health/full's status reads.
+        test_fresh_pool_reports_no_shed_recency,
+        test_shed_is_visible_in_stats,
+        test_shed_recency_expires_but_the_count_does_not,
+        test_shed_warning_names_the_caller_that_lost_its_tail,
+        test_submit_still_accepts_a_bare_coroutine,
     ]
 
 

@@ -21,9 +21,13 @@ _TMP_ROOT = tempfile.mkdtemp(prefix="zions_commands_test_")
 os.environ["COMPACTOR_STORAGE_ROOT"] = _TMP_ROOT
 os.environ["COMPACTOR_RAG_ENABLED"] = "false"
 
+import backfill  # noqa: E402
+import bgwork  # noqa: E402
 import commands  # noqa: E402
+import dedup  # noqa: E402
 import facts  # noqa: E402
 import memory  # noqa: E402
+import summarizer  # noqa: E402
 
 
 def assert_eq(actual, expected, label):
@@ -276,6 +280,337 @@ def test_forget_no_arg_nothing_to_clear():
 
 
 # ---------------------------------------------------------------------------
+# handle_command — /forget, v3.1 A3: the reply must describe what is gone,
+# not what the wipe intended
+# ---------------------------------------------------------------------------
+
+def _null_clear(**over):
+    """A clear_all_memory helper that reports a clean, empty wipe. Used to
+    isolate the layers /forget is responsible for on its own — anything the
+    reply says under this helper came from the disk, not from the counters."""
+    async def fake_clear(cid):
+        base = {
+            "conv_id": cid,
+            "forgotten_facts": 0,
+            "forgotten_episodic": 0,
+            "forgotten_summary": False,
+            "forgotten_persona": False,
+            "unreadable": [],
+        }
+        base.update(over)
+        return base
+    return fake_clear
+
+
+def test_forget_clears_the_archive_sidecar():
+    print("\n[test] /forget (no arg) clears the archive sidecar and says so")
+    # A3. prune_facts and archive_stale_facts MOVE evicted facts into this
+    # sidecar rather than deleting them, and restore_from_archive puts them
+    # back into the injected set. Before this fix nothing in the codebase
+    # deleted an archived fact, ever — /forget included.
+    _wipe()
+    cid = "arch-wipe"
+    facts.save_archive(cid, [
+        {"text": "Her mother's name is Selene.", "added_turn": 1,
+         "last_used": 1, "archived_at": 1},
+        {"text": "The inn burned down in winter.", "added_turn": 2,
+         "last_used": 2, "archived_at": 2},
+    ])
+    out = asyncio.run(commands.handle_command(
+        "forget", "", cid, ctx={"clear_all_memory": _null_clear()},
+    ))
+    assert_eq(facts.load_archive(cid), [], "archive is empty on disk")
+    assert_true("2 archived fact(s)" in out, f"archive counted in reply: {out!r}")
+
+
+def test_forget_on_archive_only_conv_does_not_claim_it_was_empty():
+    print("\n[test] /forget on an archive-only conv must not say 'no stored memory'")
+    # The exact measured sentence this fixes: the conversation's remaining
+    # memory was archived, /forget answered "Nothing to forget — this
+    # conversation had no stored memory", and /list-archive listed it on the
+    # next line.
+    _wipe()
+    cid = "arch-only"
+    facts.save_archive(cid, [{"text": "Her mother's name is Selene.",
+                              "added_turn": 1, "last_used": 1, "archived_at": 1}])
+    out = asyncio.run(commands.handle_command(
+        "forget", "", cid, ctx={"clear_all_memory": _null_clear()},
+    ))
+    assert_true("no stored memory" not in out.lower(),
+                f"does not claim the conversation was empty: {out!r}")
+    listing = asyncio.run(commands.handle_command("list-archive", "", cid, {}))
+    assert_true("Selene" not in listing,
+                f"/list-archive no longer shows the forgotten fact: {listing!r}")
+
+
+def test_forget_reports_persona_it_deleted():
+    print("\n[test] /forget names the persona it just deleted")
+    # Under-reporting a deletion is the same defect as over-reporting one:
+    # _clear_all_memory has always returned forgotten_persona and this handler
+    # dropped it, so a persona-only conversation had its persona deleted and
+    # was told it "had no stored memory".
+    _wipe()
+    out = asyncio.run(commands.handle_command(
+        "forget", "", "persona-only",
+        ctx={"clear_all_memory": _null_clear(forgotten_persona=True)},
+    ))
+    assert_true("persona" in out.lower(), f"persona named in reply: {out!r}")
+    assert_true("no stored memory" not in out.lower(),
+                f"does not claim the conversation was empty: {out!r}")
+
+
+def test_forget_reports_memory_that_survived_the_wipe():
+    print("\n[test] /forget reports a layer still on disk instead of a clean sweep")
+    # This is the shape a racing background tail leaves behind, without needing
+    # concurrency to produce it: the wipe helper reports success and the layer
+    # is on disk when the user reads the answer. The reply is built from the
+    # second read, not the first.
+    #
+    # The summary layer, not facts, because /forget's last act is to write an
+    # empty facts store (the backfill tombstone) — a fact that survives the
+    # wipe is deleted by that write rather than reported, which is the better
+    # outcome and is asserted separately. Nothing writes over the summary
+    # file, so it is the layer that can still reach the "still storing"
+    # sentence, and this test exists to prove that sentence can still fire.
+    _wipe()
+    cid = "survivor"
+    summarizer.save_state(cid, {
+        "l1": [{"text": "Scene one.", "first_turn": 1, "last_turn": 20}],
+        "l2": [], "l3": None, "last_summarized_turn": 20,
+    })
+    out = asyncio.run(commands.handle_command(
+        "forget", "", cid,
+        ctx={"clear_all_memory": _null_clear(forgotten_summary=True)},
+    ))
+    assert_true("still storing" in out.lower(),
+                f"reply admits memory survived: {out!r}")
+    assert_true("summary state" in out, f"names what survived: {out!r}")
+
+
+def test_forget_deletes_a_fact_that_landed_behind_the_wipe():
+    print("\n[test] /forget deletes a fact written behind it, rather than reporting it")
+    # The measured race, reduced to its residue: the wipe helper reports a
+    # clean sweep and a fact is on disk afterwards — what a parked tail's
+    # extraction leaves. /forget's final write is an empty facts store, so the
+    # fact is gone and the reply is both clean and true. Before this, the
+    # reply was "Forgot: 2 fact(s)." with the tail's fact sitting in the file.
+    _wipe()
+    cid = "late-write"
+    facts.save_facts(cid, [
+        {"text": "fact extracted by the parked tail", "added_turn": 5,
+         "last_used": 5},
+    ])
+    out = asyncio.run(commands.handle_command(
+        "forget", "", cid,
+        ctx={"clear_all_memory": _null_clear(forgotten_facts=2)},
+    ))
+    assert_eq(facts.load_facts(cid), [], "the late fact is off disk")
+    assert_true("still storing" not in out.lower(),
+                f"nothing left to warn about: {out!r}")
+
+
+def test_forget_leaves_an_empty_facts_store_so_backfill_cannot_resurrect():
+    print("\n[test] /forget closes the lazy-backfill gate on the wiped history")
+    # Measured before the fix: a conversation whose memory was a summary and a
+    # persona had no facts file, so /forget replied "Forgot: summary state,
+    # persona." and backfill.needs_backfill was still True — the next request
+    # would start a background extraction over the whole message history the
+    # user had just asked to be forgotten, and write the result to disk.
+    _wipe()
+    cid = "bf-gate"
+    msgs = [
+        {"role": "user", "content": "My protagonist Lyra is a half-elf ranger."},
+        {"role": "assistant", "content": "Where is she from?"},
+        {"role": "user", "content": "Aethermere. Her mother Selene died there."},
+        {"role": "assistant", "content": "A strong hook."},
+    ]
+    summarizer.save_state(cid, {
+        "l1": [{"text": "Lyra, Aethermere, Selene.", "first_turn": 1, "last_turn": 4}],
+        "l2": [], "l3": None, "last_summarized_turn": 4,
+    })
+    assert_true(backfill.needs_backfill(cid, msgs),
+                "precondition: the history was backfillable before the wipe")
+    out = asyncio.run(commands.handle_command(
+        "forget", "", cid,
+        ctx={"clear_all_memory": _null_clear(forgotten_summary=True)},
+    ))
+    assert_true(memory.facts_path(cid).is_file(),
+                f"an empty facts store is on disk: {out!r}")
+    assert_eq(facts.load_facts(cid), [], "and it is empty")
+    assert_true(not backfill.needs_backfill(cid, msgs),
+                "the backfill can no longer reconstruct the forgotten history")
+
+
+def test_forget_leaves_an_unreadable_facts_file_untouched():
+    print("\n[test] the backfill tombstone never overwrites an unreadable facts file")
+    # F1's rule outranks the tombstone: a file whose contents are unknown is
+    # not rewritten from a guess, even to write an empty store over it. The
+    # cost is that the backfill gate stays open for that conversation, which
+    # is why the layer is named in the reply.
+    _wipe()
+    cid = "tombstone-corrupt"
+    p = memory.facts_path(cid)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{ not valid js", encoding="utf-8")
+    before = p.read_text(encoding="utf-8")
+    out = asyncio.run(commands.handle_command(
+        "forget", "", cid, ctx={"clear_all_memory": _null_clear(unreadable=["facts"])},
+    ))
+    assert_eq(p.read_text(encoding="utf-8"), before,
+              "corrupt facts file left byte-identical")
+    assert_true("could not read" in out.lower() and "facts" in out,
+                f"names the layer it left alone: {out!r}")
+
+
+def test_forget_clears_the_dedup_refusal_memo():
+    print("\n[test] /forget drops this conversation's dedup refusal memo")
+    # Per-conversation state derived from the conversation's facts. Nothing can
+    # come back out of it — hashes and one-word reasons — so it is cleared
+    # silently and not counted in the reply; it is cleared at all because a
+    # wipe is exactly the "replaces a conversation wholesale" caller
+    # reset_refusal_memo's docstring is written for.
+    _wipe()
+    dedup.reset_refusal_memo()
+    dedup._memo_put("memo-mine", "clusterkey", "keep")
+    dedup._memo_put("memo-other", "clusterkey", "keep")
+    asyncio.run(commands.handle_command(
+        "forget", "", "memo-mine", ctx={"clear_all_memory": _null_clear()},
+    ))
+    assert_eq(dedup._memo_get("memo-mine", "clusterkey"), None,
+              "the wiped conversation's memo is gone")
+    assert_eq(dedup._memo_get("memo-other", "clusterkey"), "keep",
+              "another conversation's memo is untouched")
+
+
+def test_forget_retries_once_when_the_first_pass_leaves_something():
+    print("\n[test] /forget wipes a second time rather than telling the user to")
+    # "Please run /forget again" is advice the command can take itself. The
+    # shape it addresses is a tail landing between the wipe and the
+    # verification, and a second pass clears it. Bounded at one: the summary
+    # here survives pass 1 and is cleared by pass 2, and the reply comes back
+    # clean with the counters of both passes summed.
+    _wipe()
+    cid = "retry-once"
+    summarizer.save_state(cid, {
+        "l1": [{"text": "Scene one.", "first_turn": 1, "last_turn": 20}],
+        "l2": [], "l3": None, "last_summarized_turn": 20,
+    })
+    calls = []
+
+    async def clear_second_time_only(c):
+        calls.append(c)
+        if len(calls) >= 2:
+            summarizer.summary_path(c).unlink(missing_ok=True)
+        return {"conv_id": c, "forgotten_facts": 1, "forgotten_episodic": 0,
+                "forgotten_summary": True, "forgotten_persona": False,
+                "unreadable": []}
+
+    out = asyncio.run(commands.handle_command(
+        "forget", "", cid, ctx={"clear_all_memory": clear_second_time_only},
+    ))
+    assert_eq(len(calls), 2, "the wipe ran twice")
+    assert_true("still storing" not in out.lower(),
+                f"the retry cleared it, so no warning: {out!r}")
+    assert_true("2 fact(s)" in out,
+                f"both passes' counters are summed, not the first pass's: {out!r}")
+
+
+def test_forget_does_not_retry_when_the_first_pass_was_clean():
+    print("\n[test] the ordinary /forget still wipes exactly once")
+    # The retry is for the residue case only. An extra full wipe on every
+    # /forget would double the log lines and the disk writes for a command
+    # that almost always succeeds on the first pass.
+    _wipe()
+    calls = []
+
+    async def counting_clear(c):
+        calls.append(c)
+        return {"conv_id": c, "forgotten_facts": 2, "forgotten_episodic": 0,
+                "forgotten_summary": False, "forgotten_persona": False,
+                "unreadable": []}
+
+    asyncio.run(commands.handle_command(
+        "forget", "", "clean-pass", ctx={"clear_all_memory": counting_clear},
+    ))
+    assert_eq(len(calls), 1, "one pass, no retry")
+
+
+def test_forget_drains_background_work_before_wiping():
+    print("\n[test] /forget drains in-flight tails BEFORE it deletes, and again after")
+    # The first drain is the fix for the race: draining only after the wipe
+    # would let a parked tail — one that has not executed a line, holding a
+    # facts snapshot older than the command — write its extraction on top of
+    # it. The second drain is what makes the verification meaningful: a tail
+    # submitted while the wipe was running (it holds conv_lock across an
+    # extraction and a rollup) is not in the first drain's set, and reading the
+    # disk while that is still in flight measures a moving state.
+    _wipe()
+    order = []
+    real_drain = bgwork.pool.drain
+
+    async def spy_drain(timeout=10.0):
+        order.append("drain")
+        return await real_drain(timeout=timeout)
+
+    async def fake_clear(cid):
+        order.append("clear")
+        return {"conv_id": cid, "forgotten_facts": 1, "forgotten_episodic": 0,
+                "forgotten_summary": False, "forgotten_persona": False,
+                "unreadable": []}
+
+    bgwork.pool.drain = spy_drain
+    try:
+        asyncio.run(commands.handle_command(
+            "forget", "", "drain-order", ctx={"clear_all_memory": fake_clear},
+        ))
+    finally:
+        bgwork.pool.drain = real_drain
+    assert_eq(order, ["drain", "clear", "drain"],
+              "drained, cleared, drained again before verifying")
+
+
+def test_forget_says_so_when_background_work_did_not_settle():
+    print("\n[test] /forget admits it when the drain did not finish")
+    # Honest partial success. The wipe happened; the guarantee that nothing
+    # re-adds behind it did not, and the user is the one who will see the
+    # difference.
+    _wipe()
+    real_stats = bgwork.pool.stats
+    bgwork.pool.stats = lambda: {"outstanding": 2}
+    try:
+        out = asyncio.run(commands.handle_command(
+            "forget", "", "unsettled",
+            ctx={"clear_all_memory": _null_clear(forgotten_facts=2)},
+        ))
+    finally:
+        bgwork.pool.stats = real_stats
+    assert_true("2 fact(s)" in out, f"still reports the real wipe: {out!r}")
+    assert_true("may reappear" in out.lower(),
+                f"reply declines to promise a clean sweep: {out!r}")
+
+
+def test_forget_reports_an_unreadable_archive_without_rewriting_it():
+    print("\n[test] /forget with a corrupt archive names it and leaves it alone")
+    # Same rule the facts layer follows (F1): a file whose contents are unknown
+    # is never rewritten from a guess, and the user is told which layer that
+    # was rather than given a clean-sweep sentence.
+    _wipe()
+    cid = "arch-corrupt"
+    p = memory.facts_archive_path(cid)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{ not valid js", encoding="utf-8")
+    before = p.read_text(encoding="utf-8")
+    out = asyncio.run(commands.handle_command(
+        "forget", "", cid, ctx={"clear_all_memory": _null_clear()},
+    ))
+    assert_true("archived facts" in out, f"names the archive layer: {out!r}")
+    assert_true("no stored memory" not in out.lower(),
+                f"does not claim the conversation was empty: {out!r}")
+    assert_eq(p.read_text(encoding="utf-8"), before,
+              "corrupt archive left byte-identical")
+
+
+# ---------------------------------------------------------------------------
 # handle_command — /why
 # ---------------------------------------------------------------------------
 
@@ -392,6 +727,25 @@ def _all_tests():
         test_forget_no_arg_invokes_clear_all_helper,
         test_forget_no_arg_without_helper_returns_error,
         test_forget_no_arg_nothing_to_clear,
+        # v3.1 A3. These were written, left out of this list, and therefore
+        # never ran — the exact failure mode the item is about, one level up:
+        # a fix that reports itself as tested. Registered, and the list is now
+        # asserted to hold every test_* in the module (see
+        # test_every_test_in_this_module_is_registered) so the next one cannot
+        # go missing quietly.
+        test_forget_clears_the_archive_sidecar,
+        test_forget_on_archive_only_conv_does_not_claim_it_was_empty,
+        test_forget_reports_persona_it_deleted,
+        test_forget_reports_memory_that_survived_the_wipe,
+        test_forget_deletes_a_fact_that_landed_behind_the_wipe,
+        test_forget_leaves_an_empty_facts_store_so_backfill_cannot_resurrect,
+        test_forget_leaves_an_unreadable_facts_file_untouched,
+        test_forget_clears_the_dedup_refusal_memo,
+        test_forget_retries_once_when_the_first_pass_leaves_something,
+        test_forget_does_not_retry_when_the_first_pass_was_clean,
+        test_forget_drains_background_work_before_wiping,
+        test_forget_says_so_when_background_work_did_not_settle,
+        test_forget_reports_an_unreadable_archive_without_rewriting_it,
         test_why_shows_memory_state,
         test_why_with_no_state_shows_none_markers,
         test_unknown_canonical_returns_hint,
@@ -399,7 +753,23 @@ def _all_tests():
         test_synthetic_completion_shape,
         test_synthetic_completion_handles_empty_model,
         test_synthetic_completion_stream_shape,
+        test_every_test_in_this_module_is_registered,
     ]
+
+
+def test_every_test_in_this_module_is_registered():
+    print("\n[test] every test_* in this file is in the runner list")
+    # Seven A3 tests were added to this file and never added to _all_tests().
+    # They were dead code: the suite reported PASS and none of them had run.
+    # A missing registration is invisible in exactly the way a missing test is
+    # not, so the list checks itself.
+    defined = {
+        name for name, obj in sorted(globals().items())
+        if name.startswith("test_") and callable(obj)
+    }
+    registered = {t.__name__ for t in _all_tests()}
+    missing = sorted(defined - registered)
+    assert_eq(missing, [], "no test defined here is left out of the runner")
 
 
 if __name__ == "__main__":
