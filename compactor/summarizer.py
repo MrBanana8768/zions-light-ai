@@ -15,8 +15,11 @@ Why tiered:
 - Tiered summaries roll older content into denser representations without
   re-touching it — once an L1 chunk is created from turns 1-20, it never
   gets re-summarized; only when 10+ L1 chunks exist do they roll into L2.
-- Total injected size stays bounded (~5K tokens worst case: L3 + latest
-  L2 + a handful of unrolled L1 chunks).
+- Total injected size was INTENDED to stay bounded (~5K tokens worst case:
+  L3 + latest L2 + a handful of unrolled L1 chunks). It is not: nothing
+  trims l2 and format_summary_block renders every chapter, so this layer
+  grows without limit (MEMORY_REVIEW S-1/S-6). Read the line above as the
+  design, not as a property you may rely on.
 
 Storage (one JSON per conv):
     /data/openwebui/compactor/summaries/<conv_id>.json
@@ -46,6 +49,7 @@ from typing import Any
 
 import httpx
 
+import logsetup
 from memory import atomic_write_json, conv_lock, read_json_strict, storage_root
 
 logger = logging.getLogger("compactor.summarizer")
@@ -233,14 +237,68 @@ def _needs_l1_rollup(state: dict, current_turn_count: int) -> bool:
     return (current_turn_count - last) >= L1_CHUNK_SIZE
 
 
+def _reconcile_watermark(state: dict, current_turn_count: int) -> bool:
+    """Pull last_summarized_turn back to what the history actually contains.
+    Returns True if the watermark moved.
+
+    `last_summarized_turn` is an absolute position in whatever array the
+    client sent (S-5 / REMEDIATION F14). Whenever the observed history is
+    SHORTER than it — a client sending a bounded window, a user deleting or
+    editing messages, a branch switch — `current_turn_count - last` is
+    negative, so `_needs_l1_rollup` is False on this turn and on every turn
+    after it. The hierarchy stops advancing permanently and silently. That
+    is not hypothetical: 19.8 hours of production logs show every summary
+    injection reading L1=5 / L2=0 while the conversation ran from turn ~42
+    to ~58.
+
+    Resetting to the observed count un-latches the gate without
+    re-summarizing anything: rollups resume once L1_CHUNK_SIZE new turns
+    arrive. If the history later grows past the old watermark again, the
+    turns between will be summarized a second time — accepting a duplicate
+    chunk is the cheap half of the trade against a hierarchy that never
+    moves again.
+
+    The L1 chunks covering turns that are no longer observable are KEPT.
+    They are the only surviving record of that material, and deleting
+    summaries to repair a counter is exactly how the five destructive
+    memory paths removed earlier on this branch started. Their turn labels
+    stay wrong until D1 gives turns durable identities; this function fixes
+    the stall, not the units.
+    """
+    last = state.get("last_summarized_turn", 0)
+    if current_turn_count >= last:
+        return False
+    state["last_summarized_turn"] = current_turn_count
+    return True
+
+
 def _needs_l2_rollup(state: dict) -> bool:
     """True if accumulated L1 chunks have crossed the L2 threshold."""
     return len(state.get("l1", [])) >= L2_CHUNK_SIZE
 
 
 def _needs_l3_rollup(state: dict) -> bool:
-    """True if accumulated L2 chapters have crossed the L3 threshold."""
-    return len(state.get("l2", [])) >= L3_CHUNK_SIZE
+    """True if enough L2 chapters exist AND L3 does not already cover them.
+
+    The threshold alone is a standing condition, not an event (MEMORY_REVIEW
+    S-2): `_do_l3_rollup` keeps the L2 list, unlike L1→L2 which drops what it
+    consumed, so from the L3_CHUNK_SIZE-th chapter onward `len(l2) >=
+    L3_CHUNK_SIZE` never clears. Every turn then spent one L3_MAX_TOKENS LLM
+    call re-paraphrasing the same chapters, and kept `needs_rollup` True, so
+    maybe_rollup's early exit never fired either. Comparing L3's recorded
+    span against the current chapter span gives L3 the event semantics L1→L2
+    always had: refresh when the chapters have actually moved.
+    """
+    l2 = state.get("l2") or []
+    if len(l2) < L3_CHUNK_SIZE:
+        return False
+    l3 = state.get("l3")
+    if not isinstance(l3, dict):
+        return True
+    return (
+        l3.get("first_turn") != l2[0].get("first_turn")
+        or l3.get("last_turn") != l2[-1].get("last_turn")
+    )
 
 
 def needs_rollup(state: dict, current_turn_count: int) -> bool:
@@ -331,6 +389,7 @@ async def _llm_summarize(
 # ---------------------------------------------------------------------------
 
 async def _do_l1_rollup(
+    conv_id: str,
     client: httpx.AsyncClient,
     vllm_url: str,
     model: str,
@@ -355,11 +414,18 @@ async def _do_l1_rollup(
         "text": text, "first_turn": first_turn, "last_turn": last_turn,
     })
     state["last_summarized_turn"] = last_turn
+    # A rollup had no success line of its own, so the only evidence the
+    # hierarchy was advancing was the injection counter — which is why S-5
+    # froze it for the life of the deployment without anyone noticing.
+    logger.info(
+        f"conv={conv_id}: L1 rollup — chunk {len(state['l1'])} covers turns "
+        f"{first_turn}-{last_turn}"
+    )
     return True
 
 
 async def _do_l2_rollup(
-    client: httpx.AsyncClient, vllm_url: str, model: str, state: dict,
+    conv_id: str, client: httpx.AsyncClient, vllm_url: str, model: str, state: dict,
 ) -> bool:
     """Roll the OLDEST L2_CHUNK_SIZE L1 chunks into one L2 chapter, dropping
     them from the L1 list. Returns True if a chapter was produced.
@@ -383,11 +449,16 @@ async def _do_l2_rollup(
         "last_turn": chunks[-1]["last_turn"],
     })
     state["l1"] = l1[L2_CHUNK_SIZE:]  # drop the rolled-up chunks
+    logger.info(
+        f"conv={conv_id}: L2 rollup — chapter {len(state['l2'])} covers turns "
+        f"{chunks[0]['first_turn']}-{chunks[-1]['last_turn']} from "
+        f"{len(chunks)} L1 chunks"
+    )
     return True
 
 
 async def _do_l3_rollup(
-    client: httpx.AsyncClient, vllm_url: str, model: str, state: dict,
+    conv_id: str, client: httpx.AsyncClient, vllm_url: str, model: str, state: dict,
 ) -> bool:
     """Roll all L2 chapters into / refresh L3. Unlike L1→L2, this keeps the
     L2 list (so the next request still has the chapters available) and
@@ -410,6 +481,10 @@ async def _do_l3_rollup(
         "first_turn": l2[0]["first_turn"],
         "last_turn": l2[-1]["last_turn"],
     }
+    logger.info(
+        f"conv={conv_id}: L3 refresh — covers turns {l2[0]['first_turn']}-"
+        f"{l2[-1]['last_turn']} over {len(l2)} chapters"
+    )
     return True
 
 
@@ -425,7 +500,8 @@ async def maybe_rollup(
     an unreadable state file propagates memory.StoreUnreadable, because the
     one thing this function must never do is write a state it could not
     read (v3.1 F1b/G3). The caller's tail already treats that as a
-    non-fatal skipped rollup.
+    non-fatal skipped rollup. Tiers that completed before a failure are
+    persisted; only the tier that failed retries on the next turn.
 
     `messages` is the FULL message history (caller usually has the request's
     messages list right there), so L1 rollups can format the exact turns
@@ -439,37 +515,64 @@ async def maybe_rollup(
     async with conv_lock(conv_id):
         state = load_state(conv_id)
 
-        if not needs_rollup(state, current_turns):
-            return state
+        stale = state.get("last_summarized_turn", 0)
+        changed = _reconcile_watermark(state, current_turns)
+        if changed and logsetup.log_once("summarizer.watermark.reset"):
+            # WARNING, and separate from the quiet path: a negative delta
+            # reads exactly like "not enough new material" from the outside,
+            # and that is why it went unnoticed. Once per process because
+            # this is on the tail of every turn (v3.1 P0-2b).
+            logger.warning(
+                f"conv={conv_id}: observed history ({current_turns} turns) is "
+                f"shorter than last_summarized_turn ({stale}); the L1 gate was "
+                f"latched off and has been reset to {current_turns} — earlier "
+                f"chunks are kept, and their turn labels no longer line up "
+                f"with this history"
+            )
 
-        try:
-            async with httpx.AsyncClient() as client:
-                # Drain L1 rollups until either caught up or no more material.
-                while _needs_l1_rollup(state, current_turns):
-                    ok = await _do_l1_rollup(client, vllm_url, model, state, messages)
-                    if not ok:
-                        break
+        if needs_rollup(state, current_turns):
+            try:
+                async with httpx.AsyncClient() as client:
+                    # Drain L1 rollups until either caught up or no more material.
+                    while _needs_l1_rollup(state, current_turns):
+                        if not await _do_l1_rollup(
+                            conv_id, client, vllm_url, model, state, messages
+                        ):
+                            break
+                        changed = True
 
-                # Drain L2 rollups while threshold met.
-                while _needs_l2_rollup(state):
-                    ok = await _do_l2_rollup(client, vllm_url, model, state)
-                    if not ok:
-                        break
+                    # Drain L2 rollups while threshold met.
+                    while _needs_l2_rollup(state):
+                        if not await _do_l2_rollup(
+                            conv_id, client, vllm_url, model, state
+                        ):
+                            break
+                        changed = True
 
-                # L3 is at most one rollup per call (refresh, not stack).
-                if _needs_l3_rollup(state):
-                    await _do_l3_rollup(client, vllm_url, model, state)
+                    # L3 is at most one rollup per call (refresh, not stack).
+                    if _needs_l3_rollup(state):
+                        if await _do_l3_rollup(conv_id, client, vllm_url, model, state):
+                            changed = True
+            except Exception as e:
+                logger.exception(f"conv={conv_id}: rollup failed mid-flight: {e}")
 
-            # The write lives INSIDE this try (v3.1 G3). It used to sit
-            # after it, guarded only by its own narrow try, so a rollup that
-            # died mid-flight still persisted whatever `state` happened to
-            # hold. Paired with a load that returned the empty skeleton on a
-            # misread, that wrote _empty_state over a real L1/L2/L3 stack
-            # with zero LLM involvement. Losing a partial rollup costs one
-            # cycle; the rollup re-triggers on the next turn.
-            save_state(conv_id, state)
-        except Exception as e:
-            logger.exception(f"conv={conv_id}: rollup failed mid-flight: {e}")
+        # The write sits OUTSIDE the rollup try (v3.1 G3, revised for
+        # MEMORY_REVIEW S-3). G3 moved it in because a rollup that died
+        # mid-flight still persisted whatever `state` held, and a load that
+        # returned the empty skeleton on a misread made that skeleton the
+        # thing written. The load is the half that got fixed: load_state now
+        # raises StoreUnreadable and is called above, outside every try, so
+        # nothing here can reach save_state with a state it did not read.
+        # What was left was the other half — an L3 failure discarding the L1
+        # rollups that had already succeeded, on every turn, forever. Each
+        # _do_*_rollup mutates `state` only after its own LLM call returns,
+        # so `state` here is always a consistent prefix of successful
+        # rollups whether or not a later tier raised.
+        if changed:
+            try:
+                save_state(conv_id, state)
+            except Exception as e:
+                logger.exception(f"conv={conv_id}: rollup state write failed: {e}")
 
         return state
 

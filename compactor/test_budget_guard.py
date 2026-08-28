@@ -15,16 +15,27 @@ whose job is to keep requests inside the context window overflowed it:
 So: _chunk_to_budget bounds the summarizer's input, and _enforce_hard_budget is
 the final pre-flight that guarantees what we forward can actually be served.
 
-The last section drives the guard through the real endpoint rather than calling
-it directly, because the protect_system fix is load-bearing on its CALL SITE and
-nothing that calls the function can see whether the call site is right.
+The last two sections drive the endpoint rather than calling the guard
+directly, because the fixes they cover are load-bearing on the CALL SITE and
+nothing that calls a function can see whether its call site is right.
+
+The final section covers what happens when the guard loses — when the request
+goes out anyway and vLLM refuses it. On 2026-08-24 23:49 that was 139.9s of
+compaction, a context-length 400 at 33,127 tokens, and then no reply, no
+indexed exchange, no facts and no episodic write — while openwebui.log and
+compactor.log both recorded HTTP 200 and the only trace of the destroyed turn
+was two unattributed WARNING lines. A budget that can be exceeded needs its
+failure to be legible, so those tests assert the failure is visible to the USER
+and attributable in the LOG.
 
 Run inside the compactor image or any container with the requirements:
     python test_budget_guard.py
 """
 
+import asyncio
 import inspect
 import io
+import json
 import logging
 import os
 import re
@@ -52,11 +63,13 @@ _TMP_ROOT = tempfile.mkdtemp(prefix="compactor-test-budget-guard-")
 os.environ["COMPACTOR_STORAGE_ROOT"] = _TMP_ROOT
 os.environ["COMPACTOR_RAG_ENABLED"] = "false"
 
+import dedup  # noqa: E402
 import facts  # noqa: E402
 import logsetup  # noqa: E402
 import main  # noqa: E402
 import memory  # noqa: E402
 import retrieval  # noqa: E402
+import summarizer  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -1130,6 +1143,457 @@ def test_chunk_to_budget():
     assert_eq(len(batches[0]), 1, "the turn is kept, not silently discarded")
 
 
+# ---------------------------------------------------------------------------
+# When the guard loses: what the user sees, and what the log says
+# ---------------------------------------------------------------------------
+#
+# The guard forwards an over-budget payload rather than dropping the user's
+# newest turn, and says so at ERROR. vLLM then rejects it. Everything below is
+# about that second half.
+#
+# Why it is in THIS file: a context-length 400 is the budget guard being wrong,
+# and these assert the two things the 2026-08-24 record could not supply — a
+# user who is told their message failed, and a log line that names the
+# conversation and both token counts.
+
+
+def ctx_400(actual_tokens):
+    """A vLLM context-length 400 body, in the production shape.
+
+    Shares its wording with test_modality.ctx_400 because both are parsed by
+    the same two functions; the window here is this file's 1000-token one so
+    the fixture stays internally consistent."""
+    return (
+        '{"error":{"message":"This model\'s maximum context length is 1000 '
+        'tokens. However, you requested 0 output tokens and your prompt '
+        'contains ' + str(actual_tokens) + ' input tokens, for a total of ... '
+        '(parameter=input_tokens)"}}'
+    )
+
+
+# A 400 that is NOT about size. Deliberately not the "not a multimodal model"
+# body: that one flips main._backend_multimodal for the life of the process and
+# would silently strip images out of every later test in this file.
+OTHER_400 = '{"error":{"message":"only user and assistant roles are supported!"}}'
+
+
+class _StubStreamResponse:
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+
+    async def aread(self):
+        return self._body.encode()
+
+    async def aiter_raw(self):
+        raise AssertionError("the error branch must not read the body as a stream")
+        yield b""   # pragma: no cover - makes this an async generator
+
+
+class _StubStreamCM:
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _StubRejectedResponse:
+    """What the non-streaming path gets back: a real status and a parseable
+    error body, since that path reads r.json() before it looks at the status."""
+
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self.text = body
+
+    def json(self):
+        return json.loads(self.text)
+
+
+class _StubVLLMRefusing(_StubVLLM):
+    """_StubVLLM that refuses every request, on both halves of the handler.
+
+    `status` and `body` are class attributes so a test sets the rejection it
+    wants before posting."""
+
+    status = 400
+    body = ""
+
+    def stream(self, method, url, json=None, **kwargs):
+        _StubVLLM.sent.append(json)
+        return _StubStreamCM(_StubStreamResponse(self.status, self.body))
+
+    async def post(self, url, json=None, **kwargs):
+        _StubVLLM.sent.append(json)
+        return _StubRejectedResponse(self.status, self.body)
+
+
+def _post_rejected(messages, conv_id, *, status=400, body=None, stream=True,
+                   exact_tokens=None):
+    """POST one chat completion that vLLM refuses.
+
+    -> (response, log records, list of coroutines handed to _fire_and_forget).
+
+    That third value is the point of the helper: "was this turn memorized" is
+    not visible in the response or in the log, and a rejected request must not
+    reach the memory tail at all.
+
+    _BUDGET_MARGIN is saved and restored. _note_backend_rejection moves it, it
+    is a module global with no reset, and a test that left it moved would
+    silently shrink the budget for every test that runs after it.
+    """
+    body = ctx_400(1234) if body is None else body
+    _StubVLLM.sent.clear()
+    tails = []
+
+    def _record_tail(coro):
+        tails.append(coro)
+        try:
+            coro.close()
+        except Exception:
+            pass
+
+    handler = _CaptureLogs()
+    lg = logging.getLogger("compactor")
+    lg.addHandler(handler)
+    margin_before = main._BUDGET_MARGIN
+    stub = type("_S", (_StubVLLMRefusing,), {"status": status, "body": body})
+    try:
+        with patch.object(main.httpx, "AsyncClient", stub), \
+             patch.object(main, "_fire_and_forget", _record_tail), \
+             patch.object(main, "count_tokens_exact", lambda _m: exact_tokens):
+            r = client.post(
+                "/v1/chat/completions",
+                json={"model": "stub-model", "messages": messages, "stream": stream},
+                headers={"X-Conversation-Id": conv_id},
+            )
+    finally:
+        lg.removeHandler(handler)
+        main._BUDGET_MARGIN = margin_before
+    return r, handler.records, tails
+
+
+def _sse_chunks(response):
+    """The parsed `data:` payloads of an SSE body, [DONE] excluded."""
+    out = []
+    for block in response.text.split("\n\n"):
+        for line in block.split("\n"):
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:].strip()
+            if payload and payload != "[DONE]":
+                out.append(json.loads(payload))
+    return out
+
+
+def _assistant_text(chunks):
+    return "".join(
+        c.get("choices", [{}])[0].get("delta", {}).get("content") or ""
+        for c in chunks
+    )
+
+
+def _rejection_line(records):
+    """The ERROR record for a lost turn, or None.
+
+    Matched on level as well as text: the pre-v3.1 line existed, at WARNING,
+    in a file the runbook did not send anyone to. The level is the fix."""
+    for rec in records:
+        if rec.levelno != logging.ERROR:
+            continue
+        msg = rec.getMessage()
+        if "REQUEST REJECTED by vLLM" in msg or "vLLM FAILED this request" in msg:
+            return rec
+    return None
+
+
+def test_context_400_tells_the_user_the_message_did_not_go_through():
+    print("\n[test] stream 400 — the user is told the turn failed, not given a reply")
+    r, _records, _tails = _post_rejected([user("what did we decide?")], "rej-visible")
+
+    # The condition that makes everything else necessary, asserted rather than
+    # assumed: StreamingResponse commits its status before vLLM answers, so the
+    # rejection cannot be expressed as an HTTP status on this path.
+    assert_eq(r.status_code, 200, "the stream had already committed HTTP 200")
+
+    chunks = _sse_chunks(r)
+    text = _assistant_text(chunks)
+    assert_true(
+        main._REJECTED_PREAMBLE in text,
+        f"the reply leads with the outcome: {text[:80]!r}",
+    )
+    assert_true(
+        "nothing about this turn was saved to memory" in text,
+        "and says the turn was not remembered either",
+    )
+    assert_true(
+        main.MODEL_RESTART_MESSAGE not in text,
+        "and does NOT claim the backend is restarting — it answered, refusing",
+    )
+    assert_true("[DONE]" in r.text, "the stream still terminates cleanly")
+
+
+def test_context_400_is_typed_so_a_client_can_tell_it_from_a_reply():
+    print("\n[test] stream 400 — finish_reason 'error' + an error object (INCIDENT A5)")
+    # A5: the old pair ended finish_reason "stop", which to OpenWebUI is an
+    # ordinary successful completion whose text happens to read like an
+    # apology. Nothing downstream could distinguish "model replied" from
+    # "request rejected" — so the transcript kept the turn and memory did not.
+    r, _records, _tails = _post_rejected([user("what did we decide?")], "rej-typed")
+    chunks = _sse_chunks(r)
+    finals = [c for c in chunks if c["choices"][0].get("finish_reason")]
+    assert_eq(len(finals), 1, "exactly one terminal chunk")
+    assert_eq(finals[0]["choices"][0]["finish_reason"], "error", "finish_reason is 'error'")
+    err = finals[0].get("error") or {}
+    assert_eq(err.get("code"), "context_length_exceeded", "the error names the cause")
+    assert_eq(err.get("type"), "invalid_request_error", "typed as a rejection, not an outage")
+
+
+def test_context_400_logs_an_error_naming_the_conversation_and_both_counts():
+    print("\n[test] stream 400 — one ERROR carrying conv_id, our count and vLLM's")
+    r, records, _tails = _post_rejected([user("what did we decide?")], "rej-logged")
+    line = _rejection_line(records)
+    assert_true(line is not None, "a rejection was logged at ERROR")
+    msg = line.getMessage()
+    assert_true("conv=rej-logged" in msg, f"the line names the conversation: {msg[:120]!r}")
+    assert_true("we measured" in msg and "the local tokenizer" in msg,
+                "it names our own count AND which counter produced it")
+    assert_true("vLLM counted 1,234" in msg, "it carries vLLM's true count")
+    assert_true("UNDERCOUNTED" in msg, "and states which way the gap runs")
+    assert_true("no access log will show this" in msg,
+                "and warns that the 200 upstream is not evidence of success")
+    assert_true("produced no reply" in msg, "and says the turn is gone")
+    # The 2026-08-24 log had no such line at all, so a passing assertion above
+    # must not be satisfiable by an ordinary success.
+    assert_eq(r.status_code, 200, "still a 200 on the wire — that is the problem")
+
+
+def test_the_log_line_names_tokenize_when_tokenize_answered():
+    print("\n[test] stream 400 — the count's SOURCE is reported, not assumed")
+    # count_tokens and count_tokens_exact disagree by ~50% on assistant
+    # content, so "we measured N" is ambiguous until the line says which one
+    # measured it — and the reader is trying to locate an undercount.
+    _r, records, _tails = _post_rejected(
+        [user("what did we decide?")], "rej-source", exact_tokens=777,
+    )
+    msg = _rejection_line(records).getMessage()
+    assert_true("we measured 777 tokens with vLLM's /tokenize" in msg,
+                f"the line names /tokenize as the source: {msg[:160]!r}")
+
+
+def test_a_rejected_turn_is_never_memorized():
+    print("\n[test] stream 400 — no memory tail fires for a turn that produced nothing")
+    _r, _records, tails = _post_rejected([user("what did we decide?")], "rej-no-tail")
+    assert_eq(len(tails), 0, "the memory tail was not fired")
+
+
+def test_retry_is_promised_only_when_the_rejection_taught_us_something():
+    print("\n[test] stream 400 — 'send it again' only when the margin actually moved")
+    # Observed 2026-08-27: three consecutive failures moved the margin +127
+    # each while it needed ~5250, and the same "send it again" advice produced
+    # the same failure. Advice that cannot work is a lie with a friendly face.
+    margin_before = main._BUDGET_MARGIN
+    try:
+        main._BUDGET_MARGIN = 0
+        r, _records, _t = _post_rejected([user("hi")], "rej-retry")
+        first = _assistant_text(_sse_chunks(r))
+        assert_true(main.CONTEXT_OVERFLOW_RETRY.strip() in first,
+                    "a rejection that tightened the budget invites a resend")
+
+        # Now pin the margin at the cap so the same rejection can teach nothing.
+        main._BUDGET_MARGIN = main.MAX_MODEL_LEN // 4
+        r, _records, _t = _post_rejected([user("hi")], "rej-no-retry")
+        second = _assistant_text(_sse_chunks(r))
+        assert_true(main.CONTEXT_OVERFLOW_NO_RETRY.strip() in second,
+                    "a rejection that taught nothing says so instead")
+        assert_true(main.CONTEXT_OVERFLOW_RETRY.strip() not in second,
+                    "and does not invite a resend that would fail identically")
+    finally:
+        main._BUDGET_MARGIN = margin_before
+
+
+def test_a_non_size_400_does_not_blame_the_context_window():
+    print("\n[test] stream 400 — a non-size rejection gets the generic text")
+    r, _records, _t = _post_rejected([user("hi")], "rej-other", body=OTHER_400)
+    text = _assistant_text(_sse_chunks(r))
+    assert_true(main._REJECTED_PREAMBLE in text, "still leads with the outcome")
+    assert_true("too large for the model's context window" not in text,
+                "but does not invent a size problem")
+    assert_true(main.MODEL_RESTART_MESSAGE not in text,
+                "and does not claim an outage either")
+    code = _sse_chunks(r)[-1]["error"]["code"]
+    assert_eq(code, "backend_rejected", "typed as a generic rejection")
+
+
+def test_a_backend_5xx_on_the_stream_is_also_logged_as_a_lost_turn():
+    print("\n[test] stream 500 — logged at ERROR, and NOT called a rejection")
+    r, records, tails = _post_rejected(
+        [user("hi")], "rej-5xx", status=500, body='{"error":"internal"}',
+    )
+    line = _rejection_line(records)
+    assert_true(line is not None, "the lost turn is logged at ERROR")
+    msg = line.getMessage()
+    assert_true("vLLM FAILED this request (HTTP 500)" in msg,
+                f"a backend fault is not described as a rejection: {msg[:120]!r}")
+    assert_eq(len(tails), 0, "and nothing is memorized")
+    # The 5xx text is still the restart message: on a 5xx the backend really is
+    # unhealthy, so that message is true. Only the 4xx case was the lie.
+    assert_true(main.MODEL_RESTART_MESSAGE in _assistant_text(_sse_chunks(r)),
+                "the user is told the backend is unavailable")
+
+
+def test_nonstream_400_logs_the_loss_and_skips_the_memory_tail():
+    print("\n[test] non-stream 400 — relayed as a 400, logged at ERROR, not memorized")
+    # This path always handed the client vLLM's real status, which is why the
+    # invisible failure was the stream path. What it did NOT do was say which
+    # conversation lost a turn — and it fired the memory tail before it looked
+    # at the status at all (v3.1 F20).
+    r, records, tails = _post_rejected(
+        [user("what did we decide?")], "rej-nonstream", stream=False,
+    )
+    assert_eq(r.status_code, 400, "vLLM's own status is relayed verbatim")
+    line = _rejection_line(records)
+    assert_true(line is not None, "the lost turn is logged at ERROR")
+    msg = line.getMessage()
+    assert_true("conv=rej-nonstream" in msg, "naming the conversation")
+    assert_true("vLLM counted 1,234" in msg, "and carrying vLLM's true count")
+    assert_true("no access log will show this" not in msg,
+                "and NOT claiming the 200 caveat, which is false on this path")
+    assert_eq(len(tails), 0, "the memory tail was not fired for a refused turn")
+
+
+# ---------------------------------------------------------------------------
+# The tail's inputs: what the extractor and dedup are told
+# ---------------------------------------------------------------------------
+
+
+def _tail_spies(conv_id, touched, injected, *, extracted="- A new fact."):
+    """Run one _async_tail with the two vLLM-facing calls replaced by spies.
+
+    -> (extraction kwargs+args seen, dedup kwargs seen). Summaries and episodic
+    indexing are off; this is only about what the tail hands its collaborators.
+    """
+    seen = {}
+
+    async def spy_extract(_client, _url, _model, _user, _asst, existing, **kwargs):
+        seen["existing"] = existing
+        seen["extract_kwargs"] = kwargs
+        return [extracted]
+
+    async def spy_dedup(_client, _url, _model, combined, **kwargs):
+        seen["dedup_kwargs"] = kwargs
+        return combined, 0
+
+    kwargs = {} if injected is None else {"injected_facts": injected}
+    with patch.object(facts, "extract_facts_from_exchange", spy_extract), \
+         patch.object(dedup, "dedup_facts", spy_dedup), \
+         patch.object(summarizer, "enabled", lambda: False):
+        asyncio.run(main._async_tail(
+            conv_id, touched, "and then?", "Lyra drew her bow.", 9,
+            [{"role": "user", "content": "and then?"}], **kwargs,
+        ))
+    return seen
+
+
+def _oversized_store(n=8, chars=1200):
+    """A fact store comfortably past COMPACTOR_MAX_FACTS_TOKENS, so
+    select_for_injection really is narrower than the whole thing."""
+    return [
+        {"text": f"F{i} " + "s" * chars, "added_turn": i, "last_used": 1748000000 + i}
+        for i in range(1, n + 1)
+    ]
+
+
+def test_extraction_is_handed_the_injected_subset_not_the_whole_store():
+    print("\n[test] handoff — the extractor sees what the MODEL saw, not the store")
+    # facts.py now trims its own input, so the whole store no longer overflows
+    # the window. It is still the wrong list: the trim it would apply is a
+    # second, later opinion about which facts matter. Handing it the injected
+    # subset means "already known" means the same thing on both sides of the
+    # exchange.
+    store = _oversized_store()
+    injected = facts.select_for_injection(store)
+    assert_true(
+        0 < len(injected) < len(store),
+        f"fixture: injection is really narrower than the store "
+        f"({len(injected)} of {len(store)})",
+    )
+    seen = _tail_spies("tail-injected", store, injected)
+    assert_eq(len(seen["existing"]), len(injected),
+              "the extractor was handed the injected subset")
+    assert_true(seen["existing"] is injected, "and the very list the request path built")
+
+
+def test_extraction_is_bounded_even_for_a_caller_that_passes_nothing():
+    print("\n[test] handoff — the default narrows too, so no caller can pass the store")
+    # injected_facts is keyword-only with a default so its arrival breaks no
+    # caller. The default has to be select_for_injection(store), not the store:
+    # a default that reintroduces the defect for un-updated callers is not a
+    # default, it is the defect with a nicer signature.
+    store = _oversized_store()
+    seen = _tail_spies("tail-default", store, None)
+    assert_eq(len(seen["existing"]), len(facts.select_for_injection(store)),
+              "an omitted injected_facts still yields the bounded set")
+    assert_true(len(seen["existing"]) < len(store), "and not the whole store")
+
+
+def test_extraction_and_dedup_are_told_which_conversation():
+    print("\n[test] handoff — conv_id reaches facts.extract and dedup.dedup_facts")
+    # facts: without it a failed extraction logs "conv=?" and a lost memory
+    # cannot be traced to the turn that lost it.
+    # dedup: without it the refusal memo is disabled outright, so every pass
+    # re-asks the model clusters it has already refused to merge (I-6).
+    cid = "tail-conv-id"
+    store = [
+        {"text": "The ranger is Lyra.", "added_turn": 1, "last_used": 1748000000},
+        {"text": "Lyra carries a yew bow.", "added_turn": 2, "last_used": 1748000001},
+    ]
+    # On disk as well as in hand: the tail re-reads the store inside its lock,
+    # and inline dedup only runs when that re-read plus the new fact make two.
+    facts.save_facts(cid, store)
+    seen = _tail_spies(cid, store, store)
+    assert_eq(seen["extract_kwargs"].get("conv_id"), cid,
+              "the extractor is told the conversation")
+    assert_true("dedup_kwargs" in seen, "fixture: inline dedup actually ran")
+    assert_eq(seen["dedup_kwargs"].get("conv_id"), cid,
+              "dedup is told the conversation")
+
+
+def test_the_request_path_hands_the_tail_the_list_it_injected():
+    print("\n[test] handoff — the call site passes injected_facts, end to end")
+    # The narrower companion to the two above: they assert what _async_tail
+    # does with the argument, this asserts the endpoint supplies it. Without
+    # this, a call site that silently stopped passing it would fall back to the
+    # default and every assertion above would still be green.
+    cid = "tail-callsite"
+    store = _oversized_store()
+    facts.save_facts(cid, store)
+    seen = {}
+
+    def recorder(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+
+        async def _noop():
+            return None
+
+        return _noop()
+
+    with patch.object(main, "_async_tail", recorder):
+        r, _forwarded, _records = _post_chat([user("and then?")], cid)
+
+    assert_eq(r.status_code, 200, f"the request completed (body: {r.text[:200]!r})")
+    passed = seen.get("kwargs", {}).get("injected_facts")
+    assert_true(passed is not None, "injected_facts was passed by keyword")
+    assert_true(0 < len(passed) < len(store),
+                f"and it is the bounded subset ({len(passed)} of {len(store)})")
+    assert_eq(len(seen["args"][1]), len(store),
+              "while touched_facts is still the WHOLE store, so LRU keeps its signal")
+
+
 def _all_tests():
     return [
         test_hard_limit_configured,
@@ -1156,6 +1620,19 @@ def _all_tests():
         test_call_site_passes_the_callers_system_count,
         test_tier2_fallback_is_not_silent,
         test_chunk_to_budget,
+        test_context_400_tells_the_user_the_message_did_not_go_through,
+        test_context_400_is_typed_so_a_client_can_tell_it_from_a_reply,
+        test_context_400_logs_an_error_naming_the_conversation_and_both_counts,
+        test_the_log_line_names_tokenize_when_tokenize_answered,
+        test_a_rejected_turn_is_never_memorized,
+        test_retry_is_promised_only_when_the_rejection_taught_us_something,
+        test_a_non_size_400_does_not_blame_the_context_window,
+        test_a_backend_5xx_on_the_stream_is_also_logged_as_a_lost_turn,
+        test_nonstream_400_logs_the_loss_and_skips_the_memory_tail,
+        test_extraction_is_handed_the_injected_subset_not_the_whole_store,
+        test_extraction_is_bounded_even_for_a_caller_that_passes_nothing,
+        test_extraction_and_dedup_are_told_which_conversation,
+        test_the_request_path_hands_the_tail_the_list_it_injected,
     ]
 
 

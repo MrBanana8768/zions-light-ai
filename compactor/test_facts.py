@@ -656,6 +656,170 @@ def test_record_facts_for_exchange_archives_its_evictions():
 
 
 # ---------------------------------------------------------------------------
+# v3.1 — fact extraction had no INPUT budget
+# ---------------------------------------------------------------------------
+#
+# _EXTRACTION_MAX_TOKENS bounded the output and nothing bounded the input. The
+# payload is the extraction system prompt + the ENTIRE fact store + the full
+# user turn + the full assistant reply; the chat path sends no max_tokens, so
+# vLLM may generate a reply of nearly the whole window and extraction then
+# stacks the prompt and the store on top of it. Two calls in the 2026-08-24
+# window were rejected at 33,790 and 33,581 input tokens against a 32,768
+# window.
+#
+# What a rejection cost, precisely: the warning fired and no "+N facts" line
+# followed it. The exchange's facts were never extracted, nothing retried, and
+# the warning named no conversation — so the log could not say which
+# conversation had lost the turn. Hence the third test here.
+
+
+def _payload_of(client) -> dict:
+    """The JSON body the mocked client was actually asked to POST."""
+    return client.post.call_args.kwargs["json"]
+
+
+def _payload_tokens(payload: dict) -> int:
+    """Size the assembled request the way facts.py sizes everything else."""
+    return sum(facts._estimate_tokens(m["content"]) for m in payload["messages"])
+
+
+def _oversized_store() -> list[dict]:
+    """A fact store that on its own exceeds the real extraction input budget."""
+    store = [_f(f"established fact {i:04d} " + "z" * 80, i, 1000 + i) for i in range(1500)]
+    assert_true(
+        sum(facts._estimate_tokens(x["text"]) for x in store)
+        > facts._EXTRACTION_INPUT_BUDGET,
+        "prep: the store alone is over the extraction input budget",
+    )
+    return store
+
+
+def test_oversized_store_is_trimmed_not_rejected():
+    print("\n[test] an over-budget store is trimmed to fit, and the call still happens")
+    client = _mock_client_returning("- Lyra carries a yew bow.")
+    out = asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model",
+        "What does Lyra carry?", "A yew bow she made herself.",
+        _oversized_store(), conv_id="budget",
+    ))
+    assert_eq(out, ["Lyra carries a yew bow."], "the extraction returned its fact")
+    assert_true(client.post.called, "the call went out — trimmed, not skipped")
+    assert_true(
+        _payload_tokens(_payload_of(client)) <= facts._EXTRACTION_INPUT_BUDGET,
+        "the assembled payload fits the input budget",
+    )
+
+
+def test_the_exchange_survives_trimming_in_preference_to_the_store():
+    print("\n[test] trimming sheds the store first — the exchange is the new information")
+    client = _mock_client_returning("NONE")
+    store = _oversized_store()
+    user = "Her sister is named Isolde and she runs the mill at Varrow Ford."
+    asst = "Isolde keeps the mill turning while Lyra is away."
+    asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model", user, asst, store, conv_id="budget",
+    ))
+    body = _payload_of(client)["messages"][-1]["content"]
+    assert_true(user in body, "the user turn reached the model verbatim")
+    assert_true(asst in body, "the assistant reply reached the model verbatim")
+    assert_true(
+        facts._TRIM_NOTE not in body,
+        "neither half of the exchange was truncated to make room",
+    )
+    # The store is what paid for it. Not zero — it gets whatever the exchange
+    # left — but far less than the 1500 it was handed.
+    kept = [x for x in store if f"- {x['text']}" in body]
+    shed = [x for x in store if f"- {x['text']}" not in body]
+    assert_true(kept, "the store was narrowed, not emptied")
+    assert_true(shed, "the store is what got shed")
+    assert_true(
+        min(x["last_used"] for x in kept) > max(x["last_used"] for x in shed),
+        "the facts kept are the most-recently-used ones — the same order "
+        "select_for_injection and prune_facts use, not an arbitrary slice",
+    )
+
+
+def test_the_assistant_reply_is_shed_before_the_user_turn():
+    print("\n[test] when the exchange itself does not fit, the reply goes first")
+    client = _mock_client_returning("NONE")
+    user = "Remember: the Varrow Ford mill burned down in the third winter."
+    asst = "Understood. " + "The mill is gone. " * 4000
+    # A budget the exchange alone cannot fit, passed explicitly so the test does
+    # not depend on MAX_MODEL_LEN.
+    asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model", user, asst, [],
+        conv_id="budget", max_input_tokens=facts._extraction_overhead_tokens() + 600,
+    ))
+    body = _payload_of(client)["messages"][-1]["content"]
+    assert_true(user in body, "the user turn survives whole")
+    assert_true(asst not in body, "the assistant reply did not")
+    assert_true(facts._TRIM_NOTE in body, "and the model is told it was truncated")
+    assert_true(
+        _payload_tokens(_payload_of(client))
+        <= facts._extraction_overhead_tokens() + 600,
+        "the trimmed payload fits the budget it was given",
+    )
+
+
+def test_a_user_turn_larger_than_the_budget_is_truncated_not_dropped():
+    print("\n[test] even an oversized user turn is truncated, never emptied")
+    client = _mock_client_returning("NONE")
+    asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model",
+        "Lyra " * 8000, "Noted.", [],
+        conv_id="budget", max_input_tokens=facts._extraction_overhead_tokens() + 300,
+    ))
+    body = _payload_of(client)["messages"][-1]["content"]
+    # An empty message would short-circuit the whole call on the next turn and
+    # turn a budget overflow back into a silently lost exchange.
+    assert_true("[user]: Lyra" in body, "the user turn still carries its content")
+    assert_true(facts._TRIM_NOTE in body, "truncation is marked, not silent")
+
+
+def test_extraction_failure_is_an_error_that_names_the_conversation():
+    print("\n[test] a failed extraction logs at ERROR and says which conversation")
+    client = _mock_client_raising(RuntimeError("400 Bad Request: maximum context length"))
+    with patch.object(facts.logger, "error") as err, \
+         patch.object(facts.logger, "warning") as warn:
+        out = asyncio.run(facts.extract_facts_from_exchange(
+            client, "http://fake", "fake-model", "hi", "hello", [],
+            conv_id="conv-abc123",
+        ))
+    assert_eq(out, [], "still non-fatal to the chat path")
+    assert_true(err.called, "a lost extraction is an ERROR, not a WARNING")
+    assert_true(not warn.called, "and not also a warning")
+    msg = err.call_args[0][0]
+    assert_true("conv=conv-abc123" in msg, "the log names the conversation")
+    assert_true("lost" in msg, "the log says the facts are gone, not merely that a call failed")
+
+
+def test_extraction_failure_without_conv_id_says_the_caller_gave_none():
+    print("\n[test] a caller that passes no conv_id is named as the reason")
+    # main.py's async tail is that caller at HEAD — it has conv_id in scope and
+    # does not pass it. The line must not read as if the conversation were
+    # unknowable.
+    client = _mock_client_raising(RuntimeError("connection refused"))
+    with patch.object(facts.logger, "error") as err:
+        asyncio.run(facts.extract_facts_from_exchange(
+            client, "http://fake", "fake-model", "hi", "hello", [],
+        ))
+    assert_true("caller passed none" in err.call_args[0][0], "says who is at fault")
+
+
+def test_record_facts_for_exchange_passes_its_conv_id_through():
+    print("\n[test] record_facts_for_exchange attributes its own failures")
+    _wipe_storage()
+    client = _mock_client_raising(RuntimeError("connection refused"))
+    with patch.object(facts.logger, "error") as err:
+        n = asyncio.run(facts.record_facts_for_exchange(
+            "attributed", client, "http://fake", "fake-model",
+            user_msg="Who is Lyra?", assistant_msg="A ranger.", turn_index=1,
+        ))
+    assert_eq(n, 0, "no facts added")
+    assert_true("conv=attributed" in err.call_args[0][0], "the conv_id reached the log")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -707,6 +871,15 @@ if __name__ == "__main__":
         test_eviction_keeps_facts_when_the_archive_write_fails()
         test_re_archiving_a_fact_replaces_rather_than_duplicates()
         test_record_facts_for_exchange_archives_its_evictions()
+
+        # v3.1 — fact extraction had no input budget
+        test_oversized_store_is_trimmed_not_rejected()
+        test_the_exchange_survives_trimming_in_preference_to_the_store()
+        test_the_assistant_reply_is_shed_before_the_user_turn()
+        test_a_user_turn_larger_than_the_budget_is_truncated_not_dropped()
+        test_extraction_failure_is_an_error_that_names_the_conversation()
+        test_extraction_failure_without_conv_id_says_the_caller_gave_none()
+        test_record_facts_for_exchange_passes_its_conv_id_through()
 
         print("\nAll facts smoke tests passed.")
     finally:

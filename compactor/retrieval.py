@@ -17,6 +17,9 @@ Design:
   /data/openwebui/compactor/chromadb/. ONE collection; conversations are
   isolated via a `conv_id` metadata filter (cleaner deletes + better
   scaling than a collection-per-conversation).
+- Document identity is CONTENT-ADDRESSED (v3.1 D1): the id is a hash of the
+  exchange text. It was the request's turn index until that index was found
+  running backwards in production and destroying exchanges. See _doc_id.
 - Everything degrades to a safe no-op. If fastembed/chromadb can't import
   or init (disabled, missing deps, corrupt store), retrieval returns []
   and indexing silently skips — chat is NEVER broken by a memory failure.
@@ -25,6 +28,7 @@ Heavy objects (embedding model, chroma client) are lazy singletons:
 initialized on first use, reused forever.
 """
 
+import hashlib
 import logging
 import os
 import threading
@@ -157,12 +161,128 @@ def _exchange_doc(user_text: str, assistant_text: str) -> str:
     return f"[user]: {user_text}\n[assistant]: {assistant_text}"
 
 
-def _doc_id(conv_id: str, turn_index: int) -> str:
-    """Stable, unique id per (conv, turn). Re-indexing the same turn
-    overwrites rather than duplicating (chroma upserts on matching id via
-    add? No — add raises on duplicate id; we use upsert()).
+# Length of the hex digest kept in a document id. 16 hex chars = 64 bits;
+# a conversation would need billions of exchanges before a birthday collision
+# is worth thinking about, and the full digest makes the id unreadable in a log
+# line for no gain.
+_DOC_ID_HASH_CHARS = 16
+
+# One exchange is two messages: the user's and the assistant's. main.py:1416
+# computes turn_index as len(messages)+1, so it advances by 2 per exchange —
+# which is exactly the step in the production sequence below. _next_turn_index
+# keeps stored ordinals in those same message-units so that main.py:1607's
+# `recent_cutoff = turn_index - KEEP_RECENT_TURNS*2` still compares like with
+# like. A per-exchange counter (1, 2, 3…) would be a different unit system and
+# REMEDIATION rejected it for that reason.
+_TURN_INDEX_STEP = 2
+
+
+def _doc_id(conv_id: str, document: str) -> str:
+    """Content-addressed id: `{conv_id}::{sha256(document)[:16]}`.
+
+    v3.1 D1. This was `{conv_id}::{turn_index}` — the request's own
+    `len(messages)+1` — which is a property of the CLIENT'S ARRAY, not of the
+    exchange. Deleting messages in OpenWebUI shortens that array, so the index
+    goes DOWN and the upsert lands on a row that already holds a different
+    exchange. Measured in production: five DELETE /api/v1/chats/…/messages/…
+    between 06:15:29 and 06:15:44 turned the indexed sequence into
+
+        42, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58
+
+    and the real turn ~42, written at 06:14:54, was overwritten at 14:49:22.
+    The phantom conversation is the same failure at its limit: sixteen writes
+    to index 2 — one document, fifteen destructions.
+
+    **Damaged conversations do not heal.** Content-addressing stops the next
+    exchange being destroyed; it recovers nothing. The overwritten text is not
+    in any backup either, because the collapse was continuous rather than an
+    event with a before — every archive holds the same single surviving row.
+
+    A hash of the text cannot go backwards, so the pathological case becomes
+    the harmless one: re-indexing the same exchange is a no-op (see
+    index_exchange's exists probe), and any exchange whose text differs by one
+    character gets its own row. Two genuinely identical exchanges in one
+    conversation collapse to a single row — deliberate, since identical text
+    has identical retrieval value, and the alternative is re-embedding it.
     """
-    return f"{conv_id}::{turn_index}"
+    digest = hashlib.sha256(document.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{conv_id}::{digest[:_DOC_ID_HASH_CHARS]}"
+
+
+def _id_exists(doc_id: str) -> bool:
+    """True if `doc_id` is already in the store. False on a miss AND on any
+    probe failure — a failed probe must fall through to the embed+upsert, which
+    is still correct (upsert on a matching id is idempotent), never skip it.
+    """
+    if _chroma_collection is None:
+        return False
+    try:
+        # include=[] so the probe fetches ids only. The same query without it
+        # pulls the full document text back out of SQLite to answer a yes/no.
+        got = _chroma_collection.get(ids=[doc_id], include=[])
+        return bool((got or {}).get("ids"))
+    except Exception as e:
+        if logsetup.log_once("retrieval._id_exists"):
+            logger.warning(
+                f"id-exists probe failed ({type(e).__name__}: {e}); indexing "
+                f"will re-embed rather than skip until this clears"
+            )
+        return False
+
+
+def _next_turn_index(conv_id: str, seed: int) -> int:
+    """Ordering metadata for a new row, allocated from the STORE's own maximum
+    rather than from the request.
+
+    v3.1 D1. The request cannot be trusted for this: `turn_index` is
+    `len(messages)+1`, and a deletion, an edit, a branch switch or a bounded
+    client window all shrink it. Taking the max already stored for this
+    conversation and stepping past it means the sequence only ever moves
+    forward, whatever the client's array is doing.
+
+    The stored maximum is a FLOOR, not the whole answer: the result is
+    `max(stored_max + step, seed)`. The request can therefore only ever push
+    the sequence forward, never pull it back, which is the property that
+    matters — but it is still allowed to push. That second half is for the
+    conversations this fix exists for. A conversation damaged pre-D1 has one
+    surviving row at whatever index the collapse pinned (the phantom's is 2)
+    while the live conversation is hundreds of messages along. Ignoring the
+    request there would number new rows 4, 6, 8… against a `recent_cutoff`
+    (main.py:1607) computed from the client's array, so no retrieved hit would
+    ever look recent and the exclusion filter would quietly stop doing
+    anything. Taking the request as a floor-raiser puts the sequence back in
+    the same units as the thing it is compared against.
+
+    `seed` also stands alone when the conversation has no rows at all, where
+    there is by definition nothing to collide with.
+
+    A wrong answer here costs ordering, not data: since D1 the id is the hash,
+    so two rows sharing a turn_index are still two rows.
+    """
+    if _chroma_collection is None:
+        return int(seed)
+    try:
+        existing = _chroma_collection.get(
+            where={"conv_id": conv_id}, include=["metadatas"]
+        )
+    except Exception as e:
+        if logsetup.log_once("retrieval._next_turn_index"):
+            logger.warning(
+                f"conv={conv_id}: could not read the stored turn indices "
+                f"({type(e).__name__}: {e}); falling back to the request's"
+            )
+        return int(seed)
+    highest: int | None = None
+    for meta in (existing or {}).get("metadatas") or []:
+        try:
+            value = int((meta or {}).get("turn_index", -1))
+        except (TypeError, ValueError):
+            continue
+        if highest is None or value > highest:
+            highest = value
+    if highest is None:
+        return int(seed)
+    return max(highest + _TURN_INDEX_STEP, int(seed))
 
 
 # ---------------------------------------------------------------------------
@@ -174,18 +294,31 @@ def index_exchange(
 ) -> bool:
     """Embed one exchange and upsert it into the vector store. Returns True
     on success, False if skipped/failed. Never raises.
+
+    v3.1 D1: `turn_index` is still accepted, so every caller is unchanged, but
+    it no longer decides the row's IDENTITY — only where the row sorts, and
+    even there the store's own maximum is a floor it cannot go under (see
+    _next_turn_index). Identity is the hash of the exchange text, so a client
+    that deletes messages and re-sends a shorter array adds an exchange
+    instead of destroying one. See _doc_id for what it used to do.
     """
     if not _try_init() or _chroma_collection is None:
         return False
     if not user_text or not assistant_text:
         return False
     doc = _exchange_doc(user_text, assistant_text)
+    doc_id = _doc_id(conv_id, doc)
+    if _id_exists(doc_id):
+        # Same text, already stored. Under content-addressing the upsert would
+        # be a no-op, so this only skips the embedding — the expensive half.
+        return True
+    turn_index = _next_turn_index(conv_id, turn_index)
     vecs = _embed([doc])
     if not vecs:
         return False
     try:
         _chroma_collection.upsert(
-            ids=[_doc_id(conv_id, turn_index)],
+            ids=[doc_id],
             embeddings=vecs,
             documents=[doc],
             metadatas=[{"conv_id": conv_id, "turn_index": int(turn_index)}],
@@ -326,7 +459,9 @@ def export_indexed_exchanges(conv_id: str) -> list[dict]:
         docs = existing.get("documents", []) or []
         metas = existing.get("metadatas", []) or []
         out: list[dict] = []
-        for i, _doc_id in enumerate(ids):
+        # Not `_doc_id` — that is this module's id function, and rebinding it
+        # here would shadow it for the rest of the loop body.
+        for i, _row_id in enumerate(ids):
             meta = metas[i] if i < len(metas) else {}
             ti = int((meta or {}).get("turn_index", -1))
             out.append({
@@ -349,17 +484,32 @@ def import_indexed_exchange(conv_id: str, turn_index: int, document: str) -> boo
     originally, so semantic neighborhoods carry across the round-trip.
 
     Returns True on success, False on any failure. Never raises.
+
+    v3.1 D1: the id is content-addressed like index_exchange's, but the
+    bundle's `turn_index` is kept verbatim as the ordering metadata rather than
+    re-allocated from the store — it is the source conversation's ordering, it
+    is what export_indexed_exchanges sorts on, and re-numbering it here would
+    make a round-trip lossy. The bundle format is unchanged and BUNDLE_VERSION
+    stays "v2.1": ids were never in it.
+
+    The exists probe means re-importing a bundle does not re-embed, and that an
+    exchange already indexed live keeps the ordinal it has rather than taking
+    the bundle's. import_conversation(overwrite=True) clears the conversation
+    first, so a deliberate replacement still gets the bundle's ordering.
     """
     if not _try_init() or _chroma_collection is None:
         return False
     if not document:
         return False
+    doc_id = _doc_id(conv_id, document)
+    if _id_exists(doc_id):
+        return True
     vecs = _embed([document])
     if not vecs:
         return False
     try:
         _chroma_collection.upsert(
-            ids=[_doc_id(conv_id, turn_index)],
+            ids=[doc_id],
             embeddings=vecs,
             documents=[document],
             metadatas=[{"conv_id": conv_id, "turn_index": int(turn_index)}],

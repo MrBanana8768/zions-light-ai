@@ -41,6 +41,7 @@ import os
 import sys
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 import httpx
@@ -67,6 +68,27 @@ MODEL_REPO = os.environ.get("MODEL_REPO", "").strip()
 # Sentinel conv_id for the facts round-trip. Never touched by real
 # traffic, cleaned up at the end of each run.
 SELFTEST_CONV_ID = "__selftest__"
+
+# How long to wait for the compactor's post-response background work to finish
+# before cleaning up the one-shot conversation. The tail is submitted BEFORE
+# the response is returned, so it is already outstanding by the time we read
+# the body — but it makes an LLM extraction call, so the old
+# delete-immediately cleanup always won the race and the tail then re-created
+# the file. That left one orphaned conversation per boot, forever: 17 of the
+# 124 buckets in the 2026-08-24 store were __selftest_oneshot_* (v3.1 F23).
+SELFTEST_TAIL_DRAIN_TIMEOUT_S = float(
+    os.environ.get("COMPACTOR_SELFTEST_TAIL_DRAIN_TIMEOUT_S", "120.0")
+)
+SELFTEST_TAIL_DRAIN_POLL_S = 1.0
+
+# After the cleanup, look once more. The drain is a good signal on a quiet pod
+# and a weak one on a busy pod (/admin/selftest runs the same battery in-
+# process while real traffic is in flight), so the thing actually asserted is
+# that the conversation is gone AND stays gone — which catches a late tail
+# write however the drain went.
+SELFTEST_CLEANUP_SETTLE_S = float(
+    os.environ.get("COMPACTOR_SELFTEST_CLEANUP_SETTLE_S", "2.0")
+)
 
 # How long to wait for vLLM to come up before giving up.
 WAIT_FOR_READY_TIMEOUT_S = float(
@@ -100,6 +122,73 @@ TTS_URL = (
 ).rstrip("/")
 TTS_ENABLED = os.environ.get("TTS_ENABLED", "false").strip().lower() == "true"
 TTS_TIMEOUT_S = float(os.environ.get("COMPACTOR_SELFTEST_TTS_TIMEOUT_S", "30.0"))
+
+# Spoken by the TTS service to make the STT probe audio. It has to be long
+# enough and speech-like enough to survive Whisper's VAD filter, which is what
+# made the old probe vacuous — see _speech_probe_wav.
+STT_PROBE_TEXT = os.environ.get(
+    "COMPACTOR_SELFTEST_STT_PROBE_TEXT",
+    "The quick brown fox jumps over the lazy dog.",
+).strip()
+
+
+# ---------------------------------------------------------------------------
+# Leave-nothing-behind cleanup
+# ---------------------------------------------------------------------------
+#
+# Every self-test conversation is scratch. It must not survive the run: a boot
+# that mints a bucket and leaves it turns the store into mostly test residue
+# (2026-08-24: 124 buckets, only 33 of them real conversations), and every one
+# of those buckets is then walked by the O(N) health scan and listed to anyone
+# inspecting the store during an incident.
+
+def _conv_artifact_paths(conv_id: str) -> list[Path]:
+    """Every file a conversation can leave on disk.
+
+    Kept in one place because the layers are spread across four modules and a
+    cleanup that misses one is indistinguishable from a cleanup that worked.
+    The backfill sidecar is built here rather than imported from backfill.py —
+    importing that module for a path would pull the lazy-backfill machinery
+    into the self-test process for no reason.
+    """
+    return [
+        memory.facts_path(conv_id),
+        memory.facts_archive_path(conv_id),
+        memory.summary_path(conv_id),
+        memory.persona_path(conv_id),
+        memory.storage_root() / "facts" / f"{conv_id}.backfill.json",
+    ]
+
+
+def _conv_residue(conv_id: str) -> list[str]:
+    """Names of the conversation's artifact files that exist right now."""
+    out: list[str] = []
+    for p in _conv_artifact_paths(conv_id):
+        try:
+            if p.exists():
+                out.append(p.name)
+        except Exception as e:
+            # A path we cannot even stat is a path we cannot vouch for.
+            logger.warning(f"selftest cleanup could not stat {p}: {e}")
+            out.append(p.name)
+    return out
+
+
+def _purge_conv_files(conv_id: str) -> list[str]:
+    """Unlink every artifact file for `conv_id`. Returns the names that are
+    still there afterwards — empty means the store is clean.
+
+    Unlink, not `save_facts(conv_id, [])`: an empty facts file is still a file,
+    and `memory.list_known_conv_ids` globs `facts/*.json`, so an emptied
+    conversation is counted forever. That is how `facts/__selftest__.json`
+    became a permanent resident (v3.1 F23 / D10).
+    """
+    for p in _conv_artifact_paths(conv_id):
+        try:
+            p.unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"selftest cleanup could not remove {p}: {e}")
+    return _conv_residue(conv_id)
 
 
 # ---------------------------------------------------------------------------
@@ -163,9 +252,57 @@ async def _check_compactor_health(client: httpx.AsyncClient) -> tuple[bool, str]
     return False, f"HTTP {r.status_code}: {r.text[:120]}"
 
 
+async def _wait_for_tail_drain(client: httpx.AsyncClient) -> tuple[str, int | None]:
+    """Block until the compactor's background pool is empty.
+
+    Returns ("drained"|"timeout"|"unobservable", outstanding). The pool count
+    comes from /health/full's `background_work` block (bgwork.pool.stats), the
+    only outside view of whether the post-response tail has finished. Boot is
+    the quiet moment by definition — the self-test's own chat is normally the
+    only thing in flight — so an empty pool means our tail is done.
+    """
+    deadline = time.monotonic() + SELFTEST_TAIL_DRAIN_TIMEOUT_S
+    outstanding: int | None = None
+    while time.monotonic() < deadline:
+        try:
+            r = await client.get(f"{COMPACTOR_URL}/health/full", timeout=10.0)
+            bg = (r.json() or {}).get("background_work") or {}
+        except Exception as e:
+            logger.debug(f"tail-drain poll failed: {e}")
+            await asyncio.sleep(SELFTEST_TAIL_DRAIN_POLL_S)
+            continue
+        if "outstanding" not in bg:
+            # The pool could not report (bgwork import failed, older shape).
+            # Waiting out the full timeout would delay every boot for a number
+            # we are never going to see, so stop and say we could not look.
+            logger.warning(
+                f"background pool depth not reported by /health/full "
+                f"({str(bg)[:120]}); cleaning up without waiting for the tail"
+            )
+            return "unobservable", None
+        outstanding = bg["outstanding"]
+        if outstanding == 0:
+            return "drained", 0
+        await asyncio.sleep(SELFTEST_TAIL_DRAIN_POLL_S)
+    logger.warning(
+        f"background pool still had {outstanding} task(s) outstanding after "
+        f"{SELFTEST_TAIL_DRAIN_TIMEOUT_S}s"
+    )
+    return "timeout", outstanding
+
+
 async def _check_chat_round_trip(client: httpx.AsyncClient) -> tuple[bool, str]:
-    """Real chat through compactor → vLLM with max_tokens=1. Uses a
-    unique conv_id per run so the conversation never accumulates state.
+    """Real chat through compactor → vLLM with max_tokens=1, followed by a
+    cleanup that actually holds.
+
+    Uses a unique conv_id per run, then removes it. The order matters and is
+    the whole fix for F23: wait for the async tail to finish, THEN delete.
+    Deleting first — what this did — lost the race every time, because the
+    tail is fired before the response returns and takes an LLM call, so it
+    landed after the delete and wrote the conversation back. The DELETE is
+    still what clears ChromaDB (the compactor process owns that client; a
+    second process must not open it), and the unlink afterwards removes the
+    empty facts file the DELETE leaves behind.
     """
     one_shot_conv = f"__selftest_oneshot_{uuid.uuid4().hex[:8]}__"
     payload = {
@@ -188,26 +325,57 @@ async def _check_chat_round_trip(client: httpx.AsyncClient) -> tuple[bool, str]:
         content = data["choices"][0]["message"]["content"]
     except Exception as e:
         return False, f"malformed response: {e}; body={r.text[:200]}"
-    # Cleanup: forget this transient conv if possible.
+
+    drain, outstanding = await _wait_for_tail_drain(client)
     try:
         await client.delete(
             f"{COMPACTOR_URL}/admin/conversations/{one_shot_conv}/facts",
-            timeout=5.0,
+            timeout=30.0,
         )
     except Exception as e:
-        logger.debug(f"one-shot cleanup of {one_shot_conv} failed: {e}")
-    return True, f"response_len={len(content)}"
+        # The unlink below still removes the on-disk layers; only ChromaDB
+        # needs the compactor process, so say which layer is in doubt.
+        logger.warning(
+            f"one-shot cleanup of {one_shot_conv}: admin forget failed ({e}); "
+            f"episodic embeddings may remain"
+        )
+    left = _purge_conv_files(one_shot_conv)
+    # Then look again. A drain timeout is not itself reported as a failure —
+    # on-demand runs share the pool with live traffic, so a busy pool is
+    # normal there — but a file that comes BACK after the purge is the late
+    # tail write this whole sequence exists to prevent, and that is a failure
+    # whatever the drain said.
+    await asyncio.sleep(SELFTEST_CLEANUP_SETTLE_S)
+    reappeared = _conv_residue(one_shot_conv)
+    if reappeared:
+        # Don't leave the bucket behind while reporting that it was left behind.
+        _purge_conv_files(one_shot_conv)
+    if left or reappeared:
+        return False, (
+            f"response_len={len(content)}; one-shot conversation survived "
+            f"cleanup (drain={drain}, outstanding={outstanding}, "
+            f"unremovable={left or '-'}, rewritten={reappeared or '-'}) — "
+            f"every boot leaks a bucket"
+        )
+    return True, f"response_len={len(content)} cleanup={drain} store_left_clean=yes"
 
 
 def _check_facts_round_trip() -> tuple[bool, str]:
     """Write a sentinel fact, read it back, delete it. Direct module calls
     (not HTTP) — exercises the storage write path that the async tail uses.
+
+    Both the start-clean and the cleanup unlink rather than writing an empty
+    facts list: the old `save_facts(SELFTEST_CONV_ID, [])` on either side left
+    `facts/__selftest__.json` in place, and an existing-but-empty file is a
+    listed conversation as far as list_known_conv_ids is concerned. The check
+    now fails if anything survives, so a regression here is visible in the boot
+    report instead of only in the bucket count months later.
     """
     sentinel_text = f"selftest sentinel {uuid.uuid4().hex[:8]}"
     now = int(time.time())
     try:
-        # Start clean (defensive — prior crash may have left state).
-        facts.save_facts(SELFTEST_CONV_ID, [])
+        # Start clean (defensive — a prior crash may have left state).
+        _purge_conv_files(SELFTEST_CONV_ID)
         # Write
         facts.save_facts(
             SELFTEST_CONV_ID,
@@ -217,13 +385,12 @@ def _check_facts_round_trip() -> tuple[bool, str]:
         loaded = facts.load_facts(SELFTEST_CONV_ID)
         if not loaded or loaded[0].get("text") != sentinel_text:
             return False, f"readback mismatch: {loaded!r}"
-        return True, f"sentinel='{sentinel_text}'"
     finally:
         # Cleanup — even on failure, leave no junk behind.
-        try:
-            facts.save_facts(SELFTEST_CONV_ID, [])
-        except Exception as e:
-            logger.debug(f"selftest facts cleanup failed: {e}")
+        left = _purge_conv_files(SELFTEST_CONV_ID)
+    if left:
+        return False, f"sentinel files survived cleanup: {', '.join(left)}"
+    return True, f"sentinel='{sentinel_text}' store_left_clean=yes"
 
 
 async def _check_admin_localhost(client: httpx.AsyncClient) -> tuple[bool, str]:
@@ -238,10 +405,15 @@ async def _check_admin_localhost(client: httpx.AsyncClient) -> tuple[bool, str]:
 
 def _tiny_wav_bytes(seconds: float = 0.3, rate: int = 16000) -> bytes:
     """A short silent mono 16-bit PCM WAV — valid for ffmpeg/Whisper to decode.
-    Silence transcribes to empty text; the STT check asserts the response is
-    *well-formed* (HTTP 200 + a string `text` field), which proves the service
-    decodes audio and runs the model end-to-end — not just that the port is
-    open. (Quality, as opposed to liveness, is measured by the tests/eval set.)
+
+    Fallback probe only. It cannot assert a transcription: the STT service runs
+    with WHISPER_VAD_FILTER on, and VAD drops the whole clip, so a healthy
+    service answers `{"text": ""}`. Measured in the v3.0.5 image: this exact
+    0.3s probe is 9,644 bytes in and 0 chars out, which is what production was
+    recording as `[PASS] stt ... text_len=0`. A synthetic tone does not help —
+    a 1s 440Hz sine measured the same way also transcribes to "" — so there is
+    no purely-local audio that survives VAD, and the real probe comes from the
+    TTS service instead (_speech_probe_wav).
     """
     buf = io.BytesIO()
     import wave  # stdlib, only needed here
@@ -254,14 +426,63 @@ def _tiny_wav_bytes(seconds: float = 0.3, rate: int = 16000) -> bytes:
     return buf.getvalue()
 
 
-async def _check_stt(client: httpx.AsyncClient) -> tuple[bool, str]:
-    """Functional STT probe: POST a tiny WAV to the Whisper service and assert a
-    well-formed OpenAI transcription response. Catches the 'service running but
-    broken' failure mode that a port/health check alone would miss. (STT loads a
-    small model in seconds; vLLM readiness — which gates the boot self-test —
-    takes far longer, so STT is reliably up by the time this runs.)
+async def _speech_probe_wav(client: httpx.AsyncClient) -> bytes | None:
+    """Render STT_PROBE_TEXT to real speech with the Piper service, for use as
+    the STT probe. Returns None if TTS is not part of this deployment or the
+    synthesis did not produce audio.
+
+    Piper is the only speech source available at boot: the compactor venv has
+    no TTS engine, and shipping a recorded clip in the repo would fix the voice
+    and the language into the image. tts runs at priority=26 and selftest at
+    30, so it is already up when this fires. A None here is not reported as an
+    STT failure — the tts check owns that — it just costs the STT check its
+    transcription assertion, which _check_stt says out loud.
     """
-    files = {"file": ("probe.wav", _tiny_wav_bytes(), "audio/wav")}
+    if not TTS_ENABLED:
+        return None
+    try:
+        r = await client.post(
+            f"{TTS_URL}/v1/audio/speech",
+            json={
+                "model": "tts-1",
+                "input": STT_PROBE_TEXT,
+                "response_format": "wav",
+            },
+            timeout=TTS_TIMEOUT_S,
+        )
+    except Exception as e:
+        logger.warning(f"STT speech probe: TTS synthesis failed: {e}")
+        return None
+    if r.status_code != 200 or not r.content:
+        logger.warning(
+            f"STT speech probe: TTS returned HTTP {r.status_code} "
+            f"({len(r.content)} bytes)"
+        )
+        return None
+    if not r.headers.get("content-type", "").startswith("audio/"):
+        logger.warning(
+            f"STT speech probe: TTS returned non-audio content-type "
+            f"{r.headers.get('content-type')!r}"
+        )
+        return None
+    return r.content
+
+
+async def _check_stt(client: httpx.AsyncClient) -> tuple[bool, str]:
+    """Functional STT probe: speak a known sentence through the TTS service,
+    POST that audio to the Whisper service, and assert it comes back as text.
+
+    The assertion is what changed in v3.1. This check used to POST 0.3s of
+    silence and assert only that the reply was well-formed, so it passed while
+    stt-error.log recorded `VAD filter removed 00:00.300 of audio` and
+    `9644 bytes -> 0 chars` — the probe never reached the model, and the check
+    could not have told anyone. A pass now means audio went in and words came
+    out. Content is deliberately not asserted (the voice and the model are both
+    swappable per pod); the transcript is in the detail so a garbage one is
+    readable in the boot log.
+    """
+    speech = await _speech_probe_wav(client)
+    files = {"file": ("probe.wav", speech or _tiny_wav_bytes(), "audio/wav")}
     form = {"model": "whisper-1", "response_format": "json"}
     r = await client.post(
         f"{STT_URL}/v1/audio/transcriptions",
@@ -277,7 +498,23 @@ async def _check_stt(client: httpx.AsyncClient) -> tuple[bool, str]:
         return False, f"malformed response: {e}"
     if not isinstance(body, dict) or not isinstance(body.get("text"), str):
         return False, f"missing 'text' field: {str(body)[:120]}"
-    return True, f"transcribed probe ok (text_len={len(body['text'])})"
+    text = body["text"].strip()
+    if speech is None:
+        # No speech to send, so no transcription to demand. Liveness only —
+        # say so rather than reporting a text_len=0 pass as if it meant
+        # something.
+        return True, (
+            f"liveness only: no speech probe available "
+            f"(TTS_ENABLED={str(TTS_ENABLED).lower()}), so a silent clip was "
+            f"sent and only the response shape was checked; text_len={len(text)}"
+        )
+    if not text:
+        return False, (
+            f"spoke {len(speech)} bytes of synthesized audio and got an empty "
+            f"transcription — the service answered, but nothing reached the "
+            f"model (VAD, decode or weights)"
+        )
+    return True, f"transcribed spoken probe: {text[:80]!r}"
 
 
 async def _check_tts(client: httpx.AsyncClient) -> tuple[bool, str]:

@@ -175,7 +175,7 @@ def test_llm_merge_returns_text_on_merge():
         return await dedup.llm_merge_candidate(client, "http://fake", "m", cluster)
 
     out = asyncio.run(go())
-    assert_eq(out, "Lyra is a half-elf", "merged text returned")
+    assert_eq(out, ("Lyra is a half-elf", "merged"), "merged text returned")
 
 
 def test_llm_merge_returns_none_on_keep():
@@ -191,7 +191,7 @@ def test_llm_merge_returns_none_on_keep():
         return await dedup.llm_merge_candidate(client, "http://fake", "m", cluster)
 
     out = asyncio.run(go())
-    assert_eq(out, None, "KEEP → None")
+    assert_eq(out, (None, "keep"), "KEEP → None, reason 'keep'")
 
 
 def test_llm_merge_handles_keep_with_punctuation():
@@ -203,8 +203,9 @@ def test_llm_merge_handles_keep_with_punctuation():
         client.post = AsyncMock(return_value=_mock_chat_response(resp))
         return await dedup.llm_merge_candidate(client, "http://fake", "m", cluster)
 
-    assert_eq(asyncio.run(go("KEEP.")), None, "KEEP. → None")
-    assert_eq(asyncio.run(go("Keep — they are different")), None, "case+punct → None")
+    assert_eq(asyncio.run(go("KEEP.")), (None, "keep"), "KEEP. → None")
+    assert_eq(asyncio.run(go("Keep — they are different")), (None, "keep"),
+              "case+punct → None")
 
 
 def test_llm_merge_handles_trailing_keep():
@@ -222,11 +223,11 @@ def test_llm_merge_handles_trailing_keep():
         client.post = AsyncMock(return_value=_mock_chat_response(resp))
         return await dedup.llm_merge_candidate(client, "http://fake", "m", cluster)
 
-    assert_eq(asyncio.run(go("These are different, KEEP")), None,
+    assert_eq(asyncio.run(go("These are different, KEEP")), (None, "keep"),
               "trailing KEEP → None")
-    assert_eq(asyncio.run(go("They say different things - keep")), None,
+    assert_eq(asyncio.run(go("They say different things - keep")), (None, "keep"),
               "trailing lowercase keep → None")
-    assert_eq(asyncio.run(go("2. KEEP")), None, "numbered KEEP → None")
+    assert_eq(asyncio.run(go("2. KEEP")), (None, "keep"), "numbered KEEP → None")
 
 
 def test_llm_merge_returns_none_on_truncated_response():
@@ -244,11 +245,13 @@ def test_llm_merge_returns_none_on_truncated_response():
         )
         return await dedup.llm_merge_candidate(client, "http://fake", "m", cluster)
 
-    assert_eq(asyncio.run(go("length")), None, "truncated merge rejected")
+    assert_eq(asyncio.run(go("length")), (None, "truncated"),
+              "truncated merge rejected")
     # The same text is a fine merge when the model actually finished; the
     # guard must key on finish_reason, not on the content.
-    assert_eq(asyncio.run(go("stop")), truncated, "completed merge accepted")
-    assert_eq(asyncio.run(go(None)), truncated,
+    assert_eq(asyncio.run(go("stop")), (truncated, "merged"),
+              "completed merge accepted")
+    assert_eq(asyncio.run(go(None)), (truncated, "merged"),
               "missing finish_reason is not evidence of truncation")
 
 
@@ -266,9 +269,10 @@ def test_llm_merge_returns_none_on_trivially_short_merge():
 
     # 7 chars: clears the len<6 guard, so only the V7 length floor can
     # catch it. Collapsing two full facts to this is a summary, not a merge.
-    assert_eq(asyncio.run(go("Lyra is")), None, "collapsed merge rejected")
+    assert_eq(asyncio.run(go("Lyra is")), (None, "collapsed"),
+              "collapsed merge rejected")
     assert_eq(asyncio.run(go("Lyra Threadweaver is a half-elf ranger from Aethermere")),
-              "Lyra Threadweaver is a half-elf ranger from Aethermere",
+              ("Lyra Threadweaver is a half-elf ranger from Aethermere", "merged"),
               "a real merge of the same cluster still passes")
 
 
@@ -281,8 +285,10 @@ def test_llm_merge_strips_bullet_prefix():
         client.post = AsyncMock(return_value=_mock_chat_response(resp))
         return await dedup.llm_merge_candidate(client, "http://fake", "m", cluster)
 
-    assert_eq(asyncio.run(go("- merged fact")), "merged fact", "dash bullet stripped")
-    assert_eq(asyncio.run(go("1. merged fact")), "merged fact", "numbered list stripped")
+    assert_eq(asyncio.run(go("- merged fact")), ("merged fact", "merged"),
+              "dash bullet stripped")
+    assert_eq(asyncio.run(go("1. merged fact")), ("merged fact", "merged"),
+              "numbered list stripped")
 
 
 def test_llm_merge_returns_none_on_too_short_response():
@@ -294,7 +300,7 @@ def test_llm_merge_returns_none_on_too_short_response():
         client.post = AsyncMock(return_value=_mock_chat_response("ok"))
         return await dedup.llm_merge_candidate(client, "http://fake", "m", cluster)
 
-    assert_eq(asyncio.run(go()), None, "too-short response → None")
+    assert_eq(asyncio.run(go()), (None, "short"), "too-short response → None")
 
 
 def test_llm_merge_returns_none_on_network_failure():
@@ -306,7 +312,10 @@ def test_llm_merge_returns_none_on_network_failure():
         client.post = AsyncMock(side_effect=ConnectionError("boom"))
         return await dedup.llm_merge_candidate(client, "http://fake", "m", cluster)
 
-    assert_eq(asyncio.run(go()), None, "exception caught, cluster preserved")
+    # The reason matters as much as the None: "error" is the one refusal
+    # the memo must not remember, or a single vLLM blip pins a mergeable
+    # cluster shut for the life of the process.
+    assert_eq(asyncio.run(go()), (None, "error"), "exception caught, cluster preserved")
 
 
 def test_llm_merge_returns_none_on_single_fact_cluster():
@@ -320,7 +329,8 @@ def test_llm_merge_returns_none_on_single_fact_cluster():
         client.post.assert_not_called()
         return out
 
-    assert_eq(asyncio.run(go()), None, "singleton → no call, returns None")
+    assert_eq(asyncio.run(go()), (None, "singleton"),
+              "singleton → no call, returns None")
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +536,11 @@ def test_dedup_facts_logs_removed_texts_for_forensics():
     for f in facts:
         assert_true(f["text"] in logged,
                     f"removed text recoverable from the log: {f['text']!r}")
+    # The productive case reports the same counters as the silent one.
+    line = _pass_lines(log)[0]
+    assert_true("1 LLM call(s)" in line, "pass line counts the call")
+    assert_true("1 merge(s)" in line, "pass line counts the merge")
+    assert_true("1 fact(s) removed" in line, "pass line counts the removal")
 
 
 def test_dedup_facts_preserves_cluster_on_trailing_keep():
@@ -573,6 +588,405 @@ def test_dedup_facts_preserves_cluster_on_truncated_merge():
 
 
 # ---------------------------------------------------------------------------
+# I-6 — every pass logs
+# ---------------------------------------------------------------------------
+
+def _pass_lines(log) -> list[str]:
+    """The per-pass summary lines emitted at INFO."""
+    return [str(c) for c in log.info.call_args_list if "dedup pass:" in str(c)]
+
+
+def test_pass_with_zero_merges_still_logs():
+    print("\n[test] dedup_facts: a pass that merged nothing still logs")
+    # The 19h47m window: 197 of 301 vLLM calls were dedup, and roughly 23
+    # of ~30 passes logged nothing at all, because the old summary line
+    # was inside `if removed > 0`. A pass that spends calls and merges
+    # nothing is the expensive case; it is the one that must be visible.
+    facts = [
+        _fact("user wants third-person past", added_turn=1),
+        _fact("user wants first-person present", added_turn=2),
+    ]
+
+    async def go(log):
+        client = MagicMock()
+        client.post = AsyncMock(return_value=_mock_chat_response("KEEP"))
+        with _mock_embed_returns([1.0, 0.0], [1.0, 0.01]), \
+             patch.object(dedup, "logger", log):
+            return await dedup.dedup_facts(
+                client, "http://x", "m", facts, conv_id="c-log"
+            )
+
+    log = MagicMock()
+    _out, removed = asyncio.run(go(log))
+    assert_eq(removed, 0, "nothing merged")
+    lines = _pass_lines(log)
+    assert_eq(len(lines), 1, "exactly one pass line")
+    line = lines[0]
+    assert_true("conv=c-log" in line, "pass line names the conversation")
+    assert_true("2 fact(s) in" in line, "input size reported")
+    assert_true("1 candidate cluster(s)" in line, "clusters considered reported")
+    assert_true("1 LLM call(s)" in line, "LLM calls spent reported")
+    assert_true("0 merge(s)" in line, "merges made reported")
+
+
+def test_every_return_path_logs_a_pass():
+    print("\n[test] dedup_facts: no return path is silent")
+    # Each of these used to leave no trace whatsoever. They are cheap, but
+    # "the cheap case is the one that logs" was the bug — the guarantee
+    # worth having is that a pass is never silent, not that a costly one
+    # is loud.
+    async def go(log, facts, vecs):
+        client = MagicMock()
+        client.post = AsyncMock(return_value=_mock_chat_response("KEEP"))
+        with patch.object(retrieval, "_embed", lambda texts: vecs), \
+             patch.object(dedup, "logger", log):
+            return await dedup.dedup_facts(
+                client, "http://x", "m", facts, conv_id="c-paths"
+            )
+
+    log = MagicMock()
+    asyncio.run(go(log, [], []))
+    assert_eq(len(_pass_lines(log)), 1, "empty input logs a pass")
+
+    log = MagicMock()
+    asyncio.run(go(log, [_fact("solo")], [[1, 0]]))
+    assert_eq(len(_pass_lines(log)), 1, "single-fact input logs a pass")
+
+    log = MagicMock()
+    asyncio.run(go(log, [_fact("a"), _fact("b")], [[1, 0], [0, 1]]))
+    lines = _pass_lines(log)
+    assert_eq(len(lines), 1, "no-candidate-clusters pass logs")
+    assert_true("0 candidate cluster(s)" in lines[0], "reports zero clusters")
+
+    log = MagicMock()
+    with patch.object(dedup, "find_candidate_clusters",
+                      MagicMock(side_effect=RuntimeError("boom"))):
+        asyncio.run(go(log, [_fact("a"), _fact("b")], [[1, 0], [0, 1]]))
+    assert_eq(len(_pass_lines(log)), 1, "clustering failure logs a pass")
+
+
+def test_pass_is_logged_even_when_the_pass_raises():
+    print("\n[test] dedup_facts: an unexpected raise still leaves a pass line")
+    # The wrapper logs in `finally` precisely so that a future edit to the
+    # pass body cannot reintroduce a silent path.
+    async def go(log):
+        client = MagicMock()
+        with patch.object(dedup, "_dedup_pass",
+                          AsyncMock(side_effect=RuntimeError("boom"))), \
+             patch.object(dedup, "logger", log):
+            try:
+                await dedup.dedup_facts(
+                    client, "http://x", "m", [_fact("a"), _fact("b")],
+                    conv_id="c-raise",
+                )
+            except RuntimeError:
+                return "raised"
+        return "swallowed"
+
+    log = MagicMock()
+    assert_eq(asyncio.run(go(log)), "raised", "the exception still propagates")
+    assert_eq(len(_pass_lines(log)), 1, "and the pass was still reported")
+
+
+def test_pass_line_says_when_the_memo_is_off():
+    print("\n[test] dedup_facts: a conv_id-less caller is named in the log")
+    # An un-updated caller gets no memoisation, which is the difference
+    # between a handful of LLM calls a day and a few hundred. That must be
+    # visible in the log rather than inferred from the call volume.
+    async def go(log, **kw):
+        client = MagicMock()
+        client.post = AsyncMock(return_value=_mock_chat_response("KEEP"))
+        with _mock_embed_returns([1.0, 0.0], [1.0, 0.01]), \
+             patch.object(dedup, "logger", log):
+            return await dedup.dedup_facts(
+                client, "http://x", "m", [_fact("aaa"), _fact("aab")], **kw
+            )
+
+    log = MagicMock()
+    asyncio.run(go(log))
+    assert_true("refusal memo off" in _pass_lines(log)[0],
+                "no conv_id → the line says the memo is off")
+
+    log = MagicMock()
+    asyncio.run(go(log, conv_id="c-on"))
+    assert_true("refusal memo off" not in _pass_lines(log)[0],
+                "with a conv_id the marker is absent")
+
+
+# ---------------------------------------------------------------------------
+# I-6 — refusal memo
+# ---------------------------------------------------------------------------
+
+_KEEP_PAIR = [
+    _fact("user wants third-person past", added_turn=1),
+    _fact("user wants first-person present", added_turn=2),
+]
+_KEEP_PAIR_VECS = [[1.0, 0.0], [1.0, 0.01]]
+
+
+async def _two_passes(client, facts, vecs, conv_ids):
+    """Run dedup once per conv_id in order, returning post-call counts."""
+    counts = []
+    with patch.object(retrieval, "_embed", lambda texts: vecs[:len(texts)]):
+        for cid in conv_ids:
+            await dedup.dedup_facts(client, "http://x", "m", facts, conv_id=cid)
+            counts.append(client.post.call_count)
+    return counts
+
+
+def test_refused_cluster_is_not_resent_on_the_next_pass():
+    print("\n[test] dedup_facts: I-6 — a KEEP is bought once, not every turn")
+
+    async def go():
+        client = MagicMock()
+        client.post = AsyncMock(return_value=_mock_chat_response("KEEP"))
+        counts = await _two_passes(
+            client, _KEEP_PAIR, _KEEP_PAIR_VECS, ["c1", "c1", "c1"]
+        )
+        return counts
+
+    counts = asyncio.run(go())
+    assert_eq(counts[0], 1, "first pass asks the model")
+    assert_eq(counts[1], 1, "second pass does not ask again")
+    assert_eq(counts[2], 1, "and neither does the third")
+
+
+def test_refusal_memo_survives_but_facts_are_still_returned_intact():
+    print("\n[test] dedup_facts: a memoised skip preserves the cluster")
+    # A memo hit must behave exactly like the KEEP it stands in for: the
+    # facts come back, all of them, unchanged.
+    async def go():
+        client = MagicMock()
+        client.post = AsyncMock(return_value=_mock_chat_response("KEEP"))
+        with patch.object(retrieval, "_embed", lambda texts: _KEEP_PAIR_VECS):
+            await dedup.dedup_facts(
+                client, "http://x", "m", _KEEP_PAIR, conv_id="c-intact"
+            )
+            return await dedup.dedup_facts(
+                client, "http://x", "m", _KEEP_PAIR, conv_id="c-intact"
+            )
+
+    out, removed = asyncio.run(go())
+    assert_eq(removed, 0, "0 removed on the memoised pass")
+    assert_eq(sorted(f["text"] for f in out),
+              sorted(f["text"] for f in _KEEP_PAIR),
+              "both facts survive the skip verbatim")
+
+
+def test_refusal_memo_does_not_leak_across_conv_ids():
+    print("\n[test] dedup_facts: one conversation's KEEP is not another's")
+    # Facts are per-conversation; a decision about one conversation's facts
+    # is not evidence about another's, and this codebase's expensive
+    # failures have all been cross-conversation bleed.
+    async def go():
+        client = MagicMock()
+        client.post = AsyncMock(return_value=_mock_chat_response("KEEP"))
+        return await _two_passes(
+            client, _KEEP_PAIR, _KEEP_PAIR_VECS, ["conv-a", "conv-b"]
+        )
+
+    counts = asyncio.run(go())
+    assert_eq(counts[0], 1, "conv-a asks")
+    assert_eq(counts[1], 2, "conv-b asks for itself, memo not shared")
+
+
+def test_backend_failure_is_not_memoised():
+    print("\n[test] dedup_facts: a timeout is not a decision")
+    # "error" is excluded from _MEMOISABLE_REFUSALS deliberately: if a
+    # failed call were remembered, one bad minute on vLLM would pin a
+    # mergeable cluster shut for the life of the process.
+    async def go():
+        client = MagicMock()
+        client.post = AsyncMock(side_effect=ConnectionError("vllm down"))
+        return await _two_passes(
+            client, _KEEP_PAIR, _KEEP_PAIR_VECS, ["c-err", "c-err"]
+        )
+
+    counts = asyncio.run(go())
+    assert_eq(counts[0], 1, "first pass tries")
+    assert_eq(counts[1], 2, "second pass retries — the cluster is not condemned")
+
+
+def test_truncated_and_collapsed_refusals_are_memoised():
+    print("\n[test] dedup_facts: a deterministic bad reply is not re-bought")
+    # temperature is 0.0: the same cluster produces the same truncated or
+    # collapsed reply every time, so re-sending it buys the same refusal.
+    long_pair = [
+        _fact("Lyra is a half-elf ranger who lives in Aethermere", added_turn=1),
+        _fact("Lyra is a half-elf ranger and prefers the north road", added_turn=2),
+    ]
+
+    async def go(resp, finish_reason):
+        client = MagicMock()
+        client.post = AsyncMock(
+            return_value=_mock_chat_response(resp, finish_reason=finish_reason)
+        )
+        return await _two_passes(
+            client, long_pair, _KEEP_PAIR_VECS, ["c-t", "c-t"]
+        )
+
+    counts = asyncio.run(go(
+        "Lyra is a half-elf ranger who lives in Aethermere and prefers", "length"
+    ))
+    assert_eq(counts, [1, 1], "truncated reply memoised")
+
+    dedup.reset_refusal_memo()
+    counts = asyncio.run(go("Lyra.", "stop"))
+    assert_eq(counts, [1, 1], "collapsed reply memoised")
+
+
+def test_memo_key_changes_when_the_cluster_does():
+    print("\n[test] dedup_facts: a cluster that gained a fact is a new question")
+    # The memo is keyed on the whole cluster, not on pairs, because "are
+    # these two the same?" and "are these three the same?" are different
+    # questions and the second one deserves its own call.
+    pair = list(_KEEP_PAIR)
+    trio = pair + [_fact("user wants second-person future", added_turn=3)]
+
+    async def go():
+        client = MagicMock()
+        client.post = AsyncMock(return_value=_mock_chat_response("KEEP"))
+        with patch.object(retrieval, "_embed",
+                          lambda texts: [[1.0, i * 0.01] for i in range(len(texts))]):
+            await dedup.dedup_facts(client, "http://x", "m", pair, conv_id="c-grow")
+            first = client.post.call_count
+            await dedup.dedup_facts(client, "http://x", "m", trio, conv_id="c-grow")
+            return first, client.post.call_count
+
+    first, second = asyncio.run(go())
+    assert_eq(first, 1, "the pair was asked about")
+    assert_eq(second, 2, "the trio is asked about too, not memo-skipped")
+
+
+def test_memo_skip_does_not_spend_the_call_cap():
+    print("\n[test] dedup_facts: the cap reaches new clusters, not old refusals")
+    # Clusters are offered to the cap oldest-first, so without the memo the
+    # same first N refused clusters spend the entire budget every pass and
+    # a cluster involving a newly added fact is never looked at. This is
+    # the starvation half of I-6.
+    facts = []
+    vecs = []
+    for k in range(6):
+        facts.append(_fact(f"g{k}-one"))
+        facts.append(_fact(f"g{k}-two"))
+        base = [0.0] * 6
+        base[k] = 1.0
+        vecs.append(list(base))
+        near = list(base)
+        near[k] = 1.05
+        vecs.append(near)
+
+    asked: list[str] = []
+    real_merge = dedup.llm_merge_candidate
+
+    async def spy(client, vllm_url, model, cluster_facts):
+        asked.append(cluster_facts[0]["text"])
+        return await real_merge(client, vllm_url, model, cluster_facts)
+
+    async def go():
+        client = MagicMock()
+        client.post = AsyncMock(return_value=_mock_chat_response("KEEP"))
+        with patch.object(retrieval, "_embed", lambda texts: vecs), \
+             patch.object(dedup, "llm_merge_candidate", spy), \
+             patch.object(dedup, "MAX_LLM_CALLS_PER_PASS", 2):
+            for _ in range(3):
+                await dedup.dedup_facts(
+                    client, "http://x", "m", facts, conv_id="c-cap"
+                )
+
+    asyncio.run(go())
+    assert_eq(asked, ["g0-one", "g1-one", "g2-one",
+                      "g3-one", "g4-one", "g5-one"],
+              "three capped passes worked through all six clusters, none twice")
+
+
+def test_pass_line_reports_memo_skips_and_deferrals():
+    print("\n[test] dedup_facts: skips and deferrals are counted in the log")
+    facts = []
+    vecs = []
+    for k in range(3):
+        facts.append(_fact(f"h{k}-one"))
+        facts.append(_fact(f"h{k}-two"))
+        base = [0.0] * 3
+        base[k] = 1.0
+        vecs.append(list(base))
+        near = list(base)
+        near[k] = 1.05
+        vecs.append(near)
+
+    async def go(log):
+        client = MagicMock()
+        client.post = AsyncMock(return_value=_mock_chat_response("KEEP"))
+        with patch.object(retrieval, "_embed", lambda texts: vecs), \
+             patch.object(dedup, "MAX_LLM_CALLS_PER_PASS", 1), \
+             patch.object(dedup, "logger", log):
+            await dedup.dedup_facts(client, "http://x", "m", facts, conv_id="c-rep")
+            await dedup.dedup_facts(client, "http://x", "m", facts, conv_id="c-rep")
+
+    log = MagicMock()
+    asyncio.run(go(log))
+    first, second = _pass_lines(log)
+    assert_true("0 already-refused skip(s)" in first, "nothing memoised yet")
+    assert_true("2 cluster(s) deferred" in first, "two clusters deferred by the cap")
+    assert_true("1 already-refused skip(s)" in second, "the first refusal is skipped")
+    assert_true("1 cluster(s) deferred" in second,
+                "a memo skip is not counted as a deferral")
+
+
+def test_cluster_key_is_order_independent_and_collision_resistant():
+    print("\n[test] _cluster_key: same facts → same key, different facts → not")
+    ab = dedup._cluster_key([_fact("alpha"), _fact("beta")])
+    ba = dedup._cluster_key([_fact("beta"), _fact("alpha")])
+    assert_eq(ab, ba, "order does not change the key")
+    assert_true(ab != dedup._cluster_key([_fact("alpha"), _fact("gamma")]),
+                "a different member changes the key")
+    # The NUL join: without a separator these two clusters would hash the
+    # same and one would inherit the other's refusal.
+    assert_true(dedup._cluster_key([_fact("ab"), _fact("c")]) !=
+                dedup._cluster_key([_fact("a"), _fact("bc")]),
+                "concatenation ambiguity does not collide")
+
+
+def test_memo_is_bounded_in_both_dimensions():
+    print("\n[test] refusal memo: LRU-bounded per conversation and overall")
+    # Forgetting a refusal costs one LLM call and never costs a fact, so
+    # eviction can be crude — but it has to happen.
+    with patch.object(dedup, "MEMO_MAX_CLUSTERS_PER_CONV", 3):
+        for k in range(5):
+            dedup._memo_put("c-bound", f"key{k}", "keep")
+        assert_eq(len(dedup._REFUSAL_MEMO["c-bound"]), 3, "per-conv cap holds")
+        assert_eq(dedup._memo_get("c-bound", "key0"), None, "oldest evicted")
+        assert_eq(dedup._memo_get("c-bound", "key4"), "keep", "newest retained")
+
+    dedup.reset_refusal_memo()
+    with patch.object(dedup, "MEMO_MAX_CONVS", 2):
+        for k in range(4):
+            dedup._memo_put(f"conv{k}", "key", "keep")
+        assert_eq(len(dedup._REFUSAL_MEMO), 2, "conversation cap holds")
+        assert_eq(dedup._memo_get("conv0", "key"), None, "oldest conv evicted")
+        assert_eq(dedup._memo_get("conv3", "key"), "keep", "newest conv retained")
+
+
+def test_memo_is_a_no_op_without_a_conv_id():
+    print("\n[test] refusal memo: no conv_id → no entry, no shared bucket")
+    dedup._memo_put(None, "key", "keep")
+    dedup._memo_put("", "key", "keep")
+    assert_eq(len(dedup._REFUSAL_MEMO), 0, "nothing stored under a null key")
+    assert_eq(dedup._memo_get(None, "key"), None, "and nothing retrievable")
+
+
+def test_reset_refusal_memo_scopes_correctly():
+    print("\n[test] reset_refusal_memo: one conversation, or all of them")
+    dedup._memo_put("r1", "k", "keep")
+    dedup._memo_put("r2", "k", "keep")
+    dedup.reset_refusal_memo("r1")
+    assert_eq(dedup._memo_get("r1", "k"), None, "named conv cleared")
+    assert_eq(dedup._memo_get("r2", "k"), "keep", "the other is untouched")
+    dedup.reset_refusal_memo()
+    assert_eq(len(dedup._REFUSAL_MEMO), 0, "no argument clears everything")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -608,12 +1022,32 @@ def _all_tests():
         test_dedup_facts_logs_removed_texts_for_forensics,
         test_dedup_facts_preserves_cluster_on_trailing_keep,
         test_dedup_facts_preserves_cluster_on_truncated_merge,
+        test_pass_with_zero_merges_still_logs,
+        test_every_return_path_logs_a_pass,
+        test_pass_is_logged_even_when_the_pass_raises,
+        test_pass_line_says_when_the_memo_is_off,
+        test_refused_cluster_is_not_resent_on_the_next_pass,
+        test_refusal_memo_survives_but_facts_are_still_returned_intact,
+        test_refusal_memo_does_not_leak_across_conv_ids,
+        test_backend_failure_is_not_memoised,
+        test_truncated_and_collapsed_refusals_are_memoised,
+        test_memo_key_changes_when_the_cluster_does,
+        test_memo_skip_does_not_spend_the_call_cap,
+        test_pass_line_reports_memo_skips_and_deferrals,
+        test_cluster_key_is_order_independent_and_collision_resistant,
+        test_memo_is_bounded_in_both_dimensions,
+        test_memo_is_a_no_op_without_a_conv_id,
+        test_reset_refusal_memo_scopes_correctly,
     ]
 
 
 if __name__ == "__main__":
     try:
         for t in _all_tests():
+            # The memo is process-scoped by design, so it is shared state
+            # between tests. Clear it or a later test inherits an earlier
+            # one's refusals and passes for the wrong reason.
+            dedup.reset_refusal_memo()
             t()
         print("\nAll dedup smoke tests passed.")
     finally:

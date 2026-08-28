@@ -1183,6 +1183,8 @@ async def _async_tail(
     assistant_text: str,
     turn_index: int,
     original_messages: list[dict],
+    *,
+    injected_facts: list[dict] | None = None,
 ) -> None:
     """Post-response work, fired after the assistant's reply is fully
     streamed/received. Three independent jobs:
@@ -1200,6 +1202,22 @@ async def _async_tail(
     `original_messages` is the request's messages list (pre-compaction); we
     append the just-completed assistant turn before passing to the rollup so
     it sees the full conversation when computing turn ranges.
+
+    `touched_facts` is the WHOLE store as the request path read it, and it is
+    what gets merged and written back — the facts left out of this turn's
+    working set must keep their real last_used or eviction stops meaning
+    anything (v3.1 F9). `injected_facts` is the budget-bounded subset of those
+    same dicts that the request path actually put in front of the model. They
+    are separate because the two jobs need different lists: only the second may
+    be handed to the extractor, which is a request to vLLM and therefore has a
+    window.
+
+    `injected_facts` is keyword-only with a default so no caller is broken by
+    its arrival, and the default is `select_for_injection(touched_facts)` —
+    not `touched_facts` — so a caller that never learned about it still cannot
+    push the whole store into an extraction prompt. The request path passes
+    the real list because it already computed one; recomputing here would
+    answer the question against a store that may have moved since.
     """
     # V2.3 Theme 2: under disk pressure, stop GROWING memory but keep
     # serving. The chat response already went out; this tail is pure
@@ -1212,9 +1230,11 @@ async def _async_tail(
 
     # --- 1. Episodic indexing (independent of facts) ---
     # v3.1 D49: this ran outside conv_lock. A prior review called it benign
-    # because _doc_id is (conv_id, turn_index) and the upsert is idempotent —
-    # true of two tails racing each other, and irrelevant to the case that
-    # matters. _clear_all_memory holds conv_lock while it calls
+    # because the upsert is idempotent for a given doc id — true of two tails
+    # racing each other, and irrelevant to the case that matters. (That review
+    # justified it from _doc_id being (conv_id, turn_index); D1 has since made
+    # ids content-addressed, which changes the premise and not the conclusion.)
+    # _clear_all_memory holds conv_lock while it calls
     # retrieval.forget_conversation; an unlocked index_exchange lands after
     # that delete and puts the exchange the user just asked to forget back in
     # the vector store, where it is retrievable and injectable again. Its own
@@ -1262,13 +1282,27 @@ async def _async_tail(
     async with conv_lock(conv_id):
         try:
             async with httpx.AsyncClient() as client:
+                # The BOUNDED set, not the whole store. facts.py now trims its
+                # own input, so passing the store no longer overflows the
+                # window — but the trim it would apply is a second, later
+                # opinion about which facts matter, computed from a store that
+                # may have grown since. Handing it what the model was actually
+                # shown means the extractor is told about the same facts the
+                # assistant reply was written against, so "already known" means
+                # the same thing on both sides of the exchange.
+                # conv_id is logging only, and it is what makes a lost
+                # extraction attributable to the turn that lost it.
                 new_strs = await facts.extract_facts_from_exchange(
                     client,
                     VLLM_URL,
                     MODEL_REPO or "",
                     last_user_text,
                     assistant_text,
-                    touched_facts,
+                    (
+                        injected_facts if injected_facts is not None
+                        else facts.select_for_injection(touched_facts)
+                    ),
+                    conv_id=conv_id,
                 )
                 from facts import _now_unix
                 now = _now_unix()
@@ -1291,8 +1325,14 @@ async def _async_tail(
                 # never affects the user chat path.
                 if new_entries and len(combined) >= 2:
                     try:
+                        # conv_id scopes dedup's refusal memo and labels its
+                        # pass line. Without it every pass re-asks the model
+                        # about clusters it has already refused to merge, and
+                        # the one dedup line in the log cannot be tied to a
+                        # conversation (v3.1 I-6).
                         combined, removed = await dedup.dedup_facts(
-                            client, VLLM_URL, MODEL_REPO or "", combined
+                            client, VLLM_URL, MODEL_REPO or "", combined,
+                            conv_id=conv_id,
                         )
                         if removed > 0:
                             logger.info(
@@ -1582,11 +1622,37 @@ def _rejection_user_message(err_body: str, tightened: bool) -> tuple[str, str]:
     return REQUEST_REJECTED_MESSAGE, "backend_rejected"
 
 
+def _sent_token_size(messages: list[dict]) -> tuple[int | None, str]:
+    """Our own size for a payload, and WHICH counter produced it.
+
+    Resolved exactly the way _enforce_hard_budget resolves it, because this is
+    reporting on the decision that guard made: /tokenize when vLLM answers,
+    the local tokenizer otherwise. Naming the source is the point — the two
+    disagree badly on assistant content, in the direction that overflows (see
+    count_tokens_exact for the measurements), so a bare "we measured N" means
+    two different things depending on which one measured it, and the reader of
+    this line is trying to locate exactly that gap.
+
+    Blocking (httpx + tokenizer); call it through run_in_threadpool.
+    """
+    try:
+        exact = count_tokens_exact(messages)
+        if exact is not None:
+            return exact, "vLLM's /tokenize"
+        return count_tokens(messages), "the local tokenizer"
+    except Exception:
+        # This runs on a path that has already failed. It may not add a second
+        # failure to the first — the log line below is still worth writing
+        # without a count in it.
+        return None, ""
+
+
 def _log_request_rejected(
     conv_id: str | None,
     status: int,
     err_body: str,
     sent_tokens: int | None,
+    sent_source: str,
     limit: int,
     streaming: bool,
 ) -> None:
@@ -1604,11 +1670,23 @@ def _log_request_rejected(
     if sent_tokens is None:
         counts = f"budget was {limit:,} tokens (our own count was unavailable)"
     else:
-        counts = f"we estimated {sent_tokens:,} tokens against a {limit:,}-token budget"
+        counts = (
+            f"we measured {sent_tokens:,} tokens with {sent_source} against a "
+            f"{limit:,}-token budget"
+        )
     if reported is not None:
         counts += f"; vLLM counted {reported:,}"
         if sent_tokens is not None:
-            counts += f" — an undercount of {reported - sent_tokens:,}"
+            # Named by direction rather than always "undercount": which way the
+            # gap runs is the whole diagnosis, and a line that calls an
+            # overcount an undercount sends the next reader looking for a
+            # cause that is not there.
+            gap = reported - sent_tokens
+            counts += (
+                f" — we UNDERCOUNTED by {gap:,}" if gap > 0
+                else f" — we OVERCOUNTED by {-gap:,}" if gap < 0
+                else " — our count agreed, so the rejection is not a counting error"
+            )
     # The stream path commits HTTP 200 in the response header before vLLM has
     # answered, so every access log upstream of here records a success. Saying
     # so in the line is what stops the next reader from concluding, as the
@@ -1618,10 +1696,18 @@ def _log_request_rejected(
         "before the backend answers), so no access log will show this"
         if streaming else ""
     )
+    # A 4xx is vLLM refusing a request it understood; a 5xx is vLLM failing.
+    # The turn is equally gone either way — which is why both come here — but
+    # calling a backend fault a rejection sends the reader to the wrong half of
+    # the system.
+    headline = (
+        f"REQUEST REJECTED by vLLM (HTTP {status})" if status < 500
+        else f"vLLM FAILED this request (HTTP {status})"
+    )
     logger.error(
-        f"conv={conv_id}: REQUEST REJECTED by vLLM (HTTP {status}) — this turn "
-        f"produced no reply, no facts and no episodic write, and nothing "
-        f"retries it. {counts}{status_note}. vLLM said: {err_body[:300]!r}"
+        f"conv={conv_id}: {headline} — this turn produced no reply, no facts "
+        f"and no episodic write, and nothing retries it. {counts}{status_note}. "
+        f"vLLM said: {err_body[:300]!r}"
     )
 
 
@@ -1792,6 +1878,12 @@ async def chat_completions(request: Request) -> Any:
     # internally, separated by blank lines and labeled by each module's
     # block header (so the model still parses them as distinct contexts).
     touched_facts: list[dict] = []
+    # The subset of touched_facts this turn actually put in front of the model.
+    # Initialized here, beside the store, because the tail reads it whether or
+    # not the facts block below ran at all — an unreadable store or a disabled
+    # RAG path must leave the extractor with an empty set, not a NameError on
+    # the async tail where nothing would surface it.
+    injected_facts: list[dict] = []
     injected_blocks: list[str] = []
     log_parts: list[str] = []
     # Bound before the summary load so the injection log line can name it even
@@ -1848,19 +1940,19 @@ async def chat_completions(request: Request) -> Any:
                 # tail below still writes the whole store back; the facts left
                 # out keep their real last_used and become the eviction
                 # candidates, which is the entire point.
-                injected = facts.select_for_injection(touched_facts)
-                facts.touch_facts(injected)
-                block = facts.format_facts_block(injected)
+                injected_facts = facts.select_for_injection(touched_facts)
+                facts.touch_facts(injected_facts)
+                block = facts.format_facts_block(injected_facts)
                 if block:
                     injected_blocks.append(block)
                     log_parts.append(
-                        f"{len(injected)}fact(s)"
-                        if len(injected) == len(touched_facts)
+                        f"{len(injected_facts)}fact(s)"
+                        if len(injected_facts) == len(touched_facts)
                         # Only differ when the store is over budget — which
                         # v3.1 F9 now allows to persist, because a failed
                         # archive write keeps the facts rather than deleting
                         # them. Worth seeing in the log when it happens.
-                        else f"{len(injected)}/{len(touched_facts)}fact(s)"
+                        else f"{len(injected_facts)}/{len(touched_facts)}fact(s)"
                     )
         except Exception as e:
             logger.warning(f"conv={conv_id}: facts load failed (non-fatal): {e}")
@@ -1974,6 +2066,13 @@ async def chat_completions(request: Request) -> Any:
     # ...and non-system turns that ended up sharing a role (compaction hoists
     # image turns out of chronological order, which lands user next to user).
     body["messages"] = _merge_consecutive_same_role(body["messages"])
+    # The limit the guard ACTUALLY shed against, captured here rather than
+    # recomputed if this request is rejected: _note_backend_rejection moves
+    # _BUDGET_MARGIN, so by the time a rejection is logged the margin is no
+    # longer the one this payload was measured against, and the log line would
+    # name a budget that was never in force. Mirrors the clamp inside
+    # _enforce_hard_budget.
+    enforced_limit = max(256, effective_limit - _BUDGET_MARGIN)
 
     stream = bool(body.get("stream", False))
     # read=None keeps long generations from being cut off, but connect/write/
@@ -2001,23 +2100,52 @@ async def chat_completions(request: Request) -> Any:
                             # raw into a text/event-stream gives the UI a garbled
                             # reply; degrade visibly instead, like the
                             # connection-error branch below.
+                            #
+                            # v3.1: "visibly" used to mean visible to a HUMAN
+                            # only. The pair below ended finish_reason "stop"
+                            # and the response had already committed HTTP 200,
+                            # so a rejection was indistinguishable from a reply
+                            # to every machine in the path — INCIDENT §4.3 A5.
+                            # On 2026-08-24 23:49 that is exactly what happened:
+                            # a context-length 400 after 139.9s of compaction,
+                            # 200 in openwebui.log, 200 in compactor.log, and
+                            # the only trace two unattributed WARNINGs. So the
+                            # branch now says what happened at ERROR, and hands
+                            # the client an error-typed pair.
                             vllm_failed = True
-                            err_body = (await r.aread()).decode("utf-8", "replace")[:300]
-                            _note_backend_rejection(err_body)
-                            logger.warning(
-                                f"vLLM HTTP {r.status_code} on stream: {err_body!r}"
+                            # Truncate AFTER parsing, not before. vLLM states
+                            # the true prompt size mid-sentence, so the old
+                            # 300-char cut ran through the one number that
+                            # explains the rejection — in the body shape seen in
+                            # production it landed just inside the cut, which is
+                            # luck, not a margin. The log line still shows 300.
+                            err_body = (await r.aread()).decode("utf-8", "replace")[:2000]
+                            sent_tokens, sent_source = await run_in_threadpool(
+                                _sent_token_size, body["messages"]
                             )
-                            for chunk in _vllm_unreachable_stream_chunks(
-                                body.get("model") or MODEL_REPO or "",
+                            # Before _note_backend_rejection, which is what moves
+                            # the margin the line reports against.
+                            _log_request_rejected(
+                                conv_id, r.status_code, err_body, sent_tokens,
+                                sent_source, enforced_limit, streaming=True,
+                            )
+                            tightened = _note_backend_rejection(err_body)
+                            if r.status_code < 500:
                                 # A 4xx means the backend is HEALTHY and refused
                                 # our request; only 5xx/unreachable justifies the
                                 # "starting up or restarting" message.
-                                message=(
-                                    REQUEST_REJECTED_MESSAGE
-                                    if r.status_code < 500
-                                    else None
-                                ),
-                            ):
+                                message, code = _rejection_user_message(
+                                    err_body, tightened
+                                )
+                                chunks = _request_rejected_stream_chunks(
+                                    body.get("model") or MODEL_REPO or "",
+                                    message, code, detail=err_body[:300],
+                                )
+                            else:
+                                chunks = _vllm_unreachable_stream_chunks(
+                                    body.get("model") or MODEL_REPO or ""
+                                )
+                            for chunk in chunks:
                                 yield f"data: {json.dumps(chunk)}\n\n".encode()
                             yield b"data: [DONE]\n\n"
                         else:
@@ -2058,6 +2186,7 @@ async def chat_completions(request: Request) -> Any:
                             accumulator.text(),
                             turn_index,
                             messages,  # original request messages, for rollup
+                            injected_facts=injected_facts,
                         )
                     )
 
@@ -2092,6 +2221,33 @@ async def chat_completions(request: Request) -> Any:
                 ),
                 status_code=502,
             )
+        if r.status_code >= 400:
+            # Return BEFORE the memory tail, and say so at ERROR.
+            #
+            # v3.1 F20: the status check used to sit after the tail was fired,
+            # so a rejected request still ran the tail — harmless only by
+            # accident, because assistant_text happens to come out empty and
+            # every job in the tail happens to gate on it. One shape does get
+            # through even today: with extraction disabled the tail takes
+            # conv_lock and rewrites the facts file for a turn the model never
+            # answered. A request the backend refused has nothing to remember.
+            #
+            # The relay itself is unchanged — this path already hands the
+            # client vLLM's real status, which is why the incident's invisible
+            # failure was the STREAM path and not this one. What was missing
+            # here is the same thing: a line naming the conversation and the
+            # counts. (This is also the path OpenWebUI's background title/tag
+            # tasks take, so conv_id is often None; the line still says which.)
+            sent_tokens, sent_source = await run_in_threadpool(
+                _sent_token_size, body["messages"]
+            )
+            _log_request_rejected(
+                conv_id, r.status_code, str(response_json), sent_tokens,
+                sent_source, enforced_limit, streaming=False,
+            )
+            _note_backend_rejection(str(response_json)[:2000])
+            return JSONResponse(content=response_json, status_code=r.status_code)
+
         # Extract assistant text for fact extraction
         assistant_text = ""
         try:
@@ -2122,10 +2278,9 @@ async def chat_completions(request: Request) -> Any:
                     assistant_text,
                     turn_index,
                     messages,  # original request messages, for rollup
+                    injected_facts=injected_facts,
                 )
             )
-        if r.status_code >= 400:
-            _note_backend_rejection(str(response_json)[:300])
         return JSONResponse(content=response_json, status_code=r.status_code)
     finally:
         await client.aclose()
@@ -2538,7 +2693,7 @@ async def admin_dedup(conv_id: str):
             }
         async with httpx.AsyncClient() as client:
             after, removed = await dedup.dedup_facts(
-                client, VLLM_URL, MODEL_REPO or "", before
+                client, VLLM_URL, MODEL_REPO or "", before, conv_id=conv_id
             )
         if removed > 0:
             facts.save_facts(conv_id, after)

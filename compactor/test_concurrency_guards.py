@@ -191,7 +191,14 @@ async def _race_against_parked_tail(conv_id, snapshot, extracted, contender):
     async def fake_extract(*_a, **_k):
         return [extracted]
 
-    async def fake_dedup(_client, _url, _model, combined):
+    # **_kw, like fake_extract above, because the tail passes keyword-only
+    # arguments this stub does not care about — v3.1 I-6 added conv_id= to
+    # dedup_facts. A positional-only stub raises TypeError, main.py's inline
+    # dedup catches it as a non-fatal dedup failure, and the tail runs on
+    # without ever entering this body: `entered` never sets and the race
+    # times out. That failure ends the file at the first race test, so the
+    # four below it — D18, D49, F9 — stop running with no sign they stopped.
+    async def fake_dedup(_client, _url, _model, combined, **_kw):
         # The tail is now holding conv_lock, past its re-read, and parked.
         entered.set()
         await release.wait()

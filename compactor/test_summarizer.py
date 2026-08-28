@@ -10,7 +10,9 @@ Run:
 """
 
 import asyncio
+import contextlib
 import json
+import logging
 import os
 import shutil
 import sys
@@ -25,6 +27,7 @@ os.environ["COMPACTOR_L2_CHUNK_SIZE"] = "3"
 os.environ["COMPACTOR_L3_CHUNK_SIZE"] = "2"
 
 import summarizer  # noqa: E402
+import logsetup  # noqa: E402
 import memory  # noqa: E402
 
 
@@ -49,12 +52,51 @@ def _wipe():
 
 
 # ---------------------------------------------------------------------------
+# Log capture — the rollup lines are the behaviour under test below, not
+# decoration. S-5 froze the hierarchy for the life of the deployment because
+# a successful rollup said nothing and a latched gate said nothing either.
+# ---------------------------------------------------------------------------
+
+class _Collector(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+@contextlib.contextmanager
+def capture(logger_name: str = "compactor.summarizer"):
+    lg = logging.getLogger(logger_name)
+    handler = _Collector()
+    prev_level = lg.level
+    lg.addHandler(handler)
+    lg.setLevel(logging.DEBUG)
+    try:
+        yield handler
+    finally:
+        lg.removeHandler(handler)
+        lg.setLevel(prev_level)
+
+
+def find(records, needle: str):
+    for r in records:
+        if needle in r.getMessage():
+            return r
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Mock LLM client — returns canned summaries
 # ---------------------------------------------------------------------------
 
 def _mock_client_returning(content_per_call):
     """content_per_call: either a single string (all calls return it) or
     a list (consumed in order). Returns a fake AsyncClient context manager.
+
+    An Exception in the list is RAISED on that call instead of returned, so
+    a test can fail one tier of a cascade while the earlier tiers succeed.
     """
     queue = [content_per_call] if isinstance(content_per_call, str) else list(content_per_call)
 
@@ -70,6 +112,8 @@ def _mock_client_returning(content_per_call):
         async def __aexit__(self, *a): return False
         async def post(self, *a, **kw):
             content = queue.pop(0) if queue else "(no more canned)"
+            if isinstance(content, Exception):
+                raise content
             return _Resp(content)
 
     return _Client()
@@ -81,6 +125,38 @@ def _install_mock(content_per_call):
     orig = httpx.AsyncClient
     httpx.AsyncClient = lambda *a, **kw: _mock_client_returning(content_per_call)
     return orig
+
+
+def _install_call_recorder(reply: str = "(unexpected call)"):
+    """Patch in a client that RECORDS every call and returns `reply`.
+    Returns (calls, orig) where `calls` fills with the system prompt of each
+    request, so a test can assert on which tier fired.
+
+    Recording, not raising: maybe_rollup catches Exception around the whole
+    cascade, so a mock that raises AssertionError to mean "should not be
+    called" is swallowed and logged, and the test passes whether or not the
+    call happened. Confirmed the hard way — a bare-threshold mutation of
+    _needs_l3_rollup survived exactly that shape of test.
+    """
+    import httpx
+    calls: list[str] = []
+
+    class _Recorder:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, *a, **kw):
+            msgs = (kw.get("json") or {}).get("messages") or [{}]
+            calls.append(msgs[0].get("content", ""))
+
+            class _Resp:
+                def raise_for_status(self): pass
+                def json(self):
+                    return {"choices": [{"message": {"content": reply}}]}
+            return _Resp()
+
+    orig = httpx.AsyncClient
+    httpx.AsyncClient = lambda *a, **kw: _Recorder()
+    return calls, orig
 
 
 def _restore_httpx(orig):
@@ -292,6 +368,16 @@ def test_needs_l3_rollup_threshold():
     assert_eq(summarizer._needs_l3_rollup(state), False, "1 < 2 → no L3")
     state["l2"].append({"text": "ch2", "first_turn": 13, "last_turn": 24})
     assert_eq(summarizer._needs_l3_rollup(state), True, "2 ≥ 2 → L3")
+    # ...but only once for that set of chapters (S-2). _do_l3_rollup keeps the
+    # L2 list, so a pure threshold is a standing condition: it stayed true
+    # forever, spending one L3-sized LLM call every turn and holding
+    # needs_rollup open so maybe_rollup's early exit never fired.
+    state["l3"] = {"text": "theme", "first_turn": 1, "last_turn": 24}
+    assert_eq(summarizer._needs_l3_rollup(state), False,
+              "L3 already covers these chapters → no refresh")
+    state["l2"].append({"text": "ch3", "first_turn": 25, "last_turn": 36})
+    assert_eq(summarizer._needs_l3_rollup(state), True,
+              "a new chapter moves the span → refresh")
 
 
 # ---------------------------------------------------------------------------
@@ -410,21 +496,12 @@ def test_maybe_rollup_skips_when_not_needed():
     _wipe()
     cid = "noop"
     msgs = _msgs(2)  # below L1 threshold of 4
-    # No LLM calls expected — install a mock that raises if called.
-    import httpx
-    orig = httpx.AsyncClient
-
-    class _ShouldNotBeCalled:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
-        async def post(self, *a, **kw):
-            raise AssertionError("LLM should not be called when no rollup needed")
-
-    httpx.AsyncClient = lambda *a, **kw: _ShouldNotBeCalled()
+    calls, orig = _install_call_recorder()
     try:
         state = asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
     finally:
-        httpx.AsyncClient = orig
+        _restore_httpx(orig)
+    assert_eq(calls, [], "no LLM call when nothing crosses a threshold")
     assert_eq(len(state["l1"]), 0, "no L1 chunks")
 
 
@@ -449,6 +526,200 @@ def test_maybe_rollup_swallows_llm_failure():
         httpx.AsyncClient = orig
     # No crash, state remains empty-ish (no L1 produced because LLM failed).
     assert_eq(len(state["l1"]), 0, "no chunks produced on LLM failure")
+
+
+# ---------------------------------------------------------------------------
+# S-5: the watermark latch that froze the hierarchy in production
+# ---------------------------------------------------------------------------
+#
+# last_summarized_turn is an absolute position in whatever array the client
+# sent; the gate compares it against the non-system count of the array in
+# hand. When the second is smaller than the first — a bounded window, a
+# deleted or edited message, a branch switch — the delta is negative and
+# _needs_l1_rollup is False on this turn and every turn after it. 19.8 hours
+# of production logs show every injection reading L1=5 / L2=0 while the
+# conversation ran from turn ~42 to ~58: the hierarchy never rolled once.
+
+def _stranded_state(cid: str, watermark: int = 100):
+    """A conversation whose watermark is far ahead of any history a client
+    is going to send back."""
+    state = summarizer._empty_state(cid)
+    state["l1"] = [{"text": "an earlier scene", "first_turn": 1, "last_turn": 4}]
+    state["last_summarized_turn"] = watermark
+    summarizer.save_state(cid, state)
+
+
+def test_shortened_history_resets_the_watermark():
+    print("\n[test] a history shorter than the watermark resets it, not latches")
+    _wipe()
+    cid = "latched"
+    _stranded_state(cid)
+    msgs = _msgs(8)  # 8 observable turns against a watermark of 100
+    calls, orig = _install_call_recorder()
+    try:
+        state = asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+    finally:
+        _restore_httpx(orig)
+
+    assert_eq(calls, [], "repairing the counter does not re-summarize anything")
+    assert_eq(state["last_summarized_turn"], 8, "watermark pulled back to the observed count")
+    assert_eq(len(state["l1"]), 1, "the stranded chunk is kept, not deleted")
+    on_disk = json.loads(summarizer.summary_path(cid).read_text(encoding="utf-8"))
+    assert_eq(on_disk["last_summarized_turn"], 8, "and the repair is persisted")
+    assert_eq(len(on_disk["l1"]), 1, "the chunk is still on disk too")
+
+
+def test_reset_watermark_lets_rollups_resume():
+    print("\n[test] after the reset the hierarchy actually advances again")
+    # The reset is only worth anything if the next threshold crossing rolls.
+    _wipe()
+    cid = "unlatched"
+    _stranded_state(cid)
+    orig = _install_mock("RESUMED")
+    try:
+        # Turn A: 8 observable turns — repairs the watermark, no material yet.
+        asyncio.run(summarizer.maybe_rollup(cid, _msgs(8), "http://x", "m"))
+        # Turn B: 12 observable turns — 4 new, which is the L1 threshold here.
+        state = asyncio.run(summarizer.maybe_rollup(cid, _msgs(12), "http://x", "m"))
+    finally:
+        _restore_httpx(orig)
+    assert_eq(len(state["l1"]), 2, "a new chunk on top of the kept one")
+    assert_eq(state["l1"][-1]["text"], "RESUMED", "it came from the LLM")
+    assert_eq(state["l1"][-1]["first_turn"], 9, "covers the turns after the reset")
+    assert_eq(state["l1"][-1]["last_turn"], 12, "up to the observed count")
+    assert_eq(state["last_summarized_turn"], 12, "watermark advanced")
+
+
+def test_negative_delta_warns_once_per_process():
+    print("\n[test] the latched gate warns at WARNING, once per process")
+    # A negative delta is indistinguishable from healthy quiet in the log —
+    # both are silence — which is why this ran for 19.8 hours unnoticed. It
+    # is once per process because maybe_rollup is on the tail of every turn.
+    _wipe()
+    logsetup._reset_log_once_for_tests()
+    _stranded_state("warn-a")
+    _stranded_state("warn-b")
+    with capture() as cap:
+        asyncio.run(summarizer.maybe_rollup("warn-a", _msgs(8), "http://x", "m"))
+        asyncio.run(summarizer.maybe_rollup("warn-b", _msgs(8), "http://x", "m"))
+    warnings = [r for r in cap.records if r.levelno == logging.WARNING]
+    assert_eq(len(warnings), 1, "exactly one warning across two stranded convs")
+    assert_true("shorter than last_summarized_turn" in warnings[0].getMessage(),
+                "and it names the condition")
+    assert_true("100" in warnings[0].getMessage(), "reporting the stale watermark")
+    logsetup._reset_log_once_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Rollup observability
+# ---------------------------------------------------------------------------
+
+def test_rollup_logs_a_success_line():
+    print("\n[test] each tier logs when it produces something")
+    # There was no success line at all, so the only evidence the hierarchy was
+    # advancing was the injection counter in the request path.
+    _wipe()
+    cid = "logged"
+    msgs = _msgs(24)  # 6 L1 chunks → 2 L2 chapters → 1 L3
+    canned = ["L1A", "L1B", "L1C", "L1D", "L1E", "L1F", "L2A", "L2B", "L3X"]
+    orig = _install_mock(canned)
+    try:
+        with capture() as cap:
+            asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+    finally:
+        _restore_httpx(orig)
+
+    first = find(cap.records, "L1 rollup — chunk 1 covers turns 1-4")
+    assert_true(first is not None, "the first L1 rollup logged its turn range")
+    assert_eq(first.levelno, logging.INFO, "at INFO — a healthy rollup is not a warning")
+    assert_true(find(cap.records, "L1 rollup — chunk 3 covers turns 9-12") is not None,
+                "the chunk index advances with the list")
+    l2 = find(cap.records, "L2 rollup — chapter 1 covers turns 1-12")
+    assert_true(l2 is not None, "the L2 chapter logged its turn range")
+    assert_eq(l2.levelno, logging.INFO, "L2 at INFO too")
+    l3 = find(cap.records, "L3 refresh — covers turns 1-24 over 2 chapters")
+    assert_true(l3 is not None, "the L3 refresh logged its coverage")
+    assert_eq(l3.levelno, logging.INFO, "L3 at INFO too")
+
+
+# ---------------------------------------------------------------------------
+# S-3: a failed tier must not discard the tiers that succeeded
+# ---------------------------------------------------------------------------
+
+def test_failed_l3_does_not_discard_successful_l1_and_l2():
+    print("\n[test] an L3 that fails keeps the L1/L2 rollups that succeeded")
+    # save_state used to sit inside the same try as the L3 call, so a single
+    # oversized L3 body threw away every rollup of that pass — and, since the
+    # input is identical next turn, of every pass after it, forever, while
+    # spending the same LLM calls each time.
+    _wipe()
+    cid = "l3-fails"
+    msgs = _msgs(24)
+    canned = ["L1A", "L1B", "L1C", "L1D", "L1E", "L1F", "L2A", "L2B",
+              RuntimeError("400 Bad Request: input too long")]
+    orig = _install_mock(canned)
+    try:
+        state = asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+    finally:
+        _restore_httpx(orig)
+
+    assert_eq(state["l3"], None, "L3 did not land")
+    assert_eq(len(state["l2"]), 2, "both chapters survived in memory")
+    on_disk = summarizer.load_state(cid)
+    assert_eq(len(on_disk["l2"]), 2, "and both are on disk")
+    assert_eq(on_disk["last_summarized_turn"], 24, "the watermark advanced on disk")
+    assert_eq(on_disk["l3"], None, "no partial L3 written")
+
+
+def test_failed_l3_does_not_repeat_the_same_work_forever():
+    print("\n[test] the retry after a failed L3 is the L3 only")
+    # The proof that the loss was permanent: with the write discarded, the
+    # next turn re-ran the identical 6 L1 + 2 L2 + 1 L3 calls. With the
+    # successful tiers persisted, only the L3 is outstanding.
+    _wipe()
+    cid = "l3-retry"
+    msgs = _msgs(24)
+    first_pass = ["L1A", "L1B", "L1C", "L1D", "L1E", "L1F", "L2A", "L2B",
+                  RuntimeError("400 Bad Request: input too long")]
+    orig = _install_mock(first_pass)
+    try:
+        asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+    finally:
+        _restore_httpx(orig)
+
+    calls, orig = _install_call_recorder("L3X")
+    try:
+        state = asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+    finally:
+        _restore_httpx(orig)
+
+    assert_eq(len(calls), 1, "one call on the retry, not nine")
+    assert_true(calls[0] == summarizer._PROMPT_L3, "and it is the L3 that failed")
+    assert_eq(state["l3"]["text"], "L3X", "which now lands")
+
+
+def test_l3_does_not_refire_once_the_chapters_are_covered():
+    print("\n[test] a quiet turn after L3 costs no LLM call")
+    # S-2: len(l2) >= L3_CHUNK_SIZE with the L2 list retained is a standing
+    # condition, so L3 regenerated on every single turn — and kept
+    # needs_rollup True, defeating the early exit at the top of maybe_rollup.
+    _wipe()
+    cid = "l3-quiet"
+    msgs = _msgs(24)
+    orig = _install_mock(["L1A", "L1B", "L1C", "L1D", "L1E", "L1F",
+                          "L2A", "L2B", "L3X"])
+    try:
+        asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+    finally:
+        _restore_httpx(orig)
+
+    calls, orig = _install_call_recorder("L3-REGENERATED")
+    try:
+        state = asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+    finally:
+        _restore_httpx(orig)
+    assert_eq(calls, [], "no LLM call on a turn that added nothing")
+    assert_eq(state["l3"]["text"], "L3X", "the existing L3 stands unchanged")
 
 
 def test_state_summary_compact():
@@ -488,6 +759,13 @@ if __name__ == "__main__":
         test_maybe_rollup_l2_then_l3()
         test_maybe_rollup_skips_when_not_needed()
         test_maybe_rollup_swallows_llm_failure()
+        test_shortened_history_resets_the_watermark()
+        test_reset_watermark_lets_rollups_resume()
+        test_negative_delta_warns_once_per_process()
+        test_rollup_logs_a_success_line()
+        test_failed_l3_does_not_discard_successful_l1_and_l2()
+        test_failed_l3_does_not_repeat_the_same_work_forever()
+        test_l3_does_not_refire_once_the_chapters_are_covered()
         test_state_summary_compact()
         print("\nAll summarizer smoke tests passed.")
     finally:

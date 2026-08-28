@@ -6,6 +6,10 @@ test runs WITHOUT those heavy deps installed — it either exercises the
 graceful-degradation path (deps unavailable → safe no-ops) or injects mock
 embedder/collection objects to test the index/query/forget logic directly.
 
+The middle of the file covers v3.1 D1 — content-addressed document ids. See the
+block comment above test_deleted_message_does_not_overwrite_an_existing_exchange
+for the production sequence those tests are reconstructed from.
+
 The second half of the file covers the v3.1 retrieval budget
 (MAX_RETRIEVAL_TOKENS / COMPACTOR_MAX_RETRIEVAL_TOKENS), added after the
 2026-08-27 production 400: facts were capped, summary chunks were capped, and
@@ -89,15 +93,43 @@ class MockCollection:
                 ids.append(_id); docs.append(doc); metas.append(meta); dists.append(0.1)
         return {"ids": [ids], "documents": [docs], "metadatas": [metas], "distances": [dists]}
 
-    def get(self, where):
-        cid = where.get("conv_id")
-        ids = [i for i, (_, m) in self._store.items() if m.get("conv_id") == cid]
-        return {"ids": ids}
+    def get(self, where=None, ids=None, include=None):
+        """Mirrors the three call shapes retrieval.py uses against the real
+        chromadb 1.5.9, verified in angreg/zions-light-ai:v3.0.5-cu12:
+
+            get(where={"conv_id": ...})                  -> ids+docs+metas
+            get(where={"conv_id": ...}, include=["metadatas"])
+            get(ids=[...], include=[])                   -> the D1 exists probe
+
+        Real chroma returns only the requested fields and drops unknown ids
+        from the result rather than raising, which is what makes the probe a
+        membership test."""
+        if ids is not None:
+            matched = [i for i in ids if i in self._store]
+        else:
+            cid = (where or {}).get("conv_id")
+            matched = [
+                i for i, (_, m) in self._store.items() if m.get("conv_id") == cid
+            ]
+        out = {"ids": matched}
+        if include is None or "documents" in include:
+            out["documents"] = [self._store[i][0] for i in matched]
+        if include is None or "metadatas" in include:
+            out["metadatas"] = [self._store[i][1] for i in matched]
+        return out
 
     def delete(self, ids):
         for i in ids:
             self.deleted_ids.append(i)
             self._store.pop(i, None)
+
+    def turn_indices(self, conv_id):
+        """Stored ordering metadata for a conv, in insertion order."""
+        return [
+            m["turn_index"]
+            for (_, m) in self._store.values()
+            if m.get("conv_id") == conv_id
+        ]
 
 
 def _install_mocks():
@@ -114,6 +146,18 @@ def _force_unavailable():
     retrieval._chroma_collection = None
 
 
+def _seed_legacy_row(col, conv_id, turn_index, document):
+    """Write a PRE-D1 row straight into the store: id `{conv_id}::{N}`.
+
+    These are what the live ChromaDB is full of, and D1 does not migrate them —
+    the requirement is that they keep working beside the new hashed ids. Seeded
+    directly rather than through index_exchange because index_exchange can no
+    longer produce this id format, which is the whole point of the fix."""
+    col._store[f"{conv_id}::{turn_index}"] = (
+        document, {"conv_id": conv_id, "turn_index": turn_index}
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers (no backend needed)
 # ---------------------------------------------------------------------------
@@ -125,10 +169,22 @@ def test_exchange_doc_format():
     assert_true("[assistant]: hi there" in doc, "assistant line present")
 
 
-def test_doc_id_stable():
-    print("\n[test] _doc_id is stable + unique per (conv, turn)")
-    assert_eq(retrieval._doc_id("abc", 4), "abc::4", "id format")
-    assert_true(retrieval._doc_id("abc", 4) != retrieval._doc_id("abc", 6), "distinct turns")
+def test_doc_id_is_content_addressed():
+    print("\n[test] _doc_id hashes the exchange text, not the client's turn index")
+    doc = retrieval._exchange_doc("who is Lyra?", "a half-elf ranger")
+    got = retrieval._doc_id("abc", doc)
+
+    assert_true(got.startswith("abc::"), f"conversation-scoped prefix: {got!r}")
+    assert_eq(len(got.split("::", 1)[1]), 16, "16 hex chars of sha256")
+    assert_eq(got, retrieval._doc_id("abc", doc), "stable across calls")
+    assert_true(got != retrieval._doc_id("abd", doc), "same text, other conv -> other id")
+    assert_true(
+        got != retrieval._doc_id("abc", doc + "."),
+        "one character of difference -> its own row",
+    )
+    # The id takes nothing from the request at all — the parameter it used to
+    # take is gone. index_exchange still accepts turn_index for ordering; the
+    # tests below are what hold it out of the identity.
 
 
 def test_format_retrieval_block_empty():
@@ -207,10 +263,13 @@ def test_index_exchange_upserts():
     print("\n[test] index_exchange embeds + upserts with conv metadata")
     emb, col = _install_mocks()
     ok = retrieval.index_exchange("conv1", 4, "who is Lyra?", "a half-elf ranger")
+    doc = retrieval._exchange_doc("who is Lyra?", "a half-elf ranger")
     assert_eq(ok, True, "index succeeded")
     assert_eq(len(col.upserts), 1, "one upsert call")
-    assert_eq(col.upserts[0]["ids"], ["conv1::4"], "correct doc id")
+    assert_eq(col.upserts[0]["ids"], [retrieval._doc_id("conv1", doc)], "content-addressed id")
     assert_eq(col.upserts[0]["metadatas"][0]["conv_id"], "conv1", "conv_id in metadata")
+    # Nothing stored for conv1 yet, so the ordinal seeds from the caller's
+    # turn_index. Later exchanges take the store's max as a floor instead.
     assert_eq(col.upserts[0]["metadatas"][0]["turn_index"], 4, "turn_index in metadata")
 
 
@@ -237,8 +296,10 @@ def test_retrieve_returns_matches():
 def test_retrieve_excludes_recent_turns():
     print("\n[test] retrieve drops turns >= exclude_turns_from")
     emb, col = _install_mocks()
-    retrieval.index_exchange("conv1", 2, "old", "old-a")
-    retrieval.index_exchange("conv1", 20, "recent", "recent-a")
+    # Seeded as pre-D1 rows: post-D1 the ordinal is allocated from the store's
+    # own max, so index_exchange could not produce a 2/20 gap in two calls.
+    _seed_legacy_row(col, "conv1", 2, retrieval._exchange_doc("old", "old-a"))
+    _seed_legacy_row(col, "conv1", 20, retrieval._exchange_doc("recent", "recent-a"))
     hits = retrieval.retrieve("conv1", "q", k=5, exclude_turns_from=10)
     assert_eq(len(hits), 1, "recent turn (20) excluded")
     assert_eq(hits[0]["turn_index"], 2, "only the old turn remains")
@@ -261,6 +322,194 @@ def test_forget_conversation_deletes():
     # 'keep' conv survives
     assert_eq(retrieval.conversation_doc_count("keep"), 1, "other conv untouched")
     assert_eq(retrieval.conversation_doc_count("conv1"), 0, "conv1 now empty")
+
+
+# ---------------------------------------------------------------------------
+# v3.1 D1 — content-addressed document ids
+# ---------------------------------------------------------------------------
+#
+# The highest-severity finding in the v3.1 bundle, and the only one whose
+# damage is unrecoverable. `_doc_id` was `{conv_id}::{turn_index}` where
+# turn_index is main.py's `len(messages)+1` — a measurement of the CLIENT'S
+# ARRAY. Deleting messages in OpenWebUI shortens that array, so the index goes
+# down and the upsert lands on an id that already holds a different exchange.
+#
+# Measured in production. Five DELETE /api/v1/chats/…/messages/… between
+# 06:15:29 and 06:15:44 produced this indexed sequence:
+#
+#     42, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58
+#
+# The real turn ~42, written 06:14:54, was destroyed at 14:49:22 by the second
+# 42. The phantom conversation is the same failure with the array pinned short:
+# sixteen writes to index 2, leaving one document and fifteen destructions.
+#
+# These four tests are the ones named in the D1 task. Each was mutation-checked
+# against the fixed code.
+
+
+def test_deleted_message_does_not_overwrite_an_existing_exchange():
+    print("\n[test] D1 — a shortened client array adds an exchange, never replaces one")
+    emb, col = _install_mocks()
+
+    # 06:14:54 — the client's array is 41 messages long. This is the exchange
+    # that production lost.
+    doomed = "what did she say about the road?"
+    retrieval.index_exchange("prod", 42, doomed, "that it was watched")
+
+    # 06:15:29-06:15:44 — five messages deleted. turn_index drops and then
+    # climbs back, which is the measured sequence 42, 34, 36, 38, 40, 42. The
+    # SIXTH write is the one that mattered: pre-D1 it reused `prod::42` and
+    # overwrote the exchange above at 14:49:22. The shortening alone is
+    # harmless; it is the climb back onto an occupied id that destroys.
+    for nominal, text in (
+        (34, "and the watchers?"),
+        (36, "how many of them?"),
+        (38, "did they follow?"),
+        (40, "to the bridge?"),
+        (42, "and then?"),
+    ):
+        retrieval.index_exchange("prod", nominal, text, "mm")
+
+    assert_eq(retrieval.conversation_doc_count("prod"), 6, "six exchanges, none replaced")
+    docs = [doc for doc, _ in col._store.values()]
+    assert_true(
+        any(doomed in d for d in docs),
+        "the exchange at the reused index survived the second write to it",
+    )
+    assert_true(any("and then?" in d for d in docs), "and the later one was stored too")
+    # Ordinals came from the store, stepping by one exchange, never from the
+    # request — so the stored sequence cannot run backwards even while the
+    # client's array does.
+    assert_eq(
+        col.turn_indices("prod"), [42, 44, 46, 48, 50, 52], "ordering only moves forward"
+    )
+
+
+def test_identical_text_reindexed_is_idempotent():
+    print("\n[test] D1 — re-indexing identical text is one row and no second embed")
+    emb, col = _install_mocks()
+
+    retrieval.index_exchange("c", 10, "the same question", "the same answer")
+    embeds_after_first = len(emb.calls)
+
+    # A retry, a replayed request, a re-import — same text, any turn index.
+    ok = retrieval.index_exchange("c", 999, "the same question", "the same answer")
+
+    assert_eq(ok, True, "reported as indexed, because it is")
+    assert_eq(retrieval.conversation_doc_count("c"), 1, "still one row")
+    assert_eq(len(col.upserts), 1, "no second upsert")
+    assert_eq(len(emb.calls), embeds_after_first, "the exists probe skipped the embed")
+    assert_eq(col.turn_indices("c"), [10], "the stored ordinal is untouched")
+
+
+def test_distinct_text_always_gets_a_row():
+    print("\n[test] D1 — distinct text always gets its own row, however the index moves")
+    emb, col = _install_mocks()
+
+    # Turn indices deliberately hostile: descending, repeating, and colliding
+    # with each other — every shape a deleting/editing/windowing client makes.
+    for nominal, text in (
+        (42, "the first thing she said"),
+        (34, "the second thing she said"),
+        (34, "the third thing she said"),
+        (2, "the fourth thing she said"),
+        (2, "the fourth thing she said."),  # one character apart
+    ):
+        assert_eq(
+            retrieval.index_exchange("c", nominal, text, "mm"), True, f"indexed {text!r}"
+        )
+
+    assert_eq(retrieval.conversation_doc_count("c"), 5, "five distinct exchanges, five rows")
+    assert_eq(
+        col.turn_indices("c"), [42, 44, 46, 48, 50], "ordinals ascend by one exchange"
+    )
+
+
+def test_sixteen_writes_at_one_turn_index_are_sixteen_rows():
+    print("\n[test] D1 — REGRESSION: the phantom conversation's 16 writes to index 2")
+    # conv 31365d633335bbd0 in production: 105 facts and ONE episodic row. The
+    # client's array never grew past two messages, so turn_index was 2 on every
+    # request and every exchange landed on `31365d633335bbd0::2`. Fifteen
+    # exchanges were destroyed by the sixteenth. This is the test that fails if
+    # document identity is ever derived from the request again.
+    emb, col = _install_mocks()
+    conv = "31365d633335bbd0"
+
+    for n in range(16):
+        retrieval.index_exchange(
+            conv, 2, f"question {n} about the northern road", f"answer {n}"
+        )
+
+    assert_eq(retrieval.conversation_doc_count(conv), 16, "sixteen rows, not one")
+    assert_eq(len(emb.calls), 16, "each distinct exchange was embedded once")
+    ordinals = col.turn_indices(conv)
+    assert_eq(len(set(ordinals)), 16, "no two exchanges share an ordinal")
+    assert_eq(ordinals, sorted(ordinals), "and they ascend in arrival order")
+
+    # Every one of the sixteen is retrievable, which is the user-visible point.
+    hits = retrieval.retrieve(conv, "the northern road", k=20)
+    assert_eq(len(hits), 16, "all sixteen are retrievable")
+
+
+def test_legacy_rows_coexist_and_the_ordinal_continues_past_them():
+    print("\n[test] D1 — pre-D1 `{conv}::{N}` rows survive beside hashed ids")
+    # There is no migration: the live store is full of these and they are the
+    # only copy of what they hold. Every reader filters on the conv_id METADATA
+    # — verified across retrieve, forget_conversation, conversation_doc_count
+    # and export_indexed_exchanges — so the id format is free to differ.
+    emb, col = _install_mocks()
+    _seed_legacy_row(col, "old", 56, retrieval._exchange_doc("legacy u", "legacy a"))
+    _seed_legacy_row(col, "old", 58, retrieval._exchange_doc("legacy u2", "legacy a2"))
+
+    retrieval.index_exchange("old", 4, "a new question", "a new answer")
+
+    assert_eq(retrieval.conversation_doc_count("old"), 3, "legacy rows still counted")
+    assert_true("old::56" in col._store, "legacy id untouched")
+    assert_eq(
+        max(col.turn_indices("old")), 60, "the new row continues past the legacy max"
+    )
+    assert_eq(len(retrieval.retrieve("old", "q", k=10)), 3, "all three retrievable")
+    assert_eq(retrieval.forget_conversation("old"), 3, "and /forget clears both formats")
+
+
+def test_a_request_ahead_of_the_store_pulls_the_ordinal_forward():
+    print("\n[test] D1 — the store's max is a floor, not a ceiling")
+    # A conversation damaged pre-D1: one surviving row pinned at the index the
+    # collapse landed on, while the live conversation is hundreds of messages
+    # along. Numbering new rows 4, 6, 8… here would leave every stored ordinal
+    # far below main.py's `recent_cutoff = turn_index - KEEP_RECENT_TURNS*2`,
+    # so nothing would ever be excluded as recent and the filter would stop
+    # meaning anything. The request may raise the sequence; it may never lower
+    # it, which is the property that stops the overwriting.
+    emb, col = _install_mocks()
+    _seed_legacy_row(col, "damaged", 2, retrieval._exchange_doc("survivor", "row"))
+
+    retrieval.index_exchange("damaged", 300, "back to the road", "it is still watched")
+    assert_eq(max(col.turn_indices("damaged")), 300, "the request pulled it forward")
+
+    # And it still cannot go backwards: the next request arrives shorter.
+    retrieval.index_exchange("damaged", 12, "one more thing", "go on")
+    assert_eq(
+        sorted(col.turn_indices("damaged")), [2, 300, 302], "a shorter array cannot pull back"
+    )
+
+
+def test_import_keeps_the_bundle_turn_index_and_shares_identity_with_indexing():
+    print("\n[test] D1 — import preserves bundle ordering; ids match live indexing")
+    emb, col = _install_mocks()
+    doc = retrieval._exchange_doc("bundled u", "bundled a")
+
+    assert_eq(retrieval.import_indexed_exchange("c", 12, doc), True, "imported")
+    assert_eq(col.upserts[0]["ids"], [retrieval._doc_id("c", doc)], "content-addressed")
+    # The bundle's turn_index is the SOURCE conversation's ordering and it is
+    # what export_indexed_exchanges sorts on. Re-allocating it here would make
+    # the round-trip lossy, so import is the one writer that keeps the caller's.
+    assert_eq(col.upserts[0]["metadatas"][0]["turn_index"], 12, "bundle ordering kept")
+
+    # The same exchange arriving live is the same row, not a duplicate.
+    assert_eq(retrieval.index_exchange("c", 77, "bundled u", "bundled a"), True, "no-op")
+    assert_eq(retrieval.conversation_doc_count("c"), 1, "one row, not two")
+    assert_eq(col.turn_indices("c"), [12], "and the bundle's ordinal stands")
 
 
 def test_query_result_parsing_robustness():
@@ -627,7 +876,7 @@ def test_regression_20260827_three_exchanges_cannot_overflow_the_window():
 if __name__ == "__main__":
     try:
         test_exchange_doc_format()
-        test_doc_id_stable()
+        test_doc_id_is_content_addressed()
         test_format_retrieval_block_empty()
         test_format_retrieval_block_orders_by_turn()
 
@@ -644,6 +893,15 @@ if __name__ == "__main__":
         test_retrieve_excludes_recent_turns()
         test_retrieve_empty_query()
         test_forget_conversation_deletes()
+
+        test_deleted_message_does_not_overwrite_an_existing_exchange()
+        test_identical_text_reindexed_is_idempotent()
+        test_distinct_text_always_gets_a_row()
+        test_sixteen_writes_at_one_turn_index_are_sixteen_rows()
+        test_legacy_rows_coexist_and_the_ordinal_continues_past_them()
+        test_a_request_ahead_of_the_store_pulls_the_ordinal_forward()
+        test_import_keeps_the_bundle_turn_index_and_shares_identity_with_indexing()
+
         test_query_result_parsing_robustness()
 
         test_cap_invisible_when_it_does_not_bind()

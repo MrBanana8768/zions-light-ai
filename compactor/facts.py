@@ -27,7 +27,9 @@ Lifecycle:
      fact, which collapsed the eviction sort key onto `added_turn` and made
      "LRU" mean "drop the conversation's oldest, most foundational facts"
      (v3.1 F9).
-  3. After response streams back → extract_facts_from_exchange() in async tail
+  3. After response streams back → extract_facts_from_exchange() in async tail.
+     Its INPUT is budgeted too (_fit_extraction_input): the store it is handed
+     may be the whole file, and the reply it is handed is unbounded.
   4. Append new facts → prune to budget (archiving the evictions) → save_facts()
 
 All file writes go through memory.atomic_write_json() for crash safety.
@@ -74,6 +76,38 @@ _EXTRACTION_MAX_TOKENS = int(
 # from manual /remember commands (V2.1 territory). Default on.
 _EXTRACTION_ENABLED = (
     os.environ.get("COMPACTOR_FACTS_EXTRACTION", "true").lower() != "false"
+)
+
+# INPUT budget for one extraction call — the counterpart to _EXTRACTION_MAX_TOKENS
+# above, which only ever bounded the OUTPUT.
+#
+# Until v3.1 there was none. The payload is the extraction system prompt + the
+# ENTIRE fact store + the full user turn + the full assistant reply, and none of
+# it was counted. The chat path sends no max_tokens, so vLLM may generate a reply
+# of nearly the whole window and extraction then stacks the prompt and the store
+# on top of that reply. Two calls in the 2026-08-24 window were rejected at
+# 33,790 and 33,581 input tokens against a 32,768 window. A rejection is not a
+# partial result: those exchanges' facts were never extracted, and nothing
+# retried them.
+#
+# Same shape as main.summarize's own input budget (main.py's
+# `budget = min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - out - reserve))`), read
+# from the same env var so the two cannot drift apart on a re-sized deployment.
+_MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "32768") or 32768)
+# Slack left inside the window for the chat template's per-message framing and
+# for the estimator's error. Same default and same purpose as
+# COMPACTOR_SUMMARY_INPUT_RESERVE; this module has no tokenizer at all, so its
+# char/4 estimate is the coarser of the two and this reserve is the only thing
+# absorbing that difference.
+_EXTRACTION_INPUT_RESERVE = int(
+    os.environ.get("COMPACTOR_FACTS_INPUT_RESERVE", "2048") or 2048
+)
+# Clamped for the same reason as main.HARD_INPUT_LIMIT: a bare floor could sit
+# ABOVE the model's own window on a small-context model, which would budget
+# nothing at all.
+_EXTRACTION_INPUT_BUDGET = min(
+    _MAX_MODEL_LEN,
+    max(256, _MAX_MODEL_LEN - _EXTRACTION_MAX_TOKENS - _EXTRACTION_INPUT_RESERVE),
 )
 
 
@@ -559,6 +593,141 @@ def _build_extraction_messages(
     ]
 
 
+_TRIM_NOTE = "\n[...trimmed to fit the fact-extraction input budget]"
+
+
+def _assembled_tokens(
+    user_msg: str, assistant_msg: str, existing_facts: list[dict]
+) -> int:
+    """Estimated size of the request as _build_extraction_messages will
+    actually assemble it — system prompt, scaffolding, per-fact bullets and all.
+
+    Every shedding decision below is checked against this rather than against a
+    sum of the parts, for the same reason main._enforce_hard_budget verifies
+    with a real count after it sheds: the framing is not free, and a budget
+    that only counts the content is the budget that let 33k-token payloads out.
+    """
+    return sum(
+        _estimate_tokens(m["content"])
+        for m in _build_extraction_messages(user_msg, assistant_msg, existing_facts)
+    )
+
+
+def _extraction_overhead_tokens() -> int:
+    """Everything in the payload that is neither the store nor the exchange:
+    the system prompt plus the literal scaffolding.
+
+    Measured off the templates themselves rather than written down as a
+    constant, so editing either one cannot silently invalidate the budget.
+    """
+    return _assembled_tokens("", "", [])
+
+
+def _truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """Cut `text` down to roughly `max_tokens`, keeping the head and saying so.
+
+    Head rather than tail: the extraction prompt asks for what the USER
+    stated, and a reply states its answer up front and elaborates below.
+    Marked rather than silent: a sentence that stops mid-word looks to the
+    model like all there was, which is how a truncation becomes a wrong fact.
+    Never returns "" — extract_facts_from_exchange short-circuits on an empty
+    message, and shedding a turn into a silent no-op is the failure mode this
+    whole budget exists to remove.
+    """
+    if _estimate_tokens(text) <= max_tokens:
+        return text
+    # Leave room for the note itself, plus one token for the char/4 remainder
+    # the slice can carry past the boundary.
+    keep_chars = max(0, max_tokens - _estimate_tokens(_TRIM_NOTE) - 1) * 4
+    return (text[:keep_chars].rstrip() + _TRIM_NOTE).lstrip()
+
+
+def _fit_extraction_input(
+    user_msg: str,
+    assistant_msg: str,
+    existing_facts: list[dict],
+    budget: int,
+) -> tuple[str, str, list[dict], str | None]:
+    """Trim one extraction payload to `budget` estimated tokens.
+
+    Returns (user_msg, assistant_msg, existing_facts, note); `note` is None
+    when everything fit as passed and a description of what was shed otherwise.
+
+    Shedding order is by value, cheapest first — the same principle as
+    main._enforce_hard_budget, with this call's own ordering:
+
+      1. the fact store. It is already on disk. Anything the model re-extracts
+         because it could not see it here is caught by dedup on the way back
+         in, so the cost of shedding it is a duplicate, not a loss.
+      2. the assistant reply. The prompt explicitly asks for what the USER
+         stated and not what the assistant invented, and the reply is also the
+         unbounded half — the chat path sends no max_tokens.
+      3. the user message, last. It is the new information and the reason the
+         call exists.
+
+    The store is narrowed through select_for_injection so eviction, injection
+    and extraction all agree on which facts are the working set, rather than
+    this function inventing a third opinion.
+    """
+    if _assembled_tokens(user_msg, assistant_msg, existing_facts) <= budget:
+        return user_msg, assistant_msg, existing_facts, None
+
+    notes: list[str] = []
+
+    # 1. The store gets whatever the exchange and the scaffolding leave it.
+    kept = select_for_injection(
+        existing_facts,
+        max(0, budget - _assembled_tokens(user_msg, assistant_msg, [])),
+    )
+    # select_for_injection sizes a fact as its text alone — the unit it shares
+    # with prune_facts — while this payload renders it as "- <text>\n". Settle
+    # that difference against the assembled payload instead of carrying a
+    # second cost model around. It is the per-bullet framing, so this drops a
+    # few facts and stops; `kept` shrinks every round, so it terminates.
+    while kept and _assembled_tokens(user_msg, assistant_msg, kept) > budget:
+        lru = min(kept, key=lambda f: (f["last_used"], f["added_turn"]))
+        kept = [f for f in kept if f is not lru]
+    if len(kept) != len(existing_facts):
+        notes.append(f"store {len(existing_facts)}->{len(kept)} fact(s)")
+
+    # 2. The assistant reply. Two rounds: one to make the cut, one to absorb
+    #    the cost of the note the cut adds.
+    a_before = _estimate_tokens(assistant_msg)
+    for _ in range(2):
+        over = _assembled_tokens(user_msg, assistant_msg, kept) - budget
+        if over <= 0:
+            break
+        assistant_msg = _truncate_to_tokens(
+            assistant_msg, _estimate_tokens(assistant_msg) - over
+        )
+    a_after = _estimate_tokens(assistant_msg)
+    if a_after != a_before:
+        notes.append(f"assistant reply {a_before}->{a_after} tok")
+
+    # 3. The user message, last.
+    u_before = _estimate_tokens(user_msg)
+    for _ in range(2):
+        over = _assembled_tokens(user_msg, assistant_msg, kept) - budget
+        if over <= 0:
+            break
+        user_msg = _truncate_to_tokens(user_msg, _estimate_tokens(user_msg) - over)
+    u_after = _estimate_tokens(user_msg)
+    if u_after != u_before:
+        notes.append(f"user turn {u_before}->{u_after} tok")
+
+    if _assembled_tokens(user_msg, assistant_msg, kept) > budget:
+        # Reachable only when the window itself is smaller than the extraction
+        # prompt, i.e. a misconfigured MAX_MODEL_LEN. Say so here, because the
+        # next thing in the log will be the rejection and nothing else would
+        # explain why shedding everything did not help.
+        notes.append(
+            f"STILL over the {budget}-token budget with nothing left to shed — "
+            f"the configured window cannot hold the extraction prompt itself"
+        )
+
+    return user_msg, assistant_msg, kept, "; ".join(notes) or None
+
+
 def _parse_extraction_output(raw: str) -> list[str]:
     """Parse the LLM's output into a clean list of fact strings. Handles:
     - "NONE" (any casing, with/without trailing punctuation) → []
@@ -599,6 +768,8 @@ async def extract_facts_from_exchange(
     assistant_msg: str,
     existing_facts: list[dict],
     *,
+    conv_id: str | None = None,
+    max_input_tokens: int | None = None,
     timeout: float = 120.0,
 ) -> list[str]:
     """Call vLLM to extract new facts from one user/assistant exchange.
@@ -608,9 +779,31 @@ async def extract_facts_from_exchange(
 
     Errors (network, vLLM 5xx, parse failures) return [] — fact extraction
     must NEVER block or break the user's chat flow. Failures get logged.
+
+    `existing_facts` may be the whole store: the input budget below narrows it
+    here, so a caller that has not yet learned to pass a bounded set cannot
+    push this call past the model's window. Passing the bounded set — what
+    select_for_injection returned for this turn — is still better, because
+    then the store the extractor is told about is the same one the model just
+    saw.
+
+    `conv_id` is used for logging only, and only this module's own logging. It
+    is what makes a failure attributable: without it the warning this used to
+    emit named no conversation, so a lost extraction could not be traced to
+    the turn that lost it.
     """
     if not user_msg or not assistant_msg:
         return []
+    # A lost extraction is a lost memory, so every line below has to say WHOSE.
+    where = f"conv={conv_id}" if conv_id else "conv=? (caller passed none)"
+    user_msg, assistant_msg, existing_facts, trim_note = _fit_extraction_input(
+        user_msg,
+        assistant_msg,
+        existing_facts,
+        _EXTRACTION_INPUT_BUDGET if max_input_tokens is None else max_input_tokens,
+    )
+    if trim_note:
+        logger.info(f"{where}: extraction input trimmed to budget — {trim_note}")
     payload = {
         "model": model,
         "messages": _build_extraction_messages(user_msg, assistant_msg, existing_facts),
@@ -631,17 +824,28 @@ async def extract_facts_from_exchange(
         raw = data["choices"][0]["message"]["content"]
         facts = _parse_extraction_output(raw)
         if facts:
-            logger.info(f"extracted {len(facts)} new fact(s)")
+            logger.info(f"{where}: extracted {len(facts)} new fact(s)")
         else:
             # Empty result has two distinct causes; log both so the
             # silence isn't a diagnostic dead-end during integration runs.
             snippet = (raw or "").strip().replace("\n", " ")[:120]
             logger.info(
-                f"extracted 0 fact(s) — model returned: {snippet!r}"
+                f"{where}: extracted 0 fact(s) — model returned: {snippet!r}"
             )
         return facts
     except Exception as e:
-        logger.warning(f"fact extraction failed (non-fatal): {e}")
+        # ERROR, not WARNING. This is the whole of what the 2026-08-24 window
+        # left behind for two rejected extractions: one unattributed warning
+        # each, no "+N facts" line after it, no retry and no alert. The chat
+        # response had already gone out, so nothing else in the system knew
+        # anything was missing. The facts are gone for good: backfill is the
+        # only other thing that ever re-reads an old exchange, and
+        # backfill.needs_backfill returns False as soon as a conversation has
+        # a facts file, so it will never revisit this turn.
+        logger.error(
+            f"{where}: fact extraction FAILED ({e}) — this exchange's facts "
+            f"are lost; there is no retry"
+        )
         return []
 
 
@@ -669,7 +873,8 @@ async def record_facts_for_exchange(
         try:
             existing = load_facts(conv_id)
             new_strs = await extract_facts_from_exchange(
-                client, vllm_url, model, user_msg, assistant_msg, existing
+                client, vllm_url, model, user_msg, assistant_msg, existing,
+                conv_id=conv_id,
             )
             if not new_strs:
                 return 0

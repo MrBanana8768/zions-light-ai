@@ -26,9 +26,32 @@ Hybrid two-stage design:
 Cost shape:
   - Stage 1: O(N²) cosine comparisons on 384-dim vectors. 50 facts ≈ 1275
     compares ≈ <1ms.
-  - Stage 2: one LLM call per candidate cluster. MAX_LLM_CALLS_PER_PASS
-    caps total at 10 so even pathological "everything is similar" inputs
-    can't blow the time budget.
+  - Stage 2: one LLM call per candidate cluster, minus the clusters the
+    model has already refused this process (see the refusal memo below).
+    MAX_LLM_CALLS_PER_PASS caps total at 10 so even pathological
+    "everything is similar" inputs can't blow the time budget.
+
+Cost measured (v3.1 I-6). In a 19h47m production window, 197 of the 301
+compactor->vLLM calls were dedup — the single largest consumer of vLLM
+requests in the system, and nobody knew, because the module only logged
+when a pass merged something. A pass that spent the full ten-call cap and
+merged nothing said nothing at all: at 06:15:01-06:15:07 ten POSTs left
+zero log lines. Two changes follow from that. Every pass now emits one
+INFO summary whatever it did, through a wrapper that has no silent return
+path. And a cluster the model has already declined to merge is memoised
+by content hash for the life of the process, so the same KEEP is not
+re-purchased on every subsequent turn. That re-litigation is the
+mechanism MEMORY_REVIEW I-6 identifies as where most of those 197 calls
+go: clustering is a pure function of the stored facts, so a refused
+cluster re-forms identically every turn and nothing recorded that the
+question had already been answered.
+
+The memo stores decisions, never failures. A KEEP, a truncated reply, a
+degenerate-collapse reply: those are what this model produces for this
+prompt at temperature 0.0, and asking again buys the same answer. A
+timeout or a connection error is not an answer, so it is not remembered
+and the cluster is re-tried next pass. Forgetting a memo entry costs one
+LLM call and never costs a fact, which is why eviction can be crude.
 
 Blast radius (v3.1 V7). A merge is the only path in this module that
 deletes facts, and one LLM reply used to be able to delete a cluster of
@@ -49,10 +72,12 @@ facts that are distinct from everything already stored → 0 LLM calls.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 import os
 import re
+from collections import OrderedDict
 
 import httpx
 
@@ -70,6 +95,15 @@ SIMILARITY_THRESHOLD = float(
 # Hard cap on LLM calls per dedup pass. 10 is generous — typical real
 # workloads see 0-2 clusters. Note this caps *calls*, not how many facts
 # a call may delete; MAX_CLUSTER_SIZE is what bounds that.
+#
+# I-6: the cap is a per-pass budget, not a per-cluster one, and clusters
+# are offered to it in ascending first-member order over a fact list the
+# caller sorts by added_turn — oldest first. So the clusters that spend
+# the budget are the oldest ones, and a store with enough long-standing
+# look-alikes to saturate the cap starves every cluster involving a fact
+# added since. The refusal memo is what unsticks that: a cluster the
+# model already refused is skipped without spending a call, so the budget
+# reaches the new material instead of re-buying old answers.
 MAX_LLM_CALLS_PER_PASS = int(
     os.environ.get("COMPACTOR_DEDUP_MAX_LLM_CALLS", "10") or 10
 )
@@ -82,6 +116,14 @@ MAX_LLM_CALLS_PER_PASS = int(
 # sub-clusters of 2..4 rather than dropped — the facts stay eligible, but
 # no single reply can take more than three of them with it.
 # Deliberately not env-tunable: this is a safety bound, not a knob.
+#
+# Interaction with MAX_LLM_CALLS_PER_PASS (checked for I-6): splitting
+# converts one call into ceil(n/4), so the two caps multiply rather than
+# compose — a single transitive blob of 40 look-alike facts becomes ten
+# sub-clusters and spends the whole ten-call budget on its own. That is
+# the intended trade (bounded blast radius costs calls), it is bounded,
+# and with the refusal memo it is paid once per distinct sub-cluster
+# instead of once per turn.
 MAX_CLUSTER_SIZE = 4
 
 # V7: a merged fact shorter than this fraction of the shortest fact it
@@ -103,6 +145,105 @@ MERGE_MAX_TOKENS = 160
 LLM_TIMEOUT_S = float(
     os.environ.get("COMPACTOR_DEDUP_LLM_TIMEOUT_S", "30.0") or 30.0
 )
+
+
+# ---------------------------------------------------------------------------
+# I-6 — refusal memo
+# ---------------------------------------------------------------------------
+
+# Why a memo at all: clustering is a pure function of the stored facts, so
+# a cluster the model answered KEEP on re-forms identically on the next
+# turn, and on every turn after that, at one LLM call each. Nothing in the
+# store records that the question was already asked and answered.
+#
+# conv_id -> (cluster content hash -> reason the merge was refused).
+# Per-conversation because facts are per-conversation and a decision about
+# one conversation's facts is not evidence about another's; process-scoped
+# because it is a cache of a deterministic call, not memory, and losing it
+# on restart costs calls rather than data.
+_REFUSAL_MEMO: OrderedDict[str, OrderedDict[str, str]] = OrderedDict()
+
+# Bounds. Both are LRU-evicted, and eviction is safe by construction: the
+# only cost of forgetting a refusal is re-asking a question we know the
+# answer to. Sized so an ordinary conversation never reaches them — a
+# 100-fact store yields at most ~50 clusters in a pass — while a pathological
+# one cannot grow the process without limit.
+MEMO_MAX_CLUSTERS_PER_CONV = 512
+MEMO_MAX_CONVS = 32
+
+# Refusal reasons that came from a completed model reply. At temperature
+# 0.0 the same cluster produces the same reply, so re-sending it buys the
+# same refusal — memoise these. "error" is deliberately absent: a timeout
+# or a 5xx is the backend failing to answer, and remembering it would let
+# one bad minute pin a mergeable cluster shut for the life of the process.
+_MEMOISABLE_REFUSALS = frozenset({"keep", "truncated", "short", "collapsed"})
+
+
+def _cluster_key(cluster_facts: list[dict]) -> str:
+    """Content hash of a cluster's fact texts.
+
+    Sorted before hashing: after a merge the caller re-sorts the fact list
+    by added_turn, so the same set of facts can be presented in a different
+    order on a later pass, and it is the same question either way. Joined on
+    NUL — which no fact text contains — so ["ab", "c"] cannot collide with
+    ["a", "bc"].
+    """
+    texts = sorted((f.get("text", "") or "") for f in cluster_facts)
+    return hashlib.sha256(
+        "\x00".join(texts).encode("utf-8", "replace")
+    ).hexdigest()
+
+
+def _memo_get(conv_id: str | None, key: str) -> str | None:
+    """The reason this cluster was refused before, or None if it is new.
+
+    No conv_id means no memo: keying every caller's clusters into one
+    shared bucket is exactly the cross-conversation bleed the rest of this
+    codebase spends its effort preventing, and a missed memo only costs a
+    call.
+    """
+    if not conv_id:
+        return None
+    per_conv = _REFUSAL_MEMO.get(conv_id)
+    if per_conv is None:
+        return None
+    reason = per_conv.get(key)
+    if reason is not None:
+        per_conv.move_to_end(key)
+        _REFUSAL_MEMO.move_to_end(conv_id)
+    return reason
+
+
+def _memo_put(conv_id: str | None, key: str, reason: str) -> None:
+    """Record that the model refused this cluster, LRU-evicting if needed."""
+    if not conv_id:
+        return
+    per_conv = _REFUSAL_MEMO.get(conv_id)
+    if per_conv is None:
+        per_conv = OrderedDict()
+        _REFUSAL_MEMO[conv_id] = per_conv
+    per_conv[key] = reason
+    per_conv.move_to_end(key)
+    while len(per_conv) > MEMO_MAX_CLUSTERS_PER_CONV:
+        per_conv.popitem(last=False)
+    _REFUSAL_MEMO.move_to_end(conv_id)
+    while len(_REFUSAL_MEMO) > MEMO_MAX_CONVS:
+        _REFUSAL_MEMO.popitem(last=False)
+
+
+def reset_refusal_memo(conv_id: str | None = None) -> None:
+    """Forget refusals for one conversation, or all of them.
+
+    For tests, and for the call site that edits facts out from under the
+    memo: /forget and /remember change the fact set, which changes the
+    cluster hashes, so they do not strictly need this — but a caller that
+    replaces a conversation wholesale (import, restore) can drop the stale
+    decisions rather than wait for eviction.
+    """
+    if conv_id is None:
+        _REFUSAL_MEMO.clear()
+    else:
+        _REFUSAL_MEMO.pop(conv_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -250,18 +391,22 @@ async def llm_merge_candidate(
     vllm_url: str,
     model: str,
     cluster_facts: list[dict],
-) -> str | None:
-    """Ask the LLM to merge a candidate cluster. Returns:
-      - merged text (str) if LLM agreed the facts are redundant
-      - None if LLM said KEEP anywhere in its reply, the reply was
-        truncated at max_tokens, the reply is materially shorter than the
-        facts it would replace, the call failed, or it didn't parse
+) -> tuple[str | None, str]:
+    """Ask the LLM to merge a candidate cluster. Returns (text, reason):
+      - ("merged text", "merged") if the LLM agreed the facts are redundant
+      - (None, reason) otherwise — "keep" (the word KEEP anywhere in the
+        reply), "truncated" (stopped at max_tokens), "short" (not a fact),
+        "collapsed" (materially shorter than what it would replace),
+        "error" (the call failed), "singleton" (fewer than two facts)
 
-    Returning None = preserve cluster as-is. Safe default — we never lose
-    information from a failed or half-finished LLM call.
+    A None text always means "preserve the cluster as-is" — safe default,
+    we never lose information from a failed or half-finished LLM call. The
+    reason exists because the caller must tell a *decision* apart from a
+    *failure* before memoising it (I-6): re-asking after a KEEP is waste,
+    re-asking after a timeout is the retry that eventually merges.
     """
     if len(cluster_facts) < 2:
-        return None
+        return None, "singleton"
     facts_block = "\n".join(
         f"  {i+1}. {f.get('text', '')}" for i, f in enumerate(cluster_facts)
     )
@@ -291,7 +436,7 @@ async def llm_merge_candidate(
         finish_reason = choice.get("finish_reason")
     except Exception as e:
         logger.warning(f"dedup LLM call failed (cluster preserved): {e}")
-        return None
+        return None, "error"
 
     # V7: a reply that ran out of tokens is not a decision. Unchecked, the
     # fragment cleared the len<6 guard below and was stored as canonical —
@@ -302,13 +447,13 @@ async def llm_merge_candidate(
             f"dedup: merge response hit max_tokens ({MERGE_MAX_TOKENS}) and "
             f"is truncated; cluster of {len(cluster_facts)} preserved"
         )
-        return None
+        return None, "truncated"
 
     # KEEP detection (D39): anywhere in the response, not just the head.
     # Covers "KEEP", "KEEP.", "Keep — these are different" and the case
     # that used to destroy the cluster, "These are different, KEEP".
     if _KEEP_RE.search(raw):
-        return None
+        return None, "keep"
 
     # Otherwise treat as a merged fact line. Strip leading bullets/numbers.
     cleaned = raw.lstrip("- *•").lstrip()
@@ -317,7 +462,7 @@ async def llm_merge_candidate(
         cleaned = cleaned[3:].lstrip()
     # Minimal sanity: too short isn't a real fact.
     if len(cleaned) < 6:
-        return None
+        return None, "short"
     # V7: a merge is a rewording of the cluster, not a summary of it. A
     # reply materially shorter than the shortest fact it would replace has
     # dropped information; the facts it came from are the better record.
@@ -328,8 +473,8 @@ async def llm_merge_candidate(
             f"the shortest of {len(cluster_facts)} clustered facts "
             f"({shortest} chars); cluster preserved"
         )
-        return None
-    return cleaned
+        return None, "collapsed"
+    return cleaned, "merged"
 
 
 def _merge_metadata(cluster_facts: list[dict], new_text: str) -> dict:
@@ -350,11 +495,43 @@ def _merge_metadata(cluster_facts: list[dict], new_text: str) -> dict:
 # Public pass — used by both inline trigger and /admin/dedup
 # ---------------------------------------------------------------------------
 
+def _log_pass(conv_id: str | None, stats: dict) -> None:
+    """The one INFO line every pass emits, productive or not (I-6).
+
+    Before this, dedup logged only when it removed something, so most of
+    the passes in the 19h47m window — the ones that spent calls and merged
+    nothing — were invisible, and the cheap case was the one that logged.
+    Volume is not the objection: roughly thirty passes fired in that
+    window, so one line each is a few dozen a day.
+    """
+    extra = ""
+    if stats["deferred"]:
+        extra += (
+            f"; {stats['deferred']} cluster(s) deferred to the next pass "
+            f"(call cap {MAX_LLM_CALLS_PER_PASS})"
+        )
+    if not conv_id:
+        # Not decoration: the memo is per-conversation and a caller that
+        # passes no conv_id gets no memoisation at all, which is the
+        # difference between a few calls a day and a few hundred.
+        extra += "; refusal memo off (caller passed no conv_id)"
+    where = f"conv={conv_id}: " if conv_id else ""
+    logger.info(
+        f"{where}dedup pass: {stats['facts']} fact(s) in, "
+        f"{stats['clusters']} candidate cluster(s), "
+        f"{stats['memo_skips']} already-refused skip(s), "
+        f"{stats['calls']} LLM call(s), {stats['merges']} merge(s), "
+        f"{stats['removed']} fact(s) removed{extra}"
+    )
+
+
 async def dedup_facts(
     client: httpx.AsyncClient,
     vllm_url: str,
     model: str,
     facts: list[dict],
+    *,
+    conv_id: str | None = None,
 ) -> tuple[list[dict], int]:
     """Run a hybrid dedup pass. Returns (deduped_facts, removed_count).
 
@@ -364,7 +541,34 @@ async def dedup_facts(
 
     Fast exit when no candidate clusters → 0 LLM calls. This is the
     common case for inline-after-extraction.
+
+    `conv_id` is optional only so this stays a drop-in for callers that
+    have not been updated; supply it. It is what scopes the refusal memo,
+    and without it every pass re-asks the model questions it has already
+    answered (I-6). It also labels the pass line, which is otherwise the
+    one dedup line in the log that cannot be tied to a conversation.
+
+    The work is done by _dedup_pass; this wrapper exists so that no return
+    path — including an unexpected raise — can leave a pass unlogged.
     """
+    stats = {
+        "facts": len(facts), "clusters": 0, "memo_skips": 0,
+        "calls": 0, "merges": 0, "removed": 0, "deferred": 0,
+    }
+    try:
+        return await _dedup_pass(client, vllm_url, model, facts, conv_id, stats)
+    finally:
+        _log_pass(conv_id, stats)
+
+
+async def _dedup_pass(
+    client: httpx.AsyncClient,
+    vllm_url: str,
+    model: str,
+    facts: list[dict],
+    conv_id: str | None,
+    stats: dict,
+) -> tuple[list[dict], int]:
     if len(facts) < 2:
         return list(facts), 0
 
@@ -374,6 +578,7 @@ async def dedup_facts(
         logger.warning(f"dedup: clustering failed (no-op): {e}")
         return list(facts), 0
 
+    stats["clusters"] = len(clusters)
     if not clusters:
         return list(facts), 0
 
@@ -382,17 +587,23 @@ async def dedup_facts(
     calls_used = 0
 
     for cluster in clusters:
-        if calls_used >= MAX_LLM_CALLS_PER_PASS:
-            logger.info(
-                f"dedup: hit LLM call cap ({MAX_LLM_CALLS_PER_PASS}); "
-                f"{len(clusters) - calls_used} cluster(s) deferred to next pass"
-            )
-            break
         cluster_facts = [facts[i] for i in cluster]
-        merged_text = await llm_merge_candidate(
+        key = _cluster_key(cluster_facts)
+        if _memo_get(conv_id, key) is not None:
+            stats["memo_skips"] += 1
+            continue
+        if calls_used >= MAX_LLM_CALLS_PER_PASS:
+            # Count, don't break: the remaining clusters still get their
+            # memo check, which is free, so the deferred figure names the
+            # clusters that will actually cost a call next pass rather
+            # than every cluster we happened to stop in front of.
+            stats["deferred"] += 1
+            continue
+        merged_text, reason = await llm_merge_candidate(
             client, vllm_url, model, cluster_facts
         )
         calls_used += 1
+        stats["calls"] = calls_used
         if merged_text:
             # V7: log the texts, not just the count. This is the only
             # record of what a merge destroyed — the facts file is
@@ -406,6 +617,12 @@ async def dedup_facts(
             )
             merged.append(_merge_metadata(cluster_facts, merged_text))
             to_remove.update(cluster)
+            stats["merges"] += 1
+        elif reason in _MEMOISABLE_REFUSALS:
+            # I-6: remember the model's answer, never the backend's
+            # failure. _MEMOISABLE_REFUSALS is the difference between the
+            # two, and it is the whole point of the reason code.
+            _memo_put(conv_id, key, reason)
 
     if not to_remove:
         return list(facts), 0
@@ -418,9 +635,8 @@ async def dedup_facts(
     # Sort the final result by added_turn so injection sees a stable order.
     result.sort(key=lambda f: f.get("added_turn", 0))
     removed = len(facts) - len(result)
-    if removed > 0:
-        logger.info(
-            f"dedup: merged {removed} duplicate fact(s) into {len(merged)} "
-            f"canonical entries via {calls_used} LLM call(s)"
-        )
+    # The "via N LLM call(s)" line that used to live here fired only when
+    # removed > 0, which is why most passes in the 19h47m window left no
+    # trace at all. _log_pass reports the same counters unconditionally.
+    stats["removed"] = removed
     return result, removed
