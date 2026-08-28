@@ -286,6 +286,79 @@ def _message_has_image(m: dict) -> bool:
     return _message_image_count(m) > 0
 
 
+_TOKENIZE_WARNED = False
+
+
+def count_tokens_exact(messages: list[dict]) -> int | None:
+    """The number vLLM will actually charge, from its own /tokenize endpoint.
+    None when unavailable — every caller falls back to count_tokens.
+
+    v3.0.5 hotfix. count_tokens is systematically wrong on this deployment, in
+    the direction that overflows: ~50% LOW on assistant content while ~10% HIGH
+    on user and system content. Measured 2026-08-28 against /tokenize on the
+    production conversation:
+
+        assistant  16,971 chars   local 4,976   vLLM  7,513   -34%
+        assistant  27,570 chars   local 7,251   vLLM 11,347   -36%
+        assistant  17,930 chars   local 4,425   vLLM  8,988   -51%
+        user        6,865 chars   local 1,733   vLLM  1,585    +9%
+
+    The cause is the tokenizer, not the arithmetic. The served model ships only
+    tekken.json; transformers converts it on load, and the converted vocabulary
+    prices box-drawing characters and emoji far below mistral_common, which is
+    what vLLM uses. This model draws decorative rules — one 17,930-character
+    reply held 1,710 U+2501 and 441 U+2500, roughly 4,275 tokens of horizontal
+    line, 13% of the window. Assistant turns run 7-14% non-ASCII, user turns
+    0.2-0.4%, so the error concentrates in exactly the content that dominates a
+    long conversation.
+
+    Everything downstream inherited it. The summarizer packed batches it
+    believed were 29,696 tokens that were really ~46,000, so summarization 400'd
+    and compaction degraded to forwarding the originals; 116,549 tokens then
+    reached the hard budget guard on every request; the guard sheds correctly,
+    verified with the same wrong counter, certified 21,170 as fitting, and vLLM
+    charged 32,899. To survive it dropped 58 of 63 turns.
+
+    A local tokenizer cannot be made right here — the vocabulary is the thing
+    that differs. So ask the process that does the charging. It is already
+    running on localhost, and this is called only where precision decides an
+    outcome: never per message, never on the streaming hot path.
+    """
+    if not messages:
+        return 0
+    global _TOKENIZE_WARNED
+    try:
+        r = httpx.post(
+            f"{VLLM_URL}/tokenize",
+            json={"model": MODEL_REPO, "messages": messages},
+            timeout=httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0),
+        )
+        if r.status_code != 200:
+            # Usually the template refusing a message shape (an assistant-final
+            # list, most often) rather than a fault. Once per process: a broken
+            # endpoint must be visible; a mid-shed shape must not write a line
+            # per round.
+            if not _TOKENIZE_WARNED:
+                _TOKENIZE_WARNED = True
+                logger.warning(
+                    f"/tokenize returned {r.status_code}; budgeting falls back "
+                    f"to the local tokenizer, which under-counts assistant "
+                    f"content on this model. Body: {r.text[:200]!r}"
+                )
+            return None
+        n = r.json().get("count")
+        return int(n) if isinstance(n, (int, float)) else None
+    except Exception as e:
+        if not _TOKENIZE_WARNED:
+            _TOKENIZE_WARNED = True
+            logger.warning(
+                f"/tokenize unreachable ({type(e).__name__}: {e}); budgeting "
+                f"falls back to the local tokenizer and its ~50% undercount on "
+                f"assistant content. Requests may overflow until this recovers."
+            )
+        return None
+
+
 def count_tokens(messages: list[dict]) -> int:
     # V3.1: images cost tokens the text estimate can't see — add a flat
     # per-image estimate so VLM requests don't quietly overflow the budget.
@@ -340,18 +413,28 @@ async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
     return (choices[0].get("message") or {}).get("content", "").strip()
 
 
-def _chunk_to_budget(turns: list[dict], budget: int) -> list[list[dict]]:
+def _chunk_to_budget(
+    turns: list[dict], budget: int, scale: float = 1.0
+) -> list[list[dict]]:
     """Split turns into consecutive batches that each fit `budget` tokens.
 
     A single turn larger than the budget still gets its own batch — we never
     drop content here; `_summarize_once` would fail on it and the caller
     degrades. (Truncating a turn silently would be a quieter kind of lying.)
+
+    `scale` corrects the local tokenizer against vLLM's own count — see
+    count_tokens_exact. Without it this packed batches it believed were 29,696
+    tokens that were really ~46,000; every batch 400'd, and summarization
+    "degraded" by handing compaction back the original oversized messages.
+    Compaction then did nothing for hours while the log said only
+    `summarize: N turns exceed the budget — map-reduce over 4 batches` and never
+    once said it had finished.
     """
     batches: list[list[dict]] = []
     current: list[dict] = []
     current_tokens = 0
     for m in turns:
-        t = count_tokens([m])
+        t = int(count_tokens([m]) * scale)
         if current and current_tokens + t > budget:
             batches.append(current)
             current, current_tokens = [], 0
@@ -379,7 +462,16 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
         MAX_MODEL_LEN,
         max(256, MAX_MODEL_LEN - SUMMARY_MAX_TOKENS - SUMMARY_INPUT_RESERVE),
     )
-    batches = _chunk_to_budget(to_summarize, budget)
+    # Measure the local tokenizer's error on THIS content before batching to it.
+    # One /tokenize call, off the event loop, against many minutes of failed
+    # map-reduce when the batches are wrong. Falls back to 1.0 — the pre-hotfix
+    # behaviour — if vLLM cannot answer.
+    _local = count_tokens(to_summarize)
+    _exact = await run_in_threadpool(count_tokens_exact, to_summarize)
+    _scale = (_exact / _local) if (_exact is not None and _local > 0) else 1.0
+    batches = await run_in_threadpool(
+        _chunk_to_budget, to_summarize, budget, _scale
+    )
     if len(batches) == 1:
         return await _summarize_once(client, batches[0])
 
@@ -706,7 +798,26 @@ def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list
     if _fast_token_estimate(messages) <= limit // 2:
         return messages
 
-    total = count_tokens(messages)
+    # Ground truth, once, before any decision rests on it. count_tokens reads
+    # ~50% low on assistant content (see count_tokens_exact), so "total <=
+    # limit" was answering a question about a different request than the one
+    # about to be sent.
+    local_total = count_tokens(messages)
+    exact = count_tokens_exact(messages)
+    total = exact if exact is not None else local_total
+    # How wrong the local tokenizer is on THIS payload. The shedding loop needs
+    # a per-message cost and cannot afford an HTTP call each — that would be one
+    # round trip per message on the slowest path in the system. So it keeps
+    # local per-message counts scaled by the ratio the two whole-payload counts
+    # establish, and every round still verifies against a real /tokenize before
+    # it stops. scale is 1.0 when vLLM cannot answer, which reproduces the
+    # pre-hotfix behaviour exactly.
+    scale = (total / local_total) if (exact is not None and local_total > 0) else 1.0
+    if exact is not None and abs(scale - 1.0) > 0.05:
+        logger.info(
+            f"token scale {scale:.2f}x (local {local_total} -> vLLM {total}); "
+            f"shedding arithmetic corrected by that factor"
+        )
     if total <= limit:
         return messages
 
@@ -714,7 +825,7 @@ def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list
     # Per-message costs, computed ONCE. Sum-of-parts differs from the templated
     # whole by per-message template overhead, so shedding aims below the limit
     # on arithmetic and then verifies with a real count — bounded rounds.
-    per = [count_tokens([m]) for m in msgs]
+    per = [int(count_tokens([m]) * scale) for m in msgs]
     running = total
     dropped = 0
     trimmed = 0
@@ -761,9 +872,15 @@ def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list
             running += per[i]
             trimmed += 1
 
-        # --- verify with a real full count; loop only if template overhead
-        #     pushed us back over (each round does exactly ONE full count) ---
-        running = count_tokens(msgs)
+        # --- verify against GROUND TRUTH; loop only if the arithmetic left us
+        #     over (each round does exactly ONE count, and it is vLLM's) ---
+        #
+        # This line decides whether a request is forwarded, so it is the one
+        # that must not be an estimate. It used to be the local count, which is
+        # how a payload measured at 21,170 reached vLLM and was charged 32,899 —
+        # a request this guard had just certified as fitting.
+        _v = count_tokens_exact(msgs)
+        running = _v if _v is not None else int(count_tokens(msgs) * scale)
         if running <= limit:
             break
         idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
