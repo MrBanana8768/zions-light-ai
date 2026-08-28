@@ -196,14 +196,43 @@ _BUDGET_MARGIN = 0
 _CTX_OVERFLOW_RE = re.compile(r"prompt contains (?:at least )?(\d+) input tokens")
 
 
-def _note_backend_rejection(err_body: str) -> None:
+def _is_context_overflow(err_body: str) -> bool:
+    """Whether a 4xx body is vLLM's context-length rejection specifically.
+
+    The message the user gets turns on this: "too large for the window, send it
+    again" is true here and false for every other 400 (modality, alternation,
+    a malformed payload), and telling someone to resend a request that will be
+    refused identically is the same class of error as telling them the backend
+    is restarting when it is healthy."""
+    return "maximum context length" in (err_body or "")
+
+
+def _reported_prompt_tokens(err_body: str) -> int | None:
+    """The TRUE prompt size vLLM reports in a context-length 400, or None.
+
+    Read separately from the calibration below because the log line must name
+    the number whether or not the calibration decided to act on it — a
+    rejection that teaches us nothing (the margin is already larger, or capped)
+    is exactly the one whose numbers someone will need later."""
+    m = _CTX_OVERFLOW_RE.search(err_body or "")
+    return int(m.group(1)) if m else None
+
+
+def _note_backend_rejection(err_body: str) -> bool:
     """Reactive backstop for vLLM 4xx bodies. Two lessons we can learn:
     (1) the model is text-only -> strip images from subsequent requests;
     (2) our token count undercounted -> tighten the budget by the observed gap.
     Either way the conversation heals on its next message instead of staying
-    poisoned."""
+    poisoned.
+
+    Returns whether the budget margin actually advanced. The caller uses it to
+    decide what to promise the user: "send it again" is only true when this
+    rejection taught us something, and a rejection can teach us nothing (the
+    margin is already wider, or it has hit the MAX_MODEL_LEN//4 cap).
+    """
     global _backend_multimodal, _BUDGET_MARGIN
     body = err_body or ""
+    tightened = False
     if "not a multimodal model" in body and _backend_multimodal is not False:
         _backend_multimodal = False
         logger.warning(
@@ -211,10 +240,9 @@ def _note_backend_rejection(err_body: str) -> None:
             "stripped from subsequent requests (set COMPACTOR_BACKEND_MULTIMODAL "
             "to override)"
         )
-    if "maximum context length" in body:
-        m = _CTX_OVERFLOW_RE.search(body)
-        if m:
-            actual = int(m.group(1))
+    if _is_context_overflow(body):
+        actual = _reported_prompt_tokens(body)
+        if actual is not None:
             # v3.1 P0-0b: measure against the limit we ACTUALLY enforced, not
             # the original one. _enforce_hard_budget has already shed to
             # HARD_INPUT_LIMIT - _BUDGET_MARGIN, so measuring against
@@ -232,6 +260,7 @@ def _note_backend_rejection(err_body: str) -> None:
                 new_margin = min(overshoot + 512, MAX_MODEL_LEN // 4)
                 if new_margin > _BUDGET_MARGIN:
                     _BUDGET_MARGIN = new_margin
+                    tightened = True
                     logger.warning(
                         f"context calibration: vLLM counted {actual} tokens where "
                         f"we budgeted <= {effective_limit} — our estimate "
@@ -239,6 +268,7 @@ def _note_backend_rejection(err_body: str) -> None:
                         f"hard limit by {new_margin} for subsequent requests; the "
                         f"next message in this conversation should succeed."
                     )
+    return tightened
 
 
 _IMAGE_PLACEHOLDER = (
@@ -297,6 +327,73 @@ def _message_image_count(m: dict) -> int:
 
 def _message_has_image(m: dict) -> bool:
     return _message_image_count(m) > 0
+
+
+def count_tokens_exact(messages: list[dict]) -> int | None:
+    """The number vLLM will actually charge, from its own /tokenize endpoint.
+    None when unavailable — callers fall back to count_tokens.
+
+    v3.1. count_tokens is systematically wrong on this deployment, and wrong in
+    the direction that overflows: it reads ~50% LOW on assistant content while
+    reading ~10% high on user and system content. Measured 2026-08-28 on the
+    production conversation:
+
+        assistant  16,971 chars   local 4,976   vLLM  7,513   -34%
+        assistant  27,570 chars   local 7,251   vLLM 11,347   -36%
+        assistant  17,930 chars   local 4,425   vLLM  8,988   -51%
+        user        6,865 chars   local 1,733   vLLM  1,585   +9%
+
+    The cause is the tokenizer, not the arithmetic. The served model ships only
+    tekken.json; transformers converts it on load, and the converted vocabulary
+    prices box-drawing characters and emoji far below what mistral_common — the
+    tokenizer vLLM itself uses — charges for the same bytes. This model draws
+    decorative rules: one 17,930-character reply contained 1,710 U+2501 and 441
+    U+2500, roughly 4,275 tokens of horizontal line, or 13% of the whole window.
+    Assistant turns run 7-14% non-ASCII; user turns run 0.2-0.4%. So the error
+    is concentrated in exactly the content that dominates a long conversation.
+
+    Everything downstream inherited it. The summarizer packed batches it
+    believed were 29,696 tokens that were really ~46,000, so summarization 400'd
+    and compaction silently degraded to forwarding the original messages; the
+    hard budget then shed 58 of 63 turns and STILL landed over, because its own
+    arithmetic used the same number. The user was left talking to a model that
+    received six messages.
+
+    A local tokenizer cannot be made right here — the vocabulary is the thing
+    that differs. So ask the process that will do the charging. It is already
+    running, on localhost, and the call is only made where precision decides an
+    outcome: never on the request hot path, never per-message.
+    """
+    if not messages:
+        return 0
+    try:
+        r = httpx.post(
+            f"{VLLM_URL}/tokenize",
+            json={"model": MODEL_REPO, "messages": messages},
+            timeout=httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0),
+        )
+        if r.status_code != 200:
+            # A 400 here is usually the template refusing the message shape
+            # (an assistant-final list, most often) rather than a fault. Log
+            # once: a permanently broken endpoint must be visible, but a shape
+            # the guard hands it mid-shed must not write a line per round.
+            if logsetup.log_once("count_tokens_exact.http"):
+                logger.warning(
+                    f"/tokenize returned {r.status_code}; budgeting falls back "
+                    f"to the local tokenizer, which under-counts assistant "
+                    f"content on this model. Body: {r.text[:200]!r}"
+                )
+            return None
+        n = r.json().get("count")
+        return int(n) if isinstance(n, (int, float)) else None
+    except Exception as e:
+        if logsetup.log_once("count_tokens_exact.error"):
+            logger.warning(
+                f"/tokenize unreachable ({type(e).__name__}: {e}); budgeting "
+                f"falls back to the local tokenizer and its ~50% undercount on "
+                f"assistant content. Requests may overflow until this recovers."
+            )
+        return None
 
 
 def count_tokens(messages: list[dict]) -> int:
@@ -370,18 +467,28 @@ async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
     return (choices[0].get("message") or {}).get("content", "").strip()
 
 
-def _chunk_to_budget(turns: list[dict], budget: int) -> list[list[dict]]:
+def _chunk_to_budget(
+    turns: list[dict], budget: int, scale: float = 1.0
+) -> list[list[dict]]:
     """Split turns into consecutive batches that each fit `budget` tokens.
 
     A single turn larger than the budget still gets its own batch — we never
     drop content here; `_summarize_once` would fail on it and the caller
     degrades. (Truncating a turn silently would be a quieter kind of lying.)
+
+    `scale` corrects the local tokenizer against vLLM's own count — see
+    count_tokens_exact. Without it this packed batches it believed were 29,696
+    tokens that were really ~46,000, every batch 400'd, and summarization
+    "degraded" by handing compaction back the original oversized messages.
+    Compaction then did nothing at all for hours while the log said only
+    `summarize: N turns exceed the budget — map-reduce over 4 batches` and
+    never once said it had finished. The caller passes the measured ratio.
     """
     batches: list[list[dict]] = []
     current: list[dict] = []
     current_tokens = 0
     for m in turns:
-        t = count_tokens([m])
+        t = int(count_tokens([m]) * scale)
         if current and current_tokens + t > budget:
             batches.append(current)
             current, current_tokens = [], 0
@@ -409,7 +516,16 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
         MAX_MODEL_LEN,
         max(256, MAX_MODEL_LEN - SUMMARY_MAX_TOKENS - SUMMARY_INPUT_RESERVE),
     )
-    batches = _chunk_to_budget(to_summarize, budget)
+    # Measure the local tokenizer's error on THIS content before batching to
+    # it. One /tokenize call, off the event loop, against many minutes of
+    # failed map-reduce when the batches are wrong. Falls back to 1.0 — the
+    # pre-v3.1 behaviour — if vLLM cannot answer.
+    _local = count_tokens(to_summarize)
+    _exact = await run_in_threadpool(count_tokens_exact, to_summarize)
+    _scale = (_exact / _local) if (_exact is not None and _local > 0) else 1.0
+    batches = await run_in_threadpool(
+        _chunk_to_budget, to_summarize, budget, _scale
+    )
     if len(batches) == 1:
         return await _summarize_once(client, batches[0])
 
@@ -778,7 +894,25 @@ def _enforce_hard_budget(
     if _fast_token_estimate(messages) <= limit // 2:
         return messages
 
-    total = count_tokens(messages)
+    # Ground truth, once, before any decision is made on it. See
+    # count_tokens_exact: the local count reads ~50% low on assistant content,
+    # which is most of a long conversation, so "total <= limit" was answering a
+    # question about a different request than the one about to be sent.
+    local_total = count_tokens(messages)
+    exact = count_tokens_exact(messages)
+    total = exact if exact is not None else local_total
+    # How wrong the local tokenizer is on THIS payload. The shedding loop below
+    # needs a per-message cost and cannot afford an HTTP call each — that would
+    # be one round trip per message on the slowest path in the system. So it
+    # keeps local per-message counts and scales them by the ratio the two whole
+    # counts just established. Approximate, but approximately right, and every
+    # round still verifies against a real /tokenize before it stops.
+    scale = (total / local_total) if (exact is not None and local_total > 0) else 1.0
+    if exact is not None and abs(scale - 1.0) > 0.05:
+        logger.info(
+            f"token scale {scale:.2f}x (local {local_total} -> vLLM {total}); "
+            f"shedding arithmetic corrected by that factor"
+        )
     if total <= limit:
         return messages
 
@@ -786,7 +920,7 @@ def _enforce_hard_budget(
     # Per-message costs, computed ONCE. Sum-of-parts differs from the templated
     # whole by per-message template overhead, so shedding aims below the limit
     # on arithmetic and then verifies with a real count — bounded rounds.
-    per = [count_tokens([m]) for m in msgs]
+    per = [int(count_tokens([m]) * scale) for m in msgs]
     running = total
     dropped = 0
     trimmed = 0
@@ -873,9 +1007,15 @@ def _enforce_hard_budget(
             del per[i]
             sys_dropped += 1
 
-        # --- verify with a real full count; loop only if template overhead
-        #     pushed us back over (each round does exactly ONE full count) ---
-        running = count_tokens(msgs)
+        # --- verify against GROUND TRUTH; loop only if the arithmetic left us
+        #     over (each round does exactly ONE count, and it is vLLM's) ---
+        #
+        # This is the line that decides whether a request is forwarded, so it
+        # is the one that must not be an estimate. It used to be the local
+        # count, which is how a payload measured at 21,170 reached vLLM and was
+        # charged 32,899 — a request the guard had just certified as fitting.
+        _v = count_tokens_exact(msgs)
+        running = _v if _v is not None else int(count_tokens(msgs) * scale)
         if running <= limit:
             break
         idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
@@ -1352,12 +1492,137 @@ def _vllm_unreachable_stream_chunks(model: str, message: str | None = None) -> l
     ]
 
 
-REQUEST_REJECTED_MESSAGE = (
-    "That request couldn't be processed — the model backend rejected it "
-    "(this is a problem on my side, not yours). The conversation and its "
-    "memory are safe. If this keeps happening on the same message, the "
-    "operator should check the compactor logs for the rejection reason."
+# What the USER reads when vLLM refuses the request. On 2026-08-24 23:49 a turn
+# cost 139.9s of compaction, took a context-length 400 at 33,127 tokens, and
+# then produced no reply, no indexed exchange, no "+N facts" line and no
+# episodic write — while the old text below told the reader only that something
+# "couldn't be processed" and that their memory was "safe". Both statements were
+# true and neither answered the question the reader actually has: did my message
+# go through? So every one of these leads with the outcome, and says in the same
+# breath that the turn was not remembered either — because a user who believes
+# the model heard them will build on it, and the model never will.
+_REJECTED_PREAMBLE = "⚠️ This message did not go through."
+_REJECTED_MEMORY_NOTE = (
+    "There is no reply to it, and nothing about this turn was saved to memory — "
+    "the model will not see it next time. Everything from before is intact."
 )
+
+REQUEST_REJECTED_MESSAGE = (
+    f"{_REJECTED_PREAMBLE} The model backend rejected the request (a problem "
+    f"on my side, not yours). {_REJECTED_MEMORY_NOTE} If it happens again on "
+    f"the same message, the operator should check the compactor log for the "
+    f"rejection reason."
+)
+
+CONTEXT_OVERFLOW_MESSAGE = (
+    f"{_REJECTED_PREAMBLE} The conversation was too large for the model's "
+    f"context window even after compaction. {_REJECTED_MEMORY_NOTE}"
+)
+# Appended to the above, and which one depends on whether the calibration
+# backstop actually learned something from this rejection. "Send it again" was
+# observed to be a lie on 2026-08-27: three consecutive failures moved the
+# margin +127 each time while it needed ~5250, so the same advice produced the
+# same failure ~19 times. Only promise the retry when the margin moved.
+CONTEXT_OVERFLOW_RETRY = (
+    " Send it again — the compactor has just measured how far its own size "
+    "estimate was off and has tightened its budget to match."
+)
+CONTEXT_OVERFLOW_NO_RETRY = (
+    " Sending it again will most likely fail the same way: the compactor "
+    "learned nothing new from this rejection. The operator should check the "
+    "compactor log and shrink the conversation or the memory budget."
+)
+
+
+def _request_rejected_stream_chunks(
+    model: str, message: str, code: str, detail: str = ""
+) -> list[dict]:
+    """SSE chunks for a request vLLM REFUSED — a 4xx, not an outage.
+
+    Deliberately not `_vllm_unreachable_stream_chunks`. That function's pair
+    ends `finish_reason: "stop"`, which to OpenWebUI is an ordinary successful
+    completion whose text happens to read like an apology (INCIDENT §4.2
+    verified this). The user's turn is gone and the transcript records a normal
+    assistant reply; nothing downstream can tell the difference. So this pair
+    carries BOTH halves:
+
+      - the visible assistant text, so a client that understands nothing still
+        shows the user why their message failed, and
+      - a top-level `error` object with `finish_reason: "error"`, so a client
+        that does understand can mark the turn failed instead of storing it.
+
+    Adding the error object cannot make the failure less visible; omitting it
+    is what made the failure indistinguishable from a reply.
+    """
+    cid = f"chatcmpl-rejected-{int(time.time() * 1000):x}"
+    created = int(time.time())
+    base = {"id": cid, "object": "chat.completion.chunk", "created": created,
+            "model": model or "compactor"}
+    err = {"message": message, "type": "invalid_request_error", "code": code}
+    if detail:
+        err["detail"] = detail
+    return [
+        {**base, "choices": [{"index": 0,
+                              "delta": {"role": "assistant", "content": message},
+                              "finish_reason": None}]},
+        {**base,
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+         "error": err},
+    ]
+
+
+def _rejection_user_message(err_body: str, tightened: bool) -> tuple[str, str]:
+    """(the text the user reads, the OpenAI error code) for one 4xx body."""
+    if _is_context_overflow(err_body):
+        return (
+            CONTEXT_OVERFLOW_MESSAGE
+            + (CONTEXT_OVERFLOW_RETRY if tightened else CONTEXT_OVERFLOW_NO_RETRY),
+            "context_length_exceeded",
+        )
+    return REQUEST_REJECTED_MESSAGE, "backend_rejected"
+
+
+def _log_request_rejected(
+    conv_id: str | None,
+    status: int,
+    err_body: str,
+    sent_tokens: int | None,
+    limit: int,
+    streaming: bool,
+) -> None:
+    """The turn is lost; this line is the only thing that will say so.
+
+    2026-08-24 23:49 [M]: openwebui.log logged 200, compactor.log logged 200,
+    and the entire record of a destroyed user turn was two WARNING lines in a
+    file named *-error.log — carrying no conv_id and no token counts. ERROR is
+    the level, because a turn that produced nothing is not a degradation. The
+    two counts are the level's justification: our estimate beside vLLM's real
+    one IS the undercount, and it is not recoverable after the fact from
+    anything else in the log.
+    """
+    reported = _reported_prompt_tokens(err_body)
+    if sent_tokens is None:
+        counts = f"budget was {limit:,} tokens (our own count was unavailable)"
+    else:
+        counts = f"we estimated {sent_tokens:,} tokens against a {limit:,}-token budget"
+    if reported is not None:
+        counts += f"; vLLM counted {reported:,}"
+        if sent_tokens is not None:
+            counts += f" — an undercount of {reported - sent_tokens:,}"
+    # The stream path commits HTTP 200 in the response header before vLLM has
+    # answered, so every access log upstream of here records a success. Saying
+    # so in the line is what stops the next reader from concluding, as the
+    # 2026-08-24 analysis initially did, that the turn must have succeeded.
+    status_note = (
+        "; the client was already sent HTTP 200 (a stream commits its status "
+        "before the backend answers), so no access log will show this"
+        if streaming else ""
+    )
+    logger.error(
+        f"conv={conv_id}: REQUEST REJECTED by vLLM (HTTP {status}) — this turn "
+        f"produced no reply, no facts and no episodic write, and nothing "
+        f"retries it. {counts}{status_note}. vLLM said: {err_body[:300]!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
