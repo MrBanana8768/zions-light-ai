@@ -529,6 +529,438 @@ def test_maybe_rollup_swallows_llm_failure():
 
 
 # ---------------------------------------------------------------------------
+# A1: the rollup input budget
+# ---------------------------------------------------------------------------
+#
+# Until v3.1 this module had no token accounting at all: rollup input was
+# bounded by turn COUNT and by nothing else. On the conversation behind
+# INCIDENT_2026-08-28 twenty turns is 1.6-3.5x the window, so every L1 rollup
+# 400'd — and because raise_for_status fires before the watermark write, the
+# identical doomed request was re-issued on the tail of every turn, forever.
+#
+# Every mock above shares the blind spot that let that ship: it returns a
+# canned reply no matter how large the request is. A server that always says
+# yes cannot fail a test about sending it too much. So the fixture below
+# CHARGES for what it is sent and REFUSES what does not fit, the way vLLM
+# does, and each test asserts against a body it first proves is oversized —
+# so none of them can pass vacuously.
+
+
+class _FakeVllm:
+    """A vLLM-shaped server with a context window it actually enforces.
+
+    `density` is tokens per character, uniform, so a test can compute ground
+    truth. Real tokenizers are not uniform; that is the point of measuring
+    through /tokenize rather than a multiplier, and it is what the fixture is
+    standing in for.
+    """
+
+    def __init__(self, density=1.0, window=8192, reply="SUMMARY",
+                 tokenize_ok=True):
+        self.density = density
+        self.window = window
+        self.reply = reply
+        self.tokenize_ok = tokenize_ok
+        self.tokenize_calls = 0
+        self.chat_calls: list[tuple[str, str, int]] = []  # (system, body, cost)
+        self.refusals = 0
+
+    def cost(self, text: str) -> int:
+        return int(len(text) * self.density)
+
+    # -- the two endpoints ---------------------------------------------------
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+
+    async def post(self, url, **kw):
+        body = kw.get("json") or {}
+        if str(url).endswith("/tokenize"):
+            self.tokenize_calls += 1
+            if not self.tokenize_ok:
+                raise RuntimeError("connection refused")
+            return _FakeResp({"count": self.cost(body.get("prompt") or "")})
+        msgs = body.get("messages") or []
+        system = msgs[0].get("content", "") if msgs else ""
+        text = msgs[1].get("content", "") if len(msgs) > 1 else ""
+        cost = self.cost(text)
+        self.chat_calls.append((system, text, cost))
+        if cost + int(body.get("max_tokens") or 0) > self.window:
+            # The 400 the whole finding is about.
+            self.refusals += 1
+            raise RuntimeError(
+                f"400 Bad Request: this model's maximum context length is "
+                f"{self.window} tokens. However, your prompt contains {cost} "
+                f"input tokens."
+            )
+        return _FakeResp({"choices": [{"message": {"content": self.reply}}]})
+
+    # -- assertions the tests share -----------------------------------------
+
+    @property
+    def costs(self) -> list[int]:
+        return [c for _, _, c in self.chat_calls]
+
+    def prompts_used(self) -> list[str]:
+        return [s for s, _, _ in self.chat_calls]
+
+
+class _FakeResp:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+        self.text = json.dumps(payload)
+
+    def raise_for_status(self): pass
+
+    def json(self): return self._payload
+
+
+def _install_server(srv: _FakeVllm):
+    import httpx
+    orig = httpx.AsyncClient
+    httpx.AsyncClient = lambda *a, **kw: srv
+    return orig
+
+
+@contextlib.contextmanager
+def window(max_model_len: int):
+    """Shrink the module's idea of the context window for one test.
+
+    Patched rather than set through the environment because summarizer reads
+    MAX_MODEL_LEN at import and _input_budget reads the module global at call
+    time — which is also what lets a deployment's window change take effect
+    without a code change.
+    """
+    prev = summarizer.MAX_MODEL_LEN
+    summarizer.MAX_MODEL_LEN = max_model_len
+    try:
+        yield
+    finally:
+        summarizer.MAX_MODEL_LEN = prev
+
+
+def _fat_msgs(n_turns: int, chars: int = 2000, system: str | None = "sys"):
+    """Like _msgs, but each turn is big enough to matter to a budget."""
+    out = []
+    if system:
+        out.append({"role": "system", "content": system})
+    for i in range(1, n_turns + 1):
+        role = "user" if i % 2 == 1 else "assistant"
+        out.append({"role": role, "content": f"t{i}." + ("x" * chars)})
+    return out
+
+
+def test_input_budget_is_clamped_to_the_window():
+    print("\n[test] _input_budget never exceeds the window, never goes negative")
+    with window(32768):
+        assert_eq(summarizer._input_budget(500), 32768 - 500 - 2048,
+                  "the ordinary case is window minus output minus reserve")
+    # A small-context model: window minus output minus reserve is NEGATIVE, so
+    # the floor takes over. Un-clamped, max(256, ...) alone would then sit
+    # ABOVE the model's own window and quietly reintroduce the overflow this
+    # exists to prevent — the same clamp main.HARD_INPUT_LIMIT carries.
+    with window(1000):
+        assert_eq(summarizer._input_budget(500), 256, "floor applies, not the negative")
+    with window(200):
+        assert_eq(summarizer._input_budget(0), 200,
+                  "and the floor is capped by the window itself")
+
+
+def test_a_body_that_fits_costs_no_tokenize_call():
+    print("\n[test] a normal-sized rollup is byte-for-byte the old single call")
+    # The budget must not turn every rollup into a metering exercise: when the
+    # whole body fits even at the pessimistic ceiling there is nothing to
+    # decide. This is the property that makes the fix free in the common case.
+    _wipe()
+    srv = _FakeVllm()
+    orig = _install_server(srv)
+    try:
+        state = asyncio.run(summarizer.maybe_rollup("cheap", _msgs(4), "http://x", "m"))
+    finally:
+        _restore_httpx(orig)
+    assert_eq(srv.tokenize_calls, 0, "no /tokenize call for a body that obviously fits")
+    assert_eq(len(srv.chat_calls), 1, "exactly one summarize call — no map-reduce")
+    assert_eq(srv.prompts_used(), [summarizer._PROMPT_L1], "and it is the L1 prompt")
+    assert_eq(state["last_summarized_turn"], 4, "chunk produced")
+
+
+def test_oversized_l1_body_is_split_instead_of_refused():
+    print("\n[test] an L1 body over the window is split, and every part fits")
+    _wipe()
+    cid = "a1-split"
+    msgs = _fat_msgs(4, chars=2000)
+    srv = _FakeVllm(density=1.0, window=8192)
+    with window(8192):
+        budget = summarizer._input_budget(summarizer.L1_MAX_TOKENS)
+        whole = srv.cost(summarizer._format_turns(msgs, 1, 4))
+        # Guard against a vacuous test: the body this fixture builds must
+        # really be one the pre-fix code would have sent whole and had refused.
+        assert_true(whole > budget, f"the fixture is oversized ({whole} > {budget})")
+        assert_true(whole + summarizer.L1_MAX_TOKENS > 8192,
+                    "and the un-split body would have been a 400")
+        orig = _install_server(srv)
+        try:
+            state = asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+        finally:
+            _restore_httpx(orig)
+
+    assert_eq(srv.refusals, 0, "the server refused nothing")
+    assert_true(max(srv.costs) <= budget,
+                f"no request exceeded the budget (largest {max(srv.costs)} <= {budget})")
+    assert_true(len(srv.chat_calls) > 1, "it really did split — this is the map step")
+    assert_true(summarizer._PROMPT_REDUCE in srv.prompts_used(),
+                "and the parts were folded, not concatenated blind")
+    # The turn range is the contract the watermark and the L2 rollup depend
+    # on. Splitting the REQUEST must not change what the CHUNK claims to cover.
+    assert_eq(len(state["l1"]), 1, "one chunk, however many calls it took")
+    assert_eq(state["l1"][0]["first_turn"], 1, "still covers from turn 1")
+    assert_eq(state["l1"][0]["last_turn"], 4, "still covers through turn 4")
+    assert_eq(state["last_summarized_turn"], 4, "and the watermark advanced")
+
+
+def test_the_hierarchy_no_longer_latches_on_an_oversized_conversation():
+    print("\n[test] a conversation too big to summarize whole still advances")
+    # This is A1 itself. Pre-fix: the 400 fires inside _llm_summarize, before
+    # the watermark write, so last_summarized_turn never moves,
+    # _needs_l1_rollup stays true forever, and the identical doomed request is
+    # re-issued on every subsequent turn. L1 never grows, so L2 and L3 never
+    # fire either. Here the backlog is drained and the second pass is quiet.
+    _wipe()
+    cid = "a1-latch"
+    msgs = _fat_msgs(8, chars=2000)
+    srv = _FakeVllm(density=1.0, window=8192)
+    with window(8192):
+        orig = _install_server(srv)
+        try:
+            state = asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+        finally:
+            _restore_httpx(orig)
+        assert_eq(srv.refusals, 0, "nothing was refused")
+        assert_eq(len(state["l1"]), 2, "both 4-turn chunks were produced")
+        assert_eq(state["last_summarized_turn"], 8, "the watermark caught up")
+        on_disk = json.loads(summarizer.summary_path(cid).read_text(encoding="utf-8"))
+        assert_eq(on_disk["last_summarized_turn"], 8, "and it is persisted")
+
+        # The half that proves the latch is gone: the same history next turn
+        # is now a no-op, rather than the same doomed work again.
+        quiet = _FakeVllm(density=1.0, window=8192)
+        orig = _install_server(quiet)
+        try:
+            asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+        finally:
+            _restore_httpx(orig)
+    assert_eq(quiet.chat_calls, [], "no LLM call on a turn that added nothing")
+
+
+def test_a_single_turn_over_the_budget_is_truncated_not_dropped():
+    print("\n[test] one enormous turn is truncated so the hierarchy keeps moving")
+    # main.summarize's _chunk_to_budget deliberately does NOT truncate — it
+    # gives an oversized turn its own batch and lets the call fail, because
+    # compaction degrading still yields a reply. Here the same trade is wrong:
+    # a rollup that cannot fit its input LATCHES. Losing the tail of one turn
+    # is cheaper than losing every summary after it.
+    _wipe()
+    logsetup._reset_log_once_for_tests()
+    cid = "a1-truncate"
+    msgs = _fat_msgs(4, chars=40)
+    msgs[1]["content"] = "huge." + ("y" * 8000)  # turn 1, alone over the budget
+    srv = _FakeVllm(density=1.0, window=8192)
+    with window(8192):
+        budget = summarizer._input_budget(summarizer.L1_MAX_TOKENS)
+        assert_true(srv.cost(msgs[1]["content"]) > budget,
+                    "the fixture turn really does not fit on its own")
+        orig = _install_server(srv)
+        try:
+            with capture() as cap:
+                state = asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+        finally:
+            _restore_httpx(orig)
+
+    assert_eq(srv.refusals, 0, "the oversized turn was not sent whole")
+    assert_true(max(srv.costs) <= budget, "every request still fit the budget")
+    sent = "\n".join(b for _, b, _ in srv.chat_calls)
+    assert_true(summarizer._TRUNCATION_NOTE.strip() in sent,
+                "the model was told the turn was cut, not handed a silent stub")
+    warned = find(cap.records, "has been truncated")
+    assert_true(warned is not None, "and the operator was told which conversation")
+    assert_eq(warned.levelno, logging.WARNING, "at WARNING — this is lossy")
+    assert_eq(state["last_summarized_turn"], 4, "the hierarchy advanced anyway")
+
+
+class _NonUniformVllm(_FakeVllm):
+    """A server whose price per character depends on WHICH characters.
+
+    Every fixture above charges a flat rate, and a flat rate is the one thing
+    INCIDENT_2026-08-28 proves this content is not: box-drawing runs ~2.0
+    tokens/char while prose runs ~0.1-0.25. A uniform mock cannot catch a bug
+    whose cause is non-uniformity, and the truncation path had exactly that
+    bug.
+    """
+
+    DENSE = "━"  # U+2501 — 1,710 of these in one production reply
+
+    def cost(self, text: str) -> int:
+        return int(sum(2.0 if c == self.DENSE else 0.1 for c in text))
+
+
+def test_truncation_measures_the_cut_instead_of_scaling_characters():
+    print("\n[test] truncating a dense-headed turn does not overflow anyway")
+    # The first version of _truncate_to_budget scaled characters by the token
+    # ratio and trusted the result — the A4 unit error committed inside A1's
+    # own fix. It assumes tokens spread evenly across characters. A turn whose
+    # DENSE part comes first prices its head far above its average, so the
+    # proportional cut keeps a prefix that still overflows, the request is
+    # refused, and the watermark stays put: the latch, restored by the one
+    # code path that exists to prevent it.
+    _wipe()
+    logsetup._reset_log_once_for_tests()
+    cid = "a1-nonuniform"
+    srv = _NonUniformVllm(window=8192)
+    dense_headed = _NonUniformVllm.DENSE * 10000 + "w" * 90000
+    msgs = _fat_msgs(4, chars=40)
+    msgs[1]["content"] = dense_headed
+
+    with window(8192):
+        budget = summarizer._input_budget(summarizer.L1_MAX_TOKENS)
+        # The shape of the trap, stated as arithmetic so the fixture cannot
+        # drift out from under the test.
+        measured = srv.cost(dense_headed)
+        proportional = max(1, int(len(dense_headed) * (budget / measured) * 0.9))
+        assert_true(srv.cost(dense_headed[:proportional]) > budget,
+                    f"a proportional cut would still cost "
+                    f"{srv.cost(dense_headed[:proportional])} against {budget}")
+        orig = _install_server(srv)
+        try:
+            state = asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+        finally:
+            _restore_httpx(orig)
+
+    assert_eq(srv.refusals, 0, "the cut piece actually fit")
+    assert_true(max(srv.costs) <= budget,
+                f"largest request {max(srv.costs)} within budget {budget}")
+    assert_eq(state["last_summarized_turn"], 4, "and the hierarchy advanced")
+
+
+def test_truncation_still_fits_when_tokenize_is_down():
+    print("\n[test] the truncation backstop holds with no server to ask")
+    # With /tokenize down every measurement is the pessimistic ceiling, so the
+    # re-measure loop cannot converge. The backstop is arithmetic rather than
+    # another guess: at most budget/_WORST_TOKENS_PER_CHAR characters cannot
+    # exceed budget tokens unless the content beats the worst density this
+    # project has ever measured.
+    _wipe()
+    logsetup._reset_log_once_for_tests()
+    cid = "a1-trunc-blind"
+    srv = _NonUniformVllm(window=8192, tokenize_ok=False)
+    msgs = _fat_msgs(4, chars=40)
+    msgs[1]["content"] = _NonUniformVllm.DENSE * 40000
+
+    with window(8192):
+        budget = summarizer._input_budget(summarizer.L1_MAX_TOKENS)
+        orig = _install_server(srv)
+        try:
+            state = asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+        finally:
+            _restore_httpx(orig)
+
+    assert_eq(srv.refusals, 0, "nothing was refused even measuring blind")
+    assert_true(max(srv.costs) <= budget,
+                f"largest request {max(srv.costs)} within budget {budget}")
+    assert_eq(state["last_summarized_turn"], 4, "the hierarchy advanced anyway")
+
+
+def test_a_tokenize_outage_falls_back_pessimistically_never_optimistically():
+    print("\n[test] when /tokenize is down the budget errs high, not low")
+    # The fallback density is a ceiling (2.0 tokens/char, the worst this
+    # project has measured — INCIDENT_2026-08-28's box-drawing reply), not a
+    # prose multiplier. A prose multiplier is wrong on that content by ~8x and
+    # would only move the failure. Being wrong HIGH over-splits; being wrong
+    # low is the incident.
+    _wipe()
+    logsetup._reset_log_once_for_tests()
+    cid = "a1-blind"
+    msgs = _fat_msgs(4, chars=2000)
+    srv = _FakeVllm(density=1.0, window=8192, tokenize_ok=False)
+    with window(8192):
+        budget = summarizer._input_budget(summarizer.L1_MAX_TOKENS)
+        orig = _install_server(srv)
+        try:
+            with capture() as cap:
+                state = asyncio.run(summarizer.maybe_rollup(cid, msgs, "http://x", "m"))
+        finally:
+            _restore_httpx(orig)
+
+    assert_true(srv.tokenize_calls > 0, "it did try to measure")
+    assert_eq(srv.refusals, 0, "and still never sent an over-budget request")
+    assert_true(max(srv.costs) <= budget, "every request inside the budget")
+    assert_eq(state["last_summarized_turn"], 4, "the rollup completed blind")
+    warned = find(cap.records, "/tokenize unreachable")
+    assert_true(warned is not None, "the outage is reported")
+    assert_eq(warned.levelno, logging.WARNING, "at WARNING")
+    assert_true(str(summarizer._WORST_TOKENS_PER_CHAR) in warned.getMessage(),
+                "naming the density it fell back to")
+
+
+def test_l3_input_is_bounded_too():
+    print("\n[test] L3 — whose input grows without limit — is budgeted as well")
+    # _do_l3_rollup joins ALL L2 chapters and nothing trims l2 (MEMORY_REVIEW
+    # S-1), so this input grows with the conversation. Slower than L1's
+    # overflow, same shape, and a worse ending: L3 is the tier that never
+    # refires once it fails, because _needs_l3_rollup keeps returning True.
+    _wipe()
+    cid = "a1-l3"
+    state = summarizer._empty_state(cid)
+    state["l2"] = [
+        {"text": f"chapter{i}." + ("z" * 3000), "first_turn": 1 + 12 * i,
+         "last_turn": 12 + 12 * i}
+        for i in range(3)
+    ]
+    state["last_summarized_turn"] = 4
+    summarizer.save_state(cid, state)
+
+    srv = _FakeVllm(density=1.0, window=8192, reply="THEME")
+    with window(8192):
+        budget = summarizer._input_budget(summarizer.L3_MAX_TOKENS)
+        whole = srv.cost("\n\n".join(c["text"] for c in state["l2"]))
+        assert_true(whole > budget, f"the chapter set is oversized ({whole} > {budget})")
+        orig = _install_server(srv)
+        try:
+            # 4 observable turns against a watermark of 4: no L1 work is due,
+            # so the only tier that can fire is L3.
+            out = asyncio.run(summarizer.maybe_rollup(cid, _msgs(4), "http://x", "m"))
+        finally:
+            _restore_httpx(orig)
+
+    assert_eq(srv.refusals, 0, "no L3 request was refused")
+    assert_true(max(srv.costs) <= budget, "every L3 request fit the budget")
+    assert_true(out["l3"] is not None, "the theme landed")
+    assert_eq(out["l3"]["first_turn"], 1, "spanning the first chapter")
+    assert_eq(out["l3"]["last_turn"], 36, "through the last")
+
+
+def test_the_split_does_not_change_which_tier_prompt_is_used():
+    print("\n[test] map uses the tier's own prompt; only the fold uses reduce")
+    # A split must not silently demote L1 content to a generic summarization.
+    # And the fold says "merge these consecutive parts", not "summarize this
+    # again" — a second summarization pass is exactly the summary-of-summary
+    # degradation the tiering exists to avoid.
+    _wipe()
+    srv = _FakeVllm(density=1.0, window=8192)
+    with window(8192):
+        orig = _install_server(srv)
+        try:
+            asyncio.run(summarizer.maybe_rollup("a1-prompts", _fat_msgs(4, 2000),
+                                                "http://x", "m"))
+        finally:
+            _restore_httpx(orig)
+    used = srv.prompts_used()
+    assert_true(used.count(summarizer._PROMPT_L1) >= 2, "each map batch got the L1 prompt")
+    assert_eq(used[-1], summarizer._PROMPT_REDUCE, "and the last call is the fold")
+    assert_eq(used.count(summarizer._PROMPT_REDUCE), 1, "folded once, not repeatedly")
+
+
+# ---------------------------------------------------------------------------
 # S-5: the watermark latch that froze the hierarchy in production
 # ---------------------------------------------------------------------------
 #
@@ -759,6 +1191,16 @@ if __name__ == "__main__":
         test_maybe_rollup_l2_then_l3()
         test_maybe_rollup_skips_when_not_needed()
         test_maybe_rollup_swallows_llm_failure()
+        test_input_budget_is_clamped_to_the_window()
+        test_a_body_that_fits_costs_no_tokenize_call()
+        test_oversized_l1_body_is_split_instead_of_refused()
+        test_the_hierarchy_no_longer_latches_on_an_oversized_conversation()
+        test_a_single_turn_over_the_budget_is_truncated_not_dropped()
+        test_truncation_measures_the_cut_instead_of_scaling_characters()
+        test_truncation_still_fits_when_tokenize_is_down()
+        test_a_tokenize_outage_falls_back_pessimistically_never_optimistically()
+        test_l3_input_is_bounded_too()
+        test_the_split_does_not_change_which_tier_prompt_is_used()
         test_shortened_history_resets_the_watermark()
         test_reset_watermark_lets_rollups_resume()
         test_negative_delta_warns_once_per_process()

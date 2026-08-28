@@ -920,13 +920,17 @@ class _StubVLLM:
         pass
 
 
-def _swallow_tail(coro):
+def _swallow_tail(coro, label=None):
     """Stand-in for main._fire_and_forget.
 
     The post-response memory tail extracts facts, embeds and rolls up
     summaries — none of which this file is testing, all of which would write
     to the scratch volume and reach for vLLM. Closing the coroutine also keeps
     Python from warning that it was never awaited."""
+    # `label` mirrors main._fire_and_forget's signature. Named explicitly
+    # rather than swallowed by **kwargs: a stub that accepts anything can
+    # never fail when the real signature moves, and this file's stub going
+    # stale is what a signature change looks like when it breaks.
     try:
         coro.close()
     except Exception:
@@ -1249,7 +1253,7 @@ def _post_rejected(messages, conv_id, *, status=400, body=None, stream=True,
     _StubVLLM.sent.clear()
     tails = []
 
-    def _record_tail(coro):
+    def _record_tail(coro, label=None):
         tails.append(coro)
         try:
             coro.close()
@@ -1594,6 +1598,349 @@ def test_the_request_path_hands_the_tail_the_list_it_injected():
               "while touched_facts is still the WHOLE store, so LRU keeps its signal")
 
 
+# =====================================================================
+# v3.1 A14 — the prescreen, which is the last place on the request path where
+# an irreversible forward-without-measuring decision is made.
+# =====================================================================
+
+
+def _guard_watching_tokenize(msgs, limit):
+    """_enforce_hard_budget with count_tokens_exact replaced by a spy that
+    answers None. -> (out, records, call_count).
+
+    The spy answering None rather than a number is deliberate: it keeps the
+    guard on exactly the arithmetic it uses today, so the only thing this
+    helper changes is that "did anything measure this payload" becomes
+    observable. Nothing else in the package can answer that question."""
+    calls = []
+
+    def _spy(m):
+        calls.append(len(m))
+        return None
+
+    handler = _CaptureLogs()
+    lg = logging.getLogger("compactor")
+    lg.addHandler(handler)
+    try:
+        with patch.object(main, "count_tokens_exact", _spy):
+            out = main._enforce_hard_budget(msgs, limit)
+    finally:
+        lg.removeHandler(handler)
+    return out, handler.records, len(calls)
+
+
+def test_the_prescreen_measures_the_payloads_it_used_to_wave_through():
+    """v3.1 A14. The divisor was 2, and the 2x margin's stated safety argument
+    was a chars-per-LOCAL-token measurement — the oracle P0-0c discredited.
+
+    Stated in the unit that actually charges: skipping is safe when
+    chars/vLLM-token >= 4/D. D=2 bets that no payload ever prices below 2.0
+    chars per vLLM token, and the worst assistant turn measured on 2026-08-28
+    came in at 17,930/8,988 = 1.995 — through the break-even. D=8 puts the
+    condition at 0.5 chars per vLLM token, which no text can price below, so
+    the skip is safe on content rather than on a hope about content."""
+    print("\n[test] A14 — a mid-band payload is now measured, not assumed")
+    # HARD_INPUT_LIMIT is 800 here. limit//8 = 100, limit//2 = 400. Six turns
+    # of 120 chars estimate at 6 * (30 + 4) = 204 — comfortably inside the band
+    # the old divisor waved through and the new one measures.
+    band = [big("user" if i % 2 == 0 else "assistant", 30) for i in range(6)]
+    est = main._fast_token_estimate(band)
+    assert_true(100 < est <= 400, f"the fixture is in the disputed band ({est})")
+    _out, _records, calls = _guard_watching_tokenize(band, 800)
+    assert_true(calls >= 1, f"the guard asked what it actually costs ({calls} calls)")
+
+    print("\n[test] A14 — and the small payloads the prescreen exists for still skip")
+    small = [big("user", 15)]
+    assert_true(main._fast_token_estimate(small) <= 100, "fixture is under limit//8")
+    _out, _records, calls = _guard_watching_tokenize(small, 800)
+    assert_eq(calls, 0, "no /tokenize round trip for a payload 8x under the limit")
+
+    print("\n[test] A14 — the boundary is limit//8 exactly")
+    # Pinning the divisor rather than the behaviour: a future edit that moves it
+    # back toward 2 should fail here and read the comment above.
+    at = [{"role": "user", "content": "x" * 384}]        # 96 + 4 = 100
+    over = [{"role": "user", "content": "x" * 388}]      # 97 + 4 = 101
+    assert_eq(main._fast_token_estimate(at), 100, "fixture sits on the boundary")
+    assert_eq(main._fast_token_estimate(over), 101, "and one token past it")
+    assert_eq(_guard_watching_tokenize(at, 800)[2], 0, "at the boundary: skipped")
+    assert_eq(_guard_watching_tokenize(over, 800)[2], 1, "one past it: measured")
+
+
+# =====================================================================
+# v3.1 A9 — which counter made the decision, said out loud.
+# =====================================================================
+
+
+def _records_containing(records, needle):
+    return [r for r in records if needle in r.getMessage()]
+
+
+def test_the_scale_line_names_the_counter_when_tokenize_answers():
+    print("\n[test] A9 — the scale line names /tokenize as the source")
+    msgs = [big("user" if i % 2 == 0 else "assistant", 30) for i in range(6)]
+    handler = _CaptureLogs()
+    lg = logging.getLogger("compactor")
+    lg.addHandler(handler)
+    try:
+        with patch.object(main, "count_tokens_exact", lambda _m: 300):
+            main._enforce_hard_budget(msgs, 800)
+    finally:
+        lg.removeHandler(handler)
+    hits = _records_containing(handler.records, "token scale")
+    assert_true(bool(hits), "the guard reported a scale at all")
+    assert_true("counted by vLLM's /tokenize" in hits[0].getMessage(),
+                f"and named the counter: {hits[0].getMessage()[:160]!r}")
+
+
+def test_the_scale_line_speaks_when_tokenize_REFUSES():
+    """The whole of A9 in one assertion.
+
+    This line used to be gated on `exact is not None and |scale-1| > 0.05`,
+    which made the only counter-naming line in the package unreachable in
+    precisely the state it would diagnose: when /tokenize refuses, scale is
+    forced to exactly 1.0, the shed runs on a tokenizer that reads 34-51% low,
+    and the closing line is textually identical in shape to the healthy case —
+    at HTTP 200. That is the 2026-08-28 signature exactly."""
+    print("\n[test] A9 — /tokenize refusing is REPORTED, not inferred from silence")
+    msgs = [big("user" if i % 2 == 0 else "assistant", 30) for i in range(6)]
+    _out, records, _calls = _guard_watching_tokenize(msgs, 800)
+    hits = _records_containing(records, "token scale unavailable")
+    assert_true(bool(hits), "the degraded case says it is degraded")
+    assert_eq(hits[0].levelno, logging.WARNING,
+              "at WARNING — an INFO gated to zero is what this replaces")
+    assert_true("UNCORRECTED" in hits[0].getMessage(),
+                "and says the number below it is uncorrected")
+
+
+def test_the_shed_line_names_the_counter_and_the_margin():
+    print("\n[test] A9/A10 — the verdict line carries its provenance")
+    # Every number in this line came from one of two counters that disagree by
+    # up to 51% in the direction that overflows, and for a week of diagnosis it
+    # said which one: never. `limit` is already NET of _BUDGET_MARGIN, so a
+    # reader comparing it against HARD_INPUT_LIMIT could not see why they
+    # differed either.
+    margin_before = main._BUDGET_MARGIN
+    try:
+        main._BUDGET_MARGIN = 100
+        msgs = [{"role": "system", "content": PERSONA}] + [
+            big("user" if i % 2 == 0 else "assistant", 150) for i in range(8)
+        ]
+        _out, records, _calls = _guard_watching_tokenize(msgs, 800)
+        line = _budget_line(records)
+        assert_true(line is not None, "the guard reached its verdict line")
+        msg = line.getMessage()
+        assert_true("counted by the local tokenizer" in msg,
+                    f"the line names the counter: {msg[:200]!r}")
+        assert_true("margin 100" in msg,
+                    f"and the margin that explains the limit: {msg[:200]!r}")
+        assert_true("(limit 700" in msg,
+                    f"which is the limit net of that margin: {msg[:200]!r}")
+    finally:
+        main._BUDGET_MARGIN = margin_before
+
+
+# =====================================================================
+# v3.1 A13 — a /tokenize outage that starts in hour six is still reportable.
+# =====================================================================
+
+
+def _tokenize_state():
+    return (
+        main._tokenize_fail_streak,
+        main._tokenize_degraded_since,
+        dict(main._tokenize_last_warn),
+        main.TOKENIZE_WARN_INTERVAL_S,
+    )
+
+
+def _restore_tokenize_state(state):
+    (main._tokenize_fail_streak, main._tokenize_degraded_since,
+     last, main.TOKENIZE_WARN_INTERVAL_S) = state
+    main._tokenize_last_warn.clear()
+    main._tokenize_last_warn.update(last)
+
+
+def _reset_tokenize_state():
+    main._tokenize_fail_streak = 0
+    main._tokenize_degraded_since = None
+    main._tokenize_last_warn.clear()
+
+
+def test_a_tokenize_outage_is_reportable_more_than_once_per_process():
+    """v3.1 A13. This was logsetup.log_once("count_tokens_exact.http") — ONE
+    line per process, over a set that is deliberately never cleared, shared by
+    all four callers.
+
+    The aggravator is that the likeliest first spender is BENIGN: a 400 here is
+    usually the chat template refusing an assistant-final list, which the
+    summarizer hands it on any conversation long enough to compact. A structural
+    400 in minute two permanently silenced the report of a broken endpoint in
+    hour six."""
+    saved = _tokenize_state()
+    try:
+        print("\n[test] A13 — the same failure class is rate-limited, not spent")
+        _reset_tokenize_state()
+        main.TOKENIZE_WARN_INTERVAL_S = 3600.0
+        handler = _CaptureLogs()
+        lg = logging.getLogger("compactor")
+        lg.addHandler(handler)
+        try:
+            main._note_tokenize_failure("http.400", "returned HTTP 400")
+            main._note_tokenize_failure("http.400", "returned HTTP 400")
+        finally:
+            lg.removeHandler(handler)
+        assert_eq(len(_records_containing(handler.records, "/tokenize degraded")), 1,
+                  "two identical failures inside the window: one line")
+
+        print("\n[test] A13 — a benign 400 cannot spend a transport failure's signal")
+        # The key encodes the failure CLASS. Under log_once, one key covered
+        # every call site and every status for the life of the process.
+        handler = _CaptureLogs()
+        lg.addHandler(handler)
+        try:
+            main._note_tokenize_failure("error.ConnectError", "unreachable")
+        finally:
+            lg.removeHandler(handler)
+        assert_eq(len(_records_containing(handler.records, "/tokenize degraded")), 1,
+                  "a different class still gets its line")
+
+        print("\n[test] A13 — the outage is a readable FACT, not just a log line")
+        h = main.tokenize_health()
+        assert_eq(h["consecutive_failures"], 3, "three failures counted")
+        assert_true(not h["ok"], "and the dependency reports itself as not ok")
+        assert_true(h["degraded_since"] is not None, "with a start time")
+
+        print("\n[test] A13 — recovery is announced, which a one-shot cannot do")
+        handler = _CaptureLogs()
+        lg.addHandler(handler)
+        try:
+            main._note_tokenize_success()
+        finally:
+            lg.removeHandler(handler)
+        assert_eq(len(_records_containing(handler.records, "answering again")), 1,
+                  "the recovery line exists")
+        assert_true(main.tokenize_health()["ok"], "and the state is clean again")
+
+        print("\n[test] A13 — a success while healthy says nothing at all")
+        handler = _CaptureLogs()
+        lg.addHandler(handler)
+        try:
+            main._note_tokenize_success()
+        finally:
+            lg.removeHandler(handler)
+        assert_eq(len(handler.records), 0, "no line per healthy call")
+
+        print("\n[test] A13 — the real call site uses it (an outage hours in still warns)")
+        # Through count_tokens_exact, not the helper: the defect was at the CALL
+        # SITE. Interval 0 stands in for "hours later".
+        _reset_tokenize_state()
+        main.TOKENIZE_WARN_INTERVAL_S = 0.0
+
+        def _boom(*a, **kw):
+            raise main.httpx.ConnectError("connection refused")
+
+        handler = _CaptureLogs()
+        lg.addHandler(handler)
+        try:
+            with patch.object(main.httpx, "post", _boom):
+                first = main.count_tokens_exact([user("hi")])
+                second = main.count_tokens_exact([user("hi")])
+        finally:
+            lg.removeHandler(handler)
+        assert_eq((first, second), (None, None), "both calls fall back")
+        assert_eq(len(_records_containing(handler.records, "/tokenize degraded")), 2,
+                  "and both are reported — under log_once the second was silent")
+    finally:
+        _restore_tokenize_state(saved)
+
+
+# =====================================================================
+# v3.1 A10 — the release path needs a call site or it is dead code.
+# =====================================================================
+
+
+class _StubStreamAccepted:
+    """A 200 SSE response, so the streaming handler runs its normal path."""
+
+    status_code = 200
+
+    async def aread(self):
+        return b""
+
+    async def aiter_raw(self):
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{"content":"ok"},'
+            b'"finish_reason":null}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+        )
+        yield b"data: [DONE]\n\n"
+
+
+class _StubVLLMAccepting(_StubVLLM):
+    def stream(self, method, url, json=None, **kwargs):
+        _StubVLLM.sent.append(json)
+        return _StubStreamCM(_StubStreamAccepted())
+
+
+def _post_accepted(messages, conv_id, *, stream):
+    """One chat completion vLLM ACCEPTS, on either path. -> response."""
+    _StubVLLM.sent.clear()
+    with patch.object(main.httpx, "AsyncClient", _StubVLLMAccepting), \
+         patch.object(main, "_fire_and_forget", _swallow_tail):
+        return client.post(
+            "/v1/chat/completions",
+            json={"model": "stub-model", "messages": messages, "stream": stream},
+            headers={"X-Conversation-Id": conv_id},
+        )
+
+
+def test_an_accepted_request_counts_toward_releasing_the_margin():
+    """v3.1 A10, the call-site half.
+
+    _note_backend_accepted can be perfect and still change nothing if no path
+    calls it — and the rejection half has had a call site since v3.0.5 while
+    the release half had none, which is exactly how the margin came to be
+    monotonic. Both response paths are asserted because the streaming one is
+    the path production takes."""
+    saved = (main._BUDGET_MARGIN, main.BUDGET_MARGIN_RELEASE_AFTER,
+             main._budget_ok_streak)
+    try:
+        for stream in (False, True):
+            label = "streaming" if stream else "non-streaming"
+            print(f"\n[test] A10 — an accepted {label} request releases the margin")
+            main.BUDGET_MARGIN_RELEASE_AFTER = 2
+            main._budget_ok_streak = 0
+            main._BUDGET_MARGIN = 4000
+            r = _post_accepted([user("hello")], f"a10-{label}", stream=stream)
+            assert_eq(r.status_code, 200, f"{label}: the stub was served")
+            assert_eq(main._BUDGET_MARGIN, 4000, f"{label}: one success is not two")
+            _post_accepted([user("hello again")], f"a10-{label}", stream=stream)
+            assert_eq(main._BUDGET_MARGIN, 2000, f"{label}: the second releases")
+    finally:
+        (main._BUDGET_MARGIN, main.BUDGET_MARGIN_RELEASE_AFTER,
+         main._budget_ok_streak) = saved
+
+
+def test_a_rejected_request_does_NOT_count_toward_release():
+    print("\n[test] A10 — a 400 is not evidence the margin can be released")
+    saved = (main._BUDGET_MARGIN, main.BUDGET_MARGIN_RELEASE_AFTER,
+             main._budget_ok_streak)
+    try:
+        main.BUDGET_MARGIN_RELEASE_AFTER = 2
+        main._budget_ok_streak = 0
+        main._BUDGET_MARGIN = 4000
+        # _post_rejected restores _BUDGET_MARGIN itself, so the assertion here
+        # is about the STREAK: the counter that decides the next release.
+        _post_rejected([user("hi")], "a10-rejected")
+        _post_rejected([user("hi")], "a10-rejected")
+        assert_eq(main._budget_ok_streak, 0, "two rejections banked nothing")
+    finally:
+        (main._BUDGET_MARGIN, main.BUDGET_MARGIN_RELEASE_AFTER,
+         main._budget_ok_streak) = saved
+
+
 def _all_tests():
     return [
         test_hard_limit_configured,
@@ -1633,6 +1980,13 @@ def _all_tests():
         test_extraction_is_bounded_even_for_a_caller_that_passes_nothing,
         test_extraction_and_dedup_are_told_which_conversation,
         test_the_request_path_hands_the_tail_the_list_it_injected,
+        test_the_prescreen_measures_the_payloads_it_used_to_wave_through,
+        test_the_scale_line_names_the_counter_when_tokenize_answers,
+        test_the_scale_line_speaks_when_tokenize_REFUSES,
+        test_the_shed_line_names_the_counter_and_the_margin,
+        test_a_tokenize_outage_is_reportable_more_than_once_per_process,
+        test_an_accepted_request_counts_toward_releasing_the_margin,
+        test_a_rejected_request_does_NOT_count_toward_release,
     ]
 
 

@@ -31,6 +31,7 @@ import tempfile
 _TMP_ROOT = tempfile.mkdtemp(prefix="compactor-test-retrieval-")
 os.environ["COMPACTOR_STORAGE_ROOT"] = _TMP_ROOT
 
+import logsetup  # noqa: E402
 import retrieval  # noqa: E402
 
 
@@ -76,6 +77,7 @@ class MockCollection:
         self.deleted_ids = []
         self._store = {}  # id -> (doc, meta)
         self.canned_query = None  # set per-test
+        self.n_results_seen = []  # every n_results this mock was asked for
 
     def upsert(self, ids, embeddings, documents, metadatas):
         for i, _id in enumerate(ids):
@@ -83,14 +85,31 @@ class MockCollection:
         self.upserts.append({"ids": ids, "metadatas": metadatas})
 
     def query(self, query_embeddings, n_results, where):
+        """Conv-filtered rows, in insertion order, TRUNCATED TO n_results.
+
+        v3.1 A7. This mock took `n_results` and ignored it, returning every
+        conv-matching row however few were asked for — so a retrieve() that
+        asked for k and then filtered looked identical to one that over-fetched,
+        and `test_retrieve_excludes_recent_turns` passed either way. Exactly the
+        blind spot that let char/4 stand in for a tokenizer for two incidents:
+        **the mock was more generous than production.** Real chroma returns at
+        most n_results rows, and that limit is the whole subject of A7, so it
+        has to be modelled here or the fix is unverifiable.
+
+        Insertion order stands in for similarity rank. The mock embedder returns
+        a length-derived vector and a flat 0.1 distance, so there is no real
+        ranking to reproduce; a test that cares which candidates come back first
+        controls it by seeding in the order it wants (see the A7 tests)."""
+        self.n_results_seen.append(n_results)
         if self.canned_query is not None:
             return self.canned_query
-        # Default: return everything matching the conv_id filter
         cid = where.get("conv_id")
         ids, docs, metas, dists = [], [], [], []
         for _id, (doc, meta) in self._store.items():
             if meta.get("conv_id") == cid:
                 ids.append(_id); docs.append(doc); metas.append(meta); dists.append(0.1)
+            if len(ids) >= n_results:
+                break
         return {"ids": [ids], "documents": [docs], "metadatas": [metas], "distances": [dists]}
 
     def get(self, where=None, ids=None, include=None):
@@ -300,7 +319,13 @@ def test_retrieve_excludes_recent_turns():
     # own max, so index_exchange could not produce a 2/20 gap in two calls.
     _seed_legacy_row(col, "conv1", 2, retrieval._exchange_doc("old", "old-a"))
     _seed_legacy_row(col, "conv1", 20, retrieval._exchange_doc("recent", "recent-a"))
-    hits = retrieval.retrieve("conv1", "q", k=5, exclude_turns_from=10)
+    # 14, not the 10 this test used before A6. The store's max is 20, so a
+    # cutoff of 10 sits 10 message-units below it — further than the 8-unit
+    # recent window a consistent caller could ever put it, which is now read as
+    # the client's framing having drifted from the store's and the filter is
+    # ignored. 14 is 6 below, i.e. an ordinary in-frame cutoff, which is what
+    # this test is about. The out-of-frame case has its own test below.
+    hits = retrieval.retrieve("conv1", "q", k=5, exclude_turns_from=14)
     assert_eq(len(hits), 1, "recent turn (20) excluded")
     assert_eq(hits[0]["turn_index"], 2, "only the old turn remains")
 
@@ -512,6 +537,219 @@ def test_import_keeps_the_bundle_turn_index_and_shares_identity_with_indexing():
     assert_eq(col.turn_indices("c"), [12], "and the bundle's ordinal stands")
 
 
+# ---------------------------------------------------------------------------
+# v3.1 A6 — the cutoff is client-derived, and the store's is not
+# ---------------------------------------------------------------------------
+#
+# `exclude_turns_from` arrives as main.py's
+# `max(0, turn_index - KEEP_RECENT_TURNS * 2)` where `turn_index` is
+# `len(messages) + 1` — a measurement of the CLIENT'S ARRAY. Stored ordinals are
+# allocated from the store's own maximum (D1, _next_turn_index). Two
+# authorities, one comparison.
+#
+# REMEDIATION P0-3 deferred this half explicitly and D1 landed without it. P4
+# repaired `cutoff == 0` only; under a bounded client window the cutoff is a
+# POSITIVE number that conditional does not touch, and every hit is suppressed
+# on every request, indefinitely.
+
+
+def _seed_ordinals(col, conv_id, ordinals):
+    """Seed one row per ordinal, in the order given."""
+    for n in ordinals:
+        _seed_legacy_row(
+            col, conv_id, n, retrieval._exchange_doc(f"u{n}", f"a{n}")
+        )
+
+
+def test_a_bounded_client_window_no_longer_suppresses_every_hit():
+    print("\n[test] A6 — REGRESSION: a bounded client window kept 0 of 12 hits")
+    # The v3.1 preflight's reproduction, verbatim: a client sending a window of
+    # 20 messages against stored ordinals [21, 23, ... 43]. turn_index is 21,
+    # so the cutoff is max(0, 21 - 8) = 13 — positive, so P4's `> 0` guard does
+    # not fire — and every stored ordinal is >= 13. Result before A6: an empty
+    # block on every request, forever, with `0retr` the only trace.
+    emb, col = _install_mocks()
+    logsetup._reset_log_once_for_tests()
+    ordinals = list(range(21, 44, 2))
+    assert_eq(len(ordinals), 12, "fixture: twelve stored exchanges")
+    _seed_ordinals(col, "windowed", ordinals)
+
+    # Teeth check: the cutoff really does exclude all twelve, so this fixture
+    # fails on code without the fix rather than passing vacuously.
+    assert_true(
+        all(n >= 13 for n in ordinals),
+        "fixture: the client's cutoff of 13 is below every stored ordinal",
+    )
+    assert_true(
+        retrieval._cutoff_is_out_of_frame("windowed", 13),
+        "the store's max is further than one recent window above the cutoff",
+    )
+
+    hits = retrieval.retrieve("windowed", "q", k=5, exclude_turns_from=13)
+    assert_eq(len(hits), 5, "the filter was ignored, so k hits come back")
+    assert_true(
+        all(h["turn_index"] in ordinals for h in hits), "and they are real rows"
+    )
+
+
+def test_the_out_of_frame_cutoff_says_so_in_the_log():
+    print("\n[test] A6 — ignoring the caller's filter is announced, not silent")
+    # A retrieval layer that quietly overrides its caller is how you get an
+    # operator debugging "why is it repeating itself" with nothing to grep.
+    emb, col = _install_mocks()
+    logsetup._reset_log_once_for_tests()
+    _seed_ordinals(col, "loud", list(range(21, 44, 2)))
+    cap = _LogCapture()
+    try:
+        retrieval.retrieve("loud", "q", k=5, exclude_turns_from=13)
+    finally:
+        cap.stop()
+    warnings = cap.messages(logging.WARNING)
+    assert_eq(len(warnings), 1, "exactly one WARNING")
+    assert_true("exclude_turns_from=13" in warnings[0], f"names the cutoff: {warnings[0]!r}")
+    assert_true("turn_seq" in warnings[0], "and points at the real fix")
+
+
+def test_a_short_conversation_keeps_its_filter():
+    print("\n[test] A6 — an in-frame cutoff is still honoured, not overridden")
+    # The failure mode A6 guards against must not become "the filter never
+    # applies". Where the two framings agree — a short conversation whose every
+    # stored exchange really is in the request verbatim — the store's max sits
+    # exactly one recent window above the cutoff and the filter stands.
+    emb, col = _install_mocks()
+    logsetup._reset_log_once_for_tests()
+    _seed_ordinals(col, "short", [3, 5, 7, 9, 11, 13])
+    # Client array of 12 messages -> turn_index 13 -> cutoff 13 - 8 = 5.
+    assert_eq(
+        retrieval._cutoff_is_out_of_frame("short", 5), False, "13 - 5 == the window"
+    )
+    hits = retrieval.retrieve("short", "q", k=5, exclude_turns_from=5)
+    assert_eq(
+        sorted(h["turn_index"] for h in hits), [3], "only the pre-window exchange"
+    )
+
+
+def test_cutoff_zero_still_excludes_nothing():
+    print("\n[test] A6 — P4's `cutoff == 0 means exclude nothing` is unchanged")
+    emb, col = _install_mocks()
+    logsetup._reset_log_once_for_tests()
+    _seed_ordinals(col, "zero", [2, 4, 6])
+    hits = retrieval.retrieve("zero", "q", k=5, exclude_turns_from=0)
+    assert_eq(sorted(h["turn_index"] for h in hits), [2, 4, 6], "all three survive")
+    # And no override warning: nothing was dropped, so nothing needed rescuing.
+    cap = _LogCapture()
+    try:
+        retrieval.retrieve("zero", "q", k=5, exclude_turns_from=0)
+    finally:
+        cap.stop()
+    assert_eq(cap.messages(logging.WARNING), [], "silent — the filter never bit")
+
+
+def test_the_frame_check_is_only_paid_when_the_caller_lost_hits():
+    print("\n[test] A6 — no extra store read unless the filter actually cost hits")
+    # _cutoff_is_out_of_frame reads the store, and this runs on the request hot
+    # path. Two cases must not pay for it: a cutoff that excluded nothing (there
+    # is nothing to be suppressing), and a cutoff that excluded rows but still
+    # returned k (the over-fetch already made it whole). The second is the long
+    # healthy conversation — the one with the most metadata to scan.
+    emb, col = _install_mocks()
+    logsetup._reset_log_once_for_tests()
+    calls = []
+    real_get = col.get
+
+    def counting_get(where=None, ids=None, include=None):
+        calls.append(where)
+        return real_get(where=where, ids=ids, include=include)
+
+    col.get = counting_get
+
+    _seed_ordinals(col, "cheap", [2, 4, 6])
+    retrieval.retrieve("cheap", "q", k=5, exclude_turns_from=100)
+    assert_eq(calls, [], "everything is below the cutoff -> no frame check")
+
+    # 4 recent rows ranked first, then 8 older ones: k+4=9 fetched, 4 dropped,
+    # 5 kept — the caller got what it asked for, so nothing needs rescuing.
+    _seed_ordinals(col, "healthy", [46, 48, 50, 52])
+    _seed_ordinals(col, "healthy", list(range(20, 36, 2)))
+    hits = retrieval.retrieve("healthy", "q", k=5, exclude_turns_from=46)
+    assert_eq(len(hits), 5, "precondition: the over-fetch covered the exclusions")
+    assert_eq(calls, [], "k hits returned -> still no frame check")
+
+    # And the case that does need it: fewer than k survive.
+    retrieval.retrieve("cheap", "q", k=5, exclude_turns_from=4)
+    assert_eq(len(calls), 1, "a filter that cost hits -> exactly one frame check")
+
+
+# ---------------------------------------------------------------------------
+# v3.1 A7 — over-fetch, so a filtered slot is replaced rather than deleted
+# ---------------------------------------------------------------------------
+
+
+def test_the_mock_honours_n_results():
+    print("\n[test] A7 — the fake collection truncates to n_results, as chroma does")
+    # This assertion is the precondition for every A7 test below. The mock used
+    # to take n_results and ignore it, which made over-fetch unobservable: the
+    # filtered-slot bug and its fix produced identical results here. Assert the
+    # mock's fidelity directly so a future edit that re-loosens it fails LOUDLY
+    # rather than quietly re-blinding the suite.
+    emb, col = _install_mocks()
+    _seed_ordinals(col, "many", list(range(2, 42, 2)))  # 20 rows
+    res = col.query(query_embeddings=[[0.0]], n_results=3, where={"conv_id": "many"})
+    assert_eq(len(res["ids"][0]), 3, "asked for 3, got 3 — not all 20")
+
+
+def test_a_filtered_slot_is_replaced_not_deleted():
+    print("\n[test] A7 — filtering k candidates used to return fewer than k")
+    emb, col = _install_mocks()
+    logsetup._reset_log_once_for_tests()
+    # Seed the four rows the recent window covers FIRST, so they occupy the top
+    # of the candidate ranking — which is the realistic case, since the turns
+    # closest to the current question are usually the ones most like it, and
+    # exclude_turns_from exists precisely because they are already in the
+    # request verbatim. Then nine older rows behind them.
+    recent = [46, 48, 50, 52]
+    older = list(range(20, 38, 2))
+    _seed_ordinals(col, "deep", recent)
+    _seed_ordinals(col, "deep", older)
+    # Store max 52, cutoff 46 -> 6 units, inside the window: in frame, so the
+    # filter genuinely applies and this is testing over-fetch, not A6.
+    assert_eq(retrieval._cutoff_is_out_of_frame("deep", 46), False, "in frame")
+
+    hits = retrieval.retrieve("deep", "q", k=5, exclude_turns_from=46)
+
+    # Pre-A7: n_results=5 returned exactly the four recent rows plus one older,
+    # the filter dropped four, and the caller got ONE hit where it asked for
+    # five — with four perfectly good older exchanges sitting unqueried.
+    assert_eq(len(hits), 5, "five asked for, five returned")
+    assert_true(
+        all(h["turn_index"] < 46 for h in hits), "and none from the recent window"
+    )
+    assert_eq(col.n_results_seen[-1], 9, "asked chroma for k + 4, not k")
+
+
+def test_overfetch_is_bounded_and_trimmed_to_k():
+    print("\n[test] A7 — the over-fetch is k + one recent window, and k is honoured")
+    emb, col = _install_mocks()
+    logsetup._reset_log_once_for_tests()
+    _seed_ordinals(col, "big", list(range(2, 62, 2)))  # 30 rows
+    hits = retrieval.retrieve("big", "q", k=5, exclude_turns_from=100)
+    assert_eq(len(hits), 5, "never more than k, whatever was fetched")
+    assert_eq(
+        col.n_results_seen[-1],
+        5 + retrieval._OVERFETCH,
+        "bounded by k + _OVERFETCH, not by the conversation",
+    )
+
+
+def test_no_cutoff_means_no_overfetch():
+    print("\n[test] A7 — nothing to replace, so nothing extra is fetched")
+    emb, col = _install_mocks()
+    _seed_ordinals(col, "plain", list(range(2, 42, 2)))
+    hits = retrieval.retrieve("plain", "q", k=5)
+    assert_eq(len(hits), 5, "k hits")
+    assert_eq(col.n_results_seen[-1], 5, "asked for exactly k")
+
+
 def test_query_result_parsing_robustness():
     print("\n[test] retrieve tolerates malformed/empty chroma responses")
     emb, col = _install_mocks()
@@ -535,8 +773,11 @@ def test_query_result_parsing_robustness():
 # Compaction had already cut that request 76,104 -> 9,915 tokens; injection put
 # it over the window on its own. The only variable across the three was the
 # retrieved-hit count — and retrieval was the one injected layer with no cap.
-# format_retrieval_block now enforces one, as a CHARACTER budget of
-# MAX_RETRIEVAL_TOKENS * 4 (the module has no tokenizer, deliberately).
+#
+# v3.1 A4: that cap shipped denominated in CHARACTERS (MAX_RETRIEVAL_TOKENS * 4)
+# while its log line reported a token figure, so it did not cap tokens at all —
+# see the A4 section further down. These tests are now written in TOKENS, as
+# measured by retrieval._estimate_tokens, which is the unit the budget is in.
 
 # The literal appended to a truncated exchange. Mirrored from retrieval.py
 # rather than imported — it is not exported, and a silent change to the words
@@ -544,16 +785,48 @@ def test_query_result_parsing_robustness():
 _TRUNCATION_MARKER = "[...truncated to fit the retrieval budget]"
 
 _HEADER_LEN = len(retrieval._RETRIEVAL_BLOCK_HEADER)
+_HEADER_TOKENS = retrieval._estimate_tokens(retrieval._RETRIEVAL_BLOCK_HEADER)
+
+
+def _tokens(text):
+    """The module's own measure, so a test asserts against the unit the budget
+    is denominated in rather than against a second opinion."""
+    return retrieval._estimate_tokens(text)
+
+
+def _truncated_ceiling(budget):
+    """The most a block ending in a truncated exchange may measure.
+
+    Two bounded overshoots, both by design:
+      * the marker is appended AFTER the room is computed, so it is not paid for
+        (as it was not under the character budget either);
+      * `_estimate_tokens` floor-divides the ASCII term, so measuring the joined
+        block can come out up to one token per join above the sum of the parts
+        the loop priced. The block has four ASCII groups — header, separator,
+        body, marker — hence three.
+    """
+    return budget + _tokens(_TRUNCATION_MARKER) + 3
 
 
 def _hit(turn_index, document, distance=0.1):
     return {"turn_index": turn_index, "document": document, "distance": distance}
 
 
+def _sep(turn_index):
+    return f"--- (turn ~{turn_index}) ---"
+
+
 def _sep_len(turn_index):
     """Length of the per-exchange separator, measured the way the module
     measures it."""
-    return len(f"--- (turn ~{turn_index}) ---")
+    return len(_sep(turn_index))
+
+
+def _hit_cost(turn_index, document):
+    """What format_retrieval_block charges for one rendered exchange: the
+    separator, the document, and the two newlines that join them — priced as
+    the one string that actually gets emitted."""
+    return _tokens(f"{_sep(turn_index)}\n{document}\n")
 
 
 def _uncapped_block(hits):
@@ -617,7 +890,9 @@ def test_cap_invisible_when_it_does_not_bind():
     hits = [_hit(10, "A" * 300), _hit(30, "B" * 300), _hit(20, "C" * 300)]
     cap = _LogCapture()
     try:
-        # 119 header + 3 * (17 sep + 2 newlines + 300 doc) = 1076 of 6000 chars.
+        # 32-token header + 3 * 80 = 272 of a 1,500-token budget.
+        assert_eq(_HEADER_TOKENS + sum(_hit_cost(h["turn_index"], h["document"])
+                                       for h in hits), 272, "fixture is well under")
         block = retrieval.format_retrieval_block(hits)
     finally:
         cap.stop()
@@ -628,13 +903,18 @@ def test_cap_invisible_when_it_does_not_bind():
 
 def test_cap_drops_later_hits_and_says_so():
     print("\n[test] retrieval cap — over budget: later hits drop, earlier survive whole")
-    prev = _with_budget(1500)  # 6000-char budget
-    # 119 + 2519 + 2519 = 5157 fits; a third 2519 would reach 7676.
+    prev = _with_budget(1500)
+    # 32 + 700 + 700 = 1,432 tokens fits; a third 700 would reach 2,132.
     hits = [
-        _hit(10, "EARLY" + "a" * 2495),
-        _hit(20, "MIDDLE" + "b" * 2494),
-        _hit(30, "LATE" + "c" * 2496),
+        _hit(10, "EARLY" + "a" * 2775),
+        _hit(20, "MIDDLE" + "b" * 2774),
+        _hit(30, "LATE" + "c" * 2776),
     ]
+    assert_eq(
+        [_hit_cost(h["turn_index"], h["document"]) for h in hits],
+        [700, 700, 700],
+        "fixture: three equal 700-token exchanges",
+    )
     cap = _LogCapture()
     try:
         block = retrieval.format_retrieval_block(hits)
@@ -645,7 +925,7 @@ def test_cap_drops_later_hits_and_says_so():
     assert_true(hits[1]["document"] in block, "second exchange present, whole")
     assert_true("LATE" not in block, "third exchange dropped entirely")
     assert_true(_TRUNCATION_MARKER not in block, "survivors are kept whole, not trimmed")
-    assert_true(len(block) <= 1500 * 4, f"block within budget ({len(block)} chars)")
+    assert_true(_tokens(block) <= 1500, f"block within budget ({_tokens(block)} tokens)")
 
     # Dropping retrieved context silently is how you get an operator debugging
     # "the model forgot" with nothing in the log to point at.
@@ -671,19 +951,26 @@ def test_oversized_first_hit_is_truncated_not_dropped():
     assert_true("ENDING" not in block, "the tail is gone")
     assert_true(_TRUNCATION_MARKER in block, "and it says so, rather than ending mid-word")
 
-    # room = 6000 - 119 header - 17 sep - 2 newlines = 5862 chars of document.
-    room = 1500 * 4 - _HEADER_LEN - _sep_len(7) - 2
-    assert_eq(
-        len(block),
-        _HEADER_LEN + 1 + _sep_len(7) + 1 + room + 1 + len(_TRUNCATION_MARKER),
-        "cut to exactly the room left, plus the marker",
-    )
-    # The marker is appended AFTER room is computed, so a truncated block runs
-    # one marker over budget (41 chars against 6000). Bounded and harmless, but
-    # it does mean this is the one path where the block exceeds the cap.
+    # room = 1500 - 32 header - 4 (separator + its two newlines) = 1,464 tokens
+    # of document. Asserted as a property rather than as a character offset:
+    # A4's whole subject is that there is no fixed chars-per-token to slice at.
+    room = 1500 - _HEADER_TOKENS - _tokens(f"{_sep(7)}\n\n")
+    assert_eq(room, 1464, "room left for the document, in tokens")
+    body = block.split(f"{_sep(7)}\n", 1)[1][: -len("\n" + _TRUNCATION_MARKER)]
+    assert_true(_tokens(body) <= room, f"kept body fits the room ({_tokens(body)})")
+    # Maximal, not merely safe: a cap that keeps 10 tokens of a 2,258-token
+    # exchange also "fits". The next character must not have fitted.
     assert_true(
-        len(block) <= 1500 * 4 + len(_TRUNCATION_MARKER) + 1,
-        f"overshoot bounded by the marker ({len(block)} chars)",
+        _tokens(doc[: len(body) + 1]) > room,
+        "and it is the LONGEST prefix that fits — one more character does not",
+    )
+
+    # The marker is appended AFTER room is computed, so a truncated block runs
+    # one marker over budget. Bounded and harmless, but it does mean this is the
+    # one path where the block exceeds the cap.
+    assert_true(
+        _tokens(block) <= _truncated_ceiling(1500),
+        f"overshoot bounded by the marker ({_tokens(block)} tokens)",
     )
 
 
@@ -693,14 +980,15 @@ def test_oversized_first_hit_with_no_room_returns_none():
     # earlier exchanges exist and then shows it none of them. Below the
     # 200-char threshold the whole block must go away.
     ti = 7
-    fixed = _HEADER_LEN + _sep_len(ti) + 2
-    tight = (fixed + 198) // 4              # leaves ~198 chars of room
-    loose = -(-(fixed + 202) // 4)          # leaves ~202 — just over
+    threshold = retrieval._MIN_TRUNCATED_TOKENS
+    fixed = _HEADER_TOKENS + _tokens(f"{_sep(ti)}\n\n")
+    tight = fixed + threshold        # leaves exactly the threshold — not enough
+    loose = fixed + threshold + 1    # one token more — just enough
 
     prev = _with_budget(tight)
     try:
-        room = tight * 4 - fixed
-        assert_true(0 < room <= 200, f"precondition: room={room}, at/under the threshold")
+        room = tight - fixed
+        assert_true(0 < room <= threshold, f"precondition: room={room}, at the threshold")
         assert_eq(
             retrieval.format_retrieval_block([_hit(ti, "a" * 4000)]),
             None,
@@ -712,8 +1000,8 @@ def test_oversized_first_hit_with_no_room_returns_none():
     print("\n[test] retrieval cap — just over the threshold, a stub is worth emitting")
     prev = _with_budget(loose)
     try:
-        room = loose * 4 - fixed
-        assert_true(room > 200, f"precondition: room={room}, just over the threshold")
+        room = loose - fixed
+        assert_true(room > threshold, f"precondition: room={room}, just over the threshold")
         block = retrieval.format_retrieval_block([_hit(ti, "a" * 4000)])
         assert_true(block is not None, "a stub is emitted")
         assert_true(_TRUNCATION_MARKER in block, "and marked as truncated")
@@ -728,9 +1016,9 @@ def test_cap_keeps_turn_order_and_does_not_reverse_it():
     # the three fit; the survivors must be the two OLDEST, still ascending —
     # the cap must not quietly reverse the chronology the header promises.
     hits = [
-        _hit(90, "LATE" + "c" * 2496),
-        _hit(10, "EARLY" + "a" * 2495),
-        _hit(50, "MIDDLE" + "b" * 2494),
+        _hit(90, "LATE" + "c" * 2776),
+        _hit(10, "EARLY" + "a" * 2775),
+        _hit(50, "MIDDLE" + "b" * 2774),
     ]
     try:
         block = retrieval.format_retrieval_block(hits)
@@ -796,7 +1084,8 @@ def test_budget_knob_is_read_from_the_environment():
 
     tight = _probe_with_env("200")
     assert_eq(tight["max"], 200, "the env value wins")
-    # 800-char budget: header + one 419-char hit = 538; a second reaches 957.
+    # 200-token budget: 32 header + one 104-token hit = 136; a second reaches 240.
+    assert_eq(_hit_cost(0, "d" * 400), 104, "fixture: 104 tokens per hit")
     assert_eq(tight["chars"], len(_uncapped_block(hits[:1])), "budget cut it to one hit")
 
     print("\n[test] retrieval cap — an empty value falls back to the default")
@@ -850,8 +1139,8 @@ def test_regression_20260827_three_exchanges_cannot_overflow_the_window():
         cap.stop()
         retrieval.MAX_RETRIEVAL_TOKENS = prev
 
-    uncapped_tokens = len(_uncapped_block(hits)) // 4
-    capped_tokens = len(block) // 4
+    uncapped_tokens = _tokens(_uncapped_block(hits))
+    capped_tokens = _tokens(block)
     before = COMPACTED_CONVERSATION + CAPPED_FACTS + CAPPED_SUMMARY + uncapped_tokens
     after = COMPACTED_CONVERSATION + CAPPED_FACTS + CAPPED_SUMMARY + capped_tokens
 
@@ -860,7 +1149,7 @@ def test_regression_20260827_three_exchanges_cannot_overflow_the_window():
         f"fixture reproduces the failure uncapped ({before} > {WINDOW} tokens)",
     )
     assert_true(
-        len(block) <= 1500 * 4 + len(_TRUNCATION_MARKER) + 1,
+        capped_tokens <= _truncated_ceiling(1500),
         f"retrieval held to its budget ({capped_tokens} tokens, {len(block)} chars)",
     )
     assert_true(
@@ -871,6 +1160,200 @@ def test_regression_20260827_three_exchanges_cannot_overflow_the_window():
         any("of 3 exchange(s)" in m for m in cap.messages(logging.INFO)),
         "and the operator is told what was left out",
     )
+
+
+# ---------------------------------------------------------------------------
+# v3.1 A4 — the cap was denominated in characters, so it did not cap tokens
+# ---------------------------------------------------------------------------
+#
+# `budget = MAX_RETRIEVAL_TOKENS * 4`, summed against `len(sep) + len(doc) + 2`,
+# then logged as "within the 1500-TOKEN budget". Characters are the one unit
+# that cannot see decoration, and this model decorates.
+#
+# The fixtures below are box-drawing and CJK on purpose. Prose is where every
+# character-based estimate is right; a budget test written on prose passes and
+# proves nothing, which is the same blind spot that let char/4 stand in for a
+# tokenizer through two incidents (test_tokenizer_contract.py's opening
+# docstring says so at length).
+
+# INCIDENT_2026-08-28:35-37. One production assistant reply carried 1,710 U+2501
+# and 441 U+2500. The same SHAPE as test_tokenizer_contract.DECORATIVE_REPLY,
+# sized so that three of them fit the SHIPPED character budget of 6,000 with
+# room to spare (3 * 1,955 + 119 = 5,984) — the teeth check below needs the old
+# rule to admit all three, or it is not demonstrating what the old rule did.
+_BOX_RULE = "━" * 1450 + "\n" + "─" * 450 + "\nHere is the table you asked for.\n"
+
+# "Please look at the light of God." — three UTF-8 bytes per character, none of
+# them ASCII, so the character count sees a third of what the encoder does.
+_CJK = "神の光を見てください。" * 200
+
+
+def _vllm_measured_tokens(text):
+    """What vLLM was MEASURED to charge, reconstructed per character class.
+
+    Not the module's estimate — a second opinion, so the test is not simply
+    agreeing with the code under test. Both densities are measurements, not
+    guesses: INCIDENT_2026-08-28 prices 2,151 box-drawing characters at ~4,275
+    tokens (1.99 tokens/char), and main.count_tokens_exact's docstring records
+    4.10 chars/token on this deployment's ASCII chat transcript.
+    """
+    ascii_chars = len(text.encode("ascii", "ignore"))
+    return int(ascii_chars / 4.10 + (len(text) - ascii_chars) * 1.99)
+
+
+def test_the_reconstruction_matches_the_incident():
+    print("\n[test] A4 — the fixture's token density is the one production measured")
+    # Anchor the second opinion before using it to judge anything.
+    reply = "━" * 1710 + "\n" + "─" * 441
+    assert_eq(len(reply) - len(reply.encode("ascii", "ignore")), 2151, "2,151 non-ASCII")
+    measured = _vllm_measured_tokens(reply)
+    assert_true(
+        abs(measured - 4275) < 45, f"lands on the incident's ~4,275 tokens: {measured}"
+    )
+    # And this is the number the shipped cap could not see.
+    assert_true(
+        measured / max(1, len(reply) // 4) > 7.5,
+        f"chars/4 undercounts it by >7.5x ({len(reply) // 4} vs {measured})",
+    )
+
+
+def test_the_budget_is_denominated_in_tokens_not_characters():
+    print("\n[test] A4 — REGRESSION: a decorative block no longer blows the cap")
+    prev = _with_budget(1500)
+    hits = [_hit(t, _BOX_RULE) for t in (11, 47, 88)]
+    try:
+        # TEETH CHECK. Reproduce the SHIPPED rule — a character budget of
+        # MAX * 4 — and show it admits all three exchanges, then price what it
+        # admitted. A suite that only asserts the fixed path passes just as
+        # happily on code that never had the fix.
+        char_budget = 1500 * 4
+        used, admitted = _HEADER_LEN, 0
+        for h in sorted(hits, key=lambda x: x["turn_index"]):
+            cost = _sep_len(h["turn_index"]) + len(h["document"]) + 2
+            if used + cost > char_budget:
+                break
+            used += cost
+            admitted += 1
+        assert_eq(admitted, 3, "the character rule admitted every exchange")
+        real = _vllm_measured_tokens(_uncapped_block(hits))
+        assert_true(
+            real > 1500 * 7,
+            f"…and what it admitted really costs ~{real} tokens against 1,500",
+        )
+
+        block = retrieval.format_retrieval_block(hits)
+    finally:
+        retrieval.MAX_RETRIEVAL_TOKENS = prev
+
+    # The fix. The estimate is a ceiling on decoration (one token per UTF-8
+    # byte), so holding the block to the budget by that measure holds it by the
+    # measured density too — which is the property that matters.
+    assert_true(
+        _tokens(block) <= _truncated_ceiling(1500),
+        f"held to the token budget ({_tokens(block)} tokens)",
+    )
+    assert_true(
+        _vllm_measured_tokens(block) <= 1500,
+        f"and under it by the measured density too "
+        f"({_vllm_measured_tokens(block)} tokens)",
+    )
+
+
+def test_cjk_is_capped_as_well_as_box_drawing():
+    print("\n[test] A4 — the cap holds on CJK, which chars/4 also undercounts")
+    prev = _with_budget(1500)
+    try:
+        # 2,200 characters, 6,600 UTF-8 bytes: the character rule prices this at
+        # 550 tokens and admits four of them.
+        assert_eq(len(_CJK) // 4, 550, "fixture: the character rule sees 550 tokens")
+        block = retrieval.format_retrieval_block([_hit(t, _CJK) for t in (1, 2, 3, 4)])
+    finally:
+        retrieval.MAX_RETRIEVAL_TOKENS = prev
+    assert_true(
+        _tokens(block) <= _truncated_ceiling(1500),
+        f"held to the token budget ({_tokens(block)} tokens)",
+    )
+    assert_true(_TRUNCATION_MARKER in block, "one exchange, truncated — not four whole")
+
+
+def test_prose_renders_exactly_as_it_did_before_the_unit_fix():
+    print("\n[test] A4 — the common case does not shrink: ASCII is byte-identical")
+    # The unit fix must not cost the layer its ordinary job. For pure ASCII the
+    # new measure is the old one — chars/4 — so a prose block that fitted the
+    # character budget still fits the token budget, byte for byte. If this ever
+    # fails, the fix has started charging normal chat for decoration it has not
+    # got.
+    prose = (
+        "The quick brown fox jumps over the lazy dog, and the dog, being lazy, "
+        "does not object to this arrangement in the slightest degree. "
+    ) * 14
+    hits = [_hit(t, prose) for t in (10, 20, 30)]
+    # 32 + 3 * 463 = 1,421 tokens: comfortably inside, so the cap must be
+    # invisible here whatever unit it is denominated in.
+    assert_eq(_hit_cost(10, prose), 463, "fixture: 463 tokens per prose exchange")
+    prev = _with_budget(1500)
+    try:
+        block = retrieval.format_retrieval_block(hits)
+    finally:
+        retrieval.MAX_RETRIEVAL_TOKENS = prev
+    assert_eq(block, _uncapped_block(hits), "all three whole, byte-identical")
+    assert_eq(
+        _tokens(prose), len(prose) // 4, "pure ASCII is priced exactly as chars/4"
+    )
+
+
+def test_a_caller_supplied_counter_is_used_and_named():
+    print("\n[test] A4 — an exact counter can be injected across the module boundary")
+    # `main` imports `retrieval`, so `retrieval` cannot import
+    # `main.count_tokens_exact`. The seam is a parameter instead. Nothing passes
+    # one today; this test is what stops the seam rotting before it is wired.
+    prev = _with_budget(600)
+    hits = [_hit(10, "a" * 400), _hit(20, "b" * 400)]
+    seen = []
+
+    def counter(text):
+        seen.append(text)
+        return len(text)  # deliberately harsh: one token per character
+
+    cap = _LogCapture()
+    try:
+        block = retrieval.format_retrieval_block(hits, count_tokens=counter)
+    finally:
+        cap.stop()
+        retrieval.MAX_RETRIEVAL_TOKENS = prev
+    assert_true(seen, "the injected counter was actually consulted")
+    # At one token per character a 600-token budget spends 119 on the header and
+    # 420 on the first exchange, leaving no room for the second. The default
+    # estimate would have fitted both twice over, so this result can only come
+    # from the caller's measure actually being the one in force.
+    assert_true(
+        _HEADER_TOKENS + 2 * _hit_cost(10, "a" * 400) < 600,
+        "teeth: the default estimate would have fitted both",
+    )
+    assert_true("a" * 400 in block, "the first exchange fits")
+    assert_true("b" * 400 not in block, "the second does not, on the caller's measure")
+    info = cap.messages(logging.INFO)
+    assert_eq(len(info), 1, "one INFO line")
+    assert_true(
+        "caller-supplied counter" in info[0],
+        f"and it names which counter decided: {info[0]!r}",
+    )
+
+
+def test_the_log_line_no_longer_reports_characters_as_tokens():
+    print("\n[test] A4 — the dropped-hits line names its unit and its measure")
+    prev = _with_budget(1500)
+    hits = [_hit(t, _BOX_RULE) for t in (11, 47)]
+    cap = _LogCapture()
+    try:
+        retrieval.format_retrieval_block(hits)
+    finally:
+        cap.stop()
+        retrieval.MAX_RETRIEVAL_TOKENS = prev
+    info = cap.messages(logging.INFO)
+    assert_eq(len(info), 1, "exactly one INFO line")
+    assert_true("token(s) by the local estimate" in info[0], f"names the measure: {info[0]!r}")
+    assert_true("COMPACTOR_MAX_RETRIEVAL_TOKENS" in info[0], "and the knob to raise")
 
 
 if __name__ == "__main__":
@@ -902,6 +1385,17 @@ if __name__ == "__main__":
         test_a_request_ahead_of_the_store_pulls_the_ordinal_forward()
         test_import_keeps_the_bundle_turn_index_and_shares_identity_with_indexing()
 
+        test_a_bounded_client_window_no_longer_suppresses_every_hit()
+        test_the_out_of_frame_cutoff_says_so_in_the_log()
+        test_a_short_conversation_keeps_its_filter()
+        test_cutoff_zero_still_excludes_nothing()
+        test_the_frame_check_is_only_paid_when_the_caller_lost_hits()
+
+        test_the_mock_honours_n_results()
+        test_a_filtered_slot_is_replaced_not_deleted()
+        test_overfetch_is_bounded_and_trimmed_to_k()
+        test_no_cutoff_means_no_overfetch()
+
         test_query_result_parsing_robustness()
 
         test_cap_invisible_when_it_does_not_bind()
@@ -911,6 +1405,13 @@ if __name__ == "__main__":
         test_cap_keeps_turn_order_and_does_not_reverse_it()
         test_budget_knob_is_read_from_the_environment()
         test_regression_20260827_three_exchanges_cannot_overflow_the_window()
+
+        test_the_reconstruction_matches_the_incident()
+        test_the_budget_is_denominated_in_tokens_not_characters()
+        test_cjk_is_capped_as_well_as_box_drawing()
+        test_prose_renders_exactly_as_it_did_before_the_unit_fix()
+        test_a_caller_supplied_counter_is_used_and_named()
+        test_the_log_line_no_longer_reports_characters_as_tokens()
 
         print("\nAll retrieval smoke tests passed.")
     finally:

@@ -213,11 +213,74 @@ def backend_is_multimodal() -> bool:
 # encoders; production showed a 6,859-token undercount past the guard). vLLM's
 # context-length 400 reports the TRUE count, so instead of guessing we learn:
 # parse it, tighten the effective limit by the observed overshoot, and the next
-# message heals — same self-healing pattern as the modality backstop. Sticky for
-# process life, monotonic (only ever tightens), capped so a pathological report
-# can't crush the window.
+# message heals — same self-healing pattern as the modality backstop. Capped so
+# a pathological report can't crush the window.
+#
+# v3.1 A10: it is a MODULE GLOBAL — one process (supervisord.conf:87 runs
+# uvicorn with no --workers), one margin, every conversation. It was also
+# monotonic with no release path, so a single oversized turn narrowed the
+# window for everything else until the next restart. It now decays on sustained
+# success; see _note_backend_accepted. Since P0-0c gave the guard vLLM's own
+# count, this is a degraded-mode backstop rather than the primary mechanism, and
+# it is sized and released as one.
 _BUDGET_MARGIN = 0
-_CTX_OVERFLOW_RE = re.compile(r"prompt contains (?:at least )?(\d+) input tokens")
+
+# Every wording vLLM has used to state the prompt size in a context-length 400,
+# read out of the pinned engines rather than guessed. A regex that silently
+# fails to match here is the whole calibration path going dark while the log
+# still reads as though it learned something — INCIDENT_2026-08-24 D26 called
+# this out and it was still one pattern until v3.1.
+#
+# Verified 2026-08-28 by reading the vLLM installed in the two images this
+# stack actually ships:
+#
+#   0.24.0  (the cu13/default pin, Dockerfile:78; read from
+#            angreg/zions-light-ai:v3.0-cu13,
+#            vllm/renderers/params.py:429 _token_len_check)
+#       "...you requested {O} output tokens and your prompt contains
+#        {at least }{N} input tokens, for a total of ..."          -> (1)
+#
+#   0.24.0  (same file, :337 _text_len_check — a CHARACTER pre-check that
+#            fires before tokenization)
+#       "...your prompt contains {C} characters (more than {X} characters,
+#        which is the upper bound for {N} input tokens)..."        -> (none)
+#
+#   0.19.0  (the CUDA-12 fallback profile, and what
+#            angreg/zions-light-ai:v3.0.5-cu12 ships;
+#            vllm/entrypoints/openai/engine/serving.py:752,762)
+#       "...you requested {O} output tokens and your prompt contains
+#        {N} input tokens, for a total of ..."                     -> (1)
+#       "...However, your request has {N} input tokens. Please reduce the
+#        length of the input messages."                            -> (2)
+#
+#   0.10.0  (not deployed, but what the contract fixture reproduces as
+#            FIXTURE_ERROR_STYLE=v010)
+#       "...you requested {O+N} tokens ({N} in the messages, {O} in the
+#        completion)..."                                           -> (3)
+#       "...you requested {N} tokens in the messages, ..."         -> (3)
+#
+# So (1) — the only wording the single pre-v3.1 pattern covered — is emitted by
+# BOTH deployed pins, and only when the request carried a max_tokens. 0.19.0's
+# no-max_tokens branch (2) was never matched, and 0.19.0 is a shipped profile.
+#
+# The character pre-check is deliberately NOT matched. Its number is a
+# CHARACTER count, roughly 4x a token count, and feeding it to the calibration
+# below as if it were tokens would saturate the margin cap off one rejection.
+# `_is_context_overflow` still classifies it correctly, so the user is told the
+# truth; we simply decline to learn a number that means something else.
+_CTX_OVERFLOW_PATTERNS = (
+    # (1) 0.19.0 and 0.24.0, request carried max_tokens; also the older
+    #     "your prompt contains at least N input tokens" wording.
+    r"prompt contains (?:at least )?(\d+) input tokens",
+    # (2) 0.19.0, no max_tokens on the request.
+    r"request has (\d+) input tokens",
+    # (3) 0.10.0, both of its variants. The prompt half is the one after the
+    #     parenthesis ("(N in the messages") or before "tokens in the
+    #     messages"; the leading "you requested N tokens" in that wording is
+    #     prompt+completion and must not be captured.
+    r"(\d+)(?: tokens)? in the messages",
+)
+_CTX_OVERFLOW_RE = re.compile("|".join(f"(?:{p})" for p in _CTX_OVERFLOW_PATTERNS))
 
 
 def _is_context_overflow(err_body: str) -> bool:
@@ -237,24 +300,80 @@ def _reported_prompt_tokens(err_body: str) -> int | None:
     Read separately from the calibration below because the log line must name
     the number whether or not the calibration decided to act on it — a
     rejection that teaches us nothing (the margin is already larger, or capped)
-    is exactly the one whose numbers someone will need later."""
+    is exactly the one whose numbers someone will need later.
+
+    Several alternatives, one per wording vLLM has used — see
+    _CTX_OVERFLOW_PATTERNS. Exactly one group can participate in any match, so
+    the first non-None group is the answer."""
     m = _CTX_OVERFLOW_RE.search(err_body or "")
-    return int(m.group(1)) if m else None
+    if m is None:
+        return None
+    for g in m.groups():
+        if g is not None:
+            return int(g)
+    return None
 
 
-def _note_backend_rejection(err_body: str) -> bool:
+# v3.1 A10: how many consecutive ACCEPTED requests release half the learned
+# margin. _BUDGET_MARGIN used to be monotonic with no reset short of a process
+# restart, so one pathological turn cost every conversation in the process up
+# to MAX_MODEL_LEN//4 of window, forever — and post-P0-0b it latches there in a
+# single event rather than crawling. Since P0-0c, count_tokens_exact does the
+# real work and the margin is only the DEGRADED-mode backstop for when
+# /tokenize will not answer; a margin still in force after fifty clean requests
+# is describing a state the process is no longer in.
+#
+# This is a policy number, not a measurement, and it is named as one. Halving
+# rather than clearing is the conservative half of the choice: if the margin
+# was still needed, the cost of finding out is one 400 and one re-learn, and
+# the re-learn lands back at the same value because the calibration measures
+# the gap directly. Set to 0 to restore the pre-v3.1 monotonic behaviour.
+BUDGET_MARGIN_RELEASE_AFTER = _env_int("COMPACTOR_BUDGET_MARGIN_RELEASE_AFTER", 50)
+_budget_ok_streak = 0
+
+
+def _note_backend_accepted() -> None:
+    """One request vLLM did NOT refuse. Counts toward releasing the margin.
+
+    Called from both response paths on any status below 400. Cheap and
+    lock-free: uvicorn runs single-process here (supervisord.conf has no
+    --workers) and the loop is cooperative, so the read-modify-write below
+    cannot interleave."""
+    global _BUDGET_MARGIN, _budget_ok_streak
+    if not _BUDGET_MARGIN or BUDGET_MARGIN_RELEASE_AFTER <= 0:
+        return
+    _budget_ok_streak += 1
+    if _budget_ok_streak < BUDGET_MARGIN_RELEASE_AFTER:
+        return
+    _budget_ok_streak = 0
+    before = _BUDGET_MARGIN
+    _BUDGET_MARGIN = 0 if before <= 512 else before // 2
+    logger.info(
+        f"context calibration: {BUDGET_MARGIN_RELEASE_AFTER} consecutive "
+        f"accepted requests — releasing budget margin {before} -> "
+        f"{_BUDGET_MARGIN}. The margin is the backstop for a /tokenize outage, "
+        f"not a permanent tax on the window; if it is still needed the next "
+        f"rejection measures it back in one step."
+    )
+
+
+def _note_backend_rejection(err_body: str, enforced_limit: int | None = None) -> bool:
     """Reactive backstop for vLLM 4xx bodies. Two lessons we can learn:
     (1) the model is text-only -> strip images from subsequent requests;
     (2) our token count undercounted -> tighten the budget by the observed gap.
     Either way the conversation heals on its next message instead of staying
     poisoned.
 
+    `enforced_limit` is the limit the guard ACTUALLY shed this payload against,
+    margin already subtracted — see A8 below for why it is a parameter and not
+    something this function may reconstruct.
+
     Returns whether the budget margin actually advanced. The caller uses it to
     decide what to promise the user: "send it again" is only true when this
     rejection taught us something, and a rejection can teach us nothing (the
     margin is already wider, or it has hit the MAX_MODEL_LEN//4 cap).
     """
-    global _backend_multimodal, _BUDGET_MARGIN
+    global _backend_multimodal, _BUDGET_MARGIN, _budget_ok_streak
     body = err_body or ""
     tightened = False
     if "not a multimodal model" in body and _backend_multimodal is not False:
@@ -269,28 +388,60 @@ def _note_backend_rejection(err_body: str) -> bool:
         if actual is not None:
             # v3.1 P0-0b: measure against the limit we ACTUALLY enforced, not
             # the original one. _enforce_hard_budget has already shed to
-            # HARD_INPUT_LIMIT - _BUDGET_MARGIN, so measuring against
-            # HARD_INPUT_LIMIT understates the undercount by exactly the margin
-            # already in force — and the monotonic guard below then refuses to
-            # advance until the undercount roughly doubles. Observed live on
+            # (limit - _BUDGET_MARGIN), so measuring against the untightened
+            # limit understates the undercount by exactly the margin already in
+            # force — and the monotonic guard below then refuses to advance
+            # until the undercount roughly doubles. Observed live on
             # 2026-08-27: three consecutive failures on one conversation moved
             # the margin 2628 -> 2755 -> 2882, +127 each time (the
             # conversation's own growth per turn) while it needed ~5250. That is
             # a loop, not a retry: ~19 more broken messages for the user.
-            # The max(256, ...) mirrors the same clamp in _enforce_hard_budget.
-            effective_limit = max(256, HARD_INPUT_LIMIT - _BUDGET_MARGIN)
-            overshoot = actual - effective_limit
+            #
+            # v3.1 A8: and the limit is a PARAMETER, because the guard's limit
+            # is per-request. chat_completions derives it from
+            # MAX_MODEL_LEN - max(GENERATION_RESERVE, req_max_tokens), so a
+            # client asking for a large completion is shed against something
+            # well below HARD_INPUT_LIMIT. Reconstructing it from
+            # HARD_INPUT_LIMIT here understated the overshoot by up to
+            # HARD_INPUT_LIMIT - effective_limit, one-directionally: at
+            # max_tokens=8192 on the shipped 32768 window the guard enforced
+            # 24576, so a 25000-token prompt overshot by 424 and this computed
+            # -5720 — no advance, tightened=False, and the user was told, in
+            # those words, that retrying would not help. The correct number was
+            # sitting two lines from the call site and was not passed.
+            #
+            # None means "no per-request limit available" — the tests, and any
+            # future caller off the request path. Reconstructing is then the
+            # best we can do, and the log line says which limit it used so a
+            # reader is never guessing. The max(256, ...) mirrors the clamp in
+            # _enforce_hard_budget.
+            if enforced_limit is not None:
+                measured_against = max(256, enforced_limit)
+                limit_src = "the limit the guard enforced"
+            else:
+                measured_against = max(256, HARD_INPUT_LIMIT - _BUDGET_MARGIN)
+                limit_src = (
+                    "HARD_INPUT_LIMIT minus the current margin (no per-request "
+                    "limit was passed — this is a reconstruction)"
+                )
+            overshoot = actual - measured_against
             if overshoot > 0:
                 new_margin = min(overshoot + 512, MAX_MODEL_LEN // 4)
                 if new_margin > _BUDGET_MARGIN:
                     _BUDGET_MARGIN = new_margin
+                    # A fresh correction restarts the release clock: the
+                    # successes that were accumulating were describing a
+                    # process state this rejection just disproved.
+                    _budget_ok_streak = 0
                     tightened = True
                     logger.warning(
                         f"context calibration: vLLM counted {actual} tokens where "
-                        f"we budgeted <= {effective_limit} — our estimate "
-                        f"undercounts (images are the usual cause). Tightening the "
-                        f"hard limit by {new_margin} for subsequent requests; the "
-                        f"next message in this conversation should succeed."
+                        f"we budgeted <= {measured_against} ({limit_src}) — our "
+                        f"estimate undercounts (a /tokenize outage, or images, "
+                        f"are the usual causes). Tightening the hard limit by "
+                        f"{new_margin} for EVERY conversation in this process "
+                        f"(the margin is a module global, not per-conversation); "
+                        f"the next message should succeed."
                     )
     return tightened
 
@@ -353,6 +504,99 @@ def _message_has_image(m: dict) -> bool:
     return _message_image_count(m) > 0
 
 
+# v3.1 A13: /tokenize outage reporting.
+#
+# This used to be `logsetup.log_once("count_tokens_exact.http")` — ONE line per
+# process, whose `_logged_once` set is deliberately never cleared
+# (logsetup.py:117-137). Four call sites share the endpoint (summarize, the
+# guard's ground truth, the guard's per-round verify, _sent_token_size), so one
+# token covered all of them for the process lifetime, and an outage starting
+# hours after boot was completely silent.
+#
+# The aggravator is that the most likely first spender is BENIGN: the comment
+# below is right that a 400 here is usually the chat template refusing an
+# assistant-final list, which the summarizer hands it on any conversation long
+# enough to compact. A structural 400 in minute two permanently silenced the
+# report of a genuinely broken endpoint in hour six. That silencing is
+# structural, not incidental.
+#
+# So: a rate limit rather than a one-shot, keyed so a structural refusal cannot
+# spend the transport-failure signal, and — the part a one-shot can never have —
+# a RECOVERY line, because "it started working again" is half of what the reader
+# of these lines is trying to establish. The counters are also readable
+# programmatically (tokenize_health) so /health/full can report the state as a
+# fact rather than leaving it to a log line from three days ago.
+TOKENIZE_WARN_INTERVAL_S = float(_env_int("COMPACTOR_TOKENIZE_WARN_INTERVAL_S", 300))
+_tokenize_fail_streak = 0
+_tokenize_degraded_since: float | None = None
+_tokenize_last_warn: dict[str, float] = {}
+
+
+def tokenize_health() -> dict:
+    """Current state of the /tokenize dependency, for /health/full.
+
+    `consecutive_failures` > 0 means budgeting is running on the local
+    tokenizer, which reads up to 51% low on this model's assistant content —
+    i.e. the guard is in the exact degraded mode the 2026-08-28 incident ran
+    in. A health endpoint that cannot say so is asking its reader to go find a
+    log line instead."""
+    return {
+        "ok": _tokenize_fail_streak == 0,
+        "consecutive_failures": _tokenize_fail_streak,
+        "degraded_since": _tokenize_degraded_since,
+        "degraded_for_s": (
+            round(time.time() - _tokenize_degraded_since, 1)
+            if _tokenize_degraded_since is not None
+            else 0.0
+        ),
+    }
+
+
+def _note_tokenize_failure(key: str, detail: str) -> None:
+    """Record one /tokenize failure and warn at most once per key per
+    TOKENIZE_WARN_INTERVAL_S. `key` separates the failure CLASSES — a 400 from
+    a template refusal must not consume the budget for a connection error."""
+    global _tokenize_fail_streak, _tokenize_degraded_since
+    now = time.time()
+    _tokenize_fail_streak += 1
+    if _tokenize_degraded_since is None:
+        _tokenize_degraded_since = now
+    last = _tokenize_last_warn.get(key)
+    if last is not None and (now - last) < TOKENIZE_WARN_INTERVAL_S:
+        return
+    _tokenize_last_warn[key] = now
+    suppressed = (
+        ""
+        if last is None
+        else f" (further '{key}' lines suppressed for {TOKENIZE_WARN_INTERVAL_S:.0f}s)"
+    )
+    logger.warning(
+        f"/tokenize degraded: {detail}. Budgeting falls back to the local "
+        f"tokenizer, which under-counts assistant content on this model by up "
+        f"to 51% — requests may overflow until this recovers. "
+        f"{_tokenize_fail_streak} consecutive failure(s), degraded for "
+        f"{now - _tokenize_degraded_since:.0f}s{suppressed}"
+    )
+
+
+def _note_tokenize_success() -> None:
+    """Clear the degraded state, and SAY SO once. The recovery line is the
+    thing log_once structurally could not provide."""
+    global _tokenize_fail_streak, _tokenize_degraded_since
+    if _tokenize_fail_streak == 0:
+        return
+    failures = _tokenize_fail_streak
+    since = _tokenize_degraded_since
+    _tokenize_fail_streak = 0
+    _tokenize_degraded_since = None
+    _tokenize_last_warn.clear()
+    logger.warning(
+        f"/tokenize is answering again after {failures} consecutive failure(s)"
+        + (f" over {time.time() - since:.0f}s" if since is not None else "")
+        + " — budgeting is back on vLLM's own count."
+    )
+
+
 def count_tokens_exact(messages: list[dict]) -> int | None:
     """The number vLLM will actually charge, from its own /tokenize endpoint.
     None when unavailable — callers fall back to count_tokens.
@@ -398,25 +642,30 @@ def count_tokens_exact(messages: list[dict]) -> int | None:
         )
         if r.status_code != 200:
             # A 400 here is usually the template refusing the message shape
-            # (an assistant-final list, most often) rather than a fault. Log
-            # once: a permanently broken endpoint must be visible, but a shape
-            # the guard hands it mid-shed must not write a line per round.
-            if logsetup.log_once("count_tokens_exact.http"):
-                logger.warning(
-                    f"/tokenize returned {r.status_code}; budgeting falls back "
-                    f"to the local tokenizer, which under-counts assistant "
-                    f"content on this model. Body: {r.text[:200]!r}"
-                )
+            # (an assistant-final list, most often) rather than a fault. Keyed
+            # by STATUS so that benign refusal cannot spend the signal a 5xx or
+            # a connection error needs — see A13 above.
+            _note_tokenize_failure(
+                f"http.{r.status_code}",
+                f"returned HTTP {r.status_code}, body {r.text[:200]!r}",
+            )
             return None
         n = r.json().get("count")
-        return int(n) if isinstance(n, (int, float)) else None
-    except Exception as e:
-        if logsetup.log_once("count_tokens_exact.error"):
-            logger.warning(
-                f"/tokenize unreachable ({type(e).__name__}: {e}); budgeting "
-                f"falls back to the local tokenizer and its ~50% undercount on "
-                f"assistant content. Requests may overflow until this recovers."
+        if not isinstance(n, (int, float)):
+            # 200 with no usable `count`. This returned None with no line at
+            # all, so a proxy or a version skew that answers the right status
+            # with the wrong body was indistinguishable from a healthy endpoint
+            # that happened not to be consulted.
+            _note_tokenize_failure(
+                "body", f"answered HTTP 200 with no numeric 'count': {r.text[:200]!r}"
             )
+            return None
+        _note_tokenize_success()
+        return int(n)
+    except Exception as e:
+        _note_tokenize_failure(
+            f"error.{type(e).__name__}", f"unreachable ({type(e).__name__}: {e})"
+        )
         return None
 
 
@@ -547,6 +796,28 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
     _local = count_tokens(to_summarize)
     _exact = await run_in_threadpool(count_tokens_exact, to_summarize)
     _scale = (_exact / _local) if (_exact is not None and _local > 0) else 1.0
+    # v3.1 A9: say WHICH counter sized these batches, unconditionally and on
+    # both branches. This was the decisive half of the 2026-08-28 mechanism —
+    # batches believed to be 29,696 tokens were really ~46,000, every batch
+    # 400'd, and compaction "degraded" by handing back the original oversized
+    # messages for hours. The only line the log carried was the map-reduce INFO
+    # below, which named a batch COUNT and no counter, so the healthy case and
+    # the silent-fallback case were textually indistinguishable. A fallback to
+    # scale=1.0 is not a detail of this function; it is the failure.
+    _summary_counter = "vLLM's /tokenize" if _exact is not None else "the local tokenizer"
+    if _exact is not None:
+        logger.info(
+            f"summarize: token scale {_scale:.2f}x (local {_local} -> vLLM "
+            f"{_exact}); batches sized by {_summary_counter}"
+        )
+    else:
+        logger.warning(
+            f"summarize: /tokenize did not answer — batching {len(to_summarize)} "
+            f"turns on {_summary_counter}'s {_local}-token estimate, UNCORRECTED "
+            f"(scale 1.0). That estimate reads up to 51% low on this model's "
+            f"assistant content, so these batches may exceed the {budget}-token "
+            f"budget and 400."
+        )
     batches = await run_in_threadpool(
         _chunk_to_budget, to_summarize, budget, _scale
     )
@@ -555,7 +826,8 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
 
     logger.info(
         f"summarize: {len(to_summarize)} turns exceed the {budget}-token input "
-        f"budget — map-reduce over {len(batches)} batches"
+        f"budget — map-reduce over {len(batches)} batches, sized by "
+        f"{_summary_counter}"
     )
     # Map: batches run CONCURRENTLY (vLLM batches fine), bounded by a small
     # semaphore so a huge history can't monopolize the engine. Sequential
@@ -904,18 +1176,41 @@ def _enforce_hard_budget(
     # was measured on the pod and cannot be checked from this repo.
     #
     # The sign flips with content: roughly +-8% either way. Do not restate this
-    # as one percentage — three drafts did, and all three were wrong. The 2x
-    # margin is what makes the skip safe without the estimate being accurate.
+    # as one percentage — three drafts did, and all three were wrong.
     #
     # The margin is not idle for another reason: _fast_token_estimate adds
     # IMAGE_TOKEN_ESTIMATE per image, and that constant (4096) is roughly half
     # the true cost of a Mistral3 vision tile. Images are the one input that
-    # can undercount here, and the 2x gap is what absorbs them. Retention=0
+    # can undercount here, and the margin is what absorbs them. Retention=0
     # currently strips every image before this runs, so it is dormant — but
     # raise COMPACTOR_MAX_RETAINED_IMAGES and this margin is what stands
     # between an underestimated photo and a 400. Do not narrow it without
     # fixing COMPACTOR_IMAGE_TOKENS first.
-    if _fast_token_estimate(messages) <= limit // 2:
+    #
+    # v3.1 A14: the divisor was 2, and every figure above justifying it is a
+    # chars-per-LOCAL-token measurement — the oracle P0-0c discredited. The
+    # right way to state the safety condition is in chars per vLLM token, since
+    # vLLM is what charges:
+    #
+    #   skip is safe when   chars/4 + 4*M  <=  limit/D   and   true <= limit
+    #   i.e. roughly when   chars/vLLM-token  >=  4/D
+    #
+    # so D=2 was betting that no payload ever prices below 2.0 chars per vLLM
+    # token. Against the four direct chars-to-/tokenize pairs measured
+    # 2026-08-28 (see count_tokens_exact) the worst assistant turn came in at
+    # 17,930/8,988 = 1.995 — through the break-even, by 0.25%. Nothing measured
+    # crosses once the +4 per message is counted, so this is a thin margin
+    # rather than an observed failure; but it is the last place on the request
+    # path where an irreversible forward-without-measuring decision is made,
+    # and it was making it on the discredited number.
+    #
+    # D=8 puts the condition at 0.5 chars per vLLM token, which no text can
+    # price below (a token is at least one character), so the skip is safe on
+    # content rather than on a hope about content. The cost is /tokenize calls
+    # for medium payloads the old divisor waved through; the prescreen still
+    # exists for the small ones it was written for, which is the overwhelming
+    # majority of requests.
+    if _fast_token_estimate(messages) <= limit // 8:
         return messages
 
     # Ground truth, once, before any decision is made on it. See
@@ -932,10 +1227,30 @@ def _enforce_hard_budget(
     # counts just established. Approximate, but approximately right, and every
     # round still verifies against a real /tokenize before it stops.
     scale = (total / local_total) if (exact is not None and local_total > 0) else 1.0
-    if exact is not None and abs(scale - 1.0) > 0.05:
+    # v3.1 A9: WHICH counter answered, said out loud, on both branches.
+    #
+    # This line used to be gated on `exact is not None and |scale-1| > 0.05`,
+    # which made the only counter-naming INFO in the package unreachable in
+    # precisely the state it would diagnose: when /tokenize refuses, `scale` is
+    # forced to exactly 1.0, the shed runs on a tokenizer that reads 34-51% low,
+    # the verify step below falls back again unmarked, and the closing
+    # "hard budget enforced" line is textually identical in shape to the healthy
+    # case — at HTTP 200. That is the 2026-08-28 signature exactly. The two
+    # sites that DO name the counter (_sent_token_size) are both gated behind
+    # `if r.status_code >= 400` and a shed at 200 reaches neither.
+    counter = "vLLM's /tokenize" if exact is not None else "the local tokenizer"
+    if exact is not None:
         logger.info(
             f"token scale {scale:.2f}x (local {local_total} -> vLLM {total}); "
-            f"shedding arithmetic corrected by that factor"
+            f"counted by {counter}, shedding arithmetic corrected by that factor"
+        )
+    else:
+        logger.warning(
+            f"token scale unavailable (/tokenize refused) — budgeting this "
+            f"payload at {local_total} tokens from {counter}, UNCORRECTED. That "
+            f"counter reads up to 51% low on this model's assistant content, so "
+            f"{local_total} is a floor and not a count, and every number in the "
+            f"shed line below inherits it."
         )
     if total <= limit:
         return messages
@@ -1047,8 +1362,22 @@ def _enforce_hard_budget(
         # is the one that must not be an estimate. It used to be the local
         # count, which is how a payload measured at 21,170 reached vLLM and was
         # charged 32,899 — a request the guard had just certified as fitting.
+        #
+        # v3.1 A9: and when it falls back it says so. This fallback was
+        # unmarked, so the number the shed line reports as the FINAL size —
+        # the one that decided to forward — could be either vLLM's count or a
+        # local estimate scaled by a factor that is itself 1.0 when /tokenize
+        # is down, with nothing in the log to tell the two apart.
         _v = count_tokens_exact(msgs)
-        running = _v if _v is not None else int(count_tokens(msgs) * scale)
+        if _v is not None:
+            running = _v
+            counter = "vLLM's /tokenize"
+        else:
+            running = int(count_tokens(msgs) * scale)
+            counter = (
+                f"the local tokenizer x{scale:.2f}" if abs(scale - 1.0) > 0.005
+                else "the local tokenizer, UNCORRECTED"
+            )
         if running <= limit:
             break
         idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
@@ -1056,8 +1385,17 @@ def _enforce_hard_budget(
         if len(idxs) <= 1 and trimmed >= 32 and len(sys_idxs) <= 1:
             break  # nothing left to shed; forward best effort
 
+    # v3.1 A9/A10: the shed line now names the counter behind its numbers and
+    # the margin in force. Every number in this line came from one of two
+    # counters that disagree by up to 51% in the direction that overflows, and
+    # for a week of diagnosis the line said which one: never. `margin` is here
+    # for the same reason — `limit` below is already NET of _BUDGET_MARGIN, so
+    # a reader comparing it against HARD_INPUT_LIMIT could not see why they
+    # differed.
+    margin_note = f", margin {_BUDGET_MARGIN}" if _BUDGET_MARGIN else ""
     detail = (
-        f"{total} -> {running} tokens (limit {limit}); dropped {dropped} old "
+        f"{total} -> {running} tokens (limit {limit}{margin_note}), counted by "
+        f"{counter}; dropped {dropped} old "
         f"turn(s), trimmed {trimmed} injected block(s), dropped "
         f"{sys_dropped} injected block(s) entirely"
     )
@@ -1195,13 +1533,18 @@ class SseAccumulator:
         return self._complete and not self._truncated
 
 
-def _fire_and_forget(coro) -> None:
+def _fire_and_forget(coro, label: str | None = None) -> None:
     """Spawn post-response background work through the bounded pool
     (V2.3 Theme 3). The pool caps concurrency and sheds beyond a hard
     outstanding ceiling rather than spawning unboundedly under load. Task
     references are kept alive by the pool; exceptions are logged there.
+
+    `label` is what the pool's shed WARNING names when it drops this task.
+    A11 added the parameter to bgwork.pool.submit and nothing passed it, so
+    the warning could say that a tail was dropped but not WHOSE — which is
+    the entire reason the parameter exists. Pass the conversation.
     """
-    bgwork.pool.submit(coro)
+    bgwork.pool.submit(coro, label)
 
 
 def _merge_touched(fresh: list[dict], touched: list[dict]) -> list[dict]:
@@ -2194,7 +2537,15 @@ async def chat_completions(request: Request) -> Any:
                                 conv_id, r.status_code, err_body, sent_tokens,
                                 sent_source, enforced_limit, streaming=True,
                             )
-                            tightened = _note_backend_rejection(err_body)
+                            # v3.1 A8: enforced_limit is what the guard
+                            # ACTUALLY shed against. Without it the calibration
+                            # reconstructed a limit from HARD_INPUT_LIMIT and
+                            # only ever understated the overshoot, so a client
+                            # asking for a large completion could learn nothing
+                            # and still be told to retry.
+                            tightened = _note_backend_rejection(
+                                err_body, enforced_limit
+                            )
                             if r.status_code < 500:
                                 # A 4xx means the backend is HEALTHY and refused
                                 # our request; only 5xx/unreachable justifies the
@@ -2214,6 +2565,13 @@ async def chat_completions(request: Request) -> Any:
                                 yield f"data: {json.dumps(chunk)}\n\n".encode()
                             yield b"data: [DONE]\n\n"
                         else:
+                            # v3.1 A10: vLLM accepted this payload. That is the
+                            # only evidence that exists for whether the learned
+                            # margin is still needed, so it is counted here —
+                            # at the moment the status line arrives, not after
+                            # the body, because a client hanging up mid-stream
+                            # says nothing about whether the prompt fitted.
+                            _note_backend_accepted()
                             async for chunk in r.aiter_raw():
                                 yield chunk
                                 accumulator.feed(chunk)
@@ -2243,7 +2601,15 @@ async def chat_completions(request: Request) -> Any:
                         if accumulator.truncated()
                         else "ended without completion"
                     )
-                    logger.info(
+                    # WARNING, not INFO. If a client sends a max_tokens
+                    # below the model's usual reply length, EVERY reply
+                    # finishes as "length" and this branch silently stops all
+                    # memory writing — facts, episodic and rollups — for the
+                    # life of that setting. That is the 2026-08-28 shape
+                    # exactly: correct local behaviour, no error, and the user
+                    # experiencing an assistant that has stopped remembering.
+                    # The skip is right; being quiet about it is not.
+                    logger.warning(
                         f"conv={conv_id}: stream {_why} "
                         f"({len(accumulator.text())} chars accumulated) — "
                         f"skipping memory tail for the partial reply"
@@ -2258,7 +2624,8 @@ async def chat_completions(request: Request) -> Any:
                             turn_index,
                             messages,  # original request messages, for rollup
                             injected_facts=injected_facts,
-                        )
+                        ),
+                        label=f"tail conv={conv_id}",
                     )
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -2316,8 +2683,19 @@ async def chat_completions(request: Request) -> Any:
                 conv_id, r.status_code, str(response_json), sent_tokens,
                 sent_source, enforced_limit, streaming=False,
             )
-            _note_backend_rejection(str(response_json)[:2000])
+            # v3.1 A8: same fix as the streaming path — the limit the guard
+            # enforced, not one reconstructed from HARD_INPUT_LIMIT. This path
+            # still discards the return value: it relays vLLM's own body to the
+            # client verbatim, so there is no compactor-authored message for
+            # `tightened` to steer. The calibration still happens; only the
+            # advice-to-the-user half is absent here.
+            _note_backend_rejection(str(response_json)[:2000], enforced_limit)
             return JSONResponse(content=response_json, status_code=r.status_code)
+
+        # v3.1 A10: the counterpart to the rejection path above. Without a call
+        # here the release logic in _note_backend_accepted is unreachable and
+        # the margin stays monotonic exactly as it was before this branch.
+        _note_backend_accepted()
 
         # Extract assistant text for fact extraction
         assistant_text = ""
@@ -2354,7 +2732,8 @@ async def chat_completions(request: Request) -> Any:
         except (IndexError, KeyError, TypeError):
             _finish_reason = ""
         if conv_id and _finish_reason == "length":
-            logger.info(
+            # WARNING for the same reason as the streaming path above.
+            logger.warning(
                 f"conv={conv_id}: reply truncated at the generation ceiling "
                 f"(finish_reason=length, {len(assistant_text)} chars) — "
                 f"skipping memory tail for the partial reply"
@@ -2369,7 +2748,8 @@ async def chat_completions(request: Request) -> Any:
                     turn_index,
                     messages,  # original request messages, for rollup
                     injected_facts=injected_facts,
-                )
+                ),
+                label=f"tail conv={conv_id}",
             )
         return JSONResponse(content=response_json, status_code=r.status_code)
     finally:
@@ -2427,7 +2807,13 @@ async def health_full(response: Response):
     healthy even when vLLM is dead, because OpenWebUI keeps serving
     its login page).
     """
-    report = await health.gather_health_full(VLLM_URL, TARGET_TOKENS)
+    # tokenize_health() existed, was tested, and had no consumer — so a
+    # /tokenize outage, the exact degraded mode the 2026-08-28 incident ran
+    # in, was invisible on the health endpoint. health.py cannot import main
+    # (main imports health), so main hands it in.
+    report = await health.gather_health_full(
+        VLLM_URL, TARGET_TOKENS, tokenize=tokenize_health()
+    )
     response.status_code = health.status_to_http_code(report["status"])
     return report
 

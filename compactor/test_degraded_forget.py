@@ -10,6 +10,12 @@ Two surfaces, one underlying condition:
     what it can, reports "unreadable": ["facts"], and leaves the facts file
     itself on disk — it cannot be safely rewritten from an unknown state.
 
+  - the healthy full-stack /forget: same HTTP surface, nothing faked, asserted
+    against the disk rather than against the reply. A3's defect was that those
+    two disagreed — the archive sidecar and the lazy-backfill gate both
+    survived a wipe that reported a clean sweep — so the assertions here read
+    the store back after the command rather than trusting its counters.
+
   - the slash-command reply: a real person types these into a chat box. What
     reaches her must say that nothing was deleted and that she did nothing
     wrong. The absolute path and the exception class belong in the log, and
@@ -40,6 +46,7 @@ os.environ["MAX_MODEL_LEN"] = "2000"
 os.environ["COMPACTOR_RAG_ENABLED"] = "false"
 os.environ["COMPACTOR_PERSONA_AUTO_DETECT_MIN_CHARS"] = "50"
 
+import backfill  # noqa: E402
 import facts  # noqa: E402
 import main  # noqa: E402
 import memory  # noqa: E402
@@ -251,6 +258,72 @@ def test_forget_command_must_not_report_a_clean_wipe():
     )
 
 
+def test_real_forget_clears_every_layer_end_to_end():
+    print("\n[test] the real /forget leaves no layer behind (no fakes in the path)")
+    # Everything else in this file that exercises /forget does it on a store
+    # that is already broken. This one runs the healthy path through the same
+    # HTTP surface, with main._clear_all_memory really wired, and asserts
+    # against the disk rather than against the reply — the A3 defect was
+    # precisely that those two disagreed.
+    #
+    # The archive sidecar is the layer the wipe never touched: prune_facts and
+    # archive_stale_facts MOVE evicted facts there rather than unlinking them
+    # (F9), and nothing in the codebase had ever deleted one.
+    _wipe_storage()
+    cid = "forget-e2e"
+    facts.save_facts(cid, [
+        {"text": "Lyra is a half-elf ranger.", "added_turn": 1, "last_used": 1},
+    ])
+    facts.save_archive(cid, [
+        {"text": "Her mother's name is Selene.", "added_turn": 1,
+         "last_used": 1, "archived_at": 1},
+    ])
+    _seed_other_layers(cid)
+
+    reply = _command_reply("/forget", cid)
+
+    assert_eq(facts.load_facts(cid), [], "facts gone")
+    assert_eq(facts.load_archive(cid), [], "archive sidecar gone")
+    assert_true(not memory.summary_path(cid).is_file(), "summary gone")
+    assert_true(not memory.persona_path(cid).is_file(), "persona gone")
+    assert_true("still storing" not in reply.lower(),
+                f"and the reply agrees with the disk: {reply!r}")
+    for expected in ("1 fact(s)", "1 archived fact(s)", "summary state", "persona"):
+        assert_true(expected in reply, f"reply names {expected}: {reply!r}")
+
+
+def test_real_forget_closes_the_backfill_gate():
+    print("\n[test] the real /forget stops the lazy backfill re-extracting the history")
+    # The path that put memory back without any concurrency at all.
+    # backfill.needs_backfill gates on facts_path(conv_id).is_file(); a
+    # conversation whose memory was a summary and a persona has no facts file,
+    # so the wipe left the gate open and the NEXT request would start a
+    # background extraction over the whole message history — the history the
+    # user had just asked to be forgotten — and write the result to disk.
+    #
+    # Driven through the HTTP surface so the assertion is about what a user
+    # typing /forget actually gets, not about the handler in isolation.
+    _wipe_storage()
+    cid = "forget-backfill-gate"
+    msgs = [
+        {"role": "user", "content": "My protagonist Lyra is a half-elf ranger."},
+        {"role": "assistant", "content": "Where is she from?"},
+        {"role": "user", "content": "Aethermere. Her mother Selene died there."},
+        {"role": "assistant", "content": "A strong hook."},
+    ]
+    _seed_other_layers(cid)
+    assert_true(backfill.needs_backfill(cid, msgs),
+                "precondition: the forgotten history was backfillable")
+
+    reply = _command_reply("/forget", cid)
+
+    assert_true(memory.facts_path(cid).is_file(),
+                f"the wipe left an empty facts store behind: {reply!r}")
+    assert_eq(facts.load_facts(cid), [], "and it is empty")
+    assert_true(not backfill.needs_backfill(cid, msgs),
+                "the backfill can no longer reconstruct the forgotten history")
+
+
 # ---------------------------------------------------------------------------
 # C — the slash-command reply on StoreUnreadable
 # ---------------------------------------------------------------------------
@@ -336,6 +409,8 @@ def _all_tests():
         test_clear_all_memory_absent_facts_is_not_unreadable,
         test_admin_forget_endpoint_reports_unreadable,
         test_forget_command_must_not_report_a_clean_wipe,
+        test_real_forget_clears_every_layer_end_to_end,
+        test_real_forget_closes_the_backfill_gate,
         test_command_reply_hides_path_when_persona_unreadable,
         test_command_reply_streams_the_same_plain_language,
         test_command_reply_hides_path_when_facts_unreadable,

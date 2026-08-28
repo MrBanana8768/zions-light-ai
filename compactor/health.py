@@ -23,6 +23,7 @@ single broken probe should never make /health/full itself 500.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -201,20 +202,42 @@ def gather_memory_stats() -> dict:
 # Aggregated report
 # ---------------------------------------------------------------------------
 
-async def gather_health_full(vllm_url: str, target_tokens: int) -> dict:
-    """The single source of truth used by /health/full and /admin/selftest.
+def _gather_blocking() -> dict:
+    """Every filesystem-touching probe, in one call, meant to be run OFF the
+    event loop (v3.1 A12).
 
-    Status semantics:
-      - "ok"       — all checks pass; serve traffic normally
-      - "degraded" — storage OK but vLLM unreachable. Compactor can still
-                     serve admin/export endpoints. Container stays alive
-                     so supervisord can restart vLLM independently.
-      - "down"     — storage broken. Nothing useful possible. Container
-                     should be replaced.
+    All four of these blocked the loop directly until v3.1:
 
-    Returned 200 for ok+degraded, 503 for down (caller maps).
+      - `probe_storage` writes and unlinks a sentinel on the data volume —
+        and it blocks longest in exactly the situation it exists to detect,
+        a volume that has stopped answering.
+      - `gather_memory_stats` reads three layers for every conversation
+        `memory.list_known_conv_ids()` returns, which is uncapped.
+      - `degrade.write_state` statvfs's the watch path (TTL-cached, cheap).
+      - `backup.latest_backup_info` lists and stats the backup directory.
+
+    Measured on the v3.0.5-cu12 image with RAG disabled, so only the
+    facts+summaries reads are counted and the Chroma leg inside
+    `conversation_doc_count` is *on top of* these figures. Median of 5 runs of
+    `gather_memory_stats` against a seeded store, 8 facts and an L1 stack per
+    conversation:
+
+        convs=   10  median=   1.0 ms
+        convs=  100  median=  13.5 ms
+        convs=  500  median=  49.3 ms
+        convs= 1000  median= 100.0 ms
+
+    Linear and unbounded — `memory.list_known_conv_ids()` has no cap — and
+    until v3.1 it ran on the one event loop this process has (`supervisord.conf`
+    starts uvicorn with no `--workers`) every 30 s, on the Docker HEALTHCHECK.
+    Every concurrent chat stalled for the length of the scan. ~100 ms of dead
+    loop twice a minute is not an outage, which is why this is S3 and not
+    higher; it is also free to fix.
+
+    Each probe keeps its own error handling: a thread hop must not turn one
+    broken probe into a 500 from the whole endpoint, which is the promise the
+    module docstring makes.
     """
-    vllm = await probe_vllm(vllm_url)
     storage = probe_storage()
     stats = gather_memory_stats()
 
@@ -227,33 +250,119 @@ async def gather_health_full(vllm_url: str, target_tokens: int) -> dict:
     except Exception as e:
         writes = {"new_memory_writes": "unknown", "error": f"{type(e).__name__}: {e}"}
 
+    # V2.3 Theme 1: surface backup durability status (best-effort).
+    backups: dict[str, Any]
+    try:
+        import backup as backup_module
+        backups = backup_module.latest_backup_info()
+    except Exception as e:
+        backups = {"count": None, "latest": None, "error": f"{type(e).__name__}: {e}"}
+
+    return {"storage": storage, "stats": stats, "writes": writes, "backups": backups}
+
+
+async def gather_health_full(
+    vllm_url: str, target_tokens: int, tokenize: dict | None = None
+) -> dict:
+    """The single source of truth used by /health/full and /admin/selftest.
+
+    Status semantics:
+      - "ok"       — all checks pass; serve traffic normally
+      - "degraded" — storage OK but something the operator needs to see:
+                     vLLM unreachable, new-memory writes paused under disk
+                     pressure, or background work shedding. Compactor can
+                     still serve admin/export endpoints. Container stays
+                     alive so supervisord can restart vLLM independently.
+      - "down"     — storage broken. Nothing useful possible. Container
+                     should be replaced.
+
+    `status_reasons` carries WHY, because "degraded" on its own tells the
+    operator to go read three sub-dicts and diff them against a healthy run.
+
+    Returned 200 for ok+degraded, 503 for down (caller maps).
+    """
+    # The vLLM probe is async with its own timeout; everything else is
+    # blocking filesystem work and goes to a thread (see _gather_blocking).
+    # Run them concurrently — serialized, the probe's up-to-3 s timeout sat in
+    # front of the store scan for no reason. They share no state: the probe is
+    # an httpx call, the scan reads files under a different directory.
+    vllm, blocking = await asyncio.gather(
+        probe_vllm(vllm_url),
+        asyncio.to_thread(_gather_blocking),
+    )
+    storage = blocking["storage"]
+    stats = blocking["stats"]
+    writes = blocking["writes"]
+    backup_info = blocking["backups"]
+
     # V2.3 Theme 3: bounded-background-work pool stats (outstanding/shed).
+    # Pure in-memory counters, so this one stays on the loop thread.
     try:
         import bgwork
         bg = bgwork.pool.stats()
     except Exception as e:
         bg = {"error": f"{type(e).__name__}: {e}"}
 
+    # Why a reason list and not a bare string: `bg` used to be computed here,
+    # placed in the payload, and never read. Sustained shedding — the pool
+    # dropping fact extraction, episodic indexing and summary rollups because
+    # it was over its outstanding ceiling — reported "ok" and passed the
+    # HEALTHCHECK. That is the C2 finding from the incident write-up: the user
+    # has been the monitoring for this system twice, and this endpoint said ok
+    # both times. Anything that means "the system is not doing its job right
+    # now" has to reach `status`, and has to say which thing it was.
+    # (v3.1 A11.)
+    reasons: list[str] = []
     if not storage["ok"]:
+        # Storage is the one condition that makes everything else moot, so it
+        # short-circuits rather than joining the list.
+        reasons.append(f"storage not writable ({storage.get('error')})")
         status = "down"
-    elif not vllm["ok"] or writes.get("new_memory_writes") == "paused":
-        status = "degraded"
     else:
-        status = "ok"
-
-    # V2.3 Theme 1: surface backup durability status (best-effort).
-    backup_info: dict[str, Any]
-    try:
-        import backup as backup_module
-        backup_info = backup_module.latest_backup_info()
-    except Exception as e:
-        backup_info = {"count": None, "latest": None, "error": f"{type(e).__name__}: {e}"}
+        if not vllm["ok"]:
+            reasons.append(f"vLLM unreachable ({vllm.get('error')})")
+        if writes.get("new_memory_writes") == "paused":
+            reasons.append(
+                f"new-memory writes paused under disk pressure "
+                f"(free_mb={writes.get('free_mb')})"
+            )
+        if bg.get("error"):
+            # We could not read the pool at all. Same doctrine as
+            # indexed_exchanges_total: unknown is not the same as fine, and a
+            # layer we cannot see must not be reported as healthy.
+            reasons.append(f"background pool unobservable ({bg['error']})")
+        elif bg.get("shed_recently"):
+            reasons.append(
+                f"background work shedding: {bg.get('shed')} task(s) dropped, "
+                f"most recent {bg.get('seconds_since_last_shed')}s ago "
+                f"(outstanding {bg.get('outstanding')}/"
+                f"{bg.get('max_outstanding')}). New memory is not being "
+                f"written for the turns that were dropped."
+            )
+        # The counter the budget is computed from. When /tokenize is
+        # unreachable the compactor keeps serving on a local estimate that has
+        # measured up to 51% low on assistant content — it is degraded, not
+        # broken, and it is precisely the state both 2026-08-28 outages ran in
+        # while every health surface said ok. Optional so an older caller that
+        # passes two arguments still works.
+        if tokenize and not tokenize.get("ok", True):
+            reasons.append(
+                f"/tokenize unavailable: {tokenize.get('consecutive_failures')} "
+                f"consecutive failure(s). Token budgets are running on the "
+                f"local estimate, which reads low on assistant content."
+            )
+        status = "degraded" if reasons else "ok"
 
     return {
         "status": status,
+        "status_reasons": reasons,
         "checks": {
             "vllm": vllm,
             "storage": storage,
+            # None when the caller did not supply it, so "we did not ask" stays
+            # distinguishable from "we asked and it is fine" — the same
+            # doctrine as indexed_exchanges_total above.
+            "tokenize": tokenize,
         },
         "stats": stats,
         "backups": backup_info,
@@ -270,5 +379,14 @@ def status_to_http_code(status: str) -> int:
     """Map a status string to an HTTP code for the /health/full endpoint.
     Used as the Docker HEALTHCHECK target — 200 keeps the container
     healthy, 503 trips the restart policy.
+
+    Deliberately unchanged by v3.1 A11: shedding now degrades `status`, but
+    "degraded" still answers 200. Shedding is backpressure — the pool is over
+    its ceiling because the box is busy — and restarting the container in the
+    middle of that would kill every in-flight chat AND guarantee the loss of
+    every tail still outstanding, which is the harm we were trying to report.
+    The fix for a health check that could not report degradation is to make it
+    report degradation, not to make it restart things. The signal belongs in
+    the body, where `status` and `status_reasons` now carry it.
     """
     return 503 if status == "down" else 200

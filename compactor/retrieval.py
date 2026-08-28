@@ -176,6 +176,31 @@ _DOC_ID_HASH_CHARS = 16
 # REMEDIATION rejected it for that reason.
 _TURN_INDEX_STEP = 2
 
+# main.py's own knob, read here so the two stay in step. It is the size of the
+# verbatim window main.py keeps at the tail of the request, and therefore the
+# number of stored rows the caller's `exclude_turns_from` filter is *expected*
+# to remove. Read from the environment rather than imported because main
+# imports this module, not the other way round.
+_KEEP_RECENT_TURNS = int(os.environ.get("COMPACTOR_KEEP_RECENT_TURNS", "4") or 4)
+
+# The distance, in the message-units the stored ordinals use, between the
+# caller's own position and the cutoff it derives from it: main.py computes
+# `max(0, turn_index - KEEP_RECENT_TURNS * 2)`. If the caller's framing and the
+# store's agreed, the store's own maximum ordinal would sit within this distance
+# of the cutoff. See _cutoff_is_out_of_frame.
+_RECENT_WINDOW_UNITS = _KEEP_RECENT_TURNS * _TURN_INDEX_STEP
+
+# v3.1 A7. How many candidates `retrieve` asks for BEYOND k, so that a row the
+# exclusion filter removes is replaced rather than simply lost.
+#
+# _KEEP_RECENT_TURNS is the count above, and it is exactly the number of rows
+# the filter is *expected* to remove: the caller excludes its verbatim tail, and
+# that tail is _KEEP_RECENT_TURNS exchanges, which is _KEEP_RECENT_TURNS stored
+# rows. So over-fetching by that much makes the common case whole — ask for five
+# useful hits, get five — while staying bounded: chroma is asked for k + 4, not
+# for the conversation.
+_OVERFETCH = _KEEP_RECENT_TURNS
+
 
 def _doc_id(conv_id: str, document: str) -> str:
     """Content-addressed id: `{conv_id}::{sha256(document)[:16]}`.
@@ -230,6 +255,41 @@ def _id_exists(doc_id: str) -> bool:
         return False
 
 
+def _stored_max_turn_index(conv_id: str, log_key: str) -> int | None:
+    """The highest `turn_index` this conversation has in the store, or None if
+    it has no rows or the store could not be read.
+
+    The store's own answer to "where is this conversation up to", as opposed to
+    the request's, which is `len(messages) + 1` and therefore a measurement of
+    the client's array. Both _next_turn_index (the write path) and
+    _cutoff_is_out_of_frame (the read path) need exactly this number, so it is
+    one query in one place. `include=["metadatas"]` keeps the document text in
+    SQLite; only the ordinals are wanted.
+    """
+    if _chroma_collection is None:
+        return None
+    try:
+        existing = _chroma_collection.get(
+            where={"conv_id": conv_id}, include=["metadatas"]
+        )
+    except Exception as e:
+        if logsetup.log_once(log_key):
+            logger.warning(
+                f"conv={conv_id}: could not read the stored turn indices "
+                f"({type(e).__name__}: {e}); falling back to the request's"
+            )
+        return None
+    highest: int | None = None
+    for meta in (existing or {}).get("metadatas") or []:
+        try:
+            value = int((meta or {}).get("turn_index", -1))
+        except (TypeError, ValueError):
+            continue
+        if highest is None or value > highest:
+            highest = value
+    return highest
+
+
 def _next_turn_index(conv_id: str, seed: int) -> int:
     """Ordering metadata for a new row, allocated from the STORE's own maximum
     rather than from the request.
@@ -261,28 +321,53 @@ def _next_turn_index(conv_id: str, seed: int) -> int:
     """
     if _chroma_collection is None:
         return int(seed)
-    try:
-        existing = _chroma_collection.get(
-            where={"conv_id": conv_id}, include=["metadatas"]
-        )
-    except Exception as e:
-        if logsetup.log_once("retrieval._next_turn_index"):
-            logger.warning(
-                f"conv={conv_id}: could not read the stored turn indices "
-                f"({type(e).__name__}: {e}); falling back to the request's"
-            )
-        return int(seed)
-    highest: int | None = None
-    for meta in (existing or {}).get("metadatas") or []:
-        try:
-            value = int((meta or {}).get("turn_index", -1))
-        except (TypeError, ValueError):
-            continue
-        if highest is None or value > highest:
-            highest = value
+    highest = _stored_max_turn_index(conv_id, "retrieval._next_turn_index")
     if highest is None:
         return int(seed)
     return max(highest + _TURN_INDEX_STEP, int(seed))
+
+
+def _cutoff_is_out_of_frame(conv_id: str, cutoff: int) -> bool:
+    """True when `exclude_turns_from` cannot be a position in THIS store's
+    ordering, so honouring it would suppress the whole retrieval block.
+
+    v3.1 A6, the deferred half of REMEDIATION P0-3. The cutoff arrives as
+    `max(0, turn_index - KEEP_RECENT_TURNS * 2)` where `turn_index` is
+    `len(messages) + 1` — a measurement of the CLIENT'S ARRAY. Stored ordinals
+    are allocated from the store's own maximum (see _next_turn_index), so the
+    two are different authorities and they drift apart: a deletion, a
+    regeneration, or simply a client sending a bounded window (FRONTEND_SPEC
+    §4.2 makes a bounded window the committed shape) leaves the client's number
+    permanently below the store's. Reproduced in the v3.1 preflight: a window of
+    20 messages against stored ordinals [21,23,…,43] gives a cutoff of 13, and
+    **0 of 12 hits survive, on every request, indefinitely.**
+
+    P4 repaired `cutoff == 0` only — "the recent window already covers
+    everything" is a reason to exclude nothing, not everything. This is the same
+    reading generalised: under a bounded window the cutoff is a positive number
+    P4's conditional does not touch.
+
+    The discriminator is the store's own maximum. If the two framings agreed,
+    the cutoff would sit `_RECENT_WINDOW_UNITS` below it — that is the whole
+    definition of the cutoff. A store maximum further above the cutoff than that
+    means the client's position is behind the store's, and the number is not
+    comparable with what is stored. A genuinely short conversation, where every
+    stored exchange really is in the request verbatim, fails this test and keeps
+    its filter: there the store's maximum IS the client's position.
+
+    The real fix is FRONTEND_SPEC §15's server-side `turn_seq` — one authority
+    for conversational position, replacing `len(messages) + 1` in main.py. That
+    is not this module's to make. Until it lands, this keeps the failure mode on
+    the over-inclusive side (a bounded, capped block of maybe-redundant context)
+    rather than the silent side (no episodic memory at all, and nothing in the
+    log that says so).
+    """
+    highest = _stored_max_turn_index(conv_id, "retrieval._cutoff_is_out_of_frame")
+    if highest is None:
+        # No rows, or the store would not answer. Neither is evidence of drift,
+        # so leave the caller's filter alone.
+        return False
+    return highest - cutoff > _RECENT_WINDOW_UNITS
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +427,16 @@ def retrieve(
 
     `exclude_turns_from`: if set, drop results whose turn_index >= this
     value. Used to avoid re-injecting recent turns that are already present
-    verbatim in the request (waste of token budget).
+    verbatim in the request (waste of token budget). If that cutoff turns out
+    not to be a position in this store's ordering it is ignored rather than
+    honoured — see _cutoff_is_out_of_frame (v3.1 A6).
+
+    v3.1 A7: the query OVER-FETCHES by _OVERFETCH rows and the result is
+    trimmed to k at the end. It used to ask for exactly k and then filter, so
+    every excluded row was a LOST slot rather than a replaced one: ask for five,
+    have three fall in the recent window, get two — for no reason, since the
+    sixth and seventh candidates were sitting right there. Under A5's ordinal
+    drift or A6's window divergence that arithmetic empties the block entirely.
     """
     if not _try_init() or _chroma_collection is None:
         return []
@@ -351,17 +445,23 @@ def retrieve(
     vecs = _embed([query_text])
     if not vecs:
         return []
+    cutoff = exclude_turns_from
+    # Only over-fetch when there is a filter that could spend the slots. A
+    # request with no cutoff has nothing to replace, and asking chroma for rows
+    # that will certainly be returned is work for nothing.
+    want = max(1, k) + (_OVERFETCH if cutoff else 0)
     try:
         res = _chroma_collection.query(
             query_embeddings=vecs,
-            n_results=max(1, k),
+            n_results=want,
             where={"conv_id": conv_id},
         )
     except Exception as e:
         logger.warning(f"conv={conv_id}: retrieve query failed: {e}")
         return []
 
-    out: list[dict] = []
+    rows: list[dict] = []
+    dropped: list[bool] = []
     # chroma returns parallel lists nested one level (per query).
     ids = (res.get("ids") or [[]])[0]
     docs = (res.get("documents") or [[]])[0]
@@ -370,6 +470,11 @@ def retrieve(
     for i in range(len(ids)):
         meta = metas[i] if i < len(metas) else {}
         turn_index = int(meta.get("turn_index", -1)) if meta else -1
+        rows.append({
+            "turn_index": turn_index,
+            "document": docs[i] if i < len(docs) else "",
+            "distance": float(dists[i]) if i < len(dists) else None,
+        })
         # `> 0`, not `is not None`. The caller passes
         # max(0, turn_index - KEEP_RECENT_TURNS * 2), which is 0 for any short
         # conversation and for any client that sends a bounded window. At 0 the
@@ -377,15 +482,40 @@ def retrieve(
         # so episodic retrieval returned nothing and said nothing about it.
         # A cutoff of 0 means "the recent window already covers everything",
         # which is a reason to exclude NOTHING, not everything. (REMEDIATION P0-3.)
-        if exclude_turns_from is not None and exclude_turns_from > 0 \
-                and turn_index >= exclude_turns_from:
-            continue
-        out.append({
-            "turn_index": turn_index,
-            "document": docs[i] if i < len(docs) else "",
-            "distance": float(dists[i]) if i < len(dists) else None,
-        })
-    return out
+        dropped.append(
+            cutoff is not None and cutoff > 0 and turn_index >= cutoff
+        )
+
+    kept = [r for r, drop in zip(rows, dropped) if not drop]
+
+    # v3.1 A6 — the deferred half of REMEDIATION P0-3, now wired in.
+    #
+    # _cutoff_is_out_of_frame reads the store, and this runs on the request hot
+    # path, so it is only paid when the filter actually COST the caller
+    # something: it dropped rows AND left fewer than the k asked for. A cutoff
+    # that excluded nothing cannot be suppressing anything; a cutoff that
+    # excluded four rows and still returned five has already been made whole by
+    # the over-fetch below, and there is nothing to rescue. What is left is
+    # exactly the case worth a query — the long healthy conversation, which is
+    # the one with the most metadata to scan, skips it every time.
+    if any(dropped) and len(kept) < k \
+            and _cutoff_is_out_of_frame(conv_id, int(cutoff or 0)):
+        if logsetup.log_once("retrieval.cutoff_out_of_frame"):
+            logger.warning(
+                f"conv={conv_id}: exclude_turns_from={cutoff} is not a position "
+                f"in this store's ordering (stored max is more than "
+                f"{_RECENT_WINDOW_UNITS} ahead of it), so honouring it would "
+                f"drop {sum(dropped)} of {len(rows)} hit(s) that are NOT in the "
+                f"request verbatim. Ignoring the filter for this conversation "
+                f"and injecting the hits; the block stays capped either way. "
+                f"The real fix is a server-side turn_seq (FRONTEND_SPEC §15). "
+                f"Reported once per process."
+            )
+        kept = rows
+
+    # v3.1 A7 — the over-fetch is spent here. Everything above may have been
+    # handed k + _OVERFETCH candidates; the caller asked for k.
+    return kept[:k]
 
 
 def forget_conversation(conv_id: str) -> int:
@@ -537,65 +667,157 @@ _RETRIEVAL_BLOCK_HEADER = (
     "similarity — use them for continuity and exact recall]"
 )
 
+_TRUNCATION_NOTE = "\n[...truncated to fit the retrieval budget]"
 
-def format_retrieval_block(results: list[dict]) -> str | None:
+# Below this the truncated stub is not worth emitting: a header with almost
+# nothing under it tells the model relevant earlier exchanges exist and then
+# shows it none of them. 50 tokens, which is the 200 CHARACTERS this threshold
+# used to be, converted at the same 4 chars/token the ASCII term below uses.
+_MIN_TRUNCATED_TOKENS = 50
+
+
+def _estimate_tokens(text: str) -> int:
+    """Approximate what vLLM will charge for `text`, in TOKENS.
+
+    v3.1 A4. This budget used to be `MAX_RETRIEVAL_TOKENS * 4` — a CHARACTER
+    count, compared against a character sum, then logged as though it were a
+    token figure. Characters are the one unit that cannot see decoration, and
+    decoration is what this model writes: INCIDENT_2026-08-28 measures a reply
+    of 1,710 U+2501 plus 441 U+2500 that vLLM charged ~4,275 tokens, against
+    2,209 characters. chars/4 called that 552. **A 7.74x undercount, so the
+    6,000-character cap admitted ~11,600 real tokens against a nominal 1,500** —
+    about a third of the whole input budget, in the layer whose own comment
+    (above MAX_RETRIEVAL_TOKENS) says no injected memory should outweigh the
+    conversation it supports. The guard does not absorb it either: it sheds
+    conversation turns before it touches an injected system block, so the
+    oversized block wins and real conversation is deleted to make room for it.
+
+    A raised flat multiplier would not fix this, it would move it — a
+    prose-tuned constant is wrong on decoration by that same 7.74x whatever
+    value it takes. So the estimate is split by character class, because the
+    divergence is entirely a property of class:
+
+    * **ASCII → chars/4.** Unchanged, deliberately: the measured density on
+      this deployment's chat transcript is 4.10 chars/token (4.28 on Python,
+      3.66 on markdown), so /4 is the same slightly-conservative estimate this
+      module has always used, and a pure-prose block renders byte-identically
+      to what it rendered before this fix. That matters — the common case must
+      not shrink.
+    * **Non-ASCII → one token per UTF-8 byte.** A CEILING, not an estimate.
+      tekken.json (and every byte-level BPE) falls back to per-byte tokens when
+      no merge applies, so nothing can cost more than its byte length. Measured
+      against it: the incident's box-drawing run is 3 bytes/char and was charged
+      1.99 tokens/char, i.e. 0.66 of the ceiling, so this over-counts decoration
+      by ~1.5x rather than under-counting it by 7.74x.
+
+    Deliberately no tokenizer and no HTTP: this module is torch-free on purpose,
+    and `format_retrieval_block` is called from the request hot path inside an
+    async handler, where a blocking /tokenize POST is the wrong trade. Callers
+    that already hold a real counter can pass one — see `format_retrieval_block`
+    — and the exact accounting downstream in `_enforce_hard_budget` is unchanged.
+    Being wrong here now costs a retrieval block smaller than it needed to be,
+    which is recoverable, instead of one 7x larger than believed, which was not.
+    """
+    # Both halves are C-level: "ascii"/"ignore" drops exactly the non-ASCII
+    # characters, so its length IS the ASCII character count, and the remainder
+    # of the UTF-8 length is the non-ASCII byte count. A per-character Python
+    # loop over five whole exchanges is not free on the hot path.
+    data = text.encode("utf-8", "surrogatepass")
+    ascii_chars = len(text.encode("ascii", "ignore"))
+    return ascii_chars // 4 + (len(data) - ascii_chars)
+
+
+def _longest_prefix_within(text: str, budget: int, measure) -> str:
+    """The longest prefix of `text` that `measure` prices at <= `budget`.
+
+    Bisected rather than sliced at a character offset: once the budget is in
+    tokens there is no fixed chars-per-token to slice at, and the whole point of
+    A4 is that assuming one is how the cap failed. `measure` is monotonic
+    non-decreasing over prefixes — appending a character can never reduce a
+    token count — which is what makes the bisection sound.
+    """
+    if budget <= 0:
+        return ""
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if measure(text[:mid]) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo]
+
+
+def format_retrieval_block(results: list[dict], count_tokens=None) -> str | None:
     """Render retrieved exchanges as a system-message body. None if empty.
     Ordered by turn_index ascending so the model reads them chronologically.
+
+    `count_tokens` is an optional `str -> int` measure. It exists so the exact
+    counter can be supplied from outside without this module growing a tokenizer
+    or an HTTP call of its own: `main.count_tokens_exact` asks the process that
+    will do the charging, but `main` imports THIS module, so the dependency can
+    only run in this direction. Left unset — which is every caller today — the
+    budget is measured with `_estimate_tokens`, whose ceiling on the content
+    that broke this cap is documented there.
     """
     if not results:
         return None
     ordered = sorted(results, key=lambda r: r.get("turn_index", 0))
+    measure = count_tokens or _estimate_tokens
 
-    # Budget in characters: this module has no tokenizer (deliberately — it
-    # would drag transformers into the retrieval path).
-    #
-    # chars/4 is an approximation whose error depends on the text. Measured on
-    # the DEPLOYED tokenizer (vision-heretic; the image's ENV default is a
-    # different repo with different numbers): 4.10 chars/tok on this
-    # deployment's chat transcript, 4.28 on Python, 3.66 on markdown.
-    #
-    # Retrieved exchanges ARE chat text, so ~4.1 is the right central estimate
-    # and this budget lands close to nominal in practice. A markdown-heavy
-    # exchange overshoots by ~9% (~140 tokens); the densest file measured at
-    # 3.35 chars/tok would overshoot ~19% (~290 tokens). Both are small against
-    # a 32,768 window. An earlier draft called the 9% figure "the worst case" —
-    # it is the aggregate, and the real worst case is twice it.
-    #
-    # Acceptable either way: this cap's job is "never let this layer dominate
-    # the window", not exact accounting. _enforce_hard_budget does the exact
+    # A TOKEN budget, measured in tokens, and now honestly named. It was
+    # MAX_RETRIEVAL_TOKENS * 4 characters — see _estimate_tokens for what that
+    # admitted. This cap's job is still "never let this layer dominate the
+    # window" rather than exact accounting; _enforce_hard_budget does the exact
     # accounting downstream.
-    budget = MAX_RETRIEVAL_TOKENS * 4
+    budget = MAX_RETRIEVAL_TOKENS
     lines = [_RETRIEVAL_BLOCK_HEADER]
-    used = len(_RETRIEVAL_BLOCK_HEADER)
+    used = measure(_RETRIEVAL_BLOCK_HEADER)
     kept = 0
     for r in ordered:
         ti = r.get("turn_index", "?")
         sep = f"--- (turn ~{ti}) ---"
         doc = r.get("document", "") or ""
-        cost = len(sep) + len(doc) + 2
+        # Priced as the bytes that will actually be emitted, newlines included,
+        # rather than as parts plus a guessed constant for the joins.
+        cost = measure(f"{sep}\n{doc}\n")
         if used + cost > budget:
             # Truncate rather than drop when nothing has been included yet: a
             # single oversized exchange should still contribute its opening,
             # which is where the answer to "what were we talking about" lives.
             # Once something is in, prefer whole exchanges over ragged ones.
             if kept == 0:
-                room = max(0, budget - used - len(sep) - 2)
-                if room > 200:
-                    lines.append(sep)
-                    lines.append(doc[:room].rstrip() + "\n[...truncated to fit the retrieval budget]")
-                    kept = 1
+                room = budget - used - measure(f"{sep}\n\n")
+                if room > _MIN_TRUNCATED_TOKENS:
+                    body = _longest_prefix_within(doc, room, measure)
+                    if body.strip():
+                        lines.append(sep)
+                        lines.append(body.rstrip() + _TRUNCATION_NOTE)
+                        kept = 1
             break
         lines.append(sep)
         lines.append(doc)
         used += cost
         kept += 1
 
+    if kept == 0:
+        if ordered:
+            logger.info(
+                f"retrieval block: kept 0 of {len(ordered)} exchange(s) — "
+                f"nothing fits the {MAX_RETRIEVAL_TOKENS}-token budget "
+                f"(COMPACTOR_MAX_RETRIEVAL_TOKENS); no block injected"
+            )
+        return None
+    block = "\n".join(lines)
     if kept < len(ordered):
+        # Names the counter that made the decision, because "kept 2 of 3" with
+        # no unit was how a character sum passed for a token figure for a whole
+        # release (A4, and A9's general complaint).
         logger.info(
             f"retrieval block: kept {kept} of {len(ordered)} exchange(s) "
             f"within the {MAX_RETRIEVAL_TOKENS}-token budget "
-            f"(COMPACTOR_MAX_RETRIEVAL_TOKENS)"
+            f"(COMPACTOR_MAX_RETRIEVAL_TOKENS) — block measures ~"
+            f"{measure(block)} token(s) by "
+            f"{'the caller-supplied counter' if count_tokens else 'the local estimate'}"
         )
-    if kept == 0:
-        return None
-    return "\n".join(lines)
+    return block

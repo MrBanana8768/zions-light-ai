@@ -583,7 +583,7 @@ def test_start_backfill_if_needed_idempotent_in_same_process():
     ]
     fired = []
 
-    def fake_fire(coro):
+    def fake_fire(coro, label=None):
         # Don't actually run the coro — just count the spawn.
         fired.append(coro)
         coro.close()  # avoid "never awaited" warnings
