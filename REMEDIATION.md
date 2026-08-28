@@ -20,8 +20,11 @@ Four passes, in order:
 2. **Two follow-up review passes** on the incident report itself. Each found live data-destruction paths the report had missed. That is the reason for pass four.
 3. **Two independent full-codebase reviews** — one on correctness and data integrity, one on operational resilience — run without sight of each other.
 4. **A reconciliation pass** that re-checked every `file:line` claim from both reviews against the tree, adjudicated their conflicts, killed eight load-bearing claims that were wrong, and added three findings neither reviewer produced.
+5. **A second production incident, 2026-08-28**, after this document was already written. The token counter read 23% low on a live payload and 34–51% low on assistant content; the hard budget guard shed 60 of 65 turns and returned HTTP 200. Written up in [`INCIDENT_2026-08-28.md`](INCIDENT_2026-08-28.md). It produced **P0-0c**, **P0-0d**, **P0-0e**, and a correction to P0-0's stated root cause.
 
-**`INCIDENT_2026-08-24.md` is the background. This document is the action list.** You do not need to read the incident report to implement this. Read it if you want to understand why the tone here is what it is.
+**`INCIDENT_2026-08-24.md` and `INCIDENT_2026-08-28.md` are the background. This document is the action list.** You do not need to read either report to implement this. Read them if you want to understand why the tone here is what it is.
+
+**A note on pass 5, because it bears on how to read the rest.** P0-0 was written confidently, three days before the outage, and was *partly wrong* — right that the counter was broken, wrong about why, wrong about how the error scaled. A correct-sounding root cause cost hours during a live incident. Treat every diagnosis in this document as a hypothesis with a `file:line` attached, and check the line.
 
 ### What this supersedes
 
@@ -124,7 +127,20 @@ Ships in v3.1 like everything else, but these are the first commits, they are ne
 1. **jinja2 was not installed.** `apply_chat_template` renders a Jinja template; jinja2 is an *optional* transformers dependency. `compactor/requirements.txt` pinned `transformers==5.12.1` with the comment *"transformers is used tokenizer-only… Keeps the compactor venv lean."* That decision — correct in its own terms, isolating the compactor from vLLM's torch pins — removed chat templating without anything saying so. So tier 1 could not work for **any** model, ever.
 2. **The served model carries no chat template.** `coder3101/Cydonia-24B-v4.3-vision-heretic` has no `chat_template.jinja` — confirmed by a `.no_exist/` marker in the HF cache. The text-only variant it replaced *does* have one. `apply_chat_template` raises `ValueError: tokenizer.chat_template is not set` before jinja2 is reached, so cause 2 masked cause 1 during diagnosis. The tokenizer loads as `TokenizersBackend` converted from `tekken.json` — Mistral's native format — so vLLM is applying its template through mistral-common, entirely outside HF's `chat_template` attribute.
 
-**Consequence.** Every token count the system has ever produced omits chat-template framing — roughly **22 tokens per message** on Mistral. The error scales with *message count*, not content length, which is why a long conversation of short turns overflows while a short one of long turns does not. Observed live: a ~200-message conversation counted ~5,250 tokens light against a 32,768 window, producing repeated 400s.
+**Consequence.** Every token count the system has ever produced omits chat-template framing — roughly **22 tokens per message** on Mistral, scaling with *message count*. Observed live: a ~200-message conversation counted ~5,250 tokens light against a 32,768 window, producing repeated 400s.
+
+> **CORRECTED 2026-08-28 — framing is the minor term.** The paragraph above was written before the outage in [INCIDENT_2026-08-28.md](INCIDENT_2026-08-28.md) and its scaling law is **backwards for the case that actually took production down**. Framing overhead is real, but it cannot produce the errors since measured:
+>
+> ```
+> live payload:      local=122106  vLLM=150050   scale=1.23x
+> one decorative rule: local=15      vLLM=809      scale=53.93x
+> ```
+>
+> The dominant term is **vocabulary mismatch on content**. The HF-converted `tekken.json` prices box-drawing characters and emoji far below `mistral_common`, which is what vLLM actually charges. Measured per role: system reads high, user reads ~9% high, **assistant reads 34–51% low**. One assistant reply held 1,710 × U+2501 and 441 × U+2500 — about **4,275 tokens, 13% of the window, in decoration**.
+>
+> So the error scales with **content**, not message count, and it is worst on exactly what the model generates. An implementer optimising for per-message framing would have fixed nothing. Both terms are real; only one caused the outage.
+>
+> **Neither is worth estimating.** See **P0-0c** — the fix is to stop estimating.
 
 **Why it is S1 and not S2.** It is the input to every budget decision in the system: the hard-budget guard, the compaction trigger, and the shedding arithmetic all consume this number. The v3.0.5 calibration loop exists to correct it and cannot — see P0-0b.
 
@@ -170,6 +186,92 @@ The margin advanced by exactly 127 each time — the conversation's own growth p
 **Also.** `_BUDGET_MARGIN` is a module global (`main.py:194`), so every learned correction is lost on restart. Confirmed live: a pod recreate mid-diagnosis reset it to 0 and the climb started over. Persist it per conversation, or accept that the first long conversation after every restart eats a 400 — and say so in the log if so.
 
 **Ordering: P0-0 before P0-0b.** Fixing the arithmetic while the counter is blind only makes a wrong number converge faster.
+
+> **SUPERSEDED IN PART 2026-08-28.** With P0-0c shipped, the guard measures the payload exactly rather than estimating it, so there is nothing left for the loop to calibrate *away*. Fix the arithmetic anyway — the loop is still the fallback path when `/tokenize` is unreachable — but treat `_BUDGET_MARGIN` as a degraded-mode mechanism, not the primary one, and demote its severity accordingly.
+
+---
+
+#### P0-0c · Budget against measured tokens, not estimated ones
+**S1.** `main.py` (`count_tokens_exact`, `_enforce_hard_budget`, `_chunk_to_budget`)
+
+**Root cause of [INCIDENT_2026-08-28.md](INCIDENT_2026-08-28.md). Shipped as a production hotfix; on `fix/v3.1-remediation`.**
+
+The compactor decided what the user would be allowed to say to the model using an *estimate* of a quantity the enforcing server computes exactly, on request, over localhost, in single-digit milliseconds. `/tokenize` was running the whole time.
+
+The rule, stated generally because it outlives this bug:
+
+> **A component that budgets against a limit must verify its arithmetic against the authority that enforces that limit.**
+
+Three properties made the violation undetectable, and all three recur elsewhere in this codebase:
+
+1. **Shared oracle.** Guard, compaction trigger, and summarizer all called `count_tokens`. Disagreement would have been a signal; agreement was worth nothing, and agreement is what monitoring saw.
+2. **Content-tracking error.** Worst on long decorated assistant replies, so it looked like "long conversations are hard."
+3. **Fluent degradation.** Every fallback downstream was graceful. Composed, they produced a system that lied — see **P0-0d**.
+
+**Shipped.** `count_tokens_exact(messages)` posts to `{VLLM_URL}/tokenize`, short connect timeout, once-per-process warning, returns `None` rather than raising. Wired into the guard (real payload + derived `scale` for per-message arithmetic), the guard's verify step (re-measure, do not trust the scaled estimate), and the summarizer (measure before `_chunk_to_budget`).
+
+Verified against the live conversation:
+
+```
+guard:       150050 -> 15155  (limit 16384)  FITS
+summarizer:  NEW (measured)  5 batches, largest=29909  FITS
+             OLD (scale 1.0) 4 batches, largest=36280  OVERFLOWS -> 400
+```
+
+**The summarizer half is the decisive one.** The guard was the visible symptom; it only ever ran on the full conversation because summarization was failing first.
+
+**Still to do.**
+- **A test that would have caught this.** Budget a known payload, assert the local count matches `/tokenize` within a stated tolerance — **against tokenizer-hostile content** (box-drawing, emoji, CJK), not prose. Prose is where the two tokenizers agree; a test written on prose passes and proves nothing.
+- **Fail loudly when `/tokenize` is unreachable at boot.** Today it degrades to the estimate silently after one warning. The self-test should assert the endpoint answers, so "we are flying on the estimate" is a startup fact rather than a log line from three days ago.
+- **Cache per-message counts.** One `/tokenize` per request is cheap; per-message is not. The `scale` factor exists to avoid that and is an approximation — bound it, and re-measure exactly at the verify step (already done).
+
+**Do not touch `GENERATION_RESERVE` on the strength of the guard table.** That table measures *input*; the reserve exists for *output*. This user's assistant replies measure **7,513–11,347 tokens**, so the 2,048 the table appears to recommend would truncate nearly every reply mid-sentence — trading a context bug for a worse one. Keep **16,384**, or 12,288 if headroom is genuinely needed. *A headroom parameter cannot be tuned from a table that does not contain the thing it reserves for.*
+
+---
+
+#### P0-0d · Fluent degradation — three fallbacks that cannot say they fired
+**S1.** `main.py` (`_enforce_hard_budget`, compaction failure path), `summarizer.py`
+
+Ranked S1 because this is what converted a loud, immediately-diagnosable 400 into a silent week-long context collapse. The counter bug was the cause; **this is why nobody found out.**
+
+Three paths, one shape:
+
+| Path | What it does on failure | What the user sees |
+|---|---|---|
+| `_enforce_hard_budget` | sheds oldest turns until the payload fits | HTTP 200, fluent reply, **4 of 65 messages** |
+| compaction on summarizer 400 | forwards the original messages | nothing — and the full conversation now hits the guard on *every* request |
+| `count_tokens` tier fallback | silently drops to a worse estimator | one WARNING, once per process (P0-0) |
+
+**Fix.**
+- **Guard shedding is an ERROR when it discards conversational turns**, not a WARNING, and the message must state the ratio — `kept=4 of 65` — not just the token totals. A log line that reports only tokens reads like successful housekeeping. This is already partly done on `fix/v3.1-remediation`; finish it and check the phrasing.
+- **Compaction failure must be visible in the response**, not only in a log. `FRONTEND_SPEC.md` §15 already lists the budget-shed signal as **required**; this is the compactor half of the same obligation (§2.7). The spec's `context_shed` notice deliberately distinguishes *discarded* from *compressed* — honour that distinction in the signal.
+- **Emit the ratio in the per-request log line** unconditionally, so the healthy case is legible and the unhealthy case is a diff rather than an inference.
+
+**The general rule:** *a fallback that cannot signal that it fired is not a fallback; it is a cover-up.*
+
+---
+
+#### P0-0e · Deploy hygiene — a patch must be verified against the commit it lands on
+**S2.** CI, `OPERATIONS.md`
+
+Problem B of [INCIDENT_2026-08-28.md](INCIDENT_2026-08-28.md). The hotfix failed on start:
+
+```
+ImportError: cannot import name 'StoreUnreadable' from 'memory'
+```
+
+A single `main.py` was lifted from `fix/v3.1-remediation` and dropped onto a pod running v3.0.5. The symbol exists only in the branch's `memory.py`; the dependency did not travel with the file. Production stayed degraded through the rollback.
+
+**The same class of error recurred five times this week** — a symbol referenced but not imported, or not present in the module it landed in (`memory.StoreUnreadable`, `assert_in`, an unimported `StoreUnreadable` in `commands.py`, and two variants). Every one dies on import.
+
+**Fix — two lines and a rule.**
+
+1. **Import smoke test in CI and in the pre-deploy path.** `selftest.py` runs *inside* an already-working process, so by construction it cannot catch a module that fails to import at all. Nothing currently covers this.
+   ```bash
+   python -c "import compactor.main, compactor.memory, compactor.commands"
+   ```
+2. **Build hot patches from the deployed tag**, in a worktree, changing only what the fix requires — never by copying a file out of a feature branch. Record this in `OPERATIONS.md` beside the standing "production runs tagged images" rule, since the hot-patch path is exactly where that rule gets relaxed and therefore exactly where it needs written guidance.
+3. **Staged files must be named `.py`.** `spec_from_file_location` returned `None` on `main.py.new` and produced `AttributeError: 'NoneType' object has no attribute 'loader'` — a confusing second failure on top of the first.
 
 ---
 
@@ -665,7 +767,13 @@ These are the traps that turn a fix into an incident. Each is stated as *X befor
 8. **V9 (store pollution) before V10's health-scan work is meaningful.**
    Because: F12 is O(conversations), and G2 currently guarantees that N grows monotonically forever. Caching an O(N) scan whose N is unbounded postpones the problem rather than fixing it.
 
-9. **F27 (`stopwaitsecs`) with F16's `drain(60)`, not before it.**
+9. **P0-0c (measure via `/tokenize`) before P0-0b (calibration arithmetic), and before any tuning of `GENERATION_RESERVE`.**
+   Because: the calibration loop exists only to grope toward a number `/tokenize` returns directly. Fix the measurement and the loop becomes a degraded-mode fallback rather than the primary path, which changes what "correct" means for its arithmetic. And per P0-0c's closing note, the guard table that appears to justify a smaller reserve measures *input* while the reserve exists for *output* — tuning it from that table truncates replies that measure 7,513–11,347 tokens.
+
+10. **P0-0e (import smoke test) before anything is hot-patched onto a running pod, in any circumstance.**
+   Because: it is two lines, it catches the class of error that has now cost a deployment five times, and the moment it matters most is exactly when nobody has time for it. `selftest.py` cannot substitute — it runs inside a process that has already imported successfully.
+
+11. **F27 (`stopwaitsecs`) with F16's `drain(60)`, not before it.**
    Because: raising the drain timeout without raising `stopwaitsecs` means supervisord `SIGKILL`s the process mid-drain — strictly worse than today. They are one change.
 
 ---

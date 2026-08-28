@@ -116,6 +116,17 @@ These are requirements, not aspirations. Each traces to a principle in
    in the thread, and today none of that reaches her. The client-side
    instantiation is §4.1 and §12; the compactor-side instantiation is the
    budget-shed signal in §15, which is **required**, not optional.
+
+   The 2026-08-28 outage is the reference case for the server half, and it is
+   worse than the client half that motivated this obligation. The client sent a
+   complete 65-message conversation. The compactor, budgeting against a token
+   count that read 23–51% low, shed 60 of 65 turns and handed the model **4
+   messages** — then returned HTTP 200 with a fluent reply. The user's report
+   was not "an error occurred"; it was that the assistant had forgotten who she
+   was. Every layer logged success. **No number anywhere in the product was
+   wrong — the number that would have been wrong was never computed.** That is
+   the failure mode this obligation exists to make impossible, and it is why
+   §12's receipt reports server-admitted messages rather than client-sent ones.
    *(Principle 6: never paper over a failure. Principle 2: claim nothing
    unearned. Written after 2026-08-24, when a 241-message conversation sent 7
    messages with no signal of any kind.)*
@@ -727,7 +738,8 @@ true.
 | `backend_starting` | 503 / `MODEL_RESTART` | it's coming up; retry shortly |
 | `request_rejected` | 4xx / `REQUEST_REJECTED` | our side couldn't process it |
 | `backend_fault` | 502 non-JSON | upstream returned something unusable |
-| `context_trimmed` | budget shedding fired | older turns were dropped to fit — *the user deserves to know when history stopped reaching the model* |
+| `context_trimmed` | memory was *compressed* to fit — compaction, image retention, summary rollup | older material is still represented, in a denser form |
+| `context_shed` | turns were *discarded* — server-side budget shedding dropped whole messages | **distinct from trimmed on purpose.** Trimmed means compressed; shed means gone from this request. On 2026-08-28 the compactor shed 62 of 65 turns on every message and reported success at WARNING; the user experienced an assistant that had forgotten her, and nothing anywhere said so |
 | `offline` | network failure | the client cannot reach the backend |
 | `unsupported_file` | modality/sniffing refusal | this file type can't be read |
 | `context_truncated` | realised send set ≠ `window_intent` (§4 rule 7) — **client-side, no server ask needed** | only N of M messages would have reached the model; the request was not sent |
@@ -742,12 +754,34 @@ self-test result (`/admin/selftest`).
 **The context receipt.** Notices fire on anomaly; the receipt makes the normal
 case legible so the anomaly is noticeable. Always available for the active
 conversation, without a dashboard: messages on the active path, messages in the
-conversation, branch count, and **how many messages the last request actually
-carried**. No user of this client should ever be in the position of being unable
-to tell that 7 of 241 messages were sent.
+conversation, branch count, and **how many messages reached the model.**
 
-`context_trimmed` reports *server-side* shedding and depends on the budget-shed
-signal in §15, now a required ask. `context_truncated` is the client's own and
+That last field is not "how many the client sent," and the difference is the
+whole point. On 2026-08-28 the client sent all 65 messages and the compactor
+admitted **4** — it shed the rest to fit a budget it was computing wrongly. A
+receipt reading "65 sent" would have been accurate and worthless. The receipt
+must report what the server ADMITTED, which the client cannot know on its own
+and which is why the received-context echo (§15) is a required ask rather than a
+convenience.
+
+State it as a fraction of what exists, not a count of what moved:
+*4 of 65 messages reached the model.* No user of this client should be unable to
+tell that, whether the loss happened on their side of the wire or ours.
+
+**Per-message token cost.** Alongside the receipt, show what each message cost
+in tokens, from the server's own count. This is cheap once the echo exists, it
+is diffable rather than interpretive so it satisfies §7's authorship test, and
+it is the single most useful thing this client can show an operator: on
+2026-08-28 one assistant reply cost 8,988 tokens, **4,275 of them decorative
+box-drawing characters the model had emitted**. That was invisible for weeks and
+would have been obvious in a day.
+
+`context_trimmed` and `context_shed` both report *server-side* loss and both
+depend on the budget-shed signal in §15, now a required ask. Keep them separate:
+trimmed means the material was compressed and is still represented, shed means it
+was discarded from the request. Collapsing them would have made 2026-08-28 look
+like routine housekeeping, which is precisely how it read in the logs.
+`context_truncated` is the client's own and
 depends on nothing — the 2026-08-24 truncation happened entirely client-side,
 with no budget event and no error, and any implementer who reads this section as
 "blocked on the compactor" has misread it. Both matter for the same reason: on
@@ -776,15 +810,32 @@ Every bar above is performance, accessibility, or presentation. §4.1 is the
 document's central argument, so correctness gets bars too:
 
 - **Context fidelity (zero tolerance):** the set of messages sent equals the set
-  the receipt reports, on every request. A test suite asserts this against
-  adversarial chains: multi-root, missing parent, deep-versus-current divergence,
-  mixed key spaces, mid-chain failure, and the standing 241/5/8 case.
+  §4 rule 7 recorded as the intent, on every request. A test suite asserts this
+  against adversarial chains: multi-root, missing parent, deep-versus-current
+  divergence, mixed key spaces, mid-chain failure, and the standing 241/5/8 case.
+  This bar covers the client's own truncation only. The receipt (§12) reports a
+  *different* number — what the server admitted — and the two are allowed to
+  differ; what is never allowed is for the difference to go unshown.
 - **No silent state mutation:** an automated test asserting that no code path
   moves the current leaf or alters chain structure without emitting a typed
   notice.
 - **Integrity check cost:** the §4.1 checklist runs on load and pre-send within a
   stated budget on a 500-message, multi-branch conversation — the same shape as
   the 500-message scroll bar above.
+- **Budget verification (binds any layer that budgets):** a component that trims,
+  sheds, or batches against a token limit must verify its arithmetic against the
+  authority that *enforces* that limit, never against a local estimate of it.
+  §4.1 specifies one number — the message chain — with five named invariants and
+  a list of forbidden substitutes. The budget had nothing comparable, and on
+  2026-08-28 it was reading 23–51% low on assistant content, in production, for
+  weeks: every layer that might have caught it was consulting the same wrong
+  oracle. The bar is falsifiable — a test that budgets a known payload and
+  asserts the component's count matches the enforcing server's within a stated
+  tolerance, run against content that stresses the tokenizer (box-drawing,
+  emoji, CJK), not against prose. `MEMORY_REVIEW` §5.5 observes that there is no
+  measurement of whether memory helps. Add: **there was no measurement of
+  whether the budget was right.**
+
 - **Diagnosability:** one command reports `total / current_leaf /
   chain_from_current / deepest / roots` for any conversation. That five-tuple is
   what finally settled the 2026-08-24 diagnosis after hours; this client should
@@ -839,7 +890,8 @@ the decision.
 | **CORS configuration** | **required** | split origin |
 | **Server-side turn sequence.** Persist `turn_seq` per `conv_id` (natural home: the summaries state file, beside `last_summarized_turn`), increment it in `_async_tail`, and replace `turn_index = len(messages) + 1` at [main.py:1202](compactor/main.py:1202) with `turn_seq + 1` | **required** | the compactor's only notion of conversational position is the client's message-array length. Under §4 rule 2 that is a constant, so for a spec-compliant client every exchange overwrites the same ChromaDB document ([retrieval.py:144](compactor/retrieval.py:144)), `recent_cutoff` stays ~0 and retrieval returns nothing ([main.py:1346](compactor/main.py:1346)), and `_needs_l1_rollup` is never true ([summarizer.py:187](compactor/summarizer.py:187)). **The memory architecture is inert against the client this spec describes until this lands.** |
 | **Guard the destructive write.** When `turn_index` would regress below the stored high-water mark, allocate `turn_seq + 1` rather than upserting over the existing row | **required** | independent of any heuristic; this is what prevents a short window from overwriting an existing episodic row |
-| **Received-context echo.** Return, as a response header or SSE preamble, the triple the compactor already logs at [main.py:1192](compactor/main.py:1192): resolved `conv_id`, resolution `source` (`header`\|`body_metadata`\|`hash`), and messages received | **required** | gives the client independent confirmation of what actually arrived, and powers `context_truncated` and `conv_id_fallback` from the server's view rather than the client's self-report. The compactor currently sets **no custom response headers anywhere**, so this is new surface — build it as the shared mechanism the budget-shed signal also uses |
+| **Received-context echo.** Return, as a response header or SSE preamble: resolved `conv_id`, resolution `source` (`header`\|`body_metadata`\|`hash`), **messages received**, **messages admitted** (survivors of every budgeting stage), **exact prompt tokens**, and **headroom against the limit** | **required** | received-vs-admitted is the whole ask. On 2026-08-28 the client sent 65 and the compactor admitted 4; an echo of what merely *arrived* would have confirmed 65 and been useless. Admitted is the number §112's receipt reports, and the client cannot compute it. Token figures must come from vLLM's `/tokenize`, not a local estimate — see §13's budget-verification bar for why. The compactor currently sets **no custom response headers anywhere**, so this is new surface; build it as the shared mechanism the budget-shed signal also uses |
+| **Per-message token cost** in the echo — a parallel array of exact per-message counts | recommended | powers the cost display in §12. One 2026-08-28 reply cost 8,988 tokens with 4,275 of them in decorative box-drawing characters; nothing in the product could show that, and it was the proximate cause of a week of context collapse |
 | **Budget-shed signal** (response header or SSE event when hard-budget shedding, image stripping, or compaction removes content) | **required** *(was nice-to-have)* | `_enforce_hard_budget` sheds oldest turns, `_strip_image_parts` / `_apply_image_retention` remove content the user can still see in the thread, and none of it reaches her. Obligation §2.7 binds every layer that composes the context; leaving this optional exempts the compactor from the rule and leaves a live silent-truncation defect in production |
 | **Task-traffic marker.** Accept and require an explicit request-kind marker, and skip the memory tail for requests with no prior assistant turn | **required** | `_async_tail` fires unconditionally on `if conv_id:`; a `msgs=1` background call therefore hashes to a stable conv_id and writes facts. `<phantom-conv>` holds 105 facts and is still accruing as of 2026-08-24 |
 | **Injected-memory endpoint** (what facts/RAG/summary went into a given turn) | **recommended** *(was nice-to-have)* | powers "What it was given" (§7) and the memory half of the context receipt (§12). The transcript half is the client's own payload and needs no server help |
