@@ -201,7 +201,7 @@ not.
    turn changes — the exact defect that orphaned a conversation's memory in
    v3.0.1. **The client must also be able to confirm which path the compactor
    actually used.** On 2026-08-24 the compactor logged
-   `conv_id=6aca8bcdf603d584 source=hash msgs=7`: OpenWebUI was on the forbidden
+   `conv_id=<scratch-conv> source=hash msgs=7`: OpenWebUI was on the forbidden
    fallback path and had no way to know. A client that believes it is sending
    `X-Conversation-Id` but is being resolved by hash has a bug it cannot
    otherwise observe. See the received-context echo in §15.
@@ -841,7 +841,7 @@ the decision.
 | **Guard the destructive write.** When `turn_index` would regress below the stored high-water mark, allocate `turn_seq + 1` rather than upserting over the existing row | **required** | independent of any heuristic; this is what prevents a short window from overwriting an existing episodic row |
 | **Received-context echo.** Return, as a response header or SSE preamble, the triple the compactor already logs at [main.py:1192](compactor/main.py:1192): resolved `conv_id`, resolution `source` (`header`\|`body_metadata`\|`hash`), and messages received | **required** | gives the client independent confirmation of what actually arrived, and powers `context_truncated` and `conv_id_fallback` from the server's view rather than the client's self-report. The compactor currently sets **no custom response headers anywhere**, so this is new surface — build it as the shared mechanism the budget-shed signal also uses |
 | **Budget-shed signal** (response header or SSE event when hard-budget shedding, image stripping, or compaction removes content) | **required** *(was nice-to-have)* | `_enforce_hard_budget` sheds oldest turns, `_strip_image_parts` / `_apply_image_retention` remove content the user can still see in the thread, and none of it reaches her. Obligation §2.7 binds every layer that composes the context; leaving this optional exempts the compactor from the rule and leaves a live silent-truncation defect in production |
-| **Task-traffic marker.** Accept and require an explicit request-kind marker, and skip the memory tail for requests with no prior assistant turn | **required** | `_async_tail` fires unconditionally on `if conv_id:`; a `msgs=1` background call therefore hashes to a stable conv_id and writes facts. `31365d633335bbd0` holds 105 facts and is still accruing as of 2026-08-24 |
+| **Task-traffic marker.** Accept and require an explicit request-kind marker, and skip the memory tail for requests with no prior assistant turn | **required** | `_async_tail` fires unconditionally on `if conv_id:`; a `msgs=1` background call therefore hashes to a stable conv_id and writes facts. `<phantom-conv>` holds 105 facts and is still accruing as of 2026-08-24 |
 | **Injected-memory endpoint** (what facts/RAG/summary went into a given turn) | **recommended** *(was nice-to-have)* | powers "What it was given" (§7) and the memory half of the context receipt (§12). The transcript half is the client's own payload and needs no server help |
 | **Context-starvation warning.** Compare the arriving message count against the conversation's own high-water mark — `last_summarized_turn` and `max(added_turn)` over facts are already loaded in the same request — and emit a warning event when the client is far below it. If the client declares `X-History-Total`, the check becomes arithmetic rather than a heuristic | recommended | catches *any* client's truncation bug, including this one's. Two branches with different epistemic status: a declared total below the server high-water mark is a fact; an undeclared short window is a suspicion. Do not collapse them, and **never refuse on either** — a 4xx breaks first requests after a browser reset, restored backups, window migrations, and fork targets, and turns "the AI lost my history" into "the AI refuses to talk to me" |
 | **Modality endpoint** (does the served model accept images?) | nice-to-have | lets the client disable upload *before* failure (§8) |
@@ -988,7 +988,7 @@ the difference between hours and minutes of diagnosis:
 15. **Unsettled measurement.** It is not yet established whether the 8-message
     branch ran in the conversation's real memory namespace or a fresh empty one.
     Hashing the chat's true original first user message and comparing it to
-    `6aca8bcdf603d584` settles it, and it changes what the incident is called:
+    `<scratch-conv>` settles it, and it changes what the incident is called:
     context starvation with intact memory, or memory-namespace orphaning. Until
     it is run, the spec asserts the count (`msgs=7`) and the invariant, not the
     identity of the seven messages.

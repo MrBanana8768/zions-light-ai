@@ -272,7 +272,7 @@ an occupied odd id and destroys what was there. The 2026-08-24 shape (7 of 241)
 landed on an even id and got away with it; 6 of 241 would not have.
 
 `REMEDIATION.md:622` already records the production instance this analysis did
-not have: phantom conversation `31365d633335bbd0` has **105 facts and one
+not have: phantom conversation `<phantom-conv>` has **105 facts and one
 episodic row** — the collision running to completion.
 
 This is the only path in the system that destroys a stored memory with no log
@@ -1089,6 +1089,6 @@ about the state of its own memory, and where does the person see it?
 
 *Probe and benchmark scripts used for this review live in the session scratchpad
 and are disposable:*
-`C:\Users\rngge\AppData\Local\Temp\claude\D--Projects-zions-light-ai\4093b5b3-15e5-4911-b9b1-44038fc21dcb\scratchpad\`
+`C:\Users\rngge\AppData\Local\Temp\claude\D--Projects-zions-light-ai\<session-id>\scratchpad\`
 *(`probe/`, `work/`, `q/`, `adv/`). Nothing in the repository tree was modified
 in the course of producing this document.*
