@@ -81,6 +81,7 @@ from collections import OrderedDict
 
 import httpx
 
+import facts as facts_module
 import retrieval as retrieval_module
 
 logger = logging.getLogger("compactor.dedup")
@@ -463,6 +464,23 @@ async def llm_merge_candidate(
     # Minimal sanity: too short isn't a real fact.
     if len(cleaned) < 6:
         return None, "short"
+    # v3.1.1: the SAME predicate the extraction path uses. is_storable_fact's
+    # own docstring names this call site — the store has more than one write
+    # path and they must share one definition rather than grow three.
+    #
+    # This matters MORE here than at extraction, not less. Extraction storing a
+    # code fence adds one junk row. A merge storing one REPLACES every fact in
+    # the cluster with it: the model is asked for a canonical line, and if it
+    # answers with "```json" or a heading or a rule, that line becomes the
+    # record and the real facts it was built from are gone. The live store
+    # already carried scaffolding from the extraction path; nothing stopped it
+    # arriving by this one, which destroys rather than merely clutters.
+    if not facts_module.is_storable_fact(cleaned):
+        logger.warning(
+            f"dedup: merged text is not a storable fact "
+            f"({cleaned[:60]!r}); cluster of {len(cluster_facts)} preserved"
+        )
+        return None, "markup"
     # V7: a merge is a rewording of the cluster, not a summary of it. A
     # reply materially shorter than the shortest fact it would replace has
     # dropped information; the facts it came from are the better record.

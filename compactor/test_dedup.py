@@ -276,6 +276,42 @@ def test_llm_merge_returns_none_on_trivially_short_merge():
               "a real merge of the same cluster still passes")
 
 
+def test_llm_merge_rejects_markup_as_canonical_text():
+    print("\n[test] llm_merge_candidate: markup is never stored as the canonical fact")
+    # Long enough inputs that the V7 length floor cannot be what rejects the
+    # markup — otherwise this test would pass for the wrong reason.
+    cluster = [
+        _fact("Elena keeps a workshop on the north side of the river"),
+        _fact("Elena's workshop is north of the river in the old quarter"),
+    ]
+
+    async def go(resp):
+        client = MagicMock()
+        client.post = AsyncMock(return_value=_mock_chat_response(resp))
+        return await dedup.llm_merge_candidate(client, "http://fake", "m", cluster)
+
+    # These shapes were all present in a live fact store, arrived there via the
+    # EXTRACTION path, and nothing stopped them arriving by this one. The
+    # consequence differs: extraction adds a junk row, a merge REPLACES the
+    # whole cluster with it, so the real facts would be destroyed.
+    for markup in (
+        "```json",
+        "# Current Status Report",
+        "━" * 40,
+        '"follow_ups": [',
+        "## Immediate Action Taken:",
+    ):
+        text, reason = asyncio.run(go(markup))
+        assert_eq((text, reason), (None, "markup"),
+                  f"markup rejected, cluster preserved: {markup[:24]!r}")
+
+    # The control: the guard must not be so broad that it refuses real merges.
+    # A fact may legitimately contain punctuation and still be a fact.
+    ok = "Elena's workshop is on the north side of the river, in the old quarter"
+    assert_eq(asyncio.run(go(ok)), (ok, "merged"),
+              "a genuine merge of the same cluster still passes")
+
+
 def test_llm_merge_strips_bullet_prefix():
     print("\n[test] llm_merge_candidate: strips bullet/number prefix from merged text")
     cluster = [_fact("a"), _fact("b")]
@@ -1007,6 +1043,7 @@ def _all_tests():
         test_llm_merge_handles_trailing_keep,
         test_llm_merge_returns_none_on_truncated_response,
         test_llm_merge_returns_none_on_trivially_short_merge,
+        test_llm_merge_rejects_markup_as_canonical_text,
         test_llm_merge_strips_bullet_prefix,
         test_llm_merge_returns_none_on_too_short_response,
         test_llm_merge_returns_none_on_network_failure,
