@@ -46,6 +46,25 @@ EMBEDDING_MODEL = os.environ.get(
 )
 RAG_TOP_K = int(os.environ.get("COMPACTOR_RAG_TOP_K", "5") or 5)
 
+# v3.1: a token budget for the retrieval block, which had none.
+#
+# Facts are capped by COMPACTOR_MAX_FACTS_TOKENS (1500) and each summary chunk
+# by COMPACTOR_L1_MAX_TOKENS (500). Retrieved exchanges were injected verbatim,
+# uncapped, however long they happened to be — and they are whole user+assistant
+# pairs from a model that writes at length.
+#
+# Observed in production 2026-08-27 on a 32k window. Same conversation, same
+# ~102 facts, same L1=5 summary stack, three requests:
+#     1retr -> ok    0retr -> ok    3retr -> vLLM 400, 33,127 tokens
+# Compaction had already reduced that request to 9,915 tokens; injection put it
+# over the window on its own. The only variable was the retrieved-hit count.
+#
+# 1500 mirrors the facts budget deliberately: no injected memory layer should be
+# able to outweigh the conversation it is meant to support.
+MAX_RETRIEVAL_TOKENS = int(
+    os.environ.get("COMPACTOR_MAX_RETRIEVAL_TOKENS", "1500") or 1500
+)
+
 # fastembed caches the ONNX model here. Baked into the image at build time
 # (NOT on /data) since the embedding model is static, not per-deployment.
 FASTEMBED_CACHE = os.environ.get("FASTEMBED_CACHE_PATH", "/opt/embeddings")
@@ -368,9 +387,57 @@ def format_retrieval_block(results: list[dict]) -> str | None:
     if not results:
         return None
     ordered = sorted(results, key=lambda r: r.get("turn_index", 0))
+
+    # Budget in characters: this module has no tokenizer (deliberately — it
+    # would drag transformers into the retrieval path).
+    #
+    # chars/4 is an approximation whose error depends on the text. Measured on
+    # the DEPLOYED tokenizer (vision-heretic; the image's ENV default is a
+    # different repo with different numbers): 4.10 chars/tok on this
+    # deployment's chat transcript, 4.28 on Python, 3.66 on markdown.
+    #
+    # Retrieved exchanges ARE chat text, so ~4.1 is the right central estimate
+    # and this budget lands close to nominal in practice. A markdown-heavy
+    # exchange overshoots by ~9% (~140 tokens); the densest file measured at
+    # 3.35 chars/tok would overshoot ~19% (~290 tokens). Both are small against
+    # a 32,768 window. An earlier draft called the 9% figure "the worst case" —
+    # it is the aggregate, and the real worst case is twice it.
+    #
+    # Acceptable either way: this cap's job is "never let this layer dominate
+    # the window", not exact accounting. _enforce_hard_budget does the exact
+    # accounting downstream.
+    budget = MAX_RETRIEVAL_TOKENS * 4
     lines = [_RETRIEVAL_BLOCK_HEADER]
+    used = len(_RETRIEVAL_BLOCK_HEADER)
+    kept = 0
     for r in ordered:
         ti = r.get("turn_index", "?")
-        lines.append(f"--- (turn ~{ti}) ---")
-        lines.append(r.get("document", ""))
+        sep = f"--- (turn ~{ti}) ---"
+        doc = r.get("document", "") or ""
+        cost = len(sep) + len(doc) + 2
+        if used + cost > budget:
+            # Truncate rather than drop when nothing has been included yet: a
+            # single oversized exchange should still contribute its opening,
+            # which is where the answer to "what were we talking about" lives.
+            # Once something is in, prefer whole exchanges over ragged ones.
+            if kept == 0:
+                room = max(0, budget - used - len(sep) - 2)
+                if room > 200:
+                    lines.append(sep)
+                    lines.append(doc[:room].rstrip() + "\n[...truncated to fit the retrieval budget]")
+                    kept = 1
+            break
+        lines.append(sep)
+        lines.append(doc)
+        used += cost
+        kept += 1
+
+    if kept < len(ordered):
+        logger.info(
+            f"retrieval block: kept {kept} of {len(ordered)} exchange(s) "
+            f"within the {MAX_RETRIEVAL_TOKENS}-token budget "
+            f"(COMPACTOR_MAX_RETRIEVAL_TOKENS)"
+        )
+    if kept == 0:
+        return None
     return "\n".join(lines)

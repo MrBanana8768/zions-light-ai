@@ -707,7 +707,11 @@ def _merge_consecutive_same_role(messages: list[dict]) -> list[dict]:
     return out
 
 
-def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list[dict]:
+def _enforce_hard_budget(
+    messages: list[dict],
+    limit: int | None = None,
+    protect_system: int = 1,
+) -> list[dict]:
     """Last line of defense: never forward a request that vLLM must reject.
 
     Everything upstream (compaction, facts, RAG, summary injection) is
@@ -741,10 +745,36 @@ def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list
         limit = max(256, limit - _BUDGET_MARGIN)
 
     # Prescreen: skip the (expensive) full tokenization when the char-based
-    # estimate is far under the limit. The estimate can undercount token-dense
-    # text, so the margin is 2x; a pathological miss just means the request
-    # reaches vLLM and gets the 400 this guard would otherwise have prevented —
-    # degraded, not corrupted.
+    # estimate is far under the limit.
+    #
+    # v3.1, measured. All figures below are the DEPLOYED tokenizer
+    # (coder3101/Cydonia-24B-v4.3-vision-heretic, per runpod.env.template) —
+    # the image's ENV default is a different repo and gives different numbers,
+    # which two earlier drafts of this comment mixed together.
+    #
+    #   this repo's root *.md, 451,819 chars   3.66 chars/tok   char/4 UNDER by 8.4%
+    #                            per-file range 3.35 - 4.21
+    #   this repo's *.py                       4.28             char/4 OVER by 7.0%
+    #   the production chat transcript         4.10             char/4 OVER by 2.5%
+    #
+    # Corpus sizes are given only where a future reader can reproduce them: the
+    # markdown figure is the root-level *.md files at 0b9fbaf. The .py character
+    # count from an earlier draft is deleted — it matched no coherent file set,
+    # and a number nobody can re-derive is worse than no number. The transcript
+    # was measured on the pod and cannot be checked from this repo.
+    #
+    # The sign flips with content: roughly +-8% either way. Do not restate this
+    # as one percentage — three drafts did, and all three were wrong. The 2x
+    # margin is what makes the skip safe without the estimate being accurate.
+    #
+    # The margin is not idle for another reason: _fast_token_estimate adds
+    # IMAGE_TOKEN_ESTIMATE per image, and that constant (4096) is roughly half
+    # the true cost of a Mistral3 vision tile. Images are the one input that
+    # can undercount here, and the 2x gap is what absorbs them. Retention=0
+    # currently strips every image before this runs, so it is dormant — but
+    # raise COMPACTOR_MAX_RETAINED_IMAGES and this margin is what stands
+    # between an underestimated photo and a 400. Do not narrow it without
+    # fixing COMPACTOR_IMAGE_TOKENS first.
     if _fast_token_estimate(messages) <= limit // 2:
         return messages
 
@@ -760,6 +790,7 @@ def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list
     running = total
     dropped = 0
     trimmed = 0
+    sys_dropped = 0
 
     for _round in range(6):
         # --- shed oldest non-system turns (arithmetic only) ---
@@ -782,13 +813,25 @@ def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list
             idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
 
         # --- trim the largest injected system block if turns weren't enough ---
+        #
+        # Same protection as the drop stage below, and for the same reason: the
+        # caller's system messages are the first `protect_system` of them, and
+        # halving a persona mid-sentence is a quieter version of deleting it.
+        # The first cut of this guard applied the protection to the drop loop
+        # only, so the caller's prompt was safe from removal and not from
+        # mutilation — which is worse, because the model still receives
+        # something that looks like instructions.
         while running > limit and trimmed < 32:
-            big = [
-                i for i, m in enumerate(msgs)
-                if m.get("role") == "system"
-                and isinstance(m.get("content"), str)
-                and len(m["content"]) > 400
-            ]
+            sys_seen = 0
+            big = []
+            for i, m in enumerate(msgs):
+                if m.get("role") != "system":
+                    continue
+                sys_seen += 1
+                if sys_seen <= max(1, protect_system):
+                    continue
+                if isinstance(m.get("content"), str) and len(m["content"]) > 400:
+                    big.append(i)
             if not big:
                 break
             i = max(big, key=lambda j: len(msgs[j]["content"]))
@@ -803,20 +846,64 @@ def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list
             running += per[i]
             trimmed += 1
 
+        # --- last resort: DROP injected system blocks entirely ---
+        #
+        # v3.1: halving was the only thing this guard could do to a system
+        # message, and injected memory IS a system message — so the one layer
+        # most able to overshoot was the one it could least touch. Observed
+        # 2026-08-27: "28054 -> 26565 tokens (limit 24576); dropped 0 old
+        # turn(s), trimmed 5 injected block(s)" — five halvings, still 2k over,
+        # forwarded anyway, 400.
+        #
+        # `protect_system` is how many system messages the CALLER sent, counted
+        # before injection. We only drop what we added. The first cut of this
+        # stage protected index 0 alone and would delete a caller's SECOND
+        # system message once injected memory was exhausted — destroying content
+        # the pre-v3.1 code would at worst have halved, in the one case
+        # (a single oversized user turn) where dropping it does not achieve the
+        # fit anyway. Memory the model cannot receive is worth less than a
+        # request that succeeds; the caller's own prompt is not ours to spend.
+        while running > limit:
+            sys_idxs = [i for i, m in enumerate(msgs) if m.get("role") == "system"]
+            if len(sys_idxs) <= max(1, protect_system):
+                break
+            i = sys_idxs[-1]
+            running -= per[i]
+            del msgs[i]
+            del per[i]
+            sys_dropped += 1
+
         # --- verify with a real full count; loop only if template overhead
         #     pushed us back over (each round does exactly ONE full count) ---
         running = count_tokens(msgs)
         if running <= limit:
             break
         idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
-        if len(idxs) <= 1 and trimmed >= 32:
+        sys_idxs = [i for i, m in enumerate(msgs) if m.get("role") == "system"]
+        if len(idxs) <= 1 and trimmed >= 32 and len(sys_idxs) <= 1:
             break  # nothing left to shed; forward best effort
 
-    logger.warning(
-        f"hard budget enforced: {total} -> {running} tokens "
-        f"(limit {limit}); dropped {dropped} old turn(s), "
-        f"trimmed {trimmed} injected block(s)"
+    detail = (
+        f"{total} -> {running} tokens (limit {limit}); dropped {dropped} old "
+        f"turn(s), trimmed {trimmed} injected block(s), dropped "
+        f"{sys_dropped} injected block(s) entirely"
     )
+    if running > limit:
+        # v3.1: this used to log at WARNING and read like a success — "hard
+        # budget enforced" while forwarding a payload the guard itself has just
+        # measured as too large. It is a failure of the thing whose entire job
+        # is to make vLLM's 400 impossible, and the 400 is now the expected
+        # outcome. Say so, at ERROR, with the shortfall, so it is findable
+        # before the user reports it rather than after.
+        logger.error(
+            f"hard budget FAILED to fit: {detail} — still "
+            f"{running - limit} token(s) over. Forwarding anyway (the newest "
+            f"turn is never dropped); vLLM will most likely reject this. A "
+            f"single turn larger than the budget, or a conversation with "
+            f"nothing left to shed, is the usual cause."
+        )
+    else:
+        logger.warning(f"hard budget enforced: {detail}")
     return msgs
 
 
@@ -1094,8 +1181,18 @@ async def _async_tail(
             if combined:
                 facts.save_facts(conv_id, kept)
             if new_entries or dropped:
+                # "pruned" read as deleted, and until v3.1 F9 it was: this call
+                # site did not pass conv_id, so eviction unlinked rather than
+                # archived. It was visible in production as `pruned 16` every
+                # turn on a store pinned at the token cap, and nobody could tell
+                # from the line that the conversation's oldest facts were gone
+                # for good. Say which it is.
+                churn = (
+                    f", archived {dropped} least-recently-used (recoverable "
+                    f"with /list-archive)" if dropped else ""
+                )
                 logger.info(
-                    f"conv={conv_id}: +{len(new_entries)} facts, pruned {dropped}, "
+                    f"conv={conv_id}: +{len(new_entries)} facts{churn}, "
                     f"total {len(kept)}"
                 )
         except StoreUnreadable as e:
@@ -1432,6 +1529,10 @@ async def chat_completions(request: Request) -> Any:
     touched_facts: list[dict] = []
     injected_blocks: list[str] = []
     log_parts: list[str] = []
+    # Bound before the summary load so the injection log line can name it even
+    # when that load fails — an unreadable summary is exactly when you want the
+    # rest of the line.
+    last_turn: object = "?"
     if conv_id:
         # --- Persona (Phase 8) ---
         # Two paths feed the persona layer:
@@ -1519,6 +1620,7 @@ async def chat_completions(request: Request) -> Any:
         # so this is a purely local read — no LLM call on the hot path.
         try:
             sstate = summarizer.load_state(conv_id)
+            last_turn = sstate.get("last_summarized_turn", "?")
             sblock = summarizer.format_summary_block(sstate)
             if sblock:
                 injected_blocks.append(sblock)
@@ -1535,7 +1637,19 @@ async def chat_completions(request: Request) -> Any:
             combined = "\n\n".join(injected_blocks)
             try:
                 body["messages"] = inject_system_block(body["messages"], combined)
-                logger.info(f"conv={conv_id}: injected memory [{' '.join(log_parts)}]")
+                # msgs= is repeated here from the request line ~230 lines
+                # earlier. That looks redundant and is not: on 2026-08-24 the
+                # whole diagnosis was two adjacent log lines nobody joined —
+                # a message count in one and the conversation's real size in
+                # the other. `msgs=7` beside `105fact(s)` is self-evidently
+                # wrong on sight; neither number is, alone. Also carries
+                # last_summarized_turn, the only server-side record of how far
+                # the conversation actually got, so a client sending a short
+                # window is visible without cross-referencing anything.
+                logger.info(
+                    f"conv={conv_id}: injected memory [{' '.join(log_parts)}] "
+                    f"msgs={len(messages)} lastturn={last_turn}"
+                )
             except Exception as e:
                 logger.warning(f"conv={conv_id}: memory injection failed (non-fatal): {e}")
 
@@ -1581,8 +1695,15 @@ async def chat_completions(request: Request) -> Any:
     )
     # Pure CPU (tokenizer) work — off the event loop so a shedding pass on a
     # huge conversation can't stall every other request and the healthchecks.
+    # How many system messages the CALLER sent, counted on the original array
+    # before compaction or injection touched it. The guard may spend what we
+    # added; it may not spend what the caller sent. Without this it would delete
+    # a caller's second system message once injected memory ran out — and in the
+    # only case that reaches (one user turn larger than the whole budget) doing
+    # so does not even achieve the fit.
+    caller_system = sum(1 for m in messages if m.get("role") == "system")
     body["messages"] = await run_in_threadpool(
-        _enforce_hard_budget, body["messages"], effective_limit
+        _enforce_hard_budget, body["messages"], effective_limit, caller_system
     )
     body["messages"] = _merge_adjacent_system_messages(body["messages"])
     # ...and non-system turns that ended up sharing a role (compaction hoists

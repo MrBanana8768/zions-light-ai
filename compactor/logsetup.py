@@ -73,6 +73,36 @@ def configure(level: int = logging.INFO) -> None:
     else:
         handler.setFormatter(logging.Formatter(_TEXT_FORMAT))
     root.addHandler(handler)
+    _quiet_third_parties()
+
+
+# Third-party loggers that say nothing we do not already say better, and say it
+# on every request. Raised to WARNING so a real failure still surfaces.
+#
+#   httpx            one "HTTP Request: POST … 200 OK" per vLLM call — roughly
+#                    half of every line in compactor-error.log, and redundant:
+#                    the compactor logs its own `vLLM HTTP 4xx` on failure and
+#                    the success case is the absence of that.
+#   huggingface_hub  repeats the same unauthenticated-requests warning forever.
+#                    It is advice about rate limits, not a condition; set
+#                    HF_TOKEN if the rate limit ever actually bites.
+#   chromadb /       startup chatter and per-operation telemetry. Their real
+#   fastembed        failures come back to us as exceptions we log ourselves.
+#
+# Deliberately NOT silenced: uvicorn (access lines are how you see traffic
+# reaching the proxy at all) and anything under `compactor.*`.
+_QUIET: dict[str, int] = {
+    "httpx": logging.WARNING,
+    "httpcore": logging.WARNING,
+    "huggingface_hub": logging.ERROR,
+    "chromadb": logging.WARNING,
+    "fastembed": logging.WARNING,
+}
+
+
+def _quiet_third_parties() -> None:
+    for name, level in _QUIET.items():
+        logging.getLogger(name).setLevel(level)
 
 
 # ---------------------------------------------------------------------------

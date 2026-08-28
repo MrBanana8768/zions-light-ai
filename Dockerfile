@@ -364,6 +364,12 @@ ENV AUDIO_TTS_OPENAI_API_KEY="not-needed"
 ENV AUDIO_TTS_MODEL="tts-1"
 ENV AUDIO_TTS_VOICE="alloy"
 
+# Log destination. supervisord.conf expands %(ENV_LOG_DIR)s at parse time and
+# refuses to start if it is unset, so the default lives here rather than only
+# in entrypoint.sh — a `docker run` that bypasses the entrypoint still boots.
+# /data is the network volume: logs must survive the container that wrote them.
+ENV LOG_DIR="/data/logs"
+
 # 3000 — OpenWebUI (user-facing)
 # 8080 — context-compactor (OpenAI-compatible, what OpenWebUI talks to)
 # 8000 — vLLM (internal; can also be exposed for direct API access)
