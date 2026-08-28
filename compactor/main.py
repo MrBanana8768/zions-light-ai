@@ -64,7 +64,6 @@ def _env_int(name: str, default: int) -> int:
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8000").rstrip("/")
 MODEL_REPO = os.environ.get("MODEL_REPO")
 MAX_MODEL_LEN = _env_int("MAX_MODEL_LEN", 32768)
-TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(MAX_MODEL_LEN * 0.75))
 KEEP_RECENT_TURNS = _env_int("COMPACTOR_KEEP_RECENT_TURNS", 4)
 SUMMARY_MAX_TOKENS = _env_int("COMPACTOR_SUMMARY_MAX_TOKENS", 1024)
 # Slack left inside MAX_MODEL_LEN when budgeting a summarization call's INPUT
@@ -73,10 +72,35 @@ SUMMARY_INPUT_RESERVE = _env_int("COMPACTOR_SUMMARY_INPUT_RESERVE", 2048)
 # Hard ceiling for what we will forward to vLLM. Anything above this is a
 # guaranteed 400, so the guard sheds content rather than letting the request
 # fail. The reserve leaves the model room to actually generate a reply.
-GENERATION_RESERVE = _env_int("COMPACTOR_GENERATION_RESERVE", 2048)
+#
+# 2026-08-28: was 2048. That is not enough room to reply. This user's assistant
+# turns measure 7,513-11,347 tokens, so a 2048 reserve means that whenever the
+# guard actually lets a prompt grow to its ceiling, the reply is cut off
+# mid-sentence. It has been masked in practice by two things: most prompts sit
+# well under the ceiling, and _apply_request_budget (below) takes
+# max(GENERATION_RESERVE, req_max_tokens), so a client that sends max_tokens
+# gets the room it asked for. Neither is a guarantee — a client that sends no
+# max_tokens and a conversation that reaches the ceiling is exactly the
+# combination that truncates.
+GENERATION_RESERVE = _env_int("COMPACTOR_GENERATION_RESERVE", 16384)
 # Clamped to MAX_MODEL_LEN: a bare floor could sit ABOVE the model's own window
 # on a small-context model, which would defeat the entire point of the guard.
 HARD_INPUT_LIMIT = min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - GENERATION_RESERVE))
+# MUST be derived from HARD_INPUT_LIMIT, not from MAX_MODEL_LEN.
+#
+# This is the compaction trigger: exceed it and older turns get summarized.
+# Deriving it from MAX_MODEL_LEN opens a dead band the moment GENERATION_RESERVE
+# is non-trivial. With reserve=16384 the old formula gave a trigger of 24,576
+# against a guard limit of 16,384 — so every payload between those two numbers
+# skipped compaction entirely and went straight to the guard, which cannot
+# summarize and can only DELETE turns. That is the 2026-08-28 failure shape:
+# content that should have been compressed was discarded instead, silently.
+#
+# The two numbers are also in different units. `current` here is a LOCAL
+# estimate; the guard's limit is measured against vLLM. Sitting at 75% of the
+# hard limit leaves headroom for that discrepancy rather than pretending it is
+# zero. See count_tokens_exact and REMEDIATION P0-0c.
+TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(HARD_INPUT_LIMIT * 0.75))
 # V3.1 (Vision): a single image in a VLM request costs far more than its
 # text — hundreds to a couple thousand tokens depending on resolution and
 # the model's vision encoder. The text-only token estimate misses this
@@ -976,7 +1000,16 @@ def _enforce_hard_budget(
                 + "\n[...trimmed to fit the context budget]",
             }
             running -= per[i]
-            per[i] = count_tokens([msgs[i]])  # recount ONLY the trimmed block
+            # Recount ONLY the trimmed block — and scale it, because `per` and
+            # `running` are both in vLLM units. Recounting without `scale` mixes
+            # a local estimate into a scaled ledger, so `running` reads lower
+            # than the truth, the loop believes it has fit, and the verify step
+            # sends it round again to trim content it did not need to trim.
+            # Measured over 4,000 payloads: 271 diverged, 267 of them forwarding
+            # LESS content, median 1,189 characters of memory destroyed for no
+            # budget reason. Introduced by 3d3e732, which scaled line ~923 and
+            # missed this one.
+            per[i] = int(count_tokens([msgs[i]]) * scale)
             running += per[i]
             trimmed += 1
 
@@ -1080,6 +1113,7 @@ class SseAccumulator:
         self._buffer: str = ""
         self._parts: list[str] = []
         self._complete: bool = False
+        self._truncated: bool = False
 
     def feed(self, chunk: bytes) -> None:
         try:
@@ -1112,8 +1146,13 @@ class SseAccumulator:
                 try:
                     obj = json.loads(payload)
                     choice = obj.get("choices", [{}])[0]
-                    if choice.get("finish_reason"):
+                    fr = choice.get("finish_reason")
+                    if fr:
                         self._complete = True
+                        # "length" means vLLM hit the token ceiling, not that
+                        # the model finished. The text is a cut-off sentence.
+                        if fr == "length":
+                            self._truncated = True
                     delta = choice.get("delta", {})
                     content = delta.get("content")
                     if isinstance(content, str) and content:
@@ -1132,6 +1171,28 @@ class SseAccumulator:
         the model said it (rc6 review: truncated text was being fact-extracted
         and rolled into summaries as a completed assistant turn)."""
         return self._complete
+
+    def truncated(self) -> bool:
+        """True when the stream ended with finish_reason "length" — vLLM hit
+        the generation ceiling and cut the reply off mid-sentence.
+
+        Distinct from complete(). A truncated reply IS complete in the sense
+        that the stream terminated normally, which is why the finish_reason
+        check alone was not enough: `if choice.get("finish_reason")` treated
+        "length" and "stop" identically, and [DONE] sets _complete regardless,
+        so the obvious one-line fix is a no-op. It needs its own flag.
+
+        The consequence of getting this wrong is the same as the disconnect
+        case F20 already guards: a half-sentence gets fact-extracted, indexed
+        into RAG and rolled into summaries as something the model actually
+        said. Worse than the disconnect case, in fact — a truncated reply is
+        confidently phrased right up to where it stops."""
+        return self._truncated
+
+    def usable(self) -> bool:
+        """The gate the memory tail should use: the model finished, and it
+        finished because it was done rather than because it ran out of room."""
+        return self._complete and not self._truncated
 
 
 def _fire_and_forget(coro) -> None:
@@ -1968,7 +2029,11 @@ async def chat_completions(request: Request) -> Any:
             rblock = retrieval.format_retrieval_block(hits)
             if rblock:
                 injected_blocks.append(rblock)
-                log_parts.append(f"{len(hits)}retr")
+            # Logged unconditionally. Inside the `if` it only ever recorded
+            # SUCCESS, so a retrieval layer returning nothing on every request
+            # was indistinguishable in the log from one that was never asked.
+            # "0retr" is the line that makes a dead episodic layer visible.
+            log_parts.append(f"{len(hits)}retr")
         except Exception as e:
             logger.warning(f"conv={conv_id}: retrieval load failed (non-fatal): {e}")
 
@@ -2171,13 +2236,19 @@ async def chat_completions(request: Request) -> Any:
                 # (client hit Stop / tab closed mid-reply): memorizing a
                 # half-sentence as though the model said it plants false
                 # "memories" in facts/RAG/summaries (rc6 review).
-                if conv_id and not vllm_failed and not accumulator.complete():
+                if conv_id and not vllm_failed and not accumulator.usable():
+                    _why = (
+                        "truncated at the generation ceiling "
+                        "(finish_reason=length)"
+                        if accumulator.truncated()
+                        else "ended without completion"
+                    )
                     logger.info(
-                        f"conv={conv_id}: stream ended without completion "
+                        f"conv={conv_id}: stream {_why} "
                         f"({len(accumulator.text())} chars accumulated) — "
                         f"skipping memory tail for the partial reply"
                     )
-                if conv_id and not vllm_failed and accumulator.complete():
+                if conv_id and not vllm_failed and accumulator.usable():
                     _fire_and_forget(
                         _async_tail(
                             conv_id,
@@ -2269,7 +2340,26 @@ async def chat_completions(request: Request) -> Any:
                     f"vLLM response ({type(e).__name__}: {e}); this turn is "
                     f"memorized without the model's reply"
                 )
-        if conv_id:
+        # Same gate the streaming path applies via SseAccumulator.usable().
+        # This path had no finish_reason check at all, so a reply vLLM cut off
+        # at the generation ceiling was memorized as a completed assistant turn
+        # — fact-extracted, indexed into RAG, rolled into summaries. The
+        # streaming path guarded the client-disconnect case (F20) and this one
+        # guarded nothing, which is the half-applied shape worth watching for.
+        _finish_reason = ""
+        try:
+            _finish_reason = (
+                response_json.get("choices", [{}])[0].get("finish_reason") or ""
+            )
+        except (IndexError, KeyError, TypeError):
+            _finish_reason = ""
+        if conv_id and _finish_reason == "length":
+            logger.info(
+                f"conv={conv_id}: reply truncated at the generation ceiling "
+                f"(finish_reason=length, {len(assistant_text)} chars) — "
+                f"skipping memory tail for the partial reply"
+            )
+        elif conv_id:
             _fire_and_forget(
                 _async_tail(
                     conv_id,

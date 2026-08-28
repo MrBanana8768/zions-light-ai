@@ -370,7 +370,15 @@ def retrieve(
     for i in range(len(ids)):
         meta = metas[i] if i < len(metas) else {}
         turn_index = int(meta.get("turn_index", -1)) if meta else -1
-        if exclude_turns_from is not None and turn_index >= exclude_turns_from:
+        # `> 0`, not `is not None`. The caller passes
+        # max(0, turn_index - KEEP_RECENT_TURNS * 2), which is 0 for any short
+        # conversation and for any client that sends a bounded window. At 0 the
+        # old test excluded every hit with turn_index >= 0 — i.e. all of them —
+        # so episodic retrieval returned nothing and said nothing about it.
+        # A cutoff of 0 means "the recent window already covers everything",
+        # which is a reason to exclude NOTHING, not everything. (REMEDIATION P0-3.)
+        if exclude_turns_from is not None and exclude_turns_from > 0 \
+                and turn_index >= exclude_turns_from:
             continue
         out.append({
             "turn_index": turn_index,
