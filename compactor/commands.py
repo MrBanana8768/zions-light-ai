@@ -36,6 +36,18 @@ Commands (case-insensitive command name, args preserved as-is):
                            remembers, not about erasing the chat.
   /forget <substring>      Remove only facts whose text contains substring
                            (case-insensitive)
+  /tidy                    Dry run: report the extraction debris in this
+                           conversation's fact store, grouped by the rule that
+                           matched it, and separately report the rows that look
+                           odd but are being KEPT because no rule can prove they
+                           are garbage. Changes nothing. Ends with a code.
+  /tidy apply <code>       Apply exactly the plan that code was issued for.
+                           Writes a verified whole-conversation snapshot to
+                           disk first, then moves the removed rows into the
+                           archive sidecar (/list-archive, restorable) rather
+                           than unlinking them. Refuses if the plan has changed
+                           since the dry run, or if it would take more than
+                           half the store.
   /why                     Show what the next request would have injected:
                            facts that would inject, retrieval candidates for
                            recent conv tail, summary state
@@ -48,12 +60,15 @@ passes through to vLLM untouched.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 import time
 from typing import Any, Callable, Awaitable
 
 import bgwork
 import facts as facts_module
+import portability
 from memory import StoreUnreadable, conv_lock
 
 logger = logging.getLogger("compactor.commands")
@@ -97,6 +112,13 @@ _ALIASES: dict[str, str] = {
     "help": "help",
     "?": "help",
     "list-facts": "list-facts",
+    # v3.1 D6. No single-letter or near-miss alias: /tidy is the only command
+    # here that can remove a fact without naming it, and it should take a
+    # deliberate keystroke to reach.
+    "tidy": "tidy",
+    "tidy-facts": "tidy",
+    "tidy_facts": "tidy",
+    "cleanup": "tidy",
 }
 
 
@@ -140,6 +162,9 @@ async def _handle_help(arg: str, conv_id: str, ctx: dict) -> str:
         "  /remember <text>     Manually add a fact\n"
         "  /forget              Clear ALL memory for this conversation\n"
         "  /forget <substring>  Remove only facts matching the substring\n"
+        "  /tidy                Show extraction debris I could clean up "
+        "(changes nothing)\n"
+        "  /tidy apply <code>   Clean up exactly what that dry run listed\n"
         "  /why                 Show what would be injected on the next turn\n"
         "  /help                This message"
     )
@@ -638,6 +663,554 @@ async def _handle_why(arg: str, conv_id: str, ctx: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# /tidy — cleaning a store that is already polluted (v3.1 D6)
+# ---------------------------------------------------------------------------
+#
+# The store this is for holds a real person's memory of her own life mixed in
+# with extraction debris. An earlier assumption that the same bucket was
+# synthetic nearly produced a destructive delete. So the design premise is not
+# "find the garbage"; it is:
+#
+#     wrongly keeping a garbage row costs tokens.
+#     wrongly removing a row costs her a memory of her own life.
+#
+# Those are not comparable, so this does not try to balance them. Every rule
+# below is written to be *provably* content-free, and the classifier's default
+# — for every row no rule matched, and for every row a rule was unsure about —
+# is KEEP.
+#
+# Three consequences worth stating plainly, because they are choices and not
+# oversights:
+#
+#   1. **No rule judges meaning.** Nothing here decides a fact is trivial,
+#      wrong, redundant, or no longer true. Every removal rule fires on
+#      structure only: a row that is the extractor's own format vocabulary, a
+#      row with no letters and no digits anywhere in it, or a row byte-identical
+#      to one being kept. A human is the only thing that can do the other job,
+#      and the AMBIGUOUS list exists to hand her a short list instead of
+#      hundreds of rows.
+#   2. **It will therefore under-remove.** An over-eager extraction of a real
+#      but pointless detail is indistinguishable, structurally, from an
+#      extraction of a real and important one. That row stays.
+#   3. **The rules are the reviewable surface.** The dry run prints every
+#      string it would remove, grouped under the rule that matched it, so a bad
+#      rule is visible as a block of good facts under its heading BEFORE
+#      anything is written.
+#
+# Where this code lives is a compromise: classification is fact-store logic and
+# belongs in facts.py next to prune_facts. It is here because commands.py is
+# the surface that owns it today and facts.py is being edited concurrently. If
+# a second caller ever needs these rules, move them — do not copy them.
+
+# Applying is refused above this share of the store. A rule that matches half
+# a conversation's memory is a broken rule, not a thorough one, and the
+# operator should see that as a refusal rather than as a large success
+# message. The flat allowance lets a small store be cleaned at all — 5 rows of
+# punctuation out of 8 is 62%, and is still 5 rows of punctuation.
+TIDY_MAX_REMOVED_FRACTION = 0.5
+TIDY_MIN_REMOVED_ALLOWANCE = 5
+
+# Display caps. The confirmation code is computed over the FULL texts, never
+# over the truncated display form, so a truncated line can never hide a
+# difference between what was shown and what gets removed. The row cap applies
+# ONLY to the flagged-and-kept list — the removal list is never elided, because
+# a row the operator confirms without having seen it is the exact failure this
+# command exists to prevent.
+TIDY_MAX_ROWS_SHOWN = 25
+TIDY_MAX_CHARS_SHOWN = 300
+
+# Matches /remember's own cap. A stored row longer than the longest thing a
+# human is allowed to type by hand is a summary or a paste, not a fact — worth
+# a look, never worth an automatic delete.
+TIDY_OVERSIZED_CHARS = 500
+TIDY_TRIVIAL_CHARS = 15
+TIDY_DECORATION_FRACTION = 0.30
+
+# The 2026-08-28 incident's decoration: box drawing, block elements, geometric
+# shapes. One assistant reply held 2,151 of these characters. They are only
+# ever flagged here, never removed — a row that is *all* decoration has no
+# letters and no digits and is caught by `no-content` on its own merits.
+_TIDY_DECORATION_RANGES = ((0x2500, 0x257F), (0x2580, 0x259F), (0x25A0, 0x25FF))
+
+# Emitted by facts._fit_extraction_input when the exchange is trimmed to fit
+# the extraction budget. Duplicated as a literal rather than imported from a
+# private name, so a rename over there turns this into a rule that stops
+# matching rather than an ImportError at boot.
+_TIDY_TRIM_MARK = "trimmed to fit the fact-extraction input budget"
+
+# Whole-row matches only. Every string here is a piece of the extraction
+# prompt's own format vocabulary (facts._EXTRACTION_SYSTEM_PROMPT,
+# _build_extraction_messages) or a refusal token that survived
+# _parse_extraction_output. A row that is exactly one of these carries no
+# information in any conversation, which is the bar for automatic removal.
+_TIDY_SCAFFOLD_TEXTS = frozenset({
+    "none", "n/a", "nothing", "null", "empty",
+    "fact", "facts", "extracted facts", "existing facts", "latest exchange",
+    "user", "assistant", "system", "output", "output format",
+    "no facts", "no new facts", "no facts extracted", "no new information",
+    "no relevant facts", "no new facts to extract", "none of the above",
+    "here are the facts", "here are the extracted facts",
+})
+
+# Flagged, never removed. Each of these CAN begin a real fact, so the rule
+# earns a place on the operator's short list and nothing more.
+_TIDY_SCAFFOLD_PREFIXES = (
+    "[user]:", "[assistant]:", "[system]:",
+    "existing facts:", "latest exchange:", "extracted facts:",
+)
+_TIDY_META_PREFIXES = (
+    "as an ai", "i cannot ", "i can't ", "i am unable", "i'm unable",
+    "i'm sorry", "i am sorry", "sorry, ",
+    "here are the ", "here is the ", "the following ", "based on the ",
+    "note: ", "output: ", "no new facts ", "there are no ",
+)
+
+_TIDY_WS = re.compile(r"\s+")
+_TIDY_EDGE = ' \t\r\n*_`"\'“”‘’.,:;!?-–—•'
+
+
+def _tidy_norm(text: str) -> str:
+    """Fold a stored row to the form the whole-row rules compare against.
+
+    Deliberately shallow: lowercase, collapse whitespace, and strip markdown
+    emphasis / quotes / trailing punctuation from the ENDS only. It does not
+    strip words, reorder, or transliterate — a normalizer that changes what a
+    row says is a normalizer that can make two different facts look like the
+    same one, and this function's output decides what gets deleted.
+    """
+    if not text:
+        return ""
+    return _TIDY_WS.sub(" ", text).strip(_TIDY_EDGE).strip().lower()
+
+
+def _tidy_decoration_fraction(text: str) -> float:
+    if not text:
+        return 0.0
+    n = sum(
+        1
+        for ch in text
+        if any(lo <= ord(ch) <= hi for lo, hi in _TIDY_DECORATION_RANGES)
+    )
+    return n / len(text)
+
+
+def _tidy_removal_rule(text: str) -> str | None:
+    """The rule that proves this row is content-free, or None to keep it.
+
+    None is the answer for everything this function is not certain about.
+    """
+    norm = _tidy_norm(text)
+    if norm in _TIDY_SCAFFOLD_TEXTS:
+        return "scaffolding"
+    # No letter and no digit anywhere — in ANY script, since str.isalpha() is
+    # true for CJK, Cyrillic, Greek and the rest. What is left is punctuation,
+    # whitespace, box-drawing and emoji: "- -", "...", "**", "━━━━━━".
+    if not any(ch.isalpha() or ch.isdigit() for ch in text):
+        return "no-content"
+    return None
+
+
+def _tidy_flag_rule(text: str) -> str | None:
+    """The reason a KEPT row is worth a human's attention, or None.
+
+    Order is precedence: the first match is the one reported. Nothing here
+    removes anything, so a false positive costs one line of reading.
+    """
+    norm = _tidy_norm(text)
+    lowered = text.lower()
+    if any(norm.startswith(p) for p in _TIDY_SCAFFOLD_PREFIXES):
+        return "transcript-fragment"
+    if _TIDY_TRIM_MARK in lowered:
+        return "truncation-marker"
+    if not any(ch.isalpha() for ch in text):
+        # Digits but no letters. A bare date or number MIGHT be something she
+        # asked to be remembered, so this is the operator's call, not ours.
+        return "numeric-only"
+    if _tidy_decoration_fraction(text) >= TIDY_DECORATION_FRACTION:
+        return "decorative"
+    if len(text) > TIDY_OVERSIZED_CHARS:
+        return "oversized"
+    if any(norm.startswith(p) for p in _TIDY_META_PREFIXES):
+        return "meta-commentary"
+    if len(norm) < TIDY_TRIVIAL_CHARS:
+        return "very-short"
+    return None
+
+
+# Rule id -> the sentence printed under its heading. A rule with no
+# explanation here is a rule the operator cannot review, so the renderer
+# treats a missing entry as a bug and says so rather than printing a bare id.
+_TIDY_RULE_TEXT: dict[str, str] = {
+    "scaffolding": "the extractor's own format vocabulary, stored as if it were a fact",
+    "no-content": "no letter and no digit anywhere in the row",
+    "duplicate": "byte-identical to another row, which is kept",
+    "transcript-fragment": "starts with a transcript or prompt label — may still contain something real after it",
+    "truncation-marker": "contains the fact-extraction truncation marker",
+    "numeric-only": "digits but no letters — could be a date or a number she asked me to keep",
+    "decorative": f"at least {int(TIDY_DECORATION_FRACTION * 100)}% box-drawing or block characters",
+    "oversized": f"longer than {TIDY_OVERSIZED_CHARS} characters — longer than /remember allows",
+    "meta-commentary": "reads like the extractor talking about itself",
+    "very-short": f"under {TIDY_TRIVIAL_CHARS} characters once normalized",
+    "near-duplicate": "same text as another kept row once case and spacing are folded — which wording is the real one is a judgment this does not make",
+}
+
+_TIDY_REMOVE_ORDER = ("scaffolding", "no-content", "duplicate")
+_TIDY_FLAG_ORDER = (
+    "transcript-fragment", "truncation-marker", "numeric-only",
+    "decorative", "oversized", "meta-commentary", "very-short",
+    "near-duplicate",
+)
+
+
+def _tidy_survivor_index(indices: list[int], rows: list[dict]) -> int:
+    """Which copy of a byte-identical group to keep.
+
+    Highest (last_used, added_turn). Both are the eviction sort keys in
+    facts._lru_split, so keeping the maximum guarantees the surviving copy is
+    the one that would have outlived the others anyway: collapsing duplicates
+    can never move a fact FORWARD in the eviction queue. That matters because
+    dedup.py's merge already does the opposite (added_turn = min over the
+    cluster, MEMORY_REVIEW F-1) and pulls consolidated facts toward eviction.
+    This must not add a second mechanism doing that.
+    """
+    return max(
+        indices,
+        key=lambda i: (
+            int(rows[i].get("last_used", 0) or 0),
+            int(rows[i].get("added_turn", 0) or 0),
+            -i,
+        ),
+    )
+
+
+def _tidy_plan(rows: list[dict]) -> dict:
+    """Classify a facts list. Pure function of the list — no I/O, no clock,
+    no randomness — so the same store always yields the same plan and the
+    same confirmation code.
+    """
+    remove: dict[str, list[int]] = {}
+    kept_idx: list[int] = []
+
+    for i, f in enumerate(rows):
+        rule = _tidy_removal_rule(f.get("text", "") or "")
+        if rule:
+            remove.setdefault(rule, []).append(i)
+        else:
+            kept_idx.append(i)
+
+    # Duplicates, over the survivors only: a row already going to the archive
+    # must not also be counted as the duplicate of a row that is staying.
+    by_text: dict[str, list[int]] = {}
+    for i in kept_idx:
+        by_text.setdefault(rows[i].get("text", "") or "", []).append(i)
+    dupes: list[int] = []
+    for group in by_text.values():
+        if len(group) > 1:
+            survivor = _tidy_survivor_index(group, rows)
+            dupes.extend(i for i in group if i != survivor)
+    if dupes:
+        remove.setdefault("duplicate", []).extend(sorted(dupes))
+        dropped = set(dupes)
+        kept_idx = [i for i in kept_idx if i not in dropped]
+
+    flags: dict[str, list[int]] = {}
+    for i in kept_idx:
+        rule = _tidy_flag_rule(rows[i].get("text", "") or "")
+        if rule:
+            flags.setdefault(rule, []).append(i)
+
+    # Near-duplicates among survivors: same normalized form, different bytes.
+    # Reported only — choosing which wording survives is a judgment about
+    # meaning, and this operation does not make those.
+    by_norm: dict[str, list[int]] = {}
+    for i in kept_idx:
+        by_norm.setdefault(_tidy_norm(rows[i].get("text", "") or ""), []).append(i)
+    near = sorted(
+        i
+        for group in by_norm.values()
+        if len(group) > 1
+        for i in group
+    )
+    if near:
+        flags.setdefault("near-duplicate", []).extend(near)
+
+    remove_idx = sorted(i for ids in remove.values() for i in ids)
+    texts = sorted((rows[i].get("text", "") or "") for i in remove_idx)
+    # Over the full texts, NUL-joined — the same construction dedup._cluster_key
+    # uses, and for the same reason: no fact text contains a NUL, so ["ab","c"]
+    # cannot collide with ["a","bc"].
+    token = hashlib.sha256(
+        "\x00".join(texts).encode("utf-8", "replace")
+    ).hexdigest()[:12]
+
+    return {
+        "total": len(rows),
+        "remove_by_rule": remove,
+        "remove_idx": remove_idx,
+        "flag_by_rule": flags,
+        "keep_idx": kept_idx,
+        "token": token,
+    }
+
+
+def _tidy_allowance(total: int) -> int:
+    return max(TIDY_MIN_REMOVED_ALLOWANCE, int(total * TIDY_MAX_REMOVED_FRACTION))
+
+
+def _tidy_show(text: str) -> str:
+    """One row, as the operator sees it.
+
+    repr() on purpose: a `no-content` row is invisible rendered raw, and a
+    review surface that renders the evidence as blank space is not a review
+    surface.
+    """
+    if len(text) > TIDY_MAX_CHARS_SHOWN:
+        return f"{text[:TIDY_MAX_CHARS_SHOWN]!r}… ({len(text)} chars total)"
+    return repr(text)
+
+
+def _tidy_group_lines(
+    rows: list[dict],
+    by_rule: dict[str, list[int]],
+    order: tuple[str, ...],
+    *,
+    limit: int | None,
+) -> list[str]:
+    """Render one section, grouped by rule.
+
+    `limit=None` for the removal section, always. A row the operator is asked
+    to confirm and was not shown is the whole failure this command is designed
+    against, so the removal list is never elided — the blast-radius cap is what
+    bounds its length, not the renderer. Flagged rows are only a reading list,
+    so those groups do get capped.
+    """
+    lines: list[str] = []
+    seen = list(order) + [r for r in by_rule if r not in order]
+    for rule in seen:
+        idx = by_rule.get(rule)
+        if not idx:
+            continue
+        why = _TIDY_RULE_TEXT.get(
+            rule, "NO DESCRIPTION FOR THIS RULE — do not confirm this plan"
+        )
+        lines.append(f"  [{rule}] {len(idx)} row(s) — {why}")
+        shown = idx if limit is None else idx[:limit]
+        for i in shown:
+            lines.append(f"      {_tidy_show(rows[i].get('text', '') or '')}")
+        if len(shown) < len(idx):
+            lines.append(f"      … and {len(idx) - len(shown)} more not shown")
+    return lines
+
+
+def _tidy_render_plan(rows: list[dict], plan: dict) -> str:
+    total = plan["total"]
+    n_remove = len(plan["remove_idx"])
+    n_flag = sum(len(v) for v in plan["flag_by_rule"].values())
+
+    lines = [
+        "Fact cleanup — DRY RUN. Nothing has been changed.",
+        "",
+        f"This conversation has {total} stored fact(s).",
+        "",
+    ]
+
+    if n_remove:
+        pct = (100 * n_remove) // total if total else 0
+        lines.append(f"WOULD REMOVE {n_remove} of {total} ({pct}%):")
+        lines.extend(
+            _tidy_group_lines(
+                rows, plan["remove_by_rule"], _TIDY_REMOVE_ORDER, limit=None
+            )
+        )
+    else:
+        lines.append("WOULD REMOVE nothing — no row matched a removal rule.")
+    lines.append("")
+
+    if n_flag:
+        lines.append(
+            f"KEEPING {n_flag} row(s) that look odd but are not provably "
+            f"garbage. I will not touch these; read them yourself:"
+        )
+        lines.extend(
+            _tidy_group_lines(
+                rows, plan["flag_by_rule"], _TIDY_FLAG_ORDER,
+                limit=TIDY_MAX_ROWS_SHOWN,
+            )
+        )
+        lines.append("")
+
+    if n_remove:
+        allowance = _tidy_allowance(total)
+        if n_remove > allowance:
+            lines.append(
+                f"I will NOT apply this plan: {n_remove} rows is more than the "
+                f"{allowance}-row limit for a store this size. A rule that "
+                f"matches this much of a conversation's memory is a broken "
+                f"rule, not a thorough one. Send this output to whoever "
+                f"maintains the rules."
+            )
+        else:
+            lines.append(
+                "Before anything is deleted I write a full, verified snapshot "
+                "of this conversation to disk, and the removed rows go to this "
+                "conversation's archive — /list-archive shows them and they can "
+                "be restored individually. Nothing is unlinked."
+            )
+            lines.append("")
+            lines.append(f"To apply exactly this plan:   /tidy apply {plan['token']}")
+            lines.append(
+                "That code covers the exact rows listed above. If the removal "
+                "set changes before you confirm, the code stops working and "
+                "you get a fresh plan instead of a surprise."
+            )
+    return "\n".join(lines)
+
+
+async def _handle_tidy(arg: str, conv_id: str, ctx: dict) -> str:
+    parts = arg.split()
+    mode = parts[0].lower() if parts else ""
+
+    if mode in ("", "dry-run", "dryrun", "plan", "preview", "show"):
+        rows = facts_module.load_facts(conv_id)
+        if not rows:
+            return "No facts stored for this conversation — nothing to tidy."
+        return _tidy_render_plan(rows, _tidy_plan(rows))
+
+    if mode != "apply":
+        return (
+            f"Unknown option {parts[0]!r}.\n"
+            "  /tidy              show what would be removed (changes nothing)\n"
+            "  /tidy apply <code> remove exactly what that dry run listed"
+        )
+
+    token = parts[1].lower() if len(parts) > 1 else ""
+    if not token:
+        return (
+            "/tidy apply needs the code from a dry run. Run /tidy first and "
+            "read what it proposes — the code exists so that nothing is "
+            "removed that you have not seen."
+        )
+
+    # One lock for load → classify → snapshot → archive → save. Same shape as
+    # /remember, and for the same reason: unlocked, the extraction tail's own
+    # load-modify-write lands on top of this one and whichever wrote second
+    # wins outright.
+    async with conv_lock(conv_id):
+        rows = facts_module.load_facts(conv_id)
+        if not rows:
+            return "No facts stored for this conversation — nothing to tidy."
+
+        # Re-planned from disk, never carried over from the dry run. The plan
+        # is a pure function of the stored rows, so this is the compare half of
+        # a compare-and-swap: if the removal set still hashes to the code you
+        # were given, the rows about to be archived are the rows you read.
+        # A tail adding a NEW good fact in between does not change the removal
+        # set and does not invalidate the code — only a change to what would be
+        # removed does.
+        plan = _tidy_plan(rows)
+        n_remove = len(plan["remove_idx"])
+
+        if not n_remove:
+            return (
+                "Nothing to remove — no row matches a removal rule right now. "
+                "Run /tidy to see the rows I am flagging for you to read."
+            )
+
+        if plan["token"] != token:
+            return (
+                f"That code is out of date — the set of rows I would remove "
+                f"has changed since the dry run, so I have removed nothing.\n\n"
+                + _tidy_render_plan(rows, plan)
+            )
+
+        allowance = _tidy_allowance(plan["total"])
+        if n_remove > allowance:
+            return (
+                f"Refusing: this plan removes {n_remove} of {plan['total']} "
+                f"rows, over the {allowance}-row limit for a store this size. "
+                f"Nothing has been changed. A rule that matches this much of a "
+                f"conversation's memory needs fixing, not confirming."
+            )
+
+        # Archive before removing. Both halves, in this order:
+        #
+        #   1. A verified whole-conversation snapshot on disk. This is the
+        #      backstop for a bug in this code — if the classification itself
+        #      is wrong, per-row restore does not help, because the rows would
+        #      go back one at a time only if someone knew which ones. Raises
+        #      rather than returning a bad path, and a raise here means nothing
+        #      below runs.
+        #   2. facts.archive_facts — the sidecar, which is how a fact has left
+        #      the active set since F9. /list-archive shows it, and
+        #      restore_from_archive puts individual rows back with no operator
+        #      tooling at all. This is the route the user can drive herself.
+        try:
+            snap = portability.quarantine_conversation(
+                conv_id, reason="tidy-facts"
+            )
+        except portability.QuarantineError as e:
+            logger.error(
+                f"conv={conv_id}: /tidy apply aborted — could not write a "
+                f"verified snapshot: {e}"
+            )
+            return (
+                "I could not write a verified backup of this conversation "
+                "first, so I have changed nothing. Nothing has been removed. "
+                "This is a problem on my side — please mention it."
+            )
+
+        remove_rows = [rows[i] for i in plan["remove_idx"]]
+        keep_rows = [rows[i] for i in plan["keep_idx"]]
+
+        # Sidecar first, active set second — the ordering archive_facts's own
+        # docstring insists on. Interrupted in between, the row is in both
+        # files, which is recoverable; the other order loses it outright. On a
+        # re-run the same rows match the same rules, archive_facts REPLACES
+        # rather than appends, and the second pass is a no-op: idempotent.
+        n_archived = facts_module.archive_facts(conv_id, remove_rows)
+        facts_module.save_facts(conv_id, keep_rows)
+
+        # Report what is on disk, not what the operation intended — the same
+        # rule /forget's verification pass follows.
+        after = len(facts_module.load_facts(conv_id))
+
+    # Counts only in the log. Fact text is real personal memory and does not
+    # go to an operator's terminal or a log file; it goes to the chat reply
+    # the owner asked for and nowhere else.
+    logger.info(
+        f"conv={conv_id}: /tidy apply removed {n_remove} row(s) "
+        f"({', '.join(f'{r}={len(v)}' for r, v in sorted(plan['remove_by_rule'].items()))}), "
+        f"{plan['total']} -> {after}; snapshot={snap['path'].name}"
+    )
+
+    lines = [
+        f"Removed {n_remove} row(s). This conversation now has {after} fact(s) "
+        f"(was {plan['total']}).",
+        "",
+        f"All {n_archived} of them are in this conversation's archive — "
+        f"/list-archive shows them, and any one of them can be put back.",
+        f"A full snapshot of the conversation as it was a moment ago is at "
+        f"{snap['path']} ({snap['facts']} fact(s), {snap['episodic']} indexed "
+        f"exchange(s)).",
+    ]
+    if snap["unverified_layers"]:
+        lines.append(
+            "One caveat: I could not verify the "
+            + " and ".join(snap["unverified_layers"])
+            + " in that snapshot. The facts layer — the one I just changed — "
+            "was verified."
+        )
+    if after != len(keep_rows):
+        # A tail cannot have run inside the lock, so this means the write did
+        # not do what it said. Say so rather than reporting the intent.
+        lines.append(
+            f"Warning: I expected {len(keep_rows)} fact(s) to remain and read "
+            f"back {after}. Please run /tidy again and mention this."
+        )
+    return "\n".join(lines)
+
+
 _HANDLERS: dict[str, Handler] = {
     "help": _handle_help,
     "list-facts": _handle_list_facts,
@@ -645,6 +1218,7 @@ _HANDLERS: dict[str, Handler] = {
     "remember": _handle_remember,
     "forget": _handle_forget,
     "why": _handle_why,
+    "tidy": _handle_tidy,
 }
 
 

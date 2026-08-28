@@ -255,16 +255,191 @@ def test_parse_extraction_drops_too_short():
 
 
 # ---------------------------------------------------------------------------
+# v3.1 D5 — markdown scaffolding was being stored as memory
+#
+# All fixtures below are invented. Nothing here is drawn from any real
+# conversation, and nothing about the live store may be copied into this file.
+# The structural forms are what matters; the content is deliberately fictional.
+# ---------------------------------------------------------------------------
+
+# A horizontal rule of the same box-drawing character INCIDENT_2026-08-28
+# measured, at the length the live store holds one.
+_RULE = "━" * 62
+
+
+def test_markup_lines_are_not_stored_as_facts():
+    print("\n[test] the extraction parser refuses markup, keeps the fact")
+    raw = "\n".join([
+        "# EXTRACTED FACTS",
+        "## Current Status Report",
+        _RULE,
+        "-" * 20,
+        "***",
+        "```json",
+        '"follow_ups": [',
+        "{",
+        "\U0001F50B ENERGY LEVEL: 88% -> 92%",
+        "\U0001F4CA MORALE: 3/10 → 8/10",
+        "- Prefers stories written in past tense.",
+    ])
+    parsed = facts._parse_extraction_output(raw)
+    assert_eq(parsed, ["Prefers stories written in past tense."],
+              "only the real fact survives the structure filter")
+
+
+def test_each_markup_form_has_its_own_named_reason():
+    print("\n[test] _reject_reason names the structure it refused")
+    cases = [
+        (_RULE, "no alphanumeric content"),
+        ("|---|---|", "no alphanumeric content"),
+        ("```python", "code fence"),
+        ("~~~", "no alphanumeric content"),
+        ("### Summary", "markdown heading"),
+        ('"follow_ups": [', "json object key"),
+        ("follow_ups: [", "unclosed structure opener"),
+        ("\U0001F50B ENERGY LEVEL: 88% -> 92%", "status-dashboard line"),
+    ]
+    for text, expected in cases:
+        assert_eq(facts._reject_reason(text), expected, f"{text[:24]!r} refused")
+
+
+def test_the_filter_keeps_facts_that_only_look_like_markup():
+    print("\n[test] emoji, colons, caps and percentages do not disqualify a fact")
+    # Over-filtering destroys memory that exists nowhere else, so each of
+    # these is a shape the naive version of this rule would have eaten.
+    keepers = [
+        "She uses a \U0001F332 emoji as shorthand for the cabin.",
+        "Goal: finish the manuscript before October.",
+        "PTSD: diagnosed in 2019 by a clinician she trusts.",
+        "PTSD: symptoms improved 40% since 2019.",
+        "NASA is the employer she is aiming for.",
+        "STATUS: still deciding whether to move.",
+        "#1 priority is the roof repair.",
+        "Her rent went up 12% this year.",
+        "The password hint is 'blue door' — do not repeat it aloud.",
+        "彼女は日本語で書くのを好む。",
+        "Prefers the arrow style A -> B when sketching plot beats.",
+    ]
+    for text in keepers:
+        assert_true(facts.is_storable_fact(text), f"kept: {text[:40]!r}")
+    parsed = facts._parse_extraction_output(
+        "\n".join(f"- {t}" for t in keepers)
+    )
+    assert_eq(len(parsed), len(keepers), "all of them survive the parser too")
+
+
+def test_is_storable_fact_is_the_shared_public_predicate():
+    print("\n[test] is_storable_fact is exported for the other write paths")
+    assert_true(callable(facts.is_storable_fact), "public predicate exists")
+    assert_true(not facts.is_storable_fact(_RULE), "rule is not storable")
+    assert_true(not facts.is_storable_fact("   "), "blank is not storable")
+    assert_true(facts.is_storable_fact("Her cat is called Pepper."),
+                "a plain sentence is storable")
+
+
+def test_a_bulleted_heading_is_refused_on_the_heading():
+    print("\n[test] markup is judged after the bullet prefix is stripped")
+    parsed = facts._parse_extraction_output(
+        "- ## Current Status Report\n* ```json\n- She keeps bees."
+    )
+    assert_eq(parsed, ["She keeps bees."], "bulleting markup does not launder it")
+
+
+def test_refused_markup_is_logged_with_a_bounded_sample():
+    print("\n[test] the refusal is logged, named, and bounded")
+    # Five markup lines, each long enough to clear the parser's own
+    # six-character floor, so the filter is what refuses them.
+    raw = "\n".join([_RULE, "# ONE HEADING", "## TWO HEADING",
+                     "### THREE HEADING", "#### FOUR HEADING",
+                     "- A real fact about her garden."])
+    with patch.object(facts.logger, "info") as info:
+        parsed = facts._parse_extraction_output(raw, where="conv=synthetic")
+    assert_eq(parsed, ["A real fact about her garden."], "one fact kept")
+    msgs = [c[0][0] for c in info.call_args_list]
+    hits = [m for m in msgs if "markup" in m]
+    assert_eq(len(hits), 1, "exactly one refusal line")
+    assert_true("conv=synthetic" in hits[0], "the line names the conversation")
+    assert_true("5 line(s) of markup" in hits[0], "it counts what it refused")
+    assert_true("and 2 more" in hits[0], "the sample is bounded, not a dump")
+
+
+def test_the_store_never_receives_a_box_drawing_rule():
+    print("\n[test] end to end: a dashboard reply stores only the fact")
+    _wipe_storage()
+    cid = "d5-e2e"
+    client = _mock_client_returning(
+        "# EXTRACTED FACTS\n"
+        + _RULE + "\n"
+        "\U0001F50B ENERGY LEVEL: 88% -> 92%\n"
+        "- She is training for a half marathon in March.\n"
+    )
+    n = asyncio.run(facts.record_facts_for_exchange(
+        cid, client, "http://fake", "fake-model",
+        user_msg="What am I training for?",
+        assistant_msg="A half marathon.",
+        turn_index=7,
+    ))
+    assert_eq(n, 1, "one fact recorded, not four")
+    stored = [f["text"] for f in facts.load_facts(cid)]
+    assert_eq(stored, ["She is training for a half marathon in March."],
+              "only the fact is on disk")
+    assert_true(all("━" not in t for t in stored),
+                "no box-drawing character reached the store")
+
+
+def test_a_truncated_extraction_drops_its_incomplete_tail():
+    print("\n[test] finish_reason=length drops the half line it cut")
+    client = _mock_client_returning(
+        "- She grows tomatoes on the balcony.\n- She is allergic to peni",
+        finish_reason="length",
+    )
+    out = asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model", "u", "a", [], conv_id="trunc",
+    ))
+    assert_eq(out, ["She grows tomatoes on the balcony."],
+              "the complete line is kept, the cut one is not stored")
+
+
+def test_a_truncated_extraction_keeps_a_line_that_finished():
+    print("\n[test] a trailing newline means nothing was cut mid-line")
+    client = _mock_client_returning(
+        "- She grows tomatoes on the balcony.\n- She sings in a choir.\n",
+        finish_reason="length",
+    )
+    out = asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model", "u", "a", [], conv_id="trunc2",
+    ))
+    assert_eq(len(out), 2, "both complete lines survive")
+
+
+def test_an_untruncated_reply_loses_nothing():
+    print("\n[test] finish_reason=stop keeps the final line")
+    client = _mock_client_returning(
+        "- She grows tomatoes on the balcony.\n- She sings in a choir.",
+        finish_reason="stop",
+    )
+    out = asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model", "u", "a", [], conv_id="stop1",
+    ))
+    assert_eq(len(out), 2, "no tail dropped when the model finished")
+
+
+# ---------------------------------------------------------------------------
 # Extraction with mock vLLM client
 # ---------------------------------------------------------------------------
 
-def _mock_client_returning(content: str) -> MagicMock:
-    """Build a fake httpx.AsyncClient whose .post returns a canned response."""
+def _mock_client_returning(content: str, finish_reason: str | None = None) -> MagicMock:
+    """Build a fake httpx.AsyncClient whose .post returns a canned response.
+
+    `finish_reason` defaults to absent rather than "stop" so the common case
+    keeps exercising the `.get` path a real vLLM response may also take.
+    """
+    choice: dict = {"message": {"content": content}}
+    if finish_reason is not None:
+        choice["finish_reason"] = finish_reason
     mock_response = MagicMock()
     mock_response.raise_for_status = MagicMock()
-    mock_response.json = MagicMock(return_value={
-        "choices": [{"message": {"content": content}}]
-    })
+    mock_response.json = MagicMock(return_value={"choices": [choice]})
     client = MagicMock()
     client.post = AsyncMock(return_value=mock_response)
     return client
@@ -880,6 +1055,18 @@ if __name__ == "__main__":
         test_extraction_failure_is_an_error_that_names_the_conversation()
         test_extraction_failure_without_conv_id_says_the_caller_gave_none()
         test_record_facts_for_exchange_passes_its_conv_id_through()
+
+        # v3.1 D5 — markdown scaffolding stored as memory
+        test_markup_lines_are_not_stored_as_facts()
+        test_each_markup_form_has_its_own_named_reason()
+        test_the_filter_keeps_facts_that_only_look_like_markup()
+        test_is_storable_fact_is_the_shared_public_predicate()
+        test_a_bulleted_heading_is_refused_on_the_heading()
+        test_refused_markup_is_logged_with_a_bounded_sample()
+        test_the_store_never_receives_a_box_drawing_rule()
+        test_a_truncated_extraction_drops_its_incomplete_tail()
+        test_a_truncated_extraction_keeps_a_line_that_finished()
+        test_an_untruncated_reply_loses_nothing()
 
         print("\nAll facts smoke tests passed.")
     finally:

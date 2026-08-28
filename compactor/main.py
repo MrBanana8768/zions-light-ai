@@ -133,6 +133,85 @@ IMAGE_TOKEN_ESTIMATE = _env_int("COMPACTOR_IMAGE_TOKENS", 4096)
 #   -1     : unlimited (pre-v3.0.2 behavior; not recommended)
 MAX_RETAINED_IMAGES = _env_int("COMPACTOR_MAX_RETAINED_IMAGES", 1)
 
+
+def _env_float(name: str, default: float) -> float:
+    """Same contract as _env_int: an unset or unparseable value is the default,
+    never a crash at import time and never a silent zero."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+# v3.1 D3 — a ceiling on the SUM of injected memory, denominated in the window.
+#
+# Every injected layer is individually capped and their sum is not. Facts are
+# bounded by COMPACTOR_MAX_FACTS_TOKENS (1500, facts.py:67), retrieval by
+# COMPACTOR_MAX_RETRIEVAL_TOKENS (1500, retrieval.py:69 — "1500 mirrors the
+# facts budget deliberately: no injected memory layer should be able to..."),
+# and each summary chunk by its own generation ceiling. Nothing has ever
+# bounded persona + facts + retrieval + L1 + L2 + L3 TOGETHER, and no layer cap
+# has ever been able to see the limit the request will actually be measured
+# against. Caps that cannot see the limit can sum past it, and on 2026-08-28
+# they did.
+#
+# So the bound is a FRACTION of this request's effective limit rather than
+# another token constant: it moves with GENERATION_RESERVE, with MAX_MODEL_LEN
+# and with a client asking for a large completion, instead of needing a hand
+# re-tune every time any of those change. 0.5 says: whatever else happens, half
+# the window belongs to the conversation.
+INJECTION_BUDGET_FRACTION = _env_float("COMPACTOR_INJECTION_BUDGET_FRACTION", 0.5)
+
+# ...and a much tighter one for a request with no conversational history.
+#
+# Live, 2026-08-28: a request with msgs=2, source=hash, lastturn=0 and no prior
+# assistant turn was handed 95 facts and 3 retrieval hits. It could not be
+# compacted ("over budget (30437>12288) but no older turns to summarize"), it
+# could not be shed (there is nothing to drop but the injected blocks and the
+# one turn the user typed), and vLLM rejected it. The turn produced no reply,
+# no facts, no episodic write, and nothing retried it. It repeated, unchanged,
+# for four hours.
+#
+# A request with no prior assistant turn is one of two things, and neither
+# wants a conversation's whole accumulated memory:
+#
+#   - Background/task traffic — OpenWebUI's title, tag and follow-up calls.
+#     FRONTEND_SPEC §15 asks the client to mark these explicitly; today they
+#     arrive unmarked and hash to a stable conv_id. Such a call has no exchange
+#     to remember and no persona to stay in character for, so every token of
+#     injected memory it receives is spent making a title worse.
+#   - The first turn of a chat. There IS a case for memory here — "she
+#     remembers me from the first message" is the product — but a first turn is
+#     also the one shape that can neither be compacted (no older turns) nor
+#     shed (one turn, and the newest turn is never dropped), so it is exactly
+#     where an oversized injection stops being a degradation and becomes a lost
+#     turn.
+#
+# Hence bound, do not refuse. An eighth of the window still carries the
+# highest-ranked facts — facts.select_for_injection already orders them — and
+# stops there. Set COMPACTOR_INJECTION_NO_HISTORY_FRACTION to 0 to turn
+# injection off entirely for this traffic once the client marks it.
+INJECTION_NO_HISTORY_FRACTION = _env_float(
+    "COMPACTOR_INJECTION_NO_HISTORY_FRACTION", 0.125
+)
+
+# Drop order when the sum will not fit: highest number goes first.
+#
+# Retrieval is the most speculative layer — it is a guess about relevance, and
+# its own log line already reports how much of its budget it kept. Facts
+# degrade gracefully because they are ranked and truncating the tail loses the
+# least-used ones. The summary stack is the only compressed record of the part
+# of the conversation the window can no longer hold, so it outranks both.
+# Persona goes last: without it the reply is wrong in KIND, not merely less
+# informed, and it is the cheapest of the four.
+_INJECT_PRIORITY_PERSONA = 0
+_INJECT_PRIORITY_SUMMARY = 1
+_INJECT_PRIORITY_FACTS = 2
+_INJECT_PRIORITY_RETRIEVAL = 3
+
 # V2.0 Phase 1: admin endpoint binding. Default "127.0.0.1" rejects any
 # non-localhost client at the dependency layer (we still bind the FastAPI
 # socket to 0.0.0.0 because uvicorn doesn't support dual-listen, but the
@@ -230,6 +309,13 @@ def backend_is_multimodal() -> bool:
 # success; see _note_backend_accepted. Since P0-0c gave the guard vLLM's own
 # count, this is a degraded-mode backstop rather than the primary mechanism, and
 # it is sized and released as one.
+#
+# v3.1 D4: decay was not enough, because the blast radius came from what the
+# margin was allowed to LEARN, not from how long it held. A single conversation
+# whose own messages did not fit the window latched it to the
+# MAX_MODEL_LEN//4 ceiling on its first rejection and every other conversation
+# in the process paid. It now only learns from a rejection the guard did not
+# already predict — see _note_backend_rejection's `guard_measured_overflow`.
 _BUDGET_MARGIN = 0
 
 # Every wording vLLM has used to state the prompt size in a context-length 400,
@@ -364,7 +450,11 @@ def _note_backend_accepted() -> None:
     )
 
 
-def _note_backend_rejection(err_body: str, enforced_limit: int | None = None) -> bool:
+def _note_backend_rejection(
+    err_body: str,
+    enforced_limit: int | None = None,
+    guard_measured_overflow: bool = False,
+) -> bool:
     """Reactive backstop for vLLM 4xx bodies. Two lessons we can learn:
     (1) the model is text-only -> strip images from subsequent requests;
     (2) our token count undercounted -> tighten the budget by the observed gap.
@@ -374,6 +464,38 @@ def _note_backend_rejection(err_body: str, enforced_limit: int | None = None) ->
     `enforced_limit` is the limit the guard ACTUALLY shed this payload against,
     margin already subtracted — see A8 below for why it is a parameter and not
     something this function may reconstruct.
+
+    `guard_measured_overflow` is True when _enforce_hard_budget MEASURED this
+    payload as over that limit and forwarded it anyway as a best effort. The
+    margin exists to correct a SURPRISE — a payload we believed fit and vLLM
+    charged more for — and there is no surprise in a rejection the guard
+    predicted, at ERROR, before the request was sent. Widening the margin from
+    one is learning from evidence that does not bear on the question.
+
+    v3.1 D4, and not hypothetical. On 2026-08-28 one conversation kept sending
+    two messages whose own content measured 30,437 local tokens against a
+    12,288 compaction target. The guard shed everything it was permitted to
+    shed and logged
+
+        hard budget FAILED to fit: ... dropped 0 old turn(s), trimmed 6
+        injected block(s), dropped 1 injected block(s) entirely - still
+        16417 over
+
+    then forwarded and took the 400 it had just predicted. The rejection
+    reported 32,801 tokens; 16,384 + 16,417 = 32,801, so the number the
+    calibration "learned" was the number the guard had already measured and
+    logged. overshoot came to 16,417 and _BUDGET_MARGIN latched straight to its
+    MAX_MODEL_LEN//4 ceiling of 8,192 — a module global, so every OTHER
+    conversation in the process lost 8,192 tokens of window. Four hours later a
+    real conversation was running at "limit 8192, margin 8192" and shedding on
+    every request, while the conversation that imposed it was unchanged, still
+    failing, and had never benefited from it.
+
+    Note what this rule does NOT do: it does not ask whether the overflow was
+    injection-driven. In the case above it was not — the residual was the
+    client's own two messages — so a rule keyed on injection would not have
+    fired. What the two failures have in common is not their content; it is
+    that the guard already knew.
 
     Returns whether the budget margin actually advanced. The caller uses it to
     decide what to promise the user: "send it again" is only true when this
@@ -390,7 +512,23 @@ def _note_backend_rejection(err_body: str, enforced_limit: int | None = None) ->
             "stripped from subsequent requests (set COMPACTOR_BACKEND_MULTIMODAL "
             "to override)"
         )
-    if _is_context_overflow(body):
+    if _is_context_overflow(body) and guard_measured_overflow:
+        # v3.1 D4. Reported at WARNING rather than swallowed: "the calibration
+        # deliberately did not fire" is a different state from "the calibration
+        # is broken again", and the whole lesson of P0-0/A9 is that a path
+        # which cannot say it fired is indistinguishable from one that did.
+        logger.warning(
+            f"context calibration: NOT widening the budget margin from this "
+            f"rejection. The hard-budget guard had already measured this "
+            f"payload as over the limit it enforced and forwarded it as a best "
+            f"effort, so vLLM's 400 confirms a measurement we already had — it "
+            f"is not evidence that our counting is low. The margin is a module "
+            f"global; learning {_reported_prompt_tokens(body)} tokens from a "
+            f"predicted rejection would narrow the window for every other "
+            f"conversation in this process to pay for one that is unfittable "
+            f"as sent (v3.1 D4). Margin stays at {_BUDGET_MARGIN}."
+        )
+    elif _is_context_overflow(body):
         actual = _reported_prompt_tokens(body)
         if actual is not None:
             # v3.1 P0-0b: measure against the limit we ACTUALLY enforced, not
@@ -602,6 +740,54 @@ def _note_tokenize_success() -> None:
         + (f" over {time.time() - since:.0f}s" if since is not None else "")
         + " — budgeting is back on vLLM's own count."
     )
+
+
+def count_text_tokens_exact(text: str) -> int | None:
+    """Exact token count for a blob of TEXT, from vLLM's /tokenize.
+
+    The completion-shaped sibling of count_tokens_exact. Use this whenever the
+    thing being measured is not a conversation — an injected memory block, a
+    summary, a candidate fact. Those have no roles and no turn structure, and
+    routing them through the chat form asks the model's template a question it
+    was never designed to answer. A refusal there is indistinguishable from a
+    /tokenize outage and degrades every budget in the process, which is how one
+    bad request shape cost the user 80+ turns of context per message on
+    2026-08-29.
+
+    Same contract as count_tokens_exact: never raises, returns None rather than
+    a guess, and shares the same failure/recovery accounting so a real outage
+    still reaches /health/full.
+    """
+    if not text:
+        return 0
+    try:
+        r = httpx.post(
+            f"{VLLM_URL}/tokenize",
+            json={"model": MODEL_REPO, "prompt": text},
+            timeout=httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0),
+        )
+        if r.status_code != 200:
+            _note_tokenize_failure(
+                f"text.http.{r.status_code}",
+                f"returned HTTP {r.status_code} for a text count, "
+                f"body {r.text[:200]!r}",
+            )
+            return None
+        n = (r.json() or {}).get("count")
+        if not isinstance(n, (int, float)):
+            _note_tokenize_failure(
+                "text.body",
+                f"answered HTTP 200 with no numeric 'count': {r.text[:200]!r}",
+            )
+            return None
+        _note_tokenize_success()
+        return int(n)
+    except Exception as e:
+        _note_tokenize_failure(
+            f"text.error.{type(e).__name__}",
+            f"unreachable for a text count ({type(e).__name__}: {e})",
+        )
+        return None
 
 
 def count_tokens_exact(
@@ -864,10 +1050,21 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
     else:
         logger.warning(
             f"summarize: /tokenize did not answer — batching {len(to_summarize)} "
-            f"turns on {_summary_counter}'s {_local}-token estimate, UNCORRECTED "
-            f"(scale 1.0). That estimate reads up to 51% low on this model's "
-            f"assistant content, so these batches may exceed the {budget}-token "
-            f"budget and 400."
+            f"turns on {_summary_counter}'s {_local}-token estimate, corrected "
+            f"by the PESSIMISTIC scale {_scale:.2f}x. That estimate reads up to "
+            f"51% low on this model's assistant content, so it is deliberately "
+            f"over-corrected: batches will over-split against the "
+            f"{budget}-token budget rather than 400."
+            # v3.1 gate: this line said "UNCORRECTED (scale 1.0)" while the
+            # branch below it applied _PESSIMISTIC_SUMMARY_SCALE. D2 fixed the
+            # arithmetic on 3a65aa1 and left its own diagnostic quoting the
+            # pre-fix number — the fourth time on this branch that a fix landed
+            # at one site and not at its sibling, and the first time in the log
+            # rather than the code. It matters because the whole v3.1 A9
+            # doctrine is that these lines ARE the diagnosis: a reader of the
+            # next incident would have read "scale 1.0" and concluded D2 had
+            # never shipped. The scale is interpolated now, so the line cannot
+            # go stale again the next time the constant moves.
         )
     batches = await run_in_threadpool(
         _chunk_to_budget, to_summarize, budget, _scale
@@ -1002,6 +1199,112 @@ def inject_system_block(messages: list[dict], content: str) -> list[dict]:
         else:
             break
     return messages[:insert_at] + [sys_msg] + messages[insert_at:]
+
+
+def _has_conversational_history(messages: list[dict]) -> bool:
+    """Whether the CLIENT's array contains a prior assistant turn.
+
+    Computed on what the client sent, before compaction or injection touched
+    it. "A prior assistant turn" and not "more than one message" because the
+    former is what actually distinguishes a conversation from a task: a
+    background title call and a brand-new chat both arrive with one or two
+    messages and no reply behind them, while a real second turn always carries
+    the first answer."""
+    return any(
+        isinstance(m, dict) and m.get("role") == "assistant" for m in messages
+    )
+
+
+def _bound_injected_blocks(
+    blocks: list[tuple[int, str, str]], budget: int
+) -> tuple[list[str], list[str], int]:
+    """Drop whole injected layers, lowest priority first, until they fit.
+
+    `blocks` is [(priority, label, text)] in the order they must be SENT — see
+    inject_system_block for why that order matters to the model. Returns
+    (texts still in send order, labels dropped, the cost estimate used).
+
+    Why whole layers rather than truncation: every layer here already has an
+    internal budget and an internal ranking, so truncating one from the outside
+    cuts it at a point its own ranking did not choose. Halving a retrieval
+    block leaves half an exchange; dropping it leaves a conversation. The guard
+    downstream still trims as a last resort, but this is the layer that can
+    make the choice knowing what each block IS.
+
+    The floor is ONE layer, and that is deliberate. A bound that can round down
+    to nothing is not a bound, it is a refusal, and refusing makes "she
+    remembers me from the first message" impossible — which is the product. So
+    the drop loop stops before it takes the last surviving block. What that
+    leaves is at most one layer's own cap (1500 tokens for facts, 1500 for
+    retrieval, a generation ceiling for a summary chunk), which is the
+    strongest bound expressible here without overriding a module's own budget;
+    the hole this function closes is that those caps SUM, not that any one of
+    them is too large. And the guard downstream now sheds injected memory to
+    nothing before it will forward a payload it knows will 400 (v3.1 D3), so
+    the composite still has a floor of zero when the window genuinely demands
+    one — it is just reached with the whole payload in view rather than here.
+
+    Measurement discipline (P0-0c): per-block counts are local, because one
+    /tokenize per block would be four round trips on the request path. The
+    local counter reads up to 51% low on this model's content, so the cheap
+    path is deliberately PESSIMISTIC — if the local sum still fits after being
+    scaled by the worst measured undercount, nothing needs measuring and no
+    HTTP call is made. Only a payload that might genuinely be over pays for one
+    exact measurement, and that measurement supplies the scale the per-block
+    arithmetic then uses. Same shape as _enforce_hard_budget: one ground truth,
+    scaled per-part estimates, never a per-part round trip."""
+    if not blocks:
+        return [], [], 0
+    local = [
+        count_tokens([{"role": "system", "content": text}]) for _, _, text in blocks
+    ]
+    total_local = sum(local)
+    if int(total_local * _PESSIMISTIC_SUMMARY_SCALE) <= budget:
+        # Fits even if the local counter is as wrong as it has ever been
+        # measured to be. No measurement can change the outcome, so none is
+        # made.
+        return [text for _, _, text in blocks], [], total_local
+    # Measured as TEXT, not as a one-message conversation.
+    #
+    # The obvious form sends vLLM a message list whose only, and therefore
+    # last, message is a system message. Nothing in this tree had ever sent
+    # that shape, and /tokenize answers it by applying the served model's
+    # chat template — the same machinery that refused an assistant-final
+    # list and took compaction down on 2026-08-29 (D1). A refusal here
+    # degrades /tokenize for the whole PROCESS and drops every budget in it
+    # back onto the local estimator, so the blast radius is far wider than
+    # the measurement it was serving.
+    #
+    # This is not a conversation and does not need a template: it is the
+    # size of a blob of text. /tokenize's completion form answers that
+    # without a template and so cannot refuse it for conversational-shape
+    # reasons. summarizer.py's counter already uses this form.
+    exact = count_text_tokens_exact("\n\n".join(t for _, _, t in blocks))
+    scale = (
+        (exact / total_local)
+        if (exact is not None and total_local > 0)
+        else _PESSIMISTIC_SUMMARY_SCALE
+    )
+    estimated = int(total_local * scale)
+    cost = estimated
+    keep = [True] * len(blocks)
+    dropped: list[str] = []
+    # Lowest priority first; among equals, the later-inserted block first.
+    for i in sorted(range(len(blocks)), key=lambda j: (-blocks[j][0], -j)):
+        if cost <= budget or sum(keep) <= 1:
+            break
+        keep[i] = False
+        cost -= int(local[i] * scale)
+        dropped.append(blocks[i][1])
+    return (
+        [text for k, (_, _, text) in zip(keep, blocks) if k],
+        dropped,
+        # The size that BLEW the budget, not the size that survived. A line
+        # reading "0 tokens against 32" says nothing about how far over the
+        # injection was, which is the only number that would tell an operator
+        # whether the fraction is wrong or the memory is.
+        estimated,
+    )
 
 
 def _merge_adjacent_system_messages(messages: list[dict]) -> list[dict]:
@@ -1170,10 +1473,49 @@ def _merge_consecutive_same_role(messages: list[dict]) -> list[dict]:
     return out
 
 
+def _droppable_system_indices(msgs: list[dict], protect_system: int) -> list[int]:
+    """Indices of the system messages this guard is allowed to spend.
+
+    `protect_system` is how many system messages the CALLER sent, counted on
+    the original array before compaction or injection. Everything after that
+    prefix is ours — injected memory, and compaction's own summary block.
+
+    Extracted so the boundary is computed in ONE place. It was open-coded three
+    times inside the guard (the trim loop's `sys_seen` walk, the drop loop's
+    length test, and the give-up test), and a boundary restated three times is
+    a boundary that drifts: the first cut of this guard applied the protection
+    to the drop loop only, so the caller's prompt was safe from deletion and
+    not from mutilation."""
+    sys_idxs = [i for i, m in enumerate(msgs) if m.get("role") == "system"]
+    return sys_idxs[max(1, protect_system):]
+
+
+def _has_sheddable_content(msgs: list[dict], protect_system: int) -> bool:
+    """Is there anything left the guard is permitted to remove?
+
+    Exactly two things qualify: a non-system turn that is not the newest one,
+    and an injected system block. Trimming is deliberately NOT a third case —
+    the trim loop only ever operates on the same blocks the drop loop can
+    delete outright, so if nothing is droppable then nothing is trimmable
+    either, and 'we could still halve something' can never be the reason to
+    keep looping.
+
+    This replaces `len(idxs) <= 1 and trimmed >= 32 and len(sys_idxs) <= 1`,
+    which was wrong in both directions. With protect_system >= 2 the last
+    clause could never hold, so the guard ran its full six rounds — six exact
+    /tokenize calls — over a payload it could not change. With
+    protect_system == 1 and a single oversized user turn it did the same,
+    because `trimmed` stays 0 when there is nothing to trim."""
+    if len([m for m in msgs if m.get("role") != "system"]) > 1:
+        return True
+    return bool(_droppable_system_indices(msgs, protect_system))
+
+
 def _enforce_hard_budget(
     messages: list[dict],
     limit: int | None = None,
     protect_system: int = 1,
+    report: dict | None = None,
 ) -> list[dict]:
     """Last line of defense: never forward a request that vLLM must reject.
 
@@ -1198,6 +1540,15 @@ def _enforce_hard_budget(
     CPU exactly in the overload scenario. Now: one cheap prescreen, one full
     count, per-message counts for the shedding arithmetic, and a bounded
     number of full-count verification rounds.
+
+    `report`, when passed, is filled in with what this guard decided:
+    `limit`, `measured`, `fits`, `counted_by`, and the three shed counts. It
+    exists so the request path can tell a vLLM rejection it PREDICTED from one
+    that surprised it — see _note_backend_rejection and v3.1 D4. A dict rather
+    than a changed return type because every existing caller passes messages
+    and gets messages back, and a signature that breaks its callers to carry
+    diagnostics is how the same fix gets applied at one site and missed at its
+    sibling.
     """
     if limit is None:
         limit = HARD_INPUT_LIMIT
@@ -1262,6 +1613,18 @@ def _enforce_hard_budget(
     # exists for the small ones it was written for, which is the overwhelming
     # majority of requests.
     if _fast_token_estimate(messages) <= limit // 8:
+        if report is not None:
+            report.update(
+                {
+                    "limit": limit,
+                    "measured": None,
+                    "fits": True,
+                    "counted_by": "the char/4 prescreen (nothing was measured)",
+                    "dropped_turns": 0,
+                    "trimmed_blocks": 0,
+                    "dropped_blocks": 0,
+                }
+            )
         return messages
 
     # Ground truth, once, before any decision is made on it. See
@@ -1303,7 +1666,38 @@ def _enforce_hard_budget(
             f"{local_total} is a floor and not a count, and every number in the "
             f"shed line below inherits it."
         )
+
+    def _measure(ms: list[dict]) -> tuple[int, str]:
+        """Ground truth for `ms`, and the name of whoever supplied it.
+
+        Both the per-round verify step and the last-resort pass below need
+        exactly this, and when they were written out twice the two drifted:
+        3d3e732 scaled one recount and missed its sibling, destroying a median
+        1,189 characters of memory per divergent payload for no budget
+        reason."""
+        v = count_tokens_exact(ms)
+        if v is not None:
+            return v, "vLLM's /tokenize"
+        return (
+            int(count_tokens(ms) * scale),
+            f"the local tokenizer x{scale:.2f}"
+            if abs(scale - 1.0) > 0.005
+            else "the local tokenizer, UNCORRECTED",
+        )
+
     if total <= limit:
+        if report is not None:
+            report.update(
+                {
+                    "limit": limit,
+                    "measured": total,
+                    "fits": True,
+                    "counted_by": counter,
+                    "dropped_turns": 0,
+                    "trimmed_blocks": 0,
+                    "dropped_blocks": 0,
+                }
+            )
         return messages
 
     msgs = list(messages)
@@ -1346,16 +1740,12 @@ def _enforce_hard_budget(
         # mutilation — which is worse, because the model still receives
         # something that looks like instructions.
         while running > limit and trimmed < 32:
-            sys_seen = 0
-            big = []
-            for i, m in enumerate(msgs):
-                if m.get("role") != "system":
-                    continue
-                sys_seen += 1
-                if sys_seen <= max(1, protect_system):
-                    continue
-                if isinstance(m.get("content"), str) and len(m["content"]) > 400:
-                    big.append(i)
+            big = [
+                i
+                for i in _droppable_system_indices(msgs, protect_system)
+                if isinstance(msgs[i].get("content"), str)
+                and len(msgs[i]["content"]) > 400
+            ]
             if not big:
                 break
             i = max(big, key=lambda j: len(msgs[j]["content"]))
@@ -1397,10 +1787,10 @@ def _enforce_hard_budget(
         # fit anyway. Memory the model cannot receive is worth less than a
         # request that succeeds; the caller's own prompt is not ours to spend.
         while running > limit:
-            sys_idxs = [i for i, m in enumerate(msgs) if m.get("role") == "system"]
-            if len(sys_idxs) <= max(1, protect_system):
+            droppable = _droppable_system_indices(msgs, protect_system)
+            if not droppable:
                 break
-            i = sys_idxs[-1]
+            i = droppable[-1]
             running -= per[i]
             del msgs[i]
             del per[i]
@@ -1419,22 +1809,38 @@ def _enforce_hard_budget(
         # the one that decided to forward — could be either vLLM's count or a
         # local estimate scaled by a factor that is itself 1.0 when /tokenize
         # is down, with nothing in the log to tell the two apart.
-        _v = count_tokens_exact(msgs)
-        if _v is not None:
-            running = _v
-            counter = "vLLM's /tokenize"
-        else:
-            running = int(count_tokens(msgs) * scale)
-            counter = (
-                f"the local tokenizer x{scale:.2f}" if abs(scale - 1.0) > 0.005
-                else "the local tokenizer, UNCORRECTED"
-            )
+        running, counter = _measure(msgs)
         if running <= limit:
             break
-        idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
-        sys_idxs = [i for i, m in enumerate(msgs) if m.get("role") == "system"]
-        if len(idxs) <= 1 and trimmed >= 32 and len(sys_idxs) <= 1:
+        if not _has_sheddable_content(msgs, protect_system):
             break  # nothing left to shed; forward best effort
+
+    # v3.1 D3 — the last thing that happens before a payload the guard has
+    # MEASURED as too large goes out the door: spend every remaining scrap of
+    # injected memory.
+    #
+    # The rounds above can exit still over the limit with injected blocks in
+    # hand. The round budget is six, and the shedding arithmetic runs on scaled
+    # per-message LOCAL counts, so a round can believe it has fit, the exact
+    # verify can disagree, and the sixth disagreement is simply the last one.
+    # The old code then forwarded anyway, on the reasoning that the newest turn
+    # is never dropped.
+    #
+    # That reasoning is right about TURNS and does not transfer to injected
+    # memory. Dropping memory the model will never get to read costs nothing
+    # that the 400 does not already cost, and the 400 additionally loses the
+    # message the user just typed — no reply, no facts, no episodic write, and
+    # nothing retries it. Memory the model cannot receive is worth less than a
+    # request that succeeds; the drop stage already makes exactly that trade,
+    # and this is the one point where the guard used to decline to make it.
+    if running > limit:
+        forced = _droppable_system_indices(msgs, protect_system)
+        if forced:
+            for i in reversed(forced):
+                del msgs[i]
+                del per[i]
+                sys_dropped += 1
+            running, counter = _measure(msgs)
 
     # v3.1 A9/A10: the shed line now names the counter behind its numbers and
     # the margin in force. Every number in this line came from one of two
@@ -1450,6 +1856,18 @@ def _enforce_hard_budget(
         f"turn(s), trimmed {trimmed} injected block(s), dropped "
         f"{sys_dropped} injected block(s) entirely"
     )
+    if report is not None:
+        report.update(
+            {
+                "limit": limit,
+                "measured": running,
+                "fits": running <= limit,
+                "counted_by": counter,
+                "dropped_turns": dropped,
+                "trimmed_blocks": trimmed,
+                "dropped_blocks": sys_dropped,
+            }
+        )
     if running > limit:
         # v3.1: this used to log at WARNING and read like a success — "hard
         # budget enforced" while forwarding a payload the guard itself has just
@@ -1457,12 +1875,38 @@ def _enforce_hard_budget(
         # is to make vLLM's 400 impossible, and the 400 is now the expected
         # outcome. Say so, at ERROR, with the shortfall, so it is findable
         # before the user reports it rather than after.
+        #
+        # v3.1 D3: and say WHAT is left, because the two residuals need
+        # different people to act. On 2026-08-28 the line read "dropped 0 old
+        # turn(s), trimmed 6 injected block(s), dropped 1 injected block(s)
+        # entirely - still 16417 over"; 16,384 + 16,417 = 32,801, which is
+        # exactly the number vLLM went on to report, so every one of those
+        # 32,801 tokens was the caller's own system prompt and the single turn
+        # the user had typed. Nothing the compactor is allowed to touch was
+        # still in that payload — and the line said "a conversation with
+        # nothing left to shed is the usual cause" without saying which case it
+        # was looking at, so it read as a compactor problem for four hours.
+        if not _droppable_system_indices(msgs, protect_system):
+            residual = (
+                "Nothing injected remains: what is left is the caller's own "
+                "system prompt and the newest turn, and neither is this "
+                "guard's to spend. The request as SENT does not fit the "
+                "window — that is a client-side size problem, not a memory one"
+            )
+        else:
+            # Unreachable: the pass above drops every droppable block before
+            # this line can be reached. Kept as a marker, because a guard that
+            # gives up holding memory it was allowed to spend is the exact
+            # defect v3.1 D3 closed and it should be loud if it returns.
+            residual = (
+                "BUG: injected block(s) survived the last-resort drop — the "
+                "guard is holding memory it was allowed to spend"
+            )
         logger.error(
             f"hard budget FAILED to fit: {detail} — still "
             f"{running - limit} token(s) over. Forwarding anyway (the newest "
-            f"turn is never dropped); vLLM will most likely reject this. A "
-            f"single turn larger than the budget, or a conversation with "
-            f"nothing left to shed, is the usual cause."
+            f"turn is never dropped); vLLM will most likely reject this. "
+            f"{residual}."
         )
     else:
         logger.warning(f"hard budget enforced: {detail}")
@@ -2322,6 +2766,27 @@ async def chat_completions(request: Request) -> Any:
             f"the hard-budget guard will shed content if they don't fit: {e}"
         )
 
+    # The window this request will finally be measured against, computed HERE
+    # rather than at the pre-flight below because the memory injection that
+    # follows has to be bounded by it. vLLM enforces prompt + max_tokens <=
+    # window, so a fixed reserve alone leaves a client asking for a big
+    # completion still 400able; and a memory budget expressed as a token
+    # constant cannot see any of that. Nothing between here and the guard
+    # depends on the value, and it depends on nothing but `body`.
+    try:
+        req_max_tokens = int(body.get("max_tokens") or 0)
+    except (TypeError, ValueError):
+        req_max_tokens = 0
+    if req_max_tokens > MAX_MODEL_LEN // 2:
+        # Pair with the reserve cap in effective_limit so prompt+completion
+        # always fits.
+        req_max_tokens = MAX_MODEL_LEN // 2
+        body["max_tokens"] = req_max_tokens
+    effective_limit = min(
+        MAX_MODEL_LEN,
+        max(256, MAX_MODEL_LEN - max(GENERATION_RESERVE, req_max_tokens)),
+    )
+
     # V2.0 memory injection. ALL three layers (facts, RAG, summary) are
     # collected into a SINGLE combined system message and injected in one
     # shot. This matters because Mistral-family chat templates (Mistral-
@@ -2339,7 +2804,9 @@ async def chat_completions(request: Request) -> Any:
     # RAG path must leave the extractor with an empty set, not a NameError on
     # the async tail where nothing would surface it.
     injected_facts: list[dict] = []
-    injected_blocks: list[str] = []
+    # (priority, label, text). Priority orders DROPPING, not sending: the list
+    # is still sent in the order it is built. See _bound_injected_blocks.
+    injected_blocks: list[tuple[int, str, str]] = []
     log_parts: list[str] = []
     # Bound before the summary load so the injection log line can name it even
     # when that load fails — an unreadable summary is exactly when you want the
@@ -2365,7 +2832,9 @@ async def chat_completions(request: Request) -> Any:
             ptext = persona.text_to_inject(conv_id, messages)
             pblock = persona.format_persona_block(ptext)
             if pblock:
-                injected_blocks.append(pblock)
+                injected_blocks.append(
+                    (_INJECT_PRIORITY_PERSONA, "persona", pblock)
+                )
                 log_parts.append(f"persona({len(ptext)}ch)")
         except StoreUnreadable as e:
             # auto_capture_persona reads before it writes, so an unreadable
@@ -2399,7 +2868,9 @@ async def chat_completions(request: Request) -> Any:
                 facts.touch_facts(injected_facts)
                 block = facts.format_facts_block(injected_facts)
                 if block:
-                    injected_blocks.append(block)
+                    injected_blocks.append(
+                        (_INJECT_PRIORITY_FACTS, "facts", block)
+                    )
                     log_parts.append(
                         f"{len(injected_facts)}fact(s)"
                         if len(injected_facts) == len(touched_facts)
@@ -2422,7 +2893,9 @@ async def chat_completions(request: Request) -> Any:
             )
             rblock = retrieval.format_retrieval_block(hits)
             if rblock:
-                injected_blocks.append(rblock)
+                injected_blocks.append(
+                    (_INJECT_PRIORITY_RETRIEVAL, "retrieval", rblock)
+                )
             # Logged unconditionally. Inside the `if` it only ever recorded
             # SUCCESS, so a retrieval layer returning nothing on every request
             # was indistinguishable in the log from one that was never asked.
@@ -2439,7 +2912,9 @@ async def chat_completions(request: Request) -> Any:
             last_turn = sstate.get("last_summarized_turn", "?")
             sblock = summarizer.format_summary_block(sstate)
             if sblock:
-                injected_blocks.append(sblock)
+                injected_blocks.append(
+                    (_INJECT_PRIORITY_SUMMARY, "summary", sblock)
+                )
                 log_parts.append(
                     f"sum(L1={len(sstate.get('l1') or [])}"
                     f"/L2={len(sstate.get('l2') or [])}"
@@ -2450,7 +2925,51 @@ async def chat_completions(request: Request) -> Any:
 
         # Single inject point — preserves Mistral template compatibility.
         if injected_blocks:
-            combined = "\n\n".join(injected_blocks)
+            # v3.1 D3: bound the SUM before it is injected, not after.
+            #
+            # Downstream of here the only remedy is the hard-budget guard, and
+            # the guard's remedies are trimming (which cuts a block at a point
+            # its own ranking did not choose) and dropping (which is this
+            # decision made blind, without knowing which layer it is spending).
+            # Making the choice here means it is made once, with the labels in
+            # hand, before any of it has been merged into one opaque block.
+            #
+            # The no-history budget is the narrow one. See
+            # INJECTION_NO_HISTORY_FRACTION for the case that forced it: a
+            # request with no prior assistant turn can be neither compacted nor
+            # shed, so an oversized injection there is not a degraded turn, it
+            # is a lost one.
+            has_history = _has_conversational_history(messages)
+            inject_budget = int(
+                effective_limit
+                * (
+                    INJECTION_BUDGET_FRACTION
+                    if has_history
+                    else INJECTION_NO_HISTORY_FRACTION
+                )
+            )
+            kept, dropped_layers, inject_cost = await run_in_threadpool(
+                _bound_injected_blocks, injected_blocks, inject_budget
+            )
+            if dropped_layers:
+                # WARNING, not INFO. This is memory the user believes the
+                # assistant has and the model is not going to see, which is the
+                # 2026-08-28 lesson in one line: a fallback that cannot say it
+                # fired is not a fallback.
+                logger.warning(
+                    f"conv={conv_id}: injected memory over budget "
+                    f"({inject_cost} tokens against {inject_budget}, "
+                    f"{INJECTION_BUDGET_FRACTION if has_history else INJECTION_NO_HISTORY_FRACTION:.3f}"
+                    f" of the {effective_limit}-token limit"
+                    f"{'' if has_history else '; this request has NO prior assistant turn, so it is task traffic or a first turn'}"
+                    f") — dropped {', '.join(dropped_layers)} to keep the "
+                    f"conversation itself in the window"
+                )
+                log_parts.append(f"dropped:{'+'.join(dropped_layers)}")
+        else:
+            kept = []
+        if kept:
+            combined = "\n\n".join(kept)
             try:
                 body["messages"] = inject_system_block(body["messages"], combined)
                 # msgs= is repeated here from the request line ~230 lines
@@ -2491,24 +3010,15 @@ async def chat_completions(request: Request) -> Any:
     # 1. _enforce_hard_budget runs FIRST, while the system blocks are still
     #    separate — so a trim hits the largest individual block (usually the
     #    injected memory) instead of a pre-merged mega-block where halving
-    #    would chew into the persona. It also accounts for the request's OWN
-    #    max_tokens: vLLM enforces prompt + max_tokens <= window, so a fixed
-    #    reserve alone leaves a client asking for a big completion still 400able.
+    #    would chew into the persona. It is shed against `effective_limit`,
+    #    which accounts for the request's OWN max_tokens — vLLM enforces
+    #    prompt + max_tokens <= window, so a fixed reserve alone leaves a
+    #    client asking for a big completion still 400able. That limit is now
+    #    computed further up, before memory injection, because v3.1 D3 bounds
+    #    injection as a fraction of it.
     # 2. _merge_adjacent_system_messages runs LAST, collapsing every remaining
     #    run — including any adjacency the budget guard created by deleting a
     #    turn that sat between two system messages.
-    try:
-        req_max_tokens = int(body.get("max_tokens") or 0)
-    except (TypeError, ValueError):
-        req_max_tokens = 0
-    if req_max_tokens > MAX_MODEL_LEN // 2:
-        # Pair with the reserve cap below so prompt+completion always fits.
-        req_max_tokens = MAX_MODEL_LEN // 2
-        body["max_tokens"] = req_max_tokens
-    effective_limit = min(
-        MAX_MODEL_LEN,
-        max(256, MAX_MODEL_LEN - max(GENERATION_RESERVE, req_max_tokens)),
-    )
     # Pure CPU (tokenizer) work — off the event loop so a shedding pass on a
     # huge conversation can't stall every other request and the healthchecks.
     # How many system messages the CALLER sent, counted on the original array
@@ -2518,9 +3028,19 @@ async def chat_completions(request: Request) -> Any:
     # only case that reaches (one user turn larger than the whole budget) doing
     # so does not even achieve the fit.
     caller_system = sum(1 for m in messages if m.get("role") == "system")
+    # v3.1 D4: what the guard decided, carried to the rejection path. Without
+    # it a 400 the guard PREDICTED (and logged at ERROR before sending) is
+    # indistinguishable from one that surprised it, and the calibration learns
+    # a process-global margin from the first kind.
+    guard_report: dict = {}
     body["messages"] = await run_in_threadpool(
-        _enforce_hard_budget, body["messages"], effective_limit, caller_system
+        _enforce_hard_budget,
+        body["messages"],
+        effective_limit,
+        caller_system,
+        guard_report,
     )
+    guard_measured_overflow = guard_report.get("fits") is False
     body["messages"] = _merge_adjacent_system_messages(body["messages"])
     # ...and non-system turns that ended up sharing a role (compaction hoists
     # image turns out of chronological order, which lands user next to user).
@@ -2595,7 +3115,8 @@ async def chat_completions(request: Request) -> Any:
                             # asking for a large completion could learn nothing
                             # and still be told to retry.
                             tightened = _note_backend_rejection(
-                                err_body, enforced_limit
+                                err_body, enforced_limit,
+                                guard_measured_overflow=guard_measured_overflow,
                             )
                             if r.status_code < 500:
                                 # A 4xx means the backend is HEALTHY and refused
@@ -2740,7 +3261,10 @@ async def chat_completions(request: Request) -> Any:
             # client verbatim, so there is no compactor-authored message for
             # `tightened` to steer. The calibration still happens; only the
             # advice-to-the-user half is absent here.
-            _note_backend_rejection(str(response_json)[:2000], enforced_limit)
+            _note_backend_rejection(
+                str(response_json)[:2000], enforced_limit,
+                guard_measured_overflow=guard_measured_overflow,
+            )
             return JSONResponse(content=response_json, status_code=r.status_code)
 
         # v3.1 A10: the counterpart to the rejection path above. Without a call

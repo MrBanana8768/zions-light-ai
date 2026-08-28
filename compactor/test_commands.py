@@ -27,6 +27,7 @@ import commands  # noqa: E402
 import dedup  # noqa: E402
 import facts  # noqa: E402
 import memory  # noqa: E402
+import portability  # noqa: E402
 import summarizer  # noqa: E402
 
 
@@ -701,6 +702,472 @@ def test_synthetic_completion_stream_shape():
 
 
 # ---------------------------------------------------------------------------
+# /tidy — v3.1 D6
+# ---------------------------------------------------------------------------
+#
+# Every fact string below is invented for this file. The store this feature is
+# built for holds a real person's memory of her own life; nothing from it, and
+# nothing shaped like it, belongs in a test fixture, a commit message or a log
+# line. The "real fact" rows here are deliberately mundane fiction-workshop
+# material — their job is to sit in the store and NOT be removed.
+#
+# The portability.quarantine_conversation tests live here rather than in
+# test_portability.py because that file is owned elsewhere this cycle. They
+# belong beside the export tests; move them when the ownership allows.
+
+_REAL_FACTS = [
+    "The protagonist is a lighthouse keeper named Idris.",
+    "The story is set on a fictional island called Brannock.",
+    "The user wants the prose written in past tense.",
+    "The user does not want a romance subplot.",
+    "Idris keeps a logbook bound in blue cloth.",
+    "The second act should open with the storm.",
+]
+
+# Rows that are provably content-free: the extractor's own format vocabulary,
+# and rows with no letter and no digit anywhere.
+_GARBAGE_SCAFFOLD = ["NONE", "No new facts.", "EXISTING FACTS:", "assistant"]
+_GARBAGE_EMPTY = ["- -", "...", "**", "━━━━━━━━"]
+
+
+def _rows(texts, *, start_turn=1, last_used=1000):
+    return [
+        {"text": t, "added_turn": start_turn + i, "last_used": last_used + i}
+        for i, t in enumerate(texts)
+    ]
+
+
+def _tidy(arg, cid):
+    return asyncio.run(commands.handle_command("tidy", arg, cid, ctx={}))
+
+
+def _remove_section(out):
+    """Only the WOULD REMOVE block, so a test can assert a string is absent
+    from the removal list without it accidentally matching the KEEPING list."""
+    if "WOULD REMOVE" not in out:
+        return ""
+    return out.split("WOULD REMOVE", 1)[1].split("KEEPING", 1)[0]
+
+
+def _code_from(out):
+    marker = "/tidy apply "
+    assert_true(marker in out, "dry run offered a confirmation code")
+    return out.split(marker, 1)[1].split()[0]
+
+
+def test_parse_tidy_and_aliases():
+    print("\n[test] parse_command: /tidy and its aliases, and near-misses pass through")
+    assert_eq(commands.parse_command("/tidy"), ("tidy", ""), "/tidy")
+    assert_eq(commands.parse_command("/tidy apply abc123"),
+              ("tidy", "apply abc123"), "/tidy apply <code>")
+    assert_eq(commands.parse_command("/tidy-facts"), ("tidy", ""), "/tidy-facts alias")
+    assert_eq(commands.parse_command("/cleanup"), ("tidy", ""), "/cleanup alias")
+    # A near-miss must pass through to the model rather than resolve to a
+    # command that can delete facts.
+    assert_eq(commands.parse_command("/tidyup"), (None, ""), "/tidyup is not /tidy")
+    assert_eq(commands.parse_command("/t"), (None, ""), "no single-letter alias")
+
+
+def test_tidy_dry_run_changes_nothing():
+    print("\n[test] /tidy is a dry run: the store is byte-identical afterwards")
+    _wipe()
+    cid = "tidy-dry"
+    rows = _rows(_REAL_FACTS + _GARBAGE_SCAFFOLD + _GARBAGE_EMPTY)
+    facts.save_facts(cid, rows)
+    before = facts.load_facts(cid)
+    out = _tidy("", cid)
+    assert_true("DRY RUN" in out, f"reply announces a dry run: {out[:80]!r}")
+    assert_eq(facts.load_facts(cid), before, "facts unchanged by the dry run")
+    assert_eq(facts.load_archive(cid), [], "nothing archived by the dry run")
+    assert_eq(portability.list_quarantine(cid), [], "no snapshot written by a dry run")
+
+
+def test_tidy_never_proposes_a_real_fact_for_removal():
+    print("\n[test] /tidy: no real fact appears in the WOULD REMOVE section")
+    _wipe()
+    cid = "tidy-conservative"
+    facts.save_facts(cid, _rows(_REAL_FACTS + _GARBAGE_SCAFFOLD + _GARBAGE_EMPTY))
+    section = _remove_section(_tidy("", cid))
+    for text in _REAL_FACTS:
+        assert_true(text not in section, f"real fact not proposed for removal: {text!r}")
+    for text in _GARBAGE_SCAFFOLD + _GARBAGE_EMPTY:
+        assert_true(repr(text) in section, f"garbage row shown verbatim: {text!r}")
+
+
+def test_tidy_groups_removals_under_the_rule_that_matched():
+    print("\n[test] /tidy groups each proposed removal under its rule + reason")
+    # The requirement is that a BAD RULE is visible before it runs, which means
+    # the operator has to be able to see which rule claimed which row.
+    _wipe()
+    cid = "tidy-groups"
+    facts.save_facts(cid, _rows(_REAL_FACTS + _GARBAGE_SCAFFOLD + _GARBAGE_EMPTY))
+    out = _tidy("", cid)
+    assert_true("[scaffolding]" in out, "scaffolding group present")
+    assert_true("[no-content]" in out, "no-content group present")
+    assert_true("extractor's own format vocabulary" in out, "rule explained in prose")
+    assert_true("no letter and no digit" in out, "no-content rule explained in prose")
+
+
+def test_tidy_keeps_and_reports_ambiguous_rows():
+    print("\n[test] /tidy KEEPS ambiguous rows and reports them separately")
+    # The whole safety premise: when a row is odd but not provably garbage it
+    # stays, and the operator is told about it. Every row here is odd.
+    _wipe()
+    cid = "tidy-ambiguous"
+    ambiguous = [
+        "1997-04-12",                                     # numeric-only
+        "[user]: Idris hates the fog",                    # transcript-fragment
+        "I cannot determine any facts from this exchange.",  # meta-commentary
+        "━━━━━━━━ Chapter Three ━━━━━━━━",                # decorative
+        "Blue cloth.",                                    # very-short
+        "x" * (commands.TIDY_OVERSIZED_CHARS + 20),       # oversized
+    ]
+    facts.save_facts(cid, _rows(_REAL_FACTS + ambiguous))
+    out = _tidy("", cid)
+    assert_true("WOULD REMOVE nothing" in out, f"nothing removed: {out}")
+    assert_true("KEEPING" in out, "ambiguous rows reported")
+    for rule in ("numeric-only", "transcript-fragment", "meta-commentary",
+                 "decorative", "very-short", "oversized"):
+        assert_true(f"[{rule}]" in out, f"{rule} reported as kept-but-odd")
+
+
+def test_tidy_reports_near_duplicates_without_removing_them():
+    print("\n[test] /tidy flags near-duplicates but will not pick a wording")
+    _wipe()
+    cid = "tidy-near"
+    facts.save_facts(cid, _rows([
+        "Idris keeps a logbook bound in blue cloth.",
+        "Idris keeps a logbook bound in blue cloth",   # no full stop
+        "The story is set on a fictional island called Brannock.",
+    ]))
+    out = _tidy("", cid)
+    assert_true("WOULD REMOVE nothing" in out, f"no removal proposed: {out}")
+    assert_true("[near-duplicate]" in out, "near-duplicate flagged for a human")
+
+
+def test_tidy_removes_exact_duplicates_keeping_the_longest_lived_copy():
+    print("\n[test] /tidy collapses byte-identical rows, keeping the survivor "
+          "that would have outlived the others")
+    _wipe()
+    cid = "tidy-dupes"
+    dup = "Idris keeps a logbook bound in blue cloth."
+    facts.save_facts(cid, [
+        {"text": dup, "added_turn": 3, "last_used": 100},
+        {"text": dup, "added_turn": 9, "last_used": 400},   # survivor
+        {"text": dup, "added_turn": 5, "last_used": 400},
+        {"text": "The second act should open with the storm.",
+         "added_turn": 2, "last_used": 50},
+    ])
+    out = _tidy("", cid)
+    assert_true("[duplicate] 2 row(s)" in out, f"two duplicates proposed: {out}")
+    reply = _tidy(f"apply {_code_from(out)}", cid)
+    remaining = facts.load_facts(cid)
+    assert_eq(len(remaining), 2, f"one copy left plus the other fact: {reply}")
+    survivor = [f for f in remaining if f["text"] == dup][0]
+    # Eviction sorts on (last_used, added_turn) — keeping the maximum means
+    # this collapse can never move a fact FORWARD in the eviction queue.
+    assert_eq((survivor["last_used"], survivor["added_turn"]), (400, 9),
+              "survivor is the highest (last_used, added_turn) copy")
+
+
+def test_tidy_apply_without_a_code_refuses():
+    print("\n[test] /tidy apply with no code changes nothing")
+    _wipe()
+    cid = "tidy-nocode"
+    facts.save_facts(cid, _rows(_REAL_FACTS + _GARBAGE_SCAFFOLD))
+    before = facts.load_facts(cid)
+    out = _tidy("apply", cid)
+    assert_true("needs the code" in out, f"refused with a reason: {out!r}")
+    assert_eq(facts.load_facts(cid), before, "store untouched")
+
+
+def test_tidy_apply_with_a_stale_code_refuses_and_reprints_the_plan():
+    print("\n[test] /tidy apply refuses a code issued for a different removal set")
+    _wipe()
+    cid = "tidy-stale"
+    facts.save_facts(cid, _rows(_REAL_FACTS + _GARBAGE_SCAFFOLD))
+    code = _code_from(_tidy("", cid))
+    # A new GARBAGE row lands — the removal set has changed, so the code the
+    # operator is holding no longer describes what would happen.
+    facts.save_facts(cid, facts.load_facts(cid) + _rows(["NONE"], start_turn=99))
+    before = facts.load_facts(cid)
+    out = _tidy(f"apply {code}", cid)
+    assert_true("out of date" in out, f"refused as stale: {out[:120]!r}")
+    assert_true("DRY RUN" in out, "a fresh plan is printed instead")
+    assert_eq(facts.load_facts(cid), before, "nothing removed")
+
+
+def test_tidy_code_survives_an_unrelated_write():
+    print("\n[test] a new GOOD fact does not invalidate the confirmation code")
+    # The code is a compare-and-swap over the REMOVAL SET, not over the whole
+    # store. A tail adding a real fact between the dry run and the confirmation
+    # is the normal case on a live conversation; invalidating there would make
+    # the command unusable without making it safer.
+    _wipe()
+    cid = "tidy-benign"
+    facts.save_facts(cid, _rows(_REAL_FACTS + _GARBAGE_SCAFFOLD))
+    code = _code_from(_tidy("", cid))
+    facts.save_facts(cid, facts.load_facts(cid) + _rows(
+        ["Brannock has one harbour, on the eastern shore."], start_turn=99))
+    out = _tidy(f"apply {code}", cid)
+    assert_true(out.startswith("Removed "), f"applied: {out[:120]!r}")
+    texts = [f["text"] for f in facts.load_facts(cid)]
+    assert_true("Brannock has one harbour, on the eastern shore." in texts,
+                "the fact added in between survived")
+    for t in _GARBAGE_SCAFFOLD:
+        assert_true(t not in texts, f"garbage removed: {t!r}")
+
+
+def test_tidy_apply_archives_to_the_sidecar_and_is_restorable():
+    print("\n[test] /tidy apply moves rows to the archive; they can be restored")
+    _wipe()
+    cid = "tidy-restore"
+    facts.save_facts(cid, _rows(_REAL_FACTS + _GARBAGE_SCAFFOLD))
+    out = _tidy(f"apply {_code_from(_tidy('', cid))}", cid)
+    archived = {f["text"] for f in facts.load_archive(cid)}
+    assert_eq(archived, set(_GARBAGE_SCAFFOLD), "every removed row is in the archive")
+    assert_true("/list-archive" in out, f"reply says where they went: {out!r}")
+    # Nothing was unlinked: restore_from_archive puts a row back, unchanged.
+    n = facts.restore_from_archive(cid, text_substring="EXISTING FACTS:")
+    assert_eq(n, 1, "one row restored")
+    assert_true("EXISTING FACTS:" in [f["text"] for f in facts.load_facts(cid)],
+                "the restored row is back in the active set")
+
+
+def test_tidy_apply_writes_a_verified_snapshot_that_import_can_read():
+    print("\n[test] /tidy apply publishes a snapshot import_conversation accepts")
+    _wipe()
+    cid = "tidy-snap"
+    facts.save_facts(cid, _rows(_REAL_FACTS + _GARBAGE_SCAFFOLD))
+    n_before = len(facts.load_facts(cid))
+    out = _tidy(f"apply {_code_from(_tidy('', cid))}", cid)
+    snaps = portability.list_quarantine(cid)
+    assert_eq(len(snaps), 1, "exactly one snapshot published")
+    assert_true(str(snaps[0]) in out, "the reply names the snapshot path")
+    assert_eq(list(snaps[0].parent.glob("*.partial")), [], "no .partial left behind")
+    bundle = json.loads(snaps[0].read_text(encoding="utf-8"))
+    assert_eq(len(bundle["facts"]), n_before, "snapshot holds the pre-op store")
+    # The recovery route is the existing import path, with no new format.
+    res = portability.import_conversation(
+        bundle, target_conv_id="tidy-snap-restored", overwrite=False)
+    assert_eq(res["imported"]["facts"], n_before, "snapshot restores every row")
+
+
+def test_tidy_apply_aborts_when_the_snapshot_cannot_be_written():
+    print("\n[test] /tidy apply removes nothing if the pre-op snapshot fails")
+    _wipe()
+    cid = "tidy-snapfail"
+    facts.save_facts(cid, _rows(_REAL_FACTS + _GARBAGE_SCAFFOLD))
+    code = _code_from(_tidy("", cid))
+    before = facts.load_facts(cid)
+    real = portability.quarantine_conversation
+
+    def boom(conv_id, *, reason):
+        raise portability.QuarantineError("simulated: no space left on device")
+
+    portability.quarantine_conversation = boom
+    try:
+        out = _tidy(f"apply {code}", cid)
+    finally:
+        portability.quarantine_conversation = real
+    assert_true("changed nothing" in out, f"abort is stated plainly: {out!r}")
+    assert_eq(facts.load_facts(cid), before, "store untouched")
+    assert_eq(facts.load_archive(cid), [], "nothing archived")
+
+
+def test_tidy_refuses_a_plan_that_takes_more_than_half_the_store():
+    print("\n[test] /tidy refuses a plan whose blast radius is over the cap")
+    # A rule that matches half a conversation's memory is a broken rule. The
+    # operator must see a refusal, not a large success message.
+    _wipe()
+    cid = "tidy-blast"
+    garbage = _rows(["..."] * 15 + ["- -"] * 3, start_turn=1)
+    for i, r in enumerate(garbage):
+        r["text"] = f"{'.' * (3 + i)}"     # distinct, all content-free
+    facts.save_facts(cid, garbage + _rows(_REAL_FACTS[:4], start_turn=100))
+    dry = _tidy("", cid)
+    assert_true("I will NOT apply this plan" in dry, f"dry run warns: {dry}")
+    before = facts.load_facts(cid)
+    # There is no code on offer, but a stale one from elsewhere must not work
+    # either — the cap is checked on the apply path, not only in the renderer.
+    plan = commands._tidy_plan(before)
+    out = _tidy(f"apply {plan['token']}", cid)
+    assert_true("Refusing" in out, f"apply refused: {out!r}")
+    assert_eq(facts.load_facts(cid), before, "store untouched")
+
+
+def test_tidy_is_idempotent():
+    print("\n[test] /tidy apply twice removes the same rows once")
+    _wipe()
+    cid = "tidy-idem"
+    # Enough real facts that eight garbage rows stay under the blast-radius
+    # cap — the cap is exercised on its own in
+    # test_tidy_refuses_a_plan_that_takes_more_than_half_the_store.
+    more = [
+        "Brannock has one harbour, on the eastern shore.",
+        "The lamp room was rebuilt after the fire.",
+        "Idris's sister Maren visits every spring.",
+        "Chapter one should end on the wreck.",
+    ]
+    facts.save_facts(
+        cid, _rows(_REAL_FACTS + more + _GARBAGE_SCAFFOLD + _GARBAGE_EMPTY))
+    _tidy(f"apply {_code_from(_tidy('', cid))}", cid)
+    after_first = facts.load_facts(cid)
+    archive_first = facts.load_archive(cid)
+    second = _tidy("", cid)
+    assert_true("WOULD REMOVE nothing" in second, f"second pass is a no-op: {second}")
+    out = _tidy("apply deadbeef1234", cid)
+    assert_true("Nothing to remove" in out, f"apply is a no-op too: {out!r}")
+    assert_eq(facts.load_facts(cid), after_first, "active set unchanged")
+    assert_eq(facts.load_archive(cid), archive_first, "archive not re-appended")
+
+
+def test_tidy_on_an_empty_store_says_so():
+    print("\n[test] /tidy on a conversation with no facts")
+    _wipe()
+    assert_true("nothing to tidy" in _tidy("", "tidy-empty").lower(), "dry run")
+    assert_true("nothing to tidy" in _tidy("apply abc", "tidy-empty").lower(), "apply")
+
+
+def test_tidy_rejects_an_unknown_subcommand():
+    print("\n[test] /tidy with an unrecognized option does not fall through to apply")
+    _wipe()
+    cid = "tidy-badopt"
+    facts.save_facts(cid, _rows(_REAL_FACTS + _GARBAGE_SCAFFOLD))
+    before = facts.load_facts(cid)
+    out = _tidy("delete-everything", cid)
+    assert_true("Unknown option" in out, f"refused: {out!r}")
+    assert_eq(facts.load_facts(cid), before, "store untouched")
+
+
+def test_tidy_unreadable_store_is_not_rewritten():
+    print("\n[test] /tidy on an unreadable facts file changes nothing and says so")
+    _wipe()
+    cid = "tidy-corrupt"
+    memory.facts_path(cid).parent.mkdir(parents=True, exist_ok=True)
+    memory.facts_path(cid).write_text("{not json", encoding="utf-8")
+    out = _tidy("", cid)
+    assert_true("couldn't read" in out, f"plain-language store error: {out!r}")
+    assert_true("Nothing has been deleted" in out, "reassures nothing was lost")
+    assert_eq(memory.facts_path(cid).read_text(encoding="utf-8"), "{not json",
+              "the unreadable file is left exactly as it was")
+
+
+def test_every_removal_rule_has_a_printed_explanation():
+    print("\n[test] every rule the classifier can emit has operator-facing prose")
+    # A rule with no explanation is a rule the operator cannot review, and an
+    # unreviewable rule is how a bad one gets confirmed.
+    emitted = set(commands._TIDY_REMOVE_ORDER) | set(commands._TIDY_FLAG_ORDER)
+    missing = sorted(emitted - set(commands._TIDY_RULE_TEXT))
+    assert_eq(missing, [], "no rule id is missing from _TIDY_RULE_TEXT")
+
+
+def test_quarantine_refuses_to_publish_a_snapshot_short_of_the_store():
+    print("\n[test] quarantine_conversation contradicts its own export")
+    # export_conversation wraps every layer in `except Exception` and degrades
+    # to an empty value, so a conversation whose facts file raised produces a
+    # valid, empty, importable bundle. Publishing that as "your data is safe"
+    # is backup.py F2 exactly. The verify step exists to catch it.
+    _wipe()
+    cid = "tidy-shortsnap"
+    facts.save_facts(cid, _rows(_REAL_FACTS))
+    real = portability.export_conversation
+
+    def lossy(conv_id):
+        b = real(conv_id)
+        b["facts"] = []
+        return b
+
+    portability.export_conversation = lossy
+    try:
+        raised = False
+        try:
+            portability.quarantine_conversation(cid, reason="test")
+        except portability.QuarantineError:
+            raised = True
+    finally:
+        portability.export_conversation = real
+    assert_true(raised, "a snapshot short of the store is refused")
+    assert_eq(portability.list_quarantine(cid), [], "nothing published")
+    assert_eq(list(portability.quarantine_dir().glob("*.partial")), [],
+              "no .partial left behind on the failure path")
+
+
+def test_quarantine_propagates_an_unreadable_facts_file():
+    print("\n[test] quarantine_conversation raises on an unreadable facts file")
+    # It must not fall back to "0 facts expected" and then congratulate itself
+    # for capturing 0 — the operation that follows is about to rewrite that
+    # very file.
+    _wipe()
+    cid = "tidy-quarantine-corrupt"
+    memory.facts_path(cid).parent.mkdir(parents=True, exist_ok=True)
+    memory.facts_path(cid).write_text("{not json", encoding="utf-8")
+    raised = False
+    try:
+        portability.quarantine_conversation(cid, reason="test")
+    except memory.StoreUnreadable:
+        raised = True
+    assert_true(raised, "StoreUnreadable propagates to the caller")
+    assert_eq(portability.list_quarantine(cid), [], "nothing published")
+
+
+def test_tidy_finishes_an_interrupted_apply():
+    print("\n[test] /tidy resumes cleanly from a crash between the two writes")
+    # The apply writes the sidecar first and the active set second, so an
+    # interruption in between leaves a row in BOTH files. That is the
+    # recoverable order (archive_facts's docstring: the other one loses it
+    # outright), and re-running has to finish the job without doubling the
+    # archive.
+    _wipe()
+    cid = "tidy-interrupted"
+    rows = _rows(_REAL_FACTS + _GARBAGE_SCAFFOLD)
+    facts.save_facts(cid, rows)
+    facts.archive_facts(cid, [f for f in rows if f["text"] in _GARBAGE_SCAFFOLD])
+    assert_eq(len(facts.load_facts(cid)), len(rows), "active set still complete")
+    assert_eq(len(facts.load_archive(cid)), len(_GARBAGE_SCAFFOLD), "sidecar written")
+    _tidy(f"apply {_code_from(_tidy('', cid))}", cid)
+    assert_eq(len(facts.load_facts(cid)), len(_REAL_FACTS), "active set finished")
+    assert_eq(len(facts.load_archive(cid)), len(_GARBAGE_SCAFFOLD),
+              "archive holds one copy of each row, not two")
+
+
+def test_tidy_never_elides_the_removal_list():
+    print("\n[test] /tidy shows every proposed removal, however many there are")
+    # A row confirmed without being seen is the failure this command exists to
+    # prevent, so the removal section is never truncated. The flagged list is,
+    # because it is a reading list and not a consent surface.
+    _wipe()
+    cid = "tidy-longlist"
+    n = commands.TIDY_MAX_ROWS_SHOWN + 7
+    garbage = [{"text": "." * (3 + i), "added_turn": i, "last_used": i}
+               for i in range(n)]
+    real = _rows([f"Brannock landmark number {i} is on the map." for i in range(n * 3)],
+                 start_turn=500)
+    facts.save_facts(cid, garbage + real)
+    out = _tidy("", cid)
+    section = _remove_section(out)
+    assert_true("not shown" not in section, "removal list is complete")
+    for g in garbage:
+        assert_true(repr(g["text"]) in section, "every removal row is printed")
+    flagged = out.split("KEEPING", 1)[1] if "KEEPING" in out else ""
+    assert_true("not shown" in flagged or not flagged,
+                "the flagged reading list is the part that may be capped")
+
+
+def test_quarantine_does_not_overwrite_a_snapshot_from_the_same_second():
+    print("\n[test] two snapshots in one second get two names")
+    # The stamp has second resolution. A collision would mean the second run
+    # silently overwriting the snapshot that makes the first run reversible.
+    _wipe()
+    cid = "tidy-collide"
+    facts.save_facts(cid, _rows(_REAL_FACTS))
+    a = portability.quarantine_conversation(cid, reason="test")
+    b = portability.quarantine_conversation(cid, reason="test")
+    assert_true(a["path"] != b["path"], "the second snapshot got its own name")
+    assert_eq(len(portability.list_quarantine(cid)), 2, "both are on disk")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -753,6 +1220,31 @@ def _all_tests():
         test_synthetic_completion_shape,
         test_synthetic_completion_handles_empty_model,
         test_synthetic_completion_stream_shape,
+        # v3.1 D6 — /tidy
+        test_parse_tidy_and_aliases,
+        test_tidy_dry_run_changes_nothing,
+        test_tidy_never_proposes_a_real_fact_for_removal,
+        test_tidy_groups_removals_under_the_rule_that_matched,
+        test_tidy_keeps_and_reports_ambiguous_rows,
+        test_tidy_reports_near_duplicates_without_removing_them,
+        test_tidy_removes_exact_duplicates_keeping_the_longest_lived_copy,
+        test_tidy_apply_without_a_code_refuses,
+        test_tidy_apply_with_a_stale_code_refuses_and_reprints_the_plan,
+        test_tidy_code_survives_an_unrelated_write,
+        test_tidy_apply_archives_to_the_sidecar_and_is_restorable,
+        test_tidy_apply_writes_a_verified_snapshot_that_import_can_read,
+        test_tidy_apply_aborts_when_the_snapshot_cannot_be_written,
+        test_tidy_refuses_a_plan_that_takes_more_than_half_the_store,
+        test_tidy_is_idempotent,
+        test_tidy_on_an_empty_store_says_so,
+        test_tidy_rejects_an_unknown_subcommand,
+        test_tidy_unreadable_store_is_not_rewritten,
+        test_every_removal_rule_has_a_printed_explanation,
+        test_quarantine_refuses_to_publish_a_snapshot_short_of_the_store,
+        test_quarantine_propagates_an_unreadable_facts_file,
+        test_tidy_finishes_an_interrupted_apply,
+        test_tidy_never_elides_the_removal_list,
+        test_quarantine_does_not_overwrite_a_snapshot_from_the_same_second,
         test_every_test_in_this_module_is_registered,
     ]
 

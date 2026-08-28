@@ -41,6 +41,43 @@ Several tests below are TEETH CHECKS: they re-run the pre-fix behaviour and
 assert that it OVERFLOWS when measured by the server. A suite that only asserts
 the fixed path passes just as happily on code that never had the fix.
 
+WHAT THIS SUITE MISSED, AND WHY (D7, added 2026-08-29)
+------------------------------------------------------
+It was built to catch /tokenize contract failures. It ran green twice, shipped,
+and four hours later D1 — /tokenize 400s on an assistant-final message list —
+took compaction down in production.
+
+It missed it because every request it made ended on a USER turn:
+
+* `conversation()` was the only generator, and it ends on the new user turn.
+* `truth()` sent `add_generation_prompt` unset, so the server defaulted it True
+  and the fixture cheerfully tokenized assistant-final lists that real vLLM
+  refuses. Section 3 measured summarizer batches through a request production
+  could not make.
+* the fixture had no shape validation at all, so there was nothing to hit.
+
+Three places agreed on a contract nothing in the tree sends. Sections 8-10 close
+that: 8 covers the assistant-final shape end to end, 9 covers the FALLBACK path
+rather than only the measured one (both of the 2026-08-29 defects lived in
+fallbacks), and 10 enumerates every module in the tree that POSTs to /tokenize
+and drives each shape it sends — failing if a third client appears.
+
+STILL WEAKER THAN IT LOOKS
+--------------------------
+Stated plainly rather than left for the next incident to find:
+
+* The scale-correction assertions are only as hostile as the tokenizer PAIR.
+  Test [5] says so for content categories; it is equally true of [6], [7], [21]
+  and [22], whose thresholds all rest on gpt2-vs-SmolLM2 diverging.
+* Nothing here exercises `format_retrieval_block`'s `count_tokens` hook, because
+  no caller passes one — the retrieval budget runs on `_estimate_tokens` in
+  production and this suite says nothing about it.
+* `_reported_prompt_tokens` is checked against the fixture's wording, and the
+  fixture's wording was dumped from vllm 0.10.0 while the pod pins 0.24.0. See
+  [16] and the README's finding.
+* The tests assert on LOG SUBSTRINGS in several places. A log line whose numbers
+  go stale still passes those (see the note [21] can emit).
+
 How to run
 ----------
     docker compose -f docker-compose.tokenizer-contract.yml \
@@ -56,7 +93,10 @@ With no fixture reachable this module SKIPS and exits 0, so the existing
 CPU-only suite is unaffected. It is deliberately not silent about skipping.
 """
 
+import asyncio
 import os
+import pathlib
+import re
 import sys
 import tempfile
 
@@ -102,6 +142,33 @@ import logsetup  # noqa: E402
 import main  # noqa: E402
 
 FIXTURE_MAX_LEN = int(FIXTURE_INFO["max_model_len"])
+
+# A STALE FIXTURE IMAGE IS NOT A SKIP.
+#
+# The test runner mounts the repo, so editing a test takes effect immediately;
+# the fixture is a BUILT IMAGE, so editing the server does not. That asymmetry
+# is invisible from the test side, and it is how a harness ends up green against
+# a server that cannot produce the failure it is checking for — the D1 group
+# below asserts that an assistant-final /tokenize request is REFUSED, and a
+# fixture built before 2026-08-29 answers it 200. Fail loudly rather than pass
+# vacuously.
+_REQUIRED_FIXTURE_FEATURES = {"assistant_final_400", "shapes"}
+_missing = _REQUIRED_FIXTURE_FEATURES - set(FIXTURE_INFO.get("features") or [])
+if _missing:
+    print("=" * 72)
+    print("STALE FIXTURE IMAGE — refusing to run")
+    print(f"  {FIXTURE_URL} does not advertise: {', '.join(sorted(_missing))}")
+    print()
+    print("  This suite asserts that /tokenize REFUSES an assistant-final")
+    print("  message list (D1, the defect that took compaction down four hours")
+    print("  after the v3.1 deploy). A fixture without that check answers 200,")
+    print("  so those assertions would pass while proving nothing — which is")
+    print("  precisely the failure D7 is about. Rebuild it:")
+    print()
+    print("    docker compose -f docker-compose.tokenizer-contract.yml \\")
+    print("        up --build --exit-code-from contract-tests")
+    print("=" * 72)
+    sys.exit(1)
 
 _FAILURES: list[str] = []
 _NOTES: list[str] = []
@@ -171,14 +238,51 @@ def reset_fixture() -> None:
 
 def truth(messages: list[dict]) -> int:
     """The server's count, taken directly — never through main, so a test can
-    still measure ground truth while main is being lied to."""
+    still measure ground truth while main is being lied to.
+
+    `add_generation_prompt` is decided here the same way `count_tokens_exact`
+    decides it, and that is not a convenience. Until 2026-08-29 this helper sent
+    the field unset, the server defaulted it True, and the fixture happily
+    tokenized an assistant-final list that real vLLM refuses with a 400. Every
+    "measured on the server" assertion in section 3 runs on batches that
+    routinely end on an assistant turn, so the harness was measuring those
+    batches through a request production could not make. That is D7 in one
+    helper: the contract it imagined, not the one the code exercises.
+    """
+    agp = bool(messages) and messages[-1].get("role") != "assistant"
     r = httpx.post(
         f"{FIXTURE_URL}/tokenize",
-        json={"model": "fixture-model", "messages": messages},
+        json={
+            "model": "fixture-model",
+            "messages": messages,
+            "add_generation_prompt": agp,
+        },
         timeout=60.0,
     )
     r.raise_for_status()
     return int(r.json()["count"])
+
+
+def truth_prompt(text: str) -> int:
+    """The server's count for the COMPLETION shape — `{"model", "prompt"}`.
+
+    A different request than `truth`: no chat template, no generation prompt,
+    `add_special_tokens` defaulting True rather than False. This is the shape
+    `summarizer._count_tokens` sends, and nothing in this suite measured it
+    before 2026-08-29.
+    """
+    r = httpx.post(
+        f"{FIXTURE_URL}/tokenize",
+        json={"model": "fixture-model", "prompt": text},
+        timeout=60.0,
+    )
+    r.raise_for_status()
+    return int(r.json()["count"])
+
+
+def shapes() -> list[dict]:
+    """Every /tokenize request the fixture has seen since the last reset."""
+    return fixture("/_fixture/shapes").get("shapes") or []
 
 
 class CaptureLogs:
@@ -250,11 +354,30 @@ def decorative_turn(role: str = "assistant") -> dict:
 
 
 def conversation(n_pairs: int, assistant_content: str = DECORATIVE_REPLY) -> list[dict]:
+    """The GUARD's shape: a full payload ending on the user's new turn."""
     msgs: list[dict] = [{"role": "system", "content": "You are a helpful assistant."}]
     for i in range(n_pairs):
         msgs.append({"role": "user", "content": f"Question {i}: tell me about the plan."})
         msgs.append({"role": "assistant", "content": assistant_content})
     msgs.append({"role": "user", "content": "And what should I do next?"})
+    return msgs
+
+
+def old_turns(n_pairs: int, assistant_content: str = DECORATIVE_REPLY) -> list[dict]:
+    """The SUMMARIZER's shape: a slice of completed exchanges, so it ends on an
+    assistant reply and carries no system message.
+
+    This is what `split_messages` hands `summarize()` — `to_summarize` is
+    `non_system[:-KEEP_RECENT_TURNS]`, sliced at a user boundary, so the turn
+    before that boundary is the assistant's. Every summarize() in the production
+    logs of 2026-08-28 and 2026-08-29 measured a list of exactly this shape, and
+    every one of them got a 400 for it.
+    """
+    msgs: list[dict] = []
+    for i in range(n_pairs):
+        msgs.append({"role": "user", "content": f"Question {i}: tell me about the plan."})
+        msgs.append({"role": "assistant", "content": assistant_content})
+    assert msgs[-1]["role"] == "assistant"
     return msgs
 
 
@@ -713,20 +836,480 @@ def test_chat_completions_serves_a_payload_the_guard_approved():
     reset_fixture()
     limit = 8000
     out = main._enforce_hard_budget(conversation(12), limit=limit, protect_system=1)
+    # max_tokens is set so the BACKEND'S OWN GATE is tight against exactly this
+    # limit: vLLM refuses when token_num + max_tokens > max_model_len, so with
+    # max_tokens = window - limit the request is served if and only if the
+    # prompt really came in at or under `limit`.
+    #
+    # It used to be a flat 256 against a 32,768 window, which meant the backend
+    # would have accepted a payload four times the size the guard promised. A
+    # 200 proved the fixture was up, not that the guard was right. This is the
+    # production relationship — limit is HARD_INPUT_LIMIT, the remainder is
+    # GENERATION_RESERVE — rather than a number chosen to pass.
     r = httpx.post(
         f"{FIXTURE_URL}/v1/chat/completions",
-        json={"model": "fixture-model", "messages": out, "max_tokens": 256},
+        json={
+            "model": "fixture-model",
+            "messages": out,
+            "max_tokens": FIXTURE_MAX_LEN - limit,
+        },
         timeout=60.0,
     )
     check(
         r.status_code == 200,
-        "what the guard approved, the backend serves",
+        "what the guard approved, the backend serves — with the window's whole "
+        "remainder reserved for generation",
         f"status {r.status_code}: {r.text[:300]!r}",
-        extra=f"prompt_tokens {r.json().get('usage', {}).get('prompt_tokens')}",
+        extra=f"prompt_tokens {r.json().get('usage', {}).get('prompt_tokens')}"
+        if r.status_code == 200
+        else "",
     )
 
 
-# ============================================================== 8. THE REGIMES
+# ==================================== 8. D1: THE 400 THIS HARNESS DID NOT CATCH
+#
+# The harness existed to catch /tokenize contract failures. It ran green twice
+# and shipped, and four hours later an assistant-final message list 400'd
+# /tokenize in production and took compaction down.
+#
+# It missed it because every request it made ended on a USER turn. `truth()`
+# sent the flag unset; `conversation()` was the only generator; the fixture
+# answered an assistant-final list with a 200 that real vLLM has never given.
+# Three separate places all agreed on a contract nothing in the tree sends.
+
+
+def test_fixture_reproduces_the_assistant_final_refusal():
+    print("\n[18] the fixture now REFUSES an assistant-final /tokenize, as vLLM does")
+    reset_fixture()
+    slice_ = old_turns(2)
+
+    def post(msgs, **flags):
+        return httpx.post(
+            f"{FIXTURE_URL}/tokenize",
+            json={"model": "fixture-model", "messages": msgs, **flags},
+            timeout=30.0,
+        )
+
+    r = post(slice_, add_generation_prompt=True)
+    check(
+        r.status_code == 400,
+        "add_generation_prompt=True on an assistant-final list is refused",
+        f"status {r.status_code}; the fixture is not reproducing D1 at all, so "
+        f"every assertion below it is vacuous",
+    )
+    body = r.text
+    check(
+        "add_generation_prompt" in body and "continue_final_message" in body,
+        "with vLLM's own wording, which is what the log will carry",
+        f"body was {body[:300]!r}",
+        extra="'Consider using continue_final_message instead.'",
+    )
+
+    r_off = post(slice_, add_generation_prompt=False)
+    check(
+        r_off.status_code == 200 and isinstance(r_off.json().get("count"), int),
+        "the same list with the flag off is counted normally",
+        f"status {r_off.status_code}: {r_off.text[:200]!r}",
+        extra=f"{r_off.json().get('count')} tokens" if r_off.status_code == 200 else "",
+    )
+
+    # Prove the refusal is about the FLAG AND THE SHAPE and not about the
+    # content — otherwise a green [19] could be an artifact of this payload.
+    set_mode(assistant_final_400=False)
+    r_disabled = post(slice_, add_generation_prompt=True)
+    reset_fixture()
+    check(
+        r_disabled.status_code == 200,
+        "and with the check disabled the identical request succeeds",
+        f"status {r_disabled.status_code}; the 400 above came from something "
+        f"other than the shape check, so it is not evidence of D1",
+    )
+
+    # The sibling refusal, aimed at the wrong fix: keeping
+    # add_generation_prompt=True and adding continue_final_message=True.
+    r_both = post(conversation(1), add_generation_prompt=True, continue_final_message=True)
+    reset_fixture()
+    check(
+        r_both.status_code == 400,
+        "setting BOTH flags is refused too — the plausible wrong fix for D1",
+        f"status {r_both.status_code}",
+    )
+    note(
+        "the both-flags wording is reconstructed from vLLM's chat utils, NOT "
+        "dumped from the image like the assistant-final one (which is quoted "
+        "from the production log). No test asserts its text."
+    )
+
+
+def test_count_tokens_exact_measures_an_assistant_final_slice():
+    print("\n[19] D1 REGRESSION: count_tokens_exact on the summarizer's own shape")
+    reset_fixture()
+    logsetup._reset_log_once_for_tests()
+    slice_ = old_turns(3)
+    with CaptureLogs() as logs:
+        n = main.count_tokens_exact(slice_)
+    st = fixture("/_fixture/stats")
+    recorded = [s for s in shapes() if s["kind"] == "chat"]
+    check(
+        isinstance(n, int) and n > 0,
+        "an assistant-final slice gets a real count",
+        f"got {n!r} — this is D1 exactly: the measurement the summarizer needs "
+        f"most is the one it cannot get",
+        extra=f"{n} tokens",
+    )
+    check(
+        st.get("tokenize.refused", 0) == 0,
+        "because no 400 was provoked at all",
+        f"fixture stats: {st!r}",
+    )
+    check(
+        bool(recorded) and recorded[0]["add_generation_prompt"] is False,
+        "the flag was decided FROM THE MESSAGES, not left True by the caller",
+        f"the request the fixture actually received was {recorded!r}",
+    )
+    check(
+        "degraded" not in logs.at_least("WARNING"),
+        "and nothing announced a degradation",
+        f"warnings: {logs.at_least('WARNING')[:300]!r}",
+    )
+    check(
+        n == truth(slice_),
+        "and the number is the server's number for that shape",
+        f"count_tokens_exact said {n}, the server says {truth(slice_)}",
+    )
+
+    # --- TEETH: the pre-3a65aa1 call, with the flag left to the caller -------
+    reset_fixture()
+    logsetup._reset_log_once_for_tests()
+    with CaptureLogs() as logs2:
+        n_bad = main.count_tokens_exact(slice_, add_generation_prompt=True)
+    warned = logs2.at_least("WARNING")
+    check(
+        n_bad is None,
+        "forcing add_generation_prompt=True on the same slice loses the count",
+        f"got {n_bad!r}; the fixture is not biting and this teeth check proves "
+        f"nothing",
+        extra="None — the exact production failure",
+    )
+    check(
+        fixture("/_fixture/stats").get("tokenize.refused", 0) == 1,
+        "because the server refused it, once",
+    )
+    check(
+        "HTTP 400" in warned,
+        "the loss is announced at WARNING with the status",
+        f"warnings: {warned[:300]!r}",
+    )
+    check(
+        "continue_final_message" in warned,
+        "and the log carries vLLM's own wording — the whole diagnosis, in the "
+        "line a human reads",
+        f"warnings: {warned[:400]!r}",
+    )
+    reset_fixture()
+    note(
+        "[19] is the test that did not exist on 2026-08-28. Nothing about it "
+        "needed production to happen first: the shape it sends is the shape "
+        "split_messages has always produced."
+    )
+
+
+def test_summarize_survives_an_assistant_final_slice_end_to_end():
+    print("\n[20] D1 END TO END: summarize() over a slice ending on the assistant")
+    reset_fixture()
+    logsetup._reset_log_once_for_tests()
+    turns = old_turns(14)
+
+    async def _run():
+        async with httpx.AsyncClient() as c:
+            return await main.summarize(c, turns)
+
+    with CaptureLogs() as logs:
+        out = asyncio.run(_run())
+    text = logs.text()
+    st = fixture("/_fixture/stats")
+    print(f"       {len(turns)} turns -> summary of {len(out)} chars; stats {st}")
+    check(
+        isinstance(out, str) and out.strip(),
+        "summarize returns a summary rather than degrading",
+        f"got {out!r}",
+    )
+    check(
+        st.get("tokenize.refused", 0) == 0,
+        "not one /tokenize request in the whole run was refused",
+        f"fixture stats: {st!r} — the 400 is back",
+    )
+    check(
+        "summarize: token scale" in text,
+        "the batches were sized by a MEASURED scale",
+        f"log was: {text[:400]!r}",
+    )
+    check(
+        "/tokenize did not answer" not in text,
+        "and not by the fallback — the measurement reached the one path that "
+        "needs it",
+        f"log was: {text[:400]!r}",
+    )
+    check(
+        st.get("chat_completions", 0) >= 1,
+        "and the summarization calls were actually issued",
+        f"fixture stats: {st!r}",
+    )
+
+
+# ================================ 9. D2: THE FALLBACK NOTHING EVER EXERCISED
+#
+# D2 shipped a scale=1.0 fallback in main.summarize(). The harness measured the
+# batches on the MEASURED path and never on the fallback path, so a defective
+# fallback was invisible. Both of the defects found in production four hours
+# after the v3.1 deploy lived in fallbacks.
+
+
+def test_the_summarize_fallback_sizes_batches_pessimistically_and_they_fit():
+    print("\n[21] D2 REGRESSION: /tokenize down -> batches sized PESSIMISTICALLY")
+    reset_fixture()
+    logsetup._reset_log_once_for_tests()
+    turns = old_turns(14)
+    # The honest ratio for this slice, measured BEFORE /tokenize is taken away.
+    local = main.count_tokens(turns)
+    honest = truth(turns) / local if local else 1.0
+
+    seen: dict = {}
+    real_chunk = main._chunk_to_budget
+
+    def _spy(t, budget, scale=1.0):
+        out = real_chunk(t, budget, scale)
+        # summarize() also chunks during its REDUCE rounds; the first call is
+        # the map split, which is the one sized by the fallback scale.
+        seen.setdefault("scale", scale)
+        seen.setdefault("budget", budget)
+        seen.setdefault("batches", out)
+        return out
+
+    # /tokenize is down; /v1/chat/completions is NOT, so summarize() runs its
+    # whole real path with only the measurement missing. That is the production
+    # condition, not a simulation of it.
+    set_mode(tokenize_mode="http_error", status=500)
+    main._chunk_to_budget = _spy
+    try:
+
+        async def _run():
+            async with httpx.AsyncClient() as c:
+                return await main.summarize(c, turns)
+
+        with CaptureLogs() as logs:
+            asyncio.run(_run())
+    finally:
+        main._chunk_to_budget = real_chunk
+        reset_fixture()  # honest again, so `truth` is truth
+
+    scale = seen.get("scale")
+    budget = seen.get("budget")
+    batches = seen.get("batches") or []
+    print(
+        f"       honest ratio for this slice {honest:.2f}x; the fallback chose "
+        f"{scale}x; {len(batches)} batch(es) against budget {budget}"
+    )
+    check(scale is not None, "the batching call was observed", f"recorded {seen!r}")
+    check(
+        scale is not None and scale > 1.0,
+        "the fallback is NOT scale=1.0 — that is D2",
+        f"scale was {scale!r}, which asserts the local tokenizer is right at "
+        f"the exact moment we have just discovered we cannot check it",
+        extra=f"{scale}x",
+    )
+    check(
+        scale is not None and scale >= honest,
+        "and it is at least the ratio the server actually charges on this slice",
+        f"fallback scale {scale} is BELOW the measured ratio {honest:.2f}x for "
+        f"this content, so the fallback is optimistic. Either the pessimistic "
+        f"constant is too small, or this tokenizer pair diverges harder than "
+        f"the constant was set for — check which before dismissing it",
+        extra=f"{scale}x >= {honest:.2f}x measured",
+    )
+    worst = max((truth(b) for b in batches), default=0)
+    check(
+        batches and worst <= budget,
+        "and every batch the fallback packed FITS, measured on the server",
+        f"largest fallback batch measured {worst} against budget {budget}",
+        extra=f"largest {worst} <= {budget}",
+    )
+
+    # --- TEETH: the same slice, batched the way D2 batched it ---------------
+    bad = real_chunk(turns, budget, 1.0)
+    worst_bad = max(truth(b) for b in bad)
+    check(
+        worst_bad > budget,
+        "the scale=1.0 fallback D2 shipped with does NOT fit",
+        f"largest unscaled batch was {worst_bad} <= budget {budget}; the fixture "
+        f"pair is not hostile enough for this teeth check to mean anything",
+        extra=f"{worst_bad} > {budget} (+{worst_bad - budget}) in {len(bad)} batch(es)",
+    )
+
+    warned = logs.at_least("WARNING")
+    check(
+        "did not answer" in warned,
+        "the fallback announces itself at WARNING",
+        f"warnings: {warned[:300]!r}",
+    )
+    # The fallback WARNING must quote the scale it ACTUALLY applied. It used to
+    # read "UNCORRECTED (scale 1.0)" while applying _PESSIMISTIC_SUMMARY_SCALE:
+    # correct arithmetic, pre-fix diagnostic. D7 reported it and could not fix
+    # it (main.py was owned elsewhere); the gate fixed it, so this is now an
+    # assertion rather than a note. It is the A9 doctrine applied to A9's own
+    # line — a log that cannot distinguish the fixed case from the broken one
+    # is the failure, whichever half is wrong.
+    check(
+        "scale 1.0" not in warned and f"{scale:.2f}x" in warned,
+        "and it quotes the scale it actually applied, not the pre-fix one",
+        f"the fallback applied {scale}x but its WARNING says: {warned[:300]!r}",
+        extra=f"log names {scale:.2f}x",
+    )
+
+
+# ============================ 10. EVERY /tokenize CLIENT, AND EVERY SHAPE IT SENDS
+
+
+def _summarizer_count(text: str) -> int:
+    import summarizer
+
+    async def _ask():
+        async with httpx.AsyncClient() as c:
+            return await summarizer._count_tokens(c, FIXTURE_URL, "fixture-model", text)
+
+    return asyncio.run(_ask())
+
+
+def test_the_summarizer_modules_own_tokenize_client():
+    print("\n[22] the THIRD shape: summarizer._count_tokens sends {model, prompt}")
+    import summarizer
+
+    reset_fixture()
+    logsetup._reset_log_once_for_tests()
+    text = DECORATIVE_REPLY
+    n = _summarizer_count(text)
+    seen = [s for s in shapes() if s["kind"] == "completion"]
+    server = truth_prompt(text)
+    check(
+        n == server,
+        "it reads .count out of the completion-shaped response",
+        f"got {n}, the server says {server}",
+        extra=f"{n} tokens",
+    )
+    check(
+        bool(seen),
+        "and the request really was COMPLETION-shaped, not chat-shaped",
+        f"the fixture saw {shapes()!r}",
+    )
+    check(
+        fixture("/_fixture/stats").get("tokenize.refused", 0) == 0,
+        "this shape cannot hit the assistant-final 400 — no template is applied",
+    )
+
+    # --- and its fallback, which is a DIFFERENT fallback from main's --------
+    reset_fixture()
+    set_mode(tokenize_mode="http_error", status=500)
+    logsetup._reset_log_once_for_tests()
+    with CaptureLogs() as logs:
+        n_down = _summarizer_count(text)
+    reset_fixture()
+    ceiling = summarizer._pessimistic_tokens(text)
+    print(f"       /tokenize down -> {n_down} (ceiling {ceiling}, server would say {server})")
+    check(
+        n_down == ceiling,
+        "with /tokenize down it returns the pessimistic CEILING, never an estimate",
+        f"got {n_down}, expected the {summarizer._WORST_TOKENS_PER_CHAR}/char "
+        f"ceiling of {ceiling}",
+    )
+    check(
+        n_down > server,
+        "and that ceiling really is above what the server charges for this text",
+        f"ceiling {n_down} <= server {server}: the fallback would UNDER-split. "
+        f"_WORST_TOKENS_PER_CHAR is set from production measurements, so a "
+        f"failure here is most likely this tokenizer pair, not the constant — "
+        f"but check before dismissing it",
+        extra=f"{n_down} > {server}",
+    )
+    check(
+        "tokens/char" in logs.at_least("WARNING"),
+        "and the fallback says what it is doing",
+        f"warnings: {logs.at_least('WARNING')[:300]!r}",
+    )
+    note(
+        "summarizer.py holds its own httpx client, its own timeout, its own "
+        "fallback and its own log keys — main.count_tokens_exact's fixes do not "
+        "reach it. The module says why (an import cycle). It is a second "
+        "implementation of the same contract and it needs its own coverage; "
+        "before today it had none."
+    )
+
+
+def test_every_tokenize_client_in_the_tree_is_enumerated_and_covered():
+    print("\n[23] enumerate every /tokenize client, and cover every shape it sends")
+    reset_fixture()
+
+    # --- who calls /tokenize at all -----------------------------------------
+    url_literal = re.compile(r'f"\{[A-Za-z_][A-Za-z_0-9]*\}/tokenize"')
+    here = pathlib.Path(__file__).resolve().parent
+    found: dict[str, list[int]] = {}
+    for p in sorted(here.glob("*.py")):
+        if p.name.startswith("test_"):
+            continue
+        for i, line in enumerate(
+            p.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+        ):
+            if url_literal.search(line):
+                found.setdefault(p.name, []).append(i)
+    for name, lines in sorted(found.items()):
+        print(f"       {name}: {', '.join(str(x) for x in lines)}")
+    known = {"main.py", "summarizer.py"}
+    check(
+        set(found) == known,
+        "exactly two modules POST to /tokenize, and this suite covers both",
+        f"found {sorted(found)} but expected {sorted(known)}. A NEW /tokenize "
+        f"client is a new request shape, a new timeout and a new fallback, and "
+        f"none of them are covered here until someone adds a case. That is how "
+        f"D1 and D2 shipped.",
+        extra=f"{', '.join(sorted(found))}",
+    )
+
+    # --- and every shape they send, driven through the real call sites ------
+    reset_fixture()
+    main.count_tokens_exact(conversation(2))  # guard / _sent_token_size shape
+    main.count_tokens_exact(old_turns(2))  # main.summarize's slice shape
+    _summarizer_count("a short piece of rollup input")  # summarizer.py's shape
+    observed = {
+        (s["kind"], s["add_generation_prompt"], s["last_role"]) for s in shapes()
+    }
+    for s in sorted(observed, key=str):
+        print(f"       sent: kind={s[0]} add_generation_prompt={s[1]} last_role={s[2]}")
+    want = {
+        ("chat", True, "user"),
+        ("chat", False, "assistant"),
+        ("completion", None, None),
+    }
+    check(
+        want <= observed,
+        "all three shapes the tree sends were exercised against the fixture",
+        f"missing {sorted(want - observed, key=str)}",
+        extra=f"{len(observed)} distinct shape(s)",
+    )
+    check(
+        fixture("/_fixture/stats").get("tokenize.refused", 0) == 0,
+        "and not one of them was refused",
+        f"fixture stats: {fixture('/_fixture/stats')!r}",
+    )
+    reset_fixture()
+    note(
+        "shapes NOT sent by any call site today, and therefore NOT covered: a "
+        "system-final message list; a multimodal content array (the fixture has "
+        "no vision tower and drops image parts); `tools=`; "
+        "`continue_final_message=True`. If a call site starts sending one, [23] "
+        "fails on the client count before the shape can go untested."
+    )
+
+
+# ============================================================== 11. THE REGIMES
 
 
 def _all_tests():
@@ -748,6 +1331,12 @@ def _all_tests():
         test_a_wrong_high_count_over_sheds_but_never_drops_the_newest_turn,
         test_chat_completions_rejects_an_oversized_payload_recognisably,
         test_chat_completions_serves_a_payload_the_guard_approved,
+        test_fixture_reproduces_the_assistant_final_refusal,
+        test_count_tokens_exact_measures_an_assistant_final_slice,
+        test_summarize_survives_an_assistant_final_slice_end_to_end,
+        test_the_summarize_fallback_sizes_batches_pessimistically_and_they_fit,
+        test_the_summarizer_modules_own_tokenize_client,
+        test_every_tokenize_client_in_the_tree_is_enumerated_and_covered,
     ]
 
 

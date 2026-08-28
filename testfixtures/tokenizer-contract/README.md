@@ -61,13 +61,24 @@ The compactor depends on exactly two backend contracts
 ```python
 r = httpx.post(
     f"{VLLM_URL}/tokenize",
-    json={"model": MODEL_REPO, "messages": messages},
+    json={"model": MODEL_REPO, "messages": messages,
+          "add_generation_prompt": messages[-1]["role"] != "assistant"},
     ...
 n = r.json().get("count")
 ```
 
 `{"model", "messages"} -> .count`. Fidelity to **that** is the whole point; a
 server with a differently-shaped `/tokenize` tests nothing useful.
+
+Two modules in the tree POST to `/tokenize`, not one, and they send **three
+different request shapes** between them. `compactor/test_tokenizer_contract.py`
+group [23] enumerates them from the source and fails if a third client appears:
+
+| sender | shape | notes |
+| --- | --- | --- |
+| `main.count_tokens_exact` (guard, `_sent_token_size`) | `{model, messages}`, user-final, `add_generation_prompt=True` | |
+| `main.count_tokens_exact` (via `main.summarize`) | `{model, messages}`, **assistant-final**, `add_generation_prompt=False` | this is D1 |
+| `summarizer._count_tokens` | `{model, prompt}` — the **completion** shape | a separate httpx client with its own timeout and its own fallback; the import cycle it documents means `main`'s fixes do not reach it |
 
 | Option | `/tokenize` shape | Verdict |
 | --- | --- | --- |
@@ -147,6 +158,56 @@ Two behaviours were copied from `vllm/entrypoints/openai/serving_engine.py`:
 * `/v1/chat/completions` rejects when `token_num + max_tokens > max_model_len`
   (`:619-631`), with the message reproduced verbatim.
 
+And one behaviour was added on 2026-08-29, after production supplied it:
+
+* `/tokenize` **refuses a chat request whose last message is from the
+  assistant** while `add_generation_prompt` is true, because it answers by
+  applying the chat template:
+
+  > HTTP 400 — `Cannot set `add_generation_prompt` to True when the last
+  > message is from the assistant. Consider using `continue_final_message`
+  > instead.`
+
+  Quoted from the production logs of 2026-08-28 and 2026-08-29, not
+  reconstructed. See "What this fixture missed" below.
+
+## What this fixture missed, and what changed (D7)
+
+The first version of this fixture answered that request with a cheerful 200.
+
+`compactor/test_tokenizer_contract.py` was built specifically to catch
+`/tokenize` contract failures. It ran green twice, shipped with v3.1, and four
+hours later an assistant-final message list 400'd `/tokenize` in production and
+took compaction down for the whole session. **The harness tested the contract it
+imagined rather than the one the code exercises.** Three things had to line up
+for that:
+
+1. `conversation()` was the suite's only message generator, and it ends on the
+   new user turn — the guard's shape. Nothing generated the summarizer's shape.
+2. the suite's own `truth()` helper sent `add_generation_prompt` unset, so this
+   server defaulted it True and happily tokenized assistant-final lists. Every
+   "measured on the server" assertion about summarizer batches was measuring
+   them through a request production cannot make.
+3. this server had no request-shape validation at all, so there was nothing to
+   hit even if a test had sent the right shape.
+
+What changed, 2026-08-29:
+
+* the server enforces the refusal (`_template_refusal`), plus the sibling
+  refusal for setting `continue_final_message` and `add_generation_prompt`
+  both true — the fix a caller is most likely to reach for. **Provenance
+  differs:** the assistant-final wording is quoted from a production log; the
+  both-flags wording is reconstructed from vLLM's chat utils and was not dumped
+  from the image, so no test asserts its text, only that the combination is
+  refused.
+* `GET /_fixture/shapes` records every `/tokenize` request received, so a test
+  can enumerate the shapes actually sent instead of the shapes it assumed.
+* `GET /_fixture/info` advertises `features`. The test runner **mounts** the
+  repo but the fixture is a **built image**, so a stale fixture is invisible
+  from the test side — which is exactly how a suite ends up green against a
+  server that cannot produce the failure it checks for. The suite now exits 1
+  with a rebuild instruction rather than passing vacuously.
+
 ## Honest limits
 
 Read these before citing a green run.
@@ -178,7 +239,8 @@ Read these before citing a green run.
 ## Fault injection
 
 ```
-POST /_fixture/mode   {"tokenize_mode": "...", "factor": 0.5, "status": 400, "delay": 15.0}
+POST /_fixture/mode   {"tokenize_mode": "...", "factor": 0.5, "status": 400,
+                       "delay": 15.0, "assistant_final_400": true}
 ```
 
 | mode | behaviour |
@@ -189,11 +251,23 @@ POST /_fixture/mode   {"tokenize_mode": "...", "factor": 0.5, "status": 400, "de
 | `garbage` | 200 with no `count` key |
 | `hang` | sleeps `delay` s, longer than the compactor's 10 s read timeout |
 
-`GET /_fixture/stats` returns per-endpoint call counts, so a test can assert the
-guard consults `/tokenize` a **bounded** number of times rather than once per
-message — the cost discipline `main.py:846-853` depends on.
-`POST /_fixture/reset` clears both. `GET /_fixture/info` reports the baked
-tokenizer, window and error style.
+`assistant_final_400` is **not** a fault mode and defaults to **true**: it is
+vLLM's real behaviour. The switch exists only so a test can show the 400 comes
+from the flag-and-shape combination rather than from the payload's content.
+Request-shape validation runs *before* any injected fault, because vLLM rejects
+the shape without ever reaching the tokenizer.
+
+`GET /_fixture/stats` returns per-endpoint call counts (`tokenize`,
+`tokenize.chat`, `tokenize.completion`, `tokenize.refused`, ...), so a test can
+assert the guard consults `/tokenize` a **bounded** number of times rather than
+once per message, and can assert that no call site provokes a refusal.
+
+`GET /_fixture/shapes` returns one record per `/tokenize` request —
+`{kind, add_generation_prompt, continue_final_message, last_role, n_messages,
+refused}` — capped at 512 since the last reset.
+
+`POST /_fixture/reset` clears mode, stats and shapes. `GET /_fixture/info`
+reports the baked tokenizer, window, error style and `features`.
 
 `FIXTURE_ERROR_STYLE=legacy` emits the older
 `"your prompt contains at least N input tokens"` wording instead of vLLM
@@ -218,7 +292,42 @@ pre-v3.1 behaviour and assert it overflows **when a real tokenizer measures the
 result**. A suite that only asserts the fixed path passes just as happily on
 code that never had the fix.
 
-## One finding this fixture surfaced
+## Measured results, 2026-08-29 (groups 18-23, the D7 additions)
+
+Full run 23/23 green, `CONTRACT_LOCAL_TOKENIZER=gpt2`.
+
+| | measured |
+| --- | --- |
+| assistant-final slice, `add_generation_prompt=True` | **HTTP 400**, vLLM's wording |
+| same slice, flag decided from the messages | 7,047 tokens, 200 |
+| `count_tokens_exact` on a 6-turn assistant-final slice | 10,560 — equals the server's own count |
+| `summarize()` over 28 assistant-final turns | scale 1.95x (local 25,186 -> vLLM 49,207), 2 batches, 3 chat calls, **0 refusals** |
+| `summarize()` fallback with `/tokenize` returning 500 | scale **2.0x** (>= the 1.95x the server actually charges); largest batch 28,144 <= budget 29,696 |
+| the same slice at the `scale=1.0` fallback D2 shipped with | 49,207 — **+19,511 over** the 29,696 budget, in one batch |
+| `summarizer._count_tokens`, completion shape | 3,492 measured; ceiling 4,418 when `/tokenize` is down |
+| distinct `/tokenize` shapes driven through real call sites | 3 |
+
+And the same three groups run against the **pre-3a65aa1** `count_tokens_exact`
+(the flag left to the caller), to show they have teeth:
+
+```
+FAILURES WITH THE PRE-FIX count_tokens_exact: 9
+  - an assistant-final slice gets a real count: got None
+  - because no 400 was provoked at all: {'tokenize': 1, 'tokenize.refused': 1}
+  - the flag was decided FROM THE MESSAGES, not left True by the caller
+  - and the number is the server's number for that shape: said None, server says 10560
+  - test_summarize_survives_an_assistant_final_slice_end_to_end:
+        raised HTTPStatusError: Client error '400 Bad Request'
+        for url '.../v1/chat/completions'
+```
+
+That last line is the production cascade of 2026-08-29 reproduced end to end:
+`/tokenize` refuses the slice, the scale falls back, the batches are sized on an
+estimate reading ~50% low, and the summarization call is rejected by the backend.
+
+## Findings this fixture surfaced
+
+### 1. `_reported_prompt_tokens` vs the v0.10 error wording
 
 `main._reported_prompt_tokens` (`main.py:196`) parses the true prompt size out
 of vLLM's rejection with:
@@ -245,3 +354,50 @@ deployed pin is `vllm==0.24.0`, whose wording was not verified from this
 machine. Confirm it against the pod before treating it as either a bug or a
 non-issue. The fixture reproduces both wordings so the answer is one env var
 away.
+
+### 2. `summarize()`'s fallback WARNING quoted the pre-fix scale — FIXED
+
+Found by group [21], which reported it as a runtime NOTE because `main.py` was
+not owned by the D7 task. With `/tokenize` down, `main.summarize` applies
+`_PESSIMISTIC_SUMMARY_SCALE` (2.0), but the warning it logged on that same
+branch read:
+
+> `batching 28 turns on the local tokenizer's 25186-token estimate, UNCORRECTED (scale 1.0)`
+
+The scale actually applied was 2.0. Someone diagnosing the next incident from
+these lines would have concluded the D2 fix had not shipped. The arithmetic was
+right and only the log was stale — a reporting defect, not a budget one — but
+the whole v3.1 A9 doctrine is that these lines are the diagnosis.
+
+The parallel-edit gate fixed it: the line now interpolates `_scale`, so it
+cannot go stale again when the constant moves, and group [21]'s NOTE has become
+an assertion (`"scale 1.0" not in warned and f"{scale:.2f}x" in warned`). This
+was the fourth time on this branch that a fix landed at one site and not at its
+sibling — and the first time in a log line rather than in the code.
+
+### 3. `summarizer.py` is a second, independent `/tokenize` client
+
+It holds its own `httpx` client, its own timeout, its own fallback
+(`_WORST_TOKENS_PER_CHAR`, a chars-based ceiling rather than a scale) and its
+own `log_once` keys. The module documents why (an import cycle with `main`), and
+the reasoning is sound — but the consequence is that a fix to
+`main.count_tokens_exact` does not reach it, and nothing in this suite exercised
+it before 2026-08-29. It is now covered by group [22], and group [23] fails if a
+*third* client appears.
+
+## Still weaker than it looks
+
+Stated here rather than left for the next incident:
+
+* The scale-correction thresholds in groups [6], [7], [21] and [22] all rest on
+  the **tokenizer pair** diverging (gpt2 vs SmolLM2). Group [5] says this about
+  content categories; it is equally true of those.
+* Nothing exercises `retrieval.format_retrieval_block`'s `count_tokens` hook,
+  because no caller passes one. The retrieval budget runs on `_estimate_tokens`
+  in production and this suite says nothing about it.
+* Several assertions match on **log substrings**. Finding 2 above is exactly the
+  failure that survives such an assertion: the line is present, the number in it
+  is wrong.
+* The shapes **not** sent by any call site today — a system-final message list,
+  a multimodal content array, `tools=`, `continue_final_message=True` — are not
+  covered. Group [23]'s client-count assertion is the tripwire for that.

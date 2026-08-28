@@ -38,6 +38,7 @@ All read/write pairs are serialized per-conv via memory.conv_lock().
 
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -728,13 +729,134 @@ def _fit_extraction_input(
     return user_msg, assistant_msg, kept, "; ".join(notes) or None
 
 
-def _parse_extraction_output(raw: str) -> list[str]:
+# ---------------------------------------------------------------------------
+# What is not a fact — the write-path structure filter (v3.1 D5)
+# ---------------------------------------------------------------------------
+#
+# HOW THE SCAFFOLDING GOT IN. Not by splitting an assistant reply: nothing in
+# this codebase does that. `_parse_extraction_output` splits the EXTRACTION
+# MODEL'S OWN OUTPUT on newlines, and until this filter it kept every line of
+# six characters or more whether or not the model had honoured the "- " bullet
+# contract the system prompt demands. The extractor is handed the assistant's
+# reply verbatim in the `[assistant]:` half of its input; when that reply is a
+# formatted dashboard, the extractor mirrors the formatting — a heading, a rule,
+# a fenced block — and the parser promoted every one of those lines to a stored
+# fact. `_EXTRACTION_MAX_TOKENS` (256) then cut the reply mid-structure, which
+# is why the store holds openers like a bare fence line and a JSON key with an
+# unclosed bracket rather than whole blocks.
+#
+# So there are two failures, and only the second one is ours to fix here: the
+# model breaks its output contract, and the parser has no contract to break.
+# A prompt cannot be relied on; a structural gate can.
+#
+# WHY IT MATTERS BEYOND TIDINESS. `_estimate_tokens` prices a fact at char/4.
+# INCIDENT_2026-08-28 measured 1,710 U+2501 plus 441 U+2500 — 2,151 characters —
+# at roughly 4,275 real tokens, i.e. ~1.99 tokens per character where char/4
+# assumes 0.25. Decoration is therefore underpriced by about 8x by the very
+# estimator that enforces _MAX_FACTS_TOKENS, so a store full of rules and
+# dashboard rows passes a 1,500-token budget while costing tens of thousands.
+# A horizontal rule stored as memory is the box-drawing input that caused the
+# incident, re-injected on every turn — the system feeding itself its own worst
+# input.
+#
+# THE RULES ARE DELIBERATELY STRUCTURAL AND CONSERVATIVE. Over-filtering
+# destroys real memory, and the memory here is not recoverable from anywhere
+# else. Every rule below is a syntax judgement, never a topic judgement:
+# an emoji alone does not disqualify a line, a colon alone does not, an
+# ALL-CAPS acronym alone does not, and a percentage alone does not. The
+# dashboard rule fires only on the conjunction of all three of an ALL-CAPS
+# label, a value with no lowercase prose in it, and a metric or an arrow —
+# so a synthetic "MOOD: 7/10 -> 9/10" is refused while a synthetic
+# "PTSD: symptoms improved 40% since 2019" is kept.
+#
+# WRITE PATH ONLY. This is deliberately NOT applied in load_facts or
+# save_facts, which is the tempting place to put it. Every turn's tail does
+# load → append → prune → save, so a filter there would silently delete
+# already-stored entries on the next unrelated write — an irreversible
+# cleanup of a live store, smuggled in as a parser fix. Cleaning what is
+# already stored is a separate, deliberate, reversible operation.
+
+# A fenced block opener/closer: ``` or ~~~ (any longer run too).
+_FENCE_RE = re.compile(r"^(?:`{3,}|~{3,})")
+
+# An ATX markdown heading: one to six '#' followed by space or end of line.
+# "#1 priority ..." is not a heading and is not matched.
+_HEADING_RE = re.compile(r"^#{1,6}(?:\s|$)")
+
+# A JSON object key at the start of the line: "some_key":
+# English sentences do not open with a double-quoted token followed by a colon.
+_JSON_KEY_RE = re.compile(r'^"[^"]*"\s*:')
+
+# An ALL-CAPS label followed by a colon, optionally behind a few leading
+# non-alphanumerics (an emoji, a bullet glyph, a box character). The label
+# alone proves nothing — see _reject_reason for the conjunction it is part of.
+_DASHBOARD_LABEL_RE = re.compile(
+    r'^[^0-9A-Za-z]{0,8}([A-Z][A-Z0-9 _/&.\'"-]{1,39}):\s*(\S.*)$'
+)
+
+# Transition arrows, the shape of a "was -> now" dashboard cell.
+_ARROW_RE = re.compile(r"(?:-{1,2}>|={1,2}>|→|⇒|⇨|⟶)")
+
+# A percentage attached to a number ("88%"), not a bare '%' character.
+_PERCENT_RE = re.compile(r"\d\s*%")
+
+
+def _reject_reason(text: str) -> str | None:
+    """Return why `text` is structure rather than a fact, or None if it is
+    storable. The reason string is for logs; callers should treat any
+    non-None as "do not store".
+    """
+    line = text.strip()
+    if not line:
+        return "empty"
+    # No letter and no digit in any script: horizontal rules of U+2501/U+2500,
+    # "---", "***", "===", "|---|---|", a lone bracket, an emoji-only line.
+    # A fact in any language contains at least one alphanumeric character.
+    if not any(ch.isalnum() for ch in line):
+        return "no alphanumeric content"
+    if _FENCE_RE.match(line):
+        return "code fence"
+    if _HEADING_RE.match(line):
+        return "markdown heading"
+    if _JSON_KEY_RE.match(line):
+        return "json object key"
+    # A line that ends on an opening bracket is an unclosed structure opener,
+    # which is what a 256-token cut through a JSON block leaves behind.
+    if line.endswith(("[", "{")):
+        return "unclosed structure opener"
+    m = _DASHBOARD_LABEL_RE.match(line)
+    if m:
+        value = m.group(2)
+        if not any(ch.islower() for ch in value) and (
+            _ARROW_RE.search(value) or _PERCENT_RE.search(value)
+        ):
+            return "status-dashboard line"
+    return None
+
+
+def is_storable_fact(text: str) -> bool:
+    """True when `text` is shaped like a fact rather than like markup.
+
+    Public because this module is not the only write path into the store:
+    commands._handle_remember, backfill and dedup's merged canonical text all
+    mint fact text too, and they should share one definition rather than grow
+    three. Read-only callers must NOT use it to filter what is already stored.
+    """
+    return _reject_reason(text) is None
+
+
+def _parse_extraction_output(raw: str, *, where: str = "") -> list[str]:
     """Parse the LLM's output into a clean list of fact strings. Handles:
     - "NONE" (any casing, with/without trailing punctuation) → []
     - Bullets prefixed with -, *, • → stripped
     - Numbered lists "1. ..." → stripped
     - Blank lines → skipped
     - Lines too short to be a fact (< 6 chars) → skipped
+    - Lines that are markup rather than a fact → skipped, and logged (D5)
+
+    The markup check runs AFTER the bullet prefix is stripped, because a model
+    that mirrors formatting also bullets it: "- ## Current Status" has to be
+    refused on the heading, not accepted on the dash.
     """
     if not raw or not raw.strip():
         return []
@@ -742,6 +864,7 @@ def _parse_extraction_output(raw: str) -> list[str]:
     if cleaned.upper().rstrip(".").strip() == "NONE":
         return []
     out: list[str] = []
+    rejected: list[tuple[str, str]] = []
     for line in cleaned.splitlines():
         line = line.strip()
         if not line:
@@ -755,8 +878,30 @@ def _parse_extraction_output(raw: str) -> list[str]:
             # Strip "1. ", "2. ", etc.
             if len(line) >= 3 and line[0].isdigit() and line[1:3] in (". ", ") "):
                 line = line[3:].strip()
-        if len(line) >= 6:
-            out.append(line)
+        if len(line) < 6:
+            continue
+        reason = _reject_reason(line)
+        if reason:
+            rejected.append((reason, line))
+            continue
+        out.append(line)
+    if rejected:
+        # Named and bounded. Silence here is what let half a store fill with
+        # markup unnoticed; an unbounded dump is what prune_facts already
+        # learned not to do.
+        _SHOWN = 3
+        shown = "; ".join(
+            f"{reason}: {line[:60]!r}" for reason, line in rejected[:_SHOWN]
+        )
+        more = (
+            f" … and {len(rejected) - _SHOWN} more"
+            if len(rejected) > _SHOWN else ""
+        )
+        prefix = f"{where}: " if where else ""
+        logger.info(
+            f"{prefix}extraction returned {len(rejected)} line(s) of markup "
+            f"rather than facts; not stored — {shown}{more}"
+        )
     return out
 
 
@@ -821,14 +966,32 @@ async def extract_facts_from_exchange(
         )
         r.raise_for_status()
         data = r.json()
-        raw = data["choices"][0]["message"]["content"]
-        facts = _parse_extraction_output(raw)
+        choice = data["choices"][0]
+        raw = as_sent = choice["message"]["content"]
+        # A reply cut off at _EXTRACTION_MAX_TOKENS ends mid-line, and that
+        # partial line is not a fact — it is the fragment that put an unclosed
+        # JSON opener in the store (D5). Drop only the incomplete tail, and
+        # only when the model actually ran out of budget: this module already
+        # holds that a truncation which does not announce itself becomes a
+        # wrong fact (see _truncate_to_tokens). A trailing newline means the
+        # last line completed before the cut, so nothing is dropped.
+        if choice.get("finish_reason") == "length" and raw and not raw.endswith("\n"):
+            head, sep, tail = raw.rpartition("\n")
+            raw = head if sep else ""
+            logger.info(
+                f"{where}: extraction hit the {_EXTRACTION_MAX_TOKENS}-token "
+                f"output cap; dropped the incomplete final line "
+                f"({len(tail)} chars) rather than storing a half fact"
+            )
+        facts = _parse_extraction_output(raw, where=where)
         if facts:
             logger.info(f"{where}: extracted {len(facts)} new fact(s)")
         else:
             # Empty result has two distinct causes; log both so the
             # silence isn't a diagnostic dead-end during integration runs.
-            snippet = (raw or "").strip().replace("\n", " ")[:120]
+            # `as_sent`, not the tail-trimmed `raw`: when zero facts survive
+            # this line is the only record of what the model actually said.
+            snippet = (as_sent or "").strip().replace("\n", " ")[:120]
             logger.info(
                 f"{where}: extracted 0 fact(s) — model returned: {snippet!r}"
             )

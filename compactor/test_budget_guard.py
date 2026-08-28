@@ -68,6 +68,7 @@ import facts  # noqa: E402
 import logsetup  # noqa: E402
 import main  # noqa: E402
 import memory  # noqa: E402
+import persona  # noqa: E402
 import retrieval  # noqa: E402
 import summarizer  # noqa: E402
 
@@ -1043,10 +1044,11 @@ def test_call_site_passes_the_callers_system_count():
 
     seen = {}
 
-    def recorder(messages, limit=None, protect_system=None):
+    def recorder(messages, limit=None, protect_system=None, report=None):
         seen["messages"] = list(messages)
         seen["limit"] = limit
         seen["protect_system"] = protect_system
+        seen["report"] = report
         return messages
 
     with patch.object(main, "_enforce_hard_budget", recorder):
@@ -1068,6 +1070,15 @@ def test_call_site_passes_the_callers_system_count():
     assert_true(
         any(FACT_SENTINEL in main._message_text(m) for m in seen["messages"]),
         "and the third one is the injected block, not a second caller message",
+    )
+    # v3.1 D4: the fourth argument. The margin's blast radius is decided by
+    # whether the rejection path can tell a 400 the guard PREDICTED from one
+    # that surprised it, and it can only tell if the call site hands the guard
+    # somewhere to write that down. A None here is the whole mechanism dead.
+    assert_true(
+        isinstance(seen["report"], dict),
+        f"the call site passes a report dict for the guard's verdict: "
+        f"{seen['report']!r}",
     )
 
 
@@ -1941,6 +1952,379 @@ def test_a_rejected_request_does_NOT_count_toward_release():
          main._budget_ok_streak) = saved
 
 
+# =====================================================================
+# v3.1 D3 — injected memory is bounded as a FRACTION of the window, and the
+# guard spends all of it before it will forward a payload it knows will 400.
+#
+# The hole these cover is not that any one layer is too big. Facts are capped
+# at COMPACTOR_MAX_FACTS_TOKENS, retrieval at COMPACTOR_MAX_RETRIEVAL_TOKENS,
+# each summary chunk at its own generation ceiling — and their SUM was capped
+# nowhere, against a limit none of them could see. On 2026-08-28 a request with
+# msgs=2, source=hash and lastturn=0 was handed 95 facts and 3 retrieval hits,
+# could not be compacted ("no older turns to summarize"), could not be shed,
+# and was rejected. No reply, no facts, no episodic write, no retry — for four
+# hours.
+# =====================================================================
+
+
+def _blocks(*specs):
+    """[(priority, label, text)] in SEND order, as the request path builds it.
+
+    Text is `label` padded with the label's first letter, so a failure line
+    says which layer survived without printing a wall of filler."""
+    return [
+        (prio, label, label + ":" + label[0] * max(0, chars - len(label) - 1))
+        for prio, label, chars in specs
+    ]
+
+
+def test_the_injection_bound_drops_lowest_priority_first():
+    print("\n[test] _bound_injected_blocks — retrieval goes before facts, facts before the summary")
+    # Four layers, each individually within its own module's cap, summing to
+    # roughly 4x the budget. Priority orders DROPPING; the survivors must come
+    # back in SEND order, because inject_system_block's ordering contract
+    # ("original system -> facts -> retrieved -> summary") is what the model
+    # reads, and a bound that reorders the memory is a different bug.
+    blocks = _blocks(
+        (main._INJECT_PRIORITY_PERSONA, "persona", 400),
+        (main._INJECT_PRIORITY_FACTS, "facts", 1200),
+        (main._INJECT_PRIORITY_RETRIEVAL, "retrieval", 1200),
+        (main._INJECT_PRIORITY_SUMMARY, "summary", 1200),
+    )
+    # char/4 tokenizer, and no /tokenize in this environment, so the cost is
+    # the pessimistic 2x of the local count — the same worst-case undercount
+    # the summarizer assumes when it cannot check itself.
+    local = sum(main.count_tokens([{"role": "system", "content": t}]) for _, _, t in blocks)
+    budget = int(local * main._PESSIMISTIC_SUMMARY_SCALE) // 2
+
+    kept, dropped, cost = main._bound_injected_blocks(blocks, budget)
+
+    assert_eq(dropped, ["retrieval", "facts"], "the two lowest priorities went first")
+    assert_eq(
+        [t.split(":")[0] for t in kept], ["persona", "summary"],
+        "the survivors are the two highest priorities, still in SEND order — "
+        "the summary was appended last and comes back second, because priority "
+        "orders dropping and not sending",
+    )
+    assert_true(
+        cost > budget,
+        f"the reported cost is what BLEW the budget ({cost} > {budget}), not "
+        f"what survived — '0 tokens against 32' tells an operator nothing",
+    )
+
+
+def test_the_injection_bound_never_drops_the_last_layer():
+    print("\n[test] _bound_injected_blocks — a bound that rounds to zero is a refusal, not a bound")
+    # A budget of zero. Every layer is over it, so a naive loop empties the
+    # list — and "she remembers me from the first message" is the product, not
+    # a nice-to-have. The floor is one layer, which is at most that layer's own
+    # cap; the hard-budget guard is what takes it to nothing when the window
+    # genuinely demands it (see the last-resort test below).
+    blocks = _blocks(
+        (main._INJECT_PRIORITY_PERSONA, "persona", 400),
+        (main._INJECT_PRIORITY_FACTS, "facts", 1200),
+        (main._INJECT_PRIORITY_RETRIEVAL, "retrieval", 1200),
+    )
+    kept, dropped, _cost = main._bound_injected_blocks(blocks, 0)
+    assert_eq(len(kept), 1, "one layer survives a zero budget")
+    assert_eq(kept[0].split(":")[0], "persona", "and it is the highest-priority one")
+    assert_eq(dropped, ["retrieval", "facts"], "the rest are named as dropped")
+
+    print("\n[test] _bound_injected_blocks — a sum that fits is not touched, and costs no /tokenize call")
+    small = _blocks((main._INJECT_PRIORITY_FACTS, "facts", 40))
+    calls = []
+
+    def _counting_exact(msgs, *a, **k):
+        calls.append(msgs)
+        return None
+
+    with patch.object(main, "count_tokens_exact", _counting_exact):
+        kept, dropped, _cost = main._bound_injected_blocks(small, main.HARD_INPUT_LIMIT)
+    assert_eq(len(kept), 1, "the block is injected")
+    assert_eq(dropped, [], "nothing dropped")
+    assert_eq(
+        calls, [],
+        "and nothing was measured: if the PESSIMISTIC local sum already fits, "
+        "no measurement can change the outcome",
+    )
+
+
+def test_a_prior_assistant_turn_is_what_makes_a_request_a_conversation():
+    print("\n[test] _has_conversational_history — the marker FRONTEND_SPEC §15 asks the client for")
+    assert_eq(main._has_conversational_history([user("write a title")]), False,
+              "a one-message background call has no history")
+    assert_eq(
+        main._has_conversational_history(
+            [{"role": "system", "content": PERSONA}, user("hello")]
+        ),
+        False,
+        "neither does a first turn carrying a system prompt",
+    )
+    assert_eq(
+        main._has_conversational_history(
+            [user("hi"), {"role": "assistant", "content": "hello"}, user("again")]
+        ),
+        True,
+        "a prior assistant turn is the thing that distinguishes the two",
+    )
+
+
+def test_a_request_with_no_prior_assistant_turn_gets_the_narrow_budget():
+    print("\n[test] POST /v1/chat/completions — task traffic does not receive the whole store")
+    # End to end, because the fraction is chosen at the CALL SITE and nothing
+    # that calls _bound_injected_blocks can see whether its caller picked the
+    # right one. Same conversation, same stored memory, posted twice: once with
+    # a prior assistant turn and once without.
+    cid = "d3-no-history"
+    persona.save_persona(cid, "PERSONA-STORE-SENTINEL " + "q" * 80, source="admin")
+    facts.save_facts(
+        cid,
+        [
+            {"text": FACT_SENTINEL + "-" + str(i) + " " + "f" * 120,
+             "added_turn": 1, "last_used": 100}
+            for i in range(3)
+        ],
+    )
+    # No system message from the client: auto_capture must not overwrite the
+    # stored persona, and text_to_inject only returns a persona the request is
+    # not already carrying.
+    with_history = [
+        user("what did we decide?"),
+        {"role": "assistant", "content": "we decided."},
+        user("and now?"),
+    ]
+    no_history = [user("Generate a concise 3-5 word title for this chat")]
+
+    _r, forwarded, _records = _post_chat(with_history, cid)
+    assert_true(forwarded is not None, "the conversation request reached the stub")
+    sys_text = _system_text(forwarded["messages"])
+    assert_true("PERSONA-STORE-SENTINEL" in sys_text, "conversation: persona injected")
+    assert_true(
+        FACT_SENTINEL in sys_text,
+        f"conversation: facts injected too — half the window is available to "
+        f"memory here: {sys_text[:200]!r}",
+    )
+
+    _r, forwarded, records = _post_chat(no_history, cid)
+    assert_true(forwarded is not None, "the task request reached the stub")
+    sys_text = _system_text(forwarded["messages"])
+    assert_true(
+        FACT_SENTINEL not in sys_text,
+        f"task traffic: the accumulated facts were NOT injected: {sys_text[:200]!r}",
+    )
+    assert_true(
+        "PERSONA-STORE-SENTINEL" in sys_text,
+        "but the bound is a bound, not a refusal — the top layer still went",
+    )
+    line = next(
+        (r for r in records if "injected memory over budget" in r.getMessage()), None
+    )
+    assert_true(line is not None, "and the drop is reported, not silent")
+    assert_eq(line.levelno, logging.WARNING, "at WARNING — this is memory the model will not see")
+    assert_true(
+        "NO prior assistant turn" in line.getMessage(),
+        f"naming why the narrow budget applied: {line.getMessage()}",
+    )
+
+
+def test_the_guard_sheds_injection_to_nothing_before_forwarding_an_oversized_payload():
+    print("\n[test] _enforce_hard_budget — the last resort spends every injected block")
+    # The state the round loop can exit in: still over, with injected memory
+    # still in hand. /tokenize is pinned one token above the limit, so every
+    # verification round disagrees with the arithmetic and the six-round budget
+    # runs out with blocks left. Before v3.1 D3 the guard forwarded there, on
+    # the reasoning that the newest turn is never dropped — true of TURNS, and
+    # not transferable to memory the model will never get to read. The 400 that
+    # follows costs the user's typed message; dropping the memory costs
+    # nothing the 400 was not already going to cost.
+    saved_margin = main._BUDGET_MARGIN
+    main._BUDGET_MARGIN = 0
+    try:
+        msgs = (
+            [{"role": "system", "content": PERSONA}]
+            + [injected(f"BLOCK{i}:") for i in range(10)]
+            + [user("does any of this fit?")]
+        )
+        with patch.object(
+            main, "count_tokens_exact", lambda _m: main.HARD_INPUT_LIMIT + 1
+        ):
+            out, records = _guard_with_logs(msgs)
+        line = _budget_line(records)
+        assert_true(line is not None, "the guard logged a verdict")
+        assert_eq(line.levelno, logging.ERROR, "it could not fit, so it is an ERROR")
+        assert_eq(
+            _sys_dropped(line), 10,
+            f"every injected block was spent, not just the ones the rounds "
+            f"reached: {line.getMessage()}",
+        )
+        assert_true(
+            _trimmed(line) < 10,
+            f"and the rounds alone did not get there — {_trimmed(line)} "
+            f"trim(s) in six rounds is what the old code stopped at",
+        )
+        assert_eq(len(_systems(out)), 1, "one system message survives: the caller's")
+        assert_eq(out[0]["content"], PERSONA, "and it is untouched")
+        assert_eq(out[-1]["content"], msgs[-1]["content"], "as is the newest turn")
+        assert_true(
+            "Nothing injected remains" in line.getMessage(),
+            f"the line says WHAT is left, so nobody re-diagnoses this as a "
+            f"memory problem: {line.getMessage()}",
+        )
+    finally:
+        main._BUDGET_MARGIN = saved_margin
+
+
+def test_the_guard_stops_as_soon_as_nothing_is_sheddable():
+    print("\n[test] _enforce_hard_budget — six /tokenize calls over a payload it cannot change")
+    # The old give-up test was `len(idxs) <= 1 and trimmed >= 32 and
+    # len(sys_idxs) <= 1`. With protect_system=2 the last clause can never
+    # hold, so an unfittable payload burned the full six rounds — six exact
+    # measurements of a list that had not changed since the first.
+    calls = []
+
+    def _counting_exact(msgs, *a, **k):
+        calls.append(len(msgs))
+        return main.HARD_INPUT_LIMIT * 3
+
+    msgs = [
+        {"role": "system", "content": PERSONA},
+        {"role": "system", "content": CALLER2},
+        big("user", 2000),
+    ]
+    with patch.object(main, "count_tokens_exact", _counting_exact):
+        _out, records = _guard_with_logs(msgs, None, 2)
+    assert_eq(
+        len(calls), 2,
+        "one ground truth and one verification — nothing was sheddable after that",
+    )
+    line = _budget_line(records)
+    assert_eq(line.levelno, logging.ERROR, "still reported as the failure it is")
+
+
+def test_the_guard_reports_what_it_decided():
+    print("\n[test] _enforce_hard_budget — the report dict, on all three exits")
+    saved_margin = main._BUDGET_MARGIN
+    main._BUDGET_MARGIN = 0
+    try:
+        report = {}
+        main._enforce_hard_budget([user("hi")], main.HARD_INPUT_LIMIT, 1, report)
+        assert_eq(report["fits"], True, "prescreen skip: fits")
+        assert_true("prescreen" in report["counted_by"], "and says nothing was measured")
+
+        report = {}
+        main._enforce_hard_budget(
+            [{"role": "system", "content": PERSONA}, big("user", 100)],
+            main.HARD_INPUT_LIMIT, 1, report,
+        )
+        assert_eq(report["fits"], True, "measured and under the limit: fits")
+
+        report = {}
+        main._enforce_hard_budget(
+            [{"role": "system", "content": PERSONA}, big("user", 2000)],
+            main.HARD_INPUT_LIMIT, 1, report,
+        )
+        assert_eq(report["fits"], False, "measured and over the limit: does NOT fit")
+        assert_true(
+            report["measured"] > report["limit"],
+            "with the numbers that say so, not just the verdict",
+        )
+    finally:
+        main._BUDGET_MARGIN = saved_margin
+
+
+# =====================================================================
+# v3.1 D4 — _BUDGET_MARGIN is a module global, so what it is allowed to LEARN
+# is what decides its blast radius.
+#
+# 2026-08-28: one conversation sent two messages whose own content did not fit
+# the window. The guard shed everything it was permitted to shed, logged
+# "hard budget FAILED to fit ... still 16417 over", forwarded, and took the 400
+# it had just predicted. 16,384 + 16,417 = 32,801, which is exactly what vLLM
+# reported — so the calibration "learned" the number the guard had already
+# measured, and latched the margin to its MAX_MODEL_LEN//4 ceiling of 8,192 for
+# EVERY conversation in the process. Four hours later a real conversation was
+# running at "limit 8192, margin 8192" and shedding on every request.
+# =====================================================================
+
+
+def test_a_400_the_guard_predicted_does_not_widen_the_margin():
+    print("\n[test] _note_backend_rejection — a predicted rejection teaches nothing")
+    saved = (main._BUDGET_MARGIN, main._budget_ok_streak)
+    try:
+        main._BUDGET_MARGIN = 0
+        handler = _CaptureLogs()
+        lg = logging.getLogger("compactor")
+        lg.addHandler(handler)
+        try:
+            tightened = main._note_backend_rejection(
+                ctx_400(2500), 800, guard_measured_overflow=True
+            )
+        finally:
+            lg.removeHandler(handler)
+        assert_eq(tightened, False, "nothing was learned")
+        assert_eq(main._BUDGET_MARGIN, 0, "and the margin did not move")
+        line = next(
+            (r for r in handler.records
+             if "NOT widening the budget margin" in r.getMessage()),
+            None,
+        )
+        assert_true(line is not None, "the refusal is reported, not silent")
+        assert_true(
+            not any("Tightening the hard limit" in r.getMessage()
+                    for r in handler.records),
+            "and it did not also claim to have tightened",
+        )
+    finally:
+        (main._BUDGET_MARGIN, main._budget_ok_streak) = saved
+
+
+def test_a_400_that_surprised_the_guard_still_widens_the_margin():
+    print("\n[test] _note_backend_rejection — the counterfactual: a surprise still calibrates")
+    # The same body and the same limit. The ONLY difference is whether the
+    # guard had already measured this payload as over. Without this assertion
+    # the test above passes just as well against a margin that never moves at
+    # all, which would delete the /tokenize-outage backstop entirely.
+    saved = (main._BUDGET_MARGIN, main._budget_ok_streak)
+    try:
+        main._BUDGET_MARGIN = 0
+        tightened = main._note_backend_rejection(
+            ctx_400(2500), 800, guard_measured_overflow=False
+        )
+        assert_eq(tightened, True, "an unexpected 400 is evidence and is used")
+        assert_true(main._BUDGET_MARGIN > 0, "the margin advanced")
+    finally:
+        (main._BUDGET_MARGIN, main._budget_ok_streak) = saved
+
+
+def test_one_unfittable_conversation_does_not_narrow_the_window_for_the_others():
+    print("\n[test] POST /v1/chat/completions — the D4 property, end to end")
+    # The call-site half. _note_backend_rejection can be perfect and still
+    # change nothing if the endpoint never tells it what the guard decided —
+    # and the guard's verdict is computed ~200 lines from the rejection path,
+    # which is exactly the distance A8's defect survived at.
+    saved = (main._BUDGET_MARGIN, main._budget_ok_streak)
+    try:
+        main._BUDGET_MARGIN = 0
+        msgs = [{"role": "system", "content": PERSONA}, big("user", 2000)]
+        _r, records, _tails = _post_rejected(
+            msgs, "d4-unfittable", body=ctx_400(2500)
+        )
+        assert_true(
+            any("hard budget FAILED to fit" in r.getMessage() for r in records),
+            "precondition: the guard knew this payload did not fit",
+        )
+        assert_true(
+            any("NOT widening the budget margin" in r.getMessage() for r in records),
+            "so the rejection that followed was not treated as new information",
+        )
+        assert_true(
+            not any("Tightening the hard limit" in r.getMessage() for r in records),
+            "and the process-wide margin was left alone for everyone else",
+        )
+    finally:
+        (main._BUDGET_MARGIN, main._budget_ok_streak) = saved
+
+
 def _all_tests():
     return [
         test_hard_limit_configured,
@@ -1987,6 +2371,16 @@ def _all_tests():
         test_a_tokenize_outage_is_reportable_more_than_once_per_process,
         test_an_accepted_request_counts_toward_releasing_the_margin,
         test_a_rejected_request_does_NOT_count_toward_release,
+        test_the_injection_bound_drops_lowest_priority_first,
+        test_the_injection_bound_never_drops_the_last_layer,
+        test_a_prior_assistant_turn_is_what_makes_a_request_a_conversation,
+        test_a_request_with_no_prior_assistant_turn_gets_the_narrow_budget,
+        test_the_guard_sheds_injection_to_nothing_before_forwarding_an_oversized_payload,
+        test_the_guard_stops_as_soon_as_nothing_is_sheddable,
+        test_the_guard_reports_what_it_decided,
+        test_a_400_the_guard_predicted_does_not_widen_the_margin,
+        test_a_400_that_surprised_the_guard_still_widens_the_margin,
+        test_one_unfittable_conversation_does_not_narrow_the_window_for_the_others,
     ]
 
 
