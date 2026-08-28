@@ -129,6 +129,15 @@ RUN python3 -m venv /opt/compactor-venv && \
 RUN /opt/compactor-venv/bin/python -c \
     "import jinja2; print('chat-template rendering available: jinja2', jinja2.__version__)"
 
+# Same doctrine as the jinja2 guard above, for the same reason: a token counter
+# that degrades silently is the failure mode this project keeps paying for.
+# compactor/tokens.py needs mistral_common to give an accurate count when
+# vLLM's /tokenize cannot answer; without it the fallback is an estimator that
+# reads up to 51% low. The module no-ops safely if the import fails, so nothing
+# breaks — which is exactly why the absence has to fail the BUILD instead.
+RUN /opt/compactor-venv/bin/python -c \
+    "import mistral_common; print('local exact tokenization available: mistral_common', mistral_common.__version__)"
+
 # Pre-download the bge-small ONNX embedding model into the image so the
 # first request pays no download. Static weights belong in the image, not
 # on the /data volume. FASTEMBED_CACHE_PATH (ENV section below) points here.
@@ -224,6 +233,7 @@ COPY compactor/persona.py /opt/compactor/persona.py
 COPY compactor/backup.py /opt/compactor/backup.py
 COPY compactor/degrade.py /opt/compactor/degrade.py
 COPY compactor/bgwork.py /opt/compactor/bgwork.py
+COPY compactor/tokens.py /opt/compactor/tokens.py
 COPY compactor/logsetup.py /opt/compactor/logsetup.py
 COPY compactor/alert.py /opt/compactor/alert.py
 

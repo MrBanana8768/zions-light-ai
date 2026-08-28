@@ -40,3 +40,23 @@ jinja2==3.1.6
 # published. Recorded as known/accepted in CHANGELOG [3.0].
 chromadb==1.5.9
 fastembed==0.8.0           # BAAI/bge-small-en-v1.5 embeddings via ONNX (no torch)
+
+# --- v3.1.1: an ACCURATE local token count (compactor/tokens.py) ---
+# The tokenizer vLLM itself uses. Before this, a /tokenize outage dropped the
+# budget straight to a transformers-converted tekken vocabulary that reads
+# 23-51% low on this model's assistant content -- which is what took compaction
+# down on 2026-08-29 and cost the user 80+ turns of context per message.
+#
+# Measured cost on the v3.0.5 image: +82 MB to this venv (382 -> 464 MB, ~0.4%
+# of the 20 GB image), 0.59s import, +70 MB RSS, NO torch. It pulls pycountry
+# (23 MB of ISO tables, incidental) and tiktoken, and it moves numpy
+# 2.5.1 -> 2.3.5 -- verified that chromadb 1.5.9 and fastembed still import
+# cleanly on that version before pinning it here.
+#
+# PINNED, and note the hazard: vLLM declares mistral_common[image]>=1.10.0 with
+# NO upper bound, so its resolved version drifts independently of this pin and
+# nothing enforces agreement. That is why tokens.check_divergence exists --
+# a local tokenizer that silently disagrees with the enforcing server is the
+# 2026-08-28 bug wearing a better disguise. Bump this deliberately, and check
+# what vLLM resolved when you do.
+mistral_common==1.11.7
