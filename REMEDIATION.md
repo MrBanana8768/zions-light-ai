@@ -312,14 +312,24 @@ A single `main.py` was lifted from `fix/v3.1-remediation` and dropped onto a pod
 
 ---
 
-#### P0-2b · F61 — Log sweep: 47 silent exception handlers, and a health check that cannot see the corruption it exists to catch
+#### P0-2b · F61 — Log sweep: silent exception handlers, and a health check that cannot see the corruption it exists to catch
 **S2.** Whole compactor package. Inventory taken 2026-08-27.
 
 Every failure this project has spent a week diagnosing had the same shape: **a degraded mode indistinguishable from a healthy one.** P0-0 is the extreme case — the token counter lost its accuracy for months behind a bare `except Exception:` with no log statement. It is not one bad handler, it is a pattern, so this item sweeps them all rather than fixing them one incident at a time.
 
-**Method.** For every `except` block in `compactor/*.py` excluding tests, check whether its body contains a `logger.` call, a `raise`, an alert, or a `print()` to stderr. **46 do not** (`python3 log-sweep.py --count`, verified against `f106305`). They fall into three classes and only the first needs code changes.
+**Method.** For every `except` block in `compactor/*.py` excluding tests, check whether its body contains a `logger.` call, a `raise`, an alert, or a `print()` to stderr. They fall into three classes and only the first needs code changes.
 
-*A note on the count, so nobody re-derives it:* an earlier ad-hoc scan reported 47 because it did not treat `print()` as reporting. The one handler that separates the two figures is `backup.py:488`, the CLI restore entry point, which prints to stderr and returns 1 — that is surfacing the failure, so 46 is correct.
+**The count is a moving target — re-run it, do not quote it.**
+
+| Commit | Silent handlers | Note |
+|---|---|---|
+| `f106305` | 46 | the original inventory, 2026-08-27 |
+| `0a169b8` | **23** | half of them closed as a side effect of the V2–V8 destructive-path work |
+| `0a169b8` + Phase-1 working tree | **25** | two new handlers, both reviewed and defensible: one returns to a caller that surfaces, one is a per-row skip |
+
+*A note on the original figure, so nobody re-derives it:* an ad-hoc scan reported 47 because it did not treat `print()` as reporting. The one handler separating 47 from 46 is `backup.py:488`, the CLI restore entry point, which prints to stderr and returns 1 — that is surfacing the failure, so 46 was correct at `f106305`.
+
+*And a note on the drop:* 46 → 23 is real, not a change in method — the same script, run at both commits. It happened because fixing the destructive paths meant giving their handlers something to say. **This is the shape to expect: the sweep is a symptom counter, not a work queue.** Re-run `log-sweep.py --count` before planning against it; the remaining handlers are the ones no other item happened to touch, which makes them harder, not easier.
 
 **Class A — the failure vanishes. Fix these.**
 
@@ -353,7 +363,7 @@ Every failure this project has spent a week diagnosing had the same shape: **a d
 ```bash
 # 1. No Class-A handler is silent any more. Re-run the sweep; expect only Class B/C.
 python3 log-sweep.py                 # full listing, triage by hand
-python3 log-sweep.py --count         # baseline: 46 at f106305, 2026-08-27
+python3 log-sweep.py --count         # re-run; 46 at f106305, 23 at 0a169b8 (see the table above)
 
 # 2. The health endpoint reports corruption instead of hiding it:
 mv /data/openwebui/compactor/facts/<some_conv>.json{,.bak}
@@ -712,6 +722,19 @@ Ship if the release is not already late. Roughly **10 h**.
 - **F33.** `main.py:132` sets `_tokenizer = None` on failure, indistinguishable from "not yet loaded", so `count_tokens([m])` (`main.py:715`) re-attempts `AutoTokenizer.from_pretrained` once per message. `get_tokenizer` is not pre-warmed in `lifespan` (only `backend_is_multimodal` is, `:1073`). *Correction: the claim that this blocks the event loop is **wrong** — `_enforce_hard_budget` has been in `run_in_threadpool` since `main.py:1436`. The retry storm is real; the loop-blocking is not.* **Fix:** cache the failure with a sentinel and a retry interval; pre-warm in `lifespan`. **1 h.**
 
 **Estimate.** 2 h. **Depends on:** nothing.
+
+---
+
+#### P1b-M · Two mutations that survived the Phase-1 gate
+**S3.** `retrieval.py:224`, `main.py:2073`
+
+Recorded because they are the honest residue of a gate that otherwise came back green (26/26, 19 mutations applied, 16 killed). A surviving mutation is not a bug — it is a line no test defends, which is exactly what this project keeps getting hurt by.
+
+1. **`_id_exists` fails open, untested.** Mutating `return False` → `return True` in the probe's exception handler **survives the entire suite.** The code is right: a failed probe should fall through to embed-and-upsert rather than skip the write. The mutant inverts that, so a broken probe makes `index_exchange` return `True` having stored nothing — silent loss presenting as success, which is this branch's whole failure class. **Fix:** one test that breaks the probe and asserts the document is still written. **30 min.**
+
+2. **`enforced_limit` capture, untested.** Mutating away `- _BUDGET_MARGIN` at `main.py:2073` survives. Harmless in scope — the value feeds only the rejection log, while enforcement uses `effective_limit` — but the stated reason for capturing rather than recomputing has nothing holding it. **Fix:** assert the logged limit matches the enforced one. **15 min.**
+
+**Estimate.** 45 min. **Depends on:** nothing.
 
 ---
 
