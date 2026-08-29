@@ -85,6 +85,7 @@ os.environ["COMPACTOR_STORAGE_ROOT"] = _STORE
 
 import asyncio  # noqa: E402
 import logging  # noqa: E402
+import time  # noqa: E402
 from unittest.mock import patch  # noqa: E402
 
 import httpx  # noqa: E402
@@ -199,15 +200,26 @@ def _reset_fixture() -> None:
              'that is the D1 sabotage mode; a soak cannot run against it')
 
 
+def _fixture_stats() -> dict:
+    try:
+        return httpx.get(f"{FIXTURE_URL}/_fixture/stats", timeout=5.0).json()
+    except Exception:
+        return {}
+
+
 def _set_reply(seq: int) -> None:
     httpx.post(f"{FIXTURE_URL}/_fixture/mode",
                json={"reply_chars": REPLY_CHARS, "reply_seq": seq}, timeout=5.0)
 
 
-def _turn(n: int, history: list[dict]) -> tuple[int, str, list[dict], str]:
-    """One real POST through the compactor to the fixture. Returns
-    (status, captured log text, the payload actually forwarded, reply text)."""
+def _turn(n: int, history: list[dict]) -> tuple[int, str, list[dict], str, int]:
+    """One real POST through the compactor to the fixture.
+
+    Returns (status, log text, forwarded payload, reply text, LLM calls made
+    ON THE REQUEST PATH) — the last one measured before the memory tail runs,
+    because the tail does not block the user."""
     _set_reply(n)
+    _calls_at_start = _fixture_stats().get("chat_completions", 0)
     cap = _Capture()
     lg = logging.getLogger("compactor")
     lg.addHandler(cap)
@@ -231,6 +243,13 @@ def _turn(n: int, history: list[dict]) -> tuple[int, str, list[dict], str]:
             )
     finally:
         lg.removeHandler(cap)
+    # Counted HERE, before the tail is drained. The tail (fact extraction,
+    # dedup, rollup) is fire-and-forget in production and does NOT block the
+    # reply; this soak runs it synchronously only so memory accumulates
+    # deterministically. Counting it against the request-path budget measures
+    # the wrong thing — and the first version of this assertion did exactly
+    # that, then blamed the code for it.
+    request_calls = _fixture_stats().get("chat_completions", 0) - _calls_at_start
     _drain_tails()
     sent = forwarded[-1].get("messages", []) if forwarded else []
     reply = ""
@@ -238,7 +257,7 @@ def _turn(n: int, history: list[dict]) -> tuple[int, str, list[dict], str]:
         reply = (r.json()["choices"][0]["message"]["content"]) or ""
     except Exception:
         pass
-    return r.status_code, cap.text(), sent, reply
+    return r.status_code, cap.text(), sent, reply, request_calls
 
 
 def fail(label: str, detail: str = "") -> None:
@@ -259,12 +278,15 @@ _reset_fixture()
 
 history: list[dict] = []
 rows: list[dict] = []
+calls_seen: list[tuple] = []
 compaction_fired = False
 
 for n in range(1, TURNS + 1):
     history.append({"role": "user",
                     "content": f"Turn {n}. Tell me about item {n} in detail."})
-    status, log, sent, reply = _turn(n, history)
+    _t0 = time.monotonic()
+    status, log, sent, reply, _calls = _turn(n, history)
+    _elapsed = time.monotonic() - _t0
 
     # ---- invariants that must hold on EVERY turn --------------------------
     # Each one is a failure this project has actually shipped.
@@ -291,6 +313,25 @@ for n in range(1, TURNS + 1):
     ):
         if needle in log:
             fail(f"turn {n}: {needle!r} appeared", why)
+
+    # THE ASSERTION THAT WAS MISSING, and its absence is why 2026-08-29
+    # happened. Compaction runs on the REQUEST PATH. A conversation with a
+    # summarization backlog produced 33 LLM calls on one request — eight
+    # minutes with a dead composer, and the user got no reply at all. Nothing
+    # here measured how much work a single turn did, so a green soak said
+    # everything was fine.
+    #
+    # The budget is the cap plus one: the cap bounds summarization calls, and
+    # the user's own reply is the +1. Fact extraction and dedup run on the
+    # background tail, which the soak drains separately after the turn.
+    _budget = main.MAX_SUMMARY_CALLS_PER_REQUEST + 1
+    if _calls > _budget:
+        fail(f"turn {n}: one request made {_calls} LLM calls (budget {_budget})",
+             f"compaction is unbounded on the request path. At ~1024 output "
+             f"tokens per call on a 24B model this is minutes of latency for a "
+             f"user who is watching a blank composer. See "
+             f"MAX_SUMMARY_CALLS_PER_REQUEST.")
+    calls_seen.append((n, _calls, round(_elapsed, 1)))
 
     if "hard budget enforced" in log:
         compaction_fired = True  # shedding implies we got past the target
@@ -325,6 +366,13 @@ for n in range(1, TURNS + 1):
 
 print()
 print("[soak] end-of-run checks")
+if calls_seen:
+    _worst = max(calls_seen, key=lambda x: x[1])
+    _slow = max(calls_seen, key=lambda x: x[2])
+    print(f"  ok   LLM calls per request stayed bounded "
+          f"(worst {_worst[1]} at turn {_worst[0]}, budget "
+          f"{main.MAX_SUMMARY_CALLS_PER_REQUEST + 1}; slowest turn "
+          f"{_slow[2]}s at turn {_slow[0]})")
 
 if not compaction_fired:
     fail("the run never exceeded the compaction target",

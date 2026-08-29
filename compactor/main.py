@@ -105,6 +105,24 @@ TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(HARD_INPUT_LIMIT * 0.75)
 # size batches anyway. See the fallback in summarize() for why this is 2.0 and
 # not 1.0 — a counter you cannot check must be assumed wrong in the direction
 # that fails safe.
+# How many summarization LLM calls compaction may make on ONE request.
+#
+# 2026-08-29, and this is the sharpest lesson of the v3.1 line: compaction runs
+# on the REQUEST PATH (chat_completions awaits compact_if_needed). A
+# conversation of 170 turns that had never successfully compacted produced 33
+# batches; at a 4-wide semaphore and ~1024 output tokens per call on a 24B
+# model that is 8+ minutes of the user sitting in front of a dead composer.
+# She got no reply at all.
+#
+# The comment justifying the pessimistic scale said over-splitting "costs extra
+# calls on the background tail". It does not. It costs HER LATENCY, and that
+# error is why the cap did not exist from the start.
+#
+# Bounded, compaction makes partial progress each turn and the budget guard
+# absorbs whatever is left — which is exactly what the guard is for. Unbounded
+# work on a request path is not thoroughness, it is an outage.
+MAX_SUMMARY_CALLS_PER_REQUEST = _env_int("COMPACTOR_MAX_SUMMARY_CALLS", 4)
+
 _PESSIMISTIC_SUMMARY_SCALE = float(
     os.environ.get("COMPACTOR_PESSIMISTIC_SUMMARY_SCALE", "2.0") or 2.0
 )
@@ -882,6 +900,16 @@ def count_tokens_exact(
     """
     if not messages:
         return 0
+    # An assistant-final list is a CONTINUATION, not a prompt awaiting a
+    # reply. Both flags derive from that one fact and are strict complements:
+    # vLLM refuses if add_generation_prompt is True on an assistant-final
+    # list, and refuses again if the last role is assistant and neither
+    # continue_final_message nor prefix is set.
+    _asst_final = bool(messages) and messages[-1].get("role") == "assistant"
+    _agp = (
+        (not _asst_final) if add_generation_prompt is None
+        else bool(add_generation_prompt)
+    )
     try:
         r = httpx.post(
             f"{VLLM_URL}/tokenize",
@@ -903,11 +931,19 @@ def count_tokens_exact(
             json={
                 "model": MODEL_REPO,
                 "messages": messages,
-                "add_generation_prompt": (
-                    (messages[-1].get("role") != "assistant")
-                    if add_generation_prompt is None and messages
-                    else bool(add_generation_prompt)
-                ),
+                "add_generation_prompt": _agp,
+                # BOTH flags. The template has TWO guards and clearing one
+                # only reveals the other. v3.1.2 set add_generation_prompt
+                # False for an assistant-final list, which silenced
+                #   "Cannot set `add_generation_prompt` to True when the
+                #    last message is from the assistant"
+                # and hit its sibling in production within the hour:
+                #   "Expected last role User or Tool (or Assistant with
+                #    prefix or continue_final_message set to True)"
+                # tokens.py got this right on the first pass and this did
+                # not — the same one-site-not-the-sibling miss this file
+                # carries several corrections for already.
+                "continue_final_message": (not _agp),
             },
             timeout=httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0),
         )
@@ -1043,7 +1079,9 @@ def _chunk_to_budget(
     return batches
 
 
-async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
+async def summarize(
+    client: httpx.AsyncClient, to_summarize: list[dict]
+) -> tuple[str, list[dict]]:
     """Summarize older turns, MAP-REDUCE style so the summarization request
     can never itself exceed the model's context window.
 
@@ -1123,7 +1161,27 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
         _chunk_to_budget, to_summarize, budget, _scale
     )
     if len(batches) == 1:
-        return await _summarize_once(client, batches[0])
+        return await _summarize_once(client, batches[0]), []
+
+    # Cap the work this REQUEST will do. The oldest batches are summarized; the
+    # rest are handed back for the caller to forward verbatim, and the next
+    # request picks up where this one stopped. Progress every turn, latency
+    # bounded every turn.
+    deferred: list[dict] = []
+    if len(batches) > MAX_SUMMARY_CALLS_PER_REQUEST:
+        keep = batches[:MAX_SUMMARY_CALLS_PER_REQUEST]
+        for b in batches[MAX_SUMMARY_CALLS_PER_REQUEST:]:
+            deferred.extend(b)
+        logger.warning(
+            f"summarize: {len(to_summarize)} turns need {len(batches)} batches, "
+            f"which is over the {MAX_SUMMARY_CALLS_PER_REQUEST}-call per-request "
+            f"cap. Summarizing the oldest {len(keep)}; {len(deferred)} turn(s) "
+            f"are forwarded verbatim and will be summarized on a later turn. A "
+            f"conversation that reports this every turn has a backlog — run "
+            f"POST /admin/conversations/<id>/compact to clear it off the "
+            f"request path."
+        )
+        batches = keep
 
     logger.info(
         f"summarize: {len(to_summarize)} turns exceed the {budget}-token input "
@@ -1134,9 +1192,22 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
     # semaphore so a huge history can't monopolize the engine. Sequential
     # batches added multi-minute latency on long conversations (rc6 review).
     sem = asyncio.Semaphore(4)
+    # ONE budget across map AND reduce.
+    #
+    # The first cut of this cap bounded the map phase only, and the soak caught
+    # it the same hour: 4 map calls + 1 reduce call + the user's reply = 6
+    # against a budget of 5. Capping one phase of a two-phase algorithm is the
+    # sibling-site miss again, committed inside the fix for a sibling-site
+    # miss. A budget that does not cover every call is not a budget.
+    calls_left = [max(0, MAX_SUMMARY_CALLS_PER_REQUEST)]
 
     async def _bounded(batch: list[dict]) -> str:
+        # Checked inside the semaphore so concurrent waves cannot each see the
+        # last remaining call and all spend it.
         async with sem:
+            if calls_left[0] <= 0:
+                return ""
+            calls_left[0] -= 1
             return await _summarize_once(client, batch)
 
     parts = [p for p in await asyncio.gather(*(_bounded(b) for b in batches)) if p]
@@ -1147,7 +1218,7 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
     # round groups the partials to the budget and summarizes each group;
     # bounded rounds, and any failure degrades to plain concatenation.
     rounds = 0
-    while len(parts) > 1 and rounds < 3:
+    while len(parts) > 1 and rounds < 3 and calls_left[0] > 0:
         rounds += 1
         part_msgs = [{"role": "user", "content": p} for p in parts]
         # _scale, not the 1.0 default. The map phase passes it and this did
@@ -1158,12 +1229,25 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
         groups = _chunk_to_budget(part_msgs, budget, _scale)
         if all(len(g) == 1 for g in groups):
             break  # nothing can be folded further without breaking the budget
+        if len(groups) > calls_left[0]:
+            # Not enough budget to fold this round properly. Concatenating the
+            # partials is a worse summary but a correct one; spending a partial
+            # round would fold SOME groups and leave others, which silently
+            # weights the result toward whichever happened to fit.
+            logger.info(
+                f"summarize: stopping the reduce at round {rounds} — "
+                f"{len(groups)} groups need more than the {calls_left[0]} "
+                f"call(s) left in this request's budget; concatenating "
+                f"{len(parts)} partial(s) instead"
+            )
+            break
         try:
             parts = [p for p in await asyncio.gather(*(_bounded(g) for g in groups)) if p]
         except Exception as e:
             logger.warning(f"summarize reduce round {rounds} failed, using concatenation: {e}")
             break
-    return "\n\n".join(parts)
+    # (summary, turns this request deliberately did not summarize)
+    return "\n\n".join(parts), deferred
 
 
 def split_messages(messages: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
@@ -1218,13 +1302,20 @@ async def compact_if_needed(messages: list[dict]) -> list[dict]:
         )
         return messages
     async with httpx.AsyncClient() as client:
-        summary = await summarize(client, text_only)
+        summary, deferred = await summarize(client, text_only)
     summary_msg = {
         "role": "system",
         "content": f"[Summary of earlier conversation]\n{summary}",
     }
-    # Order: system → summary-of-old-text → preserved image turns → recent.
-    new_messages = system_msgs + [summary_msg] + preserved_images + keep_recent
+    # Order: system → summary-of-oldest → deferred turns → images → recent.
+    # `deferred` is chronologically NEWER than what the summary covers and
+    # OLDER than keep_recent, so it slots between them and the transcript
+    # stays in order. Forwarding them verbatim costs budget the guard may
+    # then shed, which is the correct trade: the guard sheds in
+    # milliseconds, four more summarization calls cost her a minute.
+    new_messages = (
+        system_msgs + [summary_msg] + deferred + preserved_images + keep_recent
+    )
     new_count = count_tokens(new_messages)
     logger.info(
         f"compacted: summarized {len(text_only)} text turn(s), "
@@ -4010,6 +4101,119 @@ async def admin_fork_conversation(conv_id: str, request: Request):
         )
     except portability.ImportError_ as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post(
+    "/admin/conversations/{conv_id}/compact",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_compact(conv_id: str, request: Request):
+    """Clear a conversation's summarization backlog OFF the request path.
+
+    Why this exists, precisely. Compaction runs inside chat_completions, so a
+    conversation whose rollups have been failing accumulates a backlog that the
+    NEXT user message has to pay for. On 2026-08-29 that was 170 turns needing
+    33 summarization calls: eight minutes of a dead composer, and she got no
+    reply at all. MAX_SUMMARY_CALLS_PER_REQUEST now bounds that, which means a
+    large backlog drains slowly over many turns instead of stalling one — and
+    this endpoint is how an operator drains it deliberately instead of waiting.
+
+    Self-healing was the wrong shape for this. Catch-up work belongs to whoever
+    is willing to wait for it.
+
+    Body (all optional):
+        {"max_calls": 200, "dry_run": false}
+
+    The transcript is reconstructed from the EPISODIC store, which is the only
+    ordered record of the conversation the compactor owns — OpenWebUI holds the
+    real one. So this can only summarize exchanges that were successfully
+    indexed. It reports what it found rather than pretending that is the whole
+    conversation.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    max_calls = int(body.get("max_calls") or 200)
+    dry_run = bool(body.get("dry_run", False))
+
+    exchanges = await run_in_threadpool(retrieval.export_indexed_exchanges, conv_id)
+    if not exchanges:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no indexed exchanges for conv {conv_id}. Either the id is "
+                f"wrong, or episodic indexing never ran for it — check "
+                f"GET /admin/conversations."
+            ),
+        )
+
+    # _exchange_doc writes "[user]: X\n[assistant]: Y". Split it back
+    # into the message pair the summarizer expects.
+    messages: list[dict] = []
+    for ex in sorted(exchanges, key=lambda e: e.get("turn_index", 0)):
+        doc = ex.get("document") or ""
+        if "\n[assistant]: " not in doc:
+            continue
+        u, a = doc.split("\n[assistant]: ", 1)
+        messages.append({"role": "user", "content": u.removeprefix("[user]: ")})
+        messages.append({"role": "assistant", "content": a})
+
+    before = summarizer.load_state(conv_id)
+    plan = {
+        "conv_id": conv_id,
+        "indexed_exchanges": len(exchanges),
+        "reconstructed_messages": len(messages),
+        "watermark_before": before.get("last_summarized_turn", 0),
+        "l1_before": len(before.get("l1") or []),
+        "dry_run": dry_run,
+    }
+    if dry_run or not messages:
+        plan["note"] = (
+            "dry run — nothing was written. Re-send with "
+            '{"dry_run": false} to run it.'
+        )
+        return plan
+
+    # Loop maybe_rollup until the watermark stops moving. Each call does one
+    # tier's worth of work; the loop is what turns that into a catch-up. Bounded
+    # by max_calls AND by lack of progress, because a rollup that cannot advance
+    # must not spin.
+    calls = 0
+    t0 = time.time()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
+        while calls < max_calls:
+            prev = summarizer.load_state(conv_id).get("last_summarized_turn", 0)
+            try:
+                await summarizer.maybe_rollup(conv_id, messages, VLLM_URL, MODEL_REPO)
+            except Exception as e:
+                plan["stopped_because"] = f"{type(e).__name__}: {e}"
+                break
+            calls += 1
+            now = summarizer.load_state(conv_id).get("last_summarized_turn", 0)
+            if now <= prev:
+                plan["stopped_because"] = "the watermark stopped advancing"
+                break
+        else:
+            plan["stopped_because"] = f"hit max_calls={max_calls}"
+
+    after = summarizer.load_state(conv_id)
+    plan.update({
+        "rollup_calls": calls,
+        "elapsed_s": round(time.time() - t0, 1),
+        "watermark_after": after.get("last_summarized_turn", 0),
+        "l1_after": len(after.get("l1") or []),
+        "l2_after": len(after.get("l2") or []),
+        "l3_after": bool(after.get("l3")),
+    })
+    logger.info(
+        f"conv={conv_id}: admin compact — {calls} rollup call(s) in "
+        f"{plan['elapsed_s']}s, watermark {plan['watermark_before']} -> "
+        f"{plan['watermark_after']}, L1 {plan['l1_before']} -> {plan['l1_after']}"
+    )
+    return plan
 
 
 @app.get("/admin/selftest", dependencies=[Depends(_require_localhost)])
