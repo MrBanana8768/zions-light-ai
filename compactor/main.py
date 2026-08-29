@@ -1259,6 +1259,63 @@ def inject_system_block(messages: list[dict], content: str) -> list[dict]:
     return messages[:insert_at] + [sys_msg] + messages[insert_at:]
 
 
+# v3.1.2: thresholds measured against 504 real assistant replies from a
+# production backup, not chosen. In that corpus:
+#     501 healthy    max decoration 37.9%   longest single-char run 146 (p99: 75)
+#       3 degenerate min decoration 52.8%   shortest run 386
+# so both limits sit in a real gap with margin either side. A legitimate
+# horizontal rule is 40-80 characters; nothing in five hundred healthy replies
+# came close to 250.
+DEGENERATE_RUN_CHARS = _env_int("COMPACTOR_DEGENERATE_RUN_CHARS", 250)
+DEGENERATE_DECOR_FRACTION = float(
+    os.environ.get("COMPACTOR_DEGENERATE_DECOR_FRACTION", "0.45") or 0.45
+)
+DEGENERATE_MIN_CHARS = _env_int("COMPACTOR_DEGENERATE_MIN_CHARS", 300)
+
+# Box-drawing, block elements, and the ASCII characters people rule lines with.
+_DECOR_CHARS = frozenset(
+    [chr(c) for c in range(0x2500, 0x25A0)] + list("-_=~*#.—–·•")
+)
+_RUN_RE = re.compile(r"(.)\1{19,}", re.S)
+
+
+def reply_is_degenerate(text: str) -> str | None:
+    """Why this reply looks like a repetition loop, or None if it looks fine.
+
+    On 2026-08-29 the model entered a loop emitting U+2501 and produced three
+    consecutive replies that were 50-79% box-drawing, each ending mid-rule after
+    a single unbroken run of 386, 425 and 569 characters. Decoration fraction
+    climbed 6.7% -> 50% -> 67% -> 79% across four turns, because each reply
+    entered the history and the guard — shedding to the most recent handful of
+    messages — made that pattern most of what the model could still see.
+
+    This does NOT stop the reply reaching the user; by the time we can measure
+    it, she has already read it, and silently rewriting model output is not
+    something this system does. It stops the reply being MEMORISED, so a loop
+    cannot write itself into facts, episodic and summaries and be injected back
+    as though it were something worth remembering. Same doctrine as the
+    finish_reason=="length" gate: a reply that is not a real answer is not a
+    memory.
+    """
+    if not text:
+        return None
+    n = len(text)
+    m = _RUN_RE.search(text)
+    if m and len(m.group(0)) >= DEGENERATE_RUN_CHARS:
+        return (
+            f"a single character repeated {len(m.group(0))} times "
+            f"(limit {DEGENERATE_RUN_CHARS})"
+        )
+    if n >= DEGENERATE_MIN_CHARS:
+        decor = sum(1 for c in text if c in _DECOR_CHARS)
+        if decor / n >= DEGENERATE_DECOR_FRACTION:
+            return (
+                f"{100 * decor / n:.0f}% decoration characters over {n} chars "
+                f"(limit {100 * DEGENERATE_DECOR_FRACTION:.0f}%)"
+            )
+    return None
+
+
 def _has_conversational_history(messages: list[dict]) -> bool:
     """Whether the CLIENT's array contains a prior assistant turn.
 
@@ -3292,7 +3349,18 @@ async def chat_completions(request: Request) -> Any:
                         f"({len(accumulator.text())} chars accumulated) — "
                         f"skipping memory tail for the partial reply"
                     )
-                if conv_id and not vllm_failed and accumulator.usable():
+                _degen = (
+                    reply_is_degenerate(accumulator.text())
+                    if (conv_id and not vllm_failed and accumulator.usable())
+                    else None
+                )
+                if _degen:
+                    logger.warning(
+                        f"conv={conv_id}: reply looks like a repetition loop "
+                        f"({_degen}) — skipping memory tail so it cannot be "
+                        f"extracted as facts, indexed, or rolled into a summary"
+                    )
+                if conv_id and not vllm_failed and accumulator.usable() and not _degen:
                     _fire_and_forget(
                         _async_tail(
                             conv_id,
@@ -3418,6 +3486,13 @@ async def chat_completions(request: Request) -> Any:
                 f"conv={conv_id}: reply truncated at the generation ceiling "
                 f"(finish_reason=length, {len(assistant_text)} chars) — "
                 f"skipping memory tail for the partial reply"
+            )
+        elif conv_id and reply_is_degenerate(assistant_text):
+            logger.warning(
+                f"conv={conv_id}: reply looks like a repetition loop "
+                f"({reply_is_degenerate(assistant_text)}) — skipping memory "
+                f"tail so it cannot be extracted as facts, indexed, or rolled "
+                f"into a summary"
             )
         elif conv_id:
             _fire_and_forget(
