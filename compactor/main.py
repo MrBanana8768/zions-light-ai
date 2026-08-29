@@ -1162,7 +1162,22 @@ async def summarize(
         _chunk_to_budget, to_summarize, budget, _scale
     )
     if len(batches) == 1:
-        return await _summarize_once(client, batches[0]), []
+        # Same no-lost-turns invariant as the multi-batch return below. This
+        # path is the one the test hit: an empty 200 here returned ("", []),
+        # which is "nothing summarized and nothing to forward" - the turns
+        # simply cease to exist. Applying the guard at the bottom of the
+        # function and not here is the exact fix-one-site-miss-the-sibling
+        # defect that has now bitten this branch eight times.
+        _single = await _summarize_once(client, batches[0])
+        if not (_single or "").strip():
+            logger.warning(
+                f"summarize: no usable summary for {len(to_summarize)} "
+                f"turn(s) in a single batch - the model returned empty "
+                f"content. Forwarding them verbatim rather than dropping "
+                f"them."
+            )
+            return "", to_summarize
+        return _single, []
 
     # Cap the work this REQUEST will do. The oldest batches are summarized; the
     # rest are handed back for the caller to forward verbatim, and the next
@@ -1268,8 +1283,30 @@ async def summarize(
         except Exception as e:
             logger.warning(f"summarize reduce round {rounds} failed, using concatenation: {e}")
             break
+    # INVARIANT: every turn is either represented in the summary or handed
+    # back in `deferred`. Never neither.
+    #
+    # _summarize_once returns "" for an HTTP 200 whose content is empty - no
+    # exception raised, nothing logged. That produced summary="" AND
+    # deferred=[], and compact_if_needed then built a payload with no summary
+    # block and no older turns: every one of them deleted from the request,
+    # silently. Reproduced against the production image - 8 turns in,
+    # nothing out.
+    #
+    # An empty summary is a FAILED summary, so fall back to what the over-cap
+    # skip path already does: hand the turns back verbatim and let the guard
+    # shed them if they genuinely do not fit. Shedding is logged and bounded.
+    # This was neither.
+    joined = "\n\n".join(p for p in parts if p.strip())
+    if not joined.strip():
+        logger.warning(
+            f"summarize: no usable summary for {len(to_summarize)} turn(s) "
+            f"- the model returned empty content. Forwarding them verbatim "
+            f"rather than dropping them."
+        )
+        return "", to_summarize
     # (summary, turns this request deliberately did not summarize)
-    return "\n\n".join(parts), deferred
+    return joined, deferred
 
 
 def split_messages(messages: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
@@ -1344,10 +1381,19 @@ async def compact_if_needed(messages: list[dict]) -> list[dict]:
         system_msgs + summary_blocks + deferred + preserved_images + keep_recent
     )
     new_count = count_tokens(new_messages)
+    # Count what was SUMMARIZED, not what was offered. len(text_only) counts
+    # both, so when the batch count exceeded the call cap - the steady state
+    # for this user's long conversations, where summarize() skips entirely and
+    # defers everything - this line claimed to have summarized 80 turns while
+    # forwarding all 80 untouched. A log that asserts work which did not
+    # happen is worse than no log: it is what made the second 08-29 outage
+    # look healthy while the request sat there.
+    _summarized = len(text_only) - len(deferred)
     logger.info(
-        f"compacted: summarized {len(text_only)} text turn(s), "
-        f"preserved {len(preserved_images)} image turn(s), "
-        f"{current} -> {new_count} tokens"
+        f"compacted: summarized {_summarized} text turn(s), forwarded "
+        f"{len(deferred)} verbatim, preserved {len(preserved_images)} image "
+        f"turn(s), {current} -> {new_count} tokens"
+        + ("" if _summarized else "  [NO SUMMARIZATION HAPPENED]")
     )
     return new_messages
 
@@ -1433,7 +1479,27 @@ _RUN_RE = re.compile(r"(.)\1{19,}", re.S)
 DEGENERATE_TOKEN_RUN_CHARS = _env_int("COMPACTOR_DEGENERATE_TOKEN_RUN_CHARS", 120)
 # {3,} not {1,}: two or three repeats is emphasis ("no no no"), four or more
 # of a 3+ character token is a machine stuck in a groove.
-_TOKEN_RUN_RE = re.compile(r"(\S{3,})(?:[ _\n\t]*\1){3,}")
+#
+# {3,40}, NOT {3,}, and the upper bound is not cosmetic. Unbounded, the engine
+# tries every group(1) length at every start position, which is quadratic in
+# the length of the longest whitespace-free run — and this function runs
+# SYNCHRONOUSLY on the asyncio event loop at both call sites. Measured in the
+# production image (2026-08-29 gate):
+#
+#     16k of whitespace-free alphanumerics   6214 ms  ->  39 ms
+#     prose + 12k of CJK (the real drift shape) 4508 ms  ->  31 ms
+#
+# Degeneration is exactly what produces long whitespace-free runs, so the
+# unbounded form was slowest on the only input it exists for: a several-second
+# stall of every other request, which is the "no reply" outage this whole line
+# of work is trying to stop. Verified before bounding: 0 verdict differences
+# across all 232 unique real assistant replies in the production backups, at
+# every bound from 40 to 1000. No repetition class is lost either — group(1)
+# is \S+, so the rule never spanned a space and never caught a repeated
+# sentence or paragraph; the real degenerate units measured 6 and 21
+# characters. 250 is also verdict-identical (211 ms) if more headroom is
+# wanted; 40 is the fastest of the verified set.
+_TOKEN_RUN_RE = re.compile(r"(\S{3,40})(?:[ _\n\t]*\1){3,}")
 
 
 def reply_is_degenerate(text: str) -> str | None:
@@ -1492,20 +1558,40 @@ def reply_is_degenerate(text: str) -> str | None:
         )
     # Script drift. Counted over LETTERS, not characters, so punctuation,
     # markdown and code do not dilute it.
+    # NFKC first: MATHEMATICAL BOLD / DOUBLE-STRUCK / FULLWIDTH letters are
+    # isalpha() with no "LATIN" in their unicode name, so a single styled
+    # heading — which this model likes — counted as 37 non-Latin letters.
     lat = non = 0
-    for c in text:
-        if c.isalpha():
-            if "LATIN" in unicodedata.name(c, ""):
-                lat += 1
-            else:
-                non += 1
+    scripts: set[str] = set()
+    for c in unicodedata.normalize("NFKC", text):
+        if not c.isalpha():
+            continue
+        nm = unicodedata.name(c, "")
+        if "LATIN" in nm:
+            lat += 1
+        else:
+            non += 1
+            scripts.add(nm.split(" ")[0])
     if lat + non >= DEGENERATE_MIN_LETTERS:
         frac = non / (lat + non)
-        if frac >= DEGENERATE_NONLATIN_FRACTION:
+        # BREADTH, not just fraction. A bare fraction flags one legitimate
+        # foreign quotation unless the reply is ~33x longer than it: measured,
+        # a Greek John 3:16 fragment trips replies up to ~2,525 letters and a
+        # Hebrew Genesis 1:1 trips a 611-letter one. This user quotes
+        # scripture, so that is not hypothetical, and the cost is her losing
+        # that reply from memory silently.
+        #
+        # Real drift is script SALAD: the five genuine cases carried 6, 8, 12,
+        # 14 and 14 distinct non-Latin scripts, with mean contiguous runs of
+        # 3-6 letters. The highest unflagged reply containing any non-Latin
+        # had 4. A quotation is one script. The 20% disjunct keeps a
+        # single-script runaway catchable.
+        if (frac >= DEGENERATE_NONLATIN_FRACTION and len(scripts) >= 5) or frac >= 0.20:
             return (
                 f"{100 * frac:.0f}% of letters are non-Latin over "
-                f"{lat + non} letters (limit "
-                f"{100 * DEGENERATE_NONLATIN_FRACTION:.0f}%)"
+                f"{lat + non} letters across {len(scripts)} script(s) "
+                f"(limit {100 * DEGENERATE_NONLATIN_FRACTION:.0f}% over "
+                f"5+ scripts, or 20% alone)"
             )
     if n >= DEGENERATE_MIN_CHARS:
         decor = sum(1 for c in text if c in _DECOR_CHARS)
@@ -3688,10 +3774,10 @@ async def chat_completions(request: Request) -> Any:
                 f"(finish_reason=length, {len(assistant_text)} chars) — "
                 f"skipping memory tail for the partial reply"
             )
-        elif conv_id and reply_is_degenerate(assistant_text):
+        elif conv_id and (_degen := reply_is_degenerate(assistant_text)):
             logger.warning(
                 f"conv={conv_id}: reply looks like a repetition loop "
-                f"({reply_is_degenerate(assistant_text)}) — skipping memory "
+                f"({_degen}) — skipping memory "
                 f"tail so it cannot be extracted as facts, indexed, or rolled "
                 f"into a summary"
             )

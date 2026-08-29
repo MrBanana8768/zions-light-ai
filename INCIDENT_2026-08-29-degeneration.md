@@ -158,7 +158,22 @@ chosen:
 | repeated character | 250 | longest healthy run 146 |
 | repeated token | 120 | p98 = 80, then a cliff to p99 = 384 |
 | decoration fraction | 45% over 300 chars | healthy max 37.9% |
-| non-Latin letters | 3% over 200 letters | p99 = 1.21%, max 10.79% |
+| non-Latin letters | 3% over 200 letters **and 5+ distinct scripts**, or 20% alone | p99 = 1.21%, max 10.79%; genuine drift carried 6-14 scripts, the highest clean reply 4 |
+
+The script rule needs BREADTH, not just a fraction, and that was a real
+latent false positive rather than a theoretical one. A bare fraction flags a
+single legitimate foreign quotation unless the reply is ~33x longer than it:
+measured, a Greek John 3:16 fragment trips replies up to ~2,525 letters and a
+Hebrew Genesis 1:1 trips a 611-letter one. This user quotes scripture. Text is
+also NFKC-normalised first, because `MATHEMATICAL BOLD` letters are
+`isalpha()` with no `LATIN` in their unicode name, so one styled heading — a
+habit this model has — counted as 37 non-Latin letters.
+
+Real drift is script SALAD: the five genuine cases in the corpus carried 6, 8,
+12, 14 and 14 distinct non-Latin scripts. The highest clean reply containing
+any non-Latin text had 4. Adding the breadth gate changed **zero verdicts
+across all 232 unique real replies** while clearing all four false-positive
+shapes the old rule flagged.
 
 **A false positive here costs the user a memory of her own life**, which is
 worse than the loop it guards against, because the loop is visible to her and
