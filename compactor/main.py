@@ -673,6 +673,15 @@ def _message_has_image(m: dict) -> bool:
 # fact rather than leaving it to a log line from three days ago.
 TOKENIZE_WARN_INTERVAL_S = float(_env_int("COMPACTOR_TOKENIZE_WARN_INTERVAL_S", 300))
 _tokenize_fail_streak = 0
+# Tracked separately from the chat form: see tokenize_health(). Carries its own
+# timestamp because, unlike the chat form, it is NOT exercised on every request
+# — count_text_tokens_exact runs only when there are injected blocks to measure
+# (main.py _bound_injected_blocks). Without a staleness bound a single text-form
+# failure would pin /health/full unhealthy until the next conversation that
+# happens to have memory to inject, which is the _BUDGET_MARGIN latching bug
+# wearing a different hat.
+_tokenize_text_fail_streak = 0
+_tokenize_text_last_fail_at: float | None = None
 _tokenize_degraded_since: float | None = None
 _tokenize_last_warn: dict[str, float] = {}
 
@@ -686,8 +695,19 @@ def tokenize_health() -> dict:
     in. A health endpoint that cannot say so is asking its reader to go find a
     log line instead."""
     return {
-        "ok": _tokenize_fail_streak == 0,
-        "consecutive_failures": _tokenize_fail_streak,
+        # AND across forms. count_tokens_exact (chat) and
+        # count_text_tokens_exact (completion) hit the same endpoint but ask
+        # different questions, and only the chat form can be refused by the
+        # model's template — which is exactly the D1 outage. A shared streak
+        # let one text-count success declare the endpoint healthy while every
+        # chat-form call was still 400ing, so this endpoint FLAPPED instead of
+        # reporting the degraded mode it exists to report.
+        "ok": _tokenize_fail_streak == 0 and _text_tokenize_failing_now() == 0,
+        "consecutive_failures": max(
+            _tokenize_fail_streak, _text_tokenize_failing_now()
+        ),
+        "chat_form_failures": _tokenize_fail_streak,
+        "text_form_failures": _text_tokenize_failing_now(),
         "degraded_since": _tokenize_degraded_since,
         "degraded_for_s": (
             round(time.time() - _tokenize_degraded_since, 1)
@@ -695,6 +715,36 @@ def tokenize_health() -> dict:
             else 0.0
         ),
     }
+
+
+def _note_text_tokenize_failure() -> None:
+    """Count a completion-form failure. Deliberately silent: the WARNING is
+    still emitted by _note_tokenize_failure under a text.* key, and duplicating
+    it here would double every line during an outage."""
+    global _tokenize_text_fail_streak, _tokenize_text_last_fail_at
+    _tokenize_text_fail_streak += 1
+    _tokenize_text_last_fail_at = time.time()
+
+
+def _note_text_tokenize_success() -> None:
+    global _tokenize_text_fail_streak, _tokenize_text_last_fail_at
+    _tokenize_text_fail_streak = 0
+    _tokenize_text_last_fail_at = None
+
+
+def _text_tokenize_failing_now() -> int:
+    """The completion form's streak, or 0 once it has gone stale.
+
+    Stale means "we have not seen this form fail for a whole warn interval",
+    which for a form that is only called when memory is being injected is the
+    honest reading: we do not know it is broken, and asserting a fault we
+    cannot currently observe is the same error as asserting health we cannot
+    observe."""
+    if not _tokenize_text_fail_streak or _tokenize_text_last_fail_at is None:
+        return 0
+    if (time.time() - _tokenize_text_last_fail_at) > TOKENIZE_WARN_INTERVAL_S:
+        return 0
+    return _tokenize_text_fail_streak
 
 
 def _note_tokenize_failure(key: str, detail: str) -> None:
@@ -767,6 +817,7 @@ def count_text_tokens_exact(text: str) -> int | None:
             timeout=httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0),
         )
         if r.status_code != 200:
+            _note_text_tokenize_failure()
             _note_tokenize_failure(
                 f"text.http.{r.status_code}",
                 f"returned HTTP {r.status_code} for a text count, "
@@ -775,14 +826,16 @@ def count_text_tokens_exact(text: str) -> int | None:
             return None
         n = (r.json() or {}).get("count")
         if not isinstance(n, (int, float)):
+            _note_text_tokenize_failure()
             _note_tokenize_failure(
                 "text.body",
                 f"answered HTTP 200 with no numeric 'count': {r.text[:200]!r}",
             )
             return None
-        _note_tokenize_success()
+        _note_text_tokenize_success()
         return int(n)
     except Exception as e:
+        _note_text_tokenize_failure()
         _note_tokenize_failure(
             f"text.error.{type(e).__name__}",
             f"unreachable for a text count ({type(e).__name__}: {e})",

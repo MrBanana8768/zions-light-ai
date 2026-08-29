@@ -1822,6 +1822,15 @@ def test_a_tokenize_outage_is_reportable_more_than_once_per_process():
         assert_true(h["degraded_since"] is not None, "with a start time")
 
         print("\n[test] A13 — recovery is announced, which a one-shot cannot do")
+        # Scoped to the CHAT form: clear the completion form first.
+        # Not masking. Since v3.1.1 tokenize_health()["ok"] is the AND of both
+        # request forms, because a completion-form success must not be able to
+        # declare the endpoint healthy while every chat-form call is still being
+        # refused by the model template — that is the D1 outage. An earlier
+        # endpoint test in this process drives count_text_tokens_exact against a
+        # stub that 400s, so without this the assertion below would claim health
+        # while a genuinely-failing form is outstanding.
+        main._note_text_tokenize_success()
         handler = _CaptureLogs()
         lg.addHandler(handler)
         try:

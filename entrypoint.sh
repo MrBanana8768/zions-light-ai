@@ -104,21 +104,56 @@ echo ""
 # Network / HuggingFace reachability check.
 # =============================================================================
 echo "[2/3] Checking HuggingFace connectivity..."
+
+# OFFLINE IS A SUPPORTED MODE, NOT A FAILURE.
+#
+# This block used to `exit 1` after 60 seconds without huggingface.co — on a
+# pod whose every model byte is already cached on /data. A boot-time network
+# dependency that the running system does not actually need is the worst kind:
+# it fires during a redeploy, which is exactly when nobody wants a puzzle.
+# (REMEDIATION F25.)
+#
+# The rule now: if the cache is populated, unreachable HuggingFace is a
+# supported state and we say so, loudly, once. We only refuse to boot when we
+# have NEITHER weights nor a way to fetch them, because that is the only case
+# where continuing produces a container that cannot serve.
 HF_READY=false
-for i in $(seq 1 30); do
-    if curl -sf --max-time 5 "https://huggingface.co" > /dev/null 2>&1; then
+for i in $(seq 1 10); do
+    if curl -sf --max-time 3 "https://huggingface.co" > /dev/null 2>&1; then
         echo "      HuggingFace is reachable."
         HF_READY=true
         break
-    else
-        echo "      Waiting for network... (attempt $i/30)"
-        sleep 2
     fi
+    sleep 1
 done
 
-if [ "$HF_READY" = false ]; then
-    echo "ERROR: Cannot reach HuggingFace after 60 seconds. Check network connectivity."
+# Is there a usable model cache? A snapshots/ directory under the HF hub
+# layout is the cheapest honest proxy for "weights are already here".
+HAVE_WEIGHTS=false
+if [ -n "$(find "${HF_HOME}/hub" -maxdepth 3 -type d -name snapshots 2>/dev/null | head -1)" ]; then
+    HAVE_WEIGHTS=true
+fi
+
+if [ "$HF_READY" = false ] && [ "$HAVE_WEIGHTS" = true ]; then
+    echo "      HuggingFace is UNREACHABLE — running OFFLINE from ${HF_HOME}."
+    echo "      This is supported. Model downloads and tokenizer resolution are"
+    echo "      disabled for this boot; a model change will need connectivity."
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+elif [ "$HF_READY" = false ]; then
+    echo "ERROR: HuggingFace is unreachable AND ${HF_HOME} holds no cached model."
+    echo "       There is nothing to serve and no way to fetch it."
+    echo "       Attach the volume holding the model cache, or restore"
+    echo "       connectivity, then start the pod again."
     exit 1
+fi
+
+# Belt and braces: honour an operator-set offline flag even when the network
+# IS reachable, so a deployment can be pinned offline deliberately.
+if [ "${COMPACTOR_FORCE_OFFLINE:-false}" = "true" ]; then
+    echo "      COMPACTOR_FORCE_OFFLINE=true — pinning HF offline."
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
 fi
 
 # Generate OpenWebUI secret key if not set
