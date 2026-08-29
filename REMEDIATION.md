@@ -653,6 +653,27 @@ Also confirmed: `main.py:1399` passes `messages,  # use original messages, not c
 
 **Estimate.** 2 h. **Depends on:** nothing, but **D13 must land in the same commit as D56.**
 
+> **2026-08-29 — this is the first item of V3.2, and v3.1 made it cheaper than it was.**
+>
+> Images do not reach the model because we TURNED THEM OFF, not because the
+> model cannot see them. `COMPACTOR_MAX_RETAINED_IMAGES=0` is the deliberate
+> mitigation from 2026-08-24, and `_apply_image_retention` implements it
+> exactly as documented. No model swap is indicated: a different vision model
+> would be stripped identically.
+>
+> What blocked re-enabling it was that `COMPACTOR_IMAGE_TOKENS=4096` is a
+> GUESS — the template says so — and D13 latches a process-global margin off a
+> wrong image cost. **v3.1 removed that obstacle**: `count_tokens_exact` asks
+> vLLM what an image-bearing payload actually costs, so the number can be
+> measured per resolution instead of assumed, and D4 (1a0ab15) already stopped
+> the margin learning from a rejection the guard predicted.
+>
+> So V3.2 image work is: measure real per-image cost against /tokenize at two
+> or three resolutions, set `COMPACTOR_IMAGE_TOKENS` from that, raise
+> `MAX_RETAINED_IMAGES` to 1, and re-verify D13 cannot latch. The user-facing
+> affordance (FRONTEND_SPEC §8 item 4 — telling her an image was dropped) still
+> needs the new client.
+
 ---
 
 #### V12 · F6 + F19 + F27 + F28 — Backup and shutdown hygiene
