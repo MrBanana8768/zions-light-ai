@@ -37,12 +37,16 @@ without silently truncating.
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import facts
 import memory
+import persona
 import retrieval
 import summarizer
 
@@ -87,6 +91,350 @@ def export_conversation(conv_id: str) -> dict:
         "facts": loaded_facts,
         "summary_state": summary_state,
         "episodic": episodic,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Quarantine — the archive half of a destructive admin operation
+# ---------------------------------------------------------------------------
+#
+# v3.1 D6. Anything in this codebase that removes stored memory has to be
+# reversible, and there are already two mechanisms for that. This adds no
+# third one; it wires the two together and adds the part neither had.
+#
+#   1. facts.archive_facts / restore_from_archive — the per-row, cold-storage
+#      sidecar. This is how a fact leaves the active set today (F9), it is
+#      already visible to the user as /list-archive, and it is already
+#      reversible without an operator. Any cleanup that removes facts should
+#      go through it rather than writing a shorter list with save_facts.
+#
+#   2. export_conversation / import_conversation — the whole-conversation
+#      bundle. Its docstring already names this exact use case: "back up a
+#      critical conversation before a suspect operation (forget, rollback,
+#      model swap)". So the "archive before removing" half is half-built: the
+#      export produces the snapshot, and nothing writes it anywhere.
+#
+# What is missing is durability and verification. export_conversation is
+# best-effort per layer — every read is wrapped in `except Exception` and
+# degrades to an empty value — so a bundle from a conversation whose facts
+# file is unreadable is a *valid, empty, importable* bundle. Handing that to
+# an operator as "your data is safe, go ahead and delete" is precisely the
+# shape backup.py F2 fixed: an archive of nothing that verified green,
+# published, and pruned the real archives behind it.
+#
+# So quarantine_conversation borrows backup.py's staging/verify/publish:
+# measure what the store holds BEFORE exporting, write to a `.partial`, read
+# the file back off disk and contradict the manifest from it, and only then
+# publish under the real name. A crash at any point leaves either a `.partial`
+# nothing reads or a published file that has been proven readable. Never a
+# half-trusted snapshot.
+#
+# v3.1 D8 — TWO LAYERS THE BUNDLE DOES NOT CARRY, and why they are carried
+# here instead.
+#
+# export_conversation writes exactly three payloads: facts, summary_state,
+# episodic. It does not carry the archive sidecar and it does not carry the
+# persona. For an export that is a schema question; for a PRE-REMOVAL SNAPSHOT
+# it is a correctness one, because both of those layers are things a
+# destructive admin operation deletes:
+#
+#   - commands._wipe_all_layers clears the archive sidecar, and its own
+#     comment records that "NOTHING in this codebase has ever deleted one"
+#     before it did.
+#   - main._clear_all_memory calls persona.clear_persona. INCIDENT_2026-08-24
+#     D19 states the consequence in one line: "/forget can destroy a persona
+#     that no export can back up and no import can restore."
+#
+# A snapshot that is missing the layers the operation removes is not an
+# archive-before-removing; it is a partial one that reads as complete. So both
+# are measured, carried, and verified on read-back like everything else.
+#
+# They go in the `quarantine` metadata block rather than into the bundle
+# payload. That is deliberate and it is not laziness: adding payload keys means
+# either a BUNDLE_VERSION bump — which _validate_bundle enforces by strict
+# equality, so every previously written bundle and both HTTP endpoints stop
+# working the moment it changes — or silently widening a documented schema.
+# Under `quarantine`, _validate_bundle ignores the extra key, so a snapshot
+# stays a valid v2.1 bundle that import_conversation restores with no new code,
+# AND the two extra layers travel with it for an operator (or
+# commands._handle_retire) to put back explicitly. Restoring them is a
+# `facts.save_archive` and a `persona.save_persona`; the restore_hint says so.
+#
+# This does NOT close D19 for export/import generally — export_conversation is
+# unchanged and a fork still loses the persona. It closes it for the one path
+# whose entire purpose is to make a removal reversible.
+
+# Filename-safe by construction: conv_id is already sanitized by
+# memory._sanitize to [A-Za-z0-9_-], and the stamp adds only digits, "T" and
+# "Z".
+QUARANTINE_SUBDIR = "quarantine"
+
+
+def _has_summary_content(state: Any) -> bool:
+    """True when a summary_state payload holds an actual hierarchy.
+
+    NOT `bool(state)`. summarizer.load_state "returns an empty (but
+    well-formed) skeleton if no file exists" — a dict with l1/l2/l3 and
+    last_summarized_turn keys — so a plain truthiness test on it is True for
+    every conversation that has never been summarized at all. The quarantine
+    log said `summary=yes` unconditionally, which on a snapshot surface is
+    the same class of lie as reporting a wipe from the counters instead of
+    from disk: the operator reads a layer that is not there. Same test
+    commands._memory_residue applies for /forget's verification pass.
+    """
+    if not isinstance(state, dict):
+        return False
+    return bool(state.get("l1") or state.get("l2") or state.get("l3"))
+
+
+class QuarantineError(Exception):
+    """The pre-removal snapshot could not be written or could not be proven
+    complete. Callers MUST abort the removal — this exception is the only
+    thing standing between "reversible" and "gone"."""
+
+
+def quarantine_dir() -> Path:
+    """Where pre-removal snapshots live.
+
+    Under the compactor storage root, so backup.py's `copytree(STORAGE_ROOT)`
+    picks them up for free and a snapshot survives the volume it describes.
+    Not under facts/, because memory.list_known_conv_ids and backup._census
+    both glob that directory and a quarantine file is not a conversation.
+    """
+    return memory.storage_root() / QUARANTINE_SUBDIR
+
+
+def _quarantine_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _quarantine_path(conv_id: str) -> Path:
+    """A published name that is not already taken.
+
+    Second-resolution stamps collide if the operation is run twice inside one
+    second, and the loser of that collision would be a snapshot silently
+    overwritten by the very operation it exists to make reversible.
+    """
+    d = quarantine_dir()
+    stamp = _quarantine_stamp()
+    candidate = d / f"{conv_id}.{stamp}.json"
+    n = 1
+    while candidate.exists():
+        candidate = d / f"{conv_id}.{stamp}-{n}.json"
+        n += 1
+    return candidate
+
+
+def list_quarantine(conv_id: str | None = None) -> list[Path]:
+    """Published quarantine snapshots, newest filename last. `.partial` files
+    are never returned — an interrupted write must not look like a snapshot.
+    """
+    d = quarantine_dir()
+    if not d.is_dir():
+        return []
+    pattern = f"{conv_id}.*.json" if conv_id else "*.json"
+    return sorted(p for p in d.glob(pattern) if not p.name.endswith(".partial"))
+
+
+def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
+    """Write a verified, restorable snapshot of this conversation before
+    something removes part of it. Returns {"path", "facts", "archive",
+    "episodic", "summary", "persona", "unverified_layers"}.
+
+    Raises QuarantineError if the snapshot cannot be proven to hold at least
+    what the store held a moment ago. Raises memory.StoreUnreadable if the
+    facts file is there and cannot be read — an operation that is about to
+    rewrite that file must not proceed on a guess (F1).
+
+    The produced file is a plain export bundle plus a `quarantine` metadata
+    block, so `import_conversation(json.load(open(path)),
+    target_conv_id=..., overwrite=True)` restores it with no new code and no
+    new format. _validate_bundle checks the version and the three payload
+    keys and ignores extra ones, which is what makes that work.
+
+    Restoring the whole bundle is the BACKSTOP, not the first move: it rolls
+    the conversation back wholesale and would discard anything learned since.
+    For a facts cleanup the first move is restore_from_archive, which puts
+    individual rows back without touching anything else.
+
+    Retention: nothing here deletes old snapshots. They are written only by an
+    explicit operator action, they are small (text only, no embeddings), and
+    this module is not going to invent an automatic delete for the one
+    directory whose entire job is to survive one.
+    """
+    # Measured BEFORE the export, and strictly: this is the expectation the
+    # verify step tries to contradict, so it cannot come from the same
+    # best-effort reads it is checking. StoreUnreadable propagates on purpose.
+    expected_facts = len(facts.load_facts(conv_id))
+
+    unverified: list[str] = []
+
+    # The two layers export_conversation does not carry — see the block
+    # comment above. Read as best-effort and RECORDED when they fail, never
+    # silently defaulted: a caller that is about to clear the archive sidecar
+    # has to be able to tell "there was nothing there" from "I could not look",
+    # and those are the same value if this swallows the exception.
+    archived_rows: list[dict] = []
+    try:
+        archived_rows = facts.load_archive(conv_id)
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: quarantine could not read the archive sidecar: {e}")
+        unverified.append("archived facts (unreadable)")
+    persona_record = None
+    try:
+        persona_record = persona.load_persona(conv_id)
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: quarantine could not read the persona: {e}")
+        unverified.append("persona (unreadable)")
+
+    expected_episodic = retrieval.conversation_doc_count(conv_id)
+    if expected_episodic is None:
+        # None is "could not tell", never zero (F61). The episodic layer is not
+        # what a facts cleanup modifies, so this is recorded rather than fatal
+        # — but it is recorded, because a snapshot with an unverified layer is
+        # not the same object as a snapshot with a verified one.
+        unverified.append("episodic (vector store unavailable)")
+    try:
+        summarizer.load_state(conv_id)
+    except memory.StoreUnreadable:
+        unverified.append("summaries (unreadable)")
+    except Exception:  # pragma: no cover - load_state's own best-effort paths
+        unverified.append("summaries (unreadable)")
+
+    bundle = export_conversation(conv_id)
+    bundle["quarantine"] = {
+        "reason": reason,
+        "written_at": int(time.time()),
+        "expected": {
+            "facts": expected_facts,
+            "episodic": expected_episodic,
+            "archive": len(archived_rows),
+        },
+        # The two layers the v2.1 bundle payload has no key for. Carried
+        # verbatim so a restore is a copy, not a reconstruction.
+        "archive": list(archived_rows),
+        "persona": persona_record,
+        "unverified_layers": list(unverified),
+        "restore_hint": (
+            "per-row: facts.restore_from_archive(conv_id) — preferred. "
+            "whole-conversation: import_conversation(this file, "
+            "target_conv_id=<conv>, overwrite=True) — discards anything "
+            "learned since this file was written. import_conversation does "
+            "NOT restore the two layers under quarantine.archive and "
+            "quarantine.persona: put those back with "
+            "facts.save_archive(conv_id, bundle['quarantine']['archive']) and "
+            "persona.save_persona(conv_id, "
+            "bundle['quarantine']['persona']['persona_text'])."
+        ),
+    }
+
+    # Contradiction #1, before anything is written: the export ran its reads
+    # through `except Exception` and would have handed back [] for a facts
+    # file that raised. It cannot be short of what we counted.
+    if len(bundle.get("facts") or []) < expected_facts:
+        raise QuarantineError(
+            f"conv={conv_id}: snapshot holds "
+            f"{len(bundle.get('facts') or [])} fact(s) but the store held "
+            f"{expected_facts} a moment ago — refusing to publish a snapshot "
+            f"that does not contain what it is supposed to protect"
+        )
+
+    quarantine_dir().mkdir(parents=True, exist_ok=True)
+    published = _quarantine_path(conv_id)
+    partial = published.with_name(published.name + ".partial")
+
+    try:
+        # Stage. atomic_write_json gives tmp+fsync+replace, so the `.partial`
+        # itself is never torn; the `.partial` NAME is what keeps an
+        # unverified snapshot from being mistaken for a usable one.
+        memory.atomic_write_json(partial, bundle)
+
+        # Contradiction #2: read it back off the disk it will have to be read
+        # off later, and check the payload rather than the file size. An
+        # unserializable value or a full filesystem shows up here, not in six
+        # months when someone needs the file.
+        back = memory.read_json_strict(partial, default=None)
+        if not isinstance(back, dict):
+            raise QuarantineError(
+                f"conv={conv_id}: quarantine snapshot did not read back as a "
+                f"JSON object"
+            )
+        if back.get("version") != BUNDLE_VERSION:
+            raise QuarantineError(
+                f"conv={conv_id}: quarantine snapshot read back with version "
+                f"{back.get('version')!r}, expected {BUNDLE_VERSION!r} — "
+                f"import_conversation would reject it"
+            )
+        if back.get("source_conv_id") != conv_id:
+            raise QuarantineError(
+                f"conv={conv_id}: quarantine snapshot read back for a "
+                f"different conversation"
+            )
+        n_back = len(back.get("facts") or [])
+        if n_back < expected_facts:
+            raise QuarantineError(
+                f"conv={conv_id}: quarantine snapshot read back with {n_back} "
+                f"fact(s), expected at least {expected_facts}"
+            )
+        if len(back.get("episodic") or []) < len(bundle.get("episodic") or []):
+            raise QuarantineError(
+                f"conv={conv_id}: quarantine snapshot lost episodic entries "
+                f"between write and read-back"
+            )
+        # Same contradiction for the two layers carried in the metadata block.
+        # Verified rather than trusted for exactly the reason the payload is:
+        # the caller is about to delete these, and a snapshot that quietly
+        # dropped them on serialization is worse than no snapshot, because the
+        # caller proceeds.
+        back_q = back.get("quarantine")
+        if not isinstance(back_q, dict):
+            raise QuarantineError(
+                f"conv={conv_id}: quarantine snapshot read back without its "
+                f"metadata block"
+            )
+        if len(back_q.get("archive") or []) < len(archived_rows):
+            raise QuarantineError(
+                f"conv={conv_id}: quarantine snapshot read back with "
+                f"{len(back_q.get('archive') or [])} archived fact(s), "
+                f"expected at least {len(archived_rows)}"
+            )
+        if persona_record is not None and not (back_q.get("persona") or {}).get(
+            "persona_text"
+        ):
+            raise QuarantineError(
+                f"conv={conv_id}: quarantine snapshot read back without the "
+                f"persona this conversation has stored"
+            )
+
+        # Publish. Same rename-into-place backup.py uses: the file appears
+        # under its real name only once it has been proven readable.
+        os.replace(partial, published)
+    except Exception:
+        try:
+            partial.unlink()
+        except OSError:
+            pass
+        raise
+
+    # Counts only. Never fact text, never conversation content — this log goes
+    # to an operator's terminal and the store holds real personal memory.
+    logger.info(
+        f"conv={conv_id}: quarantine snapshot published ({reason}): "
+        f"{n_back} fact(s), {len(back_q.get('archive') or [])} archived, "
+        f"{len(back.get('episodic') or [])} episodic, "
+        f"summary={'yes' if _has_summary_content(back.get('summary_state')) else 'no'}, "
+        f"persona={'yes' if back_q.get('persona') else 'no'}"
+        + (f", unverified: {'; '.join(unverified)}" if unverified else "")
+    )
+
+    return {
+        "path": published,
+        "facts": n_back,
+        "archive": len(back_q.get("archive") or []),
+        "episodic": len(back.get("episodic") or []),
+        "summary": _has_summary_content(back.get("summary_state")),
+        "persona": bool(back_q.get("persona")),
+        "unverified_layers": unverified,
     }
 
 
@@ -143,21 +491,94 @@ def import_conversation(
     if not target:
         raise ImportError_("no target_conv_id provided and bundle has no source_conv_id")
 
+    # v3.1 D18: archive, restore and dedup all serialize on conv_lock; import
+    # — the one operation that clears three layers and rewrites them wholesale
+    # — did not. The hazard is not two concurrent importers. It is an
+    # extraction tail that read facts before the import ran, is parked on its
+    # vLLM call while holding conv_lock, and writes that pre-import snapshot
+    # back the moment it returns. The bundle is gone, with no error anywhere
+    # and `overwrote_existing: true` in the response.
+    #
+    # This function is a plain `def` called from an `async def` endpoint, so it
+    # runs to completion on the event loop without yielding: nothing can take
+    # conv_lock while it is running, and it cannot await to take the lock
+    # itself. locked() is therefore the whole of the mutual exclusion — held
+    # means a writer is parked mid-sequence and this import must not land
+    # underneath it. A refused import loses nothing and the operator retries;
+    # a clobbered one loses the bundle. Making this `async def` and awaiting
+    # the lock is the better shape and needs its two call sites in main.py
+    # (the import and fork endpoints) to await it.
+    if memory.conv_lock(target).locked():
+        raise ImportError_(
+            f"conv_id {target!r} has a memory write in flight (extraction tail, "
+            f"archive, restore or dedup). Refusing rather than import "
+            f"underneath it — that writer would overwrite the bundle on its "
+            f"next save. Retry in a moment."
+        )
+
     # Pre-flight: detect existing state to honor overwrite=False.
-    pre_existing = (
-        len(facts.load_facts(target)) > 0
-        or retrieval.conversation_doc_count(target) > 0
-        or bool(summarizer.load_state(target).get("l1"))
-    )
+    #
+    # v3.1: this guard exists to stop an import silently wiping a live
+    # conversation, so "I could not check" must be treated as "occupied" — the
+    # opposite reading is how a safety check becomes a data-loss path. Two
+    # sources of not-knowing, both introduced by making failure visible rather
+    # than inventing a value:
+    #   - conversation_doc_count returns None when the vector store is
+    #     unavailable (0 now means genuinely empty, and only that)
+    #   - load_facts / load_state raise StoreUnreadable on a corrupt or
+    #     unreadable file
+    # Either way we refuse unless the caller has explicitly said overwrite.
+    # The message is operator-facing but travels out through an HTTP body, so
+    # the layer name goes in the reason and the underlying path stays in the log.
+    unverifiable: list[str] = []
+    pre_existing = False
+    try:
+        pre_existing = len(facts.load_facts(target)) > 0
+    except memory.StoreUnreadable as e:
+        unverifiable.append("facts (unreadable)")
+        logger.warning(f"conv={target}: import pre-flight could not read facts: {e}")
+    n_indexed = retrieval.conversation_doc_count(target)
+    if n_indexed is None:
+        unverifiable.append("episodic (vector store unavailable)")
+        logger.warning(f"conv={target}: import pre-flight could not reach the vector store")
+    elif n_indexed > 0:
+        pre_existing = True
+    try:
+        if summarizer.load_state(target).get("l1"):
+            pre_existing = True
+    except memory.StoreUnreadable as e:
+        unverifiable.append("summaries (unreadable)")
+        logger.warning(f"conv={target}: import pre-flight could not read summaries: {e}")
+
+    if unverifiable and not overwrite:
+        raise ImportError_(
+            f"cannot verify whether target conv_id {target!r} is empty — "
+            f"{'; '.join(unverifiable)}. Refusing rather than risk overwriting "
+            f"a live conversation; pass overwrite=true to import anyway"
+        )
     if pre_existing and not overwrite:
         raise ImportError_(
             f"target conv_id {target!r} has existing state; "
             f"pass overwrite=true to replace"
         )
 
+    if unverifiable and overwrite:
+        # Proceeding past a safety check that could not run is exactly the kind
+        # of thing that must leave a record — the operator chose this, but in
+        # six months the log is the only evidence the check was skipped rather
+        # than passed.
+        logger.warning(
+            f"conv={target}: importing with overwrite=true while unable to "
+            f"verify existing state ({'; '.join(unverifiable)}) — proceeding "
+            f"on the caller's explicit instruction"
+        )
+
     # If overwriting, clear first — guarantees we don't end up with a
-    # mix of old + new facts that confuses retrieval.
-    if pre_existing and overwrite:
+    # mix of old + new facts that confuses retrieval. `unverifiable` counts as
+    # "might be occupied": skipping the clear because we could not PROVE state
+    # exists is how stale episodic rows survive an overwrite and how
+    # overwrote_existing comes to under-report a real replacement.
+    if (pre_existing or unverifiable) and overwrite:
         facts.save_facts(target, [])
         retrieval.forget_conversation(target)
         # Summary state is overwritten wholesale by save_state, no clear needed.
@@ -194,7 +615,12 @@ def import_conversation(
             "episodic": episodic_imported,
             "summary": bool(bundle.get("summary_state")),
         },
-        "overwrote_existing": bool(pre_existing and overwrite),
+        # True when the clear step actually ran. `unverifiable` is included
+        # because we clear on it: reporting False there would tell the caller
+        # nothing was replaced while the file on disk had just been rewritten.
+        "overwrote_existing": bool((pre_existing or unverifiable) and overwrite),
+        # Non-empty when a layer could not be checked before importing.
+        "unverified_layers": list(unverifiable),
     }
 
 

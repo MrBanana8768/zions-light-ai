@@ -42,6 +42,7 @@ import retrieval
 import selftest as selftest_module
 import summarizer
 from memory import (
+    StoreUnreadable,
     conv_lock,
     ensure_storage_layout,
     facts_path,
@@ -63,7 +64,6 @@ def _env_int(name: str, default: int) -> int:
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8000").rstrip("/")
 MODEL_REPO = os.environ.get("MODEL_REPO")
 MAX_MODEL_LEN = _env_int("MAX_MODEL_LEN", 32768)
-TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(MAX_MODEL_LEN * 0.75))
 KEEP_RECENT_TURNS = _env_int("COMPACTOR_KEEP_RECENT_TURNS", 4)
 SUMMARY_MAX_TOKENS = _env_int("COMPACTOR_SUMMARY_MAX_TOKENS", 1024)
 # Slack left inside MAX_MODEL_LEN when budgeting a summarization call's INPUT
@@ -72,10 +72,42 @@ SUMMARY_INPUT_RESERVE = _env_int("COMPACTOR_SUMMARY_INPUT_RESERVE", 2048)
 # Hard ceiling for what we will forward to vLLM. Anything above this is a
 # guaranteed 400, so the guard sheds content rather than letting the request
 # fail. The reserve leaves the model room to actually generate a reply.
-GENERATION_RESERVE = _env_int("COMPACTOR_GENERATION_RESERVE", 2048)
+#
+# 2026-08-28: was 2048. That is not enough room to reply. This user's assistant
+# turns measure 7,513-11,347 tokens, so a 2048 reserve means that whenever the
+# guard actually lets a prompt grow to its ceiling, the reply is cut off
+# mid-sentence. It has been masked in practice by two things: most prompts sit
+# well under the ceiling, and _apply_request_budget (below) takes
+# max(GENERATION_RESERVE, req_max_tokens), so a client that sends max_tokens
+# gets the room it asked for. Neither is a guarantee — a client that sends no
+# max_tokens and a conversation that reaches the ceiling is exactly the
+# combination that truncates.
+GENERATION_RESERVE = _env_int("COMPACTOR_GENERATION_RESERVE", 16384)
 # Clamped to MAX_MODEL_LEN: a bare floor could sit ABOVE the model's own window
 # on a small-context model, which would defeat the entire point of the guard.
 HARD_INPUT_LIMIT = min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - GENERATION_RESERVE))
+# MUST be derived from HARD_INPUT_LIMIT, not from MAX_MODEL_LEN.
+#
+# This is the compaction trigger: exceed it and older turns get summarized.
+# Deriving it from MAX_MODEL_LEN opens a dead band the moment GENERATION_RESERVE
+# is non-trivial. With reserve=16384 the old formula gave a trigger of 24,576
+# against a guard limit of 16,384 — so every payload between those two numbers
+# skipped compaction entirely and went straight to the guard, which cannot
+# summarize and can only DELETE turns. That is the 2026-08-28 failure shape:
+# content that should have been compressed was discarded instead, silently.
+#
+# The two numbers are also in different units. `current` here is a LOCAL
+# estimate; the guard's limit is measured against vLLM. Sitting at 75% of the
+# hard limit leaves headroom for that discrepancy rather than pretending it is
+# zero. See count_tokens_exact and REMEDIATION P0-0c.
+TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(HARD_INPUT_LIMIT * 0.75))
+# The scale assumed when /tokenize cannot be reached and the summarizer must
+# size batches anyway. See the fallback in summarize() for why this is 2.0 and
+# not 1.0 — a counter you cannot check must be assumed wrong in the direction
+# that fails safe.
+_PESSIMISTIC_SUMMARY_SCALE = float(
+    os.environ.get("COMPACTOR_PESSIMISTIC_SUMMARY_SCALE", "2.0") or 2.0
+)
 # V3.1 (Vision): a single image in a VLM request costs far more than its
 # text — hundreds to a couple thousand tokens depending on resolution and
 # the model's vision encoder. The text-only token estimate misses this
@@ -100,6 +132,85 @@ IMAGE_TOKEN_ESTIMATE = _env_int("COMPACTOR_IMAGE_TOKENS", 4096)
 #   N >= 0 : keep the N most recent image turns (0 = keep none in history)
 #   -1     : unlimited (pre-v3.0.2 behavior; not recommended)
 MAX_RETAINED_IMAGES = _env_int("COMPACTOR_MAX_RETAINED_IMAGES", 1)
+
+
+def _env_float(name: str, default: float) -> float:
+    """Same contract as _env_int: an unset or unparseable value is the default,
+    never a crash at import time and never a silent zero."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+# v3.1 D3 — a ceiling on the SUM of injected memory, denominated in the window.
+#
+# Every injected layer is individually capped and their sum is not. Facts are
+# bounded by COMPACTOR_MAX_FACTS_TOKENS (1500, facts.py:67), retrieval by
+# COMPACTOR_MAX_RETRIEVAL_TOKENS (1500, retrieval.py:69 — "1500 mirrors the
+# facts budget deliberately: no injected memory layer should be able to..."),
+# and each summary chunk by its own generation ceiling. Nothing has ever
+# bounded persona + facts + retrieval + L1 + L2 + L3 TOGETHER, and no layer cap
+# has ever been able to see the limit the request will actually be measured
+# against. Caps that cannot see the limit can sum past it, and on 2026-08-28
+# they did.
+#
+# So the bound is a FRACTION of this request's effective limit rather than
+# another token constant: it moves with GENERATION_RESERVE, with MAX_MODEL_LEN
+# and with a client asking for a large completion, instead of needing a hand
+# re-tune every time any of those change. 0.5 says: whatever else happens, half
+# the window belongs to the conversation.
+INJECTION_BUDGET_FRACTION = _env_float("COMPACTOR_INJECTION_BUDGET_FRACTION", 0.5)
+
+# ...and a much tighter one for a request with no conversational history.
+#
+# Live, 2026-08-28: a request with msgs=2, source=hash, lastturn=0 and no prior
+# assistant turn was handed 95 facts and 3 retrieval hits. It could not be
+# compacted ("over budget (30437>12288) but no older turns to summarize"), it
+# could not be shed (there is nothing to drop but the injected blocks and the
+# one turn the user typed), and vLLM rejected it. The turn produced no reply,
+# no facts, no episodic write, and nothing retried it. It repeated, unchanged,
+# for four hours.
+#
+# A request with no prior assistant turn is one of two things, and neither
+# wants a conversation's whole accumulated memory:
+#
+#   - Background/task traffic — OpenWebUI's title, tag and follow-up calls.
+#     FRONTEND_SPEC §15 asks the client to mark these explicitly; today they
+#     arrive unmarked and hash to a stable conv_id. Such a call has no exchange
+#     to remember and no persona to stay in character for, so every token of
+#     injected memory it receives is spent making a title worse.
+#   - The first turn of a chat. There IS a case for memory here — "she
+#     remembers me from the first message" is the product — but a first turn is
+#     also the one shape that can neither be compacted (no older turns) nor
+#     shed (one turn, and the newest turn is never dropped), so it is exactly
+#     where an oversized injection stops being a degradation and becomes a lost
+#     turn.
+#
+# Hence bound, do not refuse. An eighth of the window still carries the
+# highest-ranked facts — facts.select_for_injection already orders them — and
+# stops there. Set COMPACTOR_INJECTION_NO_HISTORY_FRACTION to 0 to turn
+# injection off entirely for this traffic once the client marks it.
+INJECTION_NO_HISTORY_FRACTION = _env_float(
+    "COMPACTOR_INJECTION_NO_HISTORY_FRACTION", 0.125
+)
+
+# Drop order when the sum will not fit: highest number goes first.
+#
+# Retrieval is the most speculative layer — it is a guess about relevance, and
+# its own log line already reports how much of its budget it kept. Facts
+# degrade gracefully because they are ranked and truncating the tail loses the
+# least-used ones. The summary stack is the only compressed record of the part
+# of the conversation the window can no longer hold, so it outranks both.
+# Persona goes last: without it the reply is wrong in KIND, not merely less
+# informed, and it is the cheapest of the four.
+_INJECT_PRIORITY_PERSONA = 0
+_INJECT_PRIORITY_SUMMARY = 1
+_INJECT_PRIORITY_FACTS = 2
+_INJECT_PRIORITY_RETRIEVAL = 3
 
 # V2.0 Phase 1: admin endpoint binding. Default "127.0.0.1" rejects any
 # non-localhost client at the dependency layer (we still bind the FastAPI
@@ -188,21 +299,212 @@ def backend_is_multimodal() -> bool:
 # encoders; production showed a 6,859-token undercount past the guard). vLLM's
 # context-length 400 reports the TRUE count, so instead of guessing we learn:
 # parse it, tighten the effective limit by the observed overshoot, and the next
-# message heals — same self-healing pattern as the modality backstop. Sticky for
-# process life, monotonic (only ever tightens), capped so a pathological report
-# can't crush the window.
+# message heals — same self-healing pattern as the modality backstop. Capped so
+# a pathological report can't crush the window.
+#
+# v3.1 A10: it is a MODULE GLOBAL — one process (supervisord.conf:87 runs
+# uvicorn with no --workers), one margin, every conversation. It was also
+# monotonic with no release path, so a single oversized turn narrowed the
+# window for everything else until the next restart. It now decays on sustained
+# success; see _note_backend_accepted. Since P0-0c gave the guard vLLM's own
+# count, this is a degraded-mode backstop rather than the primary mechanism, and
+# it is sized and released as one.
+#
+# v3.1 D4: decay was not enough, because the blast radius came from what the
+# margin was allowed to LEARN, not from how long it held. A single conversation
+# whose own messages did not fit the window latched it to the
+# MAX_MODEL_LEN//4 ceiling on its first rejection and every other conversation
+# in the process paid. It now only learns from a rejection the guard did not
+# already predict — see _note_backend_rejection's `guard_measured_overflow`.
 _BUDGET_MARGIN = 0
-_CTX_OVERFLOW_RE = re.compile(r"prompt contains (?:at least )?(\d+) input tokens")
+
+# Every wording vLLM has used to state the prompt size in a context-length 400,
+# read out of the pinned engines rather than guessed. A regex that silently
+# fails to match here is the whole calibration path going dark while the log
+# still reads as though it learned something — INCIDENT_2026-08-24 D26 called
+# this out and it was still one pattern until v3.1.
+#
+# Verified 2026-08-28 by reading the vLLM installed in the two images this
+# stack actually ships:
+#
+#   0.24.0  (the cu13/default pin, Dockerfile:78; read from
+#            angreg/zions-light-ai:v3.0-cu13,
+#            vllm/renderers/params.py:429 _token_len_check)
+#       "...you requested {O} output tokens and your prompt contains
+#        {at least }{N} input tokens, for a total of ..."          -> (1)
+#
+#   0.24.0  (same file, :337 _text_len_check — a CHARACTER pre-check that
+#            fires before tokenization)
+#       "...your prompt contains {C} characters (more than {X} characters,
+#        which is the upper bound for {N} input tokens)..."        -> (none)
+#
+#   0.19.0  (the CUDA-12 fallback profile, and what
+#            angreg/zions-light-ai:v3.0.5-cu12 ships;
+#            vllm/entrypoints/openai/engine/serving.py:752,762)
+#       "...you requested {O} output tokens and your prompt contains
+#        {N} input tokens, for a total of ..."                     -> (1)
+#       "...However, your request has {N} input tokens. Please reduce the
+#        length of the input messages."                            -> (2)
+#
+#   0.10.0  (not deployed, but what the contract fixture reproduces as
+#            FIXTURE_ERROR_STYLE=v010)
+#       "...you requested {O+N} tokens ({N} in the messages, {O} in the
+#        completion)..."                                           -> (3)
+#       "...you requested {N} tokens in the messages, ..."         -> (3)
+#
+# So (1) — the only wording the single pre-v3.1 pattern covered — is emitted by
+# BOTH deployed pins, and only when the request carried a max_tokens. 0.19.0's
+# no-max_tokens branch (2) was never matched, and 0.19.0 is a shipped profile.
+#
+# The character pre-check is deliberately NOT matched. Its number is a
+# CHARACTER count, roughly 4x a token count, and feeding it to the calibration
+# below as if it were tokens would saturate the margin cap off one rejection.
+# `_is_context_overflow` still classifies it correctly, so the user is told the
+# truth; we simply decline to learn a number that means something else.
+_CTX_OVERFLOW_PATTERNS = (
+    # (1) 0.19.0 and 0.24.0, request carried max_tokens; also the older
+    #     "your prompt contains at least N input tokens" wording.
+    r"prompt contains (?:at least )?(\d+) input tokens",
+    # (2) 0.19.0, no max_tokens on the request.
+    r"request has (\d+) input tokens",
+    # (3) 0.10.0, both of its variants. The prompt half is the one after the
+    #     parenthesis ("(N in the messages") or before "tokens in the
+    #     messages"; the leading "you requested N tokens" in that wording is
+    #     prompt+completion and must not be captured.
+    r"(\d+)(?: tokens)? in the messages",
+)
+_CTX_OVERFLOW_RE = re.compile("|".join(f"(?:{p})" for p in _CTX_OVERFLOW_PATTERNS))
 
 
-def _note_backend_rejection(err_body: str) -> None:
+def _is_context_overflow(err_body: str) -> bool:
+    """Whether a 4xx body is vLLM's context-length rejection specifically.
+
+    The message the user gets turns on this: "too large for the window, send it
+    again" is true here and false for every other 400 (modality, alternation,
+    a malformed payload), and telling someone to resend a request that will be
+    refused identically is the same class of error as telling them the backend
+    is restarting when it is healthy."""
+    return "maximum context length" in (err_body or "")
+
+
+def _reported_prompt_tokens(err_body: str) -> int | None:
+    """The TRUE prompt size vLLM reports in a context-length 400, or None.
+
+    Read separately from the calibration below because the log line must name
+    the number whether or not the calibration decided to act on it — a
+    rejection that teaches us nothing (the margin is already larger, or capped)
+    is exactly the one whose numbers someone will need later.
+
+    Several alternatives, one per wording vLLM has used — see
+    _CTX_OVERFLOW_PATTERNS. Exactly one group can participate in any match, so
+    the first non-None group is the answer."""
+    m = _CTX_OVERFLOW_RE.search(err_body or "")
+    if m is None:
+        return None
+    for g in m.groups():
+        if g is not None:
+            return int(g)
+    return None
+
+
+# v3.1 A10: how many consecutive ACCEPTED requests release half the learned
+# margin. _BUDGET_MARGIN used to be monotonic with no reset short of a process
+# restart, so one pathological turn cost every conversation in the process up
+# to MAX_MODEL_LEN//4 of window, forever — and post-P0-0b it latches there in a
+# single event rather than crawling. Since P0-0c, count_tokens_exact does the
+# real work and the margin is only the DEGRADED-mode backstop for when
+# /tokenize will not answer; a margin still in force after fifty clean requests
+# is describing a state the process is no longer in.
+#
+# This is a policy number, not a measurement, and it is named as one. Halving
+# rather than clearing is the conservative half of the choice: if the margin
+# was still needed, the cost of finding out is one 400 and one re-learn, and
+# the re-learn lands back at the same value because the calibration measures
+# the gap directly. Set to 0 to restore the pre-v3.1 monotonic behaviour.
+BUDGET_MARGIN_RELEASE_AFTER = _env_int("COMPACTOR_BUDGET_MARGIN_RELEASE_AFTER", 50)
+_budget_ok_streak = 0
+
+
+def _note_backend_accepted() -> None:
+    """One request vLLM did NOT refuse. Counts toward releasing the margin.
+
+    Called from both response paths on any status below 400. Cheap and
+    lock-free: uvicorn runs single-process here (supervisord.conf has no
+    --workers) and the loop is cooperative, so the read-modify-write below
+    cannot interleave."""
+    global _BUDGET_MARGIN, _budget_ok_streak
+    if not _BUDGET_MARGIN or BUDGET_MARGIN_RELEASE_AFTER <= 0:
+        return
+    _budget_ok_streak += 1
+    if _budget_ok_streak < BUDGET_MARGIN_RELEASE_AFTER:
+        return
+    _budget_ok_streak = 0
+    before = _BUDGET_MARGIN
+    _BUDGET_MARGIN = 0 if before <= 512 else before // 2
+    logger.info(
+        f"context calibration: {BUDGET_MARGIN_RELEASE_AFTER} consecutive "
+        f"accepted requests — releasing budget margin {before} -> "
+        f"{_BUDGET_MARGIN}. The margin is the backstop for a /tokenize outage, "
+        f"not a permanent tax on the window; if it is still needed the next "
+        f"rejection measures it back in one step."
+    )
+
+
+def _note_backend_rejection(
+    err_body: str,
+    enforced_limit: int | None = None,
+    guard_measured_overflow: bool = False,
+) -> bool:
     """Reactive backstop for vLLM 4xx bodies. Two lessons we can learn:
     (1) the model is text-only -> strip images from subsequent requests;
     (2) our token count undercounted -> tighten the budget by the observed gap.
     Either way the conversation heals on its next message instead of staying
-    poisoned."""
-    global _backend_multimodal, _BUDGET_MARGIN
+    poisoned.
+
+    `enforced_limit` is the limit the guard ACTUALLY shed this payload against,
+    margin already subtracted — see A8 below for why it is a parameter and not
+    something this function may reconstruct.
+
+    `guard_measured_overflow` is True when _enforce_hard_budget MEASURED this
+    payload as over that limit and forwarded it anyway as a best effort. The
+    margin exists to correct a SURPRISE — a payload we believed fit and vLLM
+    charged more for — and there is no surprise in a rejection the guard
+    predicted, at ERROR, before the request was sent. Widening the margin from
+    one is learning from evidence that does not bear on the question.
+
+    v3.1 D4, and not hypothetical. On 2026-08-28 one conversation kept sending
+    two messages whose own content measured 30,437 local tokens against a
+    12,288 compaction target. The guard shed everything it was permitted to
+    shed and logged
+
+        hard budget FAILED to fit: ... dropped 0 old turn(s), trimmed 6
+        injected block(s), dropped 1 injected block(s) entirely - still
+        16417 over
+
+    then forwarded and took the 400 it had just predicted. The rejection
+    reported 32,801 tokens; 16,384 + 16,417 = 32,801, so the number the
+    calibration "learned" was the number the guard had already measured and
+    logged. overshoot came to 16,417 and _BUDGET_MARGIN latched straight to its
+    MAX_MODEL_LEN//4 ceiling of 8,192 — a module global, so every OTHER
+    conversation in the process lost 8,192 tokens of window. Four hours later a
+    real conversation was running at "limit 8192, margin 8192" and shedding on
+    every request, while the conversation that imposed it was unchanged, still
+    failing, and had never benefited from it.
+
+    Note what this rule does NOT do: it does not ask whether the overflow was
+    injection-driven. In the case above it was not — the residual was the
+    client's own two messages — so a rule keyed on injection would not have
+    fired. What the two failures have in common is not their content; it is
+    that the guard already knew.
+
+    Returns whether the budget margin actually advanced. The caller uses it to
+    decide what to promise the user: "send it again" is only true when this
+    rejection taught us something, and a rejection can teach us nothing (the
+    margin is already wider, or it has hit the MAX_MODEL_LEN//4 cap).
+    """
+    global _backend_multimodal, _BUDGET_MARGIN, _budget_ok_streak
     body = err_body or ""
+    tightened = False
     if "not a multimodal model" in body and _backend_multimodal is not False:
         _backend_multimodal = False
         logger.warning(
@@ -210,22 +512,83 @@ def _note_backend_rejection(err_body: str) -> None:
             "stripped from subsequent requests (set COMPACTOR_BACKEND_MULTIMODAL "
             "to override)"
         )
-    if "maximum context length" in body:
-        m = _CTX_OVERFLOW_RE.search(body)
-        if m:
-            actual = int(m.group(1))
-            overshoot = actual - HARD_INPUT_LIMIT
+    if _is_context_overflow(body) and guard_measured_overflow:
+        # v3.1 D4. Reported at WARNING rather than swallowed: "the calibration
+        # deliberately did not fire" is a different state from "the calibration
+        # is broken again", and the whole lesson of P0-0/A9 is that a path
+        # which cannot say it fired is indistinguishable from one that did.
+        logger.warning(
+            f"context calibration: NOT widening the budget margin from this "
+            f"rejection. The hard-budget guard had already measured this "
+            f"payload as over the limit it enforced and forwarded it as a best "
+            f"effort, so vLLM's 400 confirms a measurement we already had — it "
+            f"is not evidence that our counting is low. The margin is a module "
+            f"global; learning {_reported_prompt_tokens(body)} tokens from a "
+            f"predicted rejection would narrow the window for every other "
+            f"conversation in this process to pay for one that is unfittable "
+            f"as sent (v3.1 D4). Margin stays at {_BUDGET_MARGIN}."
+        )
+    elif _is_context_overflow(body):
+        actual = _reported_prompt_tokens(body)
+        if actual is not None:
+            # v3.1 P0-0b: measure against the limit we ACTUALLY enforced, not
+            # the original one. _enforce_hard_budget has already shed to
+            # (limit - _BUDGET_MARGIN), so measuring against the untightened
+            # limit understates the undercount by exactly the margin already in
+            # force — and the monotonic guard below then refuses to advance
+            # until the undercount roughly doubles. Observed live on
+            # 2026-08-27: three consecutive failures on one conversation moved
+            # the margin 2628 -> 2755 -> 2882, +127 each time (the
+            # conversation's own growth per turn) while it needed ~5250. That is
+            # a loop, not a retry: ~19 more broken messages for the user.
+            #
+            # v3.1 A8: and the limit is a PARAMETER, because the guard's limit
+            # is per-request. chat_completions derives it from
+            # MAX_MODEL_LEN - max(GENERATION_RESERVE, req_max_tokens), so a
+            # client asking for a large completion is shed against something
+            # well below HARD_INPUT_LIMIT. Reconstructing it from
+            # HARD_INPUT_LIMIT here understated the overshoot by up to
+            # HARD_INPUT_LIMIT - effective_limit, one-directionally: at
+            # max_tokens=8192 on the shipped 32768 window the guard enforced
+            # 24576, so a 25000-token prompt overshot by 424 and this computed
+            # -5720 — no advance, tightened=False, and the user was told, in
+            # those words, that retrying would not help. The correct number was
+            # sitting two lines from the call site and was not passed.
+            #
+            # None means "no per-request limit available" — the tests, and any
+            # future caller off the request path. Reconstructing is then the
+            # best we can do, and the log line says which limit it used so a
+            # reader is never guessing. The max(256, ...) mirrors the clamp in
+            # _enforce_hard_budget.
+            if enforced_limit is not None:
+                measured_against = max(256, enforced_limit)
+                limit_src = "the limit the guard enforced"
+            else:
+                measured_against = max(256, HARD_INPUT_LIMIT - _BUDGET_MARGIN)
+                limit_src = (
+                    "HARD_INPUT_LIMIT minus the current margin (no per-request "
+                    "limit was passed — this is a reconstruction)"
+                )
+            overshoot = actual - measured_against
             if overshoot > 0:
                 new_margin = min(overshoot + 512, MAX_MODEL_LEN // 4)
                 if new_margin > _BUDGET_MARGIN:
                     _BUDGET_MARGIN = new_margin
+                    # A fresh correction restarts the release clock: the
+                    # successes that were accumulating were describing a
+                    # process state this rejection just disproved.
+                    _budget_ok_streak = 0
+                    tightened = True
                     logger.warning(
                         f"context calibration: vLLM counted {actual} tokens where "
-                        f"we budgeted <= {HARD_INPUT_LIMIT} — our estimate "
-                        f"undercounts (images are the usual cause). Tightening the "
-                        f"hard limit by {new_margin} for subsequent requests; the "
-                        f"next message in this conversation should succeed."
+                        f"we budgeted <= {measured_against} ({limit_src}) — our "
+                        f"estimate undercounts (a /tokenize outage, or images, "
+                        f"are the usual causes). Tightening the hard limit by "
+                        f"{new_margin} for EVERY conversation in this process "
+                        f"(the margin is a module global, not per-conversation); "
+                        f"the next message should succeed."
                     )
+    return tightened
 
 
 _IMAGE_PLACEHOLDER = (
@@ -286,6 +649,297 @@ def _message_has_image(m: dict) -> bool:
     return _message_image_count(m) > 0
 
 
+# v3.1 A13: /tokenize outage reporting.
+#
+# This used to be `logsetup.log_once("count_tokens_exact.http")` — ONE line per
+# process, whose `_logged_once` set is deliberately never cleared
+# (logsetup.py:117-137). Four call sites share the endpoint (summarize, the
+# guard's ground truth, the guard's per-round verify, _sent_token_size), so one
+# token covered all of them for the process lifetime, and an outage starting
+# hours after boot was completely silent.
+#
+# The aggravator is that the most likely first spender is BENIGN: the comment
+# below is right that a 400 here is usually the chat template refusing an
+# assistant-final list, which the summarizer hands it on any conversation long
+# enough to compact. A structural 400 in minute two permanently silenced the
+# report of a genuinely broken endpoint in hour six. That silencing is
+# structural, not incidental.
+#
+# So: a rate limit rather than a one-shot, keyed so a structural refusal cannot
+# spend the transport-failure signal, and — the part a one-shot can never have —
+# a RECOVERY line, because "it started working again" is half of what the reader
+# of these lines is trying to establish. The counters are also readable
+# programmatically (tokenize_health) so /health/full can report the state as a
+# fact rather than leaving it to a log line from three days ago.
+TOKENIZE_WARN_INTERVAL_S = float(_env_int("COMPACTOR_TOKENIZE_WARN_INTERVAL_S", 300))
+_tokenize_fail_streak = 0
+# Tracked separately from the chat form: see tokenize_health(). Carries its own
+# timestamp because, unlike the chat form, it is NOT exercised on every request
+# — count_text_tokens_exact runs only when there are injected blocks to measure
+# (main.py _bound_injected_blocks). Without a staleness bound a single text-form
+# failure would pin /health/full unhealthy until the next conversation that
+# happens to have memory to inject, which is the _BUDGET_MARGIN latching bug
+# wearing a different hat.
+_tokenize_text_fail_streak = 0
+_tokenize_text_last_fail_at: float | None = None
+_tokenize_degraded_since: float | None = None
+_tokenize_last_warn: dict[str, float] = {}
+
+
+def tokenize_health() -> dict:
+    """Current state of the /tokenize dependency, for /health/full.
+
+    `consecutive_failures` > 0 means budgeting is running on the local
+    tokenizer, which reads up to 51% low on this model's assistant content —
+    i.e. the guard is in the exact degraded mode the 2026-08-28 incident ran
+    in. A health endpoint that cannot say so is asking its reader to go find a
+    log line instead."""
+    return {
+        # AND across forms. count_tokens_exact (chat) and
+        # count_text_tokens_exact (completion) hit the same endpoint but ask
+        # different questions, and only the chat form can be refused by the
+        # model's template — which is exactly the D1 outage. A shared streak
+        # let one text-count success declare the endpoint healthy while every
+        # chat-form call was still 400ing, so this endpoint FLAPPED instead of
+        # reporting the degraded mode it exists to report.
+        "ok": _tokenize_fail_streak == 0 and _text_tokenize_failing_now() == 0,
+        "consecutive_failures": max(
+            _tokenize_fail_streak, _text_tokenize_failing_now()
+        ),
+        "chat_form_failures": _tokenize_fail_streak,
+        "text_form_failures": _text_tokenize_failing_now(),
+        "degraded_since": _tokenize_degraded_since,
+        "degraded_for_s": (
+            round(time.time() - _tokenize_degraded_since, 1)
+            if _tokenize_degraded_since is not None
+            else 0.0
+        ),
+    }
+
+
+def _note_text_tokenize_failure() -> None:
+    """Count a completion-form failure. Deliberately silent: the WARNING is
+    still emitted by _note_tokenize_failure under a text.* key, and duplicating
+    it here would double every line during an outage."""
+    global _tokenize_text_fail_streak, _tokenize_text_last_fail_at
+    _tokenize_text_fail_streak += 1
+    _tokenize_text_last_fail_at = time.time()
+
+
+def _note_text_tokenize_success() -> None:
+    global _tokenize_text_fail_streak, _tokenize_text_last_fail_at
+    _tokenize_text_fail_streak = 0
+    _tokenize_text_last_fail_at = None
+
+
+def _text_tokenize_failing_now() -> int:
+    """The completion form's streak, or 0 once it has gone stale.
+
+    Stale means "we have not seen this form fail for a whole warn interval",
+    which for a form that is only called when memory is being injected is the
+    honest reading: we do not know it is broken, and asserting a fault we
+    cannot currently observe is the same error as asserting health we cannot
+    observe."""
+    if not _tokenize_text_fail_streak or _tokenize_text_last_fail_at is None:
+        return 0
+    if (time.time() - _tokenize_text_last_fail_at) > TOKENIZE_WARN_INTERVAL_S:
+        return 0
+    return _tokenize_text_fail_streak
+
+
+def _note_tokenize_failure(key: str, detail: str) -> None:
+    """Record one /tokenize failure and warn at most once per key per
+    TOKENIZE_WARN_INTERVAL_S. `key` separates the failure CLASSES — a 400 from
+    a template refusal must not consume the budget for a connection error."""
+    global _tokenize_fail_streak, _tokenize_degraded_since
+    now = time.time()
+    _tokenize_fail_streak += 1
+    if _tokenize_degraded_since is None:
+        _tokenize_degraded_since = now
+    last = _tokenize_last_warn.get(key)
+    if last is not None and (now - last) < TOKENIZE_WARN_INTERVAL_S:
+        return
+    _tokenize_last_warn[key] = now
+    suppressed = (
+        ""
+        if last is None
+        else f" (further '{key}' lines suppressed for {TOKENIZE_WARN_INTERVAL_S:.0f}s)"
+    )
+    logger.warning(
+        f"/tokenize degraded: {detail}. Budgeting falls back to the local "
+        f"tokenizer, which under-counts assistant content on this model by up "
+        f"to 51% — requests may overflow until this recovers. "
+        f"{_tokenize_fail_streak} consecutive failure(s), degraded for "
+        f"{now - _tokenize_degraded_since:.0f}s{suppressed}"
+    )
+
+
+def _note_tokenize_success() -> None:
+    """Clear the degraded state, and SAY SO once. The recovery line is the
+    thing log_once structurally could not provide."""
+    global _tokenize_fail_streak, _tokenize_degraded_since
+    if _tokenize_fail_streak == 0:
+        return
+    failures = _tokenize_fail_streak
+    since = _tokenize_degraded_since
+    _tokenize_fail_streak = 0
+    _tokenize_degraded_since = None
+    _tokenize_last_warn.clear()
+    logger.warning(
+        f"/tokenize is answering again after {failures} consecutive failure(s)"
+        + (f" over {time.time() - since:.0f}s" if since is not None else "")
+        + " — budgeting is back on vLLM's own count."
+    )
+
+
+def count_text_tokens_exact(text: str) -> int | None:
+    """Exact token count for a blob of TEXT, from vLLM's /tokenize.
+
+    The completion-shaped sibling of count_tokens_exact. Use this whenever the
+    thing being measured is not a conversation — an injected memory block, a
+    summary, a candidate fact. Those have no roles and no turn structure, and
+    routing them through the chat form asks the model's template a question it
+    was never designed to answer. A refusal there is indistinguishable from a
+    /tokenize outage and degrades every budget in the process, which is how one
+    bad request shape cost the user 80+ turns of context per message on
+    2026-08-29.
+
+    Same contract as count_tokens_exact: never raises, returns None rather than
+    a guess, and shares the same failure/recovery accounting so a real outage
+    still reaches /health/full.
+    """
+    if not text:
+        return 0
+    try:
+        r = httpx.post(
+            f"{VLLM_URL}/tokenize",
+            json={"model": MODEL_REPO, "prompt": text},
+            timeout=httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0),
+        )
+        if r.status_code != 200:
+            _note_text_tokenize_failure()
+            _note_tokenize_failure(
+                f"text.http.{r.status_code}",
+                f"returned HTTP {r.status_code} for a text count, "
+                f"body {r.text[:200]!r}",
+            )
+            return None
+        n = (r.json() or {}).get("count")
+        if not isinstance(n, (int, float)):
+            _note_text_tokenize_failure()
+            _note_tokenize_failure(
+                "text.body",
+                f"answered HTTP 200 with no numeric 'count': {r.text[:200]!r}",
+            )
+            return None
+        _note_text_tokenize_success()
+        return int(n)
+    except Exception as e:
+        _note_text_tokenize_failure()
+        _note_tokenize_failure(
+            f"text.error.{type(e).__name__}",
+            f"unreachable for a text count ({type(e).__name__}: {e})",
+        )
+        return None
+
+
+def count_tokens_exact(
+    messages: list[dict], add_generation_prompt: bool | None = None
+) -> int | None:
+    """The number vLLM will actually charge, from its own /tokenize endpoint.
+    None when unavailable — callers fall back to count_tokens.
+
+    v3.1. count_tokens is systematically wrong on this deployment, and wrong in
+    the direction that overflows: it reads ~50% LOW on assistant content while
+    reading ~10% high on user and system content. Measured 2026-08-28 on the
+    production conversation:
+
+        assistant  16,971 chars   local 4,976   vLLM  7,513   -34%
+        assistant  27,570 chars   local 7,251   vLLM 11,347   -36%
+        assistant  17,930 chars   local 4,425   vLLM  8,988   -51%
+        user        6,865 chars   local 1,733   vLLM  1,585   +9%
+
+    The cause is the tokenizer, not the arithmetic. The served model ships only
+    tekken.json; transformers converts it on load, and the converted vocabulary
+    prices box-drawing characters and emoji far below what mistral_common — the
+    tokenizer vLLM itself uses — charges for the same bytes. This model draws
+    decorative rules: one 17,930-character reply contained 1,710 U+2501 and 441
+    U+2500, roughly 4,275 tokens of horizontal line, or 13% of the whole window.
+    Assistant turns run 7-14% non-ASCII; user turns run 0.2-0.4%. So the error
+    is concentrated in exactly the content that dominates a long conversation.
+
+    Everything downstream inherited it. The summarizer packed batches it
+    believed were 29,696 tokens that were really ~46,000, so summarization 400'd
+    and compaction silently degraded to forwarding the original messages; the
+    hard budget then shed 58 of 63 turns and STILL landed over, because its own
+    arithmetic used the same number. The user was left talking to a model that
+    received six messages.
+
+    A local tokenizer cannot be made right here — the vocabulary is the thing
+    that differs. So ask the process that will do the charging. It is already
+    running, on localhost, and the call is only made where precision decides an
+    outcome: never on the request hot path, never per-message.
+    """
+    if not messages:
+        return 0
+    try:
+        r = httpx.post(
+            f"{VLLM_URL}/tokenize",
+            # add_generation_prompt: vLLM applies the chat template to answer
+            # this, and REFUSES with a 400 when the flag is True and the last
+            # message is from the assistant ("Consider using
+            # continue_final_message instead"). The guard measures a payload
+            # that ends on the user's new turn, so True is right there and the
+            # default has to stay True. The SUMMARIZER measures a slice of old
+            # turns, which routinely ends on an assistant reply — that 400 is
+            # what took compaction down on 2026-08-28 and again on 2026-08-29,
+            # because the caller then fell back to the local estimate and built
+            # batches that could not fit.
+            #
+            # Decided from the messages rather than left to the caller: every
+            # call site that measures a conversation slice would otherwise have
+            # to remember this, and the one that forgets fails silently by
+            # degrading to a worse counter.
+            json={
+                "model": MODEL_REPO,
+                "messages": messages,
+                "add_generation_prompt": (
+                    (messages[-1].get("role") != "assistant")
+                    if add_generation_prompt is None and messages
+                    else bool(add_generation_prompt)
+                ),
+            },
+            timeout=httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0),
+        )
+        if r.status_code != 200:
+            # A 400 here is usually the template refusing the message shape
+            # (an assistant-final list, most often) rather than a fault. Keyed
+            # by STATUS so that benign refusal cannot spend the signal a 5xx or
+            # a connection error needs — see A13 above.
+            _note_tokenize_failure(
+                f"http.{r.status_code}",
+                f"returned HTTP {r.status_code}, body {r.text[:200]!r}",
+            )
+            return None
+        n = r.json().get("count")
+        if not isinstance(n, (int, float)):
+            # 200 with no usable `count`. This returned None with no line at
+            # all, so a proxy or a version skew that answers the right status
+            # with the wrong body was indistinguishable from a healthy endpoint
+            # that happened not to be consulted.
+            _note_tokenize_failure(
+                "body", f"answered HTTP 200 with no numeric 'count': {r.text[:200]!r}"
+            )
+            return None
+        _note_tokenize_success()
+        return int(n)
+    except Exception as e:
+        _note_tokenize_failure(
+            f"error.{type(e).__name__}", f"unreachable ({type(e).__name__}: {e})"
+        )
+        return None
+
+
 def count_tokens(messages: list[dict]) -> int:
     # V3.1: images cost tokens the text estimate can't see — add a flat
     # per-image estimate so VLM requests don't quietly overflow the budget.
@@ -295,7 +949,24 @@ def count_tokens(messages: list[dict]) -> int:
         try:
             text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             return len(tok.encode(text)) + image_tokens
-        except Exception:
+        except Exception as e:
+            # Tier 2, and until v3.1 it was the tier that always ran while
+            # saying nothing: jinja2 was missing from the venv and the served
+            # vision model carries no chat template, so tier 1 has never
+            # executed in production. The framing this drops is ~22 tokens per
+            # message on Mistral — an error that scales with MESSAGE COUNT, not
+            # content length, which is why a long conversation of short turns
+            # overflows and a short one of long turns does not. It cost ~5,250
+            # tokens against a 32,768 window on 2026-08-27. Once per process:
+            # this runs several times per request. (v3.1 P0-0 / F60.)
+            if logsetup.log_once("count_tokens.chat_template"):
+                logger.warning(
+                    f"could not apply the chat template for {MODEL_REPO} "
+                    f"({type(e).__name__}: {e}); using per-message encode()+4 — "
+                    f"every token count from this process UNDERCOUNTS by the "
+                    f"template's per-message framing, and every budget decision "
+                    f"downstream inherits that error"
+                )
             total = 0
             for m in messages:
                 total += len(tok.encode(_message_text(m))) + 4
@@ -340,18 +1011,28 @@ async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
     return (choices[0].get("message") or {}).get("content", "").strip()
 
 
-def _chunk_to_budget(turns: list[dict], budget: int) -> list[list[dict]]:
+def _chunk_to_budget(
+    turns: list[dict], budget: int, scale: float = 1.0
+) -> list[list[dict]]:
     """Split turns into consecutive batches that each fit `budget` tokens.
 
     A single turn larger than the budget still gets its own batch — we never
     drop content here; `_summarize_once` would fail on it and the caller
     degrades. (Truncating a turn silently would be a quieter kind of lying.)
+
+    `scale` corrects the local tokenizer against vLLM's own count — see
+    count_tokens_exact. Without it this packed batches it believed were 29,696
+    tokens that were really ~46,000, every batch 400'd, and summarization
+    "degraded" by handing compaction back the original oversized messages.
+    Compaction then did nothing at all for hours while the log said only
+    `summarize: N turns exceed the budget — map-reduce over 4 batches` and
+    never once said it had finished. The caller passes the measured ratio.
     """
     batches: list[list[dict]] = []
     current: list[dict] = []
     current_tokens = 0
     for m in turns:
-        t = count_tokens([m])
+        t = int(count_tokens([m]) * scale)
         if current and current_tokens + t > budget:
             batches.append(current)
             current, current_tokens = [], 0
@@ -379,13 +1060,75 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
         MAX_MODEL_LEN,
         max(256, MAX_MODEL_LEN - SUMMARY_MAX_TOKENS - SUMMARY_INPUT_RESERVE),
     )
-    batches = _chunk_to_budget(to_summarize, budget)
+    # Measure the local tokenizer's error on THIS content before batching to
+    # it. One /tokenize call, off the event loop, against many minutes of
+    # failed map-reduce when the batches are wrong. Falls back to 1.0 — the
+    # pre-v3.1 behaviour — if vLLM cannot answer.
+    _local = count_tokens(to_summarize)
+    _exact = await run_in_threadpool(count_tokens_exact, to_summarize)
+    # Falls back PESSIMISTIC, not to 1.0.
+    #
+    # 1.0 was the pre-v3.1 behaviour and it is the bug, not a neutral default:
+    # it asserts the local tokenizer is right at the exact moment we have just
+    # discovered we cannot check it. Measured 2026-08-29 in production, four
+    # times in one session — /tokenize refused the request (see
+    # count_tokens_exact), this line chose 1.0, the batches were sized on an
+    # estimate reading up to 51% low, every batch 400'd, compaction fell
+    # through, and the guard shed 80-88 turns of her conversation per request.
+    #
+    # 2.0 is 1/(1-0.51) rounded down — the worst measured undercount on this
+    # model's assistant content. Over-splitting costs extra summarization
+    # calls on the background tail. Under-splitting costs the entire
+    # hierarchy, silently. summarizer.py:_WORST_TOKENS_PER_CHAR makes the
+    # same trade for the same reason.
+    _scale = (
+        (_exact / _local)
+        if (_exact is not None and _local > 0)
+        else _PESSIMISTIC_SUMMARY_SCALE
+    )
+    # v3.1 A9: say WHICH counter sized these batches, unconditionally and on
+    # both branches. This was the decisive half of the 2026-08-28 mechanism —
+    # batches believed to be 29,696 tokens were really ~46,000, every batch
+    # 400'd, and compaction "degraded" by handing back the original oversized
+    # messages for hours. The only line the log carried was the map-reduce INFO
+    # below, which named a batch COUNT and no counter, so the healthy case and
+    # the silent-fallback case were textually indistinguishable. A fallback to
+    # scale=1.0 is not a detail of this function; it is the failure.
+    _summary_counter = "vLLM's /tokenize" if _exact is not None else "the local tokenizer"
+    if _exact is not None:
+        logger.info(
+            f"summarize: token scale {_scale:.2f}x (local {_local} -> vLLM "
+            f"{_exact}); batches sized by {_summary_counter}"
+        )
+    else:
+        logger.warning(
+            f"summarize: /tokenize did not answer — batching {len(to_summarize)} "
+            f"turns on {_summary_counter}'s {_local}-token estimate, corrected "
+            f"by the PESSIMISTIC scale {_scale:.2f}x. That estimate reads up to "
+            f"51% low on this model's assistant content, so it is deliberately "
+            f"over-corrected: batches will over-split against the "
+            f"{budget}-token budget rather than 400."
+            # v3.1 gate: this line said "UNCORRECTED (scale 1.0)" while the
+            # branch below it applied _PESSIMISTIC_SUMMARY_SCALE. D2 fixed the
+            # arithmetic on 3a65aa1 and left its own diagnostic quoting the
+            # pre-fix number — the fourth time on this branch that a fix landed
+            # at one site and not at its sibling, and the first time in the log
+            # rather than the code. It matters because the whole v3.1 A9
+            # doctrine is that these lines ARE the diagnosis: a reader of the
+            # next incident would have read "scale 1.0" and concluded D2 had
+            # never shipped. The scale is interpolated now, so the line cannot
+            # go stale again the next time the constant moves.
+        )
+    batches = await run_in_threadpool(
+        _chunk_to_budget, to_summarize, budget, _scale
+    )
     if len(batches) == 1:
         return await _summarize_once(client, batches[0])
 
     logger.info(
         f"summarize: {len(to_summarize)} turns exceed the {budget}-token input "
-        f"budget — map-reduce over {len(batches)} batches"
+        f"budget — map-reduce over {len(batches)} batches, sized by "
+        f"{_summary_counter}"
     )
     # Map: batches run CONCURRENTLY (vLLM batches fine), bounded by a small
     # semaphore so a huge history can't monopolize the engine. Sequential
@@ -407,7 +1150,12 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
     while len(parts) > 1 and rounds < 3:
         rounds += 1
         part_msgs = [{"role": "user", "content": p} for p in parts]
-        groups = _chunk_to_budget(part_msgs, budget)
+        # _scale, not the 1.0 default. The map phase passes it and this did
+        # not — the sibling-site miss again, inside the very commit that
+        # claimed to fix that pattern. It matters here for the same reason:
+        # the partials being regrouped are model-written summary prose,
+        # which is the content the local counter reads 23-51% low on.
+        groups = _chunk_to_budget(part_msgs, budget, _scale)
         if all(len(g) == 1 for g in groups):
             break  # nothing can be folded further without breaking the budget
         try:
@@ -509,6 +1257,112 @@ def inject_system_block(messages: list[dict], content: str) -> list[dict]:
         else:
             break
     return messages[:insert_at] + [sys_msg] + messages[insert_at:]
+
+
+def _has_conversational_history(messages: list[dict]) -> bool:
+    """Whether the CLIENT's array contains a prior assistant turn.
+
+    Computed on what the client sent, before compaction or injection touched
+    it. "A prior assistant turn" and not "more than one message" because the
+    former is what actually distinguishes a conversation from a task: a
+    background title call and a brand-new chat both arrive with one or two
+    messages and no reply behind them, while a real second turn always carries
+    the first answer."""
+    return any(
+        isinstance(m, dict) and m.get("role") == "assistant" for m in messages
+    )
+
+
+def _bound_injected_blocks(
+    blocks: list[tuple[int, str, str]], budget: int
+) -> tuple[list[str], list[str], int]:
+    """Drop whole injected layers, lowest priority first, until they fit.
+
+    `blocks` is [(priority, label, text)] in the order they must be SENT — see
+    inject_system_block for why that order matters to the model. Returns
+    (texts still in send order, labels dropped, the cost estimate used).
+
+    Why whole layers rather than truncation: every layer here already has an
+    internal budget and an internal ranking, so truncating one from the outside
+    cuts it at a point its own ranking did not choose. Halving a retrieval
+    block leaves half an exchange; dropping it leaves a conversation. The guard
+    downstream still trims as a last resort, but this is the layer that can
+    make the choice knowing what each block IS.
+
+    The floor is ONE layer, and that is deliberate. A bound that can round down
+    to nothing is not a bound, it is a refusal, and refusing makes "she
+    remembers me from the first message" impossible — which is the product. So
+    the drop loop stops before it takes the last surviving block. What that
+    leaves is at most one layer's own cap (1500 tokens for facts, 1500 for
+    retrieval, a generation ceiling for a summary chunk), which is the
+    strongest bound expressible here without overriding a module's own budget;
+    the hole this function closes is that those caps SUM, not that any one of
+    them is too large. And the guard downstream now sheds injected memory to
+    nothing before it will forward a payload it knows will 400 (v3.1 D3), so
+    the composite still has a floor of zero when the window genuinely demands
+    one — it is just reached with the whole payload in view rather than here.
+
+    Measurement discipline (P0-0c): per-block counts are local, because one
+    /tokenize per block would be four round trips on the request path. The
+    local counter reads up to 51% low on this model's content, so the cheap
+    path is deliberately PESSIMISTIC — if the local sum still fits after being
+    scaled by the worst measured undercount, nothing needs measuring and no
+    HTTP call is made. Only a payload that might genuinely be over pays for one
+    exact measurement, and that measurement supplies the scale the per-block
+    arithmetic then uses. Same shape as _enforce_hard_budget: one ground truth,
+    scaled per-part estimates, never a per-part round trip."""
+    if not blocks:
+        return [], [], 0
+    local = [
+        count_tokens([{"role": "system", "content": text}]) for _, _, text in blocks
+    ]
+    total_local = sum(local)
+    if int(total_local * _PESSIMISTIC_SUMMARY_SCALE) <= budget:
+        # Fits even if the local counter is as wrong as it has ever been
+        # measured to be. No measurement can change the outcome, so none is
+        # made.
+        return [text for _, _, text in blocks], [], total_local
+    # Measured as TEXT, not as a one-message conversation.
+    #
+    # The obvious form sends vLLM a message list whose only, and therefore
+    # last, message is a system message. Nothing in this tree had ever sent
+    # that shape, and /tokenize answers it by applying the served model's
+    # chat template — the same machinery that refused an assistant-final
+    # list and took compaction down on 2026-08-29 (D1). A refusal here
+    # degrades /tokenize for the whole PROCESS and drops every budget in it
+    # back onto the local estimator, so the blast radius is far wider than
+    # the measurement it was serving.
+    #
+    # This is not a conversation and does not need a template: it is the
+    # size of a blob of text. /tokenize's completion form answers that
+    # without a template and so cannot refuse it for conversational-shape
+    # reasons. summarizer.py's counter already uses this form.
+    exact = count_text_tokens_exact("\n\n".join(t for _, _, t in blocks))
+    scale = (
+        (exact / total_local)
+        if (exact is not None and total_local > 0)
+        else _PESSIMISTIC_SUMMARY_SCALE
+    )
+    estimated = int(total_local * scale)
+    cost = estimated
+    keep = [True] * len(blocks)
+    dropped: list[str] = []
+    # Lowest priority first; among equals, the later-inserted block first.
+    for i in sorted(range(len(blocks)), key=lambda j: (-blocks[j][0], -j)):
+        if cost <= budget or sum(keep) <= 1:
+            break
+        keep[i] = False
+        cost -= int(local[i] * scale)
+        dropped.append(blocks[i][1])
+    return (
+        [text for k, (_, _, text) in zip(keep, blocks) if k],
+        dropped,
+        # The size that BLEW the budget, not the size that survived. A line
+        # reading "0 tokens against 32" says nothing about how far over the
+        # injection was, which is the only number that would tell an operator
+        # whether the fraction is wrong or the memory is.
+        estimated,
+    )
 
 
 def _merge_adjacent_system_messages(messages: list[dict]) -> list[dict]:
@@ -677,7 +1531,50 @@ def _merge_consecutive_same_role(messages: list[dict]) -> list[dict]:
     return out
 
 
-def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list[dict]:
+def _droppable_system_indices(msgs: list[dict], protect_system: int) -> list[int]:
+    """Indices of the system messages this guard is allowed to spend.
+
+    `protect_system` is how many system messages the CALLER sent, counted on
+    the original array before compaction or injection. Everything after that
+    prefix is ours — injected memory, and compaction's own summary block.
+
+    Extracted so the boundary is computed in ONE place. It was open-coded three
+    times inside the guard (the trim loop's `sys_seen` walk, the drop loop's
+    length test, and the give-up test), and a boundary restated three times is
+    a boundary that drifts: the first cut of this guard applied the protection
+    to the drop loop only, so the caller's prompt was safe from deletion and
+    not from mutilation."""
+    sys_idxs = [i for i, m in enumerate(msgs) if m.get("role") == "system"]
+    return sys_idxs[max(1, protect_system):]
+
+
+def _has_sheddable_content(msgs: list[dict], protect_system: int) -> bool:
+    """Is there anything left the guard is permitted to remove?
+
+    Exactly two things qualify: a non-system turn that is not the newest one,
+    and an injected system block. Trimming is deliberately NOT a third case —
+    the trim loop only ever operates on the same blocks the drop loop can
+    delete outright, so if nothing is droppable then nothing is trimmable
+    either, and 'we could still halve something' can never be the reason to
+    keep looping.
+
+    This replaces `len(idxs) <= 1 and trimmed >= 32 and len(sys_idxs) <= 1`,
+    which was wrong in both directions. With protect_system >= 2 the last
+    clause could never hold, so the guard ran its full six rounds — six exact
+    /tokenize calls — over a payload it could not change. With
+    protect_system == 1 and a single oversized user turn it did the same,
+    because `trimmed` stays 0 when there is nothing to trim."""
+    if len([m for m in msgs if m.get("role") != "system"]) > 1:
+        return True
+    return bool(_droppable_system_indices(msgs, protect_system))
+
+
+def _enforce_hard_budget(
+    messages: list[dict],
+    limit: int | None = None,
+    protect_system: int = 1,
+    report: dict | None = None,
+) -> list[dict]:
     """Last line of defense: never forward a request that vLLM must reject.
 
     Everything upstream (compaction, facts, RAG, summary injection) is
@@ -701,6 +1598,15 @@ def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list
     CPU exactly in the overload scenario. Now: one cheap prescreen, one full
     count, per-message counts for the shedding arithmetic, and a bounded
     number of full-count verification rounds.
+
+    `report`, when passed, is filled in with what this guard decided:
+    `limit`, `measured`, `fits`, `counted_by`, and the three shed counts. It
+    exists so the request path can tell a vLLM rejection it PREDICTED from one
+    that surprised it — see _note_backend_rejection and v3.1 D4. A dict rather
+    than a changed return type because every existing caller passes messages
+    and gets messages back, and a signature that breaks its callers to carry
+    diagnostics is how the same fix gets applied at one site and missed at its
+    sibling.
     """
     if limit is None:
         limit = HARD_INPUT_LIMIT
@@ -711,25 +1617,156 @@ def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list
         limit = max(256, limit - _BUDGET_MARGIN)
 
     # Prescreen: skip the (expensive) full tokenization when the char-based
-    # estimate is far under the limit. The estimate can undercount token-dense
-    # text, so the margin is 2x; a pathological miss just means the request
-    # reaches vLLM and gets the 400 this guard would otherwise have prevented —
-    # degraded, not corrupted.
-    if _fast_token_estimate(messages) <= limit // 2:
+    # estimate is far under the limit.
+    #
+    # v3.1, measured. All figures below are the DEPLOYED tokenizer
+    # (coder3101/Cydonia-24B-v4.3-vision-heretic, per runpod.env.template) —
+    # the image's ENV default is a different repo and gives different numbers,
+    # which two earlier drafts of this comment mixed together.
+    #
+    #   this repo's root *.md, 451,819 chars   3.66 chars/tok   char/4 UNDER by 8.4%
+    #                            per-file range 3.35 - 4.21
+    #   this repo's *.py                       4.28             char/4 OVER by 7.0%
+    #   the production chat transcript         4.10             char/4 OVER by 2.5%
+    #
+    # Corpus sizes are given only where a future reader can reproduce them: the
+    # markdown figure is the root-level *.md files at 0b9fbaf. The .py character
+    # count from an earlier draft is deleted — it matched no coherent file set,
+    # and a number nobody can re-derive is worse than no number. The transcript
+    # was measured on the pod and cannot be checked from this repo.
+    #
+    # The sign flips with content: roughly +-8% either way. Do not restate this
+    # as one percentage — three drafts did, and all three were wrong.
+    #
+    # The margin is not idle for another reason: _fast_token_estimate adds
+    # IMAGE_TOKEN_ESTIMATE per image, and that constant (4096) is roughly half
+    # the true cost of a Mistral3 vision tile. Images are the one input that
+    # can undercount here, and the margin is what absorbs them. Retention=0
+    # currently strips every image before this runs, so it is dormant — but
+    # raise COMPACTOR_MAX_RETAINED_IMAGES and this margin is what stands
+    # between an underestimated photo and a 400. Do not narrow it without
+    # fixing COMPACTOR_IMAGE_TOKENS first.
+    #
+    # v3.1 A14: the divisor was 2, and every figure above justifying it is a
+    # chars-per-LOCAL-token measurement — the oracle P0-0c discredited. The
+    # right way to state the safety condition is in chars per vLLM token, since
+    # vLLM is what charges:
+    #
+    #   skip is safe when   chars/4 + 4*M  <=  limit/D   and   true <= limit
+    #   i.e. roughly when   chars/vLLM-token  >=  4/D
+    #
+    # so D=2 was betting that no payload ever prices below 2.0 chars per vLLM
+    # token. Against the four direct chars-to-/tokenize pairs measured
+    # 2026-08-28 (see count_tokens_exact) the worst assistant turn came in at
+    # 17,930/8,988 = 1.995 — through the break-even, by 0.25%. Nothing measured
+    # crosses once the +4 per message is counted, so this is a thin margin
+    # rather than an observed failure; but it is the last place on the request
+    # path where an irreversible forward-without-measuring decision is made,
+    # and it was making it on the discredited number.
+    #
+    # D=8 puts the condition at 0.5 chars per vLLM token, which no text can
+    # price below (a token is at least one character), so the skip is safe on
+    # content rather than on a hope about content. The cost is /tokenize calls
+    # for medium payloads the old divisor waved through; the prescreen still
+    # exists for the small ones it was written for, which is the overwhelming
+    # majority of requests.
+    if _fast_token_estimate(messages) <= limit // 8:
+        if report is not None:
+            report.update(
+                {
+                    "limit": limit,
+                    "measured": None,
+                    "fits": True,
+                    "counted_by": "the char/4 prescreen (nothing was measured)",
+                    "dropped_turns": 0,
+                    "trimmed_blocks": 0,
+                    "dropped_blocks": 0,
+                }
+            )
         return messages
 
-    total = count_tokens(messages)
+    # Ground truth, once, before any decision is made on it. See
+    # count_tokens_exact: the local count reads ~50% low on assistant content,
+    # which is most of a long conversation, so "total <= limit" was answering a
+    # question about a different request than the one about to be sent.
+    local_total = count_tokens(messages)
+    exact = count_tokens_exact(messages)
+    total = exact if exact is not None else local_total
+    # How wrong the local tokenizer is on THIS payload. The shedding loop below
+    # needs a per-message cost and cannot afford an HTTP call each — that would
+    # be one round trip per message on the slowest path in the system. So it
+    # keeps local per-message counts and scales them by the ratio the two whole
+    # counts just established. Approximate, but approximately right, and every
+    # round still verifies against a real /tokenize before it stops.
+    scale = (total / local_total) if (exact is not None and local_total > 0) else 1.0
+    # v3.1 A9: WHICH counter answered, said out loud, on both branches.
+    #
+    # This line used to be gated on `exact is not None and |scale-1| > 0.05`,
+    # which made the only counter-naming INFO in the package unreachable in
+    # precisely the state it would diagnose: when /tokenize refuses, `scale` is
+    # forced to exactly 1.0, the shed runs on a tokenizer that reads 34-51% low,
+    # the verify step below falls back again unmarked, and the closing
+    # "hard budget enforced" line is textually identical in shape to the healthy
+    # case — at HTTP 200. That is the 2026-08-28 signature exactly. The two
+    # sites that DO name the counter (_sent_token_size) are both gated behind
+    # `if r.status_code >= 400` and a shed at 200 reaches neither.
+    counter = "vLLM's /tokenize" if exact is not None else "the local tokenizer"
+    if exact is not None:
+        logger.info(
+            f"token scale {scale:.2f}x (local {local_total} -> vLLM {total}); "
+            f"counted by {counter}, shedding arithmetic corrected by that factor"
+        )
+    else:
+        logger.warning(
+            f"token scale unavailable (/tokenize refused) — budgeting this "
+            f"payload at {local_total} tokens from {counter}, UNCORRECTED. That "
+            f"counter reads up to 51% low on this model's assistant content, so "
+            f"{local_total} is a floor and not a count, and every number in the "
+            f"shed line below inherits it."
+        )
+
+    def _measure(ms: list[dict]) -> tuple[int, str]:
+        """Ground truth for `ms`, and the name of whoever supplied it.
+
+        Both the per-round verify step and the last-resort pass below need
+        exactly this, and when they were written out twice the two drifted:
+        3d3e732 scaled one recount and missed its sibling, destroying a median
+        1,189 characters of memory per divergent payload for no budget
+        reason."""
+        v = count_tokens_exact(ms)
+        if v is not None:
+            return v, "vLLM's /tokenize"
+        return (
+            int(count_tokens(ms) * scale),
+            f"the local tokenizer x{scale:.2f}"
+            if abs(scale - 1.0) > 0.005
+            else "the local tokenizer, UNCORRECTED",
+        )
+
     if total <= limit:
+        if report is not None:
+            report.update(
+                {
+                    "limit": limit,
+                    "measured": total,
+                    "fits": True,
+                    "counted_by": counter,
+                    "dropped_turns": 0,
+                    "trimmed_blocks": 0,
+                    "dropped_blocks": 0,
+                }
+            )
         return messages
 
     msgs = list(messages)
     # Per-message costs, computed ONCE. Sum-of-parts differs from the templated
     # whole by per-message template overhead, so shedding aims below the limit
     # on arithmetic and then verifies with a real count — bounded rounds.
-    per = [count_tokens([m]) for m in msgs]
+    per = [int(count_tokens([m]) * scale) for m in msgs]
     running = total
     dropped = 0
     trimmed = 0
+    sys_dropped = 0
 
     for _round in range(6):
         # --- shed oldest non-system turns (arithmetic only) ---
@@ -752,12 +1789,20 @@ def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list
             idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
 
         # --- trim the largest injected system block if turns weren't enough ---
+        #
+        # Same protection as the drop stage below, and for the same reason: the
+        # caller's system messages are the first `protect_system` of them, and
+        # halving a persona mid-sentence is a quieter version of deleting it.
+        # The first cut of this guard applied the protection to the drop loop
+        # only, so the caller's prompt was safe from removal and not from
+        # mutilation — which is worse, because the model still receives
+        # something that looks like instructions.
         while running > limit and trimmed < 32:
             big = [
-                i for i, m in enumerate(msgs)
-                if m.get("role") == "system"
-                and isinstance(m.get("content"), str)
-                and len(m["content"]) > 400
+                i
+                for i in _droppable_system_indices(msgs, protect_system)
+                if isinstance(msgs[i].get("content"), str)
+                and len(msgs[i]["content"]) > 400
             ]
             if not big:
                 break
@@ -769,24 +1814,189 @@ def _enforce_hard_budget(messages: list[dict], limit: int | None = None) -> list
                 + "\n[...trimmed to fit the context budget]",
             }
             running -= per[i]
-            per[i] = count_tokens([msgs[i]])  # recount ONLY the trimmed block
+            # Recount ONLY the trimmed block — and scale it, because `per` and
+            # `running` are both in vLLM units. Recounting without `scale` mixes
+            # a local estimate into a scaled ledger, so `running` reads lower
+            # than the truth, the loop believes it has fit, and the verify step
+            # sends it round again to trim content it did not need to trim.
+            # Measured over 4,000 payloads: 271 diverged, 267 of them forwarding
+            # LESS content, median 1,189 characters of memory destroyed for no
+            # budget reason. Introduced by 3d3e732, which scaled line ~923 and
+            # missed this one.
+            per[i] = int(count_tokens([msgs[i]]) * scale)
             running += per[i]
             trimmed += 1
 
-        # --- verify with a real full count; loop only if template overhead
-        #     pushed us back over (each round does exactly ONE full count) ---
-        running = count_tokens(msgs)
+        # --- last resort: DROP injected system blocks entirely ---
+        #
+        # v3.1: halving was the only thing this guard could do to a system
+        # message, and injected memory IS a system message — so the one layer
+        # most able to overshoot was the one it could least touch. Observed
+        # 2026-08-27: "28054 -> 26565 tokens (limit 24576); dropped 0 old
+        # turn(s), trimmed 5 injected block(s)" — five halvings, still 2k over,
+        # forwarded anyway, 400.
+        #
+        # `protect_system` is how many system messages the CALLER sent, counted
+        # before injection. We only drop what we added. The first cut of this
+        # stage protected index 0 alone and would delete a caller's SECOND
+        # system message once injected memory was exhausted — destroying content
+        # the pre-v3.1 code would at worst have halved, in the one case
+        # (a single oversized user turn) where dropping it does not achieve the
+        # fit anyway. Memory the model cannot receive is worth less than a
+        # request that succeeds; the caller's own prompt is not ours to spend.
+        while running > limit:
+            droppable = _droppable_system_indices(msgs, protect_system)
+            if not droppable:
+                break
+            i = droppable[-1]
+            running -= per[i]
+            del msgs[i]
+            del per[i]
+            sys_dropped += 1
+
+        # --- verify against GROUND TRUTH; loop only if the arithmetic left us
+        #     over (each round does exactly ONE count, and it is vLLM's) ---
+        #
+        # This is the line that decides whether a request is forwarded, so it
+        # is the one that must not be an estimate. It used to be the local
+        # count, which is how a payload measured at 21,170 reached vLLM and was
+        # charged 32,899 — a request the guard had just certified as fitting.
+        #
+        # v3.1 A9: and when it falls back it says so. This fallback was
+        # unmarked, so the number the shed line reports as the FINAL size —
+        # the one that decided to forward — could be either vLLM's count or a
+        # local estimate scaled by a factor that is itself 1.0 when /tokenize
+        # is down, with nothing in the log to tell the two apart.
+        running, counter = _measure(msgs)
         if running <= limit:
             break
-        idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
-        if len(idxs) <= 1 and trimmed >= 32:
+        if not _has_sheddable_content(msgs, protect_system):
             break  # nothing left to shed; forward best effort
 
-    logger.warning(
-        f"hard budget enforced: {total} -> {running} tokens "
-        f"(limit {limit}); dropped {dropped} old turn(s), "
-        f"trimmed {trimmed} injected block(s)"
+    # v3.1 D3 — the last thing that happens before a payload the guard has
+    # MEASURED as too large goes out the door: spend every remaining scrap of
+    # injected memory.
+    #
+    # The rounds above can exit still over the limit with injected blocks in
+    # hand. The round budget is six, and the shedding arithmetic runs on scaled
+    # per-message LOCAL counts, so a round can believe it has fit, the exact
+    # verify can disagree, and the sixth disagreement is simply the last one.
+    # The old code then forwarded anyway, on the reasoning that the newest turn
+    # is never dropped.
+    #
+    # That reasoning is right about TURNS and does not transfer to injected
+    # memory. Dropping memory the model will never get to read costs nothing
+    # that the 400 does not already cost, and the 400 additionally loses the
+    # message the user just typed — no reply, no facts, no episodic write, and
+    # nothing retries it. Memory the model cannot receive is worth less than a
+    # request that succeeds; the drop stage already makes exactly that trade,
+    # and this is the one point where the guard used to decline to make it.
+    if running > limit:
+        # Drop the MINIMUM that fits — then verify, and keep going if it did not.
+        #
+        # Two properties, and the first version of this had only one each time.
+        # Dropping EVERYTHING is wasteful: measured by review, a payload over by
+        # 550 tokens lost persona, facts and summary when one 1500-token block
+        # covered it — discarding the priority reasoning _bound_injected_blocks
+        # spends twenty lines establishing (persona last, because losing it
+        # makes the reply wrong in KIND rather than merely thinner). But
+        # dropping the minimum by ARITHMETIC alone is worse: `running` here is
+        # scaled per-message estimate, and if the exact count still does not
+        # fit, forwarding while holding memory we were allowed to spend is the
+        # thing this whole path exists to prevent.
+        #
+        # So: cheapest-first by the estimate, then measure, then escalate on
+        # the measurement until it fits or nothing droppable remains. The extra
+        # /tokenize calls are bounded by the number of injected blocks and this
+        # is a last-resort path that should almost never run.
+        forced = _droppable_system_indices(msgs, protect_system)
+        for i in reversed(forced):
+            if running <= limit:
+                break
+            running -= per[i]
+            del msgs[i]
+            del per[i]
+            sys_dropped += 1
+        if sys_dropped:
+            running, counter = _measure(msgs)
+        while running > limit:
+            remaining = _droppable_system_indices(msgs, protect_system)
+            if not remaining:
+                break
+            i = remaining[-1]
+            del msgs[i]
+            del per[i]
+            sys_dropped += 1
+            running, counter = _measure(msgs)
+
+    # v3.1 A9/A10: the shed line now names the counter behind its numbers and
+    # the margin in force. Every number in this line came from one of two
+    # counters that disagree by up to 51% in the direction that overflows, and
+    # for a week of diagnosis the line said which one: never. `margin` is here
+    # for the same reason — `limit` below is already NET of _BUDGET_MARGIN, so
+    # a reader comparing it against HARD_INPUT_LIMIT could not see why they
+    # differed.
+    margin_note = f", margin {_BUDGET_MARGIN}" if _BUDGET_MARGIN else ""
+    detail = (
+        f"{total} -> {running} tokens (limit {limit}{margin_note}), counted by "
+        f"{counter}; dropped {dropped} old "
+        f"turn(s), trimmed {trimmed} injected block(s), dropped "
+        f"{sys_dropped} injected block(s) entirely"
     )
+    if report is not None:
+        report.update(
+            {
+                "limit": limit,
+                "measured": running,
+                "fits": running <= limit,
+                "counted_by": counter,
+                "dropped_turns": dropped,
+                "trimmed_blocks": trimmed,
+                "dropped_blocks": sys_dropped,
+            }
+        )
+    if running > limit:
+        # v3.1: this used to log at WARNING and read like a success — "hard
+        # budget enforced" while forwarding a payload the guard itself has just
+        # measured as too large. It is a failure of the thing whose entire job
+        # is to make vLLM's 400 impossible, and the 400 is now the expected
+        # outcome. Say so, at ERROR, with the shortfall, so it is findable
+        # before the user reports it rather than after.
+        #
+        # v3.1 D3: and say WHAT is left, because the two residuals need
+        # different people to act. On 2026-08-28 the line read "dropped 0 old
+        # turn(s), trimmed 6 injected block(s), dropped 1 injected block(s)
+        # entirely - still 16417 over"; 16,384 + 16,417 = 32,801, which is
+        # exactly the number vLLM went on to report, so every one of those
+        # 32,801 tokens was the caller's own system prompt and the single turn
+        # the user had typed. Nothing the compactor is allowed to touch was
+        # still in that payload — and the line said "a conversation with
+        # nothing left to shed is the usual cause" without saying which case it
+        # was looking at, so it read as a compactor problem for four hours.
+        if not _droppable_system_indices(msgs, protect_system):
+            residual = (
+                "Nothing injected remains: what is left is the caller's own "
+                "system prompt and the newest turn, and neither is this "
+                "guard's to spend. The request as SENT does not fit the "
+                "window — that is a client-side size problem, not a memory one"
+            )
+        else:
+            # Unreachable: the pass above drops every droppable block before
+            # this line can be reached. Kept as a marker, because a guard that
+            # gives up holding memory it was allowed to spend is the exact
+            # defect v3.1 D3 closed and it should be loud if it returns.
+            residual = (
+                "BUG: injected block(s) survived the last-resort drop — the "
+                "guard is holding memory it was allowed to spend"
+            )
+        logger.error(
+            f"hard budget FAILED to fit: {detail} — still "
+            f"{running - limit} token(s) over. Forwarding anyway (the newest "
+            f"turn is never dropped); vLLM will most likely reject this. "
+            f"{residual}."
+        )
+    else:
+        logger.warning(f"hard budget enforced: {detail}")
     return msgs
 
 
@@ -823,11 +2033,24 @@ class SseAccumulator:
         self._buffer: str = ""
         self._parts: list[str] = []
         self._complete: bool = False
+        self._truncated: bool = False
 
     def feed(self, chunk: bytes) -> None:
         try:
             self._buffer += chunk.decode("utf-8", errors="replace")
-        except Exception:
+        except Exception as e:
+            # Dropping a chunk here does not fail the request — the user still
+            # sees the full reply, because the bytes are forwarded separately.
+            # What is lost is this accumulator's copy, so the memory tail
+            # extracts facts, embeds and summarizes a reply with a hole in it,
+            # and .complete() may still say the stream finished cleanly. Once
+            # per process: feed() runs per SSE chunk. (v3.1 P0-2b / F61.)
+            if logsetup.log_once("accumulator.feed.decode"):
+                logger.warning(
+                    f"stream accumulator dropped a chunk ({type(e).__name__}: "
+                    f"{e}); the assistant text memorized for this turn is "
+                    f"incomplete"
+                )
             return
         while "\n\n" in self._buffer:
             event, self._buffer = self._buffer.split("\n\n", 1)
@@ -843,8 +2066,13 @@ class SseAccumulator:
                 try:
                     obj = json.loads(payload)
                     choice = obj.get("choices", [{}])[0]
-                    if choice.get("finish_reason"):
+                    fr = choice.get("finish_reason")
+                    if fr:
                         self._complete = True
+                        # "length" means vLLM hit the token ceiling, not that
+                        # the model finished. The text is a cut-off sentence.
+                        if fr == "length":
+                            self._truncated = True
                     delta = choice.get("delta", {})
                     content = delta.get("content")
                     if isinstance(content, str) and content:
@@ -864,14 +2092,41 @@ class SseAccumulator:
         and rolled into summaries as a completed assistant turn)."""
         return self._complete
 
+    def truncated(self) -> bool:
+        """True when the stream ended with finish_reason "length" — vLLM hit
+        the generation ceiling and cut the reply off mid-sentence.
 
-def _fire_and_forget(coro) -> None:
+        Distinct from complete(). A truncated reply IS complete in the sense
+        that the stream terminated normally, which is why the finish_reason
+        check alone was not enough: `if choice.get("finish_reason")` treated
+        "length" and "stop" identically, and [DONE] sets _complete regardless,
+        so the obvious one-line fix is a no-op. It needs its own flag.
+
+        The consequence of getting this wrong is the same as the disconnect
+        case F20 already guards: a half-sentence gets fact-extracted, indexed
+        into RAG and rolled into summaries as something the model actually
+        said. Worse than the disconnect case, in fact — a truncated reply is
+        confidently phrased right up to where it stops."""
+        return self._truncated
+
+    def usable(self) -> bool:
+        """The gate the memory tail should use: the model finished, and it
+        finished because it was done rather than because it ran out of room."""
+        return self._complete and not self._truncated
+
+
+def _fire_and_forget(coro, label: str | None = None) -> None:
     """Spawn post-response background work through the bounded pool
     (V2.3 Theme 3). The pool caps concurrency and sheds beyond a hard
     outstanding ceiling rather than spawning unboundedly under load. Task
     references are kept alive by the pool; exceptions are logged there.
+
+    `label` is what the pool's shed WARNING names when it drops this task.
+    A11 added the parameter to bgwork.pool.submit and nothing passed it, so
+    the warning could say that a tail was dropped but not WHOSE — which is
+    the entire reason the parameter exists. Pass the conversation.
     """
-    bgwork.pool.submit(coro)
+    bgwork.pool.submit(coro, label)
 
 
 def _merge_touched(fresh: list[dict], touched: list[dict]) -> list[dict]:
@@ -914,6 +2169,8 @@ async def _async_tail(
     assistant_text: str,
     turn_index: int,
     original_messages: list[dict],
+    *,
+    injected_facts: list[dict] | None = None,
 ) -> None:
     """Post-response work, fired after the assistant's reply is fully
     streamed/received. Three independent jobs:
@@ -931,6 +2188,22 @@ async def _async_tail(
     `original_messages` is the request's messages list (pre-compaction); we
     append the just-completed assistant turn before passing to the rollup so
     it sees the full conversation when computing turn ranges.
+
+    `touched_facts` is the WHOLE store as the request path read it, and it is
+    what gets merged and written back — the facts left out of this turn's
+    working set must keep their real last_used or eviction stops meaning
+    anything (v3.1 F9). `injected_facts` is the budget-bounded subset of those
+    same dicts that the request path actually put in front of the model. They
+    are separate because the two jobs need different lists: only the second may
+    be handed to the extractor, which is a request to vLLM and therefore has a
+    window.
+
+    `injected_facts` is keyword-only with a default so no caller is broken by
+    its arrival, and the default is `select_for_injection(touched_facts)` —
+    not `touched_facts` — so a caller that never learned about it still cannot
+    push the whole store into an extraction prompt. The request path passes
+    the real list because it already computed one; recomputing here would
+    answer the question against a store that may have moved since.
     """
     # V2.3 Theme 2: under disk pressure, stop GROWING memory but keep
     # serving. The chat response already went out; this tail is pure
@@ -942,15 +2215,29 @@ async def _async_tail(
         return
 
     # --- 1. Episodic indexing (independent of facts) ---
+    # v3.1 D49: this ran outside conv_lock. A prior review called it benign
+    # because the upsert is idempotent for a given doc id — true of two tails
+    # racing each other, and irrelevant to the case that matters. (That review
+    # justified it from _doc_id being (conv_id, turn_index); D1 has since made
+    # ids content-addressed, which changes the premise and not the conclusion.)
+    # _clear_all_memory holds conv_lock while it calls
+    # retrieval.forget_conversation; an unlocked index_exchange lands after
+    # that delete and puts the exchange the user just asked to forget back in
+    # the vector store, where it is retrievable and injectable again. Its own
+    # acquisition rather than one lock over the whole tail: the facts block
+    # below holds the lock across a vLLM call, and the summary rollup takes
+    # conv_lock internally, so a single enclosing `async with` would either
+    # deadlock or stall this behind an LLM round trip.
     if assistant_text and last_user_text:
-        try:
-            indexed = retrieval.index_exchange(
-                conv_id, turn_index, last_user_text, assistant_text
-            )
-            if indexed:
-                logger.info(f"conv={conv_id}: indexed exchange (turn ~{turn_index})")
-        except Exception as e:
-            logger.warning(f"conv={conv_id}: episodic indexing failed: {e}")
+        async with conv_lock(conv_id):
+            try:
+                indexed = retrieval.index_exchange(
+                    conv_id, turn_index, last_user_text, assistant_text
+                )
+                if indexed:
+                    logger.info(f"conv={conv_id}: indexed exchange (turn ~{turn_index})")
+            except Exception as e:
+                logger.warning(f"conv={conv_id}: episodic indexing failed: {e}")
 
     # --- 2. Facts extraction ---
     if not facts.extraction_enabled():
@@ -959,7 +2246,18 @@ async def _async_tail(
         # _merge_touched) so we don't clobber a concurrent tail's writes.
         async with conv_lock(conv_id):
             try:
-                facts.save_facts(conv_id, _merge_touched(facts.load_facts(conv_id), touched_facts))
+                merged = _merge_touched(facts.load_facts(conv_id), touched_facts)
+                # Nothing to persist means nothing to write (v3.1 G2) — an
+                # empty write here creates a facts file for every background
+                # utility call the compactor ever sees, and list_known_conv_ids
+                # counts them forever.
+                if merged:
+                    facts.save_facts(conv_id, merged)
+            except StoreUnreadable as e:
+                logger.error(
+                    f"conv={conv_id}: facts file unreadable ({e}); skipped the "
+                    f"touched-save rather than writing over it"
+                )
             except Exception as e:
                 logger.warning(f"conv={conv_id}: touched-save failed: {e}")
         return
@@ -970,13 +2268,27 @@ async def _async_tail(
     async with conv_lock(conv_id):
         try:
             async with httpx.AsyncClient() as client:
+                # The BOUNDED set, not the whole store. facts.py now trims its
+                # own input, so passing the store no longer overflows the
+                # window — but the trim it would apply is a second, later
+                # opinion about which facts matter, computed from a store that
+                # may have grown since. Handing it what the model was actually
+                # shown means the extractor is told about the same facts the
+                # assistant reply was written against, so "already known" means
+                # the same thing on both sides of the exchange.
+                # conv_id is logging only, and it is what makes a lost
+                # extraction attributable to the turn that lost it.
                 new_strs = await facts.extract_facts_from_exchange(
                     client,
                     VLLM_URL,
                     MODEL_REPO or "",
                     last_user_text,
                     assistant_text,
-                    touched_facts,
+                    (
+                        injected_facts if injected_facts is not None
+                        else facts.select_for_injection(touched_facts)
+                    ),
+                    conv_id=conv_id,
                 )
                 from facts import _now_unix
                 now = _now_unix()
@@ -999,8 +2311,14 @@ async def _async_tail(
                 # never affects the user chat path.
                 if new_entries and len(combined) >= 2:
                     try:
+                        # conv_id scopes dedup's refusal memo and labels its
+                        # pass line. Without it every pass re-asks the model
+                        # about clusters it has already refused to merge, and
+                        # the one dedup line in the log cannot be tied to a
+                        # conversation (v3.1 I-6).
                         combined, removed = await dedup.dedup_facts(
-                            client, VLLM_URL, MODEL_REPO or "", combined
+                            client, VLLM_URL, MODEL_REPO or "", combined,
+                            conv_id=conv_id,
                         )
                         if removed > 0:
                             logger.info(
@@ -1012,13 +2330,48 @@ async def _async_tail(
                             f"conv={conv_id}: inline dedup failed (no-op): {e}"
                         )
 
-            kept, dropped = facts.prune_facts(combined)
-            facts.save_facts(conv_id, kept)
+            # conv_id is what routes an over-budget eviction into the archive
+            # sidecar instead of unlinking it (v3.1 F9). This call site is the
+            # one that matters: it is on the async tail, so it fires on EVERY
+            # exchange. Measured without it on a 300-fact store: dropped=263,
+            # archived=0, unrecoverable. That is F9 verbatim — "past
+            # COMPACTOR_MAX_FACTS_TOKENS every single turn silently deletes the
+            # oldest facts" — and the oldest facts are the conversation's
+            # foundational ones.
+            kept, dropped = facts.prune_facts(combined, conv_id=conv_id)
+            # G2: no early return on empty extraction meant save_facts(conv_id,
+            # []) ran on EVERY exchange — the primary generator of the empty
+            # facts files D10 counts, and what made the F1a wipe re-fire every
+            # turn instead of occasionally. An empty `combined` is nothing to
+            # say, not a store to erase; a real prune down to zero still writes.
+            if combined:
+                facts.save_facts(conv_id, kept)
             if new_entries or dropped:
+                # "pruned" read as deleted, and until v3.1 F9 it was: this call
+                # site did not pass conv_id, so eviction unlinked rather than
+                # archived. It was visible in production as `pruned 16` every
+                # turn on a store pinned at the token cap, and nobody could tell
+                # from the line that the conversation's oldest facts were gone
+                # for good. Say which it is.
+                churn = (
+                    f", archived {dropped} least-recently-used (recoverable "
+                    f"with /list-archive)" if dropped else ""
+                )
                 logger.info(
-                    f"conv={conv_id}: +{len(new_entries)} facts, pruned {dropped}, "
+                    f"conv={conv_id}: +{len(new_entries)} facts{churn}, "
                     f"total {len(kept)}"
                 )
+        except StoreUnreadable as e:
+            # The re-read above says the file is there and we can't read it,
+            # so `combined` is this exchange's facts and nothing else. Writing
+            # it is the 2026-08-24 shape: 105 facts atomically replaced by 1,
+            # logged as success. Skipping costs this one exchange's facts
+            # (v3.1 F1a).
+            logger.error(
+                f"conv={conv_id}: facts file unreadable ({e}); skipped the "
+                f"fact write to avoid overwriting the store with this "
+                f"exchange alone"
+            )
         except Exception as e:
             logger.exception(f"conv={conv_id}: async fact tail failed: {e}")
 
@@ -1073,6 +2426,21 @@ async def lifespan(app: FastAPI):
         await run_in_threadpool(backend_is_multimodal)
     except Exception as e:
         logger.warning(f"modality probe failed at startup (will retry lazily): {e}")
+    # v3.1 P0-0b: _BUDGET_MARGIN is a module global, so every correction the
+    # calibration loop ever learned is gone the moment this process restarts.
+    # Confirmed live on 2026-08-27 — a pod recreate mid-diagnosis reset it to 0
+    # and the climb started over with nothing in the log to say why. Persisting
+    # it is a larger change; until then the reset is at least announced, so the
+    # 400 the next long conversation eats is explained rather than mysterious.
+    # INFO, not WARNING: this fires on every clean boot, and a warning that is
+    # always present is a warning nobody reads — the exact habit that let the
+    # token-counter fallback run unnoticed for months.
+    logger.info(
+        f"context calibration starts at {_BUDGET_MARGIN} for this process — "
+        f"the learned budget margin does not survive a restart. The first "
+        f"conversation large enough to expose the token undercount will take "
+        f"one vLLM 400 before the margin is relearned."
+    )
     yield
     # Graceful: give in-flight background work (fact extraction, indexing,
     # rollup, backfill) a moment to finish via the bounded pool.
@@ -1150,12 +2518,183 @@ def _vllm_unreachable_stream_chunks(model: str, message: str | None = None) -> l
     ]
 
 
-REQUEST_REJECTED_MESSAGE = (
-    "That request couldn't be processed — the model backend rejected it "
-    "(this is a problem on my side, not yours). The conversation and its "
-    "memory are safe. If this keeps happening on the same message, the "
-    "operator should check the compactor logs for the rejection reason."
+# What the USER reads when vLLM refuses the request. On 2026-08-24 23:49 a turn
+# cost 139.9s of compaction, took a context-length 400 at 33,127 tokens, and
+# then produced no reply, no indexed exchange, no "+N facts" line and no
+# episodic write — while the old text below told the reader only that something
+# "couldn't be processed" and that their memory was "safe". Both statements were
+# true and neither answered the question the reader actually has: did my message
+# go through? So every one of these leads with the outcome, and says in the same
+# breath that the turn was not remembered either — because a user who believes
+# the model heard them will build on it, and the model never will.
+_REJECTED_PREAMBLE = "⚠️ This message did not go through."
+_REJECTED_MEMORY_NOTE = (
+    "There is no reply to it, and nothing about this turn was saved to memory — "
+    "the model will not see it next time. Everything from before is intact."
 )
+
+REQUEST_REJECTED_MESSAGE = (
+    f"{_REJECTED_PREAMBLE} The model backend rejected the request (a problem "
+    f"on my side, not yours). {_REJECTED_MEMORY_NOTE} If it happens again on "
+    f"the same message, the operator should check the compactor log for the "
+    f"rejection reason."
+)
+
+CONTEXT_OVERFLOW_MESSAGE = (
+    f"{_REJECTED_PREAMBLE} The conversation was too large for the model's "
+    f"context window even after compaction. {_REJECTED_MEMORY_NOTE}"
+)
+# Appended to the above, and which one depends on whether the calibration
+# backstop actually learned something from this rejection. "Send it again" was
+# observed to be a lie on 2026-08-27: three consecutive failures moved the
+# margin +127 each time while it needed ~5250, so the same advice produced the
+# same failure ~19 times. Only promise the retry when the margin moved.
+CONTEXT_OVERFLOW_RETRY = (
+    " Send it again — the compactor has just measured how far its own size "
+    "estimate was off and has tightened its budget to match."
+)
+CONTEXT_OVERFLOW_NO_RETRY = (
+    " Sending it again will most likely fail the same way: the compactor "
+    "learned nothing new from this rejection. The operator should check the "
+    "compactor log and shrink the conversation or the memory budget."
+)
+
+
+def _request_rejected_stream_chunks(
+    model: str, message: str, code: str, detail: str = ""
+) -> list[dict]:
+    """SSE chunks for a request vLLM REFUSED — a 4xx, not an outage.
+
+    Deliberately not `_vllm_unreachable_stream_chunks`. That function's pair
+    ends `finish_reason: "stop"`, which to OpenWebUI is an ordinary successful
+    completion whose text happens to read like an apology (INCIDENT §4.2
+    verified this). The user's turn is gone and the transcript records a normal
+    assistant reply; nothing downstream can tell the difference. So this pair
+    carries BOTH halves:
+
+      - the visible assistant text, so a client that understands nothing still
+        shows the user why their message failed, and
+      - a top-level `error` object with `finish_reason: "error"`, so a client
+        that does understand can mark the turn failed instead of storing it.
+
+    Adding the error object cannot make the failure less visible; omitting it
+    is what made the failure indistinguishable from a reply.
+    """
+    cid = f"chatcmpl-rejected-{int(time.time() * 1000):x}"
+    created = int(time.time())
+    base = {"id": cid, "object": "chat.completion.chunk", "created": created,
+            "model": model or "compactor"}
+    err = {"message": message, "type": "invalid_request_error", "code": code}
+    if detail:
+        err["detail"] = detail
+    return [
+        {**base, "choices": [{"index": 0,
+                              "delta": {"role": "assistant", "content": message},
+                              "finish_reason": None}]},
+        {**base,
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+         "error": err},
+    ]
+
+
+def _rejection_user_message(err_body: str, tightened: bool) -> tuple[str, str]:
+    """(the text the user reads, the OpenAI error code) for one 4xx body."""
+    if _is_context_overflow(err_body):
+        return (
+            CONTEXT_OVERFLOW_MESSAGE
+            + (CONTEXT_OVERFLOW_RETRY if tightened else CONTEXT_OVERFLOW_NO_RETRY),
+            "context_length_exceeded",
+        )
+    return REQUEST_REJECTED_MESSAGE, "backend_rejected"
+
+
+def _sent_token_size(messages: list[dict]) -> tuple[int | None, str]:
+    """Our own size for a payload, and WHICH counter produced it.
+
+    Resolved exactly the way _enforce_hard_budget resolves it, because this is
+    reporting on the decision that guard made: /tokenize when vLLM answers,
+    the local tokenizer otherwise. Naming the source is the point — the two
+    disagree badly on assistant content, in the direction that overflows (see
+    count_tokens_exact for the measurements), so a bare "we measured N" means
+    two different things depending on which one measured it, and the reader of
+    this line is trying to locate exactly that gap.
+
+    Blocking (httpx + tokenizer); call it through run_in_threadpool.
+    """
+    try:
+        exact = count_tokens_exact(messages)
+        if exact is not None:
+            return exact, "vLLM's /tokenize"
+        return count_tokens(messages), "the local tokenizer"
+    except Exception:
+        # This runs on a path that has already failed. It may not add a second
+        # failure to the first — the log line below is still worth writing
+        # without a count in it.
+        return None, ""
+
+
+def _log_request_rejected(
+    conv_id: str | None,
+    status: int,
+    err_body: str,
+    sent_tokens: int | None,
+    sent_source: str,
+    limit: int,
+    streaming: bool,
+) -> None:
+    """The turn is lost; this line is the only thing that will say so.
+
+    2026-08-24 23:49 [M]: openwebui.log logged 200, compactor.log logged 200,
+    and the entire record of a destroyed user turn was two WARNING lines in a
+    file named *-error.log — carrying no conv_id and no token counts. ERROR is
+    the level, because a turn that produced nothing is not a degradation. The
+    two counts are the level's justification: our estimate beside vLLM's real
+    one IS the undercount, and it is not recoverable after the fact from
+    anything else in the log.
+    """
+    reported = _reported_prompt_tokens(err_body)
+    if sent_tokens is None:
+        counts = f"budget was {limit:,} tokens (our own count was unavailable)"
+    else:
+        counts = (
+            f"we measured {sent_tokens:,} tokens with {sent_source} against a "
+            f"{limit:,}-token budget"
+        )
+    if reported is not None:
+        counts += f"; vLLM counted {reported:,}"
+        if sent_tokens is not None:
+            # Named by direction rather than always "undercount": which way the
+            # gap runs is the whole diagnosis, and a line that calls an
+            # overcount an undercount sends the next reader looking for a
+            # cause that is not there.
+            gap = reported - sent_tokens
+            counts += (
+                f" — we UNDERCOUNTED by {gap:,}" if gap > 0
+                else f" — we OVERCOUNTED by {-gap:,}" if gap < 0
+                else " — our count agreed, so the rejection is not a counting error"
+            )
+    # The stream path commits HTTP 200 in the response header before vLLM has
+    # answered, so every access log upstream of here records a success. Saying
+    # so in the line is what stops the next reader from concluding, as the
+    # 2026-08-24 analysis initially did, that the turn must have succeeded.
+    status_note = (
+        "; the client was already sent HTTP 200 (a stream commits its status "
+        "before the backend answers), so no access log will show this"
+        if streaming else ""
+    )
+    # A 4xx is vLLM refusing a request it understood; a 5xx is vLLM failing.
+    # The turn is equally gone either way — which is why both come here — but
+    # calling a backend fault a rejection sends the reader to the wrong half of
+    # the system.
+    headline = (
+        f"REQUEST REJECTED by vLLM (HTTP {status})" if status < 500
+        else f"vLLM FAILED this request (HTTP {status})"
+    )
+    logger.error(
+        f"conv={conv_id}: {headline} — this turn produced no reply, no facts "
+        f"and no episodic write, and nothing retries it. {counts}{status_note}. "
+        f"vLLM said: {err_body[:300]!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1267,6 +2806,19 @@ async def chat_completions(request: Request) -> Any:
                     "persona_text": persona.get_persona_text(conv_id),
                 },
             )
+        except StoreUnreadable as e:
+            # v3.1: a real person types these into a chat box. The operator
+            # needs the path and the exception; she needs to know the data is
+            # not gone and that she did nothing wrong. Full detail to the log,
+            # plain language to the reply.
+            logger.error(f"conv={conv_id}: /{cmd_name} failed — store unreadable: {e}")
+            cmd_text = (
+                "I couldn't read my stored memory for this conversation just "
+                "now, so I've made no changes rather than risk losing anything. "
+                "Nothing has been deleted. This is a problem on my side — "
+                "please try again in a moment, and mention it if it keeps "
+                "happening."
+            )
         except Exception as e:
             logger.exception(f"command handling failed: {e}")
             cmd_text = f"Command failed: {type(e).__name__}: {e}"
@@ -1301,6 +2853,27 @@ async def chat_completions(request: Request) -> Any:
             f"the hard-budget guard will shed content if they don't fit: {e}"
         )
 
+    # The window this request will finally be measured against, computed HERE
+    # rather than at the pre-flight below because the memory injection that
+    # follows has to be bounded by it. vLLM enforces prompt + max_tokens <=
+    # window, so a fixed reserve alone leaves a client asking for a big
+    # completion still 400able; and a memory budget expressed as a token
+    # constant cannot see any of that. Nothing between here and the guard
+    # depends on the value, and it depends on nothing but `body`.
+    try:
+        req_max_tokens = int(body.get("max_tokens") or 0)
+    except (TypeError, ValueError):
+        req_max_tokens = 0
+    if req_max_tokens > MAX_MODEL_LEN // 2:
+        # Pair with the reserve cap in effective_limit so prompt+completion
+        # always fits.
+        req_max_tokens = MAX_MODEL_LEN // 2
+        body["max_tokens"] = req_max_tokens
+    effective_limit = min(
+        MAX_MODEL_LEN,
+        max(256, MAX_MODEL_LEN - max(GENERATION_RESERVE, req_max_tokens)),
+    )
+
     # V2.0 memory injection. ALL three layers (facts, RAG, summary) are
     # collected into a SINGLE combined system message and injected in one
     # shot. This matters because Mistral-family chat templates (Mistral-
@@ -1312,8 +2885,25 @@ async def chat_completions(request: Request) -> Any:
     # internally, separated by blank lines and labeled by each module's
     # block header (so the model still parses them as distinct contexts).
     touched_facts: list[dict] = []
-    injected_blocks: list[str] = []
+    # The subset of touched_facts this turn actually put in front of the model.
+    # Initialized here, beside the store, because the tail reads it whether or
+    # not the facts block below ran at all — an unreadable store or a disabled
+    # RAG path must leave the extractor with an empty set, not a NameError on
+    # the async tail where nothing would surface it.
+    injected_facts: list[dict] = []
+    # (priority, label, text). Priority orders DROPPING, not sending: the list
+    # is still sent in the order it is built. See _bound_injected_blocks.
+    injected_blocks: list[tuple[int, str, str]] = []
+    # Initialised unconditionally: it is ASSIGNED inside the facts branch and
+    # READ after the injection bound, so a conversation whose facts path does
+    # not run would raise NameError on the request path. Unbound names have
+    # broken this deployment five times and static analysis does not see them.
+    _pending_touch = None
     log_parts: list[str] = []
+    # Bound before the summary load so the injection log line can name it even
+    # when that load fails — an unreadable summary is exactly when you want the
+    # rest of the line.
+    last_turn: object = "?"
     if conv_id:
         # --- Persona (Phase 8) ---
         # Two paths feed the persona layer:
@@ -1334,8 +2924,21 @@ async def chat_completions(request: Request) -> Any:
             ptext = persona.text_to_inject(conv_id, messages)
             pblock = persona.format_persona_block(ptext)
             if pblock:
-                injected_blocks.append(pblock)
+                injected_blocks.append(
+                    (_INJECT_PRIORITY_PERSONA, "persona", pblock)
+                )
                 log_parts.append(f"persona({len(ptext)}ch)")
+        except StoreUnreadable as e:
+            # auto_capture_persona reads before it writes, so an unreadable
+            # record used to read as "no persona set" and get replaced by
+            # whatever this request's system message happened to be — on the
+            # request path, before vLLM is called (v3.1 F1c). It now raises
+            # here instead: nothing is written, and this turn goes out
+            # without the persona block rather than losing it.
+            logger.error(
+                f"conv={conv_id}: persona file unreadable ({e}); not captured, "
+                f"not injected, and NOT overwritten"
+            )
         except Exception as e:
             logger.warning(f"conv={conv_id}: persona handling failed (non-fatal): {e}")
 
@@ -1343,11 +2946,39 @@ async def chat_completions(request: Request) -> Any:
         try:
             touched_facts = facts.load_facts(conv_id)
             if touched_facts:
-                facts.touch_facts(touched_facts)
-                block = facts.format_facts_block(touched_facts)
+                # v3.1 F9: touch — and inject — only the budget-bounded subset,
+                # not everything on disk. Touching the whole store stamped every
+                # fact with the same second on every request, which left
+                # last_used carrying no signal and eviction falling through to
+                # added_turn, i.e. deleting the conversation's oldest and most
+                # foundational facts first. select_for_injection returns the SAME
+                # dict objects, so touched_facts still carries the touch and the
+                # tail below still writes the whole store back; the facts left
+                # out keep their real last_used and become the eviction
+                # candidates, which is the entire point.
+                injected_facts = facts.select_for_injection(touched_facts)
+                # NOT touched here. last_used is the LRU eviction key, and
+                # _bound_injected_blocks (below) may drop the facts block
+                # entirely — so touching now records "recently used" for facts
+                # the model never saw. On a conversation where the bound fires
+                # repeatedly that inverts the eviction order: the facts that
+                # were never sent look freshest and survive, while facts that
+                # WERE sent age out. The touch moved to after the bound.
+                _pending_touch = injected_facts
+                block = facts.format_facts_block(injected_facts)
                 if block:
-                    injected_blocks.append(block)
-                    log_parts.append(f"{len(touched_facts)}fact(s)")
+                    injected_blocks.append(
+                        (_INJECT_PRIORITY_FACTS, "facts", block)
+                    )
+                    log_parts.append(
+                        f"{len(injected_facts)}fact(s)"
+                        if len(injected_facts) == len(touched_facts)
+                        # Only differ when the store is over budget — which
+                        # v3.1 F9 now allows to persist, because a failed
+                        # archive write keeps the facts rather than deleting
+                        # them. Worth seeing in the log when it happens.
+                        else f"{len(injected_facts)}/{len(touched_facts)}fact(s)"
+                    )
         except Exception as e:
             logger.warning(f"conv={conv_id}: facts load failed (non-fatal): {e}")
 
@@ -1361,8 +2992,14 @@ async def chat_completions(request: Request) -> Any:
             )
             rblock = retrieval.format_retrieval_block(hits)
             if rblock:
-                injected_blocks.append(rblock)
-                log_parts.append(f"{len(hits)}retr")
+                injected_blocks.append(
+                    (_INJECT_PRIORITY_RETRIEVAL, "retrieval", rblock)
+                )
+            # Logged unconditionally. Inside the `if` it only ever recorded
+            # SUCCESS, so a retrieval layer returning nothing on every request
+            # was indistinguishable in the log from one that was never asked.
+            # "0retr" is the line that makes a dead episodic layer visible.
+            log_parts.append(f"{len(hits)}retr")
         except Exception as e:
             logger.warning(f"conv={conv_id}: retrieval load failed (non-fatal): {e}")
 
@@ -1371,9 +3008,12 @@ async def chat_completions(request: Request) -> Any:
         # so this is a purely local read — no LLM call on the hot path.
         try:
             sstate = summarizer.load_state(conv_id)
+            last_turn = sstate.get("last_summarized_turn", "?")
             sblock = summarizer.format_summary_block(sstate)
             if sblock:
-                injected_blocks.append(sblock)
+                injected_blocks.append(
+                    (_INJECT_PRIORITY_SUMMARY, "summary", sblock)
+                )
                 log_parts.append(
                     f"sum(L1={len(sstate.get('l1') or [])}"
                     f"/L2={len(sstate.get('l2') or [])}"
@@ -1384,10 +3024,73 @@ async def chat_completions(request: Request) -> Any:
 
         # Single inject point — preserves Mistral template compatibility.
         if injected_blocks:
-            combined = "\n\n".join(injected_blocks)
+            # v3.1 D3: bound the SUM before it is injected, not after.
+            #
+            # Downstream of here the only remedy is the hard-budget guard, and
+            # the guard's remedies are trimming (which cuts a block at a point
+            # its own ranking did not choose) and dropping (which is this
+            # decision made blind, without knowing which layer it is spending).
+            # Making the choice here means it is made once, with the labels in
+            # hand, before any of it has been merged into one opaque block.
+            #
+            # The no-history budget is the narrow one. See
+            # INJECTION_NO_HISTORY_FRACTION for the case that forced it: a
+            # request with no prior assistant turn can be neither compacted nor
+            # shed, so an oversized injection there is not a degraded turn, it
+            # is a lost one.
+            has_history = _has_conversational_history(messages)
+            inject_budget = int(
+                effective_limit
+                * (
+                    INJECTION_BUDGET_FRACTION
+                    if has_history
+                    else INJECTION_NO_HISTORY_FRACTION
+                )
+            )
+            kept, dropped_layers, inject_cost = await run_in_threadpool(
+                _bound_injected_blocks, injected_blocks, inject_budget
+            )
+            # Mark facts used only if the facts block SURVIVED the bound.
+            # last_used is the LRU eviction key; touching facts the model never
+            # received makes them look freshest and pushes the facts that WERE
+            # sent toward eviction instead — the eviction order inverts on
+            # exactly the conversations where the bound fires most.
+            if _pending_touch is not None and "facts" not in dropped_layers:
+                facts.touch_facts(_pending_touch)
+            if dropped_layers:
+                # WARNING, not INFO. This is memory the user believes the
+                # assistant has and the model is not going to see, which is the
+                # 2026-08-28 lesson in one line: a fallback that cannot say it
+                # fired is not a fallback.
+                logger.warning(
+                    f"conv={conv_id}: injected memory over budget "
+                    f"({inject_cost} tokens against {inject_budget}, "
+                    f"{INJECTION_BUDGET_FRACTION if has_history else INJECTION_NO_HISTORY_FRACTION:.3f}"
+                    f" of the {effective_limit}-token limit"
+                    f"{'' if has_history else '; this request has NO prior assistant turn, so it is task traffic or a first turn'}"
+                    f") — dropped {', '.join(dropped_layers)} to keep the "
+                    f"conversation itself in the window"
+                )
+                log_parts.append(f"dropped:{'+'.join(dropped_layers)}")
+        else:
+            kept = []
+        if kept:
+            combined = "\n\n".join(kept)
             try:
                 body["messages"] = inject_system_block(body["messages"], combined)
-                logger.info(f"conv={conv_id}: injected memory [{' '.join(log_parts)}]")
+                # msgs= is repeated here from the request line ~230 lines
+                # earlier. That looks redundant and is not: on 2026-08-24 the
+                # whole diagnosis was two adjacent log lines nobody joined —
+                # a message count in one and the conversation's real size in
+                # the other. `msgs=7` beside `105fact(s)` is self-evidently
+                # wrong on sight; neither number is, alone. Also carries
+                # last_summarized_turn, the only server-side record of how far
+                # the conversation actually got, so a client sending a short
+                # window is visible without cross-referencing anything.
+                logger.info(
+                    f"conv={conv_id}: injected memory [{' '.join(log_parts)}] "
+                    f"msgs={len(messages)} lastturn={last_turn}"
+                )
             except Exception as e:
                 logger.warning(f"conv={conv_id}: memory injection failed (non-fatal): {e}")
 
@@ -1413,33 +3116,48 @@ async def chat_completions(request: Request) -> Any:
     # 1. _enforce_hard_budget runs FIRST, while the system blocks are still
     #    separate — so a trim hits the largest individual block (usually the
     #    injected memory) instead of a pre-merged mega-block where halving
-    #    would chew into the persona. It also accounts for the request's OWN
-    #    max_tokens: vLLM enforces prompt + max_tokens <= window, so a fixed
-    #    reserve alone leaves a client asking for a big completion still 400able.
+    #    would chew into the persona. It is shed against `effective_limit`,
+    #    which accounts for the request's OWN max_tokens — vLLM enforces
+    #    prompt + max_tokens <= window, so a fixed reserve alone leaves a
+    #    client asking for a big completion still 400able. That limit is now
+    #    computed further up, before memory injection, because v3.1 D3 bounds
+    #    injection as a fraction of it.
     # 2. _merge_adjacent_system_messages runs LAST, collapsing every remaining
     #    run — including any adjacency the budget guard created by deleting a
     #    turn that sat between two system messages.
-    try:
-        req_max_tokens = int(body.get("max_tokens") or 0)
-    except (TypeError, ValueError):
-        req_max_tokens = 0
-    if req_max_tokens > MAX_MODEL_LEN // 2:
-        # Pair with the reserve cap below so prompt+completion always fits.
-        req_max_tokens = MAX_MODEL_LEN // 2
-        body["max_tokens"] = req_max_tokens
-    effective_limit = min(
-        MAX_MODEL_LEN,
-        max(256, MAX_MODEL_LEN - max(GENERATION_RESERVE, req_max_tokens)),
-    )
     # Pure CPU (tokenizer) work — off the event loop so a shedding pass on a
     # huge conversation can't stall every other request and the healthchecks.
+    # How many system messages the CALLER sent, counted on the original array
+    # before compaction or injection touched it. The guard may spend what we
+    # added; it may not spend what the caller sent. Without this it would delete
+    # a caller's second system message once injected memory ran out — and in the
+    # only case that reaches (one user turn larger than the whole budget) doing
+    # so does not even achieve the fit.
+    caller_system = sum(1 for m in messages if m.get("role") == "system")
+    # v3.1 D4: what the guard decided, carried to the rejection path. Without
+    # it a 400 the guard PREDICTED (and logged at ERROR before sending) is
+    # indistinguishable from one that surprised it, and the calibration learns
+    # a process-global margin from the first kind.
+    guard_report: dict = {}
     body["messages"] = await run_in_threadpool(
-        _enforce_hard_budget, body["messages"], effective_limit
+        _enforce_hard_budget,
+        body["messages"],
+        effective_limit,
+        caller_system,
+        guard_report,
     )
+    guard_measured_overflow = guard_report.get("fits") is False
     body["messages"] = _merge_adjacent_system_messages(body["messages"])
     # ...and non-system turns that ended up sharing a role (compaction hoists
     # image turns out of chronological order, which lands user next to user).
     body["messages"] = _merge_consecutive_same_role(body["messages"])
+    # The limit the guard ACTUALLY shed against, captured here rather than
+    # recomputed if this request is rejected: _note_backend_rejection moves
+    # _BUDGET_MARGIN, so by the time a rejection is logged the margin is no
+    # longer the one this payload was measured against, and the log line would
+    # name a budget that was never in force. Mirrors the clamp inside
+    # _enforce_hard_budget.
+    enforced_limit = max(256, effective_limit - _BUDGET_MARGIN)
 
     stream = bool(body.get("stream", False))
     # read=None keeps long generations from being cut off, but connect/write/
@@ -1467,26 +3185,71 @@ async def chat_completions(request: Request) -> Any:
                             # raw into a text/event-stream gives the UI a garbled
                             # reply; degrade visibly instead, like the
                             # connection-error branch below.
+                            #
+                            # v3.1: "visibly" used to mean visible to a HUMAN
+                            # only. The pair below ended finish_reason "stop"
+                            # and the response had already committed HTTP 200,
+                            # so a rejection was indistinguishable from a reply
+                            # to every machine in the path — INCIDENT §4.3 A5.
+                            # On 2026-08-24 23:49 that is exactly what happened:
+                            # a context-length 400 after 139.9s of compaction,
+                            # 200 in openwebui.log, 200 in compactor.log, and
+                            # the only trace two unattributed WARNINGs. So the
+                            # branch now says what happened at ERROR, and hands
+                            # the client an error-typed pair.
                             vllm_failed = True
-                            err_body = (await r.aread()).decode("utf-8", "replace")[:300]
-                            _note_backend_rejection(err_body)
-                            logger.warning(
-                                f"vLLM HTTP {r.status_code} on stream: {err_body!r}"
+                            # Truncate AFTER parsing, not before. vLLM states
+                            # the true prompt size mid-sentence, so the old
+                            # 300-char cut ran through the one number that
+                            # explains the rejection — in the body shape seen in
+                            # production it landed just inside the cut, which is
+                            # luck, not a margin. The log line still shows 300.
+                            err_body = (await r.aread()).decode("utf-8", "replace")[:2000]
+                            sent_tokens, sent_source = await run_in_threadpool(
+                                _sent_token_size, body["messages"]
                             )
-                            for chunk in _vllm_unreachable_stream_chunks(
-                                body.get("model") or MODEL_REPO or "",
+                            # Before _note_backend_rejection, which is what moves
+                            # the margin the line reports against.
+                            _log_request_rejected(
+                                conv_id, r.status_code, err_body, sent_tokens,
+                                sent_source, enforced_limit, streaming=True,
+                            )
+                            # v3.1 A8: enforced_limit is what the guard
+                            # ACTUALLY shed against. Without it the calibration
+                            # reconstructed a limit from HARD_INPUT_LIMIT and
+                            # only ever understated the overshoot, so a client
+                            # asking for a large completion could learn nothing
+                            # and still be told to retry.
+                            tightened = _note_backend_rejection(
+                                err_body, enforced_limit,
+                                guard_measured_overflow=guard_measured_overflow,
+                            )
+                            if r.status_code < 500:
                                 # A 4xx means the backend is HEALTHY and refused
                                 # our request; only 5xx/unreachable justifies the
                                 # "starting up or restarting" message.
-                                message=(
-                                    REQUEST_REJECTED_MESSAGE
-                                    if r.status_code < 500
-                                    else None
-                                ),
-                            ):
+                                message, code = _rejection_user_message(
+                                    err_body, tightened
+                                )
+                                chunks = _request_rejected_stream_chunks(
+                                    body.get("model") or MODEL_REPO or "",
+                                    message, code, detail=err_body[:300],
+                                )
+                            else:
+                                chunks = _vllm_unreachable_stream_chunks(
+                                    body.get("model") or MODEL_REPO or ""
+                                )
+                            for chunk in chunks:
                                 yield f"data: {json.dumps(chunk)}\n\n".encode()
                             yield b"data: [DONE]\n\n"
                         else:
+                            # v3.1 A10: vLLM accepted this payload. That is the
+                            # only evidence that exists for whether the learned
+                            # margin is still needed, so it is counted here —
+                            # at the moment the status line arrives, not after
+                            # the body, because a client hanging up mid-stream
+                            # says nothing about whether the prompt fitted.
+                            _note_backend_accepted()
                             async for chunk in r.aiter_raw():
                                 yield chunk
                                 accumulator.feed(chunk)
@@ -1509,13 +3272,27 @@ async def chat_completions(request: Request) -> Any:
                 # (client hit Stop / tab closed mid-reply): memorizing a
                 # half-sentence as though the model said it plants false
                 # "memories" in facts/RAG/summaries (rc6 review).
-                if conv_id and not vllm_failed and not accumulator.complete():
-                    logger.info(
-                        f"conv={conv_id}: stream ended without completion "
+                if conv_id and not vllm_failed and not accumulator.usable():
+                    _why = (
+                        "truncated at the generation ceiling "
+                        "(finish_reason=length)"
+                        if accumulator.truncated()
+                        else "ended without completion"
+                    )
+                    # WARNING, not INFO. If a client sends a max_tokens
+                    # below the model's usual reply length, EVERY reply
+                    # finishes as "length" and this branch silently stops all
+                    # memory writing — facts, episodic and rollups — for the
+                    # life of that setting. That is the 2026-08-28 shape
+                    # exactly: correct local behaviour, no error, and the user
+                    # experiencing an assistant that has stopped remembering.
+                    # The skip is right; being quiet about it is not.
+                    logger.warning(
+                        f"conv={conv_id}: stream {_why} "
                         f"({len(accumulator.text())} chars accumulated) — "
                         f"skipping memory tail for the partial reply"
                     )
-                if conv_id and not vllm_failed and accumulator.complete():
+                if conv_id and not vllm_failed and accumulator.usable():
                     _fire_and_forget(
                         _async_tail(
                             conv_id,
@@ -1524,7 +3301,9 @@ async def chat_completions(request: Request) -> Any:
                             accumulator.text(),
                             turn_index,
                             messages,  # original request messages, for rollup
-                        )
+                            injected_facts=injected_facts,
+                        ),
+                        label=f"tail conv={conv_id}",
                     )
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -1558,6 +3337,47 @@ async def chat_completions(request: Request) -> Any:
                 ),
                 status_code=502,
             )
+        if r.status_code >= 400:
+            # Return BEFORE the memory tail, and say so at ERROR.
+            #
+            # v3.1 F20: the status check used to sit after the tail was fired,
+            # so a rejected request still ran the tail — harmless only by
+            # accident, because assistant_text happens to come out empty and
+            # every job in the tail happens to gate on it. One shape does get
+            # through even today: with extraction disabled the tail takes
+            # conv_lock and rewrites the facts file for a turn the model never
+            # answered. A request the backend refused has nothing to remember.
+            #
+            # The relay itself is unchanged — this path already hands the
+            # client vLLM's real status, which is why the incident's invisible
+            # failure was the STREAM path and not this one. What was missing
+            # here is the same thing: a line naming the conversation and the
+            # counts. (This is also the path OpenWebUI's background title/tag
+            # tasks take, so conv_id is often None; the line still says which.)
+            sent_tokens, sent_source = await run_in_threadpool(
+                _sent_token_size, body["messages"]
+            )
+            _log_request_rejected(
+                conv_id, r.status_code, str(response_json), sent_tokens,
+                sent_source, enforced_limit, streaming=False,
+            )
+            # v3.1 A8: same fix as the streaming path — the limit the guard
+            # enforced, not one reconstructed from HARD_INPUT_LIMIT. This path
+            # still discards the return value: it relays vLLM's own body to the
+            # client verbatim, so there is no compactor-authored message for
+            # `tightened` to steer. The calibration still happens; only the
+            # advice-to-the-user half is absent here.
+            _note_backend_rejection(
+                str(response_json)[:2000], enforced_limit,
+                guard_measured_overflow=guard_measured_overflow,
+            )
+            return JSONResponse(content=response_json, status_code=r.status_code)
+
+        # v3.1 A10: the counterpart to the rejection path above. Without a call
+        # here the release logic in _note_backend_accepted is unreachable and
+        # the margin stays monotonic exactly as it was before this branch.
+        _note_backend_accepted()
+
         # Extract assistant text for fact extraction
         assistant_text = ""
         try:
@@ -1567,9 +3387,39 @@ async def chat_completions(request: Request) -> Any:
                 .get("content", "")
                 or ""
             )
+        except (IndexError, KeyError, TypeError) as e:
+            # An unexpected response shape leaves assistant_text empty, and the
+            # tail below still fires — so the exchange is memorized as a user
+            # turn answered by nothing. Indistinguishable from a model that
+            # replied with silence unless we say so. Once per process: this is
+            # the request path. (v3.1 P0-2b / F61.)
+            if logsetup.log_once("nonstream.assistant_text"):
+                logger.warning(
+                    f"conv={conv_id}: could not read assistant text from the "
+                    f"vLLM response ({type(e).__name__}: {e}); this turn is "
+                    f"memorized without the model's reply"
+                )
+        # Same gate the streaming path applies via SseAccumulator.usable().
+        # This path had no finish_reason check at all, so a reply vLLM cut off
+        # at the generation ceiling was memorized as a completed assistant turn
+        # — fact-extracted, indexed into RAG, rolled into summaries. The
+        # streaming path guarded the client-disconnect case (F20) and this one
+        # guarded nothing, which is the half-applied shape worth watching for.
+        _finish_reason = ""
+        try:
+            _finish_reason = (
+                response_json.get("choices", [{}])[0].get("finish_reason") or ""
+            )
         except (IndexError, KeyError, TypeError):
-            pass
-        if conv_id:
+            _finish_reason = ""
+        if conv_id and _finish_reason == "length":
+            # WARNING for the same reason as the streaming path above.
+            logger.warning(
+                f"conv={conv_id}: reply truncated at the generation ceiling "
+                f"(finish_reason=length, {len(assistant_text)} chars) — "
+                f"skipping memory tail for the partial reply"
+            )
+        elif conv_id:
             _fire_and_forget(
                 _async_tail(
                     conv_id,
@@ -1578,10 +3428,10 @@ async def chat_completions(request: Request) -> Any:
                     assistant_text,
                     turn_index,
                     messages,  # original request messages, for rollup
-                )
+                    injected_facts=injected_facts,
+                ),
+                label=f"tail conv={conv_id}",
             )
-        if r.status_code >= 400:
-            _note_backend_rejection(str(response_json)[:300])
         return JSONResponse(content=response_json, status_code=r.status_code)
     finally:
         await client.aclose()
@@ -1638,7 +3488,13 @@ async def health_full(response: Response):
     healthy even when vLLM is dead, because OpenWebUI keeps serving
     its login page).
     """
-    report = await health.gather_health_full(VLLM_URL, TARGET_TOKENS)
+    # tokenize_health() existed, was tested, and had no consumer — so a
+    # /tokenize outage, the exact degraded mode the 2026-08-28 incident ran
+    # in, was invisible on the health endpoint. health.py cannot import main
+    # (main imports health), so main hands it in.
+    report = await health.gather_health_full(
+        VLLM_URL, TARGET_TOKENS, tokenize=tokenize_health()
+    )
     response.status_code = health.status_to_http_code(report["status"])
     return report
 
@@ -1662,23 +3518,46 @@ async def admin_conversation_summary(conv_id: str):
     Phase 2 adds facts count, Phase 3 adds episodic doc count, Phase 4 adds
     the hierarchical summary state shape.
     """
+    # v3.1 P0-2b: every handler below reports a null/empty layer on a read
+    # error, which reads as "this conversation has no memory" to whoever is
+    # inspecting it — and the person inspecting it is, by definition, doing so
+    # during an incident. The response shape is unchanged (that is the D1/F5
+    # per-layer {ok,error} work); what changes is that the log now says the
+    # difference between empty and unreadable. Once per call site: the endpoint
+    # is per-request, and the JSON body carries the per-call signal.
     info = storage_summary(conv_id)
     # Facts (Phase 2)
     try:
         info["facts"]["count"] = len(facts.load_facts(conv_id))
-    except Exception:
+    except Exception as e:
+        if logsetup.log_once("admin.conv_summary.facts"):
+            logger.warning(
+                f"conv={conv_id}: facts unreadable ({type(e).__name__}: {e}); "
+                f"/admin/conversations reports count=null, which is NOT the "
+                f"same as zero facts"
+            )
         info["facts"]["count"] = None
     # Episodic memory (Phase 3)
     try:
         info["episodic"] = {
             "indexed_exchanges": retrieval.conversation_doc_count(conv_id),
         }
-    except Exception:
+    except Exception as e:
+        if logsetup.log_once("admin.conv_summary.episodic"):
+            logger.warning(
+                f"conv={conv_id}: episodic count unreadable "
+                f"({type(e).__name__}: {e}); reported as null, not zero"
+            )
         info["episodic"] = {"indexed_exchanges": None}
     # Hierarchical summary (Phase 4)
     try:
         info["summary"] = summarizer.state_summary(summarizer.load_state(conv_id))
-    except Exception:
+    except Exception as e:
+        if logsetup.log_once("admin.conv_summary.summary"):
+            logger.warning(
+                f"conv={conv_id}: summary state unreadable "
+                f"({type(e).__name__}: {e}); reported as null, not absent"
+            )
         info["summary"] = None
     # Persona (V2.1 Phase 8)
     try:
@@ -1688,7 +3567,13 @@ async def admin_conversation_summary(conv_id: str):
             "length": len(prec["persona_text"]) if prec else 0,
             "source": prec["source"] if prec else None,
         }
-    except Exception:
+    except Exception as e:
+        if logsetup.log_once("admin.conv_summary.persona"):
+            logger.warning(
+                f"conv={conv_id}: persona unreadable ({type(e).__name__}: "
+                f"{e}); reported as present=false, which is NOT the same as "
+                f"no persona stored"
+            )
         info["persona"] = {"present": False, "length": 0, "source": None}
     return info
 
@@ -1723,10 +3608,26 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
     """Wipe every memory layer for a conv. Returns counters for the
     response body. `source` is just for log labeling."""
     async with conv_lock(conv_id):
-        existing = facts.load_facts(conv_id)
-        n_facts = len(existing)
-        if n_facts > 0:
-            facts.save_facts(conv_id, [])
+        # v3.1: an unreadable facts file must not abort the whole wipe. The
+        # user asked for this data to be gone; refusing to clear the three
+        # layers we CAN read would leave more behind than clearing them does,
+        # and would report failure for work that partly succeeded. Clear what
+        # is readable, and say plainly which layer could not be.
+        unreadable: list[str] = []
+        try:
+            existing = facts.load_facts(conv_id)
+            n_facts = len(existing)
+            if n_facts > 0:
+                facts.save_facts(conv_id, [])
+        except StoreUnreadable as e:
+            n_facts = 0
+            unreadable.append("facts")
+            logger.error(
+                f"conv={conv_id}: {source} forget could not read the facts file "
+                f"({e}); the other memory layers were still cleared. The facts "
+                f"file is left in place — it cannot be safely rewritten from an "
+                f"unknown state."
+            )
         # Episodic memory lives in ChromaDB.
         n_episodic = retrieval.forget_conversation(conv_id)
         # Hierarchical summary state on disk.
@@ -1757,6 +3658,9 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
         "forgotten_episodic": n_episodic,
         "forgotten_summary": summary_deleted,
         "forgotten_persona": persona_deleted,
+        # Present only when a layer could not be read. Callers must not
+        # report a clean wipe when this is non-empty.
+        "unreadable": unreadable,
     }
 
 
@@ -1946,7 +3850,7 @@ async def admin_dedup(conv_id: str):
             }
         async with httpx.AsyncClient() as client:
             after, removed = await dedup.dedup_facts(
-                client, VLLM_URL, MODEL_REPO or "", before
+                client, VLLM_URL, MODEL_REPO or "", before, conv_id=conv_id
             )
         if removed > 0:
             facts.save_facts(conv_id, after)

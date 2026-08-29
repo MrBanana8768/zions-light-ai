@@ -14,6 +14,7 @@ Run: python test_persona.py
 """
 
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -45,6 +46,22 @@ def _wipe():
     if os.path.exists(_TMP_ROOT):
         shutil.rmtree(_TMP_ROOT)
     memory.ensure_storage_layout()
+
+
+def _stamp_set_at(conv_id: str, ts: int) -> None:
+    """Force a stored record's set_at, so ordering tests are about the sort.
+
+    save_persona stamps int(time.time()) — whole seconds (persona.py:132).
+    Several saves inside one test land in the same second, which leaves
+    list_personas' sort key tied and `sorted` (stable) simply preserving glob
+    order. The ordering assertion below therefore used to pass only when two
+    saves happened to straddle a second boundary, and failed the rest of the
+    time; a 0.01s sleep cannot change that at one-second resolution.
+    """
+    p = memory.persona_path(conv_id)
+    rec = json.loads(p.read_text(encoding="utf-8"))
+    rec["set_at"] = ts
+    p.write_text(json.dumps(rec), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +113,9 @@ def test_save_idempotent_on_matching_hash():
     print("\n[test] save_persona with same text → returns existing record, no timestamp churn")
     _wipe()
     first = persona.save_persona("idem", "stable text", source="admin")
-    import time
-    time.sleep(0.01)  # ensure clock advance
+    # No sleep: the matching-hash short-circuit returns the existing record
+    # without consulting the clock at all, so the assertion holds regardless of
+    # elapsed time. The 0.01s sleep that used to sit here implied it did not.
     second = persona.save_persona("idem", "stable text", source="auto")
     # set_at should be the first save, not updated
     assert_eq(first["set_at"], second["set_at"], "set_at unchanged")
@@ -143,12 +161,16 @@ def test_list_personas_sorted_by_set_at():
     print("\n[test] list_personas: sorted newest-first; returns metadata only (no text)")
     _wipe()
     persona.save_persona("a", "alpha persona text here long enough")
-    import time; time.sleep(0.01)
     persona.save_persona("b", "beta persona text here long enough")
+    persona.save_persona("c", "gamma persona text here long enough")
+    # Stamped deliberately OUT of glob order (a, b, c) so a sort that did
+    # nothing at all could not pass: the expected order is b, c, a.
+    _stamp_set_at("a", 1_700_000_100)
+    _stamp_set_at("b", 1_700_000_300)
+    _stamp_set_at("c", 1_700_000_200)
     out = persona.list_personas()
-    assert_eq(len(out), 2, "two entries")
-    assert_eq(out[0]["conv_id"], "b", "newest first")
-    assert_eq(out[1]["conv_id"], "a", "oldest last")
+    assert_eq(len(out), 3, "three entries")
+    assert_eq([r["conv_id"] for r in out], ["b", "c", "a"], "newest first")
     # Each entry: lightweight (no full text)
     for entry in out:
         assert_true("length" in entry, f"length present: {entry!r}")
@@ -232,6 +254,72 @@ def test_auto_capture_replaces_on_different_text():
     rec = persona.auto_capture_persona("auto3", msgs2)
     assert_true(rec is not None, "second save happens")
     assert_true("New persona" in persona.get_persona_text("auto3"), "new text stored")
+
+
+# --- the managed-source refusal (v3.1 F1c, change 6) ------------------------
+#
+# A record whose source is "admin" or "inherited" was set deliberately by the
+# owner. Auto-capture fires on every request, so without this refusal any
+# client that sent a different system prompt once — a front end injecting its
+# own preamble, say — quietly demoted a hand-written persona to whatever it
+# sent. This shipped with no test at all: deleting the whole source check left
+# the suite green.
+
+def test_auto_capture_declines_to_replace_admin_persona():
+    print("\n[test] auto_capture_persona: an admin persona is not replaced from the request")
+    _wipe()
+    stored = "Hand-written admin persona for this campaign. " * 3
+    persona.save_persona("managed-admin", stored, source="admin")
+    incoming = [{"role": "system", "content": "A front end's own preamble. " * 5}]
+    assert_eq(persona.auto_capture_persona("managed-admin", incoming), None,
+              "declines, returns None")
+    rec = persona.load_persona("managed-admin")
+    assert_eq(rec["persona_text"], stored.strip(), "stored text unchanged")
+    assert_eq(rec["source"], "admin", "source still admin, not demoted to auto")
+
+
+def test_auto_capture_declines_to_replace_inherited_persona():
+    print("\n[test] auto_capture_persona: an inherited persona is not replaced either")
+    _wipe()
+    stored = "Persona cloned from the parent conversation. " * 3
+    persona.save_persona("managed-inherited", stored, source="inherited")
+    incoming = [{"role": "system", "content": "A front end's own preamble. " * 5}]
+    assert_eq(persona.auto_capture_persona("managed-inherited", incoming), None,
+              "declines, returns None")
+    rec = persona.load_persona("managed-inherited")
+    assert_eq(rec["persona_text"], stored.strip(), "stored text unchanged")
+    assert_eq(rec["source"], "inherited", "source still inherited")
+
+
+def test_auto_capture_still_replaces_an_auto_persona():
+    print("\n[test] auto_capture_persona: an auto-captured persona IS still replaced")
+    # The other side of the boundary. Only deliberate records are protected —
+    # if "auto" were protected too, the first system prompt a conversation ever
+    # saw would be frozen in permanently.
+    _wipe()
+    persona.save_persona("managed-auto", "An earlier captured prompt. " * 3,
+                         source="auto")
+    incoming = [{"role": "system", "content": "A newer captured prompt. " * 5}]
+    rec = persona.auto_capture_persona("managed-auto", incoming)
+    assert_true(rec is not None, "replacement happened")
+    assert_true("newer captured prompt" in persona.get_persona_text("managed-auto"),
+                "new text stored")
+
+
+def test_auto_capture_override_managed_forces_replacement():
+    print("\n[test] auto_capture_persona: override_managed=True replaces an admin persona")
+    # The admin-tooling escape hatch. Without a test, the refusal above could
+    # be implemented as an unconditional refusal and still look correct.
+    _wipe()
+    persona.save_persona("managed-override", "Hand-written admin persona. " * 3,
+                         source="admin")
+    incoming = [{"role": "system", "content": "A replacement preamble. " * 5}]
+    rec = persona.auto_capture_persona("managed-override", incoming,
+                                       override_managed=True)
+    assert_true(rec is not None, "replacement happened")
+    assert_eq(rec["source"], "auto", "the forced record is recorded as auto")
+    assert_true("replacement preamble" in persona.get_persona_text("managed-override"),
+                "new text stored")
 
 
 def test_auto_capture_disabled_when_persona_disabled(monkeypatch=None):
@@ -343,6 +431,10 @@ def _all_tests():
         test_auto_capture_stores_on_first_sight,
         test_auto_capture_noop_on_matching_hash,
         test_auto_capture_replaces_on_different_text,
+        test_auto_capture_declines_to_replace_admin_persona,
+        test_auto_capture_declines_to_replace_inherited_persona,
+        test_auto_capture_still_replaces_an_auto_persona,
+        test_auto_capture_override_managed_forces_replacement,
         test_auto_capture_disabled_when_persona_disabled,
         test_text_to_inject_none_when_no_persona,
         test_text_to_inject_none_when_already_in_request,

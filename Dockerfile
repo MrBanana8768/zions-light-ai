@@ -119,6 +119,25 @@ RUN python3 -m venv /opt/compactor-venv && \
     find /opt/compactor-venv -name "__pycache__" -type d -exec rm -rf {} + && \
     rm -rf /root/.cache /tmp/* /var/tmp/*
 
+# Fail the build if the chat-template path is unavailable. jinja2 is an
+# OPTIONAL transformers dependency that only apply_chat_template needs, so a
+# "tokenizer-only" install omits it and count_tokens silently degrades to
+# `encode(text) + 4` per message — losing ~22 tokens/message of Mistral
+# framing, undetectable until a long conversation overflows the window.
+# That shipped for months and surfaced as vLLM 400s on 2026-08-27.
+# This guard is cheap; the failure it prevents cost a production incident.
+RUN /opt/compactor-venv/bin/python -c \
+    "import jinja2; print('chat-template rendering available: jinja2', jinja2.__version__)"
+
+# Same doctrine as the jinja2 guard above, for the same reason: a token counter
+# that degrades silently is the failure mode this project keeps paying for.
+# compactor/tokens.py needs mistral_common to give an accurate count when
+# vLLM's /tokenize cannot answer; without it the fallback is an estimator that
+# reads up to 51% low. The module no-ops safely if the import fails, so nothing
+# breaks — which is exactly why the absence has to fail the BUILD instead.
+RUN /opt/compactor-venv/bin/python -c \
+    "import mistral_common; print('local exact tokenization available: mistral_common', mistral_common.__version__)"
+
 # Pre-download the bge-small ONNX embedding model into the image so the
 # first request pays no download. Static weights belong in the image, not
 # on the /data volume. FASTEMBED_CACHE_PATH (ENV section below) points here.
@@ -214,6 +233,7 @@ COPY compactor/persona.py /opt/compactor/persona.py
 COPY compactor/backup.py /opt/compactor/backup.py
 COPY compactor/degrade.py /opt/compactor/degrade.py
 COPY compactor/bgwork.py /opt/compactor/bgwork.py
+COPY compactor/tokens.py /opt/compactor/tokens.py
 COPY compactor/logsetup.py /opt/compactor/logsetup.py
 COPY compactor/alert.py /opt/compactor/alert.py
 
@@ -353,6 +373,12 @@ ENV AUDIO_TTS_OPENAI_API_BASE_URL="http://localhost:9001/v1"
 ENV AUDIO_TTS_OPENAI_API_KEY="not-needed"
 ENV AUDIO_TTS_MODEL="tts-1"
 ENV AUDIO_TTS_VOICE="alloy"
+
+# Log destination. supervisord.conf expands %(ENV_LOG_DIR)s at parse time and
+# refuses to start if it is unset, so the default lives here rather than only
+# in entrypoint.sh — a `docker run` that bypasses the entrypoint still boots.
+# /data is the network volume: logs must survive the container that wrote them.
+ENV LOG_DIR="/data/logs"
 
 # 3000 — OpenWebUI (user-facing)
 # 8080 — context-compactor (OpenAI-compatible, what OpenWebUI talks to)

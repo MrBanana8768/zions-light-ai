@@ -244,21 +244,62 @@ def atomic_write_json(path: Path, data: Any) -> None:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
-        except OSError:
-            pass
+        except OSError as e:
+            # The write itself succeeded; only the durability barrier failed.
+            # DEBUG, not WARNING — on MooseFS this is expected often enough
+            # that warning here would train people to ignore warnings.
+            logger.debug(f"directory fsync skipped for {path.parent}: {e}")
     except Exception:
         # Best-effort cleanup of orphan temp file; don't shadow the
         # original exception if cleanup also fails.
         try:
             os.unlink(tmp_path)
-        except OSError:
-            pass
+        except OSError as e:
+            logger.debug(f"orphan temp file left behind at {tmp_path}: {e}")
         raise
 
 
-def read_json(path: Path, default: Any = None) -> Any:
-    """Convenience read with default-on-missing. Returns the default if
-    the file doesn't exist OR if it's corrupted (logs warning on corrupt).
+class StoreUnreadable(Exception):
+    """A memory file is present on disk but its contents could not be read.
+
+    The distinction this carries is the entire point of it existing. An
+    ABSENT file is an empty store — correct for a conversation that has
+    never written one. An unreadable file means the real contents are still
+    on disk and we do not know what they are. Before v3.1 read_json
+    answered both with the same default, and five callers read-modify-WROTE
+    that default back: one transient error replaced a 105-fact store with
+    the one or two facts from the current exchange, atomically, permanently,
+    behind a single WARNING line (v3.1 F1).
+
+    So every read-modify-write path raises this rather than guessing, and
+    aborts its write. A skipped write loses one exchange's memory; a
+    completed one loses the conversation's.
+    """
+
+    def __init__(self, path: Path, cause: Exception) -> None:
+        super().__init__(f"{path}: {type(cause).__name__}: {cause}")
+        self.path = Path(path)
+        self.cause = cause
+
+
+def read_json_strict(path: Path, default: Any = None) -> Any:
+    """Read JSON, raising StoreUnreadable rather than inventing a value.
+
+    Returns `default` for an absent file — that case is by design and must
+    stay that way, or every new conversation breaks on its first turn.
+    Raises StoreUnreadable for the two live failure modes: a corrupt or
+    truncated file (JSONDecodeError, what a torn write leaves behind) and
+    an OSError from open/read (MooseFS's characteristic
+    metadata-fine/chunk-unavailable shape).
+
+    Note that path.is_file() is NOT a third failure mode to defend against:
+    pathlib swallows only ENOENT/ENOTDIR/EBADF/ELOOP and re-raises
+    everything else, so an EIO on the stat already reaches the caller
+    (REMEDIATION.md §1.4 — both v3.1 reviews got this wrong).
+
+    This is the loader behind facts, the archive sidecar, summary state and
+    personas. Callers on the request path already treat a raising load as
+    "inject nothing this turn" and keep serving.
     """
     if not path.is_file():
         return default
@@ -266,7 +307,21 @@ def read_json(path: Path, default: Any = None) -> Any:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        logger.warning(f"corrupted or unreadable {path}: {e}; returning default")
+        raise StoreUnreadable(path, e) from e
+
+
+def read_json(path: Path, default: Any = None) -> Any:
+    """Convenience read with default-on-missing. Returns the default if
+    the file doesn't exist OR if it's corrupted (logs warning on corrupt).
+
+    Best-effort only. If you are going to write back what you read, you
+    want read_json_strict — this function cannot tell you which of the two
+    it just handed you (v3.1 F1).
+    """
+    try:
+        return read_json_strict(path, default)
+    except StoreUnreadable as e:
+        logger.warning(f"corrupted or unreadable {e}; returning default")
         return default
 
 

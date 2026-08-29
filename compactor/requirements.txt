@@ -22,6 +22,15 @@ fastapi==0.138.2
 uvicorn[standard]==0.49.0
 httpx==0.28.1
 transformers==5.12.1
+# REQUIRED for tokenizer.apply_chat_template — an OPTIONAL transformers dep that
+# only chat templating needs, so "tokenizer-only" installs silently omit it.
+# Without it main.py:296 raises, count_tokens falls to `encode(text) + 4` per
+# message, and every token count in the system loses its chat-template framing
+# (~22 tokens/message on Mistral). Undetectable until a long conversation
+# overflows the context window: observed 2026-08-27 as repeated vLLM 400s on a
+# ~200-message conversation with a ~5,250-token undercount. See REMEDIATION.md.
+# NOT SUFFICIENT ALONE — the served model must also carry a chat_template.
+jinja2==3.1.6
 
 # --- V2.0 Phase 3: episodic memory ---
 # chromadb runs EMBEDDED (in-process, sqlite-backed) — we do NOT run the
@@ -31,3 +40,23 @@ transformers==5.12.1
 # published. Recorded as known/accepted in CHANGELOG [3.0].
 chromadb==1.5.9
 fastembed==0.8.0           # BAAI/bge-small-en-v1.5 embeddings via ONNX (no torch)
+
+# --- v3.1.1: an ACCURATE local token count (compactor/tokens.py) ---
+# The tokenizer vLLM itself uses. Before this, a /tokenize outage dropped the
+# budget straight to a transformers-converted tekken vocabulary that reads
+# 23-51% low on this model's assistant content -- which is what took compaction
+# down on 2026-08-29 and cost the user 80+ turns of context per message.
+#
+# Measured cost on the v3.0.5 image: +82 MB to this venv (382 -> 464 MB, ~0.4%
+# of the 20 GB image), 0.59s import, +70 MB RSS, NO torch. It pulls pycountry
+# (23 MB of ISO tables, incidental) and tiktoken, and it moves numpy
+# 2.5.1 -> 2.3.5 -- verified that chromadb 1.5.9 and fastembed still import
+# cleanly on that version before pinning it here.
+#
+# PINNED, and note the hazard: vLLM declares mistral_common[image]>=1.10.0 with
+# NO upper bound, so its resolved version drifts independently of this pin and
+# nothing enforces agreement. That is why tokens.check_divergence exists --
+# a local tokenizer that silently disagrees with the enforcing server is the
+# 2026-08-28 bug wearing a better disguise. Bump this deliberately, and check
+# what vLLM resolved when you do.
+mistral_common==1.11.7

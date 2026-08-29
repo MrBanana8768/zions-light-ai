@@ -50,9 +50,10 @@ from typing import Any
 
 from memory import (
     STORAGE_ROOT,
+    StoreUnreadable,
     atomic_write_json,
     persona_path,
-    read_json,
+    read_json_strict,
 )
 
 logger = logging.getLogger("compactor.persona")
@@ -84,8 +85,15 @@ def _hash(text: str) -> str:
 
 
 def load_persona(conv_id: str) -> dict | None:
-    """Return the persona record for a conv, or None if not set."""
-    data = read_json(persona_path(conv_id), default=None)
+    """Return the persona record for a conv, or None if not set.
+
+    Raises memory.StoreUnreadable if the file IS there and could not be
+    read. None meant both, and auto_capture_persona reads this before it
+    saves — on the request path, before vLLM is even called — so one
+    misread replaced a stored persona with whatever the client happened to
+    send that turn (v3.1 F1c).
+    """
+    data = read_json_strict(persona_path(conv_id), default=None)
     if not isinstance(data, dict):
         return None
     text = data.get("persona_text")
@@ -159,7 +167,22 @@ def list_personas() -> list[dict]:
         if "." in f.stem:
             continue  # skip future sidecars
         conv_id = f.stem
-        rec = load_persona(conv_id)
+        try:
+            rec = load_persona(conv_id)
+        except StoreUnreadable as e:
+            # Listing is read-only, so this is safe to continue past — but
+            # it is reported, not dropped. A persona that silently vanishes
+            # from the library view is exactly how an unreadable file gets
+            # mistaken for an absent one (v3.1 F1c / P0-2b).
+            logger.warning(f"conv={conv_id}: persona unreadable in listing: {e}")
+            out.append({
+                "conv_id": conv_id,
+                "length": None,
+                "set_at": 0,
+                "source": "unreadable",
+                "hash": None,
+            })
+            continue
         if not rec:
             continue
         out.append({
@@ -247,7 +270,9 @@ def text_to_inject(conv_id: str, messages: list[dict]) -> str | None:
     return rec["persona_text"]
 
 
-def auto_capture_persona(conv_id: str, messages: list[dict]) -> dict | None:
+def auto_capture_persona(
+    conv_id: str, messages: list[dict], *, override_managed: bool = False
+) -> dict | None:
     """If messages contain an unrecognized long system prompt, save it
     as the conv's persona. Returns the saved record, or None if there's
     nothing to capture (no persona-like message, or it matches what's
@@ -255,6 +280,16 @@ def auto_capture_persona(conv_id: str, messages: list[dict]) -> dict | None:
 
     Called per-request on the chat handler hot path — must be cheap.
     Idempotent: matching hash → no-op.
+
+    A record whose source is "admin" or "inherited" was set deliberately by
+    the owner and is NOT replaced from the request payload; pass
+    override_managed=True (admin tooling only) to force it. Auto-capture
+    firing on every turn meant any client that sent a different system
+    prompt once — a front end injecting its own preamble, say — quietly
+    demoted a hand-written persona to whatever it sent (v3.1 F1c, change 6).
+
+    Raises memory.StoreUnreadable if the existing record can't be read, so
+    the save is skipped rather than made blind.
     """
     if not _ENABLED:
         return None
@@ -265,6 +300,16 @@ def auto_capture_persona(conv_id: str, messages: list[dict]) -> dict | None:
     new_hash = _hash(candidate)
     if existing and existing.get("hash") == new_hash:
         # Same persona as before — no-op.
+        return None
+    if (
+        existing
+        and not override_managed
+        and existing.get("source") in ("admin", "inherited")
+    ):
+        logger.info(
+            f"conv={conv_id}: auto-capture declined — persona is "
+            f"source={existing['source']}, not replacing it from the request"
+        )
         return None
     return save_persona(conv_id, candidate, source="auto")
 

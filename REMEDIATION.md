@@ -20,8 +20,11 @@ Four passes, in order:
 2. **Two follow-up review passes** on the incident report itself. Each found live data-destruction paths the report had missed. That is the reason for pass four.
 3. **Two independent full-codebase reviews** — one on correctness and data integrity, one on operational resilience — run without sight of each other.
 4. **A reconciliation pass** that re-checked every `file:line` claim from both reviews against the tree, adjudicated their conflicts, killed eight load-bearing claims that were wrong, and added three findings neither reviewer produced.
+5. **A second production incident, 2026-08-28**, after this document was already written. The token counter read 23% low on a live payload and 34–51% low on assistant content; the hard budget guard shed 60 of 65 turns and returned HTTP 200. Written up in [`INCIDENT_2026-08-28.md`](INCIDENT_2026-08-28.md). It produced **P0-0c**, **P0-0d**, **P0-0e**, and a correction to P0-0's stated root cause.
 
-**`INCIDENT_2026-08-24.md` is the background. This document is the action list.** You do not need to read the incident report to implement this. Read it if you want to understand why the tone here is what it is.
+**`INCIDENT_2026-08-24.md` and `INCIDENT_2026-08-28.md` are the background. This document is the action list.** You do not need to read either report to implement this. Read them if you want to understand why the tone here is what it is.
+
+**A note on pass 5, because it bears on how to read the rest.** P0-0 was written confidently, three days before the outage, and was *partly wrong* — right that the counter was broken, wrong about why, wrong about how the error scaled. A correct-sounding root cause cost hours during a live incident. Treat every diagnosis in this document as a hypothesis with a `file:line` attached, and check the line.
 
 ### What this supersedes
 
@@ -114,6 +117,165 @@ Ships in v3.1 like everything else, but these are the first commits, they are ne
 
 ---
 
+#### P0-0 · F60 — The accurate token counter has never run in production
+**S1.** `compactor/requirements.txt`, `main.py:296-302`, `main.py:131`
+
+**Found 2026-08-27, in production, three days after the incident.** Not from review — from a user hitting repeated vLLM 400s.
+
+`count_tokens` (`main.py:289`) has three tiers. Tier 1 applies the model's chat template and is exact. Tier 2 catches any exception and falls back to `len(tok.encode(text)) + 4` per message. Tier 3 is `char/4`. **Tier 1 has never executed.** Two independent causes, either sufficient alone, both silent:
+
+1. **jinja2 was not installed.** `apply_chat_template` renders a Jinja template; jinja2 is an *optional* transformers dependency. `compactor/requirements.txt` pinned `transformers==5.12.1` with the comment *"transformers is used tokenizer-only… Keeps the compactor venv lean."* That decision — correct in its own terms, isolating the compactor from vLLM's torch pins — removed chat templating without anything saying so. So tier 1 could not work for **any** model, ever.
+2. **The served model carries no chat template.** `coder3101/Cydonia-24B-v4.3-vision-heretic` has no `chat_template.jinja` — confirmed by a `.no_exist/` marker in the HF cache. The text-only variant it replaced *does* have one. `apply_chat_template` raises `ValueError: tokenizer.chat_template is not set` before jinja2 is reached, so cause 2 masked cause 1 during diagnosis. The tokenizer loads as `TokenizersBackend` converted from `tekken.json` — Mistral's native format — so vLLM is applying its template through mistral-common, entirely outside HF's `chat_template` attribute.
+
+**Consequence.** Every token count the system has ever produced omits chat-template framing — roughly **22 tokens per message** on Mistral, scaling with *message count*. Observed live: a ~200-message conversation counted ~5,250 tokens light against a 32,768 window, producing repeated 400s.
+
+> **CORRECTED 2026-08-28 — framing is the minor term.** The paragraph above was written before the outage in [INCIDENT_2026-08-28.md](INCIDENT_2026-08-28.md) and its scaling law is **backwards for the case that actually took production down**. Framing overhead is real, but it cannot produce the errors since measured:
+>
+> ```
+> live payload:      local=122106  vLLM=150050   scale=1.23x
+> one decorative rule: local=15      vLLM=809      scale=53.93x
+> ```
+>
+> The dominant term is **vocabulary mismatch on content**. The HF-converted `tekken.json` prices box-drawing characters and emoji far below `mistral_common`, which is what vLLM actually charges. Measured per role: system reads high, user reads ~9% high, **assistant reads 34–51% low**. One assistant reply held 1,710 × U+2501 and 441 × U+2500 — about **4,275 tokens, 13% of the window, in decoration**.
+>
+> So the error scales with **content**, not message count, and it is worst on exactly what the model generates. An implementer optimising for per-message framing would have fixed nothing. Both terms are real; only one caused the outage.
+>
+> **Neither is worth estimating.** See **P0-0c** — the fix is to stop estimating.
+
+**Why it is S1 and not S2.** It is the input to every budget decision in the system: the hard-budget guard, the compaction trigger, and the shedding arithmetic all consume this number. The v3.0.5 calibration loop exists to correct it and cannot — see P0-0b.
+
+**Fixed in this commit:** `jinja2==3.1.6` added to `compactor/requirements.txt`, and a `RUN` guard added to the `Dockerfile` that fails the build if it is absent. **Necessary, not sufficient** — cause 2 remains open.
+
+**Still to do.**
+- Supply a chat template for the vision model. The sibling `Cydonia-24B-v4.3-heretic-v4` snapshot carries one at `/data/models/hub/models--coder3101--Cydonia-24B-v4.3-heretic-v4/snapshots/*/chat_template.jinja`; both are v4.3, so it is very likely correct — **verify against vLLM's `/tokenize` endpoint before trusting it.** Vendor it into the repo and pass it explicitly as `chat_template=`; do not depend on a sibling model staying in the cache.
+- **Log the tier-2 fallback.** `main.py:298` is a bare `except Exception:` with no log statement. Tier 3 at least warns (`main.py:131`). The tier that actually ran says nothing — a total loss of accuracy presenting as normal operation, in the component whose only job is to know how big things are. Log once per process at WARNING with the exception type.
+- **Assert tier 1 in the boot self-test** against the real `MODEL_REPO`, not just at build time. A build guard cannot see the served model.
+- Consider `/tokenize` on the vLLM server as ground truth for calibration. It is the exact number the budget guard is trying to estimate, and the calibration loop has been groping toward it by absorbing 400s.
+
+**Verify.** On the pod, after deploying:
+```bash
+/opt/compactor-venv/bin/python -c "
+import os; from transformers import AutoTokenizer
+t=AutoTokenizer.from_pretrained(os.environ['MODEL_REPO'])
+m=[{'role':'user','content':'hi'},{'role':'assistant','content':'hello'}]
+print(len(t.encode(t.apply_chat_template(m, tokenize=False, add_generation_prompt=True))))"
+```
+Must print a number. A `ValueError` or `ImportError` means tier 1 is still dead.
+
+**Interim mitigation in force:** `COMPACTOR_GENERATION_RESERVE=8192` (from 2048), dropping `HARD_INPUT_LIMIT` to 24,576. Costs ~6k of usable window and buys headroom the counter cannot currently provide. **Revert to 2048 only after tier 1 is verified working on the pod.**
+
+---
+
+#### P0-0b · C4 — The calibration loop cannot converge, observed live
+**S2.** `main.py:217-221`
+
+`overshoot = actual - HARD_INPUT_LIMIT` measures against the *original* limit, not the already-tightened one (`main.py:711` applies `limit - _BUDGET_MARGIN`). So the computed overshoot understates the true undercount by exactly `_BUDGET_MARGIN`, and the `if new_margin > _BUDGET_MARGIN` guard then refuses to advance unless the undercount roughly doubles.
+
+Observed on 2026-08-27 across three consecutive failures on one conversation:
+
+| Time | vLLM counted | Margin set |
+|---|---|---|
+| 05:53:46 | 32,836 | 2,628 |
+| 05:54:20 | 32,963 | 2,755 |
+| 06:00:30 | 33,090 | 2,882 |
+
+The margin advanced by exactly 127 each time — the conversation's own growth per turn — while the payload never shrank. It needed ~5,250 and was crawling there at 127/failure, i.e. **~19 more broken messages** for the user. It is a loop, not a retry.
+
+**Fix.** `overshoot = actual - (HARD_INPUT_LIMIT - _BUDGET_MARGIN)`. Rewrite `test_modality.py:261-268` first — it currently asserts the defective behaviour as correct, so the code change will fail a green test until the test is fixed.
+
+**Also.** `_BUDGET_MARGIN` is a module global (`main.py:194`), so every learned correction is lost on restart. Confirmed live: a pod recreate mid-diagnosis reset it to 0 and the climb started over. Persist it per conversation, or accept that the first long conversation after every restart eats a 400 — and say so in the log if so.
+
+**Ordering: P0-0 before P0-0b.** Fixing the arithmetic while the counter is blind only makes a wrong number converge faster.
+
+> **SUPERSEDED IN PART 2026-08-28.** With P0-0c shipped, the guard measures the payload exactly rather than estimating it, so there is nothing left for the loop to calibrate *away*. Fix the arithmetic anyway — the loop is still the fallback path when `/tokenize` is unreachable — but treat `_BUDGET_MARGIN` as a degraded-mode mechanism, not the primary one, and demote its severity accordingly.
+
+---
+
+#### P0-0c · Budget against measured tokens, not estimated ones
+**S1.** `main.py` (`count_tokens_exact`, `_enforce_hard_budget`, `_chunk_to_budget`)
+
+**Root cause of [INCIDENT_2026-08-28.md](INCIDENT_2026-08-28.md). Shipped as a production hotfix; on `fix/v3.1-remediation`.**
+
+The compactor decided what the user would be allowed to say to the model using an *estimate* of a quantity the enforcing server computes exactly, on request, over localhost, in single-digit milliseconds. `/tokenize` was running the whole time.
+
+The rule, stated generally because it outlives this bug:
+
+> **A component that budgets against a limit must verify its arithmetic against the authority that enforces that limit.**
+
+Three properties made the violation undetectable, and all three recur elsewhere in this codebase:
+
+1. **Shared oracle.** Guard, compaction trigger, and summarizer all called `count_tokens`. Disagreement would have been a signal; agreement was worth nothing, and agreement is what monitoring saw.
+2. **Content-tracking error.** Worst on long decorated assistant replies, so it looked like "long conversations are hard."
+3. **Fluent degradation.** Every fallback downstream was graceful. Composed, they produced a system that lied — see **P0-0d**.
+
+**Shipped.** `count_tokens_exact(messages)` posts to `{VLLM_URL}/tokenize`, short connect timeout, once-per-process warning, returns `None` rather than raising. Wired into the guard (real payload + derived `scale` for per-message arithmetic), the guard's verify step (re-measure, do not trust the scaled estimate), and the summarizer (measure before `_chunk_to_budget`).
+
+Verified against the live conversation:
+
+```
+guard:       150050 -> 15155  (limit 16384)  FITS
+summarizer:  NEW (measured)  5 batches, largest=29909  FITS
+             OLD (scale 1.0) 4 batches, largest=36280  OVERFLOWS -> 400
+```
+
+**The summarizer half is the decisive one.** The guard was the visible symptom; it only ever ran on the full conversation because summarization was failing first.
+
+**Still to do.**
+- **A test that would have caught this.** Budget a known payload, assert the local count matches `/tokenize` within a stated tolerance — **against tokenizer-hostile content** (box-drawing, emoji, CJK), not prose. Prose is where the two tokenizers agree; a test written on prose passes and proves nothing.
+- **Fail loudly when `/tokenize` is unreachable at boot.** Today it degrades to the estimate silently after one warning. The self-test should assert the endpoint answers, so "we are flying on the estimate" is a startup fact rather than a log line from three days ago.
+- **Cache per-message counts.** One `/tokenize` per request is cheap; per-message is not. The `scale` factor exists to avoid that and is an approximation — bound it, and re-measure exactly at the verify step (already done).
+- **Re-run every budget test on the v3.1 image, not the v3.0.5 one.** Flagged by the Phase-1 gate and it is the sharpest caveat on this branch: `v3.0.5-cu12` has **no jinja2**, so every budget test run to date exercised the `encode()+4` fallback. P0-0 adds jinja2 and a build guard, so **the v3.1 image will have a different token counter than anything yet tested against.** The gate's 220-case regression corpus came back byte-identical baseline-vs-tree, which is a valid *comparison* — same oracle both sides — but says nothing about absolute budget correctness. Re-run it once the image exists. **This is a release gate, not a nice-to-have.**
+
+**Do not touch `GENERATION_RESERVE` on the strength of the guard table.** That table measures *input*; the reserve exists for *output*. This user's assistant replies measure **7,513–11,347 tokens**, so the 2,048 the table appears to recommend would truncate nearly every reply mid-sentence — trading a context bug for a worse one. Keep **16,384**, or 12,288 if headroom is genuinely needed. *A headroom parameter cannot be tuned from a table that does not contain the thing it reserves for.*
+
+---
+
+#### P0-0d · Fluent degradation — three fallbacks that cannot say they fired
+**S1.** `main.py` (`_enforce_hard_budget`, compaction failure path), `summarizer.py`
+
+Ranked S1 because this is what converted a loud, immediately-diagnosable 400 into a silent week-long context collapse. The counter bug was the cause; **this is why nobody found out.**
+
+Three paths, one shape:
+
+| Path | What it does on failure | What the user sees |
+|---|---|---|
+| `_enforce_hard_budget` | sheds oldest turns until the payload fits | HTTP 200, fluent reply, **4 of 65 messages** |
+| compaction on summarizer 400 | forwards the original messages | nothing — and the full conversation now hits the guard on *every* request |
+| `count_tokens` tier fallback | silently drops to a worse estimator | one WARNING, once per process (P0-0) |
+
+**Fix.**
+- **Guard shedding is an ERROR when it discards conversational turns**, not a WARNING, and the message must state the ratio — `kept=4 of 65` — not just the token totals. A log line that reports only tokens reads like successful housekeeping. This is already partly done on `fix/v3.1-remediation`; finish it and check the phrasing.
+- **Compaction failure must be visible in the response**, not only in a log. `FRONTEND_SPEC.md` §15 already lists the budget-shed signal as **required**; this is the compactor half of the same obligation (§2.7). The spec's `context_shed` notice deliberately distinguishes *discarded* from *compressed* — honour that distinction in the signal.
+- **Emit the ratio in the per-request log line** unconditionally, so the healthy case is legible and the unhealthy case is a diff rather than an inference.
+
+**The general rule:** *a fallback that cannot signal that it fired is not a fallback; it is a cover-up.*
+
+---
+
+#### P0-0e · Deploy hygiene — a patch must be verified against the commit it lands on
+**S2.** CI, `OPERATIONS.md`
+
+Problem B of [INCIDENT_2026-08-28.md](INCIDENT_2026-08-28.md). The hotfix failed on start:
+
+```
+ImportError: cannot import name 'StoreUnreadable' from 'memory'
+```
+
+A single `main.py` was lifted from `fix/v3.1-remediation` and dropped onto a pod running v3.0.5. The symbol exists only in the branch's `memory.py`; the dependency did not travel with the file. Production stayed degraded through the rollback.
+
+**The same class of error recurred five times this week** — a symbol referenced but not imported, or not present in the module it landed in (`memory.StoreUnreadable`, `assert_in`, an unimported `StoreUnreadable` in `commands.py`, and two variants). Every one dies on import.
+
+**Fix — two lines and a rule.**
+
+1. **Import smoke test in CI and in the pre-deploy path.** `selftest.py` runs *inside* an already-working process, so by construction it cannot catch a module that fails to import at all. Nothing currently covers this.
+   ```bash
+   python -c "import compactor.main, compactor.memory, compactor.commands"
+   ```
+2. **Build hot patches from the deployed tag**, in a worktree, changing only what the fix requires — never by copying a file out of a feature branch. Record this in `OPERATIONS.md` beside the standing "production runs tagged images" rule, since the hot-patch path is exactly where that rule gets relaxed and therefore exactly where it needs written guidance.
+3. **Staged files must be named `.py`.** `spec_from_file_location` returned `None` on `main.py.new` and produced `AttributeError: 'NoneType' object has no attribute 'loader'` — a confusing second failure on top of the first.
+
+---
+
 #### P0-1 · F13(a) — There is no outbound failure signal of any kind
 **S2.** `runpod.env.template:130`, `alert.py:35`, `health.py:230`, `supervisord.conf:163,199-201`, `backup.py:336,361`
 
@@ -148,6 +310,75 @@ Ships in v3.1 like everything else, but these are the first commits, they are ne
 **Verify.** `tail -f /var/log/supervisor/compactor.log` during one chat request shows `conv_id=… source=… msgs=…`.
 
 **Estimate.** 5 min. **Depends on:** nothing.
+
+---
+
+#### P0-2b · F61 — Log sweep: silent exception handlers, and a health check that cannot see the corruption it exists to catch
+**S2.** Whole compactor package. Inventory taken 2026-08-27.
+
+Every failure this project has spent a week diagnosing had the same shape: **a degraded mode indistinguishable from a healthy one.** P0-0 is the extreme case — the token counter lost its accuracy for months behind a bare `except Exception:` with no log statement. It is not one bad handler, it is a pattern, so this item sweeps them all rather than fixing them one incident at a time.
+
+**Method.** For every `except` block in `compactor/*.py` excluding tests, check whether its body contains a `logger.` call, a `raise`, an alert, or a `print()` to stderr. They fall into three classes and only the first needs code changes.
+
+**The count is a moving target — re-run it, do not quote it.**
+
+| Commit | Silent handlers | Note |
+|---|---|---|
+| `f106305` | 46 | the original inventory, 2026-08-27 |
+| `0a169b8` | **23** | half of them closed as a side effect of the V2–V8 destructive-path work |
+| `0a169b8` + Phase-1 working tree | **25** | two new handlers, both reviewed and defensible: one returns to a caller that surfaces, one is a per-row skip |
+
+*A note on the original figure, so nobody re-derives it:* an ad-hoc scan reported 47 because it did not treat `print()` as reporting. The one handler separating 47 from 46 is `backup.py:488`, the CLI restore entry point, which prints to stderr and returns 1 — that is surfacing the failure, so 46 was correct at `f106305`.
+
+*And a note on the drop:* 46 → 23 is real, not a change in method — the same script, run at both commits. It happened because fixing the destructive paths meant giving their handlers something to say. **This is the shape to expect: the sweep is a symptom counter, not a work queue.** Re-run `log-sweep.py --count` before planning against it; the remaining handlers are the ones no other item happened to touch, which makes them harder, not easier.
+
+**Class A — the failure vanishes. Fix these.**
+
+| File:line | Handler returns | What is lost |
+|---|---|---|
+| `main.py:298` | per-message `encode()+4` | **P0-0.** Total loss of token-counting accuracy. Already tracked |
+| `health.py:134` | `pass` | **The most important one here.** `/health/full` sums `load_facts(cid)` across conversations. An unreadable facts file — the exact F1/D33 scenario — is silently skipped, so `facts_total` simply reads lower while `status` stays `"ok"`. **The health endpoint cannot detect the corruption that would destroy memory.** It is the monitoring blind spot that pairs with the S1 |
+| `health.py:138` | `pass` | Same, for `conversation_doc_count` |
+| `health.py:146` | `pass` | Same, for summary state — a conversation with an unreadable summary file just stops being counted |
+| `retrieval.py:257` | `return 0` | ChromaDB unavailable is **indistinguishable from "no exchanges indexed"**. Compounds `health.py:138`: a dead vector store reports as an empty one |
+| `main.py:1669,1676,1681,1691` | `None` / empty dict | `/admin/conversations/{id}` reports `facts.count = None` and `episodic = None` on any read error. Reads as "this conversation has no memory" to anyone inspecting it — including during an incident |
+| `bgwork.py:62` | `pass` | A background task dying leaves no trace |
+| `commands.py:196,201` | `pass` | Slash-command side effects failing silently |
+| `main.py:830` | bare `return` | Async tail aborting with no record |
+| `main.py:1570` | `pass` | — |
+| `backup.py:370` | `pass` | `_alert_failure` swallowing its own failure. **The alert about a failure can fail silently.** Combined with P0-1 (no webhook configured at all), alerting is silent twice over |
+| `degrade.py:68` | `float("inf")` | Documented fail-open, and correct — but a permanently broken `disk_usage` makes the disk-pressure guard pass forever with nothing said. Log once per process, do not change the behaviour |
+| `backup.py:100` | `float("inf")` | Same shape, on the backup staleness check |
+
+**Class B — legitimate cleanup, leave the behaviour, add a DEBUG line.** `memory.py:247` (directory `fsync` after a successful write), `memory.py:254` (orphan temp-file cleanup that deliberately does not shadow the original `raise`), `backup.py:332,357` (deleting an unverifiable archive — the real error *is* logged and alerted), `selftest.py:197,225,334,480` (post-test cleanup, though see D10: this is one source of store pollution).
+
+**Class C — no change. The error is already propagated by return value** and surfaces to a caller: `selftest.py:123,133,189,276` return `(False, detail)`; `health.py:72,111,184,191,206` return error dicts that appear in `/health/full`; `backup.py:227,235,252,263` return `(False, msg)` from the verify path.
+
+**The rule to adopt, and to enforce in review.** A handler may swallow an exception only if it does exactly one of: logs it, re-raises it, or returns it to a caller that surfaces it. **"Returns a plausible-looking default" is none of those three.** That single rule is what P0-0 violated for months, and what `health.py:134` violates today in the one endpoint whose purpose is to notice.
+
+**Also worth fixing while in here.** Class-A handlers that fire on every request should log **once per process**, not per call, or the fix becomes its own denial of service. A module-level `_warned: set[str]` keyed by call site is enough.
+
+**Concrete change.** ~13 handlers in Class A get a `logger.warning` with the exception type and enough context to identify the conversation; ~8 in Class B get `logger.debug`. No control flow changes anywhere except `retrieval.py:257`, which must distinguish "unavailable" from "zero" — return `None` and let callers render it as `unknown` rather than `0`.
+
+**Verify.**
+```bash
+# 1. No Class-A handler is silent any more. Re-run the sweep; expect only Class B/C.
+python3 log-sweep.py                 # full listing, triage by hand
+python3 log-sweep.py --count         # re-run; 46 at f106305, 23 at 0a169b8 (see the table above)
+
+# 2. The health endpoint reports corruption instead of hiding it:
+mv /data/openwebui/compactor/facts/<some_conv>.json{,.bak}
+printf 'not json' > /data/openwebui/compactor/facts/<some_conv>.json
+curl -s localhost:8080/health/full | grep -iE 'status|unreadable|error'
+#    expect: a non-ok status or an explicit unreadable count — NOT a silently smaller facts_total
+mv /data/openwebui/compactor/facts/<some_conv>.json{.bak,}
+
+# 3. A dead vector store is distinguishable from an empty one:
+curl -s localhost:8080/admin/conversations/<conv> | grep episodic
+#    expect: null/"unknown" when Chroma is down, 0 only when genuinely empty
+```
+
+**Depends on:** nothing. **Blocks:** nothing. Do it in one sitting alongside P0-1 — the alert webhook is useless if the code never says anything worth alerting about.
 
 ---
 
@@ -495,13 +726,26 @@ Ship if the release is not already late. Roughly **10 h**.
 
 ---
 
+#### P1b-M · Two mutations that survived the Phase-1 gate
+**S3.** `retrieval.py:224`, `main.py:2073`
+
+Recorded because they are the honest residue of a gate that otherwise came back green (26/26, 19 mutations applied, 16 killed). A surviving mutation is not a bug — it is a line no test defends, which is exactly what this project keeps getting hurt by.
+
+1. **`_id_exists` fails open, untested.** Mutating `return False` → `return True` in the probe's exception handler **survives the entire suite.** The code is right: a failed probe should fall through to embed-and-upsert rather than skip the write. The mutant inverts that, so a broken probe makes `index_exchange` return `True` having stored nothing — silent loss presenting as success, which is this branch's whole failure class. **Fix:** one test that breaks the probe and asserts the document is still written. **30 min.**
+
+2. **`enforced_limit` capture, untested.** Mutating away `- _BUDGET_MARGIN` at `main.py:2073` survives. Harmless in scope — the value feeds only the rejection log, while enforcement uses `effective_limit` — but the stated reason for capturing rather than recomputing has nothing holding it. **Fix:** assert the logged limit matches the enforced one. **15 min.**
+
+**Estimate.** 45 min. **Depends on:** nothing.
+
+---
+
 ### Phase 2 — Deferred
 
 Not in v3.1. Each has a stated gate.
 
 | Id | Item | Why deferred | Gate |
 |---|---|---|---|
-| **D1** | Content-addressed episodic document ids. `turn_index = len(messages)+1` (`main.py:1202`) is used as the ChromaDB id via `_doc_id` (`retrieval.py:144`) and written with `upsert` (`:166`). A client sending a bounded window **pins the id and every exchange overwrites the last** — confirmed: phantom conv `31365d633335bbd0` has 105 facts and **one** episodic row. The accepted fix is content-addressed ids, **not** a per-request counter: `turn_index`, `added_turn` and `recent_cutoff` are message-units and a counter would be exchange-units. | It is the root of F14, F26, D21, D22 and the full F15 fix. It is a schema change to a live store and needs a migration, so it wants its own release. | Schedule immediately after v3.1 ships. **Nothing that makes `conv_id` more stable may land before it** — see §4. |
+| **D1** | Content-addressed episodic document ids. `turn_index = len(messages)+1` (`main.py:1202`) is used as the ChromaDB id via `_doc_id` (`retrieval.py:144`) and written with `upsert` (`:166`). A client sending a bounded window **pins the id and every exchange overwrites the last** — confirmed: phantom conv `<phantom-conv>` has 105 facts and **one** episodic row. The accepted fix is content-addressed ids, **not** a per-request counter: `turn_index`, `added_turn` and `recent_cutoff` are message-units and a counter would be exchange-units. | It is the root of F14, F26, D21, D22 and the full F15 fix. It is a schema change to a live store and needs a migration, so it wants its own release. | Schedule immediately after v3.1 ships. **Nothing that makes `conv_id` more stable may land before it** — see §4. |
 | **F5** | Import guard fails open; export hides its own failures *(AG3)*. `portability.py:58-90,116-121,147-169,224`. `pre_existing` is built from three best-effort reads that each return empty on failure — `load_facts` (F1a), `conversation_doc_count` (F8), `load_state(...).get("l1")` (F1b) — so the refusal at `:152` never fires and `save_facts`/`save_state` overwrite wholesale anyway. `_validate_bundle` checks `facts` is a *list*, nothing about elements. `export_conversation` substitutes `[]`/`{}` per layer on failure and returns **HTTP 200**; `fork_conversation:224` runs the same export. *Correction: the claim that a fully-rolled-up conversation has `l1 == []` is overstated — `_do_l2_rollup` leaves 0-9 chunks, so that holds only at exact multiples of 10. The fail-open reads are the real defect.* | V2 and V4 remove two of the three fail-open reads, which defuses most of it. The remaining work (per-layer `{ok,error}`, 5xx on partial export, element validation) is best done alongside D1's schema change. The `conv_lock` half (D18) ships in V8. | After D1. |
 | **F14** | Summary turn indices are array positions, and the counter latches. `summarizer.py:187-190,223-241,300-314,391`. `last_summarized_turn` is durable state keyed on a position in whatever array the client sent; a deletion, edit, branch switch or windowed re-send shifts every subsequent index. If the history shrinks below `last_summarized_turn` (241 → 7), `_needs_l1_rollup` is false **forever** and L1 rollups stop permanently and silently. *Correction: the claim that `:314` advances the counter regardless of how many turns `_format_turns` produced is **killed** — `_needs_l1_rollup` guarantees `current_turn_count >= last + 20` and `_format_turns` walks the same non-system count.* | Shares D1's root. Interim mitigation is cheap and worth doing in V4's neighbourhood if it is free: reset `last_summarized_turn` when the observed history is shorter than it. | After D1. |
 | **F26 + D21** | `retrieve()` has no relevance floor (`retrieval.py:201-226`: `n_results=max(1,k)`, no distance threshold) and filters **after** `query()` (`:178-227`), so exclusions shrink the result set instead of backfilling. Up to 5 past exchanges are injected under a header asserting they are relevant. | Compounds with F15, which P0-3 fixes. Both want the D1 turn identity. | After D1. ~45 min once there. |
@@ -547,7 +791,13 @@ These are the traps that turn a fix into an incident. Each is stated as *X befor
 8. **V9 (store pollution) before V10's health-scan work is meaningful.**
    Because: F12 is O(conversations), and G2 currently guarantees that N grows monotonically forever. Caching an O(N) scan whose N is unbounded postpones the problem rather than fixing it.
 
-9. **F27 (`stopwaitsecs`) with F16's `drain(60)`, not before it.**
+9. **P0-0c (measure via `/tokenize`) before P0-0b (calibration arithmetic), and before any tuning of `GENERATION_RESERVE`.**
+   Because: the calibration loop exists only to grope toward a number `/tokenize` returns directly. Fix the measurement and the loop becomes a degraded-mode fallback rather than the primary path, which changes what "correct" means for its arithmetic. And per P0-0c's closing note, the guard table that appears to justify a smaller reserve measures *input* while the reserve exists for *output* — tuning it from that table truncates replies that measure 7,513–11,347 tokens.
+
+10. **P0-0e (import smoke test) before anything is hot-patched onto a running pod, in any circumstance.**
+   Because: it is two lines, it catches the class of error that has now cost a deployment five times, and the moment it matters most is exactly when nobody has time for it. `selftest.py` cannot substitute — it runs inside a process that has already imported successfully.
+
+11. **F27 (`stopwaitsecs`) with F16's `drain(60)`, not before it.**
    Because: raising the drain timeout without raising `stopwaitsecs` means supervisord `SIGKILL`s the process mid-drain — strictly worse than today. They are one change.
 
 ---

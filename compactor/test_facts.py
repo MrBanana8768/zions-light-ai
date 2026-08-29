@@ -59,12 +59,23 @@ def test_load_facts_missing_file_returns_empty():
     assert_eq(facts.load_facts("never-seen"), [], "missing file -> []")
 
 
-def test_load_facts_corrupted_file_returns_empty():
-    print("\n[test] load_facts returns [] for a corrupted JSON file")
+def test_load_facts_corrupted_file_raises():
+    print("\n[test] load_facts raises StoreUnreadable for a corrupted JSON file")
+    # This test asserted `corrupt file -> []` until v3.1. That was the F1a
+    # contract written down as a requirement: every caller that saves read
+    # the [] as "no facts here" and wrote it back over the real store. An
+    # unreadable file must be distinguishable from an absent one — the test
+    # above covers absent, which still returns [] and always will.
     _wipe_storage()
     facts_path = memory.facts_path("corrupt")
     facts_path.write_text("{ not valid json")
-    assert_eq(facts.load_facts("corrupt"), [], "corrupt file -> [] (logged, not raised)")
+    try:
+        got = facts.load_facts("corrupt")
+    except memory.StoreUnreadable:
+        print("  ok   corrupt file -> StoreUnreadable")
+        return
+    print(f"FAIL corrupt file must not read as a fact store, got {got!r}")
+    sys.exit(1)
 
 
 def test_save_load_roundtrip():
@@ -244,16 +255,191 @@ def test_parse_extraction_drops_too_short():
 
 
 # ---------------------------------------------------------------------------
+# v3.1 D5 — markdown scaffolding was being stored as memory
+#
+# All fixtures below are invented. Nothing here is drawn from any real
+# conversation, and nothing about the live store may be copied into this file.
+# The structural forms are what matters; the content is deliberately fictional.
+# ---------------------------------------------------------------------------
+
+# A horizontal rule of the same box-drawing character INCIDENT_2026-08-28
+# measured, at the length the live store holds one.
+_RULE = "━" * 62
+
+
+def test_markup_lines_are_not_stored_as_facts():
+    print("\n[test] the extraction parser refuses markup, keeps the fact")
+    raw = "\n".join([
+        "# EXTRACTED FACTS",
+        "## Current Status Report",
+        _RULE,
+        "-" * 20,
+        "***",
+        "```json",
+        '"follow_ups": [',
+        "{",
+        "\U0001F50B ENERGY LEVEL: 88% -> 92%",
+        "\U0001F4CA MORALE: 3/10 → 8/10",
+        "- Prefers stories written in past tense.",
+    ])
+    parsed = facts._parse_extraction_output(raw)
+    assert_eq(parsed, ["Prefers stories written in past tense."],
+              "only the real fact survives the structure filter")
+
+
+def test_each_markup_form_has_its_own_named_reason():
+    print("\n[test] _reject_reason names the structure it refused")
+    cases = [
+        (_RULE, "no alphanumeric content"),
+        ("|---|---|", "no alphanumeric content"),
+        ("```python", "code fence"),
+        ("~~~", "no alphanumeric content"),
+        ("### Summary", "markdown heading"),
+        ('"follow_ups": [', "json object key"),
+        ("follow_ups: [", "unclosed structure opener"),
+        ("\U0001F50B ENERGY LEVEL: 88% -> 92%", "status-dashboard line"),
+    ]
+    for text, expected in cases:
+        assert_eq(facts._reject_reason(text), expected, f"{text[:24]!r} refused")
+
+
+def test_the_filter_keeps_facts_that_only_look_like_markup():
+    print("\n[test] emoji, colons, caps and percentages do not disqualify a fact")
+    # Over-filtering destroys memory that exists nowhere else, so each of
+    # these is a shape the naive version of this rule would have eaten.
+    keepers = [
+        "She uses a \U0001F332 emoji as shorthand for the cabin.",
+        "Goal: finish the manuscript before October.",
+        "PTSD: diagnosed in 2019 by a clinician she trusts.",
+        "PTSD: symptoms improved 40% since 2019.",
+        "NASA is the employer she is aiming for.",
+        "STATUS: still deciding whether to move.",
+        "#1 priority is the roof repair.",
+        "Her rent went up 12% this year.",
+        "The password hint is 'blue door' — do not repeat it aloud.",
+        "彼女は日本語で書くのを好む。",
+        "Prefers the arrow style A -> B when sketching plot beats.",
+    ]
+    for text in keepers:
+        assert_true(facts.is_storable_fact(text), f"kept: {text[:40]!r}")
+    parsed = facts._parse_extraction_output(
+        "\n".join(f"- {t}" for t in keepers)
+    )
+    assert_eq(len(parsed), len(keepers), "all of them survive the parser too")
+
+
+def test_is_storable_fact_is_the_shared_public_predicate():
+    print("\n[test] is_storable_fact is exported for the other write paths")
+    assert_true(callable(facts.is_storable_fact), "public predicate exists")
+    assert_true(not facts.is_storable_fact(_RULE), "rule is not storable")
+    assert_true(not facts.is_storable_fact("   "), "blank is not storable")
+    assert_true(facts.is_storable_fact("Her cat is called Pepper."),
+                "a plain sentence is storable")
+
+
+def test_a_bulleted_heading_is_refused_on_the_heading():
+    print("\n[test] markup is judged after the bullet prefix is stripped")
+    parsed = facts._parse_extraction_output(
+        "- ## Current Status Report\n* ```json\n- She keeps bees."
+    )
+    assert_eq(parsed, ["She keeps bees."], "bulleting markup does not launder it")
+
+
+def test_refused_markup_is_logged_with_a_bounded_sample():
+    print("\n[test] the refusal is logged, named, and bounded")
+    # Five markup lines, each long enough to clear the parser's own
+    # six-character floor, so the filter is what refuses them.
+    raw = "\n".join([_RULE, "# ONE HEADING", "## TWO HEADING",
+                     "### THREE HEADING", "#### FOUR HEADING",
+                     "- A real fact about her garden."])
+    with patch.object(facts.logger, "info") as info:
+        parsed = facts._parse_extraction_output(raw, where="conv=synthetic")
+    assert_eq(parsed, ["A real fact about her garden."], "one fact kept")
+    msgs = [c[0][0] for c in info.call_args_list]
+    hits = [m for m in msgs if "markup" in m]
+    assert_eq(len(hits), 1, "exactly one refusal line")
+    assert_true("conv=synthetic" in hits[0], "the line names the conversation")
+    assert_true("5 line(s) of markup" in hits[0], "it counts what it refused")
+    assert_true("and 2 more" in hits[0], "the sample is bounded, not a dump")
+
+
+def test_the_store_never_receives_a_box_drawing_rule():
+    print("\n[test] end to end: a dashboard reply stores only the fact")
+    _wipe_storage()
+    cid = "d5-e2e"
+    client = _mock_client_returning(
+        "# EXTRACTED FACTS\n"
+        + _RULE + "\n"
+        "\U0001F50B ENERGY LEVEL: 88% -> 92%\n"
+        "- She is training for a half marathon in March.\n"
+    )
+    n = asyncio.run(facts.record_facts_for_exchange(
+        cid, client, "http://fake", "fake-model",
+        user_msg="What am I training for?",
+        assistant_msg="A half marathon.",
+        turn_index=7,
+    ))
+    assert_eq(n, 1, "one fact recorded, not four")
+    stored = [f["text"] for f in facts.load_facts(cid)]
+    assert_eq(stored, ["She is training for a half marathon in March."],
+              "only the fact is on disk")
+    assert_true(all("━" not in t for t in stored),
+                "no box-drawing character reached the store")
+
+
+def test_a_truncated_extraction_drops_its_incomplete_tail():
+    print("\n[test] finish_reason=length drops the half line it cut")
+    client = _mock_client_returning(
+        "- She grows tomatoes on the balcony.\n- She is allergic to peni",
+        finish_reason="length",
+    )
+    out = asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model", "u", "a", [], conv_id="trunc",
+    ))
+    assert_eq(out, ["She grows tomatoes on the balcony."],
+              "the complete line is kept, the cut one is not stored")
+
+
+def test_a_truncated_extraction_keeps_a_line_that_finished():
+    print("\n[test] a trailing newline means nothing was cut mid-line")
+    client = _mock_client_returning(
+        "- She grows tomatoes on the balcony.\n- She sings in a choir.\n",
+        finish_reason="length",
+    )
+    out = asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model", "u", "a", [], conv_id="trunc2",
+    ))
+    assert_eq(len(out), 2, "both complete lines survive")
+
+
+def test_an_untruncated_reply_loses_nothing():
+    print("\n[test] finish_reason=stop keeps the final line")
+    client = _mock_client_returning(
+        "- She grows tomatoes on the balcony.\n- She sings in a choir.",
+        finish_reason="stop",
+    )
+    out = asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model", "u", "a", [], conv_id="stop1",
+    ))
+    assert_eq(len(out), 2, "no tail dropped when the model finished")
+
+
+# ---------------------------------------------------------------------------
 # Extraction with mock vLLM client
 # ---------------------------------------------------------------------------
 
-def _mock_client_returning(content: str) -> MagicMock:
-    """Build a fake httpx.AsyncClient whose .post returns a canned response."""
+def _mock_client_returning(content: str, finish_reason: str | None = None) -> MagicMock:
+    """Build a fake httpx.AsyncClient whose .post returns a canned response.
+
+    `finish_reason` defaults to absent rather than "stop" so the common case
+    keeps exercising the `.get` path a real vLLM response may also take.
+    """
+    choice: dict = {"message": {"content": content}}
+    if finish_reason is not None:
+        choice["finish_reason"] = finish_reason
     mock_response = MagicMock()
     mock_response.raise_for_status = MagicMock()
-    mock_response.json = MagicMock(return_value={
-        "choices": [{"message": {"content": content}}]
-    })
+    mock_response.json = MagicMock(return_value={"choices": [choice]})
     client = MagicMock()
     client.post = AsyncMock(return_value=mock_response)
     return client
@@ -461,13 +647,361 @@ def test_archive_path_is_sidecar_not_facts_file():
 
 
 # ---------------------------------------------------------------------------
+# v3.1 F9 — "LRU" eviction was not LRU, and it deleted permanently
+# ---------------------------------------------------------------------------
+#
+# Two halves to the defect, so two halves to the coverage:
+#
+#   1. The request path loaded the whole store and touched the whole store,
+#      so last_used was the same second on every fact at all times. The sort
+#      key (last_used, added_turn) collapsed onto added_turn and eviction
+#      became "drop whatever was added earliest" — the conversation's
+#      foundational facts, every turn, past the token cap.
+#   2. Nothing calls archive_stale_facts automatically (admin endpoints
+#      only), so an eviction was an unlink with no cold-storage fallback.
+#
+# test_prune_facts_lru_eviction above still passes and always did; it
+# constructs the differentiated last_used values the live pipeline could
+# never produce. These tests drive the pipeline's own sequence instead.
+
+
+def _f(text, added_turn, last_used):
+    return {"text": text, "added_turn": added_turn, "last_used": last_used}
+
+
+def test_select_for_injection_is_the_whole_store_under_budget():
+    print("\n[test] select_for_injection returns everything when it fits")
+    items = [_f("x" * 100, i, 500) for i in range(3)]
+    selected = facts.select_for_injection(items, max_tokens=1000)
+    assert_eq(len(selected), 3, "all 3 selected")
+    assert_true(
+        all(a is b for a, b in zip(selected, items)),
+        "selection shares the caller's dicts (so touching it touches the store)",
+    )
+
+
+def test_turn_touches_only_the_injected_facts():
+    print("\n[test] a turn touches only the injected facts, not all 200")
+    _wipe_storage()
+    cid = "lru-200"
+    now = int(time.time())
+    stale = now - 10000
+    # The three the model has actually been using are the FOUNDATIONAL ones
+    # — added_turn 0-2, the ones the old sort key evicted first. Each fact is
+    # 100 chars ≈ 25 tokens, so a 75-token budget admits exactly three.
+    store = [_f("who she is " + "0" * 89, 0, now)]
+    store += [_f("where she lives " + "1" * 84, 1, now)]
+    store += [_f("what she wants " + "2" * 85, 2, now)]
+    store += [_f(f"passing detail {i:03d} " * 5, i, stale) for i in range(3, 200)]
+    assert_eq(len(store), 200, "prep: 200 facts")
+    facts.save_facts(cid, store)
+
+    # --- request path ---
+    on_disk = facts.load_facts(cid)
+    injected = facts.select_for_injection(on_disk, max_tokens=75)
+    assert_eq(len(injected), 3, "3 facts injected")
+    facts.touch_facts(injected, now=now + 500)
+    block = facts.format_facts_block(injected)
+    assert_true("who she is" in block, "the injected block carries the identity facts")
+
+    # The injected subset shares its dicts with the full list, so the touch
+    # lands in `on_disk` without touching the other 197. main.py's tail
+    # re-reads under the lock and carries these forward by text via
+    # _merge_touched, which only ever moves last_used forward — same result.
+    touched = [f for f in on_disk if f["last_used"] == now + 500]
+    untouched = [f for f in on_disk if f["last_used"] != now + 500]
+    assert_eq(len(touched), 3, "exactly 3 facts touched")
+    assert_eq(len(untouched), 197, "the other 197 keep their old last_used")
+    assert_true(
+        all(f["last_used"] == stale for f in untouched),
+        "untouched facts still carry the ORIGINAL last_used, not now",
+    )
+    assert_eq(
+        sorted(f["added_turn"] for f in touched), [0, 1, 2],
+        "the touched facts are the foundational ones the model is using",
+    )
+
+
+def test_eviction_archives_instead_of_deleting():
+    print("\n[test] over-budget eviction lands in the archive file, not /dev/null")
+    _wipe_storage()
+    cid = "lru-200"
+    now = int(time.time())
+    stale = now - 10000
+    store = [_f("who she is " + "0" * 89, 0, now)]
+    store += [_f("where she lives " + "1" * 84, 1, now)]
+    store += [_f("what she wants " + "2" * 85, 2, now)]
+    store += [_f(f"passing detail {i:03d} " * 5, i, stale) for i in range(3, 200)]
+    facts.save_facts(cid, store)
+
+    kept, dropped = facts.prune_facts(store, max_tokens=75, conv_id=cid)
+    facts.save_facts(cid, kept)
+    assert_eq(len(kept), 3, "3 facts survive the budget")
+    assert_eq(dropped, 197, "197 evicted")
+    assert_eq(
+        sorted(f["added_turn"] for f in kept), [0, 1, 2],
+        "recently-used foundational facts survive — NOT evicted as 'oldest'",
+    )
+
+    # Read the sidecar off disk, not through load_archive — the claim is
+    # that the facts are on the filesystem.
+    sidecar = memory.facts_archive_path(cid)
+    assert_true(sidecar.is_file(), "the archive sidecar exists after an eviction")
+    raw = json.loads(sidecar.read_text())
+    archived_texts = {f["text"] for f in raw["facts"]}
+    assert_eq(len(archived_texts), 197, "all 197 evicted facts are in the file")
+    evicted_texts = {f["text"] for f in store if f["added_turn"] >= 3}
+    assert_eq(archived_texts, evicted_texts, "the archive holds exactly the evicted set")
+    assert_true(
+        all(f["archived_at"] > 0 for f in raw["facts"]), "archived_at stamped"
+    )
+
+    # And they are recoverable the way the user would recover them.
+    restored = facts.restore_from_archive(cid, text_substring="passing detail 042")
+    assert_eq(restored, 1, "an evicted fact restores from cold storage")
+
+
+def test_eviction_without_conv_id_logs_the_texts():
+    print("\n[test] prune_facts with no conv_id warns and names what it dropped")
+    items = [_f("secret ingredient is nutmeg" + "y" * 70, 1, 100), _f("x" * 100, 2, 500)]
+    with patch.object(facts.logger, "warning") as warn:
+        kept, dropped = facts.prune_facts(items, max_tokens=25)
+    assert_eq(dropped, 1, "1 evicted")
+    assert_eq(len(kept), 1, "1 kept")
+    assert_true(warn.called, "the unarchivable eviction is logged at WARNING")
+    msg = warn.call_args[0][0]
+    assert_true("no archive to land in" in msg, "warning says why it could not archive")
+    assert_true("secret ingredient" in msg, "warning carries the dropped text verbatim")
+
+
+def test_eviction_keeps_facts_when_the_archive_write_fails():
+    print("\n[test] a failed archive write evicts NOTHING")
+    _wipe_storage()
+    cid = "archive-broken"
+    items = [_f("x" * 100, 1, 100), _f("y" * 100, 2, 500), _f("z" * 100, 3, 999)]
+    with patch.object(facts, "save_archive", side_effect=OSError("EIO")):
+        kept, dropped = facts.prune_facts(items, max_tokens=25, conv_id=cid)
+    assert_eq(dropped, 0, "nothing reported dropped")
+    assert_eq(len(kept), 3, "all 3 facts returned — over budget beats destroyed")
+    assert_eq(
+        [f["text"] for f in kept], [f["text"] for f in items],
+        "the caller gets its store back intact",
+    )
+
+
+def test_re_archiving_a_fact_replaces_rather_than_duplicates():
+    print("\n[test] archiving the same fact twice keeps one entry, not two")
+    _wipe_storage()
+    cid = "roundtrip"
+    # A fact evicted for budget, re-established by the user (or re-extracted
+    # from a later exchange), then evicted again — without a restore in
+    # between, so copy #1 is still sitting in the sidecar.
+    facts.archive_facts(cid, [_f("Lyra is a half-elf ranger", 1, 100)])
+    facts.archive_facts(cid, [_f("Lyra is a half-elf ranger", 1, 200)])
+    archived = facts.load_archive(cid)
+    assert_eq(len(archived), 1, "one entry, not one per eviction")
+    assert_eq(archived[0]["last_used"], 200, "the newer entry is the one kept")
+    # And a full restore brings back one copy, not N.
+    assert_eq(facts.restore_from_archive(cid), 1, "restores a single copy")
+
+
+def test_record_facts_for_exchange_archives_its_evictions():
+    print("\n[test] record_facts_for_exchange routes eviction to the archive")
+    _wipe_storage()
+    cid = "tail-evict"
+    now = int(time.time())
+    # 100 facts x ~100 chars = ~2500 tokens, well past the real 1500-token
+    # default. No patching: prune_facts binds _MAX_FACTS_TOKENS as a default
+    # argument at import, so a patched module attribute would not be read.
+    seeded = [_f(f"old fact {i:03d} " + "o" * 85, i, now - 10000) for i in range(100)]
+    facts.save_facts(cid, seeded)
+    client = _mock_client_returning("- Character Lyra is a ranger.")
+    n = asyncio.run(facts.record_facts_for_exchange(
+        cid, client, "http://fake", "fake-model",
+        user_msg="Who is Lyra?",
+        assistant_msg="A half-elf ranger.",
+        turn_index=99,
+    ))
+    assert_eq(n, 1, "1 new fact added")
+    active = facts.load_facts(cid)
+    archived = facts.load_archive(cid)
+    assert_true(len(active) < 101, "the store was pruned to the token budget")
+    assert_true(len(archived) > 0, "the evicted facts went to cold storage")
+    assert_eq(len(active) + len(archived), 101, "every fact is still somewhere")
+
+
+# ---------------------------------------------------------------------------
+# v3.1 — fact extraction had no INPUT budget
+# ---------------------------------------------------------------------------
+#
+# _EXTRACTION_MAX_TOKENS bounded the output and nothing bounded the input. The
+# payload is the extraction system prompt + the ENTIRE fact store + the full
+# user turn + the full assistant reply; the chat path sends no max_tokens, so
+# vLLM may generate a reply of nearly the whole window and extraction then
+# stacks the prompt and the store on top of it. Two calls in the 2026-08-24
+# window were rejected at 33,790 and 33,581 input tokens against a 32,768
+# window.
+#
+# What a rejection cost, precisely: the warning fired and no "+N facts" line
+# followed it. The exchange's facts were never extracted, nothing retried, and
+# the warning named no conversation — so the log could not say which
+# conversation had lost the turn. Hence the third test here.
+
+
+def _payload_of(client) -> dict:
+    """The JSON body the mocked client was actually asked to POST."""
+    return client.post.call_args.kwargs["json"]
+
+
+def _payload_tokens(payload: dict) -> int:
+    """Size the assembled request the way facts.py sizes everything else."""
+    return sum(facts._estimate_tokens(m["content"]) for m in payload["messages"])
+
+
+def _oversized_store() -> list[dict]:
+    """A fact store that on its own exceeds the real extraction input budget."""
+    store = [_f(f"established fact {i:04d} " + "z" * 80, i, 1000 + i) for i in range(1500)]
+    assert_true(
+        sum(facts._estimate_tokens(x["text"]) for x in store)
+        > facts._EXTRACTION_INPUT_BUDGET,
+        "prep: the store alone is over the extraction input budget",
+    )
+    return store
+
+
+def test_oversized_store_is_trimmed_not_rejected():
+    print("\n[test] an over-budget store is trimmed to fit, and the call still happens")
+    client = _mock_client_returning("- Lyra carries a yew bow.")
+    out = asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model",
+        "What does Lyra carry?", "A yew bow she made herself.",
+        _oversized_store(), conv_id="budget",
+    ))
+    assert_eq(out, ["Lyra carries a yew bow."], "the extraction returned its fact")
+    assert_true(client.post.called, "the call went out — trimmed, not skipped")
+    assert_true(
+        _payload_tokens(_payload_of(client)) <= facts._EXTRACTION_INPUT_BUDGET,
+        "the assembled payload fits the input budget",
+    )
+
+
+def test_the_exchange_survives_trimming_in_preference_to_the_store():
+    print("\n[test] trimming sheds the store first — the exchange is the new information")
+    client = _mock_client_returning("NONE")
+    store = _oversized_store()
+    user = "Her sister is named Isolde and she runs the mill at Varrow Ford."
+    asst = "Isolde keeps the mill turning while Lyra is away."
+    asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model", user, asst, store, conv_id="budget",
+    ))
+    body = _payload_of(client)["messages"][-1]["content"]
+    assert_true(user in body, "the user turn reached the model verbatim")
+    assert_true(asst in body, "the assistant reply reached the model verbatim")
+    assert_true(
+        facts._TRIM_NOTE not in body,
+        "neither half of the exchange was truncated to make room",
+    )
+    # The store is what paid for it. Not zero — it gets whatever the exchange
+    # left — but far less than the 1500 it was handed.
+    kept = [x for x in store if f"- {x['text']}" in body]
+    shed = [x for x in store if f"- {x['text']}" not in body]
+    assert_true(kept, "the store was narrowed, not emptied")
+    assert_true(shed, "the store is what got shed")
+    assert_true(
+        min(x["last_used"] for x in kept) > max(x["last_used"] for x in shed),
+        "the facts kept are the most-recently-used ones — the same order "
+        "select_for_injection and prune_facts use, not an arbitrary slice",
+    )
+
+
+def test_the_assistant_reply_is_shed_before_the_user_turn():
+    print("\n[test] when the exchange itself does not fit, the reply goes first")
+    client = _mock_client_returning("NONE")
+    user = "Remember: the Varrow Ford mill burned down in the third winter."
+    asst = "Understood. " + "The mill is gone. " * 4000
+    # A budget the exchange alone cannot fit, passed explicitly so the test does
+    # not depend on MAX_MODEL_LEN.
+    asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model", user, asst, [],
+        conv_id="budget", max_input_tokens=facts._extraction_overhead_tokens() + 600,
+    ))
+    body = _payload_of(client)["messages"][-1]["content"]
+    assert_true(user in body, "the user turn survives whole")
+    assert_true(asst not in body, "the assistant reply did not")
+    assert_true(facts._TRIM_NOTE in body, "and the model is told it was truncated")
+    assert_true(
+        _payload_tokens(_payload_of(client))
+        <= facts._extraction_overhead_tokens() + 600,
+        "the trimmed payload fits the budget it was given",
+    )
+
+
+def test_a_user_turn_larger_than_the_budget_is_truncated_not_dropped():
+    print("\n[test] even an oversized user turn is truncated, never emptied")
+    client = _mock_client_returning("NONE")
+    asyncio.run(facts.extract_facts_from_exchange(
+        client, "http://fake", "fake-model",
+        "Lyra " * 8000, "Noted.", [],
+        conv_id="budget", max_input_tokens=facts._extraction_overhead_tokens() + 300,
+    ))
+    body = _payload_of(client)["messages"][-1]["content"]
+    # An empty message would short-circuit the whole call on the next turn and
+    # turn a budget overflow back into a silently lost exchange.
+    assert_true("[user]: Lyra" in body, "the user turn still carries its content")
+    assert_true(facts._TRIM_NOTE in body, "truncation is marked, not silent")
+
+
+def test_extraction_failure_is_an_error_that_names_the_conversation():
+    print("\n[test] a failed extraction logs at ERROR and says which conversation")
+    client = _mock_client_raising(RuntimeError("400 Bad Request: maximum context length"))
+    with patch.object(facts.logger, "error") as err, \
+         patch.object(facts.logger, "warning") as warn:
+        out = asyncio.run(facts.extract_facts_from_exchange(
+            client, "http://fake", "fake-model", "hi", "hello", [],
+            conv_id="conv-abc123",
+        ))
+    assert_eq(out, [], "still non-fatal to the chat path")
+    assert_true(err.called, "a lost extraction is an ERROR, not a WARNING")
+    assert_true(not warn.called, "and not also a warning")
+    msg = err.call_args[0][0]
+    assert_true("conv=conv-abc123" in msg, "the log names the conversation")
+    assert_true("lost" in msg, "the log says the facts are gone, not merely that a call failed")
+
+
+def test_extraction_failure_without_conv_id_says_the_caller_gave_none():
+    print("\n[test] a caller that passes no conv_id is named as the reason")
+    # main.py's async tail is that caller at HEAD — it has conv_id in scope and
+    # does not pass it. The line must not read as if the conversation were
+    # unknowable.
+    client = _mock_client_raising(RuntimeError("connection refused"))
+    with patch.object(facts.logger, "error") as err:
+        asyncio.run(facts.extract_facts_from_exchange(
+            client, "http://fake", "fake-model", "hi", "hello", [],
+        ))
+    assert_true("caller passed none" in err.call_args[0][0], "says who is at fault")
+
+
+def test_record_facts_for_exchange_passes_its_conv_id_through():
+    print("\n[test] record_facts_for_exchange attributes its own failures")
+    _wipe_storage()
+    client = _mock_client_raising(RuntimeError("connection refused"))
+    with patch.object(facts.logger, "error") as err:
+        n = asyncio.run(facts.record_facts_for_exchange(
+            "attributed", client, "http://fake", "fake-model",
+            user_msg="Who is Lyra?", assistant_msg="A ranger.", turn_index=1,
+        ))
+    assert_eq(n, 0, "no facts added")
+    assert_true("conv=attributed" in err.call_args[0][0], "the conv_id reached the log")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     try:
         test_load_facts_missing_file_returns_empty()
-        test_load_facts_corrupted_file_returns_empty()
+        test_load_facts_corrupted_file_raises()
         test_save_load_roundtrip()
         test_save_facts_is_atomic_via_temp_file()
         test_load_facts_drops_malformed_entries()
@@ -503,6 +1037,36 @@ if __name__ == "__main__":
         test_restore_with_substring_filter()
         test_restore_substring_no_match_returns_zero()
         test_archive_path_is_sidecar_not_facts_file()
+
+        # v3.1 F9 — LRU eviction is not LRU, and it deletes permanently
+        test_select_for_injection_is_the_whole_store_under_budget()
+        test_turn_touches_only_the_injected_facts()
+        test_eviction_archives_instead_of_deleting()
+        test_eviction_without_conv_id_logs_the_texts()
+        test_eviction_keeps_facts_when_the_archive_write_fails()
+        test_re_archiving_a_fact_replaces_rather_than_duplicates()
+        test_record_facts_for_exchange_archives_its_evictions()
+
+        # v3.1 — fact extraction had no input budget
+        test_oversized_store_is_trimmed_not_rejected()
+        test_the_exchange_survives_trimming_in_preference_to_the_store()
+        test_the_assistant_reply_is_shed_before_the_user_turn()
+        test_a_user_turn_larger_than_the_budget_is_truncated_not_dropped()
+        test_extraction_failure_is_an_error_that_names_the_conversation()
+        test_extraction_failure_without_conv_id_says_the_caller_gave_none()
+        test_record_facts_for_exchange_passes_its_conv_id_through()
+
+        # v3.1 D5 — markdown scaffolding stored as memory
+        test_markup_lines_are_not_stored_as_facts()
+        test_each_markup_form_has_its_own_named_reason()
+        test_the_filter_keeps_facts_that_only_look_like_markup()
+        test_is_storable_fact_is_the_shared_public_predicate()
+        test_a_bulleted_heading_is_refused_on_the_heading()
+        test_refused_markup_is_logged_with_a_bounded_sample()
+        test_the_store_never_receives_a_box_drawing_rule()
+        test_a_truncated_extraction_drops_its_incomplete_tail()
+        test_a_truncated_extraction_keeps_a_line_that_finished()
+        test_an_untruncated_reply_loses_nothing()
 
         print("\nAll facts smoke tests passed.")
     finally:

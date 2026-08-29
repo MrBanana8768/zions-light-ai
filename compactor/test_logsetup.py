@@ -2,7 +2,8 @@
 CPU-only Tier-1 tests for compactor.logsetup (V2.3 Theme 4).
 
 Verifies the text/JSON formatter switch, JSON line shape (incl. exception
-attachment), and that configure() is idempotent (no duplicate handlers).
+attachment), that configure() is idempotent (no duplicate handlers), that the
+handler writes to stdout (v3.1 P0-2), and the log_once gate (v3.1 P0-2b).
 
 Run: python test_logsetup.py
 """
@@ -94,6 +95,39 @@ def test_configure_is_idempotent():
     assert_eq(len(logging.getLogger().handlers), 1, "exactly one handler after 3 calls")
 
 
+def test_handler_writes_to_stdout():
+    """v3.1 P0-2 / F17a. StreamHandler() defaults to stderr, which under
+    supervisord is compactor-error.log — so every operational line landed in
+    the file named 'error' while compactor.log, the one OPERATIONS.md:44
+    tells the operator to read, held uvicorn access noise. This asserts the
+    stream, not just the format, so the runbook stays true."""
+    print("\n[test] configure() attaches the handler to stdout, not stderr")
+    os.environ["COMPACTOR_LOG_FORMAT"] = "text"
+    logsetup.configure()
+    handler = logging.getLogger().handlers[0]
+    assert_true(handler.stream is sys.stdout, "handler stream is sys.stdout")
+    assert_true(handler.stream is not sys.stderr, "handler stream is NOT sys.stderr")
+
+
+def test_log_once_gates_repeat_call_sites():
+    print("\n[test] log_once: True once per key, False forever after")
+    logsetup._reset_log_once_for_tests()
+    assert_eq(logsetup.log_once("site.a"), True, "first call for a key -> True")
+    assert_eq(logsetup.log_once("site.a"), False, "second call for same key -> False")
+    assert_eq(logsetup.log_once("site.a"), False, "third call for same key -> False")
+    assert_eq(logsetup.log_once("site.b"), True, "a different key is independent")
+
+
+def test_log_once_survives_reconfigure():
+    """configure() clears handlers; it must not clear the gate, or a second
+    entry point calling configure() would re-open every throttled call site."""
+    print("\n[test] log_once state is not reset by configure()")
+    logsetup._reset_log_once_for_tests()
+    assert_eq(logsetup.log_once("site.c"), True, "first call -> True")
+    logsetup.configure()
+    assert_eq(logsetup.log_once("site.c"), False, "still gated after configure()")
+
+
 def _all():
     return [
         test_text_format_default,
@@ -101,6 +135,9 @@ def _all():
         test_json_includes_exception,
         test_unknown_format_falls_back_to_text,
         test_configure_is_idempotent,
+        test_handler_writes_to_stdout,
+        test_log_once_gates_repeat_call_sites,
+        test_log_once_survives_reconfigure,
     ]
 
 
