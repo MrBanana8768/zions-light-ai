@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -1389,6 +1390,25 @@ DEGENERATE_DECOR_FRACTION = float(
 )
 DEGENERATE_MIN_CHARS = _env_int("COMPACTOR_DEGENERATE_MIN_CHARS", 300)
 
+# Script drift — a THIRD degeneration shape, and it is not repetition.
+#
+# 2026-08-29: long replies stayed coherent for roughly their first 60% and
+# then wandered into Cyrillic and other scripts. Measured by decile within
+# the worst reply: 0% through decile 6, then 19%, 32%, 24%, 17%. Neither
+# repetition rule sees it, because nothing repeats — the model simply stops
+# writing the language it was asked in.
+#
+# Threshold from 485 real replies of 200+ letters: p90=0.05%, p95=0.16%,
+# p98=0.29%, p99=1.21%, p99.5=1.66%, max=10.79%. 3% is 2.5x above p99 and
+# flags exactly the 2 drifting replies (0.4%).
+#
+# The letter floor matters more than the fraction: in a short reply one
+# foreign word is a large percentage and a perfectly ordinary thing to write.
+DEGENERATE_NONLATIN_FRACTION = float(
+    os.environ.get("COMPACTOR_DEGENERATE_NONLATIN_FRACTION", "0.03") or 0.03
+)
+DEGENERATE_MIN_LETTERS = _env_int("COMPACTOR_DEGENERATE_MIN_LETTERS", 200)
+
 # Box-drawing, block elements, and the ASCII characters people rule lines with.
 _DECOR_CHARS = frozenset(
     [chr(c) for c in range(0x2500, 0x25A0)] + list("-_=~*#.—–·•")
@@ -1470,6 +1490,23 @@ def reply_is_degenerate(text: str) -> str | None:
             f"a single character repeated {len(m.group(0))} times "
             f"(limit {DEGENERATE_RUN_CHARS})"
         )
+    # Script drift. Counted over LETTERS, not characters, so punctuation,
+    # markdown and code do not dilute it.
+    lat = non = 0
+    for c in text:
+        if c.isalpha():
+            if "LATIN" in unicodedata.name(c, ""):
+                lat += 1
+            else:
+                non += 1
+    if lat + non >= DEGENERATE_MIN_LETTERS:
+        frac = non / (lat + non)
+        if frac >= DEGENERATE_NONLATIN_FRACTION:
+            return (
+                f"{100 * frac:.0f}% of letters are non-Latin over "
+                f"{lat + non} letters (limit "
+                f"{100 * DEGENERATE_NONLATIN_FRACTION:.0f}%)"
+            )
     if n >= DEGENERATE_MIN_CHARS:
         decor = sum(1 for c in text if c in _DECOR_CHARS)
         if decor / n >= DEGENERATE_DECOR_FRACTION:

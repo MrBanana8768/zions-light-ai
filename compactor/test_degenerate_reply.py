@@ -112,4 +112,25 @@ check("aaa aaa aaa aaa. Then ordinary prose for a while. " + "stuck " * 40,
       True, "a late runaway is caught even after an early short repetition")
 
 print()
+print("[6] script drift — coherent, then wandering out of the language")
+# 2026-08-29: long replies stayed clean for their first ~60% and then drifted
+# into Cyrillic. Nothing repeats, so neither repetition rule sees it.
+# Threshold from 485 real replies of 200+ letters: p95=0.16%, p99=1.21%,
+# max=10.79%. 3% is 2.5x over p99.
+ru = "привет мир "
+en = "and the reply continues in ordinary English prose for a while longer "
+check(en * 12 + ru * 30, True, "a reply that drifts into Cyrillic at the tail")
+check(en * 40, False, "pure English of the same length is fine")
+
+# A short reply with a foreign word is normal writing, not drift — which is
+# why the rule has a letter floor rather than a fraction alone.
+check("She says " + ru + "to me sometimes.", False,
+      "a foreign phrase in a short reply is under the letter floor")
+# And a genuinely bilingual long reply is a judgement call the floor cannot
+# make; 3% is deliberately far above the p99 of real usage so ordinary
+# borrowing survives.
+check(en * 30 + "the word is " + ru, False,
+      "occasional borrowing in a long English reply stays under 3%")
+
+print()
 print("All degenerate-reply tests passed.")
