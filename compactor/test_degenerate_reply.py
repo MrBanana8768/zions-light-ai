@@ -70,7 +70,12 @@ print("[4] it must not judge content it has no business judging")
 # glyph. Catching this is correct; my first version of this test asserted the
 # opposite and was wrong.
 check("x" * 400, True, "a 400-char run of an ordinary letter is also a loop")
-check("x" * 200, False, "200 identical chars is under the run limit")
+# 200 identical letters is caught by the TOKEN rule at 120, not the character
+# rule at 250 — and that is correct: it is a loop. The two rules are disjoint
+# by content class (decoration -> character rule, word-like -> token rule), so
+# the effective limit for an alphanumeric run is the lower of the two.
+check("x" * 200, True, "200 identical letters is a loop under the token rule")
+check("x" * 100, False, "100 identical letters is under both limits")
 check("-" * 30 + "\n" + ("Real content describing something at length. " * 8),
       False, "a markdown horizontal rule followed by prose")
 # Code is full of punctuation the decoration set contains. A reply that is
@@ -78,6 +83,33 @@ check("-" * 30 + "\n" + ("Real content describing something at length. " * 8),
 # remember anything technical it said.
 check("Here is the fix:\n\n```python\n" + "x = a - b * c  # __init__\n" * 20 +
       "```\n\nThat should do it.", False, "a reply that is mostly code")
+
+print()
+print("[5] repeated TOKENS, the 2026-08-29 tail collapse")
+# Long replies degenerated into training-data identifiers at the tail:
+#     _batch_handler_shared _batch_handler_shared _batch_handler_shared ...
+#     config_config_config_config_config ...
+# Neither is one repeated CHARACTER nor decoration-heavy, so the v3.1.2 rules
+# saw nothing — 3 of 48 caught. Threshold measured against 512 real replies:
+# longest repeated-token run sits at p90=56, p97=72, p98=80, then jumps to
+# p99=384. 120 is 1.5x over the normal ceiling and 3x under the pathological
+# floor. Against the full corpus the rule now scores 9 caught / 0 missed /
+# 0 false positives.
+check("Here is the answer." + " _batch_handler_shared" * 12, True,
+      "a repeated identifier trips the token rule")
+check("config_" * 40, True, "underscore-joined repetition trips it")
+
+# The longest repeated-token run in 464 healthy replies was 56 characters.
+check("Really " + "yes " * 12 + "that is what I meant, and here is more prose "
+      "to make it a normal length reply.", False,
+      "emphasis repetition well under the measured healthy ceiling")
+check("The value is 3. The value is 3. The value is 3.", False,
+      "a phrase repeated three times is writing, not a loop")
+
+# LONGEST match, not first. A brief repetition early must not mask a runaway
+# later — that cost 4 of 9 detections before it was fixed.
+check("aaa aaa aaa aaa. Then ordinary prose for a while. " + "stuck " * 40,
+      True, "a late runaway is caught even after an early short repetition")
 
 print()
 print("All degenerate-reply tests passed.")

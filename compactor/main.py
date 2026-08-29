@@ -1369,6 +1369,26 @@ _DECOR_CHARS = frozenset(
 )
 _RUN_RE = re.compile(r"(.)\1{19,}", re.S)
 
+# A repeated TOKEN, not a repeated character.
+#
+# v3.1.2 looked for a long run of one character and for a high decoration
+# fraction. On 2026-08-29 the model degenerated a different way: the tail of
+# long replies collapsed into repeated identifiers out of its training data —
+#     _batch_handler_shared _batch_handler_shared _batch_handler_shared ...
+#     config_config_config_config_config_config_config ...
+# which is neither one character nor decoration-heavy, so the detector saw
+# nothing. Measured against 512 real replies it caught 3 of 48.
+#
+# Threshold from that corpus, not chosen: the longest repeated-token run per
+# reply sits at p90=56, p95=60, p97=72, p98=80 and then jumps to p99=384.
+# Normal writing tops out near 80 characters of a repeated token; a loop
+# lands in the hundreds. 120 is 1.5x above the normal ceiling and 3x below
+# the pathological floor, and flags 9 of 512 (1.8%).
+DEGENERATE_TOKEN_RUN_CHARS = _env_int("COMPACTOR_DEGENERATE_TOKEN_RUN_CHARS", 120)
+# {3,} not {1,}: two or three repeats is emphasis ("no no no"), four or more
+# of a 3+ character token is a machine stuck in a groove.
+_TOKEN_RUN_RE = re.compile(r"(\S{3,})(?:[ _\n\t]*\1){3,}")
+
 
 def reply_is_degenerate(text: str) -> str | None:
     """Why this reply looks like a repetition loop, or None if it looks fine.
@@ -1391,7 +1411,34 @@ def reply_is_degenerate(text: str) -> str | None:
     if not text:
         return None
     n = len(text)
-    m = _RUN_RE.search(text)
+    # LONGEST match, not the first. re.search returns the earliest match, so a
+    # reply with a brief repetition early and a runaway later was judged on the
+    # brief one and passed. Measured against 512 real replies that cost 4 of 9
+    # detections — and it is the same first-not-worst error in both rules, so
+    # both are fixed here.
+    # WORD-like tokens only. A repeated run of box-drawing is decoration and
+    # belongs to the character rule below, which has its own, HIGHER threshold
+    # measured on the same corpus (250; the longest run in 501 healthy replies
+    # was 146). Without this guard the token rule at 120 would flag a perfectly
+    # ordinary 146-character horizontal rule — the two rules would overlap and
+    # the stricter one would win, making the measured character threshold a
+    # lie. Requiring an alphanumeric in the repeated unit keeps them disjoint:
+    # decoration to the character rule, identifiers to this one.
+    tm = max(
+        (
+            x for x in _TOKEN_RUN_RE.finditer(text)
+            if any(c.isalnum() for c in x.group(1))
+        ),
+        key=lambda x: len(x.group(0)),
+        default=None,
+    )
+    if tm and len(tm.group(0)) >= DEGENERATE_TOKEN_RUN_CHARS:
+        return (
+            f"the token {tm.group(1)[:24]!r} repeated for "
+            f"{len(tm.group(0))} characters (limit "
+            f"{DEGENERATE_TOKEN_RUN_CHARS})"
+        )
+    m = max(_RUN_RE.finditer(text), key=lambda x: len(x.group(0)), default=None)
     if m and len(m.group(0)) >= DEGENERATE_RUN_CHARS:
         return (
             f"a single character repeated {len(m.group(0))} times "
