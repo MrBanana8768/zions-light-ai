@@ -48,6 +48,20 @@ Commands (case-insensitive command name, args preserved as-is):
                            than unlinking them. Refuses if the plan has changed
                            since the dry run, or if it would take more than
                            half the store.
+  /retire <conv_id>        Dry run: report how ANOTHER conversation's whole
+                           memory would be emptied into this one — which facts
+                           move, which are not worth moving, which the
+                           destination already has, and every other layer keyed
+                           to that id that would be cleared. Changes nothing.
+                           Ends with a code.
+  /retire <conv_id> apply <code>
+                           Apply exactly that plan. Writes one verified
+                           whole-conversation snapshot of the source first
+                           (facts, archive, summaries, episodic AND persona),
+                           refuses if any layer could not be accounted for,
+                           MOVES the surviving facts into this conversation,
+                           and only then clears the source. Idempotent: run it
+                           again after an interruption and it finishes.
   /why                     Show what the next request would have injected:
                            facts that would inject, retrieval candidates for
                            recent conv tail, summary state
@@ -69,7 +83,7 @@ from typing import Any, Callable, Awaitable
 import bgwork
 import facts as facts_module
 import portability
-from memory import StoreUnreadable, conv_lock
+from memory import StoreUnreadable, conv_lock, storage_root
 
 logger = logging.getLogger("compactor.commands")
 
@@ -119,6 +133,12 @@ _ALIASES: dict[str, str] = {
     "tidy-facts": "tidy",
     "tidy_facts": "tidy",
     "cleanup": "tidy",
+    # v3.1 D8. Same rule as /tidy and more so: this one empties an entire
+    # conversation's memory. One spelling, plus the underscore variant the
+    # rest of this table already tolerates. No abbreviation.
+    "retire": "retire",
+    "retire-conversation": "retire",
+    "retire_conversation": "retire",
 }
 
 
@@ -165,6 +185,10 @@ async def _handle_help(arg: str, conv_id: str, ctx: dict) -> str:
         "  /tidy                Show extraction debris I could clean up "
         "(changes nothing)\n"
         "  /tidy apply <code>   Clean up exactly what that dry run listed\n"
+        "  /retire <conv_id>    Show how I would empty ANOTHER conversation's "
+        "memory into this one (changes nothing)\n"
+        "  /retire <conv_id> apply <code>\n"
+        "                       Do exactly what that dry run listed\n"
         "  /why                 Show what would be injected on the next turn\n"
         "  /help                This message"
     )
@@ -976,6 +1000,8 @@ def _tidy_group_lines(
     order: tuple[str, ...],
     *,
     limit: int | None,
+    rule_text: dict[str, str] | None = None,
+    show: Callable[[Any], str] | None = None,
 ) -> list[str]:
     """Render one section, grouped by rule.
 
@@ -984,20 +1010,27 @@ def _tidy_group_lines(
     against, so the removal list is never elided — the blast-radius cap is what
     bounds its length, not the renderer. Flagged rows are only a reading list,
     so those groups do get capped.
+
+    `rule_text` / `show` exist so /retire (D8) can render its own rule
+    vocabulary and its own row addressing through this function rather than
+    growing a second copy of it. Both default to /tidy's behaviour, so the D6
+    call sites are unchanged.
     """
+    table = _TIDY_RULE_TEXT if rule_text is None else rule_text
+    render = show or (lambda i: _tidy_show(rows[i].get("text", "") or ""))
     lines: list[str] = []
     seen = list(order) + [r for r in by_rule if r not in order]
     for rule in seen:
         idx = by_rule.get(rule)
         if not idx:
             continue
-        why = _TIDY_RULE_TEXT.get(
+        why = table.get(
             rule, "NO DESCRIPTION FOR THIS RULE — do not confirm this plan"
         )
         lines.append(f"  [{rule}] {len(idx)} row(s) — {why}")
         shown = idx if limit is None else idx[:limit]
         for i in shown:
-            lines.append(f"      {_tidy_show(rows[i].get('text', '') or '')}")
+            lines.append(f"      {render(i)}")
         if len(shown) < len(idx):
             lines.append(f"      … and {len(idx) - len(shown)} more not shown")
     return lines
@@ -1211,6 +1244,825 @@ async def _handle_tidy(arg: str, conv_id: str, ctx: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# /retire — emptying a phantom conversation WITHOUT losing what is in it
+# (v3.1 D8)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS IS NOT /tidy, having read /tidy first.
+#
+# D6 cleans debris out of a bucket the user keeps using. It removes only rows
+# it can PROVE are content-free, keeps everything else, and refuses outright if
+# a plan would take more than half the store — because taking half of a live
+# conversation's memory is a broken rule, not a thorough one.
+#
+# This operation empties a bucket the user is never going to use again, and
+# every one of those properties is wrong for that job:
+#
+#   - It has to take 100% of the store, so /tidy's blast-radius cap would
+#     refuse it by design.
+#   - The rows it does NOT remove cannot simply stay, because the whole point
+#     is that nothing stays. They have to go somewhere, and "somewhere" is
+#     another conversation. /tidy has no concept of a destination.
+#   - The facts are not the only thing keyed to the id. Retiring a conv_id and
+#     leaving its episodic vectors, its summary chain and its persona behind
+#     retires nothing.
+#
+# So it is a genuinely different operation, and it is built on D6 rather than
+# beside it: the classifier calls facts.is_storable_fact and D6's own
+# _tidy_removal_rule / _tidy_flag_rule / _tidy_norm / _tidy_survivor_index, the
+# report goes through D6's _tidy_group_lines, and the snapshot goes through
+# D6's portability.quarantine_conversation. What is new here is the
+# destination, the layer sweep, and the two-conversation lock.
+#
+# THE ONE ASYMMETRY THAT DECIDES EVERY RULE BELOW, restated because it is even
+# sharper here than in D6:
+#
+#     wrongly keeping a garbage row costs tokens in ANOTHER conversation.
+#     wrongly dropping a row costs her a memory of her own life, and the
+#     bucket it lived in no longer exists to go back to.
+#
+# Hence: anything not provably content-free and not provably already present
+# in the destination MIGRATES. There is no "probably duplicate" branch.
+#
+# WHAT THIS OPERATION DOES NOT DO: it does not stop the bucket coming back.
+# Nothing in this file can. See the note at the end of this section.
+
+# The charset memory._sanitize reduces a conv_id to, and its length cap. A
+# conv_id typed into a chat box is used to build filesystem paths, so this
+# REFUSES anything outside the charset rather than silently stripping it the
+# way the request path does: on the request path a mangled id costs a wrong
+# bucket, here it would cost the wrong conversation being emptied.
+_RETIRE_CONV_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# Migrated rows are not being deleted, so eliding the list costs a reader some
+# scrolling and nothing else. The DROPPED list is never elided — same rule, and
+# the same reason, as D6's removal list.
+RETIRE_MAX_MIGRATE_ROWS_SHOWN = 40
+
+_RETIRE_RULE_TEXT: dict[str, str] = {
+    **_TIDY_RULE_TEXT,
+    "markup": (
+        "facts.is_storable_fact says this is markup, not a fact — a code "
+        "fence, a markdown heading, a JSON key, an unclosed bracket, a "
+        "fabricated status-dashboard line, or a row with no alphanumeric "
+        "character in any script"
+    ),
+    "duplicate-in-source": (
+        "byte-identical to another row of this same conversation that IS "
+        "being moved"
+    ),
+    "already-in-destination": (
+        "byte-identical to a fact the destination conversation already holds "
+        "in its active set"
+    ),
+    "already-in-destination-archive": (
+        "byte-identical to a fact the destination conversation already holds "
+        "in cold storage — /list-archive there shows it and it can be "
+        "restored"
+    ),
+    "near-duplicate-in-destination": (
+        "same text as a destination fact once case and spacing are folded, "
+        "but NOT byte-identical — so it is being moved, not dropped. Which "
+        "wording is the real one is a judgement this does not make"
+    ),
+}
+
+_RETIRE_DROP_ORDER = (
+    "markup",
+    "scaffolding",
+    "no-content",
+    "duplicate-in-source",
+    "already-in-destination",
+    "already-in-destination-archive",
+)
+_RETIRE_FLAG_ORDER = ("near-duplicate-in-destination",) + _TIDY_FLAG_ORDER
+
+
+def _retire_removal_rule(text: str) -> str | None:
+    """The rule that proves this row is not worth moving, or None to move it.
+
+    facts.is_storable_fact FIRST. That is the predicate the write paths already
+    share — extraction, /remember, backfill and dedup's merged canonical text
+    all gate on it (facts.py:837-846) — and this operation must not invent a
+    second definition of "not a fact" that could disagree with it.
+
+    Applying it to ALREADY-STORED rows is the thing facts.py:772-777 warns
+    against, and the warning is about WHERE, not whether: "WRITE PATH ONLY.
+    This is deliberately NOT applied in load_facts or save_facts... a filter
+    there would silently delete already-stored entries on the next unrelated
+    write — an irreversible cleanup of a live store, smuggled in as a parser
+    fix. Cleaning what is already stored is a separate, deliberate, reversible
+    operation." This is that operation: dry-run by default, snapshot first,
+    every dropped row printed verbatim, nothing unlinked.
+
+    Then D6's own removal rules, which catch the extractor's format vocabulary
+    ("NONE", "assistant", "EXISTING FACTS:") that is_storable_fact accepts
+    because it is syntactically ordinary prose. Both are existing, reviewed
+    predicates; neither is redefined here.
+    """
+    if not facts_module.is_storable_fact(text):
+        return "markup"
+    return _tidy_removal_rule(text)
+
+
+def _retire_items(
+    source_active: list[dict], source_archive: list[dict]
+) -> list[tuple[str, dict]]:
+    """The source conversation's whole fact memory as one addressable list.
+
+    ACTIVE FIRST, and that ordering is load-bearing: when the same text is in
+    both files, the hot copy is the one that migrates and the cold one is the
+    duplicate. The other way round would move a fact the user is actively
+    being reminded of into cold storage.
+
+    The archive sidecar is in here at all because it is memory. /forget's own
+    wipe path records that "NOTHING in this codebase has ever deleted one"
+    before it did, and a retirement that unlinked it would destroy every fact
+    that had ever been evicted from this bucket for budget — silently, since
+    nothing else reads it.
+    """
+    return (
+        [("active", f) for f in source_active]
+        + [("archive", f) for f in source_archive]
+    )
+
+
+def _retire_plan(
+    items: list[tuple[str, dict]],
+    dest_active: list[dict],
+    dest_archive: list[dict],
+    *,
+    source_id: str,
+    dest_id: str,
+) -> dict:
+    """Classify every row of the source's fact memory. Pure function of its
+    four inputs — no I/O, no clock — so the same pair of stores always yields
+    the same plan and the same confirmation code.
+
+    Positions in the returned lists index `items`.
+    """
+    rows = [f for _, f in items]
+    drop: dict[str, list[int]] = {}
+    survivors: list[int] = []
+
+    # 1. Structure. Nothing here looks at the destination or at meaning.
+    for pos, (_layer, f) in enumerate(items):
+        rule = _retire_removal_rule(f.get("text", "") or "")
+        if rule:
+            drop.setdefault(rule, []).append(pos)
+        else:
+            survivors.append(pos)
+
+    # 2. Exact duplicates WITHIN the source, across both its layers.
+    #
+    # Which copy survives is D6's _tidy_survivor_index — highest
+    # (last_used, added_turn) — for the reason its docstring gives: those are
+    # the eviction sort keys, so keeping the maximum guarantees collapsing
+    # duplicates can never move a fact FORWARD in the eviction queue. An
+    # active-layer copy outranks an archived one regardless, per _retire_items.
+    by_text: dict[str, list[int]] = {}
+    for pos in survivors:
+        by_text.setdefault(rows[pos].get("text", "") or "", []).append(pos)
+    dropped_dupes: set[int] = set()
+    for group in by_text.values():
+        if len(group) < 2:
+            continue
+        hot = [p for p in group if items[p][0] == "active"]
+        keeper = _tidy_survivor_index(hot or group, rows)
+        for p in group:
+            if p != keeper:
+                dropped_dupes.add(p)
+    if dropped_dupes:
+        drop.setdefault("duplicate-in-source", []).extend(sorted(dropped_dupes))
+        survivors = [p for p in survivors if p not in dropped_dupes]
+
+    # 3. Already in the destination.
+    #
+    # EXACT TEXT MATCH, and only exact. This is the one comparison in the
+    # operation that can discard a real memory, so it is the one held to a
+    # standard nothing can argue with: byte-identical strings carry identical
+    # information, so dropping one of them loses nothing that the destination
+    # does not already hold. Every looser test — normalized, token overlap,
+    # embedding distance — has a threshold, and a threshold has a wrong side
+    # whose cost is a memory of her own life against a saving of a few dozen
+    # tokens. Near-matches are FLAGGED and MIGRATED, below; they are never a
+    # reason to drop.
+    dest_active_texts = {f.get("text", "") or "" for f in dest_active}
+    dest_archive_texts = {f.get("text", "") or "" for f in dest_archive}
+    migrate_active: list[int] = []
+    migrate_archive: list[int] = []
+    for pos in survivors:
+        text = rows[pos].get("text", "") or ""
+        if text in dest_active_texts:
+            drop.setdefault("already-in-destination", []).append(pos)
+        elif text in dest_archive_texts:
+            drop.setdefault("already-in-destination-archive", []).append(pos)
+        elif items[pos][0] == "active":
+            migrate_active.append(pos)
+        else:
+            migrate_archive.append(pos)
+
+    # 4. Flags — a reading list over the rows that ARE moving. Nothing here
+    #    removes anything; a false positive costs one line of reading.
+    dest_norms = {
+        _tidy_norm(f.get("text", "") or "")
+        for f in list(dest_active) + list(dest_archive)
+    }
+    flags: dict[str, list[int]] = {}
+    moving = migrate_active + migrate_archive
+    for pos in moving:
+        text = rows[pos].get("text", "") or ""
+        if _tidy_norm(text) in dest_norms:
+            flags.setdefault("near-duplicate-in-destination", []).append(pos)
+            continue
+        rule = _tidy_flag_rule(text)
+        if rule:
+            flags.setdefault(rule, []).append(pos)
+    by_norm: dict[str, list[int]] = {}
+    for pos in moving:
+        by_norm.setdefault(_tidy_norm(rows[pos].get("text", "") or ""), []).append(pos)
+    near = sorted(p for g in by_norm.values() if len(g) > 1 for p in g)
+    if near:
+        flags.setdefault("near-duplicate", []).extend(near)
+
+    # The confirmation code covers BOTH decisions, not just the destructive
+    # one. D6's code hashes only the removal set because everything else stays
+    # put; here a change to what MOVES is just as much a change to what the
+    # operator approved, and the two conversation ids are in it because the
+    # same plan pointed at a different destination is a different operation.
+    parts = [f"source\x01{source_id}", f"dest\x01{dest_id}"]
+    parts += sorted(
+        f"migrate\x01{items[p][0]}\x01{rows[p].get('text', '') or ''}"
+        for p in moving
+    )
+    parts += sorted(
+        f"drop\x01{rule}\x01{rows[p].get('text', '') or ''}"
+        for rule, ps in drop.items()
+        for p in ps
+    )
+    token = hashlib.sha256(
+        "\x00".join(parts).encode("utf-8", "replace")
+    ).hexdigest()[:12]
+
+    return {
+        "items": items,
+        "rows": rows,
+        "n_active": sum(1 for layer, _ in items if layer == "active"),
+        "n_archive": sum(1 for layer, _ in items if layer == "archive"),
+        "drop_by_rule": drop,
+        "drop_idx": sorted(p for ps in drop.values() for p in ps),
+        "migrate_active": migrate_active,
+        "migrate_archive": migrate_archive,
+        "flag_by_rule": flags,
+        "token": token,
+    }
+
+
+def _retire_other_layers(conv_id: str) -> dict:
+    """Everything else keyed to this conv_id, read rather than assumed.
+
+    The enumeration is selftest._conv_artifact_paths — kept in one place there
+    "because the layers are spread across four modules and a cleanup that
+    misses one is indistinguishable from a cleanup that worked" — plus the two
+    that are not files: the ChromaDB episodic rows and dedup's in-process
+    refusal memo.
+
+    Full list for this conv_id, and what happens to each:
+
+      facts/<id>.json           the active facts       — classified above
+      facts/<id>.archive.json   the cold sidecar       — classified above
+      summaries/<id>.json       L1/L2/L3 rollups       — in the snapshot, then deleted
+      personas/<id>.json        the persona            — in the snapshot, then deleted
+      facts/<id>.backfill.json  lazy-backfill state    — deleted (state, not memory)
+      ChromaDB where conv_id=   indexed exchanges      — in the snapshot, then deleted
+      dedup._REFUSAL_MEMO[id]   merge refusals         — dropped (a cache, process-local)
+
+    The backfill sidecar path is built here rather than imported from
+    backfill.py for the reason selftest gives: importing that module for a path
+    would pull the lazy-backfill machinery in for no reason.
+
+    Values are None for "could not tell", never 0/False — the same distinction
+    /forget's verification pass and retrieval.conversation_doc_count draw, and
+    for the same reason: on a surface that decides whether a wipe was complete,
+    those are opposite answers.
+    """
+    out: dict[str, Any] = {
+        "summary": None, "episodic": None, "persona": None, "backfill": None,
+    }
+    try:
+        import summarizer as summarizer_module
+        state = summarizer_module.load_state(conv_id) or {}
+        out["summary"] = bool(state.get("l1") or state.get("l2") or state.get("l3"))
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: /retire could not read the summary layer: {e}")
+    try:
+        import retrieval as retrieval_module
+        out["episodic"] = retrieval_module.conversation_doc_count(conv_id)
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: /retire could not read the episodic layer: {e}")
+    try:
+        import persona as persona_module
+        out["persona"] = bool(persona_module.load_persona(conv_id))
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: /retire could not read the persona layer: {e}")
+    try:
+        out["backfill"] = (
+            storage_root() / "facts" / f"{conv_id}.backfill.json"
+        ).is_file()
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: /retire could not stat the backfill sidecar: {e}")
+    return out
+
+
+def _retire_clear_other_layers(conv_id: str) -> list[str]:
+    """Delete every non-facts layer keyed to conv_id. Returns what it cleared.
+
+    Best-effort per layer and idempotent per layer: each of these is a delete
+    of something that may already be gone, so a second run is a no-op rather
+    than an error. Failures are logged and reported, never swallowed — the
+    caller prints an observed re-read afterwards, so a layer that refused to go
+    shows up in the reply whatever this returns.
+    """
+    cleared: list[str] = []
+    try:
+        import summarizer as summarizer_module
+        sp = summarizer_module.summary_path(conv_id)
+        if sp.is_file():
+            sp.unlink()
+            cleared.append("summary state")
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: /retire summary delete failed: {e}")
+    try:
+        import retrieval as retrieval_module
+        n = retrieval_module.forget_conversation(conv_id)
+        if n:
+            cleared.append(f"{n} indexed exchange(s)")
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: /retire episodic delete failed: {e}")
+    try:
+        import persona as persona_module
+        if persona_module.clear_persona(conv_id):
+            cleared.append("persona")
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: /retire persona delete failed: {e}")
+    try:
+        bp = storage_root() / "facts" / f"{conv_id}.backfill.json"
+        if bp.is_file():
+            bp.unlink()
+            cleared.append("lazy-backfill state")
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: /retire backfill-state delete failed: {e}")
+    try:
+        import dedup as dedup_module
+        dedup_module.reset_refusal_memo(conv_id)
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: /retire memo reset failed: {e}")
+    return cleared
+
+
+def _retire_layer_lines(label: str, layers: dict) -> list[str]:
+    def say(v, yes: str, no: str) -> str:
+        if v is None:
+            return "could not read it"
+        if isinstance(v, int) and not isinstance(v, bool):
+            return f"{v} {yes}" if v else no
+        return yes if v else no
+
+    return [
+        f"{label}",
+        f"  summary state         {say(layers['summary'], 'present', 'none')}",
+        f"  indexed exchanges     {say(layers['episodic'], 'exchange(s)', 'none')}",
+        f"  persona               {say(layers['persona'], 'present', 'none')}",
+        f"  lazy-backfill state   {say(layers['backfill'], 'present', 'none')}",
+    ]
+
+
+def _retire_show(plan: dict) -> Callable[[int], str]:
+    """Row renderer for _tidy_group_lines: prefixes the source layer, because
+    'this came out of cold storage' changes what a reviewer thinks of it."""
+    def render(pos: int) -> str:
+        layer, f = plan["items"][pos]
+        tag = "active " if layer == "active" else "archived"
+        return f"({tag}) {_tidy_show(f.get('text', '') or '')}"
+    return render
+
+
+def _retire_render_plan(
+    plan: dict, layers: dict, source_id: str, dest_id: str, dest_after: dict
+) -> str:
+    n_move = len(plan["migrate_active"]) + len(plan["migrate_archive"])
+    n_drop = len(plan["drop_idx"])
+    total = plan["n_active"] + plan["n_archive"]
+    show = _retire_show(plan)
+
+    lines = [
+        f"Retire conversation {source_id} — DRY RUN. Nothing has been changed.",
+        "",
+        f"Source:      {source_id} — {plan['n_active']} active fact(s), "
+        f"{plan['n_archive']} archived fact(s)",
+        f"Destination: {dest_id} — this conversation, "
+        f"{dest_after['before_active']} active fact(s), "
+        f"{dest_after['before_archive']} archived fact(s)",
+        "",
+    ]
+    lines.extend(_retire_layer_lines(
+        f"Also keyed to {source_id}, and cleared by this operation:", layers))
+    lines.append("")
+
+    if n_move:
+        lines.append(
+            f"WOULD MOVE {n_move} of {total} fact(s) into this conversation "
+            f"({len(plan['migrate_active'])} into the active set, "
+            f"{len(plan['migrate_archive'])} into cold storage because that is "
+            f"where they already were):"
+        )
+        for label, idx in (
+            ("moving into the active set", plan["migrate_active"]),
+            ("moving into cold storage", plan["migrate_archive"]),
+        ):
+            if not idx:
+                continue
+            lines.append(f"  [{label}] {len(idx)} row(s)")
+            for pos in idx[:RETIRE_MAX_MIGRATE_ROWS_SHOWN]:
+                lines.append(f"      {show(pos)}")
+            if len(idx) > RETIRE_MAX_MIGRATE_ROWS_SHOWN:
+                lines.append(
+                    f"      … and {len(idx) - RETIRE_MAX_MIGRATE_ROWS_SHOWN} "
+                    f"more not shown (nothing in this list is being deleted)"
+                )
+    else:
+        lines.append("WOULD MOVE nothing — no fact here needs a new home.")
+    lines.append("")
+
+    if n_drop:
+        pct = (100 * n_drop) // total if total else 0
+        lines.append(
+            f"WOULD NOT MOVE {n_drop} of {total} ({pct}%). Every one is listed "
+            f"here in full, and every one is in the snapshot below:"
+        )
+        lines.extend(_tidy_group_lines(
+            plan["rows"], plan["drop_by_rule"], _RETIRE_DROP_ORDER,
+            limit=None, rule_text=_RETIRE_RULE_TEXT, show=show,
+        ))
+    else:
+        lines.append("WOULD NOT MOVE nothing — every fact here is being kept.")
+    lines.append("")
+
+    n_flag = sum(len(v) for v in plan["flag_by_rule"].values())
+    if n_flag:
+        lines.append(
+            f"MOVING ANYWAY, but worth your eyes — {n_flag} row(s) look odd "
+            f"and are NOT provably garbage, so they are being kept:"
+        )
+        lines.extend(_tidy_group_lines(
+            plan["rows"], plan["flag_by_rule"], _RETIRE_FLAG_ORDER,
+            limit=TIDY_MAX_ROWS_SHOWN, rule_text=_RETIRE_RULE_TEXT, show=show,
+        ))
+        lines.append("")
+
+    lines.append("What happens to the metadata on a moved fact:")
+    lines.append(
+        "  last_used  kept exactly. It is unix seconds with one writer "
+        "(facts.py:126-128, \"Safe to compare across facts\"), so it means the "
+        "same thing here as it did there and it is what eviction sorts on."
+    )
+    lines.append(
+        "  added_turn kept exactly, and it is NOT meaningful here. facts.py:"
+        "130-132 says do not compare two facts' added_turn unless they came "
+        "from the same writer, and these came from another conversation's. It "
+        "survives as an injection-order hint only. Rewriting it would be "
+        "inventing a number; portability.import_conversation carries it "
+        "verbatim across conversations for the same reason."
+    )
+    lines.append(
+        "  archived_at is RE-STAMPED to now on the rows that land in cold "
+        "storage, because facts.archive_facts sets it and it means \"when this "
+        "row entered this sidecar\" — which, after the move, is now. The "
+        "original value is in the snapshot."
+    )
+    lines.append(
+        "  provenance is NOT written onto the row. facts.load_facts rebuilds "
+        "every entry as exactly {text, added_turn, last_used}, so any extra "
+        "key is dropped on the next read. Where each fact came from is in the "
+        "snapshot and the log instead."
+    )
+    lines.append("")
+
+    if dest_after["over_budget"]:
+        lines.append(
+            f"Heads up: this conversation would hold "
+            f"{dest_after['after_active']} active fact(s), and "
+            f"facts.select_for_injection would fit "
+            f"{dest_after['after_injectable']} of them into the facts budget. "
+            f"The other {dest_after['after_active'] - dest_after['after_injectable']} "
+            f"are not lost — the next prune moves the least-recently-used of "
+            f"them into this conversation's archive, where /list-archive shows "
+            f"them and they can be restored."
+        )
+        lines.append("")
+
+    lines.append(
+        f"Before anything moves or is deleted I write one verified snapshot of "
+        f"{source_id} — every layer above, including the rows in the "
+        f"WOULD NOT MOVE list — and I only proceed if it reads back complete. "
+        f"That file is the complete undo and nothing ever deletes it "
+        f"automatically."
+    )
+    lines.append("")
+    lines.append(f"To do exactly this:   /retire {source_id} apply {plan['token']}")
+    lines.append(
+        "That code covers this exact source, this exact destination, and every "
+        "row listed above on both sides. If any of it changes before you "
+        "confirm, the code stops working and you get a fresh plan instead of a "
+        "surprise."
+    )
+    return "\n".join(lines)
+
+
+def _retire_dest_projection(
+    dest_active: list[dict], dest_archive: list[dict], plan: dict
+) -> dict:
+    """What the destination looks like before and after, using only public
+    fact-store API. select_for_injection is the authority on what actually
+    reaches a prompt, so the answer comes from it rather than from a token
+    estimate this file would have to keep in step with facts.py."""
+    incoming = [plan["rows"][p] for p in plan["migrate_active"]]
+    after = list(dest_active) + incoming
+    injectable = len(facts_module.select_for_injection(after))
+    return {
+        "before_active": len(dest_active),
+        "before_archive": len(dest_archive),
+        "after_active": len(after),
+        "after_injectable": injectable,
+        "over_budget": injectable < len(after),
+    }
+
+
+_RETIRE_USAGE = (
+    "Usage:\n"
+    "  /retire <conv_id>              show how I would empty that "
+    "conversation's memory into THIS one (changes nothing)\n"
+    "  /retire <conv_id> apply <code> do exactly what that dry run listed\n"
+    "\n"
+    "The conversation you name is the one that gets emptied. The destination "
+    "is always the conversation you are typing in, so it cannot be mistyped."
+)
+
+
+async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
+    parts = arg.split()
+    if not parts:
+        return _RETIRE_USAGE
+    source_id = parts[0]
+    if not _RETIRE_CONV_ID_RE.match(source_id):
+        return (
+            f"{source_id!r} is not a conversation id. Ids are 1-64 characters "
+            f"of letters, digits, dash and underscore. I have changed "
+            f"nothing.\n\n" + _RETIRE_USAGE
+        )
+    if source_id == conv_id:
+        return (
+            "That is this conversation. /retire moves one conversation's "
+            "memory into another one, so it cannot be its own destination — "
+            "for emptying the conversation you are in, /forget is the command, "
+            "and it does not move anything anywhere. Nothing has been changed."
+        )
+
+    mode = parts[1].lower() if len(parts) > 1 else ""
+    if mode not in ("", "apply"):
+        return (
+            f"Unknown option {parts[1]!r}. I have changed nothing.\n\n"
+            + _RETIRE_USAGE
+        )
+
+    if mode == "":
+        source_active = facts_module.load_facts(source_id)
+        source_archive = facts_module.load_archive(source_id)
+        layers = _retire_other_layers(source_id)
+        if not source_active and not source_archive and not any(
+            bool(layers[k]) for k in ("summary", "episodic", "persona", "backfill")
+        ):
+            return (
+                f"Conversation {source_id} has no stored memory of any kind — "
+                f"no facts, no archive, no summary, no indexed exchanges and no "
+                f"persona. There is nothing to retire."
+            )
+        items = _retire_items(source_active, source_archive)
+        dest_active = facts_module.load_facts(conv_id)
+        dest_archive = facts_module.load_archive(conv_id)
+        plan = _retire_plan(
+            items, dest_active, dest_archive,
+            source_id=source_id, dest_id=conv_id,
+        )
+        return _retire_render_plan(
+            plan, layers, source_id, conv_id,
+            _retire_dest_projection(dest_active, dest_archive, plan),
+        )
+
+    token = parts[2].lower() if len(parts) > 2 else ""
+    if not token:
+        return (
+            f"/retire ... apply needs the code from a dry run. Run "
+            f"/retire {source_id} first and read what it proposes — the code "
+            f"exists so that nothing moves and nothing is dropped that you "
+            f"have not seen."
+        )
+
+    # Both conversations are live stores with their own extraction tails, so
+    # both writes have to be serialized against them — the destination just as
+    # much as the source, because appending to a facts file a parked tail is
+    # about to rewrite from its own pre-read snapshot is the F22/F3 shape
+    # exactly, and here it would lose the migrated facts outright.
+    #
+    # Two locks means an ordering rule. Sorted by id, unconditionally: nothing
+    # else in this codebase takes two conv_locks, so self-consistency is the
+    # whole requirement, and sorted() gives it without a registry. source and
+    # conv_id are known distinct by the guard above, so this never
+    # self-deadlocks on re-entry.
+    first, second = sorted((source_id, conv_id))
+    async with conv_lock(first):
+        async with conv_lock(second):
+            source_active = facts_module.load_facts(source_id)
+            source_archive = facts_module.load_archive(source_id)
+            layers = _retire_other_layers(source_id)
+            dest_active = facts_module.load_facts(conv_id)
+            dest_archive = facts_module.load_archive(conv_id)
+
+            has_anything = bool(source_active) or bool(source_archive) or any(
+                bool(layers[k])
+                for k in ("summary", "episodic", "persona", "backfill")
+            )
+            if not has_anything:
+                # Also the clean answer to "the apply already ran and you sent
+                # it twice", which is why it is worded as a state and not as an
+                # error.
+                return (
+                    f"Conversation {source_id} has no stored memory of any "
+                    f"kind. There is nothing to retire, and nothing has been "
+                    f"changed."
+                )
+
+            items = _retire_items(source_active, source_archive)
+            # Re-planned from disk, never carried over from the dry run: the
+            # plan is a pure function of the two stores, so this is the compare
+            # half of a compare-and-swap over BOTH of them.
+            plan = _retire_plan(
+                items, dest_active, dest_archive,
+                source_id=source_id, dest_id=conv_id,
+            )
+            if plan["token"] != token:
+                return (
+                    "That code is out of date — the plan has changed since the "
+                    "dry run, so I have moved nothing and dropped nothing.\n\n"
+                    + _retire_render_plan(
+                        plan, layers, source_id, conv_id,
+                        _retire_dest_projection(dest_active, dest_archive, plan),
+                    )
+                )
+
+            # 1. ARCHIVE EVERYTHING FIRST. Raises rather than returning a bad
+            #    path, and a raise here means nothing below runs.
+            try:
+                snap = portability.quarantine_conversation(
+                    source_id, reason=f"retire-into:{conv_id}"
+                )
+            except portability.QuarantineError as e:
+                logger.error(
+                    f"conv={source_id}: /retire aborted — could not write a "
+                    f"verified snapshot: {e}"
+                )
+                return (
+                    f"I could not write a verified backup of {source_id} "
+                    f"first, so I have changed nothing. Nothing has been moved "
+                    f"and nothing has been removed. This is a problem on my "
+                    f"side — please mention it."
+                )
+
+            # A layer the snapshot could not read is a layer this operation is
+            # about to delete without a copy of it. /tidy can note an
+            # unverified layer and carry on because it only touches facts;
+            # retirement deletes every one of them, so an unverified layer is
+            # a refusal.
+            if snap["unverified_layers"]:
+                logger.error(
+                    f"conv={source_id}: /retire refused — snapshot could not "
+                    f"verify: {'; '.join(snap['unverified_layers'])}"
+                )
+                return (
+                    f"I have changed nothing. My backup of {source_id} could "
+                    f"not account for: "
+                    + "; ".join(snap["unverified_layers"])
+                    + f".\n\nRetiring a conversation deletes every one of its "
+                    f"layers, so I will not do it while I cannot prove I have "
+                    f"a copy of one of them. The snapshot I did write is at "
+                    f"{snap['path']} and nothing was removed. This is a "
+                    f"problem on my side — please mention it."
+                )
+
+            # 2. MIGRATE, and only then remove. Cold storage first, on
+            #    archive_facts' own ordering rule; both are additions, so an
+            #    interruption here leaves rows in two places — which the next
+            #    run resolves as "already in the destination" — and loses
+            #    nothing, because the source has not been touched yet.
+            move_archive = [plan["rows"][p] for p in plan["migrate_archive"]]
+            move_active = [plan["rows"][p] for p in plan["migrate_active"]]
+            n_arch = facts_module.archive_facts(conv_id, move_archive)
+            if move_active:
+                facts_module.save_facts(conv_id, dest_active + move_active)
+
+            # 3. Now empty the source. Sidecar, then the active set, then the
+            #    layers that are not facts.
+            facts_module.save_archive(source_id, [])
+            # An EMPTY facts file, not an unlinked one — /forget's tombstone,
+            # for its reason: backfill.needs_backfill gates on
+            # `facts_path(conv_id).is_file()`, so with no file there the next
+            # request on a conversation of four messages or more starts a
+            # background extraction over its whole history and writes the
+            # result straight back. The documented cost is that
+            # memory.list_known_conv_ids globs facts/*.json, so this conv_id
+            # keeps appearing in /admin/conversations. It is the right trade
+            # both times: an empty file that records a decision, against a
+            # store that rebuilds itself.
+            facts_module.save_facts(source_id, [])
+            cleared = _retire_clear_other_layers(source_id)
+
+            # Report what is on disk, not what the operation intended — the
+            # rule /forget's verification pass and /tidy both follow.
+            after_source_active = len(facts_module.load_facts(source_id))
+            after_source_archive = len(facts_module.load_archive(source_id))
+            after_layers = _retire_other_layers(source_id)
+            after_dest_active = len(facts_module.load_facts(conv_id))
+            after_dest_archive = len(facts_module.load_archive(conv_id))
+
+    n_move = len(move_active) + len(move_archive)
+    n_drop = len(plan["drop_idx"])
+    # Counts only. Fact text is real personal memory: it goes to the chat reply
+    # the owner asked for and nowhere else — not to a log file, not to an
+    # operator's terminal.
+    logger.info(
+        f"conv={source_id}: /retire into {conv_id} moved {n_move} fact(s) "
+        f"({len(move_active)} active, {n_arch} archived), dropped {n_drop} "
+        f"({', '.join(f'{r}={len(v)}' for r, v in sorted(plan['drop_by_rule'].items())) or 'none'}), "
+        f"cleared [{', '.join(cleared) or 'no other layer'}]; "
+        f"snapshot={snap['path'].name}"
+    )
+
+    lines = [
+        f"Retired {source_id}.",
+        "",
+        f"Moved {n_move} fact(s) into this conversation "
+        f"({len(move_active)} active, {n_arch} into cold storage). "
+        f"This conversation now has {after_dest_active} active fact(s) and "
+        f"{after_dest_archive} archived.",
+    ]
+    if n_drop:
+        lines.append(
+            f"Did not move {n_drop} row(s) — every one of them is in the "
+            f"snapshot below, and the dry run listed them all."
+        )
+    else:
+        lines.append("Every fact in that conversation was worth moving.")
+    if cleared:
+        lines.append(f"Cleared from {source_id}: {', '.join(cleared)}.")
+    lines.append(
+        f"A complete snapshot of {source_id} as it was a moment ago is at "
+        f"{snap['path']} ({snap['facts']} active fact(s), {snap['archive']} "
+        f"archived, {snap['episodic']} indexed exchange(s), summary="
+        f"{'yes' if snap['summary'] else 'no'}, persona="
+        f"{'yes' if snap['persona'] else 'no'}). Nothing deletes it "
+        f"automatically."
+    )
+
+    residue: list[str] = []
+    if after_source_active:
+        residue.append(f"{after_source_active} active fact(s)")
+    if after_source_archive:
+        residue.append(f"{after_source_archive} archived fact(s)")
+    for name, key in (
+        ("summary state", "summary"), ("indexed exchanges", "episodic"),
+        ("persona", "persona"), ("lazy-backfill state", "backfill"),
+    ):
+        v = after_layers[key]
+        if v is None:
+            residue.append(f"{name} (could not re-read it)")
+        elif v:
+            residue.append(name)
+    if residue:
+        lines.append("")
+        lines.append(
+            "Not everything went: " + ", ".join(residue) + " is still there. "
+            "Nothing has been lost — run this again and it will finish."
+        )
+    lines.append("")
+    lines.append(
+        f"One thing this does NOT do: if {source_id} was a bucket that "
+        f"background traffic keeps hashing to, it will start filling again on "
+        f"the next such request. Nothing in the compactor stops that yet."
+    )
+    return "\n".join(lines)
+
+
 _HANDLERS: dict[str, Handler] = {
     "help": _handle_help,
     "list-facts": _handle_list_facts,
@@ -1219,6 +2071,7 @@ _HANDLERS: dict[str, Handler] = {
     "forget": _handle_forget,
     "why": _handle_why,
     "tidy": _handle_tidy,
+    "retire": _handle_retire,
 }
 
 

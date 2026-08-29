@@ -54,3 +54,41 @@ services:
       # Read-only: these tests must not be able to mutate the repo.
       - ./:/repo:ro
     working_dir: /repo/compactor
+
+  # The soak owns its dependency rather than borrowing a shared one.
+  #
+  # Running the contract harness with --exit-code-from tears the WHOLE stack
+  # down when its container exits, including tokenize-fixture. Two suites
+  # sharing one fixture therefore kill each other, and the symptom is a soak
+  # failing mid-conversation with a connection error that looks exactly like a
+  # real defect. A test that fails for an environmental reason indistinguishable
+  # from a real one is how a suite teaches people to ignore red.
+  #
+  #   docker compose -f docker-compose.tokenizer-contract.yml   #     run --rm --build soak-tests
+  soak-tests:
+    profiles: ["soak"]
+    build:
+      context: ./testfixtures/tokenizer-contract
+      dockerfile: Dockerfile.testrunner
+    container_name: zla-soak-tests
+    depends_on:
+      tokenize-fixture:
+        condition: service_healthy
+    environment:
+      VLLM_URL: http://tokenize-fixture:8000
+      FIXTURE_URL: http://tokenize-fixture:8000
+      MODEL_REPO: fixture-model
+      # A small window so compaction fires within a soak-sized run. The soak
+      # asserts RATIOS and lag, never absolute token counts.
+      SOAK_MAX_MODEL_LEN: "8192"
+      SOAK_GENERATION_RESERVE: "2048"
+      SOAK_TURNS: "22"
+      # No network on the budgeting path: get_tokenizer resolves MODEL_REPO
+      # against huggingface.co and a 429 blocked a real run for 231 seconds.
+      # (REMEDIATION F33 composing with F25.)
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    volumes:
+      - ./:/repo:ro
+    working_dir: /repo/compactor
+    command: ["python", "test_soak_conversation.py"]

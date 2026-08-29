@@ -157,6 +157,10 @@ _tok = AutoTokenizer.from_pretrained(TOKENIZER_ID)
 
 _MODE: dict[str, Any] = {
     "tokenize_mode": "ok",
+    # 0 = the canned one-liner. >0 = generate an adversarial reply of roughly
+    # this many characters, for soak testing. See _adversarial_reply.
+    "reply_chars": 0,
+    "reply_seq": 0,
     "factor": 0.5,
     "status": 400,
     "delay": 15.0,
@@ -390,6 +394,65 @@ def _context_error(token_num: int, max_tokens: int | None) -> dict:
 
 _CANNED = "Acknowledged. (fixture reply — this server has no model weights.)"
 
+# --- Adversarial reply generation (soak testing) ---------------------------
+#
+# A canned one-liner cannot reproduce the failures this project has actually
+# had. Every one of them came from what the MODEL emits: decorative rules that
+# the local tokenizer prices at a fraction of what the server charges, markdown
+# scaffolding that fact extraction stored as memory, and replies long enough to
+# push a conversation past the compaction trigger.
+#
+# So the soak fixture generates replies that carry all of it. This is not
+# realism for its own sake — each element is one of the four things that
+# actually broke production, reproduced deliberately.
+_RULE = "━" * 62          # the exact decoration from INCIDENT_2026-08-28
+_LOREM = (
+    "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod "
+    "tempor incididunt ut labore et dolore magna aliqua enim ad minim veniam "
+    "quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo "
+).split()
+
+
+def _adversarial_reply(n: int, target_chars: int) -> str:
+    """A reply shaped like the ones that took production down.
+
+    Deterministic in `n` so a soak run is reproducible and a failure at turn 47
+    can be re-run as turn 47. Contains, on purpose:
+      - a box-drawing rule (tokenizer divergence)
+      - a markdown heading and a code fence (fact-extraction scaffolding)
+      - a fabricated status line with numbers (the "not good with numbers" loop)
+      - emoji (another tokenizer divergence source)
+      - prose to make up the length
+    """
+    parts = [
+        f"# Status Report {n} ✨",
+        _RULE,
+        f"💚 ENERGY LEVEL:  {70 + (n % 30)}% → {75 + (n % 25)}%",
+        f"💚 PROTECTION:    {10 ** (1 + n % 6)}% (Maximum!)",
+        _RULE,
+        "```json",
+        '"follow_ups": [',
+        f'  "What happens at step {n}?"',
+        "]",
+        "```",
+    ]
+    body = []
+    i = 0
+    while sum(len(x) + 1 for x in parts) + sum(len(x) + 1 for x in body) < target_chars:
+        body.append(_LOREM[(n * 7 + i) % len(_LOREM)])
+        i += 1
+        if i > 20000:  # never spin forever on a pathological target
+            break
+    return "\n".join(parts) + "\n\n" + " ".join(body)
+
+
+def _reply_for(body: dict) -> str:
+    """The assistant text this fixture will return."""
+    chars = int(_MODE.get("reply_chars") or 0)
+    if chars <= 0:
+        return _CANNED
+    return _adversarial_reply(int(_MODE.get("reply_seq") or 0), chars)
+
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -467,7 +530,7 @@ async def chat_completions(request: Request):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": _CANNED},
+                "message": {"role": "assistant", "content": _reply_for(body)},
                 "finish_reason": "stop",
             }
         ],
@@ -514,7 +577,8 @@ async def get_mode():
 @app.post("/_fixture/mode")
 async def set_mode(request: Request):
     body = await request.json()
-    for k in ("tokenize_mode", "factor", "status", "delay", "assistant_final_400"):
+    for k in ("tokenize_mode", "factor", "status", "delay", "assistant_final_400",
+              "reply_chars", "reply_seq"):
         if k in body:
             _MODE[k] = body[k]
     return dict(_MODE)

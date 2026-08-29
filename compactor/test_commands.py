@@ -27,6 +27,7 @@ import commands  # noqa: E402
 import dedup  # noqa: E402
 import facts  # noqa: E402
 import memory  # noqa: E402
+import persona  # noqa: E402
 import portability  # noqa: E402
 import summarizer  # noqa: E402
 
@@ -1168,6 +1169,570 @@ def test_quarantine_does_not_overwrite_a_snapshot_from_the_same_second():
 
 
 # ---------------------------------------------------------------------------
+# /retire — v3.1 D8
+# ---------------------------------------------------------------------------
+#
+# Same privacy rule as the /tidy block above, and it matters more here because
+# this operation names a conversation id in its own syntax. Every id in this
+# file is invented. Nothing from the live store, and no id from it, appears
+# anywhere in this repository.
+#
+# The fixtures reuse _REAL_FACTS / _GARBAGE_SCAFFOLD / _GARBAGE_EMPTY on
+# purpose: if a row is safe from /tidy it must be safe from /retire, and the
+# shared fixture is what makes a divergence show up as a failure rather than as
+# two files quietly disagreeing about what a fact is.
+
+# Markup that facts.is_storable_fact refuses and D6's rules do not — the half
+# of the classifier that /tidy does not have.
+_GARBAGE_MARKUP = [
+    "```json",
+    "## Current Status",
+    '"energy_level": 88,',
+    "ENERGY LEVEL: 88% -> 92%",
+    "The following data was recorded: {",
+]
+
+
+def _retire(arg, cid):
+    return asyncio.run(commands.handle_command("retire", arg, cid, ctx={}))
+
+
+def _retire_code(out, source):
+    marker = f"/retire {source} apply "
+    assert_true(marker in out, f"dry run offered a confirmation code: {out[-400:]}")
+    return out.split(marker, 1)[1].split()[0]
+
+
+def _retire_apply(source, dest):
+    return _retire(
+        f"{source} apply {_retire_code(_retire(source, dest), source)}", dest)
+
+
+def _drop_section(out):
+    """Only the WOULD NOT MOVE block, so a test can assert a string is absent
+    from the dropped list without it matching the moved list."""
+    if "WOULD NOT MOVE" not in out:
+        return ""
+    return out.split("WOULD NOT MOVE", 1)[1].split("MOVING ANYWAY", 1)[0]
+
+
+def test_parse_retire_and_aliases():
+    print("\n[test] parse_command: /retire, its aliases, and near-misses")
+    assert_eq(commands.parse_command("/retire abc"), ("retire", "abc"), "/retire <id>")
+    assert_eq(commands.parse_command("/retire abc apply c0ffee"),
+              ("retire", "abc apply c0ffee"), "/retire <id> apply <code>")
+    assert_eq(commands.parse_command("/retire-conversation x"),
+              ("retire", "x"), "long alias")
+    # A near-miss must reach the model, not a command that empties a store.
+    assert_eq(commands.parse_command("/retired"), (None, ""), "/retired is not /retire")
+    assert_eq(commands.parse_command("/r"), (None, ""), "no single-letter alias")
+
+
+def test_retire_without_a_source_explains_itself():
+    print("\n[test] /retire with no argument prints usage and changes nothing")
+    _wipe()
+    out = _retire("", "dest-1")
+    assert_true("Usage:" in out, f"usage printed: {out[:80]!r}")
+    assert_true("the one that gets emptied" in out, "says which side is emptied")
+
+
+def test_retire_refuses_its_own_conversation():
+    print("\n[test] /retire cannot name the conversation it was typed in")
+    _wipe()
+    facts.save_facts("self-1", _rows(_REAL_FACTS))
+    before = facts.load_facts("self-1")
+    out = _retire("self-1", "self-1")
+    assert_true("cannot be its own destination" in out, f"refused: {out!r}")
+    assert_true("/forget" in out, "points at the command that does do this")
+    assert_eq(facts.load_facts("self-1"), before, "store untouched")
+
+
+def test_retire_rejects_anything_that_is_not_a_conversation_id():
+    print("\n[test] /retire refuses a source id outside the filesystem charset")
+    # memory._sanitize STRIPS bad characters on the request path, where the
+    # cost of a mangled id is the wrong bucket. Here it would be the wrong
+    # conversation emptied, so this refuses instead.
+    _wipe()
+    for bad in ("../../etc/passwd", "a/b", "x" * 65, "sem;colon", "dot.dot",
+                "..", "%2e%2e"):
+        out = _retire(bad, "dest-1")
+        assert_true("is not a conversation id" in out, f"refused {bad!r}: {out[:60]!r}")
+    # An id with whitespace in it cannot reach the charset check at all — the
+    # arg is split on whitespace first, so the second word lands in the option
+    # slot. It still refuses, and still changes nothing, which is the property
+    # that matters; asserting the exact wording here would be asserting the
+    # tokenizer rather than the guard.
+    out = _retire("with space", "dest-1")
+    assert_true("Unknown option" in out and "changed nothing" in out,
+                f"a two-word id refuses too: {out[:80]!r}")
+
+
+def test_retire_on_a_source_with_no_memory_says_so():
+    print("\n[test] /retire on a conversation that has nothing")
+    _wipe()
+    out = _retire("ghost-1", "dest-1")
+    assert_true("no stored memory of any kind" in out, f"says so: {out!r}")
+    assert_eq(portability.list_quarantine("ghost-1"), [], "no snapshot written")
+
+
+def test_retire_dry_run_changes_nothing():
+    print("\n[test] /retire is a dry run: both stores are byte-identical after")
+    _wipe()
+    src, dst = "phantom-1", "dest-1"
+    facts.save_facts(src, _rows(_REAL_FACTS + _GARBAGE_MARKUP + _GARBAGE_SCAFFOLD))
+    facts.archive_facts(src, _rows(["Idris was born in the village of Cairn."]))
+    facts.save_facts(dst, _rows(["The user prefers short chapters."], start_turn=50))
+    persona.save_persona(src, "You are a patient writing companion.")
+    summarizer.save_state(src, {"l1": [{"text": "a chunk", "first_turn": 1,
+                                       "last_turn": 20}], "l2": [], "l3": None})
+    before_src, before_arch = facts.load_facts(src), facts.load_archive(src)
+    before_dst = facts.load_facts(dst)
+
+    out = _retire(src, dst)
+    assert_true("DRY RUN" in out, f"announces a dry run: {out[:80]!r}")
+    assert_eq(facts.load_facts(src), before_src, "source facts unchanged")
+    assert_eq(facts.load_archive(src), before_arch, "source archive unchanged")
+    assert_eq(facts.load_facts(dst), before_dst, "destination unchanged")
+    assert_true(persona.load_persona(src) is not None, "persona still there")
+    assert_true(bool(summarizer.load_state(src).get("l1")), "summary still there")
+    assert_eq(portability.list_quarantine(src), [], "no snapshot written by a dry run")
+    # Requirement 7: the plan has to name what else is keyed to that id.
+    for layer in ("summary state", "indexed exchanges", "persona",
+                  "lazy-backfill state"):
+        assert_true(f"  {layer}" in out, f"the plan reports the {layer} layer")
+
+
+def test_retire_moves_real_facts_and_leaves_markup_behind():
+    print("\n[test] /retire migrates genuine facts and drops only provable markup")
+    _wipe()
+    src, dst = "phantom-2", "dest-2"
+    facts.save_facts(src, _rows(_REAL_FACTS + _GARBAGE_MARKUP
+                                + _GARBAGE_SCAFFOLD + _GARBAGE_EMPTY))
+    facts.save_facts(dst, _rows(["The user prefers short chapters."], start_turn=50))
+    dry = _retire(src, dst)
+    dropped = _drop_section(dry)
+    for text in _REAL_FACTS:
+        assert_true(text not in dropped, f"real fact never dropped: {text!r}")
+    for text in _GARBAGE_MARKUP:
+        assert_true(repr(text) in dropped, f"markup shown verbatim as dropped: {text!r}")
+    assert_true("[markup]" in dry, "the is_storable_fact rule is named")
+    assert_true("facts.is_storable_fact" in dry, "the plan says which predicate ran")
+
+    out = _retire(f"{src} apply {_retire_code(dry, src)}", dst)
+    assert_true(out.startswith("Retired "), f"applied: {out[:160]!r}")
+    landed = [f["text"] for f in facts.load_facts(dst)]
+    for text in _REAL_FACTS:
+        assert_true(text in landed, f"migrated: {text!r}")
+    for text in _GARBAGE_MARKUP + _GARBAGE_SCAFFOLD + _GARBAGE_EMPTY:
+        assert_true(text not in landed, f"not migrated: {text!r}")
+    assert_true("The user prefers short chapters." in landed,
+                "the destination's own fact is still there")
+    assert_eq(facts.load_facts(src), [], "source facts emptied")
+    assert_true(memory.facts_path(src).is_file(),
+                "an EMPTY facts file is left behind, not an unlinked one")
+
+
+def test_retire_keeps_every_row_it_cannot_prove_is_garbage():
+    print("\n[test] /retire migrates ambiguous rows rather than dropping them")
+    # Requirement 6, and the whole premise: wrongly keeping garbage costs
+    # tokens, wrongly dropping a row costs her a memory of her own life.
+    _wipe()
+    src, dst = "phantom-3", "dest-3"
+    ambiguous = [
+        "1997-04-12",
+        "[user]: Idris hates the fog",
+        "I cannot determine any facts from this exchange.",
+        "Blue cloth.",
+        "x" * (commands.TIDY_OVERSIZED_CHARS + 20),
+    ]
+    facts.save_facts(src, _rows(ambiguous))
+    dry = _retire(src, dst)
+    assert_true("WOULD NOT MOVE nothing" in dry, f"nothing dropped: {dry}")
+    assert_true("MOVING ANYWAY" in dry, "they are surfaced as a reading list")
+    _retire(f"{src} apply {_retire_code(dry, src)}", dst)
+    landed = [f["text"] for f in facts.load_facts(dst)]
+    for text in ambiguous:
+        assert_true(text in landed, f"ambiguous row kept: {text[:40]!r}")
+
+
+def test_retire_drops_only_byte_identical_destination_duplicates():
+    print("\n[test] /retire drops an exact duplicate of a destination fact and "
+          "KEEPS a near one")
+    _wipe()
+    src, dst = "phantom-4", "dest-4"
+    exact = "Idris keeps a logbook bound in blue cloth."
+    near = "idris keeps a logbook bound in blue cloth"   # case + full stop only
+    facts.save_facts(src, _rows([exact, near, "The second act opens with a storm."]))
+    facts.save_facts(dst, _rows([exact], start_turn=50))
+    dry = _retire(src, dst)
+    assert_true("[already-in-destination]" in dry, f"exact duplicate named: {dry}")
+    assert_true("[near-duplicate-in-destination]" in dry, "near one flagged, not dropped")
+    assert_true(repr(near) not in _drop_section(dry), "the near one is not in the drop list")
+    _retire(f"{src} apply {_retire_code(dry, src)}", dst)
+    landed = [f["text"] for f in facts.load_facts(dst)]
+    assert_eq(landed.count(exact), 1, "the exact duplicate did not double")
+    assert_true(near in landed, "the near-duplicate was MOVED, not discarded")
+
+
+def test_retire_drops_a_fact_the_destination_already_has_in_cold_storage():
+    print("\n[test] /retire treats the destination's archive as 'already present'")
+    _wipe()
+    src, dst = "phantom-5", "dest-5"
+    text = "The story is set on a fictional island called Brannock."
+    facts.save_facts(src, _rows([text]))
+    facts.archive_facts(dst, _rows([text], start_turn=7))
+    dry = _retire(src, dst)
+    assert_true("[already-in-destination-archive]" in dry, f"named: {dry}")
+    assert_true("/list-archive" in dry, "the reply says where the copy is")
+    _retire(f"{src} apply {_retire_code(dry, src)}", dst)
+    assert_eq([f["text"] for f in facts.load_facts(dst)], [],
+              "not resurrected into the active set")
+    assert_eq([f["text"] for f in facts.load_archive(dst)], [text],
+              "the destination's cold copy is untouched and unduplicated")
+
+
+def test_retire_moves_archived_rows_into_the_destination_archive():
+    print("\n[test] /retire keeps cold facts cold — the sidecar is memory too")
+    _wipe()
+    src, dst = "phantom-6", "dest-6"
+    cold = "Idris's father kept the light before him."
+    hot = "The protagonist is a lighthouse keeper named Idris."
+    facts.save_facts(src, _rows([hot]))
+    facts.archive_facts(src, [{"text": cold, "added_turn": 4, "last_used": 1234}])
+    _retire_apply(src, dst)
+    assert_eq([f["text"] for f in facts.load_facts(dst)], [hot], "hot stays hot")
+    dst_arch = facts.load_archive(dst)
+    assert_eq([f["text"] for f in dst_arch], [cold], "cold stays cold")
+    assert_eq((dst_arch[0]["added_turn"], dst_arch[0]["last_used"]), (4, 1234),
+              "the archived row's own metadata came with it")
+    assert_eq(facts.load_archive(src), [], "the source sidecar is emptied")
+
+
+def test_retire_prefers_the_hot_copy_when_a_fact_is_in_both_source_layers():
+    print("\n[test] /retire migrates the active copy and drops its cold twin")
+    _wipe()
+    src, dst = "phantom-7", "dest-7"
+    text = "The user wants the prose written in past tense."
+    # The archived twin deliberately carries the HIGHER (last_used, added_turn),
+    # so D6's survivor rule on its own would pick the cold copy. Being in the
+    # active set has to outrank that: the active copy is the one she is
+    # currently being reminded of, and moving it to cold storage would take a
+    # live fact out of the injected set on a technicality.
+    facts.save_facts(src, [{"text": text, "added_turn": 1, "last_used": 100}])
+    facts.archive_facts(src, [{"text": text, "added_turn": 9, "last_used": 900}])
+    dry = _retire(src, dst)
+    assert_true("[duplicate-in-source]" in dry, f"the twin is named: {dry}")
+    _retire(f"{src} apply {_retire_code(dry, src)}", dst)
+    assert_eq([f["text"] for f in facts.load_facts(dst)], [text], "one copy, hot")
+    assert_eq(facts.load_archive(dst), [], "nothing landed in cold storage")
+
+
+def test_retire_preserves_last_used_and_added_turn():
+    print("\n[test] /retire moves a fact's metadata with it, unchanged")
+    _wipe()
+    src, dst = "phantom-8", "dest-8"
+    facts.save_facts(src, [{"text": "Idris repaints the lamp housing each spring.",
+                            "added_turn": 3, "last_used": 1700000042}])
+    dry = _retire(src, dst)
+    assert_true("last_used" in dry and "added_turn" in dry,
+                "the plan states what happens to each field")
+    assert_true("NOT meaningful here" in dry,
+                "and says plainly which one does not survive as a signal")
+    _retire(f"{src} apply {_retire_code(dry, src)}", dst)
+    moved = facts.load_facts(dst)[0]
+    assert_eq((moved["added_turn"], moved["last_used"]), (3, 1700000042),
+              "both fields carried verbatim")
+
+
+def test_retire_clears_every_layer_keyed_to_the_source():
+    print("\n[test] /retire clears summary, episodic, persona and backfill state")
+    _wipe()
+    src, dst = "phantom-9", "dest-9"
+    facts.save_facts(src, _rows(_REAL_FACTS[:2]))
+    facts.archive_facts(src, _rows(["Cairn is three hours away by boat."]))
+    persona.save_persona(src, "You are a patient writing companion.")
+    summarizer.save_state(src, {"l1": [{"text": "a chunk", "first_turn": 1,
+                                       "last_turn": 20}], "l2": [], "l3": None})
+    backfill_sidecar = memory.storage_root() / "facts" / f"{src}.backfill.json"
+    memory.atomic_write_json(backfill_sidecar, {"state": "failed"})
+
+    out = _retire_apply(src, dst)
+    assert_true(out.startswith("Retired "), f"applied: {out[:200]!r}")
+    assert_eq(facts.load_facts(src), [], "facts gone")
+    assert_eq(facts.load_archive(src), [], "archive sidecar gone")
+    assert_true(persona.load_persona(src) is None, "persona gone")
+    assert_true(not summarizer.load_state(src).get("l1"), "summary gone")
+    assert_true(not backfill_sidecar.is_file(), "backfill sidecar gone")
+    assert_true("Not everything went" not in out, f"nothing left behind: {out}")
+
+
+def test_retire_snapshot_carries_the_archive_and_the_persona():
+    print("\n[test] the pre-removal snapshot holds the two layers the bundle "
+          "schema has no key for")
+    # D19: "/forget can destroy a persona that no export can back up and no
+    # import can restore." A snapshot missing the layers the operation deletes
+    # is not an archive-before-removing.
+    _wipe()
+    src, dst = "phantom-10", "dest-10"
+    cold = "Cairn is three hours away by boat."
+    facts.save_facts(src, _rows(_REAL_FACTS[:2] + _GARBAGE_MARKUP))
+    facts.archive_facts(src, _rows([cold]))
+    persona.save_persona(src, "You are a patient writing companion.")
+    _retire_apply(src, dst)
+    snaps = portability.list_quarantine(src)
+    assert_eq(len(snaps), 1, "exactly one snapshot published")
+    assert_eq(list(snaps[0].parent.glob("*.partial")), [], "no .partial left behind")
+    bundle = json.loads(snaps[0].read_text(encoding="utf-8"))
+    q = bundle["quarantine"]
+    assert_eq([f["text"] for f in q["archive"]], [cold], "the sidecar is in the snapshot")
+    assert_eq(q["persona"]["persona_text"], "You are a patient writing companion.",
+              "the persona is in the snapshot")
+    # And the garbage: requirement 4 is "archives everything, including the
+    # garbage", so a wrong classification is recoverable and not merely visible.
+    snap_texts = {f["text"] for f in bundle["facts"]}
+    for text in _GARBAGE_MARKUP:
+        assert_true(text in snap_texts, f"dropped row is recoverable: {text!r}")
+    # Still a valid v2.1 bundle: the extra keys did not break the import path.
+    res = portability.import_conversation(
+        bundle, target_conv_id="phantom-10-restored", overwrite=False)
+    assert_eq(res["imported"]["facts"], len(_REAL_FACTS[:2] + _GARBAGE_MARKUP),
+              "the snapshot restores through the existing import, unchanged")
+
+
+def test_retire_aborts_when_the_snapshot_cannot_be_written():
+    print("\n[test] /retire moves nothing if the pre-op snapshot fails")
+    _wipe()
+    src, dst = "phantom-11", "dest-11"
+    facts.save_facts(src, _rows(_REAL_FACTS))
+    code = _retire_code(_retire(src, dst), src)
+    real = portability.quarantine_conversation
+
+    def boom(conv_id, *, reason):
+        raise portability.QuarantineError("simulated: no space left on device")
+
+    portability.quarantine_conversation = boom
+    try:
+        out = _retire(f"{src} apply {code}", dst)
+    finally:
+        portability.quarantine_conversation = real
+    assert_true("changed nothing" in out, f"abort stated plainly: {out!r}")
+    assert_eq(len(facts.load_facts(src)), len(_REAL_FACTS), "source untouched")
+    assert_eq(facts.load_facts(dst), [], "destination untouched")
+
+
+def test_retire_refuses_when_a_layer_could_not_be_accounted_for():
+    print("\n[test] /retire refuses rather than delete a layer it could not back up")
+    # /tidy notes an unverified layer and carries on, because it only touches
+    # facts. Retirement deletes every layer, so an unverified one is a refusal.
+    _wipe()
+    src, dst = "phantom-12", "dest-12"
+    facts.save_facts(src, _rows(_REAL_FACTS))
+    code = _retire_code(_retire(src, dst), src)
+    real = portability.quarantine_conversation
+
+    def half_blind(conv_id, *, reason):
+        res = real(conv_id, reason=reason)
+        res["unverified_layers"] = ["episodic (vector store unavailable)"]
+        return res
+
+    portability.quarantine_conversation = half_blind
+    try:
+        out = _retire(f"{src} apply {code}", dst)
+    finally:
+        portability.quarantine_conversation = real
+    assert_true("I have changed nothing" in out, f"refused: {out!r}")
+    assert_true("vector store unavailable" in out, "names the layer it could not prove")
+    assert_eq(len(facts.load_facts(src)), len(_REAL_FACTS), "source untouched")
+    assert_eq(facts.load_facts(dst), [], "destination untouched")
+
+
+def test_retire_apply_without_a_code_refuses():
+    print("\n[test] /retire ... apply with no code changes nothing")
+    _wipe()
+    src, dst = "phantom-13", "dest-13"
+    facts.save_facts(src, _rows(_REAL_FACTS))
+    out = _retire(f"{src} apply", dst)
+    assert_true("needs the code" in out, f"refused with a reason: {out!r}")
+    assert_eq(len(facts.load_facts(src)), len(_REAL_FACTS), "source untouched")
+
+
+def test_retire_stale_code_refuses_and_reprints_the_plan():
+    print("\n[test] /retire refuses a code issued for a different plan")
+    _wipe()
+    src, dst = "phantom-14", "dest-14"
+    facts.save_facts(src, _rows(_REAL_FACTS))
+    code = _retire_code(_retire(src, dst), src)
+    facts.save_facts(src, facts.load_facts(src)
+                     + _rows(["Brannock has one harbour."], start_turn=99))
+    before = facts.load_facts(src)
+    out = _retire(f"{src} apply {code}", dst)
+    assert_true("out of date" in out, f"refused as stale: {out[:140]!r}")
+    assert_true("DRY RUN" in out, "a fresh plan is printed instead")
+    assert_eq(facts.load_facts(src), before, "nothing moved")
+    assert_eq(facts.load_facts(dst), [], "nothing landed")
+
+
+def test_retire_code_covers_the_destination_too():
+    print("\n[test] the same source plan aimed at a different destination "
+          "needs a different code")
+    # A code that only hashed the source would let a plan reviewed against one
+    # conversation be applied into another.
+    _wipe()
+    src = "phantom-15"
+    facts.save_facts(src, _rows(_REAL_FACTS))
+    a = _retire_code(_retire(src, "dest-15a"), src)
+    b = _retire_code(_retire(src, "dest-15b"), src)
+    assert_true(a != b, "the destination is part of the code")
+    out = _retire(f"{src} apply {a}", "dest-15b")
+    assert_true("out of date" in out, f"the other destination's code is refused: {out[:120]!r}")
+    assert_eq(facts.load_facts("dest-15b"), [], "nothing landed")
+
+
+def test_retire_is_idempotent():
+    print("\n[test] /retire applied twice moves the facts once")
+    _wipe()
+    src, dst = "phantom-16", "dest-16"
+    facts.save_facts(src, _rows(_REAL_FACTS + _GARBAGE_MARKUP))
+    _retire_apply(src, dst)
+    after_first = [f["text"] for f in facts.load_facts(dst)]
+    second = _retire(src, dst)
+    assert_true("no stored memory of any kind" in second,
+                f"the second dry run has nothing to do: {second[:160]!r}")
+    assert_eq([f["text"] for f in facts.load_facts(dst)], after_first,
+              "the destination did not change")
+
+
+def test_retire_finishes_an_interrupted_apply():
+    print("\n[test] /retire resumes cleanly from a crash between the two halves")
+    # Interrupted after the destination write and before the source clear, the
+    # rows are in both places. A re-run must recognise that as "already in the
+    # destination" and finish the removal — never duplicate, never re-drop.
+    _wipe()
+    src, dst = "phantom-17", "dest-17"
+    facts.save_facts(src, _rows(_REAL_FACTS + _GARBAGE_MARKUP))
+    # Exactly the state a crash in the middle leaves: destination written,
+    # source still full.
+    facts.save_facts(dst, _rows(_REAL_FACTS, start_turn=50))
+    out = _retire_apply(src, dst)
+    assert_true(out.startswith("Retired "), f"resumed and finished: {out[:200]!r}")
+    landed = [f["text"] for f in facts.load_facts(dst)]
+    assert_eq(len(landed), len(_REAL_FACTS), "no fact was duplicated")
+    for text in _REAL_FACTS:
+        assert_eq(landed.count(text), 1, f"exactly one copy of {text[:30]!r}")
+    assert_eq(facts.load_facts(src), [], "and the source is emptied this time")
+
+
+def test_retire_writes_the_destination_before_it_touches_the_source():
+    print("\n[test] /retire crashing between the halves loses nothing")
+    # "Migrates before it removes" as a testable property rather than as a
+    # comment: fail the FIRST write to the source, which is the write that
+    # immediately follows the destination writes. In the correct order the
+    # source is still intact at that instant. In the reverse order the same
+    # crash would have emptied it with nothing landed anywhere.
+    _wipe()
+    src, dst = "phantom-21", "dest-21"
+    facts.save_facts(src, _rows(_REAL_FACTS))
+    facts.archive_facts(src, _rows(["Cairn is three hours away by boat."]))
+    code = _retire_code(_retire(src, dst), src)
+    real_save_archive = facts.save_archive
+
+    def fail_on_source(conv_id, rows):
+        if conv_id == src:
+            raise OSError("simulated: power loss between the two halves")
+        return real_save_archive(conv_id, rows)
+
+    commands.facts_module.save_archive = fail_on_source
+    try:
+        out = _retire(f"{src} apply {code}", dst)
+    finally:
+        commands.facts_module.save_archive = real_save_archive
+    assert_true("Command failed" in out, f"the crash is not swallowed: {out!r}")
+    assert_eq(len(facts.load_facts(src)), len(_REAL_FACTS),
+              "the source still holds every active fact")
+    assert_eq(len(facts.load_archive(src)), 1, "and its archived one")
+    assert_eq(len(facts.load_facts(dst)), len(_REAL_FACTS),
+              "the destination already has them — nothing is anywhere else")
+    # And the resume finishes the job without duplicating anything.
+    out2 = _retire_apply(src, dst)
+    assert_true(out2.startswith("Retired "), f"resumed: {out2[:120]!r}")
+    assert_eq(len(facts.load_facts(dst)), len(_REAL_FACTS), "still no duplicates")
+    assert_eq(facts.load_facts(src), [], "and the source is empty now")
+
+
+def test_retire_serializes_against_the_destination_conversation():
+    print("\n[test] /retire parks on the DESTINATION's lock, not just the source's")
+    # The destination is a live conversation with its own extraction tail. An
+    # unlocked append lands under a tail that is parked mid-sequence on its own
+    # pre-read snapshot, and that tail's next save deletes the migrated facts —
+    # the F22/F3 shape, with a whole conversation's memory as the payload.
+    _wipe()
+    src, dst = "phantom-22", "dest-22"
+    facts.save_facts(src, _rows(_REAL_FACTS[:3]))
+    code = _retire_code(_retire(src, dst), src)
+
+    async def scenario():
+        async with memory.conv_lock(dst):
+            task = asyncio.ensure_future(
+                commands.handle_command("retire", f"{src} apply {code}", dst, ctx={}))
+            for _ in range(50):
+                await asyncio.sleep(0)
+            parked = not task.done()
+            landed_while_parked = len(facts.load_facts(dst))
+        return parked, landed_while_parked, await task
+
+    parked, landed, out = asyncio.run(scenario())
+    assert_true(parked, "the apply parked while the destination lock was held")
+    assert_eq(landed, 0, "and wrote nothing to the destination while parked")
+    assert_true(out.startswith("Retired "), f"then finished once released: {out[:120]!r}")
+    assert_eq(len(facts.load_facts(dst)), 3, "the facts landed after the lock cleared")
+
+
+def test_retire_never_elides_the_dropped_list():
+    print("\n[test] /retire prints every dropped row, however many there are")
+    # The rule D6 states and this inherits: a row the operator confirms without
+    # having seen is the exact failure the command exists to prevent.
+    _wipe()
+    src, dst = "phantom-18", "dest-18"
+    junk = [f'"metric_{i}": {i},' for i in range(commands.TIDY_MAX_ROWS_SHOWN * 2)]
+    facts.save_facts(src, _rows(junk))
+    out = _retire(src, dst)
+    assert_true("not shown" not in _drop_section(out),
+                "the dropped list is never elided")
+    for text in junk:
+        assert_true(repr(text) in out, f"row shown verbatim: {text!r}")
+
+
+def test_retire_warns_when_the_destination_would_overflow_its_facts_budget():
+    print("\n[test] /retire says so when the move pushes the destination past "
+          "what it can inject")
+    _wipe()
+    src, dst = "phantom-19", "dest-19"
+    bulk = [f"Chapter {i} covers the crossing to Cairn and back again, "
+            f"with the storm arriving on the return leg. " * 3 for i in range(40)]
+    facts.save_facts(src, _rows(bulk))
+    out = _retire(src, dst)
+    assert_true("Heads up" in out, f"the overflow is disclosed: {out[-900:]}")
+    assert_true("restored" in out, "and says the overflow is recoverable")
+
+
+def test_retire_reports_the_bucket_will_re_form():
+    print("\n[test] the reply does not claim the conversation is gone for good")
+    _wipe()
+    src, dst = "phantom-20", "dest-20"
+    facts.save_facts(src, _rows(_REAL_FACTS[:2]))
+    out = _retire_apply(src, dst)
+    assert_true("start filling again" in out,
+                f"the reply says what it cannot promise: {out}")
+
+
+def test_every_retire_rule_has_a_printed_explanation():
+    print("\n[test] every /retire rule id has an operator-readable sentence")
+    ids = set(commands._RETIRE_DROP_ORDER) | set(commands._RETIRE_FLAG_ORDER)
+    missing = sorted(i for i in ids if i not in commands._RETIRE_RULE_TEXT)
+    assert_eq(missing, [], "no rule can reach the report as a bare id")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1245,6 +1810,35 @@ def _all_tests():
         test_tidy_finishes_an_interrupted_apply,
         test_tidy_never_elides_the_removal_list,
         test_quarantine_does_not_overwrite_a_snapshot_from_the_same_second,
+        # v3.1 D8 — /retire
+        test_parse_retire_and_aliases,
+        test_retire_without_a_source_explains_itself,
+        test_retire_refuses_its_own_conversation,
+        test_retire_rejects_anything_that_is_not_a_conversation_id,
+        test_retire_on_a_source_with_no_memory_says_so,
+        test_retire_dry_run_changes_nothing,
+        test_retire_moves_real_facts_and_leaves_markup_behind,
+        test_retire_keeps_every_row_it_cannot_prove_is_garbage,
+        test_retire_drops_only_byte_identical_destination_duplicates,
+        test_retire_drops_a_fact_the_destination_already_has_in_cold_storage,
+        test_retire_moves_archived_rows_into_the_destination_archive,
+        test_retire_prefers_the_hot_copy_when_a_fact_is_in_both_source_layers,
+        test_retire_preserves_last_used_and_added_turn,
+        test_retire_clears_every_layer_keyed_to_the_source,
+        test_retire_snapshot_carries_the_archive_and_the_persona,
+        test_retire_aborts_when_the_snapshot_cannot_be_written,
+        test_retire_refuses_when_a_layer_could_not_be_accounted_for,
+        test_retire_apply_without_a_code_refuses,
+        test_retire_stale_code_refuses_and_reprints_the_plan,
+        test_retire_code_covers_the_destination_too,
+        test_retire_is_idempotent,
+        test_retire_finishes_an_interrupted_apply,
+        test_retire_writes_the_destination_before_it_touches_the_source,
+        test_retire_serializes_against_the_destination_conversation,
+        test_retire_never_elides_the_dropped_list,
+        test_retire_warns_when_the_destination_would_overflow_its_facts_budget,
+        test_retire_reports_the_bucket_will_re_form,
+        test_every_retire_rule_has_a_printed_explanation,
         test_every_test_in_this_module_is_registered,
     ]
 

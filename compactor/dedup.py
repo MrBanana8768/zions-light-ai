@@ -476,9 +476,20 @@ async def llm_merge_candidate(
     # already carried scaffolding from the extraction path; nothing stopped it
     # arriving by this one, which destroys rather than merely clutters.
     if not facts_module.is_storable_fact(cleaned):
+        # Length and cluster size, NOT the text. This is a rewrite of a whole
+        # cluster of the user's real facts, so on the false-positive shapes
+        # this predicate is known to have (a quoted phrase with a prose gloss,
+        # a terse ALL-CAPS metric) the 60 characters this used to print were
+        # real personal memory going to an operator's log file. commands.py
+        # states the rule this now follows: "Fact text is real personal memory
+        # and does not go to an operator's terminal or a log file; it goes to
+        # the chat reply the owner asked for and nowhere else." The two
+        # neighbouring refusal branches already log counts and lengths only,
+        # and the cluster is preserved, so the text remains inspectable in the
+        # store rather than being lost with the diagnostic.
         logger.warning(
             f"dedup: merged text is not a storable fact "
-            f"({cleaned[:60]!r}); cluster of {len(cluster_facts)} preserved"
+            f"({len(cleaned)} chars); cluster of {len(cluster_facts)} preserved"
         )
         return None, "markup"
     # V7: a merge is a rewording of the cluster, not a summary of it. A

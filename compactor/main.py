@@ -1097,7 +1097,12 @@ async def summarize(client: httpx.AsyncClient, to_summarize: list[dict]) -> str:
     while len(parts) > 1 and rounds < 3:
         rounds += 1
         part_msgs = [{"role": "user", "content": p} for p in parts]
-        groups = _chunk_to_budget(part_msgs, budget)
+        # _scale, not the 1.0 default. The map phase passes it and this did
+        # not — the sibling-site miss again, inside the very commit that
+        # claimed to fix that pattern. It matters here for the same reason:
+        # the partials being regrouped are model-written summary prose,
+        # which is the content the local counter reads 23-51% low on.
+        groups = _chunk_to_budget(part_msgs, budget, _scale)
         if all(len(g) == 1 for g in groups):
             break  # nothing can be folded further without breaking the budget
         try:
@@ -1834,12 +1839,41 @@ def _enforce_hard_budget(
     # request that succeeds; the drop stage already makes exactly that trade,
     # and this is the one point where the guard used to decline to make it.
     if running > limit:
+        # Drop the MINIMUM that fits — then verify, and keep going if it did not.
+        #
+        # Two properties, and the first version of this had only one each time.
+        # Dropping EVERYTHING is wasteful: measured by review, a payload over by
+        # 550 tokens lost persona, facts and summary when one 1500-token block
+        # covered it — discarding the priority reasoning _bound_injected_blocks
+        # spends twenty lines establishing (persona last, because losing it
+        # makes the reply wrong in KIND rather than merely thinner). But
+        # dropping the minimum by ARITHMETIC alone is worse: `running` here is
+        # scaled per-message estimate, and if the exact count still does not
+        # fit, forwarding while holding memory we were allowed to spend is the
+        # thing this whole path exists to prevent.
+        #
+        # So: cheapest-first by the estimate, then measure, then escalate on
+        # the measurement until it fits or nothing droppable remains. The extra
+        # /tokenize calls are bounded by the number of injected blocks and this
+        # is a last-resort path that should almost never run.
         forced = _droppable_system_indices(msgs, protect_system)
-        if forced:
-            for i in reversed(forced):
-                del msgs[i]
-                del per[i]
-                sys_dropped += 1
+        for i in reversed(forced):
+            if running <= limit:
+                break
+            running -= per[i]
+            del msgs[i]
+            del per[i]
+            sys_dropped += 1
+        if sys_dropped:
+            running, counter = _measure(msgs)
+        while running > limit:
+            remaining = _droppable_system_indices(msgs, protect_system)
+            if not remaining:
+                break
+            i = remaining[-1]
+            del msgs[i]
+            del per[i]
+            sys_dropped += 1
             running, counter = _measure(msgs)
 
     # v3.1 A9/A10: the shed line now names the counter behind its numbers and
@@ -2807,6 +2841,11 @@ async def chat_completions(request: Request) -> Any:
     # (priority, label, text). Priority orders DROPPING, not sending: the list
     # is still sent in the order it is built. See _bound_injected_blocks.
     injected_blocks: list[tuple[int, str, str]] = []
+    # Initialised unconditionally: it is ASSIGNED inside the facts branch and
+    # READ after the injection bound, so a conversation whose facts path does
+    # not run would raise NameError on the request path. Unbound names have
+    # broken this deployment five times and static analysis does not see them.
+    _pending_touch = None
     log_parts: list[str] = []
     # Bound before the summary load so the injection log line can name it even
     # when that load fails — an unreadable summary is exactly when you want the
@@ -2865,7 +2904,14 @@ async def chat_completions(request: Request) -> Any:
                 # out keep their real last_used and become the eviction
                 # candidates, which is the entire point.
                 injected_facts = facts.select_for_injection(touched_facts)
-                facts.touch_facts(injected_facts)
+                # NOT touched here. last_used is the LRU eviction key, and
+                # _bound_injected_blocks (below) may drop the facts block
+                # entirely — so touching now records "recently used" for facts
+                # the model never saw. On a conversation where the bound fires
+                # repeatedly that inverts the eviction order: the facts that
+                # were never sent look freshest and survive, while facts that
+                # WERE sent age out. The touch moved to after the bound.
+                _pending_touch = injected_facts
                 block = facts.format_facts_block(injected_facts)
                 if block:
                     injected_blocks.append(
@@ -2951,6 +2997,13 @@ async def chat_completions(request: Request) -> Any:
             kept, dropped_layers, inject_cost = await run_in_threadpool(
                 _bound_injected_blocks, injected_blocks, inject_budget
             )
+            # Mark facts used only if the facts block SURVIVED the bound.
+            # last_used is the LRU eviction key; touching facts the model never
+            # received makes them look freshest and pushes the facts that WERE
+            # sent toward eviction instead — the eviction order inverts on
+            # exactly the conversations where the bound fires most.
+            if _pending_touch is not None and "facts" not in dropped_layers:
+                facts.touch_facts(_pending_touch)
             if dropped_layers:
                 # WARNING, not INFO. This is memory the user believes the
                 # assistant has and the model is not going to see, which is the

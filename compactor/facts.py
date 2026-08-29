@@ -783,9 +783,28 @@ _FENCE_RE = re.compile(r"^(?:`{3,}|~{3,})")
 # "#1 priority ..." is not a heading and is not matched.
 _HEADING_RE = re.compile(r"^#{1,6}(?:\s|$)")
 
-# A JSON object key at the start of the line: "some_key":
-# English sentences do not open with a double-quoted token followed by a colon.
-_JSON_KEY_RE = re.compile(r'^"[^"]*"\s*:')
+# A JSON object key at the start of the line: "some_key": <json value>
+#
+# The colon alone is NOT enough, and the earlier comment here ("English
+# sentences do not open with a double-quoted token followed by a colon") is
+# simply false of the gloss form. These are facts, and this filter would have
+# deleted them:
+#     "Little Bear": her grandmother's name for her
+#     "One day at a time": the phrase she repeats when panicking
+# Given what this store holds — coping phrases, names of the dead — a quoted
+# phrase followed by an explanation is among the LAST things that should be
+# discarded. The old rule was also inconsistent on typography: it matched the
+# ASCII quote only, so the same fact with curly quotes was kept.
+#
+# So require the remainder to look like JSON rather than like prose. A key
+# followed by an object, array, string, number, boolean, null, or nothing is
+# scaffolding; a key followed by a lowercase English word is a definition.
+#
+# This matters more under /retire than at extraction: here a false positive
+# drops one incoming line, there it DELETES something already stored.
+_JSON_KEY_RE = re.compile(
+    r'^"[^"]*"\s*:\s*(?:[\[{"]|-?\d|true\b|false\b|null\b|$)'
+)
 
 # An ALL-CAPS label followed by a colon, optionally behind a few leading
 # non-alphanumerics (an emoji, a bullet glyph, a box character). The label

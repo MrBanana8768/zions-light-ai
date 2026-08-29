@@ -46,6 +46,7 @@ from typing import Any
 
 import facts
 import memory
+import persona
 import retrieval
 import summarizer
 
@@ -127,11 +128,63 @@ def export_conversation(conv_id: str) -> dict:
 # publish under the real name. A crash at any point leaves either a `.partial`
 # nothing reads or a published file that has been proven readable. Never a
 # half-trusted snapshot.
+#
+# v3.1 D8 — TWO LAYERS THE BUNDLE DOES NOT CARRY, and why they are carried
+# here instead.
+#
+# export_conversation writes exactly three payloads: facts, summary_state,
+# episodic. It does not carry the archive sidecar and it does not carry the
+# persona. For an export that is a schema question; for a PRE-REMOVAL SNAPSHOT
+# it is a correctness one, because both of those layers are things a
+# destructive admin operation deletes:
+#
+#   - commands._wipe_all_layers clears the archive sidecar, and its own
+#     comment records that "NOTHING in this codebase has ever deleted one"
+#     before it did.
+#   - main._clear_all_memory calls persona.clear_persona. INCIDENT_2026-08-24
+#     D19 states the consequence in one line: "/forget can destroy a persona
+#     that no export can back up and no import can restore."
+#
+# A snapshot that is missing the layers the operation removes is not an
+# archive-before-removing; it is a partial one that reads as complete. So both
+# are measured, carried, and verified on read-back like everything else.
+#
+# They go in the `quarantine` metadata block rather than into the bundle
+# payload. That is deliberate and it is not laziness: adding payload keys means
+# either a BUNDLE_VERSION bump — which _validate_bundle enforces by strict
+# equality, so every previously written bundle and both HTTP endpoints stop
+# working the moment it changes — or silently widening a documented schema.
+# Under `quarantine`, _validate_bundle ignores the extra key, so a snapshot
+# stays a valid v2.1 bundle that import_conversation restores with no new code,
+# AND the two extra layers travel with it for an operator (or
+# commands._handle_retire) to put back explicitly. Restoring them is a
+# `facts.save_archive` and a `persona.save_persona`; the restore_hint says so.
+#
+# This does NOT close D19 for export/import generally — export_conversation is
+# unchanged and a fork still loses the persona. It closes it for the one path
+# whose entire purpose is to make a removal reversible.
 
 # Filename-safe by construction: conv_id is already sanitized by
 # memory._sanitize to [A-Za-z0-9_-], and the stamp adds only digits, "T" and
 # "Z".
 QUARANTINE_SUBDIR = "quarantine"
+
+
+def _has_summary_content(state: Any) -> bool:
+    """True when a summary_state payload holds an actual hierarchy.
+
+    NOT `bool(state)`. summarizer.load_state "returns an empty (but
+    well-formed) skeleton if no file exists" — a dict with l1/l2/l3 and
+    last_summarized_turn keys — so a plain truthiness test on it is True for
+    every conversation that has never been summarized at all. The quarantine
+    log said `summary=yes` unconditionally, which on a snapshot surface is
+    the same class of lie as reporting a wipe from the counters instead of
+    from disk: the operator reads a layer that is not there. Same test
+    commands._memory_residue applies for /forget's verification pass.
+    """
+    if not isinstance(state, dict):
+        return False
+    return bool(state.get("l1") or state.get("l2") or state.get("l3"))
 
 
 class QuarantineError(Exception):
@@ -185,8 +238,8 @@ def list_quarantine(conv_id: str | None = None) -> list[Path]:
 
 def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
     """Write a verified, restorable snapshot of this conversation before
-    something removes part of it. Returns {"path", "facts", "episodic",
-    "summary", "unverified_layers"}.
+    something removes part of it. Returns {"path", "facts", "archive",
+    "episodic", "summary", "persona", "unverified_layers"}.
 
     Raises QuarantineError if the snapshot cannot be proven to hold at least
     what the store held a moment ago. Raises memory.StoreUnreadable if the
@@ -215,6 +268,25 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
     expected_facts = len(facts.load_facts(conv_id))
 
     unverified: list[str] = []
+
+    # The two layers export_conversation does not carry — see the block
+    # comment above. Read as best-effort and RECORDED when they fail, never
+    # silently defaulted: a caller that is about to clear the archive sidecar
+    # has to be able to tell "there was nothing there" from "I could not look",
+    # and those are the same value if this swallows the exception.
+    archived_rows: list[dict] = []
+    try:
+        archived_rows = facts.load_archive(conv_id)
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: quarantine could not read the archive sidecar: {e}")
+        unverified.append("archived facts (unreadable)")
+    persona_record = None
+    try:
+        persona_record = persona.load_persona(conv_id)
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: quarantine could not read the persona: {e}")
+        unverified.append("persona (unreadable)")
+
     expected_episodic = retrieval.conversation_doc_count(conv_id)
     if expected_episodic is None:
         # None is "could not tell", never zero (F61). The episodic layer is not
@@ -236,13 +308,23 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
         "expected": {
             "facts": expected_facts,
             "episodic": expected_episodic,
+            "archive": len(archived_rows),
         },
+        # The two layers the v2.1 bundle payload has no key for. Carried
+        # verbatim so a restore is a copy, not a reconstruction.
+        "archive": list(archived_rows),
+        "persona": persona_record,
         "unverified_layers": list(unverified),
         "restore_hint": (
             "per-row: facts.restore_from_archive(conv_id) — preferred. "
             "whole-conversation: import_conversation(this file, "
             "target_conv_id=<conv>, overwrite=True) — discards anything "
-            "learned since this file was written."
+            "learned since this file was written. import_conversation does "
+            "NOT restore the two layers under quarantine.archive and "
+            "quarantine.persona: put those back with "
+            "facts.save_archive(conv_id, bundle['quarantine']['archive']) and "
+            "persona.save_persona(conv_id, "
+            "bundle['quarantine']['persona']['persona_text'])."
         ),
     }
 
@@ -299,6 +381,30 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
                 f"conv={conv_id}: quarantine snapshot lost episodic entries "
                 f"between write and read-back"
             )
+        # Same contradiction for the two layers carried in the metadata block.
+        # Verified rather than trusted for exactly the reason the payload is:
+        # the caller is about to delete these, and a snapshot that quietly
+        # dropped them on serialization is worse than no snapshot, because the
+        # caller proceeds.
+        back_q = back.get("quarantine")
+        if not isinstance(back_q, dict):
+            raise QuarantineError(
+                f"conv={conv_id}: quarantine snapshot read back without its "
+                f"metadata block"
+            )
+        if len(back_q.get("archive") or []) < len(archived_rows):
+            raise QuarantineError(
+                f"conv={conv_id}: quarantine snapshot read back with "
+                f"{len(back_q.get('archive') or [])} archived fact(s), "
+                f"expected at least {len(archived_rows)}"
+            )
+        if persona_record is not None and not (back_q.get("persona") or {}).get(
+            "persona_text"
+        ):
+            raise QuarantineError(
+                f"conv={conv_id}: quarantine snapshot read back without the "
+                f"persona this conversation has stored"
+            )
 
         # Publish. Same rename-into-place backup.py uses: the file appears
         # under its real name only once it has been proven readable.
@@ -314,16 +420,20 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
     # to an operator's terminal and the store holds real personal memory.
     logger.info(
         f"conv={conv_id}: quarantine snapshot published ({reason}): "
-        f"{n_back} fact(s), {len(back.get('episodic') or [])} episodic, "
-        f"summary={'yes' if back.get('summary_state') else 'no'}"
+        f"{n_back} fact(s), {len(back_q.get('archive') or [])} archived, "
+        f"{len(back.get('episodic') or [])} episodic, "
+        f"summary={'yes' if _has_summary_content(back.get('summary_state')) else 'no'}, "
+        f"persona={'yes' if back_q.get('persona') else 'no'}"
         + (f", unverified: {'; '.join(unverified)}" if unverified else "")
     )
 
     return {
         "path": published,
         "facts": n_back,
+        "archive": len(back_q.get("archive") or []),
         "episodic": len(back.get("episodic") or []),
-        "summary": bool(back.get("summary_state")),
+        "summary": _has_summary_content(back.get("summary_state")),
+        "persona": bool(back_q.get("persona")),
         "unverified_layers": unverified,
     }
 
