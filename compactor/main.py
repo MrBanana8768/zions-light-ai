@@ -1168,20 +1168,41 @@ async def summarize(
     # request picks up where this one stopped. Progress every turn, latency
     # bounded every turn.
     deferred: list[dict] = []
-    if len(batches) > MAX_SUMMARY_CALLS_PER_REQUEST:
-        keep = batches[:MAX_SUMMARY_CALLS_PER_REQUEST]
-        for b in batches[MAX_SUMMARY_CALLS_PER_REQUEST:]:
-            deferred.extend(b)
+    if len(batches) > max(1, MAX_SUMMARY_CALLS_PER_REQUEST):
+        # Do NOT summarize a prefix and defer the rest.
+        #
+        # That was this code's first shape and it does not converge. Review
+        # measured it: compact_if_needed is a pure function of the client's
+        # message array, nothing records where summarization stopped, so the
+        # SAME oldest batches are re-summarized every turn forever while the
+        # deferred tail grows by two per turn:
+        #
+        #     170 turns -> 4 calls, batches [U1, A2, U4, A5]
+        #     172 turns -> 4 calls, IDENTICAL
+        #     174 turns -> 4 calls, IDENTICAL
+        #
+        # Four LLM calls of latency per turn, permanently, for a summary of
+        # the oldest ~27 turns of a 170-turn conversation. That trades an
+        # eight-minute stall for a tax that never ends; it is not a fix.
+        #
+        # So when the backlog exceeds what one request may spend, this path
+        # does NOTHING and says so. Both mechanisms that actually handle it
+        # are persistent and off the request path: the L1/L2/L3 hierarchy
+        # summarizes into memory on the background tail and is injected
+        # separately, and the hard-budget guard sheds the rest in
+        # milliseconds. Repeating work every turn helps neither.
         logger.warning(
-            f"summarize: {len(to_summarize)} turns need {len(batches)} batches, "
-            f"which is over the {MAX_SUMMARY_CALLS_PER_REQUEST}-call per-request "
-            f"cap. Summarizing the oldest {len(keep)}; {len(deferred)} turn(s) "
-            f"are forwarded verbatim and will be summarized on a later turn. A "
-            f"conversation that reports this every turn has a backlog — run "
-            f"POST /admin/conversations/<id>/compact to clear it off the "
-            f"request path."
+            f"compaction skipped: {len(to_summarize)} turns need "
+            f"{len(batches)} summarization calls, over the "
+            f"{MAX_SUMMARY_CALLS_PER_REQUEST}-call per-request cap. "
+            f"Summarizing a prefix would be redone identically every turn, "
+            f"so nothing is summarized here: the guard will shed to fit and "
+            f"the L1/L2/L3 hierarchy carries the older context. If this "
+            f"repeats, the hierarchy is behind — POST "
+            f"/admin/conversations/<id>/compact advances it off the request "
+            f"path."
         )
-        batches = keep
+        return "", to_summarize
 
     logger.info(
         f"summarize: {len(to_summarize)} turns exceed the {budget}-token input "
@@ -1303,10 +1324,15 @@ async def compact_if_needed(messages: list[dict]) -> list[dict]:
         return messages
     async with httpx.AsyncClient() as client:
         summary, deferred = await summarize(client, text_only)
-    summary_msg = {
+    # No summary block when there is no summary. summarize() returns
+    # ("", all turns) when the backlog is too large for one request, and a
+    # bare "[Summary of earlier conversation]" header with nothing under it
+    # is worse than absent: it tells the model a summary exists and then
+    # shows it an empty one.
+    summary_blocks = ([{
         "role": "system",
         "content": f"[Summary of earlier conversation]\n{summary}",
-    }
+    }] if summary.strip() else [])
     # Order: system → summary-of-oldest → deferred turns → images → recent.
     # `deferred` is chronologically NEWER than what the summary covers and
     # OLDER than keep_recent, so it slots between them and the transcript
@@ -1314,7 +1340,7 @@ async def compact_if_needed(messages: list[dict]) -> list[dict]:
     # then shed, which is the correct trade: the guard sheds in
     # milliseconds, four more summarization calls cost her a minute.
     new_messages = (
-        system_msgs + [summary_msg] + deferred + preserved_images + keep_recent
+        system_msgs + summary_blocks + deferred + preserved_images + keep_recent
     )
     new_count = count_tokens(new_messages)
     logger.info(
@@ -4209,6 +4235,28 @@ async def admin_compact(conv_id: str, request: Request):
         messages.append({"role": "assistant", "content": a})
 
     before = summarizer.load_state(conv_id)
+    # REFUSE rather than pull the watermark backwards.
+    #
+    # last_summarized_turn is an absolute position in whatever array the LIVE
+    # request path last saw. The transcript here is rebuilt from the episodic
+    # store, which is lossy by design — it holds only exchanges that indexed
+    # successfully. Feeding a shorter reconstruction into maybe_rollup lets
+    # _reconcile_watermark pull the watermark back to it, and the turns in
+    # between are summarized a second time on the next live turn. Duplicate
+    # chunks in her memory is a worse outcome than a command declining to run.
+    _wm = before.get("last_summarized_turn", 0)
+    if len(messages) < _wm:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"refusing: the episodic store rebuilds {len(messages)} "
+                f"messages for conv {conv_id}, but the summary watermark is "
+                f"already at {_wm}. Running would pull it backwards and "
+                f"re-summarize covered turns. The reconstruction is lossy by "
+                f"design, so a shortfall means episodic indexing has gaps — "
+                f"not that the summaries are behind."
+            ),
+        )
     plan = {
         "conv_id": conv_id,
         "indexed_exchanges": len(exchanges),

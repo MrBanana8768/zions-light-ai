@@ -1025,14 +1025,26 @@ def test_summarize_survives_an_assistant_final_slice_end_to_end():
             return await main.summarize(c, turns)
 
     with CaptureLogs() as logs:
-        out = asyncio.run(_run())
+        out, deferred = asyncio.run(_run())
     text = logs.text()
     st = fixture("/_fixture/stats")
-    print(f"       {len(turns)} turns -> summary of {len(out)} chars; stats {st}")
+    print(
+        f"       {len(turns)} turns -> summary of {len(out)} chars, "
+        f"{len(deferred)} turn(s) deferred; stats {st}"
+    )
     check(
         isinstance(out, str) and out.strip(),
         "summarize returns a summary rather than degrading",
         f"got {out!r}",
+    )
+    # v3.1.3 made summarize() return (summary, deferred). This slice is well
+    # under MAX_SUMMARY_CALLS_PER_REQUEST batches, so nothing may be deferred:
+    # a non-empty list here would mean the per-request cap fired on a slice
+    # this small and silently dropped turns out of the summary.
+    check(
+        deferred == [],
+        "and defers nothing — this slice is under the per-request call cap",
+        f"deferred {len(deferred)} turn(s): {deferred!r:.200}",
     )
     check(
         st.get("tokenize.refused", 0) == 0,
