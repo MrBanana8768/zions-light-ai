@@ -91,13 +91,30 @@ else:
     print("  ok   no template flags were added to a healthy payload")
 
 print()
-print("[4] the conversation can never be emptied")
+print("[4] the conversation can never be emptied - and never sent EMPTY")
 # A lone assistant turn has no user turn to fall back to. Dropping it would
-# send vLLM an empty array, trading a 400 for a different 400.
-check("a lone empty assistant turn", {"messages": [dict(EMPTY)]},
-      "assistant", True, want_len=1)
-check("system + lone empty assistant", {"messages": [S, dict(EMPTY)]},
-      "assistant", True, want_len=2)
+# send vLLM an empty array, trading a 400 for a different 400. But keeping
+# it EMPTY with continue_final_message set is ALSO a 400: verified against
+# vLLM 0.19's full template stack in the production image, empty string
+# content is refused ("Assistant message must have either content or
+# tool_calls") while whitespace-only content is accepted. So the kept tail
+# must carry at least a space. The first version of this repair shipped the
+# refused shape; the probe caught it.
+b4a = {"messages": [dict(EMPTY)]}
+check("a lone empty assistant turn", b4a, "assistant", True, want_len=1)
+if not (b4a["messages"][-1].get("content") or ""):
+    FAILED.append(
+        "the kept lone assistant tail is still EMPTY - vLLM refuses that "
+        "shape even with continue_final_message (verified 2026-08-30)"
+    )
+else:
+    print("  ok   the kept tail carries content vLLM verifiably accepts")
+b4b = {"messages": [S, dict(EMPTY)]}
+check("system + lone empty assistant", b4b, "assistant", True, want_len=2)
+if not (b4b["messages"][-1].get("content") or ""):
+    FAILED.append("the system+lone kept tail is still EMPTY")
+else:
+    print("  ok   same for the system-prefixed variant")
 
 print()
 print("[5] a stale flag from the client is never left to collide")
@@ -128,6 +145,68 @@ if not _invalid2:
     FAILED.append("a genuinely broken tail was not reported as invalid")
 else:
     print("  ok   a dead-stream tail IS reported as invalid")
+
+print()
+print("[7] INTERIOR empty assistant turns - the 2026-08-30 06:41 production shape")
+# She cancels a stream (0 chars) -> OpenWebUI stores an empty assistant turn
+# -> she types a NEW message (not a regenerate) -> the payload is USER-final
+# with the dead turn INTERIOR, and the template refuses the whole request:
+# "Invalid assistant message: role='assistant' content=''". Four of these in
+# the 08-28..08-30 window, ~2 dead turns a day. The tail repair only shed
+# empties while they were LAST, which covers the regenerate flow its
+# docstring describes and misses this one entirely.
+#
+# Verified against vLLM 0.19's own template stack (2026-08-30): this exact
+# 6-message array with "" is REFUSED and with " " is ACCEPTED (24 tokens).
+b7 = {"messages": [S, U, A, dict(U), dict(EMPTY), dict(U)]}
+_n7, _inv7 = main._repair_template_invalid_tail(b7)
+m7 = b7["messages"]
+if len(m7) != 6:
+    FAILED.append(
+        f"an interior turn was DROPPED ({len(m7)} of 6 left) - that splices "
+        f"two user turns together and breaks the alternation the template "
+        f"also requires, trading one 400 for another"
+    )
+elif (m7[4].get("content") or "") == "":
+    FAILED.append(
+        "the interior empty assistant turn was left empty - vLLM refuses "
+        "that payload outright (production 06:41:06)"
+    )
+elif not _inv7:
+    FAILED.append("an interior repair was not reported as a real repair")
+else:
+    print("  ok   interior empty turn space-filled, all 6 turns preserved")
+
+# Several of them, and mixed with a trailing one.
+b7b = {"messages": [S, U, dict(EMPTY), dict(U), dict(BLANK), dict(U)]}
+main._repair_template_invalid_tail(b7b)
+if any(
+    m.get("role") == "assistant" and isinstance(m.get("content"), str)
+    and m["content"] == ""
+    for m in b7b["messages"]
+):
+    FAILED.append("a second interior empty turn survived the sweep")
+else:
+    print("  ok   multiple interior empties are all repaired")
+
+# A multimodal assistant turn reads as text-empty but may carry an image.
+# Filling it would be one thing; DESTROYING the image would be worse than
+# the 400, so list content must be left exactly alone.
+_img = {"role": "assistant", "content": [{"type": "image_url", "image_url": {"url": "data:x"}}]}
+b7c = {"messages": [S, U, dict(_img), dict(U)]}
+main._repair_template_invalid_tail(b7c)
+if b7c["messages"][2].get("content") != _img["content"]:
+    FAILED.append("a multimodal assistant turn was rewritten - an image may have been destroyed")
+else:
+    print("  ok   multimodal (list) content is never rewritten")
+
+# And a healthy conversation is still untouched.
+b7d = {"messages": [S, U, A, dict(U)]}
+_n7d, _inv7d = main._repair_template_invalid_tail(b7d)
+if _n7d is not None or len(b7d["messages"]) != 4:
+    FAILED.append(f"a healthy payload was modified: note={_n7d!r}")
+else:
+    print("  ok   a healthy conversation is left alone")
 
 print()
 if FAILED:

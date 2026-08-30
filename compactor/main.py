@@ -16,6 +16,7 @@ V2.0 additions:
 import asyncio
 import json
 import logging
+import warnings
 import os
 import re
 import time
@@ -1038,6 +1039,34 @@ def count_tokens_exact(
         return None
 
 
+class _DropChatTemplateNag(logging.Filter):
+    """Silence transformers' per-call `tokenize=False` advisory.
+
+    16,741 stderr lines in 48h of production (measured, 08-28..08-30) from
+    one advisory emitted on every local token count: "MistralCommonBackend.
+    apply_chat_template(..., tokenize=False) is unsafe". It is advice about
+    an API shape, not a fault, and this module deliberately calls it that
+    way - it needs the rendered STRING to count, and re-encoding is the
+    whole point of the next line. Dropped by message substring rather than
+    by silencing the transformers logger wholesale, so a real transformers
+    error still reaches the log.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return "tokenize=False" not in msg
+
+
+for _nag_logger in ("transformers", "transformers.tokenization_mistral_common"):
+    logging.getLogger(_nag_logger).addFilter(_DropChatTemplateNag())
+warnings.filterwarnings(
+    "ignore", message=".*tokenize=False.*"
+)
+
+
 def count_tokens(messages: list[dict]) -> int:
     # V3.1: images cost tokens the text estimate can't see — add a flat
     # per-image estimate so VLM requests don't quietly overflow the budget.
@@ -1853,8 +1882,67 @@ def _repair_template_invalid_tail(body: dict) -> tuple[str | None, bool]:
             f"by an earlier failed stream"
         )
 
+    # (1b) INTERIOR empty assistant turns. Production, 2026-08-30 06:41:
+    #
+    #   06:40:42  stream cancelled at 0 chars (msgs=312)
+    #             -> OpenWebUI stores an EMPTY assistant turn
+    #   she types a NEW message (not a regenerate)
+    #   06:41:06  payload is USER-final, the empty turn now INTERIOR
+    #             (msgs=314) -> the template refuses the whole request:
+    #             "Invalid assistant message: role='assistant' content=''"
+    #   06:42:06  she recovered by deleting messages by hand
+    #
+    # Step (1) above only sheds empties while they are LAST, which covers
+    # the regenerate flow its docstring describes and misses the far more
+    # common type-a-new-message flow entirely. Four such rejections in the
+    # 08-28..08-30 window, ~2 dead turns a day, each with HTTP 200 already
+    # committed so no access log shows it.
+    #
+    # SPACE-FILLED, NOT DROPPED. Dropping an interior turn would splice two
+    # user turns together and break the alternation the template also
+    # requires - trading this 400 for a different one. A single space is
+    # the minimal content vLLM 0.19's template verifiably accepts (empty
+    # string is refused; see the note in (2) below and
+    # testfixtures/tokenizer-contract/vllm_template_probe.py).
+    #
+    # str content only: a list (multimodal) part can read as text-empty
+    # while still carrying an image, and destroying an image to satisfy a
+    # template rule would be worse than the 400.
+    filled = 0
+    for i, m in enumerate(msgs):
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and isinstance(m.get("content"), str)
+            and not m["content"].strip()
+        ):
+            msgs[i] = {**m, "content": " "}
+            filled += 1
+    if filled:
+        body["messages"] = msgs
+        _f = (
+            f"space-filled {filled} empty assistant turn(s) left behind by "
+            f"cancelled stream(s) - the template refuses empty content"
+        )
+        note = f"{note}; {_f}" if note else _f
+
     # (2) A real assistant-final list is a continuation, not an error.
     if msgs and msgs[-1].get("role") == "assistant":
+        # VERIFIED against vLLM 0.19's own template stack (the full
+        # MistralTokenizer -> transformers MistralCommonTokenizer pipeline,
+        # driven directly in the production image, 2026-08-30): an
+        # assistant-final message with EMPTY string content is refused even
+        # with continue_final_message set - "Assistant message must have
+        # either content or tool_calls" - while whitespace-only content is
+        # accepted. The first version of this repair kept a lone empty
+        # assistant turn (nothing to fall back to) and set the flag, which
+        # converted one 400 into a different 400. A single space is the
+        # minimal content the template verifiably accepts. Only str content
+        # is touched: a list (multimodal) that reads as text-empty may
+        # still carry an image, and destroying it to satisfy a template
+        # rule would be worse than the 400.
+        # (the fill itself now happens once, in (1b) above, which covers
+        # every position including this one)
         body["continue_final_message"] = True
         body["add_generation_prompt"] = False
         cont = "asked vLLM to CONTINUE the final assistant turn rather than start a new one"
@@ -1867,9 +1955,9 @@ def _repair_template_invalid_tail(body: dict) -> tuple[str | None, bool]:
 
     if dropped:
         body["messages"] = msgs
-    # Dropping a turn is always a real repair; setting the flag on a payload
-    # that already carried it is not.
-    return note, bool(dropped) or not already_ok
+    # Dropping or filling a turn is always a real repair; setting the flag on
+    # a payload that already carried it is not.
+    return note, bool(dropped) or bool(filled) or not already_ok
 
 
 def _has_conversational_history(messages: list[dict]) -> bool:

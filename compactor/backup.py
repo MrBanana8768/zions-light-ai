@@ -1019,7 +1019,13 @@ def run_daemon(interval_hours: float | None = None) -> None:
                     f"{age/60:.0f} min old, under half the "
                     f"{interval/3600:.1f}h interval"
                 )
-                time.sleep(interval)
+                # Sleep the REMAINDER of the interval, not a fresh one.
+                # Sleeping `interval` restarted the 24h timer from boot, so
+                # every restart pushed the next backup further out: measured
+                # in the 08-28..08-30 bundle, one completed backup in 32.5h
+                # across 6 boots, worst case ~36h RPO. Nightly restarts are
+                # routine here, and the deploy itself is another one.
+                time.sleep(max(60.0, interval - age))
                 continue
         report = run_once()
         if not report["ok"]:
