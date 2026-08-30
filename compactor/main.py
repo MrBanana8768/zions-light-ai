@@ -705,6 +705,46 @@ _tokenize_degraded_since: float | None = None
 _tokenize_last_warn: dict[str, float] = {}
 
 
+def _degraded_since_earliest() -> float | None:
+    """The EARLIEST start among the degraded /tokenize sources, or None.
+
+    `a or b` took summarizer's timestamp whenever it was non-None regardless
+    of which fault started first, so a /tokenize outage an hour old was
+    reported as 60 seconds old the moment the summarizer also failed. The
+    field exists to tell an operator how long this has been going on;
+    reporting the most RECENT start systematically under-states exactly the
+    thing it is for.
+    """
+    starts = [t for t in (_summarizer_degraded_since(), _tokenize_degraded_since)
+              if t is not None]
+    return min(starts) if starts else None
+
+
+def _summarizer_degraded_since() -> float | None:
+    """When summarizer's /tokenize started failing, or None. Never raises."""
+    try:
+        return summarizer.tokenize_health().get("degraded_since")
+    except Exception:
+        return None
+
+
+def _summarizer_tokenize_failing_now() -> int:
+    """summarizer's /tokenize failure streak, or 0 if it cannot be read.
+
+    Staleness-bounded inside summarizer.tokenize_health() for the same reason
+    _text_tokenize_failing_now bounds its own: rollups do not run on every
+    request, so an old streak means "not asked lately", not "still broken".
+
+    Never raises. A health endpoint that 500s because a dependency's health
+    accessor moved is worse than one that under-reports, and this is the
+    endpoint an operator reaches for when everything else is already on fire.
+    """
+    try:
+        return int(summarizer.tokenize_health().get("consecutive_failures", 0))
+    except Exception:
+        return 0
+
+
 def tokenize_health() -> dict:
     """Current state of the /tokenize dependency, for /health/full.
 
@@ -721,16 +761,37 @@ def tokenize_health() -> dict:
         # let one text-count success declare the endpoint healthy while every
         # chat-form call was still 400ing, so this endpoint FLAPPED instead of
         # reporting the degraded mode it exists to report.
-        "ok": _tokenize_fail_streak == 0 and _text_tokenize_failing_now() == 0,
+        "ok": (
+            _tokenize_fail_streak == 0
+            and _text_tokenize_failing_now() == 0
+            and _summarizer_tokenize_failing_now() == 0
+        ),
         "consecutive_failures": max(
-            _tokenize_fail_streak, _text_tokenize_failing_now()
+            _tokenize_fail_streak,
+            _text_tokenize_failing_now(),
+            _summarizer_tokenize_failing_now(),
         ),
         "chat_form_failures": _tokenize_fail_streak,
         "text_form_failures": _text_tokenize_failing_now(),
-        "degraded_since": _tokenize_degraded_since,
+        # summarizer.py POSTs /tokenize too, from its own module-level state.
+        # Until this line it reported failures only through log_once, which
+        # fires ONCE per process: the rollup counter could be degraded for the
+        # life of the pod with /health/full still saying ok=true and not one
+        # further log line. Folded into the AND for the same reason the chat
+        # and text forms are - a health endpoint that can be green while a
+        # counter it covers is blind is the exact shape of the two outages
+        # this whole branch exists to close.
+        "summarizer_form_failures": _summarizer_tokenize_failing_now(),
+        # Folded in for the same reason ok/consecutive_failures are: an
+        # operator reading "ok": false with "degraded_for_s": 0.0 sees an
+        # endpoint that has been broken for zero seconds since never, and
+        # concludes the endpoint is confused rather than the summarizer is
+        # down. Reporting a fault without its duration is a sibling-site
+        # miss inside the fix that added the fault.
+        "degraded_since": _degraded_since_earliest(),
         "degraded_for_s": (
-            round(time.time() - _tokenize_degraded_since, 1)
-            if _tokenize_degraded_since is not None
+            round(time.time() - _degraded_since_earliest(), 1)
+            if _degraded_since_earliest() is not None
             else 0.0
         ),
     }
@@ -1601,6 +1662,160 @@ def reply_is_degenerate(text: str) -> str | None:
                 f"(limit {100 * DEGENERATE_DECOR_FRACTION:.0f}%)"
             )
     return None
+
+
+# v3.1.3: the skip does not do what its docstring promises without this.
+#
+# Both /v1/chat/completions call sites gate _async_tail on `not
+# reply_is_degenerate(...)`, and that is provably enough for _async_tail's
+# jobs 1-2 (episodic indexing, fact extraction): each sees only THIS
+# exchange's own last_user_text/assistant_text, so skipping the call for a
+# degenerate turn keeps it out of both for the life of the conversation —
+# nothing ever calls back for that turn again.
+#
+# Job 3 (hierarchical summary rollup) does not work that way.
+# `summarizer.maybe_rollup` slices its input out of the message history by
+# TURN POSITION on every later call, and that history is the CLIENT's, not
+# ours: the user already read the degenerate reply, so it comes back as part
+# of `original_messages` on the very next turn. The skip on turn N does
+# nothing to turn N's text once it is sitting in the array _async_tail is
+# handed on turn N+1 — maybe_rollup has never heard of "degenerate" and folds
+# it into an L1 chunk exactly like any other turn once it falls inside that
+# chunk's range, and that chunk is what gets injected back as memory. That is
+# the exact outcome the detector exists to prevent, landing one turn later
+# than the skip is looking. Verified in test_degenerate_skip.py: run against
+# the code before this function existed, the raw repeated text reached
+# summarizer.maybe_rollup's input unchanged.
+#
+# So _async_tail (below) redacts here, immediately before building the
+# message list it hands to maybe_rollup — the one place in job 3 that sees
+# the full history and runs on every turn, degenerate or not.
+_DEGENERATE_HISTORY_PLACEHOLDER = (
+    "[a reply here looked like a repetition loop and was left out of "
+    "everything memorized about this conversation]"
+)
+
+
+def _redact_degenerate_turns(messages: list[dict]) -> list[dict]:
+    """Copy of `messages` with any assistant turn that is itself a
+    repetition loop replaced by a neutral placeholder, so it cannot be
+    folded into a hierarchical summary chunk. See the comment above this
+    function for why this is necessary in addition to (not instead of) the
+    `not reply_is_degenerate(...)` gate at the call sites.
+
+    Only assistant turns are checked. The detector is calibrated against a
+    corpus of real ASSISTANT replies (see reply_is_degenerate's docstring and
+    test_degenerate_reply.py); running it on user text would be an
+    uncalibrated claim wearing the same thresholds, not a defensible one, and
+    a user turn is not the thing this detector was ever measuring.
+
+    The placeholder is deliberately non-blank: `summarizer._do_l1_rollup`
+    skips a chunk whose every piece is blank (`if not any(p.strip() for p in
+    pieces)`), and a redacted turn disappearing from a chunk that still has
+    real neighbors is not the same failure as one that empties the whole
+    chunk — but neither should look, to a chunk-existence check, like there
+    was nothing there. Saying plainly that something was omitted is the
+    difference between a gap and a silent one.
+    """
+    out = []
+    for m in messages:
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and reply_is_degenerate(_message_text(m))
+        ):
+            m = {**m, "content": _DEGENERATE_HISTORY_PLACEHOLDER}
+        out.append(m)
+    return out
+
+
+def _repair_template_invalid_tail(body: dict) -> tuple[str | None, bool]:
+    """Make the OUTGOING payload's tail valid for the Mistral chat template.
+
+    Returns (description, was_actually_invalid). The second element is
+    False when the payload would already have been accepted by vLLM - a
+    client that sent continue_final_message itself, for instance - so the
+    caller can avoid warning about a request that was never in danger.
+
+    THE BUG THIS EXISTS FOR, observed in production 2026-08-29 22:38:46.
+    Every add_generation_prompt / continue_final_message guard in this file
+    lived in count_tokens_exact - the MEASURING path. Nothing guarded the
+    payload actually forwarded to /v1/chat/completions, so vLLM refused the
+    generation itself:
+
+        ValueError: Cannot set `add_generation_prompt` to True when the last
+        message is from the assistant. Consider using
+        `continue_final_message` instead.
+
+    and the compactor logged "this turn produced no reply, no facts and no
+    episodic write, and nothing retries it". It happened 5 times today.
+
+    HOW THE PAYLOAD GETS INTO THAT SHAPE. It is a cascade, not a client bug.
+    A stream that dies mid-reply leaves an EMPTY assistant turn in the
+    client's history (28 such streams today). OpenWebUI resends the whole
+    array on the next turn, so that empty assistant turn comes back as the
+    final message, and the template refuses to build a generation prompt from
+    it. One dead stream therefore poisons the NEXT turn as well - which is
+    exactly the 22:37 -> 22:38 pair in the logs.
+
+    So there are two distinct tails to repair, and they need opposite fixes:
+
+      1. A trailing assistant turn with NO content carries no information.
+         It is the residue of a failed turn. Drop it, and the array ends on
+         the user's real question again.
+      2. A trailing assistant turn WITH content is a genuine "continue this
+         reply" request. Dropping it would silently discard what the user
+         asked to continue, so instead say so explicitly with
+         continue_final_message, which is what the template's own error
+         message tells you to do.
+
+    Never removes the last remaining user turn, and never empties the array.
+    """
+    msgs = list(body.get("messages") or [])
+    if not msgs:
+        return None, False
+    note = None
+    # Was the payload ALREADY valid on arrival? An assistant-final list that
+    # the client had already flagged with continue_final_message is exactly
+    # what the template asks for; repairing it changes nothing.
+    already_ok = bool(body.get("continue_final_message")) and not body.get(
+        "add_generation_prompt"
+    )
+
+    # (1) Shed the residue of dead streams. Bounded by the presence of a real
+    # user turn so this can never eat the conversation.
+    dropped = 0
+    while (
+        len(msgs) > 1
+        and msgs[-1].get("role") == "assistant"
+        and not _message_text(msgs[-1]).strip()
+        and any(m.get("role") == "user" for m in msgs[:-1])
+    ):
+        msgs.pop()
+        dropped += 1
+    if dropped:
+        note = (
+            f"dropped {dropped} empty trailing assistant turn(s) left behind "
+            f"by an earlier failed stream"
+        )
+
+    # (2) A real assistant-final list is a continuation, not an error.
+    if msgs and msgs[-1].get("role") == "assistant":
+        body["continue_final_message"] = True
+        body["add_generation_prompt"] = False
+        cont = "asked vLLM to CONTINUE the final assistant turn rather than start a new one"
+        note = f"{note}; {cont}" if note else cont
+    else:
+        # Both flags are refused together, so never leave a stale pair behind
+        # from a client that sent one.
+        body.pop("continue_final_message", None)
+        body.pop("add_generation_prompt", None)
+
+    if dropped:
+        body["messages"] = msgs
+    # Dropping a turn is always a real repair; setting the flag on a payload
+    # that already carried it is not.
+    return note, bool(dropped) or not already_ok
 
 
 def _has_conversational_history(messages: list[dict]) -> bool:
@@ -2724,7 +2939,22 @@ async def _async_tail(
     # conv_lock internally — nesting the same lock would deadlock.
     if summarizer.enabled() and assistant_text:
         try:
-            full_messages = list(original_messages) + [
+            # v3.1.3: redact past degenerate turns before they can reach
+            # maybe_rollup — see _redact_degenerate_turns for why the
+            # call-site skip above is not enough on its own for this job.
+            # `assistant_text` itself needs no check: neither call site
+            # reaches this function when it is degenerate.
+            # run_in_threadpool, not a bare call: this walks EVERY historical
+            # assistant turn through reply_is_degenerate, and _async_tail is a
+            # coroutine, so a bare call blocks the event loop for every other
+            # request. Measured against her real replies (median 5,248 chars):
+            # 20 turns 4.6ms, 40 turns 9.5ms, 85 turns 65ms, 170 turns 446ms -
+            # and it runs on every single turn. The detector blocking this
+            # same loop is a defect this branch has already shipped once.
+            _redacted = await run_in_threadpool(
+                _redact_degenerate_turns, list(original_messages)
+            )
+            full_messages = _redacted + [
                 {"role": "assistant", "content": assistant_text}
             ]
             before = summarizer.load_state(conv_id)
@@ -3443,12 +3673,25 @@ async def chat_completions(request: Request) -> Any:
         # Doesn't block this request — current request just degrades to
         # "no facts injected" and next request will see the facts.
         try:
+            # Redacted, like the live tail. Backfill runs BOTH jobs the
+            # detector exists to gate - it fact-extracts every historical
+            # pair and calls summarizer.maybe_rollup - over the client's raw
+            # array, and it has no degeneracy gate of its own (grep
+            # "degenerate" backfill.py: nothing). It fires exactly when a
+            # conversation has history but no facts file: a restore from
+            # backup, a migration, a lost store. That is the precise moment a
+            # degeneration episode already sitting in her history would be
+            # replayed into facts and summaries as though it were worth
+            # remembering. Redacting here rather than inside backfill.py
+            # because main imports backfill, so the reverse import would be a
+            # cycle.
             started = await backfill.start_backfill_if_needed(
                 conv_id,
-                messages,  # use original messages, not compacted
+                messages,
                 VLLM_URL,
                 MODEL_REPO or "",
                 fire_and_forget=_fire_and_forget,
+                redact=_redact_degenerate_turns,
             )
             if started:
                 logger.info(f"conv={conv_id}: lazy backfill started in background")
@@ -3495,6 +3738,23 @@ async def chat_completions(request: Request) -> Any:
     # ...and non-system turns that ended up sharing a role (compaction hoists
     # image turns out of chronological order, which lands user next to user).
     body["messages"] = _merge_consecutive_same_role(body["messages"])
+    # LAST thing before the payload goes out: make its tail template-valid.
+    # After the guard and the merges, because both can change which message
+    # is final. See _repair_template_invalid_tail - this is the fix for a
+    # production 400 that silently cost the user whole turns.
+    _tail_note, _tail_was_invalid = _repair_template_invalid_tail(body)
+    if _tail_note and _tail_was_invalid:
+        logger.warning(
+            f"conv={conv_id or '?'}: payload tail was invalid for the chat "
+            f"template - {_tail_note}. Without this the request would have "
+            f"been rejected by vLLM with no reply and no memory write."
+        )
+    elif _tail_note:
+        # A client that already sent continue_final_message is not a defect,
+        # and warning about it would train the operator to ignore the line
+        # that does matter.
+        logger.info(f"conv={conv_id or '?'}: {_tail_note}")
+
     # The limit the guard ACTUALLY shed against, captured here rather than
     # recomputed if this request is rejected: _note_backend_rejection moves
     # _BUDGET_MARGIN, so by the time a rejection is logged the margin is no
@@ -4399,13 +4659,25 @@ async def admin_compact(conv_id: str, request: Request):
     # tier's worth of work; the loop is what turns that into a catch-up. Bounded
     # by max_calls AND by lack of progress, because a rollup that cannot advance
     # must not spin.
+    # Redacted ONCE, off the event loop, before the loop starts. Same reason
+    # as the live tail: this walks every historical assistant turn through
+    # reply_is_degenerate, and the result is identical on every pass. Called
+    # bare inside the loop it blocked the loop for max_calls x the scan cost
+    # - measured at 3.2 s per pass on a 2000-turn history, i.e. up to ~10
+    # minutes of stalled event loop on an endpoint the operator is told to
+    # run WHILE she is chatting.
+    _redacted_messages = await run_in_threadpool(
+        _redact_degenerate_turns, messages
+    )
     calls = 0
     t0 = time.time()
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
         while calls < max_calls:
             prev = summarizer.load_state(conv_id).get("last_summarized_turn", 0)
             try:
-                await summarizer.maybe_rollup(conv_id, messages, VLLM_URL, MODEL_REPO)
+                await summarizer.maybe_rollup(
+                    conv_id, _redacted_messages, VLLM_URL, MODEL_REPO,
+                )
             except Exception as e:
                 plan["stopped_because"] = f"{type(e).__name__}: {e}"
                 break

@@ -399,6 +399,7 @@ async def start_backfill_if_needed(
     model: str,
     *,
     fire_and_forget,
+    redact=None,
 ) -> bool:
     """Public entry point. Returns True if a backfill was started,
     False if it wasn't needed.
@@ -406,12 +407,25 @@ async def start_backfill_if_needed(
     `fire_and_forget` is the caller's task spawner (main.py's
     _fire_and_forget) so this module doesn't need to know about the
     background-task registry. Decouples from main.py for testing.
+
+    `redact` is applied to `messages` ONLY once we have decided to run, and
+    it is a callable rather than pre-redacted messages for a measured
+    reason: needs_backfill() returns False for every conversation that
+    already has a facts file, which is every established conversation
+    forever, while this function is called on every request. Redacting in
+    the caller's argument list therefore ran a full-history degeneracy scan
+    inline before the vLLM call on every single turn - 366 ms at 170 turns,
+    1.6 s at 1000 - and threw the result away every time. Same
+    module-boundary reason as fire_and_forget: main.py owns the detector,
+    this module owns when the work happens.
     """
     if not needs_backfill(conv_id, messages):
         return False
     if conv_id in _in_progress_local:
         return False  # already started in this process
     _in_progress_local.add(conv_id)
+    if redact is not None:
+        messages = redact(messages)
     # Snapshot messages — caller may mutate the list before backfill runs
     snapshot = [dict(m) for m in messages]
     fire_and_forget(_run_backfill(conv_id, snapshot, vllm_url, model))
