@@ -1855,6 +1855,25 @@ def _repair_template_invalid_tail(body: dict) -> tuple[str | None, bool]:
 
     # (2) A real assistant-final list is a continuation, not an error.
     if msgs and msgs[-1].get("role") == "assistant":
+        # VERIFIED against vLLM 0.19's own template stack (the full
+        # MistralTokenizer -> transformers MistralCommonTokenizer pipeline,
+        # driven directly in the production image, 2026-08-30): an
+        # assistant-final message with EMPTY string content is refused even
+        # with continue_final_message set - "Assistant message must have
+        # either content or tool_calls" - while whitespace-only content is
+        # accepted. The first version of this repair kept a lone empty
+        # assistant turn (nothing to fall back to) and set the flag, which
+        # converted one 400 into a different 400. A single space is the
+        # minimal content the template verifiably accepts. Only str content
+        # is touched: a list (multimodal) that reads as text-empty may
+        # still carry an image, and destroying it to satisfy a template
+        # rule would be worse than the 400.
+        if (
+            isinstance(msgs[-1].get("content"), str)
+            and not msgs[-1]["content"].strip()
+        ):
+            msgs[-1] = {**msgs[-1], "content": " "}
+            body["messages"] = msgs
         body["continue_final_message"] = True
         body["add_generation_prompt"] = False
         cont = "asked vLLM to CONTINUE the final assistant turn rather than start a new one"

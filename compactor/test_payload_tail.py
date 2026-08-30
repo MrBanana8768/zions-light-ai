@@ -91,13 +91,30 @@ else:
     print("  ok   no template flags were added to a healthy payload")
 
 print()
-print("[4] the conversation can never be emptied")
+print("[4] the conversation can never be emptied - and never sent EMPTY")
 # A lone assistant turn has no user turn to fall back to. Dropping it would
-# send vLLM an empty array, trading a 400 for a different 400.
-check("a lone empty assistant turn", {"messages": [dict(EMPTY)]},
-      "assistant", True, want_len=1)
-check("system + lone empty assistant", {"messages": [S, dict(EMPTY)]},
-      "assistant", True, want_len=2)
+# send vLLM an empty array, trading a 400 for a different 400. But keeping
+# it EMPTY with continue_final_message set is ALSO a 400: verified against
+# vLLM 0.19's full template stack in the production image, empty string
+# content is refused ("Assistant message must have either content or
+# tool_calls") while whitespace-only content is accepted. So the kept tail
+# must carry at least a space. The first version of this repair shipped the
+# refused shape; the probe caught it.
+b4a = {"messages": [dict(EMPTY)]}
+check("a lone empty assistant turn", b4a, "assistant", True, want_len=1)
+if not (b4a["messages"][-1].get("content") or ""):
+    FAILED.append(
+        "the kept lone assistant tail is still EMPTY - vLLM refuses that "
+        "shape even with continue_final_message (verified 2026-08-30)"
+    )
+else:
+    print("  ok   the kept tail carries content vLLM verifiably accepts")
+b4b = {"messages": [S, dict(EMPTY)]}
+check("system + lone empty assistant", b4b, "assistant", True, want_len=2)
+if not (b4b["messages"][-1].get("content") or ""):
+    FAILED.append("the system+lone kept tail is still EMPTY")
+else:
+    print("  ok   same for the system-prefixed variant")
 
 print()
 print("[5] a stale flag from the client is never left to collide")
