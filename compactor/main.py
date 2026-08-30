@@ -1960,6 +1960,53 @@ def _repair_template_invalid_tail(body: dict) -> tuple[str | None, bool]:
     return note, bool(dropped) or bool(filled) or not already_ok
 
 
+def _warn_if_conversation_forked(
+    conv_id: str, source: str, messages: list[dict]
+) -> None:
+    """Shout when a LONG conversation resolves to a brand-new conv_id.
+
+    The hash fallback is sha256(system|||first_user[:512]), so editing the
+    system prompt gives a live conversation a new identity and forks its
+    memory: facts, episodic embeddings and summaries all keep accumulating,
+    just under an id nothing else references. Production, 2026-08-30: a
+    prompt edit forked a 400-turn conversation and left 106 facts and ~85
+    indexed exchanges stranded. It went unnoticed for hours because every
+    individual signal looked healthy - the new id summarized fine, extracted
+    fine, answered fine. Only the id changed, and nothing said so.
+
+    The signature is unmistakable and costs one dict lookup: many messages,
+    id derived by HASH, and no stored state under that id. A brand-new
+    conversation has few messages; a resumed one has state. Long AND empty
+    means the identity moved.
+
+    WARNING, not INFO: by the time anyone reads INFO the facts have already
+    been accumulating in the wrong place for a day.
+    """
+    if source != "hash":
+        return  # header / metadata ids are stable across prompt edits
+    try:
+        if len([m for m in messages if m.get("role") != "system"]) < 20:
+            return
+        if facts.load_facts(conv_id):
+            return
+        if (summarizer.load_state(conv_id) or {}).get("last_summarized_turn"):
+            return
+    except Exception:
+        return
+    logger.warning(
+        f"conv={conv_id}: a {len(messages)}-message conversation resolved to "
+        f"a conv_id with NO stored memory, derived by HASH. That is the "
+        f"signature of a FORK: the id is sha256(system|||first_user), so a "
+        f"system-prompt edit gives a live conversation a new identity and "
+        f"strands its facts, embeddings and summaries under the old one. "
+        f"Check GET /admin/conversations for a sibling id that went quiet, "
+        f"and POST /admin/conversations/<old>/merge-into/{conv_id} to fold "
+        f"it back. To stop this recurring, have the client send "
+        f"X-Conversation-Id or metadata.chat_id - both are stable across "
+        f"prompt edits."
+    )
+
+
 def _has_conversational_history(messages: list[dict]) -> bool:
     """Whether the CLIENT's array contains a prior assistant turn.
 
@@ -3467,6 +3514,11 @@ async def chat_completions(request: Request) -> Any:
             dict(request.headers), messages, body=body
         )
         logger.info(f"conv_id={conv_id} source={source} msgs={len(messages)}")
+        # Cheap, and it is the only thing standing between a prompt edit and
+        # a silently forked memory store. Runs on the request path but only
+        # touches disk for LONG hash-derived conversations, which is a rare
+        # shape; never raises.
+        _warn_if_conversation_forked(conv_id, source, messages)
     except Exception as e:
         logger.warning(f"conv_id resolution failed: {e}")
 
@@ -4732,6 +4784,47 @@ async def admin_fork_conversation(conv_id: str, request: Request):
             conv_id, new_conv_id=body.get("new_conv_id")
         )
     except portability.ImportError_ as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post(
+    "/admin/conversations/{src_conv_id}/merge-into/{dst_conv_id}",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_merge(src_conv_id: str, dst_conv_id: str, request: Request):
+    """Fold a forked conversation's memory back into the live one.
+
+    Body (all optional):  {"dry_run": true}
+
+    DRY RUN BY DEFAULT - unlike the compact endpoint next door, which
+    defaults to a live run and surprised an operator into one. This touches
+    two conversations, so it gets the safer default; pass
+    {"dry_run": false} to commit.
+
+    Merges FACTS and EPISODIC exchanges only. Summaries are deliberately not
+    merged: the forked half re-derives its own hierarchy from the client's
+    full array, so dst already covers the same history and folding src's in
+    would double-count it. The source is left completely intact, so a merge
+    that produces a bad result costs nothing but the re-embedding.
+
+    See portability.merge_conversation for the full contract.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    dry_run = bool(body.get("dry_run", True))
+
+    try:
+        return await run_in_threadpool(
+            portability.merge_conversation,
+            src_conv_id,
+            dst_conv_id,
+            dry_run=dry_run,
+        )
+    except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 

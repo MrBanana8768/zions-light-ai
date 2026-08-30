@@ -628,6 +628,156 @@ def import_conversation(
 # Fork
 # ---------------------------------------------------------------------------
 
+def _fact_key(text: str) -> str:
+    """Identity for merge de-duplication: casefolded, whitespace-collapsed.
+
+    Deliberately NOT semantic. dedup.py owns semantic merging and pays an
+    LLM for it; this only has to avoid importing a byte-identical fact
+    twice, which is the whole overlap when a conversation forks and both
+    halves extract from the same turns.
+    """
+    return " ".join((text or "").split()).casefold()
+
+
+def merge_conversation(
+    src_conv_id: str, dst_conv_id: str, *, dry_run: bool = True
+) -> dict:
+    """Fold src's FACTS and EPISODIC memory into dst. Both survive.
+
+    WHY THIS EXISTS. The hash-fallback conv_id is
+    sha256(system|||first_user[:512]), so editing the system prompt gives a
+    live conversation a NEW identity and forks its memory. Observed in
+    production 2026-08-30: a prompt edit at ~19:08 left 106 facts and ~85
+    indexed exchanges under the old id while the conversation carried on
+    under a new one. Nothing is lost when that happens - both halves are
+    intact on disk - but until this existed there was no way to put them
+    back together.
+
+    WHAT IT DOES NOT TOUCH, and this is the important part:
+
+      * SUMMARIES. The forked half re-derives its own hierarchy from the
+        client's full array (that is how the new id reached turn 411 in
+        three hours), so dst's summary state already covers the same
+        history src's does. Merging them would double-count the narrative
+        and corrupt the very layer that survived the fork intact.
+      * SRC. Read-only throughout. A merge that damages its source is not
+        recoverable if the result is wrong.
+
+    Facts are unioned on _fact_key; dst's copy wins on collision (it carries
+    the fresher last_used). The active store is NOT pruned here - callers
+    who want the cap enforced can prune afterwards, and leaving that
+    separate means a merge never silently evicts.
+
+    Episodic exchanges are imported by turn_index, skipping any index dst
+    already holds, because re-embedding over a live index is the one part of
+    this that costs GPU and cannot be undone by re-running.
+
+    `dry_run` defaults to TRUE. The compact endpoint defaults the other way
+    and that surprised an operator into a live run; this one touches two
+    conversations at once and gets the safer default.
+    """
+    if not src_conv_id or not dst_conv_id:
+        raise ValueError("both src_conv_id and dst_conv_id are required")
+    if src_conv_id == dst_conv_id:
+        raise ValueError("src and dst are the same conversation")
+
+    src = export_conversation(src_conv_id)
+    src_facts = src.get("facts") or []
+    src_episodic = src.get("episodic") or []
+    if not src_facts and not src_episodic:
+        raise ValueError(
+            f"conv {src_conv_id} has no facts and no indexed exchanges - "
+            f"nothing to merge (check the id against /admin/conversations)"
+        )
+
+    try:
+        dst_facts = facts.load_facts(dst_conv_id)
+    except Exception as e:
+        raise ValueError(f"could not read facts for {dst_conv_id}: {e}") from e
+    dst_keys = {_fact_key(f.get("text", "")) for f in dst_facts}
+
+    new_facts = []
+    for f in src_facts:
+        k = _fact_key(f.get("text", ""))
+        if k and k not in dst_keys:
+            dst_keys.add(k)
+            new_facts.append(f)
+
+    try:
+        dst_episodic = retrieval.export_indexed_exchanges(dst_conv_id)
+    except Exception:
+        dst_episodic = []
+    dst_turns = {e.get("turn_index") for e in dst_episodic}
+    new_exchanges = [
+        e for e in src_episodic if e.get("turn_index") not in dst_turns
+    ]
+
+    result = {
+        "src_conv_id": src_conv_id,
+        "dst_conv_id": dst_conv_id,
+        "dry_run": dry_run,
+        "src_facts": len(src_facts),
+        "dst_facts_before": len(dst_facts),
+        "facts_to_add": len(new_facts),
+        "facts_skipped_duplicate": len(src_facts) - len(new_facts),
+        "src_exchanges": len(src_episodic),
+        "dst_exchanges_before": len(dst_episodic),
+        "exchanges_to_add": len(new_exchanges),
+        "exchanges_skipped_existing": len(src_episodic) - len(new_exchanges),
+        "summaries": "not merged (dst re-derived its own; see docstring)",
+    }
+    if dry_run:
+        return result
+
+    # Same mutual exclusion import_conversation uses, and for the same reason
+    # (D18): conv_lock is an ASYNCIO lock and this is a plain def called
+    # through run_in_threadpool, so it cannot await the lock - it can only
+    # refuse to write underneath a holder. The hazard is concrete: the
+    # extraction tail reads the fact list, parks on a vLLM call holding the
+    # lock, and writes that pre-merge snapshot back when it returns. The
+    # merged facts would vanish with no error anywhere.
+    if memory.conv_lock(dst_conv_id).locked():
+        raise ValueError(
+            f"conv_id {dst_conv_id!r} has a memory write in flight (extraction "
+            f"tail, archive, restore or dedup). Refusing rather than merging "
+            f"underneath it - that writer would overwrite the merged facts on "
+            f"its next save. Retry in a moment."
+        )
+
+    # Re-read rather than trusting the counters computed above: the tail may
+    # have added facts between the pre-flight read and here.
+    current = facts.load_facts(dst_conv_id)
+    current_keys = {_fact_key(f.get("text", "")) for f in current}
+    actually_new = [
+        f for f in new_facts
+        if _fact_key(f.get("text", "")) not in current_keys
+    ]
+    if actually_new:
+        facts.save_facts(dst_conv_id, current + actually_new)
+    result["facts_added"] = len(actually_new)
+
+    added = 0
+    for e in new_exchanges:
+        try:
+            if retrieval.import_indexed_exchange(
+                dst_conv_id, e.get("turn_index"), e.get("document", "")
+            ):
+                added += 1
+        except Exception as ex:
+            logger.warning(
+                f"merge {src_conv_id}->{dst_conv_id}: exchange "
+                f"{e.get('turn_index')} failed to import: {ex}"
+            )
+    result["exchanges_added"] = added
+
+    logger.info(
+        f"merged conv {src_conv_id} into {dst_conv_id}: "
+        f"+{result.get('facts_added', 0)} fact(s), +{added} exchange(s); "
+        f"source left intact"
+    )
+    return result
+
+
 def fork_conversation(
     src_conv_id: str, *, new_conv_id: str | None = None
 ) -> dict:

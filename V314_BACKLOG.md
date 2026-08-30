@@ -155,6 +155,51 @@ fixed-size store.
 
 ---
 
+## C1 · conv_id is unstable against system-prompt edits — SHIPPED in v3.1.5
+
+Found the hard way, 2026-08-30. The hash fallback is
+`sha256(system|||first_user[:512])`, so the SYSTEM PROMPT is part of the
+conversation's identity. Editing it gives a live conversation a brand-new
+conv_id and forks its memory: facts, episodic embeddings and summaries all
+keep accumulating correctly, under an id nothing else references.
+
+Observed: a prompt edit at ~19:08 forked a ~400-turn conversation. The old
+id kept 106 facts and ~85 indexed exchanges; the new one carried on and
+re-derived its own summary hierarchy (reaching turn 411 in three hours,
+because the client resends the full array). Nothing was lost - both halves
+were intact on disk - but there was no way to put them back together, and
+nothing announced that it had happened.
+
+`source=hash` means OpenWebUI is sending neither `X-Conversation-Id` nor
+`metadata.chat_id`. The bundled Function filter that supplies the latter was
+never installed.
+
+Shipped in v3.1.5:
+
+1. **Fork detection** - a long conversation resolving to a hash-derived id
+   with NO stored state logs a WARNING naming the likely cause, the sibling
+   id to look for, and the merge command. Every individual signal looked
+   healthy during the real incident; only the identity moved, and nothing
+   said so.
+2. **`portability.merge_conversation`** + `POST
+   /admin/conversations/{src}/merge-into/{dst}`, dry-run by default. Merges
+   facts and episodic exchanges; deliberately NOT summaries (dst re-derived
+   its own over the same history, so merging would double-count). Source is
+   read-only.
+
+STILL OPEN, and the actual permanent fix:
+
+- **Install the OpenWebUI Function filter** so `metadata.chat_id` is sent.
+  Then prompt edits are free forever. Note this ALSO changes ids once for
+  existing conversations - which is exactly why the merge tool shipped
+  first.
+- **Do NOT "fix" the hash by dropping the system prompt from it.** That
+  would silently re-fork every existing hash-derived conversation on
+  upgrade: the same bug, shipped as a fix. If the fallback is ever changed,
+  it needs an alias/migration path, not a new formula.
+
+---
+
 ## Deploy-day notes carried from the analysis
 
 1. The pod is already half-on the new env: `GENERATION_RESERVE=12000` went
