@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from starlette.concurrency import run_in_threadpool
 
 import facts as facts_module
 import retrieval
@@ -425,7 +426,12 @@ async def start_backfill_if_needed(
         return False  # already started in this process
     _in_progress_local.add(conv_id)
     if redact is not None:
-        messages = redact(messages)
+        # Off the event loop: this is an async function awaited on the
+        # request path, and the redactor walks every historical assistant
+        # turn through a regex detector - measured 701ms at 1,000 turns.
+        # The other two redaction sites (live tail, admin compact) both got
+        # run_in_threadpool; this one was the thirteenth sibling miss.
+        messages = await run_in_threadpool(redact, messages)
     # Snapshot messages — caller may mutate the list before backfill runs
     snapshot = [dict(m) for m in messages]
     fire_and_forget(_run_backfill(conv_id, snapshot, vllm_url, model))

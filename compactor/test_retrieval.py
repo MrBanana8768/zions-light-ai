@@ -890,9 +890,14 @@ def test_cap_invisible_when_it_does_not_bind():
     hits = [_hit(10, "A" * 300), _hit(30, "B" * 300), _hit(20, "C" * 300)]
     cap = _LogCapture()
     try:
-        # 32-token header + 3 * 80 = 272 of a 1,500-token budget.
+        # 33-token header + 3 * 80 = 273 of a 1,500-token budget. (Was 272:
+        # v3.1.3 split the estimator's non-ASCII pricing into script-vs-
+        # decoration and added a +1 ceiling guard on any text containing
+        # non-ASCII; the header's em-dash pays it. The pin exists to stop an
+        # ambient env var changing what the fixture means, not to freeze the
+        # estimator.)
         assert_eq(_HEADER_TOKENS + sum(_hit_cost(h["turn_index"], h["document"])
-                                       for h in hits), 272, "fixture is well under")
+                                       for h in hits), 273, "fixture is well under")
         block = retrieval.format_retrieval_block(hits)
     finally:
         cap.stop()
@@ -951,11 +956,13 @@ def test_oversized_first_hit_is_truncated_not_dropped():
     assert_true("ENDING" not in block, "the tail is gone")
     assert_true(_TRUNCATION_MARKER in block, "and it says so, rather than ending mid-word")
 
-    # room = 1500 - 32 header - 4 (separator + its two newlines) = 1,464 tokens
-    # of document. Asserted as a property rather than as a character offset:
-    # A4's whole subject is that there is no fixed chars-per-token to slice at.
+    # room = 1500 - 33 header - 4 (separator + its two newlines) = 1,463 tokens
+    # of document. (Header was 32 before v3.1.3's +1 non-ASCII ceiling guard;
+    # its em-dash pays it - same shift as the fixture pin above.) Asserted as
+    # a property rather than as a character offset: A4's whole subject is
+    # that there is no fixed chars-per-token to slice at.
     room = 1500 - _HEADER_TOKENS - _tokens(f"{_sep(7)}\n\n")
-    assert_eq(room, 1464, "room left for the document, in tokens")
+    assert_eq(room, 1463, "room left for the document, in tokens")
     body = block.split(f"{_sep(7)}\n", 1)[1][: -len("\n" + _TRUNCATION_MARKER)]
     assert_true(_tokens(body) <= room, f"kept body fits the room ({_tokens(body)})")
     # Maximal, not merely safe: a cap that keeps 10 tokens of a 2,258-token

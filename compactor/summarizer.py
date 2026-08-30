@@ -27,7 +27,9 @@ Why tiered:
   never once trimmed. With the drain, l2 is bounded to at most
   L3_CHUNK_SIZE-1 chapters, the same shape l1's bound already had. On top of
   that, format_summary_block enforces its own COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS
-  ceiling (default 5000, the figure this module always intended) as a
+  ceiling (default 12,000 - above the
+  tiers' own worst-case product of 11,300, so it backstops misconfiguration
+  instead of firing in normal operation) as a
   backstop against the tiers' bounds ever being right in theory and wrong in
   practice — see its docstring for how it chooses what to keep when they
   don't fit.
@@ -327,7 +329,7 @@ def _summary_line(kind: str, chunk: dict) -> tuple[str, str]:
     return header, chunk.get("text", "")
 
 
-def format_summary_block(state: dict) -> str | None:
+def format_summary_block(state: dict, max_tokens: int | None = None) -> str | None:
     """Render the current summary stack into a single system-message body.
     Returns None if there's nothing to inject.
 
@@ -383,7 +385,20 @@ def format_summary_block(state: dict) -> str | None:
     if not (has_l3 or l2 or l1):
         return None
 
-    budget = SUMMARY_BLOCK_MAX_TOKENS
+    # The caller's cap wins when it is tighter. SUMMARY_BLOCK_MAX_TOKENS
+    # alone (12,000) is larger than main.py's whole injection budget (8,192
+    # at production config, shared with persona, facts and retrieval), so
+    # capping only here meant _bound_injected_blocks downstream dropped
+    # WHOLE layers to make room: measured, facts stopped reaching the model
+    # from ~50% tier fill and everything but persona was gone at ~70%. The
+    # caller passes its real share so the trimming happens HERE,
+    # newest-kept and graceful, instead of down there, whole-layer and
+    # blind.
+    budget = (
+        min(SUMMARY_BLOCK_MAX_TOKENS, max_tokens)
+        if max_tokens is not None
+        else SUMMARY_BLOCK_MAX_TOKENS
+    )
     used = _estimate_block_tokens(_BLOCK_HEADER)
 
     l3_line: tuple[str, str] | None = None
@@ -985,12 +1000,25 @@ async def _summarize_pieces(
         async with sem:
             return await _call(prompt, batch)
 
-    parts = [
-        p for p in await asyncio.gather(*(_bounded(system_prompt, b) for b in batches))
-        if p
-    ]
-    if not parts:
+    raw = await asyncio.gather(*(_bounded(system_prompt, b) for b in batches))
+    _empty = sum(1 for p in raw if not (p or "").strip())
+    if _empty:
+        # ANY empty map batch fails the WHOLE call - not just the all-empty
+        # case. Filtering the empty part out stored an L1 chunk claiming
+        # first_turn..last_turn while its text covered only the batches that
+        # answered, and the watermark then advanced past turns that were
+        # never summarized and never retried: permanent, unlogged loss in
+        # the stored hierarchy. The same defect this branch fixed at both
+        # main.summarize returns, at this sibling. Returning "" makes the
+        # tier return False, nothing advances, and the rollup retries next
+        # turn.
+        logger.warning(
+            f"conv={conv_id}: {_empty} of {len(batches)} rollup map "
+            f"batch(es) returned empty content - failing the whole call so "
+            f"no chunk is stored claiming a span its text does not cover"
+        )
         return ""
+    parts = list(raw)
 
     # Reduce, in bounded rounds, never handing a call more than it can take.
     # If folding can make no further progress the parts are concatenated: a
@@ -1014,7 +1042,17 @@ async def _summarize_pieces(
                 f"the partial summaries concatenated: {e}"
             )
             break
-        parts = [p for p in folded if p] or parts
+        if any(not (p or "").strip() for p in folded):
+            # A partial-empty fold quietly deletes whichever group came back
+            # blank. The pre-fold parts are all non-empty (the map phase
+            # guarantees it), so concatenating them is complete, just longer.
+            logger.warning(
+                f"conv={conv_id}: rollup reduce round {rounds} returned "
+                f"empty content for a group - keeping the "
+                f"{len(parts)} partial(s) concatenated instead"
+            )
+            break
+        parts = list(folded)
     return "\n\n".join(parts)
 
 
@@ -1117,11 +1155,24 @@ def _archive_chapters(conv_id: str, chapters: list[dict]) -> None:
     rows = existing.get("chapters") if isinstance(existing, dict) else None
     if not isinstance(rows, list):
         rows = []
-    rows.extend({
-        "text": c.get("text", ""),
-        "first_turn": c.get("first_turn"),
-        "last_turn": c.get("last_turn"),
-    } for c in chapters)
+    # Dedupe against what is already stored: the archive now runs BEFORE
+    # save_state, so a failed state save retries the whole refresh next turn
+    # and would re-archive the same chapters (measured: two refreshes of the
+    # same state produced 5 exact duplicate rows). Identity is the full
+    # (span, text) triple - two different chapters legitimately covering the
+    # same span must both survive.
+    _seen = {(r.get("first_turn"), r.get("last_turn"), r.get("text", ""))
+             for r in rows}
+    rows.extend(
+        {
+            "text": c.get("text", ""),
+            "first_turn": c.get("first_turn"),
+            "last_turn": c.get("last_turn"),
+        }
+        for c in chapters
+        if (c.get("first_turn"), c.get("last_turn"), c.get("text", ""))
+        not in _seen
+    )
     atomic_write_json(path, {"chapters": rows})
     logger.info(
         f"conv={conv_id}: archived {len(chapters)} consumed chapter(s) "
@@ -1218,7 +1269,11 @@ async def _do_l3_rollup(
     # is an input, none is privileged) and only then folding the prior L3
     # into a second call means the final text always comes from a call that
     # contained it: both inputs are bounded by L3_MAX_TOKENS, so that second
-    # call is always a single batch. An earlier attempt instead fed only the
+    # call is a single batch whenever a real token count is available. (The
+    # pessimistic no-tokenizer fallback prices at 2 tokens/char and CAN
+    # split it - which degrades to concatenation of non-empty parts, not
+    # loss, per _summarize_pieces' partial-empty rules.) An earlier attempt
+    # instead fed only the
     # chapters that fit one batch, which broke the guarantee that an
     # oversized chapter set is still covered in full.
     text = await _summarize_pieces(
@@ -1233,6 +1288,24 @@ async def _do_l3_rollup(
         )
     if not text:
         return False
+    # ARCHIVE FIRST, and a failed archive ABORTS the refresh before any
+    # state mutates. The previous order (write l3, clear l2, then try to
+    # archive) meant an archive-write failure still dropped the chapters
+    # with no cold copy - loudly, but violating the invariant all the same:
+    # eviction MOVES memory, it never unlinks it. Aborting wastes the LLM
+    # calls that produced `text`, and that is the right trade: the refresh
+    # retries next turn, and a disk that cannot take the archive write is a
+    # bigger problem than a deferred rollup.
+    try:
+        _archive_chapters(conv_id, l2)
+    except Exception as e:
+        logger.error(
+            f"conv={conv_id}: could not archive the {len(l2)} chapter(s) "
+            f"this L3 refresh would consume ({type(e).__name__}: {e}) - "
+            f"ABORTING the refresh so nothing is dropped without a cold "
+            f"copy; it will retry next turn"
+        )
+        return False
     state["l3"] = {
         "text": text,
         # Inherit the START of coverage. Taking l2[0] here would move the
@@ -1245,20 +1318,7 @@ async def _do_l3_rollup(
         ),
         "last_turn": l2[-1]["last_turn"],
     }
-    # ARCHIVE BEFORE CLEARING. Without this, an L3 refresh was the only
-    # path in the system that deleted memory outright, and it deleted the
-    # only source the (now recursively re-paraphrased) L3 could ever be
-    # regenerated from. Failing to archive must not fail the rollup - the
-    # summary itself is already written - but it must be loud.
-    try:
-        _archive_chapters(conv_id, l2)
-    except Exception as e:
-        logger.error(
-            f"conv={conv_id}: could not archive the {len(l2)} chapter(s) "
-            f"this L3 refresh consumed ({type(e).__name__}: {e}) - they are "
-            f"about to be dropped from live state with no cold copy"
-        )
-    state["l2"] = []  # consumed; archived above, bounds l2 like l1
+    state["l2"] = []  # consumed; archived above (pre-mutation), bounds l2 like l1
     logger.info(
         f"conv={conv_id}: L3 refresh — covers turns {l2[0]['first_turn']}-"
         f"{l2[-1]['last_turn']} over {len(l2)} chapters"

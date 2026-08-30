@@ -119,7 +119,33 @@ print("[6] script drift — coherent, then wandering out of the language")
 # max=10.79%. 3% is 2.5x over p99.
 ru = "привет мир "
 en = "and the reply continues in ordinary English prose for a while longer "
-check(en * 12 + ru * 30, True, "a reply that drifts into Cyrillic at the tail")
+# POLICY CHANGE, v3.1.3, and this case is where it bites: a SINGLE-script
+# tail is no longer flagged. This asserted True under the old "20% alone"
+# disjunct. That disjunct also flagged a short reply quoting one Greek verse
+# with two sentences of commentary (48% non-Latin, one script) - and once
+# the rollup-input redaction shipped, a false positive stopped costing one
+# skipped memory write and started PERMANENTLY replacing the reply with a
+# placeholder in every future summary, backfill and admin compact. This
+# user quotes scripture and Russian; that trade is not acceptable for a
+# backstop detector whose incident doc says it "should fire almost never"
+# now that sampling is fixed at the source. Genuine drift measured 6-14
+# distinct scripts; all 5 real corpus cases still flag under the tightened
+# rule (re-validated: 14/14 total flags unchanged). What is knowingly given
+# up: a pure one-language tail like this one. It is indistinguishable, by
+# script statistics alone, from her assistant quoting Russian at length.
+check(en * 12 + ru * 30, False,
+      "a single-script tail is no longer flagged - the cost of not eating "
+      "her quotations (see the policy note above)")
+# The shape the incident ACTUALLY produced - the tail wanders across
+# scripts rather than settling into one - must still be caught.
+drift_tail = (
+    "привет мир как дела "          # Cyrillic
+    "γειά σου κόσμε "               # Greek
+    "你好世界 "                      # CJK
+    "שלום עולם "                    # Hebrew
+)
+check(en * 12 + drift_tail * 10, True,
+      "a multi-script wandering tail (the measured incident shape) IS flagged")
 check(en * 40, False, "pure English of the same length is fine")
 
 # A short reply with a foreign word is normal writing, not drift — which is

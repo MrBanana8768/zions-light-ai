@@ -1308,7 +1308,26 @@ async def summarize(
             calls_left[0] -= 1
             return await _summarize_once(client, batch)
 
-    parts = [p for p in await asyncio.gather(*(_bounded(b) for b in batches)) if p]
+    _raw = await asyncio.gather(*(_bounded(b) for b in batches))
+    _empty_batches = sum(1 for p in _raw if not (p or "").strip())
+    if _empty_batches:
+        # ANY empty map batch fails the whole summarize - the invariant guard
+        # below only catches the ALL-empty case, so one empty 200 among
+        # several deleted that batch's turns from the payload (reproduced:
+        # 195 of 400 turns neither summarized nor deferred) while the
+        # "compacted:" line counted them as summarized. The over-cap skip
+        # already established that forwarding everything verbatim is the
+        # correct degraded mode; partial success takes the same road. (In
+        # this map phase "" is always genuine empty content, never
+        # call-budget exhaustion: the over-cap check above guarantees
+        # len(batches) fits the call budget.)
+        logger.warning(
+            f"summarize: {_empty_batches} of {len(batches)} map batch(es) "
+            f"returned empty content - forwarding all {len(to_summarize)} "
+            f"turn(s) verbatim rather than dropping the failed batches' turns"
+        )
+        return "", to_summarize
+    parts = list(_raw)
 
     # Reduce: fold the partials hierarchically, never handing _summarize_once
     # an input over its budget (its documented contract — the first cut of
@@ -1340,10 +1359,20 @@ async def summarize(
             )
             break
         try:
-            parts = [p for p in await asyncio.gather(*(_bounded(g) for g in groups)) if p]
+            _folded = await asyncio.gather(*(_bounded(g) for g in groups))
         except Exception as e:
             logger.warning(f"summarize reduce round {rounds} failed, using concatenation: {e}")
             break
+        if any(not (p or "").strip() for p in _folded):
+            # Same rule as the map phase: a partial-empty fold deletes the
+            # blank group's content. The current parts are all non-empty, so
+            # concatenation is complete.
+            logger.warning(
+                f"summarize reduce round {rounds} returned empty content "
+                f"for a group - concatenating {len(parts)} partial(s) instead"
+            )
+            break
+        parts = list(_folded)
     # INVARIANT: every turn is either represented in the summary or handed
     # back in `deferred`. Never neither.
     #
@@ -1647,12 +1676,24 @@ def reply_is_degenerate(text: str) -> str | None:
         # 3-6 letters. The highest unflagged reply containing any non-Latin
         # had 4. A quotation is one script. The 20% disjunct keeps a
         # single-script runaway catchable.
-        if (frac >= DEGENERATE_NONLATIN_FRACTION and len(scripts) >= 5) or frac >= 0.20:
+        # The 20% disjunct also needs breadth (>=3 scripts), measured the
+        # hard way: a short reply quoting ONE Greek verse plus two sentences
+        # of commentary hit 48% non-Latin over 227 letters in one script and
+        # was flagged - and with the rollup-input redaction in place a false
+        # positive is no longer one skipped memory write, it is the reply
+        # PERMANENTLY replaced by a placeholder in every future summary,
+        # backfill and admin compact. Genuine drift measured 6-14 distinct
+        # scripts, so >=3 costs no recall on any corpus case; a reply that
+        # is simply IN one foreign language is not degeneration at all, and
+        # the repetition rules still cover a single-script runaway loop.
+        if (frac >= DEGENERATE_NONLATIN_FRACTION and len(scripts) >= 5) or (
+            frac >= 0.20 and len(scripts) >= 3
+        ):
             return (
                 f"{100 * frac:.0f}% of letters are non-Latin over "
                 f"{lat + non} letters across {len(scripts)} script(s) "
                 f"(limit {100 * DEGENERATE_NONLATIN_FRACTION:.0f}% over "
-                f"5+ scripts, or 20% alone)"
+                f"5+ scripts, or 20% over 3+)"
             )
     if n >= DEGENERATE_MIN_CHARS:
         decor = sum(1 for c in text if c in _DECOR_CHARS)
@@ -1718,6 +1759,7 @@ def _redact_degenerate_turns(messages: list[dict]) -> list[dict]:
     difference between a gap and a silent one.
     """
     out = []
+    redacted = 0
     for m in messages:
         if (
             isinstance(m, dict)
@@ -1725,7 +1767,19 @@ def _redact_degenerate_turns(messages: list[dict]) -> list[dict]:
             and reply_is_degenerate(_message_text(m))
         ):
             m = {**m, "content": _DEGENERATE_HISTORY_PLACEHOLDER}
+            redacted += 1
         out.append(m)
+    if redacted:
+        # Logged HERE, not only at original detection time: this
+        # substitution is what actually excludes the turn from summaries,
+        # and it recurs on every rollup long after the detection-time line
+        # has scrolled away. A permanent exclusion nothing ever mentions
+        # again is exactly the silent failure shape this branch exists to
+        # kill.
+        logger.info(
+            f"redacted {redacted} degenerate historical turn(s) from "
+            f"rollup input ({len(messages)} total)"
+        )
     return out
 
 
@@ -2990,6 +3044,16 @@ async def lifespan(app: FastAPI):
         logger.info("storage layout ready")
     except Exception as e:
         logger.warning(f"could not initialize storage layout: {e}")
+    # v3.1.3: warm the exact local tokenizer HERE, off the loop, for the
+    # same reason as the modality probe below - lazily it loaded inside the
+    # async request handler, so the FIRST request after every boot that had
+    # any summary state paid ~824ms of blocked event loop. One call warms
+    # the process-wide singleton that summarizer and facts both consult.
+    try:
+        await run_in_threadpool(summarizer._estimate_block_tokens, "warmup")
+        logger.info("local exact tokenizer warmed (or confirmed unavailable)")
+    except Exception as e:
+        logger.warning(f"tokenizer warm failed (non-fatal): {e}")
     # v3.0.3: resolve backend modality HERE rather than lazily on the first
     # chat. AutoConfig.from_pretrained can touch the network (an HF HEAD
     # request when the config is not cached), and the lazy path ran it inside
@@ -3577,13 +3641,44 @@ async def chat_completions(request: Request) -> Any:
         except Exception as e:
             logger.warning(f"conv={conv_id}: retrieval load failed (non-fatal): {e}")
 
+        # Injection budget, computed HERE rather than at the inject point
+        # below, because the summary block needs its share of it first: the
+        # block's own 12,000-token cap exceeds this whole budget at
+        # production config, and capping only inside summarizer meant
+        # _bound_injected_blocks dropped whole layers (facts gone from ~50%
+        # tier fill, everything but persona at ~70%).
+        has_history = _has_conversational_history(messages)
+        inject_budget = int(
+            effective_limit
+            * (
+                INJECTION_BUDGET_FRACTION
+                if has_history
+                else INJECTION_NO_HISTORY_FRACTION
+            )
+        )
+
         # --- Hierarchical summary stack (Phase 4) ---
-        # State only grows via the async tail (rollups post-response),
-        # so this is a purely local read — no LLM call on the hot path.
+        # State only grows via the async tail (rollups post-response), so
+        # this is a purely local read - no LLM call. run_in_threadpool all
+        # the same: _estimate_block_tokens consults the exact tokenizer when
+        # one is available (7.7ms per request at full tier state, and the
+        # FIRST call after boot pays the ~824ms tokenizer load), and this is
+        # the async request handler.
         try:
             sstate = summarizer.load_state(conv_id)
             last_turn = sstate.get("last_summarized_turn", "?")
-            sblock = summarizer.format_summary_block(sstate)
+            # 60% of the injection budget: at production config that is
+            # ~4,900 tokens, which reproduces the old working behaviour
+            # (summary trimmed newest-kept, facts and persona still fit) and
+            # leaves 40% for the other three layers.
+            sblock = await run_in_threadpool(
+                summarizer.format_summary_block,
+                sstate,
+                min(
+                    summarizer.SUMMARY_BLOCK_MAX_TOKENS,
+                    int(inject_budget * 0.6),
+                ),
+            )
             if sblock:
                 injected_blocks.append(
                     (_INJECT_PRIORITY_SUMMARY, "summary", sblock)
@@ -3612,15 +3707,8 @@ async def chat_completions(request: Request) -> Any:
             # request with no prior assistant turn can be neither compacted nor
             # shed, so an oversized injection there is not a degraded turn, it
             # is a lost one.
-            has_history = _has_conversational_history(messages)
-            inject_budget = int(
-                effective_limit
-                * (
-                    INJECTION_BUDGET_FRACTION
-                    if has_history
-                    else INJECTION_NO_HISTORY_FRACTION
-                )
-            )
+            # has_history / inject_budget are computed above the summary
+            # stack section - the summary cap needed them first.
             kept, dropped_layers, inject_cost = await run_in_threadpool(
                 _bound_injected_blocks, injected_blocks, inject_budget
             )

@@ -158,7 +158,7 @@ chosen:
 | repeated character | 250 | longest healthy run 146 |
 | repeated token | 120 | p98 = 80, then a cliff to p99 = 384 |
 | decoration fraction | 45% over 300 chars | healthy max 37.9% |
-| non-Latin letters | 3% over 200 letters **and 5+ distinct scripts**, or 20% alone | p99 = 1.21%, max 10.79%; genuine drift carried 6-14 scripts, the highest clean reply 4 |
+| non-Latin letters | 3% over 200 letters **and 5+ distinct scripts**, or 20% **over 3+ scripts** | p99 = 1.21%, max 10.79%; genuine drift carried 6-14 scripts, the highest clean reply 4. The "20% alone" form flagged a short single-verse Greek quotation (48% over 227 letters, one script) - and with the v3.1.3 rollup-input redaction a false positive permanently excludes the reply from every future summary, so the single-script disjunct was tightened to require breadth too |
 
 The script rule needs BREADTH, not just a fraction, and that was a real
 latent false positive rather than a theoretical one. A bare fraction flags a
