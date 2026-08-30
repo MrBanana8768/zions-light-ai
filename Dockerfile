@@ -234,8 +234,40 @@ COPY compactor/backup.py /opt/compactor/backup.py
 COPY compactor/degrade.py /opt/compactor/degrade.py
 COPY compactor/bgwork.py /opt/compactor/bgwork.py
 COPY compactor/tokens.py /opt/compactor/tokens.py
+COPY compactor/tokenhealth.py /opt/compactor/tokenhealth.py
 COPY compactor/logsetup.py /opt/compactor/logsetup.py
 COPY compactor/alert.py /opt/compactor/alert.py
+
+# BUILD GUARD: every compactor module must actually be in the image.
+#
+# v3.1.4 shipped with tokenhealth.py missing from the COPY list above and the
+# compactor went FATAL on boot in production - "ModuleNotFoundError: No module
+# named 'tokenhealth'" - with the chat path down until an operator hot-copied
+# the file in. The module was new in v3.1.3; the COPY line was not added with
+# it.
+#
+# Nothing could have caught that. The test suite mounts the SOURCE directory
+# over the container's, so 39/39 unit tests, the contract suite, the soak and
+# three adversarial review gates all ran against a file set the image does not
+# have. This is a packaging defect class, not a code one, and the enumerated
+# COPY list above is what arms it every time a module is added.
+#
+# So: import every entrypoint the same way supervisord does, at build time,
+# from the image's own /opt/compactor. A missing module, a syntax error or a
+# broken import fails the BUILD instead of production. Offline and
+# network-free by construction (verified) so it cannot flake:
+#   - uvicorn main:app          -> main
+#   - selftest.py --on-boot     -> selftest
+#   - backup.py --daemon        -> backup
+# plus the modules those pull in transitively, which is the whole package.
+RUN cd /opt/compactor && \
+    MODEL_REPO=buildguard VLLM_URL=http://127.0.0.1:1 \
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    COMPACTOR_STORAGE_ROOT=/tmp/buildguard LOG_DIR=/tmp/buildguard \
+    /opt/compactor-venv/bin/python -c \
+      "import main, selftest, backup, health, commands, portability; \
+       print('build guard: every compactor entrypoint imports from the image')" \
+    && rm -rf /tmp/buildguard /opt/compactor/__pycache__
 
 # V3.2 — STT service source (copied late, after its venv, for cache efficiency).
 COPY stt/server.py /opt/stt/server.py
