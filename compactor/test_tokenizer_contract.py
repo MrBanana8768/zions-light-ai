@@ -99,6 +99,7 @@ import pathlib
 import re
 import sys
 import tempfile
+from unittest.mock import patch
 
 # --- environment must be set before `import main` ------------------------
 # main.py reads MAX_MODEL_LEN / VLLM_URL / MODEL_REPO at import time.
@@ -152,7 +153,7 @@ FIXTURE_MAX_LEN = int(FIXTURE_INFO["max_model_len"])
 # below asserts that an assistant-final /tokenize request is REFUSED, and a
 # fixture built before 2026-08-29 answers it 200. Fail loudly rather than pass
 # vacuously.
-_REQUIRED_FIXTURE_FEATURES = {"assistant_final_400", "shapes"}
+_REQUIRED_FIXTURE_FEATURES = {"assistant_final_400", "shapes", "expected_last_role_400"}
 _missing = _REQUIRED_FIXTURE_FEATURES - set(FIXTURE_INFO.get("features") or [])
 if _missing:
     print("=" * 72)
@@ -248,6 +249,18 @@ def truth(messages: list[dict]) -> int:
     routinely end on an assistant turn, so the harness was measuring those
     batches through a request production could not make. That is D7 in one
     helper: the contract it imagined, not the one the code exercises.
+
+    D8 found the sibling gap in this same helper: it sent `add_generation_prompt`
+    alone and left `continue_final_message` unset, which is rule 3's exact
+    refusal shape once the fixture can enforce it (an assistant-final list with
+    add_generation_prompt=False and continue_final_message left False). Every
+    single-message assistant-content measurement in section 2 — the box-drawing
+    and hostile-content ratios — is exactly such a list, so this helper started
+    raising a 400 the moment rule 3 shipped, on tests that have nothing to do
+    with D1/D8 at all. `count_tokens_exact` always pairs the two flags as
+    complements; this helper now does too, for the same reason it corrected
+    `add_generation_prompt` on 2026-08-29 — a ground-truth helper that cannot
+    send the request the code under test actually sends is not ground truth.
     """
     agp = bool(messages) and messages[-1].get("role") != "assistant"
     r = httpx.post(
@@ -256,6 +269,7 @@ def truth(messages: list[dict]) -> int:
             "model": "fixture-model",
             "messages": messages,
             "add_generation_prompt": agp,
+            "continue_final_message": not agp,
         },
         timeout=60.0,
     )
@@ -905,12 +919,27 @@ def test_fixture_reproduces_the_assistant_final_refusal():
         extra="'Consider using continue_final_message instead.'",
     )
 
+    # NOTE, corrected under D8: this used to assert that turning the flag off
+    # was BY ITSELF enough to be "counted normally". It is not — that claim was
+    # only ever true because the fixture could not enforce rule 3 yet. Real
+    # vLLM refuses THIS shape too ("Expected last role..."), which is exactly
+    # the second outage: the fix that shipped set add_generation_prompt=False
+    # and stopped, and hit this refusal within the hour. See [24]/[25].
     r_off = post(slice_, add_generation_prompt=False)
     check(
-        r_off.status_code == 200 and isinstance(r_off.json().get("count"), int),
-        "the same list with the flag off is counted normally",
-        f"status {r_off.status_code}: {r_off.text[:200]!r}",
-        extra=f"{r_off.json().get('count')} tokens" if r_off.status_code == 200 else "",
+        r_off.status_code == 400 and "Expected last role" in r_off.text,
+        "the flag off ALONE is not enough — rule 3 refuses this too",
+        f"status {r_off.status_code}: {r_off.text[:200]!r}; if this now returns "
+        f"200 then rule 3 has regressed and this suite would again go green "
+        f"through the second outage's exact shape",
+    )
+    r_fixed = post(slice_, add_generation_prompt=False, continue_final_message=True)
+    check(
+        r_fixed.status_code == 200 and isinstance(r_fixed.json().get("count"), int),
+        "the flag off TOGETHER WITH continue_final_message=True — the actual "
+        "fix — is counted normally",
+        f"status {r_fixed.status_code}: {r_fixed.text[:200]!r}",
+        extra=f"{r_fixed.json().get('count')} tokens" if r_fixed.status_code == 200 else "",
     )
 
     # Prove the refusal is about the FLAG AND THE SHAPE and not about the
@@ -1025,14 +1054,26 @@ def test_summarize_survives_an_assistant_final_slice_end_to_end():
             return await main.summarize(c, turns)
 
     with CaptureLogs() as logs:
-        out = asyncio.run(_run())
+        out, deferred = asyncio.run(_run())
     text = logs.text()
     st = fixture("/_fixture/stats")
-    print(f"       {len(turns)} turns -> summary of {len(out)} chars; stats {st}")
+    print(
+        f"       {len(turns)} turns -> summary of {len(out)} chars, "
+        f"{len(deferred)} turn(s) deferred; stats {st}"
+    )
     check(
         isinstance(out, str) and out.strip(),
         "summarize returns a summary rather than degrading",
         f"got {out!r}",
+    )
+    # v3.1.3 made summarize() return (summary, deferred). This slice is well
+    # under MAX_SUMMARY_CALLS_PER_REQUEST batches, so nothing may be deferred:
+    # a non-empty list here would mean the per-request cap fired on a slice
+    # this small and silently dropped turns out of the summary.
+    check(
+        deferred == [],
+        "and defers nothing — this slice is under the per-request call cap",
+        f"deferred {len(deferred)} turn(s): {deferred!r:.200}",
     )
     check(
         st.get("tokenize.refused", 0) == 0,
@@ -1309,7 +1350,266 @@ def test_every_tokenize_client_in_the_tree_is_enumerated_and_covered():
     )
 
 
-# ============================================================== 11. THE REGIMES
+# ================== 11. D8: THE REFUSAL RULE THIS FIXTURE COULD NOT MODEL
+#
+# The chat template has THREE refusal rules, not one:
+#
+#   1. both add_generation_prompt and continue_final_message true
+#   2. add_generation_prompt=True on an assistant-final list         (D1)
+#   3. assistant-final with neither continue_final_message nor prefix set
+#
+# Rule 2 is the 2026-08-28/-29 outage D1 already covers above. The FIX for it
+# set add_generation_prompt=False and stopped — which satisfies rule 2 and
+# walks straight into rule 3. Same outage, new error string, inside the hour.
+# Until now the fixture only implemented rules 1 and 2: it had no way to
+# REFUSE on rule 3 grounds, so a regression back to "add_generation_prompt=
+# False and nothing else" would have sailed through this suite exactly the
+# way the original bug sailed through the suite that existed on 2026-08-28.
+#
+# `main.count_tokens_exact` cannot be made to send rule 3's shape through its
+# public surface — `continue_final_message` is always the complement of
+# `add_generation_prompt` by construction, which IS the fix. So rule 3 is
+# reproduced here by intercepting the wire body and stripping that field back
+# out, simulating the exact code this suite exists to have caught, without
+# editing main.py.
+
+
+def _reset_tokenize_health() -> None:
+    """Directly clear main's rate-limited /tokenize failure-warning state.
+
+    `_note_tokenize_failure` warns at most once per (HTTP status) key per
+    TOKENIZE_WARN_INTERVAL_S (main.py). Rules 2 and 3 both surface as HTTP
+    400, so two refusals driven back to back in one test would share that key
+    and the second WARNING would be silently suppressed — not a bug, but it
+    would make an assertion on the second warning's wording flaky rather than
+    meaningful. There is no public reset for this state, so it is cleared
+    directly, the same way this file already reaches into main._tokenizer,
+    main.VLLM_URL and main.count_tokens_exact for other tests.
+    """
+    main._tokenize_fail_streak = 0
+    main._tokenize_degraded_since = None
+    main._tokenize_last_warn.clear()
+
+
+def test_fixture_reproduces_the_expected_last_role_refusal():
+    print("\n[24] the fixture now REFUSES rule 3 too — the SECOND outage's shape")
+    reset_fixture()
+    slice_ = old_turns(2)
+
+    def post(msgs, **flags):
+        return httpx.post(
+            f"{FIXTURE_URL}/tokenize",
+            json={"model": "fixture-model", "messages": msgs, **flags},
+            timeout=30.0,
+        )
+
+    # The naive "fix": turn off add_generation_prompt and stop there.
+    r = post(slice_, add_generation_prompt=False, continue_final_message=False)
+    check(
+        r.status_code == 400,
+        "add_generation_prompt=False alone, on an assistant-final list, is "
+        "STILL refused",
+        f"status {r.status_code}; a fixture without rule 3 answers this 200, "
+        f"which is exactly how the second outage shipped past the first "
+        f"fixture that existed",
+    )
+    check(
+        "Expected last role" in r.text and "continue_final_message" in r.text,
+        "with vLLM's own wording for THIS rule, not rule 2's",
+        f"body was {r.text[:300]!r}",
+    )
+    check(
+        fixture("/_fixture/stats").get("tokenize.refused.expected_last_role", 0) == 1,
+        "and the fixture attributes the refusal to the right rule",
+        f"stats: {fixture('/_fixture/stats')!r}",
+    )
+
+    # The two ways to legitimately end on assistant: continue_final_message,
+    # and Mistral's own "prefix" marker. Either cures it.
+    reset_fixture()
+    r_cfm = post(slice_, add_generation_prompt=False, continue_final_message=True)
+    check(
+        r_cfm.status_code == 200 and isinstance(r_cfm.json().get("count"), int),
+        "continue_final_message=True cures it — this is the ACTUAL fix",
+        f"status {r_cfm.status_code}: {r_cfm.text[:200]!r}",
+    )
+    reset_fixture()
+    prefixed = slice_[:-1] + [{**slice_[-1], "prefix": True}]
+    r_prefix = post(prefixed, add_generation_prompt=False, continue_final_message=False)
+    check(
+        r_prefix.status_code == 200 and isinstance(r_prefix.json().get("count"), int),
+        "an assistant message carrying prefix:true cures it too",
+        f"status {r_prefix.status_code}: {r_prefix.text[:200]!r}",
+    )
+
+    # Prove it again: the refusal is about the shape, not the content — with
+    # the check disabled the identical request succeeds.
+    reset_fixture()
+    set_mode(assistant_final_400=False)
+    r_disabled = post(slice_, add_generation_prompt=False, continue_final_message=False)
+    reset_fixture()
+    check(
+        r_disabled.status_code == 200,
+        "and with the check disabled the identical request succeeds",
+        f"status {r_disabled.status_code}; the 400 above came from something "
+        f"other than the shape check",
+    )
+
+    # The completion shape must NEVER refuse for template reasons — that
+    # distinction is the whole point of having two shapes. A fixture that
+    # refused both would be modelling something real vLLM does not do.
+    reset_fixture()
+    r_completion = httpx.post(
+        f"{FIXTURE_URL}/tokenize",
+        json={
+            "model": "fixture-model",
+            "prompt": "anything at all",
+            # These flags are meaningless on the completion shape; a
+            # template-refusal check that inspected them anyway would be a
+            # false positive waiting to happen.
+            "add_generation_prompt": True,
+            "continue_final_message": True,
+        },
+        timeout=30.0,
+    )
+    check(
+        r_completion.status_code == 200,
+        "the completion shape is never refused for template reasons, "
+        "however the flags are set",
+        f"status {r_completion.status_code}: {r_completion.text[:200]!r}",
+    )
+    reset_fixture()
+
+
+def test_compactor_survives_all_three_refusal_rules_driven_for_real():
+    print("\n[25] D8: the compactor survives all three rules, driven through real call sites")
+    slice_ = old_turns(2)
+
+    # --- rule 2: add_generation_prompt=True on an assistant-final list -----
+    # (D1 already covers this in depth at [19]; repeated here so all three
+    # rules are asserted survivable in one place, with the SAME assertions.)
+    reset_fixture()
+    _reset_tokenize_health()
+    logsetup._reset_log_once_for_tests()
+    with CaptureLogs() as logs2:
+        n2 = main.count_tokens_exact(slice_, add_generation_prompt=True)
+    check(
+        n2 is None,
+        "rule 2 (add_generation_prompt=True, assistant-final): no crash, no "
+        "bogus number",
+        f"got {n2!r}",
+    )
+    check(
+        fixture("/_fixture/stats").get("tokenize.refused.agp_assistant_final", 0) == 1,
+        "the fixture attributes it to rule 2",
+    )
+    out2 = main._enforce_hard_budget(conversation(6), limit=8000, protect_system=1)
+    check(
+        isinstance(out2, list) and bool(out2),
+        "and the guard still serves a request after rule 2",
+        f"got {out2!r}",
+    )
+
+    # --- rule 1: both flags true --------------------------------------------
+    # count_tokens_exact never constructs this shape — add_generation_prompt
+    # and continue_final_message are always complements, which is precisely
+    # the invariant test_tokenize_flags.py asserts. So this is driven at the
+    # wire, the way a caller who broke that invariant would produce it.
+    reset_fixture()
+    _reset_tokenize_health()
+    r1 = httpx.post(
+        f"{FIXTURE_URL}/tokenize",
+        json={
+            "model": "fixture-model", "messages": conversation(1),
+            "add_generation_prompt": True, "continue_final_message": True,
+        },
+        timeout=30.0,
+    )
+    check(r1.status_code == 400, "rule 1 (both flags true) is refused by the fixture")
+    check(
+        fixture("/_fixture/stats").get("tokenize.refused.both_flags", 0) == 1,
+        "attributed to rule 1",
+    )
+    out1 = main._enforce_hard_budget(conversation(6), limit=8000, protect_system=1)
+    check(
+        isinstance(out1, list) and bool(out1),
+        "and the guard still serves a request after rule 1",
+        f"got {out1!r}",
+    )
+
+    # --- rule 3: the SECOND outage -------------------------------------------
+    # count_tokens_exact's real body always pairs add_generation_prompt=False
+    # with continue_final_message=True — that pairing IS the fix, so it
+    # cannot be asked to send rule 3's shape honestly. The wire body is
+    # intercepted and continue_final_message forced back to False, simulating
+    # the naive fix this suite exists to catch a regression to.
+    reset_fixture()
+    _reset_tokenize_health()
+    logsetup._reset_log_once_for_tests()
+
+    real_post = main.httpx.post
+
+    def _strip_cfm(url, json=None, **kw):
+        if json is not None and "continue_final_message" in json:
+            json = dict(json)
+            json["continue_final_message"] = False  # the pre-D8 mistake
+        return real_post(url, json=json, **kw)
+
+    with CaptureLogs() as logs3, patch.object(main.httpx, "post", _strip_cfm):
+        n3 = main.count_tokens_exact(slice_, add_generation_prompt=False)
+    check(
+        n3 is None,
+        "rule 3 (add_generation_prompt=False, continue_final_message=False, "
+        "assistant-final): no crash, no bogus number",
+        f"got {n3!r} — a fixture without rule 3 would return a real count "
+        f"here, and this is exactly the shape that took production down a "
+        f"second time",
+    )
+    check(
+        fixture("/_fixture/stats").get("tokenize.refused.expected_last_role", 0) == 1,
+        "the fixture attributes it to rule 3 — the rule a fixture without D8 "
+        "could never have provoked",
+        f"stats: {fixture('/_fixture/stats')!r}",
+    )
+    warned3 = logs3.at_least("WARNING")
+    check(
+        "Expected last role" in warned3,
+        "the loss is announced with vLLM's own wording for THIS rule",
+        f"warnings: {warned3[:400]!r}",
+    )
+    out3 = main._enforce_hard_budget(conversation(6), limit=8000, protect_system=1)
+    check(
+        isinstance(out3, list) and bool(out3),
+        "and the guard still serves a request after rule 3",
+        f"got {out3!r}",
+    )
+    reset_fixture()
+
+    # --- and the shape the ACTUAL fix sends is never refused at all --------
+    _reset_tokenize_health()
+    logsetup._reset_log_once_for_tests()
+    n_real = main.count_tokens_exact(slice_)
+    check(
+        isinstance(n_real, int) and n_real > 0,
+        "the shipped fix (add_generation_prompt=False WITH "
+        "continue_final_message=True together) is never refused",
+        f"got {n_real!r}",
+    )
+    check(
+        fixture("/_fixture/stats").get("tokenize.refused", 0) == 0,
+        "not one refusal for the real call site's own shape",
+        f"stats: {fixture('/_fixture/stats')!r}",
+    )
+    reset_fixture()
+    note(
+        "[24]-[25] are the cases that did not exist until D8: a fixture that "
+        "could refuse on rule 3 grounds, and proof the compactor survives it "
+        "(never crashes, never trusts a number it didn't get, keeps serving) "
+        "exactly as it already does for rules 1 and 2."
+    )
+
+
+# ============================================================== 12. THE REGIMES
 
 
 def _all_tests():
@@ -1337,6 +1637,8 @@ def _all_tests():
         test_the_summarize_fallback_sizes_batches_pessimistically_and_they_fit,
         test_the_summarizer_modules_own_tokenize_client,
         test_every_tokenize_client_in_the_tree_is_enumerated_and_covered,
+        test_fixture_reproduces_the_expected_last_role_refusal,
+        test_compactor_survives_all_three_refusal_rules_driven_for_real,
     ]
 
 

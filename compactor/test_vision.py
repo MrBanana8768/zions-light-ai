@@ -98,7 +98,11 @@ def test_compaction_preserves_image_turns():
     print("\n[test] compact_if_needed keeps image turns verbatim, summarizes text")
 
     async def fake_summarize(client, to_summarize):
-        return "SUMMARY"
+        # (summary, deferred). v3.1.3 bounded the summarization calls one
+        # request may make and returns the turns it chose NOT to summarize, so
+        # the caller can forward them verbatim. A stub returning a bare string
+        # unpacks into its characters and fails with 'too many values'.
+        return "SUMMARY", []
 
     orig = main.summarize
     main.summarize = fake_summarize

@@ -157,6 +157,20 @@ def summary_path(conv_id: str) -> Path:
     return STORAGE_ROOT / "summaries" / f"{conv_id}.json"
 
 
+def summary_archive_path(conv_id: str) -> Path:
+    """Cold storage for L2 chapters consumed by an L3 refresh.
+
+    Same contract as facts_archive_path, and it exists for the same reason:
+    this project's stated invariant is that eviction MOVES memory to a
+    sidecar and never unlinks it (see facts.py's module docstring). The L3
+    rollup was the first path on this branch to delete memory outright -
+    it cleared state["l2"] with no copy anywhere - which also meant the
+    recursively re-paraphrased L3 had no source left to be regenerated from.
+    Its stem carries a dot, so list_known_conv_ids skips it exactly as it
+    skips the facts sidecar."""
+    return STORAGE_ROOT / "summaries" / f"{conv_id}.archive.json"
+
+
 def chromadb_path() -> Path:
     """Return the ChromaDB persist directory (Phase 3 will populate it)."""
     return STORAGE_ROOT / "chromadb"

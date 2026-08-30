@@ -32,6 +32,7 @@ import hashlib
 import logging
 import os
 import threading
+import unicodedata
 from typing import Any
 
 import logsetup
@@ -703,12 +704,18 @@ def _estimate_tokens(text: str) -> int:
       module has always used, and a pure-prose block renders byte-identically
       to what it rendered before this fix. That matters — the common case must
       not shrink.
-    * **Non-ASCII → one token per UTF-8 byte.** A CEILING, not an estimate.
-      tekken.json (and every byte-level BPE) falls back to per-byte tokens when
-      no merge applies, so nothing can cost more than its byte length. Measured
-      against it: the incident's box-drawing run is 3 bytes/char and was charged
-      1.99 tokens/char, i.e. 0.66 of the ceiling, so this over-counts decoration
-      by ~1.5x rather than under-counting it by 7.74x.
+    * **Non-ASCII letters and combining marks → 1.25 tokens per CHARACTER.**
+      The per-byte rule was written for decoration and applied to everything
+      non-ASCII, which over-priced natural script by its byte width: Greek at
+      ~2 bytes/char measured 2.34x real cost, CJK 4.27x - so scripture-heavy
+      retrieved memories were trimmed or dropped against the 1,500-token
+      budget on exactly the conversations this user cares most about (the
+      same mispricing v3.1.3 fixed in summarizer._estimate_block_tokens;
+      this function was its unfixed sibling). 1.25/char is a measured
+      ceiling for every script tested (worst: Hebrew with niqqud at 1.16).
+    * **Non-ASCII everything else (decoration, emoji) → 1.05 tokens per
+      UTF-8 byte.** The per-byte ceiling this rule was actually written for,
+      plus 5% because emoji measured just over one token per byte.
 
     Deliberately no tokenizer and no HTTP: this module is torch-free on purpose,
     and `format_retrieval_block` is called from the request hot path inside an
@@ -718,13 +725,28 @@ def _estimate_tokens(text: str) -> int:
     Being wrong here now costs a retrieval block smaller than it needed to be,
     which is recoverable, instead of one 7x larger than believed, which was not.
     """
-    # Both halves are C-level: "ascii"/"ignore" drops exactly the non-ASCII
-    # characters, so its length IS the ASCII character count, and the remainder
-    # of the UTF-8 length is the non-ASCII byte count. A per-character Python
-    # loop over five whole exchanges is not free on the hot path.
+    # The pure-ASCII common case stays C-level and byte-identical to the
+    # old behaviour; the per-character loop runs only over the non-ASCII
+    # remainder of mixed text, which for this deployment's transcript is
+    # rare outside the exact scripture/decoration cases it exists to price.
     data = text.encode("utf-8", "surrogatepass")
     ascii_chars = len(text.encode("ascii", "ignore"))
-    return ascii_chars // 4 + (len(data) - ascii_chars)
+    if len(data) == ascii_chars:
+        return ascii_chars // 4
+    script_chars = decor_bytes = 0
+    for c in text:
+        if ord(c) < 128:
+            continue
+        if unicodedata.category(c)[0] in ("L", "M"):
+            script_chars += 1
+        else:
+            decor_bytes += len(c.encode("utf-8", "surrogatepass"))
+    return (
+        ascii_chars // 4
+        + int(script_chars * 1.25)
+        + int(decor_bytes * 1.05)
+        + 1
+    )
 
 
 def _longest_prefix_within(text: str, budget: int, measure) -> str:

@@ -1,6 +1,44 @@
 """
 compactor.tokens — an accurate LOCAL token count, and a divergence detector.
 
+================================================================================
+STATUS (verified 2026-08-29, v3.1 remediation pass): PARTIALLY WIRED IN.
+
+  IMPORTED BY: facts.py (is_available()/count() as a real-measurement
+  backstop on the extraction-input budget) and summarizer.py
+  (_estimate_block_tokens asks it for the summary block's real cost).
+  NOT imported by main.py: main.count_tokens_exact and
+  summarizer's per-round counter still go straight from vLLM /tokenize to the
+  transformers/tekken estimator (tier 3 below) on a miss, so for those two -
+  which are the counters every budget decision in the system actually runs on
+  - tier 2 is still never consulted.
+
+  This banner previously read "NOT WIRED IN", which was true when written and
+  became false in the same working tree about an hour later, when facts.py
+  took a dependency on it. Two changes landing in parallel, each correct
+  alone. If you are editing this file, re-grep before trusting the line above
+  - that is the whole reason this section exists.
+
+AND THE PART THAT ACTUALLY MATTERS OPERATIONALLY: is_available() is False on
+a box with no tekken.json in the model cache, and TRUE on the pod, where the
+weights are on disk. Every test container is the first case; production is
+the second. So facts.py's backstop does NOT execute in any test run that does
+not deliberately stage a pod-shaped HF cache, and DOES execute for the user.
+A suite that is green here is not evidence about the branch that ships. Stage
+the cache (see the v3.1.3 verification notes) or you are testing the other
+program.
+
+This module was investigated as a suspect during the 2026-08-29 degeneration
+incident and cost real time before being ruled out - see
+INCIDENT_2026-08-29-degeneration.md, which says "It has no importer in the
+application." That sentence is now out of date in the direction that matters:
+it has one.
+
+Finishing the job means main.count_tokens_exact and summarizer's counter
+calling tokens.count() / tokens.check_divergence() as tier 2 before falling
+through to tier 3. That call-site work is what remains.
+================================================================================
+
 Why this module exists, in one sentence: on 2026-08-29 vLLM's /tokenize refused
 a request and the compactor fell back to a counter that reads up to 51% low,
 which took compaction down and cost the user 80+ turns of context per message.

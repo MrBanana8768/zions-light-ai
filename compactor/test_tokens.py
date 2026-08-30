@@ -14,11 +14,30 @@ does not have.
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 os.environ.setdefault("MODEL_REPO", "")
 os.environ.setdefault("HF_HOME", tempfile.mkdtemp(prefix="tokens-test-hf-"))
 
 import tokens  # noqa: E402
+
+# `os.environ.setdefault` above is a NO-OP on the pod, and on this repo's
+# staged-cache reproduction of it (see tokens.py's own module docstring):
+# MODEL_REPO and HF_HOME are ALREADY set — to a real model repo and a
+# populated cache — by the environment before this file even runs, so
+# `setdefault` never gets a chance to apply the blank/empty values it names.
+# Sections [1] and [4] below then silently resolve a REAL tokenizer instead
+# of exercising the "no tokenizer available" branch their own assertions
+# claim to cover — this file was green everywhere it ever ran only BECAUSE
+# no test box happened to have a cache, which is exactly the
+# environment-blindness this module's own banner warns about for facts.py's
+# backstop. Forced directly on the module's resolved globals, unconditionally
+# and regardless of what the process inherited, so the assertion means the
+# same thing on a laptop and on the pod. Section [5] below overrides
+# MODEL_REPO and _find_tekken again for its own real-tokenizer-present
+# tests, independently of this.
+tokens.MODEL_REPO = ""
+tokens.HF_HOME = Path(tempfile.mkdtemp(prefix="tokens-test-hf-empty-"))
 
 
 def assert_eq(actual, expected, label):

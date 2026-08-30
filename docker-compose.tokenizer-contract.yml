@@ -55,6 +55,37 @@ services:
       - ./:/repo:ro
     working_dir: /repo/compactor
 
+  # The soak's OWN fixture. Identical config, separate container.
+  #
+  # It used to depend on tokenize-fixture, one service shared with the
+  # contract suite, and the comment below claimed isolation the file did not
+  # implement. `up --profile soak` starts both suites against that one
+  # fixture, and the contract suite deliberately injects /tokenize 400s and
+  # malformed 200s into it — so the soak failed at turn 12 with
+  # "'/tokenize degraded' appeared". A real-looking red, caused entirely by
+  # the harness. Exactly the failure the comment warned about, in the
+  # configuration the comment was attached to.
+  soak-fixture:
+    profiles: ["soak"]
+    build:
+      context: ./testfixtures/tokenizer-contract
+      dockerfile: Dockerfile
+    container_name: zla-soak-fixture
+    environment:
+      FIXTURE_TOKENIZER: HuggingFaceTB/SmolLM2-135M-Instruct
+      FIXTURE_SERVED_MODEL_NAME: fixture-model
+      FIXTURE_MAX_MODEL_LEN: "32768"
+      FIXTURE_ERROR_STYLE: v010
+    ports:
+      # 18001, not 18000: both fixtures must be able to run at once.
+      - "18001:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
   # The soak owns its dependency rather than borrowing a shared one.
   #
   # Running the contract harness with --exit-code-from tears the WHOLE stack
@@ -64,7 +95,11 @@ services:
   # real defect. A test that fails for an environmental reason indistinguishable
   # from a real one is how a suite teaches people to ignore red.
   #
-  #   docker compose -f docker-compose.tokenizer-contract.yml   #     run --rm --build soak-tests
+  # Either of these is now safe, including the second, which starts both
+  # suites side by side:
+  #
+  #   docker compose -f docker-compose.tokenizer-contract.yml run --rm --build soak-tests
+  #   docker compose -f docker-compose.tokenizer-contract.yml --profile soak up --build
   soak-tests:
     profiles: ["soak"]
     build:
@@ -72,11 +107,11 @@ services:
       dockerfile: Dockerfile.testrunner
     container_name: zla-soak-tests
     depends_on:
-      tokenize-fixture:
+      soak-fixture:
         condition: service_healthy
     environment:
-      VLLM_URL: http://tokenize-fixture:8000
-      FIXTURE_URL: http://tokenize-fixture:8000
+      VLLM_URL: http://soak-fixture:8000
+      FIXTURE_URL: http://soak-fixture:8000
       MODEL_REPO: fixture-model
       # A small window so compaction fires within a soak-sized run. The soak
       # asserts RATIOS and lag, never absolute token counts.

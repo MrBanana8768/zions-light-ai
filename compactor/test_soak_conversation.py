@@ -85,6 +85,7 @@ os.environ["COMPACTOR_STORAGE_ROOT"] = _STORE
 
 import asyncio  # noqa: E402
 import logging  # noqa: E402
+import time  # noqa: E402
 from unittest.mock import patch  # noqa: E402
 
 import httpx  # noqa: E402
@@ -199,15 +200,26 @@ def _reset_fixture() -> None:
              'that is the D1 sabotage mode; a soak cannot run against it')
 
 
+def _fixture_stats() -> dict:
+    try:
+        return httpx.get(f"{FIXTURE_URL}/_fixture/stats", timeout=5.0).json()
+    except Exception:
+        return {}
+
+
 def _set_reply(seq: int) -> None:
     httpx.post(f"{FIXTURE_URL}/_fixture/mode",
                json={"reply_chars": REPLY_CHARS, "reply_seq": seq}, timeout=5.0)
 
 
-def _turn(n: int, history: list[dict]) -> tuple[int, str, list[dict], str]:
-    """One real POST through the compactor to the fixture. Returns
-    (status, captured log text, the payload actually forwarded, reply text)."""
+def _turn(n: int, history: list[dict]) -> tuple[int, str, list[dict], str, int]:
+    """One real POST through the compactor to the fixture.
+
+    Returns (status, log text, forwarded payload, reply text, LLM calls made
+    ON THE REQUEST PATH) — the last one measured before the memory tail runs,
+    because the tail does not block the user."""
     _set_reply(n)
+    _calls_at_start = _fixture_stats().get("chat_completions", 0)
     cap = _Capture()
     lg = logging.getLogger("compactor")
     lg.addHandler(cap)
@@ -231,6 +243,13 @@ def _turn(n: int, history: list[dict]) -> tuple[int, str, list[dict], str]:
             )
     finally:
         lg.removeHandler(cap)
+    # Counted HERE, before the tail is drained. The tail (fact extraction,
+    # dedup, rollup) is fire-and-forget in production and does NOT block the
+    # reply; this soak runs it synchronously only so memory accumulates
+    # deterministically. Counting it against the request-path budget measures
+    # the wrong thing — and the first version of this assertion did exactly
+    # that, then blamed the code for it.
+    request_calls = _fixture_stats().get("chat_completions", 0) - _calls_at_start
     _drain_tails()
     sent = forwarded[-1].get("messages", []) if forwarded else []
     reply = ""
@@ -238,7 +257,7 @@ def _turn(n: int, history: list[dict]) -> tuple[int, str, list[dict], str]:
         reply = (r.json()["choices"][0]["message"]["content"]) or ""
     except Exception:
         pass
-    return r.status_code, cap.text(), sent, reply
+    return r.status_code, cap.text(), sent, reply, request_calls
 
 
 def fail(label: str, detail: str = "") -> None:
@@ -259,12 +278,15 @@ _reset_fixture()
 
 history: list[dict] = []
 rows: list[dict] = []
+calls_seen: list[tuple] = []
 compaction_fired = False
 
 for n in range(1, TURNS + 1):
     history.append({"role": "user",
                     "content": f"Turn {n}. Tell me about item {n} in detail."})
-    status, log, sent, reply = _turn(n, history)
+    _t0 = time.monotonic()
+    status, log, sent, reply, _calls = _turn(n, history)
+    _elapsed = time.monotonic() - _t0
 
     # ---- invariants that must hold on EVERY turn --------------------------
     # Each one is a failure this project has actually shipped.
@@ -291,6 +313,25 @@ for n in range(1, TURNS + 1):
     ):
         if needle in log:
             fail(f"turn {n}: {needle!r} appeared", why)
+
+    # THE ASSERTION THAT WAS MISSING, and its absence is why 2026-08-29
+    # happened. Compaction runs on the REQUEST PATH. A conversation with a
+    # summarization backlog produced 33 LLM calls on one request — eight
+    # minutes with a dead composer, and the user got no reply at all. Nothing
+    # here measured how much work a single turn did, so a green soak said
+    # everything was fine.
+    #
+    # The budget is the cap plus one: the cap bounds summarization calls, and
+    # the user's own reply is the +1. Fact extraction and dedup run on the
+    # background tail, which the soak drains separately after the turn.
+    _budget = main.MAX_SUMMARY_CALLS_PER_REQUEST + 1
+    if _calls > _budget:
+        fail(f"turn {n}: one request made {_calls} LLM calls (budget {_budget})",
+             f"compaction is unbounded on the request path. At ~1024 output "
+             f"tokens per call on a 24B model this is minutes of latency for a "
+             f"user who is watching a blank composer. See "
+             f"MAX_SUMMARY_CALLS_PER_REQUEST.")
+    calls_seen.append((n, _calls, round(_elapsed, 1)))
 
     if "hard budget enforced" in log:
         compaction_fired = True  # shedding implies we got past the target
@@ -325,6 +366,13 @@ for n in range(1, TURNS + 1):
 
 print()
 print("[soak] end-of-run checks")
+if calls_seen:
+    _worst = max(calls_seen, key=lambda x: x[1])
+    _slow = max(calls_seen, key=lambda x: x[2])
+    print(f"  ok   LLM calls per request stayed bounded "
+          f"(worst {_worst[1]} at turn {_worst[0]}, budget "
+          f"{main.MAX_SUMMARY_CALLS_PER_REQUEST + 1}; slowest turn "
+          f"{_slow[2]}s at turn {_slow[0]})")
 
 if not compaction_fired:
     fail("the run never exceeded the compaction target",
@@ -402,13 +450,100 @@ print("  ok   no markup reached the fact store")
 
 state = summarizer.load_state(CONV)
 l1 = state.get("l1") or []
+
+# THIS USED TO BE A NOTE, NOT A FAIL — the exact "cannot discriminate" gap a
+# review found here. "if compaction fired and no L1 chunk exists, print a
+# NOTE and carry on" cannot fail for the reason its own text names: a dead
+# hierarchy (the 2026-08-28 shape, described in the very words this line used
+# to print) and a healthy one that simply produced chunks both reach the same
+# `print` and the same exit code. A soak that only NOTEs its own headline
+# failure mode provides false confidence, not coverage.
+#
+# It is safe to make this a hard FAIL: L1 rollup needs only L1_CHUNK_SIZE
+# (20) non-system message-units, sourced from the FULL history (maybe_rollup
+# runs on the background tail against every turn, not the guard's shed
+# context) — far fewer than the turns needed to first fill an 8192-token
+# window and trip `compaction_fired`. So by the time compaction ever fires in
+# this soak, at least one L1 rollup has always already had the chance to run.
 if compaction_fired and not l1:
-    print("  NOTE no L1 chunk was produced. Not fatal — the rollup threshold "
-          "may simply not have been reached — but if the run compacted and the "
-          "hierarchy never advanced, that is the 2026-08-28 dead-hierarchy "
-          "shape and worth a look.")
-else:
-    print(f"  ok   the summary hierarchy advanced (L1={len(l1)})")
+    fail(
+        "compaction fired but the summary hierarchy produced NOTHING",
+        "the run filled the window and the guard is shedding turns, but L1 "
+        "is empty — that is the 2026-08-28 dead-hierarchy shape: turns are "
+        "being consumed on the request path with nothing behind them to "
+        "represent what was lost",
+    )
+print(f"  ok   the summary hierarchy advanced (L1={len(l1)})")
+
+# The property [substantive]/[lagging] above did not check: not just THAT a
+# chunk exists, but that the chunks which exist actually TILE the turns the
+# watermark claims to have covered, with real content in each one. A bug that
+# advances last_summarized_turn without writing (or while writing an EMPTY)
+# L1/L2 entry passes every check above — the watermark moves, so the lag
+# stays bounded and "the hierarchy advanced" reads L1>=1 — while a stretch of
+# history in the middle is consumed and represented nowhere. That is exactly
+# what v3.1.3 (f8614b6, "a failed summary must not delete the turns it failed
+# on") fixed, and exactly the shape of "history consumed without being
+# represented anywhere": the watermark is evidence of PROGRESS, not of
+# COVERAGE, and this suite had nothing that checked coverage until now.
+def _summary_coverage_gaps(st: dict) -> list[str]:
+    watermark = st.get("last_summarized_turn", 0)
+    if watermark <= 0:
+        return []
+    problems: list[str] = []
+    ranges: list[tuple[int, int]] = []
+    # l3 MUST be included. _do_l3_rollup consumes the l2 chapters it folds in
+    # and clears the list, so once a conversation reaches the third tier every
+    # turn behind L3 is represented in l3 ALONE. Walking only l1+l2 would
+    # report the entire pre-L3 history as "claimed by nothing" - a false alarm
+    # on correct behaviour, which is worse than no check, because it is the
+    # check people would then learn to ignore. This assertion and the l2 drain
+    # landed in the same diff with contradictory models of coverage; the soak
+    # only passed because SOAK_TURNS never reaches the third tier, i.e. the
+    # one new assertion aimed at this branch's headline failure mode was
+    # vacuous for both tiers the diff actually changed.
+    _l3 = st.get("l3")
+    if isinstance(_l3, dict):
+        if not (_l3.get("text") or "").strip():
+            problems.append("l3 exists but has EMPTY text")
+        elif isinstance(_l3.get("first_turn"), int) and isinstance(
+            _l3.get("last_turn"), int
+        ):
+            ranges.append((_l3["first_turn"], _l3["last_turn"]))
+    for tier in ("l1", "l2"):
+        for c in st.get(tier) or []:
+            ft, lt = c.get("first_turn"), c.get("last_turn")
+            if not (c.get("text") or "").strip():
+                problems.append(f"{tier} chunk {ft}-{lt} has EMPTY text")
+                continue
+            if isinstance(ft, int) and isinstance(lt, int):
+                ranges.append((ft, lt))
+    ranges.sort()
+    covered = 0
+    for ft, lt in ranges:
+        if ft > covered + 1:
+            problems.append(
+                f"gap in coverage: turns {covered + 1}-{ft - 1} are claimed "
+                f"by nothing (l1, l2 or l3)"
+            )
+        covered = max(covered, lt)
+    if covered < watermark:
+        problems.append(
+            f"coverage stops at turn {covered} but last_summarized_turn "
+            f"says {watermark} — {watermark - covered} turn(s) were passed "
+            f"by the watermark and represented nowhere"
+        )
+    return problems
+
+
+gaps = _summary_coverage_gaps(state)
+if gaps:
+    fail(
+        "history was consumed without being represented anywhere",
+        "; ".join(gaps),
+    )
+print("  ok   every turn the watermark has passed is covered by a real, "
+      "non-empty L1/L2/L3 entry — nothing vanished")
 
 print()
 print(f"All soak checks passed over {TURNS} turns.")

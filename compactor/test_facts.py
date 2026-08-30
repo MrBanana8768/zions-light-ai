@@ -151,24 +151,84 @@ def test_prune_facts_no_op_under_budget():
 
 def test_prune_facts_lru_eviction():
     print("\n[test] prune_facts drops least-recently-used first")
-    # Each fact ≈ 100 chars → 25 tokens. Budget 25 = only 1 fact fits.
+    # Each fact is 100 chars, rendered as "- <text>\n" (102 chars -> 25
+    # tokens, same as the bare text happens to cost at this exact length).
+    #
+    # BEFORE (pre-framing-fix): this test used max_tokens=25/50 against the
+    # BARE per-fact cost _lru_split priced at the time (no header, no "- "
+    # bullet, no line break). That budget is no longer testable: fixing the
+    # framing accounting (facts.py's _lru_split now budgets against what
+    # format_facts_block ACTUALLY renders) means every budget must also pay
+    # the header once (_FACTS_BLOCK_HEADER_TOKENS = 24). A budget of 25 is
+    # barely above the header alone and cannot fit even one 25-token fact
+    # (25 - 24 = 1 token of body left) -- the OLD assertion ("1 fact
+    # survives" at budget=25) was asserting a regime a correct
+    # implementation can never satisfy, not a real property of the system:
+    # _MAX_FACTS_TOKENS defaults to 1500, so production never runs anywhere
+    # near a 25-token facts budget. See
+    # test_prune_facts_budget_below_header_injects_nothing for that
+    # degenerate regime, tested on its own terms.
+    #
+    # NOW: the budgets below are sized around the real per-fact cost PLUS
+    # the header, so they exercise the same LRU-ordering guarantee this test
+    # has always existed to prove (least-recently-used evicted first,
+    # recently-touched facts survive, added_turn order restored after
+    # eviction) in a regime an actual injected block can occupy.
     items = [
         {"text": "x" * 100, "added_turn": 1, "last_used": 100},  # oldest used → drop
         {"text": "y" * 100, "added_turn": 2, "last_used": 500},  # mid → drop
         {"text": "z" * 100, "added_turn": 3, "last_used": 999},  # newest → keep
     ]
-    kept, dropped = facts.prune_facts(items, max_tokens=25)
+    assert_eq(facts._fact_bullet_tokens("x" * 100), 25, "prep: one fact bullet costs 25 tokens")
+
+    # header (24) + one 25-token bullet fits; a second does not.
+    budget_for_one = facts._FACTS_BLOCK_HEADER_TOKENS + 25 + 1
+    kept, dropped = facts.prune_facts(items, max_tokens=budget_for_one)
     assert_eq(dropped, 2, "evicted 2 oldest")
     assert_eq(len(kept), 1, "1 fact survives")
     assert_eq(kept[0]["text"], "z" * 100, "most-recently-used preserved")
+    assert_true(
+        facts._estimate_tokens(facts.format_facts_block(kept)) <= budget_for_one,
+        "the block actually rendered from the survivor fits the budget it was given",
+    )
 
-    # Also verify intermediate budget keeps 2 most-recent.
-    kept2, dropped2 = facts.prune_facts(items, max_tokens=50)
-    assert_eq(dropped2, 1, "budget=50 evicts only the oldest")
+    # header (24) + two 25-token bullets (50) fits; a third does not.
+    budget_for_two = facts._FACTS_BLOCK_HEADER_TOKENS + 50 + 1
+    kept2, dropped2 = facts.prune_facts(items, max_tokens=budget_for_two)
+    assert_eq(dropped2, 1, "budget for two evicts only the oldest")
     assert_eq(len(kept2), 2, "2 facts survive")
     # Restored to added_turn order after eviction
     assert_eq([f["text"] for f in kept2], ["y" * 100, "z" * 100],
               "kept in added_turn order: y then z")
+    assert_true(
+        facts._estimate_tokens(facts.format_facts_block(kept2)) <= budget_for_two,
+        "the block actually rendered from the two survivors fits the budget it was given",
+    )
+
+
+def test_prune_facts_budget_below_header_injects_nothing():
+    print("\n[test] a budget too small for the header injects nothing, not a bare header")
+    # format_facts_block never renders the header over zero bullets, so a
+    # budget that cannot afford the header cannot afford ANY injection --
+    # the correct behaviour is no facts survive (all go to eviction), not a
+    # partial block. This is the degenerate regime the old, unrealistic
+    # max_tokens=25 test above used to stand in for without saying so.
+    items = [
+        {"text": "x" * 100, "added_turn": 1, "last_used": 100},
+        {"text": "y" * 100, "added_turn": 2, "last_used": 500},
+    ]
+    below_header = facts._FACTS_BLOCK_HEADER_TOKENS - 1
+    kept, dropped = facts.prune_facts(list(items), max_tokens=below_header)
+    assert_eq(kept, [], "nothing survives a budget smaller than the header alone")
+    assert_eq(dropped, 2, "both facts evicted (recoverable from the archive, not deleted)")
+    assert_eq(facts.format_facts_block(kept), None, "no header-only block is ever injected")
+
+    # Exactly at the header's own cost: the header fits with zero room left
+    # for any bullet body, so the outcome is the same -- inject nothing.
+    kept2, dropped2 = facts.prune_facts(list(items), max_tokens=facts._FACTS_BLOCK_HEADER_TOKENS)
+    assert_eq(kept2, [], "a budget equal to the header alone still fits no fact")
+    assert_eq(dropped2, 2, "both facts evicted")
+    assert_eq(facts.format_facts_block(kept2), None, "still no header-only block")
 
 
 def test_prune_facts_empty_input():
@@ -687,8 +747,7 @@ def test_turn_touches_only_the_injected_facts():
     now = int(time.time())
     stale = now - 10000
     # The three the model has actually been using are the FOUNDATIONAL ones
-    # — added_turn 0-2, the ones the old sort key evicted first. Each fact is
-    # 100 chars ≈ 25 tokens, so a 75-token budget admits exactly three.
+    # — added_turn 0-2, the ones the old sort key evicted first.
     store = [_f("who she is " + "0" * 89, 0, now)]
     store += [_f("where she lives " + "1" * 84, 1, now)]
     store += [_f("what she wants " + "2" * 85, 2, now)]
@@ -696,9 +755,18 @@ def test_turn_touches_only_the_injected_facts():
     assert_eq(len(store), 200, "prep: 200 facts")
     facts.save_facts(cid, store)
 
+    # Budget sized to fit exactly those 3 foundational facts as ACTUALLY
+    # rendered (header + "- " bullets + line breaks — see facts.py's
+    # _lru_split), not a hand-counted "each fact is 25 tokens" guess: that
+    # guess undercounts by a few tokens once the header and several bullets
+    # combine (floor-of-each-part <= floor-of-the-whole), which is exactly
+    # the framing-accounting gap this budget now has to survive rather than
+    # paper over.
+    budget = facts._estimate_tokens(facts.format_facts_block(store[:3]))
+
     # --- request path ---
     on_disk = facts.load_facts(cid)
-    injected = facts.select_for_injection(on_disk, max_tokens=75)
+    injected = facts.select_for_injection(on_disk, max_tokens=budget)
     assert_eq(len(injected), 3, "3 facts injected")
     facts.touch_facts(injected, now=now + 500)
     block = facts.format_facts_block(injected)
@@ -734,7 +802,10 @@ def test_eviction_archives_instead_of_deleting():
     store += [_f(f"passing detail {i:03d} " * 5, i, stale) for i in range(3, 200)]
     facts.save_facts(cid, store)
 
-    kept, dropped = facts.prune_facts(store, max_tokens=75, conv_id=cid)
+    # See test_turn_touches_only_the_injected_facts on why this is computed
+    # from the real rendered block rather than a hand-counted "75 tokens".
+    budget = facts._estimate_tokens(facts.format_facts_block(store[:3]))
+    kept, dropped = facts.prune_facts(store, max_tokens=budget, conv_id=cid)
     facts.save_facts(cid, kept)
     assert_eq(len(kept), 3, "3 facts survive the budget")
     assert_eq(dropped, 197, "197 evicted")
@@ -764,8 +835,13 @@ def test_eviction_archives_instead_of_deleting():
 def test_eviction_without_conv_id_logs_the_texts():
     print("\n[test] prune_facts with no conv_id warns and names what it dropped")
     items = [_f("secret ingredient is nutmeg" + "y" * 70, 1, 100), _f("x" * 100, 2, 500)]
+    # Budget for exactly the more-recent fact, as ACTUALLY rendered (header +
+    # bullet) — see test_turn_touches_only_the_injected_facts. 25 was below
+    # the header alone once the framing fix landed, which would have evicted
+    # both instead of the one this test is about.
+    budget = facts._estimate_tokens(facts.format_facts_block([items[1]]))
     with patch.object(facts.logger, "warning") as warn:
-        kept, dropped = facts.prune_facts(items, max_tokens=25)
+        kept, dropped = facts.prune_facts(items, max_tokens=budget)
     assert_eq(dropped, 1, "1 evicted")
     assert_eq(len(kept), 1, "1 kept")
     assert_true(warn.called, "the unarchivable eviction is logged at WARNING")
@@ -879,10 +955,37 @@ def test_oversized_store_is_trimmed_not_rejected():
     ))
     assert_eq(out, ["Lyra carries a yew bow."], "the extraction returned its fact")
     assert_true(client.post.called, "the call went out — trimmed, not skipped")
-    assert_true(
-        _payload_tokens(_payload_of(client)) <= facts._EXTRACTION_INPUT_BUDGET,
-        "the assembled payload fits the input budget",
-    )
+    payload = _payload_of(client)
+    # The invariant this checks is PATH-DEPENDENT, not a single fixed budget.
+    # When no real tokenizer is available, extract_facts_from_exchange trims
+    # to the conservative, worst-case-calibrated _EXTRACTION_INPUT_BUDGET (an
+    # ESTIMATE-unit ceiling) because nothing can verify the real cost before
+    # the request goes out. When a real tokenizer IS available (this repo's
+    # staged-cache reproduction of the pod — see tokens.py's module
+    # docstring), extract_facts_from_exchange deliberately starts from the
+    # GENEROUS real-token ceiling instead and relies on the tokens.count()
+    # backstop to verify and re-trim toward the REAL cost — see
+    # facts._extraction_input_budget_estimate_units's own docstring. On that
+    # path the assembled payload's char/4 ESTIMATE routinely exceeds the
+    # conservative constant by design (measured: ~14,400 estimate-units for
+    # this exact store, against a ~3,960 conservative constant) while its
+    # REAL cost still safely fits the real ceiling (measured: ~27,100 of
+    # ~30,460) — asserting against the conservative constant unconditionally
+    # was asserting an invariant that only ever held on the fallback branch.
+    if facts.tokens.is_available():
+        real = facts.tokens.count(payload["messages"])
+        assert_true(
+            real is not None and real <= facts._EXTRACTION_INPUT_BUDGET_REAL_TOKENS,
+            f"the assembled payload fits the REAL-token ceiling ({real!r} <= "
+            f"{facts._EXTRACTION_INPUT_BUDGET_REAL_TOKENS}), verified against "
+            f"the real tokenizer -- what the backstop actually guarantees "
+            f"when it is available",
+        )
+    else:
+        assert_true(
+            _payload_tokens(payload) <= facts._EXTRACTION_INPUT_BUDGET,
+            "the assembled payload fits the input budget",
+        )
 
 
 def test_the_exchange_survives_trimming_in_preference_to_the_store():
@@ -1008,6 +1111,7 @@ if __name__ == "__main__":
 
         test_prune_facts_no_op_under_budget()
         test_prune_facts_lru_eviction()
+        test_prune_facts_budget_below_header_injects_nothing()
         test_prune_facts_empty_input()
 
         test_touch_facts_updates_timestamps()

@@ -15,11 +15,24 @@ Why tiered:
 - Tiered summaries roll older content into denser representations without
   re-touching it — once an L1 chunk is created from turns 1-20, it never
   gets re-summarized; only when 10+ L1 chunks exist do they roll into L2.
-- Total injected size was INTENDED to stay bounded (~5K tokens worst case:
-  L3 + latest L2 + a handful of unrolled L1 chunks). It is not: nothing
-  trims l2 and format_summary_block renders every chapter, so this layer
-  grows without limit (MEMORY_REVIEW S-1/S-6). Read the line above as the
-  design, not as a property you may rely on.
+- Total injected size stays bounded, the same way at every tier: l1 drains
+  into l2 once L2_CHUNK_SIZE chunks accumulate (_do_l2_rollup), and l2 now
+  drains into l3 the same way once L3_CHUNK_SIZE chapters accumulate
+  (_do_l3_rollup) — MEMORY_REVIEW S-1/S-6's fix. Before this, _do_l3_rollup
+  refreshed l3 but kept every l2 chapter it had just folded in, so l2 grew
+  by one chapter per L2_CHUNK_SIZE*L1_CHUNK_SIZE turns for the life of the
+  conversation and so did the L3 input, the state file, and the injected
+  block. Measured on a synthetic 240-turn run at this module's test
+  thresholds (L1=4/L2=3/L3=2): len(l2) reached 20 and was still climbing,
+  never once trimmed. With the drain, l2 is bounded to at most
+  L3_CHUNK_SIZE-1 chapters, the same shape l1's bound already had. On top of
+  that, format_summary_block enforces its own COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS
+  ceiling (default 12,000 - above the
+  tiers' own worst-case product of 11,300, so it backstops misconfiguration
+  instead of firing in normal operation) as a
+  backstop against the tiers' bounds ever being right in theory and wrong in
+  practice — see its docstring for how it chooses what to keep when they
+  don't fit.
 
 Storage (one JSON per conv):
     /data/openwebui/compactor/summaries/<conv_id>.json
@@ -45,13 +58,22 @@ the summarizer hit a problem.
 import asyncio
 import logging
 import os
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
 import logsetup
-from memory import atomic_write_json, conv_lock, read_json_strict, storage_root
+import tokens
+import tokenhealth
+from memory import (
+    atomic_write_json,
+    conv_lock,
+    read_json_strict,
+    storage_root,
+    summary_archive_path,
+)
 
 logger = logging.getLogger("compactor.summarizer")
 
@@ -70,6 +92,23 @@ L3_CHUNK_SIZE = int(os.environ.get("COMPACTOR_L3_CHUNK_SIZE", "5") or 5)
 L1_MAX_TOKENS = int(os.environ.get("COMPACTOR_L1_MAX_TOKENS", "500") or 500)
 L2_MAX_TOKENS = int(os.environ.get("COMPACTOR_L2_MAX_TOKENS", "1200") or 1200)
 L3_MAX_TOKENS = int(os.environ.get("COMPACTOR_L3_MAX_TOKENS", "2000") or 2000)
+
+# Same env var and default main.py reads for its own /tokenize call sites
+# (main.py:693, TOKENIZE_WARN_INTERVAL_S) — deliberately, not independently
+# tuned: an operator setting this once should govern every /tokenize
+# dependency in the process, not just the ones main.py happens to own.
+TOKENIZE_WARN_INTERVAL_S = float(
+    os.environ.get("COMPACTOR_TOKENIZE_WARN_INTERVAL_S", "300") or 300
+)
+
+# Hard ceiling on the rendered injection block (see format_summary_block).
+# 5000 is the figure this module's own docstring always claimed as the
+# intended worst case (L3 + latest L2 + a handful of unrolled L1 chunks) —
+# this makes it a real, enforced number instead of an unverified comment
+# (MEMORY_REVIEW S-1/S-6).
+SUMMARY_BLOCK_MAX_TOKENS = int(
+    os.environ.get("COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS", "12000") or 12000
+)
 
 # The model's context window, and the slack left inside it for a
 # summarization call's system prompt, wrapper text and chat-template framing.
@@ -204,7 +243,93 @@ _BLOCK_HEADER = (
 )
 
 
-def format_summary_block(state: dict) -> str | None:
+def _estimate_block_tokens(text: str) -> int:
+    """Cheap, HTTP-free CEILING estimate of what vLLM will charge for `text`.
+
+    format_summary_block is a synchronous, no-I/O read on the request hot
+    path (see main.py's comment at its call site: "no LLM call on the hot
+    path"), so it cannot ask /tokenize the way _count_tokens does — a
+    blocking POST has no place inside a sync function called from an async
+    request handler. A flat chars/4 estimate is the thing
+    INCIDENT_2026-08-28 is about: it read up to 7.74x low on this model's
+    decoration characters. So this uses the same split-by-character-class
+    ceiling retrieval.py's `_estimate_tokens` (A4) already validated under
+    the identical constraint (no tokenizer, no HTTP, called synchronously):
+    ASCII priced at chars/4 (the measured prose density on this deployment),
+    non-ASCII priced at one token per UTF-8 byte — a byte-level BPE cannot
+    cost more than that per byte, so it can only over-count decoration, never
+    under-count it the way a flat multiplier does.
+
+    Duplicated here rather than imported from retrieval.py: this module's
+    few sync budget primitives (_pessimistic_tokens and this) stay together,
+    and summarizer.py does not otherwise depend on retrieval.py's private
+    helpers.
+    NON-ASCII LETTERS ARE PRICED PER CHARACTER, NOT PER BYTE, and that
+    distinction is the whole point. The per-byte ceiling was written for
+    DECORATION - box-drawing runs, where it is roughly right. Applied to
+    natural non-Latin script it is wildly pessimistic, because those
+    characters are 2-3 UTF-8 bytes each and tekken encodes them far better
+    than one token per byte. Measured in the production image against the
+    real tekken vocabulary, shipped estimator vs ground truth:
+
+        prose       1848 chars   real   364   shipped   462   1.27x
+        greek       1520 chars   real  1164   shipped  2720   2.34x
+        hebrew      1120 chars   real  1124   shipped  2030   1.81x
+        cjk         1000 chars   real   703   shipped  3000   4.27x
+        decoration   400 chars   real   803   shipped  1200   1.49x
+
+    That over-pricing is not academic here: this user quotes scripture, and
+    a summary block of 2,823 REAL tokens - inside both this cap and the
+    accurate /tokenize budget downstream - priced out at 13,282 and was
+    dropped in full. She would have silently lost her entire summary memory
+    on exactly the conversations she cares most about, with the per-turn log
+    line still reporting the chunks as injected.
+
+    One token per CHARACTER is still a true ceiling for every script
+    measured (Greek 0.77 tokens/char, Hebrew 1.00, CJK 0.70), while cutting
+    the bias to 1.10-1.42x. Decoration keeps the per-byte ceiling, which is
+    what it was for.
+    """
+    exact = None
+    try:
+        if tokens.is_available():
+            exact = tokens.count([{"role": "user", "content": text}])
+    except Exception:
+        exact = None
+    if exact is not None:
+        return exact
+
+    # Fallback only. No single multiplier fits: measured tokens-per-character
+    # for non-ASCII letters ranges from 0.40 (Russian) to 1.16 (Hebrew with
+    # niqqud), and emoji land just above one token per BYTE. 1.25 per
+    # letter/mark is a ceiling on every script measured; combining marks are
+    # counted with letters because Hebrew points are category Mn, not
+    # isalpha(), and pricing them as decoration is what made the first
+    # attempt at this fix under-count Hebrew by 11%.
+    ascii_n = script_chars = decor_bytes = 0
+    for c in text:
+        if ord(c) < 128:
+            ascii_n += 1
+        elif unicodedata.category(c)[0] in ("L", "M"):
+            script_chars += 1
+        else:
+            decor_bytes += len(c.encode("utf-8", "surrogatepass"))
+    # decor gets 5% headroom: emoji measured at 1.001 tokens/byte, i.e. the
+    # bare per-byte rule is not quite a ceiling for them.
+    return ascii_n // 4 + int(script_chars * 1.25) + int(decor_bytes * 1.05) + 1
+
+
+def _summary_line(kind: str, chunk: dict) -> tuple[str, str]:
+    """The (header, body) pair format_summary_block renders for one chunk —
+    factored out so the cost estimate and the render use IDENTICAL text."""
+    header = (
+        f"\n--- {kind} (turns {chunk.get('first_turn', '?')}-"
+        f"{chunk.get('last_turn', '?')}) ---"
+    )
+    return header, chunk.get("text", "")
+
+
+def format_summary_block(state: dict, max_tokens: int | None = None) -> str | None:
     """Render the current summary stack into a single system-message body.
     Returns None if there's nothing to inject.
 
@@ -215,6 +340,44 @@ def format_summary_block(state: dict) -> str | None:
     The most-recent L1s are what the model needs most for continuity, so
     they come last (right before the recent raw turns will appear in the
     final message list).
+
+    The whole block is capped at SUMMARY_BLOCK_MAX_TOKENS (MEMORY_REVIEW
+    S-1/S-6's other half): l1 and l2 are now bounded by construction (see
+    _do_l2_rollup / _do_l3_rollup) — but that bound is LARGER than the cap
+    was originally set to, so "never reached" was false as shipped. At
+    defaults the bounded state's own capacity is 9*L1_MAX + 4*L2_MAX +
+    L3_MAX = 11,300 tokens; against the original 5,000 cap it fired on every
+    request above roughly 45% tier fill and dropped every L2 chapter above
+    75%. Since L1 is selected before L2, chapters got only what L3 and all
+    of L1 left over — a tier that could be created, never injected, and then
+    consumed by the next L3 refresh. The default is now 12,000, above that
+    capacity, so the cap is what it was meant to be: a backstop against
+    misconfiguration, not a routine amputation.
+
+    "Bounded by construction" is still exactly the kind of claim
+    this module has been burned by before (_summarize_pieces's own docstring:
+    "a tier that is safe today by arithmetic nobody re-checks is how this
+    module got here"), and L1_CHUNK_SIZE/L2_CHUNK_SIZE/L3_CHUNK_SIZE/
+    *_MAX_TOKENS are five independently-configurable env vars whose product
+    is what actually bounds this block. This is the backstop that holds even
+    if that arithmetic is ever wrong, or configured wrong, again.
+
+    What gets dropped when it doesn't fit, in priority order (highest first):
+      1. L3 — a single object, already capped at L3_MAX_TOKENS, and the
+         cheapest way to keep the whole-conversation throughline; almost
+         never the thing that has to give.
+      2. L1 chunks, NEWEST first — "the most-recent L1s are what the model
+         needs most for continuity" (above) makes them the second-highest
+         priority to keep, so a squeeze drops the OLDEST scenes first.
+      3. L2 chapters, NEWEST first — the middle tier: by the time a chapter
+         is old enough to be first in this list, an L3 refresh has usually
+         already folded it into the theme, so it is the most redundant
+         content to lose and goes first.
+    Selection order and render order differ on purpose: what to KEEP is
+    decided newest-first (recency is what makes content worth keeping under
+    a squeeze); what gets SENT stays general-to-specific (L3, L2, L1) either
+    way, because that is what the model reads best regardless of how much of
+    each tier survived the cut.
     """
     has_l3 = state.get("l3") is not None
     l2 = state.get("l2") or []
@@ -222,19 +385,82 @@ def format_summary_block(state: dict) -> str | None:
     if not (has_l3 or l2 or l1):
         return None
 
-    lines = [_BLOCK_HEADER]
+    # The caller's cap wins when it is tighter. SUMMARY_BLOCK_MAX_TOKENS
+    # alone (12,000) is larger than main.py's whole injection budget (8,192
+    # at production config, shared with persona, facts and retrieval), so
+    # capping only here meant _bound_injected_blocks downstream dropped
+    # WHOLE layers to make room: measured, facts stopped reaching the model
+    # from ~50% tier fill and everything but persona was gone at ~70%. The
+    # caller passes its real share so the trimming happens HERE,
+    # newest-kept and graceful, instead of down there, whole-layer and
+    # blind.
+    budget = (
+        min(SUMMARY_BLOCK_MAX_TOKENS, max_tokens)
+        if max_tokens is not None
+        else SUMMARY_BLOCK_MAX_TOKENS
+    )
+    used = _estimate_block_tokens(_BLOCK_HEADER)
+
+    l3_line: tuple[str, str] | None = None
     if has_l3:
-        l3 = state["l3"]
-        lines.append(f"\n--- conversation-wide theme (turns {l3.get('first_turn','?')}-{l3.get('last_turn','?')}) ---")
-        lines.append(l3.get("text", ""))
-    if l2:
-        for ch in l2:
-            lines.append(f"\n--- chapter (turns {ch.get('first_turn','?')}-{ch.get('last_turn','?')}) ---")
-            lines.append(ch.get("text", ""))
-    if l1:
-        for ch in l1:
-            lines.append(f"\n--- scene (turns {ch.get('first_turn','?')}-{ch.get('last_turn','?')}) ---")
-            lines.append(ch.get("text", ""))
+        header, body = _summary_line("conversation-wide theme", state["l3"])
+        cost = _estimate_block_tokens(header) + _estimate_block_tokens(body)
+        if used + cost <= budget:
+            l3_line = (header, body)
+            used += cost
+
+    l1_keep = [False] * len(l1)
+    for i in range(len(l1) - 1, -1, -1):
+        header, body = _summary_line("scene", l1[i])
+        cost = _estimate_block_tokens(header) + _estimate_block_tokens(body)
+        if used + cost > budget:
+            break
+        l1_keep[i] = True
+        used += cost
+
+    l2_keep = [False] * len(l2)
+    for i in range(len(l2) - 1, -1, -1):
+        header, body = _summary_line("chapter", l2[i])
+        cost = _estimate_block_tokens(header) + _estimate_block_tokens(body)
+        if used + cost > budget:
+            break
+        l2_keep[i] = True
+        used += cost
+
+    dropped_l3 = 1 if (has_l3 and l3_line is None) else 0
+    dropped_l1 = l1_keep.count(False)
+    dropped_l2 = l2_keep.count(False)
+    if dropped_l3 or dropped_l1 or dropped_l2:
+        # WARNING, not INFO: main.py logs the analogous event ("memory the
+        # user believes the assistant has and the model is not going to
+        # see") at WARNING, and this is the same event one layer down.
+        logger.warning(
+            f"summary block: dropped {dropped_l3 + dropped_l1 + dropped_l2} "
+            f"tier item(s) to fit the {budget}-token block budget "
+            f"(COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS) — kept "
+            f"{'L3, ' if l3_line else ('no L3, ' if has_l3 else '')}"
+            f"{len(l2) - dropped_l2}/{len(l2)} chapter(s), "
+            f"{len(l1) - dropped_l1}/{len(l1)} scene(s)"
+        )
+
+    lines = [_BLOCK_HEADER]
+    if l3_line:
+        lines.extend(l3_line)
+    for i, keep in enumerate(l2_keep):
+        if keep:
+            header, body = _summary_line("chapter", l2[i])
+            lines.append(header)
+            lines.append(body)
+    for i, keep in enumerate(l1_keep):
+        if keep:
+            header, body = _summary_line("scene", l1[i])
+            lines.append(header)
+            lines.append(body)
+    if len(lines) == 1:
+        # Everything was dropped (an absurdly small budget, or a single
+        # chunk larger than the whole block cap). Consistent with the
+        # "nothing to inject" contract rather than sending a bare header.
+        return None
     return "\n".join(lines)
 
 
@@ -291,14 +517,23 @@ def _needs_l2_rollup(state: dict) -> bool:
 def _needs_l3_rollup(state: dict) -> bool:
     """True if enough L2 chapters exist AND L3 does not already cover them.
 
-    The threshold alone is a standing condition, not an event (MEMORY_REVIEW
-    S-2): `_do_l3_rollup` keeps the L2 list, unlike L1→L2 which drops what it
-    consumed, so from the L3_CHUNK_SIZE-th chapter onward `len(l2) >=
-    L3_CHUNK_SIZE` never clears. Every turn then spent one L3_MAX_TOKENS LLM
-    call re-paraphrasing the same chapters, and kept `needs_rollup` True, so
-    maybe_rollup's early exit never fired either. Comparing L3's recorded
-    span against the current chapter span gives L3 the event semantics L1→L2
-    always had: refresh when the chapters have actually moved.
+    The threshold alone used to be a standing condition, not an event
+    (MEMORY_REVIEW S-2): `_do_l3_rollup` used to keep the L2 list after
+    folding it into L3, unlike L1→L2 which drops what it consumed, so from
+    the L3_CHUNK_SIZE-th chapter onward `len(l2) >= L3_CHUNK_SIZE` never
+    cleared. Every turn then spent one L3_MAX_TOKENS LLM call re-paraphrasing
+    the same chapters, and kept `needs_rollup` True, so maybe_rollup's early
+    exit never fired either.
+
+    `_do_l3_rollup` now drops the L2 chapters it consumes on success, the
+    same contract L1→L2 already had (MEMORY_REVIEW S-1/S-6), so after a
+    successful refresh `len(l2)` drops below `L3_CHUNK_SIZE` and this
+    function's first check already returns False — the span comparison below
+    now mainly guards the case a refresh has NOT yet happened (l2 sitting at
+    or above threshold with a stale or absent l3, e.g. after a prior L3
+    failure left l2 non-empty): refresh only when the chapters on hand are
+    not what the recorded l3 (if any) already covers, rather than on the bare
+    threshold alone.
     """
     l2 = state.get("l2") or []
     if len(l2) < L3_CHUNK_SIZE:
@@ -443,11 +678,59 @@ def _input_budget(max_tokens: int) -> int:
     )
 
 
+# The name this module's own /tokenize failures are tracked under in
+# tokenhealth's per-source registry. See tokenize_health() below for what
+# reads it back out.
+_TOKENIZE_SOURCE = "summarizer"
+
+
+def tokenize_health() -> dict:
+    """This module's own /tokenize dependency state, tokenhealth-shaped.
+
+    CONSUMED by /health/full: main._summarizer_tokenize_failing_now() and
+    main._summarizer_degraded_since() fold this into that endpoint's `ok`,
+    `consecutive_failures`, `degraded_since` and `degraded_for_s`. (This
+    docstring said "not yet consumed" for about an hour after it became
+    false - the wiring landed in the same diff. A13's lesson was that a
+    health signal nothing reads is indistinguishable from one that does not
+    exist; a docstring claiming it is unread is the same failure wearing a
+    different hat.)
+
+    Passes `stale_after_s=TOKENIZE_WARN_INTERVAL_S` into source_health
+    because /tokenize is NOT asked on every request here — only when a
+    rollup is actually summarizing (main._text_tokenize_failing_now carries
+    the identical doctrine for its own not-every-request form): a streak
+    whose last failure is long past means "not asked lately," not
+    "recovered," and reporting either one as the other is asserting a fact
+    that isn't observable from here.
+    """
+    return tokenhealth.source_health(
+        _TOKENIZE_SOURCE, stale_after_s=TOKENIZE_WARN_INTERVAL_S
+    )
+
+
 async def _count_tokens(
     client: httpx.AsyncClient, vllm_url: str, model: str, text: str
 ) -> int:
     """What vLLM will charge for `text`. Asks vLLM; falls back to the
     pessimistic ceiling, never to an optimistic guess.
+
+    Failures and recoveries are counted through tokenhealth (v3.1 remediation
+    residual). Before this, a failure here reported through
+    `logsetup.log_once` — a gate that fires ONE line for the life of the
+    process and then nothing, ever again. An outage starting any time after
+    that first line was invisible in the log AND absent from every health
+    surface, because nothing here fed a counter anything could read.
+    tokenhealth.note_failure/note_success keep the "don't spam a line per
+    call" property (still rate-limited, at TOKENIZE_WARN_INTERVAL_S — the
+    same interval main.py tunes its own /tokenize reporting with) while
+    remaining observable for as long as the degradation actually lasts, and
+    they feed the streak this module's tokenize_health() reads back out.
+    `logger.warning` stays a call made HERE, on this module's own logger,
+    rather than inside tokenhealth — see tokenhealth.py's module docstring
+    for why (logger-hierarchy propagation makes that mandatory, not stylistic:
+    a warning logged under a sibling logger would never reach this module's
+    own captured tests).
     """
     if not text:
         return 0
@@ -460,21 +743,33 @@ async def _count_tokens(
         if getattr(r, "status_code", 200) == 200:
             n = (r.json() or {}).get("count")
             if isinstance(n, (int, float)):
+                msg = tokenhealth.note_success(_TOKENIZE_SOURCE)
+                if msg:
+                    logger.warning(msg)
                 return int(n)
-        if logsetup.log_once("summarizer.tokenize.http"):
-            logger.warning(
-                f"/tokenize did not answer with a count (status "
-                f"{getattr(r, 'status_code', '?')}); rollup input is being "
-                f"budgeted at {_WORST_TOKENS_PER_CHAR} tokens/char instead, so "
-                f"rollups will over-split until this recovers"
-            )
+        status = getattr(r, "status_code", "?")
+        msg = tokenhealth.note_failure(
+            _TOKENIZE_SOURCE,
+            f"http.{status}",
+            f"/tokenize did not answer with a count (status {status}); "
+            f"rollup input is being budgeted at {_WORST_TOKENS_PER_CHAR} "
+            f"tokens/char instead, so rollups will over-split until this "
+            f"recovers",
+            warn_interval_s=TOKENIZE_WARN_INTERVAL_S,
+        )
+        if msg:
+            logger.warning(msg)
     except Exception as e:
-        if logsetup.log_once("summarizer.tokenize.error"):
-            logger.warning(
-                f"/tokenize unreachable ({type(e).__name__}: {e}); rollup input "
-                f"is being budgeted at {_WORST_TOKENS_PER_CHAR} tokens/char "
-                f"instead, so rollups will over-split until this recovers"
-            )
+        msg = tokenhealth.note_failure(
+            _TOKENIZE_SOURCE,
+            f"error.{type(e).__name__}",
+            f"/tokenize unreachable ({type(e).__name__}: {e}); rollup input "
+            f"is being budgeted at {_WORST_TOKENS_PER_CHAR} tokens/char "
+            f"instead, so rollups will over-split until this recovers",
+            warn_interval_s=TOKENIZE_WARN_INTERVAL_S,
+        )
+        if msg:
+            logger.warning(msg)
     return _pessimistic_tokens(text)
 
 
@@ -705,12 +1000,25 @@ async def _summarize_pieces(
         async with sem:
             return await _call(prompt, batch)
 
-    parts = [
-        p for p in await asyncio.gather(*(_bounded(system_prompt, b) for b in batches))
-        if p
-    ]
-    if not parts:
+    raw = await asyncio.gather(*(_bounded(system_prompt, b) for b in batches))
+    _empty = sum(1 for p in raw if not (p or "").strip())
+    if _empty:
+        # ANY empty map batch fails the WHOLE call - not just the all-empty
+        # case. Filtering the empty part out stored an L1 chunk claiming
+        # first_turn..last_turn while its text covered only the batches that
+        # answered, and the watermark then advanced past turns that were
+        # never summarized and never retried: permanent, unlogged loss in
+        # the stored hierarchy. The same defect this branch fixed at both
+        # main.summarize returns, at this sibling. Returning "" makes the
+        # tier return False, nothing advances, and the rollup retries next
+        # turn.
+        logger.warning(
+            f"conv={conv_id}: {_empty} of {len(batches)} rollup map "
+            f"batch(es) returned empty content - failing the whole call so "
+            f"no chunk is stored claiming a span its text does not cover"
+        )
         return ""
+    parts = list(raw)
 
     # Reduce, in bounded rounds, never handing a call more than it can take.
     # If folding can make no further progress the parts are concatenated: a
@@ -734,7 +1042,17 @@ async def _summarize_pieces(
                 f"the partial summaries concatenated: {e}"
             )
             break
-        parts = [p for p in folded if p] or parts
+        if any(not (p or "").strip() for p in folded):
+            # A partial-empty fold quietly deletes whichever group came back
+            # blank. The pre-fold parts are all non-empty (the map phase
+            # guarantees it), so concatenating them is complete, just longer.
+            logger.warning(
+                f"conv={conv_id}: rollup reduce round {rounds} returned "
+                f"empty content for a group - keeping the "
+                f"{len(parts)} partial(s) concatenated instead"
+            )
+            break
+        parts = list(folded)
     return "\n\n".join(parts)
 
 
@@ -815,36 +1133,192 @@ async def _do_l2_rollup(
     return True
 
 
+def _chapter_piece(c: dict) -> str:
+    return (
+        f"--- chapter (turns {c['first_turn']}-{c['last_turn']}) ---\n"
+        f"{c['text']}"
+    )
+
+
+def _archive_chapters(conv_id: str, chapters: list[dict]) -> None:
+    """Append L2 chapters to the cold-storage sidecar, newest last.
+
+    Read back with load_chapter_archive(). Nothing injects these - they cost
+    no context - but they are the raw material an operator (or a future
+    re-derivation) needs after L3 has paraphrased them several generations
+    deep.
+    """
+    if not chapters:
+        return
+    path = summary_archive_path(conv_id)
+    existing = read_json_strict(path, default={})
+    rows = existing.get("chapters") if isinstance(existing, dict) else None
+    if not isinstance(rows, list):
+        rows = []
+    # Dedupe against what is already stored: the archive now runs BEFORE
+    # save_state, so a failed state save retries the whole refresh next turn
+    # and would re-archive the same chapters (measured: two refreshes of the
+    # same state produced 5 exact duplicate rows). Identity is the full
+    # (span, text) triple - two different chapters legitimately covering the
+    # same span must both survive.
+    _seen = {(r.get("first_turn"), r.get("last_turn"), r.get("text", ""))
+             for r in rows}
+    rows.extend(
+        {
+            "text": c.get("text", ""),
+            "first_turn": c.get("first_turn"),
+            "last_turn": c.get("last_turn"),
+        }
+        for c in chapters
+        if (c.get("first_turn"), c.get("last_turn"), c.get("text", ""))
+        not in _seen
+    )
+    atomic_write_json(path, {"chapters": rows})
+    logger.info(
+        f"conv={conv_id}: archived {len(chapters)} consumed chapter(s) "
+        f"({len(rows)} total in cold storage)"
+    )
+
+
+def load_chapter_archive(conv_id: str) -> list[dict]:
+    """Every L2 chapter ever consumed by an L3 refresh, oldest first."""
+    data = read_json_strict(summary_archive_path(conv_id), default={})
+    rows = data.get("chapters") if isinstance(data, dict) else None
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
 async def _do_l3_rollup(
     conv_id: str, client: httpx.AsyncClient, vllm_url: str, model: str, state: dict,
 ) -> bool:
-    """Roll all L2 chapters into / refresh L3. Unlike L1→L2, this keeps the
-    L2 list (so the next request still has the chapters available) and
-    just refreshes the L3 theme. L3 is a single object, not a list.
+    """Roll ALL current L2 chapters into / refresh L3, then DROP them from
+    l2 — the same consume-and-clear contract L1→L2 already has, so this tier
+    is bounded the same way L1 is (MEMORY_REVIEW S-1/S-6).
+
+    Before this fix, a successful refresh kept every L2 chapter it had just
+    folded in, so l2 grew by one chapter every L2_CHUNK_SIZE*L1_CHUNK_SIZE
+    turns for the life of the conversation — unbounded in the state file AND
+    in format_summary_block's injected block, and unbounded L3 INPUT too (at
+    L2_MAX_TOKENS=1200 a 25-chapter conversation was already a ~30,000-token
+    request). Measured on a synthetic 240-turn run at this module's test
+    thresholds (L1=4/L2=3/L3=2): len(l2) reached 20 and was still climbing.
+    L3 is a single object, not a list, so what "bounded" means for L2 here is
+    "at most L3_CHUNK_SIZE-1 chapters awaiting the next refresh" — the same
+    shape l1 already had relative to L2_CHUNK_SIZE.
+
+    The trade this makes explicit: once a span of chapters is folded into
+    L3, the CHAPTER-level detail for that span is gone from state and from
+    injection - only L3's denser paraphrase of it remains. That is the same
+    lossy-on-purpose compression this module's docstring already describes
+    for L1->L2 ("roll older content into denser representations without
+    re-touching it"), now actually applied at the L2->L3 boundary instead of
+    stopping short of it.
+
+    THE PRIOR L3 IS CARRIED FORWARD AS AN INPUT, and that is load-bearing.
+    L1->L2 APPENDS to a list, so dropping its inputs loses nothing. L3 is a
+    single object that is REPLACED, so clearing l2 without feeding the old
+    L3 back in would make each refresh summarize only the newest
+    L3_CHUNK_SIZE chapters and overwrite everything earlier: the first
+    refresh covers turns 1-N, the second silently replaces it with a summary
+    covering only N+1-M. That is permanent, unannounced deletion of the
+    oldest history in the system - strictly worse than the unbounded growth
+    this fix set out to solve. The two tiers do NOT have the same contract,
+    and the difference is list-versus-object.
+
+    So the refresh input is (previous L3 + the pending chapters), and
+    first_turn is inherited from the previous L3 rather than taken from the
+    chapter list, and L3 keeps covering turn 1 through now.
+
+    On INPUT SIZE, stated carefully because the earlier wording was wrong:
+    stage 2 is bounded (one L3 body plus one reduced chapter summary, both
+    capped at L3_MAX_TOKENS). Stage 1 is NOT - it takes every pending
+    chapter, and a single maybe_rollup over a long history from empty state
+    (the backfill and admin-compact shape) can present far more than
+    L3_CHUNK_SIZE of them. That is why stage 1 goes through _summarize_pieces,
+    which map-reduces; the earlier claim of a hard per-refresh bound was
+    measured false at 10x.
+
+    The cost this makes explicit: the previous L3 is re-summarized each
+    refresh, so the oldest material gains one generation of paraphrase per
+    refresh rather than being re-derived from chapters each time. The
+    chapters are archived (see _archive_chapters) precisely so that is a
+    quality trade and not a loss - the source survives in cold storage.
     """
     l2 = state.get("l2") or []
     if len(l2) < L3_CHUNK_SIZE:
         return False
-    # ALL chapters, and nothing trims l2 (MEMORY_REVIEW S-1). So this input
-    # grows without bound as the conversation does: at L2_MAX_TOKENS=1200 a
-    # 25-chapter conversation is already a ~30,000-token request. Slower than
-    # L1's overflow, same shape, same permanent-death ending — L3 is the tier
-    # that never refires once it fails, because _needs_l3_rollup keeps
-    # returning True and the call keeps being refused (v3.1 A1).
-    pieces = [
-        f"--- chapter (turns {c['first_turn']}-{c['last_turn']}) ---\n{c['text']}"
-        for c in l2
-    ]
+    prior = state.get("l3") if isinstance(state.get("l3"), dict) else None
+    prior_piece = None
+    if prior and (prior.get("text") or "").strip():
+        # First, so the model reads the story in order and the older
+        # material is not competing for attention at the end of the prompt.
+        prior_piece = (
+            f"--- the story so far (turns {prior.get('first_turn','?')}-"
+            f"{prior.get('last_turn','?')}) ---\n{prior['text']}"
+        )
+    # TWO-STAGE when a prior L3 exists, and this is what makes the span
+    # below honest rather than merely hopeful.
+    #
+    # _summarize_pieces map-reduces whenever its input exceeds the budget,
+    # and its reduce drops empty parts - so a 200-with-empty-content on the
+    # batch carrying "the story so far" would discard the prior L3 while
+    # first_turn still claimed to cover it. L3 would then assert coverage of
+    # turns its text does not describe, which is worse than losing them
+    # because nothing downstream can tell.
+    #
+    # Reducing the CHAPTERS first (map-reduce is fine there - every chapter
+    # is an input, none is privileged) and only then folding the prior L3
+    # into a second call means the final text always comes from a call that
+    # contained it: both inputs are bounded by L3_MAX_TOKENS, so that second
+    # call is a single batch whenever a real token count is available. (The
+    # pessimistic no-tokenizer fallback prices at 2 tokens/char and CAN
+    # split it - which degrades to concatenation of non-empty parts, not
+    # loss, per _summarize_pieces' partial-empty rules.) An earlier attempt
+    # instead fed only the
+    # chapters that fit one batch, which broke the guarantee that an
+    # oversized chapter set is still covered in full.
     text = await _summarize_pieces(
-        conv_id, client, vllm_url, model, _PROMPT_L3, pieces, L3_MAX_TOKENS
+        conv_id, client, vllm_url, model, _PROMPT_L3,
+        [_chapter_piece(c) for c in l2], L3_MAX_TOKENS,
     )
+    if text and prior_piece:
+        text = await _summarize_pieces(
+            conv_id, client, vllm_url, model, _PROMPT_L3,
+            [prior_piece, f"--- newer chapters ---{chr(10)}{text}"],
+            L3_MAX_TOKENS,
+        )
     if not text:
+        return False
+    # ARCHIVE FIRST, and a failed archive ABORTS the refresh before any
+    # state mutates. The previous order (write l3, clear l2, then try to
+    # archive) meant an archive-write failure still dropped the chapters
+    # with no cold copy - loudly, but violating the invariant all the same:
+    # eviction MOVES memory, it never unlinks it. Aborting wastes the LLM
+    # calls that produced `text`, and that is the right trade: the refresh
+    # retries next turn, and a disk that cannot take the archive write is a
+    # bigger problem than a deferred rollup.
+    try:
+        _archive_chapters(conv_id, l2)
+    except Exception as e:
+        logger.error(
+            f"conv={conv_id}: could not archive the {len(l2)} chapter(s) "
+            f"this L3 refresh would consume ({type(e).__name__}: {e}) - "
+            f"ABORTING the refresh so nothing is dropped without a cold "
+            f"copy; it will retry next turn"
+        )
         return False
     state["l3"] = {
         "text": text,
-        "first_turn": l2[0]["first_turn"],
+        # Inherit the START of coverage. Taking l2[0] here would move the
+        # span forward on every refresh and quietly discard everything
+        # before it - see this function's docstring.
+        "first_turn": (
+            prior.get("first_turn")
+            if prior and prior.get("first_turn") is not None
+            else l2[0]["first_turn"]
+        ),
         "last_turn": l2[-1]["last_turn"],
     }
+    state["l2"] = []  # consumed; archived above (pre-mutation), bounds l2 like l1
     logger.info(
         f"conv={conv_id}: L3 refresh — covers turns {l2[0]['first_turn']}-"
         f"{l2[-1]['last_turn']} over {len(l2)} chapters"

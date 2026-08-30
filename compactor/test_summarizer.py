@@ -486,9 +486,15 @@ def test_maybe_rollup_l2_then_l3():
     finally:
         _restore_httpx(orig)
     assert_eq(len(state["l1"]), 0, "all L1 chunks rolled into L2")
-    assert_eq(len(state["l2"]), 2, "two L2 chapters produced")
+    # Both L2 chapters are then drained into L3 in the same pass — the same
+    # consume-and-clear contract L1->L2 already had (MEMORY_REVIEW S-1/S-6
+    # fix: l2 is now bounded the way l1 already was, instead of surviving
+    # the L3 rollup that consumed it).
+    assert_eq(len(state["l2"]), 0, "both L2 chapters drained into L3")
     assert_true(state["l3"] is not None, "L3 produced")
     assert_eq(state["l3"]["text"], "L3X", "L3 text from final LLM call")
+    assert_eq(state["l3"]["first_turn"], 1, "L3 spans from the first chapter")
+    assert_eq(state["l3"]["last_turn"], 24, "through the last")
 
 
 def test_maybe_rollup_skips_when_not_needed():

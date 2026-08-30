@@ -64,28 +64,47 @@ public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:v0.10.0 on 2026-08-28:
 `serving_engine.py:606-609`, which returns early for TokenizeChatRequest. This
 server matches that: /tokenize always answers, however large the input.
 
-IT DOES, HOWEVER, VALIDATE THE MESSAGE SHAPE (added 2026-08-29, D1)
+IT DOES, HOWEVER, VALIDATE THE MESSAGE SHAPE (added 2026-08-29, D1; extended
+2026-08-29, D8 — the second outage's rule)
 -------------------------------------------------------------------
 `/tokenize` answers a chat request by APPLYING THE CHAT TEMPLATE, so it inherits
-the template layer's refusal:
+the template layer's refusal — THREE separate rules, and production hit all
+three:
 
-    HTTP 400  "Cannot set `add_generation_prompt` to True when the last message
-               is from the assistant. Consider using `continue_final_message`
-               instead."
+    1. HTTP 400  "Cannot set `add_generation_prompt` to True when the last
+                  message is from the assistant. Consider using
+                  `continue_final_message` instead."
 
-Attested by production, twice: 2026-08-28 and again 2026-08-29 four hours after
-the v3.1 deploy. The guard measures a payload ending on the user's new turn and
-never hit it; the SUMMARIZER measures a slice of old turns, which routinely ends
-on an assistant reply, so adding an exact count to the summarizer armed a 400 on
-the one path that most needed the measurement. `count_tokens_exact` fell back to
-the local estimate, `summarize()` fell back to scale=1.0, every batch 400'd, and
-compaction fell through for four hours.
+    2. HTTP 400  "Cannot set both `continue_final_message` and
+                  `add_generation_prompt` to True."
+
+    3. HTTP 400  "Expected last role User or Tool (or Assistant with prefix
+                  or continue_final_message set to True)"
+
+Rule 1 is attested by production, twice: 2026-08-28 and again 2026-08-29 four
+hours after the v3.1 deploy. The guard measures a payload ending on the user's
+new turn and never hit it; the SUMMARIZER measures a slice of old turns, which
+routinely ends on an assistant reply, so adding an exact count to the
+summarizer armed a 400 on the one path that most needed the measurement.
+`count_tokens_exact` fell back to the local estimate, `summarize()` fell back
+to scale=1.0, every batch 400'd, and compaction fell through for four hours.
 
 The first version of this fixture answered that request with a cheerful 200.
 That is why the harness ran green twice and shipped the bug it was built to
 catch. It now refuses, and `test_tokenizer_contract.py` asserts both directions:
 that the refusal fires on the flag+shape combination, and that no call site in
 the tree produces it.
+
+Rule 3 is the SECOND outage, and until D8 this fixture could not model it
+either. The fix for rule 1 set `add_generation_prompt=False` and stopped — that
+silences rule 1 but walks straight into rule 3, because an assistant-final list
+still needs to be told what to DO (continue it, via `continue_final_message` or
+a `"prefix": true` assistant message), not merely told not to add a generation
+prompt. Same outage, new error string, inside the hour. A fixture that only
+implemented rule 1 would have stayed green through a "fix" that reproduced
+rule 3 exactly. `_template_refusal` implements all three now; see
+`test_tokenizer_contract.py` group [18] for the case that drives all three
+through the compactor.
 
 `/v1/chat/completions` DOES validate, and the wording is reproduced verbatim
 from `serving_engine.py:621-631`. NOTE: the deployed stack pins
@@ -116,13 +135,18 @@ POST /_fixture/mode  {"tokenize_mode": ..., "factor": ..., "status": ...}
 
 GET /_fixture/stats returns per-endpoint call counts, so a test can assert the
 compactor consults /tokenize a BOUNDED number of times and not once per
-message — the cost discipline main.py:846-853 depends on.
+message — the cost discipline main.py:846-853 depends on. A refusal also bumps
+`tokenize.refused.<rule_id>` (`both_flags`, `agp_assistant_final`,
+`expected_last_role`), so a test can assert WHICH rule fired without parsing
+the message text.
 
 GET /_fixture/shapes returns one record per /tokenize request received:
 
     {"kind": "chat"|"completion", "add_generation_prompt": bool|None,
      "continue_final_message": bool|None, "last_role": str|None,
-     "n_messages": int|None, "refused": bool}
+     "n_messages": int|None, "refused": bool,
+     "refusal_rule": "both_flags"|"agp_assistant_final"|"expected_last_role"
+                      (present only when refused)}
 
 so a test can ENUMERATE the shapes the tree actually sends instead of the shapes
 it imagined. D7: the harness covered `{messages, user-final}` and nothing else,
@@ -200,23 +224,61 @@ _BOTH_FLAGS_MSG = (
     "Cannot set both `continue_final_message` and `add_generation_prompt` to True."
 )
 
+# The THIRD refusal, and the one this fixture was missing entirely until now.
+#
+# This is the outage the fixture could not model. 2026-08-29 morning tripped
+# _ASSISTANT_FINAL_MSG above; the fix that shipped set add_generation_prompt
+# False and stopped there, which satisfies that rule but walks straight into
+# this one — an assistant-final message list needs to be told what to DO about
+# that (continue it, via continue_final_message or a "prefix" assistant
+# message), not merely told not to add a generation prompt. Same outage, new
+# error string, inside the hour. Quoted verbatim per main.py's own record of
+# that production log (main.py count_tokens_exact, "hit its sibling in
+# production within the hour").
+_EXPECTED_LAST_ROLE_MSG = (
+    "Expected last role User or Tool (or Assistant with prefix or "
+    "continue_final_message set to True)"
+)
 
-def _template_refusal(body: dict) -> str | None:
-    """vLLM's request-shape validation, as a message or None.
+
+def _template_refusal(body: dict) -> tuple[str, str] | None:
+    """vLLM's request-shape validation, as (message, rule_id) or None.
 
     Runs BEFORE any injected fault, because it is validation of the request
     rather than a property of the backend: vLLM rejects the shape without ever
     reaching the tokenizer.
+
+    Three rules, checked in the order vLLM's own template layer would hit
+    them — each one took production down once:
+
+      1. both flags true                                   -> _BOTH_FLAGS_MSG
+      2. add_generation_prompt=True on an assistant-final list
+                                                        -> _ASSISTANT_FINAL_MSG
+      3. assistant-final with neither continue_final_message NOR a "prefix"
+         message                                    -> _EXPECTED_LAST_ROLE_MSG
+
+    `rule_id` lets a test tell WHICH rule fired without parsing message text —
+    see tokenize()'s `tokenize.refused.<rule_id>` stat.
     """
     msgs = body.get("messages")
     if not msgs:
         return None
     agp = bool(body.get("add_generation_prompt", True))
     cfm = bool(body.get("continue_final_message", False))
+    last = msgs[-1] or {}
+    last_is_assistant = last.get("role") == "assistant"
     if agp and cfm:
-        return _BOTH_FLAGS_MSG
-    if agp and (msgs[-1] or {}).get("role") == "assistant":
-        return _ASSISTANT_FINAL_MSG
+        return _BOTH_FLAGS_MSG, "both_flags"
+    if agp and last_is_assistant:
+        return _ASSISTANT_FINAL_MSG, "agp_assistant_final"
+    # "prefix" is Mistral's own way of marking an assistant message as a
+    # continuation to extend rather than a turn to answer — the other
+    # legitimate way (besides continue_final_message) to end a list on the
+    # assistant. Nothing in this tree sends it today (see the README's list of
+    # uncovered shapes), but a fixture that refused it anyway would be
+    # asserting a rule vLLM does not have.
+    if last_is_assistant and not cfm and not last.get("prefix"):
+        return _EXPECTED_LAST_ROLE_MSG, "expected_last_role"
     return None
 
 
@@ -297,15 +359,18 @@ async def tokenize(request: Request):
     # and it does so whatever the backend is doing. See _template_refusal.
     refusal = _template_refusal(body) if _MODE["assistant_final_400"] else None
     if refusal is not None:
+        refusal_msg, refusal_rule = refusal
         shape["refused"] = True
+        shape["refusal_rule"] = refusal_rule
         _bump("tokenize.refused")
+        _bump(f"tokenize.refused.{refusal_rule}")
         if len(_SHAPES) < _SHAPES_MAX:
             _SHAPES.append(shape)
         return JSONResponse(
             status_code=400,
             content={
                 "object": "error",
-                "message": refusal,
+                "message": refusal_msg,
                 "type": "BadRequestError",
                 "param": None,
                 "code": 400,
@@ -623,6 +688,8 @@ async def info():
         # a built image, so a stale image is invisible from the test side —
         # which is exactly how a harness ends up asserting against a server
         # that cannot produce the failure it is checking for. The suite refuses
-        # to run the D1 group unless this is present.
-        "features": ["assistant_final_400", "shapes"],
+        # to run the D1 group unless this is present. "expected_last_role_400"
+        # (D8) marks that rule 3 — the SECOND outage's refusal, the one a
+        # fixture without it would stay green through — is implemented too.
+        "features": ["assistant_final_400", "shapes", "expected_last_role_400"],
     }

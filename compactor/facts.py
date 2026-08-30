@@ -46,6 +46,7 @@ from typing import Any
 
 import httpx
 
+import tokens
 from memory import (
     StoreUnreadable,
     atomic_write_json,
@@ -95,21 +96,114 @@ _EXTRACTION_ENABLED = (
 # `budget = min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - out - reserve))`), read
 # from the same env var so the two cannot drift apart on a re-sized deployment.
 _MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "32768") or 32768)
-# Slack left inside the window for the chat template's per-message framing and
-# for the estimator's error. Same default and same purpose as
-# COMPACTOR_SUMMARY_INPUT_RESERVE; this module has no tokenizer at all, so its
-# char/4 estimate is the coarser of the two and this reserve is the only thing
-# absorbing that difference.
+# Slack left inside the window for the chat template's per-message framing.
+# Same default and same purpose as COMPACTOR_SUMMARY_INPUT_RESERVE. This is a
+# FIXED, real-token cost (the template's own scaffolding) — see
+# _ASSISTANT_CONTENT_ESTIMATE_LOW_FRACTION below for the separate, PROPORTIONAL
+# correction this reserve cannot do on its own.
 _EXTRACTION_INPUT_RESERVE = int(
     os.environ.get("COMPACTOR_FACTS_INPUT_RESERVE", "2048") or 2048
 )
 # Clamped for the same reason as main.HARD_INPUT_LIMIT: a bare floor could sit
 # ABOVE the model's own window on a small-context model, which would budget
-# nothing at all.
-_EXTRACTION_INPUT_BUDGET = min(
+# nothing at all. This is a REAL-token ceiling — the model's own window minus
+# what the reply and the framing need.
+_EXTRACTION_INPUT_BUDGET_REAL_TOKENS = min(
     _MAX_MODEL_LEN,
     max(256, _MAX_MODEL_LEN - _EXTRACTION_MAX_TOKENS - _EXTRACTION_INPUT_RESERVE),
 )
+
+# _fit_extraction_input below (and everything it calls) measures exclusively in
+# _estimate_tokens' unit — char/4 — never in real tokens. Comparing that
+# estimate directly against _EXTRACTION_INPUT_BUDGET_REAL_TOKENS, as this
+# module did through v3.1, silently treated "1 estimated token" as "1 real
+# token" charged by vLLM. This module's own docstring already named the gap
+# ("this module has no tokenizer at all") but the only thing bridging it was
+# the FIXED reserve above, which cannot correct a PROPORTIONAL error: on a
+# large enough payload no fixed number of tokens of slack survives a
+# percentage under-count, no matter how generous.
+#
+# MEASURED, INSIDE THE PRODUCTION IMAGE, AGAINST THE REAL TOKENIZER (tokens.py
+# + mistral_common's bundled tekken vocabulary, the same family vLLM uses) —
+# not cited from a document. An earlier draft of this fix used "51% low"
+# handed down as a general figure for this model's assistant content and
+# a synthetic repeated-lorem-ipsum reproduction built on it. Measuring that
+# same synthetic text against the real tokenizer disproved the premise: char/4
+# read it 53% HIGH, not low — repeated text compresses hard under a real BPE
+# vocabulary in a way char/4 cannot see. So a single fixed "% low" cannot be
+# right for all content, because the true direction and size depend on SHAPE:
+#
+#   ordinary structured prose (paragraphs, some markdown, numbers) ..  ~6.5% low
+#   prose with an occasional divider mixed in ....................... ~16% HIGH
+#   repetitive/degenerate filler ..................................... ~53% HIGH
+#   pure box-drawing decoration ...................................... ~87% low
+#
+# The decoration figure independently reproduces this file's own
+# INCIDENT_2026-08-28 measurement (2,151 chars / ~4,275 tokens, ~87.4% low)
+# to within a rounding error — two separate measurements agreeing is the
+# strongest evidence in this file for any number. Ordinary content is close
+# enough that no correction is really needed; decoration is the only content
+# shape actually seen to blow the estimate this badly, and it is exactly the
+# shape this module's own history keeps producing: the extraction INPUT is
+# the raw prior turn, unfiltered — is_storable_fact's structural filter only
+# ever runs on what extraction OUTPUTS, so a decoration-heavy prior reply
+# reaches this budget check completely unfiltered.
+#
+# A one-directional worst case would be no worse than imprecise; ORDINARY
+# content reading HIGH under char/4 is what makes it actually safe to say
+# direction 2 (a fact wrongly evicted or trimmed for looking bigger than it
+# is) is not a live risk from this estimator: on the content this store
+# actually holds, char/4 already errs toward "looks bigger", not smaller.
+# Only decoration flips that, and only on the INPUT side, which is exactly
+# what this constant now defends — see also the tokens.count() backstop in
+# extract_facts_from_exchange below, which is the actual fix for the common
+# case: this constant is what's left standing when that backstop cannot run.
+#
+# So this budget is deliberately calibrated to the WORST case actually
+# measured (decoration, ~87%), not to "typical" content — because typical
+# content does not need defending, and this is the one number used when
+# nothing can verify the real cost before the request goes out.
+_ASSISTANT_CONTENT_ESTIMATE_LOW_FRACTION = float(
+    os.environ.get("COMPACTOR_FACTS_ESTIMATE_LOW_FRACTION", "0.87") or 0.87
+)
+_EXTRACTION_INPUT_BUDGET = max(
+    256,
+    int(
+        _EXTRACTION_INPUT_BUDGET_REAL_TOKENS
+        * (1 - _ASSISTANT_CONTENT_ESTIMATE_LOW_FRACTION)
+    ),
+)
+
+# How many times extract_facts_from_exchange will re-trim and re-measure
+# against the real tokenizer (tokens.count()) before giving up and sending
+# its best effort. Bounded because a real disagreement should converge in a
+# step or two once corrected toward the true ratio; a cap turns "does not
+# converge" into one WARNING log rather than a request that never goes out.
+_MAX_REAL_TOKEN_MEASURE_RETRIES = 3
+
+
+def _extraction_input_budget_estimate_units() -> int:
+    """The FIRST-PASS estimate-unit budget handed to _fit_extraction_input.
+
+    Measured (see the trimming-impact numbers in the fix that added this):
+    starting from the conservative, worst-case-calibrated
+    _EXTRACTION_INPUT_BUDGET unconditionally — even when the real tokenizer
+    can verify and correct the result afterward — cut ordinary, undecorated
+    long exchanges down to roughly 15% of their real size for no reason: the
+    backstop below only ever SHRINKS the budget on disagreement, it never
+    widens it back up, so a pessimistic starting point survives even when
+    the very first real measurement would have confirmed there was 10x the
+    room actually needed.
+
+    So: generous (the bare real ceiling, in estimate-units) whenever the real
+    tokenizer is available to check the result — the backstop is what keeps
+    that safe, not this number. Conservative (the measured-worst-case
+    fallback) only when nothing can verify anything, which is the one
+    situation this number actually has to be right without help.
+    """
+    if tokens.is_available():
+        return _EXTRACTION_INPUT_BUDGET_REAL_TOKENS
+    return _EXTRACTION_INPUT_BUDGET
 
 
 def extraction_enabled() -> bool:
@@ -389,6 +483,30 @@ async def with_facts_lock(conv_id: str, fn):
 # Pruning — LRU by last_used
 # ---------------------------------------------------------------------------
 
+def _fact_bullet_tokens(text: str) -> int:
+    """Estimated cost of one fact AS ACTUALLY RENDERED in the injected block:
+    the "- " prefix and its line break, not the bare fact text.
+
+    _lru_split priced a fact by `_estimate_tokens(f["text"])` alone through
+    v3.1 — the same unit gap _fit_extraction_input already corrects for its
+    own payload (see its "Settle that difference against the assembled
+    payload" comment), just never applied here. Reproduced: 150 short facts
+    at a 1500-token budget were all kept believing the total was exactly
+    1500 (bare text), while format_facts_block's real rendering of that same
+    set measured 1674 — an 11.6% overshoot of a budget the code believed it
+    was honouring, purely from missing the "- " prefix, the per-line break,
+    and the header (see _FACTS_BLOCK_HEADER_TOKENS below), independent of
+    any question about char/4's accuracy as a tokenizer.
+
+    Includes a trailing newline even though format_facts_block's join only
+    puts one BETWEEN lines (the last line has none): a 1-character-per-fact
+    over-count in the estimator's own unit, which only ever makes this
+    module keep fewer facts than the true rendering needs, never more —
+    the safe direction for a budget, and negligible for a soft cap.
+    """
+    return _estimate_tokens(f"- {text}\n")
+
+
 def _lru_split(
     facts: list[dict], max_tokens: int
 ) -> tuple[list[dict], list[dict]]:
@@ -403,23 +521,56 @@ def _lru_split(
     tie-break on `last_used` keeps eviction deterministic between facts
     touched in the same second (a manual /remember and an extraction landing
     on the same turn), it does not decide recency.
+
+    Budgets against the block format_facts_block ACTUALLY renders — the
+    header once, plus each fact as "- <text>\n" — not the bare fact text.
+    The header is fixed and renders exactly once whenever any fact survives
+    (format_facts_block never emits a header with zero bullets under it), so
+    a budget that cannot afford the header cannot afford to inject anything:
+    that is not a smaller injection, it is no injection, and every fact goes
+    to eviction rather than a partial, header-less fragment nobody asked for.
     """
     if not facts:
         return [], []
-    total = sum(_estimate_tokens(f["text"]) for f in facts)
-    if total <= max_tokens:
+    if _FACTS_BLOCK_HEADER_TOKENS > max_tokens:
+        # Degenerate budget: too small even for the header alone. Correct
+        # behaviour is to inject nothing, not a header over an empty body —
+        # so every fact is an eviction candidate here, not a partial fit.
+        return [], sorted(facts, key=lambda f: f["added_turn"])
+
+    def _rendered_cost(subset: list[dict]) -> int:
+        block = format_facts_block(subset)
+        return _estimate_tokens(block) if block else 0
+
+    if _rendered_cost(facts) <= max_tokens:
         return list(facts), []
 
+    body_budget = max_tokens - _FACTS_BLOCK_HEADER_TOKENS
     # Sort by last_used ascending (oldest first), then by added_turn for stability
     sorted_facts = sorted(facts, key=lambda f: (f["last_used"], f["added_turn"]))
     kept_reversed: list[dict] = []
     running = 0
-    # Walk from most-recently-used backward, keeping facts that fit
+    # Walk from most-recently-used backward, keeping facts that fit. This
+    # sums PER-FACT floors as a fast approximation to pick candidates without
+    # rebuilding the whole rendered string on every step.
     for f in reversed(sorted_facts):
-        cost = _estimate_tokens(f["text"])
-        if running + cost <= max_tokens:
+        cost = _fact_bullet_tokens(f["text"])
+        if running + cost <= body_budget:
             kept_reversed.append(f)
             running += cost
+
+    # Settle against the real render before trusting the approximation: a sum
+    # of per-fact floors is always <= the floor of their true combined
+    # length, so the fast walk above can under-count by a few tokens once
+    # enough facts accumulate, letting the real block land a token or two
+    # over `max_tokens` even though the approximation said it fit. Same
+    # principle as _fit_extraction_input settling against _assembled_tokens
+    # rather than trusting a per-part cost model. kept_reversed was built
+    # most-recently-used-first, so popping the tail drops the
+    # least-recently-used fact still standing — LRU order is preserved.
+    while kept_reversed and _rendered_cost(kept_reversed) > max_tokens:
+        kept_reversed.pop()
+
     kept_ids = {id(f) for f in kept_reversed}
     # Restore original-ish ordering by added_turn for stable injection
     kept = sorted(kept_reversed, key=lambda f: f["added_turn"])
@@ -522,6 +673,14 @@ _FACTS_BLOCK_HEADER = (
     "[Persistent facts about this conversation — established earlier, "
     "maintain consistency with these]"
 )
+# Measured off the header itself, not hand-counted, so editing the header
+# text cannot silently invalidate the budget in _lru_split — the same
+# reasoning as _extraction_overhead_tokens() below for the extraction
+# payload's own fixed overhead. +1 char for the line break the header always
+# carries when any fact follows it (format_facts_block never emits the
+# header alone), a safe, negligible over-count in the same direction as
+# _fact_bullet_tokens' own trailing newline.
+_FACTS_BLOCK_HEADER_TOKENS = _estimate_tokens(_FACTS_BLOCK_HEADER + "\n")
 
 
 def format_facts_block(facts: list[dict]) -> str | None:
@@ -955,22 +1114,93 @@ async def extract_facts_from_exchange(
     is what makes a failure attributable: without it the warning this used to
     emit named no conversation, so a lost extraction could not be traced to
     the turn that lost it.
+
+    `max_input_tokens`, when given, only overrides the INITIAL estimate-unit
+    guess handed to _fit_extraction_input — the module's own default
+    (`_extraction_input_budget_estimate_units()`) picks generous or
+    conservative depending on whether tokens.py can verify the result
+    afterward, and a caller skips that choice by supplying its own number
+    directly. The real-tokenizer backstop below still runs regardless of
+    where the initial guess came from: it protects the model's REAL window,
+    which no estimate-unit budget — caller-supplied or not — should be able
+    to sign away.
     """
     if not user_msg or not assistant_msg:
         return []
     # A lost extraction is a lost memory, so every line below has to say WHOSE.
     where = f"conv={conv_id}" if conv_id else "conv=? (caller passed none)"
-    user_msg, assistant_msg, existing_facts, trim_note = _fit_extraction_input(
-        user_msg,
-        assistant_msg,
-        existing_facts,
-        _EXTRACTION_INPUT_BUDGET if max_input_tokens is None else max_input_tokens,
+    budget = (
+        _extraction_input_budget_estimate_units()
+        if max_input_tokens is None else max_input_tokens
+    )
+    trimmed_user, trimmed_assistant, trimmed_facts, trim_note = _fit_extraction_input(
+        user_msg, assistant_msg, existing_facts, budget
     )
     if trim_note:
         logger.info(f"{where}: extraction input trimmed to budget — {trim_note}")
+
+    # Real-measurement backstop. _fit_extraction_input only ever sees the
+    # char/4 estimate, which _ASSISTANT_CONTENT_ESTIMATE_LOW_FRACTION above
+    # already prices for the worst case MEASURED across content shapes — but
+    # "worst case measured in general" is still a guess about THIS specific
+    # exchange. When the real tokenizer is available (tokens.py — the same
+    # tekken vocabulary vLLM uses), verify directly and re-trim toward the
+    # true ratio rather than trust either direction of the guess: this is
+    # what actually fixes the common case. The constant above is what is left
+    # standing when this cannot run at all (mistral_common absent, no cached
+    # tekken.json, or a non-Mistral model) — see tokens.py's own doctrine,
+    # "everything degrades to None".
+    for _retry in range(_MAX_REAL_TOKEN_MEASURE_RETRIES):
+        real = tokens.count(
+            _build_extraction_messages(trimmed_user, trimmed_assistant, trimmed_facts)
+        )
+        if real is None or real <= _EXTRACTION_INPUT_BUDGET_REAL_TOKENS:
+            break
+        # The estimate under-priced THIS exchange. Shrinking `budget`
+        # PROPORTIONALLY TO ITSELF (budget * ceiling / real) does not
+        # converge when the true density is far off char/4's: on pure
+        # decoration the reply alone can estimate at a few thousand tokens
+        # while costing tens of thousands for real, so a budget shrunk by
+        # only the ceiling/real ratio can still land far ABOVE that small
+        # estimate — _fit_extraction_input's own "does it already fit?"
+        # check then sees nothing to shed, `real` never moves, and the loop
+        # burns its retries without changing anything (measured: this
+        # reproduces the 2026-08-24 class of incident again for decoration
+        # specifically, silently, even with this backstop wired in).
+        #
+        # So derive the new target from the OBSERVED density of what was
+        # actually just measured (real tokens per estimated token for THIS
+        # content), not from the ceiling/real ratio applied to the old
+        # budget. That number, divided into the ceiling, is the estimate-unit
+        # target that forces the SAME shedding logic to cut deep enough —
+        # assuming the density stays roughly uniform in what gets shed next,
+        # which is the same assumption _fit_extraction_input's own char/4
+        # estimate already makes throughout.
+        current_estimate = _assembled_tokens(trimmed_user, trimmed_assistant, trimmed_facts)
+        if current_estimate <= 0:
+            break  # nothing left to shrink an estimate-unit budget against
+        density = real / current_estimate
+        budget = max(256, int(_EXTRACTION_INPUT_BUDGET_REAL_TOKENS / density * 0.9))
+        trimmed_user, trimmed_assistant, trimmed_facts, trim_note = _fit_extraction_input(
+            user_msg, assistant_msg, existing_facts, budget
+        )
+        logger.info(
+            f"{where}: real tokenizer measured {real} tokens against a "
+            f"{_EXTRACTION_INPUT_BUDGET_REAL_TOKENS}-token window ({density:.2f} "
+            f"real tokens per estimated token on this content) — the char/4 "
+            f"estimate under-priced this exchange; re-trimmed to a "
+            f"{budget}-token estimate budget"
+        )
+    else:
+        logger.warning(
+            f"{where}: real tokenizer still reports over budget after "
+            f"{_MAX_REAL_TOKEN_MEASURE_RETRIES} re-trim(s); sending the most-"
+            f"trimmed attempt rather than holding the exchange forever"
+        )
+
     payload = {
         "model": model,
-        "messages": _build_extraction_messages(user_msg, assistant_msg, existing_facts),
+        "messages": _build_extraction_messages(trimmed_user, trimmed_assistant, trimmed_facts),
         "max_tokens": _EXTRACTION_MAX_TOKENS,
         # temp 0.0: extraction is structured-output, not creative writing.
         # We want the same input to always produce the same facts. The
