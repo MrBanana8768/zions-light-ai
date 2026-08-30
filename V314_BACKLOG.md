@@ -115,6 +115,46 @@ not `interval`.
 
 ---
 
+## F1 · The facts workstream — decouple the store from the injection
+
+Decided 2026-08-30, from N3's numbers. The design flaw under the revolving
+door is that `COMPACTOR_MAX_FACTS_TOKENS` (1500) is one knob doing two jobs:
+the STORE cap (how much she can remember) and the INJECTION size (all ~80
+active facts go into every prompt). Because everything is injected every
+turn, everything is touched every turn, `last_used` is meaningless, and LRU
+degenerates to FIFO — the 70% churn selects for nothing. Four parts:
+
+1. **Top-K relevance injection.** Rank active facts against the user's turn
+   with the SAME bge-small query embedding retrieval already computes (CPU,
+   milliseconds, zero GPU) and inject the top K (~300-400 tokens) instead of
+   the whole store (~1,400). Side effect, and the point: only injected facts
+   get touched, so LRU starts selecting for facts that keep mattering.
+2. **A pinned always-inject tier.** Identity-tier facts (who she is, who the
+   owner is to her, standing preferences) bypass ranking. Pure top-K can
+   drop "her name is X" on a turn about dinner — that is the "she forgot me"
+   failure wearing a relevance-scoring hat.
+3. **Raise the store cap once injection is decoupled** (4,000-6,000 tokens;
+   eviction already archives safely, so the cap was only ever about
+   injection economics).
+4. **Gate the dedup treadmill** — the single largest discretionary GPU spend
+   in the logs (2,024 LLM calls for 55 merges, 2.7% yield, on the same GPU
+   her replies stream from). Run the LLM pass only on clusters that gained a
+   member since last pass; embedding-similarity screening first. This is
+   likely a bigger latency win than anything else on this list, and latency
+   is N2's confirmed root cause.
+
+Explicitly rejected: LLM-driven fact COMPACTION (summarizing facts into
+profile paragraphs). Dedup's 2.7% merge yield is evidence her facts are
+distinct-but-related, not redundant; compaction would spend scarce GPU to
+destroy the granularity that makes the atomic layer useful, duplicating the
+summary hierarchy's job — which N4's data shows is keeping pace fine.
+
+Interim, already recommended for deploy day: `COMPACTOR_MAX_FACTS_TOKENS`
+~3000 so the 1024 extraction cap does not accelerate churn into a
+fixed-size store.
+
+---
+
 ## Deploy-day notes carried from the analysis
 
 1. The pod is already half-on the new env: `GENERATION_RESERVE=12000` went
