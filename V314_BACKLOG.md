@@ -200,6 +200,72 @@ STILL OPEN, and the actual permanent fix:
 
 ---
 
+## D1 · Get `webui.db` off the network filesystem, and snapshot hourly
+
+**Incident, 2026-08-31 02:17-02:41.** OpenWebUI went "no backend"; every
+query — including plain SELECTs — returned `sqlite3.OperationalError: disk
+I/O error`, 1,819 of them, and every write attempt reported "attempt to
+write a readonly database".
+
+Root cause, from the file listing: a **4.8 MB `webui.db-journal` timestamped
+02:17**, two minutes before the errors began. RunPod's MooseFS volume
+(`mfs#ca-mtl-1.runpod.net`, mounted at `/data`) dropped I/O while OpenWebUI
+was mid-transaction. SQLite then tried to roll that journal back on every
+subsequent open; rolling back requires WRITING; the write failed; SQLite
+reported readonly. **The database was never corrupt** — it was stuck
+mid-recovery on a filesystem that would not let it finish. "readonly" was
+SQLite protecting the file, not failing.
+
+Recovery (worked, nothing lost): stop OpenWebUI, copy `webui.db` AND its
+journal together to local disk, open there so SQLite can complete the
+rollback, `PRAGMA integrity_check` → `ok`, 31 chats, 2 users, VACUUM, copy
+back. **The journal and its database are a matched pair**: deleting a hot
+journal turns a recoverable file into a corrupt one, and leaving a stale
+journal beside a *replaced* database corrupts it too. Renaming both is what
+makes the swap safe.
+
+Blast radius was one file. The compactor's own storage stayed green
+throughout — 2,080 facts, 749 indexed exchanges, `unreadable: {facts: 0,
+episodic: 0, summaries: 0}`. That contrast is the finding: **many small JSON
+writes survived the same event that broke one large, continuously-written
+SQLite file.** SQLite on a network filesystem is a known-fragile pairing,
+and this is what it looks like.
+
+### The work
+
+1. **Move `webui.db` off MooseFS.** Run it on the pod's local overlay (20 GB,
+   2% used) and sync to `/data` on a timer. The overlay is not persistent
+   across pod recreation, so the sync cadence becomes the RPO — which is why
+   item 2 matters. The strategic answer remains the Postgres state home
+   already on the roadmap; it is built for exactly this and removes the
+   class rather than shortening the window.
+2. **Hourly snapshots.** `COMPACTOR_BACKUP_INTERVAL_HOURS=1` needs no code —
+   the cadence is already env-tunable, chat history is already in scope
+   (`COMPACTOR_BACKUP_WEBUI_DB`), and the snapshot is already live-SQLite-safe.
+   Retention already tiers (`RETAIN=7` newest, `RETAIN_DAYS=14`), so hourly
+   yields ~14 days of hourly archives. **The code item is the shape, not the
+   cadence**: an hourly FULL tar re-writes chromadb and every facts file
+   onto the same fragile volume 24x a day. Split it — an hourly light
+   snapshot of `webui.db` alone, plus the existing daily full archive.
+3. **Backup must not go silent when the source is sick.** During this
+   incident the backup itself failed (`backup failed: OperationalError:
+   attempt to write a readonly database`) and produced NOTHING — at exactly
+   the moment an archive was most wanted. When the SQLite-safe path fails,
+   fall back to a raw file copy of the database and its journal, label the
+   archive as degraded, and alert. A byte copy of a sick database is
+   forensically valuable; no archive at all is not.
+
+### Also worth noting
+
+- The five `webui.db.bak-*` files (2026-08-24, ~20 MB each against today's
+  41 MB) had been riding along inside `/data/openwebui`, i.e. inside every
+  one of the 17 backup archives. Removed. Keep `/data/openwebui` holding
+  exactly one database — that directory gets read during incidents, at 2am.
+- Version note: v3.1.5 is already tagged and built, so this lands as v3.1.6
+  unless the tag is moved.
+
+---
+
 ## Deploy-day notes carried from the analysis
 
 1. The pod is already half-on the new env: `GENERATION_RESERVE=12000` went
