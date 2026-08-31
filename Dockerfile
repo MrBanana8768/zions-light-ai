@@ -235,6 +235,7 @@ COPY compactor/degrade.py /opt/compactor/degrade.py
 COPY compactor/bgwork.py /opt/compactor/bgwork.py
 COPY compactor/tokens.py /opt/compactor/tokens.py
 COPY compactor/tokenhealth.py /opt/compactor/tokenhealth.py
+COPY compactor/webuidb.py /opt/compactor/webuidb.py
 COPY compactor/logsetup.py /opt/compactor/logsetup.py
 COPY compactor/alert.py /opt/compactor/alert.py
 
@@ -265,7 +266,7 @@ RUN cd /opt/compactor && \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
     COMPACTOR_STORAGE_ROOT=/tmp/buildguard LOG_DIR=/tmp/buildguard \
     /opt/compactor-venv/bin/python -c \
-      "import main, selftest, backup, health, commands, portability; \
+      "import main, selftest, backup, health, commands, portability, webuidb; \
        print('build guard: every compactor entrypoint imports from the image')" \
     && rm -rf /tmp/buildguard /opt/compactor/__pycache__
 

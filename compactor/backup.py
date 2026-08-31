@@ -70,7 +70,16 @@ logger = logging.getLogger("compactor.backup")
 
 # What to back up. DATA_DIR is OpenWebUI's state root; webui.db lives there.
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data/openwebui"))
-WEBUI_DB = Path(os.environ.get("COMPACTOR_BACKUP_WEBUI_DB", str(DATA_DIR / "webui.db")))
+# The LIVE database moved to local disk (v3.1.6, webuidb.py) so its journal
+# writes stop landing on the flaky volume. Back up the live file when it is
+# there: /data/openwebui/webui.db is now a periodic SNAPSHOT, so archiving
+# that instead would silently give every archive the staleness of the last
+# sync on top of its own age.
+_LIVE_DB = Path(os.environ.get("WEBUI_LOCAL_DB", "/var/lib/openwebui/webui.db"))
+WEBUI_DB = Path(
+    os.environ.get("COMPACTOR_BACKUP_WEBUI_DB")
+    or (str(_LIVE_DB) if _LIVE_DB.exists() else str(DATA_DIR / "webui.db"))
+)
 STORAGE_ROOT = Path(
     os.environ.get("COMPACTOR_STORAGE_ROOT", str(DATA_DIR / "compactor"))
 )

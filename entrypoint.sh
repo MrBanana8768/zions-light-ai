@@ -166,6 +166,36 @@ fi
 # Hand off to supervisord. vLLM, context-compactor, and OpenWebUI all run
 # as supervised child processes from here.
 # =============================================================================
+# =============================================================================
+# webui.db lives on LOCAL disk, not on /data.
+#
+# RunPod's MooseFS mount drops I/O occasionally. When that lands while
+# OpenWebUI is mid-transaction, SQLite leaves a hot rollback journal, every
+# later open tries to roll it back, rolling back needs to WRITE, the write
+# fails, and the whole front end is down with "attempt to write a readonly
+# database". That happened twice on 2026-08-31.
+#
+# So the live database and its journals sit on local disk where writes work,
+# and compactor/webuidb.py publishes a snapshot back to /data on a timer.
+# This step restores that snapshot on a fresh container - which is also the
+# first-run migration of the existing database, needing no special case.
+#
+# DATABASE_URL is what actually points OpenWebUI at it. Deliberately NOT a
+# symlink: SQLite derives the journal path from the path it was given, so a
+# symlinked database can still put its journal back on MooseFS and the bug
+# survives the fix.
+# =============================================================================
+export WEBUI_LOCAL_DB="${WEBUI_LOCAL_DB:-/var/lib/openwebui/webui.db}"
+export WEBUI_SNAPSHOT_DB="${WEBUI_SNAPSHOT_DB:-${DATA_DIR:-/data/openwebui}/webui.db}"
+export DATABASE_URL="${DATABASE_URL:-sqlite:///${WEBUI_LOCAL_DB}}"
+mkdir -p "$(dirname "${WEBUI_LOCAL_DB}")"
+echo "[2b/3] Placing webui.db on local disk (${WEBUI_LOCAL_DB})"
+/opt/compactor-venv/bin/python /opt/compactor/webuidb.py --restore 2>&1 | tail -3 || {
+    echo "      WARNING: restore step failed; OpenWebUI will still start."
+    echo "      Check ${LOG_DIR}/webuidb-sync.log and run:"
+    echo "        /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --status"
+}
+
 echo ""
 echo "[3/3] Starting services..."
 echo "      - vLLM             on port ${VLLM_PORT}      (internal)"
