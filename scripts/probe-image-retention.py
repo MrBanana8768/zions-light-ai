@@ -110,6 +110,18 @@ def post(url: str, payload: dict, headers: dict, timeout: int = 240):
         return 0, f"{type(e).__name__}: {e}"
 
 
+def model_name(base: str) -> str | None:
+    """Whatever the compactor is serving. probe-vision.py resolves this the
+    same way and this script shipped without it — the placeholder default
+    went straight to a 404 and told the operator nothing about the bug it
+    was written to find."""
+    try:
+        with urllib.request.urlopen(base + "/v1/models", timeout=30) as r:
+            return json.loads(r.read().decode())["data"][0]["id"]
+    except Exception:
+        return None
+
+
 def img_turn(text: str, dim: int, phase: int) -> dict:
     parts = [{"type": "image_url", "image_url": {"url": uri(dim, phase)}}]
     if text:
@@ -150,14 +162,22 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default=COMPACTOR)
     ap.add_argument("--conv", default="probe-retention-scratch")
-    ap.add_argument("--model", default="probe")
+    ap.add_argument("--model", default=None,
+                    help="default: whatever /v1/models reports")
     ap.add_argument("--size", type=int, default=512)
     args = ap.parse_args()
 
     say("=" * 70)
     say("IMAGE RETENTION PROBE — through the COMPACTOR, scratch conversation")
     say("=" * 70)
+    model = args.model or model_name(args.url)
+    if not model:
+        say(f"FAIL: could not resolve a model from {args.url}/v1/models.")
+        say("      Is the compactor up? Pass --model to override.")
+        return 2
+    args.model = model
     say(f"conv id: {args.conv}   (not a real conversation)")
+    say(f"model:   {model}")
     say("")
 
     SYS = {"role": "system", "content": "You are a helpful assistant."}
