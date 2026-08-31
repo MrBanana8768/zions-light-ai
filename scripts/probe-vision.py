@@ -28,6 +28,28 @@ same prompt twice — once text-only, once with an image — and the difference
 IS the per-image cost, exactly, with no estimating. Repeated at three
 resolutions, because the cost tiles with size.
 
+    --image PATH        measure a REAL file (PNG/JPEG/GIF/WebP) rather than
+                        generated squares. Repeatable. Generated gradients
+                        answer how the encoder SCALES; a real photo answers
+                        what her uploads will actually cost.
+    --describe          also ask the model what it sees, and print the reply.
+                        Acceptance is not comprehension: a backend can take
+                        the request, charge for the tokens and still hand the
+                        vision tower a black frame, and every number here
+                        would look perfect. This is the only check that
+                        separates "priced" from "looked at".
+
+MEASURED 2026-08-31 on coder3101/Cydonia-24B-v4.3-vision-heretic:
+
+    256px 110 · 512px 380 · 1024px 1406 · 2048px 3080 · 3072px 3080
+
+/tokenize agreed with usage.prompt_tokens to the token at every size, so the
+budget guard does see images. Cost PLATEAUS at 3,080 — the encoder downscales,
+so no upload can cost more than that however large the file, which is 14.8% of
+a 20,768-token input budget. COMPACTOR_IMAGE_TOKENS=4096 is therefore an OVER-
+estimate, not the "roughly half the true cost" main.py claims near
+IMAGE_TOKEN_ESTIMATE; it errs in the safe direction and needs no change.
+
 Stdlib only (urllib, zlib, struct): no httpx, no PIL, nothing to install,
 and it runs under any python3 on the box.
 """
@@ -70,6 +92,62 @@ def png(w: int, h: int) -> bytes:
         + chunk(b"IDAT", zlib.compress(raw, 6))
         + chunk(b"IEND", b"")
     )
+
+
+def identify(data: bytes):
+    """(mime, width, height) for a real image file, from its MAGIC BYTES.
+
+    Not from the extension: a phone photo saved as .png is still a JPEG, and
+    the data: URI has to declare what the bytes actually are or vLLM decodes
+    the wrong format. Dimensions matter because cost scales with AREA, so a
+    file's pixel size is the number that predicts its token cost — and PIL is
+    not in the compactor venv, so this reads the headers directly.
+
+    Returns (None, None, None) for anything it cannot identify, and the
+    caller refuses rather than guessing at a MIME type.
+    """
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        w, h = struct.unpack(">II", data[16:24])
+        return "image/png", w, h
+    if data[:3] == b"\xff\xd8\xff":
+        # Walk the marker segments to the frame header. SOF0/1/2/3/5/6/7/
+        # 9/10/11/13/14/15 carry the dimensions; C4 (Huffman table), C8
+        # (JPEG extension) and CC (arithmetic coding) are NOT frame headers
+        # and must be skipped or the parse lands mid-table and returns junk.
+        i = 2
+        while i < len(data) - 9:
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            seglen = struct.unpack(">H", data[i + 2:i + 4])[0]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return "image/jpeg", w, h
+            i += 2 + seglen
+        return "image/jpeg", None, None
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        w, h = struct.unpack("<HH", data[6:10])
+        return "image/gif", w, h
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk = data[12:16]
+        if chunk == b"VP8X":
+            w = int.from_bytes(data[24:27], "little") + 1
+            h = int.from_bytes(data[27:30], "little") + 1
+            return "image/webp", w, h
+        if chunk == b"VP8 ":
+            w = struct.unpack("<H", data[26:28])[0] & 0x3FFF
+            h = struct.unpack("<H", data[28:30])[0] & 0x3FFF
+            return "image/webp", w, h
+        if chunk == b"VP8L":
+            b0, b1, b2, b3 = data[21:25]
+            bits = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+            return "image/webp", (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        return "image/webp", None, None
+    return None, None, None
 
 
 def post(url: str, payload: dict, timeout: int = 120):
@@ -155,6 +233,15 @@ def main() -> int:
     ap.add_argument("--url", default=VLLM)
     ap.add_argument("--sizes", default="256,512,1024",
                     help="square image edges to measure, comma separated")
+    ap.add_argument("--image", action="append", metavar="PATH",
+                    help="measure a REAL image file instead of generated "
+                         "squares. Repeatable. This is the one that matters: "
+                         "generated gradients answer how the encoder scales, "
+                         "a real photo answers what her uploads will cost.")
+    ap.add_argument("--describe", action="store_true",
+                    help="with --image, also ask the model what it sees and "
+                         "print the reply — proves the pixels arrive, not "
+                         "just that the request is accepted")
     args = ap.parse_args()
 
     say("=" * 68)
@@ -180,19 +267,50 @@ def main() -> int:
     # --- the real question ------------------------------------------------
     estimate = 4096  # COMPACTOR_IMAGE_TOKENS default
     base_tok = tokenize(args.url, model, [{"type": "text", "text": PROMPT}])
-    say(f"{'image':>9}  {'REAL':>8}  {'/tokenize':>9}  {'flat 4096':>9}   verdict")
-    say("-" * 68)
+    # What to measure: real files if given, generated squares otherwise.
+    # (label, data-uri) pairs, so the loop below does not care which.
+    probes: list[tuple[str, str]] = []
+    if args.image:
+        for path in args.image:
+            try:
+                data = open(path, "rb").read()
+            except OSError as e:
+                say(f"FAIL: cannot read {path} ({e})")
+                return 2
+            mime, w, h = identify(data)
+            if not mime:
+                say(f"FAIL: {path} is not a PNG/JPEG/GIF/WebP by its magic bytes.")
+                say("      Refusing to guess a MIME type — vLLM would decode the")
+                say("      wrong format and the number would be meaningless.")
+                return 2
+            name = path.rsplit("/", 1)[-1].rsplit(chr(92), 1)[-1]
+            dims = f"{w}x{h}" if w else "?"
+            mp = f"{w * h / 1e6:.1f}MP" if w else "?"
+            say(f"  {name}: {mime}, {dims} ({mp}), {len(data) / 1024:.0f} KB")
+            probes.append(
+                (f"{name[:16]} {dims}",
+                 f"data:{mime};base64," + base64.b64encode(data).decode())
+            )
+        say("")
+    else:
+        for raw in args.sizes.split(","):
+            dim = int(raw.strip())
+            probes.append(
+                (f"{dim}px",
+                 "data:image/png;base64," + base64.b64encode(png(dim, dim)).decode())
+            )
+
+    say(f"{'image':>22}  {'REAL':>8}  {'/tokenize':>9}  {'vs 4096':>8}   verdict")
+    say("-" * 78)
     results = []
-    for raw in args.sizes.split(","):
-        dim = int(raw.strip())
-        uri = "data:image/png;base64," + base64.b64encode(png(dim, dim)).decode()
+    for label, uri in probes:
         parts = [
             {"type": "text", "text": PROMPT},
             {"type": "image_url", "image_url": {"url": uri}},
         ]
         st, body = ask(args.url, model, parts)
         if st != 200 or not isinstance(body, dict) or "usage" not in body:
-            say(f"{dim}x{dim}: REFUSED ({st})")
+            say(f"{label}: REFUSED ({st})")
             say("")
             say("  vLLM will not serve images on this build. That is the answer —")
             say("  do NOT raise COMPACTOR_MAX_RETAINED_IMAGES. The body was:")
@@ -210,9 +328,25 @@ def main() -> int:
             else "/tokenize LOW" if tk_cost is not None
             else "/tokenize n/a"
         )
-        results.append((dim, real, tk_cost))
-        say(f"{dim:>7}px  {real:>8}  {str(tk_cost):>9}  "
-            f"{real - estimate:>+9}   {verdict}")
+        results.append((label, real, tk_cost))
+        say(f"{label:>22}  {real:>8}  {str(tk_cost):>9}  "
+            f"{real - estimate:>+8}   {verdict}")
+
+        if args.describe:
+            # Acceptance is not comprehension. A backend can take the request,
+            # charge for the tokens and still hand the tower a black frame -
+            # every number above would look perfect. Asking what it sees is
+            # the only check that distinguishes "priced" from "looked at".
+            _st, _b = ask(args.url, model, [
+                {"type": "text",
+                 "text": "In one short sentence, what is in this image?"},
+                {"type": "image_url", "image_url": {"url": uri}},
+            ], max_tokens=60)
+            if _st == 200 and isinstance(_b, dict):
+                txt = _b["choices"][0]["message"]["content"].strip()
+                say(f"{'':>22}  -> {txt[:200]}")
+            else:
+                say(f"{'':>22}  -> (description failed: {_st})")
 
     say("")
     worst = max(r for _, r, _ in results)
