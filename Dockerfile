@@ -32,12 +32,25 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 # - binutils: for strip during the install/cleanup layers (~10 MB).
 # - build-essential + python3-dev: required at runtime by Triton's JIT,
 #   which compiles per-kernel C source during CUDA graph capture.
+# - postgresql-16 + postgresql-client-16: the state home (ARCHITECTURE.md
+#   Decision 4). Ubuntu 24.04's own repos carry 16+257build1.1 — no
+#   PostgreSQL APT repo needed, so this tracks Ubuntu's security patches on
+#   the same cadence as everything else in this layer.
+#   createcluster.conf is written FIRST: postgresql-common's postinst
+#   otherwise auto-creates a default cluster at /var/lib/postgresql/16/main
+#   as a side effect of installing the package, using Debian's
+#   pg_ctlcluster machinery. We manage PGDATA ourselves (entrypoint.sh runs
+#   initdb directly, on a path picked to live on local disk, not /data) —
+#   two clusters existing would be pure confusion, so the auto-create is
+#   switched off before apt ever runs.
 # - apt-get upgrade pulls in CVE patches for the base image's installed
 #   packages (gnupg2 etc.). One layer, picks up any patched versions
 #   released since the base image was published.
 # - apt-get clean + autoremove + lists prune keeps the layer slim.
-# ~200 MB total — necessary tax for vLLM on a slim base.
-RUN apt-get update && \
+# ~250 MB total — necessary tax for vLLM + Postgres on a slim base.
+RUN mkdir -p /etc/postgresql-common && \
+    printf 'create_main_cluster = false\n' > /etc/postgresql-common/createcluster.conf && \
+    apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         python3 \
@@ -50,7 +63,9 @@ RUN apt-get update && \
         libgomp1 \
         supervisor \
         binutils \
-        build-essential && \
+        build-essential \
+        postgresql-16 \
+        postgresql-client-16 && \
     apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
@@ -238,6 +253,17 @@ COPY compactor/tokenhealth.py /opt/compactor/tokenhealth.py
 COPY compactor/webuidb.py /opt/compactor/webuidb.py
 COPY compactor/logsetup.py /opt/compactor/logsetup.py
 COPY compactor/alert.py /opt/compactor/alert.py
+COPY compactor/pgarchive.py /opt/compactor/pgarchive.py
+COPY compactor/dbselect.py /opt/compactor/dbselect.py
+# The migration script is not a compactor module - it is the recovery step
+# entrypoint.sh PRINTS when it refuses to hand over to Postgres. It shipped
+# referenced but absent: the boot log said to run
+# /data/scripts/migrate-webui-sqlite-to-pg.py, nothing ever put a file
+# there, and BUILD GUARD 2 could not see it because its regex only covers
+# /opt/compactor/. So it lives here, where the guard DOES cover it, and the
+# printed instructions point at this path. The one moment anyone reads that
+# line is while trying to rescue her history under pressure.
+COPY scripts/migrate-webui-sqlite-to-pg.py /opt/compactor/migrate-webui-sqlite-to-pg.py
 
 # BUILD GUARD: every compactor module must actually be in the image.
 #
@@ -260,13 +286,15 @@ COPY compactor/alert.py /opt/compactor/alert.py
 #   - uvicorn main:app          -> main
 #   - selftest.py --on-boot     -> selftest
 #   - backup.py --daemon        -> backup
+#   - pgarchive.py --archive-loop (default) -> pgarchive
+#   - dbselect.py (invoked by entrypoint.sh)  -> dbselect
 # plus the modules those pull in transitively, which is the whole package.
 RUN cd /opt/compactor && \
     MODEL_REPO=buildguard VLLM_URL=http://127.0.0.1:1 \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
     COMPACTOR_STORAGE_ROOT=/tmp/buildguard LOG_DIR=/tmp/buildguard \
     /opt/compactor-venv/bin/python -c \
-      "import main, selftest, backup, health, commands, portability, webuidb; \
+      "import main, selftest, backup, health, commands, portability, webuidb, pgarchive, dbselect; \
        print('build guard: every compactor entrypoint imports from the image')" \
     && rm -rf /tmp/buildguard /opt/compactor/__pycache__
 
@@ -282,6 +310,37 @@ COPY tts/server.py /opt/tts/server.py
 RUN mkdir -p /var/log/supervisor
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY entrypoint.sh /entrypoint.sh
+
+# BUILD GUARD 2: every /opt/compactor script the RUNTIME references must be in
+# the image.
+#
+# The guard above catches a module nobody imports; this catches a script
+# nobody imports EITHER, because it is invoked as a subprocess. v3.1.4 went
+# FATAL in production on exactly that gap (tokenhealth.py, added to
+# summarizer.py's imports and never to the COPY list). It recurred on
+# 2026-08-31 with dbselect.py, which entrypoint.sh execs to decide WHICH
+# DATABASE holds her chat history: the image would have booted, hit
+# `eval "$(python /opt/compactor/dbselect.py ...)"`, found nothing there, and
+# failed at the one step that must not fail.
+#
+# Both times the fix was "remember to add a line", and both times the line
+# was forgotten. So this guard does not have a list to forget: it DERIVES
+# what to check from the runtime files themselves, and any new script picked
+# up by entrypoint.sh or supervisord.conf is covered the moment it is
+# referenced. Runs after both are COPY'd, which is why it is here and not
+# with the import guard above.
+RUN missing=""; \
+    for f in $(grep -ohE "/opt/compactor/[A-Za-z0-9_-]+\.py" \
+                 /entrypoint.sh /etc/supervisor/conf.d/supervisord.conf \
+               | sort -u); do \
+        [ -f "$f" ] || missing="$missing $f"; \
+    done; \
+    if [ -n "$missing" ]; then \
+        echo "BUILD GUARD FAILED - referenced at runtime, not in the image:$missing"; \
+        echo "Add a COPY line for each. This is the v3.1.4 FATAL, again."; \
+        exit 1; \
+    fi; \
+    echo "build guard: every /opt/compactor script referenced at runtime exists"
 RUN chmod +x /entrypoint.sh
 
 # Operator tool: reclaim volume space by removing stale HuggingFace model
@@ -366,6 +425,45 @@ ENV TTS_MODEL_ID="tts-1"
 ENV TTS_HOST="0.0.0.0"
 ENV TTS_PORT="9001"
 
+# =============================================================================
+# PostgreSQL — the state home (ARCHITECTURE.md Decision 4). PGDATA is on
+# LOCAL disk (the pod overlay) — the exact fix already proven for webui.db,
+# applied here BEFORE the failure ever gets a chance to happen instead of
+# after. Postgres listens on a unix socket only (unix_socket_directories,
+# set by entrypoint.sh at initdb time); there is no listen_addresses, so
+# there is no TCP port to fail. /data is used ONLY as a pg_dump archive
+# target (compactor/pgarchive.py) — never a place Postgres itself writes.
+#
+# PG_BIN: postgresql-common installs client wrappers (psql, pg_dump, ...)
+# onto PATH via /usr/bin, but NOT initdb/pg_ctl/postgres itself — those stay
+# under the versioned lib dir. entrypoint.sh needs the explicit path.
+#
+# DATABASE_URL is a plain libpq URI with an empty host component before
+# `?host=` — that is what selects the unix-socket code path over TCP.
+# Overridable: point it at a managed external Postgres later as a pure
+# connection-string change, no code change.
+# =============================================================================
+ENV PGDATA="/var/lib/postgresql/data"
+ENV PG_BIN="/usr/lib/postgresql/16/bin"
+ENV POSTGRES_USER="openwebui"
+ENV POSTGRES_DB="openwebui"
+ENV POSTGRES_SOCKET_DIR="/var/run/postgresql"
+ENV DATABASE_URL="postgresql://openwebui@/openwebui?host=/var/run/postgresql"
+
+# compactor/pgarchive.py — periodic pg_dump to /data (never a place Postgres
+# itself writes) plus restore-on-boot from the newest good archive. Disable
+# per-pod (e.g. CI containers) via COMPACTOR_PGARCHIVE_ENABLED=false, same
+# convention as COMPACTOR_BACKUP_ENABLED.
+# entrypoint.sh overrides this on every boot from which database it actually
+# selected. The default only has to keep supervisord's config load from
+# failing on an unset %(ENV_...)s, and "false" is the right default because
+# DATABASE_URL above defaults to Postgres.
+ENV WEBUIDB_SYNC_ENABLED="false"
+
+ENV COMPACTOR_PGARCHIVE_ENABLED="true"
+ENV PGARCHIVE_DIR="/data/openwebui/pg"
+ENV PGARCHIVE_INTERVAL_S="300"
+
 # OpenWebUI settings — points at the compactor, not vLLM directly
 ENV OPENWEBUI_PORT="3000"
 ENV WEBUI_SECRET_KEY=""
@@ -377,8 +475,14 @@ ENV ENABLE_OPENAI_API="true"
 ENV DATA_DIR="/data/openwebui"
 ENV WEBUI_AUTH="true"
 
-# SQLite hardening for OpenWebUI's DB, which lives on the RunPod NETWORK volume
-# (/data/openwebui/webui.db). OpenWebUI 0.11.0 defaults to WAL journal mode, but
+# SQLite hardening — now dormant by default. DATABASE_URL above points
+# OpenWebUI at Postgres, so it never opens webui.db at all; these PRAGMAs
+# only take effect if DATABASE_URL is overridden back to a sqlite:/// URL
+# (the documented rollback path — see entrypoint.sh). Left in place rather
+# than removed, since that rollback is exactly what this project's release
+# workflow calls "no hot-patches on prod": a connection-string revert, not a
+# code change. Original rationale, for whichever DB is actually in use over
+# /data (the RunPod NETWORK volume): OpenWebUI 0.11.0 defaults to WAL journal mode, but
 # SQLite's WAL needs an mmap'd shared-memory (-shm) index that network
 # filesystems don't support reliably — on a network volume WAL *causes* the
 # "database is locked" errors it's meant to avoid. So: fall back to rollback
