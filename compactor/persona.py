@@ -318,9 +318,35 @@ def auto_capture_persona(
 # Injection block formatting
 # ---------------------------------------------------------------------------
 
+# v3.1.5 — the division of labour between the four injected blocks.
+#
+# The user reported replies growing formulaic on 2026-08-31. The 08-29
+# degeneration detector was silent throughout, so this is not that failure
+# returning: it is stylistic sameness, and the cause is ours rather than the
+# model's. Every turn the model reads ~91 fact bullets, up to 1500 tokens of
+# its own verbatim past replies, and a hierarchical summary — and all four
+# block headers asked, in one wording or another, for CONSISTENCY. Three of
+# them had no business asking. Repetition was not a malfunction; it was what
+# the prompt requested.
+#
+# So each block now claims exactly one kind of authority:
+#
+#   persona    (here)          — identity and VOICE. The only block that
+#                                governs how she speaks.
+#   facts      (facts.py)      — what is TRUE.
+#   retrieval  (retrieval.py)  — what was SAID.
+#   summary    (summarizer.py) — what HAPPENED.
+#
+# And the wording is positive throughout. The 08-29 incident established
+# that naming an unwanted output puts it in context at high attention
+# weight: `DO NOT USE BOX-DRAWING CHARACTERS` sat in the system prompt for a
+# day and the model emitted 1,710 of them anyway. So these headers say what
+# each block is FOR and leave the phrasing free, rather than prohibiting
+# repetition by name.
 _PERSONA_BLOCK_HEADER = (
-    "[Persona / role context for this conversation — treat this as the "
-    "primary identity and voice you should maintain]"
+    "[Persona / role context for this conversation — this is where your "
+    "identity and voice come from. Hold the character steady; let the "
+    "phrasing vary from turn to turn.]"
 )
 
 

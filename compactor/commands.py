@@ -180,6 +180,9 @@ async def _handle_help(arg: str, conv_id: str, ctx: dict) -> str:
         "  /list-facts          Show what I'm remembering for this conversation\n"
         "  /list-archive        Show archived (cold-storage) facts\n"
         "  /remember <text>     Manually add a fact\n"
+        "  /pin <substring>     Always send matching facts, whatever the topic\n"
+        "  /pin                 List what is pinned\n"
+        "  /unpin <substring>   Stop always sending them\n"
         "  /forget              Clear ALL memory for this conversation\n"
         "  /forget <substring>  Remove only facts matching the substring\n"
         "  /tidy                Show extraction debris I could clean up "
@@ -200,7 +203,9 @@ async def _handle_list_facts(arg: str, conv_id: str, ctx: dict) -> str:
         return "No facts stored for this conversation yet."
     lines = [f"Current facts ({len(facts)}):"]
     for f in facts:
-        lines.append(f"  - {f['text']}")
+        # The pin marker is the only visible sign that ranking cannot drop
+        # this one; without it an operator cannot tell the tiers apart.
+        lines.append(f"  {'[pinned] ' if f.get('pin') else '- '}{f['text']}")
     return "\n".join(lines)
 
 
@@ -239,6 +244,59 @@ async def _handle_remember(arg: str, conv_id: str, ctx: dict) -> str:
         facts_module.save_facts(conv_id, kept)
     extra = f" (archived {dropped} least-recently-used to fit budget)" if dropped else ""
     return f"Remembered: {arg!r}{extra}\nFacts now: {len(kept)}"
+
+
+async def _handle_pin(arg: str, conv_id: str, ctx: dict) -> str:
+    """Pin facts so relevance ranking can never drop them.
+
+    F1 made fact injection top-K by relevance against the current message,
+    which is what stops a 1,500-token block of everything from being sent
+    every turn. The cost is that a fact only reaches the model when it looks
+    relevant, and identity does not: "her name is X" scores near zero on a
+    turn about dinner. Pinned facts bypass ranking and the budget entirely.
+
+    Without this command the pinned tier was unreachable code - facts.py
+    exposes set_pinned() and nothing called it - so the safety existed only
+    on paper.
+    """
+    if not arg:
+        pinned = [f for f in facts_module.load_facts(conv_id) if f.get("pin")]
+        if not pinned:
+            return (
+                "Nothing is pinned yet.\n"
+                "Usage: /pin <substring>   — always send facts matching it\n"
+                "       /unpin <substring> — stop always sending them\n"
+                "Pin the handful that must reach me every turn regardless of "
+                "topic: names, who we are to each other, standing preferences."
+            )
+        lines = [f"Pinned facts ({len(pinned)}) — always sent, never ranked:"]
+        lines += [f"  - {f['text']}" for f in pinned]
+        return "\n".join(lines)
+
+    async with conv_lock(conv_id):
+        current = facts_module.load_facts(conv_id)
+        n = facts_module.set_pinned(current, text_substring=arg, pinned=True)
+        if n:
+            facts_module.save_facts(conv_id, current)
+    if not n:
+        return f"No facts matched {arg!r}. /list-facts shows what I have."
+    return (
+        f"Pinned {n} fact(s) matching {arg!r}. They will now reach me on "
+        f"every turn, whatever we are talking about."
+    )
+
+
+async def _handle_unpin(arg: str, conv_id: str, ctx: dict) -> str:
+    if not arg:
+        return "Usage: /unpin <substring>   (/pin with no argument lists them)"
+    async with conv_lock(conv_id):
+        current = facts_module.load_facts(conv_id)
+        n = facts_module.set_pinned(current, text_substring=arg, pinned=False)
+        if n:
+            facts_module.save_facts(conv_id, current)
+    if not n:
+        return f"No pinned facts matched {arg!r}."
+    return f"Unpinned {n} fact(s) matching {arg!r}."
 
 
 async def _settle_background_work() -> bool:
@@ -1743,7 +1801,7 @@ def _retire_render_plan(
     )
     lines.append(
         "  provenance is NOT written onto the row. facts.load_facts rebuilds "
-        "every entry as exactly {text, added_turn, last_used}, so any extra "
+        "every entry as exactly {text, added_turn, last_used, pin}, so any extra "
         "key is dropped on the next read. Where each fact came from is in the "
         "snapshot and the log instead."
     )
@@ -1789,7 +1847,16 @@ def _retire_dest_projection(
     estimate this file would have to keep in step with facts.py."""
     incoming = [plan["rows"][p] for p in plan["migrate_active"]]
     after = list(dest_active) + incoming
-    injectable = len(facts_module.select_for_injection(after))
+    # The STORE cap, explicitly. select_for_injection's own default became
+    # the INJECTION cap (400) when F1 decoupled the two, so a bare call here
+    # started reporting "over budget" for virtually every real store and
+    # attaching an explanation that is no longer true - facts between the
+    # injection cap and the store cap stay active and are simply not all
+    # injected on a given turn. What this preview is actually about is what
+    # survives the MOVE, so it asks the question it means.
+    injectable = len(
+        facts_module.select_for_injection(after, max_tokens=facts_module._MAX_FACTS_TOKENS)
+    )
     return {
         "before_active": len(dest_active),
         "before_archive": len(dest_archive),
@@ -2068,6 +2135,8 @@ _HANDLERS: dict[str, Handler] = {
     "list-facts": _handle_list_facts,
     "list-archive": _handle_list_archive,
     "remember": _handle_remember,
+    "pin": _handle_pin,
+    "unpin": _handle_unpin,
     "forget": _handle_forget,
     "why": _handle_why,
     "tidy": _handle_tidy,

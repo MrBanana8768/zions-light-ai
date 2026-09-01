@@ -2086,10 +2086,22 @@ def test_a_request_with_no_prior_assistant_turn_gets_the_narrow_budget():
     # a prior assistant turn and once without.
     cid = "d3-no-history"
     persona.save_persona(cid, "PERSONA-STORE-SENTINEL " + "q" * 80, source="admin")
+    # Padding was "f" * 120 until v3.1.5, which left persona+facts costing 426
+    # against the wide budget's 400 — i.e. this fixture was passing on ~3% of
+    # headroom, and the v3.1.5 block-header reword (persona.py's
+    # _PERSONA_BLOCK_HEADER et al) tipped it over. The facts then dropped and
+    # the failure read "facts injected too", which points at the injection
+    # budget rather than at the four lines of prompt text that actually moved.
+    #
+    # The sizes here are scaffolding, not the subject: this test is about
+    # WHICH fraction the call site picks, and the sentinels only have to be
+    # big enough that the narrow budget cannot hold them. So carry real
+    # headroom, and let the block headers stay editable prompt text — they
+    # are tuned against a live user and will change again.
     facts.save_facts(
         cid,
         [
-            {"text": FACT_SENTINEL + "-" + str(i) + " " + "f" * 120,
+            {"text": FACT_SENTINEL + "-" + str(i) + " " + "f" * 60,
              "added_turn": 1, "last_used": 100}
             for i in range(3)
         ],
@@ -2111,7 +2123,11 @@ def test_a_request_with_no_prior_assistant_turn_gets_the_narrow_budget():
     assert_true(
         FACT_SENTINEL in sys_text,
         f"conversation: facts injected too — half the window is available to "
-        f"memory here: {sys_text[:200]!r}",
+        f"memory here. If this fails after an edit to a BLOCK HEADER, the "
+        f"fixture has run out of headroom rather than the code having "
+        f"regressed: check the 'injected memory over budget' line above for "
+        f"the cost against 400, and shrink the padding above. "
+        f"sys_text: {sys_text[:200]!r}",
     )
 
     _r, forwarded, records = _post_chat(no_history, cid)

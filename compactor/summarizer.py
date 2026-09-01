@@ -236,10 +236,18 @@ def _is_chunk(x: Any) -> bool:
 # Injection — format the existing summary stack as a system message
 # ---------------------------------------------------------------------------
 
+# v3.1.5 — this block's authority is over what HAPPENED, and nothing else.
+# "use them for continuity" was doing double duty: continuity of events is
+# wanted, continuity of phrasing is not, and the header did not distinguish
+# them. Naming it as background the model already holds also discourages
+# recapping it back at the user, which is its own species of repetition. See
+# persona.py's _PERSONA_BLOCK_HEADER for the division of labour between the
+# four injected blocks.
 _BLOCK_HEADER = (
     "[Hierarchical summary of earlier portions of this conversation, ordered "
-    "by recency — use them for continuity. Older summaries are denser; the "
-    "L3 line (if present) is the whole-conversation theme.]"
+    "by recency — background you already hold, for continuity of events. "
+    "Older summaries are denser; the L3 line (if present) is the "
+    "whole-conversation theme.]"
 )
 
 

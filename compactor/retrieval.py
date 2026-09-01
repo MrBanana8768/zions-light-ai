@@ -663,9 +663,18 @@ def import_indexed_exchange(conv_id: str, turn_index: int, document: str) -> boo
 # Injection block
 # ---------------------------------------------------------------------------
 
+# v3.1.5 — this block's authority is over what was SAID, and nothing else.
+# It is the strongest phrase-copying feed in the whole prompt: up to 1500
+# tokens of the model's OWN verbatim past replies, previously introduced as
+# something to "use for continuity". Shown its own prose and asked for
+# continuity, a model continues in exactly that voice, down to whole reused
+# phrases. Recall is the part worth keeping; the voice is not. See
+# persona.py's _PERSONA_BLOCK_HEADER for the division of labour between the
+# four injected blocks.
 _RETRIEVAL_BLOCK_HEADER = (
     "[Relevant earlier exchanges from this conversation, retrieved by "
-    "similarity — use them for continuity and exact recall]"
+    "similarity — use them for accurate recall of what happened. Say the "
+    "next thing in your own words.]"
 )
 
 _TRUNCATION_NOTE = "\n[...truncated to fit the retrieval budget]"

@@ -38,11 +38,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import facts
 import memory
@@ -436,6 +437,305 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
         "persona": bool(back_q.get("persona")),
         "unverified_layers": unverified,
     }
+
+
+# ---------------------------------------------------------------------------
+# Test/placeholder conversation cleanup — V3.1.4 N6 store pollution
+# ---------------------------------------------------------------------------
+#
+# Production carries 129 "conversations" for ~26 real ones (2026-08-30 log
+# analysis). The ~103 extras are tooling artifacts, not user activity, and
+# they inflate /admin/conversations, the health stats, and every backup
+# archive (backup.py's copytree(STORAGE_ROOT) copies them right alongside
+# real memory). Three sources:
+#
+#   1. `CLONE_CONV_ID_HERE` — INCIDENT_2026-08-24 L6/D7: a runbook
+#      placeholder pasted into a command unsubstituted. memory._sanitize is
+#      a filename filter, not a validator ([^A-Za-z0-9_\-] stripped, nothing
+#      rejected), so the literal string passed straight through and became
+#      a real store key. Exact literal match only — this is one specific
+#      known-bad id, not a shape.
+#   2. `__selftest_oneshot_<8 lowercase hex>__` — minted at
+#      selftest.py:307: `f"__selftest_oneshot_{uuid.uuid4().hex[:8]}__"`.
+#      One per boot before F23 (v3.1) fixed the delete/tail race that
+#      orphaned them; F23 stopped new ones, it did nothing about the ones
+#      it predates. NOT `__selftest__` (selftest.py:70) — that sentinel's
+#      own round trip purges its files on both sides (`_purge_conv_files`
+#      before and after) and isn't named in the N6 pollution count, so
+#      matching it here would be inventing a fourth pattern nothing asked
+#      for.
+#   3. `itest-<hex>` and its descriptive variants — minted at
+#      tests/integration/_harness.py:131: `f"itest-{uuid.uuid4().hex[:12]}"`,
+#      and at individual call sites with a descriptive segment before the
+#      hex, e.g. tests/integration/test_dedup.py:
+#      `f"itest-dedup-{uuid.uuid4().hex[:8]}"`, test_persona.py:
+#      `f"itest-persona-src-{uuid.uuid4().hex[:8]}"`, test_archive.py,
+#      test_portability.py similarly. Every one of them is the literal
+#      `itest-`, zero or more lowercase `word-` segments, then a trailing
+#      run of lowercase hex (uuid4().hex is always lowercase 0-9a-f) 6 to
+#      16 characters long (the shortest seen is test_portability.py's
+#      `hex[:6]`, the longest the harness default `hex[:12]`; 16 leaves
+#      headroom without opening the pattern up to arbitrary trailing text).
+#
+# A pattern match is a HYPOTHESIS, not a verdict — two independent refusals:
+#
+#   - a conv_id that matches none of the three shapes above is never a
+#     candidate. There is no "probably a test id" tier and no fuzzy
+#     matching; a real conv_id is a UUID (header/body-metadata path) or a
+#     16-hex sha256 prefix (hash-fallback path, memory._fingerprint_hash) —
+#     neither shape starts with `itest-` or `__selftest_oneshot_` or equals
+#     `CLONE_CONV_ID_HERE` by construction, so this signal does not degrade
+#     as the store grows.
+#   - a conv_id that DOES match is still refused (kept, never quarantined
+#     or wiped) if it holds more than a token amount of memory. A real id
+#     colliding with a test pattern is exactly the scenario the sanitizer
+#     already proved possible once (CLONE_CONV_ID_HERE itself), so the
+#     pattern alone is not trusted to carry the decision. See
+#     _SUBSTANTIAL_* below for the threshold and its evidence.
+
+# Exact literal only — see point 1 above.
+CLONE_PLACEHOLDER_CONV_ID = "CLONE_CONV_ID_HERE"
+
+_SELFTEST_ONESHOT_RE = re.compile(r"^__selftest_oneshot_[0-9a-f]{8}__$")
+
+_ITEST_RE = re.compile(r"^itest-(?:[a-z]+-)*[0-9a-f]{6,16}$")
+
+# Below this, a matched conv_id's CONTENT still looks test-shaped and is
+# safe to remove; at or above it, the id is kept regardless of which
+# pattern matched. Evidence for where the line goes:
+#   - real conversations: INCIDENT_2026-08-24 L6 measured 105-106 facts and
+#     ~85-98 indexed exchanges for a real conversation. test_conv_fork.py's
+#     production case is the same order of magnitude (106 facts, ~85
+#     indexed).
+#   - test conversations: the richest seed in the whole integration suite
+#     is 3 facts (tests/integration/test_dedup.py,
+#     test_dedup_merges_seeded_duplicates_via_import) and
+#     tests/integration/test_archive.py's largest fixture is also 3 facts.
+#     Every other integration fixture seeds 0-2.
+# 10 sits above every real integration-test fixture by more than 3x and
+# below every measured real conversation by more than 8x, so a
+# mismeasurement in either direction lands on the correct side of the line.
+SUBSTANTIAL_FACTS = 10
+SUBSTANTIAL_ARCHIVED_FACTS = 10
+SUBSTANTIAL_EPISODIC = 10
+
+
+def _test_conv_match_reason(conv_id: str) -> str | None:
+    """Which pattern conv_id matches, or None if it matches none of them.
+
+    Order doesn't matter — the three shapes are disjoint by construction
+    (one is a fixed literal, one starts `__`, one starts `itest-`).
+    """
+    if conv_id == CLONE_PLACEHOLDER_CONV_ID:
+        return "runbook placeholder literal (CLONE_CONV_ID_HERE)"
+    if _SELFTEST_ONESHOT_RE.match(conv_id):
+        return "selftest.py one-shot round-trip sentinel (__selftest_oneshot_*)"
+    if _ITEST_RE.match(conv_id):
+        return "tests/integration harness sentinel (itest-*)"
+    return None
+
+
+def _substantial_reasons(conv_id: str) -> list[str]:
+    """Why a pattern-matched conv_id must be KEPT, if any. Empty means it
+    is safe to remove.
+
+    Every layer that can hold real memory is checked, and an unreadable
+    layer counts as substantial rather than as empty — the failure mode of
+    a cleanup tool guessing "empty" on a read error is a silent real-data
+    delete, which is the one outcome this whole facility exists to prevent
+    (same rule quarantine_conversation applies: StoreUnreadable must abort,
+    never be read as zero).
+    """
+    reasons: list[str] = []
+
+    try:
+        n_facts = len(facts.load_facts(conv_id))
+    except Exception as e:
+        reasons.append(f"facts layer unreadable ({e}) — treated as substantial")
+    else:
+        if n_facts > SUBSTANTIAL_FACTS:
+            reasons.append(f"{n_facts} active fact(s) (> {SUBSTANTIAL_FACTS})")
+
+    try:
+        n_archived = len(facts.load_archive(conv_id))
+    except Exception as e:
+        reasons.append(f"archive sidecar unreadable ({e}) — treated as substantial")
+    else:
+        if n_archived > SUBSTANTIAL_ARCHIVED_FACTS:
+            reasons.append(f"{n_archived} archived fact(s) (> {SUBSTANTIAL_ARCHIVED_FACTS})")
+
+    n_episodic = retrieval.conversation_doc_count(conv_id)
+    if n_episodic is None:
+        # None means "could not tell" (F61), never zero — treated the same
+        # as an unreadable layer above.
+        reasons.append("episodic layer unreadable (vector store unavailable) — treated as substantial")
+    elif n_episodic > SUBSTANTIAL_EPISODIC:
+        reasons.append(f"{n_episodic} indexed exchange(s) (> {SUBSTANTIAL_EPISODIC})")
+
+    try:
+        persona_record = persona.load_persona(conv_id)
+    except Exception as e:
+        reasons.append(f"persona layer unreadable ({e}) — treated as substantial")
+    else:
+        if persona_record:
+            reasons.append("has a stored persona")
+
+    try:
+        summary_state = summarizer.load_state(conv_id)
+    except Exception as e:
+        reasons.append(f"summary layer unreadable ({e}) — treated as substantial")
+    else:
+        if _has_summary_content(summary_state):
+            reasons.append("has summary state (L1/L2/L3)")
+
+    return reasons
+
+
+def find_test_conversations() -> list[dict]:
+    """Scan every known conv_id and classify it. Read-only — never mutates
+    anything, so it is always safe to call for a dry-run report.
+
+    Returns one dict per PATTERN MATCH (conv_ids that match nothing are not
+    in the list at all):
+        {"conv_id", "pattern", "safe_to_remove", "reasons_kept"}
+    `reasons_kept` is empty exactly when `safe_to_remove` is True.
+    """
+    out: list[dict] = []
+    for conv_id in memory.list_known_conv_ids():
+        reason = _test_conv_match_reason(conv_id)
+        if reason is None:
+            continue
+        kept_because = _substantial_reasons(conv_id)
+        out.append(
+            {
+                "conv_id": conv_id,
+                "pattern": reason,
+                "safe_to_remove": not kept_because,
+                "reasons_kept": kept_because,
+            }
+        )
+    return out
+
+
+async def cleanup_test_conversations(
+    *,
+    dry_run: bool = True,
+    wipe_layers: Callable[[str], Awaitable[dict]] | None = None,
+) -> dict:
+    """Find, and optionally remove, test/placeholder conversations.
+
+    dry_run=True (the default, and the only mode that runs without
+    `wipe_layers`): reports every pattern match — which pattern, and
+    whether it would be removed or kept and why — and touches nothing.
+
+    dry_run=False: for every match with safe_to_remove=True,
+    quarantine_conversation() first — writes and VERIFIES a restorable
+    snapshot, raising QuarantineError if it cannot prove the snapshot holds
+    what the store held a moment ago — and only on success is
+    `wipe_layers(conv_id)` awaited to actually clear the conversation. A
+    quarantine failure for one conv_id is logged and recorded in
+    "errors"; it does not touch that conv_id and does not stop the batch.
+    Nothing is ever unlinked directly — quarantine-then-wipe is the same
+    reversible path /forget and the admin facts-delete endpoint use.
+
+    Matches that are NOT safe_to_remove are always listed under "kept",
+    dry-run or not, and are never quarantined or wiped — matching a
+    pattern is necessary, never sufficient (see the module comment above).
+
+    `wipe_layers` is injected rather than imported, the same way
+    commands.py takes a `clear_all_memory` callable through its ctx dict
+    instead of importing main.py: main.py already imports this module, so
+    portability importing back from main (or from commands, which itself
+    imports portability) would be a cycle. Wire it in main.py to
+    commands._wipe_all_layers bound to _clear_all_memory, e.g.:
+
+        async def _wipe(conv_id: str) -> dict:
+            return await commands._wipe_all_layers(
+                conv_id, lambda cid: _clear_all_memory(cid, source="cleanup")
+            )
+        await portability.cleanup_test_conversations(
+            dry_run=dry_run, wipe_layers=_wipe
+        )
+
+    That gives the cleanup the same archive-sidecar clear and empty-facts
+    tombstone a normal /forget leaves — not just _clear_all_memory's three
+    layers.
+    """
+    if not dry_run and wipe_layers is None:
+        raise ValueError(
+            "wipe_layers is required when dry_run=False — see this "
+            "function's docstring for what to wire it to"
+        )
+
+    matches = find_test_conversations()
+    removable = [m for m in matches if m["safe_to_remove"]]
+    kept = [m for m in matches if not m["safe_to_remove"]]
+
+    result: dict[str, Any] = {
+        "dry_run": dry_run,
+        "scanned": len(memory.list_known_conv_ids()),
+        "matched": len(matches),
+        "removable": len(removable),
+        "kept": [
+            {"conv_id": m["conv_id"], "pattern": m["pattern"], "reasons": m["reasons_kept"]}
+            for m in kept
+        ],
+        "removed": [],
+        "errors": [],
+    }
+    if dry_run:
+        result["would_remove"] = [
+            {"conv_id": m["conv_id"], "pattern": m["pattern"]} for m in removable
+        ]
+        return result
+
+    for m in removable:
+        conv_id = m["conv_id"]
+        try:
+            snapshot = quarantine_conversation(
+                conv_id, reason=f"N6 cleanup: {m['pattern']}"
+            )
+        except Exception as e:
+            logger.error(
+                f"conv={conv_id}: cleanup quarantine failed, LEAVING IN PLACE: {e}"
+            )
+            result["errors"].append(
+                {"conv_id": conv_id, "stage": "quarantine", "error": str(e)}
+            )
+            continue
+
+        try:
+            wipe_result = await wipe_layers(conv_id)
+        except Exception as e:
+            logger.error(
+                f"conv={conv_id}: cleanup wipe failed AFTER a verified quarantine "
+                f"snapshot was written to {snapshot['path']} — the snapshot is "
+                f"safe, the conversation itself was not cleared: {e}"
+            )
+            result["errors"].append(
+                {
+                    "conv_id": conv_id,
+                    "stage": "wipe",
+                    "error": str(e),
+                    "quarantine_path": str(snapshot["path"]),
+                }
+            )
+            continue
+
+        logger.info(
+            f"conv={conv_id}: cleanup removed ({m['pattern']}); "
+            f"quarantine={snapshot['path']}"
+        )
+        result["removed"].append(
+            {
+                "conv_id": conv_id,
+                "pattern": m["pattern"],
+                "quarantine_path": str(snapshot["path"]),
+                "wipe": wipe_result,
+            }
+        )
+
+    return result
 
 
 # ---------------------------------------------------------------------------

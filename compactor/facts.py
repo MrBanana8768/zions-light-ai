@@ -8,41 +8,58 @@ Storage shape on disk (one JSON file per conversation):
       "facts": [
         { "text": "Protagonist is Lyra, half-elf ranger, age 23.",
           "added_turn": 5,
-          "last_used": 1748419200 },
+          "last_used": 1748419200,
+          "pin": false },
         ...
       ]
     }
 
 Each fact is one short bullet extracted by the LLM from a single exchange
 (user message + assistant response). Facts are appended over time; LRU
-eviction by `last_used` keeps the injected block under
-COMPACTOR_MAX_FACTS_TOKENS. Eviction MOVES facts to the archive sidecar —
-it does not delete them (v3.1 F9).
+eviction by `last_used` keeps the STORE under COMPACTOR_MAX_FACTS_TOKENS.
+Eviction MOVES facts to the archive sidecar — it does not delete them
+(v3.1 F9).
+
+v3.1.4 F1 — the store cap and the INJECTED block are separate budgets as of
+this release, not one knob doing two jobs. COMPACTOR_MAX_FACTS_TOKENS still
+bounds what prune_facts keeps on disk; COMPACTOR_INJECT_FACTS_TOKENS (new,
+much smaller — target ~300-400 tokens) bounds what select_for_injection puts
+in THIS turn's prompt. select_for_injection ranks the non-pinned facts by
+relevance to the current turn (reusing retrieval.py's CPU-only bge-small
+embedder) rather than injecting the whole store, and a `pin`-flagged
+identity-tier fact always makes it in regardless of ranking or budget. See
+select_for_injection's own docstring for the full mechanism and its
+graceful-degradation contract.
 
 Lifecycle:
-  1. Request arrives → load_facts(conv_id) → select_for_injection() → inject
-     the selected subset as a system block
+  1. Request arrives → load_facts(conv_id) → select_for_injection(query_text=
+     <this turn's text>) → inject the selected subset as a system block
   2. Mark ONLY the injected subset as `last_used = now` (LRU tracking).
      Touching the whole store is what made `last_used` uniform across every
      fact, which collapsed the eviction sort key onto `added_turn` and made
      "LRU" mean "drop the conversation's oldest, most foundational facts"
-     (v3.1 F9).
+     (v3.1 F9) — injecting only the top-K-relevant-plus-pinned subset (F1)
+     is what keeps that touch meaningfully selective turn over turn, instead
+     of everything being "recently used" because everything was injected.
   3. After response streams back → extract_facts_from_exchange() in async tail.
      Its INPUT is budgeted too (_fit_extraction_input): the store it is handed
      may be the whole file, and the reply it is handed is unbounded.
-  4. Append new facts → prune to budget (archiving the evictions) → save_facts()
+  4. Append new facts → prune to the STORE budget (archiving the evictions,
+     COMPACTOR_MAX_FACTS_TOKENS — unrelated to the injection budget above) →
+     save_facts()
 
 All file writes go through memory.atomic_write_json() for crash safety.
 All read/write pairs are serialized per-conv via memory.conv_lock().
 """
 
 import logging
+import math
 import os
 import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -56,6 +73,18 @@ from memory import (
     read_json_strict,
 )
 
+# v3.1.4 F1. retrieval.py does not import this module (directly or
+# transitively — its only local import is `from memory import
+# STORAGE_ROOT`), so there is no cycle: dedup.py already imports BOTH
+# `facts as facts_module` and `retrieval as retrieval_module` side by side
+# and that has never been a problem. Mirrors dedup.py's own import exactly,
+# including the reason retrieval.py's import is always cheap and safe: the
+# heavy deps (fastembed, chromadb) are lazy-imported inside
+# retrieval._try_init(), never at module import time, so `import retrieval`
+# itself cannot fail or block. Ranking still degrades gracefully if THAT
+# lazy init fails later — see _relevance_order.
+import retrieval as retrieval_module
+
 logger = logging.getLogger("compactor.facts")
 
 
@@ -63,10 +92,54 @@ logger = logging.getLogger("compactor.facts")
 # Configuration (env-overridable)
 # ---------------------------------------------------------------------------
 
-# Approximate token budget for the facts block injected into every request.
-# We use char/4 as a fast estimator — precision doesn't matter for a soft
-# cap. ~1500 tokens ≈ 6000 chars ≈ 100-150 short bullets.
+# v3.1.4 F1 — two knobs, two jobs. Through v3.1.3 COMPACTOR_MAX_FACTS_TOKENS
+# was BOTH of these at once: prune_facts' STORE cap (how much a conversation
+# may remember, active-set-on-disk) and select_for_injection's INJECTION cap
+# (how much goes into every single prompt). Because the injection cap equaled
+# the store cap, the entire active set was injected every turn, so the entire
+# active set was TOUCHED every turn (see touch_facts), so `last_used` carried
+# no signal at all and LRU eviction collapsed onto `added_turn` — N3's
+# measured 70% FIFO churn (5,341 extracted, 3,714 evicted) selecting for
+# nothing but age. See select_for_injection's docstring for the fix.
+#
+# Deliberately NOT derived from each other in either direction: the deploy is
+# about to raise the store cap from 1500 to ~3000-6000 (N3/F1 part 3), and an
+# injection default computed as some fraction of the store cap would silently
+# re-grow the injected block right along with it, reproducing the exact
+# coupling this split exists to remove. Each is an independent, absolute
+# token count with its own sane fallback if the operator sets neither.
+
+# STORE cap. How much a conversation may remember, active-set-on-disk.
+# prune_facts' default budget. We use char/4 as a fast estimator — precision
+# doesn't matter for a soft cap. ~1500 tokens ≈ 6000 chars ≈ 100-150 short
+# bullets.
 _MAX_FACTS_TOKENS = int(os.environ.get("COMPACTOR_MAX_FACTS_TOKENS", "1500") or 1500)
+
+# INJECTION cap. How much goes into THIS turn's prompt. select_for_injection's
+# default budget. Small enough that only what's actually relevant to the
+# current turn (plus the pinned identity tier, see select_for_injection) gets
+# touched, which is what gives `last_used` a real recency signal again.
+# Independent of _MAX_FACTS_TOKENS by design — see the block comment above.
+#
+# 800 -> 400 in v3.1.5. F1 part 1 specified 300-400 and main.py's call site
+# has documented the default as 400 since it landed; 800 was a v3.1.4 review
+# value that the surrounding comments were never updated to match, so the
+# code and its own documentation disagreed until now.
+#
+# 400 is what the user asked for on 2026-08-31, reporting replies had gone
+# formulaic. Production was injecting a median of 91 fact bullets per turn
+# (p90 103, max 179) under a header that asked the model to maintain
+# consistency with them — see persona.py's _PERSONA_BLOCK_HEADER for the
+# header half of that fix. Halving the budget matters less than what the
+# ranking then does with it: because main.py passes query_text at both call
+# sites, the surviving ~26 are the ones THIS turn is about, so the block
+# rotates with the topic instead of presenting the same 91 lines every turn.
+# Without that wiring this change would be strictly worse than 800 — it would
+# keep a fixed most-recently-used prefix forever — which is why
+# test_facts_wiring.py exists.
+_INJECT_FACTS_TOKENS = int(
+    os.environ.get("COMPACTOR_INJECT_FACTS_TOKENS", "400") or 400
+)
 
 # Max tokens the LLM produces per extraction call. Each call should yield
 # at most a handful of bullets, so this is intentionally tight.
@@ -216,10 +289,29 @@ def extraction_enabled() -> bool:
 
 # A fact is a dict — using TypedDict-style for clarity but plain dict for
 # JSON round-trip simplicity.
-#   { "text": str, "added_turn": int, "last_used": int (unix ts) }
+#   { "text": str, "added_turn": int, "last_used": int (unix ts),
+#     "pin": bool }
 #
 # `last_used`: unix seconds, set by touch_facts() on the facts INJECTED into
 # a turn. One unit, one writer. Safe to compare across facts.
+#
+# `pin`: v3.1.4 F1 part 2. True marks an identity-tier fact (who she is, who
+# the owner is to her, a standing preference) that select_for_injection must
+# ALWAYS include, bypassing relevance ranking and the token budget entirely
+# — top-K-by-relevance alone can drop "her name is X" on a turn about dinner,
+# which is the "she forgot me" failure wearing a relevance-scoring hat.
+# Defaults to False; absent on every record written before this field
+# existed, and load_facts/load_archive/restore_from_archive all read it via
+# `.get("pin", False)` so old records load exactly as before. Set with
+# set_pinned(); reached from the /pin and /unpin commands in commands.py,
+# and shown as "[pinned]" by /list-facts.
+#
+# A pinned fact is, by construction, in select_for_injection's output on
+# EVERY turn (never excluded by budget or by ranking), so it is touched on
+# every turn too (main.py touches only what was injected — v3.1 F9). That
+# alone is what keeps prune_facts' plain LRU from ever choosing a pinned
+# fact as an eviction candidate: no special case needed in prune_facts or
+# _lru_split, the store cap's eviction policy is UNCHANGED by this field.
 #
 # `added_turn`: NOT one unit. Do not compare two facts' added_turn unless you
 # know they came from the same writer. Unifying it is the D1 identity work;
@@ -294,6 +386,10 @@ def load_facts(conv_id: str) -> list[dict]:
                 "text": f["text"],
                 "added_turn": int(f.get("added_turn", 0)),
                 "last_used": int(f.get("last_used", 0)),
+                # v3.1.4 F1: absent on every record written before this field
+                # existed (`.get(..., False)` — see the fact-shape comment
+                # above), so an old store round-trips as entirely unpinned.
+                "pin": bool(f.get("pin", False)),
             })
     return valid
 
@@ -352,6 +448,12 @@ def load_archive(conv_id: str) -> list[dict]:
                 "added_turn": int(f.get("added_turn", 0)),
                 "last_used": int(f.get("last_used", 0)),
                 "archived_at": int(f.get("archived_at", 0)),
+                # v3.1.4 F1: a pinned fact can still land in the sidecar via
+                # the time-based sweep (archive_stale_facts) — pin exempts a
+                # fact from injection ranking, not from that separate,
+                # unchanged policy — so the pin has to survive the trip
+                # there and back via restore_from_archive.
+                "pin": bool(f.get("pin", False)),
             })
     return valid
 
@@ -458,6 +560,7 @@ def restore_from_archive(
             "text": f["text"],
             "added_turn": f.get("added_turn", 0),
             "last_used": now,
+            "pin": bool(f.get("pin", False)),
         }
         for f in to_restore
     ]
@@ -547,7 +650,31 @@ def _lru_split(
 
     body_budget = max_tokens - _FACTS_BLOCK_HEADER_TOKENS
     # Sort by last_used ascending (oldest first), then by added_turn for stability
-    sorted_facts = sorted(facts, key=lambda f: (f["last_used"], f["added_turn"]))
+    # PINNED FACTS SORT LAST, i.e. they are evicted last of all. The
+    # fact-shape note above used to argue that a pin needs no eviction
+    # exemption because a pinned fact is injected every turn and therefore
+    # always freshly touched. Measured false in two windows:
+    #
+    #   1. /pin sets the flag but not last_used, so pinning a STALE fact
+    #      leaves it an eviction candidate until its first protected
+    #      injection - and the extraction tail can prune in between.
+    #   2. Touch is conditional on the facts layer surviving
+    #      _bound_injected_blocks (main.py), which drops whole layers; the
+    #      production logs show 87 over-budget drops in one window. A pinned
+    #      fact ages normally across those turns.
+    #
+    # Repro before this fix: a pinned fact with a stale last_used, against
+    # 200 fresh facts, was archived - silently no longer injected, which is
+    # identity loss with no error. Recoverable from the sidecar, but nothing
+    # would have said so.
+    #
+    # The exemption is in the SORT rather than a separate carve-out so
+    # injection and eviction still read the same ordering - the invariant
+    # this function exists to hold.
+    sorted_facts = sorted(
+        facts,
+        key=lambda f: (bool(f.get("pin")), f["last_used"], f["added_turn"]),
+    )
     kept_reversed: list[dict] = []
     running = 0
     # Walk from most-recently-used backward, keeping facts that fit. This
@@ -580,11 +707,203 @@ def _lru_split(
     return kept, evicted
 
 
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity. Doesn't assume inputs are pre-normalized — same
+    reasoning and same shape as dedup._cosine; duplicated rather than
+    imported because dedup.py imports facts.py already (facts_module) and
+    reaching back the other way for one four-line function is not worth
+    inventing a shared-utility module for.
+    """
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _relevance_order(
+    candidates: list[dict],
+    query_text: str | None,
+    embedder: Callable[[list[str]], list[list[float]] | None] | None,
+) -> list[dict] | None:
+    """Return `candidates` sorted best-match-first against `query_text`, or
+    None when ranking cannot run (no query, no embedder, embedding failed,
+    or a result shaped wrong) — callers degrade to LRU order on None.
+
+    One batched embedding call for the query AND every candidate's text
+    together (`[query_text] + texts`), matching dedup._embed_facts' batching
+    reasoning: fastembed/bge-small is CPU-milliseconds either way, but one
+    call is still cheaper than two, and it means the query and the facts are
+    embedded by the exact same call, not two that could observe the
+    embedder in different states.
+
+    `embedder` lets a caller (or a test) supply its own — see
+    select_for_injection's docstring on why this exists ALONGSIDE the direct
+    `import retrieval` at the top of this module rather than instead of it.
+    """
+    if not query_text or not candidates:
+        return None
+    embed_fn = embedder if embedder is not None else retrieval_module._embed
+    texts = [f.get("text", "") or "" for f in candidates]
+    if not all(texts):
+        # Defensive, same as dedup._embed_facts: an empty text would embed
+        # as "" and cluster/score meaninglessly against everything.
+        return None
+    try:
+        vecs = embed_fn([query_text] + texts)
+    except Exception as e:
+        logger.warning(
+            f"facts relevance ranking: embedder raised ({e}); falling back "
+            f"to LRU for this turn — chat is unaffected"
+        )
+        return None
+    if not vecs or len(vecs) != len(texts) + 1:
+        # retrieval._embed's own contract: None on failure. A short list
+        # would be a caller-supplied embedder that dropped rows silently —
+        # treat it exactly the same as unavailable rather than guess which
+        # rows are missing.
+        return None
+    query_vec, fact_vecs = vecs[0], vecs[1:]
+    scored = list(zip(candidates, fact_vecs))
+    # Stable sort: candidates already carry the store's added_turn order, so
+    # equal-scoring facts (all-zero mock vectors in a test, or a genuine
+    # exact tie) keep that order rather than an arbitrary one.
+    scored.sort(key=lambda pair: _cosine(query_vec, pair[1]), reverse=True)
+    return [f for f, _vec in scored]
+
+
+def _greedy_fill_by_priority(
+    priority: list[dict], bullets_budget: int
+) -> list[dict]:
+    """Keep facts from `priority` (already ordered best-first) greedily
+    until the summed PER-FACT bullet cost would exceed `bullets_budget` —
+    a budget for the rendered "- <text>\\n" lines ALONE, no header. Same
+    per-fact-floor approximation _lru_split uses (and the same reason: fast,
+    and the caller settles against the real combined render afterward,
+    because a sum of floors can under-count once enough facts accumulate).
+
+    Restores added_turn order in the result — same convention as
+    _lru_split's `kept` — so injection order doesn't reshuffle with every
+    turn's ranking.
+    """
+    if bullets_budget <= 0:
+        return []
+    kept: list[dict] = []
+    running = 0
+    for f in priority:
+        cost = _fact_bullet_tokens(f["text"])
+        if running + cost <= bullets_budget:
+            kept.append(f)
+            running += cost
+    return sorted(kept, key=lambda f: f["added_turn"])
+
+
+def _settle_against_budget(
+    pinned: list[dict], selected_rest: list[dict], max_tokens: int
+) -> list[dict]:
+    """Trim `selected_rest` until `pinned + selected_rest` actually renders
+    within `max_tokens`, then return the combined list.
+
+    Same principle _lru_split's own settle step uses for its per-fact-floor
+    approximation: a sum of per-fact floors is always <= the floor of their
+    true combined length, so `_greedy_fill_by_priority`'s fast walk can
+    under-count by a token or two once enough bullets accumulate, letting
+    the real block land a token over `max_tokens` even though the
+    approximation said it fit. `pinned` is untouched — pinned facts never
+    yield to this settle step (see select_for_injection's docstring: the
+    only case a pinned fact goes unrendered is pinned-alone-over-budget,
+    handled before this is ever called).
+
+    `selected_rest` is in added_turn order (see _greedy_fill_by_priority),
+    not lowest-priority-last order — re-deriving true priority order here
+    is overkill for a settle step that only ever trims a token or two of
+    slop, so this drops the last (highest added_turn) survivor each round,
+    the same bounded-iteration convergence _lru_split's own settle loop
+    relies on.
+    """
+    while selected_rest and _estimate_tokens(
+        format_facts_block(pinned + selected_rest)
+    ) > max_tokens:
+        selected_rest = selected_rest[:-1]
+    return pinned + selected_rest
+
+
+def _select_rest(
+    candidates: list[dict],
+    bullets_budget: int,
+    query_text: str | None,
+    embedder: Callable[[list[str]], list[list[float]] | None] | None,
+) -> list[dict]:
+    """Select from the NON-pinned facts against a bullets-only budget (no
+    header — the header is accounted once by select_for_injection). Ranks by
+    relevance to `query_text` when possible; degrades to LRU order (most-
+    recently-used first, same key _lru_split sorts eviction by) otherwise —
+    covers "no query_text", "no embedder available", and "embedding call
+    failed" with one fallback path.
+    """
+    if not candidates or bullets_budget <= 0:
+        return []
+    priority = _relevance_order(candidates, query_text, embedder)
+    if priority is None:
+        priority = sorted(
+            candidates, key=lambda f: (f["last_used"], f["added_turn"]), reverse=True
+        )
+    return _greedy_fill_by_priority(priority, bullets_budget)
+
+
+# The pin guarantee's REAL contract, stated once here because the docstring
+# below promises "always injected" and one layer up can still void it:
+# main._bound_injected_blocks drops WHOLE LAYERS when the combined injection
+# budget is exceeded, and facts is priority 2 of 4. So over-pinning converts
+# "a slightly oversized facts block" into "no facts at all this turn, pinned
+# included" - the opposite of the intent. Pin the handful that must always
+# land, not everything that seems important.
 def select_for_injection(
     facts: list[dict],
-    max_tokens: int = _MAX_FACTS_TOKENS,
+    max_tokens: int = _INJECT_FACTS_TOKENS,
+    *,
+    query_text: str | None = None,
+    embedder: Callable[[list[str]], list[list[float]] | None] | None = None,
 ) -> list[dict]:
     """Return the subset of `facts` to inject into this turn's prompt.
+
+    v3.1.4 F1. Two tiers:
+
+      1. PINNED facts (`f["pin"]` truthy — see the fact-shape comment near
+         the top of this module) are ALWAYS included, bypassing ranking and
+         the budget split entirely. Only when the pinned set alone costs
+         MORE than `max_tokens` does this go over budget — deliberately: a
+         dropped identity fact is the "she forgot me" failure this tier
+         exists to prevent, and that failure is worse than a slightly
+         oversized system block. Logged when it happens.
+      2. The REST is ranked against `query_text` (typically the current
+         user turn) using the SAME bge-small embedding retrieval.py already
+         computes for episodic retrieval — `retrieval._embed`, CPU-only,
+         milliseconds, no GPU, no new dependency — and the top-scoring facts
+         that fit the remaining budget are kept. `embedder` overrides which
+         embedding function is used (tests use this instead of
+         monkeypatching `retrieval._embed`, though `patch.object(retrieval,
+         "_embed", ...)` — this module's own import of retrieval, mirroring
+         dedup.py's — works too).
+
+    GRACEFUL DEGRADATION, exactly as this codebase's other embedding
+    consumer (retrieval.py's own docstring: "Everything degrades to a safe
+    no-op"):
+      - `query_text=None` (the default — EVERY caller that has not been
+        updated to pass the current turn's text) → no ranking is attempted.
+        With no pinned facts either, this is BYTE-FOR-BYTE the pre-F1
+        behaviour: `_lru_split(facts, max_tokens)`'s kept half, nothing
+        else. This is the fast path taken on every call site until main.py
+        is updated to pass `query_text=<current user turn>` — see this
+        module's F1 report for the exact one-line change.
+      - `query_text` given but embedding unavailable/fails this turn → the
+        REST falls back to LRU order (most-recently-used first), same as
+        before. Chat is never blocked or broken by a memory-ranking
+        failure.
+      - Pinned facts present → always included regardless of either case
+        above; only the REST's selection method depends on query_text/
+        embedder availability.
 
     Callers touch (and only touch) what this returns. That is what gives
     `last_used` any signal at all: while the store fits the budget this is
@@ -592,13 +911,63 @@ def select_for_injection(
     not — which is exactly when eviction starts choosing — the facts left
     out stop being refreshed and become the eviction candidates, instead of
     every fact carrying an identical timestamp and eviction falling through
-    to added_turn (v3.1 F9).
+    to added_turn (v3.1 F9). Ranking by relevance instead of injecting
+    everything is what makes that happen in practice, not just in theory —
+    only what's actually relevant (plus what's pinned) gets touched, so LRU
+    finally selects for "keeps mattering" instead of "was added early."
 
     The returned dicts are the SAME objects as the ones passed in, so
     touch_facts() on this subset updates them in the caller's full list too.
     """
-    kept, _ = _lru_split(facts, max_tokens)
-    return kept
+    if not facts:
+        return []
+
+    pinned = sorted(
+        (f for f in facts if f.get("pin")), key=lambda f: f["added_turn"]
+    )
+
+    if not pinned and not query_text:
+        # Nothing pinned (every record written before this field existed —
+        # or simply a conversation that has never used it — reads as
+        # unpinned) and no ranking requested: the exact pre-F1 code path,
+        # unconditionally. This is the guarantee "callers that pass nothing
+        # get the current behaviour" rests on.
+        kept, _ = _lru_split(facts, max_tokens)
+        return kept
+
+    rest = [f for f in facts if not f.get("pin")]
+
+    if not pinned:
+        # Ranking requested, nothing pinned to reserve budget for: rest gets
+        # the WHOLE budget, header included — same header accounting
+        # _lru_split itself uses, so hand it the header allowance directly
+        # rather than inventing a second copy of that degenerate-budget
+        # check ("too small even for the header" — see _lru_split).
+        if _FACTS_BLOCK_HEADER_TOKENS > max_tokens:
+            return []
+        selected_rest = _select_rest(
+            rest, max_tokens - _FACTS_BLOCK_HEADER_TOKENS, query_text, embedder
+        )
+        return _settle_against_budget([], selected_rest, max_tokens)
+
+    pinned_cost = _estimate_tokens(format_facts_block(pinned))  # header + pinned bullets
+    if pinned_cost >= max_tokens:
+        if pinned_cost > max_tokens:
+            logger.warning(
+                f"{len(pinned)} pinned fact(s) alone cost ~{pinned_cost} "
+                f"estimated tokens against a {max_tokens}-token injection "
+                f"budget; injecting them anyway rather than dropping an "
+                f"identity-tier fact — consider raising "
+                f"COMPACTOR_INJECT_FACTS_TOKENS or pinning fewer facts"
+            )
+        return pinned
+
+    # Budget left for `rest`, in bullets-only units: pinned_cost already
+    # paid for the header once, and the final combined block pays it only
+    # once too (format_facts_block never emits the header twice).
+    rest_bullets_budget = max_tokens - pinned_cost
+    selected_rest = _select_rest(rest, rest_bullets_budget, query_text, embedder)
+    return _settle_against_budget(pinned, selected_rest, max_tokens)
 
 
 def prune_facts(
@@ -669,9 +1038,15 @@ def prune_facts(
 # Injection — turn facts into a system message block for the LLM request
 # ---------------------------------------------------------------------------
 
+# v3.1.5 — this block's authority is over what is TRUE, and nothing else.
+# It used to end "maintain consistency with these", which arrived every turn
+# above ~91 bullets and was read as a request for consistency of EXPRESSION
+# as well as of fact. See persona.py's _PERSONA_BLOCK_HEADER for the full
+# division of labour between the four injected blocks and why the wording is
+# positive rather than prohibitive.
 _FACTS_BLOCK_HEADER = (
-    "[Persistent facts about this conversation — established earlier, "
-    "maintain consistency with these]"
+    "[Persistent facts about this conversation — established earlier. Stay "
+    "accurate to these; the wording is yours.]"
 )
 # Measured off the header itself, not hand-counted, so editing the header
 # text cannot silently invalidate the budget in _lru_split — the same
@@ -711,6 +1086,33 @@ def touch_facts(facts: list[dict], now: int | None = None) -> list[dict]:
     for f in facts:
         f["last_used"] = ts
     return facts
+
+
+def set_pinned(
+    facts: list[dict], *, text_substring: str, pinned: bool = True
+) -> int:
+    """Set (or clear) the `pin` flag on every fact whose text contains
+    `text_substring` (case-insensitive substring match — same convention as
+    restore_from_archive's text_substring). Returns how many facts changed.
+
+    Mutates the dicts in place and returns a count, the same contract as
+    touch_facts: this does not read or write storage itself. Caller owns
+    load → set_pinned → save_facts under conv_lock, same as every other
+    read-modify-write in this module.
+
+    The data-layer primitive behind the /pin and /unpin commands
+    (commands.py), which hold conv_lock around load -> set_pinned -> save.
+    Callers must do the same: an unlocked read-modify-write here races the
+    extraction tail in both directions.
+    """
+    needle = text_substring.lower()
+    changed = 0
+    for f in facts:
+        if needle in f.get("text", "").lower():
+            if bool(f.get("pin", False)) != pinned:
+                changed += 1
+            f["pin"] = pinned
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -1292,7 +1694,7 @@ async def record_facts_for_exchange(
                 return 0
             now = _now_unix()
             new_entries = [
-                {"text": s, "added_turn": turn_index, "last_used": now}
+                {"text": s, "added_turn": turn_index, "last_used": now, "pin": False}
                 for s in new_strs
             ]
             combined = existing + new_entries

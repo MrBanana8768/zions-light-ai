@@ -67,6 +67,18 @@ Both inline (after-extraction) and on-demand (/admin/.../dedup) paths
 call the single `dedup_facts()` function. Inline path benefits from the
 cheap-when-no-candidates fast exit: most extractions produce 0-1 new
 facts that are distinct from everything already stored → 0 LLM calls.
+
+Cost measured again (F1 part 4, 48h production window this time): 234
+passes, 2,024 LLM calls, 55 merges — 2.7% yield, 190 of 234 passes merged
+nothing, and "transitive cluster exceeds the cap" fired on essentially
+every pass. The refusal memo above should have absorbed most of that
+re-litigation and didn't, because the piece feeding it — how an oversized
+transitive cluster gets split into memo-sized sub-clusters — rebalanced
+every boundary from scratch as the cluster grew, so a growing blob rarely
+handed the memo the same sub-cluster shape twice even when most of its
+members hadn't changed. See _split_cluster's docstring for the fix.
+SIMILARITY_THRESHOLD was also re-examined and left alone; see its comment
+for the measurement.
 """
 
 from __future__ import annotations
@@ -89,6 +101,25 @@ logger = logging.getLogger("compactor.dedup")
 # Cosine similarity threshold for Stage 1 clustering. Lower = more LLM
 # calls but fewer missed dupes. 0.75 catches paraphrases ("Lyra is
 # half-elf" / "Lyra is half elven") while skipping unrelated facts.
+#
+# F1 part 4: measured, not assumed. 35 synthetic fact pairs embedded with
+# the real bge-small model (18 true paraphrases that should MERGE, 17
+# related-but-distinct pairs — same shape as the store's actual 2.7%
+# yield — that should KEEP) show the two classes OVERLAP in cosine space:
+# lowest true-paraphrase similarity 0.7213 ("User wants short replies" /
+# "Please keep your answers brief going forward"), highest related-distinct
+# similarity 0.9234 ("User prefers third-person past tense" / "User
+# prefers first-person present tense" — literally the adversarial example
+# this module's own docstring already names). No threshold separates the
+# classes; raising it toward 0.80+ starts refusing genuine merges before
+# it meaningfully thins the false-candidate rate, and 0.75 already sits
+# above the lowest measured true-paraphrase score. Conclusion: leave this
+# value where it is — Stage 1's job is a cheap, lossy pre-filter, and
+# Stage 2 (the LLM) is the precision the module was already documented as
+# depending on, not a redundant confirmation of what embeddings can do
+# alone. The gate that measurably reduces calls without touching recall is
+# _split_cluster's front-loaded, memo-stable splitting below, not this
+# threshold.
 SIMILARITY_THRESHOLD = float(
     os.environ.get("COMPACTOR_DEDUP_SIMILARITY", "0.75") or 0.75
 )
@@ -283,23 +314,71 @@ def _cosine(a: list[float], b: list[float]) -> float:
 def _split_cluster(cluster: list[int]) -> list[list[int]]:
     """Split an oversized cluster into sub-clusters of 2..MAX_CLUSTER_SIZE.
 
-    Sizes are balanced rather than greedy so no sub-cluster is left with a
-    single member: a singleton has nothing to merge with, so a greedy
-    4+4+1 split would silently drop that fact from the pass. Balanced
-    gives 5 → 3+2, 7 → 4+3, 9 → 3+3+3 — every member still a candidate,
-    none in a group larger than the cap.
+    F1 part 4: front-loaded, not balanced. Fill sub-clusters to
+    MAX_CLUSTER_SIZE in cluster order, then repair a too-small trailing
+    remainder by borrowing from the chunk before it — never rebalance
+    every boundary from scratch. 5 → 4+1 → repaired to 3+2 (same output
+    the old balanced split gave); 9 → 4+4+1 → repaired to 4+3+2; 20 →
+    4+4+4+4+4, no repair needed.
+
+    Why this matters more than it looks: the caller (find_candidate_
+    clusters) re-forms the SAME transitive group turn after turn as
+    extraction adds facts, and a store with enough related-but-distinct
+    material clusters into one blob well past the cap almost every pass
+    (V314_BACKLOG N3: "transitive cluster exceeds the cap" fired on
+    essentially every pass in the measured 48h window). The refusal memo
+    below keys a cluster's memo entry on its EXACT membership — so
+    whether a sub-cluster is "the same question as last time" depends
+    entirely on whether this function keeps handing it the same members.
+
+    The balanced split this replaced recomputed every boundary from the
+    current total size: growing a 6-member blob to 7 didn't just add a
+    member, it moved every chunk boundary (6 → 3+3, 7 → 4+3 — the first
+    three facts don't even share a chunk anymore). Since extraction adds
+    facts roughly every turn, that meant almost no sub-cluster shape
+    survived from one pass to the next, and a memo keyed on exact
+    membership rarely hit despite being logically correct — the model
+    kept re-answering "do these facts differ?" for group boundaries that
+    were themselves the only thing that had changed.
+
+    Front-loading fixes the boundary, not the question: once a leading
+    chunk reaches MAX_CLUSTER_SIZE it is far more stable than under the
+    balanced split - though not immutable: measured, n=8 gives
+    [[0-3],[4-7]] and n=9 gives [[0-3],[4,5,6],[7,8]], so the SECOND full
+    chunk did reshape while the leading one held. The memo win is real and
+    measured; the guarantee is "the leading chunks stop churning", not
+    "nothing ever changes". As the
+    blob keeps growing — new members always extend the last (possibly
+    under-cap) chunk instead. A leading chunk's refusal is reusable for
+    as long as that chunk's own members are unchanged, same as any other
+    exact-match memo hit; only the still-growing tail chunk — which
+    really does contain a new member and is really a new question — pays
+    a fresh call. This does not weaken the cap (MAX_CLUSTER_SIZE is still
+    the largest any sub-cluster gets) and does not change which facts are
+    eligible (every member of the group is still in exactly one
+    sub-cluster of size >= 2, same guarantee the balanced split made).
     """
     n = len(cluster)
     if n <= MAX_CLUSTER_SIZE:
         return [cluster]
-    chunks = -(-n // MAX_CLUSTER_SIZE)  # ceil
-    base, extra = divmod(n, chunks)
     out: list[list[int]] = []
-    start = 0
-    for k in range(chunks):
-        size = base + (1 if k < extra else 0)
-        out.append(cluster[start:start + size])
-        start += size
+    i = 0
+    while i < n:
+        out.append(cluster[i:i + MAX_CLUSTER_SIZE])
+        i += MAX_CLUSTER_SIZE
+    # A trailing remainder of exactly 1 (the only case MAX_CLUSTER_SIZE=4
+    # chunking can leave — 0 needs no repair, 2 and 3 are already >= 2) has
+    # nothing to merge with. Borrow one member from the chunk before it,
+    # which is always a full MAX_CLUSTER_SIZE chunk at this point and so
+    # always has one to spare. Only this last boundary moves; every
+    # earlier chunk — including the one lending a member — keeps the rest
+    # of its membership. Note its memo key DOES change - the memo keys on
+    # exact membership - so the lender pays one fresh call; the borrower's
+    # neighbours upstream are what stay stable.
+    if len(out) >= 2 and len(out[-1]) < 2:
+        short = 2 - len(out[-1])
+        out[-2], borrowed = out[-2][:-short], out[-2][-short:]
+        out[-1] = borrowed + out[-1]
     return out
 
 
@@ -517,6 +596,20 @@ def _merge_metadata(cluster_facts: list[dict], new_text: str) -> dict:
         "text": new_text,
         "added_turn": min(f.get("added_turn", 0) for f in cluster_facts),
         "last_used": max(f.get("last_used", 0) for f in cluster_facts),
+        # PIN SURVIVES A MERGE, and this line is load-bearing. Inline dedup
+        # runs on EVERY extraction over the whole store, pinned facts
+        # included, and identity facts are the most re-extracted class -
+        # exactly the ones that cluster with paraphrases of themselves. A
+        # merged record built without this key silently un-pinned her
+        # identity fact, after /pin had told her "they will now reach me on
+        # every turn". Relevance ranking was then free to drop it: the
+        # precise failure the pin tier exists to prevent.
+        #
+        # ANY pinned member pins the merge. A merge is a union of meaning,
+        # so the strongest protection in the cluster carries forward; the
+        # alternative (all-must-be-pinned) loses the pin whenever a pinned
+        # fact absorbs an unpinned paraphrase, which is the common case.
+        "pin": any(bool(f.get("pin")) for f in cluster_facts),
     }
 
 

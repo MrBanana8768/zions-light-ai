@@ -924,6 +924,41 @@ def count_text_tokens_exact(text: str) -> int | None:
         return None
 
 
+def _space_fill_empty_assistant(messages: list[dict]) -> tuple[list[dict], int]:
+    """Return (copy with empty assistant turns space-filled, how many).
+
+    NEVER MUTATES the input. Callers measure with the result and forward the
+    original, or take the copy deliberately.
+
+    A single space is the minimal content vLLM 0.19's template verifiably
+    accepts where an empty string is refused — verified against the real
+    MistralTokenizer pipeline in the production image, 2026-08-30
+    (testfixtures/tokenizer-contract/vllm_template_probe.py).
+
+    str content ONLY. A list (multimodal) part can read as text-empty while
+    still carrying an image, and destroying an image to satisfy a template
+    rule would be worse than the 400 it avoids.
+
+    Extracted in v3.1.5 so that _repair_template_invalid_tail (which fixes
+    what we FORWARD) and count_tokens_exact (which fixes what we MEASURE)
+    cannot drift apart. They were the same rule written once, applied at one
+    of the two places it was needed — see count_tokens_exact for what that
+    cost.
+    """
+    out = list(messages)
+    filled = 0
+    for i, m in enumerate(out):
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and isinstance(m.get("content"), str)
+            and not m["content"].strip()
+        ):
+            out[i] = {**m, "content": " "}
+            filled += 1
+    return out, filled
+
+
 def count_tokens_exact(
     messages: list[dict], add_generation_prompt: bool | None = None
 ) -> int | None:
@@ -968,6 +1003,41 @@ def count_tokens_exact(
     # vLLM refuses if add_generation_prompt is True on an assistant-final
     # list, and refuses again if the last role is assistant and neither
     # continue_final_message nor prefix is set.
+    # v3.1.5. MEASURE A TEMPLATE-VALID COPY, or measure nothing at all.
+    #
+    # A cancelled stream leaves an EMPTY assistant turn in the history that
+    # OpenWebUI then resends forever. The chat template refuses it outright
+    # ("Invalid assistant message: role='assistant' content=''"), so this
+    # endpoint 400s — and every caller falls back to the local tokenizer,
+    # which reads 34-51% low on this model's assistant content.
+    #
+    # _repair_template_invalid_tail already fixes exactly this, but it runs
+    # at the END of the request path, AFTER compact_if_needed and AFTER
+    # _enforce_hard_budget have both already measured and both already
+    # degraded. It repairs what we FORWARD and never what we MEASURE.
+    #
+    # Production cost of that ordering, conv <redacted>, 2026-08-30 to 08-31:
+    # ONE cancelled stream put summarize on the pessimistic 2.0x fallback
+    # (batch estimate 32 -> 69 calls, past the 4-call cap, so request-path
+    # compaction switched off), put the hard-budget guard on scale 1.0 — the
+    # 2026-08-28 signature, shedding on a counter known to read low — and
+    # pinned /health/full at ok:false deployment-wide, since the fail streak
+    # is a process global. Until the user deleted the turn by hand.
+    #
+    # The copy is measured; the caller's list is untouched and still holds
+    # the empty turn for the repair to deal with later. Sanitising here can
+    # only make a request MEASURABLE that was previously unmeasurable, and a
+    # space costs one token against a budget in the tens of thousands.
+    messages, _filled = _space_fill_empty_assistant(messages)
+    if _filled and logsetup.log_once("count_tokens_exact.space_filled"):
+        logger.info(
+            f"/tokenize: measured a copy with {_filled} empty assistant "
+            f"turn(s) space-filled — the template refuses empty content, and "
+            f"measuring the raw list would 400 and drop every budget decision "
+            f"onto the local tokenizer. What is FORWARDED is unchanged here; "
+            f"_repair_template_invalid_tail owns that, later in the request."
+        )
+
     _asst_final = bool(messages) and messages[-1].get("role") == "assistant"
     _agp = (
         (not _asst_final) if add_generation_prompt is None
@@ -1908,16 +1978,11 @@ def _repair_template_invalid_tail(body: dict) -> tuple[str | None, bool]:
     # str content only: a list (multimodal) part can read as text-empty
     # while still carrying an image, and destroying an image to satisfy a
     # template rule would be worse than the 400.
-    filled = 0
-    for i, m in enumerate(msgs):
-        if (
-            isinstance(m, dict)
-            and m.get("role") == "assistant"
-            and isinstance(m.get("content"), str)
-            and not m["content"].strip()
-        ):
-            msgs[i] = {**m, "content": " "}
-            filled += 1
+    # Shared with count_tokens_exact since v3.1.5 — one rule, one
+    # implementation. This site fixes what we FORWARD; that one fixes what we
+    # MEASURE, and having only this one was what let a single cancelled
+    # stream degrade every budget decision for a conversation.
+    msgs, filled = _space_fill_empty_assistant(msgs)
     if filled:
         body["messages"] = msgs
         _f = (
@@ -2041,7 +2106,9 @@ def _bound_injected_blocks(
     to nothing is not a bound, it is a refusal, and refusing makes "she
     remembers me from the first message" impossible — which is the product. So
     the drop loop stops before it takes the last surviving block. What that
-    leaves is at most one layer's own cap (1500 tokens for facts, 1500 for
+    leaves is at most one layer's own cap (400 tokens for facts by default
+    since F1 decoupled injection from the store cap - see
+    COMPACTOR_INJECT_FACTS_TOKENS; 1500 for
     retrieval, a generation ceiling for a summary chunk), which is the
     strongest bound expressible here without overriding a module's own budget;
     the hole this function closes is that those caps SUM, not that any one of
@@ -3034,7 +3101,9 @@ async def _async_tail(
                     assistant_text,
                     (
                         injected_facts if injected_facts is not None
-                        else facts.select_for_injection(touched_facts)
+                        else facts.select_for_injection(
+                            touched_facts, query_text=last_user_text
+                        )
                     ),
                     conv_id=conv_id,
                 )
@@ -3734,7 +3803,17 @@ async def chat_completions(request: Request) -> Any:
                 # tail below still writes the whole store back; the facts left
                 # out keep their real last_used and become the eviction
                 # candidates, which is the entire point.
-                injected_facts = facts.select_for_injection(touched_facts)
+                # query_text activates F1's relevance ranking. It MUST ship
+                # with the /pin command in commands.py: the injection budget
+                # (COMPACTOR_INJECT_FACTS_TOKENS, default 400) took effect the
+                # moment facts.py landed, so without ranking the block would be
+                # cut from ~80 facts to ~26 by the degenerate FIFO order F1
+                # exists to replace - strictly worse than before. Ranked, the
+                # 26 are the ones this turn is about; pinned identity facts
+                # bypass ranking entirely.
+                injected_facts = facts.select_for_injection(
+                    touched_facts, query_text=last_user_text
+                )
                 # NOT touched here. last_used is the LRU eviction key, and
                 # _bound_injected_blocks (below) may drop the facts block
                 # entirely — so touching now records "recently used" for facts
@@ -4785,6 +4864,34 @@ async def admin_fork_conversation(conv_id: str, request: Request):
         )
     except portability.ImportError_ as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post(
+    "/admin/conversations/cleanup-test-data",
+    dependencies=[Depends(_require_localhost)],
+)
+async def admin_cleanup_test_conversations(dry_run: bool = True):
+    """Quarantine-then-remove the test/placeholder conversations polluting
+    the store: 129 "conversations" for ~26 real ones, inflating
+    /admin/conversations, the health stats and every backup archive.
+
+    DRY RUN BY DEFAULT. Matches only ids minted by selftest.py and the
+    integration harness, and refuses any match that carries substantial
+    memory (or whose layers cannot be read - unreadable counts as
+    substantial, never as empty). Everything is quarantined before it is
+    wiped, so this is reversible; nothing is unlinked.
+    """
+    async def _wipe(conv_id: str) -> dict:
+        # Through commands._wipe_all_layers rather than _clear_all_memory
+        # directly, so a cleanup leaves exactly what /forget leaves - the
+        # archive-sidecar clear and the empty-facts tombstone included.
+        return await commands._wipe_all_layers(
+            conv_id, lambda cid: _clear_all_memory(cid, source="cleanup-test-data")
+        )
+
+    return await portability.cleanup_test_conversations(
+        dry_run=dry_run, wipe_layers=_wipe
+    )
 
 
 @app.post(

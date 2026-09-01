@@ -155,6 +155,125 @@ fixed-size store.
 
 ---
 
+## F2 · The prompt was asking for the formulaic replies — SHIPPED in v3.1.5
+
+Reported by the user 2026-08-31 ("just a little too repetitive"), against the
+bundle `…144610Z`. **Not** a return of the 08-29 degeneration: zero drift
+fires and zero repeated-run fires across the whole window, so `min_p 0.05`
+is holding and this is a different failure — stylistic sameness, and ours
+rather than the model's.
+
+**What the bundle showed.** Median **91 fact bullets injected per turn**
+(p90 103, max 179), plus up to 1500 tokens of the model's own verbatim past
+replies from RAG, plus the hierarchical summary, plus the last four turns.
+And all four injected block headers asked, in one wording or another, for
+CONSISTENCY:
+
+    facts      "…established earlier, maintain consistency with these"
+    retrieval  "…use them for continuity and exact recall"
+    summary    "…use them for continuity."
+    persona    "…the primary identity and voice you should maintain"
+
+Three of those four had no business asking. Shown several thousand tokens of
+its own prior phrasing under an instruction to be consistent, the model was
+repeating itself because the prompt requested it. The memory system that
+fixed forgetting is the same system that caused the sameness.
+
+### The work
+
+1. **Each block claims exactly one kind of authority** — persona owns
+   identity and VOICE and is now the only block that does; facts own what is
+   TRUE; retrieval owns what was SAID; summary owns what HAPPENED. Full
+   rationale at `persona.py`'s `_PERSONA_BLOCK_HEADER`; the other three
+   headers point at it.
+2. **Positive wording throughout.** The 08-29 lesson applies directly:
+   naming an unwanted output puts it in context at high attention weight
+   (`DO NOT USE BOX-DRAWING CHARACTERS` sat in the prompt for a day and drew
+   1,710 of them). These headers say what each block is FOR and leave the
+   phrasing free — "the wording is yours", "say the next thing in your own
+   words" — rather than prohibiting repetition by name.
+3. **`COMPACTOR_INJECT_FACTS_TOKENS` default 800 → 400.** F1 part 1
+   specified 300–400 and `main.py`'s call site has documented the default as
+   400 since it landed; 800 was a v3.1.4 review value the surrounding
+   comments were never updated to match, so the code and its own
+   documentation had disagreed since.
+4. **`test_facts_wiring.py` — closes the open F1 gate finding.** Halving the
+   budget is only safe because `main.py` passes `query_text` at both call
+   sites, so the surviving ~26 facts rotate with the topic. Without that
+   wiring the change is *strictly worse* than 800 — a fixed
+   most-recently-used prefix, frozen forever — and until now deleting
+   `query_text=last_user_text` left the entire suite green. Mutation-tested:
+   three separate reverts (drop it, pass `""`, drop the `_async_tail` twin),
+   all three caught by the new file, all three passing `test_facts_injection`
+   alone.
+5. **`test_block_headers.py`** pins all four header strings so prompt text
+   cannot change without a reviewer seeing it, plus budget bounds so a
+   future header cannot quietly eat the injection budget. Six mutations, all
+   caught.
+
+### Three fixtures were sized against the old header lengths
+
+Worth recording, because all three failed in a way that pointed at the wrong
+thing. `test_budget_guard`'s wide-budget case was passing on **~3% headroom**
+(426 against 400 once the headers grew) and failed as "facts injected too",
+which reads like an injection-budget regression. `test_retrieval`'s teeth
+check was **19 characters** inside a 6,000-character budget. Both now carry
+real headroom, and the budget-guard assertion names header growth as a cause
+so the next person is not sent to the wrong file. The two token pins
+(273 → 284, 1463 → 1452) were re-pinned deliberately, not loosened — their
+own comments already document the same move for v3.1.3.
+
+### Not done, and deliberately
+
+`COMPACTOR_RAG_TOP_K` left at 5 (owner's call — retrieval is the strongest
+phrase-copying feed, so it stays the first knob to reach for if this
+persists).
+
+### Sampling, as actually deployed — `repetition_penalty 1.1`
+
+Sampling is owner-side in OpenWebUI. Recording what is SET, not what was
+recommended, because this file disagreeing with production is the same
+failure as `IMAGE_TOKEN_ESTIMATE`'s stale comment and the 800-vs-400
+injection default: the next person reads the recommendation and believes it.
+
+Late on 2026-08-31 a reply ended in a run of repeating tokens. The owner set
+`repetition_penalty 1.1` and it resolved. That knob is live.
+
+This document previously advised against it, and that advice was narrower
+than it read. The mechanism is real — vLLM's `repetition_penalty` covers
+PROMPT tokens as well as output, unlike `presence_penalty`/
+`frequency_penalty`, which are output-only — so it penalises her for reusing
+words from her own injected memory, names included. But 1.1 is mild, and
+end-of-reply token loops are exactly what it is for.
+
+Neither knob risks the 08-29 drift any more: vLLM applies penalties to the
+logits BEFORE `min_p` filters, so the probability mass a penalty pushes into
+the tail is clipped before sampling. `min_p 0.05` is what makes penalties
+usable here at all.
+
+WHAT TO WATCH, and it will not look like a sampling problem: name and fact
+AVOIDANCE. If the penalty bites, she paraphrases around established facts
+rather than stating them, which reads as vagueness. The last bundle showed
+**183 facts injected per turn** — a large prompt surface for a
+prompt-covering penalty to act across.
+
+RE-TEST AFTER v3.1.5 DEPLOYS. F2 cuts the injected block from ~183 facts to
+~26 and stops the headers asking for consistency, shrinking that surface
+roughly sevenfold. 1.1 was tuned against the large-prompt regime; it should
+not be assumed correct in the small one. If it needs replacing, the
+output-only `presence_penalty` targets the same end-of-reply looping without
+reaching into the prompt at all.
+
+### Still open
+
+No measurement. "A little too repetitive" is not a number, so nothing here
+can be confirmed to have helped. The drift detector is the proof that this
+approach works; the equivalent is n-gram overlap between consecutive replies
+plus a frequency count of opening phrases over the last N replies, which is
+where "every reply starts the same way" shows up first and most sharply.
+
+---
+
 ## C1 · conv_id is unstable against system-prompt edits — SHIPPED in v3.1.5
 
 Found the hard way, 2026-08-30. The hash fallback is
