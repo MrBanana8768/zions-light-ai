@@ -135,8 +135,37 @@ RUN /opt/compactor-venv/bin/python -c \
 # vLLM's /tokenize cannot answer; without it the fallback is an estimator that
 # reads up to 51% low. The module no-ops safely if the import fails, so nothing
 # breaks — which is exactly why the absence has to fail the BUILD instead.
-RUN /opt/compactor-venv/bin/python -c \
-    "import mistral_common; print('local exact tokenization available: mistral_common', mistral_common.__version__)"
+#
+# AND THE TWO VENVS MUST AGREE ON THE VERSION (v3.1.7). vLLM declares
+# mistral_common[image]>=1.10.0 — an open lower bound — so the version IT
+# resolves moves on its own while the compactor's requirements.txt stays
+# pinned, and nothing enforces agreement. tokens.check_divergence exists to
+# catch the disagreement at runtime; this catches it at build time, which is
+# where it is cheap. A local tokenizer that silently disagrees with the
+# server doing the charging is the 2026-08-28 incident with a better
+# disguise: the wrong number is HARDER to disbelieve because it comes from
+# the right library.
+#
+# This is not hypothetical drift. Production runs vLLM 0.19.0, which resolves
+# mistral_common 1.11.7 — exactly what requirements.txt pins, so they agree
+# TODAY. But the default here is VLLM_VERSION=0.24.0 and the build command in
+# the header passes --build-arg VLLM_VERSION=0.19.0, so a rebuild that simply
+# forgets the flag gets a different vLLM, a different mistral_common, and no
+# warning at all. The guard fails that build instead of shipping it.
+RUN set -e; \
+    C=$(/opt/compactor-venv/bin/python -c "import mistral_common; print(mistral_common.__version__)"); \
+    V=$(/opt/vllm-venv/bin/python -c "import mistral_common; print(mistral_common.__version__)"); \
+    echo "local exact tokenization available: mistral_common ${C} (compactor) / ${V} (vllm ${VLLM_VERSION})"; \
+    if [ "${C}" != "${V}" ]; then \
+        echo "BUILD GUARD 3 FAILED: mistral_common differs between the venvs —" >&2; \
+        echo "  compactor-venv ${C} (pinned in compactor/requirements.txt)" >&2; \
+        echo "  vllm-venv      ${V} (resolved by vllm==${VLLM_VERSION})" >&2; \
+        echo "The compactor's local token count would disagree with the server" >&2; \
+        echo "that does the charging. Re-pin mistral_common in" >&2; \
+        echo "compactor/requirements.txt to ${V}, or build the vLLM version" >&2; \
+        echo "this image is pinned against." >&2; \
+        exit 1; \
+    fi
 
 # Pre-download the bge-small ONNX embedding model into the image so the
 # first request pays no download. Static weights belong in the image, not
@@ -235,6 +264,7 @@ COPY compactor/degrade.py /opt/compactor/degrade.py
 COPY compactor/bgwork.py /opt/compactor/bgwork.py
 COPY compactor/tokens.py /opt/compactor/tokens.py
 COPY compactor/tokenhealth.py /opt/compactor/tokenhealth.py
+COPY compactor/tailhealth.py /opt/compactor/tailhealth.py
 COPY compactor/webuidb.py /opt/compactor/webuidb.py
 COPY compactor/logsetup.py /opt/compactor/logsetup.py
 COPY compactor/alert.py /opt/compactor/alert.py

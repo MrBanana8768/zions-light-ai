@@ -1522,36 +1522,78 @@ def _oversized_store(n=8, chars=1200):
     ]
 
 
-def test_extraction_is_handed_the_injected_subset_not_the_whole_store():
-    print("\n[test] handoff — the extractor sees what the MODEL saw, not the store")
-    # facts.py now trims its own input, so the whole store no longer overflows
-    # the window. It is still the wrong list: the trim it would apply is a
-    # second, later opinion about which facts matter. Handing it the injected
-    # subset means "already known" means the same thing on both sides of the
-    # exchange.
+def test_extraction_is_bounded_by_the_store_cap_not_the_injection_cap():
+    print("\n[test] handoff — the extractor's known-facts list is bounded by the "
+          "STORE cap, not the 400-token injection budget")
+    # This list is the extractor's "EXISTING FACTS", i.e. the whole of its
+    # duplicate suppression, against a prompt that also says "When in doubt,
+    # extract." Bounding it by COMPACTOR_INJECT_FACTS_TOKENS (400) instead of
+    # COMPACTOR_MAX_FACTS_TOKENS (1500) cut a realistic store's list from 114
+    # facts to 28 — ~75% of the signal — and what that buys is byte-identical
+    # re-extractions, dedup LLM calls, and faster store churn.
+    #
+    # Still BOUNDED: this is a request to vLLM, which has a window. The store
+    # cap is the bound, and it is the one prune_facts already holds the store
+    # to, so in normal operation the extractor sees the store and nothing more.
     store = _oversized_store()
     injected = facts.select_for_injection(store)
+    store_bounded = facts.select_for_injection(
+        store, max_tokens=facts._MAX_FACTS_TOKENS
+    )
     assert_true(
-        0 < len(injected) < len(store),
-        f"fixture: injection is really narrower than the store "
-        f"({len(injected)} of {len(store)})",
+        0 < len(injected) < len(store_bounded) < len(store),
+        f"fixture: the three sizes are really distinct — injected "
+        f"{len(injected)}, store-cap {len(store_bounded)}, store {len(store)}",
     )
     seen = _tail_spies("tail-injected", store, injected)
-    assert_eq(len(seen["existing"]), len(injected),
-              "the extractor was handed the injected subset")
-    assert_true(seen["existing"] is injected, "and the very list the request path built")
+    assert_eq(len(seen["existing"]), len(store_bounded),
+              "the extractor was handed the store-cap-bounded set")
+    assert_true(len(seen["existing"]) > len(injected),
+                "which is strictly more than the model was shown this turn")
+    assert_true(len(seen["existing"]) < len(store),
+                "and still not the unbounded store")
+
+
+def test_extraction_includes_what_the_model_was_actually_shown():
+    print("\n[test] handoff — an injected fact the store-cap walk left out is "
+          "still in the extractor's known list")
+    # The two selections can disagree only when the store is OVER the store cap
+    # — which v3.1 F9 allows to persist, because a failed archive write keeps
+    # the facts. There, a relevance-ranked injection can include an LRU-cold
+    # fact the store-cap walk dropped. If that fact were missing here, the
+    # extractor would be invited to re-extract something the model had just
+    # been shown, which is the same duplicate-churn failure from the other end.
+    store = _oversized_store()
+    cold = {"text": "C0 " + "s" * 1200, "added_turn": 0, "last_used": 1}
+    store = [cold] + store
+    store_bounded = facts.select_for_injection(
+        store, max_tokens=facts._MAX_FACTS_TOKENS
+    )
+    assert_true(
+        all(f["text"] != cold["text"] for f in store_bounded),
+        "fixture: the coldest fact really is outside the store-cap set",
+    )
+    seen = _tail_spies("tail-cold-injected", store, [cold])
+    texts = [f["text"] for f in seen["existing"]]
+    assert_true(cold["text"] in texts,
+                "the injected-but-LRU-cold fact reached the extractor")
+    assert_eq(len(texts), len(set(texts)),
+              "and nothing was listed twice by the union")
 
 
 def test_extraction_is_bounded_even_for_a_caller_that_passes_nothing():
-    print("\n[test] handoff — the default narrows too, so no caller can pass the store")
+    print("\n[test] handoff — the store cap applies with or without injected_facts")
     # injected_facts is keyword-only with a default so its arrival breaks no
-    # caller. The default has to be select_for_injection(store), not the store:
-    # a default that reintroduces the defect for un-updated callers is not a
-    # default, it is the defect with a nicer signature.
+    # caller. Omitting it must not push the whole store into an extraction
+    # prompt: the store-cap bound is applied to touched_facts either way, and
+    # injected_facts only ever ADDS what that bound left out.
     store = _oversized_store()
     seen = _tail_spies("tail-default", store, None)
-    assert_eq(len(seen["existing"]), len(facts.select_for_injection(store)),
-              "an omitted injected_facts still yields the bounded set")
+    assert_eq(
+        len(seen["existing"]),
+        len(facts.select_for_injection(store, max_tokens=facts._MAX_FACTS_TOKENS)),
+        "an omitted injected_facts still yields the store-cap-bounded set",
+    )
     assert_true(len(seen["existing"]) < len(store), "and not the whole store")
 
 
@@ -2385,7 +2427,8 @@ def _all_tests():
         test_a_non_size_400_does_not_blame_the_context_window,
         test_a_backend_5xx_on_the_stream_is_also_logged_as_a_lost_turn,
         test_nonstream_400_logs_the_loss_and_skips_the_memory_tail,
-        test_extraction_is_handed_the_injected_subset_not_the_whole_store,
+        test_extraction_is_bounded_by_the_store_cap_not_the_injection_cap,
+        test_extraction_includes_what_the_model_was_actually_shown,
         test_extraction_is_bounded_even_for_a_caller_that_passes_nothing,
         test_extraction_and_dedup_are_told_which_conversation,
         test_the_request_path_hands_the_tail_the_list_it_injected,

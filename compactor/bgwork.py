@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 
@@ -48,9 +49,45 @@ MAX_OUTSTANDING = int(os.environ.get("COMPACTOR_MAX_OUTSTANDING_TAILS", "64") or
 #
 # 300 s spans ten consecutive 30 s HEALTHCHECK probes, so a burst that starts
 # and ends between two looks still shows up on the next one.
-SHED_DEGRADE_WINDOW_S = float(
-    os.environ.get("COMPACTOR_SHED_DEGRADE_WINDOW_S", "300") or 300
-)
+def _window_s(name: str, default: float) -> float:
+    """Read a degrade-window seconds value from the environment, safely.
+
+    `float(os.environ.get(name, "300") or 300)` was two failures in one line,
+    and this module is imported at main.py module scope, so both are boot
+    failures rather than degraded behaviour:
+
+      * UNPARSEABLE. `or 300` rescues only the empty string. One typo in
+        runpod.env — `30O`, a stray quote, a trailing comment — and the
+        import raises ValueError, the compactor never starts, and the chat
+        path is down until someone reads a traceback.
+      * NON-POSITIVE. `0` or a negative parses fine and then silently
+        disables the signal: `shed_recently` is `since <= window`, which is
+        never true, so /health/full reports ok while work is being shed. That
+        is the exact regression the window exists to prevent, arriving
+        quietly through a config value nobody would look at twice.
+
+    main._env_float does NOT reject a zero or a negative (its docstring once
+    said otherwise; corrected in v3.1.7), and this module cannot import main
+    anyway — main imports it. tailhealth carries the same helper, and the two
+    must stay identical.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return default
+    # isfinite, not just > 0. `inf` parses, satisfies `v > 0`, and then pins
+    # the "recently" flag True from the first event until the process
+    # restarts — a warning that is always on is a warning nobody reads, which
+    # is the failure this window exists to prevent, arriving through the one
+    # config value whose whole job is to prevent it. `nan` fails `> 0`
+    # already; this makes the rejection explicit rather than incidental.
+    return v if math.isfinite(v) and v > 0 else default
+
+
+SHED_DEGRADE_WINDOW_S = _window_s("COMPACTOR_SHED_DEGRADE_WINDOW_S", 300.0)
 
 
 class BackgroundPool:

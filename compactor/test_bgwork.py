@@ -323,6 +323,49 @@ def test_submit_still_accepts_a_bare_coroutine():
     assert_eq(len(ran), 1, "and ran")
 
 
+def test_the_shed_window_survives_a_bad_env_value():
+    """A typo in COMPACTOR_SHED_DEGRADE_WINDOW_S used to be a BOOT failure.
+
+    bgwork is imported at main.py module scope, and
+    `float(os.environ.get(..., "300") or 300)` rescues only the empty string,
+    so `30O` in runpod.env raised ValueError at import and the compactor
+    never started. A non-positive value was worse than a crash: it parsed,
+    and then made `shed_recently` (`since <= window`) permanently False, so
+    /health/full reported ok while background work — fact extraction,
+    episodic indexing, summary rollups — was being shed.
+
+    The identical defect and the identical fix live in tailhealth; this pair
+    is the sibling the project keeps fixing at one site only.
+    """
+    print("\n[test] the shed-degrade window survives a bad env value")
+    saved = os.environ.get("COMPACTOR_SHED_DEGRADE_WINDOW_S")
+    try:
+        # 'inf' parses and satisfies `v > 0`, then pins shed_recently True
+        # until restart — the always-on warning the window exists to prevent.
+        for bad in ("abc", "", "   ", "30O", "0", "-5", "inf", "Infinity",
+                    "1e400", "nan", None):
+            if bad is None:
+                os.environ.pop("COMPACTOR_SHED_DEGRADE_WINDOW_S", None)
+            else:
+                os.environ["COMPACTOR_SHED_DEGRADE_WINDOW_S"] = bad
+            try:
+                v = bgwork._window_s("COMPACTOR_SHED_DEGRADE_WINDOW_S", 300.0)
+                assert_eq(v, 300.0, f"{bad!r} -> the 300s default, no raise")
+            except SystemExit:
+                raise
+            except Exception as e:
+                assert_true(False, f"{bad!r} -> raised {type(e).__name__}")
+        # A real value must still be honoured, or the checks above would pass
+        # against a function that ignored the environment entirely.
+        os.environ["COMPACTOR_SHED_DEGRADE_WINDOW_S"] = "45.5"
+        assert_eq(bgwork._window_s("COMPACTOR_SHED_DEGRADE_WINDOW_S", 300.0), 45.5,
+                  "a valid override is still honoured")
+    finally:
+        os.environ.pop("COMPACTOR_SHED_DEGRADE_WINDOW_S", None)
+        if saved is not None:
+            os.environ["COMPACTOR_SHED_DEGRADE_WINDOW_S"] = saved
+
+
 def _all():
     return [
         test_accepts_and_runs_within_caps,
@@ -339,6 +382,7 @@ def _all():
         test_shed_recency_expires_but_the_count_does_not,
         test_shed_warning_names_the_caller_that_lost_its_tail,
         test_submit_still_accepts_a_bare_coroutine,
+        test_the_shed_window_survives_a_bad_env_value,
     ]
 
 

@@ -871,6 +871,57 @@ def test_tidy_removes_exact_duplicates_keeping_the_longest_lived_copy():
               "survivor is the highest (last_used, added_turn) copy")
 
 
+def test_tidy_keeps_the_pinned_copy_of_a_byte_identical_group():
+    print("\n[test] /tidy collapses duplicates onto the PINNED copy even when "
+          "an unpinned copy is fresher")
+    _wipe()
+    cid = "tidy-dupes-pinned"
+    dup = "Idris keeps a logbook bound in blue cloth."
+    # This is the ordering /pin actually produces: facts.set_pinned flips the
+    # flag and deliberately does NOT touch last_used (facts._lru_split's note
+    # on why the pin needs an eviction exemption at all), so the pinned copy
+    # is the older, colder one and a (last_used, added_turn) ranking with no
+    # pin term picks the unpinned copy — silently un-pinning an identity fact
+    # inside an operation the owner was told only removes duplicates.
+    facts.save_facts(cid, [
+        {"text": dup, "added_turn": 2, "last_used": 100, "pin": True},   # survivor
+        {"text": dup, "added_turn": 9, "last_used": 400, "pin": False},
+        {"text": dup, "added_turn": 7, "last_used": 300, "pin": False},
+    ])
+    out = _tidy("", cid)
+    assert_true("[duplicate] 2 row(s)" in out, f"two duplicates proposed: {out}")
+    reply = _tidy(f"apply {_code_from(out)}", cid)
+    remaining = facts.load_facts(cid)
+    assert_eq(len(remaining), 1, f"one copy left: {reply}")
+    assert_eq(remaining[0]["pin"], True,
+              "the surviving copy is the PINNED one, not the freshest one")
+    assert_eq((remaining[0]["last_used"], remaining[0]["added_turn"]), (100, 2),
+              "and it is the actual pinned record, not an unpinned copy that "
+              "happened to inherit the flag")
+
+
+def test_tidy_survivor_falls_back_to_recency_when_no_copy_is_pinned():
+    print("\n[test] with nothing pinned the survivor rule is unchanged")
+    # The pin term is a tie-break ABOVE recency, not a replacement for it: the
+    # store has never carried a pin on most rows, so the ordinary path has to
+    # keep behaving exactly as it did.
+    rows = [
+        {"text": "same", "added_turn": 3, "last_used": 100, "pin": False},
+        {"text": "same", "added_turn": 9, "last_used": 400, "pin": False},
+        {"text": "same", "added_turn": 5, "last_used": 400, "pin": False},
+    ]
+    assert_eq(commands._tidy_survivor_index([0, 1, 2], rows), 1,
+              "highest (last_used, added_turn) still wins when no row is pinned")
+    # And a legacy row with no "pin" key at all must not out-rank a pinned one
+    # or crash the comparison.
+    legacy = [
+        {"text": "same", "added_turn": 9, "last_used": 400},
+        {"text": "same", "added_turn": 1, "last_used": 1, "pin": True},
+    ]
+    assert_eq(commands._tidy_survivor_index([0, 1], legacy), 1,
+              "a pre-pin record reads as unpinned and yields to the pinned copy")
+
+
 def test_tidy_apply_without_a_code_refuses():
     print("\n[test] /tidy apply with no code changes nothing")
     _wipe()
@@ -1427,6 +1478,29 @@ def test_retire_prefers_the_hot_copy_when_a_fact_is_in_both_source_layers():
     assert_eq(facts.load_archive(dst), [], "nothing landed in cold storage")
 
 
+def test_retire_keeps_the_pinned_copy_of_a_source_duplicate():
+    print("\n[test] /retire collapses source duplicates onto the PINNED copy")
+    # The second caller of _tidy_survivor_index, asserted separately because
+    # this branch's recurring defect is a fix landing on one of two sites.
+    # Both copies are in the ACTIVE layer here, so the hot/cold preference
+    # cannot decide it and the survivor rule itself is what is under test.
+    _wipe()
+    src, dst = "phantom-pin", "dest-pin"
+    text = "Idris keeps a logbook bound in blue cloth."
+    facts.save_facts(src, [
+        {"text": text, "added_turn": 1, "last_used": 100, "pin": True},
+        {"text": text, "added_turn": 9, "last_used": 900, "pin": False},
+    ])
+    dry = _retire(src, dst)
+    assert_true("[duplicate-in-source]" in dry, f"the twin is named: {dry}")
+    _retire(f"{src} apply {_retire_code(dry, src)}", dst)
+    landed = facts.load_facts(dst)
+    assert_eq([f["text"] for f in landed], [text], "exactly one copy migrated")
+    assert_eq(landed[0]["pin"], True,
+              "the copy that migrated is the pinned one — a retirement must not "
+              "quietly un-pin a fact on its way into the destination")
+
+
 def test_retire_preserves_last_used_and_added_turn():
     print("\n[test] /retire moves a fact's metadata with it, unchanged")
     _wipe()
@@ -1793,6 +1867,8 @@ def _all_tests():
         test_tidy_keeps_and_reports_ambiguous_rows,
         test_tidy_reports_near_duplicates_without_removing_them,
         test_tidy_removes_exact_duplicates_keeping_the_longest_lived_copy,
+        test_tidy_keeps_the_pinned_copy_of_a_byte_identical_group,
+        test_tidy_survivor_falls_back_to_recency_when_no_copy_is_pinned,
         test_tidy_apply_without_a_code_refuses,
         test_tidy_apply_with_a_stale_code_refuses_and_reprints_the_plan,
         test_tidy_code_survives_an_unrelated_write,
@@ -1823,6 +1899,7 @@ def _all_tests():
         test_retire_drops_a_fact_the_destination_already_has_in_cold_storage,
         test_retire_moves_archived_rows_into_the_destination_archive,
         test_retire_prefers_the_hot_copy_when_a_fact_is_in_both_source_layers,
+        test_retire_keeps_the_pinned_copy_of_a_source_duplicate,
         test_retire_preserves_last_used_and_added_turn,
         test_retire_clears_every_layer_keyed_to_the_source,
         test_retire_snapshot_carries_the_archive_and_the_persona,
