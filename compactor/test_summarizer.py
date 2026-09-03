@@ -1722,6 +1722,39 @@ def test_a_chunk_straddling_the_window_edge_claims_only_what_it_saw():
     assert_eq(warned.levelno, logging.WARNING, "at WARNING")
 
 
+def test_a_straddle_during_an_outage_does_not_claim_a_span_it_never_recorded():
+    print("\n[test] a half-lost chunk during a vLLM outage records NOTHING, and says so")
+    # v3.1.7, R29. Same straddle fixture as the test above, but the summarizer
+    # call returns empty (an outage) instead of "CHUNK". The old code logged
+    # "summarized turns 53-54 and recorded that as the chunk's span" BEFORE
+    # calling _summarize_pieces, so when that call came back empty the
+    # function recorded nothing while the log already said it had —
+    # reproduced during triage as four such lines against l1=0, emitted
+    # exactly when an operator is reading logs during an outage.
+    _wipe()
+    cid = "straddle-outage"
+    summarizer.save_state(cid, {
+        "l1": [], "l2": [], "l3": None, "last_summarized_turn": 50,
+        "turns_seen": 60,
+        "tail_fp": summarizer._turn_fingerprints(_window(60, 8))[-4:],
+    })
+    orig = _install_mock("")  # every vLLM call returns empty content
+    try:
+        with capture() as cap:
+            state = asyncio.run(
+                summarizer.maybe_rollup(cid, _window(60, 8), "http://x", "m")
+            )
+    finally:
+        _restore_httpx(orig)
+
+    assert_eq(state["last_summarized_turn"], 50, "the watermark did not move")
+    assert_eq(state["l1"], [], "no L1 chunk was appended")
+    assert_eq(state["l2"], [], "no L2 chapter either")
+    lied = find(cap.records, "recorded that as the chunk's span")
+    assert_true(lied is None,
+                "the log must not claim a span was recorded when l1/l2 are empty")
+
+
 # ---------------------------------------------------------------------------
 # Rollup observability
 # ---------------------------------------------------------------------------
@@ -1898,6 +1931,7 @@ if __name__ == "__main__":
         test_a_rewound_watermark_is_repaired_before_it_can_discard_a_span()
         test_a_backlog_past_the_window_skips_instead_of_stalling()
         test_a_chunk_straddling_the_window_edge_claims_only_what_it_saw()
+        test_a_straddle_during_an_outage_does_not_claim_a_span_it_never_recorded()
         test_rollup_logs_a_success_line()
         test_failed_l3_does_not_discard_successful_l1_and_l2()
         test_failed_l3_does_not_repeat_the_same_work_forever()

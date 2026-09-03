@@ -101,7 +101,7 @@ R4 is small and blocks Stage 1's install sequence. R13 is a design change
 placeholders) and is the larger of the two; it can follow the cap going on,
 but not by much, because it is the only rebuild-from-store recovery path.
 
-### Stage 3 — memory correctness she would notice
+### Stage 3 — memory correctness she would notice — **R24/R9/R19/R25 DONE**
 
 | | finding | effect |
 |---|---|---|
@@ -116,11 +116,29 @@ counting `line.count(". ")`.** Two pieces of new code in one delta disagreeing
 about what a sentence end is. Fix by making them share one definition, not by
 adding a second stoplist — the duplication IS the bug.
 
-Partial work for R24/R25 exists and currently breaks a pinned boundary
-assertion (`mean 41` now reads as 40). Resolve whether the fix or the fixture
-is wrong before merging.
+**Resolved: the prior attempt's counting was wrong, not the fixture.**
+`_SENTENCE_END_RE` matches a terminator followed by whitespace OR
+end-of-string, and that end-of-string branch is essential for
+`trim_to_last_sentence` (a reply's last sentence has no trailing space) but
+wrong for a break COUNT: the formula is `fragments = breaks + 1`, and the
+`+1` already accounts for the line's own final fragment. Counting that last
+period too yields one fragment too many and moves the calibrated 1,600/40 vs
+1,640/40 line by exactly one. The fix keeps the literal two-character match
+filtered through the shared predicate, so the pinned fixture needed no change
+and still passes verbatim.
 
-### Stage 4 — observability that would have caught all of this sooner
+R24 now shares one definition of a sentence end with the trimmer
+(`_is_real_sentence_end`) - what the duplication note above asked for. R25
+replaced the lead-character set with "the preceding character is not
+alphanumeric", covering every dash rather than enumerating them. R9 requires
+the qualifying run to reach the END of the reply: a real runaway ran to its
+own end, and the corpus's 1,261-item case had no closing prose, so the
+66-books reply is clean while the runaway still fires. R19 gates the list
+rule on `DEGENERATE_MIN_CHARS`, matching this file's own doctrine.
+
+**R8 remains open** - it needs `main.py` and was not part of this pass.
+
+### Stage 4 — observability that would have caught all of this sooner — **R27/R28/R29 DONE**
 
 | | finding | effect |
 |---|---|---|
@@ -128,6 +146,27 @@ is wrong before merging.
 | 10 | **R27** | an empty reply (Stop before the first token) flips `/health/full` to degraded for five minutes and claims memory was lost |
 | 11 | **R29** | a partial-coverage warning says a chunk was recorded before the summarizer is called, so it lies during an outage |
 | 12 | **R28** | `tailhealth.note` raises out of a `finally` on a non-numeric count, and leaves the counters inconsistent |
+
+R27: `skipped_recently` is keyed off whether the outcome was LOSSY, not off
+"any skip", so a run of manual stops before the first token no longer pins
+`/health/full` degraded over turns that lost nothing. R28: the char counts go
+through a coercion helper and the outcome tally is the LAST mutation in
+`note()`, so a bookkeeping failure leaves the ledger consistent rather than
+half-incremented.
+
+R29 was **already fixed incidentally** by the R23/R12 commit, which moved the
+partial-coverage warning below the summarization. Verified by reproduction
+rather than assumed.
+
+**One defect was introduced and caught during this pass**, recorded because
+the comment was more convincing than the code: the lossy test was written as
+membership of `LOSSY_SKIP_OUTCOMES`, and that set is built by excluding from
+`OUTCOMES` - so it cannot contain a label that is not in `OUTCOMES`, making
+an unrecognised outcome NON-lossy. The exact inversion of the safe default
+its own comment claimed. Now tested as "not a store and not the one harmless
+label", pinned by a test that fails on the set-membership form.
+
+**R26 remains open** - it needs `main.py`.
 
 ### Stage 5 — the remainder, and the one that is bigger than it looks
 
