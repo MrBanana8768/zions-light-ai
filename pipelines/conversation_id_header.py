@@ -90,7 +90,16 @@ the merge does not carry everything - see MERGE LIMITS below.
 8. MERGE the old memory into the new id. Dry run first - it is the
    default - and read the counts before committing:
      curl -s -X POST "localhost:8080/admin/conversations/<old-hash-id>/merge-into/<new-uuid>"
-     curl -s -X POST "localhost:8080/admin/conversations/<old-hash-id>/merge-into/<new-uuid>?dry_run=false"
+     curl -s -X POST "localhost:8080/admin/conversations/<old-hash-id>/merge-into/<new-uuid>" \
+          -H 'Content-Type: application/json' -d '{"dry_run": false}'
+
+   READ THE COUNTS ON THE SECOND COMMAND, not just its status. Until v3.1.7
+   the handler read `dry_run` from the JSON body only, so the `?dry_run=false`
+   this runbook used to print was silently ignored: the commit was a second
+   dry run that returned 200 with plausible numbers and changed nothing. Both
+   forms work now, and the body form is the one written here because it is the
+   one that has always been read. A merge that did not happen is invisible
+   until step 10 makes the loss permanent.
 9. VERIFY the facts landed before going any further:
      curl -s "localhost:8080/admin/conversations" | grep -A3 "<new-uuid>"
    The fact count under the new id should be close to what the old id
