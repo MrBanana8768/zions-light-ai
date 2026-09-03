@@ -201,4 +201,31 @@ print(f"       30,000 chars with 3,000 fence toggles: {fence_ms:.1f} ms")
 assert_true(fence_ms < 1000, "fence bookkeeping is a bisect, not a rescan")
 
 print()
+print("[14] R25 — a dash introduces a word exactly as a space does")
+# _WORD_LEAD_CHARS used to have no dash of any kind in it, so the
+# abbreviation stoplist and the single-initial rule were both skipped right
+# after an em dash, en dash or hyphen - the opposite of every other lead
+# character tested above ([5], [6]), which all led with a space or
+# start-of-text. That made the set too PERMISSIVE-never-narrow in those
+# tests; these lead with a dash instead, so a mutation that makes
+# `whole_word` always True is caught elsewhere, and one that makes it
+# always False (or that never recognises a dash as a lead character) is
+# caught here.
+assert_eq(trim("Something ended properly. Then—i.e. a fragment that never fin"),
+          "Something ended properly.",
+          "an em dash before 'i.e.' does not defeat the abbreviation "
+          "stoplist - the trim lands on the clean sentence before it, not "
+          "on the abbreviation")
+assert_eq(trim("Written by the author—J. R. R. Tolkien and oth"), "",
+          "an em dash before a single initial does not defeat the initial "
+          "rule either - 'J.' is still not a boundary")
+assert_eq(trim("Written by the author—J. R. R. Tolkien. And oth"),
+          "Written by the author—J. R. R. Tolkien.",
+          "...the sentence after the initials still ends normally")
+assert_eq(trim("Ask the doctor-Dr. Smith-about it tomor"), "",
+          "a hyphen before 'Dr.' does not defeat the stoplist either")
+assert_eq(trim("Read Rev-Rev. 21:4 says so, and it clo"), "",
+          "an en dash reads the same way")
+
+print()
 print("All sentence-trim tests passed.")

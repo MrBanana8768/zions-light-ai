@@ -1859,6 +1859,21 @@ _TOKEN_RUN_RE = re.compile(r"(\S{3,40})(?:[ _\n\t]*\1){3,}")
 # never exceeded 9. 50 is 1.5x above the highest ambiguous value and 20x
 # below the one it exists for.
 #
+# R9/R19: this backstop used to fire on the LONGEST run seen anywhere in the
+# text, with no floor on the reply's own length — so it caught a 66-item
+# "list the books of the Bible" reply that closes in prose ("...those are
+# all 66 books, from Genesis to Revelation") exactly as if it were the
+# runaway, and fired on a bare 200-character list two-thirds under
+# DEGENERATE_MIN_CHARS, which this file's own doctrine (see
+# MIN_MEMORABLE_TRIMMED_CHARS below) calls the floor below which nothing is
+# judged structurally. Two fixes, both aimed at the description above and
+# not at the corpus case: the run must reach the END of the reply — a real
+# runaway "ran to its own end" (the 1,261-item corpus case has nothing
+# after its list; the Bible reply does) — and the reply must clear
+# DEGENERATE_MIN_CHARS, same floor the decoration-fraction rule already
+# obeys a few lines up. Both still hold for the corpus case: its list *is*
+# the end of the reply, and 1,359 lines is nowhere near the 300-char floor.
+#
 # WHY THIS MATTERS THOUGH SHE STOPPED IT. A cut reply reaches the memory
 # tail trimmed to its last complete sentence (decide_memory_tail, v3.1.4),
 # and this rule is applied to what survives the trim — an unterminated
@@ -1999,7 +2014,15 @@ def reply_is_degenerate(text: str) -> str | None:
             )
     # Structural collapse (see the block comment above the DEGENERATE_LINE_*
     # constants). One pass over lines.
-    run = best_run = 0
+    #
+    # R9: `run` (not a separate `best_run` tracked over the whole text) is
+    # what the list-run backstop below reads, so a qualifying run only
+    # counts when it is still active at the END of the reply — broken by
+    # any later non-list line (prose, a blank-then-prose close, anything
+    # that fails the item test) resets it to 0 same as before. See the R9/R19
+    # note above DEGENERATE_LINE_CHARS for why "reaches the end" is the
+    # discriminator.
+    run = 0
     in_fence = False
     for raw in text.splitlines():
         line = raw.strip()
@@ -2014,15 +2037,18 @@ def reply_is_degenerate(text: str) -> str | None:
             continue
         if len(line) <= DEGENERATE_LIST_ITEM_CHARS and _LIST_ITEM_RE.match(line):
             run += 1
-            if run > best_run:
-                best_run = run
         else:
             run = 0
         ln = len(line)
         if ln >= DEGENERATE_LINE_CHARS and line.count(" ") >= _LINE_MIN_SPACES:
+            # R24: "! " and "? " are always real ends (see
+            # _is_real_sentence_end), but "." needs the abbreviation and
+            # single-initial check trim_to_last_sentence uses, or "Dr. ",
+            # "Mrs. ", "9 a.m. " etc each register as a sentence break and
+            # collapse the computed mean on ordinary prose.
             breaks = (
-                line.count(". ") + line.count("! ") + line.count("? ")
-                + line.count("… ")
+                _count_real_period_breaks(line) + line.count("! ")
+                + line.count("? ") + line.count("… ")
             )
             if breaks == 0:
                 # No sentence at all in 1500+ characters: either a run-on,
@@ -2037,9 +2063,13 @@ def reply_is_degenerate(text: str) -> str | None:
                     f"{DEGENERATE_LINE_SENTENCE_CHARS} over "
                     f"{DEGENERATE_LINE_CHARS}+ characters)"
                 )
-    if best_run >= DEGENERATE_LIST_RUN:
+    # R19: gated on DEGENERATE_MIN_CHARS like the decoration-fraction rule
+    # above — this file's own doctrine (see MIN_MEMORABLE_TRIMMED_CHARS)
+    # calls that the floor below which nothing is judged structurally, and
+    # this branch was the one exception.
+    if n >= DEGENERATE_MIN_CHARS and run >= DEGENERATE_LIST_RUN:
         return (
-            f"a run of {best_run} consecutive list items of "
+            f"a run of {run} consecutive list items of "
             f"{DEGENERATE_LIST_ITEM_CHARS} characters or fewer (limit "
             f"{DEGENERATE_LIST_RUN})"
         )
@@ -2170,10 +2200,98 @@ _SENTENCE_ABBREVIATIONS = frozenset(
 # is scanned, found absent, and accepted without an unbounded walk back.
 _ABBREV_SCAN_CHARS = 12
 _ABBREV_RUN_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.")
-# What may precede a word for it to count as a whole word (for the
-# abbreviation and single-initial rules): start of text, whitespace, or an
-# opening mark. "1st." is not an abbreviation because "1" precedes "st".
-_WORD_LEAD_CHARS = frozenset(" \t\r\n\f\v(\"'“‘[«*_~`")
+# What may precede a word for it to count as a WHOLE word (for the
+# abbreviation and single-initial rules below): the preceding character is
+# not alphanumeric. "1st." is not the abbreviation "st." because "1"
+# precedes it and IS alphanumeric.
+#
+# R25: this used to be an explicit frozenset (space, tab, opening brackets,
+# quotes, markdown emphasis marks) with no dash of any kind in it, so
+# "Then—i.e. a fragment" and "author—J. R. R. Tolkien" skipped the
+# abbreviation stoplist and the single-initial rule entirely — whole_word
+# came back False after an em dash, en dash or hyphen, backwards, since a
+# dash introduces a word exactly as a space does. The existing tests only
+# ever led with a space or start-of-text, so the set was exercised for
+# being too permissive and never for being too narrow. "not alphanumeric"
+# is what the rule has always meant; it now covers dashes and anything
+# else a hand-enumerated set could omit without another list to keep in
+# sync with this one.
+
+
+def _is_real_sentence_end(text: str, i: int) -> bool:
+    """True when `text[i]` — a terminator `_SENTENCE_END_RE` matched at
+    position `i` — is a genuine sentence end, not an ellipsis, a dotted
+    abbreviation ("Dr.", "e.g."), a single initial ("J."), or a numbered-
+    list marker ("1.").
+
+    Shared by trim_to_last_sentence (deciding where to cut text going into
+    the store) and reply_is_degenerate's fragment-line rule (deciding
+    whether a line's dots are real sentence breaks or abbreviations) — one
+    rule, one function, the same "single shared predicate" doctrine
+    assistant_content_is_empty is built on. R24: before this function
+    existed, reply_is_degenerate counted sentence breaks with a bare
+    `line.count(". ")`, so "Dr. ", "Mrs. ", "Rev. ", "9 a.m. " were each
+    counted as a sentence end, collapsing the computed mean fragment length
+    on ordinary prose that happened to use an abbreviation — while this
+    exact list of abbreviations already existed one function away, written
+    for trim_to_last_sentence. Two pieces of code in one delta disagreed
+    about what a sentence end is; now there is one definition.
+
+    Only `.` has an abbreviation problem — `!`, `?` and the fullwidth
+    terminators are always real ends.
+    """
+    if text[i] != ".":
+        return True
+    if i > 0 and text[i - 1] == ".":
+        return False  # ellipsis
+    # The dotted word immediately before the terminator, and what precedes
+    # it, for the abbreviation, initial and list-marker rules.
+    j = i
+    while j > 0 and i - j < _ABBREV_SCAN_CHARS and text[j - 1] in _ABBREV_RUN_CHARS:
+        j -= 1
+    word = text[j:i]
+    whole_word = j == 0 or not text[j - 1].isalnum()
+    if whole_word and word:
+        if word.lower() in _SENTENCE_ABBREVIATIONS:
+            return False
+        if len(word) == 1 and word.isupper():
+            return False  # single initial
+    if not word:
+        # A bare number at the start of its line is a list marker ("1. ").
+        k = i
+        while k > 0 and text[k - 1].isdigit():
+            k -= 1
+        if k < i:
+            ls = k
+            while ls > 0 and text[ls - 1] in " \t":
+                ls -= 1
+            if ls == 0 or text[ls - 1] == "\n":
+                return False
+    return True
+
+
+def _count_real_period_breaks(line: str) -> int:
+    """Count of `. ` in `line` whose `.` is a genuine sentence end, per
+    _is_real_sentence_end — shared with trim_to_last_sentence so the two
+    agree on what a sentence end is (R24), instead of the bare
+    `line.count(". ")` that used to count "Dr. ", "Mrs. ", "9 a.m. " as
+    sentence breaks and collapsed the mean fragment length of ordinary
+    prose in reply_is_degenerate's fragment-line rule.
+
+    Deliberately `. ` (a literal period-then-space), not _SENTENCE_END_RE's
+    `(?=\\s|\\Z)` — the fragment-line rule computes
+    `fragments = breaks + 1`, where the "+1" already accounts for the
+    line's own final fragment, whose period is never followed by a space
+    (it is the last thing on the line). Matching a period at end-of-line
+    too would count that last fragment's break twice and move the
+    calibrated boundary test_degenerate_reply.py pins (1,600 chars / 40
+    fragments fires, 1,640 / 40 does not — both exactly on ". "-separated
+    fragments where every period but the line's last is followed by a
+    space).
+    """
+    return sum(
+        1 for m in re.finditer(r"\. ", line) if _is_real_sentence_end(line, m.start())
+    )
 
 
 def trim_to_last_sentence(text: str) -> str:
@@ -2250,32 +2368,8 @@ def trim_to_last_sentence(text: str) -> str:
         i = m.start()
         if toggles and bisect.bisect_right(toggles, i) % 2 == 1:
             continue  # inside an open fence
-        if text[i] == ".":
-            if i > 0 and text[i - 1] == ".":
-                continue  # ellipsis
-            # The dotted word immediately before the terminator, and what
-            # precedes it, for the abbreviation, initial and list-marker rules.
-            j = i
-            while j > 0 and i - j < _ABBREV_SCAN_CHARS and text[j - 1] in _ABBREV_RUN_CHARS:
-                j -= 1
-            word = text[j:i]
-            whole_word = j == 0 or text[j - 1] in _WORD_LEAD_CHARS
-            if whole_word and word:
-                if word.lower() in _SENTENCE_ABBREVIATIONS:
-                    continue
-                if len(word) == 1 and word.isupper():
-                    continue  # single initial
-            if not word:
-                # A bare number at the start of its line is a list marker.
-                k = i
-                while k > 0 and text[k - 1].isdigit():
-                    k -= 1
-                if k < i:
-                    ls = k
-                    while ls > 0 and text[ls - 1] in " \t":
-                        ls -= 1
-                    if ls == 0 or text[ls - 1] == "\n":
-                        continue
+        if not _is_real_sentence_end(text, i):
+            continue
         end = m.end()
     if end <= 0 or end > n:
         return ""
