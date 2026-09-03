@@ -70,6 +70,10 @@ def check(cond, label):
 
 
 LLM_CALLS = []
+# What was actually SENT to be summarized. LLM_CALLS answers "did a call
+# happen"; this answers "which turns did it contain", which is the only way to
+# see a misaligned chunk — the labels look right either way.
+LLM_BODIES = []
 
 
 async def _fake_llm(client, vllm_url, model, system_prompt, body_text,
@@ -77,6 +81,7 @@ async def _fake_llm(client, vllm_url, model, system_prompt, body_text,
     """Stand in for the vLLM round trip. Records that a call happened, which
     is the thing `dry_run` has to prove it did not do."""
     LLM_CALLS.append(len(body_text))
+    LLM_BODIES.append(body_text)
     return f"summary of {len(body_text)} chars"
 
 
@@ -435,6 +440,134 @@ check("max_calls" in str(body.get("stopped_because")),
 
 
 # ---------------------------------------------------------------------------
+# 6. R13 — a gap is FILLED at its position, not closed by concatenation
+#
+# `turns_seen` counts every exchange, including the ones decide_memory_tail
+# skipped and the ones bgwork shed; the episodic store holds only the indexed
+# ones. Concatenating what the store has therefore produced an array SHORT by
+# every gap, and short by even one turn is not merely short — every pair after
+# the gap sits one exchange early, so a chunk labelled 1-20 quietly swallows
+# exchange 11. The endpoint was right to refuse that, and refused for every
+# real conversation: 63 skips in one measured window, one gap is enough, and
+# this is the only rebuild-from-store recovery path there is.
+#
+# So place each pair at the position its `turn_index` records and fill the
+# holes with an explicit placeholder. What is left to refuse is what padding
+# cannot invent: a store that does not REACH the position.
+# ---------------------------------------------------------------------------
+
+print()
+print("[6] one un-indexed exchange in fifteen is rebuilt, not refused")
+# The backlog's exact reproduction: turns_seen=30, watermark=20,
+# concatenation=28 -> HTTP 409. Exchange 6 never reached the index, and the
+# 4-wide hole it leaves in turn_index is what production produces too — the
+# request seed (len(messages)+1) advances by 2 whether or not a row is written.
+CID = "gap-one"
+gappy = [ex for i, ex in enumerate(exchanges(15)) if i != 6]
+set_store(gappy)
+summarizer.save_state(CID, {
+    "l1": [], "l2": [], "l3": None, "last_summarized_turn": 0, "turns_seen": 30,
+})
+LLM_CALLS.clear()
+LLM_BODIES.clear()
+r = compact(CID)
+body = r.json()
+check(r.status_code == 200,
+      f"HTTP 200 — one gap no longer refuses the whole conversation "
+      f"(got {r.status_code}: {r.text[:120]})")
+check(body.get("reconstructed_messages") == 30,
+      f"the rebuild spans the full 30 turns "
+      f"(got {body.get('reconstructed_messages')})")
+check(body.get("indexed_exchanges") == 14,
+      f"...from only 14 stored rows (got {body.get('indexed_exchanges')})")
+check(body.get("gap_turns") == 2 and body.get("gap_exchanges") == 1,
+      f"and the plan REPORTS the gap rather than hiding it "
+      f"(gap_turns={body.get('gap_turns')}, "
+      f"gap_exchanges={body.get('gap_exchanges')})")
+check(body.get("recorded_position") == 30,
+      f"the plan names the position it was measured against "
+      f"(got {body.get('recorded_position')})")
+
+# The assertion that actually matters: WHICH turns went into chunk 1-20. The
+# labels are identical whether or not the alignment is right, so only the text
+# can tell. Exchanges 0-5 and 7-9 belong to it; exchange 10 does not, and
+# under the old concatenation it would have been dragged in.
+check(len(LLM_BODIES) >= 1, "a chunk was actually summarized")
+first = LLM_BODIES[0] if LLM_BODIES else ""
+check(all(f"answer {i}" in first for i in list(range(6)) + [7, 8, 9]),
+      "chunk 1-20 holds exactly the exchanges that belong to turns 1-20")
+check("answer 10" not in first,
+      "exchange 10 was NOT pulled forward into chunk 1-20 by the gap")
+check(main._UNINDEXED_TURN_PLACEHOLDER in first,
+      "and the missing exchange is present as an explicit placeholder, so the "
+      "summary can say a turn is unaccounted for rather than skip silently")
+_l1 = summarizer.load_state(CID).get("l1") or []
+check(bool(_l1) and _l1[0]["last_turn"] == 20,
+      f"the chunk is still labelled 1-20 (l1={_l1[:1]})")
+
+print()
+print("[6b] the placeholder is a summarization INPUT and never enters a store")
+# The house rule: a marker written into the memory store would be extracted as
+# a fact and become one of her memories. This one reaches maybe_rollup (proved
+# in [6] above) and nothing else. _fake_llm never echoes its input, so any
+# occurrence on disk would mean the placeholder was written directly.
+_leaked = []
+for _dirpath, _dirs, _files in os.walk(_TMP_ROOT):
+    for _name in _files:
+        _p = os.path.join(_dirpath, _name)
+        with open(_p, "rb") as _fh:
+            if main._UNINDEXED_TURN_PLACEHOLDER.encode() in _fh.read():
+                _leaked.append(os.path.relpath(_p, _TMP_ROOT))
+check(_leaked == [],
+      f"no file under the storage root contains the placeholder (found "
+      f"{_leaked})")
+
+print()
+print("[6c] a store with more gap than transcript is still refused")
+# One corrupt turn_index would otherwise open a gap as wide as the number
+# itself, and a reconstruction that is majority placeholder would spend a
+# summarization call per chunk to record that nothing is known.
+CID = "gap-majority"
+sparse = [
+    {"turn_index": 1, "document": "[user]: q\n[assistant]: a"},
+    {"turn_index": 3, "document": "[user]: q\n[assistant]: a"},
+    {"turn_index": 61, "document": "[user]: q\n[assistant]: a"},
+]
+set_store(sparse)
+summarizer.save_state(CID, {
+    "l1": [], "l2": [], "l3": None, "last_summarized_turn": 0,
+})
+before = snapshot()
+LLM_CALLS.clear()
+r = compact(CID)
+check(r.status_code == 409,
+      f"HTTP 409 for a reconstruction that is mostly holes (got {r.status_code})")
+check("more of this transcript is missing than is present" in r.text.lower(),
+      "and the body says which refusal this is")
+check(LLM_CALLS == [], "no LLM call was made")
+check(snapshot() == before, "the store is byte-identical after the refusal")
+
+print()
+print("[6d] a row whose document does not parse becomes a gap, not a shift")
+# Vanishing is what shifted everything after it. The slot is still consumed.
+CID = "gap-unparseable"
+rows = exchanges(10)
+rows[3] = {"turn_index": rows[3]["turn_index"], "document": "not an exchange"}
+set_store(rows)
+summarizer.save_state(CID, {
+    "l1": [], "l2": [], "l3": None, "last_summarized_turn": 0,
+})
+r = compact(CID, dry_run=True)
+body = r.json()
+check(r.status_code == 200, f"HTTP 200 (got {r.status_code})")
+check(body.get("reconstructed_messages") == 20,
+      f"the unparseable row still occupies its two slots "
+      f"(got {body.get('reconstructed_messages')})")
+check(body.get("gap_turns") == 2,
+      f"...counted as a gap (got {body.get('gap_turns')})")
+
+
+# ---------------------------------------------------------------------------
 
 print()
 if FAILED:
@@ -457,6 +590,24 @@ print("All admin compact tests passed.")
 #   `{conv_id}/compact`            -> `{conv_id:path}/compact`-> [4]
 #   `if now <= prev:`              -> `if False:`            ->  [5]
 #   `while calls < max_calls:`     -> `while calls < max_calls + 3:` -> [5c]
+#
+# v3.1.7 (R13), same treatment:
+#
+#   `at = max(_idx(ex) - base, cursor)` -> `at = cursor`
+#     (spacing ignored, gaps closed — the pre-R13 concatenation)  ->  [6],
+#     and it comes back with the ORIGINAL defect's body verbatim:
+#     "rebuilds 28 messages ... including 0 placeholder turns"
+#   that, PLUS the unparseable-row `continue` hoisted above the
+#     slot arithmetic (the pre-R13 shape entire)                  ->  [6d]
+#   `if gap_turns > _real_turns:` -> `if False:`                  ->  [6c]
+#
+# One mutation SURVIVED and is recorded because the reason is worth knowing:
+# hoisting the unparseable-row `continue` above the slot arithmetic ON ITS OWN
+# changes nothing, because a slot is derived from the row's turn_index and not
+# from a running cursor — an unparseable row and a missing row are the same
+# thing to this rebuild, which is the property [6d] is really pinning. It only
+# becomes visible once placement is cursor-based as well, which is the
+# two-part mutation above.
 #
 # A test whose assertions cannot be made to fail is a test that asserts
 # nothing, and this branch has shipped two of those this week.
