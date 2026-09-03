@@ -1,0 +1,54 @@
+# The full local test suite, on Linux, on the userland production runs.
+#
+# SEPARATE from docker-compose.yml (production, GPU, model weights) and from
+# docker-compose.tokenizer-contract.yml (the /tokenize fixture stack) on
+# purpose. Nothing here touches either.
+#
+#   # everything except the scale suites:
+#   docker compose -f docker-compose.tests.yml run --rm --build unit-tests
+#
+#   # add the 200-exchange saturation run:
+#   docker compose -f docker-compose.tests.yml run --rm unit-tests --saturation
+#
+#   # one suite, by substring:
+#   docker compose -f docker-compose.tests.yml run --rm unit-tests --only position
+#
+# Arguments after the service name go straight to scripts/run-tests.py, so
+# --fast, --only, --saturation, --list and --allow-skips all work as they do
+# on the host.
+#
+# WHAT THIS DOES NOT COVER. The two fixture-backed suites still live in
+# docker-compose.tokenizer-contract.yml and still need it running — this stack
+# has no /tokenize server, so test_tokenizer_contract.py and
+# test_soak_conversation.py will report SKIP here, honestly, and the runner
+# will exit 3 rather than pretend. Run them with:
+#
+#   docker compose -f docker-compose.tokenizer-contract.yml up --build --exit-code-from contract-tests
+#   docker compose -f docker-compose.tokenizer-contract.yml run --rm --build soak-tests
+
+services:
+  unit-tests:
+    build:
+      context: .
+      dockerfile: testfixtures/unit-suite/Dockerfile
+    container_name: zla-unit-tests
+    volumes:
+      # Read-only, and copied to a scratch tree inside the container before
+      # anything runs. The suites create state directories, sqlite files and
+      # chromadb stores next to the code; writing those onto a bind mount is
+      # slow across the Windows filesystem boundary and leaves artefacts in
+      # the working tree, where the next `git status` reads them as changes.
+      - ./:/src:ro
+    environment:
+      # The same offline flags scripts/run-tests.py sets for itself. Repeated
+      # here because a suite that silently downloads a tokenizer is a suite
+      # whose result depends on the network, and this is the layer that can
+      # actually enforce it.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      COMPACTOR_FORCE_OFFLINE: "true"
+    # No network. The unit suites must not reach anything, and the one place
+    # this bites is worth knowing about: any suite that expects to CONNECT to
+    # something will now fail fast rather than after a real connect timeout,
+    # which is the Linux half of the R22 finding.
+    network_mode: none
