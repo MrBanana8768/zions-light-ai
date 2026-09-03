@@ -46,6 +46,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+from envcfg import env_float, env_int
+
 logger = logging.getLogger("compactor.webuidb")
 
 # The live database: local disk, NOT /data.
@@ -55,7 +57,7 @@ LOCAL_DB = Path(os.environ.get("WEBUI_LOCAL_DB", "/var/lib/openwebui/webui.db"))
 SNAPSHOT_DB = Path(
     os.environ.get("WEBUI_SNAPSHOT_DB", "/data/openwebui/webui.db")
 )
-SYNC_INTERVAL_S = float(os.environ.get("WEBUI_DB_SYNC_INTERVAL_S", "300") or 300)
+SYNC_INTERVAL_S = env_float("WEBUI_DB_SYNC_INTERVAL_S", 300)
 # Where a local database that fails its integrity check is set aside. Never
 # deleted: this project's rule is that anything removing state is reversible.
 QUARANTINE = Path(os.environ.get("WEBUI_DB_QUARANTINE", "/data/forensics"))
@@ -76,14 +78,10 @@ SIDECARS = ("-journal", "-wal", "-shm")
 # fires on catastrophe rather than on housekeeping. Deleting a few
 # conversations must still reach the snapshot (A4) or the guard would quietly
 # stop backing her up, which is its own data-loss mode.
-SHRINK_REFUSE_BELOW = float(
-    os.environ.get("WEBUI_DB_SHRINK_REFUSE_BELOW", "0.5") or 0.5
-)
+SHRINK_REFUSE_BELOW = env_float("WEBUI_DB_SHRINK_REFUSE_BELOW", 0.5)
 # Below this many chats in the PREVIOUS snapshot the ratio is meaningless
 # (2 -> 1 is a 50% drop and means nothing), so the guard stands down.
-SHRINK_GUARD_MIN_CHATS = int(
-    os.environ.get("WEBUI_DB_SHRINK_GUARD_MIN_CHATS", "10") or 10
-)
+SHRINK_GUARD_MIN_CHATS = env_int("WEBUI_DB_SHRINK_GUARD_MIN_CHATS", 10)
 # The deliberate override: she really did clear her history and the snapshot
 # must follow. Refusing forever would be its own failure.
 ALLOW_SHRINK = (
@@ -97,19 +95,13 @@ def _reload_env() -> None:
     them without restarting the process."""
     global SHRINK_REFUSE_BELOW, SHRINK_GUARD_MIN_CHATS, ALLOW_SHRINK
     global SYNC_INTERVAL_S
-    SHRINK_REFUSE_BELOW = float(
-        os.environ.get("WEBUI_DB_SHRINK_REFUSE_BELOW", "0.5") or 0.5
-    )
-    SHRINK_GUARD_MIN_CHATS = int(
-        os.environ.get("WEBUI_DB_SHRINK_GUARD_MIN_CHATS", "10") or 10
-    )
+    SHRINK_REFUSE_BELOW = env_float("WEBUI_DB_SHRINK_REFUSE_BELOW", 0.5)
+    SHRINK_GUARD_MIN_CHATS = env_int("WEBUI_DB_SHRINK_GUARD_MIN_CHATS", 10)
     ALLOW_SHRINK = (
         os.environ.get("WEBUI_DB_ALLOW_SHRINK", "").strip().lower()
         in ("1", "true", "yes")
     )
-    SYNC_INTERVAL_S = float(
-        os.environ.get("WEBUI_DB_SYNC_INTERVAL_S", "300") or 300
-    )
+    SYNC_INTERVAL_S = env_float("WEBUI_DB_SYNC_INTERVAL_S", 300)
 
 
 def _stamp() -> str:

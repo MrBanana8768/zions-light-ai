@@ -74,6 +74,7 @@ import httpx
 import logsetup
 import tokens
 import tokenhealth
+from envcfg import env_float, env_int
 from memory import (
     atomic_write_json,
     conv_lock,
@@ -89,43 +90,37 @@ logger = logging.getLogger("compactor.summarizer")
 # Configuration (env-overridable, sensible defaults)
 # ---------------------------------------------------------------------------
 
-L1_CHUNK_SIZE = int(os.environ.get("COMPACTOR_L1_CHUNK_SIZE", "20") or 20)
-L2_CHUNK_SIZE = int(os.environ.get("COMPACTOR_L2_CHUNK_SIZE", "10") or 10)
-L3_CHUNK_SIZE = int(os.environ.get("COMPACTOR_L3_CHUNK_SIZE", "5") or 5)
+L1_CHUNK_SIZE = env_int("COMPACTOR_L1_CHUNK_SIZE", 20)
+L2_CHUNK_SIZE = env_int("COMPACTOR_L2_CHUNK_SIZE", 10)
+L3_CHUNK_SIZE = env_int("COMPACTOR_L3_CHUNK_SIZE", 5)
 
 # Per-tier token budget for the LLM's output (input tokens depend on how
 # much we're summarizing). L3 is largest because it must represent the
 # whole conversation; L1 is smallest because each chunk is one "scene."
-L1_MAX_TOKENS = int(os.environ.get("COMPACTOR_L1_MAX_TOKENS", "500") or 500)
-L2_MAX_TOKENS = int(os.environ.get("COMPACTOR_L2_MAX_TOKENS", "1200") or 1200)
-L3_MAX_TOKENS = int(os.environ.get("COMPACTOR_L3_MAX_TOKENS", "2000") or 2000)
+L1_MAX_TOKENS = env_int("COMPACTOR_L1_MAX_TOKENS", 500)
+L2_MAX_TOKENS = env_int("COMPACTOR_L2_MAX_TOKENS", 1200)
+L3_MAX_TOKENS = env_int("COMPACTOR_L3_MAX_TOKENS", 2000)
 
 # Same env var and default main.py reads for its own /tokenize call sites
 # (main.py:693, TOKENIZE_WARN_INTERVAL_S) — deliberately, not independently
 # tuned: an operator setting this once should govern every /tokenize
 # dependency in the process, not just the ones main.py happens to own.
-TOKENIZE_WARN_INTERVAL_S = float(
-    os.environ.get("COMPACTOR_TOKENIZE_WARN_INTERVAL_S", "300") or 300
-)
+TOKENIZE_WARN_INTERVAL_S = env_float("COMPACTOR_TOKENIZE_WARN_INTERVAL_S", 300)
 
 # Hard ceiling on the rendered injection block (see format_summary_block).
 # 5000 is the figure this module's own docstring always claimed as the
 # intended worst case (L3 + latest L2 + a handful of unrolled L1 chunks) —
 # this makes it a real, enforced number instead of an unverified comment
 # (MEMORY_REVIEW S-1/S-6).
-SUMMARY_BLOCK_MAX_TOKENS = int(
-    os.environ.get("COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS", "12000") or 12000
-)
+SUMMARY_BLOCK_MAX_TOKENS = env_int("COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS", 12000)
 
 # The model's context window, and the slack left inside it for a
 # summarization call's system prompt, wrapper text and chat-template framing.
 # Same env vars main.py reads, deliberately: the two summarization paths must
 # not be tunable apart, and a rollup that budgets against a different window
 # than the request path is the same defect in a second place.
-MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "32768") or 32768)
-SUMMARY_INPUT_RESERVE = int(
-    os.environ.get("COMPACTOR_SUMMARY_INPUT_RESERVE", "2048") or 2048
-)
+MAX_MODEL_LEN = env_int("MAX_MODEL_LEN", 32768)
+SUMMARY_INPUT_RESERVE = env_int("COMPACTOR_SUMMARY_INPUT_RESERVE", 2048)
 
 # Master switch — set false to fall back to v1 flat summary (or no summary).
 ENABLED = os.environ.get("COMPACTOR_HIERARCHICAL_SUMMARY", "true").lower() != "false"

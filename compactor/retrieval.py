@@ -35,6 +35,7 @@ import threading
 import unicodedata
 from typing import Any
 
+from envcfg import env_int
 import logsetup
 
 logger = logging.getLogger("compactor.retrieval")
@@ -49,7 +50,7 @@ RETRIEVAL_ENABLED = (
 EMBEDDING_MODEL = os.environ.get(
     "COMPACTOR_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"
 )
-RAG_TOP_K = int(os.environ.get("COMPACTOR_RAG_TOP_K", "5") or 5)
+RAG_TOP_K = env_int("COMPACTOR_RAG_TOP_K", 5)
 
 # v3.1: a token budget for the retrieval block, which had none.
 #
@@ -66,9 +67,7 @@ RAG_TOP_K = int(os.environ.get("COMPACTOR_RAG_TOP_K", "5") or 5)
 #
 # 1500 mirrors the facts budget deliberately: no injected memory layer should be
 # able to outweigh the conversation it is meant to support.
-MAX_RETRIEVAL_TOKENS = int(
-    os.environ.get("COMPACTOR_MAX_RETRIEVAL_TOKENS", "1500") or 1500
-)
+MAX_RETRIEVAL_TOKENS = env_int("COMPACTOR_MAX_RETRIEVAL_TOKENS", 1500)
 
 # fastembed caches the ONNX model here. Baked into the image at build time
 # (NOT on /data) since the embedding model is static, not per-deployment.
@@ -182,7 +181,7 @@ _TURN_INDEX_STEP = 2
 # number of stored rows the caller's `exclude_turns_from` filter is *expected*
 # to remove. Read from the environment rather than imported because main
 # imports this module, not the other way round.
-_KEEP_RECENT_TURNS = int(os.environ.get("COMPACTOR_KEEP_RECENT_TURNS", "4") or 4)
+_KEEP_RECENT_TURNS = env_int("COMPACTOR_KEEP_RECENT_TURNS", 4)
 
 # The distance, in the message-units the stored ordinals use, between the
 # caller's own position and the cutoff it derives from it: main.py computes
