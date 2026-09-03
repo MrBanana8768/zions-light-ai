@@ -62,6 +62,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from envcfg import env_float, env_int
+
 logger = logging.getLogger("compactor.backup")
 
 # ---------------------------------------------------------------------------
@@ -92,33 +94,31 @@ BACKUP_DIR = Path(os.environ.get("COMPACTOR_BACKUP_DIR", "/data/backups"))
 # cap it was the mechanism of the loss: RETAIN=7 with a prune at the end of
 # every cycle and a cycle at every process start meant seven container
 # restarts left seven copies of the damaged state and nothing older.
-RETAIN = int(os.environ.get("COMPACTOR_BACKUP_RETAIN", "7") or 7)
+RETAIN = env_int("COMPACTOR_BACKUP_RETAIN", 7)
 
 # Retention tiers (v3.1 F7 / D9). Keep everything younger than RETAIN_DAYS,
 # plus one archive per UTC day inside that window, plus one per ISO week for
 # GFS_WEEKS. Anything no tier claims is prunable.
-RETAIN_DAYS = float(os.environ.get("COMPACTOR_BACKUP_RETAIN_DAYS", "14") or 14)
-GFS_WEEKS = int(os.environ.get("COMPACTOR_BACKUP_GFS_WEEKS", "8") or 8)
+RETAIN_DAYS = env_float("COMPACTOR_BACKUP_RETAIN_DAYS", 14)
+GFS_WEEKS = env_int("COMPACTOR_BACKUP_GFS_WEEKS", 8)
 
 # The hard floor. Never leave fewer than this many archives on disk, whatever
 # their age and whatever the tiers say. Floored at 3 in code rather than in
 # config: a typo in an env var must not be able to empty the backup
 # directory. This is the last line between a bad cycle and total loss.
-MIN_KEEP = max(3, int(os.environ.get("COMPACTOR_BACKUP_MIN_KEEP", "3") or 3))
+MIN_KEEP = max(3, env_int("COMPACTOR_BACKUP_MIN_KEEP", 3))
 
 # Refuse to publish an archive whose payload is under this fraction of the
 # previous one's. A store that lost half its bytes between two cycles is an
 # unmounted volume, not a user deleting things. (v3.1 F2.)
-MIN_PAYLOAD_RATIO = float(
-    os.environ.get("COMPACTOR_BACKUP_MIN_PAYLOAD_RATIO", "0.5") or 0.5
-)
+MIN_PAYLOAD_RATIO = env_float("COMPACTOR_BACKUP_MIN_PAYLOAD_RATIO", 0.5)
 
 # Daemon cadence.
-INTERVAL_HOURS = float(os.environ.get("COMPACTOR_BACKUP_INTERVAL_HOURS", "24") or 24)
+INTERVAL_HOURS = env_float("COMPACTOR_BACKUP_INTERVAL_HOURS", 24)
 
 # Refuse to back up if the target volume has less than this much free space.
 # Prevents the backup process from being the thing that fills the disk.
-MIN_FREE_MB = int(os.environ.get("COMPACTOR_BACKUP_MIN_FREE_MB", "500") or 500)
+MIN_FREE_MB = env_int("COMPACTOR_BACKUP_MIN_FREE_MB", 500)
 
 # Optional off-volume target (future work). When unset, local only.
 REMOTE_TARGET = os.environ.get("COMPACTOR_BACKUP_REMOTE", "").strip()
