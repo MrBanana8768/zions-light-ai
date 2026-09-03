@@ -397,6 +397,134 @@ def test_touching_the_injected_set_touches_the_pinned_facts_too():
 
 
 # ---------------------------------------------------------------------------
+# Part 2 (continued) — the pin's EVICTION exemption, which is a different
+# mechanism from the injection tier above and fails in a different place
+# ---------------------------------------------------------------------------
+
+def test_a_stale_pinned_fact_is_not_evicted_by_fresher_unpinned_ones():
+    print("\n[test] a pinned fact with an ancient last_used survives eviction "
+          "against 20 fresh facts")
+    # The exemption lives in _lru_split's sort key, not in a carve-out, and
+    # this is the failure it was added for: /pin sets the flag and does NOT
+    # touch last_used, and the touch that would refresh it is conditional on
+    # the facts layer surviving main._bound_injected_blocks (87 over-budget
+    # drops in one production window). So a pinned fact can be both the
+    # least-recently-used row in the store and the one row that must never
+    # leave it. Before the exemption, the store below archived it: silently no
+    # longer injected, recoverable from the sidecar but with nothing anywhere
+    # saying so.
+    _wipe_storage()
+    cid = "pin-eviction"
+    now = int(time.time())
+    identity = _f("[MISC] her name is Placeholder", 0, 1, pin=True)  # ancient
+    fresh = [
+        _f(f"[HOME] lorem ipsum house fact {i} about the garden " * 2, i, now + i)
+        for i in range(1, 21)
+    ]
+    store = [identity] + fresh
+    # A budget that fits only a handful of the 21, so eviction genuinely has to
+    # choose. Without a binding budget this test would pass by keeping
+    # everything.
+    tight = facts._FACTS_BLOCK_HEADER_TOKENS + 5 * facts._fact_bullet_tokens(
+        fresh[0]["text"]
+    )
+    kept, dropped = facts.prune_facts(store, max_tokens=tight, conv_id=cid)
+    assert_true(dropped > 0, f"fixture: the budget really binds ({dropped} evicted)")
+    assert_true(
+        any(f["text"] == identity["text"] for f in kept),
+        "the stale PINNED fact is still in the active store",
+    )
+    archived = {f["text"] for f in facts.load_archive(cid)}
+    assert_true(
+        identity["text"] not in archived,
+        "and it did not go to the archive sidecar either",
+    )
+    assert_true(
+        any(f["text"] in archived for f in fresh),
+        "while unpinned facts — every one of them fresher — did",
+    )
+
+
+def test_the_pin_exemption_does_not_disturb_ordinary_lru_order():
+    print("\n[test] with nothing pinned, eviction is exactly LRU as before")
+    # The pin term is the highest-order element of the sort key, so it can only
+    # ever act as a tie-break above recency. On a store with no pins — every
+    # record written before the field existed — the order must be unchanged.
+    now = int(time.time())
+    cold = _f("[MISC] the coldest fact " * 4, 0, now - 10000)
+    warm = [_f(f"[HOME] fact {i} " * 8, i, now + i) for i in range(1, 6)]
+    tight = facts._FACTS_BLOCK_HEADER_TOKENS + 3 * facts._fact_bullet_tokens(
+        warm[0]["text"]
+    )
+    kept, dropped = facts.prune_facts([cold] + warm, max_tokens=tight)
+    assert_true(dropped > 0, "fixture: the budget binds here too")
+    assert_true(
+        all(f["text"] != cold["text"] for f in kept),
+        "the least-recently-used fact is still the first one evicted",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Part 1 (continued) — the settle step, which is what makes the fast
+# per-fact-floor walk safe to use as a budget
+# ---------------------------------------------------------------------------
+
+def test_the_selected_block_is_settled_against_its_real_rendering():
+    print("\n[test] the greedy per-fact-floor walk can overshoot; the settle "
+          "step is what brings the block back inside the budget")
+    # _fact_bullet_tokens floors each bullet at char/4, and a sum of floors is
+    # always <= the floor of the true combined length. Every bullet below is
+    # 40 characters, i.e. 43 with its "- " and newline, i.e. 3 characters of
+    # remainder each that the per-fact walk throws away — 10 facts, 30 lost
+    # characters, and the block the model would actually be sent measures 135
+    # estimated tokens against a 128-token budget the approximation believed
+    # it had honoured. Without the settle loop, select_for_injection returns
+    # an over-budget block while reporting that it fit.
+    texts = [
+        ("[MISC] synthetic filler fact number %02d" % i).ljust(40, "x")
+        for i in range(10)
+    ]
+    assert_true(all(len(t) == 40 for t in texts), "fixture: 40-char bullets")
+    budget = facts._FACTS_BLOCK_HEADER_TOKENS + sum(
+        facts._fact_bullet_tokens(t) for t in texts
+    )
+
+    def _check(items, label):
+        # embedder returning None takes the LRU fallback inside _select_rest,
+        # so this measures the budget arithmetic and not a ranking.
+        got = facts.select_for_injection(
+            items, max_tokens=budget, query_text="a query",
+            embedder=lambda _texts: None,
+        )
+        assert_true(
+            len(got) < len(items),
+            f"{label}: the settle step actually dropped something "
+            f"({len(got)} of {len(items)})",
+        )
+        assert_true(
+            facts._estimate_tokens(facts.format_facts_block(got)) <= budget,
+            f"{label}: the block as RENDERED fits the stated budget",
+        )
+
+    unpinned = [_f(t, i, 100 + i) for i, t in enumerate(texts)]
+    # Fixture guard: the whole set really is over budget as rendered, which is
+    # the only reason there is anything for the settle step to do.
+    assert_true(
+        facts._estimate_tokens(facts.format_facts_block(unpinned)) > budget,
+        "fixture: the greedy walk's own budget is genuinely an under-count",
+    )
+    _check(unpinned, "no pins")
+
+    # And the pinned branch, which reaches the same settle step by a different
+    # route (pinned cost paid first, rest given what is left) — this codebase's
+    # recurring defect is a fix that lands on one of two paths.
+    pinned = [_f(texts[0], 0, 100, pin=True)] + [
+        _f(t, i, 100 + i) for i, t in enumerate(texts[1:], start=1)
+    ]
+    _check(pinned, "one pinned")
+
+
+# ---------------------------------------------------------------------------
 # End-to-end measurement — before/after injection size, and LRU tracking
 # relevance rather than age across several simulated turns (N3/F1's claim,
 # reproduced on synthetic data at the ~80-fact scale N3 measured)
@@ -536,6 +664,10 @@ if __name__ == "__main__":
         test_pinned_facts_always_included_even_over_budget()
         test_pin_tier_reserves_room_so_rest_still_fits_the_stated_budget()
         test_touching_the_injected_set_touches_the_pinned_facts_too()
+
+        test_a_stale_pinned_fact_is_not_evicted_by_fresher_unpinned_ones()
+        test_the_pin_exemption_does_not_disturb_ordinary_lru_order()
+        test_the_selected_block_is_settled_against_its_real_rendering()
 
         test_measured_injection_size_before_and_after()
         test_lru_now_selects_by_relevance_not_age_after_several_turns()

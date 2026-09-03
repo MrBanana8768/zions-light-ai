@@ -159,4 +159,136 @@ check(en * 30 + "the word is " + ru, False,
       "occasional borrowing in a long English reply stays under 3%")
 
 print()
+print("[7] structural collapse — the 2026-09-01 runaway list, and the tail she stopped")
+# Every fixture here is SYNTHETIC: the shapes come from the corpus, the words
+# do not. Calibration (scripts/calibrate-structural-degeneracy.py, 2026-09-01,
+# 349 real replies: 17 cut by hand, 332 completed): the rules above already
+# catch 5 of the 17; the fragment-line branch catches the other 12 and flags
+# 2 of the 332; the list-run branch flags 1 more, a 1,261-item reply. Nothing
+# from the 131 pre-complaint replies trips either branch.
+
+
+def items(n, width, sep="\n"):
+    """n DISTINCT list items, each exactly `width` characters once stripped.
+    Distinct on purpose - that is what made the real ones invisible to the
+    repetition rules. The padding cycles the alphabet so no character or
+    token run forms by accident."""
+    out = []
+    for i in range(n):
+        head = f"- item {i:04d} "
+        pad = "".join(chr(97 + (i + j) % 26) for j in range(width - len(head)))
+        out.append(head + pad)
+    return sep.join(out) + "\n"
+
+
+def fragments(n, width):
+    """One line of n DISTINCT sentences, each `width` characters including
+    the terminator and the space after it."""
+    out = []
+    for i in range(n):
+        head = f"Frag {i:04d} "
+        pad = "".join(chr(97 + (i + j) % 26) for j in range(width - len(head) - 2))
+        out.append(head + pad + ".")
+    return " ".join(out)
+
+
+prose_sentence = (
+    "This sentence carries an ordinary amount of meaning across roughly "
+    "eighty characters."
+)
+
+
+def reason_quotes_nothing(text, label):
+    """The other rules quote up to 24 characters of the reply into the log;
+    this one must not, because the log is where a runaway would otherwise
+    leak a fragment of her conversation. Checked, not assumed."""
+    got = main.reply_is_degenerate(text)
+    if got and ("item 0" in got.lower() or "frag 0" in got.lower()):
+        print(f"FAIL {label}: reason quotes reply content: {got!r}")
+        sys.exit(1)
+
+
+# --- the list that runs to its own end ------------------------------------
+# One completed reply in 332 carried 1,024 consecutive short items; the next
+# highest was 34; the pre-complaint week never exceeded 9. Threshold 50.
+check(items(60, 20), True, "60 consecutive distinct short items is a runaway list")
+reason_quotes_nothing(items(60, 20), "list reason")
+check(items(50, 20), True, "50 is the limit and fires")
+check(items(49, 20), False, "49 is under the limit")
+check("Here is what I mean, in short:\n\n" + items(34, 20) +
+      "\nThat is the whole of it, and it matters.", False,
+      "34 short items - the longest run in any completed reply - is a list, "
+      "not a loop")
+# Item LENGTH is the other half of the rule. A long detailed list is writing.
+check(items(60, 60), False, "60 items of 60 characters is a detailed list")
+check(items(60, 30), True, "60 items of exactly 30 characters fires")
+check(items(60, 31), False, "60 items of 31 characters does not")
+# The real runaways double-spaced their items; a blank line is not prose.
+check(items(50, 20, sep="\n\n"), True, "blank lines between items do not end the run")
+check(items(30, 20) + "A sentence of prose between the halves.\n" + items(30, 20),
+      False, "a prose line ends the run - 30 + 30 is not 60")
+# A YAML or Markdown list inside a code fence is content, not degeneration.
+check("The config looks like this:\n\n```yaml\n" + items(60, 20) + "```\n",
+      False, "60 short items inside a code fence are not judged")
+
+# --- the unbroken tail ------------------------------------------------------
+# Every cut reply the older rules missed ends in one line of 1515+ characters
+# whose sentence-split fragments average 10-38 characters. Thresholds: 1500
+# characters, mean fragment <= 40.
+check(fragments(110, 15), True,
+      "1,600+ characters of distinct 15-character fragments on one line")
+reason_quotes_nothing(fragments(110, 15), "fragment reason")
+assert len(fragments(110, 15)) >= 1500
+check(fragments(90, 15), False, "the same fragments under 1500 characters are not judged")
+assert 1300 <= len(fragments(90, 15)) < 1500
+
+
+def exact_line(total, n):
+    """One line of exactly `total` characters: n DISTINCT pieces ending in a
+    period, joined by single spaces, so the mean fragment is total / n to the
+    digit. The boundaries below are stated in the code as >= and <=; a test
+    that only probes either side of them is decoration."""
+    w, extra = divmod(total - (n - 1), n)
+    pieces = []
+    for i in range(n):
+        width = w + (1 if i >= n - extra else 0)
+        head = f"P{i:04d}"
+        pad = [chr(97 + (i + j) % 26) for j in range(width - len(head) - 1)]
+        for j in range(4, len(pad) - 1, 5):
+            pad[j] = " "  # fragments are made of words; the guard wants spaces
+        pieces.append(head + "".join(pad) + ".")
+    line = " ".join(pieces)
+    assert len(line) == total, (len(line), total)
+    assert line.count(" ") >= 100
+    return line
+
+
+check(exact_line(1600, 40), True, "1,600 characters in 40 fragments: mean exactly 40 fires")
+check(exact_line(1640, 40), False, "1,640 characters in 40 fragments: mean 41 does not")
+check(exact_line(1500, 100), True, "a line of exactly 1,500 characters is judged")
+check(exact_line(1499, 100), False, "a line of 1,499 characters is not")
+check(" ".join(prose_sentence for _ in range(25)), False,
+      "2,000 characters of 80-character sentences on one line is a paragraph")
+# No terminator at all is a run-on, not this shape - [6] already relies on
+# en * 40 (2,800 characters, no periods) staying clean, so it is stated here.
+check(en * 40, False, "a long line with no sentence break at all is not judged as fragments")
+# When there is NO sentence in the line, the commas are the separators: two
+# real cut tails were 168 and 317 comma-separated pieces with no period.
+comma_short = ", ".join(f"piece {i:04d}" for i in range(110))
+comma_long = ", ".join(f"piece {i:04d}" for i in range(160))
+assert len(comma_short) < 1500 <= len(comma_long)
+check(comma_short, False, "a 1,300-character comma list is under the length floor")
+check(comma_long, True,
+      "a 1,900-character comma list with no sentence break is the same collapse")
+# A blob has no spaces and is never a "fragment line", whatever its length.
+blob = "".join(chr(97 + i % 26) + ("." if i % 11 == 10 else "") for i in range(1600))
+check(blob, False, "a 1,700-character blob without spaces is not judged")
+# Under 100 spaces the line is not prose, however its periods fall: 45
+# dotted identifiers average 37 characters between periods, which would read
+# as fragments if the rule judged code-shaped lines. It does not.
+dotted = " ".join(f"pkg{i:03d}.module.class.attribute.value." for i in range(45))
+assert len(dotted) >= 1500 and dotted.count(" ") < 100
+check(dotted, False, "1,600 characters of dotted identifiers with 44 spaces is not judged")
+
+print()
 print("All degenerate-reply tests passed.")

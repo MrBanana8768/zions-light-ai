@@ -57,7 +57,19 @@ def _stub_import(conv_id, turn_index, document):
     return True
 
 
+# The real retrieval.conversation_doc_count returns None for "could not tell"
+# (a dead ChromaDB) and an int for "this is genuinely the count" — its
+# docstring is explicit that callers must never fold None into a total. A stub
+# that can only return an int is LAXER than the thing it models, and what it
+# guards here is a wipe: with no None to return, portability's "unreadable
+# episodic layer counts as substantial" branch was never once executed by this
+# file. Hence the switch.
+_STUB_EPISODIC_UNREADABLE = False
+
+
 def _stub_count(conv_id):
+    if _STUB_EPISODIC_UNREADABLE:
+        return None
     return len(_STUB_STORE.get(conv_id, []))
 
 
@@ -237,6 +249,89 @@ for cid in (
     "itest-episodic-a1b2c3d4",
 ):
     reset_state(cid)
+
+# ---------------------------------------------------------------------------
+# [2b] an UNREADABLE layer is not an EMPTY one
+# ---------------------------------------------------------------------------
+#
+# This is the safety net on the only destructive path in the release. A layer
+# that cannot be read holds an unknown amount of memory, and a cleanup tool
+# that reads "unknown" as "nothing" deletes real memory with no error anywhere
+# — the one outcome the whole facility exists to prevent. Each layer gets its
+# own case because this branch has repeatedly been fixed on one of two sites.
+
+print()
+print("[2b] a layer that cannot be read is treated as substantial, never as empty")
+
+
+def _corrupt(path):
+    """A torn/truncated JSON file — what read_json_strict raises on, and the
+    shape a half-finished write actually leaves behind."""
+    path.write_text('{"facts": [{"text": "her real me', encoding="utf-8")
+
+
+def _kept_reasons(conv_id):
+    matches = {m["conv_id"]: m for m in portability.find_test_conversations()}
+    check(conv_id in matches, f"{conv_id} was scanned at all (vacuity guard)")
+    return matches[conv_id]
+
+
+cid = "itest-unreadable-facts-a1b2c3d4"
+reset_state(cid)
+_corrupt(memory.facts_path(cid))
+m = _kept_reasons(cid)
+check(m["safe_to_remove"] is False,
+      "an unreadable ACTIVE facts layer is KEPT, not read as zero facts")
+check(any("facts layer unreadable" in r for r in m["reasons_kept"]),
+      "and the reason says which layer could not be read")
+reset_state(cid)
+
+cid = "itest-unreadable-archive-a1b2c3d4"
+reset_state(cid)
+facts.save_facts(cid, [])  # readable, empty — only the sidecar is broken
+_corrupt(memory.facts_archive_path(cid))
+m = _kept_reasons(cid)
+check(m["safe_to_remove"] is False,
+      "an unreadable ARCHIVE sidecar is KEPT — evicted facts are memory too")
+check(any("archive sidecar unreadable" in r for r in m["reasons_kept"]),
+      "and the reason names the sidecar")
+reset_state(cid)
+
+cid = "itest-unreadable-persona-a1b2c3d4"
+reset_state(cid)
+facts.save_facts(cid, [])
+_corrupt(memory.persona_path(cid))
+m = _kept_reasons(cid)
+check(m["safe_to_remove"] is False, "an unreadable PERSONA layer is KEPT")
+check(any("persona layer unreadable" in r for r in m["reasons_kept"]),
+      "and the reason names the persona")
+reset_state(cid)
+
+cid = "itest-unreadable-episodic-a1b2c3d4"
+reset_state(cid)
+facts.save_facts(cid, [])
+_STUB_EPISODIC_UNREADABLE = True
+try:
+    # retrieval.conversation_doc_count returns None for "could not tell", and
+    # 0 only for "genuinely nothing indexed". Folding None into 0 here would
+    # wipe a conversation whose episodic memory was merely unreachable at that
+    # moment — a dead ChromaDB, which is a routine restart-window state.
+    check(retrieval.conversation_doc_count(cid) is None,
+          "fixture: the stub models the real None contract, not just ints")
+    m = _kept_reasons(cid)
+    check(m["safe_to_remove"] is False,
+          "an unreadable EPISODIC layer is KEPT, not read as zero exchanges")
+    check(any("episodic layer unreadable" in r for r in m["reasons_kept"]),
+          "and the reason names the vector store")
+finally:
+    _STUB_EPISODIC_UNREADABLE = False
+check(retrieval.conversation_doc_count(cid) == 0,
+      "and with the store readable again, 0 still means genuinely empty")
+m = _kept_reasons(cid)
+check(m["safe_to_remove"] is True,
+      "so the same conversation IS removable once every layer can be read — "
+      "the refusal was about the read failure, not about this id")
+reset_state(cid)
 
 # A real, un-matched conv_id with a big store is never even a candidate —
 # proves the "matches nothing" branch, not just the "matches but kept" one.

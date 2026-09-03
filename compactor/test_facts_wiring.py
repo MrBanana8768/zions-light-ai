@@ -23,9 +23,19 @@ passes and the logs still read `injected memory [26fact(s) ...]` either way.
 There is no signal anywhere that distinguishes the two. Hence this file.
 
 BOTH CALL SITES. This branch has been bitten sixteen times by a fix landing
-on one call site and not its identical twin, so both are asserted here:
-the request hot path (main.py, "--- Facts (Phase 2) ---") and the fallback
-default inside _async_tail.
+on one call site and not its twin, so both are asserted here: the request hot
+path (main.py, "--- Facts (Phase 2) ---") and the selection inside
+_async_tail.
+
+They are twins, not clones, and v3.1.6 is where that started to matter. The
+hot path builds what the MODEL sees and wants ranking against the current
+turn, bounded by COMPACTOR_INJECT_FACTS_TOKENS (400). The tail builds what
+the EXTRACTOR is told it already knows, and that list wants the store cap
+(COMPACTOR_MAX_FACTS_TOKENS, 1500) and no ranking at all: bounding it by the
+injection budget cut a realistic store's duplicate-suppression list from 114
+facts to 28, against an extraction prompt tuned to over-extract. So [1]
+asserts query_text is passed and [2] asserts the store cap is used — a fix
+that "unified" the two call sites would fail one of them.
 
 Only synthetic conversation content appears below (project rule: this repo
 is public).
@@ -205,18 +215,25 @@ def test_hot_path_ranking_is_not_silently_disabled_by_an_empty_query():
 
 
 # ---------------------------------------------------------------------------
-# [2] The twin: _async_tail's fallback default
+# [2] The twin: the selection _async_tail hands the extractor
 # ---------------------------------------------------------------------------
 
 
-def test_async_tail_fallback_also_ranks():
-    print("\n[test] _async_tail's own injected_facts default also passes query_text")
-    # The request path hands _async_tail an already-computed injected_facts
-    # list. Its `injected_facts is None` fallback recomputes, and must rank
-    # too — otherwise a caller that omits the argument silently pushes an
-    # unranked prefix into the extraction prompt, which is a request to vLLM
-    # and therefore has a window. Identical twin of the hot-path call site
-    # above; this branch has been bitten sixteen times by exactly that.
+def test_async_tail_selects_against_the_store_cap_not_the_injection_cap():
+    print("\n[test] _async_tail bounds the extractor's known-facts list by the "
+          "STORE cap")
+    # The twin call site, and it does NOT want the same thing the hot path
+    # wants. What it builds is the extractor's "EXISTING FACTS" list — the
+    # whole of that call's duplicate suppression, against a prompt that also
+    # says "When in doubt, extract." Bounding it by the injection budget
+    # (400) instead of the store cap (1500) threw away ~75% of that list on a
+    # realistic store, which buys byte-identical re-extractions and the dedup
+    # LLM calls to clean them up.
+    #
+    # So the assertion here is the store cap, and the ABSENCE of ranking:
+    # relevance order is meaningless to a "have I already stored this?" check,
+    # and asking for it would spend an embedding call per turn to sort a list
+    # whose order nothing reads.
     conv = "wiring-tail"
     seeded = _seed_facts(conv)
     _calls.clear()
@@ -237,17 +254,30 @@ def test_async_tail_fallback_also_ranks():
                 "an ordinary reply",
                 1,
                 [{"role": "user", "content": USER_TURN}],
-                # injected_facts deliberately omitted — this is the fallback
-                # under test, not the request path's precomputed list.
+                # injected_facts deliberately omitted — the store-cap bound
+                # applies either way, which is the point.
             )
 
     asyncio.run(_run())
 
-    assert_true(_calls, "the fallback actually called select_for_injection")
+    assert_true(_calls, "the tail actually called select_for_injection")
+    call = _calls[0]
+    budget = call["kwargs"].get("max_tokens")
+    if budget is None and len(call["args"]) > 1:
+        budget = call["args"][1]
     assert_eq(
-        _calls[0]["kwargs"].get("query_text"),
-        USER_TURN,
-        "fallback ranks against the same user turn",
+        budget,
+        facts._MAX_FACTS_TOKENS,
+        "the tail selects against COMPACTOR_MAX_FACTS_TOKENS",
+    )
+    assert_true(
+        budget != facts._INJECT_FACTS_TOKENS,
+        "and not the injection budget — the two are different numbers, which "
+        "is the whole reason this assertion can tell them apart",
+    )
+    assert_true(
+        not call["kwargs"].get("query_text"),
+        "no ranking is requested for the extractor's list",
     )
 
 
@@ -256,7 +286,7 @@ if __name__ == "__main__":
         for t in (
             test_hot_path_passes_the_current_user_turn_as_query_text,
             test_hot_path_ranking_is_not_silently_disabled_by_an_empty_query,
-            test_async_tail_fallback_also_ranks,
+            test_async_tail_selects_against_the_store_cap_not_the_injection_cap,
         ):
             t()
         print("\nAll facts-wiring tests passed.")

@@ -21,6 +21,7 @@ os.environ["COMPACTOR_RAG_ENABLED"] = "false"  # skip ChromaDB init in retrieval
 
 import retrieval  # noqa: E402
 import dedup  # noqa: E402
+import facts  # noqa: E402
 
 
 def assert_eq(actual, expected, label):
@@ -384,6 +385,55 @@ def test_merge_metadata_preserves_oldest_added_turn():
     assert_eq(out["text"], "merged", "text preserved")
     assert_eq(out["added_turn"], 2, "added_turn = min (earliest origin)")
     assert_eq(out["last_used"], 15, "last_used = max (most recent)")
+
+
+def test_merge_metadata_carries_the_pin_forward_from_any_member():
+    print("\n[test] _merge_metadata: ANY pinned member pins the merged record")
+    # Inline dedup runs on every extraction over the whole store, pinned facts
+    # included, and identity facts are the most re-extracted class — exactly
+    # the ones that cluster with paraphrases of themselves. A merged record
+    # built without this key silently un-pinned an identity fact AFTER /pin had
+    # promised it would reach the model on every turn, and relevance ranking
+    # was then free to drop it.
+    pinned = _fact("her name is Placeholder", added_turn=1, last_used=10)
+    pinned["pin"] = True
+    plain = _fact("she is called Placeholder", added_turn=4, last_used=20)
+    plain["pin"] = False
+
+    out = dedup._merge_metadata([pinned, plain], "her name is Placeholder")
+    assert_eq(out["pin"], True, "a pinned member pins the merge")
+    # Union of meaning, so the order of the cluster cannot change the answer.
+    assert_eq(dedup._merge_metadata([plain, pinned], "x")["pin"], True,
+              "and it does not depend on which member came first")
+    assert_eq(dedup._merge_metadata([plain, plain], "x")["pin"], False,
+              "while a cluster with nothing pinned stays unpinned")
+    # Legacy rows written before the field existed carry no "pin" key at all.
+    legacy = {"text": "old", "added_turn": 0, "last_used": 0}
+    assert_eq(dedup._merge_metadata([legacy], "x")["pin"], False,
+              "a record with no pin key reads as unpinned, not as a KeyError")
+
+    # And the consequence the key exists for: the merged record still bypasses
+    # relevance ranking. Without "pin" this record scores 0.0 against the query
+    # and is dropped from the injected block.
+    others = [
+        {"text": f"unrelated house fact {i} about the garden " * 2,
+         "added_turn": i, "last_used": 100 + i, "pin": False}
+        for i in range(1, 6)
+    ]
+    injected = facts.select_for_injection(
+        [out] + others,
+        max_tokens=facts._FACTS_BLOCK_HEADER_TOKENS
+        + facts._fact_bullet_tokens(others[0]["text"]),
+        query_text="tell me about the garden",
+        embedder=lambda texts: [
+            [0.0, 1.0] if "garden" in t else [1.0, 0.0] for t in texts
+        ],
+    )
+    assert_true(
+        any(f["text"] == out["text"] for f in injected),
+        "the merged record is still always-injected, which is what the pin "
+        "promised and what losing this key silently revoked",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1049,6 +1099,7 @@ def _all_tests():
         test_llm_merge_returns_none_on_network_failure,
         test_llm_merge_returns_none_on_single_fact_cluster,
         test_merge_metadata_preserves_oldest_added_turn,
+        test_merge_metadata_carries_the_pin_forward_from_any_member,
         test_dedup_facts_short_circuits_when_lt_2,
         test_dedup_facts_merges_when_llm_agrees,
         test_dedup_facts_keeps_all_when_llm_says_keep,

@@ -242,9 +242,36 @@ def _sanitize(messages: list[dict]) -> list[dict]:
     text. This UNDERCOUNTS an image-bearing request, which is why the caller
     must treat this as a fallback and not as the authority — vLLM's /tokenize
     prices vision tokens and this cannot.
+
+    EMPTY ASSISTANT CONTENT BECOMES A SINGLE SPACE (v3.1.7). The reduction
+    above ends in `content or ""`, and for an assistant turn that empty
+    string is exactly what MistralTokenizer refuses — the same
+    "Invalid assistant message: role='assistant' content=''" that makes
+    vLLM's /tokenize 400. Without this, tier 2 raised on precisely the
+    payloads that make tier 1 fail, so the fallback was unavailable in the
+    only situation it exists for: a cancelled stream leaves an empty
+    assistant turn behind, and OpenWebUI resends it with every later
+    message. A space is the minimal content the template accepts and costs
+    one token against a budget in the tens of thousands.
+
+    This is main._space_fill_empty_assistant's rule, applied to the reduced
+    text rather than to the wire shape — the same rule at its third call
+    site. It is written out here rather than imported because this module
+    must not depend on main (main imports the modules that import this one),
+    and because by this point the multimodal reduction has already happened:
+    an image-bearing turn has become its text, so the "never touch a list
+    that carries an image" carve-out upstream has no counterpart here.
     """
     out: list[dict] = []
     for m in messages:
+        if not isinstance(m, dict):
+            # A non-dict element used to raise here while main's helper
+            # skipped it. This function is tier 2's only entry point and
+            # tokens.count wraps it in a blanket except, so a raise did not
+            # crash anything — it just made the accurate counter silently
+            # unavailable and handed the budget to the 51%-low estimator,
+            # which is the outage this module exists to prevent.
+            continue
         content = m.get("content")
         if isinstance(content, list):
             content = "".join(
@@ -252,7 +279,24 @@ def _sanitize(messages: list[dict]) -> list[dict]:
                 for p in content
                 if isinstance(p, dict) and p.get("type") == "text"
             )
-        out.append({"role": m.get("role", "user"), "content": content or ""})
+        role = m.get("role", "user")
+        # str(), because content need not be a string. `content or ""`
+        # followed by .strip() raised AttributeError on an int or a dict —
+        # introduced with the space-fill below and caught in review before
+        # it shipped. The rule for what counts as EMPTY lives in
+        # main.assistant_content_is_empty; this cannot import main (main
+        # imports the modules that import this one), and by here the
+        # multimodal reduction has already happened, so the question is only
+        # ever about a string.
+        text = content if isinstance(content, str) else ("" if content is None else str(content))
+        if role == "assistant" and not text.strip():
+            # Empty assistant content is exactly what MistralTokenizer
+            # refuses — the same "Invalid assistant message: role='assistant'
+            # content=''" that makes vLLM's /tokenize 400. Without this, tier
+            # 2 failed on precisely the payloads that make tier 1 fail: the
+            # one situation it exists for.
+            text = " "
+        out.append({"role": role, "content": text})
     return out
 
 
