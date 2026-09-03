@@ -326,6 +326,67 @@ check("recorded position is already turn 300" in r.text,
 check(LLM_CALLS == [], "no LLM call was made")
 check(memory_snapshot() == before_mem, "and no summary content was written")
 
+print()
+print("[3f] equality is admitted AND aligned — the chunk holds the turns it "
+      "is labelled with")
+# v3.1.7 R10. [3b] pins the STATUS at equality; this pins what the 200 goes on
+# to do, which is a different assertion and the one that was wrong.
+#
+# The guard is `< _pos` and that is correct: a rebuild of exactly _pos turns
+# starts at turn 1 and ends at turn _pos, so window_offset is 0 and a label is
+# an index. What broke was downstream of the guard. _observed_position aligns
+# the array against `tail_fp` — the anchor the CHAT path left behind, taken
+# from a bounded live window — and an anchor that appears nowhere in the
+# rebuild falls back to _ASSUMED_NEW_TURNS. At equality that makes the
+# position n + 2, window_offset 2, and chunk 1-20 comes back labelled 3-20
+# holding turns 1-18: a span it does not contain, turns 1-2 covered by
+# nothing, and turns_seen inflated for good.
+#
+# Only reachable while the rebuild is within one exchange of the position — a
+# longer one takes max(n, prev + 2) = n and self-corrects — so it is exactly
+# the equality case, the one this endpoint exists to serve, that broke.
+#
+# The load-bearing assertion is which exchanges were SENT. The labels look
+# right either way: 3-20 is a perfectly plausible span.
+CID = "equality-aligned"
+summarizer.save_state(CID, {
+    "l1": [], "l2": [], "l3": None, "last_summarized_turn": 0,
+    "turns_seen": 30,
+    # An anchor from a live window of 12 turns that shares nothing with the
+    # rebuild — the shape R15 describes: one fingerprint mismatch in anchor[0]
+    # defeats every prefix in _align_candidates.
+    "tail_fp": ["0123456789abcdef", "fedcba9876543210"],
+    "head_fp": "deadbeefdeadbeef", "window_turns": 12,
+})
+set_store(exchanges(15))            # exactly 30 messages against position 30
+LLM_CALLS.clear()
+LLM_BODIES.clear()
+r = compact(CID)
+body = r.json()
+check(r.status_code == 200,
+      f"HTTP 200 — equality is not short and must not be refused "
+      f"(got {r.status_code})")
+check(body.get("reconstructed_messages") == body.get("recorded_position") == 30,
+      f"the rebuild and the position are equal, which is the case under test "
+      f"({body.get('reconstructed_messages')} vs "
+      f"{body.get('recorded_position')})")
+_l1 = summarizer.load_state(CID).get("l1") or []
+check(len(_l1) == 1 and _l1[0]["first_turn"] == 1 and _l1[0]["last_turn"] == 20,
+      f"the first chunk is labelled 1-20, not shifted off the array's start "
+      f"(l1={[(c['first_turn'], c['last_turn']) for c in _l1]})")
+check(len(LLM_BODIES) >= 1, "a chunk was actually summarized")
+_first = LLM_BODIES[0] if LLM_BODIES else ""
+check(all(f"answer {i}" in _first for i in range(10)),
+      "and it HOLDS turns 1-20 — exchanges 0-9, the ten the label claims")
+check("answer 10" not in _first,
+      "with nothing from turn 21 onwards dragged into it")
+# The other half of the damage: an inflated position is written to disk and
+# every later rollup on the live path reads its text two turns early.
+check(summarizer.load_state(CID).get("turns_seen") == 30,
+      f"the position is still 30 — a full rebuild is not evidence that two "
+      f"more turns happened (got "
+      f"{summarizer.load_state(CID).get('turns_seen')})")
+
 
 # ---------------------------------------------------------------------------
 # 4. A path-shaped conv_id never reaches the filesystem
@@ -601,7 +662,33 @@ print("All admin compact tests passed.")
 #     slot arithmetic (the pre-R13 shape entire)                  ->  [6d]
 #   `if gap_turns > _real_turns:` -> `if False:`                  ->  [6c]
 #
-# One mutation SURVIVED and is recorded because the reason is worth knowing:
+# v3.1.7 (R10), same treatment:
+#
+#   `if _state.get("tail_fp"):` -> `if False:`
+#     (the chat path's anchor is left in place for the drain)      ->  [3f],
+#     which comes back with the defect verbatim: the chunk is labelled
+#     3-20, holds turns 1-18, and turns_seen is left at 32
+#   `if len(messages) < _pos:` -> `if len(messages) <= _pos:`
+#     (the change R10 was reported as asking for)                  ->  [3b],
+#     [3f] AND [6]. It is recorded here as a mutation because it is the
+#     fix that looks right and is not: the R13 rebuild lands EXACTLY on
+#     the position whenever the store holds the head and the tail, so
+#     `<=` refuses every healthy conversation — including the one-gap
+#     case R13 exists to admit.
+#
+# Two mutations SURVIVED and are recorded because the reasons are worth
+# knowing:
+#
+#   `_state["head_fp"] = ""` / `_state["window_turns"] = 0` deleted, leaving
+# only the tail_fp clear. Nothing reads either one while the anchor is empty
+# — `window_unchanged` is only consulted on the branch where an anchor was
+# found — and _observed_position overwrites all three before it returns. They
+# are cleared together anyway because a window signature that describes an
+# array this endpoint has just declared irrelevant is a false statement on
+# disk, and the next person to add a read of it should not have to discover
+# that the three were separable.
+#
+# And the one from R13:
 # hoisting the unparseable-row `continue` above the slot arithmetic ON ITS OWN
 # changes nothing, because a slot is derived from the row's turn_index and not
 # from a running cursor — an unparseable row and a missing row are the same

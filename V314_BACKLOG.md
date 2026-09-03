@@ -1189,3 +1189,164 @@ Two of D's sub-agents shared one repo copy. Consequences, all observed:
 The spurious `test_summarizer` failure is the one to remember: under
 contention a suite reported a real-looking assertion failure that was an
 artefact. Give each agent its own worktree, or serialise them.
+
+---
+
+# v3.1.7 — the backlog cleared
+
+The nine findings left standing after the four-perspective review are closed.
+Three lanes with strictly disjoint file ownership; the merge verified by
+mutating each lane's fix with the other lane's code in place, which neither
+lane could do for itself.
+
+## The finding that was not in the review: five silent fixes
+
+**R15, R16, R20, R21 and half of R18 were already fixed in the tree**, by
+`157bdc3` — a commit whose message claims R23 and R12. `git log -S` puts
+`_image_only_marker`, `_FINGERPRINT_TAIL_TURNS`, `_align_candidates` and
+`window_unchanged` all in it. **None of the five had a test.** Five
+behaviours whose only evidence was a comment, in the position arithmetic this
+release exists to make safe, shipped inside a commit that did not mention
+them.
+
+That is the same class as the three suites that pinned the wrong behaviour:
+not a bug, but a claim nothing checks. It is recorded here because the fix —
+`test_position_edges.py`, thirteen tests — is worth less than the habit of
+noticing. A commit that fixes more than it says is a commit whose extra fixes
+nobody reviewed.
+
+## R18 · the second route, and why no content test can find it
+
+The committed fix handles a repeating TAIL. It does not handle a window that
+has become ALL repeats. Past `cap/2` identical exchanges the capped window
+slides onto period-2 identical content, so the head hash repeats and the
+length is pinned at the cap: the two arrays are equal BYTE FOR BYTE, and
+comparing the whole window or the whole fingerprint tail gives the same
+answer as comparing the head. Measured at cap 20, the position ran
+`22 ... 40` and then stalled at 40 permanently while the conversation ran on
+to 68 — the frozen hierarchy this release exists to fix, reached by a third
+route.
+
+The comment above `window_unchanged` called it "a reliable negative". It is
+not, and that is the "comment more convincing than the code" class the plan
+names.
+
+What separates the two is not content. `n < prev` says the window is a strict
+SUFFIX of a longer conversation, and the admin drain cannot be in that state:
+`/admin/compact` refuses unless the rebuild REACHES `_recorded_position`, so
+`n >= prev` throughout its loop, and holding keeps it there.
+
+**This couples two files.** If anyone relaxes
+`len(messages) < summarizer._recorded_position(before)`, the drain enters the
+`n < prev` state and a repeating transcript inflates the position on every
+pass. R10 below independently confirms that guard must stay `<`.
+
+Trade, taken deliberately: an S-5 stranded watermark also reads `n < prev`,
+so such a conversation with a repeating tail AND a byte-identical re-sent
+window advances 2 turns it should not. Two turns per duplicate request,
+against a stall that costs the whole hierarchy for as long as the loop runs.
+
+## R16 · re-examined against new evidence, and confirmed rather than repaid
+
+R15's fix cannot help — the branch is reached precisely BECAUSE there is no
+anchor, so how fingerprints are computed does not apply. v3.1.7 does persist
+`head_fp`, which is a genuinely new discriminator not available when the
+trade was taken: a head that changed on the next call proves the window is
+bounded. Rejected anyway, for two reasons. It separates bounded from
+unbounded but not a true watermark from an S-5 stranded one, and under a
+stranded watermark repaying pushes further past reality. And the deficit is
+exactly 2 only when `prev >= n`; when `n > prev` the amount that scrolled out
+is unknowable, and 2 would be a number chosen for tidiness.
+
+Both branches are now pinned, including that the hold does not compound.
+
+## R20 · the implementation was wrong, not the doc
+
+Reviewer D read 5 as the true answer. It is true FOR A FULL-HISTORY CLIENT,
+and not the rule — both readings are consistent with the anchor, so the pick
+has to be the safe one. `_align_candidates` reports every reading and
+`_align_new_turns` applies the documented smallest-advance rule; for a
+full-history client `n` dominates `prev + new`, so the answer still comes
+out 5.
+
+## R10 · the guard is right; the defect is one layer downstream
+
+`if len(messages) < _pos:` must stay `<`. Mutating it to `<=` fails 15
+assertions across `[3b]`, the new `[3f]` and all of section `[6]` — it
+refuses the one-gap rebuild R13 exists to admit, i.e. every real
+conversation. Post-R13 the array length equals `_pos` exactly when head and
+tail are both in the store, so equality IS alignment.
+
+**`test_admin_compact [3b]` is correct, not a fourth suite pinning the wrong
+behaviour.**
+
+But R10's symptom reproduces, by another mechanism.
+`window_offset = max(n, prev + new) - n`, and `new` comes from aligning the
+rebuilt array against `tail_fp` — an anchor the CHAT path left behind, from a
+bounded live window. When it does not align, `new = _ASSUMED_NEW_TURNS = 2`,
+so at equality the position becomes `n + 2`: chunk 1-20 comes back labelled
+3-20 holding turns 1-18, turns 1-2 covered by nothing, and `turns_seen`
+inflated for the conversation's life. Only reachable while the rebuild is
+within one exchange of the position — a longer one self-corrects — so
+equality, the case the endpoint exists to serve, was the exposed one.
+
+The summarizer's own `_ASSUMED_NEW_TURNS` comment already claims this is
+impossible for the admin drain. That is true from the second call and false
+on the first. Fixed by dropping the chat path's anchor under `conv_lock`
+before the drain loop, so the rebuild is measured on its own terms. No
+`summarizer.py` change needed.
+
+## R11 · re-derived, because the original enumeration was lost
+
+B's four were never written down and the code has changed under them.
+Today's sweep: **43 mutations, 41 killed, 2 survive.** Six of the original
+eight survivors were real gaps and are closed (trim-floor boundary,
+`raw_chars` measured on arrival, the user-text `.strip()` rule, and
+`_async_tail`'s three inner guards, reached by direct entry).
+
+One survivor was **a real defect rather than a missing test**:
+`_tail_store_blocked` refused a user turn on `.strip()` while `_async_tail`'s
+episodic gate 300 lines away asked bare truthiness. A whitespace-only user
+turn is truthy, so the writing side let through what the deciding side
+refused — it indexed a blank user turn against a real reply as a genuine
+exchange while the counter published a skip. Unreachable from
+`/v1/chat/completions` because R8 refuses first, which is exactly why every
+endpoint test missed it. **The recurring defect again: one rule, two call
+sites, and the fix is one shared `_has_pairable_user_text`.**
+
+Two survivors remain, recorded with reasons in the test file rather than
+papered over: `kept_chars`'s conditional (every skip carries empty text, so
+it is structurally 0) and the `<= window` boundary (unreachable through the
+public API, and the error direction is the safe one). `tailhealth.py` needed
+no change — all 17 mutations aimed at it were killed by the existing suite.
+
+## R17 · bounded, not moved
+
+32.4 ms -> 3.2 ms per call at 700 turns, by hashing only the tail slots
+alignment can use. `run_in_threadpool` was deliberately NOT added on top: 3 ms
+is not a hazard, and it would add a hop inside `conv_lock`. The test asserts
+the bound structurally — a spy records the sizes `_turn_fingerprints` is
+called with — rather than with a clock.
+
+## R22 · 239 s -> 1.6 s, and it was never a sleep
+
+`count_tokens_exact` and `count_text_tokens_exact` each make a SYNCHRONOUS
+`httpx.post` to `/tokenize` — not the async client the suite already stubs —
+and roughly 40 of the 55 tests hit it for real. Nothing listens on
+`localhost:8000`, deliberately: the char/4 fallback is the degraded path most
+of that file exists to exercise. So the call was always going to fail; only
+the wall clock was in question. On Windows, `localhost` with nothing
+listening tries the IPv6 loopback and THEN the IPv4 one, each against its own
+2 s connect timeout — ~4.2 s per call, measured. 239 seconds of dead TCP
+handshakes stacked end to end.
+
+Stubbed at module level to raise the same `ConnectError` immediately,
+generalising an idiom the file already used in one place. Side effect worth
+having: this suite's result no longer depends on whether the developer
+happens to have vLLM running locally.
+
+## Still open
+
+The client-disconnect contradiction. Both reviewers ran on Windows/Proactor
+and the disagreement is about a branch that behaves differently under
+Linux/uvloop. It needs a production-shaped stack, not another reading.

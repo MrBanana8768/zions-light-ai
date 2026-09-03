@@ -64,10 +64,11 @@ BASE_ENV = {
     "COMPACTOR_FORCE_OFFLINE": "true",
 }
 
-# Measured on this machine, 2026-09-02. Only used for --fast and for the
-# "still running" note; a suite that drifts far from its entry is worth a look.
+# Measured on this machine, 2026-09-02 (test_budget_guard.py re-measured
+# 2026-09-03 after R22). Only used for --fast and for the "still running"
+# note; a suite that drifts far from its entry is worth a look.
 SLOW_S = {
-    "test_budget_guard.py": 240,
+    "test_budget_guard.py": 5,
     "test_dedup_churn_gate.py": 147,
     "test_summarize_invariant.py": 71,
     "test_backup.py": 26,
@@ -166,8 +167,23 @@ def main() -> int:
     print("-" * 72)
     results, t_all = [], time.monotonic()
     for cwd, script in suites:
-        # The per-suite ceiling must clear the slowest known suite with room:
-        # a 240s ceiling once reported test_budget_guard (239s) as a HANG.
+        # The per-suite ceiling must clear the slowest known suite with room.
+        # R22: a 240s ceiling once reported test_budget_guard (239s, real —
+        # confirmed by running it twice) as a HANG, because every other
+        # suite finished in <=21s and the runner had no way to tell "slow"
+        # from "stuck". The 239s was two unstubbed synchronous httpx.post
+        # calls per guard test (count_tokens_exact / count_text_tokens_exact
+        # hitting VLLM_URL/tokenize for real, with nobody listening) times
+        # dozens of tests — each one paying a ~4.2s dual-stack (IPv6-then-
+        # IPv4 loopback) connect timeout on this machine. test_budget_guard.py
+        # now stubs that call at the module level so the failure it was
+        # always going to hit arrives immediately instead of after a real OS
+        # timeout; the suite runs in ~1.6s and asserts exactly what it did
+        # before (see the R22 comment near the top of that file). The ceiling
+        # logic itself stays — this class of "cannot tell slow from hung" bug
+        # is exactly why a fixed per-suite ceiling isn't enough on its own,
+        # and SLOW_S is what lets a FUTURE regression be caught the same way
+        # this one was: by comparing a fresh measurement against history.
         ceiling = max(args.timeout, SLOW_S.get(script.name, 0) * 2)
         status, dt, note = run_one(py, cwd, script, ceiling)
         results.append((status, script.name, dt, note))
