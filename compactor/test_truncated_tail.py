@@ -26,6 +26,20 @@ Mutations this file exists to kill (plan §1.7), and where:
     holed ignored                           [U]; [E6] the dropped chunk
     skip not counted                        [E7]
 
+v3.1.7, R11 — a 43-mutation sweep of decide_memory_tail, _tail_store_blocked,
+_run_memory_tail, _async_tail and tailhealth found eight survivors. Six were
+real gaps and are closed here:
+
+    floor `<` -> `<=`                       [U] the at-the-floor prefix
+    raw_chars measured on stripped text     [U] the whitespace-padded reply
+    the user-text rule without .strip()     [E9] the whitespace-only user turn
+    _async_tail's episodic gate weakened    [E10b]
+    _async_tail's rollup gate weakened      [E10b]
+    _async_tail's own degrade.guard removed [E10b]
+
+Two survived and are recorded rather than chased; see the block at the foot
+of this file for both, with the reasons.
+
 Conventions from test_degenerate_skip.py (canonical). Only synthetic
 content appears below — the repo is public.
 
@@ -190,6 +204,51 @@ assert_eq((d.store, d.outcome), (False, "skipped_degenerate_partial"),
 
 assert_eq(main.MIN_MEMORABLE_TRIMMED_CHARS, main.DEGENERATE_MIN_CHARS,
           "one floor, not two: the trim floor IS the structural-judgement floor")
+
+# --- the floor's own boundary (v3.1.7, R11 sweep, mutation M08) -------------
+#
+# The cases above straddle the floor by a wide margin, so `<` and `<=` are
+# indistinguishable to them. The floor is a KEEP/DISCARD line on a reply she
+# actually read, and the sweep found nothing pinning which side of it the
+# equal case falls on. `<` is right: MIN_MEMORABLE_TRIMMED_CHARS is the
+# minimum that IS memorable, not the first length that is not.
+#
+# Built to land exactly on the floor: whole sentences, then the last one
+# padded so the trimmed prefix measures the floor to the character.
+_floor = main.MIN_MEMORABLE_TRIMMED_CHARS
+_unit = "Sentence of an ordinary reply. "
+_body = _unit * (_floor // len(_unit))
+_pad = _floor - len(_body) - len("A.")
+assert _pad >= 0, "fixture: the padding cannot be negative"
+_at_floor = _body + "A" + ("a" * _pad) + "."
+assert_eq(len(_at_floor), _floor, "fixture: the prefix measures the floor exactly")
+d = D(_at_floor + " and then it was cu", finished=False, truncated=False, holed=False)
+assert_eq(len(main.trim_to_last_sentence(_at_floor + " and then it was cu")), _floor,
+          "fixture: ...and the trim lands on it")
+assert_eq((d.store, d.outcome), (True, "stored_trimmed"),
+          "a trimmed prefix of EXACTLY the floor is memorable — the floor is a "
+          "minimum, not the first rejected length")
+d = D(_at_floor[:-2] + "." + " and then it was cu",
+      finished=False, truncated=False, holed=False)
+assert_eq((d.store, d.outcome), (False, "skipped_too_short"),
+          "...and one character under it is not")
+
+# --- raw_chars is what ARRIVED (v3.1.7, R11 sweep, mutation M11) ------------
+#
+# raw_chars is the denominator of tailhealth's trim_retention and the "N chars
+# accumulated" in the skip line an operator greps. It must measure the reply
+# as it arrived, not some normalized form of it — every fixture above happens
+# to have no surrounding whitespace, so a raw that quietly stripped read the
+# same as one that did not. A reply cut mid-word after a newline is ordinary.
+_padded = "\n\n" + CUT + "  \n"
+d = D(_padded, finished=False, truncated=False, holed=False)
+assert_eq(d.raw_chars, len(_padded),
+          "raw_chars counts the text as it arrived, whitespace included — it "
+          "is the denominator the retention ratio is measured against")
+assert_eq(d.text, "\n\n" + PROSE,
+          "...while the text STORED is the trimmed prefix with its leading "
+          "whitespace intact — the trim cuts at a sentence boundary, it does "
+          "not normalize what she was shown")
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +728,28 @@ def _post_nonstream_content(conv_id, reply, content):
     return r, cap.records
 
 
+# v3.1.7 (R11 sweep, mutation M15). The guard is `.strip()`, not truthiness,
+# and nothing pinned the difference: a user turn of nothing but whitespace is
+# TRUE, so a guard that tested the bare string would let the tail fire on it.
+# _async_tail would then index "[user]:   \n[assistant]: ..." as a real
+# exchange — retrievable, injectable, and rebuilt as a real turn by
+# /admin/compact — while tailhealth published `stored`. That is the silent
+# skip R8 exists to end, reached through one missing method call.
+tailhealth._reset_for_tests()
+r, recs = _post_nonstream_content("tt-whitespace-user", CUT, "   \n\t  ")
+assert_eq(r.status_code, 200, "whitespace-only user text: 200")
+assert_eq(len(_fired), 0,
+          "whitespace-only user text: the tail was NOT fired — a turn of "
+          "spaces is nothing to pair a reply with")
+snap = tailhealth.snapshot()
+assert_eq(snap["stored"], 0,
+          "whitespace-only user text: NOTHING was counted as stored")
+assert_eq(snap["outcomes"]["skipped_no_user_text"], 1,
+          "whitespace-only user text: counted under the same label as no text "
+          "at all, because it is the same thing to the store")
+assert_eq(snap["skipped_recently"], True,
+          "whitespace-only user text: and it is LOSSY — she read the reply")
+
 tailhealth._reset_for_tests()
 r, recs = _post_nonstream_content("tt-nousertext", CUT, NO_TEXT_PARTS)
 assert_eq(r.status_code, 200, "no-user-text: 200")
@@ -749,6 +830,111 @@ assert_eq(len(_ROLLUPS), 1,
 
 _run_tail("tt-extract-on", extraction=True)
 assert_eq(len(_ROLLUPS), 1, "control: extraction on, the rollup still runs")
+
+# ---------------------------------------------------------------------------
+# [E10b] R11 sweep — _async_tail's OWN guards, called directly.
+#
+# Since R8 the request path refuses to fire the tail for an empty reply, a
+# blank user turn, or a full disk, so _async_tail's three inner guards are
+# unreachable through the endpoint — which is why the sweep's M21, M22 and M24
+# all survived every endpoint test in this file. Unreachable from the endpoint
+# is not unreachable: five other suites call _async_tail directly, and R8's
+# own docstring gives the reason the inner half must stay, in the disk case
+# exactly — "a tail can sit in the pool's queue while the disk fills under
+# it". The outer check is made on the request path; the disk can be full by
+# the time the coroutine runs. The same is true of the pool re-ordering work
+# behind a /forget.
+#
+# Mutations this section kills:
+#   `if assistant_text and last_user_text:` -> `if assistant_text:`      (M21)
+#   `if summarizer.enabled() and assistant_text:` -> drop the conjunct   (M22)
+#   the `degrade.guard` at the top of _async_tail -> `if False:`         (M24)
+# ---------------------------------------------------------------------------
+
+print()
+print("[E10b] R11 — _async_tail's own guards hold when it is entered directly")
+
+_run_tail("tt-inner-blank-user", extraction=True, user_text="   ")
+assert_eq(len(_INDEXED), 0,
+          "blank user text: no episodic row — an exchange with nothing on the "
+          "user side is not an exchange, however it got here")
+
+_ROLLUPS.clear()
+_INDEXED.clear()
+with patch.object(facts, "extraction_enabled", lambda: True), \
+     patch.object(facts, "load_facts", lambda c: []), \
+     patch.object(summarizer, "enabled", lambda: True), \
+     patch.object(summarizer, "maybe_rollup", _spy_rollup), \
+     patch.object(summarizer, "load_state",
+                  lambda c: {"l1": [], "l2": [], "l3": None,
+                             "last_summarized_turn": 0}), \
+     patch.object(retrieval, "index_exchange",
+                  lambda *a, **k: (_INDEXED.append(a), True)[1]):
+    asyncio.run(main._async_tail(
+        "tt-inner-empty-reply", [], "a real question", "", 4,
+        [{"role": "user", "content": "a real question"}],
+    ))
+assert_eq(len(_INDEXED), 0, "empty reply: no episodic row")
+assert_eq(len(_ROLLUPS), 0,
+          "empty reply: and NO rollup — rolling up a turn with no assistant "
+          "text advances the watermark over a turn that says nothing")
+
+# The same for a reply of nothing but whitespace, which is TRUE and therefore
+# passed both inner gates until the shared rule landed. decide_memory_tail
+# calls this SKIPPED_EMPTY on the request path; the two gates here must agree
+# with it rather than with `bool("   ")`.
+_ROLLUPS.clear()
+_INDEXED.clear()
+with patch.object(facts, "extraction_enabled", lambda: True), \
+     patch.object(facts, "load_facts", lambda c: []), \
+     patch.object(summarizer, "enabled", lambda: True), \
+     patch.object(summarizer, "maybe_rollup", _spy_rollup), \
+     patch.object(summarizer, "load_state",
+                  lambda c: {"l1": [], "l2": [], "l3": None,
+                             "last_summarized_turn": 0}), \
+     patch.object(retrieval, "index_exchange",
+                  lambda *a, **k: (_INDEXED.append(a), True)[1]):
+    asyncio.run(main._async_tail(
+        "tt-inner-blank-reply", [], "a real question", "  \n\t ", 4,
+        [{"role": "user", "content": "a real question"}],
+    ))
+assert_eq(main.decide_memory_tail("  \n\t ", finished=True, truncated=False,
+                                  holed=False).outcome, "skipped_empty",
+          "fixture: the request path calls a whitespace reply empty")
+assert_eq(len(_INDEXED), 0,
+          "whitespace reply: no episodic row — the inner gate agrees with "
+          "decide_memory_tail, not with bool('   ')")
+assert_eq(len(_ROLLUPS), 0, "whitespace reply: and no rollup")
+
+_ROLLUPS.clear()
+_INDEXED.clear()
+with patch.object(degrade, "guard", lambda op: False), \
+     patch.object(facts, "extraction_enabled", lambda: True), \
+     patch.object(facts, "load_facts", lambda c: []), \
+     patch.object(summarizer, "enabled", lambda: True), \
+     patch.object(summarizer, "maybe_rollup", _spy_rollup), \
+     patch.object(summarizer, "load_state",
+                  lambda c: {"l1": [], "l2": [], "l3": None,
+                             "last_summarized_turn": 0}), \
+     patch.object(retrieval, "index_exchange",
+                  lambda *a, **k: (_INDEXED.append(a), True)[1]), \
+     capture() as cap:
+    asyncio.run(main._async_tail(
+        "tt-inner-disk", [], "a real question", PROSE, 4,
+        [{"role": "user", "content": "a real question"}],
+    ))
+assert_eq(len(_INDEXED), 0,
+          "disk pressure at RUN time: no episodic row — the request path's "
+          "check was made before this coroutine was queued")
+assert_eq(len(_ROLLUPS), 0, "disk pressure at run time: and no rollup")
+assert_true(_find(cap.records, "disk pressure") is not None,
+            "...and it says why, rather than returning in silence")
+
+# The control, without which the three assertions above pass for an
+# _async_tail that does nothing at all.
+_run_tail("tt-inner-control", extraction=True)
+assert_eq(len(_INDEXED), 1, "control: a healthy tail still indexes")
+assert_eq(len(_ROLLUPS), 1, "control: ...and still rolls up")
 
 # ---------------------------------------------------------------------------
 # [E11] R26 — vLLM dying mid-stream must not skip the tail silently.
@@ -879,3 +1065,42 @@ assert_eq(snap["skipped_recently"], False,
 
 print()
 print("All truncated-tail tests passed.")
+
+# ---------------------------------------------------------------------------
+# Mutation record — v3.1.7 R11 sweep.
+#
+# 43 mutations across compactor/main.py (decide_memory_tail,
+# _has_pairable_user_text, _tail_store_blocked, _run_memory_tail, _async_tail)
+# and compactor/tailhealth.py (_window_s, _safe_int, note, snapshot,
+# LOSSY_SKIP_OUTCOMES, STORING_OUTCOMES), each applied alone and run against
+# test_truncated_tail.py, test_tailhealth.py, test_degenerate_skip.py and
+# test_memory.py. 41 killed. The six that were not, before this pass, are the
+# six now listed in the header docstring.
+#
+# TWO SURVIVED. Both are recorded here rather than chased, because the reason
+# is the finding:
+#
+#   `kept_chars=len(decision.text) if decision.store else 0`
+#     -> `kept_chars=len(decision.text)`
+#   Every skip is built by decide_memory_tail._skip, which is
+#   TailDecision(False, "", ...) — `text` is "" on every skip path there is,
+#   so len() is already 0 and the conditional cannot change a published
+#   number. It guards a decision shape that does not yet exist (a skip that
+#   carries text). Pinning a value that is structurally zero would assert
+#   the constructor, not the behaviour.
+#
+#   `since_lossy <= window` -> `since_lossy < window`
+#   The boundary is unreachable through the public API. `since_lossy` is
+#   round(monotonic - last_lossy_skip_at, 1) and `window` is refused by both
+#   _window_s and snapshot's own guard unless it is finite and > 0; landing
+#   exactly on it needs a window equal to a rounded monotonic delta the
+#   caller does not control, and freezing the clock to get one gives
+#   since_lossy == 0.0, which needs the one window value both guards reject.
+#   The error direction is also the safe one: `<` clears the degrade signal
+#   an instant early rather than pinning it on, which is the failure the
+#   window exists to prevent.
+#
+# A test whose assertions cannot be made to fail is a test that asserts
+# nothing — and a mutation that changes no observable behaviour is not one
+# either. Both are worth writing down; only the first is worth fixing.
+# ---------------------------------------------------------------------------

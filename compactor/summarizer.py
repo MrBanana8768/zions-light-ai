@@ -901,7 +901,12 @@ def _observed_position(conv_id: str, state: dict, messages: list[dict]) -> int:
           advances, so a zero that repeats forever is the frozen hierarchy
           this release exists to fix, reached by a different route (R18).
           A zero is therefore only believed when it is unambiguous, or when
-          the window itself is unchanged (same head, same length).
+          the window itself is unchanged (same head, same length) AND is not
+          a strict suffix of a longer conversation. The second half is not
+          decoration: a capped window that has filled with byte-identical
+          exchanges is byte-identical to the one before it, so "unchanged"
+          alone reads a live stall as the admin drain and freezes the
+          position for as long as the loop runs.
 
       I5. An empty window is not evidence of anything. A request with no
           non-system turns at all must leave both the position and the anchor
@@ -937,13 +942,47 @@ def _observed_position(conv_id: str, state: dict, messages: list[dict]) -> int:
     head_fp = _turn_fingerprints(turns[:1])[0]
     anchor = [x for x in (state.get("tail_fp") or []) if isinstance(x, str)]
     # Same head, same length: the client re-sent the window it sent last time.
-    # Under a cap the head slides out on every exchange, so this is a reliable
-    # negative — and it is the only evidence that separates the admin drain
-    # (the same transcript, looped) from a live turn whose tail repeats.
+    # Under a cap the head slides out on every exchange, so this is USUALLY a
+    # reliable negative — and it is the only content evidence that separates
+    # the admin drain (the same transcript, looped) from a live turn whose
+    # tail repeats.
+    #
+    # USUALLY, and the exception is the whole point of the second clause
+    # below. Once a capped window has filled with byte-identical exchanges —
+    # a model looping, or `_redact_degenerate_turns` replacing every reply
+    # with the same placeholder — the window slides by two turns per exchange
+    # onto content that is period-2 identical, so the head hash repeats and
+    # the length is pinned at the cap. The two arrays are then equal BYTE FOR
+    # BYTE, and no content test of any width can tell them apart: comparing
+    # the whole window, or the whole fingerprint tail, gives the same answer
+    # as comparing the head. Measured at cap 20: the position advanced for
+    # the first ten repeated exchanges, then stalled permanently at turn 40
+    # while the conversation ran on to 68 (R18, second route).
+    #
+    # WHAT DOES SEPARATE THEM IS NOT CONTENT. `n < prev` says the window is a
+    # strict SUFFIX of a longer conversation — invariant I2's own reading of a
+    # bounded window, on the evidence rather than on the outcome (the
+    # "bounded window" line below tests `position > n`, which is the same
+    # judgement AFTER `new` has been chosen and so cannot inform the choice).
+    # The admin drain cannot be in that state: /admin/compact
+    # refuses (409) unless the rebuilt transcript REACHES
+    # _recorded_position, so throughout its loop n >= prev — and holding
+    # keeps it there, because holding leaves the position at max(n, prev) = n.
+    # So a repeating window with n < prev is a live capped turn, and the zero
+    # is the coincidence.
+    #
+    # The trade, stated because it is a trade: a state file whose watermark is
+    # stranded ABOVE its true position (the S-5 case) also reads n < prev, so
+    # if such a conversation ALSO has a repeating tail AND the client re-sends
+    # a byte-identical window, this advances 2 turns it should not have. That
+    # costs two turns of coverage once per duplicate request; the stall it
+    # replaces costs every turn of the hierarchy for as long as the loop runs,
+    # which is the failure this release exists to fix.
     window_unchanged = (
         n == int(state.get("window_turns") or 0)
         and head_fp == (state.get("head_fp") or "")
     )
+    window_is_a_suffix = n < prev
 
     if not anchor:
         # First sight of this conversation with no anchor to compare against —
@@ -995,20 +1034,34 @@ def _observed_position(conv_id: str, state: dict, messages: list[dict]) -> int:
                     f"repeat of this line means the anchor is not "
                     f"round-tripping through the client"
                 )
-        elif cands[0] == 0 and len(cands) > 1 and not window_unchanged:
+        elif (
+            cands[0] == 0
+            and len(cands) > 1
+            and not (window_unchanged and not window_is_a_suffix)
+        ):
             # I4. The anchor occurs at the very end AND earlier, so "nothing
             # advanced" and "one exchange advanced" are equally consistent
             # with it — a tail of byte-identical exchanges, which
             # _redact_degenerate_turns manufactures out of two consecutive
-            # degenerate replies. The window's head and length say it is not
-            # the same window, so the zero is the coincidence, not the truth.
+            # degenerate replies. Either the window's head and length say it
+            # is not the same window, or the window is a strict suffix of a
+            # longer conversation and so cannot be the admin drain's
+            # re-presented transcript — see window_unchanged above. Either
+            # way the zero is the coincidence, not the truth.
             new = cands[1]
             if logsetup.log_once("summarizer.position.repeating_tail"):
                 logger.info(
                     f"conv={conv_id}: the last {len(anchor)} turns of this "
                     f"conversation repeat earlier ones, so the anchor alone "
-                    f"cannot say whether the window moved; the window itself "
-                    f"changed, so taking {new} new turns rather than 0. "
+                    f"cannot say whether the window moved; "
+                    + (
+                        f"the window is {n} turns against a position of "
+                        f"{prev}, so it is a suffix of a longer conversation "
+                        f"and not a re-presented transcript"
+                        if window_is_a_suffix
+                        else "the window itself changed"
+                    )
+                    + f", so taking {new} new turns rather than 0. "
                     f"Reading 0 here would stop the position advancing, and "
                     f"under a cap the position is the only thing that does"
                 )
