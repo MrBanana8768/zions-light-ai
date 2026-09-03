@@ -3972,7 +3972,14 @@ async def _async_tail(
     # below holds the lock across a vLLM call, and the summary rollup takes
     # conv_lock internally, so a single enclosing `async with` would either
     # deadlock or stall this behind an LLM round trip.
-    if assistant_text and last_user_text:
+    # _has_pairable_user_text, not `and last_user_text`: the same rule as
+    # _tail_store_blocked's, from the same function, so the outer check on
+    # the request path and this inner one cannot disagree about a user turn
+    # of nothing but whitespace. See that helper for what the disagreement
+    # cost. `assistant_text` is stripped for the same reason on the same
+    # line — decide_memory_tail already rejects a blank reply as
+    # SKIPPED_EMPTY, and a direct caller should meet the identical rule.
+    if assistant_text.strip() and _has_pairable_user_text(last_user_text):
         async with conv_lock(conv_id):
             try:
                 indexed = retrieval.index_exchange(
@@ -3998,7 +4005,11 @@ async def _async_tail(
     # --- 3. Hierarchical summary rollup (Phase 4) ---
     # Runs OUTSIDE the facts lock since maybe_rollup acquires its own
     # conv_lock internally — nesting the same lock would deadlock.
-    if summarizer.enabled() and assistant_text:
+    # .strip(), matching the episodic gate above (R11 sweep). A reply of
+    # whitespace is not a turn to roll up: it would advance the watermark
+    # over a turn that says nothing, and the label would then cover text no
+    # summary can account for.
+    if summarizer.enabled() and assistant_text.strip():
         try:
             # v3.1.3: redact past degenerate turns before they can reach
             # maybe_rollup — see _redact_degenerate_turns for why the
@@ -4037,6 +4048,29 @@ async def _async_tail(
             logger.exception(f"conv={conv_id}: async rollup failed: {e}")
 
 
+def _has_pairable_user_text(last_user_text: str) -> bool:
+    """Is there user text substantive enough to pair a reply with?
+
+    v3.1.7 (R11 sweep). ONE rule, because it was two. `_tail_store_blocked`
+    below asked `not (last_user_text or "").strip()` and refused the whole
+    tail; `_async_tail`'s episodic gate asked the bare `and last_user_text`
+    three hundred lines away and let it through. A user turn of nothing but
+    spaces is TRUE, so the two siblings disagreed about exactly one shape —
+    and the one that let it through is the one that writes to the store. It
+    indexed `[user]:    \\n[assistant]: <her reply>` as a real exchange:
+    retrievable, injectable, and rebuilt as a real turn by /admin/compact,
+    while the request path had already published the outcome as a skip.
+
+    Not reachable from /v1/chat/completions today — R8 hoisted the decision
+    to the request path, which refuses first — which is precisely why it
+    survived a mutation sweep of every endpoint test in test_truncated_tail.
+    _async_tail is entered directly by five suites and by anything that
+    re-queues a tail, so the inner guard is not decoration and must say the
+    same thing as the outer one.
+    """
+    return bool((last_user_text or "").strip())
+
+
 def _tail_store_blocked(last_user_text: str) -> tuple[str, str] | None:
     """Why the memory tail would store NOTHING for this exchange, or None.
 
@@ -4062,7 +4096,7 @@ def _tail_store_blocked(last_user_text: str) -> tuple[str, str] | None:
             "disk pressure has paused new-memory writes, so nothing about "
             "this exchange would be persisted",
         )
-    if not (last_user_text or "").strip():
+    if not _has_pairable_user_text(last_user_text):
         # Reachable, and not only through a malformed request: a user turn
         # whose content is a parts LIST carrying no text field and no part
         # _message_image_count recognises falls through _extract_last_user_text
@@ -6187,6 +6221,66 @@ async def admin_compact(conv_id: str, request: Request):
             '{"dry_run": false} to run it.'
         )
         return plan
+
+    # DROP THE LIVE ANCHOR BEFORE DRAINING (v3.1.7, R10).
+    #
+    # The guard above proves the array is long enough to be measured against
+    # the position. It does NOT make the summarizer measure it that way.
+    # _observed_position aligns the window it is handed against `tail_fp` —
+    # the fingerprints of the last few turns of the window the CHAT path sent
+    # — and when that anchor appears nowhere in the window it falls back to
+    # _ASSUMED_NEW_TURNS, i.e. "one exchange happened since last time". That
+    # fallback is right for the live path, where main.py calls maybe_rollup
+    # once per exchange. It is wrong here, where the array is not the next
+    # exchange but the WHOLE conversation rebuilt from turn 1.
+    #
+    # The arithmetic, because it is the whole of R10. With a rebuild of n
+    # turns against a recorded position of n — the exact case the guard
+    # admits, and the healthy one — an unalignable anchor makes the position
+    # max(n, n + 2) = n + 2, so window_offset becomes 2 and _do_l1_rollup
+    # reads chunk 1-20's text at array slots -1..18. It clamps, labels the
+    # chunk 3-20, and fills it with turns 1-18: a span it does not contain,
+    # with turns 1 and 2 then covered by nothing at all, and turns_seen left
+    # inflated by 2 for the rest of the conversation's life. That is verbatim
+    # the outcome the refusal above calls "worse than no chunk, because
+    # nothing downstream can tell" — reached past a guard that was right.
+    #
+    # Note WHERE the exposure is: only while n is within _ASSUMED_NEW_TURNS
+    # of the position. A longer rebuild takes max(n, prev + 2) = n and lines
+    # up by itself, which is why this never showed on a store that had run
+    # ahead — and why equality, the case the endpoint exists to serve, was
+    # the one that broke.
+    #
+    # Clearing the anchor is not throwing information away: the drain
+    # overwrites tail_fp with the rebuild's own fingerprints on its very
+    # first call regardless. All this decides is whether the FIRST call is
+    # measured against an anchor that belongs to a different array. Without
+    # one, _observed_position takes the no-anchor branch, and since the guard
+    # has already established n >= _highest_chunk_turn it HOLDS at
+    # max(n, prev) = n — window_offset 0, which is what "the array starts at
+    # turn 1" means. From the second call on the anchor is the rebuild's own
+    # and the drain is idempotent, which is what summarizer's
+    # _ASSUMED_NEW_TURNS comment already assumed was true of the first.
+    #
+    # Under conv_lock, and released before the loop: maybe_rollup takes the
+    # same non-reentrant lock, so this must not enclose it. Re-read inside
+    # the lock rather than reusing `before`, because a live rollup may have
+    # written since the guard read it.
+    async with conv_lock(conv_id):
+        _state = summarizer.load_state(conv_id)
+        if _state.get("tail_fp"):
+            _state["tail_fp"] = []
+            _state["head_fp"] = ""
+            _state["window_turns"] = 0
+            summarizer.save_state(conv_id, _state)
+            logger.info(
+                f"conv={conv_id}: dropped the chat path's window anchor "
+                f"before draining. This rebuild starts at turn 1 and reaches "
+                f"turn {len(messages)}; measuring it against the anchor from "
+                f"a bounded live window would advance the position past a "
+                f"conversation this array already holds in full, and every "
+                f"chunk would be labelled that far off the text inside it"
+            )
 
     # Loop maybe_rollup until the watermark stops moving. Each call does one
     # tier's worth of work; the loop is what turns that into a catch-up. Bounded

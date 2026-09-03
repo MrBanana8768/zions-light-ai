@@ -82,6 +82,45 @@ retrieval._available = False
 retrieval._embedder = None
 retrieval._chroma_collection = None
 
+# R22. count_tokens_exact and count_text_tokens_exact (main.py) each open a
+# REAL httpx.post to f"{VLLM_URL}/tokenize" — a plain synchronous call, not
+# the async client _StubVLLM stands in for below. Nothing in this file ever
+# points VLLM_URL at a live server, so every one of those calls was ALREADY
+# failing; the fallback to the local char/4 estimator it triggers is the
+# degraded path most of this file exists to exercise ("counted by the local
+# tokenizer, UNCORRECTED"). The failure was never in question — only how long
+# it took to arrive. On this machine, "http://localhost:8000" with nothing
+# listening does not fail fast: httpx/httpcore tries the IPv6 loopback first,
+# then the IPv4 one, EACH against its own 2s connect timeout, so one
+# unstubbed call costs ~4.2s measured — and count_tokens_exact /
+# count_text_tokens_exact sit on the hot path of nearly every guard test in
+# this file, several of them more than once per test. That is the whole
+# ~239s this suite used to take: not a sleep anyone wrote, but 55+ real dead
+# TCP handshakes stacked end to end (confirmed by timing each test in
+# isolation — see V314_BACKLOG R22).
+#
+# Raising the same exception class immediately reproduces the exact
+# except-Exception branch those two functions already run against a down
+# backend in production — same log lines, same fallback, same failure
+# counters — without paying for the two-stack timeout for real. A test that
+# wants a different /tokenize behavior still can: patch.object(main.httpx,
+# "post", ...) inside a `with` block layers its own stub on top of this one
+# for its own duration and is unaffected, exactly as
+# test_a_tokenize_outage_is_reportable_more_than_once_per_process already
+# does a few hundred lines down.
+_real_httpx_post = main.httpx.post
+
+
+def _fail_tokenize_fast(url, *args, **kwargs):
+    if "/tokenize" in url:
+        raise main.httpx.ConnectError(
+            "connection refused (stubbed for test speed — see R22)"
+        )
+    return _real_httpx_post(url, *args, **kwargs)  # pragma: no cover — belt and braces
+
+
+main.httpx.post = _fail_tokenize_fast
+
 memory.ensure_storage_layout()
 
 # client=127.0.0.1 and raise_server_exceptions=False mirror test_import_guard —

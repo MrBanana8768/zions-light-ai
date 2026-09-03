@@ -196,13 +196,13 @@ dropping the socket is not trimmed, and the 4xx branch passes through safely
 because its error chunks are never fed to the accumulator — the compactor's
 own apology cannot become a memory.
 
-### Stage 5 — the remainder, and the one that is bigger than it looks
+### Stage 5 — the remainder, and the one that is bigger than it looks — **DONE**
 
 | | finding | note |
 |---|---|---|
 | 13 | ~~**R30 (rest)**~~ **DONE** | `compactor/envcfg.py`, with no dependency on anything else in the package. Verified end to end: six typo'd variables including `MAX_MODEL_LEN=32K` now import cleanly. The positivity guard was deliberately NOT retrofitted onto the ~40 non-window sites — none rejected those values before, nothing reproduced a failure, and several knobs take 0 as a meaningful off. A range check that cannot be justified with a reproduction is a guess. |
-| 14 | R15, R16, R18, R20, R21 | remaining summarizer position edges, once R23/R12 land |
-| 15 | R10, R11, R17, R22 | `/compact` equality guard, surviving mutations, event-loop hashing cost, a 240s test that trips a 240s ceiling |
+| 14 | ~~R15, R16, R18, R20, R21~~ **DONE** | Five of these were ALREADY FIXED in the tree by `157bdc3`, beyond that commit's stated scope of R23/R12 and with no tests at all — five behaviours whose only evidence was a comment. They now have tests (`test_position_edges.py`). R18 was only half-fixed: the existing code handles a repeating TAIL but not a window that has become ALL repeats, where the two arrays are equal byte for byte and no content test of any width separates them. Measured at cap 20 the position stalled permanently at 40 while the conversation ran to 68. Fixed on `n < prev` — the window is a strict suffix, which the admin drain provably cannot be. R16's trade re-examined against the newly-persisted `head_fp` and deliberately CONFIRMED, not repaid. |
+| 15 | ~~R10, R11, R17, R22~~ **DONE** | R10: the guard is RIGHT and must stay `<` (mutating it to `<=` fails 15 assertions); the symptom is real but sits downstream, in `_observed_position` reading the CHAT path's anchor against the drain's rebuild. R11 re-derived from scratch — B's four were gone — as 43 mutations, 41 killed, and one survivor that was a real defect rather than a missing test. R17: 32.4 ms -> 3.2 ms at 700 turns, by bounding the hash rather than moving it off the loop. R22: 239 s -> 1.6 s. |
 
 ---
 
