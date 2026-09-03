@@ -245,6 +245,36 @@ check(summarizer.load_state(CID)["last_summarized_turn"] == 300,
       "the watermark was NOT pulled back to 20")
 
 print()
+print("[3e] a PULLED-DOWN watermark cannot be used to permit a short rebuild")
+# v3.1.7 R12. A state file written by the pre-v3.1.4 code under a cap has its
+# watermark pulled BELOW the chunks it tracks, and no turns_seen at all. Both
+# counters then read low, so a guard that maxes only those two permits a
+# rebuild it should refuse — and the chunks come back labelled against a
+# position hundreds of turns short, which the endpoint's own comment calls
+# "worse than no chunk, because nothing downstream can tell".
+#
+# The chunk labels are the record; the watermark is a pointer derived from
+# them. summarizer._recorded_position is the one function that knows that, and
+# the endpoint has to use it or the two disagree about what a transcript is.
+CID = "watermark-pulled-down"
+summarizer.save_state(CID, {
+    # chunks reach turn 660; the watermark was dragged back to a cap of 100
+    "l1": [{"text": "scene", "first_turn": 641, "last_turn": 660}],
+    "l2": [], "l3": None, "last_summarized_turn": 100,
+})
+set_store(exchanges(60))            # 120 messages: over 100, far under 660
+before = snapshot()
+LLM_CALLS.clear()
+r = compact(CID)
+check(r.status_code == 409,
+      f"HTTP 409 — 120 messages cannot rebuild a conversation at turn 660 "
+      f"(got {r.status_code})")
+check(LLM_CALLS == [], "no LLM call was made on a position it could not trust")
+check(snapshot() == before, "the store is byte-identical after the refusal")
+check(summarizer.load_state(CID)["l1"][0]["last_turn"] == 660,
+      "and the chunk that proved the position is untouched")
+
+print()
 print("[3b] equal length is not short — the guard must not refuse a no-op")
 CID = "watermark-equal"
 summarizer.save_state(CID, {

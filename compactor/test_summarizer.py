@@ -14,6 +14,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -228,6 +229,57 @@ def _window(total: int, cap: int, system: str | None = "you are helpful"):
         role = "user" if i % 2 == 1 else "assistant"
         out.append({"role": role, "content": f"msg{i}-content"})
     return out
+
+
+def _live_window(exchange: int, cap: int, system: str | None = "you are helpful"):
+    """The message list main.py actually hands maybe_rollup on exchange `e`.
+
+    NOT the same thing as _window(2*e, cap), and the difference is the whole
+    of R23. The valve in pipelines/conversation_id_header.py caps what
+    OPENWEBUI re-sends — the client's stored history PLUS the user turn it is
+    sending, i.e. turns 1..2e-1 — and main.py then appends the assistant turn
+    it has just streamed, which the valve never saw. So the window is
+    `min(2e-1, cap) + 1` turns long, and on the first exchange where the cap
+    bites it is one turn LONGER than the previous position while already being
+    one turn SHORTER than the conversation. _window() models the transition as
+    a full history followed immediately by a short window, which lands in a
+    different branch entirely and is why the whole suite stayed green while
+    a turn was being dropped.
+    """
+    hist = [
+        {"role": "user" if i % 2 == 1 else "assistant",
+         "content": f"msg{i}-content"}
+        for i in range(1, 2 * exchange)
+    ]
+    if cap > 0 and len(hist) > cap:
+        hist = hist[-cap:]
+    out = ([{"role": "system", "content": system}] if system else []) + hist
+    out.append({"role": "assistant", "content": f"msg{2 * exchange}-content"})
+    return out
+
+
+def _labels_logged(records) -> list[tuple[int, int]]:
+    """Every span an L1 rollup CLAIMED, in the order it claimed them.
+
+    Read out of the success line rather than out of state["l1"], because
+    sampling the list cannot see a chunk that an L2 rollup folded away inside
+    the same maybe_rollup call — and past the L2 threshold that is most of
+    them. The label at the moment of creation is the thing under test: a
+    chunk labelled 9-12 whose body is turns 10-13 is what R23 produced, and
+    it is invisible to any assertion that counts chunks.
+    """
+    out = []
+    for r in records:
+        m = re.search(r"L1 rollup — chunk \d+ covers turns (\d+)-(\d+)",
+                      r.getMessage())
+        if m:
+            out.append((int(m.group(1)), int(m.group(2))))
+    return out
+
+
+def _turns_in(body: str, upto: int) -> list[int]:
+    """Which client turns' text is actually inside one request body."""
+    return [t for t in range(1, upto + 1) if f"msg{t}-content" in body]
 
 
 # ---------------------------------------------------------------------------
@@ -1207,6 +1259,136 @@ def test_switching_the_cap_on_re_summarizes_nothing():
               "and no chunk was added")
 
 
+def test_the_cap_engaging_mid_conversation_loses_no_turn():
+    print("\n[test] the turn the valve first bites on is not swallowed")
+    # R23. test_switching_the_cap_on_re_summarizes_nothing models the
+    # transition as a full history followed immediately by a SHORT window
+    # (n <= prev), which lands in the anchor branch. A sliding cap does not do
+    # that. It engages gradually, and on the first request where it bites the
+    # window is still LONGER than the recorded position while already being
+    # SHORTER than the conversation:
+    #
+    #   cap 8, exchange 5 — the client stores turns 1-9, the valve trims to the
+    #   last 8, the compactor appends turn 10 -> n = 9, prev = 8, truth = 10.
+    #
+    # The old code read "n > prev" as "the array length IS the position" and
+    # took 9. One turn of position, swallowed permanently: client turn 9 was
+    # summarized by no tier, and every chunk from there on was labelled one
+    # turn off the text inside it.
+    _wipe()
+    cid = "valve"
+    cap = 8
+    exchanges = 12                      # 24 turns, six L1 chunks' worth
+    bodies, orig = _install_body_recorder("CHUNK")
+    try:
+        with capture() as cap_log:
+            for e in range(1, exchanges + 1):
+                state = asyncio.run(
+                    summarizer.maybe_rollup(cid, _live_window(e, cap),
+                                            "http://x", "m")
+                )
+    finally:
+        _restore_httpx(orig)
+
+    truth = 2 * exchanges
+    assert_eq(state["turns_seen"], truth,
+              "the position tracked the conversation across the valve")
+
+    # The two harms are separate questions and the second is the quiet one.
+    # First: is every covered turn's TEXT in some chunk's request body?
+    l1_bodies = [b for prompt, b in bodies if prompt == summarizer._PROMPT_L1]
+    summarized = set()
+    for b in l1_bodies:
+        summarized.update(_turns_in(b, truth))
+    watermark = state["last_summarized_turn"]
+    missing = [t for t in range(1, watermark + 1) if t not in summarized]
+    assert_eq(missing, [], "no client turn under the watermark went unsummarized")
+
+    # Second: does each chunk's LABEL name the turns its body actually held?
+    # A chunk labelled 9-12 whose text is turns 10-13 passes every count-based
+    # assertion in this file and is what _do_l1_rollup's own comment calls
+    # worse than summarizing nothing, because nothing downstream can tell.
+    labels = _labels_logged(cap_log.records)
+    assert_eq(len(labels), len(l1_bodies), "one claimed span per L1 request")
+    assert_true(len(labels) > 0, "and rollups actually happened")
+    for (first, last), body in zip(labels, l1_bodies):
+        held = _turns_in(body, truth)
+        assert_eq((held[0], held[-1]), (first, last),
+                  f"chunk labelled {first}-{last} holds exactly those turns")
+
+
+def test_a_watermark_below_its_own_chunks_is_repaired_not_discarded():
+    print("\n[test] a pulled-down watermark does not silence the rollup")
+    # R12, and it fires on the DOCUMENTED install path. A state file written
+    # by the parent commit under max_turns has the watermark pulled down to
+    # the cap by the old _reconcile_watermark, while the L1 list still holds
+    # chunks labelled up to the real position. Seeding the position from
+    # `max(turns_seen, last_summarized_turn)` restarted it at the cap, so the
+    # next chunk was labelled cap+1..cap+20 — a label an OLD chunk already
+    # owns. The duplicate-chunk guard then found it, logged a WARNING,
+    # advanced the watermark and returned True, discarding a real span. For
+    # every chunk until the position climbed past the highest old label:
+    # reproduced at `new L1 chunks=0, LLM calls=0` for ~280 exchanges.
+    #
+    # Both documented cap values (100 and 60) are multiples of L1_CHUNK_SIZE,
+    # so the labels collide exactly.
+    _wipe()
+    cid = "pulled-down"
+    cap = 8
+    chunk = summarizer.L1_CHUNK_SIZE
+    # The conversation reached turn 40. Older chunks are already folded into a
+    # chapter; the two most recent are still loose in L1 — the shape a live
+    # conversation is actually in, and the shape that makes the collision
+    # reachable, since the guard only looks at L1.
+    summarizer.save_state(cid, {
+        "l1": [{"text": "scene nine", "first_turn": 33, "last_turn": 36},
+               {"text": "scene ten", "first_turn": 37, "last_turn": 40}],
+        "l2": [{"text": "chapter one", "first_turn": 1, "last_turn": 32}],
+        "l3": None,
+        "last_summarized_turn": cap,       # PULLED DOWN from 40 by the old code
+        "turns_seen": cap,
+        "tail_fp": [],
+    })
+
+    bodies, orig = _install_body_recorder("NEW-CHUNK")
+    try:
+        with capture() as cap_log:
+            # Client turns 41-48: two chunks' worth past the highest old label.
+            for e in range(21, 25):
+                state = asyncio.run(
+                    summarizer.maybe_rollup(cid, _live_window(e, cap),
+                                            "http://x", "m")
+                )
+    finally:
+        _restore_httpx(orig)
+
+    repaired = find(cap_log.records, "while stored chunks already cover")
+    assert_true(repaired is not None,
+                "the operator is told the watermark was below its own chunks")
+    assert_eq(repaired.levelno, logging.WARNING, "at WARNING — it self-healed")
+    discarded = find(cap_log.records, "already exists")
+    assert_true(discarded is None, "and no span was discarded as a duplicate")
+
+    l1_bodies = [b for prompt, b in bodies if prompt == summarizer._PROMPT_L1]
+    assert_true(len(l1_bodies) > 0,
+                "the rollup spent a real LLM call instead of skipping silently")
+    labels = _labels_logged(cap_log.records)
+    assert_true(len(labels) > 0, "and a new chunk past the old labels was claimed")
+    assert_true(all(f > 40 for f, _ in labels),
+                "every new chunk starts past the highest old label")
+    assert_eq(state["turns_seen"], 48,
+              "the position is the conversation's, not the cap's")
+
+    # The label has to name the turns the body held. Advancing the watermark
+    # without moving the position would have produced a chunk labelled 41-44
+    # over some other four turns entirely.
+    assert_eq(len(labels), len(l1_bodies), "one claimed span per L1 request")
+    for (first, last), body in zip(labels, l1_bodies):
+        held = _turns_in(body, 48)
+        assert_eq((held[0], held[-1]), (first, last),
+                  f"chunk labelled {first}-{last} holds exactly those turns")
+
+
 def test_the_same_capped_window_twice_adds_nothing():
     print("\n[test] re-running the same window produces no duplicate chunk")
     # The admin-compact shape: /admin/conversations/<id>/compact loops
@@ -1363,32 +1545,106 @@ def test_turn_fingerprints_survive_whitespace_reflow():
 
 
 def test_a_duplicate_span_is_not_stored_twice():
-    print("\n[test] a chunk whose span already exists is skipped, not appended")
+    print("\n[test] a re-presented span is skipped — after proving it IS the same")
     # Belt and braces for the hazard the old watermark reset created: running
     # the admin drain twice appended a second identical chunk set, which
-    # cascaded into duplicate L2 chapters and a duplicate-fed L3. A monotonic
-    # position makes it unreachable through maybe_rollup, so it is asserted
-    # here at the tier that would do the appending.
+    # cascaded into duplicate L2 chapters and a duplicate-fed L3.
+    #
+    # REWRITTEN for v3.1.7 (R12). The old version of this test built the
+    # existing chunk BY HAND — text "already summarized", span 1-4 — set
+    # last_summarized_turn to 0, called it "a position that went backwards",
+    # and asserted the span was skipped "without spending an LLM call to
+    # prove it". That is a stronger claim than the fixture supports: nothing
+    # in it established that turns 1-4 of the messages in hand were the turns
+    # the existing chunk summarized. Under a pulled-down watermark they are
+    # NOT — the labels collide while the text underneath them is 500 turns
+    # apart — and the skip the test was pinning is exactly how R12 threw away
+    # every new chunk in silence. A test that cannot tell those two cases
+    # apart pins the bug as firmly as the behaviour.
+    #
+    # So the existing chunk is now MADE by a real rollup over known turns, and
+    # its request body is kept. The skip is only correct because the body
+    # proves the same four turns are already covered.
     _wipe()
     cid = "dupe-span"
     state = summarizer._empty_state(cid)
-    state["l1"] = [{"text": "already summarized", "first_turn": 1, "last_turn": 4}]
-    state["last_summarized_turn"] = 0        # a position that went backwards
-    calls, orig = _install_call_recorder("SHOULD-NOT-HAPPEN")
+    import httpx
+
+    bodies, orig = _install_body_recorder("FIRST-PASS")
     try:
-        import httpx
-        async def _run():
+        async def _first():
             async with httpx.AsyncClient() as client:
                 return await summarizer._do_l1_rollup(
                     cid, client, "http://x", "m", state, _msgs(4), 0
                 )
-        advanced = asyncio.run(_run())
+        assert_eq(asyncio.run(_first()), True, "the first rollup stored a chunk")
+    finally:
+        _restore_httpx(orig)
+    assert_eq(len(state["l1"]), 1, "one chunk so far")
+    assert_eq((state["l1"][0]["first_turn"], state["l1"][0]["last_turn"]), (1, 4),
+              "labelled 1-4")
+    held = _turns_in(bodies[0][1], 4)
+    assert_eq((held[0], held[-1]), (1, 4),
+              "and the turns it actually summarized were 1-4")
+
+    # Now the re-presentation: the same four turns, with the watermark rewound
+    # underneath them. THIS is the case the skip is right for.
+    state["last_summarized_turn"] = 0
+    calls, orig = _install_call_recorder("SHOULD-NOT-HAPPEN")
+    try:
+        with capture() as cap:
+            async def _again():
+                async with httpx.AsyncClient() as client:
+                    return await summarizer._do_l1_rollup(
+                        cid, client, "http://x", "m", state, _msgs(4), 0
+                    )
+            advanced = asyncio.run(_again())
     finally:
         _restore_httpx(orig)
     assert_eq(advanced, True, "the watermark still advances past the span")
     assert_eq(state["last_summarized_turn"], 4, "to the end of it")
     assert_eq(len(state["l1"]), 1, "and no second chunk was appended")
     assert_eq(calls, [], "without spending an LLM call to prove it")
+    # Raised from WARNING in v3.1.7: with the position seeded from the chunk
+    # labels and the watermark repaired against them before any rollup runs,
+    # nothing on the live path can reach this line. If it is in the log, the
+    # position arithmetic is wrong again and the skip is hiding how much.
+    noted = find(cap.records, "already exists")
+    assert_true(noted is not None, "the skip is reported")
+    assert_eq(noted.levelno, logging.ERROR,
+              "at ERROR — this is now an unreachable state, not routine")
+
+
+def test_a_rewound_watermark_is_repaired_before_it_can_discard_a_span():
+    print("\n[test] the position is seeded from the chunk labels, not just the pointers")
+    # The other half of R12, and the half that makes the guard above
+    # unreachable rather than merely loud. _recorded_position seeds from
+    # max(turns_seen, last_summarized_turn, highest chunk label); the third
+    # term is the one that survives a watermark the old code pulled down.
+    _wipe()
+    cid = "seeded"
+    state = {
+        "l1": [{"text": "a scene", "first_turn": 37, "last_turn": 40}],
+        "l2": [], "l3": None,
+        "last_summarized_turn": 8,       # pulled down under a cap of 8
+        "turns_seen": 8,
+        "tail_fp": [],
+    }
+    assert_eq(summarizer._recorded_position(state), 40,
+              "the chunk labels outvote the pointers that were pulled down")
+    assert_eq(summarizer._repair_watermark_below_chunks(cid, state), True,
+              "and the watermark is raised to what the chunks already prove")
+    assert_eq(state["last_summarized_turn"], 40, "to the highest label")
+    # Idempotent: a healthy state is not touched, so this cannot become a
+    # second way to move a watermark that is already correct.
+    assert_eq(summarizer._repair_watermark_below_chunks(cid, state), False,
+              "a second pass changes nothing")
+    healthy = {"l1": [{"text": "x", "first_turn": 1, "last_turn": 4}],
+               "l2": [], "l3": None, "last_summarized_turn": 100,
+               "turns_seen": 100, "tail_fp": []}
+    assert_eq(summarizer._repair_watermark_below_chunks(cid, healthy), False,
+              "a watermark ABOVE its chunks is left alone — that is S-5's case")
+    assert_eq(healthy["last_summarized_turn"], 100, "and stands where it was")
 
 
 def test_a_backlog_past_the_window_skips_instead_of_stalling():
@@ -1630,6 +1886,8 @@ if __name__ == "__main__":
         test_a_permanently_capped_window_still_rolls_up()
         test_the_capped_rollup_summarizes_the_right_turns()
         test_switching_the_cap_on_re_summarizes_nothing()
+        test_the_cap_engaging_mid_conversation_loses_no_turn()
+        test_a_watermark_below_its_own_chunks_is_repaired_not_discarded()
         test_the_same_capped_window_twice_adds_nothing()
         test_a_regenerated_reply_is_not_a_new_turn()
         test_a_window_that_cannot_be_aligned_advances_by_one_exchange()
@@ -1637,6 +1895,7 @@ if __name__ == "__main__":
         test_align_new_turns_unit()
         test_turn_fingerprints_survive_whitespace_reflow()
         test_a_duplicate_span_is_not_stored_twice()
+        test_a_rewound_watermark_is_repaired_before_it_can_discard_a_span()
         test_a_backlog_past_the_window_skips_instead_of_stalling()
         test_a_chunk_straddling_the_window_edge_claims_only_what_it_saw()
         test_rollup_logs_a_success_line()
@@ -1684,4 +1943,29 @@ if __name__ == "__main__":
 #                                                        past the strand"
 #   load_state drops tail_fp                          -> "four further turns
 #                                                        past the strand"
+#
+# v3.1.7, for R23 and R12. Same method, same file, re-run per mutation.
+#
+#   `max(n, prev + new)` -> `n if n > prev else          -> "the position
+#      prev + new`  (the old two-regime rule)               tracked the
+#                                                           conversation
+#                                                           across the valve"
+#   window_offset shifted by 1 (position stays right,    -> "no client turn
+#      only the TEXT moves — proves the coverage             under the
+#      assertion is not riding on the position one)         watermark went
+#                                                           unsummarized"
+#   _recorded_position drops the chunk-label term        -> "the chunk labels
+#                                                           outvote the
+#                                                           pointers that were
+#                                                           pulled down"
+#   _repair_watermark_below_chunks becomes a no-op       -> "the operator is
+#                                                           told the watermark
+#                                                           was below its own
+#                                                           chunks"
+#   the anchorless branch holds instead of consulting    -> "the position is
+#      _highest_chunk_turn                                  the conversation's,
+#                                                           not the cap's"
+#   the duplicate guard logs WARNING again               -> "at ERROR — this is
+#                                                           now an unreachable
+#                                                           state, not routine"
 # ---------------------------------------------------------------------------

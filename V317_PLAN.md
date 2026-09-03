@@ -54,15 +54,36 @@ about 145 times a day and every budget decision falls to a counter reading up
 to 51% low (L1). Shipping v3.1.6+ ends that chain regardless of everything
 below.
 
-### Stage 1 — unblock the cap
+### Stage 1 — unblock the cap — **DONE**
 
 | | finding | why now |
 |---|---|---|
 | 1 | **R23** | silently loses a turn at the moment the cap engages |
 | 2 | **R12** | silently stops summarizing for ~280 exchanges after upgrade |
 
-In progress. Both live in `_observed_position` / `_align_new_turns` and
-interact, so they are one piece of work, not two.
+Fixed. The two position regimes collapse to `position = max(n, prev + new)`:
+`n` is a lower bound (every window turn is real, but a capped window is a
+suffix), `prev + aligned` is the other, and the position is the larger — exact
+whenever either source is exact, never over-counting. For R12 the seed now
+reads `max(turns_seen, last_summarized_turn, highest chunk label)`, because
+**the chunk list is the record and the watermark is a pointer derived from
+it** — the only one of the three the old `_reconcile_watermark` could not
+erase. A watermark below its own chunks is repaired before anything reads it.
+
+`admin_compact` now calls `summarizer._recorded_position` rather than maxing
+the two counters locally, so the endpoint and the rollup cannot disagree about
+how far a conversation has got. Without that it would PERMIT a rebuild it
+should refuse, on exactly the pulled-down state files R12 is about.
+
+Two trades, taken deliberately and documented in the code:
+* **R16 is left standing.** With no anchor and no chunks to corroborate, the
+  hold is still never repaid; repaying it needs evidence that call does not
+  have.
+* R23 can under-count by one turn in one narrow case (no anchor, `n >= prev`,
+  no chunks) — once per conversation, erring toward duplicating rather than
+  dropping, which is the safe direction.
+
+Six mutations were watched to fail, four of them re-run independently.
 
 **Then, and only then:** install the OpenWebUI filter at `max_turns=60`,
 following the runbook in `pipelines/conversation_id_header.py` — after R4
