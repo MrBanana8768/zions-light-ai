@@ -77,6 +77,17 @@ fact-survival half-life from the archive sidecar for conv=4214….
 
 ## N4 · OpenWebUI task traffic is treated as a first-turn conversation
 
+> **STATUS 2026-09-03 — half of this shipped; the fix direction below is out
+> of date.** The INJECTION half is done: `_has_conversational_history`
+> (main.py:2710) gates `INJECTION_NO_HISTORY_FRACTION` (0.125 against 0.5),
+> and `COMPACTOR_INJECTION_NO_HISTORY_FRACTION=0` disables injection for task
+> traffic with no code change. The EXTRACTION half is not. `has_history` is
+> computed once at main.py:4850 and reaches only the budget fraction and a log
+> line; neither `_run_memory_tail` call site (main.py:5228, 5350) is told, so
+> task traffic is still fact-extracted, indexed and deduped. One
+> classification, two consumers, wired to one of them. Queued as A2 in
+> `V318_PLAN.md`.
+
 conv=d5a7… (stable hash, msgs=2, fires ~90 s after every main-conv turn) is
 OpenWebUI's title/tag/follow-up generation. It receives 79–95 injected facts
 per request, is fact-extracted, indexed, and deduped (a second treadmill),
