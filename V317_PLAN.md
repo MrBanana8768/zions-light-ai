@@ -89,17 +89,30 @@ Six mutations were watched to fail, four of them re-run independently.
 following the runbook in `pipelines/conversation_id_header.py` — after R4
 below, because step 8 of that runbook does not currently work.
 
-### Stage 2 — the runbook the operator is told to follow
+### Stage 2 — the runbook the operator is told to follow — **DONE**
 
 | | finding | why now |
 |---|---|---|
 | 3 | **R4** | `?dry_run=false` is read from the JSON body only, so the documented "commit the merge" command is a second dry run: HTTP 200, plausible counts, nothing changed |
 | 4 | **R13** | `/admin/compact` 409s for any conversation where even one exchange missed the episodic index — i.e. every real one — and it is the endpoint R12's own ERROR line points at |
 
-R4 is small and blocks Stage 1's install sequence. R13 is a design change
-(rebuild the transcript by slot from `turn_index`, filling gaps with explicit
-placeholders) and is the larger of the two; it can follow the cap going on,
-but not by much, because it is the only rebuild-from-store recovery path.
+Both fixed. R4 reads the query form as well as the body, and the runbook now
+prints the body form — the one that has always been read — with a line telling
+the operator to check the counts rather than the status code.
+
+R13 rebuilds by SLOT from `turn_index`, with one decision worth stating: slots
+are relative to the lowest stored index, not absolute. `turn_index` counts
+system messages the summarizer skips and is reallocated on write, so it is not
+an exact position — but its DIFFERENCES are exact (two message-units per
+exchange in both numberings), so a jump of four is reliably one lost exchange.
+A missing head makes the rebuild short and the existing 409 fires unchanged,
+so the assumption checks itself. `summarizer._recorded_position` is untouched,
+so a pulled-down watermark still cannot permit a short rebuild.
+
+**Correction to `V314_BACKLOG.md`:** it lists `test_admin_compact [3d]` as
+"PINNED WRONG". It is not. `[3d]` pins the refusal for a store that does not
+reach the position, which survives R13 and should. The refusal R13 removes was
+never covered by a test at all.
 
 ### Stage 3 — memory correctness she would notice — **R24/R9/R19/R25 DONE**
 
@@ -136,7 +149,17 @@ own end, and the corpus's 1,261-item case had no closing prose, so the
 66-books reply is clean while the runaway still fires. R19 gates the list
 rule on `DEGENERATE_MIN_CHARS`, matching this file's own doctrine.
 
-**R8 remains open** - it needs `main.py` and was not part of this pass.
+**R8 is now fixed** (with Stage 4's `main.py` pass). The conditions that store
+nothing are evaluated BEFORE counting, rather than having `_async_tail` report
+an outcome afterwards — because `bgwork.pool` sheds, and a tail dropped at the
+ceiling would then never be counted at all, a new silent skip of exactly the
+shape being fixed.
+
+Extraction-disabled was deliberately NOT hoisted: episodic indexing still runs
+there, so counting it as a skip would be a second lie. The real defect was that
+the facts block's `return` returned from the WHOLE tail, so the summary rollup
+was silently off for the life of any `COMPACTOR_FACTS_EXTRACTION=false`
+deployment. Fixed at source.
 
 ### Stage 4 — observability that would have caught all of this sooner — **R27/R28/R29 DONE**
 
@@ -166,13 +189,18 @@ an unrecognised outcome NON-lossy. The exact inversion of the safe default
 its own comment claimed. Now tested as "not a store and not the one harmless
 label", pinned by a test that fails on the set-membership form.
 
-**R26 remains open** - it needs `main.py`.
+**R26 is now fixed.** The stronger of the two options was taken: prose she had
+already read is MEMORIZED through the existing trim path, not merely counted.
+`finished` still comes from the accumulator, so a reply vLLM finished before
+dropping the socket is not trimmed, and the 4xx branch passes through safely
+because its error chunks are never fed to the accumulator — the compactor's
+own apology cannot become a memory.
 
 ### Stage 5 — the remainder, and the one that is bigger than it looks
 
 | | finding | note |
 |---|---|---|
-| 13 | **R30 (rest)** | ~35 bare `int(os.environ...)` / `float(os.environ...)` sites across 12 modules, every one an import-time crash on a typo. `MAX_MODEL_LEN=32K` still stops the boot via `facts.py:171` and `summarizer.py:125`. Needs one shared `envcfg` helper — nothing may import `main` — routed through everywhere. Mechanical, touches every module, deserves its own review pass. |
+| 13 | ~~**R30 (rest)**~~ **DONE** | `compactor/envcfg.py`, with no dependency on anything else in the package. Verified end to end: six typo'd variables including `MAX_MODEL_LEN=32K` now import cleanly. The positivity guard was deliberately NOT retrofitted onto the ~40 non-window sites — none rejected those values before, nothing reproduced a failure, and several knobs take 0 as a meaningful off. A range check that cannot be justified with a reproduction is a guess. |
 | 14 | R15, R16, R18, R20, R21 | remaining summarizer position edges, once R23/R12 land |
 | 15 | R10, R11, R17, R22 | `/compact` equality guard, surviving mutations, event-loop hashing cost, a 240s test that trips a 240s ceiling |
 
