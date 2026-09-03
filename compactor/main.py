@@ -5619,11 +5619,25 @@ async def admin_merge(src_conv_id: str, dst_conv_id: str, request: Request):
     """Fold a forked conversation's memory back into the live one.
 
     Body (all optional):  {"dry_run": true}
+    Query (all optional):  ?dry_run=false
 
     DRY RUN BY DEFAULT - unlike the compact endpoint next door, which
     defaults to a live run and surprised an operator into one. This touches
     two conversations, so it gets the safer default; pass
     {"dry_run": false} to commit.
+
+    THE QUERY FORM IS READ TOO, and that is not a convenience (v3.1.7, R4).
+    The install runbook in pipelines/conversation_id_header.py told the
+    operator to commit with `?dry_run=false`, this handler read the JSON body
+    only, and the query string was silently ignored - so the step whose entire
+    purpose is to un-fork her memory returned HTTP 200 with plausible counts
+    and changed nothing. It is the step before the history cap goes on, and
+    capping before a real merge is what makes the loss permanent.
+
+    A POST with a query flag is what an operator reaches for under stress, and
+    a flag that is accepted-looking and inert is worse than one that 400s. The
+    body still wins when both are present: an explicit JSON body is the more
+    deliberate of the two.
 
     Merges FACTS and EPISODIC exchanges only. Summaries are deliberately not
     merged: the forked half re-derives its own hierarchy from the client's
@@ -5639,7 +5653,16 @@ async def admin_merge(src_conv_id: str, dst_conv_id: str, request: Request):
         body = {}
     if not isinstance(body, dict):
         body = {}
-    dry_run = bool(body.get("dry_run", True))
+    if "dry_run" in body:
+        dry_run = bool(body["dry_run"])
+    else:
+        # "false"/"0"/"no" all mean commit. Anything else, including a typo,
+        # stays a dry run: this endpoint's safe direction is to change
+        # nothing, and an operator who meant to commit will see the counts
+        # come back unchanged and try again. The reverse mistake is not
+        # recoverable.
+        raw = str(request.query_params.get("dry_run", "")).strip().lower()
+        dry_run = raw not in ("false", "0", "no")
 
     try:
         return await run_in_threadpool(

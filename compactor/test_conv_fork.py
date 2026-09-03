@@ -21,6 +21,7 @@ Two halves to this file:
 
 import asyncio
 import os
+import pathlib
 import sys
 import tempfile
 
@@ -155,6 +156,73 @@ for src, dst, why in (
         FAILED.append(f"did not refuse: {why}")
     except ValueError:
         print(f"  ok   refuses {why}")
+
+print()
+print()
+print("[4] the runbook's OWN commit command actually commits (R4)")
+# The install runbook in pipelines/conversation_id_header.py prints two curl
+# commands: a dry run, then the commit. Until v3.1.7 the handler read
+# `dry_run` from the JSON body ONLY, so the runbook's `?dry_run=false`
+# returned HTTP 200 with plausible counts and changed nothing. It is step 8,
+# immediately before the history cap goes on, and capping before a real merge
+# is what makes the loss permanent.
+#
+# Driven through the real endpoint from localhost, because the defect was in
+# the handler's argument parsing and nowhere else — calling
+# portability.merge_conversation directly, which is what [2] above does,
+# cannot see it.
+from fastapi.testclient import TestClient  # noqa: E402
+
+_admin = TestClient(main.app, client=("127.0.0.1", 12352),
+                    raise_server_exceptions=False)
+
+
+def _fresh_pair(tag):
+    facts.save_facts(f"{tag}_src", [{"text": "Her name is Idris.", "added_turn": 1}])
+    facts.save_facts(f"{tag}_dst", [])
+    return f"{tag}_src", f"{tag}_dst"
+
+
+def _merge(src, dst, **kw):
+    return _admin.post(f"/admin/conversations/{src}/merge-into/{dst}", **kw)
+
+
+# The query form — what the runbook used to print, and what an operator
+# reaches for under stress.
+_src, _dst = _fresh_pair("r4q")
+_r = _merge(_src, _dst, params={"dry_run": "false"})
+check(_r.status_code == 200, f"?dry_run=false returns 200 (got {_r.status_code})")
+check(_r.json().get("dry_run") is False,
+      f"...and reports itself as a COMMIT, not a dry run "
+      f"(got dry_run={_r.json().get('dry_run')!r})")
+check(len(facts.load_facts(_dst)) == 1,
+      f"...and the fact actually landed in the destination "
+      f"({len(facts.load_facts(_dst))} facts)")
+
+# The body form, which is what the runbook prints now.
+_src, _dst = _fresh_pair("r4b")
+_r = _merge(_src, _dst, json={"dry_run": False})
+check(_r.json().get("dry_run") is False, "the JSON body form commits too")
+check(len(facts.load_facts(_dst)) == 1, "...and its fact landed as well")
+
+# Default and typo both stay a dry run. The safe direction for this endpoint
+# is to change nothing: an operator who meant to commit sees unchanged counts
+# and tries again, where the reverse mistake is not recoverable.
+for _label, _kw in (("no flag at all", {}),
+                    ("?dry_run=true", {"params": {"dry_run": "true"}}),
+                    ("?dry_run=flase (typo)", {"params": {"dry_run": "flase"}}),
+                    ("body wins over query", {"json": {"dry_run": True},
+                                              "params": {"dry_run": "false"}})):
+    _src, _dst = _fresh_pair("r4d")
+    _r = _merge(_src, _dst, **_kw)
+    check(_r.json().get("dry_run") is True, f"{_label} -> still a dry run")
+    check(len(facts.load_facts(_dst)) == 0, f"{_label} -> nothing was written")
+
+# The runbook must not go back to printing the form that did nothing.
+_runbook = (pathlib.Path(__file__).resolve().parent.parent
+            / "pipelines" / "conversation_id_header.py").read_text(encoding="utf-8")
+check("-d '{\"dry_run\": false}'" in _runbook,
+      "the runbook's commit command sends a JSON body")
 
 print()
 if FAILED:
