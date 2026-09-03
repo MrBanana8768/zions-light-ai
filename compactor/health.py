@@ -270,9 +270,10 @@ async def gather_health_full(
       - "ok"       — all checks pass; serve traffic normally
       - "degraded" — storage OK but something the operator needs to see:
                      vLLM unreachable, new-memory writes paused under disk
-                     pressure, or background work shedding. Compactor can
-                     still serve admin/export endpoints. Container stays
-                     alive so supervisord can restart vLLM independently.
+                     pressure, background work shedding, or the memory tail
+                     skipping replies (v3.1.4). Compactor can still serve
+                     admin/export endpoints. Container stays alive so
+                     supervisord can restart vLLM independently.
       - "down"     — storage broken. Nothing useful possible. Container
                      should be replaced.
 
@@ -302,6 +303,19 @@ async def gather_health_full(
         bg = bgwork.pool.stats()
     except Exception as e:
         bg = {"error": f"{type(e).__name__}: {e}"}
+
+    # v3.1.4: memory-tail decisions — replies that did NOT enter memory
+    # (facts, episodic index, rollup) and why, as counts. Same shape and same
+    # reason as the pool above: until v3.1.4 a skipped tail was a WARNING
+    # line and nothing else, so 63 skipped exchanges in one 2026-09-01 log
+    # window — more than half her recent conversation — ran for weeks with
+    # this endpoint saying ok. Read here directly, like bgwork, because
+    # main.py cannot be imported from this module (main imports health).
+    try:
+        import tailhealth
+        mt = tailhealth.snapshot()
+    except Exception as e:
+        mt = {"error": f"{type(e).__name__}: {e}"}
 
     # Why a reason list and not a bare string: `bg` used to be computed here,
     # placed in the payload, and never read. Sustained shedding — the pool
@@ -339,6 +353,23 @@ async def gather_health_full(
                 f"{bg.get('max_outstanding')}). New memory is not being "
                 f"written for the turns that were dropped."
             )
+        if mt.get("error"):
+            # Unknown is not fine (same doctrine as the pool above).
+            reasons.append(f"memory tail unobservable ({mt['error']})")
+        elif mt.get("skipped_recently"):
+            # Worded on the shed reason above, because it is the same harm
+            # seen from the other side: there, the pool dropped the tail;
+            # here, the gate declined to run it. `skipped_recently` is the
+            # windowed field (tailhealth.SKIP_DEGRADE_WINDOW_S), so a skip
+            # degrades while it is happening and for a while after, then
+            # clears itself — the cumulative `skipped` is history, not status.
+            reasons.append(
+                f"memory tail skipping: {mt.get('skipped')} reply(ies) not "
+                f"memorized ({mt.get('consecutive_skips')} consecutive, most "
+                f"recent {mt.get('seconds_since_last_skip')}s ago, last "
+                f"outcome {mt.get('last_skip_outcome')}). New memory is not "
+                f"being written for the turns that were skipped."
+            )
         # The counter the budget is computed from. When /tokenize is
         # unreachable the compactor keeps serving on a local estimate that has
         # measured up to 51% low on assistant content — it is degraded, not
@@ -368,6 +399,7 @@ async def gather_health_full(
         "backups": backup_info,
         "memory_writes": writes,
         "background_work": bg,
+        "memory_tail": mt,
         "config": {
             "vllm_url": vllm_url,
             "target_tokens": target_tokens,

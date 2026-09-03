@@ -399,3 +399,793 @@ and this is what it looks like.
 4. The background L1 hierarchy kept pace with an all-night 372-message
    session (watermark lag ~15 turns) — the memory hierarchy works; the live
    window is the constraint.
+
+---
+
+# v3.1.7 — what the 2026-09-02 log sweep found
+
+Bundle `zla-bundle-20260902T150758Z` (window 08-28 17:38 → 09-02 15:07) plus
+`zions-backup-20260902-150135`. Counts only below; no conversation content and
+no conversation ids — this repo is public.
+
+The pod is on **v3.1.4 plus hot-fixes**. That matters for reading every number
+here: several of these are fixed in v3.1.6/v3.1.7 and are still happening
+because that build has not shipped.
+
+## L1 · The empty-assistant 400 chain is live, and growing
+
+The 2026-08-28 failure shape, running on nearly every turn of the long
+conversation. One representative sequence, 09-02, eight seconds end to end:
+
+```
+00:00:56  /tokenize 400 "Invalid assistant message: role='assistant' content=''"
+00:00:57  compaction skipped: 723 turns need 102 summarization calls, over the 4-call cap
+00:01:03  token scale unavailable — budgeting this payload at 1,292,552 tokens UNCORRECTED
+00:01:04  /tokenize is answering again after 2 consecutive failure(s) over 8s
+00:01:04  hard budget enforced: 1,292,552 -> 18,710 tokens; dropped 724 old turn(s)
+```
+
+Per day, `Invalid assistant message`: 0, 8, 2, 19, **101**, **44** across
+08-28..09-02 (09-02 is a partial day, cut at 15:07). vLLM's own log carries
+343 matching `ValueError`s. `token scale unavailable` tracks it almost exactly
+(0/4/1/18/99/44), because it IS the same event seen one layer up.
+
+The turn count reached **807** by 14:58 on 09-02.
+
+**Cause:** `count_tokens_exact` measures the raw message list. v3.1.4 repairs
+the tail we FORWARD and never the payload we MEASURE. v3.1.6 introduced
+`_space_fill_empty_assistant` at both sites; v3.1.7 widened it to `None`, a
+missing content key, `[]` and blank-text lists, and shared one predicate with
+the forward path's pop.
+
+**Action: none in code. Ship v3.1.6+.** This is the highest-value single
+action available and it closes L1 and L4 together.
+
+## L2 · `backfill.py` does not pass `conv_id` to the extractor — one line
+
+139 fact-extraction failures in the window; **137 of them say
+`conv=? (caller passed none)`**, all on 08-30, i.e. one backfill run. So the
+run that lost the facts cannot be traced to the conversation that lost them.
+
+Three call sites take `conv_id`. `main.py:3675` and `facts.py:1689` pass it.
+`backfill.py:293` does not — and it HAS the value; it uses it in its own
+WARNING two statements later. The recurring defect: a parameter added at two
+of the three places that needed it.
+
+`facts.py:1515` states the intent plainly: conv_id "is what makes a failure
+attributable: without it the warning this used to emit named no conversation,
+so a lost extraction could not be traced to the turn that lost it."
+
+**Action:** pass `conv_id=conv_id` at `backfill.py:293`. One line, zero risk.
+Add a test asserting all three call sites pass it.
+
+## L3 · Inline compaction is entirely off on the long conversation
+
+`compaction skipped` per day: 0, 0, 4, 22, **102**, **44**. By 14:58 on 09-02:
+`807 turns need 119 summarization calls, over the 4-call per-request cap`.
+
+This is the documented design, not a bug — the guard sheds and the L1/L2/L3
+hierarchy is supposed to carry the older context. But it means every turn
+sheds ~724 turns and the model sees roughly the newest handful plus the memory
+blocks. The cause is upstream: OpenWebUI resends the full transcript and the
+`max_turns` filter cap is not installed.
+
+**Action:** install the OpenWebUI filter at `max_turns=60`, but only after the
+merge, per the runbook in `pipelines/conversation_id_header.py`. Note C3 from
+the v3.1.7 review first: `merge_conversation` silently un-pins facts, and
+capping a conversation whose watermark lags its position strands the span
+between them.
+
+## L4 · Memory tail skipped 52 times in two days
+
+09-01 and 09-02 only: 41 `stream ended without completion`, 10 `stream
+truncated at the generation ceiling`, 1 `reply truncated at the generation
+ceiling`. Each one is an exchange with no fact extraction, no episodic index
+and no rollup.
+
+**Action:** shipped in v3.1.7 (`trim_to_last_sentence` + `decide_memory_tail`);
+undeployed. Corpus replay says ~7 of every 17 cut replies become memorable.
+
+## L5 · The hard budget cannot fit at all — 43 times, 6 on 09-02
+
+```
+hard budget FAILED to fit: 26,587 -> 23,442 tokens (limit 20,768);
+dropped 0 old turn(s), trimmed 6 injected block(s), dropped 1 entirely
+— still 2,674 token(s) over. Nothing injected remains.
+```
+
+`dropped 0 old turns` with everything injected stripped means a single turn is
+larger than the whole budget, and the newest turn is never dropped. The
+request still goes out and usually succeeds (23,442 fits vLLM's real 32,768 —
+the 20,768 limit is `MAX_MODEL_LEN` minus the 12,000 generation reserve), so
+this is not a crash. It is a **silent total memory loss for that turn**: she
+gets no persona, no facts, no retrieval, no summary.
+
+**Action:** not yet diagnosed. Worth finding what makes a single turn 23k
+tokens — an image, or a long paste. Consider whether the guard should say so
+distinctly rather than logging the same ERROR as an ordinary overflow.
+
+## L6 · `/health/full` reported `"status":"ok"` through all of the above
+
+`health.json` at capture: `status ok`, `status_reasons []`, tokenize
+`ok:true consecutive_failures:0`, background work `shed:0`. Because the
+tokenize streak had recovered by the moment of capture, and because nothing
+counts a skipped memory tail on this build.
+
+Confirms the v3.1.7 `memory_tail` work is the right shape — the block is
+absent here, which is itself how you can tell the pod predates it.
+
+## Not actionable, recorded so it is not re-investigated
+
+- **21,304 `tokenize=False` nag lines** (4.4 MB of `compactor-error.log`). The
+  `_DropChatTemplateNag` filter IS present in v3.1.4. The lines stop at file
+  line 21,370 and the current process is quiet, so this is historical bloat.
+- **228 vLLM `maximum context length` rejections.** Prompts of 36,398 and
+  59,407 tokens with 1,024 output — extraction/summarizer calls, clustering
+  with the 08-30 backfill run, not the chat path.
+- **Disk**: `/data` 79% used, 206 TB free. Overlay 3%. Fine.
+- **Store**: 138 conversations, 2,180 facts, 1,093 indexed exchanges,
+  0 unreadable.
+
+---
+
+# v3.1.7 — the four-perspective code review
+
+Four reviewers on the same snapshot: **A** informed (incident history, the
+recurring defect, the silent-skip census), **B** and **C** cold (repo and
+stakes only, run independently so divergence between them measures
+single-reviewer reliability), **D** blank ("look for issues"). Each was told
+to reproduce before reporting and to plan fixes rather than apply them.
+
+Status: A and B complete. C and D not yet run.
+
+Findings live in the session scratchpad (`review-A-report.md`,
+`review-A-supplement.md`, `cold-review-B/review-B-report.md`) which is
+temporary; the substance is carried here so it survives.
+
+## FIXED in this branch
+
+### R1 · `tailhealth.py` was never added to the Dockerfile — found by B
+
+`main.py` imports it at module scope and `health.py` imports it inside
+`gather_health_full`; it appeared in none of the 23 `COPY compactor/*.py`
+lines. The image could not build.
+
+**Third occurrence of the identical defect.** v3.1.3 added `tokenhealth.py`
+and v3.1.4 shipped without its COPY line — the compactor went FATAL on boot
+in production, chat path down until an operator hot-copied the file into the
+running container. v3.2's `dbselect.py` was caught in review. Each time the
+missing line was for a module added in the same change that needed it.
+
+The two existing BUILD GUARDs do catch it — but only during `docker build`,
+i.e. after a tag is cut, on a GPU base image, twenty minutes into a layer
+cache miss. The information needed is entirely static and lives in two files.
+
+**Fixed:** the COPY line, plus `compactor/test_image_manifest.py`, which
+parses the Dockerfile's COPY list and walks the import graph from the five
+entry points the image executes (`main`, `selftest`, `backup`, `pgarchive`,
+`dbselect`), asserting every reachable module is copied. Uses `ast.walk`
+rather than module-scope imports only, because a function-scoped
+`import tailhealth` is equally fatal — just later, on a request instead of at
+boot. Mutation-tested: removing the COPY line is caught and names the chain
+(`selftest -> health -> tailhealth`); a COPY for a deleted module is caught.
+
+### R2 · One env typo killed the compactor at boot; `0` silently disabled the release's own signal — found by B
+
+`float(os.environ.get(name, "300") or 300)` in both `tailhealth.py` and
+`bgwork.py`. Two failures in one line, and both modules are imported at
+main.py module scope, so both are boot failures:
+
+* **Unparseable.** `or 300` rescues only the empty string. `30O` in
+  runpod.env raises ValueError at import; the compactor never starts.
+* **Non-positive.** `0` or a negative parses fine and then disables the
+  signal: `skipped_recently` / `shed_recently` is `since <= window`, never
+  true, so `/health/full` reports ok while the memory tail is skipping or
+  background work is being shed. The exact regression this release exists to
+  catch, switched off by a config line nobody would look at twice.
+
+`main._env_float` already documents the right contract ("never a crash at
+import time and never a silent zero") but neither module can import main.
+
+**Fixed:** a local `_window_s()` in each, defaulting on unset/blank/
+unparseable/non-positive, with tests in `test_tailhealth.py` [9] and
+`test_bgwork.py`. Five mutations, all caught — one initially survived because
+bgwork had no test for it, which is why that test exists now.
+
+### R3 · The empty-assistant repair had two holes — found by A
+
+`_repair_template_invalid_tail`'s pop tested emptiness with
+`_message_text().strip()`, which joins text parts and ignores images, so an
+assistant turn carrying only an image read as empty and was popped — the
+image destroyed, silently — three lines before the fill carefully refused to
+touch that shape. Two emptiness rules in one function; the laxer ran first.
+`tokens._sanitize` separately raised `AttributeError` on non-string content,
+which `tokens.count` swallowed, making tier 2 silently unavailable.
+
+**Fixed:** one shared predicate `main.assistant_content_is_empty(content)`
+used by the fill, the pop, and (restated against reduced text)
+`tokens._sanitize`. Six mutations caught.
+
+## OPEN — highest value first
+
+### R4 · The runbook's "commit the merge" command is a second dry run
+
+`pipelines/conversation_id_header.py` install step 8 tells the operator to
+run the merge with `?dry_run=false`. `admin_merge` reads `dry_run` from the
+JSON body only; nothing in main.py reads `query_params`. The commit returns
+HTTP 200 with plausible counts and changes nothing.
+
+This is the step whose entire purpose is to un-fork her memory, and it is on
+the path that must run before the `max_turns` cap is enabled (L3 above).
+Fix: correct the runbook to send a JSON body, AND make `admin_merge` accept
+the query form, which is what an operator reaches for under stress. No test
+asserts the documented curl commands work.
+
+### R5 · `merge_conversation` silently un-pins facts — found by A
+
+Facts are unioned on `_fact_key` with the destination winning on collision,
+and there is no pin union: a pinned source fact merged into a conversation
+holding an unpinned copy comes out unpinned. `_fact_key` is casefolded and
+whitespace-collapsed, so this fires on non-identical pairs too. It is on the
+documented install path (step 8), so following our own runbook un-pins
+identity facts. `dedup._merge_metadata` already does the pin union; the merge
+path is its missed sibling. `/retire` step 3 has the same defect while step 2
+was fixed. No test asserts pin survival across either.
+
+### R6 · Three suites report PASS without running their checks
+
+`test_tokenizer_contract.py` and `test_soak_conversation.py` exit 0 on a
+whole-script skip when the docker fixture on localhost:18000 is absent;
+`test_tokens.py` skips its real-tokenizer section and still prints "All
+tokens tests passed". The tokenizer-contract skip text says so itself:
+"Skipping it means the budget code is currently only covered by char/4
+assertions — the estimator that took production down."
+
+Every "all suites pass" in this branch, including every one reported during
+this review, therefore excludes tokenizer-contract behaviour. Fix: exit with
+a distinct non-zero code unless an env var opts into skipping, and make the
+last stdout line say SKIPPED so a grep-based runner cannot read it as a pass.
+
+### R7 · `SseAccumulator` corrupts multibyte characters split across reads
+
+Decoding each chunk independently with `errors="replace"` turns a UTF-8
+sequence straddling two TCP reads into U+FFFD, and the text is then stored as
+a clean `stored` turn. Found independently by A and B. The `holed` flag added
+for exactly this cannot fire on bytes input, because `errors="replace"` never
+raises — so it only ever flags a programming error. Fix: an incremental
+decoder held on the instance; set the holed flag in the JSON-drop branch when
+the dropped payload carried a content key.
+
+### R8 · `tailhealth` counts `stored` before the work runs — found by A
+
+`_run_memory_tail` counts on `decide_memory_tail`'s verdict, then fires
+`_async_tail`, which has three exits that store nothing: `degrade.guard`
+false (disk pressure), extraction disabled (which also skips the rollup, a
+dependency the docstring says does not exist), and empty `last_user_text`
+(a bare return with no log at all). So `/health/full` can report a healthy
+tail for an exchange that never reached memory. Fix: evaluate those
+conditions in `_run_memory_tail` before counting, or have `_async_tail`
+return an outcome the pool records.
+
+### R9 · `reply_is_degenerate` rejects legitimate replies
+
+A 50+ item list trips the list-run branch: a 66-item numbered list, 55 Bible
+books as bullets, 60 checkbox items. "List the 66 books of the Bible" is
+permanently unmemorable and, via `_redact_degenerate_turns`, replaced by a
+placeholder in every future summary. B found the same rule rejecting a
+coherent one-paragraph reply of short sentences that passes when the same
+text has newlines. Also: tilde fences are not recognised where backtick
+fences are, and 500 items of 35 chars evade both branches entirely.
+
+### R10 · `/compact` mislabels every chunk at `len(recon) == turns_seen`
+
+The guard is `<` where its own comment argues for `<=`, and equality is the
+healthy case. Chunks are then labelled with spans they do not contain and
+some turns are covered by nothing — verbatim the outcome the guard's comment
+calls "worse than no chunk, because nothing downstream can tell".
+
+### R11 · Four mutations survive the new memory-tail tests
+
+Recorded by B; not yet enumerated here. Re-run before shipping.
+
+## UNRESOLVED CONTRADICTION — client disconnect
+
+A's sub-agent and B disagree, and this matters because it is the mechanism
+behind the 51 stopped replies that motivated the whole memory-tail change.
+
+* **A's sub-agent:** scenarios A/B/C fine, but a fourth — the generator
+  parked at `yield` waiting on a slow consumer — defers the memory tail to
+  garbage collection and leaks the upstream socket. Also demonstrated that
+  the `aclose()` in the `finally` sits in front of the only bookkeeping and
+  is one `await` from swallowing the tail entirely.
+* **B:** the tail fires in both cancellation placements; not a defect.
+* **A's own final report** filed the whole area under "checked and found
+  sound", omitting its sub-agent's fourth scenario.
+
+Both ran on Windows/Proactor with plain asyncio. Production is Linux and
+likely uvloop, and a server advertising ASGI spec_version 2.4 takes the
+branch that lands in the deferred case every time. **Settle this on a
+production-shaped stack before building on either answer.**
+
+## Settled, no action
+
+* The `pipelines/conversation_id_header.py` diff is **docstring-only** —
+  every executable line byte-identical, and 17 differential inlet cases agree
+  on the stamped id at `max_turns` 0 and 60. No memory-wipe risk in that
+  change.
+* Summarizer state files are forward-compatible: a pre-v3.1.4 file loads with
+  chunks, watermark and rendering intact. Rolling BACK, however, strips
+  `turns_seen` and `tail_fp` permanently, because the parking mechanism for
+  unrecognised data covers chunk entries and not top-level keys.
+
+## Reviewer C (cold, run independently of B)
+
+C went at the summarizer's position tracking and the upgrade path — the area
+A explicitly marked unsettled because its sub-agent never reported. Six
+findings, all reproduced with harnesses; 30 mutations applied in throwaway
+worktrees, **all 30 caught**.
+
+**The meta-finding: three suites PIN the wrong behaviour.** Not gaps —
+assertions that the defective behaviour is correct. Named below at R12, R14
+and R16. A mutation sweep cannot find this class, because the tests agree
+with the code; only a reviewer reading intent can.
+
+### R12 · A pulled-down watermark makes the duplicate-label guard discard every new L1 chunk — silently
+
+**Highest priority: this fires on the documented install path.** Do not
+enable `max_turns` on any pod whose state file predates this build until it
+is fixed.
+
+`_observed_position` seeds from `max(turns_seen, last_summarized_turn)`. A
+state file written by the parent commit under `max_turns` has the watermark
+PULLED DOWN to the cap by the old `_reconcile_watermark`, while the L1 list
+still holds chunks labelled up to the real position. The position restarts at
+the cap, the next chunk is labelled `cap+1..cap+20`, and the new
+duplicate-chunk check finds an old chunk with that exact label — logs a
+WARNING, advances the watermark, returns True. For every chunk until the
+position climbs past the highest old label.
+
+Both documented cap values (100 and 60) are multiples of `L1_CHUNK_SIZE=20`,
+so the labels collide exactly. The guard's own comment says a monotonic
+position makes it unreachable; the upgrade path reaches it on the first
+rollup.
+
+Reproduced (33 old chunks to turn 660, watermark 100, capped 100-turn client,
+30 new exchanges): `new L1 chunks=0 LLM calls=0`. Control with the watermark
+at 660: `new L1 chunks=2 LLM calls=2`. It stays stuck for ~280 exchanges.
+
+**PINNED WRONG:** `test_a_duplicate_span_is_not_stored_twice`
+(test_summarizer.py:1365) builds exactly this shape — a chunk labelled 1-4
+with `last_summarized_turn = 0`, described as "a position that went
+backwards" — and asserts the span is skipped "without spending an LLM call to
+prove it". It never checks the turns under those labels are the turns the
+existing chunk summarized.
+
+Fix: seed the position from the chunks too
+(`max(turns_seen, last_summarized_turn, max(last_turn over l1+l2+l3))`), in
+`_observed_position` and `admin_compact`. Make the guard non-destructive:
+ERROR, and summarize with a relabelled span, or skip only after confirming
+the existing chunk covers the same turns. A duplicate chunk is recoverable; a
+silently dropped span is not.
+
+### R13 · `/admin/compact` refuses for every real conversation — and it is the endpoint the new ERROR line points at
+
+`turns_seen` counts every exchange including the ones `decide_memory_tail`
+skipped and the ones the pool shed; the episodic store holds only indexed
+ones. The guard requires `len(reconstruction) >= max(turns_seen, watermark)`,
+so one un-indexed exchange anywhere is enough to 409. Given 63 skipped in one
+window, that is every real conversation. The old guard compared against the
+watermark, which lags in steps of 20 and tolerated small gaps.
+
+Reproduced: 15 exchanges with exchange 7 skipped →
+`turns_seen=30 watermark=20 reconstruction=28 → HTTP 409`; old guard would
+have run.
+
+C is careful here: the 409 is CORRECT for the offset arithmetic, since a
+gapped reconstruction would misalign chunk text. This is a design gap, not a
+wrong line — the endpoint and the summarizer disagree about what a transcript
+is. It is also the only rebuild-from-store recovery path, and R12's ERROR
+line sends the operator straight to it.
+
+**PINNED WRONG:** test_admin_compact [3d] asserts the 409 as desired.
+
+Fix: rebuild by SLOT using the episodic rows' `turn_index`, filling gaps with
+explicit placeholder turns so length equals position and `window_offset` is
+0. Keep the 409 only when the store's highest index is below the watermark.
+Report the gap count in the plan JSON.
+
+### R14 · The multibyte corruption, confirmed by all three reviewers
+
+Same defect as R7. C adds the detail that the suite pins it: test
+[7] (test_sse_accumulator.py:155-162) asserts `holed() == False` and "the
+replacement character is what arrived" — a stub laxer than production needs.
+C also found a malformed `data:` event dropping its content with
+`holed() == False`, pinned at test_sse_accumulator.py:97.
+
+Found independently by A, B and C. Fix as R7, plus rewrite test [7] to split
+a character across chunks.
+
+### R15 · The position anchor cannot align across an image-only turn
+
+`_turn_fingerprints` hashes `_message_text(m)`, which is "" for a content
+list with no text part, while the episodic store remembers that turn as
+`[shared N image(s)]` — which is what `admin_compact` rebuilds. A mismatch in
+the newest anchor slots is absorbed by the prefix walk, but a mismatch in
+`anchor[0]` defeats every prefix: the position inflates by 2 per rollup and
+persists, so `window_offset` subtracts 2 forever and two turns are summarized
+twice.
+
+Fix: fingerprint user turns as the store will remember them, or fingerprint
+assistant turns only (identical on both sides).
+
+### R16 · Anchorless capped upgrade leaves a permanent 2-turn hole
+
+The "hold" when the window is bounded and no `tail_fp` exists is measured
+against a window that already contains this exchange's two turns, and is
+never repaid — so the position is permanently 2 behind, every chunk labelled
+`a..b` summarizes `a+2..b+2`, and two turns are never summarized. The
+docstring claims "at most one turn of latency, once". Only reachable when the
+cap is on at the moment of upgrade.
+
+### R17 · `_observed_position` hashes the whole history on the event loop, every turn, inside `conv_lock`
+
+Measured 25 ms per call at 700 messages, linear in history, ~2-4 ms under a
+cap. The codebase's own doctrine treats this shape as a shipped defect. Fix:
+hash only the tail slots alignment can use, or use `run_in_threadpool` as the
+redaction pass already does.
+
+## What the reviewer spread says
+
+* **R7/R14 (multibyte) found by A, B and C independently** — the most
+  strongly confirmed finding in the review, and none of them was told to look
+  there.
+* **C alone found R12, R13, R15, R16, R17**, all in summarizer position
+  tracking. That is precisely the area A's report listed as unsettled. Cold
+  review did not have a ceiling here; it filled the informed reviewer's
+  largest gap.
+* **A alone found R5, R8, R10** (merge un-pinning, the tailhealth counting
+  order, the `/compact` equality guard). The incident history was
+  load-bearing for those.
+* **B alone found R1, R2, R6** (the Dockerfile omission, the env-window boot
+  failure, the skip-as-pass suites) — all release-mechanics defects that
+  neither A nor C looked at.
+
+Four reviewers, four largely disjoint find-sets, one triple overlap. The
+overlap is a real bug; the disjointness is the argument for having run more
+than one.
+
+## Reviewer D (blank — "look for issues", no stakes, no history, no repo description)
+
+D was told nothing: a path and one sentence. It confirmed three findings the
+other reviewers had, and produced four nobody else did. Its baseline ran all
+62 scripts green.
+
+### R18 · Two byte-identical trailing exchanges stall the position under a cap — D only
+
+`_align_new_turns` with `_ANCHOR_TURNS = 4`: when the last two exchanges hash
+identically — two consecutive `_redact_degenerate_turns` placeholders, or
+"ok"/"Sure." twice — the full anchor matches at the END of the new window,
+`new` comes back 0, and the position does not advance. Under `max_turns` the
+position is the only thing that advances, so a repeating tail never reopens
+the L1 rollup gate.
+
+That is the frozen-hierarchy failure this release exists to fix, reached by a
+different route. Reproduced against the real `_turn_fingerprints`:
+`w2 = w1 + [ok/Sure.]` gives `aligned -> 0 (truth: 2)`. No test covers it.
+
+Note the interaction with R9/R19: a degenerate reply is replaced by a
+placeholder, and two placeholders in a row are byte-identical. The
+degeneracy rule and the anchor can starve the hierarchy together.
+
+Fix: fall back to `_ASSUMED_NEW_TURNS` when the anchor tuple occurs more than
+once in the window, hash the ordinal into the fingerprint, or widen the
+anchor.
+
+### R19 · The list rule ignores `DEGENERATE_MIN_CHARS` — D only
+
+`reply_is_degenerate("- a\n" * 50)` fires at 200 characters, while
+`DEGENERATE_MIN_CHARS` is 300 and the comment above
+`MIN_MEMORABLE_TRIMMED_CHARS` calls 300 "the floor below which this codebase
+already declines to judge a reply structurally". The structural block is not
+gated on it. One assert to fix, or correct the comment.
+
+### R20 · `_align_new_turns` prefers a long early prefix over a short late one, contrary to its docstring — D only
+
+Anchor `[A,B,C,D]` against `[A,B,C,D,X,Y,A,B,C]` returns 5; the docstring's
+"latest occurrence" rule gives 0. A mutation removing recency entirely IS
+caught by the unit test, but the ordering conflict is not. D's own read is
+that 5 is the true answer for a full-history client, so this is a
+doc/implementation ambiguity that bites only with repeated short turns —
+i.e. exactly the R18 shape. Fix: compute `new` for every match and return the
+minimum; pin the case.
+
+### R21 · An empty or system-only window adds 2 phantom turns and wipes the anchor — D only
+
+`turns_seen=100` with `tail_fp=[a,b,c,d]` and `messages=[]` (or system-only)
+gives position 102 and anchor `[]`. Fix: if the fingerprint list is empty,
+return `prev` and leave `tail_fp` alone.
+
+### R22 · `test_budget_guard.py` takes ~239 s and trips a 240 s ceiling — D only
+
+Every other script finishes in ≤ 21 s. A runner with a 4-minute timeout
+records it as a HANG when it is merely slow; D confirmed it completes twice.
+Fix: stub the clock behind the backoff it waits on, or split the script.
+Relevant to R6 — a test harness that cannot tell slow from hung is the same
+class of problem as one that cannot tell skipped from passed.
+
+### Confirmations from D
+
+* **R7/R14 multibyte corruption — rated HIGH.** D adds the detail that the
+  client receives the correct bytes (`yield chunk` forwards raw), so what is
+  fact-extracted, embedded and rolled up is *not the text she read*, and
+  nothing says so. Split at every one of 107 byte offsets: `holed=True` in 0
+  cases. D also identifies test [7] as a laxer-than-reality stub — a split
+  character is *incomplete*, not *invalid*, UTF-8.
+* **R9/R13 Bible-list false positive** — reproduced end to end at 912 chars:
+  `decide: False skipped_degenerate`, then `_redact_degenerate_turns`
+  replaces the turn permanently. D offers three fixes, of which the best is
+  requiring the run to reach the END of the reply, since a real runaway "ran
+  to its own end" and the Bible reply closes in prose.
+* **R13 `/admin/compact` refusal** — same mechanism C found, independently.
+
+### An unexplained edit, checked and cleared
+
+D reported a transient uncommitted change to `main.py` during its review
+("SseAccumulator gains an incremental utf-8 decoder") that it attributed to
+nobody. Verified afterwards: the primary working tree contains no such edit,
+and all four review copies are `git status` clean. Most likely one of D's own
+sub-agents applied the fix against instructions and reverted it — which is
+itself mild evidence for the fix, since it reached the same answer
+unprompted. Recorded because an unexplained write during a review is worth
+being able to rule out later.
+
+## Final tally across the four reviewers
+
+| finding | A | B | C | D |
+|---|---|---|---|---|
+| Multibyte SSE corruption (R7) | yes | yes | yes | yes |
+| `/admin/compact` refuses (R13) | partial | — | yes | yes |
+| Degeneracy false positive (R9) | yes | yes | yes | yes |
+| Summarizer position tracking | — | — | R12, R15-R17 | R18, R20, R21 |
+| Merge/retire un-pinning (R5) | yes | — | — | — |
+| tailhealth counting order (R8) | yes | — | — | — |
+| Dockerfile omission (R1) | — | yes | — | — |
+| Env-window boot failure (R2) | — | yes | — | — |
+| Skip-as-pass suites (R6) | — | yes | — | — |
+
+Two findings were unanimous. Everything else was found by one or two
+reviewers, and each of the four contributed something no other did —
+including D, which was told nothing at all about what the software is or who
+depends on it. The plan predicted that D-only findings would be the most
+informative outcome; there are four of them, all in areas the framed
+reviewers walked past.
+
+The practical read: a single review of this codebase, however well briefed,
+would have shipped most of these.
+
+## Reviewer D's sub-agents, reported after D's own report closed
+
+Two sub-agents returned substantial work AFTER D had already delivered, so
+none of it is in `review-D-report.md`. Recorded here because it contains the
+most serious single finding of the whole review.
+
+### R23 · One client turn is silently lost the moment the `max_turns` valve engages — HIGH
+
+**This is the exact scenario v3.1.4 exists for, and it loses a turn.**
+
+`_observed_position`'s first regime is `if n > prev: position = n`, documented
+as "the array length IS the position". That is true only while the window is
+UNBOUNDED. A sliding cap does not snap from full history to short window in
+one step — it engages gradually, and on the first request where it bites, `n`
+is still greater than `prev` while already being SHORTER than the true
+position:
+
+* cap 100, exchange 51: client stores 100 turns, appends the new user turn
+  (101), the valve trims to the last 100, the compactor appends the assistant
+  turn it just produced → `n = 101`
+* recorded `prev = 100`, so `n > prev` → `position = 101`
+* the truth is 102. One turn of position is swallowed, permanently.
+
+The anchor was present and would have answered "2 new turns"; the `n > prev`
+branch never consults it.
+
+Reproduced end to end against the real `maybe_rollup` with a recording fake
+vLLM, 64 exchanges at cap 100, window built exactly as main.py plus the
+pipeline build it:
+
+```
+client turns 1..121 that no L1 chunk summarized: [101]
+label 101-120  -> real client turns 102-121
+```
+
+Two harms, both silent — no WARNING, no ERROR, and the one INFO line that is
+emitted describes the healthy shape:
+
+1. Client turn 101 is summarized by no tier, ever. Nothing downstream can
+   tell and no counter exists for it.
+2. The chunk LABELLED 101-120 actually summarizes 102-121 — precisely the
+   failure `_do_l1_rollup`'s own comment calls "worse than summarizing
+   nothing because nothing downstream can tell", and the failure its sibling
+   test was written to prevent, but only for the `pos_first < 1` path.
+
+**Test gap:** `test_switching_the_cap_on_re_summarizes_nothing` models the
+transition as a full history followed immediately by a short window
+(`n <= prev`), which lands in the anchor branch. Nothing exercises
+`prev < n < true position`, which is what a sliding window actually produces.
+The whole suite is green while the bug reproduces.
+
+Fix: in the `n > prev` branch, still align the anchor when one exists and
+take `max(n, prev + aligned)` — the anchor is computed on every call already,
+so this costs nothing. Or use "the window's oldest turn is not turn 1" as the
+discriminator instead of `n > prev`.
+
+**Together with R12, this is the second independent reason not to enable
+`max_turns` until the summarizer's position work is fixed.**
+
+### R24 · The fragment-line rule counts an abbreviation's dot as a sentence end — HIGH
+
+`reply_is_degenerate`'s structural block counts sentence breaks with bare
+string counts: `line.count(". ") + line.count("! ") + ...`. So `Dr. `,
+`Mrs. `, `Rev. `, `St. `, `9 a.m. ` each register as a sentence break, the
+computed mean fragment length collapses, and ordinary prose trips the `<= 40`
+limit.
+
+A single paragraph of ordinary narrative prose, 1,589 characters, real mean
+sentence length 93.5 characters — squarely inside what the code's own comment
+calls healthy — is flagged:
+
+```
+rule's break count: 42   rule's mean: 37.0
+VERDICT: an unbroken line of 1589 characters made of 43 fragments averaging 37 characters
+```
+
+**The same commit adds `_SENTENCE_ABBREVIATIONS` containing exactly
+`mr mrs dr prof st rev fr a.m p.m` for precisely this reason.** Two new pieces
+of code in one delta disagree about what a sentence end is.
+
+The consequence is not a skipped write: `_redact_degenerate_turns` replaces
+the reply with a placeholder in every future rollup, backfill and admin
+compact, permanently.
+
+Fix: count breaks with a regex that reuses `_SENTENCE_ABBREVIATIONS` and the
+single-initial rule already written for `trim_to_last_sentence`, so the
+detector and the trimmer share one definition of a sentence end — the same
+"one rule, one function" argument `assistant_content_is_empty` is built on,
+applied to the other duplicated rule in this delta.
+
+### R25 · An em dash before an abbreviation bypasses the stoplist, storing fragments
+
+`_WORD_LEAD_CHARS` contains no dash of any kind, so after `—`, `–` or `-` the
+`whole_word` test fails and both the abbreviation stoplist and the
+single-initial rule are skipped:
+
+```
+'Something ended properly. Then—i.e. a fragment that never fin'
+   -> 'Something ended properly. Then—i.e.'
+'Written by the author—J. R. R. Tolkien and oth'   -> 'Written by the author—J.'
+```
+
+The first is the damaging shape: a clean complete sentence was available and
+the trim ran PAST it to end on an abbreviation — turning a correct store into
+a fragment store, which is exactly what the docstring says must never happen.
+
+The test suite covers the stoplist only with a space or start-of-text lead, so
+it tests the set for being too permissive and never for being too narrow. A
+mutation making `whole_word` always True IS caught; making it always False is
+not.
+
+Fix: add the dashes to `_WORD_LEAD_CHARS`, or invert the test to "the
+preceding character is not alphanumeric", which is what the rule means.
+
+### R26 · vLLM dying mid-stream skips the memory tail without counting or naming it
+
+The streaming site guards on `if conv_id and not vllm_failed`. `vllm_failed`
+is set when vLLM drops the connection PART WAY THROUGH a reply the user has
+already read. At that point the accumulator holds real prose, but
+`decide_memory_tail` is never called, `tailhealth.note` is never called, and
+no line containing the grep phrase "skipping memory tail" is emitted:
+
+```
+decide_memory_tail called: 0 times
+tailhealth snapshot changed: False
+log lines with 'memory tail': []
+bytes the client got contained the real prose: True
+```
+
+That is the shape this release argues against in its own comment: "a skip
+that is only a log line is the defect this exists to close" — here it is not
+even a log line naming the conversation.
+
+Fix: call `_run_memory_tail` with `finished=False` on that branch (the trim
+path already handles it), or add an explicit tailhealth outcome so the skip is
+counted and greppable.
+
+### R27 · An empty reply flips /health/full to degraded for five minutes
+
+A reply with no text is `SKIPPED_EMPTY`, which `tailhealth.note` counts like
+any other skip, which health.py turns into a degrade reason reading "1
+reply(ies) not memorized … New memory is not being written". But there was
+nothing to memorize — it is the one skip label that carries no loss. Reachable
+whenever the user hits Stop before the first token, and the release's own
+figure is that 51 of 63 skips in one window were manual stops.
+
+Fix: give tailhealth a `LOSSY_SKIP_OUTCOMES` set and key the degrade decision
+off that, or add `skipped_recently_lossy` alongside the existing field.
+
+### R28 · `tailhealth.note` half-honours its "must not raise" contract
+
+Only the outcome LABEL is guarded; the char counts go through a bare `int()`,
+which raises on `None` or a non-numeric string — out of a `finally`, which is
+the failure the docstring says it exists to prevent. Worse, the outcome
+counter is incremented BEFORE the raise while `stored` is not, so the block
+published to /health/full has `sum(outcomes.values()) != stored + skipped`.
+Not reachable today (both call sites pass real ints). Fix: coerce inside a
+try and increment the outcome last.
+
+### R29 · A partial-coverage L1 warning claims a chunk was recorded when none was
+
+`_do_l1_rollup`'s `pos_first < 1` branch logs "summarizing turns N-M and
+recording that as the chunk's span" BEFORE `_summarize_pieces` is called.
+When that returns empty — a vLLM outage — the function records nothing, but
+the warning already said it did. Reproduced: four such warnings, `l1=0`.
+Emitted exactly when an operator is reading logs during an outage. Fix: move
+the log below the `if not text: return False`.
+
+## FIXED in this branch, from the above
+
+### R30 · Env parsing crashed the compactor at import, package-wide — PARTIALLY FIXED
+
+`main._env_int` was a bare `int(v)`: one typo in runpod.env raised ValueError
+at import and the compactor never started. It is the helper every new constant
+in this delta uses, including `DEGENERATE_LIST_RUN` and
+`MIN_MEMORABLE_TRIMMED_CHARS`. The two degeneracy FRACTIONS did not use
+`_env_float` at all — raw `float(os.environ.get(...))`, same crash.
+
+Also found: `_env_float`'s docstring claimed "never a silent zero" while
+returning `0.0` for `"0"`, and **bgwork and tailhealth both cited that claim
+in docstrings written earlier in this session** — citing a contract main does
+not implement.
+
+And `_window_s` accepted `inf`, which parses, satisfies `v > 0`, and then pins
+`skipped_recently` True from the first skip until restart: the always-on
+warning the window exists to prevent, arriving through the one knob meant to
+prevent it. `snapshot(window_s=0)` bypassed the guard entirely, so 0 was MORE
+alarming than the default while -5 was less — three meanings for one
+parameter.
+
+**Fixed:** `_env_int` defaults instead of raising; both fraction knobs routed
+through `_env_float`; `_env_float`'s docstring corrected to describe what it
+actually does (behaviour deliberately unchanged, since several knobs take 0 as
+a meaningful "off"); `math.isfinite` added to both `_window_s`; `snapshot`'s
+explicit `window_s` routed through the same guard; the false citations
+removed. Test cases added for `inf`, `Infinity`, `1e400`, `nan` and the
+explicit argument in both suites. Full suite green.
+
+**STILL OPEN, and the reason this is only PARTIAL:** the same bare
+`int(os.environ...)` / `float(os.environ...)` pattern appears at roughly 35
+sites across 12 other modules — `facts.py`, `summarizer.py`, `backup.py`,
+`pgarchive.py`, `retrieval.py`, `webuidb.py`, `degrade.py`, `alert.py`,
+`health.py`, `selftest.py`, `bgwork.py`'s other constants. Every one is an
+import-time crash on a typo. Concretely, `MAX_MODEL_LEN=32K` still stops the
+compactor booting, because `facts.py:171` and `summarizer.py:125` read the
+same variable with their own bare `int()`. Fix: one shared `envcfg` helper
+module (nothing may import main), routed through everywhere — mechanical, but
+it touches every module and deserves its own review pass rather than being
+bundled into a release.
+
+## A note on running reviewers concurrently
+
+Two of D's sub-agents shared one repo copy. Consequences, all observed:
+
+* One agent's `git checkout -- compactor/main.py` discarded another agent's
+  in-flight mutation mid-measurement.
+* Both wrote to the same `findings-B.md`; one overwrote the other's header,
+  and the survivor moved the other's work into an appendix rather than lose
+  it.
+* Contention produced two spurious results — a `test_budget_guard` HANG (a
+  240 s timeout against a test that takes 239 s) and a `test_summarizer`
+  FAIL — both of which passed on isolated re-runs.
+
+The spurious `test_summarizer` failure is the one to remember: under
+contention a suite reported a real-looking assertion failure that was an
+artefact. Give each agent its own worktree, or serialise them.

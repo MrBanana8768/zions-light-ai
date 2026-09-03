@@ -12,8 +12,8 @@ Five properties, each one a thing that would cost her something if it broke:
 
   1. an absent conversation 404s rather than inventing an empty one
   2. `dry_run` writes NOTHING — no state file, no LLM call, no watermark move
-  3. the watermark guard refuses (409) rather than pulling the watermark
-     backwards, which is how the same turns get summarized twice
+  3. the position guard refuses (409) rather than summarizing text that is
+     not the text the chunk labels will claim
   4. a path-shaped conv_id never reaches the filesystem
   5. the drain loop terminates — on progress, on failure, and on the cap
 
@@ -26,6 +26,7 @@ No server, no model, no network:
 """
 
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -108,6 +109,43 @@ def snapshot():
             with open(p, "rb") as fh:
                 out[os.path.relpath(p, _TMP_ROOT)] = hashlib.sha256(
                     fh.read()).hexdigest()
+    return out
+
+
+def memory_snapshot():
+    """snapshot(), minus the bookkeeping a v3.1.4 rollup writes even when it
+    summarizes nothing.
+
+    `turns_seen` / `tail_fp` are the conversation's POSITION, and recording
+    where the conversation got to is not the same act as writing a summary —
+    the position has to be persisted on every pass or the next one re-seeds
+    from the watermark, finds no anchor, and the hierarchy stops advancing
+    under a capped client window (the 2026-09-01 defect). What "a run that
+    summarized nothing wrote nothing" is protecting is the CONTENT: no chunk,
+    no chapter, no theme, no watermark move. So that is what this compares.
+    """
+    out = {}
+    for path, digest in snapshot().items():
+        full = os.path.join(_TMP_ROOT, path)
+        if os.path.dirname(path).endswith("summaries") and path.endswith(".json"):
+            with open(full, "r", encoding="utf-8") as fh:
+                try:
+                    st = json.load(fh)
+                except Exception:
+                    out[path] = digest
+                    continue
+            content = {k: v for k, v in st.items()
+                       if k not in ("turns_seen", "tail_fp", "updated_at")}
+            if not (st.get("l1") or st.get("l2") or st.get("l3")
+                    or st.get("last_summarized_turn")):
+                # A file holding nothing but the position is not a summary;
+                # dropping the KEY as well as the value is what makes "the
+                # run created no memory" testable when there was no file at
+                # all beforehand.
+                continue
+            out[path] = json.dumps(content, sort_keys=True)
+        else:
+            out[path] = digest
     return out
 
 
@@ -228,6 +266,31 @@ set_store(exchanges(60))
 r = compact(CID, dry_run=True)
 check(r.status_code == 200, f"HTTP 200 (got {r.status_code})")
 
+print()
+print("[3d] the guard is the POSITION, not the watermark")
+# v3.1.4. Under a capped client window the two come apart: the watermark is how
+# far the SUMMARIES got, turns_seen is how far the CONVERSATION got, and it is
+# turns_seen that drives the offset _do_l1_rollup subtracts to find a chunk's
+# text. A reconstruction that clears the watermark but not the position makes
+# that offset point at the wrong turns, and the chunk it stores is labelled
+# 21-40 with somebody else's text in it. Comparing against the watermark alone
+# lets that through with a 200.
+CID = "position-guard"
+summarizer.save_state(CID, {
+    "l1": [], "l2": [], "l3": None, "last_summarized_turn": 20,
+    "turns_seen": 300, "tail_fp": ["0123456789abcdef"],
+})
+set_store(exchanges(30))            # 60 messages: past the watermark, not the
+before_mem = memory_snapshot()      # position
+LLM_CALLS.clear()
+r = compact(CID)
+check(r.status_code == 409,
+      f"HTTP 409 for a reconstruction behind the position (got {r.status_code})")
+check("recorded position is already turn 300" in r.text,
+      "and the body names the position it is behind")
+check(LLM_CALLS == [], "no LLM call was made")
+check(memory_snapshot() == before_mem, "and no summary content was written")
+
 
 # ---------------------------------------------------------------------------
 # 4. A path-shaped conv_id never reaches the filesystem
@@ -293,7 +356,7 @@ async def _boom(*a, **kw):
 
 CID = "drain-fail"
 set_store(exchanges(60))
-before = snapshot()
+before_mem = memory_snapshot()
 LLM_CALLS.clear()
 summarizer._llm_summarize = _boom
 r = compact(CID)
@@ -305,8 +368,8 @@ check(body.get("rollup_calls", 999) <= 2,
       f"the loop does not spin against a failing model "
       f"(rollup_calls={body.get('rollup_calls')})")
 check(body.get("watermark_after") == 0, "the watermark did not move")
-check(snapshot() == before,
-      "a run that summarized nothing wrote nothing")
+check(memory_snapshot() == before_mem,
+      "a run that summarized nothing wrote no summary content")
 
 print()
 print("[5c] max_calls bounds a rollup that advances forever")
@@ -359,7 +422,8 @@ print("All admin compact tests passed.")
 #
 #   `if not exchanges:`            -> `if False:`            ->  [1]
 #   `if dry_run or not messages:`  -> `if not messages:`     ->  [2]
-#   `if len(messages) < _wm:`      -> `if False:`            ->  [3]
+#   `if len(messages) < _pos:`     -> `if False:`            ->  [3]
+#   `_pos = max(turns_seen, watermark)` -> `= watermark`     ->  [3d]
 #   `{conv_id}/compact`            -> `{conv_id:path}/compact`-> [4]
 #   `if now <= prev:`              -> `if False:`            ->  [5]
 #   `while calls < max_calls:`     -> `while calls < max_calls + 3:` -> [5c]

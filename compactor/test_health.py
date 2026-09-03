@@ -517,6 +517,170 @@ def test_broken_storage_reports_its_reason_too():
 
 
 # ---------------------------------------------------------------------------
+# Memory-tail skips must reach `status` (v3.1.4)
+#
+# The defect: a reply that did not enter memory — she hit Stop, vLLM hit the
+# ceiling, the accumulator dropped a chunk — was a WARNING line and nothing
+# else. 63 skipped exchanges in one 2026-09-01 log window, more than half her
+# recent conversation, and /health/full said ok throughout. These pin the
+# chain the same way the shedding tests above do: the counter reaches
+# `status`, `status_reasons` says which condition it was and how many, a
+# stale skip does not pin the endpoint degraded forever, and an unreadable
+# counter does not read as a healthy one. One test uses the REAL tailhealth
+# module rather than a fake, so a health.py that reads a fake correctly but
+# never imports the real counter cannot pass.
+# ---------------------------------------------------------------------------
+
+import tailhealth  # noqa: E402
+
+
+def _quiet_tail(**over):
+    """A tail that is doing its job: everything stored, nothing skipped."""
+    base = {
+        "stored": 40, "skipped": 0, "outcomes": {}, "consecutive_skips": 0,
+        "last_skip_outcome": None, "seconds_since_last_skip": None,
+        "skipped_recently": False, "skip_window_s": 300.0,
+        "raw_chars": 0, "kept_chars": 0, "trimmed_raw_chars": 0,
+        "trimmed_kept_chars": 0, "trim_retention": None,
+    }
+    base.update(over)
+    return base
+
+
+class _BrokenTail:
+    def __call__(self):
+        raise RuntimeError("counter is wedged")
+
+
+@contextlib.contextmanager
+def _tail_reporting(snap):
+    fn = snap if isinstance(snap, _BrokenTail) else (lambda **kw: snap)
+    with patch("tailhealth.snapshot", new=fn):
+        yield
+
+
+def test_tail_skips_degrade_the_status():
+    print("\n[test] recent memory-tail skips make /health/full 'degraded'")
+
+    async def go():
+        with _healthy_vllm(), _pool_reporting(_quiet_pool()), _tail_reporting(_quiet_tail(
+            skipped=63, consecutive_skips=7, seconds_since_last_skip=12.0,
+            skipped_recently=True, last_skip_outcome="skipped_no_boundary",
+        )):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(r["status"], "degraded", "skipping is NOT 'ok'")
+    joined = " | ".join(r["status_reasons"])
+    assert_true("memory tail" in joined, "the reason names the memory tail")
+    assert_true("63" in joined, "and how many replies were not memorized")
+    assert_true("7 consecutive" in joined, "and the streak")
+    assert_true("12.0" in joined, "and how long ago the last one was")
+    assert_true("skipped_no_boundary" in joined, "and the last machine outcome")
+    assert_eq(r["memory_tail"]["skipped"], 63, "the block is in the payload")
+
+
+def test_a_tail_skip_long_ago_is_ok_again():
+    """The stale-skip case. Degrading on the CUMULATIVE count would pin the
+    endpoint 'degraded' from the first skip until the next restart — and a
+    warning that is always on is a warning nobody reads, which is how the
+    endpoint became decoration in the first place (v3.1 A11)."""
+    print("\n[test] a skip outside the window is 'ok' again, count intact")
+
+    async def go():
+        with _healthy_vllm(), _pool_reporting(_quiet_pool()), _tail_reporting(_quiet_tail(
+            skipped=63, consecutive_skips=63, seconds_since_last_skip=901.0,
+            skipped_recently=False, last_skip_outcome="skipped_no_boundary",
+        )):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(r["status"], "ok", "an aged-out skip does not pin 'degraded'")
+    assert_eq(r["status_reasons"], [], "and nothing is reported")
+    assert_eq(r["memory_tail"]["skipped"], 63,
+              "the cumulative count is still in the payload as history")
+
+
+def test_unreadable_tail_counter_is_not_reported_as_healthy():
+    print("\n[test] a tail counter we cannot read degrades rather than reading 'ok'")
+
+    async def go():
+        with _healthy_vllm(), _pool_reporting(_quiet_pool()), _tail_reporting(_BrokenTail()):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(r["status"], "degraded", "unobservable != healthy")
+    assert_true(any("memory tail unobservable" in x for x in r["status_reasons"]),
+                "and the reason says we could not see it")
+    assert_true("error" in r["memory_tail"], "the payload carries the error")
+
+
+def test_tail_skips_still_answer_200():
+    """Same deliberate choice as shedding: the signal belongs in the body.
+    Restarting the container would not bring the skipped memories back and
+    would kill every in-flight chat."""
+    print("\n[test] a skipping tail stays HEALTHY to Docker; the body carries it")
+
+    async def go():
+        with _healthy_vllm(), _pool_reporting(_quiet_pool()), _tail_reporting(_quiet_tail(
+            skipped=3, consecutive_skips=3, seconds_since_last_skip=2.0,
+            skipped_recently=True, last_skip_outcome="skipped_too_short",
+        )):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(health.status_to_http_code(r["status"]), 200, "200 — do not restart")
+    assert_true(r["status_reasons"], "but the body is not silent about it")
+
+
+def test_tail_reason_joins_the_others():
+    """Three things wrong report as three, not as whichever came first."""
+    print("\n[test] a tail skip is listed alongside vLLM and shedding")
+
+    async def go():
+        with patch("health.probe_vllm", new=AsyncMock(return_value={
+            "ok": False, "latency_ms": 3000.0, "models": [], "error": "timeout",
+        })), _pool_reporting(_quiet_pool(
+            shed=3, seconds_since_last_shed=1.0, shed_recently=True,
+        )), _tail_reporting(_quiet_tail(
+            skipped=1, consecutive_skips=1, seconds_since_last_skip=1.0,
+            skipped_recently=True, last_skip_outcome="skipped_holed",
+        )):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(len(r["status_reasons"]), 3, "ALL THREE conditions listed")
+
+
+def test_the_real_counter_is_wired():
+    """Not a fake: drive the real tailhealth module and read it back through
+    health. A health.py that handled a patched snapshot correctly but never
+    imported the real one would pass every test above and still be blind."""
+    print("\n[test] the REAL tailhealth counter reaches /health/full")
+    tailhealth._reset_for_tests()
+    try:
+        async def go():
+            with _healthy_vllm(), _pool_reporting(_quiet_pool()):
+                before = await health.gather_health_full("http://fake", 4096)
+                tailhealth.note(tailhealth.SKIPPED_NO_BOUNDARY, raw_chars=812, kept_chars=0)
+                tailhealth.note(tailhealth.SKIPPED_TOO_SHORT, raw_chars=400, kept_chars=0)
+                after = await health.gather_health_full("http://fake", 4096)
+                return before, after
+
+        before, after = asyncio.run(go())
+        assert_eq(before["status"], "ok", "fresh counter: ok")
+        assert_eq(before["memory_tail"]["skipped"], 0, "and the block reads 0")
+        assert_eq(after["status"], "degraded", "two real skips: degraded")
+        assert_eq(after["memory_tail"]["skipped"], 2, "the real count is in the payload")
+        assert_eq(after["memory_tail"]["last_skip_outcome"], "skipped_too_short",
+                  "with the real last outcome")
+        assert_true(any("2 reply(ies)" in x for x in after["status_reasons"]),
+                    "and the reason carries the real number")
+    finally:
+        tailhealth._reset_for_tests()
+
+
+# ---------------------------------------------------------------------------
 # The store scan must not run on the event loop (v3.1 A12)
 # ---------------------------------------------------------------------------
 
@@ -647,6 +811,13 @@ def _all_tests():
         test_shedding_still_answers_200,
         test_ok_carries_an_empty_reason_list,
         test_broken_storage_reports_its_reason_too,
+        # v3.1.4 — memory-tail skips have to reach `status`, and say so.
+        test_tail_skips_degrade_the_status,
+        test_a_tail_skip_long_ago_is_ok_again,
+        test_unreadable_tail_counter_is_not_reported_as_healthy,
+        test_tail_skips_still_answer_200,
+        test_tail_reason_joins_the_others,
+        test_the_real_counter_is_wired,
         # v3.1 A12 — the store scan must not block the one event loop.
         test_blocking_probes_run_off_the_event_loop,
         test_loop_stays_responsive_while_the_scan_runs,

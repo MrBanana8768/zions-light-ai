@@ -52,11 +52,25 @@ old one. Truncating on a hash-derived conv_id is a memory wipe with extra
 steps.
 
 So `max_turns` defaults to 0 (off), and `inlet` REFUSES to truncate on
-any request where it did not successfully stamp chat_id. Both halves of
-that are deliberate: the default means installing this filter changes
-nothing until you opt in, and the refusal means a request that somehow
-arrives without metadata cannot fork the conversation even if the valve
-is on.
+any request where it did not successfully stamp chat_id. The refusal
+means a request that somehow arrives without metadata cannot fork the
+conversation even if the valve is on.
+
+BUT BE CLEAR ABOUT WHAT THE DEFAULT DOES NOT PROTECT YOU FROM. An earlier
+draft of this file claimed "installing this filter changes nothing until
+you opt in". That is FALSE, and it is the most dangerous sentence that
+could sit in these instructions. Installing this filter switches conv_id
+from the hash to chat_id on the VERY FIRST REQUEST. That switch is itself
+a fork: everything written under the old hash id - facts, episodic
+embeddings, the whole summary hierarchy - stops being reachable under the
+id the compactor now resolves. `max_turns=0` gates the TRUNCATION, not
+the IDENTITY CHANGE.
+
+Nothing is destroyed by that fork (both halves sit on disk) and the
+install sequence below folds them back together. But the fork happens
+whether or not you are ready for it, the compactor's own fork detector
+CANNOT warn you (it returns early unless the id came from the hash), and
+the merge does not carry everything - see MERGE LIMITS below.
 
 == INSTALLATION ==
 
@@ -70,13 +84,78 @@ is on.
    You must see `source=body_metadata.chat_id`. If it still says
    `source=hash`, stop here — the filter is not reaching the compactor,
    and turning on max_turns would fork her memory.
-7. ONLY THEN, set the `max_turns` valve (100 is a reasonable start —
-   that is 100 non-system messages, so ~50 exchanges).
+7. NOTE THE NEW conv_id from that same log line. It is OpenWebUI's chat
+   UUID. Everything from before the install lives under the OLD id (the
+   16-hex hash) and is not reachable from the new one yet.
+8. MERGE the old memory into the new id. Dry run first - it is the
+   default - and read the counts before committing:
+     curl -s -X POST "localhost:8080/admin/conversations/<old-hash-id>/merge-into/<new-uuid>"
+     curl -s -X POST "localhost:8080/admin/conversations/<old-hash-id>/merge-into/<new-uuid>?dry_run=false"
+9. VERIFY the facts landed before going any further:
+     curl -s "localhost:8080/admin/conversations" | grep -A3 "<new-uuid>"
+   The fact count under the new id should be close to what the old id
+   held. If it is 0, STOP - do not set max_turns, because capping is what
+   makes the remaining gap permanent.
+10. ONLY THEN set the `max_turns` valve. USE 60. That number is chosen,
+   not rounded, and both neighbours are worse:
+
+     100  the compactor's INLINE summarizer needs <= 4 batches per request
+          (COMPACTOR_MAX_SUMMARY_CALLS). 96 turns of ~1000 tokens is 4
+          batches exactly - and 7 under the PESSIMISTIC 2.0x fallback that
+          fires whenever /tokenize refuses. On 2026-09-01 that was every
+          single request. So a 100-turn cap re-latches inline summarization
+          precisely when things are already going wrong.
+
+      25  works for the summarizer (1 batch, 2 pessimistic) but leaves only
+          1.2x margin over L1_CHUNK_SIZE=20. The window must always hold a
+          full L1 chunk plus whatever accumulated since, or the rollup
+          cannot see the text it needs. One failed rollup puts you 40 turns
+          behind with 25 visible, and the oldest 20 are gone for good.
+
+      60  2 batches, 4 under the pessimistic fallback, and 3x the L1 chunk -
+          about two failed rollups of recovery room. Turns sent drop from
+          ~1.13M tokens to ~60k, which is the latency fix; the hard-budget
+          guard still trims to ~5 exchanges verbatim either way, so this
+          buys SUMMARIES of the turns between, not more raw context.
+
+Steps 1-6 are safe on their own and can sit indefinitely: the identity
+has moved but nothing is capped, so the client still sends everything and
+the new id rebuilds its own summaries as it goes. Step 10 is the one that
+is hard to undo.
+
+== MERGE LIMITS - READ BEFORE YOU CAP ==
+
+`POST /admin/conversations/<old>/merge-into/<new>` moves FACTS and
+EPISODIC exchanges. It does NOT move:
+
+  * SUMMARIES. merge_conversation refuses them deliberately, and its
+    docstring justifies that by saying the new id re-derives its own
+    hierarchy "from the client's full array". That is true only while
+    max_turns is 0. Cap the history and the new id can never see past the
+    last N turns, so a long conversation's L1/L2/L3 narrative is stranded
+    under the old id with no tooling to move it.
+  * The ARCHIVED-FACT sidecar (facts/<conv>.archive.json). The export
+    bundle carries facts, summary_state and episodic only, so /list-archive
+    on the new id reads empty.
+  * An admin-set PERSONA. auto_capture usually re-takes it from the
+    client's system message, so this is rarely visible - unless the stored
+    record was hand-set.
+
+CAP LAST, AND ONLY AFTER THE MERGE HAS RUN. Enabling max_turns before
+merging does not wipe memory - the interlock holds - but it seeds the new
+id's episodic turn_index near N instead of past the old id's maximum. A
+later merge then reads the old id's exchanges at those same indices as
+"already existing" and SKIPS them, reporting only a count. That loss is
+striped, silent, and re-running the merge will not repair it.
 
 == ROLLBACK ==
 
-Set max_turns back to 0. Nothing persists; the next request sends the
-full history again.
+The CAP rolls back cleanly: set max_turns to 0 and the next request sends
+the full history again. Nothing persists.
+
+The IDENTITY SWITCH does not. Disabling or deleting this filter reverts
+conv_id to the hash, orphaning everything written under chat_id since
+install. The only way back is another merge, in the other direction.
 """
 
 from pydantic import BaseModel, Field

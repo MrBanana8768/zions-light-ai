@@ -939,6 +939,97 @@ def _fact_key(text: str) -> str:
     return " ".join((text or "").split()).casefold()
 
 
+def _merge_fact_pin_and_recency(dst_fact: dict, src_fact: dict) -> dict:
+    """Fold src's protection into dst's copy of the "same" fact (same
+    _fact_key), instead of dst silently winning outright and discarding it.
+
+    R5 (v3.1.7): a pinned source fact merged into a conversation holding an
+    unpinned copy came out unpinned, on the documented install runbook step
+    (pipelines/conversation_id_header.py step 8) that has to run before the
+    history cap is enabled. dedup._merge_metadata already solves this for its
+    own merge path with `"pin": any(...)`; this matches it:
+
+      - pin: UNION (any member pinned -> merged copy is pinned). A merge is a
+        union of meaning, so the strongest protection between the two copies
+        carries forward. dedup._merge_metadata's comment on this line applies
+        verbatim here.
+      - last_used: MAX. facts.py's own comment (see commands.py's /retire
+        metadata note) calls this "unix seconds with one writer... safe to
+        compare across facts", so unlike added_turn it is meaningful even
+        across two different conversations' copies, and it is what eviction
+        actually sorts on — keeping the fresher of the two is the more
+        protective choice for the surviving row.
+      - added_turn: LEFT ALONE (dst's own value survives). dedup._merge_metadata
+        takes min() over a cluster, but every member of a dedup cluster comes
+        from the SAME conversation's own turn numbering (MEMORY_REVIEW F-1) —
+        that's what makes min() meaningful there. src and dst here are two
+        different conversations, each numbering its own turns from 0;
+        combining their added_turn values would produce a number that looks
+        meaningful and isn't, exactly what facts.py warns against ("do not
+        compare two facts' added_turn unless they came from the same
+        writer"). dst's added_turn is left untouched rather than invented.
+      - text: dst's, always — the two copies matched on _fact_key (casefolded,
+        whitespace-collapsed), so they may differ in case/spacing but not in
+        content; dst's wording is the one already live in the destination.
+    """
+    return {
+        **dst_fact,
+        "pin": bool(dst_fact.get("pin")) or bool(src_fact.get("pin")),
+        "last_used": max(
+            int(dst_fact.get("last_used", 0) or 0),
+            int(src_fact.get("last_used", 0) or 0),
+        ),
+    }
+
+
+def _merge_fact_lists(dst_facts: list[dict], src_facts: list[dict]) -> tuple[list[dict], dict]:
+    """Union src into dst by _fact_key. Pure function — callers decide
+    whether/when to persist the result, so this is safe to call once against
+    a stale read for a dry-run preview and again against a freshly re-read
+    dst immediately before writing (merge_conversation does both, and
+    commands._retire_plan's "already-in-destination" step uses the same
+    per-pair fold via _merge_fact_pin_and_recency for the same reason).
+
+    A brand-new key is appended verbatim. A colliding key keeps dst's row
+    (dst's wording is what's live in the destination) but folds pin/last_used
+    across both copies with _merge_fact_pin_and_recency — see that function
+    for why pin is unioned, last_used is maxed, and added_turn is left alone.
+
+    Returns (merged_list, stats): "added" is brand-new keys, "updated" is
+    existing keys whose dst row actually changed (pin/last_used moved),
+    "unchanged" is existing keys where the fold was a no-op (a true
+    byte-for-byte-equivalent duplicate with nothing new to protect).
+    """
+    merged = list(dst_facts)
+    key_to_index: dict[str, int] = {}
+    for i, f in enumerate(merged):
+        k = _fact_key(f.get("text", ""))
+        if k:
+            key_to_index.setdefault(k, i)
+
+    added = 0
+    updated = 0
+    unchanged = 0
+    for f in src_facts:
+        k = _fact_key(f.get("text", ""))
+        if not k:
+            continue
+        idx = key_to_index.get(k)
+        if idx is None:
+            key_to_index[k] = len(merged)
+            merged.append(f)
+            added += 1
+        else:
+            folded = _merge_fact_pin_and_recency(merged[idx], f)
+            if folded != merged[idx]:
+                merged[idx] = folded
+                updated += 1
+            else:
+                unchanged += 1
+
+    return merged, {"added": added, "updated": updated, "unchanged": unchanged}
+
+
 def merge_conversation(
     src_conv_id: str, dst_conv_id: str, *, dry_run: bool = True
 ) -> dict:
@@ -963,9 +1054,12 @@ def merge_conversation(
       * SRC. Read-only throughout. A merge that damages its source is not
         recoverable if the result is wrong.
 
-    Facts are unioned on _fact_key; dst's copy wins on collision (it carries
-    the fresher last_used). The active store is NOT pruned here - callers
-    who want the cap enforced can prune afterwards, and leaving that
+    Facts are unioned on _fact_key; dst's wording wins on collision, but pin
+    and last_used are folded across BOTH copies (see _merge_fact_pin_and_recency)
+    rather than dst silently winning outright — a pinned src fact merging into
+    an unpinned dst copy comes out pinned (R5, v3.1.7), and the fresher of the
+    two last_used values survives. The active store is NOT pruned here -
+    callers who want the cap enforced can prune afterwards, and leaving that
     separate means a merge never silently evicts.
 
     Episodic exchanges are imported by turn_index, skipping any index dst
@@ -994,14 +1088,11 @@ def merge_conversation(
         dst_facts = facts.load_facts(dst_conv_id)
     except Exception as e:
         raise ValueError(f"could not read facts for {dst_conv_id}: {e}") from e
-    dst_keys = {_fact_key(f.get("text", "")) for f in dst_facts}
 
-    new_facts = []
-    for f in src_facts:
-        k = _fact_key(f.get("text", ""))
-        if k and k not in dst_keys:
-            dst_keys.add(k)
-            new_facts.append(f)
+    # Preview only, against this (possibly stale) read — the actual write
+    # below re-reads dst and re-runs this same fold so a tail that wrote
+    # between here and there is not clobbered or ignored.
+    _preview_merged, fact_stats = _merge_fact_lists(dst_facts, src_facts)
 
     try:
         dst_episodic = retrieval.export_indexed_exchanges(dst_conv_id)
@@ -1018,8 +1109,9 @@ def merge_conversation(
         "dry_run": dry_run,
         "src_facts": len(src_facts),
         "dst_facts_before": len(dst_facts),
-        "facts_to_add": len(new_facts),
-        "facts_skipped_duplicate": len(src_facts) - len(new_facts),
+        "facts_to_add": fact_stats["added"],
+        "facts_pin_or_recency_to_update": fact_stats["updated"],
+        "facts_skipped_duplicate": fact_stats["unchanged"],
         "src_exchanges": len(src_episodic),
         "dst_exchanges_before": len(dst_episodic),
         "exchanges_to_add": len(new_exchanges),
@@ -1045,16 +1137,17 @@ def merge_conversation(
         )
 
     # Re-read rather than trusting the counters computed above: the tail may
-    # have added facts between the pre-flight read and here.
+    # have added facts between the pre-flight read and here. Re-run the same
+    # fold against the fresh read rather than reusing the stale preview — a
+    # collision the preview never saw (because the tail added that key after
+    # the preview ran) still has to have its pin/last_used folded, not just
+    # its "already present" status re-checked.
     current = facts.load_facts(dst_conv_id)
-    current_keys = {_fact_key(f.get("text", "")) for f in current}
-    actually_new = [
-        f for f in new_facts
-        if _fact_key(f.get("text", "")) not in current_keys
-    ]
-    if actually_new:
-        facts.save_facts(dst_conv_id, current + actually_new)
-    result["facts_added"] = len(actually_new)
+    merged, actual_stats = _merge_fact_lists(current, src_facts)
+    if merged != current:
+        facts.save_facts(dst_conv_id, merged)
+    result["facts_added"] = actual_stats["added"]
+    result["facts_pin_or_recency_updated"] = actual_stats["updated"]
 
     added = 0
     for e in new_exchanges:
@@ -1072,8 +1165,9 @@ def merge_conversation(
 
     logger.info(
         f"merged conv {src_conv_id} into {dst_conv_id}: "
-        f"+{result.get('facts_added', 0)} fact(s), +{added} exchange(s); "
-        f"source left intact"
+        f"+{result.get('facts_added', 0)} fact(s), "
+        f"{result.get('facts_pin_or_recency_updated', 0)} existing fact(s) "
+        f"pin/last_used updated, +{added} exchange(s); source left intact"
     )
     return result
 

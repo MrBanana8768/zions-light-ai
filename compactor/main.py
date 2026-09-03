@@ -14,6 +14,9 @@ V2.0 additions:
 """
 
 import asyncio
+import bisect
+import codecs
+import dataclasses
 import json
 import logging
 import warnings
@@ -43,6 +46,7 @@ import portability
 import retrieval
 import selftest as selftest_module
 import summarizer
+import tailhealth
 from memory import (
     StoreUnreadable,
     conv_lock,
@@ -58,9 +62,29 @@ def _env_int(name: str, default: int) -> int:
     """os.environ.get returns '' (not the default) when the var is set to an
     empty string, which is what .env files do for opt-in blanks. Treat empty
     as 'use the default'.
+
+    AN UNPARSEABLE VALUE IS THE DEFAULT, NOT A CRASH. Until v3.1.7 this was a
+    bare `int(v)`, so one typo in runpod.env — `5O` for `50`, `3OO` for `300`,
+    a stray quote, a trailing comment — raised ValueError at import and the
+    compactor never started. Every constant on this module's critical path
+    reads through here, including MAX_MODEL_LEN, the degeneracy thresholds and
+    MIN_MEMORABLE_TRIMMED_CHARS, so the blast radius is the whole process and
+    the symptom is a container that will not boot with a traceback nobody
+    connects to a config line.
+
+    That is the same failure bgwork._window_s and tailhealth._window_s were
+    fixed for, and both cite this function's contract; it now actually holds.
+    A bad value is logged nowhere because logging is not configured this early
+    — the default is the safe outcome, and an operator who set a value that
+    did not take will see it in /health/full's config block.
     """
     v = os.environ.get(name, "")
-    return int(v) if v.strip() else default
+    if not v.strip():
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
 
 
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8000").rstrip("/")
@@ -155,8 +179,20 @@ MAX_RETAINED_IMAGES = _env_int("COMPACTOR_MAX_RETAINED_IMAGES", 1)
 
 
 def _env_float(name: str, default: float) -> float:
-    """Same contract as _env_int: an unset or unparseable value is the default,
-    never a crash at import time and never a silent zero."""
+    """Same contract as _env_int: an unset, blank or unparseable value is the
+    default, and never a crash at import time.
+
+    WHAT THIS DOES NOT DO, stated because the docstring used to claim it and
+    two other modules cited the claim. An explicit `0`, a negative, `nan` or
+    `inf` is RETURNED AS GIVEN — this function does not police the range,
+    because its callers disagree about what a legal range is: a budget
+    fraction of 0 is a mistake, while several knobs take 0 as a meaningful
+    'off'. A caller that needs a positive value must say so itself; that is
+    what bgwork._window_s and tailhealth._window_s do, and their docstrings
+    used to describe this function as rejecting a silent zero, which it never
+    has. Corrected in v3.1.7 rather than changing the behaviour, because
+    tightening it here would silently move every knob that legitimately
+    accepts 0."""
     raw = os.environ.get(name)
     if raw is None or not str(raw).strip():
         return default
@@ -924,6 +960,67 @@ def count_text_tokens_exact(text: str) -> int | None:
         return None
 
 
+def assistant_content_is_empty(content) -> bool:
+    """Does this assistant turn carry NOTHING? The one emptiness rule.
+
+    THREE PLACES need to answer this and each had its own answer, which is
+    how the two defects below shipped. Kept as one function so a fourth
+    caller cannot invent a fifth rule:
+
+      * _space_fill_empty_assistant — repairs an empty turn so the template
+        will accept it (what we MEASURE, and what we FORWARD).
+      * _repair_template_invalid_tail step (1) — DROPS an empty trailing
+        turn as the residue of a dead stream.
+      * tokens._sanitize — the tier-2 local counter's reduction. It cannot
+        import this module (main imports the modules that import tokens), so
+        it re-states the rule against already-reduced text and says so.
+
+    WHAT "EMPTY" MEANS, and the two ways it was got wrong. `None`, a missing
+    key, `""`, whitespace, `[]`, and a list whose parts are all blank text
+    are empty. Everything else is content.
+
+      1. Until v3.1.7 the FILL tested `isinstance(content, str)` only, so
+         `None`, a missing key, `[]` and blank-text lists reached /tokenize
+         and were refused there — twenty identical 400s in one production
+         night, every one of them reported back as `content=''`.
+      2. Until v3.1.7 the DROP tested `_message_text(...).strip()`, which
+         joins text parts and ignores every other kind. An assistant turn
+         carrying ONLY an image therefore read as empty and was popped —
+         destroying the image, permanently and silently, while the fill
+         three lines later was carefully refusing to touch that exact shape.
+         Two emptiness rules in one function, and the laxer one ran first.
+
+    A list holding a NON-TEXT part is never empty. Destroying an image to
+    satisfy a template rule is worse than the 400 it avoids, and that is the
+    one guarantee every caller of this function inherits. A part that is not
+    a dict, or a dict with no "type", counts as non-text: unknown content is
+    treated as content, because guessing "probably nothing" about a shape we
+    do not recognise is how a future client's parts get thrown away.
+
+    Never raises. Callers run on the request path, and some are inside a
+    `finally`; a bookkeeping question must not become a second failure.
+    """
+    if content is None:  # explicit null, or no content key at all
+        return True
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, list):
+        for p in content:
+            if not isinstance(p, dict) or p.get("type") != "text":
+                return False  # an image, or a part we do not recognise
+            try:
+                if str(p.get("text") or "").strip():
+                    return False
+            except Exception:
+                return False  # unreadable part — content, not emptiness
+        return True
+    # Some other type entirely (an int, a dict, an object). Not ours to
+    # judge, and NOT empty: a truthy non-string is content we cannot read,
+    # and a falsy one (0, {}) is still not a thing we are entitled to
+    # overwrite with a space.
+    return False
+
+
 def _space_fill_empty_assistant(messages: list[dict]) -> tuple[list[dict], int]:
     """Return (copy with empty assistant turns space-filled, how many).
 
@@ -935,24 +1032,41 @@ def _space_fill_empty_assistant(messages: list[dict]) -> tuple[list[dict], int]:
     MistralTokenizer pipeline in the production image, 2026-08-30
     (testfixtures/tokenizer-contract/vllm_template_probe.py).
 
-    str content ONLY. A list (multimodal) part can read as text-empty while
-    still carrying an image, and destroying an image to satisfy a template
-    rule would be worse than the 400 it avoids.
+    WHAT COUNTS AS EMPTY, and why it is not just `content == ""`. Until
+    v3.1.7 this tested `isinstance(content, str)` and nothing else, so four
+    shapes a client can legitimately send sailed straight through to
+    /tokenize and were refused there: `None`, a MISSING content key, `[]`,
+    and a list whose only parts are text parts that are all blank. All four
+    carry nothing, and vLLM reports every one of them back as `content=''`
+    — indistinguishable in the log from the str case this helper was written
+    for, which is how the gap survived being looked at.
+
+    THE ONE THING STILL LEFT ALONE is a list that carries a NON-TEXT part.
+    A multimodal part can read as text-empty while still holding an image,
+    and destroying an image to satisfy a template rule would be worse than
+    the 400 it avoids. So the list case is admitted only when every part is
+    a text part and all of them are blank — emptiness proven, not assumed.
+    An unrecognisable part (not a dict, or a dict with no "type") counts as
+    non-text for this purpose: unknown content is treated as content.
 
     Extracted in v3.1.5 so that _repair_template_invalid_tail (which fixes
     what we FORWARD) and count_tokens_exact (which fixes what we MEASURE)
     cannot drift apart. They were the same rule written once, applied at one
     of the two places it was needed — see count_tokens_exact for what that
-    cost.
+    cost. tokens._sanitize is the THIRD place the same rule is needed, and
+    carried the same hole until v3.1.7; it reduces a message list for the
+    local mistral_common counter, and `content or ""` there manufactured
+    exactly the empty assistant string the template refuses — so tier 2
+    would have failed on precisely the payloads that make tier 1 fail.
     """
+
     out = list(messages)
     filled = 0
     for i, m in enumerate(out):
         if (
             isinstance(m, dict)
             and m.get("role") == "assistant"
-            and isinstance(m.get("content"), str)
-            and not m["content"].strip()
+            and assistant_content_is_empty(m.get("content"))
         ):
             out[i] = {**m, "content": " "}
             filled += 1
@@ -1620,9 +1734,9 @@ def inject_system_block(messages: list[dict], content: str) -> list[dict]:
 # horizontal rule is 40-80 characters; nothing in five hundred healthy replies
 # came close to 250.
 DEGENERATE_RUN_CHARS = _env_int("COMPACTOR_DEGENERATE_RUN_CHARS", 250)
-DEGENERATE_DECOR_FRACTION = float(
-    os.environ.get("COMPACTOR_DEGENERATE_DECOR_FRACTION", "0.45") or 0.45
-)
+# _env_float, not a bare float(): a typo here used to raise at import and
+# stop the compactor booting (v3.1.7). Same reasoning as _env_int above.
+DEGENERATE_DECOR_FRACTION = _env_float("COMPACTOR_DEGENERATE_DECOR_FRACTION", 0.45)
 DEGENERATE_MIN_CHARS = _env_int("COMPACTOR_DEGENERATE_MIN_CHARS", 300)
 
 # Script drift — a THIRD degeneration shape, and it is not repetition.
@@ -1639,9 +1753,8 @@ DEGENERATE_MIN_CHARS = _env_int("COMPACTOR_DEGENERATE_MIN_CHARS", 300)
 #
 # The letter floor matters more than the fraction: in a short reply one
 # foreign word is a large percentage and a perfectly ordinary thing to write.
-DEGENERATE_NONLATIN_FRACTION = float(
-    os.environ.get("COMPACTOR_DEGENERATE_NONLATIN_FRACTION", "0.03") or 0.03
-)
+# _env_float, not a bare float(): see DEGENERATE_DECOR_FRACTION above.
+DEGENERATE_NONLATIN_FRACTION = _env_float("COMPACTOR_DEGENERATE_NONLATIN_FRACTION", 0.03)
 DEGENERATE_MIN_LETTERS = _env_int("COMPACTOR_DEGENERATE_MIN_LETTERS", 200)
 
 # Box-drawing, block elements, and the ASCII characters people rule lines with.
@@ -1689,6 +1802,89 @@ DEGENERATE_TOKEN_RUN_CHARS = _env_int("COMPACTOR_DEGENERATE_TOKEN_RUN_CHARS", 12
 # characters. 250 is also verdict-identical (211 ms) if more headroom is
 # wanted; 40 is the fastest of the verified set.
 _TOKEN_RUN_RE = re.compile(r"(\S{3,40})(?:[ _\n\t]*\1){3,}")
+
+# Structural collapse — a FOURTH shape, and nothing in it repeats.
+#
+# 2026-09-01: replies degenerated into a list of DISTINCT short items
+# (`- Always` / `- Forever` / `- No matter what`) that never stopped, because
+# a list item is always a valid continuation of a list item; then the
+# newlines stopped too, and the tail became one unbroken line of short
+# fragments — which is where she hit stop. measure-reply-health.py saw the
+# list phase as bullet fraction by quarter 42% -> 79% -> 100% -> 92%. None
+# of the rules above can see either phase: distinct items contain no
+# repeated character or token, are all Latin, and carry no decoration.
+#
+# Measured 2026-09-01 against 349 real replies (the largest conversation in
+# that day's backup), split by the proxy measure-reply-health.py uses for
+# "she stopped it": a final non-empty line over 1000 characters. 17 cut, 332
+# completed. The rules above already flag 5 of the 17 (the 08-29 token and
+# character loops) and 13 of the 332.
+#
+# THE LIST ITSELF DOES NOT SEPARATE THEM. Every proposed list discriminator
+# was measured on both populations (scripts/calibrate-structural-degeneracy.py
+# prints them all); at the false-positive budget of 2% of completed replies
+# (7 of 332) none catches more than 2 of the 17 cut ones:
+#     bullet fraction >= 60%                  FP 24 (7.2%)   TP  5
+#     rise Q1->Q4 >= 20%                      FP 37 (11.1%)  TP  4
+#     bullet count >= 100                     FP 58 (17.5%)  TP  5
+#     median item length <= 30                FP 49 (14.8%)  TP  8
+#     >= 10 consecutive items <= 30 chars     FP 23 (6.9%)   TP  8
+#     >= 20 consecutive items <= 30 chars     FP  5 (1.5%)   TP  2
+# because the same short-item lists appear in replies that ran to their own
+# end — nearly all of them on 08-31 and 09-01, the days of the complaint.
+# (Pre-complaint, 08-24..08-29, 131 replies: longest run of short items 9.)
+#
+# THE TAIL DOES. What every cut reply has, and almost no completed one, is a
+# single line of 1500+ characters made of FRAGMENTS: split at sentence
+# breaks, the pieces average 10-38 characters, where a paragraph's sentences
+# average 60-120. Where a line has no sentence break at all, the commas are
+# the separators — the same collapse with a smaller separator: 168 and 317
+# commas in 3917 and 3530 characters. Of the 12 cut replies the rules above
+# miss, this catches 12 (10 by sentence breaks, 2 by commas); the union with
+# the rules above is 17 of 17. On completed replies it flags 2 of 332
+# (0.6%): lines of 2419 and 1796 characters with fragments averaging 34 and
+# 26, both 08-31. In the 131 pre-complaint replies the longest
+# fragment-shaped line is 544 characters; the cut ones start at 1515. The
+# threshold sits just under the cut population, on purpose: a miss costs one
+# runaway in one summary, a false positive costs a reply from memory
+# permanently (see _redact_degenerate_turns), and 1000-1200 would add 2 more
+# completed replies for no extra catches. Sentence mean: 35-40 give the same
+# result, 45 adds a false positive, 30 loses 2 catches.
+#
+# THE LIST IS KEPT AS A BACKSTOP for the runaway that runs to its own end,
+# where there is no cut tail to see: 50+ consecutive items of <= 30
+# characters. One completed reply in 332 (0.3%) trips it — 1,359 lines,
+# 1,261 list items, 1,024 consecutive short ones, memory of nothing. The
+# highest run in any other completed reply is 34; the pre-complaint week
+# never exceeded 9. 50 is 1.5x above the highest ambiguous value and 20x
+# below the one it exists for.
+#
+# WHY THIS MATTERS THOUGH SHE STOPPED IT. A cut reply reaches the memory
+# tail trimmed to its last complete sentence (decide_memory_tail, v3.1.4),
+# and this rule is applied to what survives the trim — an unterminated
+# runaway list has no boundary and is discarded before it is judged, but a
+# list of terminated one-liners is not. And whatever the tail decides, the
+# whole cut reply comes back on the next turn inside the client's history
+# and is folded into a rollup summary by maybe_rollup unless
+# _redact_degenerate_turns flags it — the exact route by which one runaway
+# primes the next.
+#
+# Fenced code is not judged (a YAML list or a minified line is not
+# degeneration), and a line needs 100+ spaces to be judged at all, so a URL
+# or a blob is never a "fragment line". Cost: one pass over lines, every
+# regex anchored to a single line; on 30,000 characters the block adds
+# under 1 ms (0.76-0.87 ms, short-item shape) over the rules above, measured
+# 2026-09-01 against a copy with the block removed.
+DEGENERATE_LINE_CHARS = _env_int("COMPACTOR_DEGENERATE_LINE_CHARS", 1500)
+DEGENERATE_LINE_SENTENCE_CHARS = _env_int(
+    "COMPACTOR_DEGENERATE_LINE_SENTENCE_CHARS", 40
+)
+DEGENERATE_LIST_RUN = _env_int("COMPACTOR_DEGENERATE_LIST_RUN", 50)
+DEGENERATE_LIST_ITEM_CHARS = _env_int("COMPACTOR_DEGENERATE_LIST_ITEM_CHARS", 30)
+# The same expression scripts/measure-reply-health.py calls BULLET, so the
+# numbers that script prints are the numbers this rule sees.
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s")
+_LINE_MIN_SPACES = 100
 
 
 def reply_is_degenerate(text: str) -> str | None:
@@ -1801,6 +1997,52 @@ def reply_is_degenerate(text: str) -> str | None:
                 f"{100 * decor / n:.0f}% decoration characters over {n} chars "
                 f"(limit {100 * DEGENERATE_DECOR_FRACTION:.0f}%)"
             )
+    # Structural collapse (see the block comment above the DEGENERATE_LINE_*
+    # constants). One pass over lines.
+    run = best_run = 0
+    in_fence = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue  # a blank line between items does not end a list
+        if line.startswith("```"):
+            in_fence = not in_fence
+            run = 0
+            continue
+        if in_fence:
+            run = 0
+            continue
+        if len(line) <= DEGENERATE_LIST_ITEM_CHARS and _LIST_ITEM_RE.match(line):
+            run += 1
+            if run > best_run:
+                best_run = run
+        else:
+            run = 0
+        ln = len(line)
+        if ln >= DEGENERATE_LINE_CHARS and line.count(" ") >= _LINE_MIN_SPACES:
+            breaks = (
+                line.count(". ") + line.count("! ") + line.count("? ")
+                + line.count("… ")
+            )
+            if breaks == 0:
+                # No sentence at all in 1500+ characters: either a run-on,
+                # which is not this rule's shape, or a list whose separator
+                # has shrunk to a comma — judged the same way, on the commas.
+                breaks = line.count(", ")
+            if ln / (breaks + 1) <= DEGENERATE_LINE_SENTENCE_CHARS:
+                return (
+                    f"an unbroken line of {ln} characters made of "
+                    f"{breaks + 1} fragments averaging "
+                    f"{ln / (breaks + 1):.0f} characters (limit "
+                    f"{DEGENERATE_LINE_SENTENCE_CHARS} over "
+                    f"{DEGENERATE_LINE_CHARS}+ characters)"
+                )
+    if best_run >= DEGENERATE_LIST_RUN:
+        return (
+            f"a run of {best_run} consecutive list items of "
+            f"{DEGENERATE_LIST_ITEM_CHARS} characters or fewer (limit "
+            f"{DEGENERATE_LIST_RUN})"
+        )
     return None
 
 
@@ -1882,6 +2124,299 @@ def _redact_degenerate_turns(messages: list[dict]) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# v3.1.4: what a CUT reply contributes to memory.
+#
+# Measured in one log window on 2026-09-01: 51 replies skipped because she
+# hit Stop, 12 because vLLM hit the generation ceiling, 0 for repetition. 63
+# exchanges never reached memory — no facts, no episodic index, no rollup —
+# and that is more than half of her recent conversation. The old gate
+# reasoned that "memorizing a half-sentence plants false memories", which is
+# true of a 200-character fragment and wrong for a 27,000-character reply
+# cut at the end, which is 99% complete prose. The gate tested COMPLETION
+# when it should test SUBSTANCE. So: keep the longest prefix that ends on a
+# sentence boundary, and judge that.
+# ---------------------------------------------------------------------------
+
+# A sentence boundary: a terminator, optional closing marks (quotes, brackets,
+# markdown emphasis), then whitespace or end-of-text. The whitespace clause is
+# what keeps `3.14`, `v3.1.6` and `1.500` from being boundaries — the `.` in
+# each is followed by a digit — so there is NO decimal special-case and none
+# is needed. The fullwidth terminators do not need the clause: CJK prose puts
+# no space after `。` and has no decimal written with it.
+_SENTENCE_END_RE = re.compile(
+    r"""[.!?]["'”’)\]»*_~`]*(?=\s|\Z)"""
+    r"""|[。！？]["”’」』)）]*"""
+)
+# Not exhaustive, and it does not need to be: an abbreviation this list fails
+# to reject just moves the cut to a different real terminator, which costs
+# one sentence; an abbreviation it wrongly ACCEPTS stores a fragment ("...as
+# it says in Rev.") as something the model said. So the list leans towards
+# rejecting. The scripture books are here because this user quotes scripture
+# (see reply_is_degenerate's script-drift note) and "Gen. 1:1" is how it is
+# written. Matched on the dotted run immediately before the terminator, so
+# "e.g" and "u.s" are entries, not "e" and "s".
+_SENTENCE_ABBREVIATIONS = frozenset(
+    """
+    mr mrs ms dr prof sr jr st vs etc e.g i.e cf viz approx vol fig dept
+    inc ltd u.s u.k a.m p.m ph.d mt ft gen rev hon capt col lt sgt
+    ex lev num deut josh judg sam kgs chr neh ps prov eccl isa jer lam ezek
+    dan hos mic hab zeph hag zech mal matt mk lk jn rom cor gal eph phil
+    thess tim tit philem heb jas pet
+    """.split()
+)
+# The longest entry above is 6 characters ("approx", "philem"); the dotted
+# run is capped well above that so a long dotted identifier (`os.path.join`)
+# is scanned, found absent, and accepted without an unbounded walk back.
+_ABBREV_SCAN_CHARS = 12
+_ABBREV_RUN_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.")
+# What may precede a word for it to count as a whole word (for the
+# abbreviation and single-initial rules): start of text, whitespace, or an
+# opening mark. "1st." is not an abbreviation because "1" precedes "st".
+_WORD_LEAD_CHARS = frozenset(" \t\r\n\f\v(\"'“‘[«*_~`")
+
+
+def trim_to_last_sentence(text: str) -> str:
+    """The longest prefix of `text` that ends on a sentence boundary, or ""
+    when there is none. Pure; no logging.
+
+    NO MARKER IS APPENDED, unlike every other trimmer in this codebase
+    (facts._truncate_to_tokens, summarizer's chunk trim, the payload trim in
+    _enforce_hard_budget, _DEGENERATE_HISTORY_PLACEHOLDER). Those trim text
+    shown TO THE MODEL AS INPUT, where an unmarked cut reads as all there
+    was, so the marker is what keeps a truncation from becoming a wrong
+    fact. This text goes into the STORE: it is fact-extracted, embedded as
+    episodic content and folded into an L1 chunk, so a marker here would be
+    extracted as a fact, embedded and summarized — the marker would BECOME a
+    memory. Do not add one for consistency with the others; the
+    inconsistency is the point. The result is a plain prefix
+    (`text.startswith(result)` always holds), and test_sentence_trim.py
+    pins that.
+
+    A boundary is one of `.!?` plus optional closing marks, followed by
+    whitespace or end-of-text (see _SENTENCE_END_RE for why that clause
+    makes decimals and version numbers a non-issue), or one of `。！？`.
+    Rejected even when the regex matches:
+
+      - a `.` that is part of `..`/`...` — an ellipsis is a pause, not an
+        end, and `…` (U+2026) is not a terminator at all;
+      - a `.` after a word in _SENTENCE_ABBREVIATIONS ("Dr.", "e.g.");
+      - a `.` after a single capital letter ("J. R. R."; also "I." — a
+        sentence that ends "...so am I." loses that one sentence, which is
+        the cheaper error: an accepted initial stores "by J." as a memory);
+      - a `.` after a bare number at the start of a line — a numbered list
+        marker ("1. ") is not a sentence, and "Steps:\\n1." is a fragment;
+      - anything inside an open ``` fence: a cut inside a fence leaves the
+        unterminated opener that facts.py's line filter already refuses at
+        the fact level, and a `.` in code is not a sentence end anyway. A
+        fence that closes again is fine; the cut can land after it.
+
+    NEWLINES ARE DELIBERATELY NOT BOUNDARIES. Measured over 349 of her
+    replies on 2026-09-01, sentence-only discards a median of 20 characters
+    but up to 25,063, where sentence-or-line would cap the worst case at
+    3,917. That looked decisive and it was the wrong read: those 25,063
+    characters ARE the runaway bullet list — `- Always`, `- Forever`,
+    unterminated — and discarding them is the point. A reply that collapsed
+    into twenty-four distinct bullets trims back to the prose above the
+    list, and only the prose is remembered. There is also no way to tell
+    `- eggs` from `- eg` cut mid-word: punctuation is the only positive
+    evidence a unit finished. Terminated bullets ("- One thing.") are real
+    sentences and are kept.
+
+    Cost: this runs SYNCHRONOUSLY on the event loop at both memory-tail
+    call sites (see _TOKEN_RUN_RE for what an unbounded pattern cost there:
+    6,214 ms on 16k of input). One forward scan with a regex that has no
+    nested quantifier, a bisect per candidate for the fence check, and a
+    backward look of at most _ABBREV_SCAN_CHARS. Measured 2026-09-01 on
+    Python 3.14 (test_sentence_trim.py [13] prints it every run): 30,000
+    characters of prose in 1.3 ms; the pathological 30,000 characters of
+    ". . . ." (a candidate every other character) in 10 ms; 30,000
+    characters with 3,000 fence toggles in 4.6 ms.
+    """
+    if not text:
+        return ""
+    # Fence toggles as text offsets, so each candidate costs one bisect
+    # rather than a re-scan of everything before it. Same "line starts with
+    # ```" test reply_is_degenerate uses, so the two agree on what a fence is.
+    toggles: list[int] = []
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        if line.strip().startswith("```"):
+            toggles.append(pos)
+        pos += len(line)
+    end = 0
+    n = len(text)
+    for m in _SENTENCE_END_RE.finditer(text):
+        i = m.start()
+        if toggles and bisect.bisect_right(toggles, i) % 2 == 1:
+            continue  # inside an open fence
+        if text[i] == ".":
+            if i > 0 and text[i - 1] == ".":
+                continue  # ellipsis
+            # The dotted word immediately before the terminator, and what
+            # precedes it, for the abbreviation, initial and list-marker rules.
+            j = i
+            while j > 0 and i - j < _ABBREV_SCAN_CHARS and text[j - 1] in _ABBREV_RUN_CHARS:
+                j -= 1
+            word = text[j:i]
+            whole_word = j == 0 or text[j - 1] in _WORD_LEAD_CHARS
+            if whole_word and word:
+                if word.lower() in _SENTENCE_ABBREVIATIONS:
+                    continue
+                if len(word) == 1 and word.isupper():
+                    continue  # single initial
+            if not word:
+                # A bare number at the start of its line is a list marker.
+                k = i
+                while k > 0 and text[k - 1].isdigit():
+                    k -= 1
+                if k < i:
+                    ls = k
+                    while ls > 0 and text[ls - 1] in " \t":
+                        ls -= 1
+                    if ls == 0 or text[ls - 1] == "\n":
+                        continue
+        end = m.end()
+    if end <= 0 or end > n:
+        return ""
+    return text[:end]
+
+
+# The floor under a TRIMMED reply. Not a round number: it equals
+# DEGENERATE_MIN_CHARS, the floor below which this codebase already declines
+# to judge a reply structurally, and it matches the 60-word floor in
+# scripts/measure-reply-health.py ("too short to say anything about") at that
+# corpus's measured word length. Two floors where the corpus supports one
+# would be worse. Her p1 reply is 377 characters (2026-09-01, 349 replies),
+# so this excludes under 1% of real replies. It applies to the trim path
+# only: a reply the model FINISHED is stored whole whatever its length, as
+# it always was.
+#
+# No relative floor ("keep only if >= X% survived"). It would fire hardest on
+# exactly the runaway replies that make up most of the 63 lost exchanges —
+# trimming 27,000 characters down to a 900-character prose head is a GOOD
+# outcome. tailhealth's trimmed_raw/trimmed_kept totals make the retention
+# ratio a measured number instead.
+MIN_MEMORABLE_TRIMMED_CHARS = _env_int("COMPACTOR_MIN_MEMORABLE_TRIMMED_CHARS", 300)
+
+
+@dataclasses.dataclass(frozen=True)
+class TailDecision:
+    """What decide_memory_tail concluded about one reply.
+
+    `store`   — hand `text` to the memory tail, or not.
+    `text`    — exactly what to store: the reply verbatim, or its trimmed
+                prefix. "" when not storing.
+    `outcome` — the machine label (one of tailhealth.OUTCOMES) for the
+                counter. Carries no conversation text; it goes to
+                /health/full, which is not localhost-gated.
+    `reason`  — the human note for the LOG only: why it was skipped, or for
+                a trimmed store what was cut. None for a verbatim store. May
+                quote up to 24 characters of the reply (reply_is_degenerate
+                does), so it stays in the log.
+    """
+
+    store: bool
+    text: str
+    outcome: str
+    reason: str | None
+    raw_chars: int
+
+
+def decide_memory_tail(
+    text: str, *, finished: bool, truncated: bool, holed: bool
+) -> TailDecision:
+    """ONE policy for what a finished-or-cut reply contributes to memory,
+    for BOTH /v1/chat/completions call sites. Pure; no logging, no
+    counting — _run_memory_tail does those, once, for both.
+
+    Order, and why:
+
+      holed      -> skip. Text we know we could not read completely is
+                    unsafe, never safe (SseAccumulator.holed). Before the
+                    finished check on purpose: a hole in a cleanly finished
+                    stream was memorized silently until v3.1.4.
+      empty      -> skip. Nothing to remember; the old non-streaming site
+                    fired the tail anyway and, with extraction disabled,
+                    rewrote the facts file for a turn the model never
+                    answered (v3.1 F20).
+      finished and not truncated
+                 -> store VERBATIM, untrimmed, unless reply_is_degenerate
+                    says it is a repetition loop. This is today's behaviour
+                    for a reply the model finished, byte for byte.
+      otherwise  -> the reply was CUT — she hit Stop, or vLLM hit the
+                    generation ceiling; one rule, one path for both. Trim to
+                    the last complete sentence (trim_to_last_sentence), then
+                    skip if nothing survives, skip if less than
+                    MIN_MEMORABLE_TRIMMED_CHARS survives, skip if what
+                    survives is degenerate; else store the trimmed prefix.
+
+    Degeneracy is judged on the TRIMMED text, not the raw: the object of
+    judgement is the thing being stored. A clean prose head followed by a
+    box-drawing tail is kept once the tail is discarded — judged raw, it
+    would be thrown away for the part that is not being kept. The trim is
+    what makes this safe: an unterminated runaway list has no sentence
+    boundary and is discarded before it is judged, and a runaway that ran
+    to its own end is still caught by the structural-collapse rule on what
+    remains.
+
+    Why `truncated` is not folded into `finished` by the caller: the old
+    gate was `usable()` = finished and not truncated, and the non-streaming
+    site had no `finished` notion at all, so the two sites answered
+    different questions. Passing all three keeps the question here.
+    """
+    text = text or ""
+    raw = len(text)
+
+    def _skip(outcome: str, reason: str) -> TailDecision:
+        return TailDecision(False, "", outcome, reason, raw)
+
+    if holed:
+        return _skip(
+            tailhealth.SKIPPED_HOLED,
+            "the stream accumulator dropped a chunk, so the text has a hole "
+            "in it that nothing downstream could see",
+        )
+    if not text.strip():
+        return _skip(tailhealth.SKIPPED_EMPTY, "the reply is empty")
+    if finished and not truncated:
+        why = reply_is_degenerate(text)
+        if why:
+            return _skip(
+                tailhealth.SKIPPED_DEGENERATE,
+                f"reply looks like a repetition loop ({why})",
+            )
+        return TailDecision(True, text, tailhealth.STORED, None, raw)
+    # Cut. The two phrasings are what scripts/tail-logs.sh's signal filter
+    # matches on ("stream ended", "stream truncated"), and what the log has
+    # said since v3.1, so a grep across the upgrade still works.
+    how = (
+        "stream truncated at the generation ceiling (finish_reason=length)"
+        if truncated
+        else "stream ended without completion"
+    )
+    kept = trim_to_last_sentence(text)
+    if not kept:
+        return _skip(
+            tailhealth.SKIPPED_NO_BOUNDARY,
+            f"{how} and no sentence boundary survives in {raw} chars",
+        )
+    if len(kept) < MIN_MEMORABLE_TRIMMED_CHARS:
+        return _skip(
+            tailhealth.SKIPPED_TOO_SHORT,
+            f"{how}; only {len(kept)} of {raw} chars end on a sentence "
+            f"boundary (floor {MIN_MEMORABLE_TRIMMED_CHARS})",
+        )
+    why = reply_is_degenerate(kept)
+    if why:
+        return _skip(
+            tailhealth.SKIPPED_DEGENERATE_PARTIAL,
+            f"{how}; the {len(kept)} chars that end on a sentence boundary "
+            f"look like a repetition loop ({why})",
+        )
+    return TailDecision(True, kept, tailhealth.STORED_TRIMMED, how, raw)
+
+
 def _repair_template_invalid_tail(body: dict) -> tuple[str | None, bool]:
     """Make the OUTGOING payload's tail valid for the Mistral chat template.
 
@@ -1937,11 +2472,17 @@ def _repair_template_invalid_tail(body: dict) -> tuple[str | None, bool]:
 
     # (1) Shed the residue of dead streams. Bounded by the presence of a real
     # user turn so this can never eat the conversation.
+    # assistant_content_is_empty, NOT _message_text().strip(). _message_text
+    # joins TEXT parts and silently ignores every other kind, so an assistant
+    # turn carrying only an image read as empty here and was popped — the
+    # image destroyed, permanently and silently — while step (1b) below was
+    # refusing to touch that exact shape three lines later. One rule now
+    # serves the drop and the fill; see assistant_content_is_empty.
     dropped = 0
     while (
         len(msgs) > 1
         and msgs[-1].get("role") == "assistant"
-        and not _message_text(msgs[-1]).strip()
+        and assistant_content_is_empty(msgs[-1].get("content"))
         and any(m.get("role") == "user" for m in msgs[:-1])
     ):
         msgs.pop()
@@ -2849,22 +3390,51 @@ class SseAccumulator:
         self._parts: list[str] = []
         self._complete: bool = False
         self._truncated: bool = False
+        # v3.1.7 (R7/R14): an incremental decoder held for the LIFE of the
+        # accumulator, not one decode() per chunk. `r.aiter_raw()` yields
+        # chunks at arbitrary TCP-read boundaries that have nothing to do
+        # with UTF-8 character boundaries: decoding each chunk independently
+        # with errors="replace" turned a multibyte character split across
+        # two reads into U+FFFD on BOTH sides of the split — silently, with
+        # the stored text differing from what the client actually received
+        # (the raw bytes are forwarded unmodified by `yield chunk` above).
+        # Found independently by four reviewers; measured 9 of 153 real
+        # split points corrupted the text, 0 of 107 ever set holed(). The
+        # incremental decoder carries a partial multibyte sequence across
+        # the feed() boundary and resolves it once the rest arrives — see
+        # finalize() for the case where the stream ends before it does.
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        # v3.1.4: set when this accumulator KNOWS text() has a hole in it.
+        # Sticky — a later good chunk cannot un-drop an earlier one — and
+        # read by the memory tail (decide_memory_tail), which skips on it
+        # unconditionally. v3.1.7: before the incremental decoder above, the
+        # only thing that could set this was the `except Exception` in
+        # feed(), and errors="replace" made that unreachable in production —
+        # the flag guarded an impossible case while the real holes (a split
+        # character; a dropped event that carried real content) set
+        # nothing. See feed() and finalize() for where it is actually set
+        # now.
+        self._holed: bool = False
 
     def feed(self, chunk: bytes) -> None:
         try:
-            self._buffer += chunk.decode("utf-8", errors="replace")
+            self._buffer += self._decoder.decode(chunk, final=False)
         except Exception as e:
-            # Dropping a chunk here does not fail the request — the user still
-            # sees the full reply, because the bytes are forwarded separately.
-            # What is lost is this accumulator's copy, so the memory tail
-            # extracts facts, embeds and summarizes a reply with a hole in it,
-            # and .complete() may still say the stream finished cleanly. Once
-            # per process: feed() runs per SSE chunk. (v3.1 P0-2b / F61.)
+            # Defensive only, kept for this class's "failures never raise"
+            # contract: the incremental decoder above, held with
+            # errors="replace", does not raise on malformed or split UTF-8
+            # — that is exactly what made this branch unreachable in
+            # production (see the __init__ comment) and is what the
+            # R7/R14 fix relies on. What remains reachable here is a
+            # caller-side contract violation (e.g. `chunk` not being
+            # bytes), which is a programming error, not a network
+            # condition.
+            self._holed = True
             if logsetup.log_once("accumulator.feed.decode"):
                 logger.warning(
                     f"stream accumulator dropped a chunk ({type(e).__name__}: "
-                    f"{e}); the assistant text memorized for this turn is "
-                    f"incomplete"
+                    f"{e}); the assistant text for this turn has a hole in "
+                    f"it and will not be memorized"
                 )
             return
         while "\n\n" in self._buffer:
@@ -2894,7 +3464,42 @@ class SseAccumulator:
                         self._parts.append(content)
                 except (json.JSONDecodeError, IndexError, KeyError, TypeError):
                     # Single malformed event — drop it, keep accumulating.
-                    pass
+                    # v3.1.7 (R7/R14, C's finding at test_sse_accumulator.py:
+                    # 97): if the payload we could not parse looked like it
+                    # carried reply content, its text is gone from text()
+                    # the same way a decode hole is — nothing downstream can
+                    # tell the difference — so it sets the same flag.
+                    if '"content"' in payload:
+                        self._holed = True
+                        if logsetup.log_once("accumulator.feed.parse"):
+                            logger.warning(
+                                "stream accumulator dropped a malformed SSE "
+                                "event that appears to have carried reply "
+                                "content; the assistant text for this turn "
+                                "has a hole in it and will not be memorized"
+                            )
+
+    def finalize(self) -> None:
+        """Flush the incremental decoder. Call exactly once, after the last
+        feed(), before text()/holed() are trusted.
+
+        v3.1.7 (R7/R14): a stream that disconnects mid-character leaves
+        undecoded bytes sitting in the decoder that feed() alone never
+        resolves — `codecs`' buffered UTF-8 decoder exposes them via
+        `.buffer` before the final flush. errors="replace" still means
+        `decode(final=True)` returns U+FFFD instead of raising, so the only
+        way to know a real gap happened is to check the buffer first.
+        """
+        incomplete = bool(self._decoder.buffer)
+        self._buffer += self._decoder.decode(b"", final=True)
+        if incomplete:
+            self._holed = True
+            if logsetup.log_once("accumulator.finalize.incomplete"):
+                logger.warning(
+                    "stream accumulator ended with an incomplete UTF-8 "
+                    "sequence still buffered; the assistant text for this "
+                    "turn has a hole in it and will not be memorized"
+                )
 
     def text(self) -> str:
         return "".join(self._parts)
@@ -2924,9 +3529,38 @@ class SseAccumulator:
         confidently phrased right up to where it stops."""
         return self._truncated
 
+    def holed(self) -> bool:
+        """True when this accumulator KNOWS text() has a gap in it that
+        nothing downstream can see: a content-bearing SSE event that failed
+        to parse, a caller-side decode error (feed()), or the stream ending
+        mid-character (finalize()) — see those methods and the __init__
+        comment for why a split-but-eventually-complete character does NOT
+        set this (v3.1.7, R7/R14): the incremental decoder resolves that
+        case on its own, and flagging every chunk boundary would make this
+        fire on nearly every real stream.
+
+        Same doctrine as portability._substantial_reasons, inverted: text we
+        KNOW we could not read completely counts as unsafe, never as safe.
+        Trimming a holed text to its last sentence would make it worse, not
+        better — the sentence boundary is real, the sentence before it may
+        be missing its middle — so decide_memory_tail skips on this flag
+        before it looks at anything else, including on the clean-finish
+        path, where a hole was memorized silently until v3.1.4."""
+        return self._holed
+
     def usable(self) -> bool:
-        """The gate the memory tail should use: the model finished, and it
-        finished because it was done rather than because it ran out of room."""
+        """Describes the STREAM: the model finished, and it finished because
+        it was done rather than because it ran out of room.
+
+        This is NOT the memory decision, and has not been since v3.1.4. It
+        was: both call sites gated the memory tail on it, so every reply she
+        stopped by hand and every reply vLLM cut at the ceiling was discarded
+        from memory whole — 63 exchanges in one log window on 2026-09-01,
+        more than half her recent conversation. The memory decision now lives
+        in decide_memory_tail, which trims a cut reply to its last complete
+        sentence and judges what is left. Gating the tail on this method
+        again would reintroduce that loss; it is kept because "did the stream
+        finish cleanly" is still a true thing to be able to ask."""
         return self._complete and not self._truncated
 
 
@@ -3008,17 +3642,19 @@ async def _async_tail(
     what gets merged and written back — the facts left out of this turn's
     working set must keep their real last_used or eviction stops meaning
     anything (v3.1 F9). `injected_facts` is the budget-bounded subset of those
-    same dicts that the request path actually put in front of the model. They
-    are separate because the two jobs need different lists: only the second may
-    be handed to the extractor, which is a request to vLLM and therefore has a
-    window.
+    same dicts that the request path actually put in front of the model.
+
+    What the extractor is handed is neither of those two lists verbatim: it is
+    `touched_facts` bounded by the STORE cap, plus anything in
+    `injected_facts` that bound left out. The extraction prompt must stay
+    bounded — it is a request to vLLM and therefore has a window — but
+    bounding it by the 400-token INJECTION budget threw away three quarters of
+    the extractor's duplicate-suppression list, which is what the call site
+    below explains at length.
 
     `injected_facts` is keyword-only with a default so no caller is broken by
-    its arrival, and the default is `select_for_injection(touched_facts)` —
-    not `touched_facts` — so a caller that never learned about it still cannot
-    push the whole store into an extraction prompt. The request path passes
-    the real list because it already computed one; recomputing here would
-    answer the question against a store that may have moved since.
+    its omission; omitting it costs only the union above, because the store
+    cap is applied either way.
     """
     # V2.3 Theme 2: under disk pressure, stop GROWING memory but keep
     # serving. The chat response already went out; this tail is pure
@@ -3083,14 +3719,50 @@ async def _async_tail(
     async with conv_lock(conv_id):
         try:
             async with httpx.AsyncClient() as client:
-                # The BOUNDED set, not the whole store. facts.py now trims its
-                # own input, so passing the store no longer overflows the
-                # window — but the trim it would apply is a second, later
-                # opinion about which facts matter, computed from a store that
-                # may have grown since. Handing it what the model was actually
-                # shown means the extractor is told about the same facts the
-                # assistant reply was written against, so "already known" means
-                # the same thing on both sides of the exchange.
+                # BOUNDED, but by the STORE cap — not by the injection cap.
+                #
+                # This list becomes the extractor's "EXISTING FACTS", and
+                # facts._EXTRACTION_SYSTEM_PROMPT says "Do NOT restate facts
+                # already in the EXISTING FACTS list below" one line above
+                # "When in doubt, extract." It is the ONLY duplicate
+                # suppression the extraction call has, against a prompt
+                # deliberately tuned to over-extract.
+                #
+                # v3.1.6 split one knob into two (store 1500 /
+                # COMPACTOR_MAX_FACTS_TOKENS, injection 400 /
+                # COMPACTOR_INJECT_FACTS_TOKENS) and this call site kept
+                # taking the injection-bounded list, so the suppression list
+                # shrank with it: measured on a realistic store, 114 facts
+                # down to 28 — ~75% of the signal gone. What that buys is
+                # byte-identical re-extractions, which cost dedup LLM calls
+                # (the exact cost the F1 dedup work was cutting), churn the
+                # store, and bring eviction forward. One knob doing two jobs
+                # again, at a different seam.
+                #
+                # Still bounded, because this is a request to vLLM and vLLM
+                # has a window: the store cap is what prune_facts already
+                # holds the store to, so in normal operation this is the
+                # whole store and nothing more, and facts._fit_extraction_input
+                # narrows it again against the real extraction budget.
+                # No query_text: relevance order is meaningless to a
+                # "have I already stored this?" check, and asking for it
+                # would spend an embedding call per turn to sort a list
+                # whose ORDER nothing reads.
+                extraction_facts = facts.select_for_injection(
+                    touched_facts, max_tokens=facts._MAX_FACTS_TOKENS
+                )
+                if injected_facts:
+                    # Whatever the model was actually shown is in the list too,
+                    # even in the one case the two selections can disagree (a
+                    # store over the store cap — which v3.1 F9 now allows to
+                    # persist when an archive write fails — where a
+                    # relevance-ranked injection can include an LRU-cold fact
+                    # the store-cap walk left out). Cheap, and it keeps
+                    # "already known" true on both sides of the exchange.
+                    seen = {f.get("text") for f in extraction_facts}
+                    extraction_facts = extraction_facts + [
+                        f for f in injected_facts if f.get("text") not in seen
+                    ]
                 # conv_id is logging only, and it is what makes a lost
                 # extraction attributable to the turn that lost it.
                 new_strs = await facts.extract_facts_from_exchange(
@@ -3099,12 +3771,7 @@ async def _async_tail(
                     MODEL_REPO or "",
                     last_user_text,
                     assistant_text,
-                    (
-                        injected_facts if injected_facts is not None
-                        else facts.select_for_injection(
-                            touched_facts, query_text=last_user_text
-                        )
-                    ),
+                    extraction_facts,
                     conv_id=conv_id,
                 )
                 from facts import _now_unix
@@ -3232,6 +3899,77 @@ async def _async_tail(
                 )
         except Exception as e:
             logger.exception(f"conv={conv_id}: async rollup failed: {e}")
+
+
+def _run_memory_tail(
+    conv_id: str,
+    text: str,
+    *,
+    finished: bool,
+    truncated: bool,
+    holed: bool,
+    touched_facts: list[dict],
+    last_user_text: str,
+    turn_index: int,
+    messages: list[dict],
+    injected_facts: list[dict] | None,
+) -> TailDecision:
+    """Decide, count, log, and (maybe) fire the memory tail — for BOTH
+    /v1/chat/completions call sites, so that no line of tail policy or
+    bookkeeping exists at one site and not its twin. The sites reduce to
+    argument-passing: the streaming one hands in the accumulator's three
+    flags, the non-streaming one `finished=True` and finish_reason.
+
+    Returns the decision so a caller (or a test) can see what was done.
+    """
+    decision = decide_memory_tail(
+        text, finished=finished, truncated=truncated, holed=holed
+    )
+    # Counted before it is logged, and before the tail is fired: the counter
+    # is what /health/full reads, and a skip that is only a log line is the
+    # defect this exists to close (63 exchanges in one 2026-09-01 window,
+    # weeks unnoticed). tailhealth returns the streak for THIS line rather
+    # than logging it under its own logger — see its module docstring.
+    streak = tailhealth.note(
+        decision.outcome,
+        raw_chars=decision.raw_chars,
+        kept_chars=len(decision.text) if decision.store else 0,
+    )
+    if not decision.store:
+        # WARNING, not INFO. If a client sends a max_tokens below the
+        # model's usual reply length, EVERY reply finishes as "length" and
+        # this branch runs on all of them — that was the 2026-08-28 shape
+        # exactly: correct local behaviour, no error, and the user
+        # experiencing an assistant that had stopped remembering. The skip
+        # is right; being quiet about it is not. "skipping memory tail" is
+        # the phrase the pod is grepped for; keep it.
+        logger.warning(
+            f"conv={conv_id}: {decision.reason} — skipping memory tail "
+            f"({decision.raw_chars} chars accumulated; {streak})"
+        )
+        return decision
+    if decision.reason:
+        # A trimmed store. INFO: it is the fix working, not a fault — but
+        # say what was cut, so `grep "stream ended"` still finds every
+        # stopped reply after the upgrade and can see what became of it.
+        logger.info(
+            f"conv={conv_id}: {decision.reason}; memorizing the "
+            f"{len(decision.text)} of {decision.raw_chars} chars that end "
+            f"on a sentence boundary"
+        )
+    _fire_and_forget(
+        _async_tail(
+            conv_id,
+            touched_facts,
+            last_user_text,
+            decision.text,
+            turn_index,
+            messages,  # original request messages, for rollup
+            injected_facts=injected_facts,
+        ),
+        label=f"tail conv={conv_id}",
+    )
+    return decision
 
 
 # ---------------------------------------------------------------------------
@@ -3751,6 +4489,7 @@ async def chat_completions(request: Request) -> Any:
     # when that load fails — an unreadable summary is exactly when you want the
     # rest of the line.
     last_turn: object = "?"
+    turns_seen: object = "?"
     if conv_id:
         # --- Persona (Phase 8) ---
         # Two paths feed the persona layer:
@@ -3886,6 +4625,14 @@ async def chat_completions(request: Request) -> Any:
         try:
             sstate = summarizer.load_state(conv_id)
             last_turn = sstate.get("last_summarized_turn", "?")
+            # v3.1.4: paired with lastturn in the injection line below.
+            # Under pipelines/conversation_id_header.py's max_turns cap, msgs=
+            # is pinned at the cap forever, so it stopped being evidence of
+            # anything about the conversation's size. seen= is the compactor's
+            # own count and is the number that says whether the hierarchy is
+            # keeping pace: seen climbing while lastturn stands still for more
+            # than COMPACTOR_L1_CHUNK_SIZE turns is a stalled rollup.
+            turns_seen = sstate.get("turns_seen", 0)
             # 60% of the injection budget: at production config that is
             # ~4,900 tokens, which reproduces the old working behaviour
             # (summary trimmed newest-kept, facts and persona still fit) and
@@ -3970,7 +4717,8 @@ async def chat_completions(request: Request) -> Any:
                 # window is visible without cross-referencing anything.
                 logger.info(
                     f"conv={conv_id}: injected memory [{' '.join(log_parts)}] "
-                    f"msgs={len(messages)} lastturn={last_turn}"
+                    f"msgs={len(messages)} lastturn={last_turn} "
+                    f"seen={turns_seen}"
                 )
             except Exception as e:
                 logger.warning(f"conv={conv_id}: memory injection failed (non-fatal): {e}")
@@ -4177,55 +4925,36 @@ async def chat_completions(request: Request) -> Any:
                     yield b"data: [DONE]\n\n"
             finally:
                 await client.aclose()
+                # v3.1.7 (R7/R14): flush the incremental decoder before
+                # text()/holed() are read below. Unconditional and cheap —
+                # a no-op when nothing was ever fed(), which is the case on
+                # every path that set vllm_failed without touching
+                # accumulator.
+                accumulator.finalize()
                 # Fire-and-forget post-response work once the stream is done.
                 # Skip it when vLLM failed — there's no real assistant turn to
-                # extract/index from — and when the stream never COMPLETED
-                # (client hit Stop / tab closed mid-reply): memorizing a
-                # half-sentence as though the model said it plants false
-                # "memories" in facts/RAG/summaries (rc6 review).
-                if conv_id and not vllm_failed and not accumulator.usable():
-                    _why = (
-                        "truncated at the generation ceiling "
-                        "(finish_reason=length)"
-                        if accumulator.truncated()
-                        else "ended without completion"
-                    )
-                    # WARNING, not INFO. If a client sends a max_tokens
-                    # below the model's usual reply length, EVERY reply
-                    # finishes as "length" and this branch silently stops all
-                    # memory writing — facts, episodic and rollups — for the
-                    # life of that setting. That is the 2026-08-28 shape
-                    # exactly: correct local behaviour, no error, and the user
-                    # experiencing an assistant that has stopped remembering.
-                    # The skip is right; being quiet about it is not.
-                    logger.warning(
-                        f"conv={conv_id}: stream {_why} "
-                        f"({len(accumulator.text())} chars accumulated) — "
-                        f"skipping memory tail for the partial reply"
-                    )
-                _degen = (
-                    reply_is_degenerate(accumulator.text())
-                    if (conv_id and not vllm_failed and accumulator.usable())
-                    else None
-                )
-                if _degen:
-                    logger.warning(
-                        f"conv={conv_id}: reply looks like a repetition loop "
-                        f"({_degen}) — skipping memory tail so it cannot be "
-                        f"extracted as facts, indexed, or rolled into a summary"
-                    )
-                if conv_id and not vllm_failed and accumulator.usable() and not _degen:
-                    _fire_and_forget(
-                        _async_tail(
-                            conv_id,
-                            touched_facts,
-                            last_user_text,
-                            accumulator.text(),
-                            turn_index,
-                            messages,  # original request messages, for rollup
-                            injected_facts=injected_facts,
-                        ),
-                        label=f"tail conv={conv_id}",
+                # extract/index from. Everything else about whether, and how
+                # much of, this reply enters memory is decide_memory_tail's
+                # call, made through _run_memory_tail, which the non-streaming
+                # path invokes identically: no line of tail policy or
+                # bookkeeping exists at one site only. Until v3.1.4 this site
+                # was three separate `if`s re-evaluating usable() and its twin
+                # was an if/elif/elif with no complete() analogue at all —
+                # the drift that lost 63 exchanges from memory in one log
+                # window, and the eighteenth "fixed at one site, missed at
+                # the other" on this branch.
+                if conv_id and not vllm_failed:
+                    _run_memory_tail(
+                        conv_id,
+                        accumulator.text(),
+                        finished=accumulator.complete(),
+                        truncated=accumulator.truncated(),
+                        holed=accumulator.holed(),
+                        touched_facts=touched_facts,
+                        last_user_text=last_user_text,
+                        turn_index=turn_index,
+                        messages=messages,  # original request messages, for rollup
+                        injected_facts=injected_facts,
                     )
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -4310,23 +5039,25 @@ async def chat_completions(request: Request) -> Any:
                 or ""
             )
         except (IndexError, KeyError, TypeError) as e:
-            # An unexpected response shape leaves assistant_text empty, and the
-            # tail below still fires — so the exchange is memorized as a user
-            # turn answered by nothing. Indistinguishable from a model that
-            # replied with silence unless we say so. Once per process: this is
-            # the request path. (v3.1 P0-2b / F61.)
+            # An unexpected response shape leaves assistant_text empty. Since
+            # v3.1.4 decide_memory_tail skips an empty reply, so the exchange
+            # is not memorized at all — which is indistinguishable from a
+            # model that replied with silence unless we say so. Once per
+            # process: this is the request path. (v3.1 P0-2b / F61.)
             if logsetup.log_once("nonstream.assistant_text"):
                 logger.warning(
                     f"conv={conv_id}: could not read assistant text from the "
-                    f"vLLM response ({type(e).__name__}: {e}); this turn is "
-                    f"memorized without the model's reply"
+                    f"vLLM response ({type(e).__name__}: {e}); this turn "
+                    f"will not be memorized"
                 )
-        # Same gate the streaming path applies via SseAccumulator.usable().
-        # This path had no finish_reason check at all, so a reply vLLM cut off
-        # at the generation ceiling was memorized as a completed assistant turn
-        # — fact-extracted, indexed into RAG, rolled into summaries. The
-        # streaming path guarded the client-disconnect case (F20) and this one
-        # guarded nothing, which is the half-applied shape worth watching for.
+        # The same policy the streaming path applies, through the same helper
+        # (_run_memory_tail / decide_memory_tail). This path has no complete()
+        # analogue — a non-streaming response is whole by construction — so
+        # `finished` is True here and the only cut it can see is
+        # finish_reason=length. Until v3.1.4 this site had no finish_reason
+        # check at all (a reply cut at the ceiling was memorized as complete),
+        # then an if/elif/elif that its streaming twin did not share; the
+        # shared helper is what stops the two drifting a nineteenth time.
         _finish_reason = ""
         try:
             _finish_reason = (
@@ -4334,32 +5065,18 @@ async def chat_completions(request: Request) -> Any:
             )
         except (IndexError, KeyError, TypeError):
             _finish_reason = ""
-        if conv_id and _finish_reason == "length":
-            # WARNING for the same reason as the streaming path above.
-            logger.warning(
-                f"conv={conv_id}: reply truncated at the generation ceiling "
-                f"(finish_reason=length, {len(assistant_text)} chars) — "
-                f"skipping memory tail for the partial reply"
-            )
-        elif conv_id and (_degen := reply_is_degenerate(assistant_text)):
-            logger.warning(
-                f"conv={conv_id}: reply looks like a repetition loop "
-                f"({_degen}) — skipping memory "
-                f"tail so it cannot be extracted as facts, indexed, or rolled "
-                f"into a summary"
-            )
-        elif conv_id:
-            _fire_and_forget(
-                _async_tail(
-                    conv_id,
-                    touched_facts,
-                    last_user_text,
-                    assistant_text,
-                    turn_index,
-                    messages,  # original request messages, for rollup
-                    injected_facts=injected_facts,
-                ),
-                label=f"tail conv={conv_id}",
+        if conv_id:
+            _run_memory_tail(
+                conv_id,
+                assistant_text,
+                finished=True,
+                truncated=_finish_reason == "length",
+                holed=False,
+                touched_facts=touched_facts,
+                last_user_text=last_user_text,
+                turn_index=turn_index,
+                messages=messages,  # original request messages, for rollup
+                injected_facts=injected_facts,
             )
         return JSONResponse(content=response_json, status_code=r.status_code)
     finally:
@@ -4994,26 +5711,37 @@ async def admin_compact(conv_id: str, request: Request):
         messages.append({"role": "assistant", "content": a})
 
     before = summarizer.load_state(conv_id)
-    # REFUSE rather than pull the watermark backwards.
+    # REFUSE rather than summarize the wrong text.
     #
-    # last_summarized_turn is an absolute position in whatever array the LIVE
-    # request path last saw. The transcript here is rebuilt from the episodic
-    # store, which is lossy by design — it holds only exchanges that indexed
-    # successfully. Feeding a shorter reconstruction into maybe_rollup lets
-    # _reconcile_watermark pull the watermark back to it, and the turns in
-    # between are summarized a second time on the next live turn. Duplicate
-    # chunks in her memory is a worse outcome than a command declining to run.
-    _wm = before.get("last_summarized_turn", 0)
-    if len(messages) < _wm:
+    # The transcript here is rebuilt from the episodic store, which is lossy by
+    # design — it holds only exchanges that indexed successfully. Since v3.1.4
+    # the summarizer locates a chunk's text at `position - len(window)` turns
+    # into the array it is handed (summarizer._do_l1_rollup), so a
+    # reconstruction SHORTER than the conversation's position is not merely
+    # short: its slots do not line up with the turns the chunk claims, and a
+    # gapped reconstruction compresses them unpredictably. A chunk labelled
+    # 652-671 whose text is some other twenty turns is worse than no chunk,
+    # because nothing downstream can tell.
+    #
+    # Compared against turns_seen rather than last_summarized_turn (which it
+    # can never be below): the watermark is how far the SUMMARIES got, the
+    # position is how far the CONVERSATION got, and the offset arithmetic is
+    # driven by the second.
+    _pos = max(
+        before.get("turns_seen", 0) or 0,
+        before.get("last_summarized_turn", 0) or 0,
+    )
+    if len(messages) < _pos:
         raise HTTPException(
             status_code=409,
             detail=(
                 f"refusing: the episodic store rebuilds {len(messages)} "
-                f"messages for conv {conv_id}, but the summary watermark is "
-                f"already at {_wm}. Running would pull it backwards and "
-                f"re-summarize covered turns. The reconstruction is lossy by "
-                f"design, so a shortfall means episodic indexing has gaps — "
-                f"not that the summaries are behind."
+                f"messages for conv {conv_id}, but the conversation's "
+                f"recorded position is already turn {_pos}. Running would "
+                f"summarize text that is not the text the chunk labels claim. "
+                f"The reconstruction is lossy by design, so a shortfall means "
+                f"episodic indexing has gaps — not that the summaries are "
+                f"behind."
             ),
         )
     plan = {

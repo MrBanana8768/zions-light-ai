@@ -306,6 +306,129 @@ def test_export_is_json_serializable():
 
 
 # ---------------------------------------------------------------------------
+# merge_conversation — R5 (v3.1.7): pin/last_used must survive a collision,
+# not be silently discarded because dst's copy "wins".
+# ---------------------------------------------------------------------------
+
+def test_merge_conversation_adds_new_facts_and_leaves_source_intact():
+    print("\n[test] merge_conversation unions non-colliding facts, src untouched")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-1")
+    reset_state("merge-dst-1")
+    facts.save_facts(
+        "merge-src-1",
+        [{"text": "The lighthouse has a red door.", "added_turn": 5, "last_used": 300}],
+    )
+    facts.save_facts(
+        "merge-dst-1",
+        [{"text": "The user prefers past tense.", "added_turn": 1, "last_used": 100}],
+    )
+    result = portability.merge_conversation("merge-src-1", "merge-dst-1", dry_run=False)
+    assert_eq(result["facts_added"], 1, "one new fact added")
+    dst_texts = {f["text"] for f in facts.load_facts("merge-dst-1")}
+    assert_true("The lighthouse has a red door." in dst_texts, "new fact landed in dst")
+    assert_true("The user prefers past tense." in dst_texts, "dst's own fact still there")
+    assert_eq(len(facts.load_facts("merge-src-1")), 1, "source untouched by the merge")
+
+
+def test_merge_conversation_pins_the_destination_copy_on_collision():
+    print("\n[test] R5: a pinned source fact merging into an unpinned dst copy "
+          "comes out pinned, not silently un-pinned")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-2")
+    reset_state("merge-dst-2")
+    # _fact_key casefolds and collapses whitespace, so this is deliberately
+    # NOT byte-identical text — the backlog is explicit that R5 fires on
+    # non-identical pairs too.
+    facts.save_facts(
+        "merge-src-2",
+        [{"text": "Her name is Elena and she goes by El.",
+          "added_turn": 3, "last_used": 500, "pin": True}],
+    )
+    facts.save_facts(
+        "merge-dst-2",
+        [{"text": "her name is elena and she goes by el.",
+          "added_turn": 40, "last_used": 900, "pin": False}],
+    )
+    result = portability.merge_conversation("merge-src-2", "merge-dst-2", dry_run=False)
+    after = facts.load_facts("merge-dst-2")
+    assert_eq(len(after), 1, "still exactly one row, not two")
+    # The core R5 assertion, checked before anything about the reporting
+    # fields below — this is the one that must fail loudly on old code, not
+    # as a side effect of a KeyError on a field the fix happens to add.
+    assert_true(after[0]["pin"], "destination's copy is now pinned")
+    assert_eq(result["facts_added"], 0, "no NEW row — the key already existed")
+    assert_eq(result.get("facts_pin_or_recency_updated"), 1, "the collision is reported")
+    # last_used: the fresher of the two (dst's 900 already beat src's 500).
+    assert_eq(after[0]["last_used"], 900, "last_used is the max of the two")
+    # added_turn: dst's own value survives untouched — merging two different
+    # conversations' turn numbering is not meaningful (see
+    # _merge_fact_pin_and_recency's docstring).
+    assert_eq(after[0]["added_turn"], 40, "added_turn is dst's own, not touched")
+    # dst's own wording survives — the two texts differed only in case/full
+    # stop, and the key match does not mean byte-identical text.
+    assert_eq(after[0]["text"], "her name is elena and she goes by el.",
+              "dst's own wording is kept")
+
+
+def test_merge_conversation_last_used_takes_the_max_either_direction():
+    print("\n[test] merge collision keeps the fresher last_used, whichever side it's on")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-3")
+    reset_state("merge-dst-3")
+    facts.save_facts(
+        "merge-src-3",
+        [{"text": "The story is set on Brannock.", "added_turn": 1, "last_used": 9999}],
+    )
+    facts.save_facts(
+        "merge-dst-3",
+        [{"text": "The story is set on Brannock.", "added_turn": 1, "last_used": 100}],
+    )
+    portability.merge_conversation("merge-src-3", "merge-dst-3", dry_run=False)
+    after = facts.load_facts("merge-dst-3")
+    assert_eq(after[0]["last_used"], 9999, "src's fresher last_used wins even though src is not kept as the row")
+
+
+def test_merge_conversation_dry_run_previews_the_pin_update_without_writing():
+    print("\n[test] merge_conversation dry_run reports the pin update but changes nothing")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-4")
+    reset_state("merge-dst-4")
+    facts.save_facts(
+        "merge-src-4",
+        [{"text": "Idris keeps a logbook.", "added_turn": 1, "last_used": 50, "pin": True}],
+    )
+    facts.save_facts(
+        "merge-dst-4",
+        [{"text": "Idris keeps a logbook.", "added_turn": 1, "last_used": 50, "pin": False}],
+    )
+    result = portability.merge_conversation("merge-src-4", "merge-dst-4", dry_run=True)
+    assert_eq(result["dry_run"], True, "dry_run flag echoed")
+    assert_eq(result.get("facts_pin_or_recency_to_update"), 1, "preview reports the pending pin update")
+    after = facts.load_facts("merge-dst-4")
+    assert_eq(after[0]["pin"], False, "dry run changed nothing on disk")
+
+
+def test_merge_conversation_byte_identical_duplicate_is_a_true_no_op():
+    print("\n[test] a genuinely identical pair (same pin, same or lower last_used) "
+          "is reported as skipped, not as an update")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-5")
+    reset_state("merge-dst-5")
+    facts.save_facts(
+        "merge-src-5",
+        [{"text": "Setting: Aethermere.", "added_turn": 9, "last_used": 100, "pin": True}],
+    )
+    facts.save_facts(
+        "merge-dst-5",
+        [{"text": "Setting: Aethermere.", "added_turn": 1, "last_used": 100, "pin": True}],
+    )
+    result = portability.merge_conversation("merge-src-5", "merge-dst-5", dry_run=False)
+    assert_eq(result.get("facts_pin_or_recency_updated"), 0, "nothing actually changed")
+    assert_eq(result["facts_skipped_duplicate"], 1, "counted as a true duplicate")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -322,6 +445,11 @@ def _all_tests():
         test_fork_creates_independent_copy,
         test_fork_with_explicit_new_id,
         test_export_is_json_serializable,
+        test_merge_conversation_adds_new_facts_and_leaves_source_intact,
+        test_merge_conversation_pins_the_destination_copy_on_collision,
+        test_merge_conversation_last_used_takes_the_max_either_direction,
+        test_merge_conversation_dry_run_previews_the_pin_update_without_writing,
+        test_merge_conversation_byte_identical_duplicate_is_a_true_no_op,
     ]
 
 
