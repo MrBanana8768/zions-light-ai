@@ -5727,10 +5727,18 @@ async def admin_compact(conv_id: str, request: Request):
     # can never be below): the watermark is how far the SUMMARIES got, the
     # position is how far the CONVERSATION got, and the offset arithmetic is
     # driven by the second.
-    _pos = max(
-        before.get("turns_seen", 0) or 0,
-        before.get("last_summarized_turn", 0) or 0,
-    )
+    # summarizer._recorded_position, not a local max() of the two counters.
+    # v3.1.7 (R12): a state file written by the pre-v3.1.4 code under a cap has
+    # its watermark PULLED DOWN below the chunks it is supposed to track, and
+    # turns_seen absent entirely. Both counters then read low, this guard
+    # PERMITS a rebuild it should refuse, and the chunks come back labelled
+    # against a position that is hundreds of turns short. The chunk labels are
+    # the record; the watermark is a pointer derived from them, and it is the
+    # only one of the three the old _reconcile_watermark could erase. One
+    # function decides what "how far has this conversation got" means, here and
+    # in the summarizer, so the endpoint and the rollup cannot disagree about
+    # it — which is the disagreement R13 is still open on.
+    _pos = summarizer._recorded_position(before)
     if len(messages) < _pos:
         raise HTTPException(
             status_code=409,

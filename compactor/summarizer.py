@@ -160,6 +160,15 @@ def _empty_state(conv_id: str) -> dict:
         "last_summarized_turn": 0,
         "turns_seen": 0,
         "tail_fp": [],
+        # v3.1.7 (R18). The anchor alone cannot tell "the client re-sent the
+        # same window" from "the client appended one more exchange" when the
+        # conversation's tail REPEATS — two consecutive degenerate replies
+        # redact to byte-identical placeholders, and "ok"/"Sure." twice does
+        # it without any redaction. These two say whether the window itself
+        # changed: under a cap the first turn slides out on every exchange,
+        # and an unchanged window keeps both its head and its length.
+        "head_fp": "",
+        "window_turns": 0,
     }
 
 
@@ -207,6 +216,13 @@ def load_state(conv_id: str) -> dict:
         state["turns_seen"] = data["turns_seen"]
     if isinstance(data.get("tail_fp"), list):
         state["tail_fp"] = [x for x in data["tail_fp"] if isinstance(x, str)]
+    # v3.1.7. Absent on every file written before this release. Missing, they
+    # read as "the window is not known to be unchanged", which is the side
+    # that duplicates a summary rather than the side that stalls the position.
+    if isinstance(data.get("head_fp"), str):
+        state["head_fp"] = data["head_fp"]
+    if isinstance(data.get("window_turns"), int):
+        state["window_turns"] = data["window_turns"]
     if parked["l1"] or parked["l2"] or parked["l3"] is not None:
         state[_UNRECOGNIZED] = parked
     return state
@@ -650,6 +666,47 @@ _ANCHOR_TURNS = 4
 # (there the window is unchanged, so the anchor matches and this never runs).
 _ASSUMED_NEW_TURNS = 2
 
+# How many trailing turns are fingerprinted per call (v3.1.7, R17). The whole
+# history used to be hashed on the event loop inside conv_lock, on EVERY turn:
+# measured 47 ms per call at 660 turns of her real reply length, linear in
+# history and growing for the life of the conversation. The alignment below
+# only ever needs the anchor plus whatever arrived after it, and main.py calls
+# maybe_rollup once per exchange, so 64 turns is 32 exchanges of slack against
+# a per-call rate of one. Beyond that the anchor falls off the end and the
+# call degrades to _ASSUMED_NEW_TURNS with the warning that already exists —
+# the same degradation as an anchor the client never echoed back.
+_FINGERPRINT_TAIL_TURNS = 64
+
+
+def _image_only_marker(m: dict) -> str:
+    """What the EPISODIC STORE will remember an image-only turn as, or "".
+
+    The twin of main._memorable_user_text / main._message_image_count, and it
+    has to stay byte-identical to them (R15). `_message_text` is "" for a
+    content list with no text part, while the store holds "[shared 1 image]"
+    — so the live path fingerprinted one string and /admin/compact's
+    reconstruction fingerprinted another, and a mismatch in anchor[0] defeats
+    every prefix in _align_candidates. The position then inflated by 2 per
+    rollup and stayed inflated, so window_offset subtracted 2 forever and two
+    turns were summarized twice.
+
+    It cannot import main: main imports summarizer, so the constant is
+    duplicated here rather than shared. If main's marker changes, change this
+    one in the same commit — the fingerprints must agree.
+    """
+    content = m.get("content")
+    if not isinstance(content, list):
+        return ""
+    n = 0
+    for c in content:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") in ("image_url", "image", "input_image") or "image_url" in c:
+            n += 1
+    if not n:
+        return ""
+    return f"[shared {n} image{'s' if n > 1 else ''}]"
+
 
 def _turn_fingerprints(messages: list[dict]) -> list[str]:
     """One short content hash per observed turn, oldest first, system skipped.
@@ -661,12 +718,20 @@ def _turn_fingerprints(messages: list[dict]) -> list[str]:
     as a different turn. Truncated to 16 hex chars: at ~10^4 turns per
     conversation the collision probability is ~10^-11, and the whole anchor
     lives in a state file that is read and written on every rollup.
+
+    A turn with images and no text is fingerprinted as the episodic store
+    will remember it (see _image_only_marker), not as the empty string its
+    request shape reduces to. The marker never leaves this function — it is
+    hashed, never stored and never summarized — so nothing can extract it as
+    a fact.
     """
     out: list[str] = []
     for m in messages:
         if m.get("role") == "system":
             continue
         text = " ".join(_message_text(m).split())
+        if not text:
+            text = _image_only_marker(m)
         payload = f"{m.get('role', 'unknown')}\x00{text}"
         out.append(
             hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()[:16]
@@ -674,128 +739,303 @@ def _turn_fingerprints(messages: list[dict]) -> list[str]:
     return out
 
 
-def _align_new_turns(anchor: list[str], fps: list[str]) -> int | None:
-    """How many turns at the END of `fps` are new, relative to a conversation
-    whose last `len(anchor)` turns were `anchor`. None if it cannot be told.
+def _align_candidates(anchor: list[str], fps: list[str]) -> list[int]:
+    """Every "how many turns at the END of `fps` are new" that the anchor
+    supports, sorted ascending and de-duplicated. Empty if it cannot be told.
 
     `anchor` is oldest-first and ends at the previous position, so a match on
     the whole anchor ending at window slot j means slot j IS the previous
     position and everything after it is new.
 
-    PREFIXES ARE TRIED, LONGEST FIRST, and that is what makes a regeneration
-    cost nothing. Regenerating the last reply rewrites the newest turn and
-    leaves the three before it alone: the full anchor is nowhere in the new
-    window, the 3-element prefix is, ending one slot earlier — so `new` comes
-    out 0, which is the truth (a replaced turn is not a new turn). Without the
-    prefix walk that reads as one fresh exchange, and a position that is 2
-    ahead of reality shifts every later chunk boundary by 2, which is a 2-turn
-    HOLE in what the hierarchy summarizes. Direction matters here: over-
-    counting drops turns, under-counting merely summarizes some twice.
+    PREFIXES ARE TRIED, and that is what makes a regeneration cost nothing.
+    Regenerating the last reply rewrites the newest turn and leaves the three
+    before it alone: the full anchor is nowhere in the new window, the
+    3-element prefix is, ending one slot earlier — so `new` comes out 0, which
+    is the truth (a replaced turn is not a new turn). Without the prefix walk
+    that reads as one fresh exchange, and a position that is 2 ahead of
+    reality shifts every later chunk boundary by 2, which is a 2-turn HOLE in
+    what the hierarchy summarizes.
 
-    j is scanned DOWNWARD for the same reason. The latest occurrence is the
-    smallest `new` consistent with the evidence, so a short repeated turn
-    ("ok") that collides with an older one lands on the side that duplicates
-    rather than the side that loses.
+    EVERY match is scored, not just the first one found. Until v3.1.7 the walk
+    returned the first hit of the LONGEST matching prefix, which is a
+    different rule from the one the docstring claimed ("the latest
+    occurrence"): anchor [A,B,C,D] against [A,B,C,D,X,Y,A,B,C] returned 5
+    because the 4-element prefix matches early, while the 3-element prefix
+    matches at the very end for 0 (R20). Returning the candidate list lets the
+    caller apply the recency rule uniformly AND see when the evidence is
+    ambiguous, which is the only way to tell a repeating tail (R18) from a
+    window that genuinely did not move.
     """
     n = len(fps)
+    out: set[int] = set()
     for m in range(len(anchor), 0, -1):
         prefix = anchor[:m]
         for j in range(n, m - 1, -1):
             if fps[j - m:j] == prefix:
                 # The prefix ends (len(anchor) - m) turns before the previous
                 # position, so those turns are already accounted for.
-                return max(0, n - j - (len(anchor) - m))
-    return None
+                out.add(max(0, n - j - (len(anchor) - m)))
+    return sorted(out)
+
+
+def _align_new_turns(anchor: list[str], fps: list[str]) -> int | None:
+    """The SMALLEST advance the anchor supports, or None if it supports none.
+
+    Smallest, because direction matters: over-counting drops turns for good,
+    under-counting merely summarizes some of them twice. A short repeated turn
+    ("ok") that collides with an older one must land on the side that
+    duplicates rather than the side that loses.
+
+    _observed_position uses _align_candidates directly — it holds the extra
+    evidence (the window's own length and head) needed to decide whether a
+    zero-advance answer is credible when the tail repeats. This function is
+    that rule with no extra evidence, and is what the unit test pins.
+    """
+    cands = _align_candidates(anchor, fps)
+    return cands[0] if cands else None
+
+
+def _highest_chunk_turn(state: dict) -> int:
+    """The furthest turn any stored chunk claims to cover, across all tiers.
+
+    The chunk list is the RECORD of what was summarized; `last_summarized_turn`
+    is a pointer derived from it. When the two disagree the chunks are the
+    survivors — they carry text, the pointer carries none — so this is a lower
+    bound on the conversation's position that no watermark edit can erase.
+    """
+    highest = 0
+    for c in list(state.get("l1") or []) + list(state.get("l2") or []):
+        lt = c.get("last_turn") if isinstance(c, dict) else None
+        if isinstance(lt, int) and lt > highest:
+            highest = lt
+    l3 = state.get("l3")
+    if isinstance(l3, dict) and isinstance(l3.get("last_turn"), int):
+        highest = max(highest, l3["last_turn"])
+    return highest
+
+
+def _recorded_position(state: dict) -> int:
+    """The furthest turn this conversation is KNOWN to have reached.
+
+    Three sources, and the third is the v3.1.7 repair (R12). `turns_seen` is
+    the compactor's own counter; `last_summarized_turn` covers a state file
+    written before that counter existed; and the CHUNK LABELS cover a state
+    file whose watermark was pulled DOWN by the old _reconcile_watermark
+    (S-5 / REMEDIATION F14) while the chunks it had already written kept their
+    real labels. Seeding from the first two alone restarted the position at
+    the cap on the first post-upgrade request, which is what made every new
+    L1 chunk collide with an old label and be discarded.
+    """
+    return max(
+        int(state.get("turns_seen") or 0),
+        int(state.get("last_summarized_turn") or 0),
+        _highest_chunk_turn(state),
+    )
+
+
+def _repair_watermark_below_chunks(conv_id: str, state: dict) -> bool:
+    """Raise a watermark that sits below the chunks it is supposed to track.
+
+    Every writer in this module advances `last_summarized_turn` to a chunk's
+    `last_turn` in the same state dict it appends the chunk to, so the
+    watermark is never legitimately below the highest label. Below it means
+    the file was written by the old _reconcile_watermark, which pulled the
+    watermark down to the client's array length when a cap shortened it.
+
+    Left alone, that costs twice over: turns 101-280 are re-summarized from
+    the WRONG text (the offset arithmetic no longer matches the labels), and
+    then each new chunk collides with an existing label and is thrown away by
+    the duplicate guard in _do_l1_rollup — silently, for as many turns as the
+    old chunks span. Raising the pointer to what the chunks already prove is
+    the only repair that loses nothing: the text under those labels is
+    summarized, and this module still holds the summaries.
+
+    Returns True if it changed anything, so the caller persists it.
+    """
+    highest = _highest_chunk_turn(state)
+    last = int(state.get("last_summarized_turn") or 0)
+    if highest <= last:
+        return False
+    state["last_summarized_turn"] = highest
+    logger.warning(
+        f"conv={conv_id}: the watermark was at turn {last} while stored "
+        f"chunks already cover through turn {highest} — a state file written "
+        f"by the pre-v3.1.4 watermark reset. Advancing it to {highest}, which "
+        f"is what the chunks themselves record; without this every new chunk "
+        f"would be labelled over an existing one and discarded"
+    )
+    return True
 
 
 def _observed_position(conv_id: str, state: dict, messages: list[dict]) -> int:
     """This conversation's monotonic turn position, updated in `state`.
 
-    Two regimes, and the first one is today's behaviour untouched:
+    THE INVARIANTS, because several separate defects lived in the arithmetic
+    below and the next person needs to be able to check it:
 
-      len(window) > turns_seen — the client sent MORE than we have ever seen,
-        which is every request from a client that re-sends the whole history.
-        The array length IS the position; take it. Identical to the pre-v3.1.4
-        code for those clients, including a conversation resumed from a state
-        file written before `turns_seen` existed.
+      I1. The position is the number of turns the CONVERSATION has reached.
+          It never moves backwards. That is the deliberate reversal of
+          _reconcile_watermark (S-5 / REMEDIATION F14), which pulled the
+          watermark down to the observed count: under a PERSISTENT cap the
+          pull-down happens once and the rollup gate then never opens again.
 
-      len(window) <= turns_seen — the window is bounded, or simply unchanged
-        since the last call. The array cannot answer the question, so the
-        anchor does: align it against this window and add whatever sits past
-        the match.
+      I2. `n`, the count of non-system messages, is a LOWER BOUND on the
+          position and nothing more. Every turn in the window is a real turn
+          of this conversation, so the conversation has at least n of them —
+          but a capped window is a SUFFIX, so n says nothing about how many
+          came before. Until v3.1.7 `n > prev` was read as "the array length
+          IS the position", which is true only while the window is unbounded.
+          A sliding cap does not snap from full history to short window in one
+          step: on the first request where it bites, n is still greater than
+          prev while ALREADY BEING SHORTER than the truth (cap 100, exchange
+          51: the client stores 100 turns, appends turn 101, the valve trims
+          to the last 100, the compactor appends turn 102 -> n = 101 against a
+          truth of 102). One turn of position was swallowed permanently, the
+          chunk labelled 101-120 held turns 102-121, and nothing said so
+          (R23).
 
-    NEVER MOVES BACKWARDS. That is the deliberate reversal of
-    _reconcile_watermark (S-5 / REMEDIATION F14), which pulled the watermark
-    down to the observed count and accepted "a duplicate chunk is the cheap
-    half of the trade". Under a PERSISTENT cap that trade stops being cheap:
-    the pull-down happens once and the gate then never opens again. It also
-    removes the duplicate: the transition case — an existing conversation at
-    watermark 651 when the cap switches on at 100 — anchors on the same four
-    trailing turns the full history ended with, matches at the end of the
-    100-turn window, and reports 0 new turns. The position stays 651 and not
-    one covered turn is summarized twice.
+      I3. `prev + aligned` is the other lower bound: `prev` is monotonic and
+          `aligned` counts the turns past the anchor's match. So the position
+          is `max(n, prev + new)` — the larger of two lower bounds, which is
+          exact whenever either source is exact and never over-counts.
 
-    S-5's own case (a watermark stranded ABOVE a genuinely shorter history)
-    still un-latches, in the same number of turns as the reset did: the
-    position advances 2 per exchange from wherever it was stranded, so the
-    gate opens after L1_CHUNK_SIZE further turns either way. The turn LABELS
-    are then offset from the client's array by a constant, which _do_l1_rollup
-    subtracts back off to find the text — and a constant offset is the one
-    thing that keeps consecutive chunks contiguous.
+      I4. Over-counting drops turns for good; under-counting only summarizes
+          some of them twice. Where the evidence is ambiguous, take the
+          smaller — EXCEPT that "0 new turns" under a cap is not merely
+          conservative, it is a stall: the position is the only thing that
+          advances, so a zero that repeats forever is the frozen hierarchy
+          this release exists to fix, reached by a different route (R18).
+          A zero is therefore only believed when it is unambiguous, or when
+          the window itself is unchanged (same head, same length).
+
+      I5. An empty window is not evidence of anything. A request with no
+          non-system turns at all must leave both the position and the anchor
+          exactly as they were — advancing by an exchange invents two turns,
+          and overwriting the anchor with [] destroys the only thing that can
+          align the NEXT window (R21).
+
+      I6. `prev` comes from _recorded_position, which counts the CHUNK LABELS
+          as well as the two pointers. A chunk labelled a..b is evidence that
+          b turns existed and were summarized, and it is the only one of the
+          three that the old _reconcile_watermark could not erase. Seeding
+          from the pointers alone restarted an upgraded conversation at the
+          cap, so every new chunk was labelled over one that already existed
+          and the duplicate guard threw it away — silently, for hundreds of
+          turns (R12). Where there is no anchor, the labels are also the only
+          evidence that the window in hand is a SUFFIX rather than the whole
+          conversation; see the branch below.
     """
-    n = sum(1 for m in messages if m.get("role") != "system")
-    # max() over both keys, not just turns_seen: a pre-v3.1.4 state file has no
-    # turns_seen at all, and seeding from the watermark is what stops the first
-    # post-upgrade request from re-summarizing a 651-turn history from turn 1.
-    prev = max(
-        int(state.get("turns_seen") or 0),
-        int(state.get("last_summarized_turn") or 0),
-    )
-    fps = _turn_fingerprints(messages)
+    turns = [m for m in messages if m.get("role") != "system"]
+    n = len(turns)
+    prev = _recorded_position(state)
 
-    if n > prev:
-        position = n
-    else:
-        anchor = [x for x in (state.get("tail_fp") or []) if isinstance(x, str)]
-        if not anchor:
-            # First sight of a short window with no anchor to compare it to —
-            # a state file from before v3.1.4, or a conversation whose very
-            # first observation is already capped. Hold the position and let
-            # THIS call lay down the anchor; the next one can measure against
-            # it. Holding costs at most one turn of latency, once.
-            new = 0
+    if not turns:
+        # I5. Neither the position nor the anchor may be touched.
+        state["turns_seen"] = prev
+        return prev
+
+    # R17: only the tail is hashed. The alignment below cannot use a slot
+    # older than the anchor plus everything appended after it, and hashing the
+    # whole history cost 47 ms per call at 660 turns, on the event loop,
+    # inside conv_lock, every single turn.
+    fps = _turn_fingerprints(turns[-_FINGERPRINT_TAIL_TURNS:])
+    head_fp = _turn_fingerprints(turns[:1])[0]
+    anchor = [x for x in (state.get("tail_fp") or []) if isinstance(x, str)]
+    # Same head, same length: the client re-sent the window it sent last time.
+    # Under a cap the head slides out on every exchange, so this is a reliable
+    # negative — and it is the only evidence that separates the admin drain
+    # (the same transcript, looped) from a live turn whose tail repeats.
+    window_unchanged = (
+        n == int(state.get("window_turns") or 0)
+        and head_fp == (state.get("head_fp") or "")
+    )
+
+    if not anchor:
+        # First sight of this conversation with no anchor to compare against —
+        # a state file from before v3.1.4, or a conversation whose very first
+        # observation is already capped.
+        #
+        # The question is whether the window in hand ALREADY contains this
+        # exchange's two turns (so holding is right) or is a suffix that sits
+        # past everything recorded (so holding loses two turns that are never
+        # repaid). `prev` cannot answer it: a watermark can be stranded above
+        # a genuinely shorter history, which is the S-5 case, and treating
+        # that as proof of a bounded window pushes the position past a history
+        # that has not caught up to it.
+        #
+        # THE CHUNK LABELS CAN. A stored chunk labelled a..b is evidence that
+        # b turns of this conversation existed and were summarized — evidence
+        # that carries text, unlike the watermark. So:
+        if n < _highest_chunk_turn(state):
+            # The window provably cannot hold the whole conversation: the
+            # chunks alone account for more turns than the client sent. It is
+            # a suffix, so this call's exchange is past everything recorded,
+            # and main.py calls maybe_rollup once per exchange. Without this
+            # the R12 upgrade path (chunks to turn 660, watermark pulled down
+            # to the cap) came back with every chunk labelled two turns off
+            # the text inside it.
+            new = _ASSUMED_NEW_TURNS
         else:
-            aligned = _align_new_turns(anchor, fps)
-            if aligned is None:
-                new = _ASSUMED_NEW_TURNS
-                if logsetup.log_once("summarizer.position.unaligned"):
-                    logger.warning(
-                        f"conv={conv_id}: none of the {len(anchor)} anchored "
-                        f"turns appear in the {n}-turn window the client sent, "
-                        f"so the conversation's position ({prev}) cannot be "
-                        f"measured against it; advancing by "
-                        f"{_ASSUMED_NEW_TURNS} (one exchange) per rollup call "
-                        f"instead. Summary turn labels will drift from the "
-                        f"client's numbering, which costs nothing, but a "
-                        f"repeat of this line means the anchor is not "
-                        f"round-tripping through the client"
-                    )
-            else:
-                new = aligned
-        position = prev + new
-        if position > n and logsetup.log_once("summarizer.position.bounded"):
-            # Once per process: this is the tail of EVERY turn under a cap.
-            # It is the healthy shape, not a fault — logged so that an
-            # operator turning max_turns on can see the compactor noticed.
-            logger.info(
-                f"conv={conv_id}: the client is sending a bounded window "
-                f"({n} turns) while the conversation is at turn {position}; "
-                f"rollups are driven by the compactor's own counter from here "
-                f"on, and chunk text is read at an offset of {position - n}"
-            )
+            # The window could contain everything the chunks prove exists, so
+            # the watermark is the suspect number, not the window. HOLD, and
+            # let THIS call lay the anchor down; from the next call on the
+            # alignment is exact. Holding is the under-counting side
+            # (invariant I4), and it is also what keeps /admin/compact's drain
+            # loop still — it re-presents ONE unchanged transcript, which
+            # n >= _highest_chunk_turn always describes.
+            new = 0
+    else:
+        cands = _align_candidates(anchor, fps)
+        if not cands:
+            new = _ASSUMED_NEW_TURNS
+            if logsetup.log_once("summarizer.position.unaligned"):
+                logger.warning(
+                    f"conv={conv_id}: none of the {len(anchor)} anchored "
+                    f"turns appear in the {n}-turn window the client sent, "
+                    f"so the conversation's position ({prev}) cannot be "
+                    f"measured against it; advancing by "
+                    f"{_ASSUMED_NEW_TURNS} (one exchange) per rollup call "
+                    f"instead. Summary turn labels will drift from the "
+                    f"client's numbering, which costs nothing, but a "
+                    f"repeat of this line means the anchor is not "
+                    f"round-tripping through the client"
+                )
+        elif cands[0] == 0 and len(cands) > 1 and not window_unchanged:
+            # I4. The anchor occurs at the very end AND earlier, so "nothing
+            # advanced" and "one exchange advanced" are equally consistent
+            # with it — a tail of byte-identical exchanges, which
+            # _redact_degenerate_turns manufactures out of two consecutive
+            # degenerate replies. The window's head and length say it is not
+            # the same window, so the zero is the coincidence, not the truth.
+            new = cands[1]
+            if logsetup.log_once("summarizer.position.repeating_tail"):
+                logger.info(
+                    f"conv={conv_id}: the last {len(anchor)} turns of this "
+                    f"conversation repeat earlier ones, so the anchor alone "
+                    f"cannot say whether the window moved; the window itself "
+                    f"changed, so taking {new} new turns rather than 0. "
+                    f"Reading 0 here would stop the position advancing, and "
+                    f"under a cap the position is the only thing that does"
+                )
+        else:
+            new = cands[0]
+
+    position = max(n, prev + new)
+    if position > n and logsetup.log_once("summarizer.position.bounded"):
+        # Once per process: this is the tail of EVERY turn under a cap.
+        # It is the healthy shape, not a fault — logged so that an
+        # operator turning max_turns on can see the compactor noticed.
+        logger.info(
+            f"conv={conv_id}: the client is sending a bounded window "
+            f"({n} turns) while the conversation is at turn {position}; "
+            f"rollups are driven by the compactor's own counter from here "
+            f"on, and chunk text is read at an offset of {position - n}"
+        )
 
     state["turns_seen"] = position
     state["tail_fp"] = fps[-_ANCHOR_TURNS:]
+    state["head_fp"] = head_fp
+    state["window_turns"] = n
     return position
 
 
@@ -1305,14 +1545,8 @@ async def _do_l1_rollup(
         return True
 
     covered_first = first_turn
-    if pos_first < 1:
-        logger.warning(
-            f"conv={conv_id}: turns {first_turn}-{window_offset} of this "
-            f"chunk are behind the client's window; summarizing turns "
-            f"{window_offset + 1}-{last_turn} and recording that as the "
-            f"chunk's span rather than claiming coverage of text this rollup "
-            f"never saw"
-        )
+    partial = pos_first < 1
+    if partial:
         pos_first = 1
         covered_first = window_offset + 1
 
@@ -1330,15 +1564,26 @@ async def _do_l1_rollup(
         # Belt and braces against the hazard the old watermark reset created:
         # an operator running /admin/conversations/<id>/compact twice appended
         # a second identical chunk set, which then cascaded into duplicate L2
-        # chapters and a duplicate-fed L3. A monotonic position makes that
-        # unreachable (the second run sees the watermark already past the
-        # span), so this firing at all means the position went backwards —
-        # skip the span rather than spend an LLM call proving it.
+        # chapters and a duplicate-fed L3.
+        #
+        # ERROR, not WARNING, since v3.1.7. The watermark is now repaired
+        # against the chunk list before any position is derived from it
+        # (_repair_watermark_below_chunks), and _recorded_position seeds from
+        # the labels too, so the only way to reach this line is a genuine
+        # re-presentation of a span the labels already own — the idempotent
+        # admin drain. Under the pre-v3.1.7 code this fired on the FIRST
+        # rollup of every upgraded capped conversation and threw away a real
+        # span each time, at WARNING, for hundreds of turns (R12). If it is
+        # in the log now, the position arithmetic is wrong again, and the
+        # skip below is hiding how much.
         state["last_summarized_turn"] = last_turn
-        logger.warning(
+        logger.error(
             f"conv={conv_id}: an L1 chunk covering turns {covered_first}-"
             f"{last_turn} already exists; advancing the watermark past it "
-            f"instead of storing a duplicate"
+            f"instead of storing a duplicate. This should be unreachable — "
+            f"the position only moves forward and is seeded from the chunk "
+            f"labels — so check turns_seen against the l1 spans in "
+            f"GET /admin/conversations/{conv_id}"
         )
         return True
     text = await _summarize_pieces(
@@ -1346,6 +1591,19 @@ async def _do_l1_rollup(
     )
     if not text:
         return False
+    if partial:
+        # BELOW the summarization, not above it (v3.1.7, R29). Logged first,
+        # this line announced "recording that as the chunk's span" and then
+        # the vLLM call returned empty and recorded nothing — four such lines
+        # against l1=0 during an outage, which is exactly when an operator is
+        # reading the log.
+        logger.warning(
+            f"conv={conv_id}: turns {first_turn}-{window_offset} of this "
+            f"chunk are behind the client's window; summarized turns "
+            f"{covered_first}-{last_turn} and recorded that as the "
+            f"chunk's span rather than claiming coverage of text this rollup "
+            f"never saw"
+        )
     state["l1"].append({
         "text": text, "first_turn": covered_first, "last_turn": last_turn,
     })
@@ -1610,16 +1868,25 @@ async def maybe_rollup(
     async with conv_lock(conv_id):
         state = load_state(conv_id)
 
+        # Before anything reads the watermark: a file written by the old
+        # _reconcile_watermark can have it BELOW the chunks it wrote, and
+        # every number below is derived from it (v3.1.7, R12).
+        changed = _repair_watermark_below_chunks(conv_id, state)
+
         before_position = state.get("turns_seen")
         before_anchor = state.get("tail_fp")
+        before_window = (state.get("head_fp"), state.get("window_turns"))
         current_turns = _observed_position(conv_id, state, messages)
         # The position and the anchor are useless unless they are PERSISTED:
         # unwritten, the next call re-seeds from last_summarized_turn, finds no
         # anchor, and holds — which is the frozen hierarchy this release
-        # exists to fix, reintroduced by an unsaved counter.
-        changed = (
+        # exists to fix, reintroduced by an unsaved counter. The window
+        # signature rides along for the same reason: unwritten, every
+        # repeating tail reads as ambiguous forever (R18).
+        changed = changed or (
             before_position != state["turns_seen"]
             or before_anchor != state["tail_fp"]
+            or before_window != (state.get("head_fp"), state.get("window_turns"))
         )
         # How many turns of this conversation sit before the array's first
         # turn. Computed ONCE and held constant for the whole drain: the
