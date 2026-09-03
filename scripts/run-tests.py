@@ -1,6 +1,22 @@
 #!/usr/bin/env python3
 """Run the whole local test suite, and be honest about what actually ran.
 
+PREFER THE CONTAINER. This project tests on Linux, because Linux is what
+ships — the production image is Ubuntu 24.04 userland:
+
+    docker compose -f docker-compose.tests.yml run --rm unit-tests
+    docker compose -f docker-compose.tests.yml run --rm unit-tests --saturation
+
+Everything below still works when invoked directly on the host, and the flags
+are identical either way. But a host run is a development convenience, not
+evidence: the asyncio loop differs (Proactor vs epoll/uvloop, which is the
+whole of the open client-disconnect question), and the timings differ enough
+to have cost a full investigation once already (see SLOW_S). The two
+fixture-backed suites need their own stack and will honestly SKIP in both:
+
+    docker compose -f docker-compose.tokenizer-contract.yml up --build --exit-code-from contract-tests
+    docker compose -f docker-compose.tokenizer-contract.yml run --rm --build soak-tests
+
     python scripts/run-tests.py                # everything
     python scripts/run-tests.py --fast         # skip the suites over 60s
     python scripts/run-tests.py --only tail    # substring filter
@@ -64,17 +80,36 @@ BASE_ENV = {
     "COMPACTOR_FORCE_OFFLINE": "true",
 }
 
-# Measured on this machine, 2026-09-02 (test_budget_guard.py re-measured
-# 2026-09-03 after R22). Only used for --fast and for the "still running"
-# note; a suite that drifts far from its entry is worth a look.
-SLOW_S = {
-    "test_budget_guard.py": 5,
-    "test_dedup_churn_gate.py": 147,
-    "test_summarize_invariant.py": 71,
-    "test_backup.py": 26,
-    "test_saturation.py": 45,
+# Measured 2026-09-03 in the Ubuntu 24.04 test image
+# (docker-compose.tests.yml), which is the platform this project tests on.
+# Only used for --fast and for the "still running" note; a suite that drifts
+# far from its entry is worth a look.
+#
+# THESE WERE WINDOWS NUMBERS UNTIL 2026-09-03, AND THAT MADE THE DRIFT SIGNAL
+# USELESS. Windows resolves "localhost" to the IPv6 loopback and THEN the IPv4
+# one, each against its own 2s connect timeout, so every suite that talks to a
+# port nothing listens on paid ~4.2s per call. That is not a small skew:
+# test_summarize_invariant measured 71s there and 3.6s here, and
+# test_dedup_churn_gate 147s against 58.4s. R22 chased that cost out of
+# test_budget_guard specifically (239s -> 1.1s here) before the platform was
+# the thing that changed; the entries below are what the suites actually cost
+# on the userland production runs.
+#
+# Windows numbers are kept in the second column for exactly one reason: if
+# someone runs the suite on the host and sees 60s where this table says 3.6s,
+# the table should tell them why rather than look broken.
+SLOW_S = {                            # linux (docker)   windows (host)
+    "test_dedup_churn_gate.py": 58,   #      58.4              147
+    "test_saturation.py": 19,         #      19.4               45
+    "test_backup.py": 18,             #      17.9               26
+    "test_summarize_invariant.py": 4,  #       3.6               71
+    "test_budget_guard.py": 1,        #       1.1                5
 }
-FAST_CUTOFF_S = 60
+# Lowered from 60 with the platform change. At 60 nothing on Linux qualified
+# as slow, which made --fast a synonym for a full run — a flag that silently
+# does nothing is worse than no flag. At 15 it drops the three suites that
+# account for most of the wall clock and leaves the run around 35s.
+FAST_CUTOFF_S = 15
 
 # Not run unless --saturation. It is the only suite whose job is scale rather
 # than logic, and it is slow enough that gating it keeps the default run

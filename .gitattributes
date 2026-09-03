@@ -26,3 +26,4 @@ Dockerfile    text eol=lf
 *.jpg         binary
 *.jpeg        binary
 *.ico         binary
+testfixtures/unit-suite/entrypoint.sh text eol=lf
