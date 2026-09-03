@@ -79,6 +79,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from envcfg import env_float, env_int
+
 logger = logging.getLogger("compactor.pgarchive")
 
 # ---------------------------------------------------------------------------
@@ -97,25 +99,21 @@ PGDATABASE = os.environ.get("POSTGRES_DB", "openwebui")
 # must not be confused with the JSON/webui.db archive set backup.py manages.
 ARCHIVE_DIR = Path(os.environ.get("PGARCHIVE_DIR", "/data/openwebui/pg"))
 
-ARCHIVE_INTERVAL_S = float(os.environ.get("PGARCHIVE_INTERVAL_S", "300") or 300)
+ARCHIVE_INTERVAL_S = env_float("PGARCHIVE_INTERVAL_S", 300)
 
 # Retention: keep the newest RETAIN archives, never fewer than MIN_KEEP
 # regardless of RETAIN's value — the same "floor in code, not just config"
 # rule backup.py uses, so a typo'd env var can't empty the archive directory.
-RETAIN = int(os.environ.get("PGARCHIVE_RETAIN", "10") or 10)
-MIN_KEEP = max(3, int(os.environ.get("PGARCHIVE_MIN_KEEP", "3") or 3))
+RETAIN = env_int("PGARCHIVE_RETAIN", 10)
+MIN_KEEP = max(3, env_int("PGARCHIVE_MIN_KEEP", 3))
 
 # REGRESSION GUARD — see the module docstring. Refuse to publish an archive
 # holding less than this fraction of the previous archive's row count.
-SHRINK_REFUSE_BELOW = float(
-    os.environ.get("PGARCHIVE_SHRINK_REFUSE_BELOW", "0.5") or 0.5
-)
+SHRINK_REFUSE_BELOW = env_float("PGARCHIVE_SHRINK_REFUSE_BELOW", 0.5)
 # Below this many rows in the PREVIOUS archive the ratio is meaningless
 # (2 -> 1 is a 50% drop and means nothing), so the guard stands down —
 # same reasoning as webuidb.SHRINK_GUARD_MIN_CHATS.
-SHRINK_GUARD_MIN_ROWS = int(
-    os.environ.get("PGARCHIVE_SHRINK_GUARD_MIN_ROWS", "50") or 50
-)
+SHRINK_GUARD_MIN_ROWS = env_int("PGARCHIVE_SHRINK_GUARD_MIN_ROWS", 50)
 # The deliberate override for a real, intended shrink (bulk delete, a
 # deliberate `/forget`-equivalent). Refusing forever would be its own
 # failure mode.
@@ -136,13 +134,13 @@ ALLOW_SHRINK = (
 # (388 MB used, 2026-08-31) that is still a wide margin, but it is the point
 # where "plenty of runway" stops being true and someone should look within
 # the week rather than after the next incident.
-DISK_WARN_FREE_MB = int(os.environ.get("PGARCHIVE_DISK_WARN_FREE_MB", "4096") or 4096)
+DISK_WARN_FREE_MB = env_int("PGARCHIVE_DISK_WARN_FREE_MB", 4096)
 # CRITICAL: 1024 MB. Below this, zionslight.conf's own settings (entrypoint.sh)
 # no longer have room to fail safely — max_wal_size=512MB plus a single
 # query hitting temp_file_limit=1GB is 1.5 GB by itself, before
 # shared_buffers or anything else sharing the overlay. Under 1 GB free, the
 # next checkpoint or one large query can be the PANIC.
-DISK_CRITICAL_FREE_MB = int(os.environ.get("PGARCHIVE_DISK_CRITICAL_FREE_MB", "1024") or 1024)
+DISK_CRITICAL_FREE_MB = env_int("PGARCHIVE_DISK_CRITICAL_FREE_MB", 1024)
 
 _PREFIX = "pg-"
 _SUFFIX = ".sql.gz"
@@ -160,24 +158,18 @@ def _reload_env() -> None:
     PGUSER = os.environ.get("POSTGRES_USER", "openwebui")
     PGDATABASE = os.environ.get("POSTGRES_DB", "openwebui")
     ARCHIVE_DIR = Path(os.environ.get("PGARCHIVE_DIR", "/data/openwebui/pg"))
-    ARCHIVE_INTERVAL_S = float(os.environ.get("PGARCHIVE_INTERVAL_S", "300") or 300)
-    RETAIN = int(os.environ.get("PGARCHIVE_RETAIN", "10") or 10)
-    MIN_KEEP = max(3, int(os.environ.get("PGARCHIVE_MIN_KEEP", "3") or 3))
-    SHRINK_REFUSE_BELOW = float(
-        os.environ.get("PGARCHIVE_SHRINK_REFUSE_BELOW", "0.5") or 0.5
-    )
-    SHRINK_GUARD_MIN_ROWS = int(
-        os.environ.get("PGARCHIVE_SHRINK_GUARD_MIN_ROWS", "50") or 50
-    )
+    ARCHIVE_INTERVAL_S = env_float("PGARCHIVE_INTERVAL_S", 300)
+    RETAIN = env_int("PGARCHIVE_RETAIN", 10)
+    MIN_KEEP = max(3, env_int("PGARCHIVE_MIN_KEEP", 3))
+    SHRINK_REFUSE_BELOW = env_float("PGARCHIVE_SHRINK_REFUSE_BELOW", 0.5)
+    SHRINK_GUARD_MIN_ROWS = env_int("PGARCHIVE_SHRINK_GUARD_MIN_ROWS", 50)
     ALLOW_SHRINK = (
         os.environ.get("PGARCHIVE_ALLOW_SHRINK", "").strip().lower()
         in ("1", "true", "yes")
     )
     global DISK_WARN_FREE_MB, DISK_CRITICAL_FREE_MB
-    DISK_WARN_FREE_MB = int(os.environ.get("PGARCHIVE_DISK_WARN_FREE_MB", "4096") or 4096)
-    DISK_CRITICAL_FREE_MB = int(
-        os.environ.get("PGARCHIVE_DISK_CRITICAL_FREE_MB", "1024") or 1024
-    )
+    DISK_WARN_FREE_MB = env_int("PGARCHIVE_DISK_WARN_FREE_MB", 4096)
+    DISK_CRITICAL_FREE_MB = env_int("PGARCHIVE_DISK_CRITICAL_FREE_MB", 1024)
 
 
 def _stamp() -> str:

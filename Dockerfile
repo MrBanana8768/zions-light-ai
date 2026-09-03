@@ -263,6 +263,7 @@ RUN python3 -m venv /app/venv && \
 # runtime module explicitly to avoid pulling test_*.py and V2_PLAN.md
 # into the production image.
 COPY compactor/main.py /opt/compactor/main.py
+COPY compactor/envcfg.py /opt/compactor/envcfg.py
 COPY compactor/memory.py /opt/compactor/memory.py
 COPY compactor/facts.py /opt/compactor/facts.py
 COPY compactor/backfill.py /opt/compactor/backfill.py

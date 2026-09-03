@@ -64,6 +64,7 @@ from typing import Any, Callable
 import httpx
 
 import tokens
+from envcfg import env_float, env_int
 from memory import (
     StoreUnreadable,
     atomic_write_json,
@@ -113,7 +114,7 @@ logger = logging.getLogger("compactor.facts")
 # prune_facts' default budget. We use char/4 as a fast estimator — precision
 # doesn't matter for a soft cap. ~1500 tokens ≈ 6000 chars ≈ 100-150 short
 # bullets.
-_MAX_FACTS_TOKENS = int(os.environ.get("COMPACTOR_MAX_FACTS_TOKENS", "1500") or 1500)
+_MAX_FACTS_TOKENS = env_int("COMPACTOR_MAX_FACTS_TOKENS", 1500)
 
 # INJECTION cap. How much goes into THIS turn's prompt. select_for_injection's
 # default budget. Small enough that only what's actually relevant to the
@@ -137,15 +138,11 @@ _MAX_FACTS_TOKENS = int(os.environ.get("COMPACTOR_MAX_FACTS_TOKENS", "1500") or 
 # Without that wiring this change would be strictly worse than 800 — it would
 # keep a fixed most-recently-used prefix forever — which is why
 # test_facts_wiring.py exists.
-_INJECT_FACTS_TOKENS = int(
-    os.environ.get("COMPACTOR_INJECT_FACTS_TOKENS", "400") or 400
-)
+_INJECT_FACTS_TOKENS = env_int("COMPACTOR_INJECT_FACTS_TOKENS", 400)
 
 # Max tokens the LLM produces per extraction call. Each call should yield
 # at most a handful of bullets, so this is intentionally tight.
-_EXTRACTION_MAX_TOKENS = int(
-    os.environ.get("COMPACTOR_FACTS_EXTRACTION_MAX_TOKENS", "256") or 256
-)
+_EXTRACTION_MAX_TOKENS = env_int("COMPACTOR_FACTS_EXTRACTION_MAX_TOKENS", 256)
 
 # Whether to even run fact extraction. Off → facts memory becomes append-only
 # from manual /remember commands (V2.1 territory). Default on.
@@ -168,15 +165,13 @@ _EXTRACTION_ENABLED = (
 # Same shape as main.summarize's own input budget (main.py's
 # `budget = min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - out - reserve))`), read
 # from the same env var so the two cannot drift apart on a re-sized deployment.
-_MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "32768") or 32768)
+_MAX_MODEL_LEN = env_int("MAX_MODEL_LEN", 32768)
 # Slack left inside the window for the chat template's per-message framing.
 # Same default and same purpose as COMPACTOR_SUMMARY_INPUT_RESERVE. This is a
 # FIXED, real-token cost (the template's own scaffolding) — see
 # _ASSISTANT_CONTENT_ESTIMATE_LOW_FRACTION below for the separate, PROPORTIONAL
 # correction this reserve cannot do on its own.
-_EXTRACTION_INPUT_RESERVE = int(
-    os.environ.get("COMPACTOR_FACTS_INPUT_RESERVE", "2048") or 2048
-)
+_EXTRACTION_INPUT_RESERVE = env_int("COMPACTOR_FACTS_INPUT_RESERVE", 2048)
 # Clamped for the same reason as main.HARD_INPUT_LIMIT: a bare floor could sit
 # ABOVE the model's own window on a small-context model, which would budget
 # nothing at all. This is a REAL-token ceiling — the model's own window minus
@@ -236,8 +231,8 @@ _EXTRACTION_INPUT_BUDGET_REAL_TOKENS = min(
 # measured (decoration, ~87%), not to "typical" content — because typical
 # content does not need defending, and this is the one number used when
 # nothing can verify the real cost before the request goes out.
-_ASSISTANT_CONTENT_ESTIMATE_LOW_FRACTION = float(
-    os.environ.get("COMPACTOR_FACTS_ESTIMATE_LOW_FRACTION", "0.87") or 0.87
+_ASSISTANT_CONTENT_ESTIMATE_LOW_FRACTION = env_float(
+    "COMPACTOR_FACTS_ESTIMATE_LOW_FRACTION", 0.87
 )
 _EXTRACTION_INPUT_BUDGET = max(
     256,
@@ -421,9 +416,7 @@ def save_facts(conv_id: str, facts: list[dict]) -> None:
 # /admin/facts listings. Moving to a sidecar keeps the active set lean and
 # makes the cold/hot distinction obvious in any tooling that walks storage.
 
-ARCHIVE_DEFAULT_DAYS = int(
-    os.environ.get("COMPACTOR_ARCHIVE_DEFAULT_DAYS", "90") or 90
-)
+ARCHIVE_DEFAULT_DAYS = env_int("COMPACTOR_ARCHIVE_DEFAULT_DAYS", 90)
 
 
 def load_archive(conv_id: str) -> list[dict]:

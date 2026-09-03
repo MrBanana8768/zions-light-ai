@@ -31,6 +31,7 @@ import shutil
 import time
 from pathlib import Path
 
+from envcfg import env_float, env_int
 import logsetup
 
 logger = logging.getLogger("compactor.degrade")
@@ -39,13 +40,11 @@ logger = logging.getLogger("compactor.degrade")
 # this. Distinct from (and higher than) the backup min-free guard — we want
 # to stop *growing* memory well before the disk is truly full, leaving
 # headroom for the backup daemon and for in-flight writes to complete.
-MIN_FREE_MB_WRITES = int(
-    os.environ.get("COMPACTOR_MIN_FREE_MB_WRITES", "200") or 200
-)
+MIN_FREE_MB_WRITES = env_int("COMPACTOR_MIN_FREE_MB_WRITES", 200)
 
 # How long a free-space reading is trusted before re-checking. Keeps a
 # request burst from calling statvfs hundreds of times a second.
-_CHECK_TTL_S = float(os.environ.get("COMPACTOR_DEGRADE_CHECK_TTL_S", "10") or 10)
+_CHECK_TTL_S = env_float("COMPACTOR_DEGRADE_CHECK_TTL_S", 10)
 
 # What volume to watch. Defaults to the storage root's filesystem.
 _WATCH_PATH = os.environ.get(

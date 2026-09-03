@@ -25,16 +25,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import os
 import time
 
+from envcfg import env_int, env_window_s
 import logsetup
 
 logger = logging.getLogger("compactor.bgwork")
 
-MAX_CONCURRENT = int(os.environ.get("COMPACTOR_MAX_CONCURRENT_TAILS", "4") or 4)
-MAX_OUTSTANDING = int(os.environ.get("COMPACTOR_MAX_OUTSTANDING_TAILS", "64") or 64)
+MAX_CONCURRENT = env_int("COMPACTOR_MAX_CONCURRENT_TAILS", 4)
+MAX_OUTSTANDING = env_int("COMPACTOR_MAX_OUTSTANDING_TAILS", 64)
 
 # How long after a shed /health/full keeps calling the system "degraded"
 # (v3.1 A11).
@@ -52,39 +52,25 @@ MAX_OUTSTANDING = int(os.environ.get("COMPACTOR_MAX_OUTSTANDING_TAILS", "64") or
 def _window_s(name: str, default: float) -> float:
     """Read a degrade-window seconds value from the environment, safely.
 
-    `float(os.environ.get(name, "300") or 300)` was two failures in one line,
-    and this module is imported at main.py module scope, so both are boot
-    failures rather than degraded behaviour:
+    A thin alias for envcfg.env_window_s (v3.1.7 R30 rest): this module's own
+    copy used to duplicate the parsing logic byte-for-byte, because it cannot
+    import main (main imports it) and main.py's helpers are not shared code.
+    envcfg.py fixes exactly that — a module with no dependency on anything
+    else in the package, so both bgwork and main (and tailhealth, which
+    keeps its own identical copy rather than importing this one, since it
+    is not owned by this change) can read through it without a cycle.
 
-      * UNPARSEABLE. `or 300` rescues only the empty string. One typo in
-        runpod.env — `30O`, a stray quote, a trailing comment — and the
-        import raises ValueError, the compactor never starts, and the chat
-        path is down until someone reads a traceback.
-      * NON-POSITIVE. `0` or a negative parses fine and then silently
-        disables the signal: `shed_recently` is `since <= window`, which is
-        never true, so /health/full reports ok while work is being shed. That
-        is the exact regression the window exists to prevent, arriving
-        quietly through a config value nobody would look at twice.
-
-    main._env_float does NOT reject a zero or a negative (its docstring once
-    said otherwise; corrected in v3.1.7), and this module cannot import main
-    anyway — main imports it. tailhealth carries the same helper, and the two
-    must stay identical.
+    Kept as a named wrapper, not inlined at the two call sites below, so
+    every existing caller (`bgwork._window_s(...)` — see test_bgwork.py) and
+    every existing docstring reference to `bgwork._window_s` keeps working
+    unchanged. Behaviour is unchanged: unparseable/blank -> default,
+    non-positive or non-finite (`0`, a negative, `inf`, `nan`) -> default.
+    See envcfg.env_window_s's docstring for the full reasoning, including the
+    incident (an always-on `shed_recently` from an `inf` window) this guards
+    against. tailhealth._window_s is a separate, unowned copy of the same
+    logic; test_envcfg.py asserts the two still agree.
     """
-    raw = os.environ.get(name)
-    if raw is None or not str(raw).strip():
-        return default
-    try:
-        v = float(raw)
-    except (TypeError, ValueError):
-        return default
-    # isfinite, not just > 0. `inf` parses, satisfies `v > 0`, and then pins
-    # the "recently" flag True from the first event until the process
-    # restarts — a warning that is always on is a warning nobody reads, which
-    # is the failure this window exists to prevent, arriving through the one
-    # config value whose whole job is to prevent it. `nan` fails `> 0`
-    # already; this makes the rejection explicit rather than incidental.
-    return v if math.isfinite(v) and v > 0 else default
+    return env_window_s(name, default)
 
 
 SHED_DEGRADE_WINDOW_S = _window_s("COMPACTOR_SHED_DEGRADE_WINDOW_S", 300.0)
