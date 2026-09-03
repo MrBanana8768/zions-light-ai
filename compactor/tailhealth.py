@@ -97,7 +97,7 @@ def _window_s(name: str, default: float) -> float:
 
 SKIP_DEGRADE_WINDOW_S = _window_s("COMPACTOR_TAIL_SKIP_DEGRADE_WINDOW_S", 300.0)
 
-# Machine outcome labels. decide_memory_tail returns exactly one of these per
+# Machine outcome labels. decide_memory_tail returns one of the first eight per
 # decision; the first two store, the rest skip.
 STORED = "stored"                                    # finished; verbatim
 STORED_TRIMMED = "stored_trimmed"                    # cut; trimmed prefix stored
@@ -107,10 +107,20 @@ SKIPPED_DEGENERATE = "skipped_degenerate"            # finished; repetition loop
 SKIPPED_NO_BOUNDARY = "skipped_no_boundary"          # cut; no sentence survives
 SKIPPED_TOO_SHORT = "skipped_too_short"              # cut; trimmed under the floor
 SKIPPED_DEGENERATE_PARTIAL = "skipped_degenerate_partial"  # cut; trimmed text loops
+# v3.1.7 (R8). The two labels above this line are decisions about the REPLY;
+# these two are about whether the store can be reached at all, and they are
+# decided in main._run_memory_tail immediately after decide_memory_tail says
+# "store". Until v3.1.7 both conditions were evaluated INSIDE the fired tail,
+# after `stored` had already been counted, so /health/full reported a healthy
+# tail for an exchange that never reached memory — the same class this module
+# was built to end, one layer up.
+SKIPPED_DISK_PRESSURE = "skipped_disk_pressure"      # degrade.guard says no
+SKIPPED_NO_USER_TEXT = "skipped_no_user_text"        # nothing to pair the reply with
 STORING_OUTCOMES = frozenset({STORED, STORED_TRIMMED})
 OUTCOMES = (
     STORED, STORED_TRIMMED, SKIPPED_HOLED, SKIPPED_EMPTY, SKIPPED_DEGENERATE,
     SKIPPED_NO_BOUNDARY, SKIPPED_TOO_SHORT, SKIPPED_DEGENERATE_PARTIAL,
+    SKIPPED_DISK_PRESSURE, SKIPPED_NO_USER_TEXT,
 )
 
 # v3.1.7 (R27). SKIPPED_EMPTY is the one skip label that carries no loss: she
@@ -124,6 +134,11 @@ OUTCOMES = (
 # degrade decision off "any skip" instead of this set pinned /health/full
 # degraded for the full SKIP_DEGRADE_WINDOW_S on every one of those 51, for a
 # turn that lost nothing.
+#
+# The exclusion is why R8's two new labels needed no edit here: a reply she
+# READ that did not reach memory is a loss whether the reason was the reply
+# (degenerate, holed) or the store (disk pressure, no user text to pair it
+# with), and adding them to OUTCOMES alone puts both on the lossy side.
 LOSSY_SKIP_OUTCOMES = frozenset(OUTCOMES) - STORING_OUTCOMES - {SKIPPED_EMPTY}
 
 

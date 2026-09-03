@@ -578,5 +578,304 @@ assert_eq(tailhealth.snapshot()["outcomes"].get("skipped_holed"), 0,
 assert_true(_fired and "平安" in _fired[-1]["assistant_text"],
             "and the reassembled text reaches the tail intact")
 
+# ---------------------------------------------------------------------------
+# [E9] R8 — the counter must not report memory that was never written.
+#
+# decide_memory_tail says "store", and then _async_tail declines to store
+# anything. Until v3.1.7 that decision was taken AFTER tailhealth.note had
+# already published `stored`, so /health/full reported a healthy tail for an
+# exchange that never reached memory — the silent-skip class this counter was
+# built to end, one layer up from where it was closed.
+#
+# Two conditions, both asserted on both paths:
+#   disk pressure       degrade.guard("async memory tail") is False
+#   no user text        a parts list with no text and no recognised image
+#
+# Mutations this section kills:
+#   the hoist deleted entirely (count as `stored`, fire the tail) -> all of it
+#   hoisted but not counted (return without note())               -> the counts
+#   counted under SKIPPED_EMPTY instead of a new label            -> lossy check
+# ---------------------------------------------------------------------------
+
+print()
+print("[E9] R8 — a tail that will store nothing is counted as a SKIP, not a store")
+
+import degrade  # noqa: E402
+
+
+def _post_nonstream_no_disk(conv_id, reply):
+    with patch.object(degrade, "guard", lambda op: False):
+        return _post_nonstream(conv_id, reply)
+
+
+def _post_stream_no_disk(conv_id, chunks):
+    with patch.object(degrade, "guard", lambda op: False):
+        return _post_stream(conv_id, chunks)
+
+
+for label, poster, arg in (
+    ("non-stream", _post_nonstream_no_disk, CUT),
+    ("stream", _post_stream_no_disk, _stream_of(CUT)),
+):
+    tailhealth._reset_for_tests()
+    r, recs = poster(f"tt-disk-{label}", arg)
+    assert_eq(r.status_code, 200, f"{label}/disk: 200 — chat is never gated on this")
+    assert_eq(len(_fired), 0, f"{label}/disk: the tail was NOT fired")
+    snap = tailhealth.snapshot()
+    assert_eq(snap["stored"], 0, f"{label}/disk: NOTHING was counted as stored")
+    assert_eq(snap["outcomes"]["skipped_disk_pressure"], 1,
+              f"{label}/disk: counted under its own label")
+    assert_eq(snap["skipped_recently"], True,
+              f"{label}/disk: and it is LOSSY — a reply she read did not reach memory")
+    line = _find(recs, "skipping memory tail")
+    assert_true(line is not None and line.levelno == logging.WARNING,
+                f"{label}/disk: the greppable WARNING names the conversation")
+    assert_true("disk pressure" in line.getMessage(),
+                f"{label}/disk: ...and says which of the two it was")
+
+# A parts list with neither text nor a recognised image part: it falls through
+# _extract_last_user_text AND _memorable_user_text, and _async_tail's
+# `if not assistant_text or not last_user_text: return` was a bare return with
+# no log line of any kind.
+NO_TEXT_PARTS = [{"type": "video_url", "video_url": {"url": "x"}}]
+assert_eq(main._extract_last_user_text([{"role": "user", "content": NO_TEXT_PARTS}]), "",
+          "fixture: the parts list yields no user text")
+assert_eq(main._memorable_user_text([{"role": "user", "content": NO_TEXT_PARTS}], ""), "",
+          "fixture: ...and no image marker rescues it")
+# The control that keeps this from being an argument against image uploads:
+# an image-only turn DOES get a marker, so it never takes this branch.
+assert_true(main._memorable_user_text(
+    [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "u"}}]}], ""
+).startswith("[shared 1 image"),
+    "fixture: an image-only upload is rescued by the marker, NOT skipped")
+
+
+def _post_nonstream_content(conv_id, reply, content):
+    """_post_nonstream with an arbitrary user content payload."""
+    _fired.clear()
+    _StubVLLM.reply = reply
+    _StubVLLM.finish_reason = "stop"
+    with patch.object(main.httpx, "AsyncClient", _StubVLLM), \
+         patch.object(main, "_async_tail", _spy_tail), \
+         patch.object(main, "_fire_and_forget", _spy_fire), \
+         capture() as cap:
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "stub-model",
+                  "messages": [{"role": "user", "content": content}],
+                  "stream": False},
+            headers={"X-Conversation-Id": conv_id},
+        )
+    return r, cap.records
+
+
+tailhealth._reset_for_tests()
+r, recs = _post_nonstream_content("tt-nousertext", CUT, NO_TEXT_PARTS)
+assert_eq(r.status_code, 200, "no-user-text: 200")
+assert_eq(len(_fired), 0, "no-user-text: the tail was NOT fired")
+snap = tailhealth.snapshot()
+assert_eq(snap["stored"], 0, "no-user-text: NOTHING was counted as stored")
+assert_eq(snap["outcomes"]["skipped_no_user_text"], 1,
+          "no-user-text: counted under its own label")
+assert_eq(snap["skipped_recently"], True, "no-user-text: and it is LOSSY")
+assert_true(_find(recs, "skipping memory tail") is not None,
+            "no-user-text: a line naming the conversation exists AT ALL")
+
+# The ledger test_saturation.py asserts must still reconcile with the two new
+# labels in play: every decision is exactly one of stored or skipped.
+snap = tailhealth.snapshot()
+assert_eq(sum(snap["outcomes"].values()), snap["stored"] + snap["skipped"],
+          "the outcome tally still reconciles with stored + skipped")
+
+# And the control: with the disk healthy and real user text, the same reply
+# still stores. Without this, [E9] passes for an endpoint that never stores.
+tailhealth._reset_for_tests()
+r, _ = _post_nonstream("tt-disk-control", CUT)
+assert_eq(_fired_text(), CUT, "control: a healthy disk and real user text still store")
+assert_eq(tailhealth.snapshot()["stored"], 1, "control: counted as a store")
+
+# ---------------------------------------------------------------------------
+# [E10] R8, second half — job 2 must not be able to cancel job 3.
+#
+# _async_tail's docstring calls its three jobs independent, and job 2 (facts)
+# owned two early `return`s that returned from the WHOLE tail. So a deployment
+# running with COMPACTOR_FACTS_EXTRACTION=false had the hierarchical summary
+# rollup silently off for its entire life, with nothing in the log and nothing
+# in the docstring claiming the dependency existed.
+#
+# Mutation: put the `return` back in _facts_tail's caller (i.e. inline the
+# function again) and this dies.
+# ---------------------------------------------------------------------------
+
+print()
+print("[E10] R8 — extraction disabled must not switch off the summary rollup")
+
+import asyncio      # noqa: E402
+import facts        # noqa: E402
+import summarizer   # noqa: E402
+
+_ROLLUPS: list = []
+_INDEXED: list = []
+
+
+async def _spy_rollup(conv_id, messages, vllm_url, model):
+    _ROLLUPS.append(conv_id)
+    return {"l1": [], "l2": [], "l3": None, "last_summarized_turn": 0}
+
+
+def _run_tail(conv_id, *, extraction, user_text="a real question"):
+    _ROLLUPS.clear()
+    _INDEXED.clear()
+    with patch.object(facts, "extraction_enabled", lambda: extraction), \
+         patch.object(facts, "load_facts", lambda c: []), \
+         patch.object(summarizer, "enabled", lambda: True), \
+         patch.object(summarizer, "maybe_rollup", _spy_rollup), \
+         patch.object(summarizer, "load_state",
+                      lambda c: {"l1": [], "l2": [], "l3": None,
+                                 "last_summarized_turn": 0}), \
+         patch.object(retrieval, "index_exchange",
+                      lambda *a, **k: (_INDEXED.append(a), True)[1]):
+        asyncio.run(main._async_tail(
+            conv_id, [], user_text, PROSE, 4,
+            [{"role": "user", "content": user_text}],
+        ))
+
+
+_run_tail("tt-noextract", extraction=False)
+assert_eq(len(_INDEXED), 1, "extraction off: job 1 (episodic) still ran")
+assert_eq(len(_ROLLUPS), 1,
+          "extraction off: job 3 (summary rollup) ran too — it is not job 2's "
+          "to cancel")
+
+_run_tail("tt-extract-on", extraction=True)
+assert_eq(len(_ROLLUPS), 1, "control: extraction on, the rollup still runs")
+
+# ---------------------------------------------------------------------------
+# [E11] R26 — vLLM dying mid-stream must not skip the tail silently.
+#
+# `vllm_failed` is set when the backend drops the connection PART WAY THROUGH a
+# reply she has already read. The accumulator holds real prose, and the old
+# guard `if conv_id and not vllm_failed` meant decide_memory_tail was never
+# called, tailhealth.note was never called, and no line containing "memory
+# tail" was emitted. Measured before the fix: 0 decisions, an unchanged
+# snapshot, an empty grep, while the client got the prose.
+#
+# A connection that dies mid-reply IS a cut reply, so this takes the same trim
+# path as a manual Stop.
+#
+# Mutations this section kills:
+#   `if conv_id:` -> `if conv_id and not vllm_failed:`   -> the whole section
+#   the tail fired but on the error text                 -> [E11b]
+# ---------------------------------------------------------------------------
+
+print()
+print("[E11] R26 — a stream vLLM killed mid-reply is memorized, not silently dropped")
+
+
+class _DyingStreamResp:
+    status_code = 200
+
+    def __init__(self, chunks, status=200):
+        self._chunks = chunks
+        self.status_code = status
+
+    async def aread(self):
+        return b'{"error": {"message": "context length exceeded"}}'
+
+    async def aiter_raw(self):
+        for c in self._chunks:
+            yield c
+        raise main.httpx.ReadError("connection reset by peer")
+
+
+class _DyingCM:
+    def __init__(self, chunks, status=200):
+        self._resp = _DyingStreamResp(chunks, status)
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _DyingVLLM:
+    chunks: list = []
+    status: int = 200
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def stream(self, method, url, json=None, **kwargs):
+        return _DyingCM(list(_DyingVLLM.chunks), _DyingVLLM.status)
+
+    async def aclose(self):
+        pass
+
+
+def _post_dying(conv_id, chunks, status=200):
+    _fired.clear()
+    _DyingVLLM.chunks = chunks
+    _DyingVLLM.status = status
+    with patch.object(main.httpx, "AsyncClient", _DyingVLLM), \
+         patch.object(main, "_async_tail", _spy_tail), \
+         patch.object(main, "_fire_and_forget", _spy_fire), \
+         capture() as cap:
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "stub-model",
+                  "messages": [{"role": "user", "content": "hi"}],
+                  "stream": True},
+            headers={"X-Conversation-Id": conv_id},
+        )
+    return r, cap.records
+
+
+tailhealth._reset_for_tests()
+r, recs = _post_dying("tt-midstream-death", [_content(CUT)])
+assert_eq(r.status_code, 200, "the client still gets its 200")
+assert_true("Sentence number 12" in r.content.decode("utf-8", "replace"),
+            "...and the prose it had already been sent")
+assert_eq(_fired_text(), PROSE,
+          "the tail was fired with the prose up to the last sentence boundary")
+snap = tailhealth.snapshot()
+assert_eq(snap["outcomes"]["stored_trimmed"], 1,
+          "and the decision was COUNTED — the accumulator held a cut reply")
+assert_true(_find(recs, "the backend failed during this stream") is not None,
+            "a WARNING names the conversation whose backend died")
+
+# The same death with nothing memorable must still be COUNTED and greppable —
+# the half of R26 that a store alone would not prove.
+tailhealth._reset_for_tests()
+r, recs = _post_dying("tt-midstream-nothing", [_content(NO_BOUNDARY)])
+assert_eq(len(_fired), 0, "nothing memorable: no tail")
+assert_eq(tailhealth.snapshot()["last_skip_outcome"], "skipped_no_boundary",
+          "nothing memorable: but the skip is counted")
+assert_true(_find(recs, "skipping memory tail") is not None,
+            "nothing memorable: and greppable, naming the conversation")
+
+print()
+print("[E11b] R26 — the compactor's own apology must never become a memory")
+# vLLM REJECTS the request (4xx). The friendly error chunks are yielded
+# straight to the client and never fed to the accumulator, so the tail sees ""
+# and decides SKIPPED_EMPTY — the one outcome tailhealth treats as lossless,
+# because nothing was ever generated to lose. If the error chunks were ever
+# accumulated, this would come back as a stored reply made of an apology.
+tailhealth._reset_for_tests()
+r, recs = _post_dying("tt-rejected", [], status=400)
+assert_eq(len(_fired), 0, "a rejected request stores nothing")
+snap = tailhealth.snapshot()
+assert_eq(snap["stored"], 0, "...and counts no store")
+assert_eq(snap["outcomes"]["skipped_empty"], 1,
+          "...counted as empty: there was never any reply")
+assert_eq(snap["skipped_recently"], False,
+          "...and NOT as a loss: a request the backend refused lost nothing")
+
 print()
 print("All truncated-tail tests passed.")

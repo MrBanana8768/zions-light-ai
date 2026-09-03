@@ -3705,86 +3705,31 @@ def _merge_touched(fresh: list[dict], touched: list[dict]) -> list[dict]:
     return merged
 
 
-async def _async_tail(
+async def _facts_tail(
     conv_id: str,
     touched_facts: list[dict],
     last_user_text: str,
     assistant_text: str,
     turn_index: int,
-    original_messages: list[dict],
     *,
     injected_facts: list[dict] | None = None,
 ) -> None:
-    """Post-response work, fired after the assistant's reply is fully
-    streamed/received. Three independent jobs:
+    """Job 2 of the memory tail: fact extraction, dedup, prune, save.
 
-      1. Episodic indexing (Phase 3): embed this exchange into ChromaDB so
-         it's retrievable later. Runs regardless of facts settings.
-      2. Facts extraction (Phase 2): pull new persistent facts from the
-         exchange, merge + prune + save.
-      3. Hierarchical rollup (Phase 4): if enough new turns have accumulated
-         since the last summarization, roll L0→L1, L1→L2, L2→L3 as needed.
+    v3.1.7 (R8). Lifted out of _async_tail UNCHANGED, line for line, for one
+    reason: it owns two early `return`s, and inside _async_tail those returns
+    were returns from the WHOLE tail — so turning fact extraction off, or
+    handing the tail an exchange with no user text, also silently cancelled
+    job 3, the hierarchical summary rollup. _async_tail's own docstring lists
+    the three jobs as independent and says job 1 "runs regardless of facts
+    settings"; nothing anywhere claimed job 3 depended on job 2, and the
+    dependency was invisible because it was expressed as control flow rather
+    than as a condition. A `return` here now ends only this job.
 
-    All degrade to no-ops on failure — never affects the user response.
-    Facts and summary writes are serialized per-conv via conv_lock.
-
-    `original_messages` is the request's messages list (pre-compaction); we
-    append the just-completed assistant turn before passing to the rollup so
-    it sees the full conversation when computing turn ranges.
-
-    `touched_facts` is the WHOLE store as the request path read it, and it is
-    what gets merged and written back — the facts left out of this turn's
-    working set must keep their real last_used or eviction stops meaning
-    anything (v3.1 F9). `injected_facts` is the budget-bounded subset of those
-    same dicts that the request path actually put in front of the model.
-
-    What the extractor is handed is neither of those two lists verbatim: it is
-    `touched_facts` bounded by the STORE cap, plus anything in
-    `injected_facts` that bound left out. The extraction prompt must stay
-    bounded — it is a request to vLLM and therefore has a window — but
-    bounding it by the 400-token INJECTION budget threw away three quarters of
-    the extractor's duplicate-suppression list, which is what the call site
-    below explains at length.
-
-    `injected_facts` is keyword-only with a default so no caller is broken by
-    its omission; omitting it costs only the union above, because the store
-    cap is applied either way.
+    Not merged into _async_tail as an `if/else`: the branch it would need is
+    exactly the shape that let the dependency in, and a reviewer cannot see a
+    missing `else` the way they can see a function boundary.
     """
-    # V2.3 Theme 2: under disk pressure, stop GROWING memory but keep
-    # serving. The chat response already went out; this tail is pure
-    # persistence, so skipping it entirely is the correct degraded
-    # behavior. Explicit user writes (/remember, admin) are gated
-    # separately and still allowed.
-    if not degrade.guard("async memory tail"):
-        logger.info(f"conv={conv_id}: skipped memory tail (disk pressure)")
-        return
-
-    # --- 1. Episodic indexing (independent of facts) ---
-    # v3.1 D49: this ran outside conv_lock. A prior review called it benign
-    # because the upsert is idempotent for a given doc id — true of two tails
-    # racing each other, and irrelevant to the case that matters. (That review
-    # justified it from _doc_id being (conv_id, turn_index); D1 has since made
-    # ids content-addressed, which changes the premise and not the conclusion.)
-    # _clear_all_memory holds conv_lock while it calls
-    # retrieval.forget_conversation; an unlocked index_exchange lands after
-    # that delete and puts the exchange the user just asked to forget back in
-    # the vector store, where it is retrievable and injectable again. Its own
-    # acquisition rather than one lock over the whole tail: the facts block
-    # below holds the lock across a vLLM call, and the summary rollup takes
-    # conv_lock internally, so a single enclosing `async with` would either
-    # deadlock or stall this behind an LLM round trip.
-    if assistant_text and last_user_text:
-        async with conv_lock(conv_id):
-            try:
-                indexed = retrieval.index_exchange(
-                    conv_id, turn_index, last_user_text, assistant_text
-                )
-                if indexed:
-                    logger.info(f"conv={conv_id}: indexed exchange (turn ~{turn_index})")
-            except Exception as e:
-                logger.warning(f"conv={conv_id}: episodic indexing failed: {e}")
-
-    # --- 2. Facts extraction ---
     if not facts.extraction_enabled():
         # Even with extraction off, save the touched state so LRU
         # tracking persists across restarts. Re-read under the lock (see
@@ -3953,6 +3898,103 @@ async def _async_tail(
         except Exception as e:
             logger.exception(f"conv={conv_id}: async fact tail failed: {e}")
 
+
+async def _async_tail(
+    conv_id: str,
+    touched_facts: list[dict],
+    last_user_text: str,
+    assistant_text: str,
+    turn_index: int,
+    original_messages: list[dict],
+    *,
+    injected_facts: list[dict] | None = None,
+) -> None:
+    """Post-response work, fired after the assistant's reply is fully
+    streamed/received. Three independent jobs:
+
+      1. Episodic indexing (Phase 3): embed this exchange into ChromaDB so
+         it's retrievable later. Runs regardless of facts settings.
+      2. Facts extraction (Phase 2): pull new persistent facts from the
+         exchange, merge + prune + save. Its own coroutine (_facts_tail)
+         since v3.1.7 — see R8 there for why that is not cosmetic.
+      3. Hierarchical rollup (Phase 4): if enough new turns have accumulated
+         since the last summarization, roll L0→L1, L1→L2, L2→L3 as needed.
+
+    INDEPENDENT means independent: none of the three may end another. Job 2
+    used to, by returning out of this function, and job 3 was silently off
+    for the whole of any deployment running with extraction disabled.
+
+    All degrade to no-ops on failure — never affects the user response.
+    Facts and summary writes are serialized per-conv via conv_lock.
+
+    `original_messages` is the request's messages list (pre-compaction); we
+    append the just-completed assistant turn before passing to the rollup so
+    it sees the full conversation when computing turn ranges.
+
+    `touched_facts` is the WHOLE store as the request path read it, and it is
+    what gets merged and written back — the facts left out of this turn's
+    working set must keep their real last_used or eviction stops meaning
+    anything (v3.1 F9). `injected_facts` is the budget-bounded subset of those
+    same dicts that the request path actually put in front of the model.
+
+    What the extractor is handed is neither of those two lists verbatim: it is
+    `touched_facts` bounded by the STORE cap, plus anything in
+    `injected_facts` that bound left out. The extraction prompt must stay
+    bounded — it is a request to vLLM and therefore has a window — but
+    bounding it by the 400-token INJECTION budget threw away three quarters of
+    the extractor's duplicate-suppression list, which is what the call site
+    below explains at length.
+
+    `injected_facts` is keyword-only with a default so no caller is broken by
+    its omission; omitting it costs only the union above, because the store
+    cap is applied either way.
+    """
+    # V2.3 Theme 2: under disk pressure, stop GROWING memory but keep
+    # serving. The chat response already went out; this tail is pure
+    # persistence, so skipping it entirely is the correct degraded
+    # behavior. Explicit user writes (/remember, admin) are gated
+    # separately and still allowed.
+    if not degrade.guard("async memory tail"):
+        logger.info(f"conv={conv_id}: skipped memory tail (disk pressure)")
+        return
+
+    # --- 1. Episodic indexing (independent of facts) ---
+    # v3.1 D49: this ran outside conv_lock. A prior review called it benign
+    # because the upsert is idempotent for a given doc id — true of two tails
+    # racing each other, and irrelevant to the case that matters. (That review
+    # justified it from _doc_id being (conv_id, turn_index); D1 has since made
+    # ids content-addressed, which changes the premise and not the conclusion.)
+    # _clear_all_memory holds conv_lock while it calls
+    # retrieval.forget_conversation; an unlocked index_exchange lands after
+    # that delete and puts the exchange the user just asked to forget back in
+    # the vector store, where it is retrievable and injectable again. Its own
+    # acquisition rather than one lock over the whole tail: the facts block
+    # below holds the lock across a vLLM call, and the summary rollup takes
+    # conv_lock internally, so a single enclosing `async with` would either
+    # deadlock or stall this behind an LLM round trip.
+    if assistant_text and last_user_text:
+        async with conv_lock(conv_id):
+            try:
+                indexed = retrieval.index_exchange(
+                    conv_id, turn_index, last_user_text, assistant_text
+                )
+                if indexed:
+                    logger.info(f"conv={conv_id}: indexed exchange (turn ~{turn_index})")
+            except Exception as e:
+                logger.warning(f"conv={conv_id}: episodic indexing failed: {e}")
+
+    # --- 2. Facts extraction ---
+    # In its own coroutine since v3.1.7 (R8): its early returns must end
+    # fact extraction and NOT the summary rollup below. See _facts_tail.
+    await _facts_tail(
+        conv_id,
+        touched_facts,
+        last_user_text,
+        assistant_text,
+        turn_index,
+        injected_facts=injected_facts,
+    )
+
     # --- 3. Hierarchical summary rollup (Phase 4) ---
     # Runs OUTSIDE the facts lock since maybe_rollup acquires its own
     # conv_lock internally — nesting the same lock would deadlock.
@@ -3995,6 +4037,48 @@ async def _async_tail(
             logger.exception(f"conv={conv_id}: async rollup failed: {e}")
 
 
+def _tail_store_blocked(last_user_text: str) -> tuple[str, str] | None:
+    """Why the memory tail would store NOTHING for this exchange, or None.
+
+    v3.1.7 (R8). These are the two conditions _async_tail evaluates that end
+    in no episodic row, no fact, and no rollup — the whole tail a no-op. They
+    are read here, on the request path, so the decision they force is COUNTED
+    and LOGGED like any other skip instead of being taken silently after
+    `stored` had already been published. Returns (outcome, reason) in the
+    shape TailDecision wants.
+
+    Order matters only in that disk pressure is the operator-visible one:
+    when both apply, the operator needs to see the disk.
+
+    `degrade.guard` is therefore called twice per exchange — once here and
+    once inside _async_tail, which keeps its own guard because a tail can sit
+    in the pool's queue while the disk fills under it. writes_allowed() is
+    cached for COMPACTOR_DEGRADE_CHECK_TTL_S (10 s), so the second call is a
+    tuple read, not a second statvfs; only its debug line repeats.
+    """
+    if not degrade.guard("async memory tail"):
+        return (
+            tailhealth.SKIPPED_DISK_PRESSURE,
+            "disk pressure has paused new-memory writes, so nothing about "
+            "this exchange would be persisted",
+        )
+    if not (last_user_text or "").strip():
+        # Reachable, and not only through a malformed request: a user turn
+        # whose content is a parts LIST carrying no text field and no part
+        # _message_image_count recognises falls through _extract_last_user_text
+        # and then through _memorable_user_text, which only substitutes a
+        # marker when it can count images. An image-only upload does NOT land
+        # here — that is exactly what the marker covers. Before this, the tail
+        # took a bare `return` with no log line of any kind and the counter
+        # said `stored`.
+        return (
+            tailhealth.SKIPPED_NO_USER_TEXT,
+            "the exchange has no user text to pair the reply with, so "
+            "episodic indexing and fact extraction both refuse it",
+        )
+    return None
+
+
 def _run_memory_tail(
     conv_id: str,
     text: str,
@@ -4019,6 +4103,36 @@ def _run_memory_tail(
     decision = decide_memory_tail(
         text, finished=finished, truncated=truncated, holed=holed
     )
+    # v3.1.7 (R8). decide_memory_tail judges the REPLY; it cannot know whether
+    # the store is reachable. Two conditions inside _async_tail store nothing
+    # at all, and both were reached AFTER `stored` had been counted, so
+    # /health/full reported a healthy tail for an exchange that never got
+    # near memory — the silent-skip class this counter exists to end, one
+    # layer up from where it was closed.
+    #
+    # Evaluated HERE rather than returned from _async_tail and recorded by the
+    # pool. Three reasons, and the first is decisive:
+    #
+    #   * bgwork.pool SHEDS. A tail dropped at the ceiling would then never be
+    #     counted at ALL, which is a new silent skip of exactly the shape
+    #     being fixed — and shedding is not hypothetical here (R13's own
+    #     evidence counts "the ones the pool shed").
+    #   * /health/full is read on a 30 s probe. A count that lands whenever a
+    #     background coroutine happens to finish describes a different window
+    #     than the one it is published in.
+    #   * one note() per exchange, on the request path, at a deterministic
+    #     point, keeps test_saturation.py's ledger (stored + skipped ==
+    #     exchanges) exact rather than eventually-exact.
+    #
+    # Only conditions under which NOTHING is stored are hoisted. Extraction
+    # being disabled is not one: episodic indexing still runs, and the rollup
+    # it used to skip is fixed in _async_tail itself rather than counted as a
+    # loss here.
+    if decision.store:
+        _blocked = _tail_store_blocked(last_user_text)
+        if _blocked is not None:
+            _outcome, _why = _blocked
+            decision = TailDecision(False, "", _outcome, _why, decision.raw_chars)
     # Counted before it is logged, and before the tail is fired: the counter
     # is what /health/full reads, and a skip that is only a log line is the
     # defect this exists to close (63 exchanges in one 2026-09-01 window,
@@ -5026,18 +5140,57 @@ async def chat_completions(request: Request) -> Any:
                 # accumulator.
                 accumulator.finalize()
                 # Fire-and-forget post-response work once the stream is done.
-                # Skip it when vLLM failed — there's no real assistant turn to
-                # extract/index from. Everything else about whether, and how
-                # much of, this reply enters memory is decide_memory_tail's
-                # call, made through _run_memory_tail, which the non-streaming
-                # path invokes identically: no line of tail policy or
-                # bookkeeping exists at one site only. Until v3.1.4 this site
-                # was three separate `if`s re-evaluating usable() and its twin
-                # was an if/elif/elif with no complete() analogue at all —
-                # the drift that lost 63 exchanges from memory in one log
-                # window, and the eighteenth "fixed at one site, missed at
-                # the other" on this branch.
-                if conv_id and not vllm_failed:
+                # Everything about whether, and how much of, this reply enters
+                # memory is decide_memory_tail's call, made through
+                # _run_memory_tail, which the non-streaming path invokes
+                # identically: no line of tail policy or bookkeeping exists at
+                # one site only. Until v3.1.4 this site was three separate
+                # `if`s re-evaluating usable() and its twin was an
+                # if/elif/elif with no complete() analogue at all — the drift
+                # that lost 63 exchanges from memory in one log window, and
+                # the eighteenth "fixed at one site, missed at the other" on
+                # this branch.
+                #
+                # v3.1.7 (R26): `and not vllm_failed` used to sit on this
+                # condition, justified as "there's no real assistant turn to
+                # extract/index from". That is true of the 4xx branch, where
+                # nothing was ever generated — and false of the RequestError
+                # branch, which fires when vLLM drops the connection PART WAY
+                # THROUGH a reply she has already read. The accumulator held
+                # real prose, and decide_memory_tail was never called,
+                # tailhealth.note was never called, and no line containing
+                # "skipping memory tail" was emitted. Measured: 0 decisions, 0
+                # counter movement, an empty grep — on a reply the client
+                # received in full. That is the shape of the defect this
+                # release argues against in its own comment two screens up.
+                #
+                # A connection that dies mid-reply IS a cut reply, so the
+                # existing trim path handles it exactly: keep the prose up to
+                # the last sentence boundary, or skip and SAY SO with a
+                # counted outcome. `finished` stays accumulator.complete() and
+                # is not forced to False — if vLLM sent finish_reason and then
+                # died on the trailing [DONE], the reply really is whole and
+                # trimming it would throw away its last sentence.
+                #
+                # The 4xx branch is safe through here rather than special-
+                # cased: nothing on it feeds the accumulator (the friendly
+                # error chunks are yielded straight to the client, never
+                # accumulator.feed'ed), so text() is "" and the decision is
+                # SKIPPED_EMPTY — the one outcome tailhealth treats as
+                # lossless. The compactor's own apology can never become a
+                # memory.
+                if vllm_failed and conv_id:
+                    # `vllm_failed` no longer decides anything; it is still
+                    # worth ONE line, because "the tail ran on a reply the
+                    # backend cut" and "the tail ran on a whole reply" look
+                    # identical in the log otherwise, and the first is the
+                    # case an operator is grepping for after an outage.
+                    logger.warning(
+                        f"conv={conv_id}: the backend failed during this "
+                        f"stream; the memory tail is deciding on the "
+                        f"{len(accumulator.text())} chars that did arrive"
+                    )
+                if conv_id:
                     _run_memory_tail(
                         conv_id,
                         accumulator.text(),
@@ -5769,6 +5922,109 @@ async def admin_merge(src_conv_id: str, dst_conv_id: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+# v3.1.7 (R13). What fills a slot the episodic store has no row for.
+#
+# THE DISTINCTION THAT MAKES THIS ALLOWED. This string is a SUMMARIZATION
+# INPUT and nothing else. It is built here, handed to summarizer.maybe_rollup,
+# and dropped; it never reaches facts.extract_facts_from_exchange, never
+# reaches retrieval.index_exchange, and is never written to any store. A
+# marker written INTO memory would be extracted as a fact and become one of
+# her memories — that is why this file has no other placeholders. The only
+# thing this one can do is make a summary say that part of the transcript was
+# missing, which is true.
+#
+# Deliberately non-blank, for _DEGENERATE_HISTORY_PLACEHOLDER's reason:
+# _do_l1_rollup skips a chunk whose every piece is blank, and a gap that
+# silently empties a chunk is not the same failure as one that says so.
+_UNINDEXED_TURN_PLACEHOLDER = (
+    "[this turn was not recorded in the episodic index and could not be "
+    "rebuilt]"
+)
+
+
+def _rebuild_transcript_by_slot(rows: list[dict]) -> tuple[list[dict], int]:
+    """The episodic rows laid out at their own turn POSITIONS, gaps filled.
+
+    Returns (messages, gap_turns).
+
+    v3.1.7 (R13). The old rebuild concatenated the rows it had. That is fine
+    for reading them back and wrong for summarizing them: since v3.1.4 the
+    summarizer locates a chunk's text at `position - len(window)` turns into
+    the array it is handed, so a transcript that is SHORT by the exchanges the
+    tail skipped and the pool shed does not merely stop early — every turn
+    after the first gap sits at the wrong index, and a chunk labelled 652-671
+    holds some other twenty turns. `admin_compact` was therefore right to 409
+    on it, and 409'd for every real conversation (63 skips in one measured
+    window; one gap anywhere is enough).
+
+    So place each pair where it belongs and leave the holes visible.
+
+    WHY THE SLOTS ARE RELATIVE TO THE FIRST ROW, not absolute. `turn_index` is
+    NOT an exact position and never was: the request path sets it to
+    `len(messages) + 1`, which counts system messages the summarizer's own
+    numbering skips, and retrieval._next_turn_index then reallocates it as
+    `max(stored_max + 2, seed)`. What IS exact is its DIFFERENCES — both the
+    request seed and the store's allocator advance by exactly
+    _TURN_INDEX_STEP (2) message-units per exchange, whether or not a row was
+    written — so a jump of 4 is one lost exchange, reliably, in either
+    numbering. Anchoring on the lowest stored index and spacing by differences
+    therefore reproduces the store's own gaps without inheriting either
+    scheme's offset.
+
+    That anchoring assumes the conversation's FIRST exchange is in the store.
+    The assumption is self-checking rather than trusted: if the head is
+    missing, the rebuild comes up short of the recorded position and the
+    caller's 409 fires — the same refusal, for the same reason, without the
+    endpoint having to detect the case.
+
+    A row whose document does not parse leaves its slot as a gap rather than
+    vanishing. Vanishing is what shifted everything after it.
+    """
+    def _idx(ex: dict) -> int:
+        try:
+            return int(ex.get("turn_index") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    ordered = sorted(rows, key=_idx)
+    if not ordered:
+        return [], 0
+    base = _idx(ordered[0])
+    pairs: dict[int, tuple[str, str]] = {}
+    cursor = 0
+    for ex in ordered:
+        at = max(_idx(ex) - base, cursor)
+        # Pairs sit on even offsets. An ODD difference means the two
+        # numberings disagreed about a system message somewhere; rounding up
+        # costs one placeholder pair and keeps user/assistant alternation,
+        # which the Mistral template requires and _turn_pieces assumes.
+        if at % 2:
+            at += 1
+        cursor = at + 2
+        # _exchange_doc writes "[user]: X\n[assistant]: Y". Split it back into
+        # the message pair the summarizer expects.
+        doc = ex.get("document") or ""
+        if "\n[assistant]: " not in doc:
+            continue
+        u, a = doc.split("\n[assistant]: ", 1)
+        pairs[at] = (u.removeprefix("[user]: "), a)
+
+    messages: list[dict] = []
+    gap_turns = 0
+    for at in range(0, cursor, 2):
+        pair = pairs.get(at)
+        if pair is None:
+            messages.append(
+                {"role": "user", "content": _UNINDEXED_TURN_PLACEHOLDER})
+            messages.append(
+                {"role": "assistant", "content": _UNINDEXED_TURN_PLACEHOLDER})
+            gap_turns += 2
+        else:
+            messages.append({"role": "user", "content": pair[0]})
+            messages.append({"role": "assistant", "content": pair[1]})
+    return messages, gap_turns
+
+
 @app.post(
     "/admin/conversations/{conv_id}/compact",
     dependencies=[Depends(_require_localhost)],
@@ -5795,6 +6051,14 @@ async def admin_compact(conv_id: str, request: Request):
     real one. So this can only summarize exchanges that were successfully
     indexed. It reports what it found rather than pretending that is the whole
     conversation.
+
+    Since v3.1.7 (R13) that reconstruction is BY SLOT: each pair sits at the
+    position its `turn_index` records, and an exchange the store never indexed
+    becomes an explicit placeholder pair instead of a hole that shifts every
+    later turn one place left. `gap_turns` / `gap_exchanges` in the plan say
+    how much of the transcript is placeholder. Refusals are now only for the
+    two things padding cannot fix: a store that does not reach the recorded
+    position, and one with more gap than transcript.
     """
     try:
         body = await request.json()
@@ -5816,16 +6080,12 @@ async def admin_compact(conv_id: str, request: Request):
             ),
         )
 
-    # _exchange_doc writes "[user]: X\n[assistant]: Y". Split it back
-    # into the message pair the summarizer expects.
-    messages: list[dict] = []
-    for ex in sorted(exchanges, key=lambda e: e.get("turn_index", 0)):
-        doc = ex.get("document") or ""
-        if "\n[assistant]: " not in doc:
-            continue
-        u, a = doc.split("\n[assistant]: ", 1)
-        messages.append({"role": "user", "content": u.removeprefix("[user]: ")})
-        messages.append({"role": "assistant", "content": a})
+    # Rebuilt BY SLOT, not by concatenation (v3.1.7, R13). See
+    # _rebuild_transcript_by_slot: each pair goes to the position its
+    # `turn_index` says it holds, and the exchanges the memory tail skipped
+    # and the pool shed become explicit placeholder turns rather than a
+    # silently shorter array.
+    messages, gap_turns = _rebuild_transcript_by_slot(exchanges)
 
     before = summarizer.load_state(conv_id)
     # REFUSE rather than summarize the wrong text.
@@ -5835,10 +6095,19 @@ async def admin_compact(conv_id: str, request: Request):
     # the summarizer locates a chunk's text at `position - len(window)` turns
     # into the array it is handed (summarizer._do_l1_rollup), so a
     # reconstruction SHORTER than the conversation's position is not merely
-    # short: its slots do not line up with the turns the chunk claims, and a
-    # gapped reconstruction compresses them unpredictably. A chunk labelled
-    # 652-671 whose text is some other twenty turns is worse than no chunk,
-    # because nothing downstream can tell.
+    # short: its slots do not line up with the turns the chunk claims. A chunk
+    # labelled 652-671 whose text is some other twenty turns is worse than no
+    # chunk, because nothing downstream can tell.
+    #
+    # v3.1.7 (R13) narrows WHEN that is true. Until now the comparison was
+    # against a concatenation, so ANY gap anywhere made the array short and
+    # the endpoint refused — 63 skips in one measured window means every real
+    # conversation, on the one rebuild-from-store recovery path there is, and
+    # the one R12's own ERROR line sends the operator to. Filling the gaps in
+    # place restores the alignment the arithmetic needs, so what is left to
+    # refuse is the case the placeholders cannot fix: a store that does not
+    # REACH the position at all. That is a genuinely missing tail (or head),
+    # and no amount of padding invents it.
     #
     # Compared against turns_seen rather than last_summarized_turn (which it
     # can never be below): the watermark is how far the SUMMARIES got, the
@@ -5853,30 +6122,65 @@ async def admin_compact(conv_id: str, request: Request):
     # the record; the watermark is a pointer derived from them, and it is the
     # only one of the three the old _reconcile_watermark could erase. One
     # function decides what "how far has this conversation got" means, here and
-    # in the summarizer, so the endpoint and the rollup cannot disagree about
-    # it — which is the disagreement R13 is still open on.
+    # in the summarizer, so the endpoint and the rollup cannot disagree.
     _pos = summarizer._recorded_position(before)
     if len(messages) < _pos:
         raise HTTPException(
             status_code=409,
             detail=(
                 f"refusing: the episodic store rebuilds {len(messages)} "
-                f"messages for conv {conv_id}, but the conversation's "
-                f"recorded position is already turn {_pos}. Running would "
-                f"summarize text that is not the text the chunk labels claim. "
-                f"The reconstruction is lossy by design, so a shortfall means "
-                f"episodic indexing has gaps — not that the summaries are "
-                f"behind."
+                f"messages for conv {conv_id} (including {gap_turns} "
+                f"placeholder turns for exchanges it never indexed), but the "
+                f"conversation's recorded position is already turn {_pos}. "
+                f"Running would summarize text that is not the text the chunk "
+                f"labels claim. Gaps INSIDE the store are filled and are not "
+                f"why this refused; the store's highest turn falls short of "
+                f"the position, so the end (or the beginning) of the "
+                f"conversation is missing from it entirely."
+            ),
+        )
+    # The second refusal, and the only new one: a reconstruction that is more
+    # placeholder than transcript is not a transcript. Summarizing it would
+    # spend a vLLM call per chunk to record that nothing is known, advance the
+    # watermark past turns nothing will ever summarize, and store the result
+    # as memory. It also bounds this array: one corrupt turn_index would
+    # otherwise open a gap as wide as the number itself.
+    _real_turns = len(messages) - gap_turns
+    if gap_turns > _real_turns:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"refusing: rebuilding conv {conv_id} by turn position needs "
+                f"{gap_turns} placeholder turns against only {_real_turns} "
+                f"recorded ones. More of this transcript is missing than is "
+                f"present, so summarizing it would record that it is unknown "
+                f"rather than what it said. Check "
+                f"GET /admin/conversations/{conv_id} and the episodic store's "
+                f"turn_index values."
             ),
         )
     plan = {
         "conv_id": conv_id,
         "indexed_exchanges": len(exchanges),
         "reconstructed_messages": len(messages),
+        # v3.1.7 (R13): the gap count is the honest half of the answer. A plan
+        # that reports 30 rebuilt messages without saying 2 of them are
+        # placeholders is the same claim the old concatenation made.
+        "gap_turns": gap_turns,
+        "gap_exchanges": gap_turns // 2,
+        "recorded_position": _pos,
         "watermark_before": before.get("last_summarized_turn", 0),
         "l1_before": len(before.get("l1") or []),
         "dry_run": dry_run,
     }
+    if gap_turns:
+        logger.warning(
+            f"conv={conv_id}: rebuilding from the episodic store needs "
+            f"{gap_turns // 2} placeholder exchange(s) among "
+            f"{len(messages) // 2} — those turns were never indexed, so the "
+            f"summaries covering them will say so rather than claim text "
+            f"this rebuild never had"
+        )
     if dry_run or not messages:
         plan["note"] = (
             "dry run — nothing was written. Re-send with "
