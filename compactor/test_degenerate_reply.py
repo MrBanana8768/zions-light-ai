@@ -291,4 +291,78 @@ assert len(dotted) >= 1500 and dotted.count(" ") < 100
 check(dotted, False, "1,600 characters of dotted identifiers with 44 spaces is not judged")
 
 print()
+print("[8] R24 — an abbreviation's dot is not a sentence break")
+# The fragment-line rule used to count sentence breaks with a bare
+# line.count(". "), so "Dr. ", "Mrs. ", "Prof. ", "St. ", "9 a.m. " and
+# "Rev. " were each counted as a sentence end. 15 real sentences, ~105
+# characters each (real mean well over the 40-char limit) but each one
+# uses six of those abbreviations, so the old rule counted 105 "breaks"
+# for what is really 15 sentences and flagged ordinary prose.
+_r24_sentence = ("Dr. Smith met Mrs. Jones and Prof. Lee outside St. "
+                  "Andrew's at 9 a.m. before Rev. Brown arrived to help.")
+r24_prose = " ".join(_r24_sentence for _ in range(15))
+assert len(r24_prose) >= 1500 and r24_prose.count(" ") >= 100
+assert len(r24_prose) / 15 > 100  # real mean sentence length
+check(r24_prose, False,
+      "ordinary prose whose sentences carry abbreviations is not a fragment "
+      "line - real mean ~105 chars, not the ~15 a bare '. ' count would see")
+# The abbreviation stoplist must still leave a GENUINE fragment collapse
+# detectable - this is the same shape as [7]'s fragments(), interleaved
+# with a couple of abbreviations, so the fix does not just turn the rule off.
+r24_fragments_with_abbrev = fragments(108, 15) + " Dr. Smith. Mrs. Jones."
+check(r24_fragments_with_abbrev, True,
+      "a real fragment collapse is still caught even when a couple of its "
+      "pieces happen to end in an abbreviation")
+
+print()
+print("[9] R9/R19 — the list backstop must reach the reply's own end, and "
+      "clear DEGENERATE_MIN_CHARS")
+# A legitimate 66-item enumeration (a scripture assistant will produce
+# exactly this) that CLOSES IN PROSE, unlike the corpus runaway which had
+# nothing after its list. Real book names, since they are simply facts and
+# not copyrightable expression.
+bible_books = [
+    "Genesis", "Exodus", "Leviticus", "Numbers", "Deuteronomy", "Joshua",
+    "Judges", "Ruth", "1 Samuel", "2 Samuel", "1 Kings", "2 Kings",
+    "1 Chronicles", "2 Chronicles", "Ezra", "Nehemiah", "Esther", "Job",
+    "Psalms", "Proverbs", "Ecclesiastes", "Song of Solomon", "Isaiah",
+    "Jeremiah", "Lamentations", "Ezekiel", "Daniel", "Hosea", "Joel",
+    "Amos", "Obadiah", "Jonah", "Micah", "Nahum", "Habakkuk", "Zephaniah",
+    "Haggai", "Zechariah", "Malachi", "Matthew", "Mark", "Luke", "John",
+    "Acts", "Romans", "1 Corinthians", "2 Corinthians", "Galatians",
+    "Ephesians", "Philippians", "Colossians", "1 Thessalonians",
+    "2 Thessalonians", "1 Timothy", "2 Timothy", "Titus", "Philemon",
+    "Hebrews", "James", "1 Peter", "2 Peter", "1 John", "2 John",
+    "3 John", "Jude", "Revelation",
+]
+assert len(bible_books) == 66
+bible_reply = (
+    "Here are all 66 books of the Bible:\n\n"
+    + "\n".join(f"- {b}" for b in bible_books)
+    + "\n\nThose are all 66 books, from Genesis to Revelation, across the "
+    "Old and New Testaments."
+)
+check(bible_reply, False,
+      "a 66-item enumeration that closes in prose is a list, not a runaway "
+      "- the run does not reach the reply's own end")
+# The same 66 items with NOTHING after them - the corpus shape - must still
+# fire: this is the backstop the rule exists for.
+check(bible_reply.split("\n\nThose")[0], True,
+      "the same 66-item list with no closing prose - running to its own "
+      "end - is still the runaway the backstop exists for")
+# The synthetic generator from [7] must show the same thing: a run that
+# clears the item-count limit but is followed by prose is not a runaway.
+check(items(60, 20) + "\nThat is the complete list, and nothing more "
+      "needs to be said about it.", False,
+      "60 items followed by a closing sentence do not trip the backstop "
+      "- items(60, 20) alone (ending at EOF) still does, see [7]")
+# R19: the list rule must respect DEGENERATE_MIN_CHARS (300), same as the
+# decoration-fraction rule a few lines above it in main.py.
+short_list = "- a\n" * 50
+assert len(short_list) == 200 < main.DEGENERATE_MIN_CHARS
+check(short_list, False,
+      "50 one-character list items (200 chars) is under DEGENERATE_MIN_CHARS "
+      "and must not trip the structural block at all")
+
+print()
 print("All degenerate-reply tests passed.")

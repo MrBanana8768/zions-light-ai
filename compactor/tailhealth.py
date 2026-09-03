@@ -32,6 +32,16 @@ nobody reads. Skips degrade while they are happening and for one window
 after, then clear themselves. The cumulative counters stay in the payload
 as the record.
 
+`skipped_recently` is also keyed off LOSSY_SKIP_OUTCOMES, not off "any skip"
+(v3.1.7, R27). SKIPPED_EMPTY — she pressed Stop before the first token — is
+counted like every other skip but carries no loss: there was no text to
+memorize. Keying the degrade decision off "any skip" made that the SAME
+always-on-warning failure the paragraph above already fixed once, arriving
+through the other door: the release's own figure is 51 of 63 skips in one
+window were manual stops, so a run of those alone used to pin /health/full
+degraded for the full window on every one of them, over a turn that lost
+nothing.
+
 No conversation text and no conv_id reaches this module — only outcome
 labels and character counts. /health/full is not localhost-gated the way
 the /admin endpoints are (bgwork.submit's docstring makes the same point
@@ -103,12 +113,25 @@ OUTCOMES = (
     SKIPPED_NO_BOUNDARY, SKIPPED_TOO_SHORT, SKIPPED_DEGENERATE_PARTIAL,
 )
 
+# v3.1.7 (R27). SKIPPED_EMPTY is the one skip label that carries no loss: she
+# pressed Stop before the first token, so there was never any text to
+# memorize. Every OTHER skip means a reply she read did not reach memory.
+# Computed by exclusion, not by naming the five lossy labels, so a skip
+# outcome this module has never heard of — including one `note()`'s
+# unknown-label branch below is about to count for the first time — is lossy
+# BY DEFAULT. The 2026-09-01 incident this module exists to prevent was 63
+# skips in one window, 51 of them manual stops (SKIPPED_EMPTY): keying the
+# degrade decision off "any skip" instead of this set pinned /health/full
+# degraded for the full SKIP_DEGRADE_WINDOW_S on every one of those 51, for a
+# turn that lost nothing.
+LOSSY_SKIP_OUTCOMES = frozenset(OUTCOMES) - STORING_OUTCOMES - {SKIPPED_EMPTY}
+
 
 class _State:
     __slots__ = (
         "outcomes", "stored", "skipped", "raw_chars", "kept_chars",
         "trimmed_raw_chars", "trimmed_kept_chars", "consecutive_skips",
-        "last_skip_at", "last_skip_outcome",
+        "last_skip_at", "last_skip_outcome", "last_lossy_skip_at",
     )
 
     def __init__(self) -> None:
@@ -131,9 +154,31 @@ class _State:
         # that must not jump when the clock is stepped.
         self.last_skip_at: float | None = None
         self.last_skip_outcome: str | None = None
+        # v3.1.7 (R27). Tracked separately from last_skip_at: `skipped_recently`
+        # must clear itself when the only skip in the window was SKIPPED_EMPTY,
+        # even while last_skip_at (any skip, kept as the general record) is
+        # still fresh.
+        self.last_lossy_skip_at: float | None = None
 
 
 _state = _State()
+
+
+def _safe_int(v) -> int:
+    """`int(v)`, clamped at 0, that never raises.
+
+    v3.1.7 (R28). The two call sites today always pass real ints, but this
+    module's whole reason for existing is a decision made in the request
+    path's `finally` (see the module docstring's "must not raise" contract) —
+    and until this fix only the OUTCOME label was guarded against that. A
+    `None` or a non-numeric string reaching `raw_chars`/`kept_chars` went
+    through a bare `int()` and raised out of the finally, which is the exact
+    second failure the docstring already claimed could not happen.
+    """
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return 0
 
 
 def note(outcome: str, *, raw_chars: int, kept_chars: int) -> str | None:
@@ -150,21 +195,50 @@ def note(outcome: str, *, raw_chars: int, kept_chars: int) -> str | None:
     a store. Never logs; see the module docstring for why.
     """
     s = _state
-    s.outcomes[outcome] = s.outcomes.get(outcome, 0) + 1
-    s.raw_chars += max(0, int(raw_chars))
-    if outcome in STORING_OUTCOMES:
+    raw = _safe_int(raw_chars)
+    kept = _safe_int(kept_chars)
+    s.raw_chars += raw
+    storing = outcome in STORING_OUTCOMES
+    if storing:
         s.stored += 1
-        s.kept_chars += max(0, int(kept_chars))
+        s.kept_chars += kept
         if outcome == STORED_TRIMMED:
-            s.trimmed_raw_chars += max(0, int(raw_chars))
-            s.trimmed_kept_chars += max(0, int(kept_chars))
+            s.trimmed_raw_chars += raw
+            s.trimmed_kept_chars += kept
         s.consecutive_skips = 0
-        return None
-    s.skipped += 1
-    s.consecutive_skips += 1
-    s.last_skip_at = time.monotonic()
-    s.last_skip_outcome = outcome
-    return f"{s.consecutive_skips} consecutive memory-tail skip(s)"
+        result = None
+    else:
+        s.skipped += 1
+        s.consecutive_skips += 1
+        s.last_skip_at = time.monotonic()
+        s.last_skip_outcome = outcome
+        # v3.1.7 (R27). SKIPPED_EMPTY does not touch this clock, so a skip
+        # storm of manual stops cannot make `skipped_recently` true — see
+        # LOSSY_SKIP_OUTCOMES above.
+        #
+        # Tested as "not a store and not the one harmless label", NOT as
+        # membership of LOSSY_SKIP_OUTCOMES. Those read the same for every
+        # label this module knows and OPPOSITELY for one it does not: a set
+        # built by excluding from OUTCOMES cannot contain a name that is not
+        # in OUTCOMES, so `outcome in LOSSY_SKIP_OUTCOMES` silently makes an
+        # unrecognised outcome NON-lossy — the exact inversion of the safe
+        # default the comment on that set claims, and of note()'s own
+        # unknown-label contract two branches up. An outcome added in main.py
+        # and forgotten here would then be counted and never degrade health,
+        # which is the silent-skip shape this whole module exists to end.
+        if outcome not in STORING_OUTCOMES and outcome != SKIPPED_EMPTY:
+            s.last_lossy_skip_at = time.monotonic()
+        result = f"{s.consecutive_skips} consecutive memory-tail skip(s)"
+    # v3.1.7 (R28). The outcome tally is the LAST mutation in this function,
+    # on purpose: everything above it is now raise-proof (_safe_int), but if
+    # some future line between here and the top ever raises anyway, the
+    # published block must fail with the outcome NOT yet counted rather than
+    # counted without a matching stored/skipped increment — the direction
+    # that keeps `sum(outcomes.values()) == stored + skipped`
+    # (test_saturation.py's reconciliation) from going stale rather than
+    # going wrong.
+    s.outcomes[outcome] = s.outcomes.get(outcome, 0) + 1
+    return result
 
 
 def snapshot(*, window_s: float | None = None) -> dict:
@@ -191,6 +265,16 @@ def snapshot(*, window_s: float | None = None) -> dict:
         None if s.last_skip_at is None
         else round(time.monotonic() - s.last_skip_at, 1)
     )
+    # v3.1.7 (R27). Separate clock from `since` above: a SKIPPED_EMPTY skip
+    # (Stop before the first token) advances `since` but not this one, so it
+    # cannot make `skipped_recently` true on its own — see LOSSY_SKIP_OUTCOMES.
+    # `since` and `last_skip_outcome`/`consecutive_skips` stay keyed off ANY
+    # skip: they are the general record ("the cumulative counters stay in the
+    # payload as the record" — module docstring), not the degrade signal.
+    since_lossy = (
+        None if s.last_lossy_skip_at is None
+        else round(time.monotonic() - s.last_lossy_skip_at, 1)
+    )
     return {
         "stored": s.stored,
         "skipped": s.skipped,
@@ -198,7 +282,8 @@ def snapshot(*, window_s: float | None = None) -> dict:
         "consecutive_skips": s.consecutive_skips,
         "last_skip_outcome": s.last_skip_outcome,
         "seconds_since_last_skip": since,
-        "skipped_recently": since is not None and since <= window,
+        "seconds_since_last_lossy_skip": since_lossy,
+        "skipped_recently": since_lossy is not None and since_lossy <= window,
         "skip_window_s": window,
         "raw_chars": s.raw_chars,
         "kept_chars": s.kept_chars,

@@ -135,6 +135,17 @@ r = tailhealth.note("skipped_something_new", raw_chars=5, kept_chars=0)
 s = tailhealth.snapshot()
 assert_eq(s["outcomes"].get("skipped_something_new"), 1, "counted under its own name")
 assert_eq(s["skipped"], 1, "an unknown outcome is a skip, never a silent store")
+# ...AND LOSSY BY DEFAULT. LOSSY_SKIP_OUTCOMES is computed by exclusion
+# rather than by naming the five lossy labels, precisely so that a label
+# this module has never heard of degrades health instead of being waved
+# through. An outcome added to main.py and forgotten here is the shape of
+# every silent-skip defect this module was written to end, so the default
+# has to be the loud one. Without this the "by exclusion" construction can
+# be replaced with an `and outcome in OUTCOMES` guard and no test notices.
+assert_true(s["skipped_recently"],
+            "an unknown outcome is treated as LOSSY, so health still degrades")
+assert_true("skipped_something_new" not in tailhealth.OUTCOMES,
+            "fixture: the label really is one the module does not know")
 assert_true(r is not None, "and reported as one")
 
 print()
@@ -192,6 +203,79 @@ finally:
     os.environ.pop("COMPACTOR_TAIL_SKIP_DEGRADE_WINDOW_S", None)
     if _saved is not None:
         os.environ["COMPACTOR_TAIL_SKIP_DEGRADE_WINDOW_S"] = _saved
+
+print()
+print("[10] SKIPPED_EMPTY does not make skipped_recently true (v3.1.7, R27)")
+# She hit Stop before the first token: nothing to memorize, so this is the
+# one skip label that carries no loss. Keying the degrade decision off ANY
+# skip pinned /health/full degraded on this alone — the release's own figure
+# is 51 of 63 skips in one window were manual stops.
+tailhealth._reset_for_tests()
+tailhealth.note(tailhealth.SKIPPED_EMPTY, raw_chars=10, kept_chars=0)
+s = tailhealth.snapshot()
+assert_eq(s["skipped"], 1, "still counted — the record is intact")
+assert_eq(s["last_skip_outcome"], "skipped_empty", "and named")
+assert_true(s["seconds_since_last_skip"] is not None, "the general clock started")
+assert_eq(s["skipped_recently"], False, "but an empty skip alone is not 'recently lossy'")
+assert_eq(s["seconds_since_last_lossy_skip"], None, "no lossy skip has ever happened")
+
+print()
+print("[11] a lossy skip alongside empty skips still degrades")
+tailhealth._reset_for_tests()
+tailhealth.note(tailhealth.SKIPPED_EMPTY, raw_chars=0, kept_chars=0)
+tailhealth.note(tailhealth.SKIPPED_NO_BOUNDARY, raw_chars=50, kept_chars=0)
+tailhealth.note(tailhealth.SKIPPED_EMPTY, raw_chars=0, kept_chars=0)
+s = tailhealth.snapshot()
+assert_eq(s["skipped"], 3, "all three counted")
+assert_eq(s["last_skip_outcome"], "skipped_empty", "the most recent skip of any kind")
+assert_eq(s["skipped_recently"], True,
+          "a real loss happened in the window, even though the LAST skip did not")
+assert_true(s["seconds_since_last_lossy_skip"] is not None
+            and s["seconds_since_last_lossy_skip"] < 5.0,
+            "the lossy clock reflects the middle (lossy) skip")
+
+print()
+print("[12] LOSSY_SKIP_OUTCOMES excludes only SKIPPED_EMPTY")
+assert_eq(tailhealth.SKIPPED_EMPTY not in tailhealth.LOSSY_SKIP_OUTCOMES, True,
+           "the one label with no loss")
+for _o in tailhealth.OUTCOMES:
+    if _o in tailhealth.STORING_OUTCOMES or _o == tailhealth.SKIPPED_EMPTY:
+        continue
+    assert_true(_o in tailhealth.LOSSY_SKIP_OUTCOMES, f"{_o} is lossy")
+
+print()
+print("[13] note() does not raise on a non-numeric char count (v3.1.7, R28)")
+# `int(None)` and `int('bad')` both raise TypeError/ValueError. note() runs in
+# the request path's `finally`, where a bookkeeping error must not become a
+# second failure — the module docstring's own claim, previously honoured only
+# for the outcome label.
+tailhealth._reset_for_tests()
+for _raw, _kept in ((None, 0), ("not-a-number", 0), (5, None), (5, "also-bad")):
+    r = tailhealth.note(tailhealth.SKIPPED_TOO_SHORT, raw_chars=_raw, kept_chars=_kept)
+    assert_true(r is not None, f"note({_raw!r}, {_kept!r}) did not raise and returned a streak")
+s = tailhealth.snapshot()
+assert_eq(s["skipped"], 4, "all four calls counted despite the bad inputs")
+assert_eq(sum(s["outcomes"].values()), s["stored"] + s["skipped"],
+          "outcomes reconcile with stored+skipped even after coercion failures")
+
+print()
+print("[14] the outcome tally and stored/skipped never disagree (v3.1.7, R28)")
+# Belt and braces on the reconciliation test_saturation.py relies on: mix
+# clean and dirty calls, storing and skipping, and check the invariant holds
+# throughout, not just at the end.
+tailhealth._reset_for_tests()
+_calls = [
+    (tailhealth.STORED, 100, 100),
+    (tailhealth.SKIPPED_EMPTY, None, 0),
+    (tailhealth.SKIPPED_NO_BOUNDARY, "bad", 0),
+    (tailhealth.STORED_TRIMMED, 500, 200),
+    (tailhealth.SKIPPED_TOO_SHORT, 30, None),
+]
+for _outcome, _raw, _kept in _calls:
+    tailhealth.note(_outcome, raw_chars=_raw, kept_chars=_kept)
+    _s = tailhealth.snapshot()
+    assert_eq(sum(_s["outcomes"].values()), _s["stored"] + _s["skipped"],
+              f"reconciled after {_outcome}")
 
 print()
 print("All tailhealth tests passed.")

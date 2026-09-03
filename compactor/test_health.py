@@ -680,6 +680,65 @@ def test_the_real_counter_is_wired():
         tailhealth._reset_for_tests()
 
 
+def test_an_empty_reply_skip_does_not_degrade_status():
+    """v3.1.7, R27. SKIPPED_EMPTY is she-hit-Stop-before-the-first-token:
+    there was never any text to memorize, so it is the one skip label that
+    carries no loss. Keying the degrade decision off "any skip" made a run of
+    these — the release's own figure is 51 of 63 skips in one window were
+    manual stops — pin /health/full degraded for a turn that lost nothing.
+    Mirrors test_tail_skips_degrade_the_status exactly except for the
+    outcome label, so the only variable is whether that label degrades."""
+    print("\n[test] an empty-reply skip alone does NOT degrade /health/full")
+
+    async def go():
+        with _healthy_vllm(), _pool_reporting(_quiet_pool()), _tail_reporting(_quiet_tail(
+            skipped=63, consecutive_skips=63, seconds_since_last_skip=0.0,
+            skipped_recently=False, last_skip_outcome="skipped_empty",
+        )):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(r["status"], "ok", "an empty-reply skip is not memory loss")
+    assert_eq(r["status_reasons"], [], "so nothing is reported")
+    assert_eq(r["memory_tail"]["skipped"], 63,
+              "the cumulative count is still in the payload as history")
+
+
+def test_the_real_counter_does_not_degrade_on_empty_skips_alone():
+    """Not a fake: drive the real tailhealth.note() with SKIPPED_EMPTY only,
+    the way test_the_real_counter_is_wired drives it with lossy outcomes. A
+    health.py/tailhealth.py pair that passed every mocked test above but
+    still computed `skipped_recently` off ANY skip internally would be blind
+    to this."""
+    print("\n[test] the REAL tailhealth counter: empty skips alone stay 'ok'")
+    tailhealth._reset_for_tests()
+    try:
+        async def go():
+            with _healthy_vllm(), _pool_reporting(_quiet_pool()):
+                for _ in range(63):
+                    tailhealth.note(tailhealth.SKIPPED_EMPTY, raw_chars=0, kept_chars=0)
+                return await health.gather_health_full("http://fake", 4096)
+
+        r = asyncio.run(go())
+        assert_eq(r["status"], "ok", "63 real empty skips: still ok")
+        assert_eq(r["status_reasons"], [], "nothing reported")
+        assert_eq(r["memory_tail"]["skipped"], 63, "but the record shows all 63")
+        assert_eq(r["memory_tail"]["last_skip_outcome"], "skipped_empty",
+                  "with the real last outcome")
+
+        # A LOSSY skip afterward still degrades — the fix must not have made
+        # tailhealth blind to real loss, only to the zero-loss label.
+        async def go2():
+            with _healthy_vllm(), _pool_reporting(_quiet_pool()):
+                tailhealth.note(tailhealth.SKIPPED_NO_BOUNDARY, raw_chars=100, kept_chars=0)
+                return await health.gather_health_full("http://fake", 4096)
+
+        r2 = asyncio.run(go2())
+        assert_eq(r2["status"], "degraded", "a real lossy skip still degrades")
+    finally:
+        tailhealth._reset_for_tests()
+
+
 # ---------------------------------------------------------------------------
 # The store scan must not run on the event loop (v3.1 A12)
 # ---------------------------------------------------------------------------
@@ -818,6 +877,9 @@ def _all_tests():
         test_tail_skips_still_answer_200,
         test_tail_reason_joins_the_others,
         test_the_real_counter_is_wired,
+        # v3.1.7, R27 — SKIPPED_EMPTY carries no loss and must not degrade.
+        test_an_empty_reply_skip_does_not_degrade_status,
+        test_the_real_counter_does_not_degrade_on_empty_skips_alone,
         # v3.1 A12 — the store scan must not block the one event loop.
         test_blocking_probes_run_off_the_event_loop,
         test_loop_stays_responsive_while_the_scan_runs,
