@@ -1898,3 +1898,258 @@ a path argument was APPENDED rather than substituted: every
 suites against one compactor. That produced a container exiting 255 and took
 Docker Desktop down mid-session. The path now lives in CMD, where an argument
 replaces it.
+
+---
+
+# The adversarial review — four lanes, isolated stacks
+
+Four adversaries, each with its own compose project, compactor, vLLM stand-in
+and storage volume, told to break the system and to disbelieve every claim the
+code makes about itself. Findings below are theirs; the verification and the
+fixes are mine, and where a fix was wrong the first time that is recorded too.
+
+Everything here was reproduced from a clean stack before it was believed.
+
+---
+
+## FIXED — the ones that were losing or corrupting memory
+
+### A-01 · A wrong-shape store reads as EMPTY, and the next turn overwrites it
+
+**The worst finding of the sweep**, because it is silent amnesia rather than
+an error.
+
+`read_json_strict` raises `StoreUnreadable` on a PARSE failure. A file that
+parses but holds the wrong THING — a bare list where a dict belongs, `null`,
+a number — came back to callers written as
+`data.get(...) if isinstance(data, dict) else []`, i.e. **as empty**. Nothing
+raised, `stats.unreadable` did not move, and the next chat turn wrote a fresh
+empty store over it. Measured with a PINNED fact: gone. The control (a
+truncated file, which breaks the parser) was preserved on disk.
+
+**So the difference between "recoverable" and "destroyed" was whether the
+damage happened to break the JSON parser.**
+
+This is v3.1 F1a one branch over. F1a was "a corrupt file returns [] and
+callers write back over the real facts"; its fix taught the loader to raise on
+a parse failure and left the wrong-shape case returning empty — and
+`load_facts`' own docstring describes the danger three lines above the line
+that had it.
+
+Fixed at the loader with an `expect` shape, not at the eight call sites:
+`read_json_strict(..., expect=dict)` raises `StoreUnreadable` for a present
+file of the wrong type, and an absent file still returns its default so a new
+conversation does not raise on its first turn. `load_facts` also raises when
+`"facts"` is present but not a list — the same hazard one level down.
+
+Affected all four layers: facts, summaries, personas, archive sidecar. The
+persona case additionally bypassed the managed/admin-persona protection,
+replacing an admin persona with the client's system prompt.
+
+### A-02 · `stats.unreadable` was counted and never read
+
+The health scan goes to the trouble of counting unreadable files per layer,
+and `/health/full` never consulted the number. Confirmed live: three corrupted
+conversations present, `status: "ok"`, `status_reasons: []`, Docker
+HEALTHCHECK green.
+
+The module's own docstring says a layer we cannot see must not be reported as
+healthy. The count was in the payload; an operator would have had to notice a
+nested figure inside a body whose top line said everything was fine. Now it
+degrades, and names the layers.
+
+### A-03 (F-07 / RACE-03) · A shed memory tail was counted as `stored`
+
+Found independently by two adversaries. Measured: 160 concurrent turns, pool
+shed 61, `memory_tail` reported `stored=160, skipped=0`. Confirmed again at
+192 stored / 55 shed / 137 rows actually written.
+
+**This is R8's own fix meeting its own reasoning from the other side.** R8
+hoisted the count onto the request path PRECISELY BECAUSE the pool sheds — a
+tail counted only on completion would vanish silently. The cost of counting
+early is that it counts work that never happened. "Uncounted loss" became
+"loss counted as a success", which is worse: the first is a gap, the second is
+a lie. The loss WAS visible in `background_work.shed`, just not in the dict
+named after the thing that was lost.
+
+`_fire_and_forget` now returns whether the pool accepted the work, and a shed
+tail is re-labelled `skipped_shed` — lossy by exclusion like every other skip.
+Amending after the fact is safe because `submit()` cannot run the coroutine
+before returning and there is no `await` between the count and the correction.
+
+Verified after the fix by the adversary that found it: 135 stored / 57 shed /
+135 rows.
+
+**Three test doubles had to be corrected with it**, and that is worth
+recording: `test_saturation`, `test_truncated_tail` and `test_task_traffic`
+each patch `_fire_and_forget` with a spy that returned `None`. Under the new
+bool contract `None` reads as "the pool shed it", so every clean finish came
+back skipped. The suite caught the contract change immediately — a double that
+does not honour the contract tests the double.
+
+### A-04 (RACE-01) · `DELETE /admin/conversations/{id}/facts` did not drain
+
+Reproduced 10/10, and 5/5 in the forced worst case.
+
+The chat `/forget` settles the background pool, wipes, verifies the residue
+and retries once. The admin endpoint called `_clear_all_memory` bare.
+`conv_lock` cannot substitute: `_async_tail` deliberately takes that lock
+THREE separate times so it never holds it across an LLM call, so a wipe lands
+BETWEEN the tail's jobs.
+
+Worst case measured: the endpoint answered **HTTP 200 with all-zero
+counters** — "there was nothing to forget" — and the fact, the episodic row
+carrying the verbatim user turn and reply, and the position were all on disk
+seconds later. For an endpoint whose whole purpose is to make something gone,
+answering "done, nothing there" while it is being written back is the worst
+available way to be wrong.
+
+Fixed by draining first, like its twin, and reporting `background_settled` so
+the response does not imply a guarantee the best-effort drain did not make.
+
+---
+
+## OPEN — confirmed, not yet fixed
+
+### A-05 (RACE-02) · Two concurrent `merge-into` destroy one side's facts
+
+**92% (23/25), 100% (10/10) on the current tree.** Both merges answered 200
+with `facts_added: 20`; 20 of 40 were in the store — all of one side, none of
+the other.
+
+`merge_conversation` is dispatched with `run_in_threadpool`, so it runs on a
+worker thread, and its only mutual exclusion is a `conv_lock(dst).locked()`
+PROBE — an asyncio lock a thread can neither take nor wait on — around a bare
+`load_facts → merge → save_facts`. `import_conversation` carries the same
+probe and is safe from itself only because it runs to completion on the event
+loop. The merge is the sibling that was moved onto a thread and kept the guard
+without the property that made it work.
+
+The fix is a real mutual exclusion for the threaded path, and it is a
+threading-model change rather than a one-liner, which is why it is recorded
+rather than rushed at the end of a long session.
+
+### A-06 (RACE-04) · `conv_lock()` is called from a threadpool worker
+
+By inspection, not reproduced. Its docstring states the precondition that this
+violates. Racing the get-or-create can hand two callers different `Lock`
+objects for one conv_id, after which a holder is invisible to `locked()` and
+mutual exclusion for that conversation is broken FOR THE LIFE OF THE PROCESS.
+
+Reported despite being unreproducible because every "sound" concurrency result
+assumes it holds.
+
+### A-07 (F-01) · A `/tokenize` that answers confidently and wrongly is trusted
+
+`count_tokens_exact` validates only `isinstance(n, (int, float))`. A count of
+0, a negative count and a 1000x count are all taken as ground truth, and
+`checks.tokenize.ok` stays `true` with `status: "ok"`. At factor 1000 a
+**12,002-token conversation reached the model as 38 tokens**, HTTP 200.
+
+`tokenize.ok` covers "did not answer" and not "answered, confidently,
+wrongly" — which is the 2026-08-28 shape exactly.
+
+### A-08 (F-13) · Compaction and the hard budget use different counters
+
+Two payloads of **21,506 true tokens each**: the plain-English one compacted
+to 5,412; **the box-drawing one was forwarded whole at 21,506.**
+`compact_if_needed` uses `count_tokens` (char/4) while `_enforce_hard_budget`
+was given vLLM's count. On production content, which reads LOW on char/4, this
+is the failing direction — and it connects directly to the decoration work:
+box-drawing replies are exactly the content char/4 misprices.
+
+### A-09 (F-02) · One backend lie latches the budget margin for the process
+
+v3.1 D4's `guard_measured_overflow` declines to learn only when the guard
+already measured the overflow. An under-reporting `/tokenize` makes the guard
+measure "fits", so it learns the whole overshoot in one step and latches
+`_BUDGET_MARGIN` to its 8192 ceiling process-wide. Victim conversation: 17,418
+tokens forwarded before, 13,073 after. No margin field in `/health/full`;
+recovery is ~250 requests or a restart.
+
+### A-10 (F-04) · `read=None` lets a paused backend hang forever
+
+`docker pause` on the backend: connect succeeds (kernel listen queue), no
+bytes ever arrive, measured **100.1 s with no answer**. The comment above the
+line claims the bounded connect timeout prevents "a socket that accepts and
+then stalls".
+
+### A-11 (F-05) · A backend-unreachable stream still ends `finish_reason: "stop"`
+
+No `error` object, on both the 5xx and connection-dropped paths. Its sibling
+`_request_rejected_stream_chunks` was written to fix exactly this and its
+docstring names the incident.
+
+### A-12 (F-S6) · `import` writes fact records without validating them
+
+One malformed record (`added_turn: {}` / `NaN` / a list) → import returns 200
+"success", then `GET /facts` 500s forever and **the fact-extraction tail
+aborts every turn** — memory formation silently dies — while `/health` stays
+green.
+
+### A-13 · Smaller, recorded in the findings files
+
+`pool.drain(timeout=10.0)` abandons in-flight tails on graceful shutdown (5 of
+6 lost, already counted stored); `_enforce_hard_budget`'s `dropped_turns` /
+`dropped_blocks` report is written and only `fits` is read (L5/L6, still
+open); `health_full`'s docstring claims the container goes unhealthy when vLLM
+is FATAL (it answers 200 "degraded"); `/health/full` reports `backups` and
+never judges them, while `alert.notify` no-ops without a webhook, so a backup
+that never happens is invisible in the default configuration;
+`verify_backup` is blind to shape damage, so a store that already lost facts
+backs up green and verified.
+
+---
+
+## Attacked and SOUND — recorded because it is half the value
+
+* **Atomicity held.** 18 hard SIGKILLs during a multi-conversation write storm:
+  zero torn files, zero orphan `.tmp`.
+* **Disk pressure (R8) was the best-behaved subsystem**: guard fires,
+  `skipped_disk_pressure` counted, accurate status reasons, clean recovery, no
+  corruption on ENOSPC, `/remember` fails loudly.
+* **Watermark repair (R12)** self-heals with real traffic; a 10^12 watermark
+  makes `/compact` refuse rather than mis-summarize.
+* Every `/tokenize` OUTAGE mode degrades and recovers honestly. Budget
+  boundaries are exact to the token. A 4xx stream is properly error-typed. The
+  tail never memorizes the compactor's own apology. Mid-stream backend death is
+  counted. SIGKILL under load: no partial 200s, no corruption, healthy in 15 s.
+  Backup verification catches truncated and bit-flipped archives.
+* **20 concurrency attacks found nothing**: `/forget` vs tail (0/15),
+  `/remember` vs tail (0/15), 16 simultaneous `/remember`, 12 simultaneous
+  chats with 12 distinct indices, position exactly 2/exchange under load, 24
+  streams aborted at 8 stages, duplicate requests, conv_ids the sanitiser folds
+  together, compact-during-chat, merge/import under a queued tail, opposing
+  merges (no deadlock — `_handle_retire` sorts its two locks), backup during
+  write load, Chroma written from a thread and the loop at once.
+* Well-formed contradictory summary state (overlaps, `first > last`, duplicate
+  labels, L3-without-L2, negative counts) is tolerated without crash or loss.
+* Import guards, backup verify/restore, observability listings, and
+  100 MB / deeply-nested resource files (no OOM).
+
+## Three false leads, retracted by the adversary that raised them
+
+Recorded because each produces the exact signature of a race and cost real
+time: **inline dedup** eating templated near-duplicate test facts (four bogus
+100% findings); **`skipped_task_traffic`** silently skipping every tail from a
+load generator whose arrays lack an assistant turn (56 of 64 requests — the
+new v3.1.8 behaviour, working correctly, looking like data loss); and **httpx
+refusing to encode a non-ASCII header**, so the request never left the client.
+
+## Caveats on the concurrency results
+
+The stand-in answers instantly, so windows that open while the tail is parked
+on a real vLLM call are far narrower here than on the pod — RACE-01 needed a
+manufactured 18-deep queue to reach timing that one slow extraction would
+produce alone. **Multi-worker uvicorn was NOT tested; if the deployment ever
+runs more than one worker, `conv_lock` protects nothing across them and all of
+the sound concurrency results above become structural rather than settled.**
+
+## Fixture capability gaps found by using it
+
+No fault injection for `/v1/chat/completions` — no way to force 4xx/5xx,
+malformed SSE, a cut stream, or `[DONE]` without content. Requested: a
+`completion_mode` mirroring `tokenize_mode`, plus `stream_cut_after_chunks` /
+`stream_malformed`, and intermittent (1-in-N) faults. Also `tokens.py` tier 2
+is `is_available() == False` in every container here, so its fallback and
+divergence detector were never exercised and no finding above bears on them.

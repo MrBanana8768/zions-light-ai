@@ -372,8 +372,18 @@ def load_facts(conv_id: str) -> list[dict]:
     real ones (v3.1 F1a). Callers that merely display or count facts should
     catch it and say so; callers that write must abort.
     """
-    data = read_json_strict(facts_path(conv_id), default={})
-    facts = data.get("facts", []) if isinstance(data, dict) else []
+    data = read_json_strict(facts_path(conv_id), default={}, expect=dict)
+    # `expect=dict` above means a non-dict has already raised, so the old
+    # `if isinstance(data, dict) else []` fallback is gone: it was the line
+    # that turned a wrong-shape file into "this conversation has no facts",
+    # which the very next save then made true. A non-list under the key is
+    # the same hazard one level down, so it raises rather than emptying.
+    facts = data.get("facts", [])
+    if not isinstance(facts, list):
+        raise StoreUnreadable(
+            facts_path(conv_id),
+            TypeError(f'"facts" is {type(facts).__name__}, not a list'),
+        )
     # Defensive: ensure each entry has the expected shape; drop malformed.
     valid: list[dict] = []
     for f in facts:
@@ -428,7 +438,7 @@ def load_archive(conv_id: str) -> list[dict]:
     back, so a silent empty here lost the cold store and the active set in
     one call (v3.1 F1e).
     """
-    data = read_json_strict(facts_archive_path(conv_id), default={})
+    data = read_json_strict(facts_archive_path(conv_id), default={}, expect=dict)
     archived = data.get("facts", []) if isinstance(data, dict) else []
     valid: list[dict] = []
     for f in archived:
