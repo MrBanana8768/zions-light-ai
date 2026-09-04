@@ -5,14 +5,14 @@
 # the only thing it could point at was the pod. This stack gives it a local
 # target.
 #
-#   docker compose -f docker-compose.integration.yml run --rm --build integration-tests
+#   docker compose -f docker-compose.integration.yml run --rm --build --force-recreate integration-tests
 #
 #   # one file, or any other pytest argument:
-#   docker compose -f docker-compose.integration.yml run --rm integration-tests -k facts
-#   docker compose -f docker-compose.integration.yml run --rm integration-tests tests/integration/test_health.py -v
+#   docker compose -f docker-compose.integration.yml run --rm --force-recreate integration-tests -k facts
+#   docker compose -f docker-compose.integration.yml run --rm --force-recreate integration-tests tests/integration/test_health.py -v
 #
 #   # leave the stack up to poke at by hand (compactor on localhost:8081):
-#   docker compose -f docker-compose.integration.yml up -d compactor
+#   docker compose -f docker-compose.integration.yml up -d --force-recreate compactor
 #   docker compose -f docker-compose.integration.yml down
 #
 # WHY THIS IS POSSIBLE AT ALL. The compactor is CPU-only by design — its
@@ -22,23 +22,26 @@
 # asks of it: /v1/chat/completions, /v1/models, /tokenize, /detokenize,
 # /health, plus _fixture/mode hooks for injecting refusals.
 #
-# CURRENT RESULT: 62 passed, 2 failed, 2 deselected in ~49s.
+# RESULTS. Against the canned fixture the suite runs in about a minute.
+# Two cases in test_facts.py seed distinctive content and assert it comes
+# back as an EXTRACTED FACT; the weightless fixture answers every
+# completion — the extraction call included — with a canned string, so
+# there is nothing for the extractor to find. Run the `model` profile
+# below and one of them passes; the other needs a longer poll than the
+# suite's ceiling used to allow (see POLL_CEILING in _harness.py).
 #
-# The two failures are `test_facts.py::test_fact_extracted_and_persisted` and
-# `::test_fact_used_in_next_turn`, and they are an honest limit of the
-# fixture rather than a defect. Both seed distinctive content ("pirate",
-# "dialect") and assert it comes back as an extracted fact; the fixture has
-# no model weights and answers every completion — including the extraction
-# call — with "acknowledged. (fixture reply - this server has no model
-# weights.)", so there is nothing for the extractor to find. Closing them
-# means teaching the fixture to recognise an extraction prompt and answer it
-# with JSON echoing salient phrases from its input. That is real work and it
-# is not done.
+# They are left FAILING rather than skipped on purpose. A skip would need
+# the black-box suite to learn what a fixture is, and this project has been
+# bitten twice by suites reporting a pass they did not earn — a known,
+# explained, reproducible red is the more honest signal.
 #
-# They are left FAILING rather than skipped on purpose. A skip would need the
-# black-box suite to learn what a fixture is, and this project has been bitten
-# twice by suites that report a pass they did not earn — a known, explained,
-# reproducible red is the more honest signal until the fixture can answer.
+# A NOTE ON A NUMBER THAT USED TO BE HERE. This block previously stated a
+# precise pass/fail count. It was measured against a container that had
+# copied the code at start and was 49 minutes older than the commit it was
+# credited to — so the number described a build nobody had. It is not
+# replaced with a new number: a count pinned in a comment goes stale the
+# next time anyone edits anything, which is how it was wrong in the first
+# place. Run the suite; it will tell you.
 #
 # WHAT A GREEN RUN HERE DOES AND DOES NOT MEAN. It proves the WIRING and the
 # BEHAVIOUR: that facts are extracted and injected, that /forget clears what
@@ -93,10 +96,26 @@ services:
       vllm-fixture:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
+    # Runs FROM THE READ-ONLY MOUNT, not from a copy.
+    #
+    # This used to `cp -a /src/compactor /app` at container start, and that
+    # froze the code at whichever moment the container happened to start.
+    # `docker compose up -d` does not recreate a container that is already
+    # running, so the stack silently served stale code: on 2026-09-04 it was
+    # 49 minutes older than the commit it was being asked to verify, and a
+    # regression test written against that commit failed for a reason that
+    # had nothing to do with the code under test. A test stack that appears
+    # to test the working tree and does not is the exact defect class this
+    # branch has spent its life on.
+    #
+    # Running from /src removes the copy, and PYTHONDONTWRITEBYTECODE is set
+    # in the image so nothing tries to write __pycache__ into a read-only
+    # mount. The container still has to be RECREATED to pick up an edit
+    # (uvicorn is not reloading), which is why every documented command
+    # above passes --force-recreate.
     command:
       - >
-        cp -a /src/compactor /app &&
-        cd /app &&
+        cd /src/compactor &&
         exec /opt/compactor-venv/bin/uvicorn main:app
         --host 0.0.0.0 --port 8080 --log-level info
     volumes:
@@ -128,7 +147,7 @@ services:
   # --- The same stack, with REAL WEIGHTS (opt-in) --------------------------
   #
   #   docker compose -f docker-compose.integration.yml --profile model \
-  #       run --rm --build integration-tests-model
+  #       run --rm --build --force-recreate integration-tests-model
   #
   # A 0.5B instruct model in GGUF, CPU only, ~400 MB. It exists because two
   # integration tests seed distinctive content and assert it comes back as an
@@ -174,10 +193,26 @@ services:
       model-fixture:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
+    # Runs FROM THE READ-ONLY MOUNT, not from a copy.
+    #
+    # This used to `cp -a /src/compactor /app` at container start, and that
+    # froze the code at whichever moment the container happened to start.
+    # `docker compose up -d` does not recreate a container that is already
+    # running, so the stack silently served stale code: on 2026-09-04 it was
+    # 49 minutes older than the commit it was being asked to verify, and a
+    # regression test written against that commit failed for a reason that
+    # had nothing to do with the code under test. A test stack that appears
+    # to test the working tree and does not is the exact defect class this
+    # branch has spent its life on.
+    #
+    # Running from /src removes the copy, and PYTHONDONTWRITEBYTECODE is set
+    # in the image so nothing tries to write __pycache__ into a read-only
+    # mount. The container still has to be RECREATED to pick up an edit
+    # (uvicorn is not reloading), which is why every documented command
+    # above passes --force-recreate.
     command:
       - >
-        cp -a /src/compactor /app &&
-        cd /app &&
+        cd /src/compactor &&
         exec /opt/compactor-venv/bin/uvicorn main:app
         --host 0.0.0.0 --port 8080 --log-level info
     volumes:
@@ -216,8 +251,16 @@ services:
       ZIONS_TEST_MODEL: fixture-model
       # Generous: a 0.5B model on CPU is slow, and a timeout here would look
       # exactly like a hang, which is the confusion R22 was about.
-      ZIONS_TEST_TIMEOUT: "180"
-      ZIONS_TEST_TAIL_WAIT: "30"
+      ZIONS_TEST_TIMEOUT: "300"
+      # 240, not 30. The memory tail fires AFTER the response is returned and
+      # makes its own generation call (fact extraction), so on CPU it lands
+      # long after the reply does. At 30 the polling loop gave up and the log
+      # then showed "extracted 1 new fact(s)" moments later: a real pass
+      # reported as a failure, which is only marginally better than the
+      # reverse. Runtime is not a constraint here — the owner said so — and a
+      # wait that is too short turns this suite into a slow random number
+      # generator.
+      ZIONS_TEST_TAIL_WAIT: "240"
     volumes:
       - ./:/repo:ro
     working_dir: /repo
