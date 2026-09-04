@@ -1650,7 +1650,14 @@ async def extract_facts_from_exchange(
         # backfill.needs_backfill returns False as soon as a conversation has
         # a facts file, so it will never revisit this turn.
         logger.error(
-            f"{where}: fact extraction FAILED ({e}) — this exchange's facts "
+            # v3.1.8 (L7): the TYPE, not just str(e). Several exceptions on
+            # this path stringify to nothing — httpx's timeouts among them —
+            # and the production log for 2026-09-03 carries three of these
+            # reading literally "fact extraction FAILED ()". An error that
+            # says an exchange is lost and cannot say why is the shape the
+            # comment above is about, wearing the fix's own clothes.
+            f"{where}: fact extraction FAILED ({type(e).__name__}: {e}) — "
+            f"this exchange's facts "
             f"are lost; there is no retry"
         )
         return []

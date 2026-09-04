@@ -235,13 +235,32 @@ assert_true(s["seconds_since_last_lossy_skip"] is not None
             "the lossy clock reflects the middle (lossy) skip")
 
 print()
-print("[12] LOSSY_SKIP_OUTCOMES excludes only SKIPPED_EMPTY")
-assert_eq(tailhealth.SKIPPED_EMPTY not in tailhealth.LOSSY_SKIP_OUTCOMES, True,
-           "the one label with no loss")
+print("[12] LOSSY_SKIP_OUTCOMES excludes exactly the harmless labels")
+# v3.1.8 (N4b): this used to name SKIPPED_EMPTY twice, because it was the only
+# harmless label. SKIPPED_TASK_TRAFFIC is the second, so the test now reads the
+# shared HARMLESS_SKIP_OUTCOMES rather than re-stating the membership — a test
+# that hardcodes one side of a rule the code has generalised is how a suite
+# starts pinning yesterday's behaviour.
+#
+# Asserted as a PARTITION, which is stronger than what was here before: every
+# outcome is storing, harmless, or lossy, and never two of those. That closes
+# the gap the old form left — a new label omitted from OUTCOMES, or present in
+# both sets, would have passed it.
+assert_true(tailhealth.SKIPPED_EMPTY in tailhealth.HARMLESS_SKIP_OUTCOMES,
+            "the original no-loss label is still harmless")
 for _o in tailhealth.OUTCOMES:
-    if _o in tailhealth.STORING_OUTCOMES or _o == tailhealth.SKIPPED_EMPTY:
-        continue
-    assert_true(_o in tailhealth.LOSSY_SKIP_OUTCOMES, f"{_o} is lossy")
+    _storing = _o in tailhealth.STORING_OUTCOMES
+    _harmless = _o in tailhealth.HARMLESS_SKIP_OUTCOMES
+    _lossy = _o in tailhealth.LOSSY_SKIP_OUTCOMES
+    assert_eq(sum((_storing, _harmless, _lossy)), 1,
+              f"{_o} is in exactly one of storing/harmless/lossy")
+assert_eq(
+    tailhealth.STORING_OUTCOMES
+    | tailhealth.HARMLESS_SKIP_OUTCOMES
+    | tailhealth.LOSSY_SKIP_OUTCOMES,
+    frozenset(tailhealth.OUTCOMES),
+    "and the three sets together cover OUTCOMES with nothing left over",
+)
 
 print()
 print("[13] note() does not raise on a non-numeric char count (v3.1.7, R28)")
