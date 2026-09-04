@@ -77,6 +77,24 @@ RUN /opt/compactor-venv/bin/python -c \
 RUN /opt/compactor-venv/bin/pip install --no-cache-dir uvloop==0.22.1 && \
     /opt/compactor-venv/bin/python -c "import uvloop; print('uvloop', uvloop.__version__)"
 
+# The bge-small ONNX embedder, baked exactly as the production image bakes it
+# (Dockerfile:185-189) and pointed at by the same two env vars. The unit
+# suites do not need it — they set COMPACTOR_RAG_ENABLED=false — but
+# docker-compose.integration.yml runs the real compactor from this image, and
+# retrieval is a third of what the integration suite tests. Without it the
+# compactor logs "retrieval init failed … RAG disabled, chat unaffected" and
+# every episodic assertion fails for a reason that has nothing to do with the
+# code under test.
+#
+# This is the one build step that needs the network. It is also the only
+# reason this image is not fully offline-reproducible, which is worth the
+# trade: a test stack that silently tests less than it appears to is the
+# defect this whole branch has been about.
+RUN /opt/compactor-venv/bin/python -c \
+    "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5', cache_dir='/opt/embeddings')"
+ENV COMPACTOR_EMBEDDING_MODEL="BAAI/bge-small-en-v1.5" \
+    FASTEMBED_CACHE_PATH="/opt/embeddings"
+
 # The repo is COPIED from a read-only mount at run time, not bind-mounted for
 # writing. Suites create state directories, sqlite files and chromadb stores;
 # doing that straight onto the Windows bind mount is both slow and a way to
