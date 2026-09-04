@@ -3744,7 +3744,7 @@ class SseAccumulator:
         return self._complete and not self._truncated
 
 
-def _fire_and_forget(coro, label: str | None = None) -> None:
+def _fire_and_forget(coro, label: str | None = None) -> bool:
     """Spawn post-response background work through the bounded pool
     (V2.3 Theme 3). The pool caps concurrency and sheds beyond a hard
     outstanding ceiling rather than spawning unboundedly under load. Task
@@ -3755,7 +3755,10 @@ def _fire_and_forget(coro, label: str | None = None) -> None:
     the warning could say that a tail was dropped but not WHOSE — which is
     the entire reason the parameter exists. Pass the conversation.
     """
-    bgwork.pool.submit(coro, label)
+    # Returns whether the pool ACCEPTED it. The caller needs to know: a
+    # shed tail is memory that will never be written, and counting it as a
+    # store is the silent-loss defect wearing the fix's clothes (F-07).
+    return bgwork.pool.submit(coro, label)
 
 
 def _merge_touched(fresh: list[dict], touched: list[dict]) -> list[dict]:
@@ -4299,7 +4302,7 @@ def _run_memory_tail(
             f"{len(decision.text)} of {decision.raw_chars} chars that end "
             f"on a sentence boundary"
         )
-    _fire_and_forget(
+    accepted = _fire_and_forget(
         _async_tail(
             conv_id,
             touched_facts,
@@ -4311,6 +4314,29 @@ def _run_memory_tail(
         ),
         label=f"tail conv={conv_id}",
     )
+    if not accepted:
+        # v3.1.8 (F-07). The pool shed it, so nothing will be written. Say
+        # so, under its own label, and correct the store we just counted.
+        #
+        # Safe to amend after the fact because submit() cannot run the
+        # coroutine before returning and there is no await between the
+        # note above and this line — the tail cannot have completed in
+        # between, so no reader can have seen the optimistic count.
+        tailhealth.note_correction(
+            tailhealth.STORED if not decision.reason else tailhealth.STORED_TRIMMED,
+            tailhealth.SKIPPED_SHED,
+        )
+        logger.warning(
+            f"conv={conv_id}: the background pool shed this memory tail at "
+            f"its outstanding ceiling, so the {len(decision.text)} chars "
+            f"this exchange would have stored are lost. Counted as "
+            f"{tailhealth.SKIPPED_SHED}; see background_work.shed"
+        )
+        return TailDecision(
+            False, "", tailhealth.SKIPPED_SHED,
+            "the background pool shed this tail at its outstanding ceiling",
+            decision.raw_chars,
+        )
     return decision
 
 
@@ -5749,7 +5775,34 @@ async def admin_forget_facts(conv_id: str):
     three-layer memory reset for when the model is stuck on something
     wrong. Targeted forgetting (single fact by substring) is V2.1.
     """
-    return await _clear_all_memory(conv_id, source="admin")
+    # DRAIN FIRST, exactly as the chat /forget does (RACE-01, adversarial
+    # concurrency sweep, reproduced 10/10 and 5/5 in the forced case).
+    #
+    # This endpoint used to call _clear_all_memory bare while its twin —
+    # commands._handle_forget — settled the background pool first, verified
+    # the residue afterwards, and retried once. conv_lock cannot substitute:
+    # _async_tail deliberately takes that lock THREE separate times so it
+    # never holds it across an LLM call, so a wipe lands BETWEEN the tail's
+    # jobs and the tail then writes the conversation back.
+    #
+    # Measured worst case: the endpoint answered HTTP 200 with all-zero
+    # counters — 'there was nothing to forget' — and the fact, the episodic
+    # row carrying the verbatim user turn and reply, and the position were
+    # all on disk seconds later. For an endpoint whose entire purpose is to
+    # make something gone, answering 'done, nothing there' while it is being
+    # written back is the worst possible way to be wrong.
+    #
+    # One rule, two call sites, implemented at one. The same defect this
+    # codebase keeps paying for, on the delete path.
+    settled = await commands._settle_background_work()
+    result = await _clear_all_memory(conv_id, source="admin")
+    if isinstance(result, dict):
+        # Say so rather than implying a guarantee that was not made. The
+        # drain is best-effort by design (commands._settle_background_work
+        # refuses to block a wipe the user asked for), so the honest answer
+        # is whether it succeeded.
+        result["background_settled"] = settled
+    return result
 
 
 # V2.1 Phase 5: shared full-clear used by /admin/forget AND the /forget

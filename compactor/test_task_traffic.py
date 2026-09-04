@@ -144,7 +144,14 @@ def _seed_store(conv_id, position):
 # coroutine is closed rather than scheduled — leaving it unawaited turns a
 # passing suite into a RuntimeWarning that the runner reports as a failure.
 def _no_schedule(coro, label=""):
+    # Returns True: it stands in for a pool that ACCEPTED the work.
+    # v3.1.8 gave _fire_and_forget a bool contract (a shed tail is now
+    # counted as skipped_shed rather than as a store, F-07), so a double
+    # returning None reads as 'the pool shed it' and every clean finish
+    # comes back skipped. A test double that does not honour the contract
+    # tests the double.
     coro.close()
+    return True
 
 
 main._fire_and_forget = _no_schedule
