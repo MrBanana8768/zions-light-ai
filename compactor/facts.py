@@ -63,6 +63,7 @@ from typing import Any, Callable
 
 import httpx
 
+import textclean
 import tokens
 from envcfg import env_float, env_int
 from memory import (
@@ -1387,6 +1388,23 @@ def _reject_reason(text: str) -> str | None:
     # A fact in any language contains at least one alphanumeric character.
     if not any(ch.isalnum() for ch in line):
         return "no alphanumeric content"
+    # v3.1.8 — AND THE MIXED LINE IS DELIBERATELY NOT REJECTED HERE.
+    #
+    # `━━━ Current Status ━━━` has alphanumerics, is not a heading, is not a
+    # fence and does not end on a bracket, so it reaches the store. That is
+    # the hole the 2026-09-04 measurement found (8 of 156 fact files carrying
+    # 3,119 box characters, re-injected on every turn), but the fix belongs
+    # one step later, in _parse_extraction_output, which stores the STRIPPED
+    # form. A decorated fact is a fact; losing the words to punish the border
+    # would trade one defect for a worse one.
+    #
+    # A "rule decoration only" check was written here first and mutation
+    # testing proved it dead: strip_rule_decoration removes only rule
+    # characters, so a line with any alphanumeric always survives it, so the
+    # check could only ever fire where "no alphanumeric content" above had
+    # already fired. Recorded rather than quietly deleted, because it read
+    # like the heart of the fix and was worth nothing — and because the test
+    # that "covered" it was passing against the older rule.
     if _FENCE_RE.match(line):
         return "code fence"
     if _HEADING_RE.match(line):
@@ -1457,7 +1475,11 @@ def _parse_extraction_output(raw: str, *, where: str = "") -> list[str]:
         if reason:
             rejected.append((reason, line))
             continue
-        out.append(line)
+        # v3.1.8: store the words, not the border. _reject_reason has already
+        # confirmed something survives stripping; this is where the surviving
+        # form actually becomes the fact, so that what is injected on every
+        # subsequent turn is prose rather than a diagram the model will copy.
+        out.append(textclean.strip_rule_decoration(line) or line)
     if rejected:
         # Named and bounded. Silence here is what let half a store fill with
         # markup unnoticed; an unbounded dump is what prune_facts already

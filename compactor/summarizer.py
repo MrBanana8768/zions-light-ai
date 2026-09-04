@@ -72,6 +72,7 @@ from typing import Any
 import httpx
 
 import logsetup
+import textclean
 import tokens
 import tokenhealth
 from envcfg import env_float, env_int
@@ -1435,6 +1436,38 @@ async def _llm_summarize(
 
 
 async def _summarize_pieces(
+    conv_id: str,
+    client: httpx.AsyncClient,
+    vllm_url: str,
+    model: str,
+    system_prompt: str,
+    pieces: list[str],
+    max_tokens: int,
+) -> str:
+    """Every tier's summary text comes from here, so this is where
+    rule/box decoration comes off it (v3.1.8).
+
+    A WRAPPER rather than a strip at each `return`. _summarize_pieces_raw
+    has five return paths and four call sites; applying the rule at any
+    subset of them is the fix-one-site-miss-the-sibling defect this
+    codebase has paid for more than a dozen times. One seam, all tiers,
+    every path.
+
+    Measured before this landed: 3 of 14 summary files carried box
+    characters, 1,173 in all, including the live summary of the
+    conversation in daily use - which is injected into every request. A
+    model shown its own decoration in its memory block keeps producing
+    it, whatever the system prompt asks for.
+    """
+    return textclean.strip_rule_decoration(
+        await _summarize_pieces_raw(
+            conv_id, client, vllm_url, model, system_prompt, pieces,
+            max_tokens,
+        )
+    )
+
+
+async def _summarize_pieces_raw(
     conv_id: str,
     client: httpx.AsyncClient,
     vllm_url: str,
