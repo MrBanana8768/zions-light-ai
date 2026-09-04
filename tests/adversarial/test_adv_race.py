@@ -1309,69 +1309,96 @@ def test_byte_identical_requests_sent_twice_at_once(client):
     assert len(idx) == len(set(idx)), f"duplicate turn indices:\n{detail}"
 
 
-def test_conv_ids_differing_only_by_case_or_normalisation(client):
-    """Two conversations whose ids differ only in case, or only in unicode
-    normalisation, must not share a store — or, if the sanitiser folds them
-    together, must do so consistently rather than racing.
+def test_conv_ids_that_the_sanitiser_folds_together(client):
+    """Clients whose conv_ids DIFFER but which `memory._sanitize` folds into
+    one, writing at the same time.
 
-    memory._sanitize strips everything outside [A-Za-z0-9_-] and length-caps
-    at 64. So `Alpha` and `alpha` are DIFFERENT ids, while `alpha` and
-    `alp\\u0301ha` both reduce to `alpha` (the combining accent is stripped).
-    Written concurrently, the second pair is two clients writing one file.
+    `_sanitize` strips everything outside `[A-Za-z0-9_-]` and then truncates
+    to 64 characters. So two clients can hold ids they believe are distinct
+    and land on one store without either being told. Three shapes here:
 
-    WHAT WOULD MAKE THIS FAIL: an acknowledged fact from either client
-    missing, or the two ids sharing a store in one direction only.
+      * CASE: `Alpha` and `alpha` survive sanitisation unchanged, so they are
+        genuinely different stores and must stay separate.
+      * PUNCTUATION: `x.` and `x` both reduce to `x`.
+      * LENGTH: two 70-character ids sharing their first 64 both reduce to
+        that prefix — the shape a client generating long composite ids would
+        actually produce.
+
+    All ASCII, deliberately: httpx encodes header values as ASCII and RAISES
+    on a non-ASCII conv_id, so a test using one measures the client rather
+    than the compactor. (My first version did exactly that and reported a
+    false positive.)
+
+    WHAT WOULD MAKE THIS FAIL: an acknowledged fact missing from the store
+    its id folds to — a lost update between two clients that do not know they
+    have collided — or the case-distinct pair sharing a store.
     """
     stem = uuid.uuid4().hex[:10]
     upper = f"advraceCASE{stem}"
     lower = f"advracecase{stem}"
-    plain = f"advracenorm{stem}"
-    # A character the sanitiser strips, so this id REDUCES TO `plain` — two
-    # clients that do not know they have collided, writing one store.
-    #
-    # Latin-1 deliberately: httpx encodes header values as latin-1, so a
-    # combining acute (U+0301) raises client-side and never reaches the
-    # compactor at all. "e-acute" is in range, and _sanitize removes it just
-    # the same, which is the property under test.
-    decomposed = f"advracenorm{stem}é"
+    plain = f"advracepunct{stem}"
+    punct = f"advracepunct{stem}."          # folds to `plain`
+    long_stem = "advracelong" + "z" * (64 - 11 - 10) + stem   # exactly 64 chars
+    long_a = long_stem + "AAAAAA"           # both truncate to long_stem
+    long_b = long_stem + "BBBBBB"
 
-    ca, cb, cc, cd = (fresh_client() for _ in range(4))
+    markers = {
+        upper: "upper case identity marker",
+        lower: "lower case identity marker",
+        plain: "plain punctuation marker",
+        punct: "trailing dot marker",
+        long_a: "long id A marker",
+        long_b: "long id B marker",
+    }
+    cs = {cid: fresh_client() for cid in markers}
     try:
-        barrier_parallel([
-            (lambda: say(ca, upper, "/remember upper case identity marker")),
-            (lambda: say(cb, lower, "/remember lower case identity marker")),
-            (lambda: say(cc, plain, "/remember plain normalisation marker")),
-            (lambda: say(cd, decomposed, "/remember decomposed normalisation marker")),
+        res = barrier_parallel([
+            (lambda cid=cid, m=m: (cid, say(cs[cid], cid, f"/remember {m}")))
+            for cid, m in markers.items()
         ])
     finally:
-        for c in (ca, cb, cc, cd):
+        for c in cs.values():
             c.close()
     assert settle(client)
 
-    detail = (
-        f"upper={upper}: {sorted(fact_texts(client, upper))}\n"
-        f"lower={lower}: {sorted(fact_texts(client, lower))}\n"
-        f"plain={plain}: {sorted(fact_texts(client, plain))}\n"
-    )
-    print("\n" + detail)
-    record("race-identity", f"## conv_id case and normalisation\n\n{detail}")
+    # Every request must actually have been SENT and acknowledged, or the
+    # assertions below are about a request that never happened.
+    sent = {}
+    for ok, v in res:
+        assert ok, f"a /remember raised client-side rather than being sent: {v!r}"
+        cid, r = v
+        assert r.status_code == 200, f"{cid}: {r.status_code} {r.text[:200]}"
+        sent[cid] = reply_text(r)
+        assert "Remembered" in sent[cid], f"{cid}: {sent[cid]!r}"
 
     up, lo = fact_texts(client, upper), fact_texts(client, lower)
-    assert "upper case identity marker" in up, (
-        f"case-distinct ids lost a fact:\n{detail}"
-    )
-    assert "lower case identity marker" in lo, (
-        f"case-distinct ids lost a fact:\n{detail}"
-    )
-    assert not (up & lo), f"ids differing only in case shared a store:\n{detail}"
-    # Both writers reduce to the same sanitised id, so BOTH acknowledged
-    # facts must be in the one store they share. Losing one is a lost update
-    # between two clients that do not know they collided.
     pl = fact_texts(client, plain)
-    for marker in ("plain normalisation marker", "decomposed normalisation marker"):
+    lg = fact_texts(client, long_stem)
+    detail = (
+        f"acknowledgements: {json.dumps(sent, indent=2)}\n"
+        f"upper={upper}: {sorted(up)}\n"
+        f"lower={lower}: {sorted(lo)}\n"
+        f"plain={plain} (also written as {punct!r}): {sorted(pl)}\n"
+        f"long fold target={long_stem}: {sorted(lg)}\n"
+    )
+    print("\n" + detail)
+    record("race-identity", f"## conv_id folding under concurrent writes\n\n{detail}")
+
+    assert "upper case identity marker" in up, f"case-distinct id lost a fact:\n{detail}"
+    assert "lower case identity marker" in lo, f"case-distinct id lost a fact:\n{detail}"
+    assert not (up & lo), f"ids differing only in case shared a store:\n{detail}"
+    # Both writers of each COLLIDING pair were told "Remembered". Both facts
+    # must therefore be in the single store their ids fold to; losing one is a
+    # lost update between clients that never knew they collided.
+    for marker in ("plain punctuation marker", "trailing dot marker"):
         assert marker in pl, (
             f"a fact acknowledged under a colliding conv_id is not stored "
             f"({marker!r}):\n{detail}"
+        )
+    for marker in ("long id A marker", "long id B marker"):
+        assert marker in lg, (
+            f"a fact acknowledged under a length-truncated conv_id is not "
+            f"stored ({marker!r}):\n{detail}"
         )
 
 
@@ -1472,11 +1499,17 @@ def test_command_storm_on_one_conversation(client):
     nevertheless absent, or a store that cannot be read back afterwards.
     """
     conv = new_conv("storm")
-    keep = [f"storm keeper {i} about lighthouses" for i in range(6)]
-    doomed = [f"storm doomed {i} about scaffolding" for i in range(4)]
-    # Seed deterministically so the storm has something to fight over.
-    _remember_many(client, conv, keep + doomed)
-    assert settle(client)
+    # Distinct, not templated. The first version of this case used
+    # "storm keeper 0 about lighthouses" ... "storm keeper 5 ...", and the
+    # concurrent /dedup clustered all six and replaced them with ONE merged
+    # canonical — which, against a fixture with no model weights, is the
+    # canned reply string. Every keeper "vanished", and none of it was a race.
+    # See RACE-00.
+    keep = [f"{t} (storm-keep)" for t in _DISTINCT_FACTS[:6]]
+    # These carry a shared, distinctive word so `/forget scaffolding` has a
+    # substring to match; they are otherwise unrelated to each other.
+    doomed = [f"{t} — filed under scaffolding" for t in _DISTINCT_FACTS[20:24]]
+    _seed_facts(client, conv, keep + doomed)
 
     ops = []
     cs = [fresh_client() for _ in range(14)]
