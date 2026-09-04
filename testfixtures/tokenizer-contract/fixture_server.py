@@ -635,6 +635,21 @@ async def chat_completions(request: Request):
 
     if body.get("stream"):
 
+        # ensure_ascii=False on every event below, and it is not cosmetic.
+        #
+        # json.dumps defaults to ensure_ascii=True, which escapes every
+        # non-ASCII character into an ASCII escape sequence. That put ZERO
+        # bytes above 127 on the wire - measured: 2,704 bytes over 13
+        # chunks, not one of them multibyte - so characters only became
+        # characters inside SseAccumulator's json.loads, long after any
+        # read boundary.
+        #
+        # R7/R14 is a defect about a UTF-8 character SPLIT ACROSS TWO
+        # READS. With escaped ASCII on the wire there is nothing to split,
+        # so an end-to-end test of it could not fail however broken the
+        # accumulator was: the check that cannot fail, living inside the
+        # fixture built to catch exactly this class of bug. Real vLLM
+        # emits UTF-8, so this is also simply more faithful.
         async def _sse():
             first = {
                 "id": cid,
@@ -645,7 +660,7 @@ async def chat_completions(request: Request):
                     {"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}
                 ],
             }
-            yield f"data: {json.dumps(first)}\n\n"
+            yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n"
             # v3.1.8: _reply_for, not _CANNED.
             #
             # This path used the canned string directly while its
@@ -667,7 +682,7 @@ async def chat_completions(request: Request):
                         {"index": 0, "delta": {"content": word + " "}, "finish_reason": None}
                     ],
                 }
-                yield f"data: {json.dumps(chunk)}\n\n"
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             last = {
                 "id": cid,
                 "object": "chat.completion.chunk",
@@ -680,7 +695,7 @@ async def chat_completions(request: Request):
                     "total_tokens": token_num + _reply_tokens,
                 },
             }
-            yield f"data: {json.dumps(last)}\n\n"
+            yield f"data: {json.dumps(last, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(_sse(), media_type="text/event-stream")

@@ -1624,3 +1624,127 @@ it to 62/2 and cut the run from 205 s to 49 s.
 
 The remaining two are the real fixture limit, and they are left RED rather
 than skipped. See the compose file for why.
+
+---
+
+# The regression net, and five defects the act of building it found
+
+`tests/integration/test_regression_{tail,text,summary}.py` — 3,151 lines, 36
+cases, pinning every defect fixed in v3.1.7 and v3.1.8 that is reachable from
+the public API. Written by three agents on strictly disjoint files against a
+shared local stack.
+
+Building a net for known bugs found five NEW ones. That is the argument for
+writing it, and it is worth recording as its own finding: four of the five are
+the same shape as the bugs the net was built for — a rule registered at one
+site and missing at its sibling.
+
+## L11 · `/pin` and `/unpin` have never worked
+
+`commands._HANDLERS` registers both. `/help` advertises both. `_handle_pin`'s
+own comment says *"Without this command the pinned tier was unreachable
+code."* But `_ALIASES` (commands.py:117-142) has **no entry for either**, and
+`parse_command` returns `(None, "")` for any name not in that table — so
+`/pin <substring>` was forwarded to vLLM as an ordinary chat message.
+
+Confirmed inside the running container:
+
+    '/pin foo'    -> (None, '')
+    '/unpin foo'  -> (None, '')
+    '/remember x' -> ('remember', 'x')
+    pin in _ALIASES: False    pin in _HANDLERS: True
+
+Registered in three places, wired in two. **The pinned tier stayed
+unreachable, and R5's fix — a pinned fact surviving a merge — was protecting a
+flag no user could set.** Fixed: two `_ALIASES` entries.
+
+## L12 · `/remember` bypassed both fact write-path guards
+
+`commands._handle_remember` stored its argument verbatim: no
+`is_storable_fact`, no `strip_rule_decoration`. So
+`/remember ━━━ she prefers tea ━━━` put box characters straight into the
+store, to be injected on every subsequent turn — the exact feedback loop
+v3.1.8 exists to break, reached by the one route that skipped both guards.
+
+`facts.is_storable_fact`'s own docstring **names this function** as a write
+path that "should share one definition rather than grow three". The v3.1.8
+pass fixed the extraction path and walked past the one the docstring pointed
+at. Fixed: strip, then judge, then store.
+
+## L13 · The local stack served code 49 minutes older than the commit it was verifying
+
+`docker-compose.integration.yml`'s compactor did `cp -a /src/compactor /app`
+at container start, so the code froze at whichever moment the container
+happened to start — and `docker compose up -d` does not recreate a container
+that is already running. Measured: container started `17:16:07Z`, commit
+`a175b34` landed 49 minutes later, and inside the container
+`ls /app/textclean.py` said no such file while `grep -c strip_rule_decoration`
+returned 0 for both write paths.
+
+A regression test written against that commit failed for a reason that had
+nothing to do with the code under test. **A test stack that appears to test
+the working tree and does not is the defect class this whole branch is
+about.** Fixed: the compactor runs directly from the read-only mount, and
+every documented invocation passes `--force-recreate`.
+
+Recorded with it: a pass/fail count that had been written into that file as
+"CURRENT RESULT" was measured against the stale build. It has been removed
+rather than corrected — a number pinned in a comment is how it was wrong in
+the first place.
+
+## L14 · The fixture put no multibyte bytes on the wire, so R7/R14 could not be tested end to end
+
+`fixture_server.py` serialised every SSE event with `json.dumps(chunk)` at its
+`ensure_ascii=True` default, so every non-ASCII character travelled as an
+ASCII escape and was only turned back into a character by `json.loads` INSIDE
+`SseAccumulator` — long after any read boundary. Measured: **2,704 bytes over
+13 chunks, not one of them above 127.**
+
+R7/R14 is a defect about a UTF-8 character split across two reads. With
+escaped ASCII on the wire there is nothing to split, so an end-to-end test of
+it **could not fail however broken the accumulator was** — the check that
+cannot fail, living inside the fixture built to catch exactly that class of
+bug. The reviewing agent detected this, measured it, and skipped LOUDLY rather
+than writing a green that meant nothing.
+
+Fixed: `ensure_ascii=False` on all three event sites. Real vLLM emits UTF-8,
+so this is also simply more faithful. The wire now carries multibyte bytes,
+the skip has lifted, and the case passes on its own merits.
+
+## L15 · The integration harness's poll ceiling ignored its own configuration knob
+
+`_harness.wait_for_facts` and `wait_for_indexed_exchanges` hardcoded
+`max_wait: float = 30.0` and ignored `ZIONS_TEST_TAIL_WAIT` entirely, while
+their docstrings promised slow paths "a generous ceiling". Against a CPU-only
+model that is false: extraction lands 40-90 s after the reply, the poll gave
+up at 30, and the compactor log then said "extracted 3 new fact(s)" moments
+later — **a real pass reported as a failure**, with the one knob that looks
+like it controls this reaching only the coarse sleep.
+
+Fixed: `POLL_CEILING = max(30.0, TAIL_WAIT)`, so the pod default cannot
+shorten the existing ceiling and a slow backend can lengthen it.
+
+## What the net does NOT cover, stated so a green run is not over-read
+
+* **R24 / R9 / R19 / R25's text shapes are unreachable from the public API.**
+  Those rules judge the ASSISTANT REPLY, and no black-box lever puts chosen
+  prose into one. They stay pinned at unit level by
+  `compactor/test_degenerate_reply.py` and `test_sentence_trim.py`.
+* **N1's actual failure mode is unreachable**: the fixture models three vLLM
+  template refusals on `/tokenize`, and the empty-assistant refusal is not
+  among them, so an unrepaired payload also returns 200 here. What the seven
+  N1 cases pin is that the repair does not itself break the request or the
+  tail across every shape it covers.
+* **The fact-store half of the decoration fix is weaker than it reads.** It
+  passes against a pre-v3.1.8 compactor, which proves it pins
+  `_reject_reason`, not `strip_rule_decoration`. Measured, and recorded in the
+  test's own docstring.
+* **`_assert_tiled_coverage` catches R12 and R10 but NOT R23** — under R23 the
+  labels still tile contiguously and the missing turn is a content fact only.
+  Said explicitly rather than letting one helper look like it covers three
+  defects.
+* **Chunk text cannot be asserted against the turns it contains.** No endpoint
+  exposes the summarization input. The position arithmetic is asserted
+  instead — `window_offset = turns_seen - array length`, both terms exactly
+  known — which is the whole input to the label-to-text mapping, but one
+  inference step from the bytes.

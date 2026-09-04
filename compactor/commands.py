@@ -83,6 +83,7 @@ from typing import Any, Callable, Awaitable
 import bgwork
 import facts as facts_module
 import portability
+import textclean
 from memory import StoreUnreadable, conv_lock, storage_root
 
 logger = logging.getLogger("compactor.commands")
@@ -120,6 +121,16 @@ _ALIASES: dict[str, str] = {
     "list-archive": "list-archive",
     "archive": "list-archive",
     "remember": "remember",
+    # v3.1.8: pin/unpin were in _HANDLERS, advertised by /help, and MISSING
+    # HERE — and parse_command returns (None, "") for any name not in this
+    # table, so `/pin <substring>` was forwarded to vLLM as ordinary chat.
+    # _handle_pin's own comment says "Without this command the pinned tier was
+    # unreachable code"; without these two lines it stayed unreachable, and
+    # R5's fix (a pinned fact surviving a merge) protected a flag no user could
+    # set. Registered in three places, wired in two — the recurring defect, on
+    # the feature whose comment warned about exactly this.
+    "pin": "pin",
+    "unpin": "unpin",
     "forget": "forget",
     "why": "why",
     "why-did-you-say-that": "why",
@@ -224,6 +235,25 @@ async def _handle_remember(arg: str, conv_id: str, ctx: dict) -> str:
         return "Usage: /remember <fact text>"
     if len(arg) > 500:
         return f"Fact too long ({len(arg)} chars) — keep it under 500."
+    # v3.1.8: the same cleaning the EXTRACTED path gets.
+    #
+    # facts.is_storable_fact's docstring names this function as one of the
+    # write paths that "should share one definition rather than grow three",
+    # and until now this one shared neither: no storability check and no
+    # decoration strip. `/remember ━━━ she prefers tea ━━━` put box characters
+    # straight into the store, which is then injected on every turn — exactly
+    # the feedback loop v3.1.8 exists to break, reached by the one route that
+    # skipped both guards. The recurring defect, on a function whose own
+    # docstring warned about it.
+    #
+    # Strip first, then judge: a decorated fact is a fact, and the words are
+    # what the user asked to be remembered.
+    arg = textclean.strip_rule_decoration(arg) or arg
+    if not facts_module.is_storable_fact(arg):
+        return (
+            f"That is markup rather than a fact, so it was not stored: {arg!r}. "
+            f"Try phrasing it as a sentence."
+        )
     now = int(time.time())
     # v3.1 F22: load-modify-write, so it holds the per-conv lock for the whole
     # sequence. Unlocked, this raced _async_tail's locked write in both
