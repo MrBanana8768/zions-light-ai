@@ -116,12 +116,28 @@ SKIPPED_DEGENERATE_PARTIAL = "skipped_degenerate_partial"  # cut; trimmed text l
 # was built to end, one layer up.
 SKIPPED_DISK_PRESSURE = "skipped_disk_pressure"      # degrade.guard says no
 SKIPPED_NO_USER_TEXT = "skipped_no_user_text"        # nothing to pair the reply with
+
+# v3.1.8 (N4b). OpenWebUI's title/tag/follow-up generation, arriving on a
+# stable conv_id we have already stored an exchange for. Not a loss and not a
+# fault: it is a request we deliberately decline to memorize, and counting it
+# is what stops it looking like one of the skips above.
+SKIPPED_TASK_TRAFFIC = "skipped_task_traffic"        # background task, not a conversation
 STORING_OUTCOMES = frozenset({STORED, STORED_TRIMMED})
 OUTCOMES = (
     STORED, STORED_TRIMMED, SKIPPED_HOLED, SKIPPED_EMPTY, SKIPPED_DEGENERATE,
     SKIPPED_NO_BOUNDARY, SKIPPED_TOO_SHORT, SKIPPED_DEGENERATE_PARTIAL,
-    SKIPPED_DISK_PRESSURE, SKIPPED_NO_USER_TEXT,
+    SKIPPED_DISK_PRESSURE, SKIPPED_NO_USER_TEXT, SKIPPED_TASK_TRAFFIC,
 )
+
+# The skips that cost the user NOTHING, named once.
+#
+# There are two consumers — LOSSY_SKIP_OUTCOMES just below, and the
+# `skipped_recently` decision in note() — and until v3.1.8 each spelled the
+# rule out for itself as "... and outcome != SKIPPED_EMPTY". One harmless
+# label is a coincidence; two is a list, and a list written twice is the
+# fix-one-site-miss-the-sibling defect this project keeps paying for. Add a
+# harmless label HERE and both consumers follow.
+HARMLESS_SKIP_OUTCOMES = frozenset({SKIPPED_EMPTY, SKIPPED_TASK_TRAFFIC})
 
 # v3.1.7 (R27). SKIPPED_EMPTY is the one skip label that carries no loss: she
 # pressed Stop before the first token, so there was never any text to
@@ -139,7 +155,9 @@ OUTCOMES = (
 # READ that did not reach memory is a loss whether the reason was the reply
 # (degenerate, holed) or the store (disk pressure, no user text to pair it
 # with), and adding them to OUTCOMES alone puts both on the lossy side.
-LOSSY_SKIP_OUTCOMES = frozenset(OUTCOMES) - STORING_OUTCOMES - {SKIPPED_EMPTY}
+LOSSY_SKIP_OUTCOMES = (
+    frozenset(OUTCOMES) - STORING_OUTCOMES - HARMLESS_SKIP_OUTCOMES
+)
 
 
 class _State:
@@ -241,7 +259,13 @@ def note(outcome: str, *, raw_chars: int, kept_chars: int) -> str | None:
         # unknown-label contract two branches up. An outcome added in main.py
         # and forgotten here would then be counted and never degrade health,
         # which is the silent-skip shape this whole module exists to end.
-        if outcome not in STORING_OUTCOMES and outcome != SKIPPED_EMPTY:
+        # v3.1.8 (N4b): the harmless labels are a SET now, named once in
+        # HARMLESS_SKIP_OUTCOMES, so this test and LOSSY_SKIP_OUTCOMES cannot
+        # disagree about which skips cost the user nothing. Still written as
+        # exclusion from STORING_OUTCOMES, never as membership of
+        # LOSSY_SKIP_OUTCOMES, for the reason above.
+        if (outcome not in STORING_OUTCOMES
+                and outcome not in HARMLESS_SKIP_OUTCOMES):
             s.last_lossy_skip_at = time.monotonic()
         result = f"{s.consecutive_skips} consecutive memory-tail skip(s)"
     # v3.1.7 (R28). The outcome tally is the LAST mutation in this function,

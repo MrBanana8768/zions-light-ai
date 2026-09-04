@@ -515,7 +515,13 @@ async def llm_merge_candidate(
         # would silently disable dedup instead of bounding it.
         finish_reason = choice.get("finish_reason")
     except Exception as e:
-        logger.warning(f"dedup LLM call failed (cluster preserved): {e}")
+        # v3.1.8 (L7): the type as well as the message. Its twin in
+        # facts.py had the same hole and the same symptom in the same log
+        # window — five of these on 2026-09-03 reading "dedup LLM call
+        # failed (cluster preserved): " with nothing after the colon.
+        logger.warning(
+            f"dedup LLM call failed (cluster preserved): {type(e).__name__}: {e}"
+        )
         return None, "error"
 
     # V7: a reply that ran out of tokens is not a decision. Unchecked, the

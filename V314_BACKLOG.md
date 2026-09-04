@@ -1361,3 +1361,143 @@ happens to have vLLM running locally.
 The client-disconnect contradiction. Both reviewers ran on Windows/Proactor
 and the disagreement is about a branch that behaves differently under
 Linux/uvloop. It needs a production-shaped stack, not another reading.
+
+---
+
+# The 2026-09-04 log sweep, and A1/A2
+
+Bundle `zla-bundle-20260904T163306Z`, the 09-03/09-04 window. One genuinely
+new finding; everything else in the window is a defect already fixed and
+waiting on the deploy.
+
+## What was NOT new, recorded so it is not re-investigated
+
+The pod has not rebooted since 2026-08-30 22:57 (boot.log), so it is still
+running v3.1.4 plus hot-patches. Every count below is that code, not the
+branch:
+
+* **102 `/tokenize` HTTP 400s**, and the body names the cause every time:
+  `Invalid assistant message: role='assistant' content=''`. The same 102
+  requests appear as `Invalid assistant message` on the compactor side and
+  589 tracebacks in `vllm-error.log`. This is L1/N1 exactly, unchanged.
+  Fixed by R3.
+* **102 `compaction skipped: N turns need N summarization calls`** — L3,
+  fixed by the `max_turns` cap, which R23/R12 unblocked.
+* **24 `hard budget FAILED to fit`** — L5.
+* **15 `stream truncated at the generation ceiling … skipping memory tail
+  for the partial reply`** on replies of 17,000-22,000 characters. Looks
+  alarming and is already fixed: that log phrasing does not exist in the
+  current tree. `decide_memory_tail` trims to the last sentence and stores.
+* **8 `Expected last role User or Tool`** — four events, both exception types
+  each, at a boot-time pid. Known, and covered by `test_tokenize_flags.py`
+  and three assertions in `test_tokenizer_contract.py`.
+* `/health/full` at capture: tokenize ok, 0 consecutive failures, bgwork
+  shed 0 with submitted == completed == 342, 138 conversations, 2,216 facts,
+  1,320 indexed exchanges, no unreadable layers.
+
+## L7 · An error that says an exchange is lost and cannot say why
+
+**New, and present in the current tree.** Two log lines in the window carry
+an empty exception:
+
+    compactor.facts ERROR conv=026752…: fact extraction FAILED () —
+        this exchange's facts are lost; there is no retry        (x3)
+    compactor.dedup WARNING dedup LLM call failed (cluster preserved):   (x5)
+
+Both interpolate `{e}` alone, and several exceptions on those paths
+stringify to nothing — httpx's timeouts among them. The facts one is the
+sharper case: the comment directly above it explains, at length, that this
+must be an ERROR rather than a WARNING because the 2026-08-24 window left
+behind "one unattributed warning each" with no way to tell what happened.
+The code then produces exactly that.
+
+Nineteen sites across the package use the bare `({e})` form. The two that
+have been observed producing empty parentheses in production are fixed;
+the rest are left alone deliberately, because most describe a file that
+failed to parse and those exceptions do carry messages. Fixing all
+nineteen on suspicion would be churn against no evidence.
+
+Fix: `({type(e).__name__}: {e})` at both sites.
+
+## A1 · The client-disconnect contradiction — SETTLED
+
+Reviewer B was right. A's sub-agent's two claims do not reproduce.
+
+The reason neither reviewer could settle it is sharper than "they ran on
+Windows": **both used `TestClient`, which drives the app in-process through
+the ASGI interface and never opens a socket.** The event under test — a peer
+hanging up mid-response — cannot occur in it. The disagreement was between
+two readings of code, dressed as two experiments.
+
+`test_disconnect_uvloop.py` runs the real app under real uvicorn on real
+uvloop and hangs up a real socket with `SO_LINGER 0`, which sends RST rather
+than FIN: a peer vanishing, the harshest form of the event and what a closed
+browser tab produces. Measured:
+
+| case | result |
+|---|---|
+| control, stream fully consumed | `stored` |
+| RST after 397 bytes | `skipped_too_short`, counted and named |
+| RST after 6,139 bytes | **`stored_trimmed`** — the prose she read reached memory |
+| upstream generators still open afterwards | 0 |
+
+So the `finally` is not swallowed, the bookkeeping runs, and the upstream is
+torn down. R26 — which was built on B's answer — is standing on the correct
+one, and the long-partial case above is the first time that has been shown
+on a production-shaped stack rather than argued.
+
+**What this does NOT settle.** A's sub-agent's scenario was specifically a
+generator parked at `yield` behind a slow consumer that never disconnects.
+That is backpressure, not cancellation: it delays the tail, it does not lose
+it, and it is not what the 51 stopped replies were. The suite skips (exit 3)
+rather than passing when uvloop is absent, so a Windows host run cannot
+report an answer to a question it cannot ask.
+
+## A2 · N4b — task traffic is no longer memorized
+
+99 of the window's requests were OpenWebUI title/tag/follow-up calls on
+conv=026752…, one roughly every 90 seconds after every real turn, each one
+fact-extracted, episodically indexed and deduped. N3's "second treadmill".
+
+**The backlog's own suggested fix direction was unsafe, and the first
+implementation of it was a bug.** `_has_conversational_history` is False for
+a genuine FIRST TURN too — its docstring says so — so skipping the tail on
+that predicate alone silently drops the opening exchange of every new
+conversation.
+
+The second implementation was also wrong, and `test_budget_guard` caught it
+within one run: keying off "have we stored anything under this conv_id"
+eats a REGENERATE of the first reply, which sends exactly that shape.
+
+What ships is a threshold. `_recorded_position >= 4` — two exchanges deep —
+is the point past which an array with no assistant turn in it stops being an
+honest picture of the conversation. Task traffic passes that bar within
+minutes and stays past it; a new conversation and its regenerates sit below
+it. The residual false positive (regenerating the first message of a
+conversation already two exchanges deep) is rare, self-limiting, and —
+unlike the defect it replaces — counted under `skipped_task_traffic` and
+visible in `/health/full`.
+
+`tailhealth` gained `HARMLESS_SKIP_OUTCOMES`, because "the skips that cost
+the user nothing" now has two members and was being spelled out separately
+in two places. One list written twice is the fix-one-site-miss-the-sibling
+defect; `LOSSY_SKIP_OUTCOMES` and `note()`'s degrade decision both read it
+now, and `test_tailhealth` asserts the three sets partition `OUTCOMES`
+rather than naming one label.
+
+**N4a is still the better fix and is still open**: a separate task model in
+OpenWebUI's admin settings stops the traffic reaching the compactor at all,
+where this can only decline to remember it.
+
+## A note on the fix that hid its own failure
+
+The first draft of `_is_repeat_task_traffic` referenced the `memory` module
+by a name `main.py` does not bind, inside a bare `except Exception`. Every
+call raised `NameError`, the catch-all swallowed it, and the function
+answered "not task traffic" for everything. It looked like a fix, passed
+import, and did nothing.
+
+Caught by the test, not by review. The except is now `(OSError,
+StoreUnreadable)` — a state read can fail for real, and that must fall back
+to the old behaviour; anything else is a programming error and must be
+allowed to be loud.
