@@ -40,8 +40,8 @@ pinned the wrong behaviour and two findings inverted on inspection.
 | # | item | severity | evidence | effort | blocked by |
 |---|---|---|---|---|---|
 | 1 | **Deploy v3.1.7** | — | — | ~1 h + pod work | owner |
-| 2 | **Client-disconnect contradiction** | high | contradictory, reproduced on the wrong OS | ~half a day | nothing (unblocked) |
-| 3 | **N4b · task traffic is still fact-extracted** | high | measured in logs | ~2-3 h | nothing |
+| 2 | ~~Client-disconnect contradiction~~ **DONE** | high | SETTLED on uvloop/Linux with a real socket | done | — |
+| 3 | ~~N4b · task traffic is still fact-extracted~~ **DONE** | high | 99 requests in 2 days, measured | done | — |
 | 4 | **N4a · OpenWebUI task model** | high | measured in logs | config only | owner |
 | 5 | **D1.3 · backup goes silent when the source is sick** | medium | one incident, root-caused | ~2 h | nothing |
 | 6 | **D1.2 · split the backup shape** | medium | reasoned, not measured | ~3 h | nothing |
@@ -54,56 +54,78 @@ pinned the wrong behaviour and two findings inverted on inspection.
 
 ## Stage A — things that do not need the deploy
 
-### A1 · Settle the client disconnect — **do this first**
+### A1 · Settle the client disconnect — **DONE, B was right**
 
-The only item here the review left explicitly unresolved, and it is now
-unblocked: `testfixtures/unit-suite/Dockerfile` installs uvloop, so the
-question can finally be asked on a production-shaped stack.
+**Reviewer B was right.** A's sub-agent's two claims — that the tail is
+deferred to garbage collection and the upstream socket leaked — do not
+reproduce on the loop production runs.
 
-The contradiction: A's sub-agent reproduced a fourth scenario — the generator
-parked at `yield` waiting on a slow consumer — that defers the memory tail to
-garbage collection and leaks the upstream socket, and showed the `aclose()`
-in the `finally` sits in front of the only bookkeeping, one `await` from
-swallowing the tail entirely. B found the tail fires in both cancellation
-placements. **Both ran on Windows/Proactor with plain asyncio**, and A's own
-final report then filed the area under "checked and found sound", omitting
-its sub-agent's result.
+The reason neither reviewer could settle it is sharper than "they ran on
+Windows". **Both used `TestClient`, which drives the app in-process through
+the ASGI interface and never opens a socket**, so the event under test — a
+peer hanging up mid-response — cannot occur in it. The disagreement was
+between two readings of the code, dressed as two experiments.
 
-Why it leads the queue despite fixing nothing directly: it is the mechanism
-behind the 51 stopped replies that motivated the entire memory-tail change,
-and R26 has now been built on one of the two answers. A server advertising
-ASGI `spec_version 2.4` takes the branch that lands in the deferred case
-every time.
+`compactor/test_disconnect_uvloop.py` runs the real app under real uvicorn on
+real uvloop and hangs up a real socket with `SO_LINGER 0`, sending RST rather
+than FIN: a peer vanishing, which is what a closed browser tab produces.
 
-Deliverable is EVIDENCE, not a patch: a reproduction under uvloop on Linux
-that settles which reading is true, and a test that pins it. If A's
-sub-agent is right, the leak and the deferred tail are new findings and get
-their own entries.
+| case | result |
+|---|---|
+| control, stream fully consumed | `stored` |
+| RST after 397 bytes | `skipped_too_short` — counted and named |
+| RST after 6,139 bytes | **`stored_trimmed`** — the prose she read reached memory |
+| upstream generators still open afterwards | 0 |
 
-### A2 · N4b · Stop extracting memory FROM task traffic
+The `finally` is not swallowed, the bookkeeping runs, the upstream is torn
+down. R26 was built on B's answer and is standing on the correct one — and
+the long-partial row above is the first time that has been demonstrated on a
+production-shaped stack rather than argued.
 
-**Correcting the backlog, which is half out of date.** N4 says the compactor
-"already detects the shape" and "could stop injecting memory into and
-extracting memory from requests it has already classified as tasks". The
-injection half SHIPPED: `_has_conversational_history` (main.py:2710) gates
+**What this does not settle**, stated because the suite's name implies more
+than it proves: A's sub-agent's scenario was a generator parked at `yield`
+behind a slow consumer that never disconnects. That is backpressure, not
+cancellation — it delays the tail, it does not lose it, and it is not what
+the 51 stopped replies were. The suite exits 3 (SKIP) rather than passing
+when uvloop is absent, so a Windows host run cannot report an answer to a
+question it is unable to ask.
+
+### A2 · N4b · Stop extracting memory FROM task traffic — **DONE**
+
+**The backlog's own fix direction was unsafe, and implementing it as written
+would have been a worse bug than the one it fixes.**
+
+Half of N4 had already shipped: `_has_conversational_history` gates
 `INJECTION_NO_HISTORY_FRACTION` (0.125 against 0.5), and
-`COMPACTOR_INJECTION_NO_HISTORY_FRACTION=0` turns injection off for task
-traffic entirely, no code change needed.
+`COMPACTOR_INJECTION_NO_HISTORY_FRACTION=0` disables injection for task
+traffic with no code change. The extraction half had not — `has_history` was
+computed once and reached only that fraction and a log line, so neither
+`_run_memory_tail` call site knew, and all 99 of the window's title/tag calls
+were fact-extracted, indexed and deduped.
 
-The extraction half did not. `has_history` is computed once at main.py:4850
-and reaches exactly two places: the budget fraction and a log line. Neither
-`_run_memory_tail` call site (main.py:5228, 5350) is told. So every
-title/tag/follow-up call is still fact-extracted, episodically indexed and
-deduped — N3's "second treadmill", on a conversation that fires ~90 s after
-every real turn and is not a conversation.
+But that same predicate is False for a genuine FIRST TURN, so acting on it
+alone silently drops the opening exchange of every new conversation. A second
+attempt — "have we stored anything under this conv_id" — was killed by
+`test_budget_guard` within one run, because it eats a REGENERATE of the first
+reply, which sends exactly that shape.
 
-This is the recurring defect in its usual costume: **one classification, two
-consumers, wired to one of them.** Fix by passing the value the function
-already computes to the call sites that need it — not by re-deriving it
-there, which is how the two would drift apart again.
+What ships is a threshold: `_recorded_position >= 4`, two exchanges deep, is
+the point past which an array with no assistant turn stops being an honest
+picture of the conversation. Task traffic passes it within minutes and stays
+past it; a new conversation and its regenerates sit below it. The residual
+false positive — regenerating the first message of a conversation already two
+exchanges deep — is rare, self-limiting, and unlike the defect it replaces it
+is COUNTED, under `skipped_task_traffic`, and visible in `/health/full`.
 
-Watch for the twin: `backfill.py` and `commands.py` also reach the fact
-store, and neither knows what task traffic is.
+`tailhealth` gained `HARMLESS_SKIP_OUTCOMES` on the way through: "the skips
+that cost the user nothing" now has two members and was being spelled out
+separately in two places, which is the fix-one-site-miss-the-sibling defect
+in miniature. Both consumers read the one set now, and `test_tailhealth`
+asserts the three sets partition `OUTCOMES` instead of naming a label.
+
+**N4a remains open and remains the better fix**: a separate task model in
+OpenWebUI's admin settings stops this traffic reaching the compactor at all,
+where the code can only decline to remember it.
 
 ### A3 · D1.3 · A backup that produces nothing is worse than a degraded one
 

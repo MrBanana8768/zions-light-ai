@@ -55,6 +55,7 @@ from memory import (
     list_known_conv_ids,
     resolve_conv_id,
     storage_summary,
+    summary_path,
 )
 
 
@@ -2721,6 +2722,90 @@ def _has_conversational_history(messages: list[dict]) -> bool:
     )
 
 
+# Turns, not exchanges: _recorded_position counts message-units, two per
+# exchange. 4 means "this conversation has genuinely got two exchanges deep",
+# which is the point past which an array with no assistant turn in it stops
+# being an honest picture of it. Deliberately not 2: a brand-new conversation
+# whose single first reply was regenerated sits at 2, and that is a real
+# exchange that must still be memorized.
+TASK_TRAFFIC_MIN_POSITION = _env_int("COMPACTOR_TASK_TRAFFIC_MIN_POSITION", 4)
+
+
+def _is_repeat_task_traffic(conv_id: str, messages: list[dict]) -> bool:
+    """Whether this is OpenWebUI background task traffic, not a conversation.
+
+    v3.1.8 (N4b). The compactor has classified this shape since v3.1 — the
+    "task traffic or a first turn" line in the over-budget warning — but only
+    the INJECTION side ever acted on it (INJECTION_NO_HISTORY_FRACTION, 0.125
+    against 0.5). The memory tail was never told, so OpenWebUI's title, tag
+    and follow-up calls are still fact-extracted, episodically indexed and
+    deduped: N3's "second treadmill", ~90 s after every real turn, on a
+    conversation that is not one. Measured 2026-09-03/04: 99 such requests in
+    two days on conv=026752…, against 0 real exchanges.
+
+    THE CLASSIFICATION ALONE IS NOT ENOUGH, and this is the whole reason this
+    is a function rather than a call to _has_conversational_history at the
+    tail site. That predicate is False for a genuine FIRST TURN too — it says
+    so itself — so skipping the tail on it would drop the opening exchange of
+    every new conversation, permanently and silently. That is a worse bug
+    than the one being fixed, and it is the shape the backlog's own suggested
+    fix direction would have produced.
+
+    What separates them is not the request, it is the history: OpenWebUI's
+    task calls arrive on a STABLE conv_id, over and over, each time with no
+    assistant turn, for as long as the deployment lives. A real conversation
+    looks like that only at its very beginning.
+
+    "AT ITS VERY BEGINNING" IS WHY THERE IS A THRESHOLD HERE RATHER THAN A
+    BARE "have we stored anything". The first draft used file existence, and
+    test_budget_guard caught it immediately with a fixture that is a perfectly
+    ordinary shape: a conversation with a facts file receiving a history-less
+    turn. That is what OpenWebUI sends when the user REGENERATES the first
+    reply, and eating it would be a silent memory loss on a real exchange.
+    So the bar is the recorded POSITION: a conversation that has genuinely
+    got two exchanges deep cannot honestly present an array with no assistant
+    turn in it, while task traffic passes that bar within its first few
+    minutes and stays past it forever.
+
+    Cost: one state read, and only on requests that already have no assistant
+    turn — never on the hot path of an ongoing conversation.
+
+    Three consequences, stated rather than left to be discovered:
+
+      * The first few task calls for a given conv_id are memorized, because at
+        that moment they are indistinguishable from a new conversation. A
+        handful of polluted exchanges per task conv_id for the life of the
+        store, not 99 every two days.
+      * Regenerating the FIRST message of a conversation already two exchanges
+        deep reads as task traffic and is not memorized. Rare, self-limiting
+        (the next turn carries an assistant message and behaves normally), and
+        — unlike the defect this replaces — COUNTED and named, so it is
+        visible in /health/full rather than silent.
+      * This is the code half of N4. The backlog's first recommendation is a
+        separate task model in OpenWebUI's admin settings, and that remains
+        the better fix: it stops the traffic reaching the compactor at all,
+        where this can only decline to remember it.
+    """
+    if _has_conversational_history(messages):
+        return False
+    try:
+        position = summarizer._recorded_position(summarizer.load_state(conv_id))
+    except (OSError, StoreUnreadable):
+        # These two, NOT bare Exception, and the narrowness is the point. The
+        # first draft of this function caught Exception and referenced the
+        # `memory` module by a name main.py does not bind — so every call
+        # raised NameError, the catch-all swallowed it, and the function
+        # quietly answered "not task traffic" for everything. It looked like a
+        # fix and did nothing, which is the exact failure this file is full of
+        # comments about. A state read can fail for real (a vanished mount, a
+        # permission change, a half-written file) and that must fall back to
+        # the old behaviour: memorizing task traffic is the bug being fixed,
+        # dropping a real exchange is worse. Anything else is a programming
+        # error and must be allowed to be loud.
+        return False
+    return position >= TASK_TRAFFIC_MIN_POSITION
+
+
 def _bound_injected_blocks(
     blocks: list[tuple[int, str, str]], budget: int
 ) -> tuple[list[str], list[str], int]:
@@ -4167,6 +4252,20 @@ def _run_memory_tail(
         if _blocked is not None:
             _outcome, _why = _blocked
             decision = TailDecision(False, "", _outcome, _why, decision.raw_chars)
+    # v3.1.8 (N4b). Hoisted here for R8's reason and checked LAST among the
+    # pre-count conditions: the ones above are about whether the store can be
+    # reached, this is about whether this request deserves to reach it, and a
+    # request that could not have been stored anyway should keep the label
+    # that says why.
+    if decision.store and _is_repeat_task_traffic(conv_id, messages):
+        decision = TailDecision(
+            False,
+            "",
+            tailhealth.SKIPPED_TASK_TRAFFIC,
+            "this is OpenWebUI background task traffic (no assistant turn, on "
+            "a conv_id already in the store), not an exchange to remember",
+            decision.raw_chars,
+        )
     # Counted before it is logged, and before the tail is fired: the counter
     # is what /health/full reads, and a skip that is only a log line is the
     # defect this exists to close (63 exchanges in one 2026-09-01 window,
