@@ -1748,3 +1748,153 @@ shorten the existing ceiling and a slow backend can lengthen it.
   instead — `window_offset = turns_seen - array length`, both terms exactly
   known — which is the whole input to the label-to-text mapping, but one
   inference step from the bytes.
+
+---
+
+# S1 · Arbitrary file write via `conv_id` path traversal — CRITICAL, FIXED
+
+Found by the adversarial input sweep, 2026-09-04. Reproduced end to end
+against a clean stack before anything was changed.
+
+    POST /admin/conversations/import
+    {"bundle": <a real exported bundle>,
+     "target_conv_id": "../../../../../../tmp/CLAUDE_PWNED",
+     "overwrite": true}
+
+    -> HTTP 200
+    -> {"conv_id": "../../../../../../tmp/CLAUDE_PWNED", "imported": {...}}
+    -> /tmp/CLAUDE_PWNED.json, 305 bytes, root-owned, OUTSIDE STORAGE_ROOT
+
+The endpoint echoed the traversal back in its own success response. The same
+hole existed on `fork`'s `new_conv_id`.
+
+## The root cause was a comment
+
+`portability.py` carried:
+
+> Filename-safe by construction: conv_id is already sanitized by
+> memory._sanitize to [A-Za-z0-9_-] …
+
+`_sanitize` is called in **exactly one place** — `resolve_conv_id`, on the
+CHAT path. `import_conversation` and `fork_conversation` take their target id
+from the request BODY, which never passes through it. A confident assertion
+about someone else's invariant, written where it could not be checked, and it
+held for years because nobody tested the route it did not describe.
+
+## The variant that needs no attacker
+
+Because `..` escapes the per-layer subdirectory, `facts_path` and
+`summary_path` collide on one file. An import aimed at
+`../facts/<other-conv>` reported `imported.facts: 1` while that other
+conversation's facts became `[]`. **Silent cross-conversation data loss,
+reachable by a typo**, on a system whose worst failure mode is memory
+disappearing without anyone noticing.
+
+## Exploitability, stated plainly
+
+Admin endpoints are gated on the caller being loopback
+(`_require_localhost`), so this is NOT remotely exploitable in the default
+configuration: it needs on-pod access, or an operator who set
+`COMPACTOR_ADMIN_BIND` permissively. The DESTRUCTION path needs no malice at
+all — only a wrong conv_id in an admin call.
+
+## The fix, and the fix that was not enough
+
+`memory._safe_path`, at the five path builders every caller goes through —
+not at the two endpoints known to be affected, because patching the known
+callers and leaving the sixth to reintroduce it is the defect this codebase
+keeps paying for.
+
+**The first version of the guard was insufficient, and testing it directly is
+what caught that.** It checked that the RESOLVED path stayed inside
+`STORAGE_ROOT`. `"../facts/victim"` passed `facts_path`: inside the root,
+inside the correct subdirectory, pointed at someone else's conversation.
+"Somewhere legal" was the wrong question — the right one is whether the
+conv_id is a NAME at all. The guard now validates the id against the same
+character class `_sanitize` enforces, shared rather than restated, with the
+resolved-path check kept as a second line of defence.
+
+Verified after the fix: `../../../../../../tmp/PWN`, `../facts/<conv>`, `..`,
+`.`, `a/b`, empty, over-length and NUL all refused with a 400 naming the
+reason; `normal` and `conv-1_A` still resolve; a legitimate import still
+returns 200.
+
+## And the same defect committed while fixing it
+
+The first fix caught `UnsafeConvId` at the two admin routes known to take a
+body conv_id. The adversarial suite immediately found a third —
+`inherit-persona`'s `source_conv_id` — still returning 500. Now an APP-WIDE
+`@app.exception_handler(UnsafeConvId)` covers every route, including ones not
+written yet.
+
+---
+
+# S2 · Malformed request bodies crashed instead of being refused — FIXED
+
+`chat_completions` did `body = await request.json()` unguarded and then
+`body.get("messages")`. The careful empty/invalid-messages 400 below it — the
+right answer, with a good log line — could never be reached by the requests
+that most needed it.
+
+Measured: an empty body, a bare string, and `null` returned **500**; a JSON
+array, an integer, and a form Content-Type **dropped the connection with no
+HTTP envelope**. A 500 from a proxy is always its own bug: the backend never
+saw these, so there is nothing upstream to blame.
+
+## S2a · NaN and Infinity
+
+Python's `json.loads` ACCEPTS `NaN`, `Infinity` and `-Infinity` as a
+non-standard extension, so such a body parses cleanly and looks ordinary.
+httpx encodes the forwarded request with `allow_nan=False`, so the failure
+surfaced at the FORWARD step as `ValueError: Out of range float values are
+not JSON compliant` — a 500 for a body the backend never received.
+
+Rejected at PARSE time via `json.loads(..., parse_constant=...)`: it costs
+nothing on a normal body (the hook fires only when one of the three literals
+appears) and it covers nested positions, where a hand-written list of
+sampling fields would have covered the half someone thought of.
+
+## S2b · Unpaired surrogates
+
+`"\ud83d"` is valid JSON and a valid Python `str`, and cannot be encoded as
+UTF-8. httpx encodes the forward with `ensure_ascii=False`, so the client got
+a dropped connection with **no HTTP response at all** — indistinguishable
+from a network fault, and therefore worse than an error.
+
+Checked only when a backslash-u escape actually appears in the raw bytes,
+because the check is a full re-serialisation and must not cost anything on a
+normal turn. A surrogate can only ARRIVE as an escape: sent as raw bytes it
+is invalid UTF-8 and `json.loads` has already refused it. Paired surrogates
+are combined into an astral character and pass, so ordinary emoji are
+unaffected.
+
+---
+
+# What the input sweep attacked and could NOT break
+
+Recorded because knowing what held is half the value:
+
+* **Chat-path conv_id** — the header and `metadata.chat_id` both go through
+  `_sanitize`; traversal there was already neutralised.
+* **Admin URL-path conv_id routes** — the router will not match `/`, and
+  uvicorn decodes `%2F` to `/` giving a 404. No multi-segment escape.
+* **Hostile text that is valid UTF-8** — zero-width bombs, RTL overrides,
+  20,000 combining marks, astral emoji, all-whitespace, block-marker
+  lookalikes, a 2 MB single word: all handled, no 5xx.
+* **Size and shape** — 6,000 tiny messages, 200 consecutive system messages,
+  500-deep nested content, `max_tokens=1e12`.
+* **Slash commands** with huge, empty, RTL, SQL- and JSON-metacharacter
+  arguments, including text designed to be re-parsed as a command later.
+* **Process survival** — a liveness sentinel passed after the full battery.
+* **Read-outside-root was not achievable over HTTP**: no body-addressed
+  endpoint returns file content. Write-outside-root was the exploitable
+  half.
+
+# A harness defect found the same way
+
+The adversary image baked `pytest tests/adversarial` into its ENTRYPOINT, so
+a path argument was APPENDED rather than substituted: every
+`run --rm adversary <one file>` silently executed all four adversaries'
+suites against one compactor. That produced a container exiting 255 and took
+Docker Desktop down mid-session. The path now lives in CMD, where an argument
+replaces it.
