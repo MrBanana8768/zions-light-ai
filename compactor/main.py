@@ -49,6 +49,7 @@ import summarizer
 import tailhealth
 from memory import (
     StoreUnreadable,
+    UnsafeConvId,
     conv_lock,
     ensure_storage_layout,
     facts_path,
@@ -4371,6 +4372,28 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="context-compactor", lifespan=lifespan)
 
 
+@app.exception_handler(UnsafeConvId)
+async def _unsafe_conv_id_handler(request: Request, exc: UnsafeConvId):
+    """A rejected conv_id is a 400 about the request, not a 500 about us.
+
+    APP-WIDE rather than per route, and that is the whole point. The
+    traversal this guard closes reached the filesystem through TWO admin
+    routes that take a conversation id from the request body, and the first
+    fix caught UnsafeConvId at those two. An adversarial sweep immediately
+    found a third — inherit-persona's source_conv_id — still returning 500,
+    which is the fix-one-site-miss-the-sibling defect committed while
+    fixing an instance of it.
+
+    Every route that builds a store path is covered here, including ones
+    not written yet. The per-route catches that remain are the ones which
+    also handle ImportError_ and would otherwise need a bare re-raise.
+    """
+    logger.warning(
+        f"rejected {request.method} {request.url.path}: unsafe conv_id ({exc})"
+    )
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
 def _require_localhost(request: Request) -> None:
     """FastAPI dependency: gate admin endpoints to localhost unless
     COMPACTOR_ADMIN_BIND is explicitly set to something other than 127.0.0.1.
@@ -4622,9 +4645,111 @@ def _log_request_rejected(
 # Main request flow
 # ---------------------------------------------------------------------------
 
+def _reject_json_constant(name: str):
+    """Refuse NaN / Infinity / -Infinity in a request body.
+
+    Python's json.loads ACCEPTS these three as a non-standard extension, so
+    a body carrying them parses cleanly and looks like an ordinary dict.
+    Nothing downstream can take them: httpx encodes the forwarded request
+    with allow_nan=False, so the failure surfaced at the FORWARD step as
+    "ValueError: Out of range float values are not JSON compliant" and the
+    client got a 500 — for a body the backend never saw.
+
+    Rejecting at PARSE time rather than validating the sampling parameters
+    afterwards, for two reasons. It costs nothing on a normal body: this is
+    called only when one of the three literals actually appears. And it
+    covers every position, including nested ones, where a hand-written list
+    of numeric fields would cover the half someone thought of.
+    """
+    raise ValueError(f"{name} is not valid JSON for a request body")
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Any:
-    body = await request.json()
+    # PARSE DEFENSIVELY. The careful empty/invalid-messages 400 below is
+    # the right answer and it could never be reached by the requests that
+    # needed it most: `await request.json()` raises on a body that is not
+    # JSON, and `body.get(...)` raises AttributeError when the body is
+    # valid JSON that is not an OBJECT. Adversarial sweep, v3.1.8: an empty
+    # body, a bare string, `null`, and a NaN temperature all returned 500;
+    # a JSON array, an integer, and a form Content-Type dropped the
+    # connection with no HTTP envelope at all.
+    #
+    # A 500 from a PROXY is always its own bug. The backend never saw these
+    # — they never got that far — so there is nothing to blame upstream for,
+    # and a client that sent nonsense deserves to be told which nonsense.
+    _raw = await request.body()
+    try:
+        body = json.loads(_raw, parse_constant=_reject_json_constant)
+    except Exception as e:
+        logger.warning(
+            f"rejected chat request with an unparseable body "
+            f"({type(e).__name__}): "
+            f"ua={request.headers.get('user-agent', '?')!r} "
+            f"content-type={request.headers.get('content-type', '?')!r}"
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "request body must be valid JSON",
+                    "type": "invalid_request_error",
+                    "code": "unparseable_body",
+                }
+            },
+        )
+    if not isinstance(body, dict):
+        logger.warning(
+            f"rejected chat request whose body is {type(body).__name__}, "
+            f"not an object: "
+            f"ua={request.headers.get('user-agent', '?')!r}"
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "request body must be a JSON object",
+                    "type": "invalid_request_error",
+                    "code": "body_not_an_object",
+                }
+            },
+        )
+    # A LONE SURROGATE is valid JSON, valid Python str, and cannot be sent.
+    #
+    # json.loads happily produces '\ud83d' as a one-character string, so the
+    # body parses and looks ordinary. httpx then encodes the forwarded
+    # request with ensure_ascii=False and UTF-8 cannot represent an
+    # unpaired surrogate, so the failure landed at the FORWARD step and the
+    # client got a dropped connection with no HTTP response at all - which
+    # is indistinguishable from a network fault, and so is worse than an
+    # error. (Adversarial sweep, v3.1.8.)
+    #
+    # Gated on the escape actually appearing in the raw bytes, because the
+    # check is a full re-serialisation and this must not cost anything on a
+    # normal turn. A surrogate can only ARRIVE as a backslash-u escape: sent
+    # as raw bytes it is invalid UTF-8 and json.loads has already refused it
+    # above. Paired surrogates are legal and are combined by json.loads into
+    # an astral character, which encodes fine and passes here - so ordinary
+    # emoji are unaffected.
+    if b"\\u" in _raw or b"\\U" in _raw:
+        try:
+            json.dumps(body, ensure_ascii=False).encode("utf-8")
+        except UnicodeEncodeError as e:
+            logger.warning(
+                f"rejected chat request carrying an unpaired surrogate: {e}"
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": (
+                            "request body contains an unpaired surrogate, "
+                            "which cannot be encoded as UTF-8"
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "unpaired_surrogate",
+                    }
+                },
+            )
     messages = body.get("messages", [])
 
     # Guard: never forward an empty/invalid messages list to vLLM — its chat
@@ -5933,7 +6058,11 @@ async def admin_import_conversation(request: Request):
             target_conv_id=body.get("target_conv_id"),
             overwrite=bool(body.get("overwrite", False)),
         )
-    except portability.ImportError_ as e:
+    # v3.1.8: UnsafeConvId alongside ImportError_. A body-supplied
+    # target_conv_id / new_conv_id is CLIENT INPUT that reaches the
+    # filesystem; memory._safe_path refuses to leave STORAGE_ROOT, and
+    # that refusal is a 400 about the request, not a 500 about us.
+    except (portability.ImportError_, UnsafeConvId) as e:
         raise HTTPException(status_code=400, detail=str(e))
     return result
 
@@ -5959,7 +6088,11 @@ async def admin_fork_conversation(conv_id: str, request: Request):
         return portability.fork_conversation(
             conv_id, new_conv_id=body.get("new_conv_id")
         )
-    except portability.ImportError_ as e:
+    # v3.1.8: UnsafeConvId alongside ImportError_. A body-supplied
+    # target_conv_id / new_conv_id is CLIENT INPUT that reaches the
+    # filesystem; memory._safe_path refuses to leave STORAGE_ROOT, and
+    # that refusal is a 400 about the request, not a 500 about us.
+    except (portability.ImportError_, UnsafeConvId) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
