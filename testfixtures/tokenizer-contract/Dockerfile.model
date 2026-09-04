@@ -1,0 +1,84 @@
+# The fixture server WITH real weights: a 0.5B instruct model, GGUF, CPU only.
+#
+# Separate from Dockerfile (the weightless fixture) rather than an ARG on it,
+# because the contract suite runs on every change and must stay a fast,
+# deterministic, canned-reply build. This one downloads ~400 MB and answers
+# in seconds rather than microseconds; it is opt-in and it should stay that
+# way.
+#
+#   docker compose -f docker-compose.integration.yml --profile model \
+#       run --rm --build integration-tests-model
+#
+# WHY 0.5B AND WHY GGUF. The requirement is only that fact extraction returns
+# something ABOUT the conversation — two integration tests seed distinctive
+# content and assert it comes back as an extracted fact, and no canned string
+# can satisfy that. Q4_K_M at 0.5B is ~400 MB and generates a short JSON list
+# in a couple of seconds per call on CPU, which keeps a full integration run
+# in minutes rather than hours. llama.cpp rather than transformers because a
+# quantised CPU runtime is several times faster here and does not drag a
+# ~200 MB torch wheel into an image that has no use for one.
+#
+# THE TOKENIZER AND THE WEIGHTS ARE THE SAME MODEL, deliberately. This whole
+# fixture exists because on 2026-08-28 the compactor's local tokenizer and the
+# server's priced the same bytes differently. Serving one model's weights
+# behind another's tokenizer would rebuild that bug on purpose.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/hf \
+    HF_HUB_DISABLE_TELEMETRY=1
+
+# build-essential and cmake are NOT optional, and the first draft of this file
+# said they were. llama-cpp-python publishes CPU wheels, but not for every
+# python/version pair, and when the index has no match pip falls back to a
+# SOURCE build — which then fails with "CMake configuration failed" in an
+# image that has no compiler. Better to carry the toolchain and always
+# succeed than to depend on a wheel existing for whatever base image this
+# lands on next.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        build-essential \
+        cmake \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# The wheel index first, source build as the fallback. This is the slow step
+# on a cold build (minutes); it is cached thereafter.
+RUN pip install --no-cache-dir \
+        --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
+        llama-cpp-python==0.3.16 \
+        huggingface-hub==0.36.0
+
+ARG MODEL_REPO_GGUF=Qwen/Qwen2.5-0.5B-Instruct-GGUF
+ARG MODEL_FILE=qwen2.5-0.5b-instruct-q4_k_m.gguf
+ARG MODEL_TOKENIZER=Qwen/Qwen2.5-0.5B-Instruct
+
+RUN python -c "\
+from huggingface_hub import hf_hub_download; \
+p = hf_hub_download(repo_id='${MODEL_REPO_GGUF}', filename='${MODEL_FILE}', local_dir='/models'); \
+print('gguf at', p)"
+
+# The matching tokenizer, baked so the server never reaches the network at run
+# time — a fixture whose result depends on huggingface.co being up is a
+# fixture that will one day fail for a reason that has nothing to do with the
+# code.
+RUN python -c "\
+from transformers import AutoTokenizer; \
+t = AutoTokenizer.from_pretrained('${MODEL_TOKENIZER}'); \
+t.save_pretrained('/models/tokenizer'); \
+print('tokenizer vocab', t.vocab_size)"
+
+ENV FIXTURE_MODEL_GGUF=/models/${MODEL_FILE} \
+    FIXTURE_TOKENIZER=/models/tokenizer \
+    FIXTURE_SERVED_MODEL_NAME=fixture-model \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
+COPY fixture_server.py /app/fixture_server.py
+WORKDIR /app
+EXPOSE 8000
+CMD ["python", "-m", "uvicorn", "fixture_server:app", "--host", "0.0.0.0", "--port", "8000"]

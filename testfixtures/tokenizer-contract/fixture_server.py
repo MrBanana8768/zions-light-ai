@@ -511,12 +511,93 @@ def _adversarial_reply(n: int, target_chars: int) -> str:
     return "\n".join(parts) + "\n\n" + " ".join(body)
 
 
+# --- Optional REAL model (v3.1.8) ------------------------------------------
+#
+# Set FIXTURE_MODEL_GGUF to a GGUF path and this fixture stops pretending: it
+# loads the weights with llama-cpp-python and answers from an actual model, on
+# CPU, with no GPU anywhere.
+#
+# WHY IT IS WORTH THE TROUBLE. Two integration tests seed distinctive content
+# and assert it comes back as an EXTRACTED FACT. A canned string cannot
+# satisfy them, and neither can the adversarial generator, because fact
+# extraction is itself an LLM call whose answer has to be about the input.
+# Those two were the last red in the local integration run, and everything
+# downstream of real extraction — dedup's merges, archive's evictions, what a
+# summary actually says — has never been exercised locally at all.
+#
+# WHAT IT IS NOT. A 0.5B model is not Cydonia. Its replies are worse, its
+# token counts are its own, and nothing here licenses a claim about production
+# quality or production budgets. It is enough to make extraction return
+# something ABOUT the conversation, which is all these tests need and all this
+# is for.
+#
+# Keep FIXTURE_TOKENIZER pointed at the SAME model as the GGUF. The whole
+# point of this fixture is that /tokenize and the completion agree; loading
+# one model's weights behind another model's tokenizer would reintroduce the
+# 2026-08-28 divergence deliberately.
+MODEL_GGUF = os.environ.get("FIXTURE_MODEL_GGUF", "").strip()
+MODEL_MAX_TOKENS = int(os.environ.get("FIXTURE_MODEL_MAX_TOKENS", "256"))
+_llm = None
+
+
+def _real_model_reply(body: dict) -> str | None:
+    """Generate from the GGUF, or None if no real model is configured."""
+    global _llm
+    if not MODEL_GGUF:
+        return None
+    if _llm is None:
+        from llama_cpp import Llama  # imported lazily: absent in the CPU-only image
+        _llm = Llama(
+            model_path=MODEL_GGUF,
+            n_ctx=int(os.environ.get("FIXTURE_MODEL_CTX", "4096")),
+            n_threads=int(os.environ.get("FIXTURE_MODEL_THREADS", "4")),
+            verbose=False,
+        )
+    messages = [
+        {"role": m.get("role", "user"), "content": _text_of(m)}
+        for m in (body.get("messages") or [])
+        if isinstance(m, dict)
+    ]
+    requested = body.get("max_completion_tokens") or body.get("max_tokens")
+    out = _llm.create_chat_completion(
+        messages=messages,
+        max_tokens=min(int(requested or MODEL_MAX_TOKENS), MODEL_MAX_TOKENS),
+        temperature=float(os.environ.get("FIXTURE_MODEL_TEMPERATURE", "0.3")),
+    )
+    try:
+        return out["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def _text_of(m: dict) -> str:
+    """Content as a string, whether it arrived as one or as a part list."""
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(
+            p.get("text", "") for p in c
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return ""
+
+
 def _reply_for(body: dict) -> str:
-    """The assistant text this fixture will return."""
+    """The assistant text this fixture will return.
+
+    Order matters. An explicitly requested adversarial reply wins over the
+    real model: a test that asked for 20,000 characters of decorative rules is
+    testing the compactor's handling of them and must get them whether or not
+    weights happen to be loaded.
+    """
     chars = int(_MODE.get("reply_chars") or 0)
-    if chars <= 0:
-        return _CANNED
-    return _adversarial_reply(int(_MODE.get("reply_seq") or 0), chars)
+    if chars > 0:
+        return _adversarial_reply(int(_MODE.get("reply_seq") or 0), chars)
+    real = _real_model_reply(body)
+    if real is not None:
+        return real
+    return _CANNED
 
 
 @app.post("/v1/chat/completions")
@@ -545,6 +626,13 @@ async def chat_completions(request: Request):
     created = int(time.time())
     model = body.get("model") or SERVED_MODEL_NAME
 
+    # Once, before the branch: both paths send this text and both report
+    # token counts for it. The counts used to be computed from _CANNED
+    # regardless of what was actually returned, so any non-canned reply
+    # was described by usage numbers belonging to a different string.
+    _reply_text = _reply_for(body)
+    _reply_tokens = len(_tok.encode(_reply_text))
+
     if body.get("stream"):
 
         async def _sse():
@@ -558,7 +646,18 @@ async def chat_completions(request: Request):
                 ],
             }
             yield f"data: {json.dumps(first)}\n\n"
-            for word in _CANNED.split(" "):
+            # v3.1.8: _reply_for, not _CANNED.
+            #
+            # This path used the canned string directly while its
+            # non-streaming twin (below) went through _reply_for. So the
+            # adversarial reply generator — written to reproduce
+            # "decorative rules ... markdown scaffolding that fact
+            # extraction stored as memory", i.e. exactly the box-character
+            # class of failure — has never run on the STREAMING path, and
+            # streaming is what production uses. A fixture feature that
+            # cannot reach the path under test is a fixture feature that
+            # is not there.
+            for word in _reply_text.split(" "):
                 chunk = {
                     "id": cid,
                     "object": "chat.completion.chunk",
@@ -577,8 +676,8 @@ async def chat_completions(request: Request):
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 "usage": {
                     "prompt_tokens": token_num,
-                    "completion_tokens": len(_tok.encode(_CANNED)),
-                    "total_tokens": token_num + len(_tok.encode(_CANNED)),
+                    "completion_tokens": _reply_tokens,
+                    "total_tokens": token_num + _reply_tokens,
                 },
             }
             yield f"data: {json.dumps(last)}\n\n"
@@ -586,7 +685,7 @@ async def chat_completions(request: Request):
 
         return StreamingResponse(_sse(), media_type="text/event-stream")
 
-    completion_tokens = len(_tok.encode(_CANNED))
+    completion_tokens = _reply_tokens
     return {
         "id": cid,
         "object": "chat.completion",
@@ -595,7 +694,7 @@ async def chat_completions(request: Request):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": _reply_for(body)},
+                "message": {"role": "assistant", "content": _reply_text},
                 "finish_reason": "stop",
             }
         ],

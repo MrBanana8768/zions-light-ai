@@ -298,3 +298,93 @@ tags exist for deterministic rollback regardless.
    doing anything else destructive.
 5. If a release is the suspect → **roll back the image tag** (above).
 6. If the volume is gone → fresh pod + restore from an off-pod archive copy.
+
+---
+
+## Shadow deploy: test a build on the pod without touching the live compactor
+
+**Yes, this is safe, and it is the right way to validate a build before the
+`:latest` flip.** A second compactor process on the same pod, on its own port,
+with its own storage root, sharing the vLLM that is already running. The live
+compactor is never stopped, never reconfigured, and never reads or writes the
+shadow's memory.
+
+**The one thing to be deliberate about is the GPU.** The shadow talks to the
+SAME vLLM, so every generation it triggers — replies, fact extraction, dedup,
+summary rollups — queues behind and alongside her real traffic. That is
+usually fine for a handful of curl requests and is NOT fine for a soak. Do
+this when she is not mid-conversation, and keep it short.
+
+### 1. Get the code onto the pod, beside the live copy
+
+```bash
+# The live compactor runs from /opt/compactor. Leave it alone.
+git -C /opt/compactor-shadow pull 2>/dev/null || \
+  git clone -b fix/v3.1.4 <repo-url> /opt/compactor-shadow
+```
+
+### 2. Start it on its own port, with its own storage
+
+```bash
+# 8081, not $COMPACTOR_PORT. A SEPARATE storage root is the load-bearing
+# part: point this at /data/openwebui/compactor and the shadow will write
+# facts, summaries and episodic entries into her live memory.
+COMPACTOR_STORAGE_ROOT=/data/shadow-compactor \
+VLLM_URL=http://127.0.0.1:8000 \
+MODEL_REPO="$MODEL_REPO" \
+MAX_MODEL_LEN="$MAX_MODEL_LEN" \
+COMPACTOR_GENERATION_RESERVE="$COMPACTOR_GENERATION_RESERVE" \
+/opt/compactor-venv/bin/uvicorn main:app \
+    --app-dir /opt/compactor-shadow/compactor \
+    --host 127.0.0.1 --port 8081 --log-level info \
+    > /tmp/shadow.log 2>&1 &
+```
+
+It reuses `/opt/compactor-venv` on purpose: the point of a shadow deploy is to
+test the CODE against the venv that is actually installed. If the branch adds
+a dependency, this is where you find out — and finding out here is the whole
+idea.
+
+### 3. Hit it with curl
+
+`--host 127.0.0.1` keeps it off the public proxy, and admin endpoints are
+gated on the caller being loopback, so run these ON the pod.
+
+```bash
+# Health, and whether it thinks vLLM and storage are reachable
+curl -s localhost:8081/health/full | python3 -m json.tool
+
+# A real exchange. X-Conversation-Id keeps it out of her conversations.
+curl -s localhost:8081/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-Conversation-Id: shadow-smoke-1' \
+  -d '{"model":"'"$MODEL_REPO"'","stream":false,
+       "messages":[{"role":"user","content":"Say hello in one sentence."}]}' \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["choices"][0]["message"]["content"][:400])'
+
+# Did the memory tail fire, and under what outcome?
+curl -s localhost:8081/health/full \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["memory_tail"])'
+
+# What it stored
+curl -s localhost:8081/admin/conversations/shadow-smoke-1/facts | python3 -m json.tool
+```
+
+### 4. Stop it and clear up
+
+```bash
+pkill -f "port 8081"
+rm -rf /data/shadow-compactor      # the shadow's memory, and only the shadow's
+```
+
+### What a shadow deploy can and cannot tell you
+
+It answers: does this build boot on the real image, against the real venv,
+with the real env file? Does an exchange complete end to end? Does the memory
+tail fire and store? Do the admin endpoints answer? Those are exactly the
+failures that have historically shipped — v3.1.4 went down on a module missing
+from the Dockerfile, and one env typo used to stop the boot.
+
+It does not answer: anything about her actual conversation, whose state lives
+in a storage root this process cannot see. To test against real data, restore
+a backup into the shadow's root first — never point the shadow at the live one.
