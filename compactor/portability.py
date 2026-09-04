@@ -165,9 +165,23 @@ def export_conversation(conv_id: str) -> dict:
 # unchanged and a fork still loses the persona. It closes it for the one path
 # whose entire purpose is to make a removal reversible.
 
-# Filename-safe by construction: conv_id is already sanitized by
-# memory._sanitize to [A-Za-z0-9_-], and the stamp adds only digits, "T" and
-# "Z".
+# THIS COMMENT WAS FALSE, and it was the root of an arbitrary-file-write.
+#
+# It claimed conv_id arrives "already sanitized by memory._sanitize to
+# [A-Za-z0-9_-]". _sanitize is called in exactly one place —
+# resolve_conv_id, on the CHAT path. import_conversation and
+# fork_conversation take their target id from the request BODY, which
+# never passes through it, so a traversal went straight to the filesystem:
+# target_conv_id "../../../../../../tmp/PWNED" returned HTTP 200 and wrote
+# outside STORAGE_ROOT. Worse without any attacker: ".." escapes the
+# per-layer subdir, so an import aimed at "../facts/<other-conv>" reported
+# success while emptying a bystander's memory.
+#
+# Since v3.1.8 the guarantee is real but it comes from memory._safe_path,
+# which refuses any path resolving outside STORAGE_ROOT, at the five path
+# builders every caller goes through. Left as a comment rather than
+# deleted: a confident assertion about someone else's invariant, written
+# where it cannot be checked, is the thing to be suspicious of.
 QUARANTINE_SUBDIR = "quarantine"
 
 

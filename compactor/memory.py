@@ -134,15 +134,100 @@ def resolve_conv_id(
 # Storage layout
 # ---------------------------------------------------------------------------
 
+class UnsafeConvId(ValueError):
+    """A conv_id that would place a file outside STORAGE_ROOT."""
+
+
+def _safe_path(subdir: str, conv_id: str, suffix: str) -> Path:
+    """Build a storage path and REFUSE to leave STORAGE_ROOT.
+
+    v3.1.8, and this one was a live arbitrary-file-write.
+
+    _sanitize strips a conv_id to [A-Za-z0-9_-], but it is called in
+    exactly one place: resolve_conv_id, on the CHAT path. The admin
+    endpoints take a conversation id straight out of the request BODY —
+    import's `target_conv_id`, fork's `new_conv_id` — and hand it to these
+    builders unsanitized. portability.py carried a comment asserting
+    "conv_id is already sanitized by memory._sanitize", which was simply
+    not true of that route.
+
+    Reproduced against a clean stack: POST /admin/conversations/import with
+    target_conv_id "../../../../../../tmp/CLAUDE_PWNED" returned HTTP 200,
+    echoed the traversal back in its own response, and wrote
+    /tmp/CLAUDE_PWNED.json — outside STORAGE_ROOT, as root.
+
+    The nastier variant needs no attacker at all. Because ".." climbs out
+    of the per-layer subdirectory, facts_path and summary_path collide on
+    one file, so an import targeting "../facts/<someone-else>" reports
+    success while emptying a bystander conversation's memory. That is
+    silent cross-conversation data loss reachable by a typo.
+
+    THE GUARD LIVES HERE, not at the endpoints, deliberately. Sanitizing
+    at each admin route would fix the two known holes and leave the sixth
+    caller to reintroduce it — the fix-one-site-miss-the-sibling defect
+    this codebase has paid for more than a dozen times. Every path into
+    the store is built by one of the five functions below, so this is the
+    chokepoint that cannot be walked past.
+
+    Raises UnsafeConvId rather than sanitizing silently: a caller that
+    passes a traversal is confused about what it is doing, and quietly
+    rewriting its target would hide that. Endpoints turn this into a 400.
+    """
+    # TWO checks, and the first is the one that matters.
+    #
+    # A resolved-path check alone is NOT enough, and the first version of
+    # this function proved it: "../facts/victim" passed facts_path,
+    # because it resolves back INTO the facts directory. Inside the root,
+    # inside the right subdirectory, and pointed at somebody else's
+    # conversation — which is the silent cross-conversation destruction
+    # this guard exists to stop. "Somewhere legal" is the wrong question;
+    # the right one is whether the conv_id is a NAME at all.
+    #
+    # So the id is validated against the SAME character class _sanitize
+    # enforces on the chat path, shared rather than restated: a conv_id
+    # the chat path would have stripped is not one the admin path may
+    # keep. That also settles ".." and "." (which produced the perfectly
+    # legal, perfectly wrong "/data/compactor/facts/...json") and any id
+    # long enough to hit a filesystem name limit.
+    if not conv_id:
+        raise UnsafeConvId("conv_id is empty")
+    if chr(0) in conv_id:
+        raise UnsafeConvId(f"conv_id contains a NUL byte: {conv_id!r}")
+    if _CONV_ID_ALLOWED.search(conv_id):
+        raise UnsafeConvId(
+            f"conv_id must match [A-Za-z0-9_-] and does not: {conv_id!r}"
+        )
+    if len(conv_id) > _CONV_ID_MAX_LEN:
+        raise UnsafeConvId(
+            f"conv_id is longer than {_CONV_ID_MAX_LEN} characters: "
+            f"{len(conv_id)}"
+        )
+
+    # Second line of defence. The check above already makes traversal
+    # unrepresentable, so this can only fire if the character class is
+    # ever widened — which is exactly when a reviewer would want it to.
+    root = STORAGE_ROOT.resolve()
+    candidate = root / subdir / f"{conv_id}{suffix}"
+    try:
+        resolved = candidate.resolve()
+    except (OSError, ValueError) as e:
+        raise UnsafeConvId(f"conv_id is not a usable path: {conv_id!r}") from e
+    if resolved.parent != root / subdir:
+        raise UnsafeConvId(
+            f"conv_id would place a file outside {subdir}/: "
+            f"{conv_id!r} -> {resolved}"
+        )
+    return candidate
+
 def facts_path(conv_id: str) -> Path:
-    return STORAGE_ROOT / "facts" / f"{conv_id}.json"
+    return _safe_path("facts", conv_id, ".json")
 
 
 def facts_archive_path(conv_id: str) -> Path:
     """V2.1 Phase 7 Step 2: cold-storage sidecar for archived facts.
     Sits next to the active facts file; list_known_conv_ids skips it
     (its stem has a dot, so the sidecar filter excludes it)."""
-    return STORAGE_ROOT / "facts" / f"{conv_id}.archive.json"
+    return _safe_path("facts", conv_id, ".archive.json")
 
 
 def persona_path(conv_id: str) -> Path:
@@ -150,11 +235,11 @@ def persona_path(conv_id: str) -> Path:
     that have facts but no persona don't pollute the persona listing,
     and vice versa.
     """
-    return STORAGE_ROOT / "personas" / f"{conv_id}.json"
+    return _safe_path("personas", conv_id, ".json")
 
 
 def summary_path(conv_id: str) -> Path:
-    return STORAGE_ROOT / "summaries" / f"{conv_id}.json"
+    return _safe_path("summaries", conv_id, ".json")
 
 
 def summary_archive_path(conv_id: str) -> Path:
@@ -168,7 +253,7 @@ def summary_archive_path(conv_id: str) -> Path:
     recursively re-paraphrased L3 had no source left to be regenerated from.
     Its stem carries a dot, so list_known_conv_ids skips it exactly as it
     skips the facts sidecar."""
-    return STORAGE_ROOT / "summaries" / f"{conv_id}.archive.json"
+    return _safe_path("summaries", conv_id, ".archive.json")
 
 
 def chromadb_path() -> Path:

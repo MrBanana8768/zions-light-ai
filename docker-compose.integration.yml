@@ -5,11 +5,17 @@
 # the only thing it could point at was the pod. This stack gives it a local
 # target.
 #
-#   docker compose -f docker-compose.integration.yml run --rm --build --force-recreate integration-tests
+#   # ALWAYS recreate the compactor first. `run` starts a dependency that
+#   # is not running but will NOT recreate one that is, and the container
+#   # picks up the working tree only at start — that is how this stack
+#   # once served code 49 minutes older than the commit it was verifying.
+#   # (--force-recreate is an `up` flag; `docker compose run` rejects it.)
+#   docker compose -f docker-compose.integration.yml up -d --force-recreate compactor
+#   docker compose -f docker-compose.integration.yml run --rm --no-deps integration-tests
 #
 #   # one file, or any other pytest argument:
-#   docker compose -f docker-compose.integration.yml run --rm --force-recreate integration-tests -k facts
-#   docker compose -f docker-compose.integration.yml run --rm --force-recreate integration-tests tests/integration/test_health.py -v
+#   docker compose -f docker-compose.integration.yml run --rm integration-tests -k facts
+#   docker compose -f docker-compose.integration.yml run --rm integration-tests tests/integration/test_health.py -v
 #
 #   # leave the stack up to poke at by hand (compactor on localhost:8081):
 #   docker compose -f docker-compose.integration.yml up -d --force-recreate compactor
@@ -112,7 +118,8 @@ services:
     # in the image so nothing tries to write __pycache__ into a read-only
     # mount. The container still has to be RECREATED to pick up an edit
     # (uvicorn is not reloading), which is why every documented command
-    # above passes --force-recreate.
+    # above recreates it explicitly with `up -d --force-recreate` before
+    # running the suite (`docker compose run` has no such flag).
     command:
       - >
         cd /src/compactor &&
@@ -147,7 +154,7 @@ services:
   # --- The same stack, with REAL WEIGHTS (opt-in) --------------------------
   #
   #   docker compose -f docker-compose.integration.yml --profile model \
-  #       run --rm --build --force-recreate integration-tests-model
+  #       run --rm --build integration-tests-model
   #
   # A 0.5B instruct model in GGUF, CPU only, ~400 MB. It exists because two
   # integration tests seed distinctive content and assert it comes back as an
@@ -209,7 +216,8 @@ services:
     # in the image so nothing tries to write __pycache__ into a read-only
     # mount. The container still has to be RECREATED to pick up an edit
     # (uvicorn is not reloading), which is why every documented command
-    # above passes --force-recreate.
+    # above recreates it explicitly with `up -d --force-recreate` before
+    # running the suite (`docker compose run` has no such flag).
     command:
       - >
         cd /src/compactor &&
