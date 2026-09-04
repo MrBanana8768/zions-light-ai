@@ -1501,3 +1501,126 @@ Caught by the test, not by review. The except is now `(OSError,
 StoreUnreadable)` — a state read can fail for real, and that must fall back
 to the old behaviour; anything else is a programming error and must be
 allowed to be loud.
+
+---
+
+# The 2026-09-04 CHAT-log sweep (`zions-backup-20260904-163151.tar.gz`)
+
+The first sweep of `webui.db` rather than the pod logs. It carries what every
+previous sweep was missing — **reply text and the sampling params as actually
+stored** — which is exactly what F2's "Still open" said was needed and
+N6's formulaic-responses item said was "not determinable from logs".
+
+Privacy, as elsewhere in this file: counts and structure, conversation ids to
+4 hex, and no quoted content beyond the short opening n-grams that ARE the
+metric.
+
+Corpus: 33 chats, 1,154 user and 1,175 assistant messages, 976 assistant
+replies carrying text. Largest conversation 1,077 messages. Reply length
+p50 7,818 chars, p90 17,930, p99 33,673, max 51,290.
+
+## L8 · F2's metric, built and run — the complaint is real, and it is 13.5%
+
+F2 asked for two numbers: frequency of opening phrases over the last N
+replies, and n-gram overlap between consecutive replies. Both now exist
+(`scratchpad/chat_sweep.py`, to be productionised) and both fire.
+
+**Opening four-grams, 976 replies, 439 distinct:**
+
+| opener | replies | share |
+|---|---|---|
+| father's heart responding with | 56 | 5.7% |
+| father's heart broken and | 26 | 2.7% |
+| father's immediate desperate response | 17 | 1.7% |
+| father's immediate fervent response | 13 | 1.3% |
+| father's heart tears of | 11 | 1.1% |
+| father's heart overwhelmed with | 9 | 0.9% |
+
+**132 replies — 13.5% — open with "father's …".** The top five openers of any
+kind account for 12.7% of all replies.
+
+The degeneracy detector cannot see this, and should not: it is not a
+repetition LOOP inside one reply, it is sameness ACROSS replies. That is the
+gap F2 identified and this is the first time it has been a number rather
+than "a little too repetitive".
+
+**Consecutive-reply 5-gram overlap, 954 pairs:** p50 0.013, p90 0.203,
+max 1.000. **97 pairs (10.2%) share more than 20% of their 5-grams**, and at
+least one consecutive pair is effectively identical.
+
+Next step is not a fix, it is a home: this belongs as a periodic check
+against the store rather than a script in a scratch directory, so the number
+moves when a prompt or a knob moves.
+
+## L9 · The deployed sampling params are not what this file records
+
+From the `model` table, for `coder3101/Cydonia-24B-v4.3-vision-heretic` —
+note also that the deployed model is the VISION variant:
+
+    min_p 0.05   temperature 1.1   presence_penalty 0.3   repeat_penalty 1.1
+
+Two discrepancies with F2's "Sampling, as actually deployed" section:
+
+1. **`presence_penalty 0.3` is set and is recorded nowhere.** F2 discusses
+   presence_penalty as the output-only ALTERNATIVE to reach for if the
+   prompt-covering penalty bites. It is already on.
+2. **The key is `repeat_penalty`, not `repetition_penalty`.**
+   `repetition_penalty` is vLLM's name; `repeat_penalty` is
+   llama.cpp/Ollama's. F2 states flatly "That knob is live."
+
+**This is NOT established, and must not be written down as if it were.** The
+compactor proxies the body wholesale and logs no sampling parameters, so
+neither bundle contains evidence about what reaches vLLM. What is
+established is that the stored key is the wrong library's name.
+
+It matters because F2's whole analysis — that this penalty covers PROMPT
+tokens and can therefore make her avoid her own injected facts and names —
+depends on the knob being active, and its "what to watch" warning was
+written on that basis.
+
+Settle it on the pod, not by reading: send one completion with an absurd
+`repetition_penalty` and one with an absurd `repeat_penalty`, and see which
+changes the output.
+
+## L10 · The compactor's own error text is stored as her replies
+
+Two of the top openers are the compactor speaking as itself:
+
+    "the model backend is …"        10 replies
+    "that request couldn't be …"     8 replies
+
+**18 replies, 1.8% of the corpus.** R26 made sure those chunks never become
+MEMORY — the error stream is never fed to the accumulator, and there is a
+test pinning it. But they are still persisted by OpenWebUI as assistant
+turns in `webui.db`, so they are re-sent as conversation context on every
+subsequent request, and they are what a restore or an export would carry.
+
+Not urgent and not a data-loss bug. Recorded because "the compactor's
+apology cannot become a memory" is now only half true, and the half that is
+false is the visible one.
+
+---
+
+# The local integration stack
+
+`docker-compose.integration.yml` gives `tests/integration/` a local target
+for the first time: the tokenizer-contract fixture standing in for vLLM, the
+real compactor from the working tree on the production userland, and a
+pytest runner sharing the compactor's network namespace so the
+`_require_localhost` admin gate is exercised rather than disabled.
+
+**62 passed, 2 failed, 2 deselected in ~49 s. No GPU, no model weights, no
+pod.**
+
+The first run was 14 failed / 50 passed, and the diagnosis is worth keeping
+because the obvious reading was wrong. It looked like the fixture's canned
+reply breaking every content assertion across facts, dedup, archive,
+portability and retrieval. It was not: twelve of the fourteen were downstream
+of ONE cause — `fastembed` had no model in the image, so
+`retrieval init failed … RAG disabled` and every episodic assertion fell over
+for a reason unrelated to the code under test. Baking bge-small exactly as
+the production image bakes it (`Dockerfile:185-189`, same two env vars) took
+it to 62/2 and cut the run from 205 s to 49 s.
+
+The remaining two are the real fixture limit, and they are left RED rather
+than skipped. See the compose file for why.

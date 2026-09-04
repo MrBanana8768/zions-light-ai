@@ -1,0 +1,151 @@
+# The Tier-3 integration suite, run LOCALLY, with no GPU and no model weights.
+#
+# `tests/integration/` is a black-box suite: it imports no compactor code and
+# hits the public API from outside. That made it a post-deploy tool, because
+# the only thing it could point at was the pod. This stack gives it a local
+# target.
+#
+#   docker compose -f docker-compose.integration.yml run --rm --build integration-tests
+#
+#   # one file, or any other pytest argument:
+#   docker compose -f docker-compose.integration.yml run --rm integration-tests -k facts
+#   docker compose -f docker-compose.integration.yml run --rm integration-tests tests/integration/test_health.py -v
+#
+#   # leave the stack up to poke at by hand (compactor on localhost:8081):
+#   docker compose -f docker-compose.integration.yml up -d compactor
+#   docker compose -f docker-compose.integration.yml down
+#
+# WHY THIS IS POSSIBLE AT ALL. The compactor is CPU-only by design — its
+# requirements.txt is deliberately torch-free, and fastembed runs on ONNX.
+# The only GPU-bound component in the production image is vLLM, and the
+# tokenizer-contract fixture already implements everything the compactor
+# asks of it: /v1/chat/completions, /v1/models, /tokenize, /detokenize,
+# /health, plus _fixture/mode hooks for injecting refusals.
+#
+# CURRENT RESULT: 62 passed, 2 failed, 2 deselected in ~49s.
+#
+# The two failures are `test_facts.py::test_fact_extracted_and_persisted` and
+# `::test_fact_used_in_next_turn`, and they are an honest limit of the
+# fixture rather than a defect. Both seed distinctive content ("pirate",
+# "dialect") and assert it comes back as an extracted fact; the fixture has
+# no model weights and answers every completion — including the extraction
+# call — with "acknowledged. (fixture reply - this server has no model
+# weights.)", so there is nothing for the extractor to find. Closing them
+# means teaching the fixture to recognise an extraction prompt and answer it
+# with JSON echoing salient phrases from its input. That is real work and it
+# is not done.
+#
+# They are left FAILING rather than skipped on purpose. A skip would need the
+# black-box suite to learn what a fixture is, and this project has been bitten
+# twice by suites that report a pass they did not earn — a known, explained,
+# reproducible red is the more honest signal until the fixture can answer.
+#
+# WHAT A GREEN RUN HERE DOES AND DOES NOT MEAN. It proves the WIRING and the
+# BEHAVIOUR: that facts are extracted and injected, that /forget clears what
+# it claims to, that the summarizer advances, that admin endpoints refuse
+# what they should. It proves NOTHING about the model or the numbers. The
+# fixture's tokenizer is not Cydonia's, so token counts here are fiction, and
+# reply quality is whatever the stub was told to say. Same caveat the
+# contract suite prints in its own banner, for the same reason.
+#
+# Separate from docker-compose.yml (production, GPU, weights),
+# docker-compose.tests.yml (the unit suite) and
+# docker-compose.tokenizer-contract.yml (the /tokenize contract). Nothing
+# here touches any of them.
+
+services:
+  # The vLLM stand-in. Same image as the contract suite's fixture, its own
+  # container and its own port — the contract suite deliberately injects
+  # /tokenize 400s and malformed 200s into its fixture, and a suite sharing
+  # one fixture with it fails mid-run for a reason indistinguishable from a
+  # real defect. That already happened once (see the soak comments in
+  # docker-compose.tokenizer-contract.yml); it does not happen twice.
+  vllm-fixture:
+    build:
+      context: ./testfixtures/tokenizer-contract
+      dockerfile: Dockerfile
+    container_name: zla-integration-fixture
+    environment:
+      FIXTURE_TOKENIZER: HuggingFaceTB/SmolLM2-135M-Instruct
+      FIXTURE_SERVED_MODEL_NAME: fixture-model
+      FIXTURE_MAX_MODEL_LEN: "32768"
+      FIXTURE_ERROR_STYLE: v010
+    ports:
+      - "18002:8000"   # 18000/18001 belong to the contract suite and the soak
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  # The real compactor, from the working tree, on the userland production
+  # runs. Reuses the unit-suite image: it is Ubuntu 24.04 with
+  # /opt/compactor-venv built from the same pinned requirements.txt, which is
+  # exactly what this needs, and building a second near-identical image would
+  # be a second thing to keep in step.
+  compactor:
+    build:
+      context: .
+      dockerfile: testfixtures/unit-suite/Dockerfile
+    container_name: zla-integration-compactor
+    depends_on:
+      vllm-fixture:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        cp -a /src/compactor /app &&
+        cd /app &&
+        exec /opt/compactor-venv/bin/uvicorn main:app
+        --host 0.0.0.0 --port 8080 --log-level info
+    volumes:
+      - ./:/src:ro
+    environment:
+      VLLM_URL: http://vllm-fixture:8000
+      MODEL_REPO: fixture-model
+      MAX_MODEL_LEN: "32768"
+      COMPACTOR_GENERATION_RESERVE: "8192"
+      # Storage lives inside the container and dies with it: every run starts
+      # from an empty store, which is what makes the suite's assertions about
+      # what it just wrote mean anything.
+      COMPACTOR_STORAGE_ROOT: /data/compactor
+      # RAG on: retrieval is a third of what this suite tests, and chromadb +
+      # fastembed are in the image. The embedder is bundled with fastembed,
+      # so this still needs no network.
+      COMPACTOR_RAG_ENABLED: "true"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    ports:
+      - "8081:8080"   # 8080 on the host is often the developer's own tunnel
+    healthcheck:
+      test: ["CMD", "/opt/compactor-venv/bin/python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health', timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  integration-tests:
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile
+    container_name: zla-integration-tests
+    depends_on:
+      compactor:
+        condition: service_healthy
+    # Shares the compactor's network namespace ON PURPOSE, so 127.0.0.1:8080
+    # reaches it. The admin endpoints are gated on the caller being loopback
+    # (_require_localhost, main.py) and the alternative — setting
+    # COMPACTOR_ADMIN_BIND to something permissive — would test a
+    # configuration production does not run and quietly disable the gate the
+    # suite is partly there to check.
+    network_mode: "service:compactor"
+    environment:
+      ZIONS_TEST_BASE_URL: http://127.0.0.1:8080
+      ZIONS_TEST_ADMIN_URL: http://127.0.0.1:8080
+      ZIONS_TEST_MODEL: fixture-model
+      # The stub answers instantly; the default 120s only ever hides a hang.
+      ZIONS_TEST_TIMEOUT: "30"
+    volumes:
+      - ./:/repo:ro
+    working_dir: /repo
