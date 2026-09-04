@@ -60,6 +60,14 @@ MARGIN_CEILING = MAX_MODEL_LEN // 4
 
 _WORD = "quick brown fox jumps over lazy dogs "
 
+# The content class this deployment's model actually writes, and the one the
+# char/4 estimator is worst on: `count_tokens_exact`'s docstring measures one
+# 17,930-character reply holding 1,710 U+2501 and 441 U+2500. Three UTF-8 bytes
+# and about one token per character, so char/4 reads roughly a quarter of the
+# truth. Used deliberately wherever a payload must be large in TOKENS while
+# staying small in CHARACTERS.
+_RULE = "━" * 60 + "\n"
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -94,8 +102,8 @@ def _user_turn_of(fixture_client, target_tokens: int) -> list[dict]:
     return [{"role": "user", "content": (_WORD * (lo // len(_WORD) + 1))[:lo]}]
 
 
-def _build_multi_turn(chars_per_turn: int, pairs: int) -> list[dict]:
-    body = (_WORD * (chars_per_turn // len(_WORD) + 1))[:chars_per_turn]
+def _build_multi_turn(chars_per_turn: int, pairs: int, unit: str) -> list[dict]:
+    body = (unit * (chars_per_turn // len(unit) + 1))[:chars_per_turn]
     msgs: list[dict] = []
     for i in range(pairs):
         msgs.append({"role": "user", "content": f"turn {i}. {body}"})
@@ -104,26 +112,27 @@ def _build_multi_turn(chars_per_turn: int, pairs: int) -> list[dict]:
     return msgs
 
 
-def _multi_turn_of(fixture_client, target_tokens: int, pairs: int = 4) -> list[dict]:
-    """A user/assistant conversation of AT LEAST target_tokens (and as close to
-    it as one turn's granularity allows), ending on a short user turn — a shape
-    the hard-budget guard is ALLOWED to shed from. A single-turn payload would
-    prove nothing about shedding, because the guard may never drop the newest
-    turn.
+def _multi_turn_of(
+    fixture_client, target_tokens: int, pairs: int = 4, unit: str = _WORD
+) -> list[dict]:
+    """A user/assistant conversation of AT LEAST target_tokens, ending on a
+    short user turn — a shape the hard-budget guard is ALLOWED to shed from. A
+    single-turn payload would prove nothing about shedding, because the guard
+    may never drop the newest turn.
 
     Binary-searched against the fixture's own tokenizer rather than estimated:
-    a chars-per-token guess is exactly the thing this whole project keeps
-    getting wrong, and a test whose payload lands somewhere near the boundary
-    is not testing the boundary.
+    a chars-per-token guess is exactly the thing this project keeps getting
+    wrong, and a test whose payload lands somewhere near the boundary is not
+    testing the boundary.
     """
-    lo, hi = 16, 120_000
+    lo, hi = 16, 400_000
     while lo < hi:
         mid = (lo + hi) // 2
-        if _true_count(fixture_client, _build_multi_turn(mid, pairs)) < target_tokens:
+        if _true_count(fixture_client, _build_multi_turn(mid, pairs, unit)) < target_tokens:
             lo = mid + 1
         else:
             hi = mid
-    return _build_multi_turn(lo, pairs)
+    return _build_multi_turn(lo, pairs, unit)
 
 
 def _chat(client, messages, conv: str, **extra):
@@ -336,6 +345,73 @@ def test_budget_boundaries_are_exact(client, fixture_client, target):
     assert _forwarded_prompt_tokens(r) == target, (
         f"the compactor forwarded {_forwarded_prompt_tokens(r)} tokens for a "
         f"payload of exactly {target}"
+    )
+
+
+def test_compaction_triggers_on_the_discredited_counter(client, fixture_client):
+    """F-13. Two payloads of IDENTICAL true size, both above
+    COMPACTOR_TARGET_TOKENS, get opposite treatment because `compact_if_needed`
+    still triggers on `count_tokens` — the char/4 estimator P0-0c discredited —
+    while `_enforce_hard_budget` was given vLLM's own count.
+
+    The discriminator is characters per token. Plain English prices near 4
+    chars/token so char/4 agrees; box-drawing rules price near 1 char/token, so
+    char/4 reads about a quarter of the truth. The second is not a contrived
+    input: `count_tokens_exact`'s own docstring measures one production reply
+    holding 1,710 U+2501 and 441 U+2500.
+
+    Measured black-box through `usage.prompt_tokens` — what the backend was
+    actually charged — so nothing here depends on reading a log.
+
+    In THIS stack the estimator reads HIGH on English, so the visible failure is
+    compaction NOT firing on the box-drawing payload. On production content the
+    estimator reads LOW, which is the same defect pointing the failing way.
+
+    FAILS IF: compact_if_needed starts consulting count_tokens_exact.
+    """
+    target = (TARGET_TOKENS + HARD_INPUT_LIMIT) // 2  # above the compaction
+    # target, below the hard budget, so ONLY the compaction decision is on trial
+
+    english = _multi_turn_of(fixture_client, target, unit=_WORD)
+    rules = _multi_turn_of(fixture_client, target, unit=_RULE)
+    n_english = _true_count(fixture_client, english)
+    n_rules = _true_count(fixture_client, rules)
+    assert abs(n_english - n_rules) <= 8, (
+        f"the two payloads must be the same true size to compare: "
+        f"{n_english} vs {n_rules}"
+    )
+    assert n_english > TARGET_TOKENS, "both payloads must be over the compaction target"
+
+    r_eng = _chat(client, english, "advf-trigger-english")
+    r_rul = _chat(client, rules, "advf-trigger-rules")
+    assert r_eng.status_code == 200 and r_rul.status_code == 200
+    fwd_eng = _forwarded_prompt_tokens(r_eng)
+    fwd_rul = _forwarded_prompt_tokens(r_rul)
+
+    chars_eng = sum(len(m["content"]) for m in english)
+    chars_rul = sum(len(m["content"]) for m in rules)
+    h = _health(client)
+    record(
+        "faults-13-compaction-trigger",
+        f"- both payloads {n_rules} true tokens (target {TARGET_TOKENS}). "
+        f"english: {chars_eng} chars (char/4={chars_eng // 4}) -> forwarded "
+        f"{fwd_eng}. rules: {chars_rul} chars (char/4={chars_rul // 4}) -> "
+        f"forwarded {fwd_rul}. /health/full status={h['status']} "
+        f"reasons={json.dumps(h['status_reasons'])}",
+    )
+
+    assert fwd_eng is not None and fwd_rul is not None
+    assert fwd_eng < n_english * 0.8, (
+        f"expected the English payload to be compacted ({n_english} true -> "
+        f"{fwd_eng} forwarded)"
+    )
+    assert fwd_rul >= n_rules - 8, (
+        "GOOD NEWS, and this test is now stale: the box-drawing payload was "
+        f"compacted too ({n_rules} true -> {fwd_rul} forwarded), so the "
+        "compaction trigger no longer runs on the char/4 estimator."
+    )
+    assert not any("budget" in x or "compact" in x for x in h["status_reasons"]), (
+        "GOOD NEWS: /health/full now says something about compaction not firing"
     )
 
 
@@ -716,9 +792,17 @@ def test_one_lying_tokenize_latches_the_process_wide_budget_margin(
     learning from a rejection whose measurement came from a non-positive count.
     """
     # Sized to sit between (HARD_INPUT_LIMIT - MARGIN_CEILING) and TARGET_TOKENS,
-    # so compaction does not fire and only the poisoned guard can shed it.
+    # so only the poisoned guard can shed it.
+    #
+    # Built from box-drawing rules, and that is load-bearing: compaction
+    # triggers on char/4 (see test_compaction_triggers_on_the_discredited_counter),
+    # and an English payload of this many TOKENS is long enough in CHARACTERS to
+    # trip that trigger and be summarized before the guard ever sees it — which
+    # is exactly what happened on the first run of this case. At ~1 char per
+    # token the rules payload is far under the compaction trigger and far over
+    # the poisoned budget, so the guard is the only thing that can move it.
     victim_target = (HARD_INPUT_LIMIT - MARGIN_CEILING + TARGET_TOKENS) // 2
-    victim = _multi_turn_of(fixture_client, victim_target)
+    victim = _multi_turn_of(fixture_client, victim_target, unit=_RULE)
     victim_true = _true_count(fixture_client, victim)
     assert HARD_INPUT_LIMIT - MARGIN_CEILING < victim_true < TARGET_TOKENS, (
         f"victim payload landed at {victim_true}, outside the window this test "
@@ -737,7 +821,9 @@ def test_one_lying_tokenize_latches_the_process_wide_budget_margin(
 
     # --- poison: one request the backend refuses, measured by a lying oracle --
     _set_mode(fixture_client, tokenize_mode="wrong", factor=0.0)
-    huge = _user_turn_of(fixture_client, MAX_MODEL_LEN + 7000)
+    huge = _user_turn_of(fixture_client, MAX_MODEL_LEN + 7000)  # one turn: no
+    # older turns to summarize, and the guard may never drop the newest turn,
+    # so this reaches the backend and is refused there.
     poison = _chat(client, huge, "advf-margin-poison")
     assert poison.status_code == 400, (
         "the poisoning request was supposed to be refused by the backend; got "
