@@ -125,6 +125,103 @@ services:
       retries: 40
       start_period: 10s
 
+  # --- The same stack, with REAL WEIGHTS (opt-in) --------------------------
+  #
+  #   docker compose -f docker-compose.integration.yml --profile model \
+  #       run --rm --build integration-tests-model
+  #
+  # A 0.5B instruct model in GGUF, CPU only, ~400 MB. It exists because two
+  # integration tests seed distinctive content and assert it comes back as an
+  # EXTRACTED FACT, and no canned string can satisfy that — fact extraction is
+  # itself an LLM call whose answer has to be about the input. Everything
+  # downstream of real extraction (dedup's merges, archive's evictions, what a
+  # summary actually says) has never been exercised locally either.
+  #
+  # Slower by a lot: seconds per generation rather than microseconds, and two
+  # generations per exchange. Expect minutes, not the 49s the canned run takes.
+  # That is why it is a profile and not the default.
+  #
+  # It is NOT a claim about production. A 0.5B model's replies are worse than
+  # Cydonia's and its token counts are its own; this proves the pipeline moves
+  # real text end to end, nothing more.
+  model-fixture:
+    profiles: ["model"]
+    build:
+      context: ./testfixtures/tokenizer-contract
+      dockerfile: Dockerfile.model
+    container_name: zla-integration-model-fixture
+    environment:
+      FIXTURE_MAX_MODEL_LEN: "32768"
+      FIXTURE_ERROR_STYLE: v010
+      FIXTURE_MODEL_MAX_TOKENS: "256"
+      FIXTURE_MODEL_THREADS: "4"
+    ports:
+      - "18003:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+      start_period: 30s   # loading weights is not instant
+
+  compactor-model:
+    profiles: ["model"]
+    build:
+      context: .
+      dockerfile: testfixtures/unit-suite/Dockerfile
+    container_name: zla-integration-compactor-model
+    depends_on:
+      model-fixture:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        cp -a /src/compactor /app &&
+        cd /app &&
+        exec /opt/compactor-venv/bin/uvicorn main:app
+        --host 0.0.0.0 --port 8080 --log-level info
+    volumes:
+      - ./:/src:ro
+    environment:
+      VLLM_URL: http://model-fixture:8000
+      MODEL_REPO: fixture-model
+      MAX_MODEL_LEN: "32768"
+      COMPACTOR_GENERATION_RESERVE: "8192"
+      COMPACTOR_STORAGE_ROOT: /data/compactor
+      COMPACTOR_RAG_ENABLED: "true"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    ports:
+      - "8082:8080"
+    healthcheck:
+      test: ["CMD", "/opt/compactor-venv/bin/python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 20s
+
+  integration-tests-model:
+    profiles: ["model"]
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile
+    container_name: zla-integration-tests-model
+    depends_on:
+      compactor-model:
+        condition: service_healthy
+    network_mode: "service:compactor-model"
+    environment:
+      ZIONS_TEST_BASE_URL: http://127.0.0.1:8080
+      ZIONS_TEST_ADMIN_URL: http://127.0.0.1:8080
+      ZIONS_TEST_MODEL: fixture-model
+      # Generous: a 0.5B model on CPU is slow, and a timeout here would look
+      # exactly like a hang, which is the confusion R22 was about.
+      ZIONS_TEST_TIMEOUT: "180"
+      ZIONS_TEST_TAIL_WAIT: "30"
+    volumes:
+      - ./:/repo:ro
+    working_dir: /repo
+
   integration-tests:
     build:
       context: ./tests/integration
