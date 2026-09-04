@@ -53,6 +53,21 @@ MODEL = os.environ.get("ZIONS_TEST_MODEL", "")
 TIMEOUT = float(os.environ.get("ZIONS_TEST_TIMEOUT", "120") or 120)
 TAIL_WAIT = float(os.environ.get("ZIONS_TEST_TAIL_WAIT", "8") or 8)
 
+# The polling helpers' ceiling, and it must be CONFIGURABLE.
+#
+# wait_for_facts and wait_for_indexed_exchanges hardcoded max_wait=30.0 and
+# ignored TAIL_WAIT entirely, while their docstrings promised slow paths "a
+# generous ceiling". Against a CPU-only fixture model that is simply false:
+# extraction is a real generation that lands ~40-90s after the reply, the
+# poll gave up at 30, and the compactor log then said "extracted 3 new
+# fact(s)" moments later. A real pass reported as a failure, and the one
+# knob that looks like it controls this (ZIONS_TEST_TAIL_WAIT) reached only
+# the coarse sleep.
+#
+# max() so the pod default (8) does not SHORTEN the ceiling from 30, and a
+# deliberately large TAIL_WAIT can lengthen it.
+POLL_CEILING = max(30.0, TAIL_WAIT)
+
 # Only "true" if user explicitly opted in to admin tests. Bare BASE_URL
 # fallback for ADMIN_URL doesn't count — admin tests require an explicit
 # decision because they may need extra pod-side config.
@@ -223,7 +238,7 @@ def wait_for_facts(
     conv_id: str,
     *,
     min_count: int = 1,
-    max_wait: float = 30.0,
+    max_wait: float | None = None,
     poll_interval: float = 2.0,
 ) -> list[dict]:
     """Poll /admin/conversations/<id>/facts until at least `min_count`
@@ -241,6 +256,7 @@ def wait_for_facts(
     Falls back to a coarse sleep when admin endpoints aren't reachable
     (otherwise we'd be looping uselessly against 403s).
     """
+    max_wait = POLL_CEILING if max_wait is None else max_wait
     if not ADMIN_ENABLED:
         time.sleep(max_wait if max_wait > TAIL_WAIT else TAIL_WAIT)
         return []
@@ -260,7 +276,7 @@ def wait_for_indexed_exchanges(
     conv_id: str,
     *,
     min_count: int = 1,
-    max_wait: float = 30.0,
+    max_wait: float | None = None,
     poll_interval: float = 2.0,
 ) -> int:
     """Poll /admin/conversations/<id> until episodic.indexed_exchanges
@@ -273,6 +289,7 @@ def wait_for_indexed_exchanges(
 
     Falls back to a coarse sleep when admin endpoints aren't reachable.
     """
+    max_wait = POLL_CEILING if max_wait is None else max_wait
     if not ADMIN_ENABLED:
         time.sleep(TAIL_WAIT)
         return 0

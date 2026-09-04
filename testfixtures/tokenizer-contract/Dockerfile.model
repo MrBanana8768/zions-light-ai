@@ -48,10 +48,18 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # The wheel index first, source build as the fallback. This is the slow step
 # on a cold build (minutes); it is cached thereafter.
+#
+# huggingface-hub is deliberately NOT pinned here. The first draft pinned it
+# to 0.36.0 and broke transformers==5.12.1 at import
+# ("cannot import name 'is_offline_mode' from 'huggingface_hub'") — pip warned
+# about the conflict and carried on, and the build failed two steps later at
+# the tokenizer download. transformers already depends on the hub client and
+# resolves a compatible version itself; hf_hub_download comes with it. Pinning
+# a transitive dependency of a pinned package is how you get a version pair
+# nobody chose.
 RUN pip install --no-cache-dir \
         --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
-        llama-cpp-python==0.3.16 \
-        huggingface-hub==0.36.0
+        llama-cpp-python==0.3.16
 
 ARG MODEL_REPO_GGUF=Qwen/Qwen2.5-0.5B-Instruct-GGUF
 ARG MODEL_FILE=qwen2.5-0.5b-instruct-q4_k_m.gguf
