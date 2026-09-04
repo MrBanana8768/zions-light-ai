@@ -381,7 +381,9 @@ class StoreUnreadable(Exception):
         self.cause = cause
 
 
-def read_json_strict(path: Path, default: Any = None) -> Any:
+def read_json_strict(
+    path: Path, default: Any = None, *, expect: type | tuple[type, ...] | None = None
+) -> Any:
     """Read JSON, raising StoreUnreadable rather than inventing a value.
 
     Returns `default` for an absent file — that case is by design and must
@@ -396,6 +398,28 @@ def read_json_strict(path: Path, default: Any = None) -> Any:
     everything else, so an EIO on the stat already reaches the caller
     (REMEDIATION.md §1.4 — both v3.1 reviews got this wrong).
 
+    `expect` is the SHAPE half of the same contract, and it exists because
+    the shape half was missing (v3.1.8, adversarial state sweep).
+
+    A file that parses but holds the wrong THING — a bare list where a dict
+    belongs, `null`, a number — used to come back to callers that wrote
+    `data.get(...) if isinstance(data, dict) else []`, i.e. as EMPTY. Not
+    unreadable: empty. Nothing raised, `stats.unreadable` did not move, and
+    the next turn's save wrote a fresh empty store OVER IT — measured, with
+    a pinned fact, gone.
+
+    That is the v3.1 F1a defect exactly, one branch over: F1a was that a
+    corrupt file returned [] and callers wrote back over the real facts, and
+    the fix taught this loader to raise on a PARSE failure while leaving the
+    wrong-shape case returning empty. So the difference between 'recoverable'
+    and 'destroyed' was whether the damage happened to break the JSON parser.
+
+    The check lives HERE rather than at the eight call sites for the reason
+    this codebase keeps relearning: a rule applied at some call sites and
+    missed at one is how the sibling defect survives. An absent file still
+    returns `default` untouched — a new conversation must not raise on its
+    first turn.
+
     This is the loader behind facts, the archive sidecar, summary state and
     personas. Callers on the request path already treat a raising load as
     "inject nothing this turn" and keep serving.
@@ -404,9 +428,21 @@ def read_json_strict(path: Path, default: Any = None) -> Any:
         return default
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         raise StoreUnreadable(path, e) from e
+    if expect is not None and not isinstance(data, expect):
+        # A present file holding the wrong thing is UNREADABLE, not empty.
+        # Returning it (or an empty stand-in) is what let the next save
+        # write over real memory.
+        raise StoreUnreadable(
+            path,
+            TypeError(
+                f"expected {getattr(expect, '__name__', expect)}, "
+                f"found {type(data).__name__}"
+            ),
+        )
+    return data
 
 
 def read_json(path: Path, default: Any = None) -> Any:

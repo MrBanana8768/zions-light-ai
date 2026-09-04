@@ -188,7 +188,7 @@ def load_state(conv_id: str) -> dict:
     current window — worse than the facts equivalent, because summaries are
     replaced wholesale rather than merged (v3.1 F1b).
     """
-    data = read_json_strict(summary_path(conv_id), default=None)
+    data = read_json_strict(summary_path(conv_id), default=None, expect=dict)
     if not isinstance(data, dict):
         return _empty_state(conv_id)
     # Defensive: ensure all top-level keys exist with the right types.
@@ -1750,7 +1750,7 @@ def _archive_chapters(conv_id: str, chapters: list[dict]) -> None:
     if not chapters:
         return
     path = summary_archive_path(conv_id)
-    existing = read_json_strict(path, default={})
+    existing = read_json_strict(path, default={}, expect=dict)
     rows = existing.get("chapters") if isinstance(existing, dict) else None
     if not isinstance(rows, list):
         rows = []
@@ -1781,7 +1781,7 @@ def _archive_chapters(conv_id: str, chapters: list[dict]) -> None:
 
 def load_chapter_archive(conv_id: str) -> list[dict]:
     """Every L2 chapter ever consumed by an L3 refresh, oldest first."""
-    data = read_json_strict(summary_archive_path(conv_id), default={})
+    data = read_json_strict(summary_archive_path(conv_id), default={}, expect=dict)
     rows = data.get("chapters") if isinstance(data, dict) else None
     return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
 

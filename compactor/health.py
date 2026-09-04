@@ -382,6 +382,26 @@ async def gather_health_full(
                 f"consecutive failure(s). Token budgets are running on the "
                 f"local estimate, which reads low on assistant content."
             )
+        # v3.1.8 (adversarial state sweep). stats.unreadable was COUNTED and
+        # then never consulted: three corrupted conversations present and
+        # /health/full still answered status "ok", status_reasons [], with a
+        # green Docker HEALTHCHECK.
+        #
+        # This module's own docstring says a layer we cannot see must not be
+        # reported as healthy, and the scan above goes to the trouble of
+        # counting each unreadable layer for exactly this purpose. The number
+        # was in the payload; nothing read it. An operator would have had to
+        # notice a nested count inside a body whose top line said everything
+        # was fine.
+        _unreadable = stats.get("unreadable") or {}
+        _damaged = {k: v for k, v in _unreadable.items() if isinstance(v, int) and v > 0}
+        if _damaged:
+            reasons.append(
+                "unreadable memory on disk: "
+                + ", ".join(f"{n} {layer}" for layer, n in sorted(_damaged.items()))
+                + ". Those conversations are not being read and must not be "
+                "written over; see stats.unreadable."
+            )
         status = "degraded" if reasons else "ok"
 
     return {

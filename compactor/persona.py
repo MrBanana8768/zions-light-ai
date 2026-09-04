@@ -93,7 +93,7 @@ def load_persona(conv_id: str) -> dict | None:
     misread replaced a stored persona with whatever the client happened to
     send that turn (v3.1 F1c).
     """
-    data = read_json_strict(persona_path(conv_id), default=None)
+    data = read_json_strict(persona_path(conv_id), default=None, expect=dict)
     if not isinstance(data, dict):
         return None
     text = data.get("persona_text")

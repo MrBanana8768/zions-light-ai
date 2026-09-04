@@ -122,11 +122,30 @@ SKIPPED_NO_USER_TEXT = "skipped_no_user_text"        # nothing to pair the reply
 # fault: it is a request we deliberately decline to memorize, and counting it
 # is what stops it looking like one of the skips above.
 SKIPPED_TASK_TRAFFIC = "skipped_task_traffic"        # background task, not a conversation
+
+# v3.1.8 (F-07, adversarial). The tail was DECIDED, was going to store, and
+# then bgwork.pool shed it at the outstanding ceiling. Measured under load:
+# 160 concurrent turns, 61 shed, and memory_tail reported stored=160
+# skipped=0.
+#
+# That is R8's fix meeting its own reasoning from the other side. R8 hoisted
+# the count onto the request path PRECISELY BECAUSE the pool sheds — a tail
+# dropped at the ceiling would otherwise never be counted at all. The cost
+# of counting early is that it counts work that never happened, so
+# "uncounted loss" became "loss counted as a success", which is worse: the
+# first is a gap, the second is a lie. The loss WAS visible in
+# background_work.shed, but not in the dict named after the thing that was
+# lost.
+#
+# LOSSY, and by exclusion like every other skip: a reply she read did not
+# reach memory, and the reason being our own load does not make it less lost.
+SKIPPED_SHED = "skipped_shed"                        # bgwork dropped it at the ceiling
 STORING_OUTCOMES = frozenset({STORED, STORED_TRIMMED})
 OUTCOMES = (
     STORED, STORED_TRIMMED, SKIPPED_HOLED, SKIPPED_EMPTY, SKIPPED_DEGENERATE,
     SKIPPED_NO_BOUNDARY, SKIPPED_TOO_SHORT, SKIPPED_DEGENERATE_PARTIAL,
     SKIPPED_DISK_PRESSURE, SKIPPED_NO_USER_TEXT, SKIPPED_TASK_TRAFFIC,
+    SKIPPED_SHED,
 )
 
 # The skips that cost the user NOTHING, named once.
@@ -278,6 +297,38 @@ def note(outcome: str, *, raw_chars: int, kept_chars: int) -> str | None:
     # going wrong.
     s.outcomes[outcome] = s.outcomes.get(outcome, 0) + 1
     return result
+
+
+def note_correction(was: str, now: str) -> None:
+    """Move one already-counted decision from `was` to `now`.
+
+    For the one case where the outcome is not knowable at note() time:
+    _run_memory_tail counts the store BEFORE handing the tail to
+    bgwork.pool (R8's ordering, and its reasoning still holds — the pool
+    sheds, so a tail counted only on completion would vanish silently).
+    When the pool then sheds, the store that was counted did not happen.
+
+    Raise-proof for R28's reason: this runs on the request path, after the
+    response has been decided, and a bookkeeping failure must never become
+    the client's problem. A correction that cannot be applied leaves the
+    ledger optimistic, which is the state it was already in.
+    """
+    try:
+        s = _state
+        if s.outcomes.get(was, 0) <= 0:
+            return
+        s.outcomes[was] -= 1
+        s.outcomes[now] = s.outcomes.get(now, 0) + 1
+        if was in STORING_OUTCOMES and now not in STORING_OUTCOMES:
+            s.stored = max(0, s.stored - 1)
+            s.skipped += 1
+            s.consecutive_skips += 1
+            s.last_skip_at = time.monotonic()
+            s.last_skip_outcome = now
+            if now not in HARMLESS_SKIP_OUTCOMES:
+                s.last_lossy_skip_at = time.monotonic()
+    except Exception:
+        return
 
 
 def snapshot(*, window_s: float | None = None) -> dict:
