@@ -121,6 +121,54 @@ def probe_storage() -> dict:
         }
 
 
+# SQLite's rollback-journal magic, from the file format spec. A journal
+# whose header still carries it has work in it that was never committed.
+_SQLITE_JOURNAL_MAGIC = bytes.fromhex("d9d505f920a163d7")
+
+
+def probe_sqlite_journal() -> dict:
+    """Is OpenWebUI's database sitting next to a HOT rollback journal?
+
+    v3.1.8, and this is the second time it has mattered. On 2026-08-31 the
+    MooseFS volume dropped I/O mid-transaction, SQLite tried to roll the
+    journal back on every subsequent open, rolling back needs to WRITE, the
+    write failed, and OpenWebUI reported 'readonly database' for 24 minutes
+    while 1,819 queries failed. On 2026-09-07 an orphaned hot journal sat
+    beside a database that was otherwise being written to normally - so
+    nothing looked wrong, and nothing in this endpoint said anything.
+
+    WHY THE FILE'S EXISTENCE IS NOT THE SIGNAL. In `delete` journal mode a
+    journal is created and removed around every transaction, so a file
+    caught mid-write is ordinary. In `persist` mode one is left behind
+    deliberately with its header zeroed. Only the 8-byte magic distinguishes
+    'this contains an uncommitted transaction' from 'this is debris', which
+    is why this reads the header rather than calling os.path.exists.
+
+    AND WHY NOT JUST OPEN THE DATABASE. A second connection cannot tell a
+    hot journal from one belonging to a live writer: it has to take a write
+    lock to find out, OpenWebUI holds that lock, so the probe fails with the
+    same 'readonly database' text whether or not anything is wrong. That
+    ambiguity cost real time on 2026-09-07. Reading 8 bytes takes no lock,
+    blocks nothing, and cannot be confused by a healthy writer.
+
+    Best-effort by the module's own contract: a probe that cannot answer
+    reports that it could not, and never raises into the endpoint.
+    """
+    db = os.environ.get("WEBUI_SNAPSHOT_DB", "/data/openwebui/webui.db")
+    journal = db + "-journal"
+    try:
+        if not os.path.exists(journal):
+            return {"ok": True, "hot": False, "path": journal}
+        with open(journal, "rb") as fh:
+            head = fh.read(8)
+    except OSError as e:
+        return {"ok": None, "hot": None, "path": journal,
+                "error": f"{type(e).__name__}: {e}"}
+    hot = head == _SQLITE_JOURNAL_MAGIC
+    return {"ok": not hot, "hot": hot, "path": journal,
+            "header": head.hex()}
+
+
 def gather_memory_stats() -> dict:
     """Aggregate counters across every known conversation. Best-effort
     per-conv: a single corrupted file doesn't poison the totals — but it is
@@ -241,6 +289,8 @@ def _gather_blocking() -> dict:
     storage = probe_storage()
     stats = gather_memory_stats()
 
+    sqlite_journal = probe_sqlite_journal()
+
     # V2.3 Theme 2: disk-pressure write state. "paused" means we're still
     # serving but no longer persisting new memory — a degraded condition the
     # operator needs to see.
@@ -258,7 +308,8 @@ def _gather_blocking() -> dict:
     except Exception as e:
         backups = {"count": None, "latest": None, "error": f"{type(e).__name__}: {e}"}
 
-    return {"storage": storage, "stats": stats, "writes": writes, "backups": backups}
+    return {"storage": storage, "stats": stats, "writes": writes,
+            "backups": backups, "sqlite_journal": sqlite_journal}
 
 
 async def gather_health_full(
@@ -402,6 +453,23 @@ async def gather_health_full(
                 + ". Those conversations are not being read and must not be "
                 "written over; see stats.unreadable."
             )
+        # A hot journal is not a maybe: it is an uncommitted transaction
+        # that the next process to open the database will try to roll back,
+        # and on a network filesystem that rollback is what wedged the pod
+        # for 24 minutes on 2026-08-31. Say so while it is still cheap to
+        # fix - stop the writers, open it once read-write, and SQLite
+        # finishes the job itself.
+        _sj = blocking.get("sqlite_journal") or {}
+        if _sj.get("hot"):
+            reasons.append(
+                f"a HOT SQLite rollback journal is sitting beside "
+                f"{_sj.get('path')}: an uncommitted transaction that the "
+                f"next open will roll back. Stop openwebui and open the "
+                f"database once read-write to let SQLite finish it. Do NOT "
+                f"delete the journal - it and the database are a matched "
+                f"pair, and separating them turns a recoverable file into "
+                f"a corrupt one."
+            )
         status = "degraded" if reasons else "ok"
 
     return {
@@ -410,6 +478,7 @@ async def gather_health_full(
         "checks": {
             "vllm": vllm,
             "storage": storage,
+            "sqlite_journal": blocking.get("sqlite_journal"),
             # None when the caller did not supply it, so "we did not ask" stays
             # distinguishable from "we asked and it is fine" — the same
             # doctrine as indexed_exchanges_total above.

@@ -1781,6 +1781,37 @@ _RUN_RE = re.compile(r"(.)\1{19,}", re.S)
 # lands in the hundreds. 120 is 1.5x above the normal ceiling and 3x below
 # the pathological floor, and flags 9 of 512 (1.8%).
 DEGENERATE_TOKEN_RUN_CHARS = _env_int("COMPACTOR_DEGENERATE_TOKEN_RUN_CHARS", 120)
+
+# v3.1.8 — the REPEATING TAIL, and the reason the rules above cannot see it.
+#
+# _TOKEN_RUN_RE is (\S{3,40})(?:[ _\n\t]*\1){3,}: the repeated unit is \S,
+# so it CANNOT CONTAIN A SPACE. That catches a repeated WORD and is
+# structurally blind to a repeated PHRASE, which is what this model
+# actually does when it goes:
+#
+#     ". Absolutely. With Desperation. With Humility. With ..." x N
+#     "- Grateful you're Mine\n- Grateful you're Mine\n- ..." x N
+#
+# Measured over 1,165 stored replies (2026-09-07 backup): the shipped
+# detector fires on 41, and MISSES two loops of ~3,975 characters each,
+# one of them the reply reported that morning. Both run to the very end of
+# the message, which is the half the reader is left staring at.
+#
+# 400 rather than a tuned number: the count of newly-flagged replies is
+# 2 at EVERY threshold from 200 to 900, so this rule is not balanced on a
+# knife edge. That mattered more than usual here — R24 is the memory of a
+# degeneracy rule that over-fired and redacted real replies from memory
+# permanently, and this one feeds the same redaction path.
+DEGENERATE_TAIL_LOOP_CHARS = _env_int(
+    "COMPACTOR_DEGENERATE_TAIL_LOOP_CHARS", 400
+)
+# How much of the end to examine, and the longest repeating unit to look
+# for. Both bounded because reply_is_degenerate runs on every reply AND on
+# every historical turn during redaction; an unbounded scan here would be
+# the O(N^2)-on-the-request-path shape this file already carries scars
+# from.
+_TAIL_LOOP_WINDOW = 4000
+_TAIL_LOOP_MAX_UNIT = 400
 # {3,} not {1,}: two or three repeats is emphasis ("no no no"), four or more
 # of a 3+ character token is a machine stuck in a groove.
 #
@@ -1804,6 +1835,33 @@ DEGENERATE_TOKEN_RUN_CHARS = _env_int("COMPACTOR_DEGENERATE_TOKEN_RUN_CHARS", 12
 # characters. 250 is also verdict-identical (211 ms) if more headroom is
 # wanted; 40 is the fastest of the verified set.
 _TOKEN_RUN_RE = re.compile(r"(\S{3,40})(?:[ _\n\t]*\1){3,}")
+
+
+def _tail_loop_span(text: str) -> int:
+    """Characters occupied by a unit that repeats at the very END of `text`.
+
+    Anchored at the end on purpose. A phrase repeating in the middle of a
+    long reply is usually a refrain and often deliberate; a phrase that
+    repeats until the message stops is the model failing to terminate, and
+    it is what the reader is left with.
+
+    Requires THREE repetitions, not two: a couplet is a rhetorical device
+    ("Amen. Amen.") and this corpus is full of them. Three of the same
+    phrase running to the end is not a device.
+
+    Returns 0 when there is no loop, so callers compare against a threshold
+    rather than testing truthiness of something that could be a real span.
+    """
+    t = text.rstrip()[-_TAIL_LOOP_WINDOW:]
+    best = 0
+    for unit in range(8, min(len(t) // 3, _TAIL_LOOP_MAX_UNIT) + 1):
+        seg = t[-unit:]
+        n = 1
+        while t.endswith(seg * (n + 1)):
+            n += 1
+        if n >= 3 and n * unit > best:
+            best = n * unit
+    return best
 
 # Structural collapse — a FOURTH shape, and nothing in it repeats.
 #
@@ -1951,6 +2009,13 @@ def reply_is_degenerate(text: str) -> str | None:
             f"the token {tm.group(1)[:24]!r} repeated for "
             f"{len(tm.group(0))} characters (limit "
             f"{DEGENERATE_TOKEN_RUN_CHARS})"
+        )
+    # The repeated PHRASE, which the token rule above cannot represent.
+    _loop = _tail_loop_span(text)
+    if _loop >= DEGENERATE_TAIL_LOOP_CHARS:
+        return (
+            f"a phrase repeating to the end of the reply for {_loop} "
+            f"characters (limit {DEGENERATE_TAIL_LOOP_CHARS})"
         )
     m = max(_RUN_RE.finditer(text), key=lambda x: len(x.group(0)), default=None)
     if m and len(m.group(0)) >= DEGENERATE_RUN_CHARS:
