@@ -223,6 +223,44 @@ check(_d.raw_chars == 0,
 check(_empty == [],
       "nothing is scheduled when the model produced no reply at all")
 
+print("[6] the REAL predicate, not a lambda, closes the gate")
+# [3] proves the gate calls something; it does not prove the something is
+# right. This drives _is_repeat_task_traffic itself, under the state it was
+# written for: a stable conv_id past TASK_TRAFFIC_MIN_POSITION receiving a
+# request with no assistant turn - OpenWebUI asking for a title. That array
+# is NOT the conversation, and rolling it up is what review showed could
+# burn 21 real turns.
+TASK_CONV = "rollup_task_traffic"
+_st = summarizer.load_state(TASK_CONV)
+_st["turns_seen"] = main.TASK_TRAFFIC_MIN_POSITION + 2
+summarizer.save_state(TASK_CONV, _st)
+TASK_MESSAGES = [{"role": "user", "content": "Generate a title."}]
+check(main._is_repeat_task_traffic(TASK_CONV, TASK_MESSAGES),
+      "the real predicate calls this task traffic — without it [6] proves "
+      "nothing")
+
+_task_labels: list = []
+
+
+def _spy_task(coro, label=None):
+    _task_labels.append(label)
+    coro.close()
+    return True
+
+
+main._fire_and_forget = _spy_task
+try:
+    main._run_memory_tail(
+        TASK_CONV, DEGENERATE, finished=True, truncated=False, holed=False,
+        touched_facts=[], last_user_text="Generate a title.", turn_index=2,
+        messages=list(TASK_MESSAGES), injected_facts=None,
+    )
+finally:
+    main._fire_and_forget = _real_fire
+check(_task_labels == [],
+      "no rollup is scheduled for it, through the production predicate "
+      "rather than a stand-in")
+
 if FAILED:
     print(f"\n{len(FAILED)} check(s) FAILED")
     sys.exit(1)
