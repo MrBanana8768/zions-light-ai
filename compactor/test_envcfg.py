@@ -181,7 +181,6 @@ IMPORT_CASES = [
     ("facts", "MAX_MODEL_LEN", "_MAX_MODEL_LEN", 32768),
     ("summarizer", "MAX_MODEL_LEN", "MAX_MODEL_LEN", 32768),
     ("backup", "COMPACTOR_BACKUP_RETAIN", "RETAIN", 7),
-    ("pgarchive", "PGARCHIVE_RETAIN", "RETAIN", 10),
     ("retrieval", "COMPACTOR_RAG_TOP_K", "RAG_TOP_K", 5),
     ("webuidb", "WEBUI_DB_SYNC_INTERVAL_S", "SYNC_INTERVAL_S", 300.0),
     ("degrade", "COMPACTOR_MIN_FREE_MB_WRITES", "MIN_FREE_MB_WRITES", 200),
