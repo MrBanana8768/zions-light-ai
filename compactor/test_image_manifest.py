@@ -46,7 +46,7 @@ DOCKERFILE = HERE.parent / "Dockerfile"
 # What the running image actually starts. main.py is the compactor itself;
 # the rest are invoked by supervisord or entrypoint.sh as subprocesses, which
 # is why a module only THEY need is just as required as one main needs.
-ENTRY_POINTS = ("main", "selftest", "backup", "pgarchive", "dbselect")
+ENTRY_POINTS = ("main", "selftest", "backup")
 
 FAILED = []
 
