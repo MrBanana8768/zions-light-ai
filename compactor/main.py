@@ -4198,6 +4198,13 @@ async def _rollup_hierarchy(
     """
     if not summarizer.enabled():
         return
+    # HERE, not at the call site. A rollup WRITES state, so it is subject
+    # to the same pause every other new-memory write is, and putting the
+    # check inside means both callers get it rather than the one that
+    # remembered. writes_allowed() is cached for
+    # COMPACTOR_DEGRADE_CHECK_TTL_S, so this is a tuple read.
+    if not degrade.guard("hierarchy rollup"):
+        return
     # A reply of whitespace is not a turn to roll up: it would advance the
     # watermark over a turn that says nothing, and the label would then
     # cover text no summary can account for. None is not whitespace - it is
@@ -4234,7 +4241,7 @@ async def _rollup_hierarchy(
             or (state.get("l3") is not None) != (before.get("l3") is not None)
         ):
             logger.info(
-                f"conv={conv_id}: rollup -> L1={len(state.get('l1') or [])} "
+                f"conv={conv_id}: rollup → L1={len(state.get('l1') or [])} "
                 f"L2={len(state.get('l2') or [])} "
                 f"L3={'y' if state.get('l3') else 'n'} "
                 f"last_turn={state.get('last_summarized_turn', 0)}"
@@ -4420,7 +4427,13 @@ def _run_memory_tail(
         # unfit to store.
         if (
             decision.raw_chars > 0
-            and decision.outcome not in tailhealth.ROLLUP_UNSAFE_SKIP_OUTCOMES
+            # ASKED, not read off a label. Both conditions this used to
+            # test - task traffic and disk pressure - are computed only
+            # behind `if decision.store` above, so on the path this gate
+            # guards (a reply already refused) neither label had ever been
+            # set and the guard could not fire. Found in review; it is this
+            # file's own recurring defect, committed while fixing it.
+            and not _is_repeat_task_traffic(conv_id, messages)
             and not _fire_and_forget(
                 _rollup_hierarchy(conv_id, messages, None),
                 label=f"rollup conv={conv_id}",

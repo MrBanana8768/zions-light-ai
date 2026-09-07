@@ -131,6 +131,98 @@ finally:
     main._fire_and_forget = _real_fire
     summarizer.maybe_rollup = _real_rollup
 
+
+# ---------------------------------------------------------------------------
+# THE GATE. Three conditions decide whether the skip path rolls up at all,
+# and until review found it the gate tested two of them against labels that
+# `_run_memory_tail` only computes behind `if decision.store` - so on this
+# path they were never set and the guard could not fire. A gate with no test
+# is how that shipped: the broken version passed every suite in the repo.
+# ---------------------------------------------------------------------------
+
+
+def _fire_once(**patches):
+    """Run one skipped-tail decision, return the labels scheduled."""
+    labels: list = []
+
+    def _spy(coro, label=None):
+        labels.append(label)
+        coro.close()
+        return True
+
+    saved = {k: getattr(main, k) for k in patches}
+    main._fire_and_forget = _spy
+    for k, v in patches.items():
+        setattr(main, k, v)
+    try:
+        main._run_memory_tail(
+            CONV, DEGENERATE, finished=True, truncated=False, holed=False,
+            touched_facts=[], last_user_text="And the tea?", turn_index=2,
+            messages=list(HISTORY), injected_facts=None,
+        )
+    finally:
+        for k, v in saved.items():
+            setattr(main, k, v)
+        main._fire_and_forget = _real_fire
+    return labels
+
+
+print("[3] task traffic does NOT roll up")
+# Its message array is not this conversation - it is OpenWebUI asking for a
+# title on a conv_id that happens to match. Rolling it up hands
+# _observed_position a foreign array and moves the position against text the
+# conversation never contained.
+check(_fire_once(_is_repeat_task_traffic=lambda c, m: True) == [],
+      "nothing is scheduled when the request is background task traffic")
+check(_fire_once(_is_repeat_task_traffic=lambda c, m: False) != [],
+      "and the control still schedules - so [3] is not passing because the "
+      "gate refuses everything")
+
+print("[4] disk pressure does NOT roll up")
+# A rollup WRITES state, so it is subject to the same pause as every other
+# new-memory write. The check lives inside _rollup_hierarchy, so it holds
+# for BOTH callers rather than the one that remembered.
+rolled.clear()
+_real_guard = main.degrade.guard
+main.degrade.guard = lambda _label: False
+summarizer.maybe_rollup = _spy_rollup
+try:
+    for coro, _label in [(main._rollup_hierarchy(CONV, list(HISTORY), None), None)]:
+        asyncio.run(coro)
+finally:
+    main.degrade.guard = _real_guard
+    summarizer.maybe_rollup = _real_rollup
+check(rolled == [],
+      "no rollup happens while degrade.guard has writes paused")
+
+print("[5] a reply that never arrived does NOT roll up")
+# A backend rejection adds no turn to roll up and needs the same backend the
+# rollup would call, so during a vLLM outage every 400 would fire a
+# summarization at the process that is already failing. The discriminator is
+# raw_chars: nothing arrived, so there is nothing new to summarize.
+_empty: list = []
+
+
+def _spy_empty(coro, label=None):
+    _empty.append(label)
+    coro.close()
+    return True
+
+
+main._fire_and_forget = _spy_empty
+try:
+    _d = main._run_memory_tail(
+        CONV, "", finished=True, truncated=False, holed=False,
+        touched_facts=[], last_user_text="And the tea?", turn_index=2,
+        messages=list(HISTORY), injected_facts=None,
+    )
+finally:
+    main._fire_and_forget = _real_fire
+check(_d.raw_chars == 0,
+      "(the empty reply really does report 0 raw chars)")
+check(_empty == [],
+      "nothing is scheduled when the model produced no reply at all")
+
 if FAILED:
     print(f"\n{len(FAILED)} check(s) FAILED")
     sys.exit(1)
