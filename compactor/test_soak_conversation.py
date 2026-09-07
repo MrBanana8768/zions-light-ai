@@ -170,6 +170,11 @@ def _defer_tail(coro, label=None):
     every assertion about accumulation is meaningless.
     """
     _pending.append(coro)
+    # TRUE, and it is not a formality. v3.1.8 gave _fire_and_forget a bool
+    # contract - False means the pool SHED the tail - and a double that
+    # returns None reads as shed, so the caller counts the exchange lost and
+    # skips it. Same defect already fixed in _spy_fire/_no_schedule.
+    return True
 
 
 def _drain_tails() -> None:

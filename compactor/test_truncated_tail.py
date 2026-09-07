@@ -273,7 +273,11 @@ def _spy_fire(obj, label=None):
     # returning None reads as 'the pool shed it' and every clean finish
     # comes back skipped. A test double that does not honour the contract
     # tests the double.
-    _fired.append(obj)
+    # TAILS ONLY (v3.1.8): a skipped reply also fires the hierarchy rollup
+    # under a `rollup conv=` label, and _fired_text() below reads _fired[0]
+    # expecting the tail's own arguments. See test_rollup_on_skip.py.
+    if (label or "").startswith("tail"):
+        _fired.append(obj)
     return True
 
 
