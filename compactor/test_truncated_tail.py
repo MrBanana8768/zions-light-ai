@@ -278,6 +278,15 @@ def _spy_fire(obj, label=None):
     # expecting the tail's own arguments. See test_rollup_on_skip.py.
     if (label or "").startswith("tail"):
         _fired.append(obj)
+    else:
+        # CLOSED, not merely ignored. Dropping the rollup coroutine on the
+        # floor emitted 19 'coroutine was never awaited' RuntimeWarnings,
+        # and nothing failed on them: scripts/run-tests.py judges by return
+        # code and discards stderr on a pass, so the warning was invisible.
+        try:
+            obj.close()
+        except Exception:
+            pass
     return True
 
 

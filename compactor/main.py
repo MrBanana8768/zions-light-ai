@@ -4374,7 +4374,18 @@ def _run_memory_tail(
     # reached, this is about whether this request deserves to reach it, and a
     # request that could not have been stored anyway should keep the label
     # that says why.
-    if decision.store and _is_repeat_task_traffic(conv_id, messages):
+    # ONE read, both consumers. This reads the store, and a task-traffic
+    # turn consulted it twice: once here and again at the rollup gate below,
+    # because this branch REPLACES `decision` and so does not exclude it.
+    #
+    # Computed UNCONDITIONALLY, and that is the load-bearing part. Writing
+    # `decision.store and _is_repeat_task_traffic(...)` would make this
+    # False for every already-refused reply, which is precisely the class
+    # the gate below has to recognise - it is F1, restored, in the shape of
+    # a tidy-up. (_has_conversational_history short-circuits before the disk
+    # read, so an ongoing conversation pays nothing for the extra call.)
+    _task_traffic = _is_repeat_task_traffic(conv_id, messages)
+    if decision.store and _task_traffic:
         decision = TailDecision(
             False,
             "",
@@ -4433,7 +4444,7 @@ def _run_memory_tail(
             # guards (a reply already refused) neither label had ever been
             # set and the guard could not fire. Found in review; it is this
             # file's own recurring defect, committed while fixing it.
-            and not _is_repeat_task_traffic(conv_id, messages)
+            and not _task_traffic
             and not _fire_and_forget(
                 _rollup_hierarchy(conv_id, messages, None),
                 label=f"rollup conv={conv_id}",
