@@ -103,7 +103,14 @@ _tail_labels: list = []
 
 
 def _spy_fire_and_forget(coro, label=None):
-    _tail_labels.append(label)
+    # TAILS ONLY (v3.1.8). A skipped reply still fires the hierarchy
+    # rollup, under its own `rollup conv=` label, because the rollup
+    # summarizes turns already in the history rather than this reply - see
+    # main._rollup_hierarchy. Counting both would make every assertion here
+    # read 1 where it means 'the reply was memorized'. This file is about
+    # the tail; test_rollup_on_skip.py is about the rollup.
+    if (label or "").startswith("tail"):
+        _tail_labels.append(label)
     try:
         coro.close()
     except Exception:

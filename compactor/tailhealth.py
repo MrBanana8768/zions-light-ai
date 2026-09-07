@@ -158,6 +158,30 @@ OUTCOMES = (
 # harmless label HERE and both consumers follow.
 HARMLESS_SKIP_OUTCOMES = frozenset({SKIPPED_EMPTY, SKIPPED_TASK_TRAFFIC})
 
+# The skips after which the HIERARCHY ROLLUP must NOT run (v3.1.8).
+#
+# A skipped reply does not stop the rollup: it summarizes turns already in
+# the history and redacts degenerate ones itself, so freezing it on one bad
+# reply froze the watermark for as long as a loop lasted. These two are the
+# exceptions, and they are exceptions for different reasons:
+#
+#   SKIPPED_TASK_TRAFFIC - the message array is NOT this conversation. It
+#     is OpenWebUI asking for a title or tags, on a conv_id that happens to
+#     match. Rolling it up would hand _observed_position a foreign array and
+#     move the position and the anchor against text the conversation never
+#     contained.
+#   SKIPPED_DISK_PRESSURE - degrade.guard has already said writes are
+#     refused, and a rollup WRITES state. Running it would be a write taken
+#     after the decision not to write.
+#
+# Everything else here - degenerate, holed, empty, no-boundary, too-short,
+# no-user-text - is 'this reply does not enter memory' with a history in
+# hand that is still a real conversation.
+ROLLUP_UNSAFE_SKIP_OUTCOMES = frozenset({
+    SKIPPED_TASK_TRAFFIC,
+    SKIPPED_DISK_PRESSURE,
+})
+
 # v3.1.7 (R27). SKIPPED_EMPTY is the one skip label that carries no loss: she
 # pressed Stop before the first token, so there was never any text to
 # memorize. Every OTHER skip means a reply she read did not reach memory.

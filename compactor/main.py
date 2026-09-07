@@ -4163,43 +4163,84 @@ async def _async_tail(
     # whitespace is not a turn to roll up: it would advance the watermark
     # over a turn that says nothing, and the label would then cover text no
     # summary can account for.
-    if summarizer.enabled() and assistant_text.strip():
-        try:
-            # v3.1.3: redact past degenerate turns before they can reach
-            # maybe_rollup — see _redact_degenerate_turns for why the
-            # call-site skip above is not enough on its own for this job.
-            # `assistant_text` itself needs no check: neither call site
-            # reaches this function when it is degenerate.
-            # run_in_threadpool, not a bare call: this walks EVERY historical
-            # assistant turn through reply_is_degenerate, and _async_tail is a
-            # coroutine, so a bare call blocks the event loop for every other
-            # request. Measured against her real replies (median 5,248 chars):
-            # 20 turns 4.6ms, 40 turns 9.5ms, 85 turns 65ms, 170 turns 446ms -
-            # and it runs on every single turn. The detector blocking this
-            # same loop is a defect this branch has already shipped once.
-            _redacted = await run_in_threadpool(
-                _redact_degenerate_turns, list(original_messages)
+    # ONE function, both tail paths. Extracted in v3.1.8 rather than
+    # copied: the skip path below needs exactly this, and a second copy of
+    # it is the fix-one-site-miss-the-sibling defect this file has paid
+    # for eighteen times.
+    await _rollup_hierarchy(conv_id, original_messages, assistant_text)
+
+
+async def _rollup_hierarchy(
+    conv_id: str,
+    messages: list[dict],
+    assistant_text: str | None,
+) -> None:
+    """Advance the hierarchical summary. Both tail paths call this.
+
+    `assistant_text` is the reply to roll up WITH the history, or None to
+    roll up the history alone — which is what the skipped-tail path passes.
+
+    WHY None IS A CASE AT ALL (v3.1.8). A reply that trips
+    reply_is_degenerate must not enter memory: the fact extractor would
+    store its markup and the episodic index would embed a repetition loop.
+    But `_run_memory_tail` expressed that by returning before the WHOLE
+    tail, and the rollup is not about this reply — it summarizes turns
+    already in the history, and `_redact_degenerate_turns` below is how it
+    handles degenerate ones. Coupling the two meant a model that loops for
+    n turns froze the hierarchy for n turns, with no floor and no recovery:
+    the soak measured 14 consecutive skips in a 22-turn run, and the
+    watermark never left 0. That is the frozen hierarchy this release
+    exists to fix, reached by a third route.
+
+    So the degenerate reply is excluded from the rollup INPUT while the
+    rollup itself still runs. Nothing about it reaches a summary; the turns
+    around it stop being held hostage to it.
+    """
+    if not summarizer.enabled():
+        return
+    # A reply of whitespace is not a turn to roll up: it would advance the
+    # watermark over a turn that says nothing, and the label would then
+    # cover text no summary can account for. None is not whitespace - it is
+    # 'do not append a reply at all', which is a different instruction.
+    if assistant_text is not None and not assistant_text.strip():
+        return
+    try:
+        # v3.1.3: redact past degenerate turns before they can reach
+        # maybe_rollup - see _redact_degenerate_turns for why the call-site
+        # skip is not enough on its own for this job.
+        #
+        # run_in_threadpool, not a bare call: this walks EVERY historical
+        # assistant turn through reply_is_degenerate, and this is a
+        # coroutine, so a bare call blocks the event loop for every other
+        # request. Measured against her real replies (median 5,248 chars):
+        # 20 turns 4.6ms, 40 turns 9.5ms, 85 turns 65ms, 170 turns 446ms -
+        # and it runs on every single turn. The detector blocking this same
+        # loop is a defect this branch has already shipped once.
+        _redacted = await run_in_threadpool(
+            _redact_degenerate_turns, list(messages)
+        )
+        full_messages = _redacted + (
+            [{"role": "assistant", "content": assistant_text}]
+            if assistant_text is not None
+            else []
+        )
+        before = summarizer.load_state(conv_id)
+        state = await summarizer.maybe_rollup(
+            conv_id, full_messages, VLLM_URL, MODEL_REPO or ""
+        )
+        if (
+            len(state.get("l1") or []) != len(before.get("l1") or [])
+            or len(state.get("l2") or []) != len(before.get("l2") or [])
+            or (state.get("l3") is not None) != (before.get("l3") is not None)
+        ):
+            logger.info(
+                f"conv={conv_id}: rollup -> L1={len(state.get('l1') or [])} "
+                f"L2={len(state.get('l2') or [])} "
+                f"L3={'y' if state.get('l3') else 'n'} "
+                f"last_turn={state.get('last_summarized_turn', 0)}"
             )
-            full_messages = _redacted + [
-                {"role": "assistant", "content": assistant_text}
-            ]
-            before = summarizer.load_state(conv_id)
-            state = await summarizer.maybe_rollup(
-                conv_id, full_messages, VLLM_URL, MODEL_REPO or ""
-            )
-            if (
-                len(state.get("l1") or []) != len(before.get("l1") or [])
-                or len(state.get("l2") or []) != len(before.get("l2") or [])
-                or (state.get("l3") is not None) != (before.get("l3") is not None)
-            ):
-                logger.info(
-                    f"conv={conv_id}: rollup → L1={len(state.get('l1') or [])} "
-                    f"L2={len(state.get('l2') or [])} "
-                    f"L3={'y' if state.get('l3') else 'n'} "
-                    f"last_turn={state.get('last_summarized_turn', 0)}"
-                )
-        except Exception as e:
-            logger.exception(f"conv={conv_id}: async rollup failed: {e}")
+    except Exception as e:
+        logger.exception(f"conv={conv_id}: async rollup failed: {e}")
 
 
 def _has_pairable_user_text(last_user_text: str) -> bool:
@@ -4357,6 +4398,39 @@ def _run_memory_tail(
             f"conv={conv_id}: {decision.reason} — skipping memory tail "
             f"({decision.raw_chars} chars accumulated; {streak})"
         )
+        # THE REPLY IS SKIPPED; THE HIERARCHY IS NOT (v3.1.8).
+        #
+        # Everything above is about not letting THIS reply into memory,
+        # and that is right. The rollup is a different question: it
+        # summarizes turns that are already in the history, and it redacts
+        # degenerate ones itself. Returning here skipped it too, so a model
+        # that loops froze the watermark for as long as the loop lasted -
+        # 14 consecutive skips in a 22-turn soak, watermark still 0 - and
+        # nothing recovered it afterwards, because the rollup is only ever
+        # driven from the tail. The reply is passed as None so it is
+        # excluded from the input rather than summarized.
+        #
+        # raw_chars > 0 is the discriminator, and it is not a proxy for the
+        # outcome label. It asks whether the MODEL PRODUCED ANYTHING. A
+        # backend rejection produces no reply, adds no turn to roll up, and
+        # needs the same backend the rollup would call - so during a vLLM
+        # outage every 400 would fire a summarization against the process
+        # that is already failing. A repetition loop is the opposite: 1,412
+        # characters arrived, the conversation moved, and only the reply is
+        # unfit to store.
+        if (
+            decision.raw_chars > 0
+            and decision.outcome not in tailhealth.ROLLUP_UNSAFE_SKIP_OUTCOMES
+            and not _fire_and_forget(
+                _rollup_hierarchy(conv_id, messages, None),
+                label=f"rollup conv={conv_id}",
+            )
+        ):
+            logger.warning(
+                f"conv={conv_id}: the background pool also shed the "
+                f"hierarchy rollup for this turn; the watermark does not "
+                f"advance until a later turn is accepted"
+            )
         return decision
     if decision.reason:
         # A trimmed store. INFO: it is the fix working, not a fault — but
