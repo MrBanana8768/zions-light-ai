@@ -113,6 +113,114 @@ du -sh /data/* | sort -h
   ones with `/opt/clean-models.sh` (see
   [Cleaning up old model weights](#cleaning-up-old-model-weights-on-the-volume)).
 
+### A HOT SQLite rollback journal beside `webui.db`
+
+**Seen twice: 2026-08-31 (wedged the pod) and 2026-09-07 (silent).** Both on
+the MooseFS volume, which is the actual cause — see the note at the end.
+
+#### What it looks like
+
+The 08-31 shape is loud: OpenWebUI answers "no backend", every query returns
+`sqlite3.OperationalError: disk I/O error`, and writes report
+`attempt to write a readonly database`. SQLite is trying to roll the journal
+back on every open; rolling back requires WRITING; the write fails; SQLite
+protects the file by reporting readonly. **The database is not corrupt** — it
+is stuck mid-recovery on a filesystem that will not let it finish.
+
+The 09-07 shape is silent, and it is the one to know about. An ORPHANED hot
+journal sat beside a database that was being written to perfectly normally:
+`/health/full` said `ok`, storage said writable, `indexed_exchanges_total` was
+climbing, and the database's mtime advanced minute by minute while the journal
+sat 36 minutes stale. Nothing was failing. The uncommitted transaction was
+simply waiting for the next process to open the database and roll it back.
+
+#### Do not diagnose it by the file's existence, or by opening the database
+
+A `-journal` file is ORDINARY. In `delete` mode SQLite creates one around
+every transaction and removes it on commit; in `persist` mode it deliberately
+leaves one behind with a zeroed header. Catching one mid-write means nothing.
+
+And a second connection **cannot** tell a hot journal from a live writer's: it
+must take a write lock to find out, OpenWebUI holds that lock, and the probe
+fails with the same `attempt to write a readonly database` text either way.
+That ambiguity wasted real time on 09-07.
+
+#### The check: read eight bytes
+
+```bash
+/opt/compactor-venv/bin/python -c "
+import os
+j='/data/openwebui/webui.db-journal'
+b=open(j,'rb').read(8) if os.path.exists(j) else b''
+print('header:', b.hex() or '(no journal)')
+print('HOT - uncommitted transaction pending' if b.hex()=='d9d505f920a163d7' else 'clean')"
+```
+
+`d9d505f920a163d7` is SQLite's rollback-journal magic. Anything else — zeros,
+or no file — is debris or nothing. Reading takes no lock and cannot be
+confused by a healthy writer.
+
+Since v3.1.8 `/health/full` does this itself and degrades on it:
+
+```bash
+curl -s localhost:8080/health/full | python3 -c "import json,sys; print(json.load(sys.stdin)['checks']['sqlite_journal'])"
+```
+
+#### The repair: let SQLite do it
+
+```bash
+supervisorctl stop openwebui
+```
+
+```bash
+/opt/compactor-venv/bin/python -c "import sqlite3; c=sqlite3.connect('/data/openwebui/webui.db'); print('journal_mode:', c.execute('PRAGMA journal_mode').fetchone()[0]); print('quick_check:', c.execute('PRAGMA quick_check').fetchone()[0]); c.close()"
+```
+
+```bash
+supervisorctl start openwebui
+```
+
+Opening it read-write with the writers stopped IS the repair — SQLite rolls
+the journal back and deletes it. `quick_check: ok` and a vanished journal file
+mean it is done. On 09-07 that whole sequence took under a minute.
+
+If the volume is refusing writes (the 08-31 shape) the open will fail. Then
+copy the database **and its journal together** to local disk, open it there so
+the rollback can complete, `PRAGMA integrity_check`, `VACUUM`, and copy back —
+renaming both originals aside rather than deleting them.
+
+#### The one thing that turns this into real damage
+
+> **Never delete the journal by hand.** It and the database are a matched
+> pair. Deleting a hot journal turns a recoverable file into a corrupt one,
+> and leaving a stale journal beside a *replaced* database corrupts that one
+> too. Renaming both together is what makes a swap safe.
+
+#### Afterwards: check nothing was rolled away
+
+A rollback undoes an incomplete transaction, so confirm the counters did not
+go backwards.
+
+```bash
+curl -s localhost:8080/health/full | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['status'], d['stats'])"
+```
+
+Compare against the newest backup's own numbers. Lower means the rollback took
+something and a restore is the answer.
+
+#### Why it recurs
+
+```
+mfs#ca-mtl-1.runpod.net:9421  965T  765T  201T  80% /data
+```
+
+`webui.db` lives on MooseFS, and SQLite on a network filesystem is the
+known-fragile pairing: the volume drops I/O mid-transaction and leaves a
+journal behind. **v3.1.6's `webuidb.py` moves the live database to the pod's
+local overlay and syncs to `/data`, which removes the cause** — but a pod
+running an older image does not have it. Until that ships, expect this on any
+volume hiccup, and keep the eight-byte check to hand.
+
 ### Memory looks wrong for one conversation
 See [USER_GUIDE.md](USER_GUIDE.md). Quick: `/why` in the chat,
 `/list-facts`, `/forget <substring>`, or full reset

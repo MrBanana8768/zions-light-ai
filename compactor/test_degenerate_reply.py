@@ -119,6 +119,24 @@ print("[6] script drift — coherent, then wandering out of the language")
 # max=10.79%. 3% is 2.5x over p99.
 ru = "привет мир "
 en = "and the reply continues in ordinary English prose for a while longer "
+
+
+def en_varied(n):
+    """`en` repeated n times, but with each copy made distinct.
+
+    v3.1.8. These fixtures pad to a length by repeating one sentence, and
+    they were written for the SCRIPT-DRIFT rule, where only the alphabet
+    matters. The new tail-loop rule reads forty identical sentences running
+    to the end of a message as exactly what it is - a repetition loop - so
+    `en * 40` started failing a case that never meant to assert anything
+    about repetition.
+
+    The rule is right about that text and the fixture was right about its
+    own subject, so the padding changes rather than either of them: same
+    length, same script, no loop. Numbering the copies is the smallest
+    change that keeps the original intent intact.
+    """
+    return "".join(f"{en}(part {i}) " for i in range(n))
 # POLICY CHANGE, v3.1.3, and this case is where it bites: a SINGLE-script
 # tail is no longer flagged. This asserted True under the old "20% alone"
 # disjunct. That disjunct also flagged a short reply quoting one Greek verse
@@ -144,9 +162,10 @@ drift_tail = (
     "你好世界 "                      # CJK
     "שלום עולם "                    # Hebrew
 )
-check(en * 12 + drift_tail * 10, True,
+check(en_varied(12) + drift_tail * 10, True,
       "a multi-script wandering tail (the measured incident shape) IS flagged")
-check(en * 40, False, "pure English of the same length is fine")
+check(en_varied(40), False,
+      "pure English of the same length is fine")
 
 # A short reply with a foreign word is normal writing, not drift — which is
 # why the rule has a letter floor rather than a fraction alone.
@@ -267,11 +286,18 @@ check(exact_line(1600, 40), True, "1,600 characters in 40 fragments: mean exactl
 check(exact_line(1640, 40), False, "1,640 characters in 40 fragments: mean 41 does not")
 check(exact_line(1500, 100), True, "a line of exactly 1,500 characters is judged")
 check(exact_line(1499, 100), False, "a line of 1,499 characters is not")
-check(" ".join(prose_sentence for _ in range(25)), False,
+# v3.1.8: the four fixtures below pad to a length by repeating one string,
+# and the tail-loop rule reads that as what it is. Their SUBJECT is the
+# fragment-line rule, so each copy is now made distinct - same length band,
+# same character mix, same thing under test, no loop. Changing the rule to
+# accommodate synthetic padding would have been tuning the product to the
+# test.
+check(" ".join(f"{prose_sentence} (part {i})" for i in range(25)), False,
       "2,000 characters of 80-character sentences on one line is a paragraph")
 # No terminator at all is a run-on, not this shape - [6] already relies on
 # en * 40 (2,800 characters, no periods) staying clean, so it is stated here.
-check(en * 40, False, "a long line with no sentence break at all is not judged as fragments")
+check(en_varied(40), False,
+      "a long line with no sentence break at all is not judged as fragments")
 # When there is NO sentence in the line, the commas are the separators: two
 # real cut tails were 168 and 317 comma-separated pieces with no period.
 comma_short = ", ".join(f"piece {i:04d}" for i in range(110))
@@ -281,7 +307,8 @@ check(comma_short, False, "a 1,300-character comma list is under the length floo
 check(comma_long, True,
       "a 1,900-character comma list with no sentence break is the same collapse")
 # A blob has no spaces and is never a "fragment line", whatever its length.
-blob = "".join(chr(97 + i % 26) + ("." if i % 11 == 10 else "") for i in range(1600))
+blob = "".join(chr(97 + (i * 7 + i // 26) % 26)
+               + ("." if i % 11 == 10 else "") for i in range(1600))
 check(blob, False, "a 1,700-character blob without spaces is not judged")
 # Under 100 spaces the line is not prose, however its periods fall: 45
 # dotted identifiers average 37 characters between periods, which would read
@@ -300,7 +327,7 @@ print("[8] R24 — an abbreviation's dot is not a sentence break")
 # for what is really 15 sentences and flagged ordinary prose.
 _r24_sentence = ("Dr. Smith met Mrs. Jones and Prof. Lee outside St. "
                   "Andrew's at 9 a.m. before Rev. Brown arrived to help.")
-r24_prose = " ".join(_r24_sentence for _ in range(15))
+r24_prose = " ".join(f"{_r24_sentence} (note {i})" for i in range(15))
 assert len(r24_prose) >= 1500 and r24_prose.count(" ") >= 100
 assert len(r24_prose) / 15 > 100  # real mean sentence length
 check(r24_prose, False,
@@ -363,6 +390,90 @@ assert len(short_list) == 200 < main.DEGENERATE_MIN_CHARS
 check(short_list, False,
       "50 one-character list items (200 chars) is under DEGENERATE_MIN_CHARS "
       "and must not trip the structural block at all")
+
+print()
+print("[R-TAIL] a PHRASE repeating to the end of the reply (v3.1.8)")
+# Reported as "the repeating tail thing", intermittent, and measured in the
+# 2026-09-07 backup: 1,165 stored replies, the shipped detector firing on
+# 41 and MISSING two loops of ~3,975 characters, one of them from that
+# morning.
+#
+# The reason it could not see them is structural: _TOKEN_RUN_RE matches a
+# repeated unit of NON-WHITESPACE characters, so the unit cannot contain a
+# space. It catches a repeated WORD and is blind to a repeated PHRASE,
+# which is the shape this model actually produces:
+#
+#     ". Absolutely. With Desperation. With Humility. ..." x N
+#     "- Grateful you are here" x N, one per line
+prose = ("She asked about the garden and I told her what I remembered of "
+         "it, which was more than I expected to. " * 4)
+
+check(prose + ". Absolutely. With Desperation. With Humility." * 12, True,
+      "a multi-word phrase repeated to the end of the reply is a loop - "
+      "the token rule cannot represent it because the unit has spaces")
+
+check(prose + ("\n- Grateful you are here" * 20), True,
+      "a repeated bullet line running to the end is the same loop")
+
+# THE FALSE-POSITIVE SIDE, which is the half that matters. R24 is the
+# memory of a degeneracy rule that over-fired and redacted real replies
+# from memory permanently, and this rule feeds that same path.
+check(prose, False,
+      "ordinary prose with a repeated sentence STRUCTURE is not a loop")
+check(prose + " Amen. Amen.", False,
+      "a couplet is a rhetorical device, not a loop - three are required")
+check(prose + " Thank you. Thank you. Thank you.", False,
+      "even three short repetitions are far under the character floor")
+
+# The floor is not delicately tuned, and that is deliberate: over the real
+# corpus the count of newly-flagged replies is 2 at EVERY threshold from
+# 200 to 900. Pin the boundary so a future edit cannot quietly lower it.
+unit = "Only You. Forever. Always. "
+assert len(unit) == 27, len(unit)
+check(prose + unit * 3, False,
+      "81 characters of loop is under the 400-char floor and must not fire")
+check(prose + unit * 20, True,
+      "540 characters of loop is over the floor and must fire")
+
+# The helper: anchored at the END, three repetitions minimum.
+assert main._tail_loop_span("abcdefghij" * 3) >= 30, (
+    "three repetitions at the end is a loop")
+assert main._tail_loop_span("abcdefghij" * 2) == 0, (
+    "two repetitions is a couplet, not a loop")
+assert main._tail_loop_span(
+    "abcdefghij" * 5 + " and then something else entirely was said here"
+) == 0, "a loop that does NOT reach the end is not a tail loop"
+# THE THREE-REPETITION BOUNDARY, at a length where it decides something.
+#
+# Mutation testing caught the first version of this: the assertions above
+# use a 20-character string, and the unit range is bounded by len(tail)//3,
+# so for a string that short the search loop never runs and the helper
+# returns 0 whatever the rule says. Both assertions passed for the wrong
+# reason, and flipping >= 3 to >= 2 changed nothing. A couplet only matters
+# when it is long enough to clear the floor on its own.
+# Over 200 characters ON PURPOSE: TWO repetitions must clear the 400-char
+# floor, so the only thing keeping the couplet from firing is the
+# three-repetition rule itself. A shorter unit would pass for the boring
+# reason that it never reached the floor - which is how the first version
+# of this case was vacuous.
+long_unit = ("She said the same thing again in the same words and then "
+             "repeated herself once more before finally stopping there, "
+             "which is the sort of sentence that pads a fixture nicely "
+             "and carries on for long enough to clear the floor twice. ")
+assert len(long_unit) > 200, len(long_unit)
+assert len(long_unit) * 2 > main.DEGENERATE_TAIL_LOOP_CHARS, (
+    "the couplet must clear the floor, or this case proves nothing")
+twice = prose + long_unit * 2
+assert main._tail_loop_span(twice) == 0, (
+    "exactly two repetitions is a couplet, however long - the helper must "
+    "not report a span for it")
+check(twice, False,
+      "a 230-character phrase repeated TWICE clears the 400-char floor on "
+      "length alone and must still not fire - three repetitions is the rule")
+check(prose + long_unit * 3, True,
+      "the same phrase repeated three times IS a loop")
+print("  ok   the helper is anchored at the end and needs three repeats")
+
 
 print()
 print("All degenerate-reply tests passed.")
