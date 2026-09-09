@@ -94,6 +94,25 @@ export class FakeChainReader implements ChainReader {
 		const chainFromCurrent = leaf !== null && depthOf.has(leaf) ? (depthOf.get(leaf) as number) : 0;
 		const pass = roots.length === 1 && missingParent === 0 && depthOf.size === all.length && leafOnTree;
 
+		// Gate remediation D4 (docs/lanes/L2-gate-findings.md). Mirrors
+		// migrations/0001_init.sql's `sendable` CTE: walk UPWARD from the
+		// current leaf via parentId, counting while each visited message is
+		// `state === 'complete'` and not tombstoned, stopping at the FIRST
+		// one that is not (never visiting, and never counting, anything
+		// further up). Deliberately NOT part of `pass` — see this file's own
+		// header comment and the SQL function's, for why sendability and
+		// structural soundness are kept independent.
+		let sendableFromCurrent = 0;
+		let cur: string | null = leaf;
+		while (cur !== null) {
+			const m = this.messages.get(cur);
+			if (!m) break;
+			const ok = m.state === 'complete' && m.deletedAt === null;
+			if (!ok) break;
+			sendableFromCurrent += 1;
+			cur = m.parentId;
+		}
+
 		return {
 			convId,
 			roots: roots.length,
@@ -104,8 +123,22 @@ export class FakeChainReader implements ChainReader {
 			leafOnTree,
 			chainFromCurrent,
 			deepest,
+			sendableFromCurrent,
 			pass
 		};
+	}
+
+	/** Gate remediation D8 (docs/lanes/L2-gate-findings.md): a one-row
+	 *  lookup of the conversation's synthetic root, mirroring store.ts's
+	 *  `getRoot` — used so sendSet.test.ts can assert this is called
+	 *  (and readOlder is NOT) instead of the retired O(n) root-lookup
+	 *  pattern. */
+	async getRoot(convId: string): Promise<Message | null> {
+		if (this.conv.id !== convId) return null;
+		for (const m of this.messages.values()) {
+			if (m.convId === convId && m.parentId === null) return m;
+		}
+		return null;
 	}
 
 	async readTail(convId: string, limit: number): Promise<ReadPage> {

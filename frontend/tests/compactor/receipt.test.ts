@@ -20,18 +20,28 @@ const AUDIT: AuditResult = {
 	leafOnTree: true,
 	chainFromCurrent: 66,
 	deepest: 66,
+	sendableFromCurrent: 66,
 	pass: true
 };
 
 function makeSuccessGate(): GateOutcome {
 	const sys = makeMessage({ id: 'root', convId: 'c1', role: 'system' });
+	// D12's minor note: the ORIGINAL fixture here returned `turns: []` with
+	// `sentCount: 59` — self-inconsistent, and buildReceipt reported it
+	// without complaint (buildReceipt never reads `.turns`, only
+	// `.windowIntent`/`.sentCount`, so the inconsistency was harmless to
+	// THIS module specifically, but still a fixture that should not exist
+	// uncorrected). `turns.length` now genuinely equals `sentCount`.
+	const turns = Array.from({ length: 59 }, (_, i) =>
+		makeMessage({ id: `turn-${i}`, convId: 'c1', role: i % 2 === 0 ? 'user' : 'assistant' })
+	);
 	return {
 		ok: true,
 		convId: 'c1',
 		windowIntent: 59,
 		systemMessage: sys,
-		turns: [],
-		sentCount: 59
+		turns,
+		sentCount: turns.length
 	};
 }
 
@@ -111,4 +121,46 @@ test('buildReceipt: sentUnderOverride is carried through verbatim', () => {
 	const gate = makeSuccessGate();
 	const receipt = buildReceipt({ convId: 'c1', audit: AUDIT, gate, sentUnderOverride: true });
 	assert.equal(receipt.sentUnderOverride, true);
+});
+
+// ---------------------------------------------------------------------------
+// D12 — the explicit "refused, nothing was sent" signal
+// ---------------------------------------------------------------------------
+
+function makeFailureGate(): GateOutcome {
+	return {
+		ok: false,
+		convId: 'c1',
+		kind: 'context_truncated',
+		reasons: ['realized 58 turn(s), intended 59'],
+		windowIntent: 59,
+		systemMessage: null,
+		turns: [],
+		sentCount: 58
+	};
+}
+
+test('buildReceipt: refused=true when the gate failed and no override was applied — even though messagesAdmitted is ALSO null here, exactly like a normal send with no echo header yet', () => {
+	const gate = makeFailureGate();
+	const receipt = buildReceipt({ convId: 'c1', audit: AUDIT, gate, sentUnderOverride: false });
+	assert.equal(receipt.refused, true);
+	assert.deepEqual(receipt.refusalReasons, ['realized 58 turn(s), intended 59']);
+	// THE property this field exists for: before it, this receipt and a
+	// genuinely successful send whose echo header simply had not shipped
+	// yet were INDISTINGUISHABLE (both show messagesAdmitted: null).
+	assert.equal(receipt.messagesAdmitted, null);
+});
+
+test('buildReceipt: refused=false when a gate failure was sent anyway under a D4 override — it DID reach the network', () => {
+	const gate = makeFailureGate();
+	const receipt = buildReceipt({ convId: 'c1', audit: AUDIT, gate, sentUnderOverride: true });
+	assert.equal(receipt.refused, false);
+	assert.equal(receipt.refusalReasons, null);
+});
+
+test('buildReceipt: refused=false and refusalReasons=null on an ordinary successful send', () => {
+	const gate = makeSuccessGate();
+	const receipt = buildReceipt({ convId: 'c1', audit: AUDIT, gate, sentUnderOverride: false });
+	assert.equal(receipt.refused, false);
+	assert.equal(receipt.refusalReasons, null);
 });

@@ -8,7 +8,7 @@ import { GenerationTimeoutError, streamChatCompletion, UpstreamHttpError } from 
 import type { TransportConfig } from '../../src/lib/server/compactor/config.js';
 
 function baseConfig(overrides: Partial<TransportConfig> = {}): TransportConfig {
-	return { baseUrl: 'http://127.0.0.1:8080', timeoutMs: 5_000, ...overrides };
+	return { baseUrl: 'http://127.0.0.1:8080', timeoutMs: 5_000, windowN: 60, ...overrides };
 }
 
 async function collect<T>(iter: AsyncGenerator<T, void, unknown>): Promise<T[]> {
@@ -191,3 +191,70 @@ test('streamChatCompletion: a response with no body ends the generator with noth
 	);
 	assert.deepEqual(events, []);
 });
+
+test(
+	'streamChatCompletion: D6 — a genuinely IDLE timeout: a healthy, slow-but-STEADY stream survives well past the total-duration budget',
+	// Generous outer bound — the test's own real delays sum to ~320ms; this
+	// is a "did not hang" ceiling, not the property under test (that's the
+	// explicit per-gap timeoutMs below).
+	{ timeout: 5_000 },
+	async () => {
+		// timeoutMs=150. Four chunks, each arriving ~80ms after the reader
+		// asks for it — no single GAP between arrivals ever exceeds 150ms,
+		// but the stream's TOTAL duration (~320ms+) does. §3.4 records a
+		// real turn costing 139.9s of compaction alone before vLLM was ever
+		// contacted — this is that shape in miniature. The ORIGINAL
+		// (total-wall-clock) implementation arms one `setTimeout` before
+		// `fetch` and never re-arms it, so it would abort THIS stream well
+		// before the final chunk arrives — a false failure on a healthy
+		// send, the mirror image of the false-refusal mode this whole gate
+		// exists to close.
+		const chunks = [
+			'data: {"id":"chatcmpl-real","choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}]}\n\n',
+			'data: {"id":"chatcmpl-real","choices":[{"index":0,"delta":{"content":"b"},"finish_reason":null}]}\n\n',
+			'data: {"id":"chatcmpl-real","choices":[{"index":0,"delta":{"content":"c"},"finish_reason":null}]}\n\n',
+			'data: {"id":"chatcmpl-real","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+			'data: [DONE]\n\n'
+		];
+		const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+			const encoder = new TextEncoder();
+			// Wired to the SAME AbortSignal streamChatCompletion passes to
+			// fetch — a real fetch/undici implementation aborts the body
+			// read the instant the signal fires, so a mock that does NOT
+			// react to it would let a wrongly-non-refreshed timer's abort()
+			// call go unnoticed and this test would pass for the wrong
+			// reason (the mutation-testing method's own warning: "a test
+			// that has never actually failed is a claim, not evidence" —
+			// verified failing against exactly this gap before landing).
+			let aborted = false;
+			init?.signal?.addEventListener('abort', () => {
+				aborted = true;
+			});
+			const stream = new ReadableStream<Uint8Array>({
+				async pull(controller) {
+					if (aborted) {
+						controller.error(new DOMException('Aborted', 'AbortError'));
+						return;
+					}
+					if (chunks.length === 0) {
+						controller.close();
+						return;
+					}
+					await new Promise((resolve) => setTimeout(resolve, 80));
+					if (aborted) {
+						controller.error(new DOMException('Aborted', 'AbortError'));
+						return;
+					}
+					controller.enqueue(encoder.encode(chunks.shift() as string));
+				}
+			});
+			return new Response(stream, { status: 200 });
+		}) as typeof fetch;
+
+		const events = await collect(
+			streamChatCompletion({ convId: 'c1', body: '{}', config: baseConfig({ timeoutMs: 150 }), fetchImpl })
+		);
+		assert.equal(events.length, 5, 'every chunk must arrive — nothing should have been aborted mid-stream');
+		assert.equal(events[events.length - 1].isDone, true);
+	}
+);

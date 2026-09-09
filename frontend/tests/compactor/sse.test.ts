@@ -99,11 +99,49 @@ test('splitSseBlocks: a chunk boundary landing mid-block is recoverable once the
 	assert.equal(extractDataPayload(blocks2[0]), '{"b":2}');
 });
 
-test('extractDataPayload: strips the "data: " prefix and the leading space only', () => {
+test('splitSseBlocks: CRLF (\\r\\n\\r\\n) block separators split identically to LF — surviving-mutation audit #4', () => {
+	// The audit's own finding: `/\r?\n\r?\n/` -> `/\n\n/` stayed green
+	// because every existing fixture uses bare `\n\n`. A real HTTP server
+	// (or a proxy in front of one) can legitimately send CRLF line endings
+	// for SSE; this is the fixture that actually exercises the `\r?` part
+	// of the regex rather than assuming it.
+	const buf = 'data: {"a":1}\r\n\r\ndata: {"b":2}\r\n\r\ndata: {"c":3';
+	const { blocks, remainder } = splitSseBlocks(buf);
+	assert.equal(blocks.length, 2);
+	assert.equal(extractDataPayload(blocks[0]), '{"a":1}');
+	assert.equal(extractDataPayload(blocks[1]), '{"b":2}');
+	assert.equal(remainder, 'data: {"c":3');
+});
+
+test('splitSseBlocks: a MIXED stream (some blocks LF-separated, some CRLF-separated) still splits every block', () => {
+	const buf = 'data: {"a":1}\n\ndata: {"b":2}\r\n\r\ndata: {"c":3}\n\n';
+	const { blocks, remainder } = splitSseBlocks(buf);
+	assert.equal(blocks.length, 3);
+	assert.equal(remainder, '');
+});
+
+test('extractDataPayload: strips the "data: " prefix and the leading space only — not a full trim', () => {
 	assert.equal(extractDataPayload('data: {"x":1}'), '{"x":1}');
 	assert.equal(extractDataPayload('data:{"x":1}'), '{"x":1}'); // no space variant
 	assert.equal(extractDataPayload('data: [DONE]'), '[DONE]');
 	assert.equal(extractDataPayload(': keep-alive comment, no data line'), null);
+});
+
+test('extractDataPayload: surviving-mutation audit #5 — a SECOND leading space (or trailing whitespace) survives, proving this is `.replace(/^ /, \'\')`, never `.trim()`', () => {
+	// The audit's own finding: `.replace(/^ /, '')` -> `.trim()` stayed
+	// green "despite the doc comment claiming 'not a trim.'" Every existing
+	// fixture has exactly zero or one leading space and no trailing
+	// whitespace, which both implementations handle identically. This
+	// fixture has TWO leading spaces (SSE's own spec strips only the first)
+	// and trailing whitespace before the newline — `.trim()` would remove
+	// all of both; the real implementation must leave the second leading
+	// space and any trailing whitespace untouched.
+	assert.equal(extractDataPayload('data:  {"x":1}'), ' {"x":1}', 'only the FIRST leading space is stripped');
+	assert.equal(
+		extractDataPayload('data: {"x":1}  '),
+		'{"x":1}  ',
+		'trailing whitespace must survive — a real .trim() would remove it'
+	);
 });
 
 // ---------------------------------------------------------------------------

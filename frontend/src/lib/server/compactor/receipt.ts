@@ -89,6 +89,19 @@ export function buildReceipt(params: BuildReceiptParams): ReceiptSnapshot {
 	const sentCount =
 		'sentCount' in params.gate && params.gate.sentCount !== undefined ? params.gate.sentCount : 0;
 
+	// Gate remediation D12 (docs/lanes/L2-gate-findings.md): explicit
+	// "refused, nothing was sent" — false whenever the gate succeeded, OR
+	// the caller sent anyway under a D4 override (which DID touch the
+	// network; `sentUnderOverride` already carries that half of the
+	// distinction). Before this field, `{sentCount: 59, messagesAdmitted:
+	// null}` was the SAME shape whether 59 turns were genuinely posted or
+	// the gate refused and nothing ever reached the wire.
+	const refused = !params.gate.ok && !params.sentUnderOverride;
+	// Narrowed on `params.gate.ok` directly (not on the separately-computed
+	// `refused` boolean) so TypeScript's discriminated-union narrowing
+	// actually applies — `GateSuccess` has no `.reasons` field at all.
+	const refusalReasons = !params.gate.ok && refused ? params.gate.reasons : null;
+
 	return {
 		convId: params.convId,
 		messagesOnActivePath: params.audit.chainFromCurrent,
@@ -106,6 +119,8 @@ export function buildReceipt(params: BuildReceiptParams): ReceiptSnapshot {
 		sentCount,
 		sentUnderOverride: params.sentUnderOverride,
 		messagesAdmitted,
-		admittedSource
+		admittedSource,
+		refused,
+		refusalReasons
 	};
 }

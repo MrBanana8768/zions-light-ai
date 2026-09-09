@@ -48,6 +48,18 @@ export interface AuditResult {
 	chainFromCurrent: number;
 	/** Diagnostic only, same rule as chainFromCurrent. */
 	deepest: number;
+	/** Gate remediation D4 (docs/lanes/L2-gate-findings.md): the longest
+	 *  CONTIGUOUS SUFFIX of the chain, ending at `leaf`, in which every
+	 *  message is `state = 'complete'` and not tombstoned. Computed
+	 *  SQL-side (migrations/0001_init.sql's audit_conversation), never by
+	 *  walking fetched rows client-side — that is what keeps the transport
+	 *  lane's window_intent an INDEPENDENTLY-derived number rather than a
+	 *  tautology. 0 iff the leaf itself is not sendable (mid-stream, still
+	 *  pending, or a failed leaf nobody has retried away from yet) — "if
+	 *  the leaf itself is not complete, nothing is sendable." NOT part of
+	 *  `pass`: this is a sendability property, not a structural-soundness
+	 *  one (see the SQL function's own comment). */
+	sendableFromCurrent: number;
 	pass: boolean;
 }
 

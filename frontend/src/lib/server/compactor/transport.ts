@@ -9,6 +9,17 @@
 //      hangs the stream indefinitely. This module's AbortController is
 //      the only thing standing between that and a browser tab that spins
 //      forever with no error.
+//
+//      Gate remediation D6 (docs/lanes/L2-gate-findings.md): this is a
+//      genuine IDLE timeout, not a total-wall-clock one — the timer is
+//      REFRESHED (`timer.refresh()`) after the connection is established
+//      and again after every successful `reader.read()`, so a healthy
+//      reply that takes a long time in AGGREGATE (§3.4 records a turn
+//      costing 139.9s of compaction alone before vLLM was even contacted)
+//      is never aborted while tokens keep arriving. Only a genuine GAP of
+//      `timeoutMs` with NOTHING arriving trips it — a hung stream is the
+//      failure mode this exists to catch; a slow one is not.
+//
 //   2. Distinguishing "HTTP 200" from "vLLM actually answered." §3.4:
 //      "HTTP 200 is committed before vLLM is contacted" — a 200 here
 //      proves only that the compactor accepted the shape of the request,
@@ -95,6 +106,11 @@ export async function* streamChatCompletion(
 			throw err;
 		}
 
+		// D6: the connection is up — refresh the idle budget so however long
+		// the connect itself took does not eat into the read loop's own
+		// allowance.
+		timer.refresh();
+
 		if (res.status >= 400) {
 			const text = await res.text();
 			throw new UpstreamHttpError(parseErrorEnvelope(res.status, text));
@@ -113,6 +129,11 @@ export async function* streamChatCompletion(
 				if (timedOut) throw new GenerationTimeoutError(params.config.timeoutMs);
 				throw err;
 			}
+			// D6: refresh on every SUCCESSFUL read, not just the first one.
+			// This is the whole of what turns the timeout into a genuine
+			// IDLE timeout: the deadline is always "timeoutMs since the last
+			// byte arrived," never "timeoutMs since the request started."
+			timer.refresh();
 			if (step.done) break;
 			buffer += decoder.decode(step.value, { stream: true });
 			const { blocks, remainder } = splitSseBlocks(buffer);

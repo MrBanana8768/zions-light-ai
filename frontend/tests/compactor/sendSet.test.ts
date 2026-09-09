@@ -2,13 +2,24 @@
 // header comment before reading these tests: the window_intent formula
 // tested here is this lane's resolution of a real ambiguity in
 // FRONTEND_PLAN.md §3.2, not a restatement of the plan's literal words.
+//
+// Gate remediation (docs/lanes/L2-gate-findings.md) D1/D2/D3/D4/D8/D11 all
+// land in this file — see each test's own comment for which finding it
+// closes.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyOverride, computeWindowIntent, runGate } from '../../src/lib/server/compactor/sendSet.js';
+import {
+	applyOverride,
+	assertValidWindowN,
+	computeWindowIntent,
+	MAX_WINDOW_N,
+	runGate,
+	verifyChainShape
+} from '../../src/lib/server/compactor/sendSet.js';
 import type { GateFailure } from '../../src/lib/server/compactor/types.js';
 import { FakeChainReader, buildConversation, makeMessage } from './helpers/fakeChain.js';
-import type { AuditResult, Conversation, ReadPage } from '../../src/lib/server/store/types.js';
+import type { AuditResult } from '../../src/lib/server/store/types.js';
 import type { ChainReader } from '../../src/lib/server/compactor/types.js';
 
 // ---------------------------------------------------------------------------
@@ -38,6 +49,77 @@ test('computeWindowIntent: generalizes to an odd N (no parity bug at all)', () =
 	// odd - odd = even -> never needs a trim.
 	assert.equal(computeWindowIntent(65, 59), 59);
 	assert.equal(computeWindowIntent(121, 59), 59);
+});
+
+// ---------------------------------------------------------------------------
+// D11 — n is validated: positive integer, ceiling, rejected loudly
+// ---------------------------------------------------------------------------
+
+test('assertValidWindowN: accepts any positive integer up to MAX_WINDOW_N', () => {
+	assert.doesNotThrow(() => assertValidWindowN(1));
+	assert.doesNotThrow(() => assertValidWindowN(60));
+	assert.doesNotThrow(() => assertValidWindowN(MAX_WINDOW_N));
+});
+
+test('assertValidWindowN: rejects zero, negative, non-integer, and NaN — loudly, not by clamping', () => {
+	assert.throws(() => assertValidWindowN(0), /positive integer/);
+	assert.throws(() => assertValidWindowN(-5), /positive integer/);
+	assert.throws(() => assertValidWindowN(0.5), /positive integer/);
+	assert.throws(() => assertValidWindowN(NaN), /positive integer/);
+});
+
+test('assertValidWindowN: rejects anything over MAX_WINDOW_N — the exact D11 defect (n=100000 used to return ok:true)', () => {
+	assert.throws(() => assertValidWindowN(MAX_WINDOW_N + 1), /exceeds MAX_WINDOW_N/);
+	assert.throws(() => assertValidWindowN(100_000), /exceeds MAX_WINDOW_N/);
+});
+
+test('runGate: an invalid n is rejected loudly (thrown), before any chain read at all', async () => {
+	const { chain, conv } = buildConversation({ turnCount: 5 });
+	let auditCalls = 0;
+	const counting: ChainReader = {
+		getConversation: (id) => chain.getConversation(id),
+		auditConversation: (id) => {
+			auditCalls += 1;
+			return chain.auditConversation(id);
+		},
+		readTail: (id, limit) => chain.readTail(id, limit),
+		readOlder: (id, before, limit) => chain.readOlder(id, before, limit),
+		getRoot: (id) => chain.getRoot(id)
+	};
+	await assert.rejects(() => runGate(counting, conv.id, 100_000), /exceeds MAX_WINDOW_N/);
+	await assert.rejects(() => runGate(counting, conv.id, -1), /positive integer/);
+	assert.equal(auditCalls, 0, 'an invalid n must be rejected before the audit is even read');
+});
+
+// ---------------------------------------------------------------------------
+// verifyChainShape — the structural check, reused by request.ts (D10)
+// ---------------------------------------------------------------------------
+
+test('verifyChainShape: a healthy window has no reasons', () => {
+	const { conv, turns } = buildConversation({ turnCount: 5 });
+	assert.deepEqual(verifyChainShape(conv.id, turns), []);
+});
+
+test('verifyChainShape: empty turns is its own single reason, not a crash', () => {
+	const reasons = verifyChainShape('c1', []);
+	assert.equal(reasons.length, 1);
+	assert.ok(reasons[0].includes('no turns'));
+});
+
+test('verifyChainShape: D4 — a non-complete turn anywhere in the window is named explicitly', () => {
+	const { conv, turns } = buildConversation({ turnCount: 5 });
+	const corrupted = [...turns];
+	corrupted[3] = { ...corrupted[3], state: 'streaming' };
+	const reasons = verifyChainShape(conv.id, corrupted);
+	assert.ok(reasons.some((r) => r.includes('not complete') && r.includes('state=streaming')));
+});
+
+test('verifyChainShape: a turn from a different conversation is refused', () => {
+	const { conv, turns } = buildConversation({ turnCount: 3 });
+	const foreign = [...turns];
+	foreign[1] = { ...foreign[1], convId: 'some-other-conv' };
+	const reasons = verifyChainShape(conv.id, foreign);
+	assert.ok(reasons.some((r) => r.includes('belongs to conversation some-other-conv')));
 });
 
 // ---------------------------------------------------------------------------
@@ -77,12 +159,39 @@ test('runGate: long conversation past N=60 — the mandatory one-turn parity tri
 });
 
 test('runGate: exactly at the boundary (turnsOnChain == n) sends the whole chain untrimmed', async () => {
-	const { chain, conv } = buildConversation({ turnCount: 60 });
-	const outcome = await runGate(chain, conv.id, 60);
+	// 59, not 60: turnsOnChain must be ODD for a healthy fixture to end on
+	// 'user' at all (see this file's header comment / D1 below) — the
+	// ORIGINAL version of this test used turnCount: 60 (EVEN), which put
+	// the leaf on an ASSISTANT turn and only ever passed because the gate
+	// did not yet check the closing role. See the D1 test immediately
+	// below for that exact defect, now fixed and asserted directly.
+	const { chain, conv } = buildConversation({ turnCount: 59 });
+	const outcome = await runGate(chain, conv.id, 59);
 	assert.equal(outcome.ok, true);
 	if (!outcome.ok) throw new Error('unreachable');
-	assert.equal(outcome.windowIntent, 60);
-	assert.equal(outcome.sentCount, 60);
+	assert.equal(outcome.windowIntent, 59);
+	assert.equal(outcome.sentCount, 59);
+	assert.equal(outcome.turns[outcome.turns.length - 1].role, 'user');
+});
+
+test('runGate: integration coverage for the EVEN-startIndex "no trim needed" path — closes surviving-mutation audit #3', async () => {
+	// The audit's own finding: "computeWindowIntent's even-startIndex path
+	// is never integration-tested (fixtures are 5, 60, 65, 501)." With
+	// N=60 (even) that path is actually UNREACHABLE by any healthy fixture
+	// at all: turnsOnChain is always odd for a healthy conversation (this
+	// file's header comment), so odd - even is always odd — every N=60
+	// integration fixture in this file exercises the ODD-startIndex
+	// (trim-needed) branch, by construction, no matter how it is varied.
+	// Reaching the even branch for real needs an ODD n instead: 65 - 59 =
+	// 6 (even) -> no trim -> the newest 59 turns already open on 'user'.
+	const { chain, conv } = buildConversation({ turnCount: 65 });
+	const outcome = await runGate(chain, conv.id, 59);
+	assert.equal(outcome.ok, true, 'the even-startIndex path must accept the window untrimmed');
+	if (!outcome.ok) throw new Error('unreachable');
+	assert.equal(outcome.windowIntent, 59); // n itself — computeWindowIntent's even-offset branch
+	assert.equal(outcome.sentCount, 59);
+	assert.equal(outcome.turns[0].role, 'user', 'no leading assistant to strip on this branch');
+	assert.equal(outcome.turns[outcome.turns.length - 1].role, 'user');
 });
 
 test('runGate: never issues more than two chain reads regardless of conversation length', async () => {
@@ -92,6 +201,7 @@ test('runGate: never issues more than two chain reads regardless of conversation
 	const { chain, conv } = buildConversation({ turnCount: 501 });
 	let readTailCalls = 0;
 	let readOlderCalls = 0;
+	let getRootCalls = 0;
 	let auditCalls = 0;
 	const counting: ChainReader = {
 		getConversation: (id) => chain.getConversation(id),
@@ -106,19 +216,35 @@ test('runGate: never issues more than two chain reads regardless of conversation
 		readOlder: (id, before, limit) => {
 			readOlderCalls += 1;
 			return chain.readOlder(id, before, limit);
+		},
+		getRoot: (id) => {
+			getRootCalls += 1;
+			return chain.getRoot(id);
 		}
 	};
 	const outcome = await runGate(counting, conv.id, 60);
 	assert.equal(outcome.ok, true);
 	assert.equal(auditCalls, 1);
 	assert.equal(readTailCalls, 1);
-	assert.equal(readOlderCalls, 1); // long conversation: one extra read to locate the root
+	// D8 (docs/lanes/L2-gate-findings.md): the root lookup for a long
+	// conversation is now getRoot — a one-row, indexed read — not a
+	// second O(n) readOlder walk. readOlderCalls must be ZERO: this
+	// module no longer calls readOlder AT ALL. getRootCalls must be
+	// exactly one. The store-level test (frontend/tests/store/
+	// f11-sendable-and-root.test.ts) is what actually proves getRoot
+	// touches exactly one row regardless of conversation length — this
+	// fake cannot see row counts, only call counts, which is exactly the
+	// limitation the findings named ("the call-counting test cannot see
+	// it").
+	assert.equal(readOlderCalls, 0, 'D8: the O(n) root-lookup path must never be called at all');
+	assert.equal(getRootCalls, 1, 'D8: getRoot replaces it, called exactly once for a long conversation');
 	if (outcome.ok) assert.equal(outcome.sentCount, 59);
 });
 
 test('runGate: a conversation shorter than N never needs the root-lookup read at all', async () => {
 	const { chain, conv } = buildConversation({ turnCount: 5 });
 	let readOlderCalls = 0;
+	let getRootCalls = 0;
 	const counting: ChainReader = {
 		getConversation: (id) => chain.getConversation(id),
 		auditConversation: (id) => chain.auditConversation(id),
@@ -126,10 +252,15 @@ test('runGate: a conversation shorter than N never needs the root-lookup read at
 		readOlder: (id, before, limit) => {
 			readOlderCalls += 1;
 			return chain.readOlder(id, before, limit);
+		},
+		getRoot: (id) => {
+			getRootCalls += 1;
+			return chain.getRoot(id);
 		}
 	};
 	await runGate(counting, conv.id, 60);
 	assert.equal(readOlderCalls, 0);
+	assert.equal(getRootCalls, 0, 'the whole chain already fit in the tail page — no root lookup of any kind needed');
 });
 
 // ---------------------------------------------------------------------------
@@ -203,22 +334,24 @@ test('runGate: broken alternation inside the window is context_truncated, not si
 test('runGate: a race between the audit read and the window read is caught as context_truncated', async () => {
 	const { chain, conv } = buildConversation({ turnCount: 65 });
 	// Simulate a concurrent append landing between this module's audit
-	// call and its window read: the audit reports the OLD, shorter chain
-	// (turnsOnChain=63, which predicts windowIntent 59 via the same
-	// formula as the real 65-turn case — pick a value where the
-	// PREDICTION genuinely diverges from what the window read will find).
+	// call and its window read: the audit reports a STALE, much-shorter
+	// sendable-suffix (D4: window_intent is now derived from
+	// sendable_from_current, not chain_from_current — so THAT is the
+	// field a race must stale for this test to still exercise the
+	// intended scenario) — wildly different from the 65 turns readTail is
+	// about to actually find.
 	const racy: ChainReader = {
 		getConversation: (id) => chain.getConversation(id),
 		auditConversation: async (id) => {
 			const real = await chain.auditConversation(id);
 			if (!real) return real;
-			// Report as if only 3 turns existed (chain_from_current = 4,
-			// i.e. 3 turns + the root) — wildly different from the 65
-			// turns readTail is about to actually find.
-			return { ...real, chainFromCurrent: 4 };
+			// Report as if only 3 turns were sendable (sendable_from_current
+			// = 4, i.e. 3 turns + the root).
+			return { ...real, sendableFromCurrent: 4 };
 		},
 		readTail: (id, limit) => chain.readTail(id, limit),
-		readOlder: (id, before, limit) => chain.readOlder(id, before, limit)
+		readOlder: (id, before, limit) => chain.readOlder(id, before, limit),
+		getRoot: (id) => chain.getRoot(id)
 	};
 	const outcome = await runGate(racy, conv.id, 60);
 	assert.equal(outcome.ok, false);
@@ -227,6 +360,46 @@ test('runGate: a race between the audit read and the window read is caught as co
 	assert.equal(outcome.windowIntent, 3); // the (stale) audit's prediction
 	assert.notEqual(outcome.sentCount, 3); // the read found the real, longer chain
 	assert.ok(outcome.reasons.some((r) => r.includes('intended 3')));
+});
+
+test('runGate: surviving-mutation audit #1 — an off-by-EXACTLY-ONE mismatch between windowIntent and the realized count must still refuse', async () => {
+	// This is the test the surviving-mutation audit's own item #1 flags as
+	// missing: "if (turns.length !== windowIntent) -> Math.abs(...) > 1
+	// (sendSet.ts:244). GREEN. No test fails on a ±1 mismatch." Every OTHER
+	// racy fixture in this file happens to produce either a genuine match
+	// (0 apart) or a huge mismatch (56+ apart) — both stay correctly
+	// detected (or correctly accepted) even with the count check relaxed
+	// to `> 1`. This fixture is built SPECIFICALLY to differ by exactly
+	// one: the real, healthy realization of a 65-turn/N=60 conversation is
+	// 59 turns (the mandatory parity trim); a stale audit reporting
+	// sendable_from_current as if turnsOnChain were 64 (one turn less than
+	// the real 65) predicts windowIntent=60 (64 is even-offset, no trim
+	// needed) — |59 - 60| = 1. The strict `!==` check catches this
+	// immediately; a relaxed `Math.abs(...) > 1` would let it through as
+	// `ok: true`, silently sending a window one turn short of what a
+	// fresher read would have found — precisely the "1 or 2 messages
+	// missing" shape the whole gate exists to make loud.
+	const { chain, conv } = buildConversation({ turnCount: 65 });
+	const racy: ChainReader = {
+		getConversation: (id) => chain.getConversation(id),
+		auditConversation: async (id) => {
+			const real = await chain.auditConversation(id);
+			if (!real) return real;
+			// As if turnsOnChain were 64 (sendableFromCurrent = 65: 64 turns
+			// + the root) instead of the real 65 — one turn stale.
+			return { ...real, sendableFromCurrent: 65 };
+		},
+		readTail: (id, limit) => chain.readTail(id, limit),
+		readOlder: (id, before, limit) => chain.readOlder(id, before, limit),
+		getRoot: (id) => chain.getRoot(id)
+	};
+	const outcome = await runGate(racy, conv.id, 60);
+	assert.equal(outcome.ok, false, 'a genuine off-by-one between intent and realization must still refuse');
+	if (outcome.ok) throw new Error('unreachable');
+	assert.equal(outcome.kind, 'context_truncated');
+	assert.equal(outcome.windowIntent, 60); // the stale audit's prediction (64 is an even offset -> no trim)
+	assert.equal(outcome.sentCount, 59); // the real, healthy realization (65 is an odd offset -> the mandatory trim)
+	assert.ok(outcome.reasons.some((r) => r.includes('realized 59') && r.includes('intended 60')));
 });
 
 test('runGate: a tombstoned message inside the window is context_truncated', async () => {
@@ -239,15 +412,17 @@ test('runGate: a tombstoned message inside the window is context_truncated', asy
 	assert.ok(outcome.reasons.some((r) => r.includes('tombstoned')));
 });
 
-test('runGate: an unlocatable root (root-lookup exhausted) is context_truncated, never a fabricated persona', async () => {
+test('runGate: an unlocatable root (getRoot returns null) is context_truncated, never a fabricated persona', async () => {
 	const { chain, conv } = buildConversation({ turnCount: 65 });
 	const blind: ChainReader = {
 		getConversation: (id) => chain.getConversation(id),
 		auditConversation: (id) => chain.auditConversation(id),
 		readTail: (id, limit) => chain.readTail(id, limit),
-		// Every readOlder call returns nothing — as if the root-lookup
-		// walk hit a wall (a cyclic/corrupt chain beyond ROOT_LOOKUP_LIMIT).
-		readOlder: async (): Promise<ReadPage> => ({ messages: [], cursor: null })
+		readOlder: (id, before, limit) => chain.readOlder(id, before, limit),
+		// D8: the root lookup is getRoot now, not readOlder — simulate the
+		// "root genuinely could not be found" case at that primitive
+		// directly (e.g. a corrupt/cyclic chain the store itself flags).
+		getRoot: async (): Promise<null> => null
 	};
 	const outcome = await runGate(blind, conv.id, 60);
 	assert.equal(outcome.ok, false);
@@ -255,6 +430,152 @@ test('runGate: an unlocatable root (root-lookup exhausted) is context_truncated,
 	assert.equal(outcome.kind, 'context_truncated');
 	assert.equal(outcome.systemMessage, null);
 	assert.ok(outcome.reasons.some((r) => r.includes('could not be located')));
+});
+
+// ---------------------------------------------------------------------------
+// D1 — the window must end on 'user', not merely open on one
+// ---------------------------------------------------------------------------
+
+test('runGate: D1 — a window ending on an assistant turn is refused, never blessed', async () => {
+	// The EXACT original defect (docs/lanes/L2-gate-findings.md D1):
+	// buildConversation's role assignment (i % 2 === 0 ? user : assistant)
+	// puts the leaf on 'assistant' whenever turnCount is EVEN. The count
+	// (6) equals windowIntent (6) — this is precisely why the count check
+	// alone is only one bit (D3): it says nothing about which role sits at
+	// either end. The ORIGINAL verifyRealizedWindow never checked the
+	// CLOSING role at all, so this exact shape passed as `ok: true`.
+	const { chain, conv } = buildConversation({ turnCount: 6 });
+	const outcome = await runGate(chain, conv.id, 60);
+	assert.equal(outcome.ok, false, 'a window ending on assistant must never be ok:true');
+	if (outcome.ok) throw new Error('unreachable');
+	assert.equal(outcome.kind, 'context_truncated');
+	assert.ok(outcome.reasons.some((r) => r.includes('does not end on a user turn')));
+	// The count check specifically must NOT be what caught this — proving
+	// the new check is a genuinely separate signal, not a restatement of
+	// the old one.
+	assert.ok(!outcome.reasons.some((r) => r.includes('intended')));
+});
+
+// ---------------------------------------------------------------------------
+// D2/D3 — the audited leaf must match the realized window's last turn
+// ---------------------------------------------------------------------------
+
+test('runGate: D2 — an equal-length branch switch between the audit read and the window read is caught via the audited leaf, not the count', async () => {
+	const { chain, conv, root } = buildConversation({ turnCount: 5 }); // branch A, ends on user
+	const leafA = chain.conv.currentLeafId as string;
+
+	// Branch B: an independent branch off the SAME root, equal length and
+	// equal alternation shape — count and shape checks alone cannot tell
+	// these apart, which is the entire point of D2/D3.
+	let parent = root.id;
+	let leafB = root.id;
+	for (let i = 0; i < 5; i++) {
+		const role = i % 2 === 0 ? 'user' : 'assistant';
+		const m = makeMessage({
+			id: `branchB-${i}`,
+			convId: conv.id,
+			role,
+			parentId: parent,
+			content: JSON.stringify(`b-${i}`)
+		});
+		chain.addMessage(m);
+		parent = m.id;
+		leafB = m.id;
+	}
+
+	const racy: ChainReader = {
+		getConversation: (id) => chain.getConversation(id),
+		// Audits branch A — captured BEFORE the race below moves the leaf.
+		auditConversation: (id) => chain.auditConversation(id),
+		readTail: (id, limit) => {
+			// The race: a concurrent selectLeaf moves the leaf to branch B
+			// in the gap between the audit read (above) and this read.
+			chain.conv.currentLeafId = leafB;
+			return chain.readTail(id, limit);
+		},
+		readOlder: (id, before, limit) => chain.readOlder(id, before, limit),
+		getRoot: (id) => chain.getRoot(id)
+	};
+
+	const outcome = await runGate(racy, conv.id, 60);
+	assert.equal(outcome.ok, false, 'branch B must never be silently sent under branch A\'s verified intent');
+	if (outcome.ok) throw new Error('unreachable');
+	assert.equal(outcome.kind, 'context_truncated');
+	// The count/shape checks alone would have passed (branch B is
+	// internally healthy and the same length as branch A) — only the
+	// audited-leaf comparison catches this.
+	assert.ok(!outcome.reasons.some((r) => r.includes('intended')), 'the COUNT matched — this must be caught some other way');
+	assert.ok(
+		outcome.reasons.some((r) => r.includes('audited current leaf')),
+		'the audited leaf (branch A) must not match the realized window\'s last turn (branch B)'
+	);
+	assert.notEqual(outcome.turns?.[outcome.turns.length - 1]?.id, leafA);
+});
+
+// ---------------------------------------------------------------------------
+// D4 — non-`complete` messages
+// ---------------------------------------------------------------------------
+
+test('runGate: D4 — the current leaf is still streaming: nothing is sendable, refused with a typed reason, never a bare throw', async () => {
+	const { chain, conv, turns } = buildConversation({ turnCount: 5 });
+	const streamingLeaf = { ...turns[4], state: 'streaming' as const };
+	chain.addMessage(streamingLeaf);
+
+	const outcome = await runGate(chain, conv.id, 60);
+	assert.equal(outcome.ok, false, 'a streaming leaf must never be blessed as a sendable window');
+	if (outcome.ok) throw new Error('unreachable');
+	assert.equal(outcome.kind, 'context_truncated'); // a typed reason, not a bare throw
+	assert.ok(outcome.reasons.some((r) => r.includes('not complete') && r.includes('state=streaming')));
+});
+
+test('runGate: D4 — the current leaf failed and nobody has retried yet: nothing is sendable', async () => {
+	const { chain, conv, turns } = buildConversation({ turnCount: 5 });
+	const failedLeaf = { ...turns[4], state: 'failed' as const };
+	chain.addMessage(failedLeaf);
+
+	const outcome = await runGate(chain, conv.id, 60);
+	assert.equal(outcome.ok, false);
+	if (outcome.ok) throw new Error('unreachable');
+	assert.equal(outcome.kind, 'context_truncated');
+	assert.ok(outcome.reasons.some((r) => r.includes('not complete') && r.includes('state=failed')));
+});
+
+test('runGate: D4 — a failed message on a dead SIBLING branch (never the active chain) does not block a healthy retry', async () => {
+	// The documented consequence: because the store's state machine is
+	// monotonic and `failed` is terminal, a retry appends a SIBLING under
+	// the shared parent rather than continuing the failed row — so the
+	// failed turn leaves the active chain as soon as the retry succeeds,
+	// and the gate must see a perfectly healthy window.
+	const { chain, conv, root } = buildConversation({ turnCount: 0 });
+	const u1 = makeMessage({ id: 'u1', convId: conv.id, role: 'user', parentId: root.id, content: JSON.stringify('hi') });
+	chain.addMessage(u1);
+	const failedReply = makeMessage({
+		id: 'failed-reply',
+		convId: conv.id,
+		role: 'assistant',
+		parentId: u1.id,
+		state: 'failed',
+		content: JSON.stringify('')
+	});
+	chain.addMessage(failedReply);
+	// Retry: a sibling under u1, never a child of the failed row.
+	const retried = makeMessage({
+		id: 'retried',
+		convId: conv.id,
+		role: 'assistant',
+		parentId: u1.id,
+		content: JSON.stringify('all better')
+	});
+	chain.addMessage(retried);
+	const u2 = makeMessage({ id: 'u2', convId: conv.id, role: 'user', parentId: retried.id, content: JSON.stringify('thanks') });
+	chain.addMessage(u2);
+	chain.conv.currentLeafId = u2.id;
+
+	const outcome = await runGate(chain, conv.id, 60);
+	assert.equal(outcome.ok, true, 'the failed sibling never entered the active chain — nothing to refuse');
+	if (!outcome.ok) throw new Error('unreachable');
+	assert.equal(outcome.sentCount, 3); // u1, retried, u2 — NOT the failed reply
+	assert.ok(!outcome.turns.some((t) => t.id === 'failed-reply'));
 });
 
 // ---------------------------------------------------------------------------
@@ -276,6 +597,15 @@ test('applyOverride: copies every field verbatim — never recomputes, never ove
 	assert.equal(record.sentCount, failure.sentCount);
 	assert.deepEqual(record.turns, failure.turns);
 	assert.deepEqual(record.reasons, failure.reasons);
+	// Surviving-mutation audit #2: `systemMessage: failure.systemMessage ??
+	// null` -> `null` was GREEN against the suite before this assertion
+	// existed — "neither override test asserts it. An override send would
+	// lose the persona." This fixture's systemMessage is genuinely
+	// non-null (the root was located fine; only the window's alternation
+	// was corrupted), so a mutation that discards it to null is now caught
+	// right here.
+	assert.equal(record.systemMessage, failure.systemMessage);
+	assert.ok(record.systemMessage, 'the persona must survive the override, not be discarded');
 
 	// The defining property: re-running the gate on the SAME (still
 	// corrupted) chain still fails the same way — proving applyOverride
@@ -284,22 +614,41 @@ test('applyOverride: copies every field verbatim — never recomputes, never ove
 	assert.equal(rerun.ok, false);
 });
 
+test('applyOverride: a genuinely null systemMessage (root unlocatable) stays null — never fabricated', async () => {
+	const { chain, conv } = buildConversation({ turnCount: 65 });
+	const blind: ChainReader = {
+		getConversation: (id) => chain.getConversation(id),
+		auditConversation: (id) => chain.auditConversation(id),
+		readTail: (id, limit) => chain.readTail(id, limit),
+		readOlder: (id, before, limit) => chain.readOlder(id, before, limit),
+		getRoot: async (): Promise<null> => null
+	};
+	const outcome = await runGate(blind, conv.id, 60);
+	assert.equal(outcome.ok, false);
+	const failure = outcome as GateFailure;
+	assert.equal(failure.systemMessage, null);
+
+	const record = applyOverride(failure);
+	assert.equal(record.systemMessage, null, 'no persona was ever found — the override must not invent one');
+});
+
 test('applyOverride: originalWindowIntent is the INTENT, never silently substituted with sentCount', async () => {
 	// Deliberately a scenario where windowIntent and sentCount are
 	// DIFFERENT numbers — the alternation-corruption fixture above leaves
 	// them accidentally equal (5 and 5), which would let a mutation that
 	// swapped one field for the other slip through undetected. This is
 	// the race fixture from the runGate tests above, reused here
-	// specifically because windowIntent=3 and sentCount=65 there.
+	// specifically because windowIntent=3 and sentCount=59 there.
 	const { chain, conv } = buildConversation({ turnCount: 65 });
 	const racy = {
 		getConversation: (id: string) => chain.getConversation(id),
 		auditConversation: async (id: string) => {
 			const real = await chain.auditConversation(id);
-			return real ? { ...real, chainFromCurrent: 4 } : real;
+			return real ? { ...real, sendableFromCurrent: 4 } : real;
 		},
 		readTail: (id: string, limit: number) => chain.readTail(id, limit),
-		readOlder: (id: string, before: string, limit: number) => chain.readOlder(id, before, limit)
+		readOlder: (id: string, before: string, limit: number) => chain.readOlder(id, before, limit),
+		getRoot: (id: string) => chain.getRoot(id)
 	};
 	const outcome = await runGate(racy, conv.id, 60);
 	assert.equal(outcome.ok, false);

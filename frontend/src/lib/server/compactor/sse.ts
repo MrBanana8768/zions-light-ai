@@ -25,7 +25,7 @@
 // caller also checks the id prefix, which is exactly why this module makes
 // prefix-matching the primary signal rather than a fallback.
 
-import type { ClassifiedChunk, NormalizedError, StreamShapeKind } from './types.js';
+import type { ClassifiedChunk, NormalizedError, StreamShapeKind, StreamShapeSummary } from './types.js';
 
 export const STREAM_ID_PREFIX = {
 	slash_command: 'chatcmpl-cmd-',
@@ -124,6 +124,65 @@ export function classifyChunk(chunk: Record<string, unknown>): ClassifiedChunk {
 	}
 
 	return { kind, chunk, terminal, error };
+}
+
+function relayDeltaContent(chunk: Record<string, unknown>): string {
+	const choice = firstChoice(chunk);
+	const delta = choice?.delta;
+	if (typeof delta !== 'object' || delta === null) return '';
+	const content = (delta as Record<string, unknown>).content;
+	return typeof content === 'string' ? content : '';
+}
+
+/** Gate remediation D7 (docs/lanes/L2-gate-findings.md). Consumes a stream
+ *  of parsed SSE events (typically `transport.ts`'s `streamChatCompletion`
+ *  output, but any sync or async iterable of `SseParsedEvent` works — see
+ *  the test suite for both shapes) and reports the mixed-stream signal a
+ *  per-chunk caller cannot see on its own: the first non-relay kind
+ *  encountered, how much genuine relay prose came before it, and whether
+ *  the stream ever reached a terminal chunk or `[DONE]` at all.
+ *
+ *  Deliberately STOPS accumulating `relayText` and stops advancing
+ *  `relayContentStoppedAt` the instant a non-relay kind is seen — nothing
+ *  after that point is treated as "the reply," which is exactly what keeps
+ *  a caller from welding an outage apology onto truncated real prose into
+ *  one assistant message (main.py's own documented failure mode). A
+ *  malformed/unparseable event (`classified: null`) is skipped for
+ *  classification purposes but does not reset or advance anything —  it is
+ *  not evidence of either shape. */
+export async function reduceStreamShape(
+	events: AsyncIterable<SseParsedEvent> | Iterable<SseParsedEvent>
+): Promise<StreamShapeSummary> {
+	let firstNonRelayKind: StreamShapeKind | null = null;
+	let relayContentStoppedAt = 0;
+	let relayText = '';
+	let sawTerminal = false;
+
+	for await (const ev of events) {
+		if (ev.isDone) {
+			sawTerminal = true;
+			continue;
+		}
+		if (!ev.classified) continue; // a parse error is not a shape signal either way
+
+		if (firstNonRelayKind === null) {
+			if (ev.classified.kind === 'relay') {
+				relayContentStoppedAt += 1;
+				relayText += relayDeltaContent(ev.classified.chunk);
+			} else {
+				firstNonRelayKind = ev.classified.kind;
+			}
+		}
+
+		if (ev.classified.terminal) sawTerminal = true;
+	}
+
+	return {
+		firstNonRelayKind,
+		relayContentStoppedAt,
+		relayText,
+		endedWithoutTerminal: !sawTerminal
+	};
 }
 
 /** Normalizes a non-streaming (or pre-stream) HTTP failure body into one

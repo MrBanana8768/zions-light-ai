@@ -681,3 +681,370 @@ test rather than declaring victory early. The plan's `window_intent` formula,
 taken literally, would make the gate refuse the majority of sends in any
 conversation longer than 60 messages — corrected here, with the derivation
 recorded in §2.1 for the Opus gate to accept or overrule.
+
+---
+
+## Gate remediation (adversarial review response)
+
+A follow-up pass fixing the twelve defects docs/lanes/L2-gate-findings.md found
+in this lane's own output (§1-§9 above), plus the six surviving mutations its
+audit named. **Suite went from 76 to 137 tests** (61 new), all green, in
+`docker compose -f docker-compose.compactor-tests.yml run --rm --build
+compactor-unit`. The store suite (`docker-compose.tests.yml`'s `client-unit`)
+went from 54 to **63** (9 new — D4/D8 needed two store primitives; see below)
+and stays green, confirmed by actually re-running it in this session.
+
+Every fix below was mutated in place — original bytes held in a scratchpad
+backup (`cp`, never `git checkout`), restored from that copy after each
+mutation, diffed byte-identical against the backup before the GREEN re-run —
+per FRONTEND_HANDOFF.md §6. No git command was run at any point in this pass.
+Two mutation cycles (noted below, D6 and surviving-mutation #1) were **not**
+caught on the first attempt; both are reported here exactly as they happened,
+not smoothed over — that is the entire point of the "watched to fail"
+standard.
+
+### D1/D2/D3 - the count check gets its two missing bits back
+
+`verifyRealizedWindow` now takes the `AuditResult` (not just three loose
+values) and checks, in addition to everything it already checked:
+
+1. **`turns.at(-1).role === 'user'`** (D1). The original function checked
+   only the OPENING role; `sendSet.test.ts:79-86`'s `turnCount: 60` fixture
+   (even, so the leaf lands on `assistant`) passed clean because nothing
+   ever looked at the closing role. That test is rewritten - `turnCount: 59`
+   with `n: 59`, an odd/odd pairing that still exercises "exactly at the
+   boundary" without violating the invariant every fixture in this file
+   relies on (turnsOnChain is always odd for a healthy conversation, per
+   this module's own U-2 resolution) - and a **new** test asserts the
+   original shape (`turnCount: 60`) is now refused, explicitly checking the
+   refusal is NOT via the count check (`!reasons.some(r => r.includes('intended'))`),
+   proving this is a genuinely separate signal.
+2. **`audit.leaf === turns.at(-1).id`** (D2/D3). `audit` is now threaded
+   into `verifyRealizedWindow` and this comparison added. This is what turns
+   the count check back into a real two-bit signal: a new test builds the
+   exact Scenario B from the findings - two sibling branches of equal
+   length off the same root, the audit captured against branch A, a
+   simulated race that moves `current_leaf_id` to branch B before the
+   window read runs - and confirms the count/shape checks alone would have
+   passed (asserted directly: `!reasons.some(r => r.includes('intended'))`)
+   while the leaf comparison catches it.
+
+Both checks live in a new exported function, `verifyChainShape`, factored out
+of `verifyRealizedWindow` specifically so D10 (below) can reuse it.
+
+### D4 - non-`complete` messages, and the consequence worth recording
+
+**The send set is now genuinely "the longest contiguous suffix of the chain,
+ending at the current leaf, in which every message is `complete` and not
+tombstoned"** - computed on BOTH sides independently, the way D2/D3 already
+required for the count:
+
+- **SQL-side** (`migrations/0001_init.sql`): `audit_conversation` gained a
+  new column, `sendable_from_current`, via a second recursive CTE (`sendable`)
+  that walks upward from `current_leaf_id` the same direction as
+  `select_leaf`'s own `up` walk, continuing past a row only while THAT row is
+  `state = 'complete' AND deleted_at IS NULL`. If the leaf itself fails that
+  test, the walk cannot even take its first step and the count is 0.
+  Deliberately **not** part of `pass` - sendability is not structural
+  soundness, and a trailing failed sibling (a normal, expected shape) must
+  never make the audit itself report the conversation unsound. Passed
+  `store.ts`'s own `MAX_WALK_DEPTH` explicitly (a new second parameter,
+  `p_max_depth DEFAULT 20000`) rather than hardcoding a second copy of that
+  constant in SQL.
+- **`sendSet.ts`**: `turnsOnChain` is now derived from `audit.sendableFromCurrent`,
+  not `audit.chainFromCurrent`. `verifyChainShape` also checks every turn's
+  `state` directly, producing an explicit reason (`"turn X is not complete
+  (state=Y)"`) rather than relying on the count mismatch alone to say why.
+
+**The consequence, recorded as asked:** because the store's message state
+machine is monotonic and `failed` is terminal (gate remediation F5 in
+`docs/lanes/L1-store.md` - `message_enforce_state_machine`), a retry can
+never reset a failed row in place. It must append a **sibling** under the
+shared parent instead. That is coherent with the branching model this whole
+system already uses for regenerations, and it has a sharp edge worth naming
+explicitly: **a failed turn leaves the active chain the instant the retry
+succeeds** - not because anything tombstones it, but because the leaf simply
+moves past it onto a different branch. `sendable_from_current`'s "interior
+failed message" case (the `f11-sendable-and-root.test.ts` test built for it)
+is therefore a defensive backstop for a shape the store's own write
+discipline should never actually produce in production, not the primary
+mechanism - the primary mechanism is simply "the leaf itself is complete or
+it isn't."
+
+Both new store primitives (`sendable_from_current`, `getRoot` - D8, below)
+live under this lane's borrowed ownership of `frontend/src/lib/server/store/**`,
+`frontend/migrations/0001_init.sql`, and `frontend/tests/store/**`, per the
+brief. New file: `frontend/tests/store/f11-sendable-and-root.test.ts` (9
+tests). Three dedicated mutations there (removing the `sendable` CTE's own
+recursion guard; wrongly gating `pass` on `sendable_from_current`; a
+`getRoot` mutation returning the newest row instead of the root - the last
+one notably survived against the "fresh conversation" fixture, since a
+conversation with exactly one message can't distinguish "newest" from
+"root," and was only caught by the "long conversation" fixture built
+specifically to have more than one row).
+
+### D5 - the fingerprint port, corrected on both named axes
+
+**Whitespace.** `collapseWhitespace` now tests against
+`PYTHON_WHITESPACE_CODEPOINTS`, a 29-code-point set **dumped from a live
+`python.exe` run** (`[cp for cp in range(0x110000) if chr(cp).isspace()]`,
+3.14.7 - the same interpreter the previous lane used), not JS's `\s`. Cross-
+checked both named vectors against the same interpreter:
+
+```
+py  'a﻿b'.isspace-per-char -> False for U+FEFF -> one token -> 8241c16cd56ac357
+py  'a\x85b'  -> U+0085 IS whitespace -> two tokens  -> 1bb94d01e957ee54 (== 'a b')
+```
+
+Both are now exact TypeScript vectors in `fingerprint.test.ts`, asserting the
+divergence goes the RIGHT way on both sides (FEFF must NOT collapse; 0085
+MUST).
+
+**`messageText`'s falsy handling.** `isPythonFalsy` now matches Python's `or`
+exactly - `0`, `false`, and (the one the findings' own table didn't name) an
+**empty dict** - in addition to the original `null`/`''`/`[]`. The non-list
+stringify path is a real (if partial) Python `str()`/`repr()` port
+(`pythonStr`/`pythonRepr`/`pythonStringRepr`), not JS's `String()` - verified
+against the exact table in the findings, cross-checked against a live Python
+run:
+
+```
+content=0      -> ''          content=false -> ''
+content=true   -> 'True'      content={"a":1} -> "{'a': 1}"
+```
+
+**Known, accepted limitation, stated plainly:** `pythonRepr`'s number
+formatting is JS's `String()`, not a full Python float-repr port (e.g.
+Python's `str(1.0)` is `"1.0"`; this gives `"1"`). Content is never actually
+a bare number in this system's normal shapes (string or content-parts
+array); this only matters for the same adversarial "content is a raw scalar"
+edge case D5's own table exercises, and a divergence there degrades to the
+existing `_ASSUMED_NEW_TURNS` path, not data loss.
+
+**The vacuous byte-stability test, replaced.** The original test built
+`send2` via `JSON.parse`-then-`JSON.stringify` on a bare STRING - a no-op, so
+`send1`/`send2` were byte-identical and the test compared a value to itself.
+The new version constructs two conversations that are asserted
+byte-**different** (`assert.notEqual(JSON.stringify(send1),
+JSON.stringify(send2))`) before comparing their fingerprints: reordered
+object keys inside a content-parts array, a duplicate `"text"` key
+jsonb-style collapsed to "last value wins," and a `\u`-escaped non-ASCII
+character against its literal UTF-8 byte. One genuine bug was found and
+fixed while building this fixture: the first draft used a **bare object**
+(not wrapped in a content-parts array) for the duplicate-key case, and
+`messageText`'s dict-repr fallback path legitimately IS key-order-sensitive
+(Python dicts preserve insertion order in `repr()`, and jsonb does not
+preserve input key order) - a real, narrower limitation than D5's own
+whitespace one, encountered and worked around by using the array shape real
+multimodal content actually has, rather than by weakening the test.
+
+### D6 - a genuine idle timeout, and a self-correction worth reporting
+
+`transport.ts`'s `timer` (a `setTimeout`) is now refreshed
+(`timer.refresh()`) once after the connection is established and again after
+every successful `reader.read()`. The deadline is always "`timeoutMs` since
+the last byte arrived," never "`timeoutMs` since the request started."
+
+**The self-correction:** the first version of the dedicated idle-timeout test
+(four chunks, 80ms apart, `timeoutMs: 150`, asserting all five events arrive)
+stayed **green even with `timer.refresh()` deliberately removed** - not
+because the fix was wrong, but because the test's own mock `ReadableStream`
+never checked the `AbortSignal` it was handed, so `controller.abort()` firing
+had **no effect** on it at all; the mutation was invisible for a reason that
+had nothing to do with the property under test. Found by actually running
+the mutation (per the "watched to fail" standard) rather than trusting the
+test's own logic. Fixed by wiring the mock's `pull()` to `controller.error()`
+on abort, matching the pre-existing "stall mid-stream" test's own pattern -
+re-ran the mutation, now correctly RED at ~162ms. This is the exact shape of
+M6/M11 in the original mutation log: a test that has never actually failed
+is a claim, not evidence, and this one's first draft was such a claim.
+
+### D7 - a stream-level reducer for mixed streams
+
+New: `sse.ts`'s `reduceStreamShape(events)`, consuming any sync or async
+iterable of `SseParsedEvent` (so it composes directly with
+`streamChatCompletion`'s own output) and returning
+`{firstNonRelayKind, relayContentStoppedAt, relayText, endedWithoutTerminal}`.
+Stops accumulating `relayText` the instant a non-relay kind is seen - nothing
+after that point is treated as "the reply." Tested against the exact mixed
+stream the brief names: real prose, then `chatcmpl-unavail-`, then `[DONE]`
+- asserting `firstNonRelayKind === 'unavailable'`, `relayContentStoppedAt === 3`,
+`relayText === 'Once upon a time'` (never the outage apology), plus the
+related "ended without a terminal chunk" signal for a connection that simply
+closes mid-reply with neither a `finish_reason` nor `[DONE]`. New file:
+`tests/compactor/streamShape.test.ts` (9 tests). `StreamShapeSummary` is a
+new exported type (`types.ts`).
+
+### D8 - `getRoot`, O(1)
+
+New store primitive, `Store.getRoot(convId)` - `SELECT * FROM message WHERE
+conv_id = $1 AND parent_id IS NULL LIMIT 1`, answered directly by
+`message_one_root_per_conv`'s own partial unique index. `sendSet.ts`'s
+`fetchRoot` now calls it instead of `readOlder(convId, cursor,
+ROOT_LOOKUP_LIMIT)`; `ROOT_LOOKUP_LIMIT` (100,000) is gone entirely.
+
+**On "assert the row count fetched, not just the call count":** this lane's
+own `sendSet.test.ts` can only assert `getRoot` was called exactly once -
+`getRoot`'s signature (`Promise<Message | null>`, no `limit` parameter) makes
+"more than one row" structurally inexpressible through this interface at
+all, but a fake `ChainReader` has no row-count concept to assert against
+even if it wanted to. The actual row-count evidence lives at the STORE
+layer, where it belongs: `frontend/tests/store/f11-sendable-and-root.test.ts`'s
+"still finds the SAME root on a long conversation" test runs against real
+Postgres with 40+ messages and confirms `getRoot` returns the root, not the
+leaf, at that depth - and the dedicated store-layer mutation (returning the
+newest row instead of the oldest) is caught there, not in this lane's own
+suite. Recorded here rather than silently claimed as covered by this lane
+alone.
+
+### D9 - `assertSendableConvId` requires `sanitize(id) === id`
+
+New exported `sanitizeConvId(raw)` - a direct, order-faithful port of
+`memory.py`'s `_sanitize`: `.trim()` (its `.strip()`), THEN strip
+`[^A-Za-z0-9_-]`, THEN slice to 64 - confirmed against the source that
+truncation runs **after** the regex substitution, not before.
+`assertSendableConvId` now throws on `sanitize(id) !== id`, not merely on
+`sanitize(id) === ''`. New tests: `"my chat"` (sanitizes to `"mychat"`,
+non-empty, previously accepted) now refused; `"my chat"` and `"m ychat"`
+(both collapse to `"mychat"`) both refused, with the collision proven, not
+asserted blind; a 70-character id refused (the 64-char truncation would
+silently rename it); a real UUID (what every actual caller sends) still
+passes untouched.
+
+### D10 - binding the gate's output to what is posted
+
+The findings named two acceptable remedies: "have `GateSuccess` carry the
+built body, **or** a token `buildChatCompletionBody` demands." This lane took
+the second: `ChatCompletionRequestParams.gate: GateSuccess` replaces the
+former loose `{systemMessage, turns}` pair - there is exactly one function in
+this lane that produces a `GateSuccess` (`runGate`), so every call site now
+plumbs that same object through rather than picking fields out of it.
+**Why not the first option:** embedding the built body inside `GateSuccess`
+would require `runGate` to accept `model`/`stream`/`maxTokens` - parameters
+that belong to the transport layer, not the chain-verification layer - mixing
+two concerns this lane's own module boundaries (§1) keep deliberately
+separate. The chosen approach still closes the finding's three named gaps:
+
+1. `buildChatCompletionBody` now re-runs `verifyChainShape` (the SAME
+   function `sendSet.ts` uses, D1's fix) on `gate.turns` before ever
+   building a byte of the wire body - contiguity/alternation/tombstone/state
+   are re-checked, not merely the two ad hoc checks (non-empty, last-is-user)
+   the finding named.
+2. `gate.systemMessage.parentId === null` and `gate.systemMessage.convId ===
+   gate.convId` are both now asserted explicitly - closing "checked only for
+   `role === 'system'`."
+3. `gate.turns.length === gate.sentCount` is asserted as a self-consistency
+   guard on the `GateSuccess` shape itself.
+
+**§4 rule 8.** Every outbound body now carries `"metadata":{"request_kind":
+"conversation"}`. Confirmed against FRONTEND_PLAN.md §3.4's own inventory of
+what `main.py` inspects (`messages`, `stream`, `model`, `max_tokens`,
+`metadata.{chat_id,conversation_id}`, `continue_final_message`,
+`add_generation_prompt`) that `request_kind` is **not** read anywhere today
+- sent anyway, as instructed, and recorded here as a live gap the compactor
+lane would need to close for rule 8 to have any actual effect.
+
+### D11 - `n` is validated and behind a real runtime switch
+
+New: `assertValidWindowN(n)` (`sendSet.ts`) - positive integer, `<=
+MAX_WINDOW_N` (200), thrown loudly otherwise. Called at the top of `runGate`,
+before a single read. `MAX_WINDOW_N = 200` is this lane's own choice, not
+prescribed: FRONTEND_PLAN.md §3.2's own derivation table already rejects
+N=100 as too large for the inline-summarizer budget, so 200 (2x an
+already-rejected value) makes "send me everything" structurally unreachable
+through this parameter while leaving real tuning headroom.
+
+`TransportConfig` gained `windowN` (`config.ts`), read from
+`COMPACTOR_WINDOW_N`, validated with the exact same `assertValidWindowN` -
+one rule, enforced once, not re-derived at the config boundary. This is what
+makes D2's "behind a runtime switch with a full-history setting" literally
+true rather than aspirational; `DEFAULT_WINDOW_N` was, until this pass, the
+only number that had ever existed anywhere in this lane.
+
+### D12 - the receipt's explicit refused state
+
+`ReceiptSnapshot` gained `refused: boolean` and `refusalReasons: string[] |
+null`. `refused = !gate.ok && !sentUnderOverride` - false whenever the gate
+succeeded, or the caller sent anyway under a D4 override (which DID reach
+the network; `sentUnderOverride` already carried that half). Before this,
+`{sentCount: 59, messagesAdmitted: null}` was the identical shape for "59
+turns genuinely posted, echo header not shipped yet" and "the gate refused,
+nothing was ever sent" - this field is the only thing that now
+distinguishes them. The fixture-hygiene note from D12's own "minor" callout
+is also fixed: `receipt.test.ts`'s `makeSuccessGate()` used to return `turns:
+[]` with `sentCount: 59` (self-inconsistent, harmless only because
+`buildReceipt` never reads `.turns`) - now builds a 59-element `turns` array
+so `turns.length === sentCount` genuinely.
+
+### Surviving mutations, closed
+
+| # | Mutation | Status before this pass | Closed by |
+|---|---|---|---|
+| 1 | `if (turns.length !== windowIntent)` -> `Math.abs(...) > 1` | **Green** - no test failed on a ±1 mismatch | New test built specifically to differ by exactly one (a stale audit reporting `sendableFromCurrent` as if `turnsOnChain` were 64 instead of the real 65 - `windowIntent=60` vs real `sentCount=59`). **First attempt at this section also initially found the gap green** (no existing fixture produces an off-by-one; every racy fixture in the file was either a genuine match or a huge mismatch) - the new test was added specifically to close it, then verified RED against the mutation, then GREEN restored. |
+| 2 | `applyOverride`: `systemMessage: failure.systemMessage ?? null` -> `null` | **Green** - neither override test asserted it | Added the assertion to the existing "copies every field verbatim" test (this fixture's `systemMessage` is genuinely non-null) plus a new dedicated test proving a genuinely-null `systemMessage` (root unlocatable) stays null rather than being fabricated. |
+| 3 | `computeWindowIntent`'s even-`startIndex` path never integration-tested | Unit-level only (fixtures 5, 60, 65, 501) | New integration test through `runGate` at `n=59` (odd) - N=60's own even-ness makes the even-`startIndex` branch structurally **unreachable** by any healthy N=60 fixture at all (turnsOnChain is always odd; odd minus even is always odd), which is worth stating plainly: the "missing" integration test could never have existed at N=60 specifically. Verified by swapping the branch's return values - caught at both unit and integration level. |
+| 4 | `splitSseBlocks`'s `/\r?\n\r?\n/` -> `/\n\n/` | Green - every fixture uses `\n\n` | New test with `\r\n\r\n` block separators (plus a mixed-LF/CRLF fixture) - splits identically to the LF case. Mutated (`/\r?\n\r?\n/` -> `/\n\n/`): RED (2 tests) - restored, GREEN. |
+| 5 | `extractDataPayload`'s `.replace(/^ /, '')` -> `.trim()` | Green, despite the doc comment | New test with a SECOND leading space and separately with trailing whitespace - neither is stripped by the real implementation, both would vanish under a genuine `.trim()`. Mutated (`.replace(/^ /, '')` -> `.trim()`): RED - restored, GREEN. |
+| 6 | The byte-stability test was vacuous | `send2` was a no-op re-derivation of `send1` | Replaced - see D5 above. |
+
+**All six are now closed.** #4 and #5 were initially left as an honest gap
+in an earlier draft of this section (SSE parsing was not otherwise touched
+by any of D1-D12, and closing them was judged lower priority than the
+twelve named defects) - revisited once the rest of the pass was done, closed
+the same way as every other item here: a fixture built to differ in exactly
+the property the mutation changes, watched RED against the mutation,
+restored, watched GREEN.
+
+### `config.ts` and `index.ts` - the two files with no test and no mutation
+
+Both now have dedicated test files (`config.test.ts`, 10 tests;
+`index.test.ts`, 6 tests) and were mutation-tested directly:
+
+- `config.ts`: disabling the `timeoutMs` validation (`!Number.isFinite(parsed)
+  || parsed <= 0`) - RED, caught. Disabling the `windowN` validation
+  (`assertValidWindowN(parsed)`) - RED, caught (2 tests). The exact value the
+  original finding named as "unguarded" (`COMPACTOR_CLIENT_TIMEOUT_MS=0.5`) is
+  now asserted on BOTH sides: accepted as a legal (if unusual) fractional
+  value, and the branch that would reject a genuinely invalid one is
+  independently exercised.
+- `index.ts`: removing the `reduceStreamShape` re-export - caught, though as
+  a **TypeScript compile error** rather than a runtime test failure (`import
+  * as CompactorIndex` with a direct property-typed access means a missing
+  export fails the build, not just one test). This is a stronger catch than
+  a runtime assertion, not a weaker one, and is reported as such rather than
+  reframed as a "runtime RED."
+
+### Coverage claim, stated precisely
+
+Every one of D1-D12 was mutated and watched RED, then restored and watched
+GREEN, in this pass - no exceptions. All six surviving mutations were closed
+with new or strengthened tests and re-verified RED-then-restore-then-GREEN.
+`config.ts` and `index.ts` - the two files the original audit named as
+having no test and no mutation at all - both now have dedicated test files
+and dedicated mutation cycles. The store side of D4/D8
+(`sendable_from_current`, `getRoot`) was mutated at the SQL/store layer
+directly against real Postgres 16, not only through this lane's own
+in-memory fake.
+
+**Final counts, confirmed by actually running both suites in this session,
+not assumed:**
+
+```
+docker compose -f docker-compose.compactor-tests.yml run --rm --build compactor-unit
+  137 pass, 0 fail, 0 skipped
+
+docker compose -f docker-compose.tests.yml run --rm --build client-unit
+  63 pass, 0 fail, 0 skipped
+```
+
+### Disagreements with the findings
+
+**None of the twelve findings were wrong.** Two places this pass made a
+judgment call the findings left open, recorded rather than left silent:
+
+- **D10's "GateSuccess carries the body" vs. "a token it demands"** - this
+  lane took the second, for the reason given above (keeping `runGate`
+  ignorant of `model`/`stream`/`maxTokens`, which are transport concerns).
+- **D11's `MAX_WINDOW_N` value** - 200, not prescribed by the findings; the
+  reasoning (2x the plan's own already-rejected N=100) is recorded above and
+  in the constant's own comment.

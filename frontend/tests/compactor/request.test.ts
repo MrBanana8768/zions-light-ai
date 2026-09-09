@@ -4,6 +4,11 @@
 // an object before comparing would pass even if this module silently
 // started re-serializing content, which is exactly the defect this file
 // exists to catch.
+//
+// Gate remediation D10 (docs/lanes/L2-gate-findings.md): buildChatCompletionBody
+// now demands an actual GateSuccess (`gate: GateSuccess`), not a bespoke
+// {systemMessage, turns} pair — see request.ts's own header comment. Every
+// test below builds one via makeGate() rather than passing loose fields.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,9 +17,24 @@ import {
 	buildChatCompletionBody,
 	buildRequestHeaders,
 	mintConvId,
+	sanitizeConvId,
 	wouldSanitizeToEmpty
 } from '../../src/lib/server/compactor/request.js';
+import type { GateSuccess } from '../../src/lib/server/compactor/types.js';
+import type { Message } from '../../src/lib/server/store/types.js';
 import { makeMessage } from './helpers/fakeChain.js';
+
+function makeGate(params: { systemMessage: Message; turns: Message[]; convId?: string }): GateSuccess {
+	const convId = params.convId ?? 'c1';
+	return {
+		ok: true,
+		convId,
+		windowIntent: params.turns.length,
+		systemMessage: params.systemMessage,
+		turns: params.turns,
+		sentCount: params.turns.length
+	};
+}
 
 test('buildChatCompletionBody: content is spliced onto the wire verbatim, never re-serialized', () => {
 	// A content string containing things a parse/reserialize round trip
@@ -33,8 +53,7 @@ test('buildChatCompletionBody: content is spliced onto the wire verbatim, never 
 	});
 	const body = buildChatCompletionBody({
 		model: 'test-model',
-		systemMessage: sys,
-		turns: [userTurn],
+		gate: makeGate({ systemMessage: sys, turns: [userTurn] }),
 		stream: true
 	});
 	// The EXACT raw content bytes must appear, uninterrupted, inside the
@@ -62,7 +81,11 @@ test('buildChatCompletionBody: an escape form a JSON.parse/stringify round trip 
 	const rawContent = '"caf\\u0041\\u0301 \\u0041"'; // note: literal escape sequences in the SOURCE JSON text
 	const sys = makeMessage({ id: 'root', convId: 'c1', role: 'system', content: JSON.stringify('persona') });
 	const userTurn = makeMessage({ id: 'u1', convId: 'c1', role: 'user', parentId: 'root', content: rawContent });
-	const body = buildChatCompletionBody({ model: 'm', systemMessage: sys, turns: [userTurn], stream: true });
+	const body = buildChatCompletionBody({
+		model: 'm',
+		gate: makeGate({ systemMessage: sys, turns: [userTurn] }),
+		stream: true
+	});
 	assert.ok(
 		body.includes(`"content":${rawContent}`),
 		'the escape sequence must appear byte-for-byte, not normalized to its decoded characters'
@@ -77,14 +100,18 @@ test('buildChatCompletionBody: a multimodal content-parts array passes through u
 	const rawContent = JSON.stringify(parts);
 	const sys = makeMessage({ id: 'root', convId: 'c1', role: 'system', content: JSON.stringify('persona') });
 	const userTurn = makeMessage({ id: 'u1', convId: 'c1', role: 'user', parentId: 'root', content: rawContent });
-	const body = buildChatCompletionBody({ model: 'm', systemMessage: sys, turns: [userTurn], stream: false });
+	const body = buildChatCompletionBody({
+		model: 'm',
+		gate: makeGate({ systemMessage: sys, turns: [userTurn] }),
+		stream: false
+	});
 	assert.ok(body.includes(`"content":${rawContent}`));
 });
 
 test('buildChatCompletionBody: refuses zero turns — never `messages: []`', () => {
 	const sys = makeMessage({ id: 'root', convId: 'c1', role: 'system', content: JSON.stringify('persona') });
 	assert.throws(
-		() => buildChatCompletionBody({ model: 'm', systemMessage: sys, turns: [], stream: true }),
+		() => buildChatCompletionBody({ model: 'm', gate: makeGate({ systemMessage: sys, turns: [] }), stream: true }),
 		/refusing to build a request with zero turns/
 	);
 });
@@ -103,8 +130,7 @@ test('buildChatCompletionBody: refuses a window that does not end on a user turn
 		() =>
 			buildChatCompletionBody({
 				model: 'm',
-				systemMessage: sys,
-				turns: [userTurn, asstTurn],
+				gate: makeGate({ systemMessage: sys, turns: [userTurn, asstTurn] }),
 				stream: true
 			}),
 		/newest message in the window is 'assistant', not 'user'/
@@ -115,23 +141,102 @@ test('buildChatCompletionBody: refuses a non-system systemMessage', () => {
 	const notSystem = makeMessage({ id: 'root', convId: 'c1', role: 'user', content: JSON.stringify('oops') });
 	const userTurn = makeMessage({ id: 'u1', convId: 'c1', role: 'user', parentId: 'root', content: JSON.stringify('hi') });
 	assert.throws(() =>
-		buildChatCompletionBody({ model: 'm', systemMessage: notSystem, turns: [userTurn], stream: true })
+		buildChatCompletionBody({ model: 'm', gate: makeGate({ systemMessage: notSystem, turns: [userTurn] }), stream: true })
 	);
 });
 
 test('buildChatCompletionBody: max_tokens is included only when supplied', () => {
 	const sys = makeMessage({ id: 'root', convId: 'c1', role: 'system', content: JSON.stringify('persona') });
 	const userTurn = makeMessage({ id: 'u1', convId: 'c1', role: 'user', parentId: 'root', content: JSON.stringify('hi') });
-	const withoutIt = buildChatCompletionBody({ model: 'm', systemMessage: sys, turns: [userTurn], stream: false });
+	const gate = makeGate({ systemMessage: sys, turns: [userTurn] });
+	const withoutIt = buildChatCompletionBody({ model: 'm', gate, stream: false });
 	assert.ok(!JSON.parse(withoutIt).hasOwnProperty('max_tokens'));
 	const withIt = buildChatCompletionBody({
 		model: 'm',
-		systemMessage: sys,
-		turns: [userTurn],
+		gate,
 		stream: false,
 		maxTokens: 512
 	});
 	assert.equal(JSON.parse(withIt).max_tokens, 512);
+});
+
+// ---------------------------------------------------------------------------
+// D10 — the gate's window bound to what is posted
+// ---------------------------------------------------------------------------
+
+test('buildChatCompletionBody: D10 — refuses a systemMessage that is not the conversation root (parentId !== null)', () => {
+	const notRoot = makeMessage({
+		id: 'not-root',
+		convId: 'c1',
+		role: 'system',
+		parentId: 'something',
+		content: JSON.stringify('persona')
+	});
+	const userTurn = makeMessage({ id: 'u1', convId: 'c1', role: 'user', parentId: 'not-root', content: JSON.stringify('hi') });
+	assert.throws(
+		() => buildChatCompletionBody({ model: 'm', gate: makeGate({ systemMessage: notRoot, turns: [userTurn] }), stream: true }),
+		/gate.systemMessage is not the conversation root/
+	);
+});
+
+test('buildChatCompletionBody: D10 — refuses a systemMessage/convId mismatch', () => {
+	const sys = makeMessage({ id: 'root', convId: 'OTHER-CONV', role: 'system', content: JSON.stringify('persona') });
+	const userTurn = makeMessage({ id: 'u1', convId: 'c1', role: 'user', parentId: 'root', content: JSON.stringify('hi') });
+	assert.throws(
+		() =>
+			buildChatCompletionBody({
+				model: 'm',
+				gate: makeGate({ systemMessage: sys, turns: [userTurn], convId: 'c1' }),
+				stream: true
+			}),
+		/gate.systemMessage belongs to conversation/
+	);
+});
+
+test('buildChatCompletionBody: D10 — refuses a self-inconsistent GateSuccess (turns.length !== sentCount)', () => {
+	const sys = makeMessage({ id: 'root', convId: 'c1', role: 'system', content: JSON.stringify('persona') });
+	const userTurn = makeMessage({ id: 'u1', convId: 'c1', role: 'user', parentId: 'root', content: JSON.stringify('hi') });
+	const gate: GateSuccess = {
+		ok: true,
+		convId: 'c1',
+		windowIntent: 5,
+		systemMessage: sys,
+		turns: [userTurn],
+		sentCount: 5 // inconsistent with turns.length (1)
+	};
+	assert.throws(
+		() => buildChatCompletionBody({ model: 'm', gate, stream: true }),
+		/self-inconsistent GateSuccess/
+	);
+});
+
+test('buildChatCompletionBody: D10 — the defensive verifyChainShape re-check refuses a broken-alternation window even without a fresh audit', () => {
+	const sys = makeMessage({ id: 'root', convId: 'c1', role: 'system', content: JSON.stringify('persona') });
+	const u1 = makeMessage({ id: 'u1', convId: 'c1', role: 'user', parentId: 'root', content: JSON.stringify('hi') });
+	// A second consecutive 'user' turn — the shape sendSet.ts's own
+	// alternation check exists to catch, reused here at the point of
+	// posting.
+	const u2 = makeMessage({ id: 'u2', convId: 'c1', role: 'user', parentId: 'u1', content: JSON.stringify('again') });
+	const gate: GateSuccess = {
+		ok: true,
+		convId: 'c1',
+		windowIntent: 2,
+		systemMessage: sys,
+		turns: [u1, u2],
+		sentCount: 2
+	};
+	assert.throws(
+		() => buildChatCompletionBody({ model: 'm', gate, stream: true }),
+		/defensive structural re-check/
+	);
+});
+
+test('buildChatCompletionBody: D10 — the §4 rule 8 request-kind marker is present on every send', () => {
+	const sys = makeMessage({ id: 'root', convId: 'c1', role: 'system', content: JSON.stringify('persona') });
+	const userTurn = makeMessage({ id: 'u1', convId: 'c1', role: 'user', parentId: 'root', content: JSON.stringify('hi') });
+	const body = buildChatCompletionBody({ model: 'm', gate: makeGate({ systemMessage: sys, turns: [userTurn] }), stream: true });
+	const parsed = JSON.parse(body);
+	assert.equal(parsed.metadata.request_kind, 'conversation');
 });
 
 // ---------------------------------------------------------------------------
@@ -148,9 +253,51 @@ test('wouldSanitizeToEmpty: mirrors memory.py\'s _CONV_ID_ALLOWED charset', () =
 	assert.equal(wouldSanitizeToEmpty('018f6b1a-2e3e-7c3f-8a1b-abcdef123456'), false);
 });
 
+test('sanitizeConvId: strips disallowed characters and caps at 64, matching memory.py\'s _sanitize', () => {
+	assert.equal(sanitizeConvId('a-b_c123'), 'a-b_c123');
+	assert.equal(sanitizeConvId('my chat'), 'mychat');
+	assert.equal(sanitizeConvId(''), '');
+	assert.equal(sanitizeConvId('  ###  '), '');
+	const seventy = 'a'.repeat(70);
+	const sanitizedSeventy = sanitizeConvId(seventy);
+	assert.equal(sanitizedSeventy.length, 64);
+	assert.equal(sanitizedSeventy, 'a'.repeat(64));
+});
+
 test('assertSendableConvId: throws rather than sending a header that sanitizes to empty', () => {
 	assert.throws(() => assertSendableConvId('###'), /would sanitize to empty/);
 	assert.throws(() => assertSendableConvId(''), /would sanitize to empty/);
+	assert.doesNotThrow(() => assertSendableConvId(mintConvId()));
+});
+
+// ---------------------------------------------------------------------------
+// D9 — sanitize(id) === id, not merely non-empty
+// ---------------------------------------------------------------------------
+
+test('assertSendableConvId: D9 — a non-empty id that sanitizes to a DIFFERENT value is refused, not sent silently mis-keyed', () => {
+	// The ORIGINAL predicate only checked wouldSanitizeToEmpty — "my chat"
+	// is non-empty even after sanitizing ("mychat"), so it used to pass
+	// straight through, get sent verbatim as X-Conversation-Id, and the
+	// compactor would key memory under "mychat" while resolve_conv_id
+	// still reports source="header" with no signal anything diverged.
+	assert.throws(() => assertSendableConvId('my chat'), /does not survive memory\.py's _sanitize unchanged/);
+});
+
+test('assertSendableConvId: D9 — two distinct ids that sanitize to the SAME value are BOTH refused (the collision, caught before either is sent)', () => {
+	assert.throws(() => assertSendableConvId('my chat'));
+	assert.throws(() => assertSendableConvId('m ychat'));
+	// Both sanitize to "mychat" — proving the collision this predicate
+	// exists to prevent is real, not hypothetical.
+	assert.equal(sanitizeConvId('my chat'), sanitizeConvId('m ychat'));
+});
+
+test('assertSendableConvId: D9 — an id longer than 64 chars is refused (the truncation would silently rename it)', () => {
+	const seventy = 'a'.repeat(70);
+	assert.throws(() => assertSendableConvId(seventy), /does not survive memory\.py's _sanitize unchanged/);
+});
+
+test('assertSendableConvId: D9 — a UUID (the actual shape every real caller sends) survives sanitize() unchanged', () => {
+	assert.doesNotThrow(() => assertSendableConvId('018f6b1a-2e3e-7c3f-8a1b-abcdef123456'));
 	assert.doesNotThrow(() => assertSendableConvId(mintConvId()));
 });
 

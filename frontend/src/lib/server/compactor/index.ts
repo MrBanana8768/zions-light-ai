@@ -12,11 +12,20 @@ export type {
 	OverrideRecord,
 	StreamShapeKind,
 	ClassifiedChunk,
+	StreamShapeSummary,
 	NormalizedError,
 	ReceiptSnapshot
 } from './types.js';
 
-export { DEFAULT_WINDOW_N, computeWindowIntent, runGate, applyOverride } from './sendSet.js';
+export {
+	DEFAULT_WINDOW_N,
+	MAX_WINDOW_N,
+	assertValidWindowN,
+	computeWindowIntent,
+	verifyChainShape,
+	runGate,
+	applyOverride
+} from './sendSet.js';
 
 export {
 	messageText,
@@ -32,6 +41,7 @@ export {
 export {
 	mintConvId,
 	assertSendableConvId,
+	sanitizeConvId,
 	wouldSanitizeToEmpty,
 	buildRequestHeaders,
 	buildChatCompletionBody
@@ -45,7 +55,8 @@ export {
 	splitSseBlocks,
 	extractDataPayload,
 	parseSseEvent,
-	parseErrorEnvelope
+	parseErrorEnvelope,
+	reduceStreamShape
 } from './sse.js';
 export type { SseParsedEvent } from './sse.js';
 

@@ -20,6 +20,13 @@ export interface ChainReader {
 	auditConversation(convId: string): Promise<AuditResult | null>;
 	readTail(convId: string, limit: number): Promise<ReadPage>;
 	readOlder(convId: string, beforeId: string, limit: number): Promise<ReadPage>;
+	/** Gate remediation D8 (docs/lanes/L2-gate-findings.md): a one-row,
+	 *  indexed lookup of the conversation's synthetic persona root —
+	 *  replaces the O(n) `readOlder(convId, cursor, 100_000)` pattern
+	 *  sendSet.ts used to fall back to for a long conversation's root
+	 *  (backed by `message_one_root_per_conv`'s own partial unique index;
+	 *  see ../store/store.ts and migrations/0001_init.sql). */
+	getRoot(convId: string): Promise<Message | null>;
 }
 
 /** Why a gate attempt failed to produce a sendable window, named so a
@@ -119,6 +126,38 @@ export interface ClassifiedChunk {
 	error?: { message: string; type?: string; code?: string; detail?: string };
 }
 
+/** Gate remediation D7 (docs/lanes/L2-gate-findings.md). `main.py`'s own
+ *  comment: on a mid-reply `httpx.RequestError`, the compactor yields N
+ *  relay chunks of genuine prose, THEN `chatcmpl-unavail-` chunks, THEN
+ *  `[DONE]` — "when vLLM drops the connection PART WAY THROUGH a reply she
+ *  has already read." A naive per-chunk caller (accumulate delta.content,
+ *  mark complete on the first terminal chunk) welds the outage apology
+ *  onto the truncated real reply into ONE assistant message — §12 requires
+ *  those be typed notices visually distinct from assistant messages. This
+ *  is the STREAM-LEVEL summary a caller needs to avoid that: where relay
+ *  content stopped, what it turned into, and whether the stream ended
+ *  cleanly at all. See sse.ts's `reduceStreamShape`. */
+export interface StreamShapeSummary {
+	/** The first classified kind other than 'relay' encountered, or null if
+	 *  the whole stream (so far, or to its end) was ordinary relay. */
+	firstNonRelayKind: StreamShapeKind | null;
+	/** How many RELAY chunks were yielded before `firstNonRelayKind` fired
+	 *  — equivalently, the 0-based index of the first non-relay chunk.
+	 *  Equal to the total relay-chunk count if the stream never left relay. */
+	relayContentStoppedAt: number;
+	/** The concatenated `delta.content` text from relay chunks ONLY, up to
+	 *  (never past) the point relay content stopped — the genuine prose a
+	 *  caller has to decide what to do with, kept separate from whatever a
+	 *  `rejected`/`unavailable` shape's own text says. */
+	relayText: string;
+	/** True iff the stream was exhausted (the generator returned) without
+	 *  EVER seeing a terminal chunk (`finish_reason` set) or a `[DONE]`
+	 *  sentinel — `transport.ts`'s own flush-on-exit path produces exactly
+	 *  this shape for a connection that simply closes mid-reply, which is
+	 *  otherwise indistinguishable from a clean end. */
+	endedWithoutTerminal: boolean;
+}
+
 /** One HTTP-level failure envelope, normalized from whichever of the
  *  compactor's two shapes (plus FastAPI's stock 422) produced it —
  *  FRONTEND_PLAN.md §3.4: "Two different error envelopes exist... Handle
@@ -160,4 +199,18 @@ export interface ReceiptSnapshot {
 	 *  substitution is the 2026-08-28 failure verbatim. */
 	messagesAdmitted: number | null;
 	admittedSource: 'header' | 'not_reported';
+	/** Gate remediation D12 (docs/lanes/L2-gate-findings.md): explicit
+	 *  "we refused and sent nothing at all" — independent of
+	 *  `messagesAdmitted`'s absence, which ALSO reads `null` for a normal
+	 *  send whose echo header simply hasn't shipped yet. Before this field,
+	 *  those two situations were receipt-indistinguishable: `{sentCount: 59,
+	 *  sentUnderOverride: false, messagesAdmitted: null}` read exactly the
+	 *  same whether 59 turns were genuinely posted or the gate refused and
+	 *  the network was never touched. `false` whenever the gate succeeded
+	 *  OR the caller sent anyway under a D4 override (which DID reach the
+	 *  network — `sentUnderOverride` already carries that distinction). */
+	refused: boolean;
+	/** The gate's own reasons, present iff `refused` is true — so a receipt
+	 *  can explain WHY nothing was sent without a second query. */
+	refusalReasons: string[] | null;
 }

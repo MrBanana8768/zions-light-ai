@@ -490,6 +490,32 @@ export class Store {
 		return rows.length ? rowToConversation(rows[0]) : null;
 	}
 
+	/** Gate remediation D8 (docs/lanes/L2-gate-findings.md): a one-row,
+	 *  indexed lookup of the conversation's synthetic persona root —
+	 *  `message_one_root_per_conv`'s own partial unique index on
+	 *  `(conv_id) WHERE parent_id IS NULL` answers this directly, with no
+	 *  walk. Replaces the O(n) `readOlder(convId, cursor, ROOT_LOOKUP_LIMIT)`
+	 *  pattern the transport lane used to fall back to for a long
+	 *  conversation's root: that call's own recursive CTE (readChain) returns
+	 *  every row it visits — content included — so it cost ~1,940 full rows
+	 *  per outbound message on a 2,000-message conversation, purely to read
+	 *  one row's `id`. This method returns `null` if the conversation has no
+	 *  root at all (should never happen for a real conversation, but this is
+	 *  a plain read — it has no opinion about that, unlike auditConversation,
+	 *  which is the place that DOES). Returns whichever row Postgres finds
+	 *  first if, adversarially, more than one exists (message_one_root_per_conv
+	 *  dropped) — callers that need to distinguish that from a healthy
+	 *  single-root conversation already have auditConversation's own
+	 *  `roots` count for that; this method's contract is "the root," not
+	 *  "assert there is exactly one." */
+	async getRoot(convId: string): Promise<Message | null> {
+		const { rows } = await this.pool.query(
+			'SELECT * FROM message WHERE conv_id = $1 AND parent_id IS NULL LIMIT 1',
+			[convId]
+		);
+		return rows.length ? rowToMessage(rows[0]) : null;
+	}
+
 	/** The newest `limit` messages of the ACTIVE path (walking parent_id
 	 *  from current_leaf_id toward the root), newest first. Never reads more
 	 *  than `limit` rows regardless of total conversation length — see
@@ -546,7 +572,17 @@ export class Store {
 	 *  wrapper, the future CLI (F30) and a future importer all share the
 	 *  exact same logic rather than each reimplementing the traversal. */
 	async auditConversation(convId: string): Promise<AuditResult | null> {
-		const { rows } = await this.pool.query('SELECT * FROM audit_conversation($1)', [convId]);
+		// Gate remediation D4: MAX_WALK_DEPTH is passed explicitly rather than
+		// left to the SQL function's own DEFAULT, so this one JS constant is
+		// the single place that bounds every walk-away-from-a-proven-root
+		// query in the system (selectLeaf's `up`, tombstoneSubtree's
+		// `subtree`, and now audit_conversation's `sendable`) — see that
+		// function's own comment in the migration SQL for why `sendable`
+		// needs a bound at all when `down` provably does not.
+		const { rows } = await this.pool.query('SELECT * FROM audit_conversation($1, $2)', [
+			convId,
+			MAX_WALK_DEPTH
+		]);
 		if (rows.length === 0) return null;
 		const r = rows[0];
 		return {
@@ -559,6 +595,7 @@ export class Store {
 			leafOnTree: r.leaf_on_tree === true,
 			chainFromCurrent: Number(r.chain_from_current),
 			deepest: Number(r.deepest),
+			sendableFromCurrent: Number(r.sendable_from_current),
 			pass: r.pass === true
 		};
 	}

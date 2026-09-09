@@ -76,6 +76,14 @@ CREATE TABLE message (
 -- parent_id IS NULL per conv_id" is inherently a cross-row constraint. This
 -- is what makes 2026-08-24's second root structurally impossible rather
 -- than merely tested against.
+--
+-- Gate remediation D8 (docs/lanes/L2-gate-findings.md): this is also what
+-- makes store.ts's getRoot() an indexed, single-row lookup rather than a
+-- table scan — `SELECT * FROM message WHERE conv_id = $1 AND parent_id IS
+-- NULL` is answered directly by this exact partial index, with no need to
+-- walk (and fetch full `content`, jsonb and all) the ~2,000 rows of a long
+-- conversation the way the O(n) `readOlder(convId, cursor, 100_000)` root
+-- lookup it replaces used to.
 CREATE UNIQUE INDEX message_one_root_per_conv
     ON message (conv_id) WHERE parent_id IS NULL;
 
@@ -295,18 +303,45 @@ CREATE TRIGGER message_enforce_state_machine
 -- cycle has no root of its own. Nothing about this function needed to
 -- change; this comment exists so the property is asserted, not merely
 -- true by accident.
-CREATE OR REPLACE FUNCTION audit_conversation(p_conv_id uuid)
+-- Gate remediation D4 (docs/lanes/L2-gate-findings.md). `sendable_from_current`
+-- is the longest CONTIGUOUS SUFFIX of the chain, ending at current_leaf_id,
+-- in which every message is state = 'complete' AND NOT tombstoned. It is a
+-- SEPARATE walk from `down`/`walk` above (which are about STRUCTURE — roots,
+-- reachability, depth — and must never know about `state`): this one is about
+-- SENDABILITY, and it exists so the L2 transport lane's window_intent can be
+-- computed as arithmetic over a number the DATABASE derived independently,
+-- never by the transport lane walking the rows it just fetched (which would
+-- make its own gate tautological — see sendSet.ts).
+--
+-- Walks UPWARD from current_leaf_id via parent_id (the same direction as
+-- select_leaf's `up` CTE in store.ts, NOT `down`'s root-to-leaf direction, so
+-- it needs the identical cycle defense: an explicit depth bound, since a
+-- walk that starts from an arbitrary row and moves away from the root has no
+-- structural cycle immunity the way `down` does). Recursion continues past a
+-- row only if THAT row itself was sendable — so the moment it finds a
+-- non-complete or tombstoned message, it stops, and nothing further up
+-- (however healthy) is ever visited or counted. If current_leaf_id itself is
+-- not 'complete' (mid-stream, still pending, or a failed leaf nobody has
+-- retried away from yet), the anchor row's own `ok` is false and NOTHING is
+-- counted — sendable_from_current = 0 — which is exactly D4's "if the leaf
+-- itself is not complete, nothing is sendable."
+--
+-- p_max_depth defaults to store.ts's own MAX_WALK_DEPTH; store.ts passes that
+-- constant explicitly (see auditConversation()) so the two stay in sync by
+-- construction rather than by two hand-copied literals silently drifting.
+CREATE OR REPLACE FUNCTION audit_conversation(p_conv_id uuid, p_max_depth bigint DEFAULT 20000)
 RETURNS TABLE (
-    conv_id             uuid,
-    roots               bigint,
-    total               bigint,
-    reachable_n         bigint,
-    missing_parent      bigint,
-    leaf                uuid,
-    leaf_on_tree        boolean,
-    chain_from_current  bigint,
-    deepest             bigint,
-    pass                boolean
+    conv_id               uuid,
+    roots                 bigint,
+    total                 bigint,
+    reachable_n           bigint,
+    missing_parent        bigint,
+    leaf                  uuid,
+    leaf_on_tree          boolean,
+    chain_from_current    bigint,
+    deepest               bigint,
+    sendable_from_current bigint,
+    pass                  boolean
 )
 LANGUAGE sql
 STABLE
@@ -323,6 +358,16 @@ AS $$
     ),
     walk AS (
         SELECT id, min(depth) AS depth FROM down GROUP BY id
+    ),
+    sendable(id, parent_id, ok, depth) AS (
+        SELECT m.id, m.parent_id, (m.state = 'complete' AND m.deleted_at IS NULL), 1
+        FROM message m, conversation c
+        WHERE c.id = p_conv_id AND m.conv_id = p_conv_id AND m.id = c.current_leaf_id
+        UNION ALL
+        SELECT m.id, m.parent_id, (m.state = 'complete' AND m.deleted_at IS NULL), sendable.depth + 1
+        FROM message m
+        JOIN sendable ON m.id = sendable.parent_id
+        WHERE m.conv_id = p_conv_id AND sendable.ok AND sendable.depth < p_max_depth
     )
     SELECT
         p_conv_id,
@@ -337,7 +382,15 @@ AS $$
             AND EXISTS (SELECT 1 FROM walk WHERE id = c.current_leaf_id)),
         coalesce((SELECT depth FROM walk WHERE id = c.current_leaf_id), 0),
         coalesce((SELECT max(depth) FROM walk), 0),
+        (SELECT count(*) FROM sendable WHERE ok),
         -- roots = 1 AND missing_parent = 0 AND reachable_n = total AND leaf_on_tree
+        -- Deliberately NOT joined by sendable_from_current — §4.1's PASS
+        -- formula is about STRUCTURE, never about state. A trailing failed
+        -- turn is a real, expected shape (a rejected sibling stays on a dead
+        -- branch, or momentarily IS the leaf right after a failure) and must
+        -- never make audit_conversation itself report the conversation
+        -- unsound; it is the SEND gate's job to notice, not the structural
+        -- audit's.
         (
             (SELECT count(*) FROM message WHERE conv_id = p_conv_id AND parent_id IS NULL) = 1
             AND (SELECT count(*) FROM message m

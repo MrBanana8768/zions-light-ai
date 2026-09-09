@@ -61,6 +61,29 @@ test('messageText: falsy content (None/""/[]) all collapse to "", matching Pytho
 	assert.equal(messageText(JSON.stringify([])), '');
 });
 
+test('messageText: D5 falsy-handling table — cross-checked against a real Python run (0/false/true/{"a":1})', () => {
+	// python: {"role":"user","content":0} -> _message_text = ''
+	//   (0 is falsy in Python; `or ""` substitutes it BEFORE str() ever runs
+	//   — this module's earlier port only special-cased None/""/[], so 0
+	//   fell through to String(0) = "0", not "")
+	assert.equal(messageText(JSON.stringify(0)), '');
+	// python: content=False -> _message_text = ''
+	assert.equal(messageText(JSON.stringify(false)), '');
+	// python: content=True -> _message_text = 'True'
+	//   (True is TRUTHY in Python — `or ""` does not touch it — so this
+	//   falls to str(True), which is the capitalized "True", not JS's "true")
+	assert.equal(messageText(JSON.stringify(true)), 'True');
+	// python: content={"a": 1} -> _message_text = "{'a': 1}"
+	//   (a non-empty dict is truthy; str() of a dict is Python's own
+	//   single-quoted repr, not JS's "[object Object]")
+	assert.equal(messageText(JSON.stringify({ a: 1 })), "{'a': 1}");
+	// python: content={} -> _message_text = ''
+	//   (an EMPTY dict is falsy in Python, unlike a JS empty object, which
+	//   is truthy — this is the one falsy case neither the original port
+	//   nor the table in the findings names explicitly)
+	assert.equal(messageText(JSON.stringify({})), '');
+});
+
 test('messageText: a content-parts list joins only its text parts, dropping non-dict/non-text entries', () => {
 	const content = [{ type: 'text', text: 'hello' }, 'not-a-dict', { type: 'image_url', image_url: {} }];
 	assert.equal(messageText(JSON.stringify(content)), 'hello ');
@@ -95,31 +118,105 @@ test('turnFingerprints: skips system, preserves order, oldest-first input to old
 	assert.equal(fps[2], turnFingerprint('user', JSON.stringify('three')));
 });
 
-test('trailingAnchorFingerprints: the byte-stability invariant — identical across two sends of the same conversation', () => {
-	const conversation = [
+test('trailingAnchorFingerprints: the byte-stability invariant — identical across two GENUINELY different byte serializations of the same conversation', () => {
+	// D5 / the surviving-mutation audit's #6: the ORIGINAL version of this
+	// test built `send2` via JSON.parse then JSON.stringify on a bare
+	// STRING — a no-op (JSON.stringify(JSON.parse('"turn 1"')) is
+	// byte-for-byte '"turn 1"' again), so `send1` and `send2` were
+	// byte-IDENTICAL and this test compared a value to itself. §3.2 names
+	// this as "the corrected test" specifically because the invariant is
+	// about the EXTRACTED TEXT surviving a real difference in bytes, not
+	// about re-running the same serializer twice. Every turn below is
+	// constructed two DIFFERENT ways that Postgres's own jsonb round trip
+	// (see docs/lanes/L1-store.md §8) or a different-but-valid JSON
+	// serializer could plausibly produce, while decoding to the identical
+	// VALUE:
+	//   - reordered object keys (jsonb does not preserve input key order)
+	//   - a duplicate key jsonb collapses to "last value wins"
+	//   - a \u-escaped non-ASCII character vs. the literal UTF-8 byte
+	//     (Python's json.dumps default ensure_ascii=True produces the
+	//     escaped form; this store's own content is never re-serialized,
+	//     but a caller reading a DIFFERENT prior serialization back must
+	//     still fingerprint identically)
+	const send1 = [
 		{ role: 'system' as const, content: JSON.stringify('persona') },
 		{ role: 'user' as const, content: JSON.stringify('turn 1') },
-		{ role: 'assistant' as const, content: JSON.stringify('reply 1') },
+		// key order: type, text
+		{ role: 'assistant' as const, content: '[{"type":"text","text":"reply 1"}]' },
 		{ role: 'user' as const, content: JSON.stringify('turn 2') },
-		{ role: 'assistant' as const, content: JSON.stringify('reply 2') },
-		{ role: 'user' as const, content: JSON.stringify('turn 3') },
+		// a content-parts array whose single object has a duplicate "text"
+		// key — jsonb's own "last value wins" behaviour, reproduced here as
+		// a literal string this module must decode exactly as JSON.parse
+		// (and Postgres) both do. Wrapped in an array (a real multimodal
+		// content shape), not a bare object: messageText reads a bare
+		// object's dict REPR, which embeds key order and is legitimately
+		// NOT key-order-stable (a separate, already-known limitation of
+		// that fallback path, not what this test exists to demonstrate).
+		{ role: 'assistant' as const, content: '[{"text":"WRONG","type":"text","text":"reply 2"}]' },
+		// literal UTF-8 non-ASCII character.
+		{ role: 'user' as const, content: JSON.stringify('turn café 3') },
+		{ role: 'assistant' as const, content: JSON.stringify('reply 3') }
+	];
+	const send2 = [
+		{ role: 'system' as const, content: JSON.stringify('persona') },
+		{ role: 'user' as const, content: JSON.stringify('turn 1') },
+		// same VALUE, keys reordered: text, type.
+		{ role: 'assistant' as const, content: '[{"text":"reply 1","type":"text"}]' },
+		{ role: 'user' as const, content: JSON.stringify('turn 2') },
+		// the jsonb-normalized shape: duplicate key already collapsed,
+		// same content-parts array shape as send1's version.
+		{ role: 'assistant' as const, content: '[{"type":"text","text":"reply 2"}]' },
+		// \u-escaped form of the identical character — Python's
+		// json.dumps(..., ensure_ascii=True) default, and jsonb resolves
+		// \u-escapes to the literal character on output, so a reader that
+		// re-derives this turn from either the client's OWN prior send or
+		// a jsonb round trip must still see the same decoded string.
+		{ role: 'user' as const, content: '"turn caf\\u00e9 3"' },
 		{ role: 'assistant' as const, content: JSON.stringify('reply 3') }
 	];
 
-	// "Send 1": the client's JSON serializer happens to use one key order.
-	const send1 = conversation.map((m) => ({ role: m.role, content: m.content }));
-	// "Send 2": semantically IDENTICAL turns, but re-derived independently
-	// (e.g. read back from Postgres jsonb, which reorders keys/re-renders
-	// escapes for any multi-key object — irrelevant here since content is
-	// a bare string, but exercised anyway with a fresh JSON.stringify call
-	// per turn to prove this is testing re-derivation, not object identity).
-	const send2 = conversation.map((m) => ({ role: m.role, content: JSON.parse(m.content) }))
-		.map((m) => ({ role: m.role, content: JSON.stringify(m.content) }));
+	// Prove these two conversations are genuinely byte-DIFFERENT before
+	// asserting their fingerprints agree — otherwise this test could
+	// silently regress back to the exact vacuity it replaces.
+	assert.notEqual(JSON.stringify(send1), JSON.stringify(send2));
 
 	const anchor1 = trailingAnchorFingerprints(send1);
 	const anchor2 = trailingAnchorFingerprints(send2);
 	assert.equal(anchor1.length, ANCHOR_TURNS);
 	assert.deepEqual(anchor1, anchor2);
+});
+
+test('turnFingerprint: D5 cross-check — U+FEFF (BOM) is NOT whitespace in Python; the anchor must not collapse it like a space', () => {
+	// python (verified against a live python.exe run, 3.14.7):
+	//   'a﻿b'.split() == ['a﻿b']   (isspace() is False for FEFF)
+	//   turn_fp(user, 'a﻿b') == '8241c16cd56ac357'
+	//   turn_fp(user, 'a b')      == '1bb94d01e957ee54'   (an ordinary space)
+	// JS's \s DOES match U+FEFF, so the module this replaces collapsed
+	// 'a﻿b' down to 'a b' and produced 1bb94d01e957ee54 — the WRONG,
+	// JS-\s-derived hash — for this exact input.
+	const withFeff = 'a\uFEFFb'; // explicit \uFEFF escape — no invisible literal byte in the source
+	assert.equal(turnFingerprint('user', JSON.stringify(withFeff)), '8241c16cd56ac357');
+	assert.notEqual(
+		turnFingerprint('user', JSON.stringify(withFeff)),
+		turnFingerprint('user', JSON.stringify('a b')),
+		'U+FEFF must NOT collapse like an ordinary space — Python does not consider it whitespace'
+	);
+});
+
+test('turnFingerprint: D5 cross-check — U+0085 (NEL) IS whitespace in Python, the opposite divergence from U+FEFF', () => {
+	// python: 'a\x85b'.split() == ['a', 'b']   (isspace() is True for NEL)
+	//   turn_fp(user, 'a\x85b') == turn_fp(user, 'a b') == '1bb94d01e957ee54'
+	// JS's \s does NOT match U+0085, so a naive JS \s-based collapse would
+	// treat 'a\x85b' as ONE token and diverge from Python here — the exact
+	// opposite direction of the FEFF case above, which is why the findings
+	// call these "the two that diverge in opposite directions."
+	const withNel = 'a\u0085b'; // explicit \u0085 escape — no invisible literal byte in the source
+	assert.equal(turnFingerprint('user', JSON.stringify(withNel)), '1bb94d01e957ee54');
+	assert.equal(
+		turnFingerprint('user', JSON.stringify(withNel)),
+		turnFingerprint('user', JSON.stringify('a b')),
+		'U+0085 (NEL) must collapse exactly like an ordinary space — Python DOES consider it whitespace'
+	);
 });
 
 test('trailingAnchorFingerprints: fewer than ANCHOR_TURNS turns returns a short anchor, not padding', () => {
