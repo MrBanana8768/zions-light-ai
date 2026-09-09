@@ -17,6 +17,26 @@
 # --fast, --only, --saturation, --list and --allow-skips all work as they do
 # on the host.
 #
+# THE L1 STORE SUITE. client-unit is a SEPARATE service with its own
+# Postgres 16 sidecar (postgres-client-unit) — see FRONTEND_PLAN.md §3.1/§6
+# and docs/lanes/L1-store.md. `run` starts the sidecar as a dependency
+# automatically; `--build` matters here too, for the same staleness reason
+# as unit-tests above.
+#
+#   # the whole L1 store suite (basic + F4 rejection + F5 adversarial + F6
+#   # schema + F7 scale):
+#   docker compose -f docker-compose.tests.yml run --rm --build client-unit
+#
+#   # the standing 241/5-root/leaf-at-8 case only:
+#   docker compose -f docker-compose.tests.yml run --rm client-unit --only chain_audit
+#
+#   # append-cost / streaming-checkpoint measurements only:
+#   docker compose -f docker-compose.tests.yml run --rm client-unit --only scale
+#
+# --only maps to node's --test-name-pattern (a substring, regex-escaped) —
+# it is not scripts/run-tests.py, so --fast/--saturation/--allow-skips do
+# not apply here.
+#
 # WHAT THIS DOES NOT COVER. The two fixture-backed suites still live in
 # docker-compose.tokenizer-contract.yml and still need it running — this stack
 # has no /tokenize server, so test_tokenizer_contract.py and
@@ -52,3 +72,51 @@ services:
     # something will now fail fast rather than after a real connect timeout,
     # which is the Linux half of the R22 finding.
     network_mode: none
+
+  # The L1 store's unit suite (frontend/tests/store/**) — FRONTEND_PLAN.md
+  # §6's acceptance command 1/2/3. UNLIKE unit-tests above, this suite is
+  # deliberately, structurally NOT offline: F3's whole point is a real
+  # Postgres enforcing real constraints, so `network_mode: none` (which
+  # would also cut it off from its own sidecar) is not applicable here —
+  # that tension is recorded in docs/lanes/L1-store.md rather than papered
+  # over. What IS preserved is the SPIRIT of "must not reach anything
+  # unexpected": both services below sit on client-unit-net, an `internal:
+  # true` network with no route out to the wider world or the default
+  # compose network — the suite can reach exactly one thing, its own
+  # sidecar, and nothing else.
+  postgres-client-unit:
+    image: postgres:16
+    container_name: zla-client-unit-postgres
+    networks: [client-unit-net]
+    environment:
+      POSTGRES_USER: client_test
+      POSTGRES_PASSWORD: client_test
+      POSTGRES_DB: client_test
+    # Throwaway on purpose: every run starts from an empty cluster, and
+    # nothing this suite writes needs to survive the container.
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U client_test -d client_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  client-unit:
+    build:
+      context: .
+      dockerfile: testfixtures/client-unit/Dockerfile
+    container_name: zla-client-unit-tests
+    depends_on:
+      postgres-client-unit:
+        condition: service_healthy
+    networks: [client-unit-net]
+    volumes:
+      - ./:/src:ro
+    environment:
+      DATABASE_URL: postgresql://client_test:client_test@postgres-client-unit:5432/client_test
+
+networks:
+  client-unit-net:
+    internal: true

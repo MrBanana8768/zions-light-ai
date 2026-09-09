@@ -1,0 +1,17 @@
+{
+	"compilerOptions": {
+		"target": "es2022",
+		"module": "nodenext",
+		"moduleResolution": "nodenext",
+		"lib": ["es2022"],
+		"strict": true,
+		"esModuleInterop": true,
+		"forceConsistentCasingInFileNames": true,
+		"skipLibCheck": true,
+		"resolveJsonModule": true,
+		"sourceMap": false,
+		"outDir": "dist-store-tests",
+		"rootDir": "."
+	},
+	"include": ["src/lib/server/store/**/*.ts", "tests/store/**/*.ts"]
+}

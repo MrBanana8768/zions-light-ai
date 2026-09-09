@@ -311,17 +311,46 @@ advances across ≥20 client turns at N=60 — because if memory looks dead now,
 zero advance. When the anchor cannot be found, `_ASSUMED_NEW_TURNS = 2` and the
 position drifts.
 
-**So the trailing turns must be byte-stable across requests.** This is a store
-requirement, not a transport one:
+**So the trailing turns must be stable across requests — but "stable" means
+something narrower and more useful than "byte-identical," and the difference
+matters.** An earlier draft of this section said byte-stable and prescribed a
+test comparing outbound JSON bytes. That test is both too strict and wrong. Read
+`_turn_fingerprints` (`summarizer.py:707-730`): the anchor hashes
 
-- `message.content` stores the **exact wire form** sent (the schema says so:
-  `content jsonb NOT NULL -- the wire form`). The client sends it verbatim.
-- **Never re-render content for the wire from the display form.** Markdown
-  normalization, whitespace tidying, re-serializing content-parts in a different
-  key order, or trimming trailing newlines all break the anchor — silently, with
-  no error, and the only symptom is a summary hierarchy that drifts behind.
-- Test: send the same conversation twice, assert the outbound JSON bytes for the
-  trailing 4 turns are identical.
+```
+sha256( role + "\x00" + " ".join(_message_text(m).split()) )[:16]
+```
+
+— the **extracted text of the turn, whitespace-collapsed**, not the JSON
+envelope. Its own docstring says why: the anchor is compared across two separate
+HTTP requests, "and a re-flowed trailing newline must not read as a different
+turn."
+
+What follows:
+
+- **JSON key order, inter-token whitespace and escape representation are
+  irrelevant.** So `content jsonb` is safe, despite Postgres `jsonb` genuinely
+  not preserving input bytes — it normalizes key order, drops duplicate keys and
+  re-renders `\uXXXX` escapes. None of that changes a string *value*, and values
+  are all the fingerprint reads. The L1 lane verified the normalization
+  empirically and correctly escalated it; this is the resolution.
+- **What must be stable is the extracted text and the role.** Markdown
+  normalization, smart-quote substitution, entity encoding, or trimming and
+  re-wrapping that changes characters rather than only whitespace runs — those
+  break the anchor, silently, and the only symptom is a summary hierarchy
+  drifting behind.
+- **Never re-render content for the wire from the display form.** Store the wire
+  form; send that. This is a store requirement, not a transport one.
+- **One real `jsonb` limitation to know:** Postgres cannot store `\u0000` inside
+  a jsonb string. A message containing a literal NUL fails to insert rather than
+  round-tripping wrongly — loud, not silent, which is the right failure, but it
+  needs a typed notice rather than an unhandled driver error.
+- **The test, corrected:** reproduce `_turn_fingerprints` client-side and assert
+  the trailing-4 fingerprints are identical across two sends of the same
+  conversation. That tests the invariant the server actually uses, and it keeps
+  passing when a JSON serializer legitimately reorders keys. **An image-only turn
+  is fingerprinted through `_image_only_marker`, not as the empty string its
+  request shape reduces to** — mirror that, or every image turn reads as a new turn.
 
 #### D4's override must not recompute its way to compliance
 
@@ -697,8 +726,12 @@ Handoff §6's standards, which a new thread will not guess:
 **Acceptance.** The harnesses define `unit-tests` (`docker-compose.tests.yml:30`)
 and `vllm-fixture`/`compactor`/`integration-tests`. Add `client-unit` beside
 `unit-tests` and `client` beside `compactor` — **new services, following the
-existing ones' shape**, including `network_mode: none` for the unit lane and the
-read-only working-tree mount for the integration lane.
+existing ones' shape**. Note `unit-tests` uses `network_mode: none`, which the
+store lane **cannot** copy - it needs a Postgres sidecar, and the two are
+structurally incompatible. The equivalent isolation is a dedicated
+`internal: true` network, which is what `client-unit` uses; that satisfies the
+intent (no egress) without the impossible letter of it. The integration lane
+keeps the read-only working-tree mount.
 
 ```bash
 # 1. The store rejects every mechanical step of 2026-08-24
