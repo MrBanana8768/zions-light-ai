@@ -495,3 +495,304 @@ and I'd rather flag it loudly than let it ship silently disguised as
   column-type decision, both outside L1's remit as scoped.
 - **Everything else:** all 24 store tests pass, reproducibly, in
   `docker compose -f docker-compose.tests.yml run --rm --build client-unit`.
+
+---
+
+## Gate remediation (adversarial review response)
+
+A follow-up pass, fixing ten defects an adversarial review of §3 found in
+this lane's output. **Suite went from 24 to 54 tests** (30 new), all green,
+in `docker compose -f docker-compose.tests.yml run --rm --build client-unit`.
+Every fix below was mutated in place (original bytes held in a scratchpad
+backup, restored from that copy, never `git checkout`), run against
+`postgres:16` inside `client-unit`, watched RED, restored, watched GREEN
+again — per `FRONTEND_HANDOFF.md` §6. No git command was run at any point.
+
+### F1 — CRITICAL: two definitions of reachability disagreed
+
+**The defect.** `appendMessage`'s CAS (`store.ts`) conditioned only on
+`current_leaf_id` and `rev`; it never read the parent row's `deleted_at`. So
+`create → append M1 → tombstoneSubtree(M1) → appendMessage(parent=M1)`
+succeeded, hanging a live message under a tombstoned parent, while
+`selectLeaf`'s own upward walk (tombstone-aware) would then throw
+`UnreachableLeafError` for the exact leaf `audit_conversation` reported
+`pass=true` for.
+
+**Fix, four parts, all in `store.ts`/`0001_init.sql`:**
+1. `message_forbid_child_of_tombstone` — a `BEFORE INSERT` trigger on
+   `message` that raises (`ERRCODE = integrity_constraint_violation`) if
+   `NEW.parent_id`'s row has `deleted_at IS NOT NULL`. A live child of a
+   dead parent is now impossible at the database, regardless of which code
+   path (present or future) attempts it.
+2. `tombstoneSubtree` now takes `SELECT current_leaf_id FROM conversation
+   WHERE id = $1 FOR UPDATE` as its first statement, computes the target's
+   subtree (depth-bounded, F8), and throws a new `TombstoneRefusedError`
+   *before touching any row* if `current_leaf_id` is inside that subtree.
+   The caller must `selectLeaf` elsewhere first. This makes "the current
+   leaf is never tombstoned" true by construction.
+3. The same function also refuses outright if the target's `parent_id IS
+   NULL` (i.e. it is the conversation's synthetic root) — tombstoning it
+   would hide the entire conversation while `roots`/`reachable_n`/
+   `leaf_on_tree` all stay structurally clean (`pass = true` against an
+   invisible conversation).
+4. The stale comment conceding the old behaviour was wrong "in spirit" (the
+   leaf could end up pointing at hidden content) is deleted — that state is
+   no longer reachable, so there was nothing left to concede.
+
+**Mutations run (all in `store.ts` / `0001_init.sql`, restored from an
+in-memory backup after each):**
+
+| # | Mutation | Test | Result |
+|---|---|---|---|
+| 1 | Commented out `CREATE TRIGGER message_forbid_child_of_tombstone` | "a live message cannot be appended under an already-tombstoned parent" | RED (`Missing expected rejection`) → restored → GREEN |
+| 2 | Deleted the `currentLeafId !== null && subtreeIds.includes(...)` check | "tombstoneSubtree refuses when the subtree contains the current leaf" AND "...a DESCENDANT..." | Both RED → restored → GREEN |
+| 3a | Deleted the `parent_id === null` root-guard check | "tombstoneSubtree refuses to tombstone the synthetic root" | **Stayed GREEN — a real finding, not a clean catch.** Tombstoning the root always targets a subtree that IS the whole tree, which always contains wherever the current leaf is (as long as the leaf is non-null) — so the *leaf-containment* check fires for an unrelated reason and masks the root guard's own removal. Closed by adding an ISOLATED test that first forces `current_leaf_id = NULL` (via the F2 fixture's own helper) so the leaf-containment check's `!== null` guard short-circuits away, leaving the root guard as the *only* thing that can refuse. Re-ran mutation 3 against that new test: RED, correctly. Restored → GREEN. |
+
+**Also verified:** the database-level trigger (mutation 1) rejects not just a
+raw `INSERT` but `appendMessage()` itself (the public API) — added as a
+second, explicit test, since the review's own wording ("a live message
+could be hung") is about the store's write path, not merely raw SQL.
+
+### F2 — HIGH: `leaf_on_tree` was untestable-by-omission
+
+**Fix:** added the exact fixture the review specified —
+`UPDATE conversation SET current_leaf_id = NULL` (legal: nullable column, no
+`NOT NULL`, and `conversation_leaf_fk` is `MATCH SIMPLE` so any-NULL
+vacuously satisfies it) — asserting `roots=1`, `missingParent=0`,
+`reachableN=total`, **`leafOnTree === false`, `pass === false`**.
+
+**Mutation:** deleted the `leaf_on_tree` conjunct from the `pass` formula in
+`0001_init.sql`. Ran the **full suite** (not just the new test) to confirm
+the review's own prediction: **53/54 passed — only the new F2 fixture went
+red**, every pre-existing fixture (including the standing 241/5/8 case)
+stayed green, because each of those fails via `roots` or `reachable_n`
+regardless. Restored → 54/54 GREEN.
+
+**Analysis result, not a test (as instructed):** `missing_parent = 0` is
+logically implied by `reachable_n = total` — a row whose `parent_id` names
+nothing can never enter the recursive walk (`down`), so it can never be
+counted in `reachable_n`; if it existed, `reachable_n < total` would already
+be showing it. No test isolates `missing_parent` alone for this reason, by
+design, not by oversight.
+
+### F3 — HIGH: `selectLeaf`'s whole rejecting path was untested
+
+The test that carried the name "a pointer move to an unreachable node"
+(`f4-rejection.test.ts`) used a UUID that exists nowhere — it tests
+`conversation_leaf_fk`'s membership check via a raw `UPDATE`, not
+`selectLeaf`'s own reachability predicate. Added three tests, all calling
+`selectLeaf` through the public `Store` API:
+
+| Test | Mutation | Result |
+|---|---|---|
+| target exists in-conversation but unreachable | Removed `!reachedRoot` from selectLeaf's rejection condition | RED → restored → GREEN |
+| target's path is tombstoned | Removed `tombstoned > 0` from the same condition | RED → restored → GREEN |
+| stale `rev` | Deleted `AND rev = $3` from the CAS's SQL *and* its bind param (a partial removal left an unused-placeholder SQL error rather than the silent-overwrite the review describes — corrected to drop the param too) | RED (silent overwrite: `Missing expected rejection`) → restored → GREEN |
+
+### F4 — HIGH: `selectLeaf` was TOCTOU
+
+**Fix:** `SELECT id FROM conversation WHERE id = $1 FOR UPDATE` as
+`selectLeaf`'s first statement, before its reachability predicate.
+`tombstoneSubtree` takes the identical lock (`SELECT current_leaf_id ...
+FOR UPDATE`) as ITS first statement, so the two serialize instead of
+interleaving — whichever gets there first forces the other to wait, and the
+one that waits re-evaluates against post-commit state once it proceeds.
+
+**Two interleaved-connection tests** (`concurrency.test.ts`), each using a
+raw second connection that hand-replicates the OTHER side's own locking
+discipline so the interleave is deterministic (no `pg_sleep`, no timing
+assumption — the test controls exactly when the lock is released):
+1. A raw connection holds the conversation lock; `selectLeaf` (real call)
+   fires concurrently targeting a node about to be tombstoned; the raw
+   connection applies the tombstone and releases the lock; `selectLeaf`
+   unblocks and must see the fresh state → `UnreachableLeafError`.
+2. A raw connection holds the lock; `tombstoneSubtree` (real call) fires
+   concurrently targeting a subtree the raw connection is about to move the
+   leaf into; the raw connection moves the leaf and releases; `tombstoneSubtree`
+   unblocks and must see the fresh `current_leaf_id` → `TombstoneRefusedError`.
+
+**Mutations:** removed `FOR UPDATE` from `selectLeaf`'s lock query → test 1
+RED (the leaf landed on the tombstoned node — `Missing expected rejection`)
+→ restored → GREEN. Removed `FOR UPDATE` from `tombstoneSubtree`'s lock
+query → test 2 RED (tombstoned the node the conversation now pointed at) →
+restored → GREEN.
+
+### F5 — MEDIUM-HIGH: `appendStreamDelta` was last-write-wins
+
+**Fix:** `message_enforce_state_machine`, a `BEFORE UPDATE` trigger (pure
+OLD-vs-NEW check — exactly what a trigger is for) enforcing
+`pending → streaming → complete|failed`, same-stage checkpoints allowed,
+terminal states (`complete`/`failed`) freezing both `state` and `content`
+permanently. Raises with a custom SQLSTATE (`ZL0ST`, chosen simply as a
+recognisable, non-reserved code); `updateMessageState` in `store.ts`
+recognises that code via the pg driver's `.code` and wraps it as a typed
+`IllegalStateTransitionError` — the ONE place `errors.ts`'s own "don't wrap
+constraint violations" rule is deliberately broken, by explicit instruction.
+
+**Tested both directions:** forward legal paths (`pending→streaming→complete`,
+`pending→complete` directly, `pending|streaming→failed`, repeated
+same-stage checkpoints) all succeed; the named attack (flip a `complete`
+message back to `streaming` and truncate content) is rejected with content
+verified byte-unchanged; `complete↔failed` crossing and any terminal content
+edit are rejected; a backward `streaming→pending` transition is rejected.
+
+**Mutation:** commented out `CREATE TRIGGER message_enforce_state_machine`.
+All three "attack-direction" tests went RED (`Missing expected rejection`);
+the "legal path" tests stayed green (correctly — nothing about a *missing*
+trigger makes a legal transition illegal). Restored → all 6 GREEN.
+
+### F6 — MEDIUM: `search_path` fell back to `public`
+
+**Fix:** dropped `,public` from `db.ts`'s `options: '-c search_path=...'`.
+
+**Test:** plants a decoy `public.message` table (simulating OpenWebUI's own
+tables), points a pool at a schema that exists but was never migrated, and
+asserts the query fails with `relation "message" does not exist` rather
+than silently resolving against the decoy.
+
+**Mutation:** restored `,public`. RED (`Missing expected rejection` — the
+query silently succeeded against the decoy instead of failing). Restored →
+GREEN.
+
+### F7 — MEDIUM: `dropSchema` was on the public API surface
+
+**Fix:** moved `dropSchema` out of `migrate.ts` into a new, clearly-marked
+test-only module (`testSupport.ts`); removed its re-export from `index.ts`;
+`tests/store/helpers/testdb.ts` now imports it directly from
+`testSupport.js`, bypassing the public surface entirely.
+
+**Test:** `import * as StoreIndex from '.../index.js'` and asserts
+`StoreIndex.dropSchema === undefined` — a runtime check, deliberately not a
+named import (which would be a *compile* error, failing the whole suite's
+build rather than this one test, and defeating the mutation methodology).
+
+**Mutation:** re-added `export { dropSchema } from './testSupport.js'` to
+`index.ts`. RED (`dropSchema` was an `AsyncFunction`, not `undefined`).
+Restored → GREEN.
+
+### F8 — unbounded recursive CTEs
+
+`audit_conversation` is left untouched, **with a new comment stating its
+cycle-safety property**: its `down` walk starts ONLY from `parent_id IS
+NULL` rows and moves parent→child; a cycle member necessarily has a
+non-null `parent_id`, so it can never be a root and can never be walked
+into from one. This was true and unstated before; it is now stated.
+
+**Fix:** `selectLeaf`'s `up` walk and `tombstoneSubtree`'s `subtree` walk
+(the two that move the OTHER direction from an arbitrary starting row) each
+gained a depth column and a bound, `WHERE ... AND walk.depth < $N` — the
+identical pattern `readChain` already uses. `MAX_WALK_DEPTH = 20_000`: no
+value was prescribed, so this lane chose 10× the 2,000-message scale bar —
+generous headroom for any legitimate conversation, small enough that even a
+full-bound walk against a 2-node cycle finishes in well under a second.
+
+**Tests (`f8-cycle-safety.test.ts`):**
+- A genuine 2-node cycle (`a.parent_id = b`, `b.parent_id = a`), built by
+  defeating `message_parent_fk` exactly like F5's other adversarial
+  fixtures (proving the guard first, inline, before dropping it) — disjoint
+  from any root, from F1's refusals, and from the current leaf, so this
+  isolates PURELY the depth bound. `selectLeaf` on it terminates and throws
+  `UnreachableLeafError`; `tombstoneSubtree` on it terminates and tombstones
+  exactly the 2 real rows (the alternating walk visits `(id, depth)` pairs
+  up to the bound, but the final `UPDATE ... WHERE id = ANY(...)` only ever
+  touches 2 distinct rows). Both assert `elapsedMs < 5000` as a coarse
+  "did not hang" signal.
+- **Safety net, not a substitute for the fix:** both cyclic tests run
+  against a DEDICATED connection with `statement_timeout=5000` (not the
+  shared pool), so if a future edit ever removes the depth bound again,
+  Postgres itself kills the query in 5s instead of the suite (or CI)
+  hanging indefinitely. This is exactly why the mutation below is safe to
+  run at all — see below.
+- A legitimate 2,000-message LINEAR chain (bulk-built, the §13 scale bar)
+  proves the bound does NOT falsely reject real depth.
+
+**Mutation — deliberately NOT "remove the bound entirely."** Per
+`FRONTEND_HANDOFF.md` §6 / this task's own "never block >120s" instruction,
+actually removing the depth bound and running it against a real cycle would
+mean betting the whole exercise on the `statement_timeout` safety net firing
+correctly on the very first try, with a genuinely open-ended recursive CTE
+in play if it didn't. Instead: **shrunk `MAX_WALK_DEPTH` from 20,000 to
+100** and ran the legitimate-2,000-message test. RED, exactly as predicted:
+`UnreachableLeafError: ... visited=100 reachedRoot=false`. This proves the
+constant is genuinely load-bearing (changing it changes real behaviour) and
+gives high confidence the *mechanism* (a `WHERE depth < $N` clause actually
+present in the query) is what the cyclic tests exercise, without ever
+running an unbounded query against cyclic data even once. Restored →
+GREEN, including both cyclic tests still finishing in ~100-250ms.
+
+### F9 — untried mutations, closed with tests
+
+Three, each a rule tested at one call site and missed at its sibling:
+
+| Property | Test | Mutation | Result |
+|---|---|---|---|
+| `conversation_leaf_fk` composite (`id, current_leaf_id`) — a conversation's leaf cannot name a real message of ANOTHER conversation | Points conv A's leaf at conv B's real root | Dropped `id,`, leaving a bare FK on `current_leaf_id -> message(id)` | RED → restored → GREEN |
+| `message.conv_id ... ON DELETE RESTRICT` | `DELETE FROM conversation` with a live message present | Changed to `ON DELETE CASCADE` | RED → restored → GREEN |
+| `typeof message.content === 'string'` end to end | Round-trips a scalar and an array wire shape through `appendMessage`, `readTail`, and a raw `pool.query` (bypassing `store.ts`'s own mapping, to isolate `db.ts`'s type-parser override specifically) | Commented out `types.setTypeParser(types.builtins.JSONB, ...)` in `db.ts` | RED (the auto-parsed scalar value lost its JSON quoting; an array wire shape would have failed the `typeof` check directly had the scalar assertion not failed first) → restored → GREEN |
+
+### F10 — tombstones, tested nowhere, now covered
+
+New file `tombstone.test.ts`. Covers: descendants tombstoned (siblings
+untouched); idempotency (a second call tombstones nothing new, does not
+error); `conv_id`-anchoring (tombstoning conversation A's subtree never
+touches conversation B's identically-shaped tree); plus F1's two refusals.
+
+**Two mutations run against the non-refusal properties:**
+- Broke the recursive term's join (`AND false` appended) so only the
+  target itself would ever be found, never descendants → "target and every
+  descendant are tombstoned" went RED (`1 !== 4`) → restored → GREEN.
+- Removed `AND deleted_at IS NULL` from the final `UPDATE`'s `WHERE` →
+  "is idempotent" went RED (second call reported `1`, not `0`, since it
+  re-touched the already-tombstoned rows) → restored → GREEN.
+
+**Analysis result, not a mutation, on the third property (`conv_id`-anchoring
+in both the anchor and the recursive term):** both clauses are already
+redundant with constraints that exist for other reasons — `message.id` is
+a PRIMARY KEY (globally unique), so the anchor's `conv_id = $1` cannot
+change which single row `id = $2` names; and `message_parent_fk` is
+composite on `(conv_id, parent_id)`, so a row in conversation B can
+*structurally never* have `parent_id` equal to an id belonging to
+conversation A. Under those two constraints, removing either `conv_id`
+filter from `tombstoneSubtree`'s SQL produces **no observable behavioural
+difference** for any state reachable through the legitimate API (or even
+through a raw `INSERT` that doesn't ALSO defeat `message_parent_fk`) — so no
+mutation of just this clause can be "watched to fail" without first
+constructing a cross-conversation parent link by defeating the FK, which is
+a materially different (and already F1/F8-style) adversarial fixture, not a
+one-line mutation of this property alone. The outcome-level test (tombstone
+A, assert B is untouched) still exists and still passes — it is real
+insurance against a future refactor that loosens either constraint — but,
+in the same spirit as F2's `missing_parent`/`reachable_n` finding above,
+this is recorded as an analysis result rather than forced into a synthetic
+mutation.
+
+### Disagreements with the prescribed fixes
+
+**None.** Every fix in F1–F10 was implementable as specified and, on
+reflection, is the right fix — nothing here is a case of "the brief asked
+for something wrong." Two judgment calls this lane made where the brief
+left specifics open, recorded for the next reader rather than left silent:
+
+- **`MAX_WALK_DEPTH = 20_000` (F8)** — no exact value was prescribed. Chosen
+  as 10× the 2,000-message scale bar: generous enough that no legitimate
+  conversation can ever approach it, small enough that a full-bound walk
+  against pathological cyclic data still completes in a small fraction of
+  a second (measured: both cyclic tests finish in 100–250ms).
+- **The F1 root-guard test's initial blind spot** (documented above under
+  F1, mutation 3a) is worth restating here because it is the kind of gap
+  this whole exercise exists to catch: a test with the RIGHT NAME and the
+  RIGHT ASSERTION can still fail to isolate the property it claims to test,
+  when a SECOND, unrelated check happens to fire for the same input. The
+  fix was not to weaken the root guard or the leaf-containment check —
+  both are independently correct and independently necessary (the root
+  guard is the ONLY defense once `current_leaf_id` is `NULL`, a state the
+  leaf-containment check explicitly does not police) — it was to build a
+  test input where only one of the two checks is even eligible to fire.
+
+### Final suite
+
+`docker compose -f docker-compose.tests.yml run --rm --build client-unit`:
+**54 passed, 0 failed, 0 skipped** (up from 24/24 before this pass). Every
+mutation above was restored from an in-memory/scratchpad-backed copy of the
+original file — never `git checkout` — and re-verified byte-identical
+against that backup before its GREEN re-run.

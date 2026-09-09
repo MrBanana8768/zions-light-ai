@@ -21,7 +21,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTestDb } from './helpers/testdb.js';
 import { uuidv7 } from '../../src/lib/server/store/uuid7.js';
-import { dropConstraint, dropIndex, insertChain, setCurrentLeaf } from './fixtures/adversarial.js';
+import { dropConstraint, dropIndex, insertChain, setCurrentLeaf, setCurrentLeafNull } from './fixtures/adversarial.js';
 
 test('F5: multi-root — a second independent root fails the audit via `roots` alone, nothing else', async () => {
 	const db = await createTestDb({ prefix: 'f5multiroot' });
@@ -394,6 +394,48 @@ test('F5 (chain_audit): the standing case — 241 messages, 5 roots, current lea
 			false,
 			'roots=5 alone must fail the audit — this is the exact property that would have made ' +
 				'2026-08-24 structurally impossible rather than merely detected after the fact'
+		);
+	} finally {
+		await db.close();
+	}
+});
+
+// Gate remediation F2: `leaf_on_tree` was untestable-by-omission — deleting
+// that conjunct from the `pass` formula (0001_init.sql) leaves the whole
+// suite green, because every OTHER pass=false fixture above also fails via
+// `roots` or `reachable_n`. This fixture isolates it: NULL is a legal value
+// for current_leaf_id per the column's own definition (nullable, no CHECK,
+// and conversation_leaf_fk is MATCH SIMPLE — a composite FK with any NULL
+// column is vacuously satisfied) — the migration's own comment
+// (0001_init.sql:28-29) already says a null leaf must read as
+// leaf_on_tree=false, but nothing exercised that until now.
+test('F2: current_leaf_id = NULL isolates leaf_on_tree as the ONLY failing signal', async () => {
+	const db = await createTestDb({ prefix: 'f2leafnull' });
+	try {
+		const userId = uuidv7();
+		const { conversation, root } = await db.store.createConversation({ userId, systemContent: '"sys"' });
+		await db.store.appendMessage({
+			convId: conversation.id,
+			parentId: root.id,
+			expectedRev: conversation.rev,
+			userId,
+			role: 'user',
+			content: '"hi"'
+		});
+
+		await setCurrentLeafNull(db, conversation.id);
+
+		const audit = await db.store.auditConversation(conversation.id);
+		assert.ok(audit);
+		assert.equal(audit!.roots, 1);
+		assert.equal(audit!.missingParent, 0);
+		assert.equal(audit!.reachableN, audit!.total, 'the tree itself is perfectly intact');
+		assert.equal(audit!.leaf, null);
+		assert.equal(audit!.leafOnTree, false, 'a NULL leaf must read as leaf_on_tree = false');
+		assert.equal(
+			audit!.pass,
+			false,
+			'roots=1, missing_parent=0 and reachable_n=total all hold — pass must fail SOLELY because leaf_on_tree is false'
 		);
 	} finally {
 		await db.close();

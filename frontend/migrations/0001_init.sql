@@ -131,6 +131,115 @@ CREATE TRIGGER message_forbid_structural_update
     FOR EACH ROW
     EXECUTE FUNCTION message_forbid_structural_update();
 
+-- Gate remediation F1 (docs/lanes/L1-store.md, "Gate remediation" section).
+-- The reviewed defect: append_message's CAS (store.ts) conditions on
+-- current_leaf_id and rev alone; it never reads the parent row's
+-- deleted_at, so a live message could be hung under a tombstoned parent
+-- (create -> append M1 -> tombstoneSubtree(M1) -> appendMessage(parent=M1)
+-- used to succeed). selectLeaf's OWN reachability walk is tombstone-aware
+-- (store.ts's `up` CTE), so the two code paths disagreed about what
+-- "reachable" means for the exact same data — audit_conversation reported
+-- PASS while selectLeaf threw UnreachableLeafError for the leaf the
+-- conversation was already pointing at.
+--
+-- Fixed at the one place that makes it impossible rather than merely
+-- discouraged: a message cannot be INSERTED with a live parent_id pointing
+-- at an already-tombstoned row, full stop, regardless of which code path
+-- (or which future code path) tries it. tombstone_subtree's own refusal to
+-- tombstone the current leaf's subtree (store.ts) is the other half — see
+-- that function's header comment — and together they make "a live message
+-- under a tombstoned parent" unreachable from any sequence of calls through
+-- the public Store API.
+CREATE OR REPLACE FUNCTION message_forbid_child_of_tombstone() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    parent_deleted_at timestamptz;
+BEGIN
+    IF NEW.parent_id IS NOT NULL THEN
+        SELECT deleted_at INTO parent_deleted_at
+        FROM message
+        WHERE conv_id = NEW.conv_id AND id = NEW.parent_id;
+        IF parent_deleted_at IS NOT NULL THEN
+            RAISE EXCEPTION
+                'message %: parent % is tombstoned (deleted_at=%) — a live message cannot be appended under a tombstoned parent',
+                NEW.id, NEW.parent_id, parent_deleted_at
+                USING ERRCODE = 'integrity_constraint_violation';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER message_forbid_child_of_tombstone
+    BEFORE INSERT ON message
+    FOR EACH ROW
+    EXECUTE FUNCTION message_forbid_child_of_tombstone();
+
+-- Gate remediation F5. FRONTEND_SPEC.md:617-619's "never last-write-wins on
+-- a blob ... it must never overwrite. It loses its own write, loudly" was
+-- enforced for the LEAF POINTER (rev CAS) but not for an individual
+-- message's own state: update_message_state took no expected-state
+-- precondition, so a lagging second writer could flip an already-`complete`
+-- message back to `streaming` and truncate its `content` — silently, and
+-- with it the turn's extracted text, drifting the compactor's tail_fp
+-- anchor (FRONTEND_PLAN.md §3.2).
+--
+-- This is a pure OLD-vs-NEW check with no cross-row lookup, which is
+-- exactly what a BEFORE UPDATE trigger is for (unlike F1's checks above,
+-- which need to inspect a role — no wait, this one needs no join at all).
+-- Allowed transitions: pending -> {streaming, complete, failed};
+-- streaming -> {complete, failed}; and a same-state update at any
+-- non-terminal stage (pending -> pending, streaming -> streaming — the
+-- repeated checkpoint writes append_stream_delta makes while a reply is
+-- still streaming). Once a message reaches complete or failed, EVERY
+-- column this trigger watches (state, content) is frozen: no further
+-- state change, including complete <-> failed, and no further content
+-- change. Reaching a terminal state is one-way.
+--
+-- ERRCODE 'ZL0ST' is a custom, non-standard SQLSTATE chosen so store.ts can
+-- recognise this specific violation (via the pg driver's `.code`) and wrap
+-- it as a typed IllegalStateTransitionError, per the gate remediation
+-- brief's explicit instruction — every OTHER trigger/constraint in this
+-- file is deliberately left to propagate as a raw, unwrapped pg error (see
+-- errors.ts's header comment for why); this is the one, named exception.
+CREATE OR REPLACE FUNCTION message_enforce_state_machine() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.state IN ('complete', 'failed') THEN
+        IF NEW.state IS DISTINCT FROM OLD.state OR NEW.content IS DISTINCT FROM OLD.content THEN
+            RAISE EXCEPTION
+                'message % is in terminal state % — state and content are frozen (attempted state=%, content changed=%)',
+                OLD.id, OLD.state, NEW.state, (NEW.content IS DISTINCT FROM OLD.content)
+                USING ERRCODE = 'ZL0ST';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    -- OLD.state is 'pending' or 'streaming' here.
+    IF NEW.state = OLD.state THEN
+        RETURN NEW; -- a same-stage checkpoint write, e.g. streaming -> streaming
+    END IF;
+
+    IF OLD.state = 'pending' AND NEW.state IN ('streaming', 'complete', 'failed') THEN
+        RETURN NEW;
+    END IF;
+
+    IF OLD.state = 'streaming' AND NEW.state IN ('complete', 'failed') THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION
+        'illegal message state transition % -> % for message % — the only forward path is pending -> streaming -> complete|failed',
+        OLD.state, NEW.state, OLD.id
+        USING ERRCODE = 'ZL0ST';
+END;
+$$;
+
+CREATE TRIGGER message_enforce_state_machine
+    BEFORE UPDATE ON message
+    FOR EACH ROW
+    EXECUTE FUNCTION message_enforce_state_machine();
+
 -- audit_conversation(conv_id) — FRONTEND_SPEC.md §11.4 / FRONTEND_PLAN.md
 -- §3.1: "one function, one recursive query, shared by the load path, the
 -- tests, the importer and the CLI." A single SQL function (not plpgsql) so
@@ -169,6 +278,23 @@ CREATE TRIGGER message_forbid_structural_update
 -- PASS — on 2026-08-24 a deepest=208 read as healthy while
 -- chain_from_current=8; the fix is that this function never lets either
 -- number near the boolean.
+-- Gate remediation F8 — cycle safety, stated because it is real and was
+-- previously unstated. This function's recursive CTE (`down`) is provably
+-- cycle-safe WITHOUT a depth bound or a CYCLE clause, unlike select_leaf's
+-- `up` walk and tombstone_subtree's `subtree` walk in store.ts (both fixed
+-- to carry an explicit depth bound, see those call sites): `down` starts
+-- ONLY from rows with parent_id IS NULL and moves strictly parent -> child
+-- from there. A row that is part of a cycle necessarily has a non-null
+-- parent_id (every member of a cycle points at another member), so no
+-- cycle member can ever be a root, and therefore no cycle member can ever
+-- be visited by a walk that only ever starts at roots and only ever moves
+-- downward from an already-visited row to ITS child. A human repairing the
+-- chain from outside the app (§11.5) could still construct a cycle among
+-- non-root rows — this walk simply never reaches it, in either direction:
+-- it can't start there, and it can't be walked into from a root, because a
+-- cycle has no root of its own. Nothing about this function needed to
+-- change; this comment exists so the property is asserted, not merely
+-- true by accident.
 CREATE OR REPLACE FUNCTION audit_conversation(p_conv_id uuid)
 RETURNS TABLE (
     conv_id             uuid,

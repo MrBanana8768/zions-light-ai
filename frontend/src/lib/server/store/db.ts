@@ -82,6 +82,18 @@ export function createPool(config: StoreConfig = {}): pg.Pool {
 		// libpq startup-packet options; `-c search_path=...` is the
 		// standard way to pin search_path per-connection without every
 		// checkout having to issue its own `SET search_path` round trip.
-		options: `-c search_path=${schema},public`
+		//
+		// Gate remediation F6: NO trailing `,public`. Production points this
+		// at the `openwebui` database, whose OWN tables live in `public`
+		// (FRONTEND_PLAN.md §3.1 — the `client` schema sits alongside them,
+		// not instead of them). With `,public` in the path, a missing or
+		// half-applied migration does not fail: `INSERT INTO message`
+		// silently resolves to whatever `public.message` happens to be
+		// (nothing, today; anything, if OpenWebUI or a later migration ever
+		// adds one) instead of raising — exactly the silent-corruption
+		// class §11 is written against. A single-schema search_path makes a
+		// missing migration an immediate `relation "message" does not
+		// exist` — see tests/store/search-path.test.ts.
+		options: `-c search_path=${schema}`
 	});
 }

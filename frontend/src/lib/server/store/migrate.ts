@@ -85,9 +85,7 @@ export async function applyMigrations(pool: Pool, opts: MigrateOptions): Promise
 	return { applied, alreadyApplied };
 }
 
-/** Drops the schema and everything in it. Test teardown only — never call
- *  this against a schema you did not create for a single test run. */
-export async function dropSchema(pool: Pool, schema: string): Promise<void> {
-	assertValidIdentifier(schema, 'schema');
-	await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
-}
+// Gate remediation F7: dropSchema used to live here and be re-exported from
+// index.ts. It moved to ./testSupport.ts, which is not part of the public
+// index — see that file's header and index.ts's comment at the export it
+// used to have.

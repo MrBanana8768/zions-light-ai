@@ -78,3 +78,12 @@ export async function insertChain(
 export async function setCurrentLeaf(db: TestDb, convId: string, leafId: string): Promise<void> {
 	await db.pool.query(`UPDATE conversation SET current_leaf_id = $1 WHERE id = $2`, [leafId, convId]);
 }
+
+/** Points current_leaf_id at NULL directly. Legal per the column's own
+ *  definition (nullable; conversation_leaf_fk is a composite FK, and a
+ *  MATCH SIMPLE composite FK with any NULL member is vacuously satisfied —
+ *  Postgres never even evaluates it), and selectLeaf() could never produce
+ *  this state on its own (F2, docs/lanes/L1-store.md). */
+export async function setCurrentLeafNull(db: TestDb, convId: string): Promise<void> {
+	await db.pool.query(`UPDATE conversation SET current_leaf_id = NULL WHERE id = $1`, [convId]);
+}

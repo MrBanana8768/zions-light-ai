@@ -11,6 +11,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTestDb } from './helpers/testdb.js';
 import { uuidv7 } from '../../src/lib/server/store/uuid7.js';
+import { dropConstraint } from './fixtures/adversarial.js';
 
 async function seedConversation(db: Awaited<ReturnType<typeof createTestDb>>) {
 	const userId = uuidv7();
@@ -250,6 +251,173 @@ test('F4 (bonus, via the Store API): appendMessage against a stale/foreign paren
 					userId,
 					role: 'user',
 					content: '"hi"'
+				}),
+			/StaleWriteError/
+		);
+	} finally {
+		await db.close();
+	}
+});
+
+// Gate remediation F3. §11.4 mandates a test for "a pointer move to an
+// unreachable node." The test ALREADY carrying that name above
+// ('F4: a pointer move to an unreachable (nonexistent/foreign) node...')
+// uses a UUID that exists NOWHERE in the table — it exercises
+// conversation_leaf_fk's membership check (a raw SQL UPDATE bypassing
+// selectLeaf entirely), not selectLeaf's own reachability predicate. The
+// three tests below are what was actually missing: selectLeaf(), called
+// through the public Store API, rejecting each of the three ways a target
+// can fail reachability without failing existence.
+
+test('F3: selectLeaf rejects a node that EXISTS in this conversation but is unreachable from the root (UnreachableLeafError)', async () => {
+	const db = await createTestDb({ prefix: 'f3unreachable' });
+	try {
+		const userId = uuidv7();
+		const { conversation } = await db.store.createConversation({ userId, systemContent: '"sys"' });
+
+		// A two-message "phantom" chain, real rows, never connected to any
+		// root (message_parent_fk would refuse this — proven inline, as
+		// F5's identical fixture does — before it is dropped).
+		const danglingParent = uuidv7();
+		await assert.rejects(
+			() =>
+				db.pool.query(
+					`INSERT INTO message (id, conv_id, parent_id, user_id, role, content)
+					 VALUES ($1,$2,$3,$4,'user','"b"'::jsonb)`,
+					[uuidv7(), conversation.id, danglingParent, userId]
+				),
+			/message_parent_fk/
+		);
+		await dropConstraint(db, 'message', 'message_parent_fk');
+
+		const bId = uuidv7();
+		await db.pool.query(
+			`INSERT INTO message (id, conv_id, parent_id, user_id, role, content)
+			 VALUES ($1,$2,$3,$4,'user','"b"'::jsonb)`,
+			[bId, conversation.id, danglingParent, userId]
+		);
+		const aId = uuidv7();
+		await db.pool.query(
+			`INSERT INTO message (id, conv_id, parent_id, user_id, role, content)
+			 VALUES ($1,$2,$3,$4,'user','"a"'::jsonb)`,
+			[aId, conversation.id, bId, userId]
+		);
+
+		// aId is a REAL row of THIS conversation — existence is not in
+		// question. It simply cannot reach a root. selectLeaf, called
+		// through the public API, must reject it.
+		await assert.rejects(
+			() =>
+				db.store.selectLeaf({
+					convId: conversation.id,
+					targetMessageId: aId,
+					expectedRev: conversation.rev
+				}),
+			/UnreachableLeafError/
+		);
+
+		// And the conversation's own pointer must be untouched by the
+		// rejected attempt.
+		const after = await db.store.getConversation(conversation.id);
+		assert.equal(after!.rev, conversation.rev);
+	} finally {
+		await db.close();
+	}
+});
+
+test('F3: selectLeaf rejects a node whose path is tombstoned (UnreachableLeafError)', async () => {
+	const db = await createTestDb({ prefix: 'f3tombstoned' });
+	try {
+		const userId = uuidv7();
+		const { conversation, root } = await db.store.createConversation({ userId, systemContent: '"sys"' });
+
+		// root -> a (stays the current leaf) ; root -> b2 -> c (a sibling
+		// branch, never current). b2 is appended from root, so it needs the
+		// leaf back at root momentarily; c then becomes leaf briefly before
+		// being moved back off, so it is a real, live, ordinary sibling
+		// chain by the time it is tombstoned below — nothing about how it
+		// was built is contrived.
+		const { message: a, rev: revA } = await db.store.appendMessage({
+			convId: conversation.id,
+			parentId: root.id,
+			expectedRev: conversation.rev,
+			userId,
+			role: 'user',
+			content: '"a"'
+		});
+		const { rev: revAtRoot } = await db.store.selectLeaf({
+			convId: conversation.id,
+			targetMessageId: root.id,
+			expectedRev: revA
+		});
+		const { message: b2, rev: revB2 } = await db.store.appendMessage({
+			convId: conversation.id,
+			parentId: root.id,
+			expectedRev: revAtRoot,
+			userId,
+			role: 'user',
+			content: '"b2"'
+		});
+		const { message: c, rev: revC } = await db.store.appendMessage({
+			convId: conversation.id,
+			parentId: b2.id,
+			expectedRev: revB2,
+			userId,
+			role: 'user',
+			content: '"c"'
+		});
+
+		// Move the leaf back to `a` before tombstoning b2's branch —
+		// tombstoneSubtree refuses a subtree containing the current leaf
+		// (F1), and b2/c must not be it when that happens.
+		await db.store.selectLeaf({ convId: conversation.id, targetMessageId: a.id, expectedRev: revC });
+
+		await db.store.tombstoneSubtree({ convId: conversation.id, rootMessageId: b2.id });
+
+		// c's own path (through b2) is now tombstoned. selectLeaf must
+		// reject it, even though c itself is a real, existing row.
+		const convAfterTombstone = (await db.store.getConversation(conversation.id))!;
+		await assert.rejects(
+			() =>
+				db.store.selectLeaf({
+					convId: conversation.id,
+					targetMessageId: c.id,
+					expectedRev: convAfterTombstone.rev
+				}),
+			/UnreachableLeafError/
+		);
+	} finally {
+		await db.close();
+	}
+});
+
+test('F3: selectLeaf rejects a stale rev even when the target is otherwise perfectly reachable (StaleWriteError) — proves the CAS is load-bearing', async () => {
+	const db = await createTestDb({ prefix: 'f3stalerev' });
+	try {
+		const userId = uuidv7();
+		const { conversation, root } = await db.store.createConversation({ userId, systemContent: '"sys"' });
+		const staleRev = conversation.rev; // '0', captured before the append below
+
+		// Advance the conversation for real — rev is now '1'.
+		const { message: a } = await db.store.appendMessage({
+			convId: conversation.id,
+			parentId: root.id,
+			expectedRev: conversation.rev,
+			userId,
+			role: 'user',
+			content: '"a"'
+		});
+
+		// `a` is perfectly reachable (it IS the current leaf). The only
+		// thing wrong with this call is the caller's stale rev — this is
+		// exactly what deleting `AND rev = $3` from selectLeaf's own CAS
+		// (store.ts) would make silently succeed instead.
+		await assert.rejects(
+			() =>
+				db.store.selectLeaf({
+					convId: conversation.id,
+					targetMessageId: a.id,
+					expectedRev: staleRev
 				}),
 			/StaleWriteError/
 		);

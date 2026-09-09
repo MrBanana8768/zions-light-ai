@@ -21,7 +21,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type pg from 'pg';
 import { createPool } from '../../../src/lib/server/store/db.js';
-import { applyMigrations, dropSchema } from '../../../src/lib/server/store/migrate.js';
+import { applyMigrations } from '../../../src/lib/server/store/migrate.js';
+// Gate remediation F7: dropSchema is test-only and deliberately NOT part of
+// the store's public index — imported directly from its own module path.
+import { dropSchema } from '../../../src/lib/server/store/testSupport.js';
 import { Store } from '../../../src/lib/server/store/store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

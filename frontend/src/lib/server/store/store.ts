@@ -19,8 +19,47 @@
 
 import type { Pool, PoolClient } from 'pg';
 import { uuidv7 } from './uuid7.js';
-import { StaleWriteError, UnreachableLeafError, NotFoundError } from './errors.js';
+import {
+	StaleWriteError,
+	UnreachableLeafError,
+	NotFoundError,
+	TombstoneRefusedError,
+	IllegalStateTransitionError
+} from './errors.js';
 import type { Conversation, Message, AuditResult, Role, MessageState, ReadPage } from './types.js';
+
+// Gate remediation F8: an explicit depth bound for the two recursive walks
+// in this file that move against the parent-to-child direction from an
+// arbitrary starting row (selectLeaf's `up` walk; tombstoneSubtree's
+// `subtree` walk) rather than from a proven root (audit_conversation's
+// `down` walk — see that function's own comment in the migration SQL for
+// why it needs no bound). Neither walk has any structural immunity to a
+// cycle: §11.5 grants a human repairing the chain from outside the app
+// exactly the freedom to construct one, and an unbounded `UNION ALL`
+// recursive CTE against cyclic data loops until the connection dies,
+// holding an open transaction the whole time. This mirrors the bound
+// readChain already applies (`chain.depth + 1 < $3`, using the caller's
+// own page-size limit) — these two walks have no natural caller-supplied
+// limit, so the bound is a constant instead, set far above any realistic
+// conversation depth (the 2,000-message scale bar) so it can only ever
+// fire on a genuine cycle, never on legitimate depth.
+const MAX_WALK_DEPTH = 20_000;
+
+// Gate remediation F5: the custom SQLSTATE the migration's
+// message_enforce_state_machine trigger raises with. Matched against the
+// `pg` driver's `.code` so updateMessageState can wrap that ONE violation
+// as a typed IllegalStateTransitionError — every other constraint/trigger
+// in this schema is deliberately left unwrapped (see errors.ts).
+const STATE_MACHINE_SQLSTATE = 'ZL0ST';
+
+function isPgErrorWithCode(err: unknown, code: string): err is { code: string; message: string } {
+	return (
+		typeof err === 'object' &&
+		err !== null &&
+		'code' in err &&
+		(err as { code?: unknown }).code === code
+	);
+}
 
 function rowToMessage(row: Record<string, unknown>): Message {
 	return {
@@ -176,7 +215,19 @@ export class Store {
 	 *  anyway) and never moves the leaf pointer. Used both for "on failure,
 	 *  the user turn is retained in place, marked failed" (§4.1) and as the
 	 *  building block append_stream_delta below is a thin, named wrapper
-	 *  around. */
+	 *  around.
+	 *
+	 *  Gate remediation F5: the transition itself (pending -> streaming ->
+	 *  complete|failed, terminal states frozen) is enforced by the
+	 *  migration's message_enforce_state_machine trigger, not by this
+	 *  function — this function's own job is only to recognise that
+	 *  trigger's violation (by its distinguishing SQLSTATE) and surface it
+	 *  as a typed IllegalStateTransitionError instead of a raw driver
+	 *  exception. A lagging second writer that tries to flip an already-
+	 *  `complete` message back to `streaming` (or change its content once
+	 *  terminal) loses this call loudly, with a typed error, exactly as
+	 *  §11.3's "it loses its own write, loudly" already requires for the
+	 *  leaf pointer. */
 	async updateMessageState(params: {
 		convId: string;
 		messageId: string;
@@ -194,14 +245,21 @@ export class Store {
 			values.push(params.error);
 			sets.push(`error = $${values.length}::jsonb`);
 		}
-		const { rows, rowCount } = await this.pool.query(
-			`UPDATE message SET ${sets.join(', ')} WHERE conv_id = $1 AND id = $2 RETURNING *`,
-			values
-		);
-		if (rowCount !== 1) {
-			throw new NotFoundError(`message ${params.messageId} not found in conversation ${params.convId}`);
+		try {
+			const { rows, rowCount } = await this.pool.query(
+				`UPDATE message SET ${sets.join(', ')} WHERE conv_id = $1 AND id = $2 RETURNING *`,
+				values
+			);
+			if (rowCount !== 1) {
+				throw new NotFoundError(`message ${params.messageId} not found in conversation ${params.convId}`);
+			}
+			return rowToMessage(rows[0]);
+		} catch (err) {
+			if (isPgErrorWithCode(err, STATE_MACHINE_SQLSTATE)) {
+				throw new IllegalStateTransitionError(err.message);
+			}
+			throw err;
 		}
-		return rowToMessage(rows[0]);
 	}
 
 	/** Decision 6 (FRONTEND_PLAN.md §3.1): the row is inserted ONCE at
@@ -237,7 +295,21 @@ export class Store {
 	 *  does not exist, cannot reach a root, or any node on that path is
 	 *  tombstoned) and a rev CAS, both inside one transaction, matching
 	 *  FRONTEND_SPEC.md §11.3 exactly. This is the ONLY other path (besides
-	 *  appendMessage's CAS) that may move current_leaf_id. */
+	 *  appendMessage's CAS) that may move current_leaf_id.
+	 *
+	 *  Gate remediation F4 (TOCTOU): the reachability predicate below is a
+	 *  plain SELECT under READ COMMITTED, and tombstone_subtree bumps no
+	 *  `rev` and (before this fix) took no lock on `conversation` — so a
+	 *  predicate that ran clean, followed by a CAS that only re-checks
+	 *  `rev`, could still land the leaf inside a subtree a concurrent
+	 *  tombstone_subtree hid in the gap between the two. `SELECT ... FOR
+	 *  UPDATE` on the conversation row, taken FIRST — before the predicate
+	 *  even runs — closes that gap: tombstone_subtree takes the identical
+	 *  lock as its own first statement (see below), so whichever of the
+	 *  two gets there first forces the other to wait, and the one that
+	 *  waits re-evaluates against the FRESH, post-commit state once it
+	 *  proceeds. Neither call can now act on a predicate computed against
+	 *  data the other has since changed. */
 	async selectLeaf(params: {
 		convId: string;
 		targetMessageId: string;
@@ -246,19 +318,27 @@ export class Store {
 		const client = await this.pool.connect();
 		try {
 			await client.query('BEGIN');
+			const lockRes = await client.query(
+				'SELECT id FROM conversation WHERE id = $1 FOR UPDATE',
+				[params.convId]
+			);
+			if (lockRes.rowCount !== 1) {
+				await rollbackQuietly(client);
+				throw new NotFoundError(`conversation ${params.convId} not found`);
+			}
 			const { rows } = await client.query(
-				`WITH RECURSIVE up(id, parent_id, deleted_at) AS (
-					SELECT id, parent_id, deleted_at FROM message WHERE conv_id = $1 AND id = $2
+				`WITH RECURSIVE up(id, parent_id, deleted_at, depth) AS (
+					SELECT id, parent_id, deleted_at, 1 FROM message WHERE conv_id = $1 AND id = $2
 					UNION ALL
-					SELECT m.id, m.parent_id, m.deleted_at
+					SELECT m.id, m.parent_id, m.deleted_at, up.depth + 1
 					FROM message m JOIN up ON m.id = up.parent_id
-					WHERE m.conv_id = $1
+					WHERE m.conv_id = $1 AND up.depth < $3
 				 )
 				 SELECT count(*) AS visited,
 				        count(*) FILTER (WHERE deleted_at IS NOT NULL) AS tombstoned,
 				        bool_or(parent_id IS NULL) AS reached_root
 				 FROM up`,
-				[params.convId, params.targetMessageId]
+				[params.convId, params.targetMessageId, MAX_WALK_DEPTH]
 			);
 			const visited = Number(rows[0].visited);
 			const tombstoned = Number(rows[0].tombstoned);
@@ -285,7 +365,11 @@ export class Store {
 			await client.query('COMMIT');
 			return { rev: String(casRes.rows[0].rev) };
 		} catch (err) {
-			if (!(err instanceof StaleWriteError) && !(err instanceof UnreachableLeafError)) {
+			if (
+				!(err instanceof StaleWriteError) &&
+				!(err instanceof UnreachableLeafError) &&
+				!(err instanceof NotFoundError)
+			) {
 				await rollbackQuietly(client);
 			}
 			throw err;
@@ -295,28 +379,108 @@ export class Store {
 	}
 
 	/** Subtree-wide tombstone. Sets deleted_at on the target AND every
-	 *  descendant in one statement (a recursive walk down from the target),
-	 *  so hiding a message can never leave its children reachable-but-
-	 *  orphaned-looking or, worse, visibly dangling in a render while their
-	 *  parent is gone from view (FRONTEND_SPEC.md §11.1). Does not touch
-	 *  current_leaf_id — if the current leaf is inside the tombstoned
-	 *  subtree, the conversation now legitimately fails leaf_on_tree's
-	 *  spirit (the leaf points at now-hidden content) until an explicit
-	 *  selectLeaf() moves it elsewhere; this store does not do that move
-	 *  silently, per D6. */
+	 *  descendant in one statement (a bounded recursive walk down from the
+	 *  target), so hiding a message can never leave its children
+	 *  reachable-but-orphaned-looking or, worse, visibly dangling in a
+	 *  render while their parent is gone from view (FRONTEND_SPEC.md
+	 *  §11.1).
+	 *
+	 *  Gate remediation F1: refuses outright — before touching any row —
+	 *  in two cases, both via a typed TombstoneRefusedError:
+	 *    1. The target IS the conversation's synthetic root. Tombstoning it
+	 *       would hide the entire conversation while audit_conversation
+	 *       still reports `pass = true` (roots/reachable_n/leaf_on_tree are
+	 *       all about STRUCTURE, not visibility — a fully-tombstoned tree
+	 *       is still structurally intact).
+	 *    2. The conversation's current `current_leaf_id` lies inside the
+	 *       subtree about to be tombstoned. The caller must select_leaf()
+	 *       to a different leaf FIRST. This is what makes "the current
+	 *       leaf is never tombstoned" true BY CONSTRUCTION, rather than a
+	 *       property the caller was merely trusted to preserve — an
+	 *       earlier version of this comment conceded the old behaviour was
+	 *       wrong "in spirit" (the leaf could end up pointing at hidden
+	 *       content); that state is no longer reachable, so there is
+	 *       nothing left to concede.
+	 *
+	 *  Gate remediation F4: takes `SELECT ... FOR UPDATE` on the
+	 *  conversation row as its FIRST statement — the identical lock
+	 *  select_leaf takes — so the two serialize. Without this, a
+	 *  concurrent select_leaf could move current_leaf_id into this exact
+	 *  subtree in the gap between this function reading current_leaf_id
+	 *  and applying the UPDATE below, and this function would tombstone
+	 *  the node the conversation was, by the time of that UPDATE,
+	 *  genuinely pointing at. See select_leaf's own comment for the other
+	 *  half of this.
+	 *
+	 *  Gate remediation F8: the downward walk carries an explicit depth
+	 *  bound (MAX_WALK_DEPTH), matching select_leaf's `up` walk and
+	 *  readChain's existing pattern — see MAX_WALK_DEPTH's own comment. */
 	async tombstoneSubtree(params: { convId: string; rootMessageId: string }): Promise<number> {
-		const { rowCount } = await this.pool.query(
-			`WITH RECURSIVE subtree(id) AS (
-				SELECT id FROM message WHERE conv_id = $1 AND id = $2
-				UNION ALL
-				SELECT m.id FROM message m JOIN subtree ON m.parent_id = subtree.id
-				WHERE m.conv_id = $1
-			 )
-			 UPDATE message SET deleted_at = now(), updated_at = now()
-			 WHERE conv_id = $1 AND id IN (SELECT id FROM subtree) AND deleted_at IS NULL`,
-			[params.convId, params.rootMessageId]
-		);
-		return rowCount ?? 0;
+		const client = await this.pool.connect();
+		try {
+			await client.query('BEGIN');
+			const lockRes = await client.query(
+				'SELECT current_leaf_id FROM conversation WHERE id = $1 FOR UPDATE',
+				[params.convId]
+			);
+			if (lockRes.rowCount !== 1) {
+				await rollbackQuietly(client);
+				throw new NotFoundError(`conversation ${params.convId} not found`);
+			}
+			const currentLeafId = (lockRes.rows[0].current_leaf_id as string | null) ?? null;
+
+			const targetRes = await client.query(
+				'SELECT parent_id FROM message WHERE conv_id = $1 AND id = $2',
+				[params.convId, params.rootMessageId]
+			);
+			if (targetRes.rowCount !== 1) {
+				await rollbackQuietly(client);
+				throw new NotFoundError(
+					`message ${params.rootMessageId} not found in conversation ${params.convId}`
+				);
+			}
+			if (targetRes.rows[0].parent_id === null) {
+				await rollbackQuietly(client);
+				throw new TombstoneRefusedError(
+					`refusing to tombstone ${params.rootMessageId}: it is the synthetic root of conversation ${params.convId} — tombstoning it would hide the entire conversation`
+				);
+			}
+
+			const subtreeRes = await client.query(
+				`WITH RECURSIVE subtree(id, depth) AS (
+					SELECT id, 1 FROM message WHERE conv_id = $1 AND id = $2
+					UNION ALL
+					SELECT m.id, subtree.depth + 1
+					FROM message m JOIN subtree ON m.parent_id = subtree.id
+					WHERE m.conv_id = $1 AND subtree.depth < $3
+				 )
+				 SELECT id FROM subtree`,
+				[params.convId, params.rootMessageId, MAX_WALK_DEPTH]
+			);
+			const subtreeIds: string[] = subtreeRes.rows.map((r) => r.id as string);
+
+			if (currentLeafId !== null && subtreeIds.includes(currentLeafId)) {
+				await rollbackQuietly(client);
+				throw new TombstoneRefusedError(
+					`refusing to tombstone ${params.rootMessageId}: the conversation's current_leaf_id (${currentLeafId}) is inside this subtree — select_leaf to a different leaf first`
+				);
+			}
+
+			const updateRes = await client.query(
+				`UPDATE message SET deleted_at = now(), updated_at = now()
+				 WHERE conv_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL`,
+				[params.convId, subtreeIds]
+			);
+			await client.query('COMMIT');
+			return updateRes.rowCount ?? 0;
+		} catch (err) {
+			if (!(err instanceof TombstoneRefusedError) && !(err instanceof NotFoundError)) {
+				await rollbackQuietly(client);
+			}
+			throw err;
+		} finally {
+			client.release();
+		}
 	}
 
 	// ---- reads -----------------------------------------------------------
