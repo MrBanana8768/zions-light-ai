@@ -303,15 +303,18 @@ ENV PATH="/opt/node/bin:${PATH}"
 # frontend/src/lib/styles/tokens.css's header and docs/lanes/L0-scaffold.md)
 # so there is no private-registry credential to fail to have, either.
 #
-# Verified by this lane: a SvelteKit + adapter-node production build
-# bundles everything the running server needs INTO build/ — tested by
-# deleting node_modules entirely after `npm run build` and confirming
-# `node build/index.js` still serves. So, in the SAME layer: install,
-# build, then delete node_modules/the lockfile/source/config — never
-# shipped — mirroring the venvs' install+strip+clean pattern above with
-# npm's equivalent of "keep only what runtime needs" (there is no npm
-# analogue of `strip --strip-unneeded`, so "delete node_modules outright"
-# is that step here).
+# `npm prune --omit=dev`, NOT `rm -rf node_modules`. An earlier revision of
+# this hunk deleted node_modules outright, on the then-true premise that
+# package.json had ZERO `dependencies` - adapter-node bundles the SvelteKit
+# server into build/, so nothing was left to resolve at runtime. That premise
+# died the moment the store lane added `pg`, and the failure it would have
+# caused is the shape this project keeps repeating: the image still BUILDS,
+# BUILD GUARD 4 still passes because build/index.js exists, and the client
+# dies at import time on the pod. Pruning is correct whether or not a given
+# dependency ends up bundled, costs a few MB, and cannot rot when the next
+# dependency is added. It is the faithful analogue of the venvs'
+# install+strip+clean above: keep what runtime needs, drop what only the
+# build needed.
 # =============================================================================
 COPY frontend/package.json frontend/package-lock.json frontend/.npmrc /opt/client/
 RUN cd /opt/client && npm ci
@@ -320,7 +323,8 @@ COPY frontend/src /opt/client/src
 COPY frontend/static /opt/client/static
 RUN cd /opt/client && \
     npm run build && \
-    rm -rf node_modules package-lock.json src static .svelte-kit \
+    npm prune --omit=dev && \
+    rm -rf package-lock.json src static .svelte-kit \
         vite.config.ts tsconfig.json && \
     npm cache clean --force && \
     rm -rf /root/.npm /root/.cache /tmp/* /var/tmp/*
@@ -336,6 +340,7 @@ RUN test -x /opt/node/bin/node || \
       { echo "BUILD GUARD 4 FAILED: /opt/node/bin/node missing — supervisord.conf's [program:client] command= references this path directly."; exit 1; }; \
     test -f /opt/client/build/index.js || \
       { echo "BUILD GUARD 4 FAILED: /opt/client/build/index.js missing — the client build did not produce adapter-node's entrypoint where [program:client] expects it."; exit 1; }; \
+    /opt/node/bin/node -e 'const fs=require("fs"),p=require("/opt/client/package.json"),d=Object.keys(p.dependencies||{});const miss=d.filter(n=>!fs.existsSync("/opt/client/node_modules/"+n));if(miss.length){console.error("BUILD GUARD 4 FAILED: runtime dependencies missing from node_modules after prune: "+miss.join(", ")+". The client dies at import time on the pod even though this image built cleanly.");process.exit(1)}console.log("build guard: "+d.length+" runtime dependency(ies) survived the prune")' && \
     echo "build guard: the client binary and its built server both exist"
 
 # Compactor sources copied AFTER the expensive install layer so editing
