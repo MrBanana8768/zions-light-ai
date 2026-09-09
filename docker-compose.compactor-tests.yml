@@ -1,0 +1,40 @@
+# The L2 transport lane's unit suite (frontend/tests/compactor/**), on
+# Linux, per FRONTEND_HANDOFF.md §6 / FRONTEND_PLAN.md §6: "tests run on
+# Linux, in Docker. A Windows host run is a development convenience, not
+# evidence."
+#
+# A SEPARATE compose file from docker-compose.tests.yml on purpose — this
+# lane's brief is explicit that docker-compose.tests.yml is not-to-touch
+# (it belongs to L1/the store lane's own client-unit service, and to the
+# project-wide unit-tests service). FRONTEND_PLAN.md §6 says "add a
+# service or extend the existing client-unit pattern" — this file adds a
+# NEW service that follows that pattern's SHAPE (the same read-only
+# bind-mount-to-scratch-tree Dockerfile convention as
+# testfixtures/client-unit and testfixtures/unit-suite) without editing
+# either of the files that pattern already lives in.
+#
+# UNLIKE client-unit, this suite needs no Postgres sidecar: F8's send-set
+# gate is tested against an in-memory fake ChainReader (this lane's own
+# tests/compactor/helpers/fakeChain.ts — the real Store's constraints are
+# L1's suite to prove), and the compactor's HTTP surface is mocked via an
+# injected fetchImpl (tests/compactor/transport.test.ts) rather than a
+# live backend. So `network_mode: none` genuinely applies here, unlike
+# client-unit's own documented tension with that setting.
+#
+#   docker compose -f docker-compose.compactor-tests.yml run --rm --build compactor-unit
+#
+#   # one suite, by substring (maps to node's --test-name-pattern):
+#   docker compose -f docker-compose.compactor-tests.yml run --rm compactor-unit --only fingerprint
+
+services:
+  compactor-unit:
+    build:
+      context: .
+      dockerfile: testfixtures/compactor-unit/Dockerfile
+    container_name: zla-compactor-unit-tests
+    volumes:
+      - ./:/src:ro
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    network_mode: none

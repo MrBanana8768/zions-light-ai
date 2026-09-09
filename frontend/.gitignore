@@ -24,3 +24,6 @@ vite.config.ts.timestamp-*
 
 # store-test compile output
 /dist-store-tests
+
+# compactor-test (L2 transport) compile output
+/dist-compactor-tests

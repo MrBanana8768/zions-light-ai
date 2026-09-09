@@ -352,6 +352,43 @@ What follows:
   is fingerprinted through `_image_only_marker`, not as the empty string its
   request shape reduces to** — mirror that, or every image turn reads as a new turn.
 
+#### `window_intent` is not a bare `min(N, turns_on_chain)` — the parity correction
+
+FRONTEND_SPEC §4 rule 2 and an earlier draft of this section both wrote
+`window_intent = min(N, turns_on_the_current_chain)`, then required the realized
+send set to equal it exactly. **Those two statements are incompatible with the
+alternation rule, and together they refuse almost every send.**
+
+At gate time the chain from the leaf is user-first, strictly alternating, and
+ends on the turn she just typed — so `turns_on_chain` is always **odd**. N = 60
+is **even**. So whenever the conversation is longer than the window,
+`turns_on_chain - N` is `odd - even = odd`, which indexes an **assistant** turn —
+and the rule that the first kept turn must be a `user` turn then trims exactly
+one. Realized 59, intent 60, mismatch, `context_truncated`. On every message,
+forever, in any conversation past 60 turns.
+
+The fix is to fold the alternation adjustment into the intent's own definition:
+
+```
+window_intent(turns_on_chain, N):
+    if turns_on_chain <= N:            return turns_on_chain
+    start = turns_on_chain - N
+    return N if start is even else N - 1
+```
+
+**This does not make the gate tautological, and that distinction is the whole
+point.** The intent is pure arithmetic over a single integer, computed *before*
+the chain is walked — and that integer is `audit.chain_from_current - 1`, which
+comes from `audit_conversation`'s **database-side recursive walk**, not from the
+selection code path. So the transport is still checked against a number the store
+derived independently. A selection that drops a turn, mis-walks the chain, or
+reads a stale leaf still fails the comparison. What no longer fails is a healthy
+send, which is what a gate that fires constantly would have trained everyone to
+ignore.
+
+`context_truncated` is therefore reserved for genuine anomalies — a race, a
+corrupt chain, or a shortfall of more than the one turn parity accounts for.
+
 #### D4's override must not recompute its way to compliance
 
 If the send set did not match the intent, the *recomputed* intent is by
@@ -804,6 +841,8 @@ Phase 1.
 | **A signal when image retention drops an image** | recommended | `main.py:3033-3039` names the gap itself. |
 | **Injected-memory endpoint** | recommended | Powers F28. Until it lands, F28 renders as unknown — **never wired to `/why`** (U-5). |
 | **Task-traffic marker** | see note | F18 makes *this* client send none, but `V4_FEATURES` P7 closes the path server-side for **any** client, including OpenWebUI during F24's parallel running. Confirm P7's status rather than assuming. |
+| **`conv_id` is specified as UUIDv4 but the store mints UUIDv7** | finding | The plan says UUIDv4 in §4 rule 1; `uuidv7()` is what the store actually generates. Both sanitize intact through the compactor's `[A-Za-z0-9_-]`/64 filter, so nothing breaks — but two documents disagreeing about an id format is how key-space bugs start. Pick one and say so. |
+| **No store primitive for the receipt's `branch_count`** | finding | §3.3's receipt reports branch count; the store exposes no way to get it without walking the tree client-side. One `count(*)` over siblings belongs in `audit_conversation`, beside the five-tuple it already computes. |
 | **N is coupled to `L1_CHUNK_SIZE` / `KEEP_RECENT_TURNS` / `COMPACTOR_MAX_SUMMARY_CALLS`** | finding | One place with a test, not two configs. |
 | **Destructive-write guard** | **verified landed** | `_next_turn_index` (`retrieval.py:293-327`). §15 lists it as required; it is done. |
 | `pipelines/conversation_id_header.py` **retires** when the client ships | note | Confirm the header path is actually taken **before** deleting it — disabling it reverts conv_id to the hash and orphans everything written under `chat_id`. |

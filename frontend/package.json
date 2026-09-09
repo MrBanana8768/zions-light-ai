@@ -14,7 +14,9 @@
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"build:store-tests": "tsc -p tsconfig.store-tests.json",
-		"test:store": "npm run build:store-tests && node --test $(find dist-store-tests/tests/store -name '*.test.js')"
+		"test:store": "npm run build:store-tests && node --test $(find dist-store-tests/tests/store -name '*.test.js')",
+		"build:compactor-tests": "tsc -p tsconfig.compactor-tests.json",
+		"test:compactor": "npm run build:compactor-tests && node --test $(find dist-compactor-tests/tests/compactor -name '*.test.js')"
 	},
 	"dependencies": {
 		"pg": "^8.13.1"

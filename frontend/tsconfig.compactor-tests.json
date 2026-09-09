@@ -1,0 +1,22 @@
+{
+	"compilerOptions": {
+		"target": "es2022",
+		"module": "nodenext",
+		"moduleResolution": "nodenext",
+		"lib": ["es2022"],
+		"strict": true,
+		"esModuleInterop": true,
+		"forceConsistentCasingInFileNames": true,
+		"skipLibCheck": true,
+		"resolveJsonModule": true,
+		"types": ["node"],
+		"sourceMap": false,
+		"outDir": "dist-compactor-tests",
+		"rootDir": "."
+	},
+	"include": [
+		"src/lib/server/compactor/**/*.ts",
+		"src/lib/server/store/types.ts",
+		"tests/compactor/**/*.ts"
+	]
+}
