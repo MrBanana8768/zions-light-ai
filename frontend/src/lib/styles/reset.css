@@ -1,0 +1,54 @@
+/*
+ * A small, deliberate reset — not a full reset library. Vendoring
+ * normalize.css/modern-normalize would be one more dependency to keep
+ * offline for marginal gain; this is the handful of browser defaults that
+ * actively fight a chat UI (list markers, form-control fonts, image
+ * overflow), left as plain CSS in a file short enough to read in full.
+ */
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	height: 100%;
+}
+
+body {
+	margin: 0;
+}
+
+img,
+svg,
+video {
+	display: block;
+	max-width: 100%;
+}
+
+button,
+input,
+textarea,
+select {
+	font: inherit;
+	color: inherit;
+}
+
+button {
+	background: none;
+	border: none;
+	cursor: pointer;
+}
+
+ul,
+ol {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+a {
+	color: inherit;
+}

@@ -1,0 +1,193 @@
+/*
+ * Design tokens — plain CSS custom properties, committed into the repo.
+ *
+ * FRONTEND_PLAN.md §2.3 / V4_FEATURES.md "A package dependency on the
+ * Doulos libraries": do NOT depend on any @telos-llc/* package. The
+ * standing offline requirement (the pod must build and boot without
+ * internet) makes resolving a private package from an external registry a
+ * coupling worth avoiding. This file is a complete, hand-authored token
+ * set — color, space, type, radii, motion — not a copy of Doulos's actual
+ * values (this thread has no access to that private registry to copy
+ * them from). Swap the values below for the real Doulos scale later; the
+ * token NAMES are the contract components should be written against.
+ *
+ * Theming pattern (light / dark / system, applied before first paint):
+ *   1. Light values live on bare :root — the default with no JS at all.
+ *   2. A system preference (prefers-color-scheme: dark) overrides them,
+ *      guarded by :not([data-theme="light"]) so an explicit "light" choice
+ *      still wins over a dark OS setting.
+ *   3. An explicit user choice — data-theme="dark" | "light" on <html>,
+ *      set synchronously by app.html's inline pre-paint script and kept in
+ *      sync after hydration by lib/theme.svelte.ts — overrides step 2
+ *      again in both directions.
+ * Every color a component uses should be one of the semantic tokens below
+ * (--zl-bg, --zl-text, ...), never a raw --zl-gray-N or hex value, so the
+ * three rules above are the ONLY place light/dark is decided.
+ */
+
+:root {
+	/* ---- Color: base neutral scale (not used directly by components) ---- */
+	--zl-gray-0: #ffffff;
+	--zl-gray-50: #f7f8f9;
+	--zl-gray-100: #eceef1;
+	--zl-gray-200: #d9dce1;
+	--zl-gray-300: #b9bfc7;
+	--zl-gray-400: #8f97a3;
+	--zl-gray-500: #6b7280;
+	--zl-gray-600: #4b515c;
+	--zl-gray-700: #363c45;
+	--zl-gray-800: #23272e;
+	--zl-gray-900: #16191e;
+	--zl-gray-950: #0b0d10;
+
+	/* ---- Color: accent + status — one hue family per role ---- */
+	--zl-accent-500: #3b6fe0;
+	--zl-accent-600: #2f5bc4;
+	--zl-accent-contrast: #ffffff;
+
+	--zl-danger-500: #d3402f;
+	--zl-danger-600: #b3331f;
+	--zl-warning-500: #c98a1f;
+	--zl-warning-600: #a86f13;
+	--zl-success-500: #2e9563;
+	--zl-success-600: #237a4f;
+
+	/* ---- Color: semantic tokens — what components actually use ---- */
+	--zl-bg: var(--zl-gray-0);
+	--zl-bg-inset: var(--zl-gray-50);
+	--zl-surface: var(--zl-gray-0);
+	--zl-surface-raised: var(--zl-gray-0);
+	--zl-border: var(--zl-gray-200);
+	--zl-border-strong: var(--zl-gray-300);
+
+	--zl-text: var(--zl-gray-900);
+	--zl-text-muted: var(--zl-gray-600);
+	--zl-text-subtle: var(--zl-gray-500);
+	--zl-text-on-accent: var(--zl-accent-contrast);
+
+	--zl-accent: var(--zl-accent-500);
+	--zl-accent-hover: var(--zl-accent-600);
+	--zl-danger: var(--zl-danger-500);
+	--zl-danger-hover: var(--zl-danger-600);
+	--zl-warning: var(--zl-warning-500);
+	--zl-success: var(--zl-success-500);
+
+	--zl-focus-ring: var(--zl-accent-500);
+
+	--zl-shadow-sm: 0 1px 2px rgba(11, 13, 16, 0.06);
+	--zl-shadow-md: 0 4px 12px rgba(11, 13, 16, 0.1);
+
+	/* ---- Space — 4px base unit ---- */
+	--zl-space-0: 0;
+	--zl-space-1: 0.25rem;
+	--zl-space-2: 0.5rem;
+	--zl-space-3: 0.75rem;
+	--zl-space-4: 1rem;
+	--zl-space-5: 1.5rem;
+	--zl-space-6: 2rem;
+	--zl-space-7: 3rem;
+	--zl-space-8: 4rem;
+
+	/*
+	 * ---- Type ----
+	 * System font stack, deliberately: FRONTEND_PLAN.md F1 forbids any
+	 * runtime font fetch (Google Fonts, a CDN, anything). The alternative —
+	 * commit real .woff2 files under static/ and @font-face them — is
+	 * available and reversible; this thread chose the system stack because
+	 * no brand typeface was specified anywhere in the plan, spec or
+	 * handoff, and shipping a guessed brand font is a worse default than a
+	 * well-chosen system stack. See docs/lanes/L0-scaffold.md for the full
+	 * decision record.
+	 */
+	--zl-font-sans:
+		system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans',
+		sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji';
+	--zl-font-mono:
+		ui-monospace, 'Cascadia Code', 'Segoe UI Mono', 'SFMono-Regular', Consolas,
+		'Liberation Mono', Menlo, monospace;
+
+	--zl-font-size-xs: 0.75rem;
+	--zl-font-size-sm: 0.875rem;
+	--zl-font-size-md: 1rem;
+	--zl-font-size-lg: 1.125rem;
+	--zl-font-size-xl: 1.375rem;
+	--zl-font-size-2xl: 1.75rem;
+
+	--zl-line-height-tight: 1.25;
+	--zl-line-height-normal: 1.5;
+	--zl-line-height-relaxed: 1.7;
+
+	--zl-font-weight-normal: 400;
+	--zl-font-weight-medium: 500;
+	--zl-font-weight-semibold: 600;
+
+	/* ---- Radii ---- */
+	--zl-radius-sm: 0.25rem;
+	--zl-radius-md: 0.5rem;
+	--zl-radius-lg: 0.875rem;
+	--zl-radius-full: 999px;
+
+	/*
+	 * ---- Motion ----
+	 * prefers-reduced-motion collapses all three durations to (near) zero
+	 * below, in ONE place, rather than requiring every future transition to
+	 * remember to check the media query itself — the project's own
+	 * documented failure pattern (FRONTEND_HANDOFF.md §6: "a rule applied
+	 * at one call site and missed at its identical sibling") applied to CSS
+	 * authoring, not just application code.
+	 */
+	--zl-duration-fast: 100ms;
+	--zl-duration-base: 180ms;
+	--zl-duration-slow: 320ms;
+	--zl-easing-standard: cubic-bezier(0.2, 0, 0, 1);
+	--zl-easing-decelerate: cubic-bezier(0, 0, 0, 1);
+}
+
+/* Dark, by system preference — unless the user explicitly picked "light". */
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme='light']) {
+		--zl-bg: var(--zl-gray-950);
+		--zl-bg-inset: var(--zl-gray-900);
+		--zl-surface: var(--zl-gray-900);
+		--zl-surface-raised: var(--zl-gray-800);
+		--zl-border: var(--zl-gray-700);
+		--zl-border-strong: var(--zl-gray-600);
+
+		--zl-text: var(--zl-gray-50);
+		--zl-text-muted: var(--zl-gray-300);
+		--zl-text-subtle: var(--zl-gray-400);
+
+		--zl-accent-hover: #5c8bef;
+
+		--zl-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+		--zl-shadow-md: 0 4px 16px rgba(0, 0, 0, 0.5);
+	}
+}
+
+/* Dark, by explicit user choice — wins over system preference either way. */
+:root[data-theme='dark'] {
+	--zl-bg: var(--zl-gray-950);
+	--zl-bg-inset: var(--zl-gray-900);
+	--zl-surface: var(--zl-gray-900);
+	--zl-surface-raised: var(--zl-gray-800);
+	--zl-border: var(--zl-gray-700);
+	--zl-border-strong: var(--zl-gray-600);
+
+	--zl-text: var(--zl-gray-50);
+	--zl-text-muted: var(--zl-gray-300);
+	--zl-text-subtle: var(--zl-gray-400);
+
+	--zl-accent-hover: #5c8bef;
+
+	--zl-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+	--zl-shadow-md: 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+
+/* FRONTEND_SPEC.md §13: "respects prefers-reduced-motion". */
+@media (prefers-reduced-motion: reduce) {
+	:root {
+		--zl-duration-fast: 0.01ms;
+		--zl-duration-base: 0.01ms;
+		--zl-duration-slow: 0.01ms;
+	}
+}

@@ -258,6 +258,86 @@ RUN python3 -m venv /app/venv && \
 # volume), created by entrypoint.sh at boot. No /app/data dirs needed —
 # that was the pre-single-volume layout (removed in V2.2 cleanup).
 
+# =============================================================================
+# Node.js — FRONTEND_PLAN.md F1/F2. The one non-Python runtime in this
+# image, for the SvelteKit client (frontend/) only; vLLM/compactor/STT/
+# TTS/OpenWebUI stay Python, each in its own venv per the pattern above.
+#
+# Installed as a pinned, direct download of the official prebuilt tarball
+# into /opt/node — not an apt/NodeSource install. That keeps this layer to
+# ONE new trust boundary (nodejs.org's TLS cert), not two (that, plus a
+# NodeSource apt repo + signing key), and it is the same "download and
+# extract into /opt" shape already used below for the TTS voice files.
+# NODE_VERSION is an ARG for the same reason VLLM_VERSION is: pin the exact
+# version rather than "whatever apt/NodeSource has today", and make bumping
+# it a one-line change. v24.x ("Krypton") is Active LTS as of this build.
+# =============================================================================
+ARG NODE_VERSION=24.21.0
+# .tar.gz, not the smaller .tar.xz nodejs.org also publishes: `tar -z`
+# needs only gzip, present in essentially every base image by construction,
+# where `tar -J` needs xz-utils, which this image never installs and whose
+# presence here is unverified. One dependency fewer to be wrong about.
+RUN curl -fsSL -o /tmp/node.tar.gz \
+        "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" && \
+    mkdir -p /opt/node && \
+    tar -xzf /tmp/node.tar.gz -C /opt/node --strip-components=1 && \
+    rm -f /tmp/node.tar.gz
+ENV PATH="/opt/node/bin:${PATH}"
+
+# =============================================================================
+# Client (frontend/) — SvelteKit + adapter-node (FRONTEND_PLAN.md F1/F2).
+#
+# COPY package*.json before the rest of the source, same cache-layering
+# reason as `COPY compactor/requirements.txt` above: editing a .svelte file
+# later must not bust the (slow) npm-install layer. `npm ci`, not
+# `npm install` — it installs exactly what package-lock.json records and
+# fails the build if the lockfile and package.json have drifted, rather
+# than silently re-resolving.
+#
+# NETWORK CALLED OUT EXPLICITLY (FRONTEND_PLAN.md F2 asks for this to be
+# flagged so it can be challenged): `npm ci` resolves packages from the
+# public npm registry. This is BUILD-time only, the same category as `pip
+# install` from PyPI or `apt-get install` from the Ubuntu archive above —
+# the pod still builds and boots and serves with NO network reachable at
+# runtime. No package here is a private/`@telos-llc/*` package (see
+# frontend/src/lib/styles/tokens.css's header and docs/lanes/L0-scaffold.md)
+# so there is no private-registry credential to fail to have, either.
+#
+# Verified by this lane: a SvelteKit + adapter-node production build
+# bundles everything the running server needs INTO build/ — tested by
+# deleting node_modules entirely after `npm run build` and confirming
+# `node build/index.js` still serves. So, in the SAME layer: install,
+# build, then delete node_modules/the lockfile/source/config — never
+# shipped — mirroring the venvs' install+strip+clean pattern above with
+# npm's equivalent of "keep only what runtime needs" (there is no npm
+# analogue of `strip --strip-unneeded`, so "delete node_modules outright"
+# is that step here).
+# =============================================================================
+COPY frontend/package.json frontend/package-lock.json frontend/.npmrc /opt/client/
+RUN cd /opt/client && npm ci
+COPY frontend/vite.config.ts frontend/tsconfig.json /opt/client/
+COPY frontend/src /opt/client/src
+COPY frontend/static /opt/client/static
+RUN cd /opt/client && \
+    npm run build && \
+    rm -rf node_modules package-lock.json src static .svelte-kit \
+        vite.config.ts tsconfig.json && \
+    npm cache clean --force && \
+    rm -rf /root/.npm /root/.cache /tmp/* /var/tmp/*
+
+# BUILD GUARD 4: the client's built server must exist exactly where
+# supervisord.conf's [program:client] stanza invokes it. Same failure
+# class as BUILD GUARD / BUILD GUARD 2 above (a runtime reference to a
+# path this image never actually produced, e.g. because `npm run build`
+# failed non-fatally, output moved, or the adapter changed its layout) —
+# applied to the one program in this file that is not a Python import
+# BUILD GUARD 1/2 already cover.
+RUN test -x /opt/node/bin/node || \
+      { echo "BUILD GUARD 4 FAILED: /opt/node/bin/node missing — supervisord.conf's [program:client] command= references this path directly."; exit 1; }; \
+    test -f /opt/client/build/index.js || \
+      { echo "BUILD GUARD 4 FAILED: /opt/client/build/index.js missing — the client build did not produce adapter-node's entrypoint where [program:client] expects it."; exit 1; }; \
+    echo "build guard: the client binary and its built server both exist"
+
 # Compactor sources copied AFTER the expensive install layer so editing
 # the Python files doesn't invalidate the vllm install cache. List each
 # runtime module explicitly to avoid pulling test_*.py and V2_PLAN.md
@@ -550,11 +630,17 @@ ENV AUDIO_TTS_VOICE="alloy"
 ENV LOG_DIR="/data/logs"
 
 # 3000 — OpenWebUI (user-facing)
+# 3001 — client (user-facing; FRONTEND_PLAN.md F1/F2 — the SvelteKit
+#        replacement for OpenWebUI, [program:client] in supervisord.conf).
+#        This EXPOSE is necessary but not sufficient: RunPod's pod template
+#        exposes ports independently of the image, and adding 3001 there is
+#        NOT done by this Dockerfile change — hand that back (see
+#        docs/lanes/L0-scaffold.md).
 # 8080 — context-compactor (OpenAI-compatible, what OpenWebUI talks to)
 # 8000 — vLLM (internal; can also be exposed for direct API access)
 # 9000 — STT / Whisper (OpenAI audio API; OpenWebUI talks here for voice input)
 # 9001 — TTS / Piper (OpenAI audio API; OpenWebUI talks here for voice output)
-EXPOSE 8000 8080 3000 9000 9001
+EXPOSE 8000 8080 3000 3001 9000 9001
 
 # V2.1 Phase 6: switch from `curl :3000` (OpenWebUI login page) to the
 # compactor's /health/full deep probe. The old check stayed "healthy"

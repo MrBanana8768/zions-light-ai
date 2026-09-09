@@ -627,10 +627,10 @@ level myself.
 
 | Lane | Owns | Model | Can start |
 |---|---|---|---|
-| **L0 Scaffold** | `frontend/` root config, the `supervisord.conf` stanza, the Dockerfile hunk, vendored tokens/fonts | Sonnet | day 1 |
+| **L0 Scaffold** | `frontend/` root config; `src/app.html`, `src/routes/+layout*`, `src/lib/components/shell/**`, `src/lib/styles/**`, `src/lib/i18n/**`; the `supervisord.conf` stanza; the Dockerfile hunk; vendored fonts | Sonnet | day 1 |
 | **L1 Store** | `frontend/src/lib/server/store/**`, migration SQL | Sonnet, **Opus gate** | after L0 |
 | **L2 Transport** | `frontend/src/lib/server/compactor/**` — send-set, pre-send gate, SSE parse, echo read | Sonnet, **Opus gate** | after the interface freeze |
-| **L3 Chat UI** | `frontend/src/routes/**`, `frontend/src/lib/components/**` | Sonnet | after the interface freeze |
+| **L3 Chat UI** | the chat surface only — `src/routes/(chat)/**` and `src/lib/components/chat/**`. **Not** `components/shell/**` or `+layout*`, which L0 owns | Sonnet | after the interface freeze |
 | **L4 Notices & receipt** | `frontend/src/lib/components/system/**`, the catalogue module | Sonnet | after L2 types |
 | **L5 Fixtures & harness** | `frontend/tests/**`, generators, the 241/5/8 corpus | Sonnet | day 1 (fixtures only) |
 | **L6 Memory panel** | `frontend/src/lib/components/memory/**`, `frontend/src/lib/server/admin/**` | Sonnet | after F26 |
@@ -651,6 +651,14 @@ unless the freeze includes more than write signatures:
 So the frozen interface must include **the read/pagination contract and the
 streaming-persistence granularity** (§3.1), or L3 builds against a mock and
 re-integrates — a legitimate choice, but say so rather than discover it.
+
+**L0 and L3 both touch `routes/` and `components/` — the split is by subtree, not
+by directory.** An earlier draft of this table gave L3 all of both, which
+contradicted F1's own brief (F1 builds the shell). L0 owns the application
+*chrome* — the HTML document, the root layout, theming, the i18n seam, and the
+empty rail/pane placeholders under `components/shell/`. L3 replaces the
+placeholders' contents under `components/chat/`. Neither edits the other's
+subtree.
 
 **L1 and L2 get an Opus gate** because they are where the spec's argument lives,
 and because the recurring failure here is a rule applied at one call site and

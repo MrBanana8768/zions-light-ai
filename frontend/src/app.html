@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="theme-color" content="#0b0d10" />
+		<!--
+			Theme applied before first paint (FRONTEND_SPEC.md §13). This script
+			MUST run before the SvelteKit head placeholder just below (where the
+			page's stylesheet link gets injected) — data-theme has to already be
+			on <html> by the time src/lib/styles/tokens.css's selectors evaluate,
+			or dark mode flashes light for one frame. Sets only the attribute;
+			every actual color stays in tokens.css so there is exactly one place
+			that defines them. Mirrored (same storage key, same fallback) by
+			src/lib/theme.svelte.ts, which takes over after hydration.
+
+			NOTE FOR THE NEXT EDITOR: do not write the literal SvelteKit
+			placeholder token as text anywhere in this file outside its one real
+			use below. app.html substitution is a raw string replace, not
+			HTML-comment-aware — writing that token inside THIS comment (an
+			earlier draft did, to say "runs before X") got replaced too, and the
+			substituted markup's own empty comment closed this comment early,
+			leaking the rest of this sentence as visible page text. Refer to it
+			descriptively instead, as done above.
+		-->
+		<script>
+			(function () {
+				var KEY = 'zl-theme';
+				try {
+					var stored = localStorage.getItem(KEY);
+					var pref =
+						stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'system';
+					var resolved =
+						pref === 'system'
+							? window.matchMedia('(prefers-color-scheme: dark)').matches
+								? 'dark'
+								: 'light'
+							: pref;
+					var root = document.documentElement;
+					root.setAttribute('data-theme', resolved);
+					root.setAttribute('data-theme-pref', pref);
+				} catch (e) {
+					document.documentElement.setAttribute('data-theme', 'light');
+				}
+			})();
+		</script>
+		%sveltekit.head%
+	</head>
+	<body data-sveltekit-preload-data="hover">
+		<div style="display: contents">%sveltekit.body%</div>
+	</body>
+</html>

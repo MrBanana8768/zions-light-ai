@@ -1,0 +1,35 @@
+@import './tokens.css';
+@import './reset.css';
+
+html {
+	/* Tells the browser both schemes are supported, so native form controls,
+	   scrollbars, etc. pick a matching chrome instead of defaulting to light. */
+	color-scheme: light dark;
+}
+
+body {
+	background: var(--zl-bg);
+	color: var(--zl-text);
+	font-family: var(--zl-font-sans);
+	font-size: var(--zl-font-size-md);
+	line-height: var(--zl-line-height-normal);
+	-webkit-font-smoothing: antialiased;
+	text-rendering: optimizeLegibility;
+}
+
+/*
+ * Visible focus, everywhere, never suppressed (FRONTEND_SPEC.md §13:
+ * "fully keyboard-operable ... visible focus"). :focus-visible rather than
+ * :focus so a mouse click doesn't ring the whole app, but every keyboard
+ * focus does.
+ */
+:focus-visible {
+	outline: 2px solid var(--zl-focus-ring);
+	outline-offset: 2px;
+	border-radius: var(--zl-radius-sm);
+}
+
+::selection {
+	background: var(--zl-accent);
+	color: var(--zl-text-on-accent);
+}

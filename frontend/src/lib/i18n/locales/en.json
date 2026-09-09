@@ -1,0 +1,12 @@
+{
+	"app.title": "Zion's Light",
+	"shell.skip_to_content": "Skip to conversation",
+	"shell.conversations.heading": "Conversations",
+	"shell.conversations.empty": "No conversations yet.",
+	"shell.message_pane.heading": "Conversation",
+	"shell.message_pane.placeholder": "Select a conversation, or start a new one.",
+	"theme.toggle.label": "Theme",
+	"theme.light": "Light",
+	"theme.dark": "Dark",
+	"theme.system": "System"
+}
