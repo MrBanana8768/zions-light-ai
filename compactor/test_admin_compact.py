@@ -47,7 +47,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 memory.ensure_storage_layout()
 
-# client=127.0.0.1 satisfies _require_localhost without loosening
+# client=127.0.0.1 satisfies _require_admin_access without loosening
 # COMPACTOR_ADMIN_BIND. raise_server_exceptions=False so an unhandled
 # exception in the handler arrives as a 500 to assert on rather than a crash.
 admin = TestClient(main.app, client=("127.0.0.1", 12345),

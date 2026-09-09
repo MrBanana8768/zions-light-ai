@@ -63,7 +63,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 client = TestClient(main.app, raise_server_exceptions=False)
 
 # Separate client for the admin surface: client=127.0.0.1 satisfies
-# _require_localhost without loosening COMPACTOR_ADMIN_BIND, so the gate stays
+# _require_admin_access without loosening COMPACTOR_ADMIN_BIND, so the gate stays
 # genuinely under test on the chat client above.
 admin_client = TestClient(
     main.app, client=("127.0.0.1", 12345), raise_server_exceptions=False

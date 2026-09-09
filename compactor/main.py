@@ -32,6 +32,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+import apiauth
 import backfill
 import backup as backup_module
 import bgwork
@@ -4463,6 +4464,30 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="context-compactor", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def _api_key_guard(request: Request, call_next):
+    """Optional API-key gate on the PUBLIC surface (PR #30, carried forward).
+
+    No-op when COMPACTOR_API_KEY is unset. Only `/v1/*` is gated here;
+    `/health*` stay open, and `/admin/*` is decided at the route by
+    _require_admin_access because that rule needs the client host too.
+    """
+    if apiauth.path_requires_auth(request.url.path) and not apiauth.key_ok(
+        request.headers.get("authorization")
+    ):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "message": "missing or invalid API key",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            },
+        )
+    return await call_next(request)
+
+
 @app.exception_handler(UnsafeConvId)
 async def _unsafe_conv_id_handler(request: Request, exc: UnsafeConvId):
     """A rejected conv_id is a 400 about the request, not a 500 about us.
@@ -4485,21 +4510,30 @@ async def _unsafe_conv_id_handler(request: Request, exc: UnsafeConvId):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
-def _require_localhost(request: Request) -> None:
-    """FastAPI dependency: gate admin endpoints to localhost unless
-    COMPACTOR_ADMIN_BIND is explicitly set to something other than 127.0.0.1.
+def _require_admin_access(request: Request) -> None:
+    """FastAPI dependency on all twenty-five `/admin/*` routes: localhost,
+    or a valid API key.
+
+    Was `_require_localhost`, and the rename is not cosmetic - a function
+    still called that while accepting a bearer token is a lie the next
+    reader has to discover. The rule itself lives in apiauth.admin_access,
+    which is a pure function of (client host, authorization, admin bind) so
+    it can be tested without a request; this wrapper only turns its answer
+    into an HTTPException.
+
+    ONE dependency for all twenty-five routes, which is why this file did
+    not have to be edited twenty-five times to add key auth. Keep it that
+    way: a second admin gate anywhere is the fix-one-site-miss-the-sibling
+    defect with `/admin/forget` on the wrong side of it.
     """
-    if ADMIN_BIND != "127.0.0.1":
-        return  # operator opted in to external admin access
     client_host = request.client.host if request.client else None
-    if client_host not in ("127.0.0.1", "::1", "localhost"):
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "admin endpoints are localhost-only by default; "
-                "set COMPACTOR_ADMIN_BIND=0.0.0.0 to expose externally"
-            ),
-        )
+    allowed, reason = apiauth.admin_access(
+        client_host,
+        request.headers.get("authorization"),
+        ADMIN_BIND,
+    )
+    if not allowed:
+        raise HTTPException(status_code=403, detail=reason)
 
 
 # ---------------------------------------------------------------------------
@@ -5745,7 +5779,7 @@ async def health_full(response: Response):
 # V2.0 admin/observability endpoints (Phase 1 + Phase 2)
 # ---------------------------------------------------------------------------
 
-@app.get("/admin/conversations", dependencies=[Depends(_require_localhost)])
+@app.get("/admin/conversations", dependencies=[Depends(_require_admin_access)])
 async def admin_list_conversations():
     """List every conv_id that has any V2 state on disk."""
     return {"conversations": list_known_conv_ids()}
@@ -5753,7 +5787,7 @@ async def admin_list_conversations():
 
 @app.get(
     "/admin/conversations/{conv_id}",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_conversation_summary(conv_id: str):
     """Per-conv inventory: file presence + sizes + per-layer memory stats.
@@ -5822,7 +5856,7 @@ async def admin_conversation_summary(conv_id: str):
 
 @app.get(
     "/admin/conversations/{conv_id}/facts",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_get_facts(conv_id: str):
     """Return the current facts list for inspection / debugging."""
@@ -5831,7 +5865,7 @@ async def admin_get_facts(conv_id: str):
 
 @app.delete(
     "/admin/conversations/{conv_id}/facts",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_forget_facts(conv_id: str):
     """Forget ALL memory for a conversation (V2.0 granularity: all-or-
@@ -5935,7 +5969,7 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
 
 @app.get(
     "/admin/conversations/{conv_id}/summary",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_get_summary(conv_id: str):
     """Return the current hierarchical summary state (L1/L2/L3) for
@@ -5947,7 +5981,7 @@ async def admin_get_summary(conv_id: str):
 # V2.1 Phase 8: persona endpoints (localhost-only).
 @app.get(
     "/admin/personas",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_list_personas():
     """Library view: list every conv that has a persona, with length
@@ -5959,7 +5993,7 @@ async def admin_list_personas():
 
 @app.get(
     "/admin/conversations/{conv_id}/persona",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_get_persona(conv_id: str):
     """Return the persona record (full text + metadata) for one conv.
@@ -5972,7 +6006,7 @@ async def admin_get_persona(conv_id: str):
 
 @app.post(
     "/admin/conversations/{conv_id}/persona",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_set_persona(conv_id: str, request: Request):
     """Set or replace the persona for a conv.
@@ -5996,7 +6030,7 @@ async def admin_set_persona(conv_id: str, request: Request):
 
 @app.delete(
     "/admin/conversations/{conv_id}/persona",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_delete_persona(conv_id: str):
     """Clear the persona for a conv. Idempotent — returns deleted=False
@@ -6007,7 +6041,7 @@ async def admin_delete_persona(conv_id: str):
 
 @app.post(
     "/admin/conversations/{conv_id}/inherit-persona",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_inherit_persona(conv_id: str, request: Request):
     """Copy a persona from another conv (typically a 'base persona' conv)
@@ -6035,7 +6069,7 @@ async def admin_inherit_persona(conv_id: str, request: Request):
 # V2.1 Phase 7 Step 2: stale-fact archival endpoints.
 @app.get(
     "/admin/conversations/{conv_id}/archive",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_get_archive(conv_id: str):
     """Return the archived (cold-storage) facts for a conv. Useful for
@@ -6045,7 +6079,7 @@ async def admin_get_archive(conv_id: str):
 
 @app.post(
     "/admin/conversations/{conv_id}/archive",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_archive_stale(conv_id: str, older_than_days: int | None = None):
     """Trigger a stale-fact archival pass for one conv. Moves facts whose
@@ -6066,7 +6100,7 @@ async def admin_archive_stale(conv_id: str, older_than_days: int | None = None):
 
 @app.post(
     "/admin/conversations/{conv_id}/restore",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_restore_from_archive(conv_id: str, request: Request):
     """Move archived facts back to active storage.
@@ -6097,7 +6131,7 @@ async def admin_restore_from_archive(conv_id: str, request: Request):
 # V2.1 Phase 7 Step 1: on-demand semantic deduplication.
 @app.post(
     "/admin/conversations/{conv_id}/dedup",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_dedup(conv_id: str):
     """Run a full hybrid (embedding + LLM) dedup pass on the conv's facts.
@@ -6134,7 +6168,7 @@ async def admin_dedup(conv_id: str):
 # V2.1 Phase 6 Step 3: portability — export / import / fork.
 @app.get(
     "/admin/conversations/{conv_id}/export",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_export_conversation(conv_id: str):
     """Snapshot one conv's full V2 state (facts + summary + episodic) as
@@ -6146,7 +6180,7 @@ async def admin_export_conversation(conv_id: str):
 
 @app.post(
     "/admin/conversations/import",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_import_conversation(request: Request):
     """Restore a conversation from a previously-exported bundle.
@@ -6187,7 +6221,7 @@ async def admin_import_conversation(request: Request):
 
 @app.post(
     "/admin/conversations/{conv_id}/fork",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_fork_conversation(conv_id: str, request: Request):
     """Clone src conv's full state into a new conv_id. Original
@@ -6216,7 +6250,7 @@ async def admin_fork_conversation(conv_id: str, request: Request):
 
 @app.post(
     "/admin/conversations/cleanup-test-data",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_cleanup_test_conversations(dry_run: bool = True):
     """Quarantine-then-remove the test/placeholder conversations polluting
@@ -6244,7 +6278,7 @@ async def admin_cleanup_test_conversations(dry_run: bool = True):
 
 @app.post(
     "/admin/conversations/{src_conv_id}/merge-into/{dst_conv_id}",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_merge(src_conv_id: str, dst_conv_id: str, request: Request):
     """Fold a forked conversation's memory back into the live one.
@@ -6411,7 +6445,7 @@ def _rebuild_transcript_by_slot(rows: list[dict]) -> tuple[list[dict], int]:
 
 @app.post(
     "/admin/conversations/{conv_id}/compact",
-    dependencies=[Depends(_require_localhost)],
+    dependencies=[Depends(_require_admin_access)],
 )
 async def admin_compact(conv_id: str, request: Request):
     """Clear a conversation's summarization backlog OFF the request path.
@@ -6683,7 +6717,7 @@ async def admin_compact(conv_id: str, request: Request):
     return plan
 
 
-@app.get("/admin/selftest", dependencies=[Depends(_require_localhost)])
+@app.get("/admin/selftest", dependencies=[Depends(_require_admin_access)])
 async def admin_selftest(response: Response, round_trip: bool = True):
     """V2.1 Phase 6 Step 2: on-demand live-stack self-test.
 
@@ -6702,7 +6736,7 @@ async def admin_selftest(response: Response, round_trip: bool = True):
 
 
 # V2.3 Theme 1: data-durability backup endpoints (localhost-only).
-@app.get("/admin/backups", dependencies=[Depends(_require_localhost)])
+@app.get("/admin/backups", dependencies=[Depends(_require_admin_access)])
 async def admin_list_backups():
     """List existing backup archives (newest first) + latest-backup summary."""
     return {
@@ -6711,7 +6745,7 @@ async def admin_list_backups():
     }
 
 
-@app.post("/admin/backups", dependencies=[Depends(_require_localhost)])
+@app.post("/admin/backups", dependencies=[Depends(_require_admin_access)])
 async def admin_run_backup(response: Response):
     """Trigger one backup cycle now (create → verify → publish → prune).
     Returns the report. HTTP 200 if the backup was created AND verified;
@@ -6722,7 +6756,7 @@ async def admin_run_backup(response: Response):
     return report
 
 
-@app.get("/admin/backups/verify", dependencies=[Depends(_require_localhost)])
+@app.get("/admin/backups/verify", dependencies=[Depends(_require_admin_access)])
 async def admin_verify_backup(response: Response, name: str | None = None):
     """Verify an existing archive (default: the newest). Restores it to a
     scratch dir and runs the integrity checks. 200 ok / 503 fail / 404 none."""

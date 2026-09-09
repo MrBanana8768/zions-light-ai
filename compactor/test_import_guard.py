@@ -73,7 +73,7 @@ retrieval._available = False
 retrieval._embedder = None
 retrieval._chroma_collection = None
 
-# client=127.0.0.1 so _require_localhost is satisfied without loosening
+# client=127.0.0.1 so _require_admin_access is satisfied without loosening
 # COMPACTOR_ADMIN_BIND — the gate stays genuinely under test.
 # raise_server_exceptions=False so an unhandled exception inside the endpoint
 # comes back as a real 500 response instead of propagating into the test. That

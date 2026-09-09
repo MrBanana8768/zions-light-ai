@@ -308,6 +308,13 @@ async def _check_chat_round_trip(client: httpx.AsyncClient) -> tuple[bool, str]:
         "stream": False,
     }
     headers = {"X-Conversation-Id": one_shot_conv}
+    # The selftest calls the compactor's own /v1 surface, which the API-key
+    # middleware gates once COMPACTOR_API_KEY is set. Without this the boot
+    # selftest 401s on every deploy that turns auth on - a red boot check
+    # caused entirely by the check's own request.
+    _key = os.environ.get("COMPACTOR_API_KEY", "").strip()
+    if _key:
+        headers["Authorization"] = f"Bearer {_key}"
     r = await client.post(
         f"{COMPACTOR_URL}/v1/chat/completions",
         json=payload,
