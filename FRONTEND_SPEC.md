@@ -822,8 +822,31 @@ model.
 - **Theming:** light / dark / system, with the theme applied before first paint.
 - **i18n-ready:** no hard-coded user-facing strings.
 - **Performance budget:** initial JS < 200 KB gzipped; interactive < 2 s on a
-  mid-range device; a 500-message conversation scrolls without virtualization
-  jank.
+  mid-range device.
+- **Conversation scale (revised 2026-09-09 against production, not estimated).**
+  The bar was "a 500-message conversation scrolls without virtualization jank".
+  It was set at under a third of reality: the conversation in daily use is
+  **1,718 messages / 27.71 MB**, and it grew 25.66 -> 27.71 MB in one day,
+  about **2 MB/day**. So:
+
+  * **Scroll:** smooth at 60 fps on a **2,000-message** conversation. The
+    original bar's "without virtualization" is struck: at this size
+    virtualization is required, not a fallback, and forbidding it was the
+    thing that made the bar unmeetable rather than the frame rate.
+  * **Time to first paint:** opening a **2,000-message / 30 MB** conversation
+    paints readable content in < 1 s and reaches interactive in < 3 s. The
+    client renders the tail first and fetches earlier turns on demand; it must
+    never need the whole conversation in memory to show the newest turn. This
+    bar exists because OpenWebUI has no equivalent: it ships the entire blob
+    to the browser on every open, which is what made the live conversation
+    unusable while the DISK read it in 0.45 s (MooseFS, 473 MB/s). The volume
+    was never the problem and must not be blamed for it.
+  * **Append cost is O(1) in conversation length.** Appending message n+1
+    writes one record and touches no representation whose size grows with n.
+    A test appends to a 2,000-message conversation and asserts the bytes
+    written are within a constant factor of the message itself. This is
+    §11.1's rule stated as a measurement, because §11.1 alone did not stop
+    the failure it describes from shipping in the system this replaces.
 
 Every bar above is performance, accessibility, or presentation. §4.1 is the
 document's central argument, so correctness gets bars too:
@@ -839,8 +862,10 @@ document's central argument, so correctness gets bars too:
   moves the current leaf or alters chain structure without emitting a typed
   notice.
 - **Integrity check cost:** the §4.1 checklist runs on load and pre-send within a
-  stated budget on a 500-message, multi-branch conversation — the same shape as
-  the 500-message scroll bar above.
+  stated budget on a **2,000-message**, multi-branch conversation — the same
+  shape as the scale bar above, and raised with it. A checklist that is only
+  affordable on a conversation smaller than the real one is a checklist that
+  gets disabled on the conversation that matters.
 - **Budget verification (binds any layer that budgets):** a component that trims,
   sheds, or batches against a token limit must verify its arithmetic against the
   authority that *enforces* that limit, never against a local estimate of it.
