@@ -3827,6 +3827,34 @@ def _fire_and_forget(coro, label: str | None = None) -> bool:
     return bgwork.pool.submit(coro, label)
 
 
+def _next_added_turn(fresh: list[dict], turn_index: int) -> int:
+    """Where a new fact's `added_turn` comes from: the STORE, not the request.
+
+    `turn_index` is `len(messages) + 1` — a measurement of the CLIENT'S
+    ARRAY. FRONTEND_SPEC §4 rule 2 makes a bounded window the committed
+    shape of the client being built, and under one that number stops
+    growing: every fact in a 200-turn conversation is stamped with the same
+    `added_turn`, and the `(pin, last_used, added_turn)` ranking loses its
+    tiebreaker exactly where the store is largest and needs it most.
+
+    Same floor-raiser idiom as `retrieval._next_turn_index`, and for the
+    same reason. The stored maximum is a FLOOR so the sequence only ever
+    moves forward, whatever the client's array is doing — but the request is
+    still allowed to push it up, so a conversation whose facts predate this
+    returns to the client's units instead of counting from 1 alongside
+    episodic rows numbered in the hundreds.
+
+    A wrong answer here costs ORDERING, not data: `added_turn` is the last
+    term of a three-term sort and facts.py:130 already warns against
+    comparing it across sources.
+    """
+    stored_max = max(
+        (int(f.get("added_turn") or 0) for f in fresh if isinstance(f, dict)),
+        default=0,
+    )
+    return max(stored_max + 1, int(turn_index))
+
+
 def _merge_touched(fresh: list[dict], touched: list[dict]) -> list[dict]:
     """Reconcile a freshly-read facts list with an older in-flight snapshot.
 
@@ -3970,16 +3998,21 @@ async def _facts_tail(
                 )
                 from facts import _now_unix
                 now = _now_unix()
+                # Re-read INSIDE the lock, and BEFORE new_entries because
+                # `added_turn` is now derived from what is already stored.
+                #
+                # `touched_facts` was loaded back in the request path
+                # (outside any lock), so building on it alone would silently
+                # drop facts written by a tail that finished in the meantime
+                # — the lock serializes writers but cannot prevent a lost
+                # update when the read happened before it was acquired.
+                fresh = _merge_touched(facts.load_facts(conv_id), touched_facts)
+                added_turn = _next_added_turn(fresh, turn_index)
                 new_entries = [
-                    {"text": s, "added_turn": turn_index, "last_used": now}
+                    {"text": s, "added_turn": added_turn, "last_used": now}
                     for s in new_strs
                 ]
-                # Re-read INSIDE the lock. `touched_facts` was loaded back in
-                # the request path (outside any lock), so building on it would
-                # silently drop facts written by a tail that finished in the
-                # meantime — the lock serializes writers but cannot prevent a
-                # lost update when the read happened before it was acquired.
-                combined = _merge_touched(facts.load_facts(conv_id), touched_facts) + new_entries
+                combined = fresh + new_entries
 
                 # V2.1 Phase 7: hybrid dedup BEFORE pruning. Embedding
                 # filter is cheap (no LLM call when no candidate clusters
