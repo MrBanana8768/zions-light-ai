@@ -70,16 +70,17 @@ Three live constraints frame the work:
 | **D3** | **Fork at cutover; the transcript importer is a later, separate deliverable.** | Memory continuity is *nearly* one API call — see F-1 in §3.5: fork does **not** carry persona or the archive sidecar. OpenWebUI is frozen read-only as the scrollback archive. |
 | **D4** | **Refuse on a fidelity mismatch, with an override the daily user can reach.** | §3.2's override rules are load-bearing: the override must **not** recompute its way to compliance. |
 
-### 2.2 Still on the handoff's escalate list — needed before F3 commits the schema
+### 2.2 The rest of the handoff's escalate list — also settled, 2026-09-08
 
 `FRONTEND_HANDOFF.md:118-121` escalates **Q8, Q9, Q10, Q14**. Q9 is D4 and Q14 is
-D3. **Q8 and Q10 are not yet answered**, and an earlier draft filed them as
-delegated. They are not.
+D3. An earlier draft of this plan wrongly filed Q8 and Q10 as delegated; they
+were put to the owner and answered.
 
-| Q | Recommendation | Why it needs sign-off |
+| # | Decision | Consequence |
 |---|---|---|
-| **Q8 — repair or quarantine a corrupt chain?** | **Quarantine and report.** `FRONTEND_SPEC.md:316-322` and `V4_FEATURES.md:577-583` land here independently: a silent pointer move is the mechanism of the incident. Cost is a branch-selection dialog she did not ask for. | User-facing policy on the exact failure that caused the incident. |
-| **Q10 — are multiple roots ever legitimate?** | **One synthetic root; commit the unique index.** Safe *because of D3* — import is the only legitimate multi-root source and it is out of the phase-1 store. If the importer is funded later it uses `import_boundary` grafting (§16.2) rather than relaxing the index. | It commits `message_one_root_per_conv`, expensive to reverse six days into F3. **Answer before F3 starts.** |
+| **D5 (Q10)** | **One synthetic root; the unique index is committed.** | `message_one_root_per_conv` ships in F3's DDL. This is what makes the 2026-08-24 failure *structurally impossible* rather than merely tested against — a constraint that cannot be bypassed, not code that can. Safe because of D3: import is the only legitimate multi-root source and it is out of the phase-1 store. If the importer is funded later it grafts under an `import_boundary` node (§16.2) rather than relaxing the index. |
+| **D6 (Q8)** | **Quarantine and report; never repair automatically.** | F14. State what was found, list candidate chains with lengths and dates, move nothing. `FRONTEND_SPEC.md:316-322` and `V4_FEATURES.md:577-583` reach this independently: a silent pointer move is the mechanism of the incident, and §4.1 was explicitly revised to remove the wording that authorized one. Accepted cost: she sometimes faces a branch-selection dialog she did not ask for. |
+| **D7 (U-1)** | **Facts get stable ids.** | Unblocks F26. Identity is a uuid, not the text, so editing one of two identical facts is defined and §7's "every fact traceable to the turn that produced it" becomes mechanical. Cost, to be carried by the compactor lane: it touches the write path, dedup's merge, the archive sidecar, the export bundle format — **which needs a version bump from `v2.1`, and `import_conversation` enforces strict equality on that field** — and the importer. |
 
 ### 2.3 Delegated to me by handoff §5, taken and recorded
 
@@ -478,12 +479,15 @@ only thing between a `.paint` file and the model. `COMPACTOR_MAX_RETAINED_IMAGES
   both say the opposite and are stale. Either surface it on the turn ("the part
   it had written was remembered") or hand back an ask for a client-declared
   discard signal. **Do not list it as a free parity win.**
-- **U-1 — `{ref}` has no referent.** Facts have **no id**.
-  `V4_FEATURES.md:805-809` flags this as open and says it **blocks C11**. Stable
-  ids touch the write path, dedup's merge, the archive sidecar, the export bundle
-  format and the importer; exact-text matching avoids all of it but is ambiguous
-  on duplicates — which is what dedup exists for. **Decide before F26 starts.**
-  Seven days of Phase 4 rest on it.
+- **U-1 — `{ref}` has no referent. Settled by D7: facts get stable ids.**
+  `V4_FEATURES.md:805-809` flagged this as open and blocking C11. The work lands
+  in the compactor lane and touches the write path, dedup's merge, the archive
+  sidecar, the export bundle format and the importer. **Two things not to miss:**
+  the bundle's `version` is `"v2.1"` (`portability.py:56`) and
+  `import_conversation` enforces **strict equality** on it, so adding a field to
+  the fact shape is a format change that needs a version bump *and* a decision
+  about whether old bundles still import; and `dedup` merges facts by text today,
+  so it must learn which id survives a merge rather than minting a third.
 - **U-2 — when the user row is written, relative to the pre-send gate.** §4.1
   says both *"appended only after the request is accepted"* and *"on failure the
   user turn is retained in place, marked `failed`."* Resolve the ordering: it
@@ -522,7 +526,7 @@ calendar.
 | 0.4 | Run the five-tuple over **every** OpenWebUI conversation. Five roots accumulated in one chat; no reason to assume it is the only one. |
 | 0.5 | Confirm the conv_id path is `source=body_metadata.chat_id`, not `hash`. Forking from the wrong id forks the wrong memory. |
 | 0.6 | Read `/health/full` for `l1`/`l2` counts and `status_reasons`; confirm free space on the **ephemeral** 20 GB local overlay. |
-| 0.7 | **Get Q8 and Q10 answered** (§2.2). F3 commits a unique index on Q10's answer. |
+| 0.7 | ~~Get Q8 and Q10 answered~~ — **done 2026-09-08, D5/D6.** F3's DDL commits the unique index. |
 
 ### Phase 1 — handoff §8's definition of done (18 d)
 
@@ -747,7 +751,7 @@ Phase 1.
 | Ask | Priority | Note |
 |---|---|---|
 | **Received-context echo** as response headers, both write sites | required | §3.3. The data is already computed and discarded; the compactor sets **no custom response header anywhere**, so this is new surface. |
-| **Per-fact admin endpoints**, `conv_lock`-correct | required for Phase 4 | Blocked on U-1: facts have no id. Today's `DELETE` wipes all five layers; there is no add, edit or single-delete route. |
+| **Per-fact admin endpoints**, `conv_lock`-correct, **keyed on a stable fact id** | required for Phase 4 | Unblocked by D7. Today's `DELETE` wipes all five layers; there is no add, edit or single-delete route. Adding the id changes the export bundle shape, whose `version` (`"v2.1"`, `portability.py:56`) `import_conversation` compares by strict equality — bump it deliberately and decide what happens to bundles already on disk. `dedup` must learn which id survives a merge. |
 | **`error` object on the `chatcmpl-unavail-` shape** | required | A backend outage is currently machine-indistinguishable from a real reply. One-line fix at the sibling of code that already does it right. |
 | **Budget-shed signal** | required | `context_shed` (F13) cannot be honest without it. `dropped_layers` is a `logger.warning` at `main.py:5250`. |
 | **Stamp `added_turn` / `recent_cutoff` from the server's own sequence**, not `len(messages) + 1` | required | `main.py:4895`, `:5142`. The remaining, much smaller half of B2. Under a bounded window `added_turn` is a near-constant, which breaks §7's "every fact traceable to the turn that produced it." |
