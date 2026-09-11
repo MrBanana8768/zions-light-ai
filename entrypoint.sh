@@ -185,16 +185,45 @@ fi
 # symlinked database can still put its journal back on MooseFS and the bug
 # survives the fix.
 # =============================================================================
+# GATED since the v3.1.4.x rollout. WEBUI_DB_LOCAL=false keeps the live
+# database exactly where v3.1.5 had it, so this release can ship its code
+# without moving anything, and the move becomes its own deployment step.
+#
+# It is the last step of that series for a reason: it is the only change in
+# the line whose rollback is not clean. Every other step is "redeploy the
+# previous image"; this one has moved the live database, and /data holds a
+# snapshot that is as old as the last sync.
+#
+# The flag is not rollout scaffolding to be deleted afterwards - it is the
+# kill switch for the one subsystem here that owns where her chat history
+# physically lives.
+export WEBUI_DB_LOCAL="${WEBUI_DB_LOCAL:-true}"
 export WEBUI_LOCAL_DB="${WEBUI_LOCAL_DB:-/var/lib/openwebui/webui.db}"
 export WEBUI_SNAPSHOT_DB="${WEBUI_SNAPSHOT_DB:-${DATA_DIR:-/data/openwebui}/webui.db}"
-export DATABASE_URL="${DATABASE_URL:-sqlite:///${WEBUI_LOCAL_DB}}"
-mkdir -p "$(dirname "${WEBUI_LOCAL_DB}")"
-echo "[2b/3] Placing webui.db on local disk (${WEBUI_LOCAL_DB})"
-/opt/compactor-venv/bin/python /opt/compactor/webuidb.py --restore 2>&1 | tail -3 || {
-    echo "      WARNING: restore step failed; OpenWebUI will still start."
-    echo "      Check ${LOG_DIR}/webuidb-sync.log and run:"
-    echo "        /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --status"
-}
+
+if [ "${WEBUI_DB_LOCAL}" = "true" ]; then
+    export DATABASE_URL="${DATABASE_URL:-sqlite:///${WEBUI_LOCAL_DB}}"
+    export WEBUIDB_SYNC_ENABLED=true
+    mkdir -p "$(dirname "${WEBUI_LOCAL_DB}")"
+    echo "[2b/3] Placing webui.db on local disk (${WEBUI_LOCAL_DB})"
+    /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --restore 2>&1 | tail -3 || {
+        echo "      WARNING: restore step failed; OpenWebUI will still start."
+        echo "      Check ${LOG_DIR}/webuidb-sync.log and run:"
+        echo "        /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --status"
+    }
+else
+    # THE SYNC DAEMON MUST NOT RUN HERE, and this is the whole safety of the
+    # flag. It publishes the LOCAL file over the snapshot path; with the
+    # live database sitting at that same snapshot path, a single publish
+    # would overwrite her real chat history with whatever stale copy is on
+    # local disk. Off means off, not "on but pointed elsewhere".
+    export DATABASE_URL="${DATABASE_URL:-sqlite:///${WEBUI_SNAPSHOT_DB}}"
+    export WEBUIDB_SYNC_ENABLED=false
+    echo "[2b/3] WEBUI_DB_LOCAL=false - webui.db stays on ${WEBUI_SNAPSHOT_DB}"
+    echo "      The local-disk move and its sync daemon are BOTH off. This is"
+    echo "      the pre-v3.1.6 placement, so MooseFS is still in the SQLite write"
+    echo "      path and a hot rollback journal remains possible."
+fi
 
 echo ""
 echo "[3/3] Starting services..."
