@@ -342,19 +342,113 @@ def _set_aside(path: Path, why: str) -> bool:
     branches later landed the snapshot on top of the database we had just
     promised to preserve. That database is unreadable, not empty; a hot
     rollback journal is recoverable and may hold the only copy of everything
-    written since the last sync."""
+    written since the last sync.
+
+    ALL OR NOTHING (v3.1.9, hostile pass #2). It moved the main file FIRST and
+    stopped at the first failure, so one ENOSPC after that move left the
+    database in quarantine and its -journal / -wal ORPHANED at the live path.
+    The refusal that followed was correct — and its banner said "free space
+    ... then boot again", and the boot after that copied the snapshot onto
+    the live path, opened it, and SQLite replayed the orphan into the healthy
+    copy. The module's own remediation instruction completed the corruption.
+
+    Two changes, and neither alone is enough:
+
+      * a failure part-way MOVES BACK what already moved, so the pair is never
+        split by an exception;
+      * SIDECARS GO FIRST, for the failure no rollback can handle — SIGKILL
+        between two moves, which is what a RunPod redeploy is. Stranded that
+        way, the main file sits at the live path without its journal. That is
+        not harmless: a hot journal is how a half-applied transaction rolls
+        back, and this is the database we were quarantining because it failed
+        quick_check. But the next boot re-checks it, sets it aside again, and
+        nothing GOOD is destroyed. The other order strands a journal beside
+        the live path with no database, and the next thing written there is
+        the healthy snapshot. A hostile pass proposed the reorder alone as
+        harmless; it is not harmless, it is the lesser loss, and restore_on_boot
+        now clears orphans before it copies so the stranded state is caught
+        either way.
+    """
     try:
         QUARANTINE.mkdir(parents=True, exist_ok=True)
-        stamp = _stamp()
-        for suffix in ("",) + SIDECARS:
+    except Exception as e:
+        logger.error(f"could not set aside {path}: {type(e).__name__}: {e}")
+        return False
+    stamp = _stamp()
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for suffix in SIDECARS + ("",):
             p = path.with_name(path.name + suffix)
             if p.exists():
-                shutil.move(str(p), str(QUARANTINE / f"{p.name}.{why}-{stamp}"))
+                dest = QUARANTINE / f"{p.name}.{why}-{stamp}"
+                shutil.move(str(p), str(dest))
+                moved.append((p, dest))
         logger.warning(f"set aside {path} ({why}) -> {QUARANTINE}")
         return True
     except Exception as e:
         logger.error(f"could not set aside {path}: {type(e).__name__}: {e}")
+        for src, dest in reversed(moved):
+            try:
+                shutil.move(str(dest), str(src))
+            except Exception as back:
+                logger.error(
+                    f"AND could not move {dest} back to {src} "
+                    f"({type(back).__name__}: {back}). The database and its "
+                    f"sidecars are now split between {path.parent} and "
+                    f"{QUARANTINE}; reunite them by hand BEFORE anything opens "
+                    f"{path}, or SQLite will apply the wrong journal."
+                )
         return False
+
+
+def _clear_orphan_sidecars(db: Path) -> bool:
+    """Set aside any -journal/-wal/-shm beside `db` when `db` itself is ABSENT.
+    False if one could not be moved — the caller must then not create or copy
+    anything at `db`.
+
+    v3.1.9 (B5). A sidecar with no database belongs to no database we are
+    keeping, and SQLite derives the sidecar path from the path it is GIVEN, so
+    the first open of whatever lands at `db` next replays it. restore_on_boot
+    copied the snapshot there and opened it one statement later, for the
+    success log line. Demonstrated: 3,502,080 B / 400 chats became 933,888 B of
+    "database disk image is malformed", the function returned
+    restored_from_snapshot, RESTORE_EXIT_CODES mapped that to 0, and
+    entrypoint.sh booted OpenWebUI onto it. The refuse-to-boot gate could not
+    fire, because the restore genuinely succeeded and then its own
+    VERIFICATION destroyed it.
+
+    Three shipped routes produce the orphan: this module's own banner ("or move
+    /var/lib/openwebui/webui.db by hand" leaves the sidecars behind), a
+    _set_aside that stopped part-way, and a SIGKILLed writer in WAL mode. They
+    are set aside, never deleted — an orphan journal may still be what someone
+    needs to recover the database it came from.
+
+    integrity()'s docstring said opening "replays/rolls back any journal,
+    which on local disk always succeeds". It does always succeed. What it
+    succeeds at, when the journal is not the file's own, is destroying the
+    file.
+
+    A NO-OP WHILE `db` EXISTS, and that is the half that matters most. Those
+    sidecars are the database's OWN, possibly a hot journal, and moving them
+    away is the loss restore_backup was just fixed for. Every caller today
+    reaches this only after finding no database or setting it aside with its
+    sidecars — so inside restore_on_boot the check never decides anything.
+    It lives HERE, in a helper with its own test, precisely so that it is a
+    tested property rather than a condition that cannot fire: an invariant
+    enforced three branches away is only a comment.
+    """
+    if db.exists():
+        return True
+    for suffix in SIDECARS:
+        orphan = db.with_name(db.name + suffix)
+        if orphan.exists() and not _set_aside(orphan, "orphan-sidecar"):
+            logger.error(
+                f"{orphan} is beside {db}, which does not exist, and could not "
+                f"be moved aside. NOT creating anything at {db}: SQLite would "
+                f"apply it on the first open. Move it by hand, then boot again."
+            )
+            return False
+    return True
 
 
 def restore_on_boot() -> dict:
@@ -492,6 +586,15 @@ def restore_on_boot() -> dict:
                 result["action"] = "error"
                 return result
 
+    # ORPHANED SIDECARS AT THE DESTINATION GO FIRST (v3.1.9, B5). Ahead of
+    # BOTH branches below: the snapshot restore opens LOCAL_DB immediately,
+    # and on the `fresh` branch OpenWebUI's own first open of the database
+    # it creates would replay an orphan just the same. See
+    # _clear_orphan_sidecars for what this cost before it existed.
+    if not _clear_orphan_sidecars(LOCAL_DB):
+        result["action"] = "error"
+        return result
+
     if SNAPSHOT_DB.exists():
         ok, detail = integrity(SNAPSHOT_DB)
         if not ok:
@@ -505,41 +608,73 @@ def restore_on_boot() -> dict:
             )
             result["action"] = "snapshot_unhealthy"
             return result
+        # Against the RESOLVED path. os.replace does not follow a symlink at
+        # its destination — it replaces the link — while the shutil.copy2 this
+        # used to be followed it and wrote the target. So a staged rename onto
+        # LOCAL_DB silently turned an operator's symlinked database into a
+        # regular file beside nothing, and turned a DANGLING link (the fixture
+        # test_webuidb_restore_guard uses to pin restore_failed -> 4) from a
+        # failed restore into a "successful" one. The first version of this
+        # change did exactly that, and the exit-code row caught it.
+        dest = LOCAL_DB.resolve()
+        staged = dest.with_name(f"{dest.name}.restoring-{_stamp()}")
         try:
-            shutil.copy2(SNAPSHOT_DB, LOCAL_DB)
-            # Sidecars are deliberately NOT copied: the snapshot is written by
-            # sqlite3's backup API, which produces a self-contained database.
-            # A journal beside it would belong to a different generation of
-            # the file, and applying one to the other is how a good database
-            # becomes a bad one.
-            size = LOCAL_DB.stat().st_size / 1e6
-            logger.info(
-                f"restored snapshot -> local ({size:.1f} MB, "
-                f"{_has_rows(LOCAL_DB)} chats)"
-            )
-            result["action"] = "restored_from_snapshot"
-            # A successful restore is the one event that ENDS an empty start:
-            # local now holds exactly what the snapshot holds, so publishing it
-            # back can lose nothing. Clearing the marker here is what keeps the
-            # empty-start refusal from becoming the permanent block it exists
-            # to replace - the operator who repairs the snapshot and re-runs
-            # --restore gets their sync daemon back without having to know
-            # about a dotfile. Best-effort: a marker we cannot remove costs one
-            # deliberate `rm`, while a restore that failed because of one would
-            # cost the boot.
-            try:
-                EMPTY_START_MARKER.unlink(missing_ok=True)
-            except Exception as e:
-                logger.warning(
-                    f"restored, but could not clear {EMPTY_START_MARKER}: "
-                    f"{type(e).__name__}: {e} — the sync daemon will keep "
-                    f"refusing until it is removed by hand"
-                )
+            # Staged and renamed, so a crash mid-copy leaves LOCAL_DB absent
+            # (and the next boot simply restores again) rather than a truncated
+            # file that the next boot finds, fails quick_check on, and has to
+            # quarantine. Sidecars are deliberately NOT copied: the snapshot is
+            # written by sqlite3's backup API, which produces a self-contained
+            # database, and a journal beside it would belong to a different
+            # generation of the file.
+            shutil.copy2(SNAPSHOT_DB, staged)
+            os.replace(staged, dest)
         except Exception as e:
+            try:
+                staged.unlink(missing_ok=True)
+            except Exception:
+                pass
             logger.error(
                 f"could not restore snapshot: {type(e).__name__}: {e}"
             )
             result["action"] = "restore_failed"
+            return result
+        # VERIFIED AFTER IT LANDS. A restore that is not checked where it
+        # landed is not a restore; the snapshot passed quick_check on /data,
+        # and that says nothing about the copy on local disk.
+        landed_ok, landed_detail = integrity(LOCAL_DB)
+        if not landed_ok:
+            logger.error(
+                f"the snapshot passed quick_check on {SNAPSHOT_DB} but the "
+                f"restored copy at {LOCAL_DB} does NOT ({landed_detail}). "
+                f"Refusing to boot OpenWebUI onto it. The snapshot on /data is "
+                f"untouched."
+            )
+            _set_aside(LOCAL_DB, "restore-unverified")
+            result["action"] = "restore_failed"
+            return result
+        size = LOCAL_DB.stat().st_size / 1e6
+        logger.info(
+            f"restored snapshot -> local ({size:.1f} MB, "
+            f"{_has_rows(LOCAL_DB)} chats)"
+        )
+        result["action"] = "restored_from_snapshot"
+        # A successful restore is the one event that ENDS an empty start:
+        # local now holds exactly what the snapshot holds, so publishing it
+        # back can lose nothing. Clearing the marker here is what keeps the
+        # empty-start refusal from becoming the permanent block it exists
+        # to replace - the operator who repairs the snapshot and re-runs
+        # --restore gets their sync daemon back without having to know
+        # about a dotfile. Best-effort: a marker we cannot remove costs one
+        # deliberate `rm`, while a restore that failed because of one would
+        # cost the boot.
+        try:
+            EMPTY_START_MARKER.unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(
+                f"restored, but could not clear {EMPTY_START_MARKER}: "
+                f"{type(e).__name__}: {e} — the sync daemon will keep "
+                f"refusing until it is removed by hand"
+            )
         return result
 
     logger.info(
