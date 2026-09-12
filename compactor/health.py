@@ -204,6 +204,14 @@ def gather_memory_stats() -> dict:
     # also covers conversation_doc_count returning None (store unavailable),
     # which is not an exception but is equally "we could not count this".
     unreadable = {"facts": 0, "episodic": 0, "summaries": 0}
+    # THE ROLLUP HAS NO OTHER OBSERVABLE. v3.1.8 gave the skip path a
+    # hierarchy rollup and left six ways for it to do nothing, five of
+    # them completely silent, with /health/full reporting "ok" either way
+    # - the exact failure it was built to fix (a 22-turn soak,
+    # last_summarized_turn still 0) reads as a healthy pod. This scan
+    # already opens every state file, so the number costs nothing extra.
+    worst_lag = 0
+    worst_lag_conv = None
     for cid in conv_ids:
         try:
             facts_total += len(facts.load_facts(cid))
@@ -234,6 +242,12 @@ def gather_memory_stats() -> dict:
                 summaries_with_l1 += 1
             if state.get("l3"):
                 summaries_with_l3 += 1
+            _seen = state.get("turns_seen")
+            _done = state.get("last_summarized_turn")
+            if isinstance(_seen, int) and isinstance(_done, int):
+                _lag = _seen - _done
+                if _lag > worst_lag:
+                    worst_lag, worst_lag_conv = _lag, cid
         except Exception as e:
             unreadable["summaries"] += 1
             if logsetup.log_once("health.stats.summaries"):
@@ -254,6 +268,8 @@ def gather_memory_stats() -> dict:
         ),
         "summaries_with_l1": summaries_with_l1,
         "summaries_with_l3": summaries_with_l3,
+        "hierarchy_lag": worst_lag,
+        "hierarchy_lag_conv": worst_lag_conv,
         "unreadable": unreadable,
     }
 
@@ -261,6 +277,47 @@ def gather_memory_stats() -> dict:
 # ---------------------------------------------------------------------------
 # Aggregated report
 # ---------------------------------------------------------------------------
+
+def probe_snapshot() -> dict:
+    """Is the durable copy of webui.db still being written?
+
+    Only meaningful while the sync daemon owns that file. With
+    WEBUI_DB_LOCAL=false the snapshot IS the live database, its mtime moves on
+    every message, and "stale" would be meaningless - so this reports
+    watched=False rather than a number nobody should read.
+
+    With the gate ON, /data/openwebui/webui.db is the ONLY copy that survives
+    a pod recreate, and sync_loop is the only thing writing it. When publishing
+    fails repeatedly that loop shouts three times and goes quiet, /health/full
+    said "ok", chat worked perfectly, and the durability gap was unbounded.
+    This is the number that was missing.
+
+    Three intervals, not one: a single missed cycle is ordinary (a publish that
+    overran, a refusal that cleared). Three in a row is a daemon that is not
+    coming back on its own.
+    """
+    enabled = os.environ.get("WEBUIDB_SYNC_ENABLED", "").strip().lower() == "true"
+    snap = os.environ.get("WEBUI_SNAPSHOT_DB", "/data/openwebui/webui.db")
+    interval = env_float("WEBUI_DB_SYNC_INTERVAL_S", 300.0)
+    out: dict[str, Any] = {
+        "watched": enabled, "path": snap, "interval_s": round(interval),
+        "age_s": None, "stale": False, "error": None,
+    }
+    if not enabled:
+        return out
+    try:
+        age = time.time() - os.path.getmtime(snap)
+    except OSError as e:
+        # The snapshot is supposed to exist whenever the daemon runs. Missing
+        # is worse than stale, not better, so it reports as stale with the
+        # reason attached rather than as a quiet False.
+        out["error"] = f"{type(e).__name__}: {e}"
+        out["stale"] = True
+        return out
+    out["age_s"] = round(age)
+    out["stale"] = age > 3 * interval
+    return out
+
 
 def _gather_blocking() -> dict:
     """Every filesystem-touching probe, in one call, meant to be run OFF the
@@ -320,8 +377,15 @@ def _gather_blocking() -> dict:
     except Exception as e:
         backups = {"count": None, "latest": None, "error": f"{type(e).__name__}: {e}"}
 
+    try:
+        snapshot = probe_snapshot()
+    except Exception as e:
+        snapshot = {"watched": None, "stale": False,
+                    "error": f"{type(e).__name__}: {e}"}
+
     return {"storage": storage, "stats": stats, "writes": writes,
-            "backups": backups, "sqlite_journal": sqlite_journal}
+            "backups": backups, "sqlite_journal": sqlite_journal,
+            "snapshot": snapshot}
 
 
 async def gather_health_full(
@@ -482,6 +546,44 @@ async def gather_health_full(
                 f"pair, and separating them turns a recoverable file into "
                 f"a corrupt one."
             )
+        # THE ROLLUP IS OTHERWISE UNOBSERVABLE. v3.1.8's skip-path rollup has
+        # six ways to do nothing and five are silent: raw_chars == 0, no
+        # conversational history, task traffic, the summarizer disabled, an
+        # empty chunk, and a degrade guard that logs at DEBUG while production
+        # runs at INFO. The only positive evidence is a "rollup ->" line, at
+        # best once per 20 turns. So the failure this feature exists to fix -
+        # a 22-turn soak with last_summarized_turn still 0 - reported "ok",
+        # empty reasons, green HEALTHCHECK.
+        #
+        # Two chunks of lag, because one chunk of drift is ordinary: the
+        # rollup fires on the tail, so the newest turns are always ahead of
+        # the watermark. Twice that is a hierarchy that has stopped keeping up.
+        _lag = stats.get("hierarchy_lag")
+        _lag_limit = 2 * summarizer.L1_CHUNK_SIZE
+        if isinstance(_lag, int) and _lag > _lag_limit:
+            reasons.append(
+                f"the summary hierarchy is {_lag} turns behind on "
+                f"conv={stats.get('hierarchy_lag_conv')} (limit {_lag_limit}). "
+                f"Turns past the watermark are carried by the raw window "
+                f"alone, so the oldest of them fall out of the request as it "
+                f"grows. POST /admin/conversations/<id>/compact drains the "
+                f"backlog off the request path."
+            )
+        # A SNAPSHOT THAT HAS STOPPED REFRESHING is the one condition where
+        # /data no longer holds a copy that survives a pod recreate, and
+        # nothing anywhere reported it: sync_loop shouted three times and went
+        # quiet, and this endpoint never looked. Only meaningful while the sync
+        # daemon owns that file - with WEBUI_DB_LOCAL=false the snapshot IS the
+        # live database and its mtime moves on every message.
+        _snap = blocking.get("snapshot") or {}
+        if _snap.get("stale"):
+            reasons.append(
+                f"the webui.db snapshot on /data is {_snap.get('age_s')}s old "
+                f"against a {_snap.get('interval_s')}s sync interval. The live "
+                f"database is on local disk, which a pod recreate destroys, so "
+                f"this is the durable copy and it is not being written. Check "
+                f"`supervisorctl status webuidb-sync`."
+            )
         status = "degraded" if reasons else "ok"
 
     return {
@@ -491,6 +593,7 @@ async def gather_health_full(
             "vllm": vllm,
             "storage": storage,
             "sqlite_journal": blocking.get("sqlite_journal"),
+            "snapshot": blocking.get("snapshot"),
             # None when the caller did not supply it, so "we did not ask" stays
             # distinguishable from "we asked and it is fine" — the same
             # doctrine as indexed_exchanges_total above.

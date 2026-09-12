@@ -14,6 +14,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -883,7 +884,162 @@ def _all_tests():
         # v3.1 A12 — the store scan must not block the one event loop.
         test_blocking_probes_run_off_the_event_loop,
         test_loop_stays_responsive_while_the_scan_runs,
+        test_snapshot_probe_is_silent_when_the_gate_is_off,
+        test_snapshot_probe_flags_a_snapshot_that_stopped_refreshing,
+        test_snapshot_probe_treats_a_missing_snapshot_as_stale,
+        test_hierarchy_lag_is_measured_and_reported,
+        test_hierarchy_lag_surfaces_as_a_status_reason,
     ]
+
+
+def test_snapshot_probe_is_silent_when_the_gate_is_off():
+    """With WEBUI_DB_LOCAL=false the snapshot IS the live database.
+
+    Its mtime moves on every message, so "stale" would be meaningless, and a
+    number nobody should read is worse than no number. watched=False says so.
+    """
+    print("")
+    print("[test] snapshot probe: not watched when the sync daemon is off")
+    with patch.dict(os.environ, {"WEBUIDB_SYNC_ENABLED": "false"}):
+        out = health.probe_snapshot()
+    assert_eq(out["watched"], False, "watched is False")
+    assert_eq(out["stale"], False, "and it does not claim staleness")
+    assert_eq(out["age_s"], None, "and reports no age rather than a wrong one")
+
+
+def test_snapshot_probe_flags_a_snapshot_that_stopped_refreshing():
+    """The one condition where /data holds no copy that survives a recreate.
+
+    sync_loop shouted three times and went quiet; this endpoint never looked.
+    The result was a pod reporting "ok", chat working perfectly, and an
+    unbounded durability gap.
+    """
+    print("")
+    print("[test] snapshot probe: a stale snapshot is flagged, a fresh one is not")
+    snap = os.path.join(_TMP_ROOT, "snapshot-webui.db")
+    with open(snap, "wb") as fh:
+        fh.write(b"x")
+    env = {
+        "WEBUIDB_SYNC_ENABLED": "true",
+        "WEBUI_SNAPSHOT_DB": snap,
+        "WEBUI_DB_SYNC_INTERVAL_S": "300",
+    }
+
+    # Fresh: just written, well inside one interval.
+    with patch.dict(os.environ, env):
+        fresh = health.probe_snapshot()
+    assert_eq(fresh["watched"], True, "watched is True when the daemon owns it")
+    assert_eq(fresh["stale"], False, "a just-written snapshot is not stale")
+
+    # Stale: four intervals of age, past the three-interval threshold.
+    old = time.time() - (4 * 300)
+    os.utime(snap, (old, old))
+    with patch.dict(os.environ, env):
+        gone = health.probe_snapshot()
+    assert_eq(gone["stale"], True, "four intervals of age reads as stale")
+    assert_true(gone["age_s"] >= 3 * 300, "and the age is reported")
+
+    # CONTROL on the threshold itself: two intervals must NOT trip it, or the
+    # check is just "any age at all" and cries wolf on every slow cycle.
+    recent = time.time() - (2 * 300)
+    os.utime(snap, (recent, recent))
+    with patch.dict(os.environ, env):
+        ok = health.probe_snapshot()
+    assert_eq(ok["stale"], False,
+              "two intervals is an overrun, not a dead daemon")
+
+
+def test_snapshot_probe_treats_a_missing_snapshot_as_stale():
+    """Missing is worse than stale, not better.
+
+    The daemon is supposed to be writing this file. Reporting a quiet False on
+    an OSError would be the same silence the probe exists to end.
+    """
+    print("")
+    print("[test] snapshot probe: an absent snapshot is not a quiet pass")
+    with patch.dict(os.environ, {
+        "WEBUIDB_SYNC_ENABLED": "true",
+        "WEBUI_SNAPSHOT_DB": os.path.join(_TMP_ROOT, "does-not-exist.db"),
+    }):
+        out = health.probe_snapshot()
+    assert_eq(out["stale"], True, "absent reads as stale")
+    assert_true(out["error"], "with the reason attached")
+
+
+def test_hierarchy_lag_is_measured_and_reported():
+    """The rollup's only observable.
+
+    v3.1.8's skip-path rollup has six ways to do nothing, five of them
+    completely silent, and the failure it exists to fix - a soak ending with
+    last_summarized_turn still 0 - reported status "ok" with empty reasons.
+    """
+    print("")
+    print("[test] hierarchy lag: measured by the scan and named by conversation")
+    cid = "lagging_conv"
+    st = summarizer.load_state(cid)
+    st["l1"] = [{"text": "a scene", "first_turn": 1, "last_turn": 20}]
+    st["last_summarized_turn"] = 20
+    st["turns_seen"] = 20 + (3 * summarizer.L1_CHUNK_SIZE)
+    summarizer.save_state(cid, st)
+
+    stats = health.gather_memory_stats()
+    assert_eq(stats["hierarchy_lag"], 3 * summarizer.L1_CHUNK_SIZE,
+              "the scan measured turns_seen - last_summarized_turn")
+    assert_eq(stats["hierarchy_lag_conv"], cid, "and named the conversation")
+
+    # CONTROL: a conversation keeping pace must NOT be reported, or this
+    # degrades every healthy pod and gets switched off within a week.
+    st["last_summarized_turn"] = st["turns_seen"]
+    summarizer.save_state(cid, st)
+    caught_up = health.gather_memory_stats()
+    assert_eq(caught_up["hierarchy_lag"], 0,
+              "a hierarchy that has kept pace reports no lag")
+
+
+def test_hierarchy_lag_surfaces_as_a_status_reason():
+    """Measuring it is half the fix; SAYING it is the half that matters.
+
+    stats.hierarchy_lag in the payload is what stats.unreadable used to be -
+    a number nobody reads, inside a body whose top line says everything is
+    fine. This asserts the reason, and asserts a caught-up hierarchy stays
+    quiet, because a check that degrades a healthy pod is switched off within
+    a week.
+    """
+    print("")
+    print("[test] hierarchy lag: degrades the pod, and only when it should")
+    cid = "lag_reason_conv"
+    st = summarizer.load_state(cid)
+    st["l1"] = [{"text": "a scene", "first_turn": 1, "last_turn": 20}]
+    st["last_summarized_turn"] = 20
+    st["turns_seen"] = 20 + (3 * summarizer.L1_CHUNK_SIZE)
+    summarizer.save_state(cid, st)
+
+    async def go():
+        with patch("health.probe_vllm", new=AsyncMock(return_value={
+            "ok": True, "latency_ms": 10.0, "models": ["m"], "error": None,
+        })):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(r["status"], "degraded", "a lagging hierarchy degrades the pod")
+    assert_true(
+        any("summary hierarchy is" in x for x in r["status_reasons"]),
+        "and says so by name: %r" % (r["status_reasons"],),
+    )
+
+    # CONTROL, and it is ONE CHUNK of lag rather than zero on purpose.
+    # The rollup fires on the tail, so the newest turns are always ahead
+    # of the watermark - a hierarchy is never caught up in the strict
+    # sense. A control at zero would pass with the threshold set to 0 and
+    # would leave every healthy pod degraded. This pins the boundary.
+    st["last_summarized_turn"] = st["turns_seen"] - summarizer.L1_CHUNK_SIZE
+    summarizer.save_state(cid, st)
+    r2 = asyncio.run(go())
+    assert_true(
+        not any("summary hierarchy is" in x for x in r2["status_reasons"]),
+        "one chunk of ordinary drift raises no reason: %r"
+        % (r2["status_reasons"],),
+    )
 
 
 if __name__ == "__main__":

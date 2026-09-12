@@ -870,7 +870,18 @@ def sync_loop() -> None:
         r = sync_once()
         if r["error"]:
             consecutive_failures += 1
-            if consecutive_failures in (3, 12, 48):
+            # `in (3, 12, 48)` MEANT THE LOG WENT QUIET AFTER FOUR HOURS, on
+            # the one condition where /data holds the only copy that survives
+            # a pod recreate. A membership test says it three times and then
+            # never again: at failure 49 the log is silent, /health/full reads
+            # "ok", chat works perfectly, and the durability gap is unbounded.
+            #
+            # This is the shape bgwork.BackgroundPool.submit already uses for
+            # the same problem — shout on the first, then at a fixed interval
+            # forever — so the two now agree.
+            if consecutive_failures == 3 or (
+                consecutive_failures > 3 and consecutive_failures % 12 == 0
+            ):
                 logger.error(
                     f"snapshot publish has failed {consecutive_failures} times "
                     f"in a row ({consecutive_failures * SYNC_INTERVAL_S / 60:.0f} "
