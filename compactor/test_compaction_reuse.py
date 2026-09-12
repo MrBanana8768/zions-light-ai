@@ -28,6 +28,7 @@ WHAT IT HAS TO PIN, and the second is as important as the first:
 """
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -43,6 +44,7 @@ import memory  # noqa: E402
 
 memory.ensure_storage_layout()
 
+import httpx  # noqa: E402
 import main  # noqa: E402
 import summarizer  # noqa: E402
 
@@ -110,6 +112,13 @@ state["last_summarized_turn"] = 40
 # this state is turns 1..40.
 _ns = [m for m in MSGS if m.get("role") != "system"]
 state["tail_fp"] = summarizer._turn_fingerprints(_ns[:40])[-summarizer._ANCHOR_TURNS:]
+# AND THE COVERED-TURNS DIGEST, for the same reason (v3.1.9, B1). _do_l1_rollup
+# extends it immediately after appending each chunk, so a hierarchy written by
+# this release carries one; without it the gate reads NO EVIDENCE and declines,
+# which is correct for a pre-v3.1.9 file and would make this fixture describe
+# one. Built by the rollup's own function, once per chunk, in order.
+for _c in state["l1"]:
+    summarizer._extend_covered_fp(state, MSGS, _c["first_turn"], _c["last_turn"], 0)
 summarizer.save_state(CONV, state)
 
 CALLS.clear()
@@ -174,8 +183,21 @@ check(not any("STORED-CHUNK" in str(m.get("content", "")) for m in out),
 # ---------------------------------------------------------------------------
 
 
-def _seed(conv: str, msgs: list[dict], chunks: list[dict], *, anchor_through: int):
-    """A hierarchy the way maybe_rollup would have left it."""
+def _seed(conv: str, msgs: list[dict], chunks: list[dict], *, anchor_through: int,
+          digest: bool = True):
+    """A hierarchy the way maybe_rollup would have left it.
+
+    The covered-turns digest is built by calling the SAME function the rollup
+    calls, once per chunk in order, rather than by recomputing it some other
+    way here. A fixture that assembles state by a second route is how this
+    file got its last defect: [6]'s first version seeded no tail_fp at all,
+    which is a state production never produces, and the resulting red read as
+    the fix being wrong. If _extend_covered_fp refuses a span — a hole, a
+    capped window — the fixture inherits that refusal, which is the point.
+
+    `digest=False` seeds a file written BEFORE v3.1.9, which every existing
+    conversation on disk is until its next rollup.
+    """
     st = summarizer.load_state(conv)
     st["l1"] = chunks
     st["last_summarized_turn"] = chunks[-1]["last_turn"]
@@ -183,6 +205,11 @@ def _seed(conv: str, msgs: list[dict], chunks: list[dict], *, anchor_through: in
     st["tail_fp"] = summarizer._turn_fingerprints(
         ns[:anchor_through]
     )[-summarizer._ANCHOR_TURNS:]
+    if digest:
+        for c in sorted(chunks, key=lambda c: c["first_turn"]):
+            summarizer._extend_covered_fp(
+                st, msgs, c["first_turn"], c["last_turn"], 0
+            )
     summarizer.save_state(conv, st)
     return st
 
@@ -364,49 +391,55 @@ check(summarizer._align_candidates(_ANCH, ["zz", "aa", "yy"]) != [],
       "_align_candidates still accepts the 1-element match it is built to "
       "find — the fix is a separate predicate, not a broken primitive")
 
-print("[12] a capped window that DOES align is still refused on length")
-# The gate ced4520 proved with a mutation, re-proved. That mutation went RED
-# then; f78a389 later added `_aligned` as a conjunct IN FRONT of it, and [5]'s
-# fixture declines on ALIGNMENT — so the length gate has been untested since,
-# and dropping it left this suite GREEN. Mutation evidence expires when a
-# conjunct lands in front of it.
+print("[12] an array SHORTER than the recorded position is refused on length")
+# The gate ced4520 proved with a mutation, re-proved TWICE. That mutation went
+# RED then; f78a389 added `_aligned` in front of it and it went GREEN; this
+# suite's first fix built a capped window whose anchor aligned and it went RED
+# again — and then B1's digest landed in front of BOTH and it went GREEN a
+# second time, within the hour, because a sliding-window cap can never match a
+# digest of turns 1..N. Mutation evidence expires every time a stronger gate
+# lands ahead of a weaker one.
 #
-# The fixture matters: a real capped window ALIGNS BY CONSTRUCTION, because a
-# cap sends the last max_turns turns and the anchor is the previous request's
-# tail. So the anchor here is built from the WINDOW's own tail, not from turns
-# that appear nowhere in it, and the length comparison is the only thing left
-# standing between this array and the substitution.
-CONV_CAP2 = "reuse_capped_aligning"
-MSGS_CAP2 = history(24)
-_ns_cap2 = [m for m in MSGS_CAP2 if m.get("role") != "system"]
-_seed(CONV_CAP2, MSGS_CAP2,
-      [{"text": "CAPPED-CHUNK", "first_turn": 1, "last_turn": 40}],
-      anchor_through=40)
-_st_cap2 = summarizer.load_state(CONV_CAP2)
-# turns_seen past the window's length is what a capped client looks like: the
-# conversation is known to have reached 48, the client is sending 16.
-_st_cap2["turns_seen"] = 48
-_WINDOW = _ns_cap2[-16:]
-_st_cap2["tail_fp"] = summarizer._turn_fingerprints(
-    _WINDOW)[-summarizer._ANCHOR_TURNS:]
-summarizer.save_state(CONV_CAP2, _st_cap2)
-# FIXTURE CHECK: the two gates must be in the states this case claims, or it
-# proves nothing about which one fired.
+# So the fixture must be one where EVERY OTHER GATE PASSES and length alone
+# refuses: a TRUNCATED array — the head of the conversation, not a sliding
+# window over its tail. A client that replays the beginning and stops (an
+# import, a replay, a history cut at a length limit) produces exactly this:
+# the first turns are genuine, so the digest matches; the anchor is its own
+# tail, so it aligns; and it is shorter than the conversation is KNOWN to be.
+CONV_TRUNC = "reuse_truncated_head"
+_FULL = history(24)                                  # the conversation: 48 turns
+_ns_full = [m for m in _FULL if m.get("role") != "system"]
+_TRUNC = [_FULL[0]] + _ns_full[:20]                  # the request: turns 1..20
+_seed(CONV_TRUNC, _TRUNC,
+      [{"text": "TRUNC-CHUNK", "first_turn": 1, "last_turn": 10}],
+      anchor_through=20)
+_st_tr = summarizer.load_state(CONV_TRUNC)
+_st_tr["turns_seen"] = 48                            # known to have reached 48
+summarizer.save_state(CONV_TRUNC, _st_tr)
+_ns_tr = [m for m in _TRUNC if m.get("role") != "system"]
+_, _ts_tr, _ = main.split_messages(list(_TRUNC))
+# FIXTURE CHECKS: every gate but length must PASS, or this proves nothing
+# about which one refused.
+check(summarizer._covered_prefix(_st_tr) == 10,
+      "fixture: the contiguous prefix is 10")
+check(_st_tr["covered_fp_turns"] == 10 and summarizer._covered_fp_over(
+          _ts_tr, 10) == _st_tr["covered_fp"],
+      "fixture: the digest covers 10 turns and MATCHES this array's first 10")
 check(summarizer._aligns_fully(
-          _st_cap2["tail_fp"],
+          _st_tr["tail_fp"],
           summarizer._turn_fingerprints(
-              _WINDOW[-summarizer._FINGERPRINT_TAIL_TURNS:])) is True,
-      "fixture: this window ALIGNS — so the refusal below cannot come from "
-      "the alignment gate")
-check(len(_WINDOW) < summarizer._recorded_position(_st_cap2),
-      "fixture: and it is SHORTER than the recorded position, so the length "
-      "gate is the one under test")
+              _ns_tr[-summarizer._FINGERPRINT_TAIL_TURNS:])) is True,
+      "fixture: the anchor aligns fully")
+check(len(_ns_tr) < summarizer._recorded_position(_st_tr),
+      "fixture: and the array is shorter than the recorded position — length "
+      "is the only gate left that can refuse")
 CALLS.clear()
-out = asyncio.run(main.compact_if_needed(list(_WINDOW), CONV_CAP2))
-check(not any("CAPPED-CHUNK" in str(m.get("content", "")) for m in out),
-      "a window that aligns but is shorter than the recorded position is "
-      "REFUSED — turn numbers are not array indices once a client caps, and "
-      "the stored summary covers turns this array does not contain")
+out = asyncio.run(main.compact_if_needed(list(_TRUNC), CONV_TRUNC))
+check(not any("TRUNC-CHUNK" in str(m.get("content", "")) for m in out),
+      "an array shorter than the conversation is known to be is REFUSED even "
+      "when its head matches and its tail aligns")
+check(len(CALLS) == 1 and any("question 0" in t for t in CALLS[0]),
+      "and its oldest turn went to summarize() rather than being replaced")
 
 print("[13] a HOLE in the stored coverage stops the substitution at the hole")
 # [10] proves _covered_prefix. It does NOT prove the gate calls it: reverting
@@ -481,6 +514,160 @@ check(len(CALLS) == 1 and any("question 0" in t for t in CALLS[0]),
       "turn went to summarize() rather than being replaced")
 check(not any("COLLIDE-CHUNK" in str(m.get("content", "")) for m in out),
       "and the stored summary did not reach the array")
+
+print("[13b] a digest that claims MORE than the chunks can back is refused")
+# B1's digest now caps the reuse at a hole by itself — _extend_covered_fp
+# refuses a non-contiguous span — so [13] passes whether or not the gate uses
+# _covered_prefix, and reverting that call site went GREEN again. The prefix
+# check is defence in depth against a digest that is WRONG: extended across a
+# hole by a future bug, or written by a build that disagrees about spans. So
+# build exactly that: chunks with a hole at 11-30, and a digest that is a
+# perfectly valid fold over turns 1..44 of this very array. Only the
+# contiguous-prefix check can refuse it, and it has to.
+CONV_LIE = "reuse_digest_overclaims"
+MSGS_LIE = history(24)
+_seed(CONV_LIE, MSGS_LIE,
+      [{"text": "LIE-CHUNK-A", "first_turn": 1, "last_turn": 10},
+       {"text": "LIE-CHUNK-B", "first_turn": 31, "last_turn": 44}],
+      anchor_through=44, digest=False)
+_st_lie = summarizer.load_state(CONV_LIE)
+_, _ts_lie, _ = main.split_messages(list(MSGS_LIE))
+_st_lie["covered_fp"] = summarizer._covered_fp_over(_ts_lie, 44)
+_st_lie["covered_fp_turns"] = 44
+summarizer.save_state(CONV_LIE, _st_lie)
+check(summarizer._covered_prefix(_st_lie) == 10
+      and summarizer._covered_fp_over(_ts_lie, 44) == _st_lie["covered_fp"],
+      "fixture: the digest is internally VALID for 44 turns, while the chunks "
+      "can only back 10")
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(list(MSGS_LIE), CONV_LIE))
+check(len(CALLS) == 1 and any("question 5" in t for t in CALLS[0]),
+      "turn 11, inside the hole, still reached summarize() — a digest cannot "
+      "vouch for turns no chunk summarized, however well it hashes")
+
+print("[15] an EDITED earlier turn is not replaced by the summary of its old text")
+# B1, the only unrecoverable break in this path. OpenWebUI's edit-without-
+# regenerate rewrites one message in the middle and keeps everything after it,
+# so the tail is byte-identical: _aligned passes, _covered_prefix passes, the
+# length gate passes. The stored summary describes the PRE-EDIT text, the
+# substitution deletes the corrected turn, and the hierarchy never re-reads
+# that span because last_summarized_turn is already past it. The correction is
+# gone for the life of the conversation.
+CONV_EDIT = "reuse_edited_turn"
+MSGS_EDIT = history(24)
+_seed(CONV_EDIT, MSGS_EDIT,
+      [{"text": "PRE-EDIT-CHUNK", "first_turn": 1, "last_turn": 20},
+       {"text": "PRE-EDIT-CHUNK-2", "first_turn": 21, "last_turn": 40}],
+      anchor_through=40)
+# CONTROL FIRST, on the identical unedited array: it must reuse, or every
+# refusal below passes by the feature being off.
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(list(MSGS_EDIT), CONV_EDIT))
+check(any("PRE-EDIT-CHUNK" in str(m.get("content", "")) for m in out),
+      "CONTROL: the unedited array still reuses the stored summaries")
+# Turn 5 is the user's 3rd message (turn 2k+1 is question k): MSGS_EDIT[5]
+# counting the system message at index 0.
+_EDITED = [dict(m) for m in MSGS_EDIT]
+check(_EDITED[5]["role"] == "user" and "question 2" in _EDITED[5]["content"],
+      "fixture: index 5 is turn 5, the user's 'question 2'")
+_EDITED[5]["content"] = "CORRECTED-FACT my sister is Sarah, not Sara " + ("word " * 60)
+_ns_ed = [m for m in _EDITED if m.get("role") != "system"]
+_st_ed = summarizer.load_state(CONV_EDIT)
+check(summarizer._aligns_fully(
+          _st_ed["tail_fp"],
+          summarizer._turn_fingerprints(
+              _ns_ed[-summarizer._FINGERPRINT_TAIL_TURNS:])) is True
+      and summarizer._covered_prefix(_st_ed) == 40
+      and len(_ns_ed) >= summarizer._recorded_position(_st_ed),
+      "fixture: after the edit, the tail still aligns, the prefix is still 40 "
+      "and the length still passes — every pre-B1 gate would substitute")
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(list(_EDITED), CONV_EDIT))
+_sent_ed = CALLS[0] if CALLS else []
+check(any("CORRECTED-FACT" in t for t in _sent_ed)
+      or any("CORRECTED-FACT" in str(m.get("content", "")) for m in out),
+      "the corrected turn survives — in the summarize() input or verbatim in "
+      "the array, anywhere but deleted")
+check(not any("PRE-EDIT-CHUNK" in str(m.get("content", "")) for m in out),
+      "and the summary of the text the user CORRECTED did not stand in for it")
+
+print("[16] a state written before v3.1.9 has no digest, and declines")
+# Every conversation on disk today. Absent must read as NO EVIDENCE — the
+# direction that costs one summarization call, not the one that costs turns.
+CONV_OLD = "reuse_pre_v319_state"
+MSGS_OLD = history(24)
+_seed(CONV_OLD, MSGS_OLD,
+      [{"text": "OLD-FORMAT-CHUNK", "first_turn": 1, "last_turn": 40}],
+      anchor_through=40, digest=False)
+check(summarizer.load_state(CONV_OLD).get("covered_fp") == "",
+      "fixture: this state carries no digest")
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(list(MSGS_OLD), CONV_OLD))
+check(not any("OLD-FORMAT-CHUNK" in str(m.get("content", "")) for m in out),
+      "a pre-v3.1.9 hierarchy is not substituted on the strength of gates that "
+      "cannot see an edit")
+check(len(CALLS) == 1 and any("question 0" in t for t in CALLS[0]),
+      "and the turns went to summarize(), exactly as before the feature")
+# A half-written pair reads as nothing, not as half of something.
+_st_half = summarizer.load_state(CONV_OLD)
+_st_half["covered_fp"] = "0123456789abcdef"
+summarizer.save_state(CONV_OLD, _st_half)
+_raw = json.loads(summarizer.summary_path(CONV_OLD).read_text(encoding="utf-8"))
+_raw.pop("covered_fp_turns", None)
+summarizer.summary_path(CONV_OLD).write_text(json.dumps(_raw), encoding="utf-8")
+check(summarizer.load_state(CONV_OLD).get("covered_fp") == "",
+      "a digest on disk WITHOUT its turn count loads as no digest at all")
+
+print("[17] the digest the ROLLUP writes is the digest the GATE computes")
+# Every case above seeds through _seed, which calls _extend_covered_fp with
+# window_offset 0 directly. That proves the reader agrees with a helper. It
+# does not prove it agrees with _do_l1_rollup, which is the only writer
+# production has — and a writer and reader that each agree with a fixture but
+# not with each other is a gate that declines forever, silently, which is the
+# "reuse permanently off with zero log signal" shape a hostile pass already
+# found here once. So drive the real rollup, twice, with the LLM stubbed, and
+# hand its state straight to the gate.
+CONV_RT = "reuse_roundtrip"
+MSGS_RT = history(24)
+_real_pieces = summarizer._summarize_pieces
+
+
+async def _stub_pieces(conv_id, client, vllm_url, model, prompt, pieces, max_tokens):
+    return f"ROUNDTRIP-CHUNK over {len(pieces)} turn(s)"
+
+
+summarizer._summarize_pieces = _stub_pieces
+try:
+    _st_rt = summarizer.load_state(CONV_RT)
+
+    async def _two_rollups():
+        async with httpx.AsyncClient() as _c:
+            a = await summarizer._do_l1_rollup(CONV_RT, _c, "http://stub", "m", _st_rt, MSGS_RT)
+            b = await summarizer._do_l1_rollup(CONV_RT, _c, "http://stub", "m", _st_rt, MSGS_RT)
+        return a, b
+
+    _adv = asyncio.run(_two_rollups())
+finally:
+    summarizer._summarize_pieces = _real_pieces
+check(_adv == (True, True) and len(_st_rt["l1"]) == 2,
+      f"fixture: two real L1 rollups advanced (got {_adv}, "
+      f"{len(_st_rt['l1'])} chunk(s))")
+check(_st_rt.get("covered_fp_turns") == 2 * summarizer.L1_CHUNK_SIZE,
+      "the rollup extended the digest over exactly the turns it summarized "
+      f"(got {_st_rt.get('covered_fp_turns')})")
+_, _ts_rt, _ = main.split_messages(list(MSGS_RT))
+check(summarizer._covered_fp_over(_ts_rt, _st_rt["covered_fp_turns"])
+      == _st_rt["covered_fp"],
+      "and the gate's own computation over the same request AGREES with it — "
+      "writer and reader, not writer and fixture")
+_st_rt["tail_fp"] = summarizer._turn_fingerprints(
+    [m for m in MSGS_RT if m.get("role") != "system"][:40]
+)[-summarizer._ANCHOR_TURNS:]
+summarizer.save_state(CONV_RT, _st_rt)
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(list(MSGS_RT), CONV_RT))
+check(any("ROUNDTRIP-CHUNK" in str(m.get("content", "")) for m in out),
+      "end to end: state written by the real rollup is REUSED by the real gate")
 
 main.summarize = _real
 

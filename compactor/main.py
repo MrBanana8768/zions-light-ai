@@ -1727,6 +1727,59 @@ async def compact_if_needed(
             # logged them as "covered by stored summaries". See
             # _covered_prefix for why l3 is excluded.
             _covered = summarizer._covered_prefix(_st)
+            # AND THE TURNS THEMSELVES MUST MATCH (v3.1.9, B1).
+            #
+            # _covered_prefix proves the hierarchy CLAIMS an unbroken span
+            # from turn 1, and _aligned proves the array's tail is this
+            # conversation's. Neither looks at the turns being deleted.
+            # OpenWebUI's edit-without-regenerate rewrites one message in the
+            # middle and leaves the tail byte-identical, so both gates pass
+            # and the stored summary of the PRE-EDIT text replaces the
+            # corrected turn — and the hierarchy never re-reads that span, so
+            # the correction is gone for good. That is the only unrecoverable
+            # break in this path.
+            #
+            # covered_fp is folded one turn at a time at rollup over exactly
+            # the turns each chunk summarized; recomputing it here over the
+            # prefix about to be removed is the content relation the
+            # substitution has always needed and never had.
+            #
+            # Absent on state written before v3.1.9, and absent is NO
+            # EVIDENCE: _covered drops to 0 and this turn summarizes from
+            # scratch, as it did before the feature existed. The next rollup
+            # writes one.
+            #
+            # NO SEPARATE CHECK FOR THE ABSENT CASE, deliberately. The first
+            # version read `if not _fp_want or _fp_turns <= 0 or _fp_turns >
+            # _covered`, and a mutation dropping the first two conjuncts left
+            # every test green — correctly, because they cannot change the
+            # outcome. load_state admits the digest and its count together or
+            # not at all, so no digest means _fp_turns == 0, which makes
+            # `_covered = _fp_turns` zero coverage by itself; and a non-zero
+            # count beside an empty digest could only reach the comparison
+            # below, where _covered_fp_over of a non-empty prefix is never ""
+            # and so declines. This gate has already shipped three conditions
+            # that could not fire. It does not get a fourth for reassurance.
+            _fp_turns = int(_st.get("covered_fp_turns") or 0)
+            _fp_want = _st.get("covered_fp") or ""
+            if _fp_turns > _covered:
+                # Should be unreachable — the digest only extends
+                # contiguously, so it cannot claim more than the contiguous
+                # prefix. Unreachable is not impossible, and the two numbers
+                # come from different evidence on purpose; when they disagree
+                # the honest answer is to decline. [13b] builds the
+                # disagreement and a mutation removing this goes RED.
+                _covered = 0
+            else:
+                _covered = _fp_turns
+                if summarizer._covered_fp_over(to_summarize, _covered) != _fp_want:
+                    logger.info(
+                        f"conv={conv_id}: the stored summaries do not match "
+                        f"the first {_covered} turn(s) of this request — an "
+                        f"edited or re-ordered turn, or a different branch. "
+                        f"Summarizing from scratch rather than replacing them."
+                    )
+                    _covered = 0
             # ONLY WHEN THE ARRAY IS NOT A SUFFIX, and this is the whole
             # safety of it. Turn numbers are not array indices once a
             # client sends a bounded window; mapping between them needs
