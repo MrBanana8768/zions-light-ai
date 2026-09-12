@@ -4438,12 +4438,6 @@ def _run_memory_tail(
         # unfit to store.
         if (
             decision.raw_chars > 0
-            # ASKED, not read off a label. Both conditions this used to
-            # test - task traffic and disk pressure - are computed only
-            # behind `if decision.store` above, so on the path this gate
-            # guards (a reply already refused) neither label had ever been
-            # set and the guard could not fire. Found in review; it is this
-            # file's own recurring defect, committed while fixing it.
             # NOTHING TO ROLL UP WITHOUT A HISTORY (v3.1.8.1). Found by the
             # R8 integration tests, which post a SINGLE user message and
             # assert a skipped tail leaves the store untouched. The rollup
@@ -4457,8 +4451,30 @@ def _run_memory_tail(
             # those arrays always carry prior assistant turns, so that case
             # is untouched. What this declines is the one where there is no
             # earlier exchange to summarize at all.
+            #
+            # DO NOT DELETE THIS ON THE STRENGTH OF THE DOCSTRING ON
+            # _is_repeat_task_traffic. That docstring argues against calling
+            # _has_conversational_history "at the tail site", and it is
+            # right about the site it means: the STORE decision, where a
+            # history check would silently drop the opening exchange of
+            # every new conversation. This is not that site. Nothing is
+            # stored here - the reply was already refused - and the only
+            # question left is whether an earlier exchange exists to
+            # summarize. Delete it and R8 comes straight back.
+            #
+            # This gate also used to carry `and not _task_traffic`, which
+            # was itself the fix for a label read that could never fire
+            # (both labels it tested are set only behind `if decision.store`
+            # above). The history check subsumed it:
+            # _is_repeat_task_traffic opens with
+            # `if _has_conversational_history(messages): return False`, so
+            # the conjunct was only ever reached once it was already
+            # guaranteed True - dead, exactly like the label read it
+            # replaced. Two of this gate's defects have now been a condition
+            # that could not fire, so the dead one is removed rather than
+            # left as decoration. _task_traffic is still computed
+            # unconditionally above, and the store branch still uses it.
             and _has_conversational_history(messages)
-            and not _task_traffic
             and not _fire_and_forget(
                 _rollup_hierarchy(conv_id, messages, None),
                 label=f"rollup conv={conv_id}",

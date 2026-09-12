@@ -133,11 +133,14 @@ finally:
 
 
 # ---------------------------------------------------------------------------
-# THE GATE. Three conditions decide whether the skip path rolls up at all,
-# and until review found it the gate tested two of them against labels that
-# `_run_memory_tail` only computes behind `if decision.store` - so on this
-# path they were never set and the guard could not fire. A gate with no test
-# is how that shipped: the broken version passed every suite in the repo.
+# THE GATE. Two conditions decide whether the skip path rolls up at all: the
+# model produced something (raw_chars), and there is an earlier exchange to
+# summarize (_has_conversational_history). THREE separate defects have come
+# out of this one gate and every one of them was a condition that could not
+# fire - first two labels `_run_memory_tail` computes only behind
+# `if decision.store`, then a `not _task_traffic` conjunct the history check
+# in front of it had already guaranteed. A gate with no test is how the first
+# shipped: the broken version passed every suite in the repo.
 # ---------------------------------------------------------------------------
 
 
@@ -167,16 +170,39 @@ def _fire_once(**patches):
     return labels
 
 
-print("[3] task traffic does NOT roll up")
-# Its message array is not this conversation - it is OpenWebUI asking for a
-# title on a conv_id that happens to match. Rolling it up hands
-# _observed_position a foreign array and moves the position against text the
-# conversation never contained.
-check(_fire_once(_is_repeat_task_traffic=lambda c, m: True) == [],
-      "nothing is scheduled when the request is background task traffic")
-check(_fire_once(_is_repeat_task_traffic=lambda c, m: False) != [],
-      "and the control still schedules - so [3] is not passing because the "
-      "gate refuses everything")
+print("[3] the history check SUBSUMES the task-traffic check")
+# This step used to patch _is_repeat_task_traffic to return True while
+# handing the gate an array WITH history - a combination the real predicate
+# cannot produce, so it asserted nothing and stayed green with the conjunct
+# deleted. What actually keeps task traffic out is the history check: the
+# predicate opens with `if _has_conversational_history(messages): return
+# False`, so by the time `and not _task_traffic` was reached the conjunct in
+# front of it had already guaranteed the answer. That is why the dead
+# conjunct could be removed, and the subsumption is pinned HERE rather than
+# left in a comment. Take the early return out of _is_repeat_task_traffic
+# and this goes red - which is the signal that the gate needs a
+# task-traffic condition of its own back.
+#
+# THE POSITION HAS TO BE SEEDED PAST THE THRESHOLD. The predicate ends with
+# `return position >= TASK_TRAFFIC_MIN_POSITION`, so a conversation that has
+# not reached it answers False for BOTH reasons and the check passes whether
+# the early return is there or not. The first draft of this step did exactly
+# that and stayed green under the mutation - the same vacuous shape it was
+# written to replace. Seeding the position above the line leaves the early
+# return as the ONLY thing that can make the answer False.
+SUB_CONV = "rollup_subsumption"
+_sub = summarizer.load_state(SUB_CONV)
+_sub["turns_seen"] = main.TASK_TRAFFIC_MIN_POSITION + 2
+summarizer.save_state(SUB_CONV, _sub)
+check(main._is_repeat_task_traffic(SUB_CONV, [{"role": "user", "content": "Title?"}]),
+      "the seeded conv_id IS task traffic when the array carries no assistant "
+      "turn - without this the next check proves nothing")
+check(not main._is_repeat_task_traffic(SUB_CONV, list(HISTORY)),
+      "and the SAME conv_id at the SAME position answers False as soon as the "
+      "array carries history - the subsumption the removed conjunct rested on")
+check(_fire_once() != [],
+      "and the gate still schedules on that array - so [3] is not passing "
+      "because the gate refuses everything")
 
 print("[4] disk pressure does NOT roll up")
 # A rollup WRITES state, so it is subject to the same pause as every other
