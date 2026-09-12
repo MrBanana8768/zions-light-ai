@@ -816,9 +816,10 @@ r = webuidb.restore_on_boot()
 check(
     r["action"] == "kept_local" and chats(LOCAL) == 12,
     f"a healthy local database wins outright even beside an unreadable "
-    f"snapshot (action={r['action']}, local={chats(LOCAL)}) - it is by "
-    f"definition newer than any snapshot, and nothing here needs the "
-    f"snapshot to be readable",
+    f"snapshot (action={r['action']}, local={chats(LOCAL)}) - nothing here "
+    f"needs the snapshot to be readable. (Not because local is 'by "
+    f"definition newer': it need not be, and an older one is refused at "
+    f"PUBLISH time instead - test_webuidb_publish_guards.py [N5].)",
 )
 
 # ---------------------------------------------------------------------------

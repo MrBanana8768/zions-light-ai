@@ -316,35 +316,77 @@ Restore is **destructive** — it overwrites the live `webui.db` and the
 compactor store with the archive's contents. It refuses to run on an archive
 that doesn't verify.
 
+**There are four writers, not three.** With `WEBUI_DB_LOCAL=true` (the
+default) the live `webui.db` is on local disk and a fourth supervisord
+program, `webuidb-sync`, copies it to `/data/openwebui/webui.db` every
+`WEBUI_DB_SYNC_INTERVAL_S`. That copy on `/data` is the one a pod recreate
+restores from. If the restore does not reach it, **the next redeploy copies
+the un-restored database back over your restore** — hours or days later, with
+nothing in the log at the time.
+
+And it will not reach it on its own. You restore an archive because something
+was lost, so the restored database is usually *older and smaller* than the
+copy on `/data`, and `webuidb-sync` refuses exactly that (the shrink,
+per-conversation-loss and older-generation guards). Step 4 publishes it once,
+deliberately, with the three overrides set *for that one command only*.
+
 ```bash
-# 1. Pick an archive (newest last)
+# 1. Pick an archive (newest FIRST - ls -t sorts newest to the top)
 ls -1t /data/backups/
 
-# 2. Stop the writers so nothing races the restore
-supervisorctl stop openwebui compactor backup
+# 2. Which placement is this pod in? Look BEFORE stopping anything:
+supervisorctl status webuidb-sync
+#    RUNNING            -> WEBUI_DB_LOCAL=true: follow every step below.
+#    STOPPED / Not started -> WEBUI_DB_LOCAL=false: the live database IS
+#                          /data/openwebui/webui.db, there is no sync, and
+#                          you SKIP steps 4 and the `webuidb-sync` in step 5.
 
-# 3. Restore (the --yes confirms the destructive op)
+# 3. Stop ALL FOUR writers, then restore (--yes confirms the destructive op)
+supervisorctl stop openwebui compactor backup webuidb-sync
 /opt/compactor-venv/bin/python /opt/compactor/backup.py \
     --restore /data/backups/zions-backup-YYYYMMDD-HHMMSS.tar.gz --yes
 
-# 4. Bring the writers back
-supervisorctl start compactor openwebui backup
+# 4. (WEBUI_DB_LOCAL=true only) Publish the restored database to /data, once.
+#    First check the two paths match the ones webuidb-sync logs at startup
+#    ("webui.db sync: <local> -> <snapshot>" in webuidb-sync.log):
+/opt/compactor-venv/bin/python /opt/compactor/webuidb.py --status
+#    Then publish. The overrides are set on THIS command line only - never on
+#    the RunPod template, where they would stay set and wave through the next
+#    real loss. --force skips the "unchanged" check.
+WEBUI_DB_ALLOW_SHRINK=1 WEBUI_DB_ALLOW_ROW_LOSS=1 WEBUI_DB_ALLOW_OLDER_GENERATION=1 \
+    /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --sync-once --force
+#    It must print {'synced': True, ...} and exit 0. If it refuses, READ the
+#    refusal - an unreadable snapshot on /data is deliberately NOT one of the
+#    overrides above - and do not start webuidb-sync until it has published.
 
-# 5. Confirm
+# 5. Bring the writers back (webuidb-sync only if it was RUNNING in step 2 -
+#    started on a WEBUI_DB_LOCAL=false pod it would publish a stale local
+#    file over the live database)
+supervisorctl start compactor openwebui backup webuidb-sync
+
+# 6. Confirm
 curl -s http://localhost:8080/health/full | jq '.stats'
+/opt/compactor-venv/bin/python /opt/compactor/webuidb.py --status
+#    local and snapshot should now show the same chats= and content=
 ```
 
 ### Recover from a wiped / replaced volume
 If the Network Volume itself was lost and you have an archive saved
-elsewhere (copied off-pod):
+elsewhere (copied off-pod). Same four writers and the same publish step: a
+fresh pod has already published whatever OpenWebUI created on first boot, and
+the restored archive has to replace it on `/data` too.
 ```bash
 # On a fresh pod with the new volume mounted at /data:
 mkdir -p /data/backups
 # copy your saved archive into /data/backups/ first, then:
-supervisorctl stop openwebui compactor backup
+supervisorctl status webuidb-sync          # RUNNING = do step 4 below
+supervisorctl stop openwebui compactor backup webuidb-sync
 /opt/compactor-venv/bin/python /opt/compactor/backup.py \
     --restore /data/backups/<archive>.tar.gz --yes
-supervisorctl start compactor openwebui backup
+# (WEBUI_DB_LOCAL=true only)
+WEBUI_DB_ALLOW_SHRINK=1 WEBUI_DB_ALLOW_ROW_LOSS=1 WEBUI_DB_ALLOW_OLDER_GENERATION=1 \
+    /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --sync-once --force
+supervisorctl start compactor openwebui backup webuidb-sync   # webuidb-sync only if it was RUNNING
 ```
 > This is exactly why off-volume backups matter — if the only copy was on
 > the lost volume, there's nothing to restore. Until off-volume DR ships,
