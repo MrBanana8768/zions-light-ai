@@ -73,6 +73,24 @@ POLL_CEILING = max(30.0, TAIL_WAIT)
 # decision because they may need extra pod-side config.
 ADMIN_ENABLED = bool(os.environ.get("ZIONS_TEST_ADMIN_URL"))
 
+# Does the backend behind this run have REAL WEIGHTS?
+#
+# This cannot be inferred, and inferring it was the plan until the compose
+# files were read: BOTH integration profiles advertise the served model as
+# "fixture-model", so ZIONS_TEST_MODEL tells the two apart not at all. The
+# weightless fixture returns canned strings, which is exactly right for the
+# contract suite and useless for any test whose assertion is "the reply/the
+# extracted fact is ABOUT this conversation".
+#
+# Three tests already fail for this reason rather than skipping, which is the
+# worst of both worlds: a red suite that means "you ran the wrong profile",
+# so a real regression in those three would arrive as no change at all. A
+# capability the environment declares, rather than one a test guesses from a
+# symptom, keeps a genuine failure loud.
+REAL_MODEL = os.environ.get("ZIONS_TEST_REAL_MODEL", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 
 def require_base_url() -> None:
     """Pytest fixtures call this so missing config produces a clear error."""
@@ -89,6 +107,25 @@ def skip_if_no_admin(reason: str = "admin endpoint required") -> None:
     ZIONS_TEST_ADMIN_URL is unset, rather than failing with a 403/404."""
     if not ADMIN_ENABLED:
         pytest.skip(f"{reason} (set ZIONS_TEST_ADMIN_URL to enable)")
+
+
+def requires_real_model(reason: str = "assertion needs a real generation") -> None:
+    """Tests whose assertion is about the CONTENT of a model's output call
+    this. Skips, loudly and by name, against the weightless fixture.
+
+    A skip is not a pass. This one names the profile that runs it, so the
+    absence is visible as a gap rather than read as coverage:
+
+        docker compose -f docker-compose.integration.yml --profile model \\
+            run --rm --build integration-tests-model
+    """
+    if not REAL_MODEL:
+        pytest.skip(
+            f"{reason} — the weightless fixture returns canned text, so this "
+            f"can only be exercised under the real-weights profile: "
+            f"docker compose -f docker-compose.integration.yml --profile model "
+            f"run --rm --build integration-tests-model"
+        )
 
 
 # ---------------------------------------------------------------------------

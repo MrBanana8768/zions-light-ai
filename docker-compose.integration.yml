@@ -257,6 +257,12 @@ services:
       ZIONS_TEST_BASE_URL: http://127.0.0.1:8080
       ZIONS_TEST_ADMIN_URL: http://127.0.0.1:8080
       ZIONS_TEST_MODEL: fixture-model
+      # THE capability flag, and the only thing here that separates this
+      # service from the weightless one. Both advertise the served model as
+      # "fixture-model", so nothing else distinguishes them — a test whose
+      # assertion needs a real generation has to be TOLD, not left to infer it
+      # from its own failure. H.requires_real_model() reads this.
+      ZIONS_TEST_REAL_MODEL: "1"
       # Generous: a 0.5B model on CPU is slow, and a timeout here would look
       # exactly like a hang, which is the confusion R22 was about.
       ZIONS_TEST_TIMEOUT: "300"
