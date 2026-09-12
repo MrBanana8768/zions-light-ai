@@ -159,14 +159,22 @@ class adversarial_replies:
     That is the exact failure this project has been bitten by twice.
     """
 
-    def __init__(self, reply_chars: int, reply_seq: int) -> None:
+    def __init__(self, reply_chars: int, reply_seq: int,
+                 looping: bool = True) -> None:
         self.reply_chars = reply_chars
         self.reply_seq = reply_seq
+        # looping=False asks the fixture for NON-cycling padding. The
+        # default walk repeats the same ~212-char phrase every 34 words,
+        # which v3.1.8's fourth degeneracy rule (a phrase repeating to the
+        # end for 400+ chars) correctly refuses — so a long decorated
+        # reply cannot be legitimate prose unless this is False.
+        self.looping = looping
         self.raw = ""
 
     def __enter__(self) -> "adversarial_replies":
         self._before = fixture_mode_get()
-        fixture_mode_set(reply_chars=self.reply_chars, reply_seq=self.reply_seq)
+        fixture_mode_set(reply_chars=self.reply_chars, reply_seq=self.reply_seq,
+                         reply_looping=self.looping)
         self.raw = fixture_reply_text(self.reply_chars, self.reply_seq)
         if not box_chars(self.raw):
             self.__exit__(None, None, None)
@@ -654,7 +662,8 @@ def test_decorated_prose_reply_is_still_memorized(conv_id):
     """
     H.skip_if_no_admin("indexed_exchanges is an admin observable")
 
-    with adversarial_replies(reply_chars=1400, reply_seq=9) as adv:
+    with adversarial_replies(reply_chars=1400, reply_seq=9,
+                             looping=False) as adv:
         status, reply = chat_slow(
             "Tell me how the project is going.", conv_id=conv_id,
         )

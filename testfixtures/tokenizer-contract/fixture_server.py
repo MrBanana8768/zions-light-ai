@@ -185,6 +185,9 @@ _MODE: dict[str, Any] = {
     # this many characters, for soak testing. See _adversarial_reply.
     "reply_chars": 0,
     "reply_seq": 0,
+    # v3.1.9: False asks _body_words for non-cycling padding, so a long
+    # decorated reply is not ALSO a tail loop. See _body_words.
+    "reply_looping": True,
     "factor": 0.5,
     "status": 400,
     "delay": 15.0,
@@ -478,7 +481,7 @@ _LOREM = (
 ).split()
 
 
-def _adversarial_reply(n: int, target_chars: int) -> str:
+def _adversarial_reply(n: int, target_chars: int, looping: bool = True) -> str:
     """A reply shaped like the ones that took production down.
 
     Deterministic in `n` so a soak run is reproducible and a failure at turn 47
@@ -501,14 +504,48 @@ def _adversarial_reply(n: int, target_chars: int) -> str:
         "]",
         "```",
     ]
-    body = []
+    budget = target_chars - sum(len(x) + 1 for x in parts)
+    return "\n".join(parts) + "\n\n" + " ".join(_body_words(n, budget, looping))
+
+
+def _body_words(n: int, budget: int, looping: bool) -> list[str]:
+    """Padding words, cycling or not, and the difference is the whole point.
+
+    looping=True walks _LOREM with `(n*7 + i) % len(_LOREM)`, so the same
+    ~212-character phrase repeats every 34 words. That is deliberate and the
+    SOAK SUITE DEPENDS ON IT: the reply reads as a repetition loop, the memory
+    tail refuses it, and 22 consecutive refusals is what exercises
+    rollup-on-skip. Do not "fix" it.
+
+    looping=False exists because v3.1.8 added a FOURTH degeneracy rule — a
+    phrase repeating to the end of the reply for DEGENERATE_TAIL_LOOP_CHARS
+    (400) — and the cycling padding trips it at any length worth testing. That
+    left no way to ask this fixture for a long, heavily decorated reply that is
+    legitimate PROSE, which is precisely what the R9/R19/R24/R25 false-positive
+    family needs at integration level. The distinction matters more than an
+    ordinary skipped write: a reply refused there is replaced by a placeholder
+    in every future rollup, backfill and admin compact, permanently.
+
+    The non-looping walk is an LCG, so it stays deterministic in `n` (a soak
+    failure at turn 47 re-runs as turn 47) while emitting no phrase that
+    repeats to the end.
+    """
+    out: list[str] = []
+    used = 0
     i = 0
-    while sum(len(x) + 1 for x in parts) + sum(len(x) + 1 for x in body) < target_chars:
-        body.append(_LOREM[(n * 7 + i) % len(_LOREM)])
+    seed = (n * 7 + 1) & 0x7FFFFFFF
+    while used < budget:
+        if looping:
+            w = _LOREM[(n * 7 + i) % len(_LOREM)]
+        else:
+            seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+            w = _LOREM[seed % len(_LOREM)]
+        out.append(w)
+        used += len(w) + 1
         i += 1
         if i > 20000:  # never spin forever on a pathological target
             break
-    return "\n".join(parts) + "\n\n" + " ".join(body)
+    return out
 
 
 # --- Optional REAL model (v3.1.8) ------------------------------------------
@@ -593,7 +630,11 @@ def _reply_for(body: dict) -> str:
     """
     chars = int(_MODE.get("reply_chars") or 0)
     if chars > 0:
-        return _adversarial_reply(int(_MODE.get("reply_seq") or 0), chars)
+        return _adversarial_reply(
+            int(_MODE.get("reply_seq") or 0),
+            chars,
+            bool(_MODE.get("reply_looping", True)),
+        )
     real = _real_model_reply(body)
     if real is not None:
         return real
@@ -757,7 +798,7 @@ async def get_mode():
 async def set_mode(request: Request):
     body = await request.json()
     for k in ("tokenize_mode", "factor", "status", "delay", "assistant_final_400",
-              "reply_chars", "reply_seq"):
+              "reply_chars", "reply_seq", "reply_looping"):
         if k in body:
             _MODE[k] = body[k]
     return dict(_MODE)
