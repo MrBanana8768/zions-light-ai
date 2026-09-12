@@ -200,17 +200,114 @@ fi
 export WEBUI_DB_LOCAL="${WEBUI_DB_LOCAL:-true}"
 export WEBUI_LOCAL_DB="${WEBUI_LOCAL_DB:-/var/lib/openwebui/webui.db}"
 export WEBUI_SNAPSHOT_DB="${WEBUI_SNAPSHOT_DB:-${DATA_DIR:-/data/openwebui}/webui.db}"
+# The escape hatch for the boot refusal below. Default false: a restore that
+# fails stops the boot. It exists because "refuse forever" is its own failure
+# mode - if the snapshot is genuinely unrecoverable, an operator has to be
+# able to bring the pod up and start again from nothing, deliberately, having
+# read what that costs.
+export WEBUI_DB_ALLOW_EMPTY_START="${WEBUI_DB_ALLOW_EMPTY_START:-false}"
 
 if [ "${WEBUI_DB_LOCAL}" = "true" ]; then
     export DATABASE_URL="${DATABASE_URL:-sqlite:///${WEBUI_LOCAL_DB}}"
     export WEBUIDB_SYNC_ENABLED=true
     mkdir -p "$(dirname "${WEBUI_LOCAL_DB}")"
     echo "[2b/3] Placing webui.db on local disk (${WEBUI_LOCAL_DB})"
-    /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --restore 2>&1 | tail -3 || {
-        echo "      WARNING: restore step failed; OpenWebUI will still start."
-        echo "      Check ${LOG_DIR}/webuidb-sync.log and run:"
+
+    # THE EXIT CODE, NOT THE PIPELINE'S. This step was
+    #
+    #     webuidb.py --restore 2>&1 | tail -3 || { echo WARNING...; }
+    #
+    # and that warning could not print, three ways over at once:
+    # restore_on_boot() never raises (every failure RETURNS a dict with
+    # action="error"/"snapshot_unhealthy"/"restore_failed"), __main__ printed
+    # that dict with no sys.exit, and the status of `cmd | tail` is TAIL's,
+    # which is 0 whatever ran to its left. So a restore that failed outright
+    # reported success: OpenWebUI started with DATABASE_URL pointing at a file
+    # that does not exist, alembic built a fresh empty schema, and one message
+    # later the sync daemon published that 1-chat database over the snapshot
+    # holding every conversation she has. webuidb.py now exits per failure
+    # (RESTORE_EXIT_CODES in that module) and this reads that status.
+    #
+    # A command substitution, NOT `set -o pipefail`. pipefail is a GLOBAL
+    # flag, and the obvious way to reach for it -
+    #     set -o pipefail; cmd | tail || { set +o pipefail; ...; }
+    # - puts the restore inside the branch that only runs on FAILURE, so a
+    # successful restore leaves pipefail set for every later pipeline in this
+    # script. `x="$(cmd)" || rc=$?` needs no flag and leaks nothing. (The
+    # `|| rc=$?` is not optional either: a bare assignment from a command
+    # substitution is a simple command, and under `set -e` a failing one
+    # aborts the script before the next line can look at it.)
+    restore_rc=0
+    restore_out="$(/opt/compactor-venv/bin/python /opt/compactor/webuidb.py --restore 2>&1)" \
+        || restore_rc=$?
+    printf '%s\n' "${restore_out}" | tail -3
+
+    if [ "${restore_rc}" -ne 0 ]; then
+        # WHY THIS REFUSES TO BOOT RATHER THAN WARNING AND CARRYING ON. Both
+        # outcomes were written out before choosing between them.
+        #
+        # Carrying on: OpenWebUI starts, finds nothing at DATABASE_URL, builds
+        # an empty schema, and she opens the app to a companion that has
+        # forgotten her. Every service is green, nothing says a word, and the
+        # pod runs that way until a person happens to look. The snapshot on
+        # /data is still intact in that moment - but the live database is now
+        # an empty one, and something eventually publishes it.
+        #
+        # Refusing: the pod does not come up. Loud, immediate, and it leaves
+        # /data EXACTLY as it was, with the snapshot still there for
+        # scripts/recover-webui-db.py and nothing written over it.
+        #
+        # The asymmetry that decides it: this deployment works fail-forward
+        # and does not roll back, so data loss is the one failure class with
+        # no recovery path. A pod that will not boot can be recovered by hand
+        # at any later hour. A pod that boots empty and then publishes cannot
+        # be, and it is the COMPOSITION rather than either half that loses
+        # everything - so it gets broken here, before anything writes. This
+        # file already refuses to boot for an unwritable /data and for a
+        # driver too old to serve, on the same principle: a boot that cannot
+        # end in an honest system does not get to proceed halfway.
+        echo ""
+        echo "      ============================================================"
+        echo "      RESTORE FAILED (exit ${restore_rc}) - REFUSING TO START."
+        echo ""
+        case "${restore_rc}" in
+            3)  echo "      The snapshot on /data failed quick_check - a hot rollback"
+                echo "      journal, a corrupt header, a stalled mount - and local disk"
+                echo "      holds no history either. It was NOT copied down: restoring a"
+                echo "      half-rolled-back database and calling it live is how a"
+                echo "      recoverable problem becomes a permanent one." ;;
+            4)  echo "      The snapshot is healthy but could not be copied to local disk."
+                echo "      A full overlay is the usual cause. Nothing on /data was"
+                echo "      touched." ;;
+            5)  echo "      Local disk could not be prepared: either ${WEBUI_LOCAL_DB%/*}"
+                echo "      could not be created, or an existing local database could not"
+                echo "      be moved aside and so must not be overwritten. The log line"
+                echo "      just above this banner says which." ;;
+            *)  echo "      webuidb.py reported a failure this script has no text for."
+                echo "      Treated as fatal deliberately - an unrecognised failure on"
+                echo "      this path is not a pass." ;;
+        esac
+        echo ""
+        echo "      Look, with someone watching:"
         echo "        /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --status"
-    }
+        echo "        /opt/compactor-venv/bin/python /data/scripts/recover-webui-db.py --check"
+        echo "      Then redeploy. Nothing has been lost and nothing was changed."
+        echo ""
+        echo "      To start anyway, having read the above and accepting that"
+        echo "      OpenWebUI will build an EMPTY schema and show her no history:"
+        echo "        WEBUI_DB_ALLOW_EMPTY_START=true"
+        echo "      ============================================================"
+        echo ""
+        if [ "${WEBUI_DB_ALLOW_EMPTY_START}" != "true" ]; then
+            exit 1
+        fi
+        echo "      WEBUI_DB_ALLOW_EMPTY_START=true - starting anyway."
+        echo "      The sync daemon stays ON, and that is safe rather than an"
+        echo "      oversight: every route out of this state is refused by"
+        echo "      webuidb.sync_once - an unreadable snapshot, a readable one"
+        echo "      holding more than local does, or no local database at all."
+        echo "      It will say so in the log every sync until this is fixed."
+    fi
 else
     # THE SYNC DAEMON MUST NOT RUN HERE, and this is the whole safety of the
     # flag. It publishes the LOCAL file over the snapshot path; with the
