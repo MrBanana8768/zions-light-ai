@@ -4031,6 +4031,25 @@ async def _facts_tail(
     exactly the shape that let the dependency in, and a reviewer cannot see a
     missing `else` the way they can see a function boundary.
     """
+    # HERE, not only at the call site, for the same reason job 3 gives at
+    # _rollup_hierarchy: this job WRITES — the touched-save below and
+    # save_facts further down — so it is subject to the same pause every
+    # other new-memory write is. _async_tail checks once at its top, and
+    # then job 1 indexes and this job makes a vLLM extraction call that can
+    # take seconds, so the disk can fill between that check and this write;
+    # a re-queued tail can sit in the pool's queue for longer still. Job 3
+    # got its own guard when it was extracted in v3.1.8 and said exactly
+    # this; job 2 was extracted in v3.1.7 (R8) and did not, so the two
+    # halves of the same split disagreed about whether the outer check was
+    # enough. degrade.py's module docstring lists "fact extraction (async
+    # tail)" first under what gets gated, which is what made the gap read
+    # as covered. writes_allowed() is cached for
+    # COMPACTOR_DEGRADE_CHECK_TTL_S, so this is a tuple read, not a second
+    # statvfs. Silent return, matching job 3: guard() already logs at debug
+    # and writes_allowed() warned on the transition.
+    if not degrade.guard("fact extraction tail"):
+        return
+
     if not facts.extraction_enabled():
         # Even with extraction off, save the touched state so LRU
         # tracking persists across restarts. Re-read under the lock (see
@@ -4053,7 +4072,32 @@ async def _facts_tail(
                 logger.warning(f"conv={conv_id}: touched-save failed: {e}")
         return
 
-    if not assistant_text or not last_user_text:
+    # .strip(), not bare truthiness — the R11 sweep's rule, which this job
+    # was carrying the pre-sweep version of. A user turn of nothing but
+    # spaces is TRUE, so job 1 next door refused it via
+    # _has_pairable_user_text while this one accepted it: it spent a vLLM
+    # extraction call on `[user]:    ` / `[assistant]: <reply>` and stored
+    # whatever the extractor made of a blank question, against a prompt
+    # tuned to over-extract. Same disagreement _has_pairable_user_text was
+    # written to end, at the third site the sweep did not reach — R8 lifted
+    # this decision out of _async_tail into a function of its own two
+    # releases before the sweep unified the spelling, and a moved condition
+    # is not what a sweep greps for.
+    #
+    # Not reachable from /v1/chat/completions today: _tail_store_blocked
+    # refuses on the request path first, and counts it as
+    # SKIPPED_NO_USER_TEXT. _async_tail is entered directly by six suites
+    # and by anything that re-queues a tail, which is the same reachability
+    # the helper's own docstring calls "not decoration".
+    #
+    # `(assistant_text or "")` deliberately, where job 1 writes a bare
+    # assistant_text.strip(): _rollup_hierarchy next door types this
+    # parameter `str | None` and means it, so the None-tolerant spelling is
+    # the one that cannot turn a direct caller's None into an
+    # AttributeError while we are here fixing a truthiness bug.
+    if not (assistant_text or "").strip() or not _has_pairable_user_text(
+        last_user_text
+    ):
         return
 
     async with conv_lock(conv_id):

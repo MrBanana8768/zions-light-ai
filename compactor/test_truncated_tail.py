@@ -37,6 +37,13 @@ real gaps and are closed here:
     _async_tail's rollup gate weakened      [E10b]
     _async_tail's own degrade.guard removed [E10b]
 
+v3.1.9, M7 — two more of the same, at the third copy of the rule. R8 had
+already moved job 2 out into _facts_tail, so the R11 sweep above did not
+reach it and [E10b] watched jobs 1 and 3 while running job 2's inputs:
+
+    job 2's user/reply rule without .strip()  [E10c]
+    job 2's own degrade.guard absent          [E10c]
+
 Two survived and are recorded rather than chased; see the block at the foot
 of this file for both, with the reasons.
 
@@ -955,6 +962,145 @@ assert_true(_find(cap.records, "disk pressure") is not None,
 _run_tail("tt-inner-control", extraction=True)
 assert_eq(len(_INDEXED), 1, "control: a healthy tail still indexes")
 assert_eq(len(_ROLLUPS), 1, "control: ...and still rolls up")
+
+# ---------------------------------------------------------------------------
+# [E10c] M7 — job 2's OWN guards, which [E10b] structurally could not see.
+#
+# [E10b] above runs a blank user turn, a whitespace reply and a full disk
+# through _async_tail and asserts on _INDEXED and _ROLLUPS: jobs 1 and 3. It
+# has no spy on job 2 at all. So every one of those three cases passed while
+# _facts_tail accepted all three of them — the shapes were exercised, the
+# conclusions were only ever read off the other two jobs. A case that runs
+# the input and looks somewhere else is not coverage, and this is the fourth
+# time on this branch that it has read as coverage.
+#
+# What job 2 was carrying:
+#
+#   * bare truthiness, `if not assistant_text or not last_user_text`. The
+#     R11 sweep unified that rule into _has_pairable_user_text and reached
+#     _tail_store_blocked and the episodic gate; it did not reach this copy,
+#     because R8 had moved the condition into a function of its own two
+#     releases earlier and a moved condition is not what a sweep greps for.
+#     A user turn of nothing but spaces is TRUE, so job 1 refused it and job
+#     2 spent a vLLM extraction call on a blank question — against a prompt
+#     that says "when in doubt, extract" — and stored the answer.
+#
+#   * no degrade.guard of its own. Job 3 took one when it was extracted in
+#     v3.1.8, with the reason written next to it: the outer check happens
+#     once at the top of _async_tail, and job 1 indexes and job 2 makes an
+#     LLM round trip before job 2's writes land, so the disk can fill in
+#     between. Job 2 was extracted a release earlier and kept nothing.
+#     degrade.py's module docstring lists "fact extraction (async tail)"
+#     FIRST under what gets gated, which is exactly what made it read as
+#     covered.
+#
+# The guard patches below are LABEL-SELECTIVE on purpose. A blanket
+# `guard -> False` returns at the top of _async_tail and job 2 never runs,
+# so the assertion would hold for a _facts_tail with no guard whatsoever —
+# passing for the wrong reason. Blocking only job 2's own label is the disk-
+# fills-mid-tail case, and it fails if the second call site is gone.
+#
+# Mutations this section kills:
+#   drop `if not degrade.guard("fact extraction tail")`                 (M7a)
+#   `not (assistant_text or "").strip()` -> `not assistant_text`        (M7b)
+#   `not _has_pairable_user_text(...)` -> `not last_user_text`          (M7c)
+# ---------------------------------------------------------------------------
+
+print()
+print("[E10c] M7 — _facts_tail's own guards, watched at job 2 rather than 1")
+
+_EXTRACTED: list = []
+_SAVED: list = []
+_STORED_FACT = {"text": "an existing fact", "last_used": 1}
+
+
+async def _spy_extract(*a, **k):
+    _EXTRACTED.append(k.get("conv_id"))
+    return []
+
+
+def _run_job2(conv_id, *, extraction=True, user_text="a real question",
+              reply=PROSE, blocked_label=None):
+    """Enter _async_tail directly and watch what JOB 2 did.
+
+    `blocked_label` is the single degrade.guard label to refuse; everything
+    else is allowed. See the header for why a blanket refusal would make
+    these assertions vacuous.
+    """
+    _EXTRACTED.clear()
+    _SAVED.clear()
+    _ROLLUPS.clear()
+    _INDEXED.clear()
+    touched = [{**_STORED_FACT, "last_used": 99}]
+    with patch.object(degrade, "guard", lambda op: op != blocked_label), \
+         patch.object(facts, "extraction_enabled", lambda: extraction), \
+         patch.object(facts, "load_facts", lambda c: [dict(_STORED_FACT)]), \
+         patch.object(facts, "save_facts",
+                      lambda c, f: _SAVED.append((c, list(f)))), \
+         patch.object(facts, "extract_facts_from_exchange", _spy_extract), \
+         patch.object(summarizer, "enabled", lambda: True), \
+         patch.object(summarizer, "maybe_rollup", _spy_rollup), \
+         patch.object(summarizer, "load_state",
+                      lambda c: {"l1": [], "l2": [], "l3": None,
+                                 "last_summarized_turn": 0}), \
+         patch.object(retrieval, "index_exchange",
+                      lambda *a, **k: (_INDEXED.append(a), True)[1]):
+        asyncio.run(main._async_tail(
+            conv_id, touched, user_text, reply, 4,
+            [{"role": "user", "content": user_text}],
+        ))
+
+
+# CONTROL FIRST, so every refusal below is measured against a job 2 that is
+# demonstrably alive in this harness. Without it the four cases that follow
+# pass just as well for a _facts_tail that never extracts anything.
+_run_job2("tt-job2-control")
+assert_eq(len(_EXTRACTED), 1, "control: a healthy job 2 makes its extraction call")
+assert_eq(len(_SAVED), 1, "control: ...and writes the store")
+assert_eq(len(_INDEXED), 1, "control: job 1 ran too")
+assert_eq(len(_ROLLUPS), 1, "control: and job 3")
+
+_run_job2("tt-job2-blank-user", user_text="   ")
+assert_eq(len(_EXTRACTED), 0,
+          "blank user turn: NO extraction call — job 1 already refuses this "
+          "shape, and job 2 must not pay an LLM round trip to invent facts "
+          "out of a question of three spaces")
+assert_eq(len(_SAVED), 0, "blank user turn: and nothing written")
+assert_eq(len(_INDEXED), 0, "blank user turn: job 1 still refuses it (E10b)")
+
+_run_job2("tt-job2-blank-reply", reply="  \n\t ")
+assert_eq(len(_EXTRACTED), 0,
+          "whitespace reply: NO extraction call — decide_memory_tail calls "
+          "this SKIPPED_EMPTY on the request path and job 2 must agree with "
+          "it rather than with bool('   ')")
+assert_eq(len(_SAVED), 0, "whitespace reply: and nothing written")
+
+_run_job2("tt-job2-disk", blocked_label="fact extraction tail")
+assert_eq(len(_EXTRACTED), 0,
+          "disk fills mid-tail: NO extraction call — job 2 re-checks the "
+          "pause for itself, exactly as job 3 does, because the outer check "
+          "was made before job 1 and an LLM round trip")
+assert_eq(len(_SAVED), 0, "disk fills mid-tail: and no fact write")
+assert_eq(len(_INDEXED), 1,
+          "disk fills mid-tail: job 1 still ran — this is the selective case, "
+          "not _async_tail's outer guard firing and hiding the point")
+assert_eq(len(_ROLLUPS), 1, "disk fills mid-tail: and job 3 still ran")
+
+# The extraction-OFF branch writes too — the touched-save that keeps LRU
+# tracking across restarts is a save_facts like any other, and it sits ABOVE
+# the text check, so it is reached on turns nothing else is.
+_run_job2("tt-job2-off-disk", extraction=False,
+          blocked_label="fact extraction tail")
+assert_eq(len(_SAVED), 0,
+          "extraction off + disk pressure: not even the touched-save runs — "
+          "it is a write, and the guard is above it")
+
+_run_job2("tt-job2-off-control", extraction=False)
+assert_eq(len(_SAVED), 1,
+          "control: extraction off on a healthy disk still persists the LRU "
+          "touch, so the line above is the guard and not the branch")
+assert_eq(len(_EXTRACTED), 0,
+          "control: ...and still makes no extraction call, obviously")
 
 # ---------------------------------------------------------------------------
 # [E11] R26 — vLLM dying mid-stream must not skip the tail silently.
