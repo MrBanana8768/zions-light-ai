@@ -1714,7 +1714,19 @@ async def compact_if_needed(
     if conv_id:
         try:
             _st = summarizer.load_state(conv_id)
-            _covered = summarizer._highest_chunk_turn(_st)
+            # THE CONTIGUOUS PREFIX, not the highest label (v3.1.9, B3/B4).
+            #
+            # _highest_chunk_turn answers where coverage ENDS; the
+            # substitution deletes turns from the START, so what it needs is
+            # where coverage BEGINS and whether it is unbroken. Two shipped
+            # rollup paths leave a hole on purpose (`pos_last < 1` advances
+            # the watermark with no chunk at all; `partial` records a
+            # deliberately narrower first_turn), and load_state parks an
+            # unparseable chunk, which leaves one with no outage at all.
+            # Across a hole this deleted 20 turns no chunk represents and
+            # logged them as "covered by stored summaries". See
+            # _covered_prefix for why l3 is excluded.
+            _covered = summarizer._covered_prefix(_st)
             # ONLY WHEN THE ARRAY IS NOT A SUFFIX, and this is the whole
             # safety of it. Turn numbers are not array indices once a
             # client sends a bounded window; mapping between them needs
@@ -1744,14 +1756,26 @@ async def compact_if_needed(
             # _observed_position must not be called here; this is the half of
             # it that is safe to borrow. Empty means "cannot be told", which is
             # the answer that must decline.
+            # THE FULL ANCHOR, not any prefix of it (v3.1.9, B2).
+            #
+            # This read `bool(_align_candidates(...))` — non-emptiness — and
+            # _align_candidates tries every prefix down to length ONE. The
+            # anchor's first element is a user turn, so a single repeated
+            # short turn satisfied it: an adversarial pass reproduced the
+            # very break the paragraph above says was closed, 20 of 30
+            # branch-B exchanges replaced by branch A's summary, with
+            # candidates == [0], which is truthy. Prefixes are correct for
+            # _observed_position, which must read a regenerated reply as
+            # zero new turns; they are wrong for "is this the same
+            # conversation". _align_new_turns already documents the rule this
+            # site broke — a repeated "ok" must land on the side that
+            # duplicates, not the side that loses.
             _anchor = _st.get("tail_fp") or []
-            _aligned = bool(_anchor) and bool(
-                summarizer._align_candidates(
-                    _anchor,
-                    summarizer._turn_fingerprints(
-                        _non_system[-summarizer._FINGERPRINT_TAIL_TURNS:]
-                    ),
-                )
+            _aligned = bool(_anchor) and summarizer._aligns_fully(
+                _anchor,
+                summarizer._turn_fingerprints(
+                    _non_system[-summarizer._FINGERPRINT_TAIL_TURNS:]
+                ),
             )
 
             if _covered > 0 and _n >= summarizer._recorded_position(_st) and _aligned:

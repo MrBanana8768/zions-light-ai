@@ -800,6 +800,50 @@ def _align_candidates(anchor: list[str], fps: list[str]) -> list[int]:
     return sorted(out)
 
 
+def _aligns_fully(anchor: list[str], fps: list[str]) -> bool:
+    """Does the WHOLE anchor appear as a contiguous run inside `fps`?
+
+    _align_candidates above tries every prefix down to length 1, and that is
+    right for what it does — a regenerated last reply rewrites the newest
+    turn and only a shorter prefix can still be found, and reading that as
+    one fresh exchange would put the position 2 ahead of reality and punch a
+    2-turn hole in the hierarchy. So prefixes are load-bearing THERE.
+
+    They are not load-bearing for a caller asking "is this the same
+    conversation?", and one such caller read `bool(_align_candidates(...))`
+    — non-emptiness — as its answer. A 1-element match satisfies that. The
+    anchor's first element is a USER turn (tail_fp is fps[-4:] of a history
+    ending on an assistant reply), and in a companion chat the user types
+    "ok" more than once, so a single repeated short turn passed the gate: an
+    adversarial pass put 20 of 30 exchanges from one branch under the other
+    branch's summary, with `candidates == [0]`, which is truthy.
+
+    _align_new_turns, twenty lines below, already knew: "A short repeated
+    turn ('ok') that collides with an older one must land on the side that
+    duplicates rather than the side that loses." It takes the SMALLEST
+    candidate for exactly that reason. The reuse gate borrowed the pure half
+    of _observed_position and left behind the judgment that made it safe —
+    which is this file's signature defect, committed against its own
+    documented rule.
+
+    So: a separate predicate rather than a `min_prefix` argument on
+    _align_candidates. That function is shared with _observed_position, whose
+    recency rule depends on seeing every candidate including the short ones,
+    and adding a mode to a primitive two callers disagree about is how the
+    borrow went wrong the first time.
+
+    Full-length only, and therefore no `new`-turn count: a caller that needs
+    to know HOW FAR the window moved must use _observed_position, which owns
+    the extra evidence. This answers one question.
+    """
+    n, m = len(fps), len(anchor)
+    if m == 0 or n < m:
+        return False
+    # Scanned newest-first, so the common case (the anchor is the previous
+    # tail and the window barely moved) exits on the first comparison.
+    return any(fps[j - m:j] == anchor for j in range(n, m - 1, -1))
+
+
 def _align_new_turns(anchor: list[str], fps: list[str]) -> int | None:
     """The SMALLEST advance the anchor supports, or None if it supports none.
 
@@ -834,6 +878,65 @@ def _highest_chunk_turn(state: dict) -> int:
     if isinstance(l3, dict) and isinstance(l3.get("last_turn"), int):
         highest = max(highest, l3["last_turn"])
     return highest
+
+
+def _covered_prefix(state: dict) -> int:
+    """The furthest turn N such that turns 1..N are covered by an UNBROKEN
+    chain of stored chunks. 0 when the chain does not start at turn 1.
+
+    _highest_chunk_turn above answers where coverage ENDS. Nothing asked
+    where it STARTS, and two shipped paths in _do_l1_rollup deliberately
+    leave a hole:
+
+      * `pos_last < 1` advances `last_summarized_turn` to `window_offset`
+        and appends NO chunk. The span is gone on purpose — the text was
+        never in a request and this module never held a copy — and the error
+        line says so, pointing at /admin/.../compact to rebuild it.
+      * `partial` records `first_turn = window_offset + 1`, deliberately
+        NARROWER than `last + 1`, precisely so the chunk does not claim
+        coverage of text the rollup never saw.
+
+    Both are correct as rollup behaviour. Both are invisible to
+    _highest_chunk_turn, which takes a max over `last_turn` and never looks
+    at `first_turn` at all. So a reader asking "how many turns can I replace
+    with stored summary text?" got a number that counted straight across the
+    hole, and the reuse path in compact_if_needed deleted turns no chunk
+    represents — logged as "N covered by stored summaries". An adversarial
+    pass demonstrated 20 such turns.
+
+    A gap also appears with no outage at all: load_state parks a chunk whose
+    shape it cannot parse (v3.1 F1b, correct on its own terms) and the
+    survivors either side are contiguous with each other but not with turn 1.
+
+    l1 + l2, matching _highest_chunk_turn's domain, because an L2 rollup
+    CONSUMES its inputs — `state["l1"] = l1[L2_CHUNK_SIZE:]` — so a span can
+    live in either tier. l3 is excluded for the same reason it is a special
+    case there: it inherits `first_turn` from the previous l3 rather than
+    measuring it, so its span is a claim about a claim. Excluding it can only
+    make this number smaller, and smaller is the safe direction: under-
+    claiming coverage costs a summarization call, over-claiming deletes
+    turns.
+
+    Spans may overlap, nest and arrive in any order, so the walk sorts and
+    takes `max` rather than requiring `first_turn == reach + 1`.
+    """
+    spans: list[tuple[int, int]] = []
+    for c in list(state.get("l1") or []) + list(state.get("l2") or []):
+        if not isinstance(c, dict):
+            continue
+        ft, lt = c.get("first_turn"), c.get("last_turn")
+        if isinstance(ft, int) and isinstance(lt, int) and ft >= 1 and lt >= ft:
+            spans.append((ft, lt))
+    reach = 0
+    for ft, lt in sorted(spans):
+        # A chunk starting past the end of what we have proven leaves a hole,
+        # and everything after it is unreachable from turn 1 no matter how
+        # much of it there is.
+        if ft > reach + 1:
+            break
+        if lt > reach:
+            reach = lt
+    return reach
 
 
 def _recorded_position(state: dict) -> int:

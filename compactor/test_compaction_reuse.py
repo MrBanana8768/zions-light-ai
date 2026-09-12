@@ -280,6 +280,208 @@ check(any("question 20" in t for t in _sent_img),
 check(not any("question 0" in t for t in _sent_img),
       "and the covered oldest turns were still NOT re-summarized")
 
+print("[10] _covered_prefix: coverage that does not reach turn 1 is not coverage")
+# B3/B4. _highest_chunk_turn answers where coverage ENDS; the substitution
+# deletes turns from the START. Two shipped rollup paths leave a hole on
+# purpose (pos_last < 1 advances the watermark with NO chunk; `partial`
+# records a deliberately narrower first_turn) and load_state parks an
+# unparseable chunk, which makes one with no outage at all. The adversarial
+# pass deleted 20 turns across such a hole and logged them as covered.
+_cp = summarizer._covered_prefix
+# CONTROL FIRST: an unbroken chain still returns its full reach, so every
+# refusal below is measured against a function that can say yes.
+check(_cp({"l1": [{"first_turn": 1, "last_turn": 20},
+                  {"first_turn": 21, "last_turn": 40}]}) == 40,
+      "an unbroken chain from turn 1 covers its whole span")
+check(_cp({"l1": [{"first_turn": 21, "last_turn": 40}]}) == 0,
+      "a chain that starts at turn 21 covers NOTHING — this is the "
+      "`pos_last < 1` path, which advances the watermark and appends no chunk")
+check(_cp({"l1": [{"first_turn": 1, "last_turn": 10},
+                  {"first_turn": 31, "last_turn": 44}]}) == 10,
+      "a hole at 11-30 stops the count at 10, not 44 — this is the parked "
+      "chunk, and 44 is what _highest_chunk_turn answered")
+check(_cp({"l1": [{"first_turn": 11, "last_turn": 20}],
+           "l2": [{"first_turn": 1, "last_turn": 10}]}) == 20,
+      "the chain may span tiers — an L2 rollup CONSUMES its L1 inputs, so a "
+      "span lives in whichever tier last touched it")
+check(_cp({"l1": [{"first_turn": 21, "last_turn": 40},
+                  {"first_turn": 1, "last_turn": 20}]}) == 40,
+      "order does not matter; the walk sorts")
+check(_cp({"l1": [{"first_turn": 1, "last_turn": 20},
+                  {"first_turn": 15, "last_turn": 30}]}) == 30,
+      "overlapping spans are contiguous, not a hole")
+check(_cp({"l1": [{"first_turn": 1, "last_turn": 40},
+                  {"first_turn": 5, "last_turn": 10}]}) == 40,
+      "a nested span cannot pull the reach back down")
+check(_cp({"l1": [{"first_turn": 1, "last_turn": 20}, "not-a-dict",
+                  {"first_turn": 21, "last_turn": 40}]}) == 40,
+      "a non-dict entry is skipped, not fatal")
+check(_cp({"l1": [{"first_turn": "1", "last_turn": 20}]}) == 0,
+      "a string turn number is not an int and claims nothing")
+check(_cp({"l1": [{"first_turn": 0, "last_turn": 20}]}) == 0,
+      "turn 0 does not exist, so a span claiming it claims nothing")
+check(_cp({"l1": [{"first_turn": 30, "last_turn": 5}]}) == 0,
+      "a span whose end precedes its start claims nothing")
+check(_cp({}) == 0 and _cp({"l1": None, "l2": None}) == 0,
+      "an empty or null state covers nothing")
+# l3 is excluded DELIBERATELY: it inherits first_turn from the previous l3
+# rather than measuring it. Pin that, so a later change to include it is a
+# decision and not a drift.
+check(_cp({"l3": {"first_turn": 1, "last_turn": 999}}) == 0,
+      "l3 alone claims nothing — its span is inherited, not measured")
+
+print("[11] _aligns_fully: one repeated short turn is not the same conversation")
+# B2. The gate read `bool(_align_candidates(...))`, and _align_candidates
+# tries every prefix down to length ONE. tail_fp's first element is a USER
+# turn, and in a companion chat "ok" is typed more than once, so a single
+# collision put 20 of 30 exchanges from one branch under the other's summary
+# with candidates == [0], which is truthy.
+_af = summarizer._aligns_fully
+_ANCH = ["aa", "bb", "cc", "dd"]
+# CONTROL FIRST.
+check(_af(_ANCH, ["xx", "aa", "bb", "cc", "dd"]) is True,
+      "the whole anchor present contiguously aligns")
+check(_af(_ANCH, ["aa", "bb", "cc", "dd"]) is True,
+      "...including when it is the entire window")
+check(_af(_ANCH, ["aa", "bb", "cc", "dd", "yy", "zz"]) is True,
+      "...and when the window has moved on past it")
+check(_af(_ANCH, ["zz", "aa", "yy"]) is False,
+      "a ONE-element match is refused — this is the 'ok' collision")
+check(_af(_ANCH, ["aa", "bb", "zz"]) is False,
+      "a two-element prefix is refused too")
+check(_af(_ANCH, ["aa", "bb", "cc"]) is False,
+      "three of four is still not the anchor")
+check(_af(_ANCH, ["aa", "zz", "bb", "cc", "dd"]) is False,
+      "the run must be CONTIGUOUS — an inserted turn breaks it")
+check(_af([], ["aa", "bb"]) is False,
+      "an empty anchor is no evidence")
+check(_af(_ANCH, []) is False and _af(_ANCH, ["aa", "bb"]) is False,
+      "a window shorter than the anchor cannot contain it")
+# AND the primitive is UNCHANGED, so this is a new predicate rather than a
+# weakened shared function. _observed_position's recency rule depends on
+# seeing the short candidates.
+check(summarizer._align_candidates(_ANCH, ["zz", "aa", "yy"]) != [],
+      "_align_candidates still accepts the 1-element match it is built to "
+      "find — the fix is a separate predicate, not a broken primitive")
+
+print("[12] a capped window that DOES align is still refused on length")
+# The gate ced4520 proved with a mutation, re-proved. That mutation went RED
+# then; f78a389 later added `_aligned` as a conjunct IN FRONT of it, and [5]'s
+# fixture declines on ALIGNMENT — so the length gate has been untested since,
+# and dropping it left this suite GREEN. Mutation evidence expires when a
+# conjunct lands in front of it.
+#
+# The fixture matters: a real capped window ALIGNS BY CONSTRUCTION, because a
+# cap sends the last max_turns turns and the anchor is the previous request's
+# tail. So the anchor here is built from the WINDOW's own tail, not from turns
+# that appear nowhere in it, and the length comparison is the only thing left
+# standing between this array and the substitution.
+CONV_CAP2 = "reuse_capped_aligning"
+MSGS_CAP2 = history(24)
+_ns_cap2 = [m for m in MSGS_CAP2 if m.get("role") != "system"]
+_seed(CONV_CAP2, MSGS_CAP2,
+      [{"text": "CAPPED-CHUNK", "first_turn": 1, "last_turn": 40}],
+      anchor_through=40)
+_st_cap2 = summarizer.load_state(CONV_CAP2)
+# turns_seen past the window's length is what a capped client looks like: the
+# conversation is known to have reached 48, the client is sending 16.
+_st_cap2["turns_seen"] = 48
+_WINDOW = _ns_cap2[-16:]
+_st_cap2["tail_fp"] = summarizer._turn_fingerprints(
+    _WINDOW)[-summarizer._ANCHOR_TURNS:]
+summarizer.save_state(CONV_CAP2, _st_cap2)
+# FIXTURE CHECK: the two gates must be in the states this case claims, or it
+# proves nothing about which one fired.
+check(summarizer._aligns_fully(
+          _st_cap2["tail_fp"],
+          summarizer._turn_fingerprints(
+              _WINDOW[-summarizer._FINGERPRINT_TAIL_TURNS:])) is True,
+      "fixture: this window ALIGNS — so the refusal below cannot come from "
+      "the alignment gate")
+check(len(_WINDOW) < summarizer._recorded_position(_st_cap2),
+      "fixture: and it is SHORTER than the recorded position, so the length "
+      "gate is the one under test")
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(list(_WINDOW), CONV_CAP2))
+check(not any("CAPPED-CHUNK" in str(m.get("content", "")) for m in out),
+      "a window that aligns but is shorter than the recorded position is "
+      "REFUSED — turn numbers are not array indices once a client caps, and "
+      "the stored summary covers turns this array does not contain")
+
+print("[13] a HOLE in the stored coverage stops the substitution at the hole")
+# [10] proves _covered_prefix. It does NOT prove the gate calls it: reverting
+# the one call site to _highest_chunk_turn left this suite GREEN, which is the
+# same defect as running the right input and asserting somewhere else. So
+# assert it END TO END, through compact_if_needed, on a state with a hole.
+#
+# Chunks cover 1-10 and 31-44. _highest_chunk_turn says 44; the real coverage
+# is 10, and turns 11-30 are represented by nothing at all.
+CONV_HOLE = "reuse_hole"
+MSGS_HOLE = history(24)
+_seed(CONV_HOLE, MSGS_HOLE,
+      [{"text": "HOLE-CHUNK-A", "first_turn": 1, "last_turn": 10},
+       {"text": "HOLE-CHUNK-B", "first_turn": 31, "last_turn": 44}],
+      anchor_through=44)
+_st_hole = summarizer.load_state(CONV_HOLE)
+# FIXTURE CHECK: the two readings must actually disagree here, or [13] proves
+# nothing about which one the gate used.
+check(summarizer._highest_chunk_turn(_st_hole) == 44
+      and summarizer._covered_prefix(_st_hole) == 10,
+      "fixture: the highest label says 44 and the contiguous prefix says 10")
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(list(MSGS_HOLE), CONV_HOLE))
+check(len(CALLS) == 1 and any("question 5" in t for t in CALLS[0]),
+      "turn 11 — the first turn INSIDE the hole — reached summarize() rather "
+      "than being deleted under a summary that does not mention it")
+check(len(CALLS) == 1 and any("question 15" in t for t in CALLS[0]),
+      "and so did turn 31, which HOLE-CHUNK-B claims: a chunk unreachable "
+      "from turn 1 cannot stand in for its own span either, because the "
+      "turns before it would have to go with it")
+# CONTROL: the part that IS contiguously covered is still reused, so [13] is
+# not passing because the substitution declined outright.
+check(not any("question 0" in t for t in CALLS[0]),
+      "CONTROL: turns 1-10 were still reused — the gate narrowed, it did not "
+      "give up")
+
+print("[14] an anchor matching ONE turn of the window is refused end to end")
+# [11] proves _aligns_fully. Reverting the call site to the old
+# `bool(_align_candidates(...))` left this suite GREEN, so prove it through
+# compact_if_needed too. This is the shipped 'ok' collision: the anchor's
+# first element is a real turn of this array and the other three are
+# impossible, which is what a repeated short user turn looks like.
+CONV_OK = "reuse_ok_collision"
+MSGS_OK = history(24)
+_seed(CONV_OK, MSGS_OK,
+      [{"text": "COLLIDE-CHUNK", "first_turn": 1, "last_turn": 40}],
+      anchor_through=40)
+_st_ok = summarizer.load_state(CONV_OK)
+_ns_ok = [m for m in MSGS_OK if m.get("role") != "system"]
+_fps_ok = summarizer._turn_fingerprints(_ns_ok)
+# Mid-window deliberately, NOT at the tail: a collision on the last turn makes
+# _align_candidates answer 0, which is falsy, so a mutant reading the old
+# non-emptiness rule would decline for the wrong reason and [14] would pass
+# without testing anything.
+_st_ok["tail_fp"] = [_fps_ok[20], "deadbeef", "cafebabe", "f00dface"]
+summarizer.save_state(CONV_OK, _st_ok)
+_window_fps = summarizer._turn_fingerprints(
+    _ns_ok[-summarizer._FINGERPRINT_TAIL_TURNS:])
+# FIXTURE CHECK: the OLD rule must accept this and the new one refuse it.
+# Without this the case passes for any anchor at all.
+check(summarizer._align_candidates(_st_ok["tail_fp"], _window_fps) != [],
+      "fixture: the old non-emptiness rule ACCEPTS this anchor")
+check(0 not in summarizer._align_candidates(_st_ok["tail_fp"], _window_fps),
+      "fixture: and not via a zero candidate, so a falsy answer cannot be "
+      "what declines it")
+check(summarizer._aligns_fully(_st_ok["tail_fp"], _window_fps) is False,
+      "fixture: and the full-anchor rule refuses it")
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(list(MSGS_OK), CONV_OK))
+check(len(CALLS) == 1 and any("question 0" in t for t in CALLS[0]),
+      "one matching turn is not evidence this is the same branch: the oldest "
+      "turn went to summarize() rather than being replaced")
+check(not any("COLLIDE-CHUNK" in str(m.get("content", "")) for m in out),
+      "and the stored summary did not reach the array")
+
 main.summarize = _real
 
 if FAILED:
