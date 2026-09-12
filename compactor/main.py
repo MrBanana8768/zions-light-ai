@@ -1639,7 +1639,9 @@ def split_messages(messages: list[dict]) -> tuple[list[dict], list[dict], list[d
     return system_msgs, to_summarize, keep_recent
 
 
-async def compact_if_needed(messages: list[dict]) -> list[dict]:
+async def compact_if_needed(
+    messages: list[dict], conv_id: str | None = None
+) -> list[dict]:
     current = count_tokens(messages)
     if current <= TARGET_TOKENS:
         return messages
@@ -1665,17 +1667,81 @@ async def compact_if_needed(messages: list[dict]) -> list[dict]:
             f"images — kept verbatim (still over budget: {current}>{TARGET_TOKENS})"
         )
         return messages
+    # ALREADY SUMMARIZED ONCE, PERSISTENTLY (v3.1.9.1).
+    #
+    # maybe_rollup has been folding this conversation into L1/L2/L3 chunks
+    # all along, and this function has never heard of them - main.py:1467
+    # says why: it is a pure function of the client's array, so "nothing
+    # records where summarization stopped". Something does. The result was
+    # the same oldest turns re-summarized from scratch EVERY request: 56
+    # turns, 104,917 tokens, four concurrent LLM calls and 117 seconds
+    # before generation could start, measured 2026-09-11 23:45.
+    #
+    # Coverage comes from the CHUNK LABELS, not the watermark:
+    # _repair_watermark_below_chunks exists because a watermark has been
+    # found below the chunks it wrote, and a label carries text.
+    stored_text = ""
+    stored_turns = 0
+    if conv_id:
+        try:
+            _st = summarizer.load_state(conv_id)
+            _covered = summarizer._highest_chunk_turn(_st)
+            # ONLY WHEN THE ARRAY IS NOT A SUFFIX, and this is the whole
+            # safety of it. Turn numbers are not array indices once a
+            # client sends a bounded window; mapping between them needs
+            # window_offset, and the function that owns that arithmetic
+            # (_observed_position) MUTATES state - calling it here would
+            # advance the anchor a second time per turn. Under-claiming
+            # coverage costs a little speed; over-claiming drops turns the
+            # hierarchy cannot actually speak for. So when the client is
+            # sending everything (offset provably 0) this applies, and
+            # when it is not, it declines and today's behaviour stands.
+            _n = len([m for m in messages if m.get("role") != "system"])
+            if _covered > 0 and _n >= summarizer._recorded_position(_st):
+                stored_turns = min(_covered, len(text_only))
+                if stored_turns > 0:
+                    stored_text = await run_in_threadpool(
+                        summarizer.format_summary_block,
+                        _st,
+                        summarizer.SUMMARY_BLOCK_MAX_TOKENS,
+                    ) or ""
+            if not stored_text:
+                stored_turns = 0
+        except Exception as e:
+            # Never fail a request over an optimisation. Falling back is
+            # exactly today's behaviour.
+            logger.warning(
+                f"conv={conv_id}: could not reuse stored summaries "
+                f"({type(e).__name__}: {e}); summarizing from scratch"
+            )
+            stored_text = ""
+            stored_turns = 0
+
+    fresh_input = text_only[stored_turns:]
     async with httpx.AsyncClient() as client:
-        summary, deferred = await summarize(client, text_only)
+        if fresh_input:
+            summary, deferred = await summarize(client, fresh_input)
+        else:
+            summary, deferred = "", []
     # No summary block when there is no summary. summarize() returns
     # ("", all turns) when the backlog is too large for one request, and a
     # bare "[Summary of earlier conversation]" header with nothing under it
     # is worse than absent: it tells the model a summary exists and then
     # shows it an empty one.
+    # THE STAND-IN TRAVELS WITH THE REMOVAL (v3.1.9.1). The stored text goes
+    # into the array this function RETURNS, not into the separately-injected
+    # summary block - that block is capped at 60% of the injection budget and
+    # can be trimmed or shed downstream, so relying on it to carry turns this
+    # function removed would leave a silent hole the moment it was shed. That
+    # is the 2026-08-24 shape.
+    #
+    # Oldest first: stored covers the older span, `summary` the fresher one.
+    _parts = [q for q in (stored_text.strip(), summary.strip()) if q]
     summary_blocks = ([{
         "role": "system",
-        "content": f"[Summary of earlier conversation]\n{summary}",
-    }] if summary.strip() else [])
+        "content": "[Summary of earlier conversation]\n"
+                   + "\n\n".join(_parts),
+    }] if _parts else [])
     # Order: system → summary-of-oldest → deferred turns → images → recent.
     # `deferred` is chronologically NEWER than what the summary covers and
     # OLDER than keep_recent, so it slots between them and the transcript
@@ -1693,12 +1759,19 @@ async def compact_if_needed(messages: list[dict]) -> list[dict]:
     # forwarding all 80 untouched. A log that asserts work which did not
     # happen is worse than no log: it is what made the second 08-29 outage
     # look healthy while the request sat there.
-    _summarized = len(text_only) - len(deferred)
+    _summarized = len(fresh_input) - len(deferred)
     logger.info(
         f"compacted: summarized {_summarized} text turn(s), forwarded "
         f"{len(deferred)} verbatim, preserved {len(preserved_images)} image "
         f"turn(s), {current} -> {new_count} tokens"
-        + ("" if _summarized else "  [NO SUMMARIZATION HAPPENED]")
+        # REPORTED SEPARATELY, never added together. A log that
+        # asserts work which did not happen is what made the second
+        # 2026-08-29 outage look healthy, and 'summarized 56' would
+        # now be a lie when 40 of them came off a shelf.
+        + (f", {stored_turns} covered by stored summaries"
+           if stored_turns else "")
+        + ("" if (_summarized or stored_turns)
+           else "  [NO SUMMARIZATION HAPPENED]")
     )
     return new_messages
 
@@ -5116,7 +5189,7 @@ async def chat_completions(request: Request) -> Any:
 
     # V1 compaction
     try:
-        body["messages"] = await compact_if_needed(messages)
+        body["messages"] = await compact_if_needed(messages, conv_id)
     except Exception as e:
         logger.exception(
             f"compaction failed; falling through with the original messages — "
