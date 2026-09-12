@@ -302,11 +302,60 @@ if [ "${WEBUI_DB_LOCAL}" = "true" ]; then
             exit 1
         fi
         echo "      WEBUI_DB_ALLOW_EMPTY_START=true - starting anyway."
-        echo "      The sync daemon stays ON, and that is safe rather than an"
-        echo "      oversight: every route out of this state is refused by"
-        echo "      webuidb.sync_once - an unreadable snapshot, a readable one"
-        echo "      holding more than local does, or no local database at all."
-        echo "      It will say so in the log every sync until this is fixed."
+
+        # THE CLAIM THAT USED TO BE PRINTED HERE WAS FALSE, AND THE BEHAVIOUR
+        # HAS BEEN CHANGED RATHER THAN THE WORDING. It said: "The sync daemon
+        # stays ON, and that is safe rather than an oversight: every route out
+        # of this state is refused by webuidb.sync_once." It is not safe. The
+        # shrink guard is a RATIO, so an empty-started database is refused only
+        # until it grows past half the snapshot - one was demonstrated
+        # publishing over the snapshot at 51% of its size. At ~2 MB/day against
+        # a 41 MB snapshot that is roughly ten days, and this is a RunPod
+        # template variable, so once it is set to get a pod up it stays set
+        # through every later redeploy and reprints this banner into a boot log
+        # nobody re-reads. The guard was buying time and calling it safety.
+        #
+        # So leave a marker the sync daemon refuses on unconditionally. On
+        # LOCAL disk, not /data: a marker on the volume would outlive the
+        # incident and become a permanent block on publishing, which is the
+        # defect this whole series is repairing. On the overlay it dies with
+        # the pod, so it can only ever describe THIS boot.
+        #
+        # FAIL CLOSED IF IT CANNOT BE WRITTEN. A guard that silently no-ops
+        # when the disk says no is worse than no guard, because the banner
+        # above has just told the operator they are protected. If we cannot
+        # write one file to local disk, OpenWebUI is not going to be able to
+        # write a database there either.
+        empty_start_marker="$(dirname "${WEBUI_LOCAL_DB}")/.empty-start"
+        if ! printf '%s\n' \
+            "written by entrypoint.sh at $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "restore exited ${restore_rc} and WEBUI_DB_ALLOW_EMPTY_START=true" \
+            "the only durable copy of her history is ${WEBUI_SNAPSHOT_DB}" \
+            "while this file exists the sync daemon refuses to publish" \
+            "delete it only to accept starting over from nothing" \
+            > "${empty_start_marker}"
+        then
+            echo ""
+            echo "      ============================================================"
+            echo "      Could not write ${empty_start_marker} - REFUSING TO START."
+            echo "      That file is what stops the empty database OpenWebUI is"
+            echo "      about to build from being published over the snapshot on"
+            echo "      /data once it grows past half its size. Without it this"
+            echo "      pod would come up looking protected and would not be."
+            echo "      ============================================================"
+            exit 1
+        fi
+        echo "      The sync daemon stays ON so the log keeps saying what is"
+        echo "      wrong, but it will NOT publish: ${empty_start_marker}"
+        echo "      refuses every cycle while it exists. What protects /data is"
+        echo "      that file, not the shrink ratio - the ratio only delays an"
+        echo "      empty database, it does not stop one."
+        echo ""
+        echo "      To get back to normal: repair the snapshot, then run"
+        echo "        /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --restore"
+        echo "      which restores it to local disk and clears the marker."
+        echo "      To accept starting over from nothing instead, delete the"
+        echo "      marker by hand and the next sync overwrites the snapshot."
     fi
 else
     # THE SYNC DAEMON MUST NOT RUN HERE, and this is the whole safety of the
