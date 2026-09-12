@@ -4034,19 +4034,41 @@ async def _facts_tail(
     # HERE, not only at the call site, for the same reason job 3 gives at
     # _rollup_hierarchy: this job WRITES — the touched-save below and
     # save_facts further down — so it is subject to the same pause every
-    # other new-memory write is. _async_tail checks once at its top, and
-    # then job 1 indexes and this job makes a vLLM extraction call that can
-    # take seconds, so the disk can fill between that check and this write;
-    # a re-queued tail can sit in the pool's queue for longer still. Job 3
-    # got its own guard when it was extracted in v3.1.8 and said exactly
-    # this; job 2 was extracted in v3.1.7 (R8) and did not, so the two
-    # halves of the same split disagreed about whether the outer check was
-    # enough. degrade.py's module docstring lists "fact extraction (async
-    # tail)" first under what gets gated, which is what made the gap read
-    # as covered. writes_allowed() is cached for
-    # COMPACTOR_DEGRADE_CHECK_TTL_S, so this is a tuple read, not a second
-    # statvfs. Silent return, matching job 3: guard() already logs at debug
-    # and writes_allowed() warned on the transition.
+    # other new-memory write is. Job 3 took its own guard when it was
+    # extracted in v3.1.8; job 2 was extracted in v3.1.7 (R8) and did not,
+    # so the two halves of one split disagreed about whether the outer
+    # check was enough. degrade.py's module docstring lists "fact
+    # extraction (async tail)" FIRST under what gets gated, which is what
+    # made the gap read as covered.
+    #
+    # WHAT THIS SECOND CHECK CAN AND CANNOT SEE. writes_allowed() caches
+    # its reading for COMPACTOR_DEGRADE_CHECK_TTL_S (10 s), so within that
+    # window this call answers from the SAME statvfs _async_tail's guard
+    # took and cannot see a disk that filled in between. The first version
+    # of this comment claimed it covered exactly that window — "job 1
+    # indexes and this job makes a vLLM extraction call that can take
+    # seconds, so the disk can fill between that check and this write" —
+    # and then cited the TTL two sentences later as proof the call was
+    # cheap. The second half nullifies the first, in one paragraph, and a
+    # hostile review caught it the same day it was written. A cache quoted
+    # as a performance reassurance is still a cache.
+    #
+    # So the honest account of what it buys, in order of how often it
+    # bites:
+    #   * COVERAGE. _facts_tail is a public-shaped coroutine with five
+    #     suites entering the tail directly; a future caller that is not
+    #     _async_tail gets the pause applied rather than the one that
+    #     remembered. That is job 3's argument verbatim and it does not
+    #     depend on timing at all.
+    #   * The gaps that DO exceed 10 s: a tail re-queued behind a pool
+    #     backlog (bgwork.pool caps concurrency, so a burst makes this
+    #     arbitrarily long), and an extraction plus dedup round trip to a
+    #     loaded vLLM.
+    # Inside 10 s of the outer check it is a no-op, and that is fine — the
+    # outer check already refused, or the disk genuinely had room.
+    #
+    # Silent return, matching job 3: guard() already logs at debug and
+    # writes_allowed() warned on the transition.
     if not degrade.guard("fact extraction tail"):
         return
 
@@ -4090,11 +4112,18 @@ async def _facts_tail(
     # and by anything that re-queues a tail, which is the same reachability
     # the helper's own docstring calls "not decoration".
     #
-    # `(assistant_text or "")` deliberately, where job 1 writes a bare
-    # assistant_text.strip(): _rollup_hierarchy next door types this
-    # parameter `str | None` and means it, so the None-tolerant spelling is
-    # the one that cannot turn a direct caller's None into an
-    # AttributeError while we are here fixing a truthiness bug.
+    # `(assistant_text or "")` where job 1 writes a bare
+    # assistant_text.strip(). This is DEFENCE ONLY, and currently
+    # unreachable: job 1's gate runs first and raises AttributeError on a
+    # None reply before control ever arrives here, so no caller can
+    # actually exercise the tolerance. The commit that added it justified
+    # it as protecting "a direct caller's None", which was wrong — the
+    # direct caller goes through job 1 too. It is kept because
+    # _rollup_hierarchy types the same parameter `str | None` and means it,
+    # so the tolerant spelling is what this function should have if job 1's
+    # gate is ever softened, and because removing it would be a third
+    # spelling of the same rule. The dialect sweep is M9's job, not this
+    # commit's.
     if not (assistant_text or "").strip() or not _has_pairable_user_text(
         last_user_text
     ):
