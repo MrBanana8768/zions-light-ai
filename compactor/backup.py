@@ -82,6 +82,13 @@ WEBUI_DB = Path(
     os.environ.get("COMPACTOR_BACKUP_WEBUI_DB")
     or (str(_LIVE_DB) if _LIVE_DB.exists() else str(DATA_DIR / "webui.db"))
 )
+# The same three suffixes webuidb.SIDECARS sweeps, for the same reason:
+# SQLite derives them from the database path it was given, so they belong
+# to whatever file carries that name. Duplicated rather than imported —
+# backup.py is loaded by the CLI and the daemon and must not drag in the
+# sync module to learn three strings.
+SIDECARS = ("-journal", "-wal", "-shm")
+
 STORAGE_ROOT = Path(
     os.environ.get("COMPACTOR_STORAGE_ROOT", str(DATA_DIR / "compactor"))
 )
@@ -946,6 +953,7 @@ def restore_backup(
     *,
     data_dir: Path | None = None,
     storage_root: Path | None = None,
+    webui_db: Path | None = None,
     confirm: bool = False,
 ) -> dict:
     """Restore an archive over the live data locations. DESTRUCTIVE — it
@@ -971,8 +979,53 @@ def restore_backup(
         # webui.db
         src_db = scratch / "webui.db"
         if src_db.is_file():
-            ddir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_db, ddir / "webui.db")
+            # WHERE THE LIVE DATABASE ACTUALLY IS, not where it used to be.
+            # create_backup reads WEBUI_DB, which follows the local-disk gate;
+            # this wrote to DATA_DIR/webui.db unconditionally. With the gate on
+            # those are different files, so the restore landed where OpenWebUI
+            # was not reading and webuidb-sync overwrote it within
+            # SYNC_INTERVAL_S. Reading one path and writing another is not a
+            # restore.
+            target = webui_db or (
+                ddir / "webui.db" if data_dir is not None else WEBUI_DB
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            # SIDECARS TRAVEL WITH THE DATABASE, and leaving them behind is how
+            # a good restore becomes a corrupt one. A -journal or -wal beside
+            # the target belongs to the database being REPLACED; SQLite applies
+            # it to whatever file carries that name on the next open.
+            # scripts/recover-webui-db.py and OPERATIONS.md both name this as
+            # the thing that corrupts a good file, and webuidb._set_aside
+            # sweeps these same three suffixes for the same reason. This is the
+            # sibling that did not.
+            #
+            # RENAMED, NEVER DELETED: a hot journal may hold the only copy of
+            # everything written since the last commit, and this runs at the
+            # moment an operator is already recovering from something.
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            for suffix in SIDECARS:
+                side = target.with_name(target.name + suffix)
+                if side.exists():
+                    aside = side.with_name(f"{side.name}.pre-restore-{stamp}")
+                    side.rename(aside)
+                    logger.warning(
+                        f"moved {side.name} aside to {aside.name} before "
+                        f"restoring — it belongs to the database being "
+                        f"replaced, and SQLite would have applied it to the "
+                        f"restored one"
+                    )
+
+            # ATOMIC. A crash mid-copy left a TRUNCATED live database where a
+            # whole one had been — on the one code path an operator reaches
+            # only when something has already gone wrong. The temp name is a
+            # sibling so os.replace stays on one filesystem.
+            tmp = target.with_name(f"{target.name}.restore-{os.getpid()}")
+            try:
+                shutil.copy2(src_db, tmp)
+                os.replace(tmp, target)
+            finally:
+                tmp.unlink(missing_ok=True)
             restored.append("webui.db")
         # compactor store — replace wholesale
         src_store = scratch / "compactor"

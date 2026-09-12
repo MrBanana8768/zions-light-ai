@@ -705,8 +705,93 @@ def _all():
         test_boot_run_suppressed_when_a_recent_archive_exists,
         test_restore_requires_confirm,
         test_restore_refuses_unverifiable_archive,
+        test_restore_moves_sqlite_sidecars_aside,
+        test_restore_targets_the_live_database_not_data_dir,
         test_latest_backup_info_shape,
     ]
+
+
+def test_restore_moves_sqlite_sidecars_aside():
+    """A stale -journal beside the target must not survive the restore.
+
+    SQLite derives the journal path from the database path it is GIVEN, so a
+    journal left next to the restored file belongs to the database that was
+    just replaced - and SQLite applies it on the next open. That is exactly
+    what scripts/recover-webui-db.py and OPERATIONS.md warn about, and
+    webuidb._set_aside already sweeps these three suffixes. restore_backup was
+    the sibling that did not: it did a bare copy2 over the live path.
+
+    RENAMED, NEVER DELETED - a hot journal may hold the only copy of anything
+    written since the last commit, and this path runs when an operator is
+    already recovering from something.
+    """
+    print("")
+    print("[test] restore: stale sqlite sidecars are moved aside, not left")
+    _seed_sources(facts_text="sidecar case")
+    _clean_backups()
+    rep = backup.run_once()
+    arch = _BACKUPS / rep["archive"]
+
+    # A journal from the database about to be REPLACED, carrying the real
+    # magic so nothing can pass by treating it as an ordinary file.
+    hot = bytes.fromhex("d9d505f920a163d7")
+    journal = _DB.with_name(_DB.name + "-journal")
+    journal.write_bytes(hot + b"stale rollback")
+    wal = _DB.with_name(_DB.name + "-wal")
+    wal.write_bytes(b"stale wal")
+
+    res = backup.restore_backup(arch, confirm=True)
+    assert_true(res["ok"], "restore ok")
+    assert_true(not journal.exists(),
+                "the -journal is gone from beside the restored database")
+    assert_true(not wal.exists(), "and so is the -wal")
+
+    aside = sorted(_DATA.glob("webui.db-journal.pre-restore-*"))
+    assert_true(len(aside) == 1,
+                "it was RENAMED rather than deleted (found %d)" % len(aside))
+    assert_eq(aside[0].read_bytes()[:8], hot,
+              "and its contents are intact - a hot journal may be the only "
+              "copy of what was written since the last commit")
+
+    # CONTROL: the restore still did its job. Without this the test passes
+    # perfectly if restore_backup simply stopped restoring anything.
+    con = sqlite3.connect(str(_DB))
+    n = con.execute("SELECT COUNT(*) FROM chat").fetchone()[0]
+    con.close()
+    assert_true(n >= 1, "and the database itself was restored and is readable")
+    assert_eq(list(_DATA.glob("webui.db.restore-*")), [],
+              "no temp file left behind by the atomic replace")
+
+
+def test_restore_targets_the_live_database_not_data_dir():
+    """create_backup reads WEBUI_DB; restore must write that same file.
+
+    WEBUI_DB follows the local-disk gate. restore_backup wrote to
+    DATA_DIR/webui.db unconditionally, so with the gate on it restored to a
+    path OpenWebUI was not reading and webuidb-sync overwrote it within
+    SYNC_INTERVAL_S. Reading one path and writing another is not a restore.
+    """
+    print("")
+    print("[test] restore: lands on the live database, not DATA_DIR/webui.db")
+    _seed_sources(facts_text="target case")
+    _clean_backups()
+    rep = backup.run_once()
+    arch = _BACKUPS / rep["archive"]
+
+    elsewhere = _TMP / "live" / "webui.db"
+    elsewhere.parent.mkdir(parents=True, exist_ok=True)
+    _DB.unlink()
+
+    res = backup.restore_backup(arch, confirm=True, webui_db=elsewhere)
+    assert_true(res["ok"], "restore ok")
+    assert_true(elsewhere.is_file(),
+                "the archive landed on the path it was told was live")
+    assert_true(not _DB.exists(),
+                "and NOT on DATA_DIR/webui.db, which nothing is reading")
+    con = sqlite3.connect(str(elsewhere))
+    n = con.execute("SELECT COUNT(*) FROM chat").fetchone()[0]
+    con.close()
+    assert_true(n >= 1, "and it is a real database, not an empty file")
 
 
 if __name__ == "__main__":
