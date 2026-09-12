@@ -37,12 +37,24 @@ import logsetup
 import memory
 import retrieval
 import summarizer
+from envcfg import env_float
 
 logger = logging.getLogger("compactor.health")
 
 # Probe timeout — short, because /health/full is hit by HEALTHCHECK
 # every 30s and an unresponsive vLLM shouldn't make the probe hang.
-_VLLM_PROBE_TIMEOUT_S = float(os.environ.get("COMPACTOR_HEALTH_PROBE_TIMEOUT_S", "3.0"))
+#
+# READ THROUGH envcfg, NOT `float(os.environ.get(...))` (v3.1.9). The v3.1.7
+# R30 sweep converted ~47 sites and missed this one, and it was the worst of
+# the seven it missed: it had no `or default` softening at all, so unlike its
+# siblings in dedup.py and persona.py it raised on an EMPTY value as well as
+# a mistyped one — and runpod.env.template:72 says in its own words that
+# RunPod "handles empty values inconsistently", so the empty case is not
+# hypothetical. main.py imports this module at module scope, so either raise
+# is a container that will not boot, with a ValueError traceback nobody
+# connects to a config line. 3.0 is unchanged: `float("3.0")` and the literal
+# `3.0` are the same double.
+_VLLM_PROBE_TIMEOUT_S = env_float("COMPACTOR_HEALTH_PROBE_TIMEOUT_S", 3.0)
 
 
 # ---------------------------------------------------------------------------

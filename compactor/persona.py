@@ -48,6 +48,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from envcfg import env_int
 from memory import (
     STORAGE_ROOT,
     StoreUnreadable,
@@ -61,9 +62,14 @@ logger = logging.getLogger("compactor.persona")
 # Minimum length for auto-detection of a system message as a persona.
 # Short system prompts ("be concise", "respond in JSON") aren't personas
 # — they're per-request style guidance. The threshold is a heuristic.
-AUTO_DETECT_MIN_CHARS = int(
-    os.environ.get("COMPACTOR_PERSONA_AUTO_DETECT_MIN_CHARS", "200") or 200
-)
+#
+# Read through envcfg (v3.1.9). `or 200` rescued only an EMPTY value, so a
+# mistyped one (`2OO`) still raised ValueError, and main.py imports this
+# module at module scope — a boot failure, not a knob reverting. This is the
+# one of the seven missed sites that .env.example actually documents to
+# operators (line 172, commented out), so it is the likeliest to be typed.
+# 200 is unchanged.
+AUTO_DETECT_MIN_CHARS = env_int("COMPACTOR_PERSONA_AUTO_DETECT_MIN_CHARS", 200)
 
 # Feature gate. Persona detection + injection can be disabled per-pod
 # if the operator wants V2.0 behavior.

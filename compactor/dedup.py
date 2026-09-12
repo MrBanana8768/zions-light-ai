@@ -87,7 +87,6 @@ import asyncio
 import hashlib
 import logging
 import math
-import os
 import re
 from collections import OrderedDict
 
@@ -95,6 +94,7 @@ import httpx
 
 import facts as facts_module
 import retrieval as retrieval_module
+from envcfg import env_float, env_int
 
 logger = logging.getLogger("compactor.dedup")
 
@@ -120,9 +120,13 @@ logger = logging.getLogger("compactor.dedup")
 # alone. The gate that measurably reduces calls without touching recall is
 # _split_cluster's front-loaded, memo-stable splitting below, not this
 # threshold.
-SIMILARITY_THRESHOLD = float(
-    os.environ.get("COMPACTOR_DEDUP_SIMILARITY", "0.75") or 0.75
-)
+#
+# Read through envcfg (v3.1.9). `or 0.75` rescues only the EMPTY string; a
+# mistyped one (`O.75`, a stray quote, a trailing comment) still raised
+# ValueError here, and main.py imports this module at module scope, so that
+# was a boot failure rather than a knob reverting to its default. Value
+# unchanged: `float("0.75")` and the literal `0.75` are the same double.
+SIMILARITY_THRESHOLD = env_float("COMPACTOR_DEDUP_SIMILARITY", 0.75)
 
 # Hard cap on LLM calls per dedup pass. 10 is generous — typical real
 # workloads see 0-2 clusters. Note this caps *calls*, not how many facts
@@ -136,9 +140,10 @@ SIMILARITY_THRESHOLD = float(
 # added since. The refusal memo is what unsticks that: a cluster the
 # model already refused is skipped without spending a call, so the budget
 # reaches the new material instead of re-buying old answers.
-MAX_LLM_CALLS_PER_PASS = int(
-    os.environ.get("COMPACTOR_DEDUP_MAX_LLM_CALLS", "10") or 10
-)
+#
+# Read through envcfg (v3.1.9), same reason as SIMILARITY_THRESHOLD above:
+# `or 10` covered the empty value and not the mistyped one. 10 is unchanged.
+MAX_LLM_CALLS_PER_PASS = env_int("COMPACTOR_DEDUP_MAX_LLM_CALLS", 10)
 
 # V7: hard cap on how many facts a single LLM reply may replace.
 # Stage-1 clustering is a transitive closure with no similarity floor
@@ -174,9 +179,10 @@ MERGE_MAX_TOKENS = 160
 
 # Per-LLM-call timeout. Short — these are quick yes/no merges, not
 # generation. Failed LLM call → cluster preserved (no false merges).
-LLM_TIMEOUT_S = float(
-    os.environ.get("COMPACTOR_DEDUP_LLM_TIMEOUT_S", "30.0") or 30.0
-)
+#
+# Read through envcfg (v3.1.9), same reason as the two knobs above. 30.0 is
+# unchanged: `float("30.0")` and the literal `30.0` are the same double.
+LLM_TIMEOUT_S = env_float("COMPACTOR_DEDUP_LLM_TIMEOUT_S", 30.0)
 
 
 # ---------------------------------------------------------------------------

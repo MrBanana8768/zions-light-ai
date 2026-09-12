@@ -88,6 +88,7 @@ import threading
 from pathlib import Path
 
 import logsetup
+from envcfg import env_float
 
 logger = logging.getLogger("compactor.tokens")
 
@@ -108,9 +109,13 @@ ENABLED = os.environ.get("COMPACTOR_LOCAL_TOKENIZER", "true").lower() != "false"
 # few tokens of template framing. It is a DRIFT threshold: 5% is far larger
 # than framing and far smaller than a version mismatch, which showed up as
 # 23-51% in production.
-DIVERGENCE_TOLERANCE = float(
-    os.environ.get("COMPACTOR_TOKENIZER_DIVERGENCE_TOLERANCE", "0.05") or 0.05
-)
+#
+# Read through envcfg (v3.1.9). `or 0.05` rescued only an EMPTY value, so a
+# mistyped one still raised ValueError at import. facts.py imports this module
+# and main.py imports facts.py, both at module scope, so the reach is the whole
+# process. 0.05 is unchanged: `float("0.05")` and the literal `0.05` are the
+# same double.
+DIVERGENCE_TOLERANCE = env_float("COMPACTOR_TOKENIZER_DIVERGENCE_TOLERANCE", 0.05)
 
 # ---------------------------------------------------------------------------
 # Lazy singleton (thread-safe, resolved once)

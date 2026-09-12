@@ -47,6 +47,7 @@ import retrieval
 import selftest as selftest_module
 import summarizer
 import tailhealth
+from envcfg import env_float
 from memory import (
     StoreUnreadable,
     UnsafeConvId,
@@ -151,9 +152,11 @@ TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(HARD_INPUT_LIMIT * 0.75)
 # work on a request path is not thoroughness, it is an outage.
 MAX_SUMMARY_CALLS_PER_REQUEST = _env_int("COMPACTOR_MAX_SUMMARY_CALLS", 4)
 
-_PESSIMISTIC_SUMMARY_SCALE = float(
-    os.environ.get("COMPACTOR_PESSIMISTIC_SUMMARY_SCALE", "2.0") or 2.0
-)
+# env_float from envcfg, NOT the local _env_float: that one is defined ~30
+# lines BELOW this line, so calling it here is a NameError at import — an
+# unconditional boot failure in place of the conditional one being fixed.
+# A typo in this variable used to stop the container from starting at all.
+_PESSIMISTIC_SUMMARY_SCALE = env_float("COMPACTOR_PESSIMISTIC_SUMMARY_SCALE", 2.0)
 # V3.1 (Vision): a single image in a VLM request costs far more than its
 # text — hundreds to a couple thousand tokens depending on resolution and
 # the model's vision encoder. The text-only token estimate misses this
