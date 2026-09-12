@@ -64,6 +64,21 @@ import _harness as H
 
 # The fixture's own port, inside the compose network. The tests container
 # shares the compactor's network namespace, so this name resolves for both.
+#
+# THIS FILE NEEDS THE WEIGHTLESS STACK AND MUST NOT BE GUARDED WITH
+# H.requires_real_model(). Every decoration case here drives the fixture's
+# adversarial generator through /_fixture/mode, and `vllm-fixture` is a
+# service of the DEFAULT compose profile only — the `model` profile builds
+# `model-fixture` instead, a different hostname that this name does not
+# resolve to. So the real-weights profile is the one place these cases cannot
+# run, and a real-weights guard on them would skip the only profile that can.
+#
+# Said here because a v3.1.9 review listed
+# test_decorated_prose_reply_is_still_memorized among the tests that "fail
+# against the weightless fixture" and should carry the guard. It does not:
+# its assertion is `indexed_exchanges >= 1`, episodic indexing is an
+# embedding and an upsert with no generation in it, and its controls are on
+# the generator's deterministic output. Nothing in it reads a model's words.
 FIXTURE_URL = "http://vllm-fixture:8000"
 
 # Generous, deliberately. The stub answers in microseconds but the memory

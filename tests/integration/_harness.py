@@ -82,11 +82,21 @@ ADMIN_ENABLED = bool(os.environ.get("ZIONS_TEST_ADMIN_URL"))
 # contract suite and useless for any test whose assertion is "the reply/the
 # extracted fact is ABOUT this conversation".
 #
-# Three tests already fail for this reason rather than skipping, which is the
-# worst of both worlds: a red suite that means "you ran the wrong profile",
-# so a real regression in those three would arrive as no change at all. A
-# capability the environment declares, rather than one a test guesses from a
-# symptom, keeps a genuine failure loud.
+# Tests that assert on generated CONTENT fail rather than skip against the
+# weightless fixture, which is the worst of both worlds: a red suite that
+# means "you ran the wrong profile", so a real regression in those tests
+# arrives as no change at all. A capability the environment declares, rather
+# than one a test guesses from a symptom, keeps a genuine failure loud.
+#
+# IT DEFAULTS TO FALSE, AND THAT COSTS SOMETHING. The original use of this
+# suite is a POD run — `ZIONS_TEST_BASE_URL=https://<pod>-8080.proxy.runpod.net
+# pytest tests/integration/` — where the weights are Cydonia's and every
+# content assertion is meaningful. Nothing there sets this variable, so those
+# tests now SKIP on the run where they matter most unless the operator sets
+# it. That is the honest trade (a skip that names itself beats a red that
+# means nothing), but it is only honest if the skip says how to turn it on,
+# which is why the message below names the variable and not just the compose
+# command. tests/integration/README.md's variable table should carry it too.
 REAL_MODEL = os.environ.get("ZIONS_TEST_REAL_MODEL", "").strip().lower() in (
     "1", "true", "yes", "on",
 )
@@ -113,18 +123,33 @@ def requires_real_model(reason: str = "assertion needs a real generation") -> No
     """Tests whose assertion is about the CONTENT of a model's output call
     this. Skips, loudly and by name, against the weightless fixture.
 
-    A skip is not a pass. This one names the profile that runs it, so the
-    absence is visible as a gap rather than read as coverage:
+    A skip is not a pass. This one names BOTH ways to run the test, because
+    there are two backends with real weights and only one of them is a
+    compose profile:
 
         docker compose -f docker-compose.integration.yml --profile model \\
             run --rm --build integration-tests-model
+
+        ZIONS_TEST_REAL_MODEL=1 ...   # any pod or deployment run
+
+    The second line is not decoration. A pod run has Cydonia behind it and
+    sets none of the compose environment, so without it these tests skip on
+    the deployment they were written to validate.
+
+    NOT FOR A TEST THAT NEEDS THE FIXTURE'S CONTROL PLANE. tests that drive
+    `/_fixture/mode` (test_regression_text.py) need the WEIGHTLESS stack, not
+    this one: the model profile serves `model-fixture`, a different hostname,
+    and `vllm-fixture` is not in it at all. Guarding one of those with this
+    would skip it on the only profile that can run it.
     """
     if not REAL_MODEL:
         pytest.skip(
             f"{reason} — the weightless fixture returns canned text, so this "
-            f"can only be exercised under the real-weights profile: "
+            f"can only be exercised against real weights. Either: "
             f"docker compose -f docker-compose.integration.yml --profile model "
-            f"run --rm --build integration-tests-model"
+            f"run --rm --build integration-tests-model  — or set "
+            f"ZIONS_TEST_REAL_MODEL=1 if the backend behind this run already "
+            f"has weights (a pod, or any deployment)."
         )
 
 

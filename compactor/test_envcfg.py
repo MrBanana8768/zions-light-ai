@@ -39,9 +39,10 @@ Run: python test_envcfg.py
 import ast
 import math
 import os
+import re
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -291,9 +292,21 @@ def test_the_original_crash_reproduction_no_longer_crashes():
 # is tts/server.py's twin, same `_env` helper, same `int(_env(PORT))` on the
 # line below it, two defects in it rather than one. An instruction to sweep
 # the siblings missed a sibling. A list is only ever as complete as the last
-# person to think about it, so this one is checked against the image: every
-# directory Dockerfile COPYs a .py from belongs here.
+# person to think about it, so [7] READS THE DOCKERFILE and fails if it COPYs
+# a .py out of a directory that is not in this list.
+#
+# The check is one-directional, and the direction matters. Every directory
+# the image takes Python from must be scanned; the reverse is not true,
+# because pipelines/ ships without being COPYed at all — it is an OpenWebUI
+# Function, pasted into OpenWebUI's admin UI by hand (see its own runbook),
+# so the Dockerfile has never mentioned it and never will. It is in this list
+# because it runs in production, which is the actual rule; the Dockerfile is
+# one source of that list, not the definition of it.
+#
+# This comment used to claim the check existed when nothing in the file read
+# the Dockerfile. The claim is now true.
 SHIPPED_DIRS = [HERE, ROOT / "tts", ROOT / "stt", ROOT / "pipelines"]
+DOCKERFILE = ROOT / "Dockerfile"
 
 # Conversions that raise on a string the operator mistyped. `str`, `bool`,
 # `Path` and f-string interpolation are absent deliberately: none of them can
@@ -332,6 +345,32 @@ def _handler_names(handler: ast.ExceptHandler) -> set[str]:
     return out
 
 
+def _annotation_offers_str(ann: ast.AST | None) -> bool:
+    """True if this return annotation can hand back a `str`.
+
+    `-> str` is the obvious one. `-> str | None` and `-> Optional[str]` are
+    the same helper with a missing default, and they are WORSE, not better:
+    `int(_env("PORT"))` on an unset variable is a TypeError instead of a
+    ValueError and the container is just as dead. The first version of this
+    matched `isinstance(ann, ast.Name) and ann.id == "str"` only, so a
+    `-> str | None` helper read as "not a string source" and its call sites
+    were invisible — a reader seeing `str` in the signature would reasonably
+    assume the opposite.
+    """
+    if isinstance(ann, ast.Name):
+        return ann.id == "str"
+    if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):
+        return _annotation_offers_str(ann.left) or _annotation_offers_str(ann.right)
+    if isinstance(ann, ast.Subscript):
+        base = ann.value
+        name = base.id if isinstance(base, ast.Name) else getattr(base, "attr", "")
+        if name in ("Optional", "Union"):
+            sl = ann.slice
+            parts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+            return any(_annotation_offers_str(p) for p in parts)
+    return False
+
+
 def _env_string_sources(tree: ast.AST) -> set[str]:
     """Functions in this file that read the environment and hand back a STRING.
 
@@ -345,8 +384,7 @@ def _env_string_sources(tree: ast.AST) -> set[str]:
     out = set()
     for n in ast.walk(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            ann = n.returns
-            if isinstance(ann, ast.Name) and ann.id == "str" and _reads_env(n):
+            if _annotation_offers_str(n.returns) and _reads_env(n):
                 out.add(n.name)
     return out
 
@@ -357,6 +395,19 @@ def _env_tainted_names(tree: ast.AST) -> set[str]:
     Catches the two-line spelling of the same bug:
         raw = os.environ.get("X", "3")
         TIMEOUT = float(raw)          # <- still a ValueError on a typo
+
+    THREE BINDING FORMS, not one, because the first version only handled
+    `ast.Name` targets on an `ast.Assign` and the other two are ordinary
+    Python that reads as equivalent to anyone writing it:
+
+        if (raw := os.environ.get("X")): V = int(raw)      # ast.NamedExpr
+        HOST, PORT = os.environ.get(...), os.environ.get(...)   # tuple target
+
+    The tuple form pairs targets with values ELEMENT BY ELEMENT rather than
+    tainting every name on the left. `_reads_env` walks the whole subtree, so
+    `a, b = os.environ.get("X"), compute()` would otherwise mark `b` tainted
+    and report `int(b)` — a false positive, and a false positive here is how
+    this whole check gets deleted.
     """
     out = set()
     for n in ast.walk(tree):
@@ -364,10 +415,50 @@ def _env_tainted_names(tree: ast.AST) -> set[str]:
             for t in n.targets:
                 if isinstance(t, ast.Name):
                     out.add(t.id)
+                elif (
+                    isinstance(t, (ast.Tuple, ast.List))
+                    and isinstance(n.value, (ast.Tuple, ast.List))
+                    and len(t.elts) == len(n.value.elts)
+                ):
+                    for target, value in zip(t.elts, n.value.elts):
+                        if isinstance(target, ast.Name) and _reads_env(value):
+                            out.add(target.id)
         elif isinstance(n, ast.AnnAssign) and n.value is not None and _reads_env(n.value):
             if isinstance(n.target, ast.Name):
                 out.add(n.target.id)
+        elif isinstance(n, ast.NamedExpr) and _reads_env(n.value):
+            out.add(n.target.id)
     return out
+
+
+def _handler_softens(handler: ast.ExceptHandler) -> bool:
+    """False if this handler re-raises or exits instead of recovering.
+
+        try:
+            PORT = int(os.environ.get("PORT", "9000"))
+        except ValueError:
+            raise SystemExit("PORT must be a number")
+
+    is not a softened conversion. It is the same dead container with a nicer
+    message: supervisord restarts the process, the process exits again, and
+    the chat path stays down until an operator edits the pod's environment.
+    The exemption exists for the helpers that return a DEFAULT, so a handler
+    that cannot return one does not earn it.
+
+    TOP-LEVEL statements only. A handler that re-raises on one branch and
+    falls back on another (`if STRICT: raise` / `X = default`) still softens
+    the ordinary case, and calling that an offence would be a false positive
+    on code that is doing the right thing.
+    """
+    for st in handler.body:
+        if isinstance(st, ast.Raise):
+            return False
+        if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call):
+            f = st.value.func
+            name = f.id if isinstance(f, ast.Name) else getattr(f, "attr", "")
+            if name in ("exit", "_exit"):
+                return False
+    return True
 
 
 def _unsoftened_env_conversions(src: str, label: str) -> list[str]:
@@ -378,29 +469,60 @@ def _unsoftened_env_conversions(src: str, label: str) -> list[str]:
          call is wrapped across lines, including with an `or default` that
          only ever rescued the empty string.
       2. The same through a local name: `raw = os.environ.get(...)` then
-         `int(raw)`.
-      3. The same through a local helper annotated `-> str` that reads the
-         environment (tts/server.py's `_env`).
+         `int(raw)` — whether that name was bound by an assignment, by a
+         walrus in an `if`, or as one element of a tuple unpacking.
+      3. The same through a local helper annotated `-> str`, `-> str | None`
+         or `-> Optional[str]` that reads the environment (tts/server.py's
+         `_env`).
       4. os.environ["X"] — a KeyError at module scope is the same dead
          container by a different exception.
+      5. A METHOD CALL ON ANY OF THE ABOVE: `int(_env("PORT", "9000").strip())`
+         and `int(raw.strip())`. This is the one that matters most here.
+         `.strip()` on an env read is this codebase's house style — alert.py,
+         backup.py, logsetup.py, main.py, selftest.py and webuidb.py all do
+         it, and envcfg.env_int does it internally — so the most likely way
+         the defect comes back is with a `.strip()` on the end, and that is
+         exactly the spelling the first version of this detector was blind
+         to. Subscripting one too: `CFG = dict(os.environ)` then
+         `int(CFG["X"])`.
+      6. builtins.int(...) as well as int(...), and a value passed by
+         keyword rather than position.
+      7. A conversion inside a `try` whose handler RE-RAISES or exits (see
+         _handler_softens). "It is in a try/except" is the reassurance that
+         would otherwise hide the next one.
     ...and exempts any of those lexically inside a `try` whose handlers
-    catch the exception in question, because that IS the softening.
+    catch the exception in question AND recover from it, because that IS the
+    softening.
 
-    WHAT IT DOES NOT CATCH, stated so the next person does not over-trust it:
+    WHAT IT DOES NOT CATCH, stated so the next person does not over-trust it.
+    Everything in this list was measured, not guessed:
       * A conversion two or more hops from the env read (env -> a -> b ->
         int(b)). One hop is what the real defects looked like; a full taint
         analysis is not worth the false positives.
-      * A helper that returns a string without saying `-> str`. The
-         annotation is the signal; an unannotated one is invisible here.
+      * A helper that returns a string without saying so in a real
+        annotation. The annotation is the signal: an unannotated helper, or
+        one whose annotation is a quoted string ("str"), is invisible here.
+      * A TRY THAT CATCHES BUT NEVER REBINDS:
+            try:    X = float(os.environ.get("X", "1.0"))
+            except Exception: logger.warning("bad X")
+        reads as softened and is not — `X` is unbound and the first use is a
+        NameError. Deliberately left out: deciding it needs to know whether
+        the name is bound on every other path (an earlier default, a
+        `global`, a different scope), and getting that wrong in the strict
+        direction would flag correct code. It is also a different failure
+        class from the one this detector is named for.
+      * A handler that re-raises on SOME branch only (`if STRICT: raise`)
+        still reads as softened — see _handler_softens for why that is
+        deliberate.
       * A raise from something other than int/float/complex — json.loads,
         datetime.fromisoformat, re.compile, or an `assert` on a config
         value. Add the callable to _CONVERTERS if one ever appears.
       * A try that catches the wrong exception (`except OSError:` around an
         int()) reads as softened here but is not. Nothing in the tree does
         this; a reviewer would catch it.
-      * Anything outside compactor/, tts/ and pipelines/ — scripts/ and the
-        shell are not scanned, and entrypoint.sh does its own parsing in a
-        dialect this cannot see (see V319 report, the env_bool note).
+      * Anything outside compactor/, tts/, stt/ and pipelines/ — scripts/ and
+        the shell are not scanned, and entrypoint.sh does its own parsing in
+        a dialect this cannot see (see V319 report, the env_bool note).
     """
     tree = ast.parse(src, filename=label)
     tainted = _env_tainted_names(tree)
@@ -412,15 +534,30 @@ def _unsoftened_env_conversions(src: str, label: str) -> list[str]:
             return True
         if isinstance(a, ast.Name) and a.id in tainted:
             return True
-        if isinstance(a, ast.Call) and isinstance(a.func, ast.Name) and a.func.id in sources:
-            return True
+        if isinstance(a, ast.Call):
+            if isinstance(a.func, ast.Name) and a.func.id in sources:
+                return True
+            # `raw.strip()` / `_env("PORT", "9000").strip()`: the tainted name
+            # or the helper call is the Attribute's VALUE, so none of the
+            # three tests above sees it. Recursing one level down the receiver
+            # is what closes the house-style bypass, and it chains, so
+            # `.strip().lstrip("0")` is caught too.
+            if isinstance(a.func, ast.Attribute):
+                return arg_is_env(a.func.value)
+        if isinstance(a, ast.Subscript):
+            # `CFG = dict(os.environ)` then `int(CFG["X"])`. NOT a bare
+            # Attribute (`int(DATA_DIR.stat().st_size)` where DATA_DIR came
+            # from the environment is a size, cannot raise, and flagging it
+            # would be the false positive that gets this check deleted).
+            return arg_is_env(a.value)
         return False
 
     def visit(node: ast.AST, caught: frozenset) -> None:
         if isinstance(node, ast.Try):
             handled = set()
             for h in node.handlers:
-                handled |= _handler_names(h)
+                if _handler_softens(h):
+                    handled |= _handler_names(h)
             inner = caught | handled
             # Only the `try:` body is protected. A raise inside a handler,
             # an `else:` or a `finally:` is not caught by this same try — a
@@ -433,9 +570,17 @@ def _unsoftened_env_conversions(src: str, label: str) -> list[str]:
                     visit(child, caught)
             return
 
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in _CONVERTERS and not (caught & _VALUE_GUARDS):
-                if any(arg_is_env(a) for a in node.args):
+        if isinstance(node, ast.Call):
+            # `int(...)` and `builtins.int(...)` are the same call. Reading
+            # only ast.Name meant a module-qualified spelling walked past.
+            f = node.func
+            callee = f.id if isinstance(f, ast.Name) else getattr(f, "attr", None)
+            if callee in _CONVERTERS and not (caught & _VALUE_GUARDS):
+                # node.keywords as well as node.args: `int(x=os.environ[...])`
+                # is the same conversion, and `**` a dict built from the
+                # environment is the same again.
+                passed = list(node.args) + [k.value for k in node.keywords]
+                if any(arg_is_env(a) for a in passed):
                     found.append(f"{label}:{node.lineno}: {ast.unparse(node)}")
         elif isinstance(node, ast.Subscript) and not (caught & _KEY_GUARDS):
             # ast.Load ONLY. `os.environ["X"] = "y"` is a WRITE and cannot
@@ -467,21 +612,48 @@ def _shipped_modules() -> list[Path]:
     return out
 
 
+def _dockerfile_python_dirs() -> set[str]:
+    """Directories the Dockerfile COPYs a .py out of, as repo-relative paths.
+
+    `COPY compactor/main.py /opt/compactor/main.py` -> "compactor".
+    Today that set is {compactor, stt, tts}; the point is that the day
+    someone adds a fourth service with its own `int(os.environ[...])`, this
+    file finds out from the Dockerfile instead of from production.
+    """
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    out: set[str] = set()
+    for src in re.findall(r"^COPY\s+(?:--\S+\s+)*([A-Za-z0-9_./-]+\.py)\s", text, re.M):
+        parent = PurePosixPath(src).parent.as_posix()
+        out.add("." if parent == "." else parent)
+    return out
+
+
 def test_detector_can_actually_say_no():
     """CONTROL for [7]. A scanner that never finds anything passes forever.
 
     This is the assertion that would have caught the v3.1.7 miss if the
-    sweep's author had written it: it proves the detector reports each of
-    the four real shapes, INCLUDING the exact line health.py shipped, before
-    [7] is allowed to report a clean tree as good news.
+    sweep's author had written it: it proves the detector reports each real
+    shape, INCLUDING the exact line health.py shipped, before [7] is allowed
+    to report a clean tree as good news.
+
+    ONE FIXTURE PER SHAPE, AND AN EXACT COUNT. `>= 5` would go on passing
+    while a rule silently stopped firing, which is how the gap list below
+    grew to five unstated bypasses in the first place: the file said what it
+    caught, nothing proved it still did. The count is 15 and every line that
+    contributes to it is labelled. The last six are the shapes v3.1.9 added
+    after a review found them by hand — every one of them was measured
+    MISSED by the version that shipped, against the real stt/server.py.
     """
     print("\n[6] CONTROL: the detector flags every bad shape, and no good one")
 
     bad = '''
+import builtins
 import os
 def _env(name: str, default: str) -> str:
     v = os.environ.get(name)
     return v if v is not None and v != "" else default
+def _env_or_none(name: str) -> str | None:
+    return os.environ.get(name)
 A = float(os.environ.get("X", "3.0"))
 B = int(
     os.environ.get("Y", "10") or 10
@@ -490,11 +662,48 @@ raw = os.environ.get("Z", "1")
 C = float(raw)
 D = int(_env("W", "9001"))
 E = os.environ["MUST_BE_SET"]
+F = int(_env("STT_PORT", "9000").strip())
+G = float(raw.strip())
+if (walrus := os.environ.get("WALRUS")):
+    H = int(walrus)
+HOST, PORT = os.environ.get("HOST", "h"), os.environ.get("PORT", "1")
+I = int(PORT)
+CFG = dict(os.environ)
+J = int(CFG["SNAPSHOT"])
+K = int(_env_or_none("MAYBE"))
+L = builtins.int(os.environ.get("QUALIFIED", "1"))
+M = int(x=os.environ.get("KEYWORD", "1"))
+try:
+    N = int(os.environ.get("RERAISE", "1"))
+except ValueError:
+    raise SystemExit("RERAISE is not a number")
+try:
+    pass
+except ValueError:
+    pass
+else:
+    O = int(os.environ.get("ELSE_BODY", "1"))
 '''
     hits = _unsoftened_env_conversions(bad, "<bad>")
-    assert_eq(len(hits), 5, f"detector finds all 5 planted defects (got: {hits})")
-    for want in ("float(os.environ.get('X', '3.0'))", "int(_env('W', '9001'))",
-                 "float(raw)", "os.environ['MUST_BE_SET']"):
+    assert_eq(len(hits), 15, f"detector finds all 15 planted defects (got: {hits})")
+    for want in (
+        # The four original shapes.
+        "float(os.environ.get('X', '3.0'))",   # direct
+        "int(_env('W', '9001'))",              # via an `-> str` helper
+        "float(raw)",                          # via a tainted local
+        "os.environ['MUST_BE_SET']",           # KeyError, same dead container
+        # The six v3.1.9 additions, each measured MISSED before this change.
+        "int(_env('STT_PORT', '9000').strip())",  # house style, on the helper
+        "float(raw.strip())",                     # house style, on the local
+        "int(walrus)",                            # walrus binding
+        "int(PORT)",                              # tuple-unpacked binding
+        "int(CFG['SNAPSHOT'])",                   # dict(os.environ) snapshot
+        "int(_env_or_none('MAYBE'))",             # `-> str | None` helper
+        "builtins.int(",                          # module-qualified call
+        "int(x=os.environ.get('KEYWORD', '1'))",  # passed by keyword
+        "int(os.environ.get('RERAISE', '1'))",    # handler re-raises
+        "int(os.environ.get('ELSE_BODY', '1'))",  # in the try's `else:`
+    ):
         assert_true(any(want in h for h in hits), f"detector reports {want}")
 
     good = '''
@@ -506,7 +715,7 @@ def env_int2(name: str, default: int) -> int:
     if not v.strip():
         return default
     try:
-        return int(v)
+        return int(v.strip())
     except (TypeError, ValueError):
         return default
 A = env_float("X", 3.0)
@@ -516,22 +725,37 @@ D = os.environ.get("FLAG", "true").lower() != "false"
 E = f"http://host:{os.environ.get('PORT', '9000')}"
 F = int(A * 2)
 G = int(env_int("Y", 10))
+SIZE = int(C.stat().st_size)
+STRICT = False
 os.environ["WEBUIDB_SYNC_ENABLED"] = "false"
 try:
     H = int(os.environ["MUST_BE_SET"])
 except (KeyError, ValueError):
     H = 0
+try:
+    I = int(os.environ.get("MAYBE_STRICT", "1"))
+except ValueError:
+    if STRICT:
+        raise
+    I = 1
 '''
     hits = _unsoftened_env_conversions(good, "<good>")
     # Each line of `good` is a shape that exists in the real tree and MUST
     # NOT be reported, because the cost of a false positive here is the whole
     # check being deleted the first time it blocks a correct change:
-    #   C  Path(os.environ.get(...))  — cannot raise on any string
-    #   E  f-string interpolation     — same
-    #   G  int() over an `-> int` helper — not an env STRING; flagging it
-    #      would punish the very fix this module exists to encourage
+    #   C    Path(os.environ.get(...))  — cannot raise on any string
+    #   E    f-string interpolation     — same
+    #   G    int() over an `-> int` helper — not an env STRING; flagging it
+    #        would punish the very fix this module exists to encourage
+    #   env_int2's `int(v.strip())` — the softened helper written in the
+    #        house style the new rule 5 hunts for; the try is what makes it
+    #        legitimate, and rule 5 must not fire on it
+    #   SIZE int() of an ATTRIBUTE off an env-derived Path: a file size, not
+    #        a string, and this is the bound on how far arg_is_env recurses
     #   os.environ[...] = ...        — a WRITE, not a read
-    #   H  a read and a conversion both inside a try that catches both
+    #   H    a read and a conversion both inside a try that catches both
+    #   I    a handler that re-raises only on one branch and recovers on the
+    #        other — still softened; see _handler_softens
     assert_eq(hits, [], f"detector is silent on legitimate code (got: {hits})")
 
 
@@ -544,6 +768,23 @@ def test_no_unsoftened_env_conversion_survives_anywhere():
     # a pass — so the directories and the file count are themselves checked.
     for d in SHIPPED_DIRS:
         assert_true(d.is_dir(), f"CONTROL: scan directory exists: {d.name}/")
+
+    # AND THE LIST IS CHECKED AGAINST THE IMAGE, which is what the comment on
+    # SHIPPED_DIRS says. Without this the list is a literal that four people
+    # have to remember to extend — the same "as complete as the last person
+    # to think about it" failure the whole section exists to retire, one
+    # level up. A new service with its own env reads and its own COPY line
+    # turns this red on the day it is written.
+    assert_true(DOCKERFILE.is_file(), f"CONTROL: the Dockerfile is readable at {DOCKERFILE}")
+    copied_dirs = _dockerfile_python_dirs()
+    assert_true(len(copied_dirs) >= 2,
+                f"CONTROL: parsed the Dockerfile's .py COPY lines (got {sorted(copied_dirs)})")
+    scanned = {d.relative_to(ROOT).as_posix() for d in SHIPPED_DIRS}
+    unscanned = sorted(copied_dirs - scanned)
+    assert_eq(unscanned, [],
+              f"every directory the Dockerfile COPYs a .py from is scanned "
+              f"(COPY dirs {sorted(copied_dirs)}, scanned {sorted(scanned)})")
+
     mods = _shipped_modules()
     assert_true(len(mods) >= 20, f"CONTROL: scan reached >=20 shipped modules (got {len(mods)})")
     rels = {p.relative_to(ROOT).as_posix() for p in mods}
