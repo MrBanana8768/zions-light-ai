@@ -429,7 +429,21 @@ def read_json_strict(
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
+    # UnicodeDecodeError IS NOT A JSONDecodeError, and that is the whole gap
+    # (v3.1.9). Both descend from ValueError, but json.load DECODES the bytes
+    # before it parses them, so a file holding invalid UTF-8 — a write torn
+    # mid-multibyte, or the volume that already dropped I/O mid-transaction on
+    # 2026-08-31 — raised straight past this handler, unwrapped.
+    #
+    # read_json catches only StoreUnreadable, so the best-effort path missed it
+    # too, and v3.1.8 added a REQUEST-path consumer (_is_repeat_task_traffic)
+    # behind a deliberately narrow `except (OSError, StoreUnreadable)`. One bad
+    # byte therefore escaped out of _run_memory_tail inside event_stream's
+    # finally — an ASGI exception on a request the user had already seen
+    # succeed — and stats.unreadable never counted it, so v3.1.8's own
+    # "unreadable memory on disk" reason stayed silent about the one file that
+    # actually was.
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
         raise StoreUnreadable(path, e) from e
     if expect is not None and not isinstance(data, expect):
         # A present file holding the wrong thing is UNREADABLE, not empty.

@@ -285,15 +285,41 @@ logsetup.configure()  # V2.3 Theme 4: text (default) or JSON via COMPACTOR_LOG_F
 logger = logging.getLogger("compactor")
 
 _tokenizer = None
+# Whether get_tokenizer has ALREADY tried and failed. See its docstring:
+# caching only the success made every later count_tokens re-enter
+# from_pretrained, 238x slower per call.
+_TOKENIZER_TRIED = False
 
 
 def get_tokenizer():
-    global _tokenizer
-    if _tokenizer is not None:
+    """The local tokenizer, or None. THE FAILURE IS CACHED TOO (v3.1.9).
+
+    `if _tokenizer is not None: return` caches only a SUCCESS. The except
+    below sets `_tokenizer = None`, which fails that same test, so every later
+    call re-entered AutoTokenizer.from_pretrained — a filesystem walk and, when
+    the HF cache is cold, a network attempt. Benchmarked: 0.012 ms cached
+    against 2.859 ms per call after a miss, and `_chunk_to_budget` calls
+    count_tokens once PER MESSAGE, so one 2,301-message compaction spends about
+    6.6 seconds re-failing to load the same tokenizer. That is the FAST failure
+    (HF_HUB_OFFLINE=1); a cold cache reaching for the network is worse.
+
+    Latent rather than live on the pod today — the live logs show one
+    "loaded tokenizer" per boot and zero failures — but the whole point is that
+    it arms itself the first time the cache is evicted or /data hiccups, which
+    is exactly when the compactor is least able to spare six seconds a turn.
+
+    _TOKENIZER_TRIED is a separate flag rather than a sentinel object because
+    `None` is a legitimate return here: it means "use the char/4 estimator",
+    and several callers check for it.
+    """
+    global _tokenizer, _TOKENIZER_TRIED
+    if _tokenizer is not None or _TOKENIZER_TRIED:
         return _tokenizer
     if not MODEL_REPO:
         logger.warning("MODEL_REPO not set; falling back to char/4 token estimator")
+        _TOKENIZER_TRIED = True
         return None
+    _TOKENIZER_TRIED = True
     try:
         from transformers import AutoTokenizer
 
@@ -6495,6 +6521,35 @@ async def admin_cleanup_test_conversations(dry_run: bool = True):
     )
 
 
+def _dry_run_from(request: Request, body: dict, *, default: bool) -> bool:
+    """Read dry_run from the body, then the QUERY STRING, then the default.
+
+    Both admin endpoints that take it are reachable by curl, and an operator
+    reaching for one reaches for `?dry_run=true` at least as often as for a
+    JSON body. admin_merge learned to read the query string in v3.1.7 (R4);
+    admin_compact did not, and its default is the OPPOSITE — a live run — so
+    `POST /admin/conversations/<id>/compact?dry_run=true` silently performed up
+    to 200 vLLM summarization calls, rewrote the state file and advanced the
+    watermark. The operator asked for a plan and got a write. admin_merge's own
+    docstring already named it: "unlike the compact endpoint next door, which
+    defaults to a live run and surprised an operator into one."
+
+    One function, because the rule that was applied at one site and missed at
+    its sibling is this project's most expensive recurring defect, and two
+    copies of this parsing would be a third instance waiting to happen.
+
+    "false"/"0"/"no" mean commit; anything else, INCLUDING A TYPO, leaves the
+    caller in whatever direction is safe for that endpoint. `default` is what
+    an absent flag means, not what a malformed one does.
+    """
+    if "dry_run" in body:
+        return bool(body["dry_run"])
+    raw = str(request.query_params.get("dry_run", "")).strip().lower()
+    if not raw:
+        return default
+    return raw not in ("false", "0", "no")
+
+
 @app.post(
     "/admin/conversations/{src_conv_id}/merge-into/{dst_conv_id}",
     dependencies=[Depends(_require_localhost)],
@@ -6537,16 +6592,10 @@ async def admin_merge(src_conv_id: str, dst_conv_id: str, request: Request):
         body = {}
     if not isinstance(body, dict):
         body = {}
-    if "dry_run" in body:
-        dry_run = bool(body["dry_run"])
-    else:
-        # "false"/"0"/"no" all mean commit. Anything else, including a typo,
-        # stays a dry run: this endpoint's safe direction is to change
-        # nothing, and an operator who meant to commit will see the counts
-        # come back unchanged and try again. The reverse mistake is not
-        # recoverable.
-        raw = str(request.query_params.get("dry_run", "")).strip().lower()
-        dry_run = raw not in ("false", "0", "no")
+    # Absent means DRY for merge: this endpoint rewrites two conversations
+    # and an operator who meant to commit sees unchanged counts and tries
+    # again, while the reverse mistake is not recoverable.
+    dry_run = _dry_run_from(request, body, default=True)
 
     try:
         return await run_in_threadpool(
@@ -6704,7 +6753,9 @@ async def admin_compact(conv_id: str, request: Request):
     if not isinstance(body, dict):
         body = {}
     max_calls = int(body.get("max_calls") or 200)
-    dry_run = bool(body.get("dry_run", False))
+    # Absent means LIVE for compact, which is the documented contract and
+    # stays — but ?dry_run=true is honoured now instead of ignored.
+    dry_run = _dry_run_from(request, body, default=False)
 
     exchanges = await run_in_threadpool(retrieval.export_indexed_exchanges, conv_id)
     if not exchanges:

@@ -576,6 +576,104 @@ def test_auto_capture_leaves_corrupt_persona_file_untouched():
 # Runner
 # ---------------------------------------------------------------------------
 
+def test_invalid_utf8_is_unreadable_not_a_crash():
+    """A file holding invalid UTF-8 must raise StoreUnreadable, like any other
+    unreadable file - not escape as a bare UnicodeDecodeError.
+
+    json.load DECODES before it parses, so UnicodeDecodeError is raised by the
+    codec and is NOT a JSONDecodeError; the old handler named only the latter.
+    Both descend from ValueError, which is why it reads as covered.
+
+    What escaping costs: read_json catches only StoreUnreadable, so the
+    best-effort path missed it too, and v3.1.8's _is_repeat_task_traffic reads
+    summary state on the REQUEST path behind a narrow
+    `except (OSError, StoreUnreadable)`. One torn multibyte write therefore
+    raised out of _run_memory_tail inside event_stream's finally - an ASGI
+    exception on a request the user had already seen succeed - while
+    stats.unreadable counted nothing and /health/full said the store was fine.
+    """
+    print("")
+    print("[test] a file with invalid UTF-8 raises StoreUnreadable")
+    p = memory.summary_path("torn_utf8_conv")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # A lone continuation byte: valid JSON shape, impossible UTF-8. This is
+    # what a write torn mid-multibyte leaves behind.
+    p.write_bytes(b'{"conv_id": "torn_utf8_conv", "l1": "\xff\xfe"}')
+
+    raised = None
+    try:
+        memory.read_json_strict(p, default=None, expect=dict)
+    except memory.StoreUnreadable as e:
+        raised = e
+    except UnicodeDecodeError as e:
+        raised = e
+
+    assert_true(isinstance(raised, memory.StoreUnreadable),
+                "it raised StoreUnreadable, not a bare UnicodeDecodeError "
+                "(got %r)" % (type(raised).__name__ if raised else None,))
+
+    # CONTROL: a well-formed file still loads, so this is not passing because
+    # read_json_strict now refuses everything.
+    good = memory.summary_path("intact_utf8_conv")
+    good.write_text('{"conv_id": "intact_utf8_conv", "l1": []}', encoding="utf-8")
+    data = memory.read_json_strict(good, default=None, expect=dict)
+    assert_eq(data["conv_id"], "intact_utf8_conv",
+              "and a valid file still reads back")
+
+
+def test_get_tokenizer_caches_the_failure_too():
+    """One attempt per process, not one per count_tokens call.
+
+    `if _tokenizer is not None: return` caches only a SUCCESS; the except sets
+    _tokenizer = None, which fails that same test, so every later call
+    re-entered AutoTokenizer.from_pretrained. Measured at 0.012 ms cached
+    against 2.859 ms per call after a miss, and _chunk_to_budget calls
+    count_tokens once PER MESSAGE - about 6.6 seconds inside one 2,301-message
+    compaction, and that is the FAST failure.
+    """
+    print("")
+    print("[test] get_tokenizer stops re-entering from_pretrained after a miss")
+    calls = []
+
+    class _Boom:
+        @staticmethod
+        def from_pretrained(repo):
+            calls.append(repo)
+            raise OSError("no weights here")
+
+    import types
+    fake = types.ModuleType("transformers")
+    fake.AutoTokenizer = _Boom
+    saved_mod = sys.modules.get("transformers")
+    saved_tok = main._tokenizer
+    saved_tried = main._TOKENIZER_TRIED
+    saved_repo = main.MODEL_REPO
+    sys.modules["transformers"] = fake
+    main._tokenizer = None
+    main._TOKENIZER_TRIED = False
+    main.MODEL_REPO = "does/not-exist"
+    try:
+        first = main.get_tokenizer()
+        second = main.get_tokenizer()
+        third = main.get_tokenizer()
+    finally:
+        if saved_mod is None:
+            sys.modules.pop("transformers", None)
+        else:
+            sys.modules["transformers"] = saved_mod
+        main._tokenizer = saved_tok
+        main._TOKENIZER_TRIED = saved_tried
+        main.MODEL_REPO = saved_repo
+
+    assert_eq(len(calls), 1,
+              "from_pretrained was attempted ONCE across three calls "
+              "(got %d)" % len(calls))
+    # CONTROL: it still answers None every time, so callers keep falling back
+    # to the char/4 estimator rather than getting a stale object.
+    assert_true(first is None and second is None and third is None,
+                "and every call still returns None, so callers still degrade")
+
+
 if __name__ == "__main__":
     try:
         # Loader discrimination — expected to fail until F1.
@@ -603,6 +701,10 @@ if __name__ == "__main__":
         test_rollup_leaves_corrupt_summary_file_untouched()
         test_auto_capture_keeps_persona_after_unreadable_read()
         test_auto_capture_leaves_corrupt_persona_file_untouched()
+
+        # v3.1.9: two handlers that read as covered and were not.
+        test_invalid_utf8_is_unreadable_not_a_crash()
+        test_get_tokenizer_caches_the_failure_too()
 
         print("\nAll store-failure tests passed.")
     finally:

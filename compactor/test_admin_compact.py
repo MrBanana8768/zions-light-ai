@@ -631,6 +631,55 @@ check(body.get("gap_turns") == 2,
 # ---------------------------------------------------------------------------
 
 print()
+# ---------------------------------------------------------------------------
+# 9. ?dry_run=true is HONOURED, not ignored
+# ---------------------------------------------------------------------------
+#
+# This endpoint's default is a LIVE run - up to 200 vLLM summarization calls, a
+# rewritten state file and an advanced watermark - and until v3.1.9 it read
+# dry_run from the JSON body only. So `?dry_run=true` silently performed the
+# thing it was asking to preview. The operator asked for a plan and got a
+# write. admin_merge next door learned to read the query string in v3.1.7 and
+# this one did not; its docstring even names the asymmetry.
+
+print()
+print("[9] ?dry_run=true in the QUERY STRING is honoured")
+QCID = "dryrun-query"
+set_store(exchanges(60))
+_before_q = snapshot()
+r = admin.post(f"/admin/conversations/{QCID}/compact?dry_run=true", json={})
+check(r.status_code == 200, f"HTTP 200 (got {r.status_code})")
+check(r.json().get("dry_run") is True,
+      "the report says dry_run: true (got %r)" % (r.json().get("dry_run"),))
+check(snapshot() == _before_q,
+      "and not one byte under the storage root changed")
+
+# CONTROL: the same endpoint with no flag anywhere still runs LIVE. Without
+# this, [9] passes just as well if the endpoint became dry-run-always, which
+# would be a different bug of the same size.
+# A FRESH conversation. The live run below drains this one to its
+# watermark, so reusing it for the next check leaves nothing to write and
+# "and it wrote" fails for a reason that has nothing to do with dry_run.
+QCID_LIVE = "dryrun-live"
+set_store(exchanges(60))
+_before_live = snapshot()
+r = admin.post(f"/admin/conversations/{QCID_LIVE}/compact", json={})
+check(r.status_code == 200, f"HTTP 200 for the live default (got {r.status_code})")
+check(r.json().get("dry_run") is False,
+      "an absent flag is still a LIVE run - that is the documented contract")
+check(snapshot() != _before_live,
+      "and it actually wrote something")
+
+# And the explicit opt-out still commits, so "false" is not swallowed by the
+# same parser that now accepts the query string.
+QCID_FALSE = "dryrun-false"
+set_store(exchanges(60))
+_before_false = snapshot()
+r = admin.post(f"/admin/conversations/{QCID_FALSE}/compact?dry_run=false", json={})
+check(r.json().get("dry_run") is False, "?dry_run=false means commit")
+check(snapshot() != _before_false, "and it wrote")
+
+
 if FAILED:
     print(f"{len(FAILED)} assertion(s) failed:")
     for label in FAILED:
