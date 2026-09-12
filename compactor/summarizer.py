@@ -70,6 +70,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
+from starlette.concurrency import run_in_threadpool
 
 import logsetup
 import textclean
@@ -1947,7 +1948,25 @@ async def maybe_rollup(
     maps it back onto the array in hand (v3.1.4).
     """
     async with conv_lock(conv_id):
-        state = load_state(conv_id)
+        # OFF THE EVENT LOOP (v3.1.9.2). Benchmarked on the v3.1.9 harness:
+        # this read and the save_state below cost 3.8-4.9 ms of BLOCKING loop
+        # time on every turn the tail runs, unconditionally, producing p99
+        # loop lateness of 7.2 ms with spikes to 21.9 ms. The transfer
+        # function into request lateness measured 1:1 — every millisecond
+        # blocked here is a millisecond added to whatever else the loop was
+        # serving. Wrapped, a 500 ms stall becomes 0.75 ms p99.
+        #
+        # This was NOT where the plan said the cost was. v3.1.9 originally
+        # targeted _is_repeat_task_traffic's load_state, which measures
+        # 0.000 ms on any ongoing conversation because _has_conversational_
+        # history returns before the disk read. That would have moved ~2% of
+        # the blocking. The measurement is the reason this line changed and
+        # that one did not.
+        #
+        # conv_lock is an asyncio.Lock and it stays HELD across the await,
+        # which is the point: the IO moves to a worker, the serialisation
+        # that stops concurrent rollups tearing the file does not.
+        state = await run_in_threadpool(load_state, conv_id)
 
         # Before anything reads the watermark: a file written by the old
         # _reconcile_watermark can have it BELOW the chunks it wrote, and
@@ -2018,7 +2037,10 @@ async def maybe_rollup(
         # rollups whether or not a later tier raised.
         if changed:
             try:
-                save_state(conv_id, state)
+                # The expensive half: tempfile + fsync + rename, measured at
+                # 3.8-4.9 ms on the loop. Same reasoning as the load above,
+                # and the same conv_lock held across the await.
+                await run_in_threadpool(save_state, conv_id, state)
             except Exception as e:
                 logger.exception(f"conv={conv_id}: rollup state write failed: {e}")
 

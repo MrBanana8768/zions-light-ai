@@ -4307,7 +4307,11 @@ async def _rollup_hierarchy(
             if assistant_text is not None
             else []
         )
-        before = summarizer.load_state(conv_id)
+        # OFF THE EVENT LOOP (v3.1.9.2), same reasoning as the two reads
+        # inside maybe_rollup. This one is purely a "did anything change"
+        # snapshot for the log line below, and it runs on every turn the tail
+        # runs — a blocking disk read on the loop to decide whether to print.
+        before = await run_in_threadpool(summarizer.load_state, conv_id)
         state = await summarizer.maybe_rollup(
             conv_id, full_messages, VLLM_URL, MODEL_REPO or ""
         )
