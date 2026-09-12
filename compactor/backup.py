@@ -72,16 +72,59 @@ logger = logging.getLogger("compactor.backup")
 
 # What to back up. DATA_DIR is OpenWebUI's state root; webui.db lives there.
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data/openwebui"))
-# The LIVE database moved to local disk (v3.1.6, webuidb.py) so its journal
-# writes stop landing on the flaky volume. Back up the live file when it is
-# there: /data/openwebui/webui.db is now a periodic SNAPSHOT, so archiving
-# that instead would silently give every archive the staleness of the last
-# sync on top of its own age.
-_LIVE_DB = Path(os.environ.get("WEBUI_LOCAL_DB", "/var/lib/openwebui/webui.db"))
-WEBUI_DB = Path(
-    os.environ.get("COMPACTOR_BACKUP_WEBUI_DB")
-    or (str(_LIVE_DB) if _LIVE_DB.exists() else str(DATA_DIR / "webui.db"))
-)
+
+
+def live_webui_db() -> Path:
+    """The webui.db OpenWebUI is actually reading, resolved at CALL time.
+
+    v3.1.9 (M10 / A3-4). This was a module constant:
+
+        WEBUI_DB = COMPACTOR_BACKUP_WEBUI_DB
+                   or (_LIVE_DB if _LIVE_DB.exists() else DATA_DIR/webui.db)
+
+    — a guess by EXISTENCE, while the deployment decides by a GATE.
+    entrypoint.sh calls WEBUI_DB_LOCAL "the kill switch for the one subsystem
+    here that owns where her chat history physically lives", and its
+    documented rollback (`false`) points OpenWebUI at the snapshot while
+    leaving /var/lib/openwebui/webui.db exactly where it was. On any restart
+    that keeps the overlay the stale local file still exists, so every nightly
+    archive became a copy of a database nobody had written to since the flag
+    flipped, and every CLI restore landed on that abandoned file where
+    OpenWebUI would never read it. The string WEBUI_DB_LOCAL did not appear
+    anywhere in this file.
+
+    It was also frozen at IMPORT, in the two longest-lived processes on the
+    pod (the backup daemon and main.py), so a gate flipped under a running
+    daemon was invisible to it until restart.
+
+    Resolution order is the order of authority:
+
+      1. COMPACTOR_BACKUP_WEBUI_DB — an explicit operator override, unchanged.
+      2. DATABASE_URL, when it is a sqlite URL — that IS what OpenWebUI reads.
+         entrypoint.sh derives it from the gate with `:-`, so an operator's
+         own value wins there too, and this reads the result rather than
+         re-deriving it. Present for the daemon (supervisord inherits
+         entrypoint's exports); ABSENT for `docker exec ... backup.py`, which
+         gets only the image and pod environment, so:
+      3. the gate, compared EXACTLY as entrypoint.sh compares it
+         (`[ "${WEBUI_DB_LOCAL}" = "true" ]`, default true). Deliberately not a
+         folded boolean: `True` means MooseFS to the shell, and a reader that
+         disagreed with the writer about which file is live is the defect
+         being fixed. The dialect itself is M9's problem, and the fix for it
+         must change both sides at once.
+    """
+    explicit = os.environ.get("COMPACTOR_BACKUP_WEBUI_DB")
+    if explicit:
+        return Path(explicit)
+    url = os.environ.get("DATABASE_URL", "")
+    if url.startswith("sqlite:///"):
+        # sqlite:////var/lib/x.db -> /var/lib/x.db; sqlite:///rel.db -> rel.db
+        return Path(url[len("sqlite:///"):])
+    if os.environ.get("WEBUI_DB_LOCAL", "true") == "true":
+        return Path(os.environ.get("WEBUI_LOCAL_DB", "/var/lib/openwebui/webui.db"))
+    return Path(os.environ.get("WEBUI_SNAPSHOT_DB", str(DATA_DIR / "webui.db")))
+
+
 # The same three suffixes webuidb.SIDECARS sweeps, for the same reason:
 # SQLite derives them from the database path it was given, so they belong
 # to whatever file carries that name. Duplicated rather than imported —
@@ -435,13 +478,17 @@ def create_backup(backup_dir: Path | None = None) -> Path:
     try:
         # 1. webui.db via online snapshot (live-safe)
         db_dest = staging / "webui.db"
-        if _snapshot_sqlite(WEBUI_DB, db_dest):
+        # Resolved per cycle, not at import: the daemon is the longest-lived
+        # process on the pod, and a gate flipped under it was invisible
+        # until restart (A3-9). See live_webui_db.
+        live_db = live_webui_db()
+        if _snapshot_sqlite(live_db, db_dest):
             manifest["sources"]["webui.db"] = {
                 "present": True, "bytes": db_dest.stat().st_size,
             }
         else:
             manifest["sources"]["webui.db"] = {"present": False}
-            logger.warning(f"webui.db not found at {WEBUI_DB} — backing up memory only")
+            logger.warning(f"webui.db not found at {live_db} — backing up memory only")
 
         # 2. compactor/ store (atomic-written files are individually consistent)
         if not STORAGE_ROOT.is_dir():
@@ -964,7 +1011,6 @@ def restore_backup(
     """
     if not confirm:
         raise RuntimeError("restore is destructive; pass confirm=True (CLI: --yes)")
-    ddir = data_dir or DATA_DIR
     sroot = storage_root or STORAGE_ROOT
 
     ok, detail = verify_backup(archive_path)
@@ -976,68 +1022,272 @@ def restore_backup(
         with tarfile.open(archive_path, "r:gz") as tar:
             tar.extractall(scratch, filter="data")  # path-traversal safe
         restored: list[str] = []
-        # webui.db
         src_db = scratch / "webui.db"
-        if src_db.is_file():
-            # WHERE THE LIVE DATABASE ACTUALLY IS, not where it used to be.
-            # create_backup reads WEBUI_DB, which follows the local-disk gate;
-            # this wrote to DATA_DIR/webui.db unconditionally. With the gate on
-            # those are different files, so the restore landed where OpenWebUI
-            # was not reading and webuidb-sync overwrote it within
-            # SYNC_INTERVAL_S. Reading one path and writing another is not a
-            # restore.
-            target = webui_db or (
-                ddir / "webui.db" if data_dir is not None else WEBUI_DB
-            )
-            target.parent.mkdir(parents=True, exist_ok=True)
+        src_store = scratch / "compactor"
+        have_db = src_db.is_file()
+        have_store = src_store.is_dir()
 
-            # SIDECARS TRAVEL WITH THE DATABASE, and leaving them behind is how
-            # a good restore becomes a corrupt one. A -journal or -wal beside
-            # the target belongs to the database being REPLACED; SQLite applies
-            # it to whatever file carries that name on the next open.
-            # scripts/recover-webui-db.py and OPERATIONS.md both name this as
-            # the thing that corrupts a good file, and webuidb._set_aside
-            # sweeps these same three suffixes for the same reason. This is the
-            # sibling that did not.
-            #
-            # RENAMED, NEVER DELETED: a hot journal may hold the only copy of
-            # everything written since the last commit, and this runs at the
-            # moment an operator is already recovering from something.
-            stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        # WHERE THE LIVE DATABASE ACTUALLY IS — resolved now, by the gate, the
+        # same way create_backup resolves it. `data_dir` no longer selects the
+        # target: a data root cannot say where the live database is (under
+        # WEBUI_DB_LOCAL=true it is not under the data root at all), and no
+        # caller in the tree ever passed it. The parameter stays so an old
+        # call does not break; it is simply not evidence.
+        target = webui_db or live_webui_db()
+        stamp = _restore_stamp()
+
+        # ------------------------------------------------------------------
+        # STAGE EVERYTHING FIRST, TOUCH NOTHING LIVE UNTIL IT IS STAGED.
+        #
+        # v3.1.9 (A3-2, A3-3, A3-12). The previous version was two different
+        # defects of one shape — move-then-write — ten lines apart:
+        #
+        #   * the database's SIDECARS were renamed aside before the copy that
+        #     could fail, so an ENOSPC left the original database byte-for-byte
+        #     intact and stripped of its hot journal: the one file that can roll
+        #     back a half-applied transaction, gone at the moment an operator
+        #     is recovering from something. SQLite then opens it silently,
+        #     because as far as it can see there is nothing to replay.
+        #   * the STORE was `rmtree(sroot)` then `copytree` — every fact, every
+        #     summary tier, every persona and ChromaDB deleted before the first
+        #     byte came back, with no set-aside, in the commit whose message
+        #     said it had fixed this function's atomicity. It fixed the half
+        #     above and walked past the half below.
+        #
+        # So both halves are copied to siblings of their targets first, and
+        # fsynced. Only then does anything live move, and every live move is a
+        # rename on one filesystem. An interruption during staging leaves the
+        # live data exactly as it was plus some `.incoming` debris. An
+        # interruption during the renames leaves every piece on disk under a
+        # name that says what it is, and the log line below says how to put it
+        # back.
+        # ------------------------------------------------------------------
+        needed: list[tuple[Path, int]] = []
+        if have_db:
+            needed.append((target.parent, src_db.stat().st_size))
+        if have_store:
+            needed.append((sroot.parent, _tree_bytes(src_store)))
+        _require_free_space(needed)
+
+        db_tmp = target.with_name(f"{target.name}.restore-{stamp}")
+        store_incoming = sroot.with_name(f"{sroot.name}.incoming-{stamp}")
+        try:
+            if have_db:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_db, db_tmp)
+                _fsync_file(db_tmp)
+            if have_store:
+                sroot.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(src_store, store_incoming)
+                _fsync_tree(store_incoming)
+        except BaseException:
+            db_tmp.unlink(missing_ok=True)
+            shutil.rmtree(store_incoming, ignore_errors=True)
+            raise
+
+        # Staged. From here every step is a rename, and the recovery path for
+        # each possible stopping point is written down BEFORE the first one.
+        logger.warning(
+            f"restoring {archive_path.name}: staged "
+            f"{'webui.db -> ' + db_tmp.name if have_db else 'no webui.db'} and "
+            f"{'store -> ' + store_incoming.name if have_store else 'no store'}. "
+            f"If this process dies before 'restored' is logged, nothing was "
+            f"deleted: the pre-restore originals are named *.pre-restore-{stamp} "
+            f"beside their targets, and the staged copies are the "
+            f"*.restore-{stamp} / *.incoming-{stamp} names above."
+        )
+
+        if have_db:
+            # SIDECARS TRAVEL WITH THE DATABASE. A -journal or -wal beside the
+            # target belongs to the database being REPLACED, and SQLite applies
+            # it to whatever file carries that name on the next open. Renamed,
+            # never deleted — and now only once the replacement is certain, and
+            # put BACK if the replace itself fails, so no path through here
+            # leaves the original without its journal.
+            moved: list[tuple[Path, Path]] = []
             for suffix in SIDECARS:
                 side = target.with_name(target.name + suffix)
                 if side.exists():
-                    aside = side.with_name(f"{side.name}.pre-restore-{stamp}")
+                    aside = _free_name(side.with_name(f"{side.name}.pre-restore-{stamp}"))
                     side.rename(aside)
+                    moved.append((side, aside))
                     logger.warning(
                         f"moved {side.name} aside to {aside.name} before "
                         f"restoring — it belongs to the database being "
                         f"replaced, and SQLite would have applied it to the "
                         f"restored one"
                     )
-
-            # ATOMIC. A crash mid-copy left a TRUNCATED live database where a
-            # whole one had been — on the one code path an operator reaches
-            # only when something has already gone wrong. The temp name is a
-            # sibling so os.replace stays on one filesystem.
-            tmp = target.with_name(f"{target.name}.restore-{os.getpid()}")
             try:
-                shutil.copy2(src_db, tmp)
-                os.replace(tmp, target)
-            finally:
-                tmp.unlink(missing_ok=True)
+                os.replace(db_tmp, target)
+            except BaseException:
+                for side, aside in reversed(moved):
+                    try:
+                        aside.rename(side)
+                    except OSError as e:
+                        logger.error(
+                            f"could not put {aside.name} back as {side.name} "
+                            f"after a failed restore ({e}); move it back by "
+                            f"hand BEFORE anything opens {target.name}"
+                        )
+                db_tmp.unlink(missing_ok=True)
+                # Nothing live has moved on the store side yet, so its staged
+                # copy is only debris; leaving it would be a multi-gigabyte
+                # `.incoming` nobody is told about.
+                shutil.rmtree(store_incoming, ignore_errors=True)
+                raise
+            _fsync_dir(target.parent)
             restored.append("webui.db")
-        # compactor store — replace wholesale
-        src_store = scratch / "compactor"
-        if src_store.is_dir():
+
+        if have_store:
+            # Set aside, never deleted. The old store is the only copy of
+            # everything written since the archive was taken; an operator who
+            # restored the wrong archive needs it back, and this is the moment
+            # nobody can tell yet whether they did.
+            store_aside = None
             if sroot.exists():
-                shutil.rmtree(sroot)
-            shutil.copytree(src_store, sroot)
+                store_aside = _free_name(
+                    sroot.with_name(f"{sroot.name}.pre-restore-{stamp}")
+                )
+                os.replace(sroot, store_aside)
+            try:
+                os.replace(store_incoming, sroot)
+            except BaseException:
+                if store_aside is not None:
+                    os.replace(store_aside, sroot)
+                raise
+            _fsync_dir(sroot.parent)
+            if store_aside is not None:
+                logger.warning(
+                    f"the compactor store in place before this restore is "
+                    f"kept at {store_aside} — nothing deleted it, and nothing "
+                    f"will; remove it by hand once the restore is confirmed"
+                )
             restored.append("compactor")
+
         logger.info(f"restored {restored} from {archive_path.name}")
         return {"ok": True, "restored": restored, "archive": archive_path.name}
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _restore_stamp() -> str:
+    """Millisecond resolution, matching webuidb._stamp().
+
+    Whole seconds collided: two back-to-back restores produced one
+    `.pre-restore-<stamp>` name, and on POSIX a rename onto an existing name
+    is a SILENT REPLACE — so the second destroyed the first set-aside, the
+    older journal, the one more likely to hold the transaction an operator is
+    chasing. webuidb._stamp() carries a comment saying exactly this happened
+    there; this file copied its three suffixes and its reasoning and not its
+    stamp. One time read, so the second and the millisecond cannot disagree.
+    """
+    now = time.time()
+    return (
+        time.strftime("%Y%m%d-%H%M%S", time.gmtime(now))
+        + f"-{int(now * 1000) % 1000:03d}"
+    )
+
+
+def _free_name(p: Path) -> Path:
+    """`p`, or `p-1`, `p-2`... — whichever does not exist yet.
+
+    Millisecond stamps make a collision rare; this makes it impossible. A set-
+    aside exists because something already went wrong, and a rename that can
+    silently replace one is not a set-aside.
+    """
+    if not p.exists():
+        return p
+    n = 1
+    while p.with_name(f"{p.name}-{n}").exists():
+        n += 1
+    return p.with_name(f"{p.name}-{n}")
+
+
+def _tree_bytes(root: Path) -> int:
+    return sum(f.stat().st_size for f in root.rglob("*") if f.is_file())
+
+
+def _require_free_space(needed: list[tuple[Path, int]]) -> None:
+    """Refuse BEFORE staging if a target volume cannot hold its copy.
+
+    create_backup — the non-destructive half — has had a free-space guard for
+    releases; restore, the destructive one, had none, and ENOSPC mid-copy was
+    the named trigger for both move-then-write losses above. Staging no longer
+    touches anything live, so running out of space is now merely a failed
+    restore rather than a lost journal or a lost store; this makes it a clear
+    one, before a multi-gigabyte copy, instead of an OSError halfway through.
+
+    Totals per volume: when the database and the store share one, both copies
+    need room at once. 10% headroom plus MIN_FREE_MB, the same floor
+    create_backup keeps.
+    """
+    by_dev: dict[int, tuple[Path, int]] = {}
+    for where, nbytes in needed:
+        probe = where
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        try:
+            dev = probe.stat().st_dev
+        except OSError:
+            continue
+        prev = by_dev.get(dev, (probe, 0))
+        by_dev[dev] = (prev[0], prev[1] + nbytes)
+    for probe, nbytes in by_dev.values():
+        try:
+            free = shutil.disk_usage(str(probe)).free
+        except OSError:
+            continue
+        want = int(nbytes * 1.1) + MIN_FREE_MB * 1024 * 1024
+        if free < want:
+            raise RuntimeError(
+                f"refusing to restore: {free / 1048576:.0f} MB free at {probe}, "
+                f"and staging this archive there needs about "
+                f"{want / 1048576:.0f} MB. Nothing has been touched."
+            )
+
+
+def _fsync_file(p: Path) -> None:
+    """Durable before it is renamed into place.
+
+    memory.atomic_write_json fsyncs the file and its directory and says why:
+    /data is MooseFS, where rename and fsync guarantees are weaker than local
+    POSIX. The restore's `os.replace` was never fsynced at all, so a pod killed
+    after the rename could come back with a name pointing at pages that never
+    reached the disk.
+    """
+    with open(p, "rb") as f:
+        os.fsync(f.fileno())
+
+
+def _fsync_tree(root: Path) -> None:
+    """Every file, then every directory, under `root`.
+
+    copytree writes each file with copy2 and fsyncs nothing, so fsyncing
+    only the top directory would make the rename durable and leave the
+    contents it names in the page cache. A restore is rare and manual; the
+    cost of a full pass is paid once, at the moment it matters.
+    """
+    for f in root.rglob("*"):
+        if f.is_file():
+            _fsync_file(f)
+    for d in sorted((x for x in root.rglob("*") if x.is_dir()), reverse=True):
+        _fsync_dir(d)
+    _fsync_dir(root)
+
+
+def _fsync_dir(d: Path) -> None:
+    """Best-effort: a filesystem that refuses a directory fsync is not a
+    reason to fail a restore that has already succeeded."""
+    try:
+        fd = os.open(str(d), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
