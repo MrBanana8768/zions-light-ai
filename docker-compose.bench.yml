@@ -1,0 +1,86 @@
+# The v3.1.9 compaction benchmark, on Linux, on the userland production runs.
+#
+#   docker compose -f docker-compose.bench.yml run --rm --build bench
+#   docker compose -f docker-compose.bench.yml run --rm bench --only B
+#   docker compose -f docker-compose.bench.yml run --rm bench \
+#       --json /out/after.json --baseline /out/before.json
+#
+# Arguments after the service name go straight to scripts/bench-compaction.py.
+#
+# WHY IT REUSES testfixtures/unit-suite/Dockerfile RATHER THAN BUILDING ITS
+# OWN IMAGE. A performance number is only comparable to another number taken
+# on the same stack, and that image is already the exact one the suites run
+# on: Ubuntu 24.04 userland (what the production image is built on), the
+# compactor venv constructed from the same compactor/requirements.txt, with
+# the jinja2 and mistral_common guards that stop a silently different
+# tokenizer path being measured. A second Dockerfile here would be a second
+# thing to keep in step, and the first time it drifted the benchmark would
+# start comparing two machines while claiming to compare two commits. It also
+# means this stack costs nothing to build when the unit-test image is already
+# warm.
+#
+# WHY THERE IS NO NETWORK AND NO GPU. The benchmark measures the compactor's
+# own CPU and disk, never generation: the backend is stubbed inside the
+# script. `network_mode: none` is what makes that a property of the stack
+# rather than a promise in a docstring - if a path ever reaches for vLLM, it
+# fails here instead of quietly measuring a round trip.
+#
+# WHAT THIS STACK CANNOT MEASURE, stated so nobody reads a number off it that
+# it never took:
+#
+#   * Generation latency. There is no model. Path A reports the NUMBER of
+#     backend calls and a separately-labelled modelled end-to-end; the
+#     modelled figure is arithmetic, not a measurement.
+#   * The production tokenizer. count_tokens falls to the chars/4 estimator
+#     with no model weights on disk, where the pod loads the transformers
+#     tokenizer. The report prints which tier ran. To measure the pod's tier,
+#     stage an HF cache and mount it at /hf.
+#   * MooseFS. The state file here lands on the container's own filesystem.
+#     Path C therefore reports the read as measured locally AND an injected
+#     stall sweep, which is the transfer function a slow volume would be
+#     multiplied through.
+#
+# THE OUTPUT. The run prints a table and then a JSON block between
+# BENCH-JSON-BEGIN/END markers; redirect stdout to keep it. --json writes the
+# same JSON to a file, and /out is a bind mount so a before/after pair can
+# live outside the worktree - set ZLA_BENCH_OUT to choose where. It
+# deliberately does NOT default to a directory inside the repo: benchmark
+# artefacts in the working tree read as uncommitted changes to the next
+# `git status`, which is how the test stacks got their read-only mount.
+
+services:
+  bench:
+    build:
+      context: .
+      dockerfile: testfixtures/unit-suite/Dockerfile
+    container_name: zla-bench-compaction
+    volumes:
+      # Read-only, and NOT copied to a scratch tree the way the unit suite
+      # copies it. The suites write sqlite files and chromadb stores next to
+      # the code and so need a writable copy; this script writes only summary
+      # state, and that goes to COMPACTOR_STORAGE_ROOT below, on the
+      # container's own filesystem. Skipping the copy keeps the measured
+      # process from paying for a 60 MB tar first.
+      - ./:/src:ro
+      - ${ZLA_BENCH_OUT:-/tmp}:/out
+    working_dir: /src
+    environment:
+      # The same offline flags the unit stack sets, for the same reason: a run
+      # whose timings depend on whether a tokenizer download succeeded is not
+      # a baseline.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      COMPACTOR_FORCE_OFFLINE: "true"
+      # On the container filesystem, not on /src (read-only) and not on the
+      # Windows bind mount (which would measure the 9p/virtiofs boundary and
+      # call it a disk read).
+      COMPACTOR_STORAGE_ROOT: "/bench-state"
+      # Retrieval is a third of the compactor and none of what is being
+      # measured; leaving it on would import chromadb and fastembed into the
+      # timing process for nothing.
+      COMPACTOR_RAG_ENABLED: "false"
+      BENCH_LABEL: "${BENCH_LABEL:-baseline}"
+    network_mode: none
+    entrypoint:
+      - /opt/compactor-venv/bin/python
+      - /src/scripts/bench-compaction.py
