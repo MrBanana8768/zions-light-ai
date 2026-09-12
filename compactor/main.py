@@ -1699,14 +1699,59 @@ async def compact_if_needed(
             # hierarchy cannot actually speak for. So when the client is
             # sending everything (offset provably 0) this applies, and
             # when it is not, it declines and today's behaviour stands.
-            _n = len([m for m in messages if m.get("role") != "system"])
-            if _covered > 0 and _n >= summarizer._recorded_position(_st):
-                stored_turns = min(_covered, len(text_only))
+            _non_system = [m for m in messages if m.get("role") != "system"]
+            _n = len(_non_system)
+
+            # THE LENGTH TEST ALONE IS NOT ENOUGH. It proves a length
+            # relation; the substitution needs a CONTENT one, and an
+            # adversarial pass demonstrated the gap: OpenWebUI keeps branches
+            # in ONE chat, so conv_id never changes, and a regenerate or an
+            # edit produces an array that satisfies `_n >= _recorded_position`
+            # while being a DIFFERENT branch. 20 of 30 branch-B exchanges were
+            # deleted and replaced by branch A's summary, and it never
+            # self-heals - _do_l1_rollup's duplicate-label guard then discards
+            # branch B's replacement chunks.
+            #
+            # _align_candidates answers exactly this and is PURE - it takes the
+            # anchor and the fingerprints and returns candidates, touching no
+            # state. That matters because the comment above is right that
+            # _observed_position must not be called here; this is the half of
+            # it that is safe to borrow. Empty means "cannot be told", which is
+            # the answer that must decline.
+            _anchor = _st.get("tail_fp") or []
+            _aligned = bool(_anchor) and bool(
+                summarizer._align_candidates(
+                    _anchor,
+                    summarizer._turn_fingerprints(
+                        _non_system[-summarizer._FINGERPRINT_TAIL_TURNS:]
+                    ),
+                )
+            )
+
+            if _covered > 0 and _n >= summarizer._recorded_position(_st) and _aligned:
+                # TURN NUMBERS ARE NOT text_only INDICES. _covered counts every
+                # non-system turn; text_only has image turns removed, so
+                # `min(_covered, len(text_only))` overruns by the image count
+                # and deletes that many turns the hierarchy never covered -
+                # demonstrated at 1 and 5 turns of overrun, reachable at the
+                # shipped MAX_RETAINED_IMAGES=1. Count the prefix instead of
+                # assuming the two units agree.
+                stored_turns = min(
+                    sum(
+                        1 for m in to_summarize[:_covered]
+                        if not _message_has_image(m)
+                    ),
+                    len(text_only),
+                )
                 if stored_turns > 0:
+                    # all_or_nothing: a squeezed block drops the OLDEST scenes,
+                    # which are the same turns removed below. See the kwarg's
+                    # docstring - this is the caller it exists for.
                     stored_text = await run_in_threadpool(
                         summarizer.format_summary_block,
                         _st,
                         summarizer.SUMMARY_BLOCK_MAX_TOKENS,
+                        all_or_nothing=True,
                     ) or ""
             if not stored_text:
                 stored_turns = 0

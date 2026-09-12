@@ -367,9 +367,26 @@ def _summary_line(kind: str, chunk: dict) -> tuple[str, str]:
     return header, chunk.get("text", "")
 
 
-def format_summary_block(state: dict, max_tokens: int | None = None) -> str | None:
+def format_summary_block(
+    state: dict, max_tokens: int | None = None, *, all_or_nothing: bool = False
+) -> str | None:
     """Render the current summary stack into a single system-message body.
     Returns None if there's nothing to inject.
+
+    all_or_nothing=True returns None instead of a partial block whenever the
+    budget forced ANY tier item out. It exists for one caller and one reason:
+    compact_if_needed REMOVES the turns this block stands in for, and a squeeze
+    here drops the OLDEST scenes first (see below) — the same end of the
+    conversation compaction removes from the array. A partial block there is
+    not a smaller summary, it is turns deleted from the array and absent from
+    the stand-in: gone from the request entirely, with the log still reporting
+    them as "covered by stored summaries". Demonstrated at 9 L1 / 4 L2 / 1 L3,
+    a state at its documented capacity, via _estimate_block_tokens pricing
+    non-ASCII per UTF-8 BYTE while L1_MAX_TOKENS bounds output TOKENS.
+
+    Every other caller injects this block ALONGSIDE the turns rather than
+    instead of them, so a partial block is a smaller summary and nothing more.
+    They keep the default.
 
     Order in the rendered block (most-general → most-specific):
       1. L3 (whole-conversation theme), if any
@@ -480,6 +497,14 @@ def format_summary_block(state: dict, max_tokens: int | None = None) -> str | No
             f"{len(l2) - dropped_l2}/{len(l2)} chapter(s), "
             f"{len(l1) - dropped_l1}/{len(l1)} scene(s)"
         )
+        if all_or_nothing:
+            logger.warning(
+                "and the caller asked for all-or-nothing, so NOTHING is "
+                "returned: it substitutes this block for turns it removes "
+                "from the array, and a block missing its oldest scenes "
+                "cannot stand in for the oldest turns"
+            )
+            return None
 
     lines = [_BLOCK_HEADER]
     if l3_line:

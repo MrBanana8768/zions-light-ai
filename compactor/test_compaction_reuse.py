@@ -97,6 +97,19 @@ state["l1"] = [
     {"text": "STORED-CHUNK-TWO", "first_turn": 21, "last_turn": 40},
 ]
 state["last_summarized_turn"] = 40
+# THE ANCHOR IS NOW LOAD-BEARING, and its absence here made this fixture
+# describe a state production never writes. maybe_rollup sets tail_fp on every
+# rollup (`state["tail_fp"] = fps[-_ANCHOR_TURNS:]`), so a hierarchy that
+# exists AT ALL has one. compact_if_needed refuses to substitute without it,
+# because the length test it used to rely on proves a length relation while
+# the substitution needs a content one — an adversarial pass replaced 20 of 30
+# live turns with an abandoned branch's summary through exactly that gap.
+#
+# Built the way maybe_rollup builds it: the fingerprints of the last
+# _ANCHOR_TURNS turns of the array as it stood when the rollup ran, which for
+# this state is turns 1..40.
+_ns = [m for m in MSGS if m.get("role") != "system"]
+state["tail_fp"] = summarizer._turn_fingerprints(_ns[:40])[-summarizer._ANCHOR_TURNS:]
 summarizer.save_state(CONV, state)
 
 CALLS.clear()
@@ -149,6 +162,123 @@ if CALLS:
           "mapping turn numbers onto indices that do not mean the same thing")
 check(not any("STORED-CHUNK" in str(m.get("content", "")) for m in out),
       "and no stored text was substituted into a window it cannot speak for")
+
+
+# ---------------------------------------------------------------------------
+# THE THREE GUARDS AN ADVERSARIAL PASS PUT HERE (v3.1.9.3). Each one closes a
+# DEMONSTRATED break, and each is a different way the same habit went wrong:
+# deleting turns on the strength of a number never checked against the array
+# in hand, the block actually rendered, or the content the chunk was made
+# from. Every one has a CONTROL beside it, because a guard that declines
+# everything passes a "nothing was substituted" check perfectly.
+# ---------------------------------------------------------------------------
+
+
+def _seed(conv: str, msgs: list[dict], chunks: list[dict], *, anchor_through: int):
+    """A hierarchy the way maybe_rollup would have left it."""
+    st = summarizer.load_state(conv)
+    st["l1"] = chunks
+    st["last_summarized_turn"] = chunks[-1]["last_turn"]
+    ns = [m for m in msgs if m.get("role") != "system"]
+    st["tail_fp"] = summarizer._turn_fingerprints(
+        ns[:anchor_through]
+    )[-summarizer._ANCHOR_TURNS:]
+    summarizer.save_state(conv, st)
+    return st
+
+
+print("[6] a SQUEEZED summary block does not stand in for removed turns")
+# format_summary_block drops the OLDEST scenes under budget pressure — the
+# same end of the conversation compaction removes. Demonstrated break: 80
+# turns deleted from the array and absent from the block, on a state at its
+# documented capacity, with the log still calling them covered.
+CONV_SQ = "reuse_squeezed"
+MSGS_SQ = history(24)
+# Sized so the two scenes TOGETHER exceed SUMMARY_BLOCK_MAX_TOKENS (12,000)
+# while each one alone fits — that is the shape that drops the oldest scene
+# rather than returning nothing. The first draft used 4,000 chars and the
+# block fit comfortably, so the test failed by never squeezing at all.
+_fat = "z" * 30000
+_seed(CONV_SQ, MSGS_SQ,
+      [{"text": f"SQUEEZED-{i} {_fat}", "first_turn": i * 20 + 1,
+        "last_turn": (i + 1) * 20} for i in range(2)],
+      anchor_through=40)
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(list(MSGS_SQ), CONV_SQ))
+check(len(CALLS) == 1 and any("question 0" in t for t in CALLS[0]),
+      "the oldest turn was handed to summarize() rather than deleted — a "
+      "block that lost its oldest scenes cannot stand in for the oldest turns")
+check(not any("SQUEEZED-" in str(m.get("content", "")) for m in out),
+      "and no partial block reached the array")
+
+print("[7] an array that does NOT align with the stored anchor is refused")
+# OpenWebUI keeps branches in ONE chat, so conv_id never changes. The length
+# test is satisfied by a DIFFERENT branch of the same conversation, and the
+# demonstrated break replaced 20 of 30 live turns with the abandoned branch's
+# summary. tail_fp is the content evidence; _align_candidates reads it.
+CONV_BR = "reuse_branch"
+MSGS_BR = history(24)
+_seed(CONV_BR, MSGS_BR,
+      [{"text": "BRANCH-A-CHUNK", "first_turn": 1, "last_turn": 40}],
+      anchor_through=40)
+_st_br = summarizer.load_state(CONV_BR)
+_st_br["tail_fp"] = ["deadbeef", "cafebabe", "f00dface", "badc0ffe"]
+summarizer.save_state(CONV_BR, _st_br)
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(list(MSGS_BR), CONV_BR))
+check(len(CALLS) == 1 and any("question 0" in t for t in CALLS[0]),
+      "an anchor that appears nowhere in this array declines the substitution")
+check(not any("BRANCH-A-CHUNK" in str(m.get("content", "")) for m in out),
+      "and the other branch's summary did not reach the array")
+
+# THE CONTROL for [6] and [7] together. Same shape, nothing wrong with it, and
+# it MUST still reuse — otherwise both checks above pass by the feature being
+# dead, which is exactly how this suite was green while reuse did nothing.
+print("[8] control — a sound hierarchy with a matching anchor STILL reuses")
+CONV_OK = "reuse_control"
+MSGS_OK = history(24)
+_seed(CONV_OK, MSGS_OK,
+      [{"text": "SOUND-CHUNK", "first_turn": 1, "last_turn": 40}],
+      anchor_through=40)
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(list(MSGS_OK), CONV_OK))
+check(len(CALLS) == 1 and not any("question 0" in t for t in CALLS[0]),
+      "the covered oldest turns were NOT re-summarized — reuse still applies")
+check(any("SOUND-CHUNK" in str(m.get("content", "")) for m in out),
+      "and the stored text travelled into the array with the removal")
+
+print("[9] an IMAGE turn inside the covered span does not shift the mapping")
+# _covered counts every non-system turn; text_only has image turns REMOVED, so
+# min(_covered, len(text_only)) indexes one unit into the other and deletes one
+# live turn per image in the span — demonstrated at 1 and 5 turns of overrun,
+# reachable at the shipped MAX_RETAINED_IMAGES=1.
+#
+# Turn 2 is an image, chunks cover turns 1-40, so 39 of the first 40 turns are
+# text. Correct: text_only[39:] starts at turn 41. Wrong: text_only[40:] starts
+# at turn 42 and turn 41 is in NEITHER the array nor the summary.
+CONV_IMG = "reuse_image"
+MSGS_IMG = history(24)
+MSGS_IMG[2] = {
+    "role": "assistant",
+    "content": [
+        {"type": "text", "text": "here is the sketch"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+    ],
+}
+_seed(CONV_IMG, MSGS_IMG,
+      [{"text": "IMG-SPAN-CHUNK", "first_turn": 1, "last_turn": 40}],
+      anchor_through=40)
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(list(MSGS_IMG), CONV_IMG))
+_sent_img = CALLS[0] if CALLS else []
+check(any("question 20" in t for t in _sent_img),
+      "turn 41 — the first turn past the claimed coverage — still reached "
+      "summarize(); the image did not push the boundary one turn deep into "
+      "live history")
+# CONTROL: the covered span really was reused, so [9] is not passing because
+# the substitution declined outright.
+check(not any("question 0" in t for t in _sent_img),
+      "and the covered oldest turns were still NOT re-summarized")
 
 main.summarize = _real
 
