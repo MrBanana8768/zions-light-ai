@@ -5183,6 +5183,49 @@ def _reject_json_constant(name: str):
     """
     raise ValueError(f"{name} is not valid JSON for a request body")
 
+def _unpaired_surrogate(obj: Any) -> str | None:
+    """The UnicodeEncodeError text if `obj` cannot be written as UTF-8 JSON.
+
+    A LONE SURROGATE is valid JSON and a valid Python str, and it cannot be
+    encoded: json.loads turns the escape into a one-character string that looks
+    ordinary until the first write. Paired surrogates are combined by json.loads
+    into an astral character and pass, so ordinary emoji are unaffected.
+    """
+    try:
+        json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError as e:
+        return str(e)
+    return None
+
+
+def _refuse_unpaired_surrogate(body: Any) -> None:
+    """400, before any handler does anything with `body`.
+
+    v3.1.9 (M3, BLOCKER). chat_completions had this guard since v3.1.8 and its
+    seven body-parsing siblings did not. Through /admin/conversations/import it
+    was not a 500 but a DELETION: import_conversation wiped the facts file,
+    wiped the episodic index, and only then tried to write the bundle, which
+    raised UnicodeEncodeError — a ValueError the endpoint's handler did not name.
+    Executed against the real memory.py: 105 facts in, [] on disk, HTTP 500.
+
+    One helper, called by every handler that reads a JSON body, and
+    test_surrogate_guard.py walks this file's AST to fail the build if a handler
+    that calls `request.json()` does not also call this. Seven copies of a
+    guard is how the first one got missed; an eighth handler is how the next
+    one would be.
+    """
+    err = _unpaired_surrogate(body)
+    if err is not None:
+        logger.warning(f"rejected request carrying an unpaired surrogate: {err}")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "body contains an unpaired surrogate, which cannot be "
+                "encoded as UTF-8"
+            ),
+        )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Any:
     # PARSE DEFENSIVELY. The careful empty/invalid-messages 400 below is
@@ -5251,11 +5294,12 @@ async def chat_completions(request: Request) -> Any:
     # an astral character, which encodes fine and passes here - so ordinary
     # emoji are unaffected.
     if b"\\u" in _raw or b"\\U" in _raw:
-        try:
-            json.dumps(body, ensure_ascii=False).encode("utf-8")
-        except UnicodeEncodeError as e:
+        # The detector is shared with every admin handler; the RESPONSE is
+        # not, because this endpoint answers in OpenAI's error shape.
+        _surr = _unpaired_surrogate(body)
+        if _surr is not None:
             logger.warning(
-                f"rejected chat request carrying an unpaired surrogate: {e}"
+                f"rejected chat request carrying an unpaired surrogate: {_surr}"
             )
             return JSONResponse(
                 status_code=400,
@@ -6414,6 +6458,7 @@ async def admin_set_persona(conv_id: str, request: Request):
         raise HTTPException(status_code=400, detail="body must be JSON")
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
+    _refuse_unpaired_surrogate(body)
     text = body.get("text")
     if not isinstance(text, str) or not text.strip():
         raise HTTPException(status_code=400, detail="missing required field: 'text' (non-empty string)")
@@ -6451,6 +6496,7 @@ async def admin_inherit_persona(conv_id: str, request: Request):
         raise HTTPException(status_code=400, detail="body must be JSON")
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
+    _refuse_unpaired_surrogate(body)
     src = body.get("source_conv_id")
     if not isinstance(src, str) or not src.strip():
         raise HTTPException(status_code=400, detail="missing required field: 'source_conv_id'")
@@ -6511,6 +6557,7 @@ async def admin_restore_from_archive(conv_id: str, request: Request):
         body = {}
     if not isinstance(body, dict):
         body = {}
+    _refuse_unpaired_surrogate(body)
     substring = body.get("text_substring")
     async with conv_lock(conv_id):
         restored = facts.restore_from_archive(
@@ -6596,6 +6643,7 @@ async def admin_import_conversation(request: Request):
         raise HTTPException(status_code=400, detail="body must be JSON")
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
+    _refuse_unpaired_surrogate(body)
     bundle = body.get("bundle")
     if bundle is None:
         raise HTTPException(status_code=400, detail="missing required field: 'bundle'")
@@ -6631,6 +6679,7 @@ async def admin_fork_conversation(conv_id: str, request: Request):
         body = {}
     if not isinstance(body, dict):
         body = {}
+    _refuse_unpaired_surrogate(body)
     try:
         return portability.fork_conversation(
             conv_id, new_conv_id=body.get("new_conv_id")
@@ -6742,6 +6791,7 @@ async def admin_merge(src_conv_id: str, dst_conv_id: str, request: Request):
         body = {}
     if not isinstance(body, dict):
         body = {}
+    _refuse_unpaired_surrogate(body)
     # Absent means DRY for merge: this endpoint rewrites two conversations
     # and an operator who meant to commit sees unchanged counts and tries
     # again, while the reverse mistake is not recoverable.
@@ -6902,6 +6952,7 @@ async def admin_compact(conv_id: str, request: Request):
         body = {}
     if not isinstance(body, dict):
         body = {}
+    _refuse_unpaired_surrogate(body)
     max_calls = int(body.get("max_calls") or 200)
     # Absent means LIVE for compact, which is the documented contract and
     # stays — but ?dry_run=true is honoured now instead of ignored.

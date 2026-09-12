@@ -36,6 +36,7 @@ without silently truncating.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -781,6 +782,19 @@ def _validate_bundle(bundle: dict) -> None:
         raise ImportError_("bundle.episodic must be a list")
     if not isinstance(bundle.get("summary_state"), dict):
         raise ImportError_("bundle.summary_state must be an object")
+    # v3.1.9 (M3). Before any I/O, like everything else here: the whole
+    # bundle must be writable. A lone surrogate is valid JSON and a valid
+    # str, and raised UnicodeEncodeError only at the first save — after the
+    # old facts and episodic rows had been cleared. The endpoint guards the
+    # request body too; this is the guard that protects every other caller
+    # of import_conversation, including scripts that load a bundle from disk.
+    try:
+        json.dumps(bundle, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise ImportError_(
+            f"bundle contains text that cannot be written as UTF-8 "
+            f"(an unpaired surrogate): {e}"
+        )
 
 
 def import_conversation(
@@ -887,21 +901,32 @@ def import_conversation(
             f"on the caller's explicit instruction"
         )
 
-    # If overwriting, clear first — guarantees we don't end up with a
-    # mix of old + new facts that confuses retrieval. `unverifiable` counts as
+    # If overwriting, nothing old may survive beside the new — a mix of old and
+    # new episodic rows confuses retrieval. It used to say "clear first"; see
+    # below for why that order was the bug. `unverifiable` counts as
     # "might be occupied": skipping the clear because we could not PROVE state
     # exists is how stale episodic rows survive an overwrite and how
     # overwrote_existing comes to under-report a real replacement.
-    if (pre_existing or unverifiable) and overwrite:
-        facts.save_facts(target, [])
-        retrieval.forget_conversation(target)
-        # Summary state is overwritten wholesale by save_state, no clear needed.
+    #
+    # WRITE THE REPLACEMENTS FIRST, CLEAR ONLY WHAT THEY CANNOT REPLACE
+    # (v3.1.9, M3). This used to run save_facts(target, []) and
+    # forget_conversation BEFORE writing the bundle, so any failure in the
+    # bundle write — an unpaired surrogate, ENOSPC, a stalled volume — left
+    # the conversation wiped and nothing imported. Demonstrated: 105 facts
+    # in, [] on disk. The facts clear bought nothing even when it worked:
+    # save_facts replaces the file atomically, so writing the bundle's facts
+    # IS the clear. Summary state is the same. Only the episodic index is
+    # additive, so it is the one thing that must be emptied — and it is now
+    # emptied only after both atomic writes above it have landed.
 
     # Restore facts wholesale (already-pruned by export, no further pruning).
     facts.save_facts(target, list(bundle.get("facts", [])))
 
     # Restore summary state wholesale.
     summarizer.save_state(target, dict(bundle.get("summary_state", {})))
+
+    if (pre_existing or unverifiable) and overwrite:
+        retrieval.forget_conversation(target)
 
     # Re-embed and re-index each exchange.
     episodic_imported = 0
