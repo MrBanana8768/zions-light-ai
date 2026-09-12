@@ -4444,6 +4444,20 @@ def _run_memory_tail(
             # guards (a reply already refused) neither label had ever been
             # set and the guard could not fire. Found in review; it is this
             # file's own recurring defect, committed while fixing it.
+            # NOTHING TO ROLL UP WITHOUT A HISTORY (v3.1.8.1). Found by the
+            # R8 integration tests, which post a SINGLE user message and
+            # assert a skipped tail leaves the store untouched. The rollup
+            # fired anyway: it cannot build a chunk from one message, so its
+            # only effect was writing turns_seen=1 for a conversation that
+            # stored nothing - cost with no benefit, and adversarial finding
+            # F5 (summary state for conversations that stored nothing).
+            #
+            # This is not the test being bent to fit the code. The feature
+            # exists so a LOOPING model stops freezing the hierarchy, and
+            # those arrays always carry prior assistant turns, so that case
+            # is untouched. What this declines is the one where there is no
+            # earlier exchange to summarize at all.
+            and _has_conversational_history(messages)
             and not _task_traffic
             and not _fire_and_forget(
                 _rollup_hierarchy(conv_id, messages, None),

@@ -261,6 +261,66 @@ check(_task_labels == [],
       "no rollup is scheduled for it, through the production predicate "
       "rather than a stand-in")
 
+print("[7] a first turn with NO history does not roll up")
+# Found by the R8 integration tests, not by this file, which is the point:
+# they post a SINGLE user message and assert a skipped tail leaves the
+# store untouched. The rollup fired anyway and wrote turns_seen=1 - it
+# cannot build a chunk from one message, so the write was cost with no
+# benefit, and it created summary state for a conversation that stored
+# nothing (adversarial F5).
+FIRST = [{"role": "user", "content": "hello for the very first time"}]
+_first: list = []
+
+
+def _spy_first(coro, label=None):
+    _first.append(label)
+    coro.close()
+    return True
+
+
+main._fire_and_forget = _spy_first
+try:
+    main._run_memory_tail(
+        "first_turn_conv", DEGENERATE, finished=True, truncated=False,
+        holed=False, touched_facts=[], last_user_text="hello", turn_index=1,
+        messages=list(FIRST), injected_facts=None,
+    )
+finally:
+    main._fire_and_forget = _real_fire
+check(_first == [],
+      "nothing is scheduled when the array carries no prior assistant turn "
+      "- there is no earlier exchange to summarize")
+
+# THE CONTROL, so [7] cannot pass by the gate refusing everything. The same
+# degenerate reply, with one completed exchange behind it, still rolls up -
+# which is the 14-consecutive-skips case this feature exists for.
+WITH_HIST = [
+    {"role": "user", "content": "earlier question"},
+    {"role": "assistant", "content": "an earlier answer"},
+    {"role": "user", "content": "and now"},
+]
+_hist: list = []
+
+
+def _spy_hist(coro, label=None):
+    _hist.append(label)
+    coro.close()
+    return True
+
+
+main._fire_and_forget = _spy_hist
+try:
+    main._run_memory_tail(
+        "hist_conv", DEGENERATE, finished=True, truncated=False,
+        holed=False, touched_facts=[], last_user_text="and now", turn_index=3,
+        messages=list(WITH_HIST), injected_facts=None,
+    )
+finally:
+    main._fire_and_forget = _real_fire
+check(_hist != [],
+      "but a looping reply WITH a history behind it still rolls up - the "
+      "guard narrowed the case, it did not remove the feature")
+
 if FAILED:
     print(f"\n{len(FAILED)} check(s) FAILED")
     sys.exit(1)
