@@ -439,7 +439,19 @@ def load_archive(conv_id: str) -> list[dict]:
     one call (v3.1 F1e).
     """
     data = read_json_strict(facts_archive_path(conv_id), default={}, expect=dict)
-    archived = data.get("facts", []) if isinstance(data, dict) else []
+    # v3.1.9 (A3-1). load_facts, 66 lines up, was fixed to refuse this one
+    # level down and says so; this loader kept the fallback it describes, so
+    # one parseable file with a dict under the key read as EMPTY and the next
+    # archive_facts atomically wrote that emptiness over the cold store —
+    # pinned facts included, and restore_from_archive then reported nothing
+    # to restore. `expect=dict` checks the top level only. Copied from
+    # load_facts verbatim, None included, so the two siblings cannot drift.
+    archived = data.get("facts", [])
+    if not isinstance(archived, list):
+        raise StoreUnreadable(
+            facts_archive_path(conv_id),
+            TypeError(f'"facts" is {type(archived).__name__}, not a list'),
+        )
     valid: list[dict] = []
     for f in archived:
         if (

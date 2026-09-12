@@ -78,6 +78,7 @@ import tokens
 import tokenhealth
 from envcfg import env_float, env_int
 from memory import (
+    StoreUnreadable,
     atomic_write_json,
     conv_lock,
     read_json_strict,
@@ -204,9 +205,22 @@ def load_state(conv_id: str) -> dict:
     state = _empty_state(conv_id)
     parked: dict = {"l1": [], "l2": [], "l3": None}
     for tier in ("l1", "l2"):
-        if isinstance(data.get(tier), list):
-            state[tier] = [x for x in data[tier] if _is_chunk(x)]
-            parked[tier] = [x for x in data[tier] if not _is_chunk(x)]
+        # v3.1.9. The FOURTH site of A3-1, and the one on the hot path; the
+        # hostile pass named three and not this. A tier that is not a list
+        # was neither loaded NOR parked — the F1b parking below only ever
+        # saw lists — so it silently read as [] and the next save_state
+        # erased that tier of the hierarchy. Parking cannot hold it either:
+        # _for_disk folds parked tiers back with list(), which turns a dict
+        # into its keys. So it raises, exactly as an unreadable file already
+        # does from this function — no caller gains a new obligation.
+        v = data.get(tier, [])
+        if not isinstance(v, list):
+            raise StoreUnreadable(
+                summary_path(conv_id),
+                TypeError(f'"{tier}" is {type(v).__name__}, not a list'),
+            )
+        state[tier] = [x for x in v if _is_chunk(x)]
+        parked[tier] = [x for x in v if not _is_chunk(x)]
     if isinstance(data.get("l3"), dict) and _is_chunk(data["l3"]):
         state["l3"] = data["l3"]
     elif data.get("l3") is not None:
@@ -2000,9 +2014,19 @@ def _archive_chapters(conv_id: str, chapters: list[dict]) -> None:
         return
     path = summary_archive_path(conv_id)
     existing = read_json_strict(path, default={}, expect=dict)
-    rows = existing.get("chapters") if isinstance(existing, dict) else None
+    # v3.1.9 (A3-1). A READ-MODIFY-WRITE, so the fallback here was not a
+    # misread but a deletion: a wrong-type "chapters" became [] and the
+    # atomic_write_json below replaced the whole cold chapter store with
+    # this refresh's rows. After L3 has paraphrased a span this sidecar is
+    # the ONLY copy of its chapter-level detail. Raising aborts the L3
+    # refresh before it consumes anything — its caller already treats any
+    # archive failure that way — so the chapters stay in l2, uncompressed
+    # and intact, until someone looks at the file.
+    rows = existing.get("chapters", [])
     if not isinstance(rows, list):
-        rows = []
+        raise StoreUnreadable(
+            path, TypeError(f'"chapters" is {type(rows).__name__}, not a list')
+        )
     # Dedupe against what is already stored: the archive now runs BEFORE
     # save_state, so a failed state save retries the whole refresh next turn
     # and would re-archive the same chapters (measured: two refreshes of the
@@ -2031,8 +2055,16 @@ def _archive_chapters(conv_id: str, chapters: list[dict]) -> None:
 def load_chapter_archive(conv_id: str) -> list[dict]:
     """Every L2 chapter ever consumed by an L3 refresh, oldest first."""
     data = read_json_strict(summary_archive_path(conv_id), default={}, expect=dict)
-    rows = data.get("chapters") if isinstance(data, dict) else None
-    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+    # v3.1.9 (A3-1): the same rule as _archive_chapters above and
+    # facts.load_archive — an operator asking for the cold chapters must be
+    # told the file is unreadable, not that there are none.
+    rows = data.get("chapters", [])
+    if not isinstance(rows, list):
+        raise StoreUnreadable(
+            summary_archive_path(conv_id),
+            TypeError(f'"chapters" is {type(rows).__name__}, not a list'),
+        )
+    return [r for r in rows if isinstance(r, dict)]
 
 
 async def _do_l3_rollup(

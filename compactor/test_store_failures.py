@@ -674,6 +674,118 @@ def test_get_tokenizer_caches_the_failure_too():
                 "and every call still returns None, so callers still degrade")
 
 
+def _raises_unreadable(fn):
+    try:
+        fn()
+    except memory.StoreUnreadable:
+        return True
+    except Exception as e:  # anything else is a different failure
+        print(f"    (raised {type(e).__name__}: {e})")
+        return False
+    return False
+
+
+def test_wrong_type_inner_key_raises_at_every_loader():
+    """A parseable file with the WRONG TYPE under its key must raise, at every
+    loader that feeds a read-modify-write — never read as empty.
+
+    `read_json_strict(..., expect=dict)` validates the top level only. load_facts
+    was fixed to refuse one level down and says so in a comment; three siblings
+    kept the fallback that comment describes, and a hostile pass demonstrated
+    what it costs: one ordinary eviction replaced the whole cold fact archive,
+    pinned facts included, with that eviction's single fact. A fourth sibling —
+    summarizer.load_state, on the hot path — dropped a non-list l1/l2 tier
+    without parking it, so the next save_state erased that tier.
+
+    And the one site that WAS correct, load_facts itself, had no test at all:
+    a mutation removing its guard passed the whole suite. Correct by nobody's
+    measurement is not the same as correct.
+
+    Each case pairs the refusal with a CONTROL on a well-formed file, so none
+    of this passes because the loader now refuses everything.
+    """
+    print("")
+    print("[test] a wrong-type inner key raises at all five loaders")
+    WRONG = {"a dict": "where a list belongs"}
+
+    # 1. load_facts — correct already, untested until now.
+    cid = "wrongtype_active"
+    memory.facts_path(cid).parent.mkdir(parents=True, exist_ok=True)
+    memory.facts_path(cid).write_text(json.dumps({"conv_id": cid, "facts": WRONG}), encoding="utf-8")
+    assert_true(_raises_unreadable(lambda: facts.load_facts(cid)),
+                "load_facts refuses a dict under \"facts\"")
+    memory.facts_path(cid).write_text(json.dumps({"conv_id": cid, "facts": [{"text": "ok"}]}), encoding="utf-8")
+    assert_eq([f["text"] for f in facts.load_facts(cid)], ["ok"],
+              "CONTROL: and a list under it still loads")
+
+    # 2. facts.load_archive, and the write that used to follow it.
+    cid = "wrongtype_archive"
+    ap = memory.facts_archive_path(cid)
+    ap.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"conv_id": cid, "facts": WRONG}).encode("utf-8")
+    ap.write_bytes(body)
+    assert_true(_raises_unreadable(lambda: facts.load_archive(cid)),
+                "load_archive refuses a dict under \"facts\"")
+    assert_true(_raises_unreadable(lambda: facts.archive_facts(
+                    cid, [{"text": "an ordinary eviction", "added_turn": 1, "last_used": 1}])),
+                "archive_facts refuses rather than writing over it")
+    assert_eq(ap.read_bytes(), body,
+              "and the cold archive is BYTE-FOR-BYTE untouched — the eviction "
+              "did not replace it with itself")
+    ap.write_text(json.dumps({"conv_id": cid, "facts": [
+        {"text": "she was baptized on 12 April", "pin": True}]}), encoding="utf-8")
+    assert_eq([f["text"] for f in facts.load_archive(cid)], ["she was baptized on 12 April"],
+              "CONTROL: a well-formed archive still loads")
+
+    # 3. summarizer._archive_chapters — a read-modify-write on the only copy of
+    #    chapter detail once L3 has paraphrased it.
+    cid = "wrongtype_chapters"
+    cp = memory.summary_archive_path(cid)
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"chapters": WRONG}).encode("utf-8")
+    cp.write_bytes(body)
+    chapter = {"text": "a chapter", "first_turn": 1, "last_turn": 200}
+    assert_true(_raises_unreadable(lambda: summarizer._archive_chapters(cid, [chapter])),
+                "_archive_chapters refuses a dict under \"chapters\"")
+    assert_eq(cp.read_bytes(), body,
+              "and the chapter archive is byte-for-byte untouched")
+
+    # 4. summarizer.load_chapter_archive
+    assert_true(_raises_unreadable(lambda: summarizer.load_chapter_archive(cid)),
+                "load_chapter_archive refuses it too — an operator asking is told "
+                "the file is unreadable, not that there are no chapters")
+    cp.write_text(json.dumps({"chapters": [chapter]}), encoding="utf-8")
+    summarizer._archive_chapters(cid, [{"text": "a second chapter", "first_turn": 201, "last_turn": 400}])
+    assert_eq(len(summarizer.load_chapter_archive(cid)), 2,
+              "CONTROL: a well-formed archive still loads, and still appends")
+
+    # 5. summarizer.load_state — the hot-path sibling nobody named.
+    cid = "wrongtype_state"
+    sp = memory.summary_path(cid)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    for tier in ("l1", "l2"):
+        body = json.dumps({"conv_id": cid, tier: WRONG, "last_summarized_turn": 40}).encode("utf-8")
+        sp.write_bytes(body)
+        assert_true(_raises_unreadable(lambda: summarizer.load_state(cid)),
+                    f"load_state refuses a dict under \"{tier}\"")
+        assert_eq(sp.read_bytes(), body, f"and the {tier} state file is untouched")
+    sp.write_text(json.dumps({"conv_id": cid, "l1": [
+        {"text": "scene", "first_turn": 1, "last_turn": 20}], "l2": []}), encoding="utf-8")
+    assert_eq(len(summarizer.load_state(cid)["l1"]), 1,
+              "CONTROL: a well-formed state still loads its chunks")
+    # And the F1b parking of an unparseable CHUNK inside a real list is
+    # unchanged: that is a chunk this build cannot read, not a tier of the
+    # wrong type, and it must still round-trip rather than raise.
+    sp.write_text(json.dumps({"conv_id": cid, "l1": [
+        {"text": "scene", "first_turn": 1, "last_turn": 20},
+        {"from a newer build": True}], "l2": []}), encoding="utf-8")
+    st = summarizer.load_state(cid)
+    assert_true(len(st["l1"]) == 1 and summarizer._UNRECOGNIZED in st,
+                "CONTROL: an unparseable chunk INSIDE a list is still parked, "
+                "not raised on — the new rule is about the tier's type only")
+
+
+
 if __name__ == "__main__":
     try:
         # Loader discrimination — expected to fail until F1.
@@ -705,6 +817,8 @@ if __name__ == "__main__":
         # v3.1.9: two handlers that read as covered and were not.
         test_invalid_utf8_is_unreadable_not_a_crash()
         test_get_tokenizer_caches_the_failure_too()
+        # v3.1.9, A3-1: the one-level-down rule at all five loaders.
+        test_wrong_type_inner_key_raises_at_every_loader()
 
         print("\nAll store-failure tests passed.")
     finally:
