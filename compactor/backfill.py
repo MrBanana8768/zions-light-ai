@@ -233,6 +233,7 @@ async def _run_backfill(
     messages: list[dict],
     vllm_url: str,
     model: str,
+    raw_messages: list[dict] | None = None,
 ) -> None:
     """The actual backfill: iterate pairs, extract facts, save state
     incrementally so a crash mid-run can resume from progress.
@@ -358,7 +359,14 @@ async def _run_backfill(
         # facts backfill is still considered complete.
         try:
             if summarizer.enabled():
-                await summarizer.maybe_rollup(conv_id, messages, vllm_url, model)
+                # `messages` has been redacted by start_backfill_if_needed, so
+                # it cannot feed the covered-turns digest; `raw_messages` is
+                # the same array snapshotted before redaction. None (a direct
+                # caller) leaves the digest unadvanced: reuse declines, which
+                # costs summarization calls and never a turn.
+                await summarizer.maybe_rollup(
+                    conv_id, messages, vllm_url, model, raw_messages=raw_messages
+                )
         except Exception as e:
             logger.warning(f"conv={conv_id}: backfill summary rollup failed (non-fatal): {e}")
 
@@ -425,6 +433,11 @@ async def start_backfill_if_needed(
     if conv_id in _in_progress_local:
         return False  # already started in this process
     _in_progress_local.add(conv_id)
+    # The array exactly as the client sent it, snapshotted BEFORE redaction:
+    # the covered-turns digest must be folded from turns the next request will
+    # carry, and redaction replaces degenerate replies with placeholders that
+    # no request ever does (see summarizer._catch_up_covered_fp).
+    raw_snapshot = [dict(m) for m in messages]
     if redact is not None:
         # Off the event loop: this is an async function awaited on the
         # request path, and the redactor walks every historical assistant
@@ -434,5 +447,7 @@ async def start_backfill_if_needed(
         messages = await run_in_threadpool(redact, messages)
     # Snapshot messages — caller may mutate the list before backfill runs
     snapshot = [dict(m) for m in messages]
-    fire_and_forget(_run_backfill(conv_id, snapshot, vllm_url, model))
+    fire_and_forget(
+        _run_backfill(conv_id, snapshot, vllm_url, model, raw_messages=raw_snapshot)
+    )
     return True

@@ -83,7 +83,7 @@ def _spy_fire(coro, label=None):
 rolled: list = []
 
 
-async def _spy_rollup(conv_id, messages, vllm_url, model):
+async def _spy_rollup(conv_id, messages, vllm_url, model, **_kw):
     rolled.append(list(messages))
     return summarizer.load_state(conv_id)
 

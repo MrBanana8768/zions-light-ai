@@ -65,6 +65,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import unicodedata
 from datetime import datetime, timezone
 from typing import Any
@@ -167,14 +168,13 @@ def _empty_state(conv_id: str) -> dict:
         # and an unchanged window keeps both its head and its length.
         "head_fp": "",
         "window_turns": 0,
-        # v3.1.9 (B1). The digest of every turn the hierarchy has
-        # actually summarized, folded one turn at a time, plus how many
-        # turns it covers. Absent on every file written before this
-        # release, and absent reads as NO EVIDENCE: the reuse path
-        # declines until a rollup writes one, which costs a
-        # summarization call and cannot cost a turn.
-        "covered_fp": "",
-        "covered_fp_turns": 0,
+        # v3.1.9. One fingerprint per covered turn, turn 1 first, taken
+        # from the RAW turns the client sent, concatenated. Absent on every
+        # file written before this release, and absent reads as NO
+        # EVIDENCE: the reuse path declines until a rollup records it,
+        # which costs a summarization call and cannot cost a turn. See
+        # _catch_up_covered_fp.
+        "covered_fps": "",
     }
 
 
@@ -242,16 +242,13 @@ def load_state(conv_id: str) -> dict:
         state["head_fp"] = data["head_fp"]
     if isinstance(data.get("window_turns"), int):
         state["window_turns"] = data["window_turns"]
-    # v3.1.9. Both or neither: a digest without its turn count cannot be
-    # checked against anything, and a count without its digest would let
-    # the reuse path claim coverage it cannot verify. A file carrying one
-    # and not the other is a file written by something that did not
-    # finish, so it reads as no evidence.
-    if isinstance(data.get("covered_fp"), str) and isinstance(
-        data.get("covered_fp_turns"), int
-    ):
-        state["covered_fp"] = data["covered_fp"]
-        state["covered_fp_turns"] = data["covered_fp_turns"]
+    # v3.1.9. Validated as a whole (see _covered_fps). The digest keys an
+    # earlier unreleased cut of this branch wrote (`covered_fp`,
+    # `covered_fp_turns`, `covered_fp_marks`) are ignored and dropped on the
+    # next save: the first two were built over redacted text and can never
+    # match a request.
+    if _covered_fps(data):
+        state["covered_fps"] = data["covered_fps"]
     if parked["l1"] or parked["l2"] or parked["l3"] is not None:
         state[_UNRECOGNIZED] = parked
     return state
@@ -832,50 +829,6 @@ def _align_candidates(anchor: list[str], fps: list[str]) -> list[int]:
     return sorted(out)
 
 
-def _aligns_fully(anchor: list[str], fps: list[str]) -> bool:
-    """Does the WHOLE anchor appear as a contiguous run inside `fps`?
-
-    _align_candidates above tries every prefix down to length 1, and that is
-    right for what it does — a regenerated last reply rewrites the newest
-    turn and only a shorter prefix can still be found, and reading that as
-    one fresh exchange would put the position 2 ahead of reality and punch a
-    2-turn hole in the hierarchy. So prefixes are load-bearing THERE.
-
-    They are not load-bearing for a caller asking "is this the same
-    conversation?", and one such caller read `bool(_align_candidates(...))`
-    — non-emptiness — as its answer. A 1-element match satisfies that. The
-    anchor's first element is a USER turn (tail_fp is fps[-4:] of a history
-    ending on an assistant reply), and in a companion chat the user types
-    "ok" more than once, so a single repeated short turn passed the gate: an
-    adversarial pass put 20 of 30 exchanges from one branch under the other
-    branch's summary, with `candidates == [0]`, which is truthy.
-
-    _align_new_turns, twenty lines below, already knew: "A short repeated
-    turn ('ok') that collides with an older one must land on the side that
-    duplicates rather than the side that loses." It takes the SMALLEST
-    candidate for exactly that reason. The reuse gate borrowed the pure half
-    of _observed_position and left behind the judgment that made it safe —
-    which is this file's signature defect, committed against its own
-    documented rule.
-
-    So: a separate predicate rather than a `min_prefix` argument on
-    _align_candidates. That function is shared with _observed_position, whose
-    recency rule depends on seeing every candidate including the short ones,
-    and adding a mode to a primitive two callers disagree about is how the
-    borrow went wrong the first time.
-
-    Full-length only, and therefore no `new`-turn count: a caller that needs
-    to know HOW FAR the window moved must use _observed_position, which owns
-    the extra evidence. This answers one question.
-    """
-    n, m = len(fps), len(anchor)
-    if m == 0 or n < m:
-        return False
-    # Scanned newest-first, so the common case (the anchor is the previous
-    # tail and the window barely moved) exits on the first comparison.
-    return any(fps[j - m:j] == anchor for j in range(n, m - 1, -1))
-
-
 def _align_new_turns(anchor: list[str], fps: list[str]) -> int | None:
     """The SMALLEST advance the anchor supports, or None if it supports none.
 
@@ -912,105 +865,173 @@ def _highest_chunk_turn(state: dict) -> int:
     return highest
 
 
-def _fold_covered_fp(prev: str, fps: list[str]) -> str:
-    """Extend a covered-turns digest by the fingerprints of more turns.
+# Width of one covered-turn fingerprint in `covered_fps`, matching
+# _turn_fingerprints.
+_FP_WIDTH = 16
 
-    A LEFT FOLD OVER INDIVIDUAL TURNS, deliberately, not a hash of a joined
-    chunk: the writer extends it L1_CHUNK_SIZE turns at a time and the reader
-    recomputes it in one pass over whatever prefix it holds, so the two must
-    agree without agreeing about chunk boundaries. Fold per turn and they do,
-    for any chunking, including a chunk size that changes between releases —
-    COMPACTOR_L1_CHUNK_SIZE is an env knob and a digest that silently depended
-    on it would come apart on the first operator who turned it.
+# The note main._apply_image_retention leaves in place of a demoted image. It
+# cannot import main (main imports summarizer), so the format is duplicated
+# here, exactly like _image_only_marker; if main's note changes, change this
+# pattern in the same commit or every demotion reads as an edited turn.
+_RETENTION_NOTE = re.compile(
+    r"\s*\[(\d+) images? shared earlier in this conversation\]\s*$"
+)
 
-    Order-dependent, which is the point: two turns swapped is a different
-    conversation and must produce a different digest.
 
-    16 hex chars, matching _turn_fingerprints. The inputs are already
-    fingerprints, so this is a fold over digests rather than over text, and
-    the collision probability that matters is theirs.
+def _covered_turn_fingerprints(messages: list[dict]) -> list[str]:
+    """One fingerprint per non-system turn, for the covered-turns record ONLY.
+
+    Not _turn_fingerprints, which feeds the position anchor and must not
+    change under existing state files. This one has to be stable across
+    something the anchor never compares across: IMAGE RETENTION. An image
+    turn arrives with its image parts; a later upload demotes it to its text
+    plus a "[1 image shared earlier in this conversation]" note, and the same
+    turn now reads differently in every later request. Keyed on the raw text
+    that would read as an edit on every conversation that ever shared two
+    pictures. So a turn is its role, its whitespace-normalized text with any
+    retention note removed, and its image count — the note's count when
+    demoted, the parts' count when not — which is the same triple either way.
     """
-    h = prev or ""
-    for fp in fps:
-        h = hashlib.sha256(f"{h}\x00{fp}".encode("utf-8")).hexdigest()[:16]
-    return h
+    out: list[str] = []
+    for m in messages:
+        if m.get("role") == "system":
+            continue
+        text = _message_text(m)
+        images = 0
+        note = _RETENTION_NOTE.search(text) if isinstance(text, str) else None
+        if note is not None:
+            images = int(note.group(1))
+            text = text[: note.start()]
+        else:
+            content = m.get("content")
+            if isinstance(content, list):
+                images = sum(
+                    1 for c in content
+                    if isinstance(c, dict)
+                    and (c.get("type") in ("image_url", "image", "input_image")
+                         or "image_url" in c)
+                )
+        payload = f"{m.get('role', 'unknown')}\x00{' '.join(text.split())}\x00{images}"
+        out.append(
+            hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()[:_FP_WIDTH]
+        )
+    return out
 
 
-def _covered_fp_over(messages: list[dict], count: int) -> str:
-    """The digest of the FIRST `count` non-system turns of `messages`.
+def _covered_fps(state: dict) -> list[str]:
+    """The covered-turn fingerprints on record, turn 1 first, validated.
 
-    What the reader computes, against what _extend_covered_fp wrote. Empty
-    string for count <= 0, which is the same value an un-extended digest has,
-    so "nothing covered" compares equal to "nothing recorded" and neither
-    side has to special-case it.
+    Stored as ONE string of concatenated 16-hex fingerprints rather than a
+    JSON list: her conversation is ~1,900 turns and this is read on every
+    request, so it is parsed as one token rather than 1,900. Anything that is
+    not a whole number of lowercase-hex fingerprints voids the record — a
+    partly unreadable record was written by something that did not finish,
+    and reads as no evidence rather than as some of it.
     """
-    if count <= 0:
-        return ""
-    non_system = [m for m in messages if m.get("role") != "system"]
-    return _fold_covered_fp("", _turn_fingerprints(non_system[:count]))
+    raw = state.get("covered_fps")
+    if not isinstance(raw, str) or len(raw) % _FP_WIDTH:
+        return []
+    if raw.strip("0123456789abcdef"):
+        return []
+    return [raw[i:i + _FP_WIDTH] for i in range(0, len(raw), _FP_WIDTH)]
 
 
-def _extend_covered_fp(
-    state: dict,
-    messages: list[dict],
-    covered_first: int,
-    last_turn: int,
-    window_offset: int,
-) -> None:
-    """Record that turns `covered_first..last_turn` are now summarized, by
-    folding their fingerprints into the covered-turns digest. No-op unless
-    they are exactly contiguous with what the digest already covers.
+def _catch_up_covered_fp(
+    state: dict, raw_messages: list[dict], window_offset: int
+) -> bool:
+    """Record fingerprints for turns the stored chunks now cover and the
+    record does not, taken ONLY from turns the client itself sent. True if
+    the record grew.
 
-    WHY THE DIGEST EXISTS. The reuse path in compact_if_needed replaces the
-    oldest turns of a request with stored summary text. Its gates check the
-    array's TAIL (the anchor fingerprints) and its LENGTH; the turns it
-    deletes are at the HEAD. OpenWebUI lets a user edit an earlier message and
-    save WITHOUT regenerating, which rewrites one message in the middle and
-    leaves the tail byte-identical — so every tail-and-length gate passes and
-    the stored summary of the PRE-EDIT text replaces the corrected turn. The
-    hierarchy never re-reads that span (last_summarized_turn is past it), so
-    the correction is gone for the life of the conversation. This is the only
-    gate that can see it, because it is the only one that looks at the turns
-    actually being removed.
+    v3.1.9, third shape. WHAT EACH EARLIER ONE GOT WRONG, because both were
+    reviewed and both shipped the defect to the soak:
 
-    NO-OP UNLESS CONTIGUOUS, and that is what keeps the digest honest rather
-    than merely present. Two shipped rollup paths leave a hole on purpose —
-    `pos_last < 1` advances the watermark with no chunk, `partial` records a
-    narrower first_turn — and folding across one would produce a digest that
-    claims turns nothing summarized. Leaving it alone instead means it keeps
-    describing the prefix BEFORE the hole, which is exactly the prefix
-    _covered_prefix will independently cap the reuse to. The two narrow to the
-    same place from different evidence, which is the property worth having.
+      * A single digest written inside _do_l1_rollup, over the `messages`
+        that function is handed. Those are not the turns the client sends:
+        _rollup_hierarchy replaces every degenerate reply with a placeholder
+        and appends this request's reply as streamed, which for a reply she
+        stopped is the trimmed text. So one redacted reply or one Stop and
+        the digest never matched a request again. The 112-turn soak showed
+        reuse substituting nothing from turn ~58 on and the 4-call cap
+        refusing the rest — the 2026-09-12 failure, on the code built to fix
+        it.
+      * Checkpointed digests from the raw array, which fixed that, and which
+        STOPPED EXTENDING at the first checkpoint that no longer matched so
+        as not to bless the stale summary of an edited turn. Correct about
+        the summary; wrong about everything after it. One edited old turn,
+        or one image demoted to its text note, froze the record for the life
+        of the conversation, and the span summarized fresh on every request
+        then grew by a chunk every twenty turns until the cap refused it
+        again.
 
-    ALSO A NO-OP UNDER A CAP whose window starts after turn 1 and whose digest
-    has not caught up: the turns are not in `messages` to fingerprint. The
-    reuse path already declines for a capped client on the length gate, so
-    nothing is lost that was available.
+    So: one fingerprint PER TURN, appended and never rewritten. A turn edited
+    after its chunk was written keeps its original fingerprint forever, so
+    the gate sees exactly THAT turn differ and summarizes exactly that turn
+    fresh (see _coverage_plan); every turn around it keeps reusing, and
+    turns covered later are recorded from whatever the client sends then.
+    The cost of an edit or a branch is bounded by how many covered turns it
+    touched, and does not grow with the conversation.
+
+    Extended only as far as both the stored chunks (_covered_prefix) and the
+    array in hand reach. The reply this rollup just summarized is not in
+    `raw_messages` (it is appended to the rollup input, not to the request),
+    so it is recorded on a LATER call, from the request that carried it back.
+
+    A state with no record (every file written before v3.1.9) is recorded
+    from the array in hand on its first rollup. That blesses whatever the
+    client sends at that moment, which is the only evidence there is, and it
+    is what the pre-v3.1.9 gate substituted on with no evidence at all.
     """
-    have = int(state.get("covered_fp_turns") or 0)
-    if covered_first != have + 1 or last_turn <= have:
-        return
-    pos_first = covered_first - window_offset
-    pos_last = last_turn - window_offset
-    if pos_first < 1:
-        # The head of this span is behind the client's window, so its
-        # fingerprints cannot be computed from what is in hand. Extending
-        # with what IS in hand would silently re-label the span.
-        return
-    non_system = [m for m in messages if m.get("role") != "system"]
-    turns = non_system[pos_first - 1:pos_last]
-    if len(turns) != last_turn - covered_first + 1:
-        # The window does not actually hold every turn the label claims.
-        return
-    state["covered_fp"] = _fold_covered_fp(
-        state.get("covered_fp") or "", _turn_fingerprints(turns)
-    )
-    state["covered_fp_turns"] = last_turn
+    have = _covered_fps(state)
+    raw = [m for m in raw_messages if m.get("role") != "system"]
+    target = min(_covered_prefix(state), window_offset + len(raw))
+    if target <= len(have):
+        return False
+    if window_offset != 0:
+        # The head of the conversation is not in this array, so turn N of the
+        # conversation is not raw[N-1] and nothing here can be fingerprinted
+        # by position. A capped client is declined at the gate anyway.
+        return False
+    new = _covered_turn_fingerprints(raw[len(have):target])
+    if len(new) != target - len(have):
+        return False
+    state["covered_fps"] = "".join(have + new)
+    return True
+
+
+def _coverage_plan(state: dict, to_summarize: list[dict]) -> tuple[int, set[int]]:
+    """(covered, changed): how many leading turns of `to_summarize` the stored
+    chunks cover AND the record vouches for, and the 0-based indices among
+    those whose content no longer matches what was recorded.
+
+    The gate replaces the `covered` turns with the stored summary text EXCEPT
+    the `changed` ones, which it summarizes fresh: an edited turn keeps its
+    correction (B1), a turn from a different branch keeps its content (B2),
+    and nothing is deleted on the strength of a summary of other text.
+
+    covered is 0 when there is no record (no evidence), and when EVERY
+    covered turn changed: then the stored text describes none of this array
+    and would only cost tokens beside a full fresh summary.
+
+    Pure; O(turns), so the gate runs it in the threadpool.
+    """
+    have = _covered_fps(state)
+    if not have:
+        return 0, set()
+    non_system = [m for m in to_summarize if m.get("role") != "system"]
+    covered = min(_covered_prefix(state), len(have), len(non_system))
+    if covered <= 0:
+        return 0, set()
+    now = _covered_turn_fingerprints(non_system[:covered])
+    changed = {i for i in range(covered) if now[i] != have[i]}
+    if len(changed) == covered:
+        return 0, set()
+    return covered, changed
 
 
 def _covered_prefix(state: dict) -> int:
     """The furthest turn N such that turns 1..N are covered by an UNBROKEN
-    chain of stored chunks. 0 when the chain does not start at turn 1.
+    chain of stored summaries. 0 when the chain does not start at turn 1.
 
     _highest_chunk_turn above answers where coverage ENDS. Nothing asked
     where it STARTS, and two shipped paths in _do_l1_rollup deliberately
@@ -1036,20 +1057,27 @@ def _covered_prefix(state: dict) -> int:
     shape it cannot parse (v3.1 F1b, correct on its own terms) and the
     survivors either side are contiguous with each other but not with turn 1.
 
-    l1 + l2, matching _highest_chunk_turn's domain, because an L2 rollup
-    CONSUMES its inputs — `state["l1"] = l1[L2_CHUNK_SIZE:]` — so a span can
-    live in either tier. l3 is excluded for the same reason it is a special
-    case there: it inherits `first_turn` from the previous l3 rather than
-    measuring it, so its span is a claim about a claim. Excluding it can only
-    make this number smaller, and smaller is the safe direction: under-
-    claiming coverage costs a summarization call, over-claiming deletes
-    turns.
+    l1 + l2 + l3. An L2 rollup CONSUMES its inputs (`state["l1"] =
+    l1[L2_CHUNK_SIZE:]`) and an L3 refresh consumes every L2 chapter, so a span
+    can live in any tier. The first version EXCLUDED l3 as "a claim about a
+    claim" and argued that excluding it could only make this number smaller,
+    which is the safe direction. It is — and it also made the number ZERO for
+    every conversation after its first L3 refresh, because the refresh removes
+    the L2 chapters from 1 onward and leaves l3 as the only span that starts at
+    turn 1. Reuse was then off for good on exactly the conversations long
+    enough to need it. l3's first_turn is inherited from the previous l3, which
+    took it from l2[0] at the first refresh, so it is measured once and carried;
+    and what makes a claimed span trustworthy for substitution is the covered-
+    turn record (_coverage_plan), not this walk.
 
     Spans may overlap, nest and arrive in any order, so the walk sorts and
     takes `max` rather than requiring `first_turn == reach + 1`.
     """
     spans: list[tuple[int, int]] = []
-    for c in list(state.get("l1") or []) + list(state.get("l2") or []):
+    tiers = list(state.get("l1") or []) + list(state.get("l2") or [])
+    if isinstance(state.get("l3"), dict):
+        tiers.append(state["l3"])
+    for c in tiers:
         if not isinstance(c, dict):
             continue
         ft, lt = c.get("first_turn"), c.get("last_turn")
@@ -1946,12 +1974,12 @@ async def _do_l1_rollup(
         "text": text, "first_turn": covered_first, "last_turn": last_turn,
     })
     state["last_summarized_turn"] = last_turn
-    # v3.1.9 (B1). Immediately after the chunk it describes, so the two
-    # cannot drift: a digest written anywhere else would need its own
-    # argument about which turns it had covered, and that argument is the
-    # thing being verified. No-op unless the span is contiguous with what
-    # the digest already holds - see _extend_covered_fp.
-    _extend_covered_fp(state, messages, covered_first, last_turn, window_offset)
+    # The covered-turn fingerprints are NOT recorded here. They were, and
+    # `messages` here is the rollup input — degenerate replies already
+    # redacted, this turn's reply as streamed (trimmed, if she stopped it) —
+    # which is not what the next request carries, so the record never
+    # matched again. maybe_rollup records them from the raw array; see
+    # _catch_up_covered_fp.
     # A rollup had no success line of its own, so the only evidence the
     # hierarchy was advancing was the injection counter — which is why S-5
     # froze it for the life of the deployment without anyone noticing.
@@ -2211,6 +2239,8 @@ async def maybe_rollup(
     messages: list[dict],
     vllm_url: str,
     model: str,
+    *,
+    raw_messages: list[dict] | None = None,
 ) -> dict:
     """Public entry point. Loads state, runs whichever tier(s) need work,
     saves atomically. Held under conv_lock so concurrent rollups can't tear
@@ -2315,6 +2345,20 @@ async def maybe_rollup(
         # _do_*_rollup mutates `state` only after its own LLM call returns,
         # so `state` here is always a consistent prefix of successful
         # rollups whether or not a later tier raised.
+        # The covered-turn record follows the chunks, from the RAW array the
+        # client sent (`raw_messages`), never from `messages`, which may carry
+        # redacted replies and this turn's reply as streamed. A caller with
+        # no raw array (the admin rebuild summarizes text reconstructed from
+        # the episodic store) passes None and the record simply does not
+        # grow, which is the declining direction. It runs every call, so a
+        # reply is recorded on the request that carries it back; hashing only
+        # touches the turns not yet recorded.
+        if raw_messages is not None:
+            if await run_in_threadpool(
+                _catch_up_covered_fp, state, raw_messages, window_offset
+            ):
+                changed = True
+
         if changed:
             try:
                 # The expensive half: tempfile + fsync + rename, measured at

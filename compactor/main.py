@@ -1825,127 +1825,68 @@ async def compact_if_needed(
     # found below the chunks it wrote, and a label carries text.
     stored_text = ""
     stored_turns = 0
+    # Covered turns that changed since their chunk was written. They go to
+    # summarize() ahead of the uncovered turns, in their original order.
+    refreshed: list[dict] = []
     if conv_id:
         try:
             _st = summarizer.load_state(conv_id)
-            # THE CONTIGUOUS PREFIX, not the highest label (v3.1.9, B3/B4).
+            # WHAT MAY BE REPLACED, decided by CONTENT (v3.1.9).
             #
-            # _highest_chunk_turn answers where coverage ENDS; the
-            # substitution deletes turns from the START, so what it needs is
-            # where coverage BEGINS and whether it is unbroken. Two shipped
-            # rollup paths leave a hole on purpose (`pos_last < 1` advances
-            # the watermark with no chunk at all; `partial` records a
-            # deliberately narrower first_turn), and load_state parks an
-            # unparseable chunk, which leaves one with no outage at all.
-            # Across a hole this deleted 20 turns no chunk represents and
-            # logged them as "covered by stored summaries". See
-            # _covered_prefix for why l3 is excluded.
-            _covered = summarizer._covered_prefix(_st)
-            # AND THE TURNS THEMSELVES MUST MATCH (v3.1.9, B1).
+            # _coverage_plan compares the turns about to be removed, one by
+            # one, against the fingerprints recorded when the stored chunks
+            # covered them. It returns how many leading turns are covered —
+            # stopped by a hole in the chain (_covered_prefix, B3/B4) and by
+            # the end of the record — and WHICH of those changed since. A
+            # changed turn is summarized fresh below instead of being replaced
+            # by a summary of other text: an edited turn keeps its correction
+            # (B1), a turn from another branch under the same conversation id
+            # keeps its content (B2). Every unchanged turn around it still
+            # comes off the shelf.
             #
-            # _covered_prefix proves the hierarchy CLAIMS an unbroken span
-            # from turn 1, and _aligned proves the array's tail is this
-            # conversation's. Neither looks at the turns being deleted.
-            # OpenWebUI's edit-without-regenerate rewrites one message in the
-            # middle and leaves the tail byte-identical, so both gates pass
-            # and the stored summary of the PRE-EDIT text replaces the
-            # corrected turn — and the hierarchy never re-reads that span, so
-            # the correction is gone for good. That is the only unrecoverable
-            # break in this path.
+            # THIS REPLACED THREE GATES, each of which declined on ordinary
+            # traffic. The tail anchor (`tail_fp`) and the first digest were
+            # both written from the ROLLUP input — degenerate replies redacted,
+            # this turn's reply as streamed and possibly trimmed — which no
+            # request carries, so one redaction or one Stop switched reuse off:
+            # the 112-turn soak substituted nothing from turn ~58 on and the
+            # 4-call cap refused every request, the 2026-09-12 production
+            # failure on the code built to fix it. Checkpointed digests fixed
+            # that and declined everything past the first edited turn or
+            # demoted image, forever. Per-turn fingerprints make the cost of an
+            # edit the edited turn.
             #
-            # covered_fp is folded one turn at a time at rollup over exactly
-            # the turns each chunk summarized; recomputing it here over the
-            # prefix about to be removed is the content relation the
-            # substitution has always needed and never had.
-            #
-            # Absent on state written before v3.1.9, and absent is NO
-            # EVIDENCE: _covered drops to 0 and this turn summarizes from
-            # scratch, as it did before the feature existed. The next rollup
-            # writes one.
-            #
-            # NO SEPARATE CHECK FOR THE ABSENT CASE, deliberately. The first
-            # version read `if not _fp_want or _fp_turns <= 0 or _fp_turns >
-            # _covered`, and a mutation dropping the first two conjuncts left
-            # every test green — correctly, because they cannot change the
-            # outcome. load_state admits the digest and its count together or
-            # not at all, so no digest means _fp_turns == 0, which makes
-            # `_covered = _fp_turns` zero coverage by itself; and a non-zero
-            # count beside an empty digest could only reach the comparison
-            # below, where _covered_fp_over of a non-empty prefix is never ""
-            # and so declines. This gate has already shipped three conditions
-            # that could not fire. It does not get a fourth for reassurance.
-            _fp_turns = int(_st.get("covered_fp_turns") or 0)
-            _fp_want = _st.get("covered_fp") or ""
-            if _fp_turns > _covered:
-                # Should be unreachable — the digest only extends
-                # contiguously, so it cannot claim more than the contiguous
-                # prefix. Unreachable is not impossible, and the two numbers
-                # come from different evidence on purpose; when they disagree
-                # the honest answer is to decline. [13b] builds the
-                # disagreement and a mutation removing this goes RED.
-                _covered = 0
-            else:
-                _covered = _fp_turns
-                if summarizer._covered_fp_over(to_summarize, _covered) != _fp_want:
-                    logger.info(
-                        f"conv={conv_id}: the stored summaries do not match "
-                        f"the first {_covered} turn(s) of this request — an "
-                        f"edited or re-ordered turn, or a different branch. "
-                        f"Summarizing from scratch rather than replacing them."
-                    )
-                    _covered = 0
-            # ONLY WHEN THE ARRAY IS NOT A SUFFIX, and this is the whole
-            # safety of it. Turn numbers are not array indices once a
-            # client sends a bounded window; mapping between them needs
-            # window_offset, and the function that owns that arithmetic
-            # (_observed_position) MUTATES state - calling it here would
-            # advance the anchor a second time per turn. Under-claiming
-            # coverage costs a little speed; over-claiming drops turns the
-            # hierarchy cannot actually speak for. So when the client is
-            # sending everything (offset provably 0) this applies, and
-            # when it is not, it declines and today's behaviour stands.
+            # Hashing is O(turns), so it runs in the threadpool.
+            _covered, _changed = await run_in_threadpool(
+                summarizer._coverage_plan, _st, to_summarize
+            )
+            if _covered == 0 and summarizer._covered_fps(_st):
+                logger.info(
+                    f"conv={conv_id}: none of the turns the stored summaries "
+                    f"cover match this request (a different branch, or a "
+                    f"window that does not start at turn 1); summarizing "
+                    f"from scratch rather than replacing them"
+                )
+            elif _changed:
+                logger.info(
+                    f"conv={conv_id}: {len(_changed)} of the {_covered} turn(s) "
+                    f"the stored summaries cover changed since they were "
+                    f"summarized (edited, or another branch); summarizing "
+                    f"those fresh rather than replacing them"
+                )
+            # ONLY WHEN THE ARRAY IS NOT A SUFFIX. Turn numbers are not array
+            # indices once a client sends a bounded window, and a request
+            # shorter than the conversation is known to be is a truncated or
+            # capped window. The fingerprints would usually mark most of such
+            # an array changed (its head is not turn 1), but a sliding window
+            # over repetitive turns can match by position here and there, and
+            # a truncated array whose head IS genuine matches outright; this
+            # is cheap, so it stays: [12] in test_compaction_reuse is the case
+            # where it alone decides.
             _non_system = [m for m in messages if m.get("role") != "system"]
             _n = len(_non_system)
 
-            # THE LENGTH TEST ALONE IS NOT ENOUGH. It proves a length
-            # relation; the substitution needs a CONTENT one, and an
-            # adversarial pass demonstrated the gap: OpenWebUI keeps branches
-            # in ONE chat, so conv_id never changes, and a regenerate or an
-            # edit produces an array that satisfies `_n >= _recorded_position`
-            # while being a DIFFERENT branch. 20 of 30 branch-B exchanges were
-            # deleted and replaced by branch A's summary, and it never
-            # self-heals - _do_l1_rollup's duplicate-label guard then discards
-            # branch B's replacement chunks.
-            #
-            # _align_candidates answers exactly this and is PURE - it takes the
-            # anchor and the fingerprints and returns candidates, touching no
-            # state. That matters because the comment above is right that
-            # _observed_position must not be called here; this is the half of
-            # it that is safe to borrow. Empty means "cannot be told", which is
-            # the answer that must decline.
-            # THE FULL ANCHOR, not any prefix of it (v3.1.9, B2).
-            #
-            # This read `bool(_align_candidates(...))` — non-emptiness — and
-            # _align_candidates tries every prefix down to length ONE. The
-            # anchor's first element is a user turn, so a single repeated
-            # short turn satisfied it: an adversarial pass reproduced the
-            # very break the paragraph above says was closed, 20 of 30
-            # branch-B exchanges replaced by branch A's summary, with
-            # candidates == [0], which is truthy. Prefixes are correct for
-            # _observed_position, which must read a regenerated reply as
-            # zero new turns; they are wrong for "is this the same
-            # conversation". _align_new_turns already documents the rule this
-            # site broke — a repeated "ok" must land on the side that
-            # duplicates, not the side that loses.
-            _anchor = _st.get("tail_fp") or []
-            _aligned = bool(_anchor) and summarizer._aligns_fully(
-                _anchor,
-                summarizer._turn_fingerprints(
-                    _non_system[-summarizer._FINGERPRINT_TAIL_TURNS:]
-                ),
-            )
-
-            if _covered > 0 and _n >= summarizer._recorded_position(_st) and _aligned:
+            if _covered > 0 and _n >= summarizer._recorded_position(_st):
                 # TURN NUMBERS ARE NOT text_only INDICES. _covered counts every
                 # non-system turn; text_only has image turns removed, so
                 # `min(_covered, len(text_only))` overruns by the image count
@@ -1970,8 +1911,15 @@ async def compact_if_needed(
                         summarizer.SUMMARY_BLOCK_MAX_TOKENS,
                         all_or_nothing=True,
                     ) or ""
+                    # Image turns are preserved verbatim whatever their
+                    # fingerprint says, so only text turns can need it.
+                    refreshed = [
+                        m for i, m in enumerate(to_summarize[:_covered])
+                        if i in _changed and not _message_has_image(m)
+                    ]
             if not stored_text:
                 stored_turns = 0
+                refreshed = []
         except Exception as e:
             # Never fail a request over an optimisation. Falling back is
             # exactly today's behaviour.
@@ -1981,8 +1929,9 @@ async def compact_if_needed(
             )
             stored_text = ""
             stored_turns = 0
+            refreshed = []
 
-    fresh_input = text_only[stored_turns:]
+    fresh_input = refreshed + text_only[stored_turns:]
     async with httpx.AsyncClient() as client:
         if fresh_input:
             summary, deferred = await summarize(client, fresh_input)
@@ -2033,7 +1982,7 @@ async def compact_if_needed(
         # asserts work which did not happen is what made the second
         # 2026-08-29 outage look healthy, and 'summarized 56' would
         # now be a lie when 40 of them came off a shelf.
-        + (f", {stored_turns} covered by stored summaries"
+        + (f", {stored_turns - len(refreshed)} covered by stored summaries"
            if stored_turns else "")
         + ("" if (_summarized or stored_turns)
            else "  [NO SUMMARIZATION HAPPENED]")
@@ -4648,7 +4597,11 @@ async def _rollup_hierarchy(
         # runs — a blocking disk read on the loop to decide whether to print.
         before = await run_in_threadpool(summarizer.load_state, conv_id)
         state = await summarizer.maybe_rollup(
-            conv_id, full_messages, VLLM_URL, MODEL_REPO or ""
+            conv_id, full_messages, VLLM_URL, MODEL_REPO or "",
+            # The covered-turns digest is built from what the client SENT,
+            # not from full_messages: redaction and the streamed reply are
+            # rollup-input transformations the next request does not carry.
+            raw_messages=list(messages),
         )
         if (
             len(state.get("l1") or []) != len(before.get("l1") or [])

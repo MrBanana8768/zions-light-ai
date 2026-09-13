@@ -826,7 +826,7 @@ _ROLLUPS: list = []
 _INDEXED: list = []
 
 
-async def _spy_rollup(conv_id, messages, vllm_url, model):
+async def _spy_rollup(conv_id, messages, vllm_url, model, **_kw):
     _ROLLUPS.append(conv_id)
     return {"l1": [], "l2": [], "l3": None, "last_summarized_turn": 0}
 
