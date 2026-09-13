@@ -117,7 +117,21 @@ services:
       # asserts RATIOS and lag, never absolute token counts.
       SOAK_MAX_MODEL_LEN: "8192"
       SOAK_GENERATION_RESERVE: "2048"
-      SOAK_TURNS: "22"
+      # 112 turns in three phases: store 1-30, refuse 31-70, store 71-112.
+      # It was 22, which put the watermark-lag guard arithmetically out of
+      # reach (max observable lag 43 against a budget of 48) and never built
+      # L2 or L3. Do not shorten these by hand: the soak computes whether the
+      # configured numbers can still fire every assertion and FAILS if not,
+      # rather than printing `ok` over checks that could not have failed.
+      # See _lag_guard_unreachable and _tier_plan in test_soak_conversation.py.
+      SOAK_TURNS: "112"
+      SOAK_STORE_TURNS: "30"
+      SOAK_REFUSE_TURNS: "40"
+      # L2/L3 fan-out only; L1_CHUNK_SIZE stays at production 20. At 10/5 the
+      # upper tiers need 100 and 500 turns. See the soak's comment on why the
+      # counts, not the mechanism, are what this changes.
+      SOAK_L2_CHUNK_SIZE: "2"
+      SOAK_L3_CHUNK_SIZE: "2"
       # No network on the budgeting path: get_tokenizer resolves MODEL_REPO
       # against huggingface.co and a 429 blocked a real run for 231 seconds.
       # (REMEDIATION F33 composing with F25.)
