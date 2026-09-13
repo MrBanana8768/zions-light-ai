@@ -429,6 +429,175 @@ def test_merge_conversation_byte_identical_duplicate_is_a_true_no_op():
 
 
 # ---------------------------------------------------------------------------
+# merge_conversation LRU floor — v3.1.9 F6 (hostile pass 2, review B):
+# merging the hash-id store into the new chat-id store used to keep each
+# merged fact's OWN last_used. A backfill's fresh re-extractions under the
+# new id then won facts.prune_facts's LRU on the very next write, and a
+# reviewed real merge archived 115 of a user's 136 original facts.
+#
+# These tests use facts.prune_facts as the REAL evictor (not a hand-rolled
+# stand-in), exactly the brief's instruction, so the LRU ordering exercised
+# here is the one production actually runs.
+# ---------------------------------------------------------------------------
+
+def _bulk_facts(n, prefix, lu_base, lu_spread, turn_base=0):
+    """n synthetic facts shaped like the reviewed real store: distinct text,
+    a spread of last_used values, no pins. `lu_base`/`lu_spread` control
+    where in "time" this batch sits relative to another batch — the whole
+    point of these tests is comparing two batches with DIFFERENT last_used
+    neighborhoods, the way "her hours-old originals" and "backfill's
+    just-minted facts" sit in production.
+    """
+    out = []
+    for i in range(n):
+        out.append({
+            "text": f"{prefix} fact {i}: a distinct detail long enough to "
+                    f"cost real budget once rendered as a bullet line.",
+            "added_turn": turn_base + i,
+            "last_used": lu_base + (i * lu_spread // max(n, 1)),
+            "pin": False,
+        })
+    return out
+
+
+def test_merge_conversation_f6_new_facts_survive_lru_against_fresher_backfill():
+    print("\n[test] F6: merged-in facts are not archived wholesale just because "
+          "a same-moment backfill minted fresher last_used values in dst")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-f6")
+    reset_state("merge-dst-f6")
+    # src: 40 facts with OLD last_used (~1000-2000) — "her originals",
+    # hours old by the time the merge runs.
+    facts.save_facts("merge-src-f6", _bulk_facts(40, "hers", lu_base=1000, lu_spread=1000))
+    # dst: 60 facts with FRESH last_used (~99000-100000) — "backfill's",
+    # minted moments before the merge. Calibrated (not arbitrary): 60 of
+    # this exact bullet shape ALREADY slightly exceeds the default
+    # COMPACTOR_MAX_FACTS_TOKENS budget on its own (measured: 60 alone ->
+    # 57 kept, 3 dropped) — the same shape as the reviewed real store,
+    # where backfill's own batch was already most of the way to the cap
+    # before anything was merged in. This matters: with dst's own batch
+    # already filling the budget, an unprotected merge leaves ZERO slack
+    # for anything merged in, which is what makes this test actually
+    # discriminate the fix from the bug (a smaller/looser dst batch leaves
+    # enough spare capacity that some of "hers" survives by sheer room
+    # either way, and the assertion below would pass for the wrong reason).
+    facts.save_facts("merge-dst-f6", _bulk_facts(60, "backfill", lu_base=99000, lu_spread=1000))
+
+    result = portability.merge_conversation("merge-src-f6", "merge-dst-f6", dry_run=False)
+    assert_eq(result["facts_added"], 40, "all 40 of her facts were new (no collisions)")
+
+    merged = facts.load_facts("merge-dst-f6")
+    assert_eq(len(merged), 100, "post-merge store holds both batches")
+
+    # The default budget forces real eviction — the CONTROL half: this must
+    # still be able to say yes, not just refuse to evict anything.
+    kept, dropped = facts.prune_facts(merged, conv_id="merge-dst-f6")
+    assert_true(dropped > 0, "CONTROL: eviction still happens under the real budget")
+    assert_true(len(kept) < len(merged), "CONTROL: not everything survives")
+
+    hers_kept = sum(1 for f in kept if f["text"].startswith("hers"))
+    hers_archived = 40 - hers_kept
+    # Before the fix this was 0/40 (every one of "hers" lost the LRU race to
+    # "backfill" — measured directly against the unfixed code with this
+    # exact fixture before the fix landed), matching the shape of the
+    # reviewed incident (115/136 archived, a large majority). The floor
+    # does not guarantee ALL of hers survive every possible store shape —
+    # it stops hers being the ONE-SIDED loser of a race it was never a
+    # real participant in, which this fixture is calibrated to show clearly:
+    # fixed, hers_kept measures 40/40.
+    assert_true(
+        hers_kept >= 30,
+        f"a floor-protected merge keeps the large majority of the merged-in "
+        f"facts against a dst batch that was already at/over budget before "
+        f"the merge (kept {hers_kept}/40, archived {hers_archived}/40)",
+    )
+
+
+def test_merge_conversation_f6_no_backfill_competition_all_of_hers_survive():
+    print("\n[test] F6: with an EMPTY dst (the recommended merge-before-message "
+          "order — no backfill has run), the floor is a no-op and normal "
+          "budget math applies")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-f6b")
+    reset_state("merge-dst-f6b")
+    facts.save_facts("merge-src-f6b", _bulk_facts(20, "hers", lu_base=1000, lu_spread=1000))
+    # dst starts genuinely empty — no backfill has run, matching F3's fix
+    # (merging first means the destination already has a facts file, so the
+    # backfill trigger never fires).
+    facts.save_facts("merge-dst-f6b", [])
+
+    result = portability.merge_conversation("merge-src-f6b", "merge-dst-f6b", dry_run=False)
+    assert_eq(result["facts_added"], 20, "all 20 landed, nothing to collide with")
+
+    merged = facts.load_facts("merge-dst-f6b")
+    # Budget comfortably fits all 20 — nothing should be evicted, floor or
+    # not, proving the floor logic does not invent phantom pressure when
+    # there was none.
+    kept, dropped = facts.prune_facts(merged, conv_id="merge-dst-f6b")
+    assert_eq(dropped, 0, "nothing evicted when the store fits the default budget")
+    assert_eq(len(kept), 20, "all of hers present")
+
+
+def test_merge_conversation_f6_collision_last_used_is_not_floored():
+    print("\n[test] F6's floor applies ONLY to brand-new facts, never to a "
+          "collision fold — a colliding row keeps max(dst, src), not the "
+          "destination's unrelated newest fact")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-f6c")
+    reset_state("merge-dst-f6c")
+    # Two facts in dst: one with a very high last_used (sets the floor a
+    # naive implementation might apply everywhere), and one that will
+    # COLLIDE with src's fact at a much lower last_used than the floor.
+    facts.save_facts(
+        "merge-dst-f6c",
+        [
+            {"text": "Unrelated fresh fact.", "added_turn": 0, "last_used": 90000, "pin": False},
+            {"text": "The story is set on Brannock.", "added_turn": 1, "last_used": 200, "pin": False},
+        ],
+    )
+    facts.save_facts(
+        "merge-src-f6c",
+        [{"text": "The story is set on Brannock.", "added_turn": 1, "last_used": 300, "pin": False}],
+    )
+    portability.merge_conversation("merge-src-f6c", "merge-dst-f6c", dry_run=False)
+    after = {f["text"]: f for f in facts.load_facts("merge-dst-f6c")}
+    assert_eq(len(after), 2, "still two rows — the collision did not add a third")
+    assert_eq(
+        after["The story is set on Brannock."]["last_used"], 300,
+        "collision keeps max(dst=200, src=300) — NOT floored up to the "
+        "unrelated fact's 90000",
+    )
+    assert_eq(
+        after["Unrelated fresh fact."]["last_used"], 90000,
+        "the untouched dst fact is exactly untouched",
+    )
+
+
+def test_merge_conversation_f6_reports_facts_over_budget_after_merge():
+    print("\n[test] F6: the merge response says how many facts are already "
+          "over budget right after it lands, in both dry-run and commit")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-f6d")
+    reset_state("merge-dst-f6d")
+    facts.save_facts("merge-src-f6d", _bulk_facts(40, "hers", lu_base=1000, lu_spread=1000))
+    facts.save_facts("merge-dst-f6d", _bulk_facts(25, "backfill", lu_base=99000, lu_spread=1000))
+
+    # Same numbers dry or committed — the preview must not undercount.
+    dry = portability.merge_conversation("merge-src-f6d", "merge-dst-f6d", dry_run=True)
+    assert_true("facts_over_budget_after_merge" in dry, "dry-run response carries the field")
+    assert_true(dry["facts_over_budget_after_merge"] > 0,
+                f"dry-run: the merged 40+25 facts over the "
+                f"{facts._MAX_FACTS_TOKENS}-token "
+                f"default budget is reported as already over "
+                f"(got {dry['facts_over_budget_after_merge']})")
+
+    live = portability.merge_conversation("merge-src-f6d", "merge-dst-f6d", dry_run=False)
+    assert_eq(dry["facts_over_budget_after_merge"], live["facts_over_budget_after_merge"],
+               "dry-run preview matches the committed reality (same inputs, "
+               "same LRU split)")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -450,6 +619,10 @@ def _all_tests():
         test_merge_conversation_last_used_takes_the_max_either_direction,
         test_merge_conversation_dry_run_previews_the_pin_update_without_writing,
         test_merge_conversation_byte_identical_duplicate_is_a_true_no_op,
+        test_merge_conversation_f6_new_facts_survive_lru_against_fresher_backfill,
+        test_merge_conversation_f6_no_backfill_competition_all_of_hers_survive,
+        test_merge_conversation_f6_collision_last_used_is_not_floored,
+        test_merge_conversation_f6_reports_facts_over_budget_after_merge,
     ]
 
 

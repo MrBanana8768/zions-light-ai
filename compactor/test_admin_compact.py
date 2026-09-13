@@ -501,6 +501,105 @@ check("max_calls" in str(body.get("stopped_because")),
 
 
 # ---------------------------------------------------------------------------
+# 5d. v3.1.9 (hostile pass 2, MEDIUM): {"max_calls": 0} means ZERO calls, not
+# the 200-call LIVE default; a non-numeric max_calls is a 400, not a 500; and
+# an absurdly large max_calls is clamped rather than trusted outright.
+# `int(body.get("max_calls") or 200)` read 0 as falsy and silently swapped in
+# the 200 default — reproduced against the unfixed code: {"max_calls": 0} on
+# a 60-exchange backlog ran 2 live rollup calls and moved the watermark
+# 0 -> 120, exactly the write an explicit 0 is asking this loop not to make.
+# ---------------------------------------------------------------------------
+
+print()
+print("[5d] max_calls=0 makes ZERO calls; non-numeric is 400; huge is clamped")
+
+CID = "maxcalls-zero"
+set_store(exchanges(60))
+before = snapshot()
+r = compact(CID, max_calls=0)
+body = r.json()
+check(r.status_code == 200, f"max_calls=0: HTTP 200 (got {r.status_code})")
+check(body.get("rollup_calls") == 0,
+      f"max_calls=0: zero rollup calls, not the 200 default's worth "
+      f"(got {body.get('rollup_calls')})")
+check(body.get("watermark_after") == body.get("watermark_before") == 0,
+      f"max_calls=0: the watermark never moved "
+      f"(before={body.get('watermark_before')}, after={body.get('watermark_after')})")
+check("max_calls=0" in str(body.get("stopped_because")),
+      f"max_calls=0: stopped_because names the cap, not a model or "
+      f"no-progress stop (got {body.get('stopped_because')!r})")
+check(snapshot() == before,
+      "max_calls=0: not one byte under the storage root changed")
+
+CID = "maxcalls-nonnumeric"
+set_store(exchanges(60))
+before = snapshot()
+r = compact(CID, max_calls="abc")
+check(r.status_code == 400,
+      f"max_calls='abc': HTTP 400, not the unhandled-ValueError 500 the "
+      f"unfixed code raised (got {r.status_code})")
+check("max_calls" in r.text and "abc" in r.text,
+      f"max_calls='abc': the 400 body names the field and the bad value "
+      f"(got {r.text!r})")
+check(snapshot() == before, "max_calls='abc': not one byte changed")
+
+CID = "maxcalls-negative"
+set_store(exchanges(60))
+before = snapshot()
+r = compact(CID, max_calls=-5)
+body = r.json()
+check(r.status_code == 200, f"max_calls=-5: HTTP 200 (got {r.status_code})")
+check(body.get("rollup_calls") == 0,
+      f"max_calls=-5: clamped to 0 calls, not treated as unlimited "
+      f"(got {body.get('rollup_calls')})")
+# NOT a "rollup_calls == 0" check: `while calls < max_calls` already makes
+# zero iterations for ANY negative max_calls with no clamp at all (0 < -5 is
+# already False) — a check that cannot fire, caught by mutation-testing this
+# very test (removing the clamp line left this assertion green). The one
+# place the actual clamped VALUE is observable for a negative input is the
+# stopped_because message, which the while/else writes from the (post-clamp)
+# variable itself.
+check(body.get("stopped_because") == "hit max_calls=0",
+      f"max_calls=-5: the clamp actually replaced -5 with 0 (the loop "
+      f"itself would skip a negative max_calls either way, clamped or not) "
+      f"(got {body.get('stopped_because')!r})")
+check(snapshot() == before, "max_calls=-5: not one byte changed")
+
+# CONTROL: max_calls absent is still the documented 200-call LIVE default —
+# without this, a guard that refuses every max_calls value would pass [5d]
+# just as well as the real fix.
+CID = "maxcalls-absent-control"
+set_store(exchanges(60))
+before = snapshot()
+r = compact(CID)
+body = r.json()
+check(r.status_code == 200, f"CONTROL absent: HTTP 200 (got {r.status_code})")
+check(body.get("rollup_calls", 0) > 0 and snapshot() != before,
+      "CONTROL: an absent max_calls still runs live and writes "
+      f"(rollup_calls={body.get('rollup_calls')})")
+
+# The clamp itself: a max_calls past the 1000 ceiling still stops at 1000,
+# not at the caller's number — reusing [5c]'s always-advancing stub so the
+# loop has no OTHER reason to stop first. 1500 rather than something far
+# larger: the unclamped (mutated) code path below actually SPINS this many
+# times (file I/O per iteration), and the mutation record needs this section
+# to finish in seconds, not minutes, whether or not the clamp is present.
+CID = "maxcalls-clamped"
+set_store(exchanges(60))
+SPINS[0] = 0
+summarizer.maybe_rollup = _always_advances
+r = compact(CID, max_calls=1500)
+summarizer.maybe_rollup = _real_rollup
+body = r.json()
+check(r.status_code == 200, f"max_calls=1500: HTTP 200 (got {r.status_code})")
+check(SPINS[0] == 1000,
+      f"max_calls=1500: clamped to the 1000 ceiling, not the caller's "
+      f"number (ran {SPINS[0]})")
+check(body.get("rollup_calls") == 1000,
+      f"and the report says 1000 (says {body.get('rollup_calls')})")
+
+
+# ---------------------------------------------------------------------------
 # 6. R13 — a gap is FILLED at its position, not closed by concatenation
 #
 # `turns_seen` counts every exchange, including the ones decide_memory_tail
@@ -841,6 +940,19 @@ print("All admin compact tests passed.")
 #   `{conv_id}/compact`            -> `{conv_id:path}/compact`-> [4]
 #   `if now <= prev:`              -> `if False:`            ->  [5]
 #   `while calls < max_calls:`     -> `while calls < max_calls + 3:` -> [5c]
+#
+# v3.1.9 (hostile pass 2, MEDIUM), same treatment:
+#
+#   `max_calls = ...try/except/clamp...` -> the exact shipped line
+#     `max_calls = int(body.get("max_calls") or 200)`             ->  [5d]
+#     (all 8 assertions: max_calls=0 ran live, "abc" was 500, 1500
+#     ran unclamped instead of stopping at 1000)
+#   `max_calls = max(0, min(max_calls, 1000))` deleted (clamp only) -> [5d]
+#     (exactly the -5 and 1500 checks; 0 and "abc" stayed green,
+#     correctly — untouched by this mutant)
+#   `try: ... except (TypeError, ValueError): raise HTTPException(...)`
+#     deleted (bare `int(_raw_max_calls)` again, clamp kept)         -> [5d]
+#     (exactly the two "abc" checks)
 #
 # v3.1.7 (R13), same treatment:
 #
