@@ -872,7 +872,16 @@ def _message_has_image(m: dict) -> bool:
 # of these lines is trying to establish. The counters are also readable
 # programmatically (tokenize_health) so /health/full can report the state as a
 # fact rather than leaving it to a log line from three days ago.
-TOKENIZE_WARN_INTERVAL_S = float(_env_int("COMPACTOR_TOKENIZE_WARN_INTERVAL_S", 300))
+# hostile2-config: env_float, not float(_env_int(...)). summarizer.py reads
+# the SAME variable with env_float, and the comment there ("an operator
+# setting this once should govern every /tokenize dependency in the
+# process, not just the ones main.py happens to own") asserted the two
+# already agreed. They did not: _env_int parses with int(), which rejects
+# any non-integer string ("0.5", "60.5", "1e3") and silently falls back to
+# the default of 300 HERE while summarizer.py applied the operator's real
+# value — one process, one env var, two different rate limits, with no
+# error or log line naming the disagreement.
+TOKENIZE_WARN_INTERVAL_S = env_float("COMPACTOR_TOKENIZE_WARN_INTERVAL_S", 300)
 _tokenize_fail_streak = 0
 # Tracked separately from the chat form: see tokenize_health(). Carries its own
 # timestamp because, unlike the chat form, it is NOT exercised on every request
@@ -1783,8 +1792,25 @@ def split_messages(messages: list[dict]) -> tuple[list[dict], list[dict], list[d
 
 
 async def compact_if_needed(
-    messages: list[dict], conv_id: str | None = None
+    messages: list[dict], conv_id: str | None = None,
+    *, stored_turns_out: list | None = None,
 ) -> list[dict]:
+    """
+    `stored_turns_out`, if given, receives exactly one `int` — how many
+    older turns this call replaced with a stand-in FROM STORED SUMMARIES
+    (0 if none, including every early-return path below, which never touch
+    it). hostile2-reuse M1: the caller also injects its OWN copy of the
+    summary hierarchy as a separate system block (see the `format_summary_
+    block` call beside `sstate` in chat_completions), and on a reusing turn
+    that produced TWO renders of one hierarchy that could disagree — one
+    trimmed to fit the array's budget here, the other independently trimmed
+    to 60% of the injection budget there, so the model could receive
+    different sets of scenes from the SAME stored hierarchy in the SAME
+    request, with the shared ones sent twice. This out-param is how the
+    caller learns to skip its own copy without re-deriving the decision (or
+    changing this function's return type, which test_compaction_reuse.py
+    and its mutation suite pin as `list[dict]`).
+    """
     current = count_tokens(messages)
     if current <= TARGET_TOKENS:
         return messages
@@ -1883,17 +1909,89 @@ async def compact_if_needed(
             # a truncated array whose head IS genuine matches outright; this
             # is cheap, so it stays: [12] in test_compaction_reuse is the case
             # where it alone decides.
-            _non_system = [m for m in messages if m.get("role") != "system"]
-            _n = len(_non_system)
+            #
+            # hostile2-reuse H7: `_n` must count only turns the hierarchy
+            # could ever have summarized. A `!= "system"` count also counts
+            # `tool`/`developer`/other roles, which add nothing the hierarchy
+            # tracks but still lift `_n` — and a genuine capped window
+            # aligns by construction (a cap sends the previous anchor's own
+            # tail), so padding a capped-but-refused window with extra
+            # non-conversational turns re-enables the substitution the same
+            # window was refused for, deleting real turns under a summary
+            # that never covered them. OpenWebUI never sends such roles
+            # today, so this is not live on the one client this pod serves,
+            # but the compactor is a generic OpenAI-compatible proxy and
+            # nothing gates it. Narrowing `_n` alone (not `to_summarize` or
+            # `_coverage_plan`, which still track every non-system turn) can
+            # only make this gate MORE conservative than before: a real
+            # historical tool turn no longer counts toward `_n`, so at worst
+            # reuse declines where it previously would have allowed — the
+            # same "costs a call, never a turn" trade this gate already
+            # makes elsewhere. It cannot become more permissive, because a
+            # turn this undercounts was never something `_recorded_position`
+            # could be inflated by either (see summarizer._turn_fingerprints,
+            # which still fingerprints every non-system role — deliberately
+            # left as is, since narrowing that definition is a much larger,
+            # cross-cutting change to the position-tracking primitive this
+            # gate borrows and does not need to fix this hole).
+            _conversational = [
+                m for m in messages if m.get("role") in ("user", "assistant")
+            ]
+            _n = len(_conversational)
+            _recorded = summarizer._recorded_position(_st)
 
-            if _covered > 0 and _n >= summarizer._recorded_position(_st):
+            # hostile2-reuse H9: this is the one decline path that used to log
+            # NOTHING. `_covered > 0` with `_changed` empty means the content
+            # genuinely matches — the two log branches above only fire on a
+            # MISMATCH — so a length-gate refusal here produced a compaction
+            # line indistinguishable from "no hierarchy yet" or "conv_id was
+            # None". `turns_seen` is monotonic and can end up ahead of what a
+            # request actually carries (an admin drain loop that idles, a
+            # cap installed mid-conversation); when it does, THIS is the gate
+            # that then declines every request forever, silently, which is
+            # the 117-second regression this whole feature exists to fix,
+            # reached by a route with no log line to find it by.
+            if _covered > 0 and _n < _recorded and logsetup.log_once(
+                f"compact.reuse.length_declined.{conv_id}"
+            ):
+                logger.info(
+                    f"conv={conv_id}: the stored summaries cover {_covered} "
+                    f"turn(s) whose content matches this request, but the "
+                    f"request itself carries only {_n} turn(s) against a "
+                    f"recorded position of {_recorded} — the array is "
+                    f"shorter than the conversation is known to have "
+                    f"reached, so reuse declines rather than risk treating "
+                    f"a capped or truncated window as the full history "
+                    f"(logged once per conversation; repeats mean this is "
+                    f"not recovering on its own)"
+                )
+
+            # OPEN_ISSUES2 LOW, re-checked against this gate: `_covered > 0`
+            # is a READABILITY guard here, not a safety one — `_covered == 0`
+            # already makes every line below it a no-op (`to_summarize[:0]`
+            # is empty, `stored_turns` computes to 0, `stored_text` stays
+            # "" and the `if not stored_text` fallback a few lines down
+            # resets both). Kept explicit anyway: a reader should not have
+            # to trace that chain to know a zero-coverage state cannot
+            # substitute anything, and the two states DO mean different
+            # things worth naming separately ("nothing is covered" vs "not
+            # enough of the array is present to trust what is").
+            if _covered > 0 and _n >= _recorded:
                 # TURN NUMBERS ARE NOT text_only INDICES. _covered counts every
                 # non-system turn; text_only has image turns removed, so
                 # `min(_covered, len(text_only))` overruns by the image count
                 # and deletes that many turns the hierarchy never covered -
                 # demonstrated at 1 and 5 turns of overrun, reachable at the
                 # shipped MAX_RETAINED_IMAGES=1. Count the prefix instead of
-                # assuming the two units agree.
+                # assuming the two units agree. The `min` cannot currently
+                # choose `len(text_only)` — `to_summarize` is always a
+                # prefix of `non_system` on every path through
+                # split_messages, so the prefix-count on its left is always
+                # <= len(text_only) — kept as a real bound rather than an
+                # assumption for exactly the reason the sentence above this
+                # one exists: the two units have disagreed before and the
+                # cost of being wrong here is deleting turns the hierarchy
+                # never covered, not a slower request.
                 stored_turns = min(
                     sum(
                         1 for m in to_summarize[:_covered]
@@ -1930,6 +2028,9 @@ async def compact_if_needed(
             stored_text = ""
             stored_turns = 0
             refreshed = []
+
+    if stored_turns_out is not None:
+        stored_turns_out.append(stored_turns)
 
     fresh_input = refreshed + text_only[stored_turns:]
     async with httpx.AsyncClient() as client:
@@ -2376,9 +2477,29 @@ def reply_is_degenerate(text: str) -> str | None:
     # that fails the item test) resets it to 0 same as before. See the R9/R19
     # note above DEGENERATE_LINE_CHARS for why "reaches the end" is the
     # discriminator.
+    # R25 (hostile317-a F5): the fragment-line check below must reach the
+    # reply's own end, same as the list-run backstop a few lines down does
+    # already (see [9] in test_degenerate_reply.py: "60 items followed by a
+    # closing sentence do not trip the backstop"). Before this, ANY line
+    # anywhere in the reply that happened to be 1500+ characters of
+    # short-sentence prose flagged the whole reply — including a finished,
+    # ordinary paragraph ("Lyra laughs. Mrs. Hale nods slowly. The rain
+    # stops. ...") sitting in the middle of a longer reply that goes on to
+    # say other things afterward. Real corpus check (2026-09-01, 332
+    # completed replies): 23 flagged, 21 of them ARE the last non-empty
+    # line (already accounted for by other signals — a tail loop in 16 of
+    # them), and the 2 true false positives are exactly the two that are
+    # NOT the last line. Requiring last-line closes both without touching
+    # the case the rule exists for: a runaway that ends the reply, which is
+    # a last line by construction.
+    last_nonblank_idx = -1
+    for _i, _raw in enumerate(text.splitlines()):
+        if _raw.strip():
+            last_nonblank_idx = _i
+
     run = 0
     in_fence = False
-    for raw in text.splitlines():
+    for line_idx, raw in enumerate(text.splitlines()):
         line = raw.strip()
         if not line:
             continue  # a blank line between items does not end a list
@@ -2394,7 +2515,11 @@ def reply_is_degenerate(text: str) -> str | None:
         else:
             run = 0
         ln = len(line)
-        if ln >= DEGENERATE_LINE_CHARS and line.count(" ") >= _LINE_MIN_SPACES:
+        if (
+            line_idx == last_nonblank_idx
+            and ln >= DEGENERATE_LINE_CHARS
+            and line.count(" ") >= _LINE_MIN_SPACES
+        ):
             # R24: "! " and "? " are always real ends (see
             # _is_real_sentence_end), but "." needs the abbreviation and
             # single-initial check trim_to_last_sentence uses, or "Dr. ",
@@ -4182,34 +4307,36 @@ async def _facts_tail(
     # made the gap read as covered.
     #
     # WHAT THIS SECOND CHECK CAN AND CANNOT SEE. writes_allowed() caches
-    # its reading for COMPACTOR_DEGRADE_CHECK_TTL_S (10 s), so within that
-    # window this call answers from the SAME statvfs _async_tail's guard
-    # took and cannot see a disk that filled in between. The first version
-    # of this comment claimed it covered exactly that window — "job 1
-    # indexes and this job makes a vLLM extraction call that can take
-    # seconds, so the disk can fill between that check and this write" —
-    # and then cited the TTL two sentences later as proof the call was
-    # cheap. The second half nullifies the first, in one paragraph, and a
-    # hostile review caught it the same day it was written. A cache quoted
-    # as a performance reassurance is still a cache.
+    # its reading for COMPACTOR_DEGRADE_CHECK_TTL_S (10 s), so a plain
+    # second call here would answer from the SAME statvfs _async_tail's
+    # guard took and could not see a disk that filled in between — a
+    # cache read here read as covering "job 1 indexes and this job makes a
+    # vLLM extraction call that can take seconds", when the TTL it also
+    # relied on for cheapness made that exact window invisible. A hostile
+    # review caught the contradiction the same day it was written
+    # (hostile2-config): the second half nullified the first, in one
+    # paragraph.
     #
-    # So the honest account of what it buys, in order of how often it
-    # bites:
+    # hostile2-config's fix: fresh=True. This call is the one that exists
+    # BECAUSE a vLLM extraction call can take seconds after the outer
+    # check ran, so it must take a new statvfs rather than trust the
+    # outer check's cached one — that is the whole reason for this call to
+    # exist rather than relying on _async_tail's outer guard alone. What it
+    # ALSO still buys, independent of timing:
     #   * COVERAGE. _facts_tail is a public-shaped coroutine with five
     #     suites entering the tail directly; a future caller that is not
     #     _async_tail gets the pause applied rather than the one that
-    #     remembered. That is job 3's argument verbatim and it does not
-    #     depend on timing at all.
-    #   * The gaps that DO exceed 10 s: a tail re-queued behind a pool
-    #     backlog (bgwork.pool caps concurrency, so a burst makes this
-    #     arbitrarily long), and an extraction plus dedup round trip to a
-    #     loaded vLLM.
-    # Inside 10 s of the outer check it is a no-op, and that is fine — the
-    # outer check already refused, or the disk genuinely had room.
+    #     remembered. That is job 3's argument verbatim.
+    #   * The gaps that used to exceed the 10 s TTL anyway even on a cache
+    #     read: a tail re-queued behind a pool backlog (bgwork.pool caps
+    #     concurrency, so a burst makes this arbitrarily long), and an
+    #     extraction plus dedup round trip to a loaded vLLM. `fresh=True`
+    #     subsumes both — the cache is irrelevant to a call that always
+    #     re-reads.
     #
     # Silent return, matching job 3: guard() already logs at debug and
     # writes_allowed() warned on the transition.
-    if not degrade.guard("fact extraction tail"):
+    if not degrade.guard("fact extraction tail", fresh=True):
         return
 
     if not facts.extraction_enabled():
@@ -4252,18 +4379,16 @@ async def _facts_tail(
     # and by anything that re-queues a tail, which is the same reachability
     # the helper's own docstring calls "not decoration".
     #
-    # `(assistant_text or "")` where job 1 writes a bare
-    # assistant_text.strip(). This is DEFENCE ONLY, and currently
-    # unreachable: job 1's gate runs first and raises AttributeError on a
-    # None reply before control ever arrives here, so no caller can
-    # actually exercise the tolerance. The commit that added it justified
-    # it as protecting "a direct caller's None", which was wrong — the
-    # direct caller goes through job 1 too. It is kept because
-    # _rollup_hierarchy types the same parameter `str | None` and means it,
-    # so the tolerant spelling is what this function should have if job 1's
-    # gate is ever softened, and because removing it would be a third
-    # spelling of the same rule. The dialect sweep is M9's job, not this
-    # commit's.
+    # `(assistant_text or "")`, matching job 1's own gate a few lines up
+    # (hostile2-config: it used to write a bare `assistant_text.strip()`
+    # and raise AttributeError on a None reply before control ever reached
+    # here, which made THIS tolerance decoration — job 1 now spells the
+    # identical check the same way, so a None reply is refused here, on its
+    # own terms, rather than never arriving. Both sites now say the same
+    # thing for the same reason: decide_memory_tail already rejects a blank
+    # reply as SKIPPED_EMPTY, and every direct caller of either job should
+    # meet that same rule rather than crash on one spelling and pass on the
+    # other.
     if not (assistant_text or "").strip() or not _has_pairable_user_text(
         last_user_text
     ):
@@ -4493,7 +4618,19 @@ async def _async_tail(
     # cost. `assistant_text` is stripped for the same reason on the same
     # line — decide_memory_tail already rejects a blank reply as
     # SKIPPED_EMPTY, and a direct caller should meet the identical rule.
-    if assistant_text.strip() and _has_pairable_user_text(last_user_text):
+    #
+    # hostile2-config: `(assistant_text or "")`, not a bare `.strip()`.
+    # _facts_tail (job 2, a few lines below) spells this same check
+    # None-tolerantly and says so at length — but this gate runs FIRST and
+    # used to raise AttributeError on a None reply before job 2's tolerance
+    # could ever be reached, making it decoration rather than a real
+    # defence. No production caller passes None today (decide_memory_tail's
+    # `decision.text` is guaranteed non-None whenever `decision.store` is
+    # true, which is what gates reaching here), so this closes a currently
+    # theoretical gap rather than a live one — but it is the same gap job 2
+    # was written to close, at the sibling site that actually decides
+    # whether it is reachable.
+    if (assistant_text or "").strip() and _has_pairable_user_text(last_user_text):
         async with conv_lock(conv_id):
             try:
                 indexed = retrieval.index_exchange(
@@ -4561,14 +4698,38 @@ async def _rollup_hierarchy(
     # HERE, not at the call site. A rollup WRITES state, so it is subject
     # to the same pause every other new-memory write is, and putting the
     # check inside means both callers get it rather than the one that
-    # remembered. writes_allowed() is cached for
-    # COMPACTOR_DEGRADE_CHECK_TTL_S, so this is a tuple read.
-    if not degrade.guard("hierarchy rollup"):
+    # remembered.
+    #
+    # hostile2-config: fresh=True, not a cache read. This call exists to
+    # catch disk pressure that develops WHILE the summarization LLM call
+    # this function is about to make is in flight — the outer check
+    # (_tail_store_blocked, on the request path) already ran, and a
+    # summarization round trip is exactly the multi-second gap the
+    # COMPACTOR_DEGRADE_CHECK_TTL_S cache (10s default) would otherwise
+    # paper over. A fresh statvfs here costs one syscall per rollup, not
+    # per request.
+    if not degrade.guard("hierarchy rollup", fresh=True):
         return
     # A reply of whitespace is not a turn to roll up: it would advance the
     # watermark over a turn that says nothing, and the label would then
     # cover text no summary can account for. None is not whitespace - it is
     # 'do not append a reply at all', which is a different instruction.
+    #
+    # OPEN_ISSUES2 LOW re-checked: reported as unreachable from EITHER
+    # PRODUCTION call site (_async_tail's job 3, which only ever receives
+    # decide_memory_tail's already-non-blank decision.text; and the
+    # skipped-tail path, which passes None). Both of those still hold. But
+    # this function is a "public-shaped coroutine" in this file's own
+    # words a few lines up about its sibling _facts_tail, entered DIRECTLY
+    # by test suites (and by extension anything else that re-queues a
+    # tail) with arbitrary text that never passed through decide_memory_
+    # tail's own `if not text.strip()` gate — test_truncated_tail.py's
+    # `tt-inner-empty-reply` case does exactly this, calling _async_tail
+    # with assistant_text="" directly and asserting NO rollup happens.
+    # Removing this guard as "dead" broke that real, already-shipped
+    # coverage the moment it was tried — kept, and the "unreachable from
+    # either call site" reading corrected to name what it was actually
+    # checked against.
     if assistant_text is not None and not assistant_text.strip():
         return
     try:
@@ -5527,8 +5688,17 @@ async def chat_completions(request: Request) -> Any:
         )
 
     # V1 compaction
+    # hostile2-reuse M1: `_compaction_stored_turns` is how the summary
+    # injection below (search `format_summary_block`) learns whether THIS
+    # call already put a stand-in for the hierarchy in the array, so it can
+    # skip injecting its own, separately-trimmed copy of the same summaries
+    # — see compact_if_needed's docstring for why this is an out-param
+    # rather than a return-type change.
+    _compaction_stored_turns: list[int] = []
     try:
-        body["messages"] = await compact_if_needed(messages, conv_id)
+        body["messages"] = await compact_if_needed(
+            messages, conv_id, stored_turns_out=_compaction_stored_turns
+        )
     except Exception as e:
         logger.exception(
             f"compaction failed; falling through with the original messages — "
@@ -5730,27 +5900,43 @@ async def chat_completions(request: Request) -> Any:
             # keeping pace: seen climbing while lastturn stands still for more
             # than COMPACTOR_L1_CHUNK_SIZE turns is a stalled rollup.
             turns_seen = sstate.get("turns_seen", 0)
-            # 60% of the injection budget: at production config that is
-            # ~4,900 tokens, which reproduces the old working behaviour
-            # (summary trimmed newest-kept, facts and persona still fit) and
-            # leaves 40% for the other three layers.
-            sblock = await run_in_threadpool(
-                summarizer.format_summary_block,
-                sstate,
-                min(
-                    summarizer.SUMMARY_BLOCK_MAX_TOKENS,
-                    int(inject_budget * 0.6),
-                ),
-            )
-            if sblock:
-                injected_blocks.append(
-                    (_INJECT_PRIORITY_SUMMARY, "summary", sblock)
+            # hostile2-reuse M1: compact_if_needed already put a stand-in
+            # for the hierarchy IN THE ARRAY on this turn (_compaction_
+            # stored_turns[0] > 0) — rendered against the array's own
+            # all-or-nothing budget. Injecting a SECOND, independently
+            # trimmed copy here (60% of a DIFFERENT budget, no all_or_
+            # nothing) used to send the shared scenes twice and disagree
+            # about which scenes survived — array 9, injected 6, on one
+            # documented reproduction. The array copy is authoritative for
+            # a reusing turn (it travels with the removal, see
+            # compact_if_needed's own comment on why it cannot rely on this
+            # injected block instead), so this one is skipped rather than
+            # rendered a second time.
+            if _compaction_stored_turns and _compaction_stored_turns[0] > 0:
+                sblock = None
+                log_parts.append("sum(in-array)")
+            else:
+                # 60% of the injection budget: at production config that is
+                # ~4,900 tokens, which reproduces the old working behaviour
+                # (summary trimmed newest-kept, facts and persona still fit)
+                # and leaves 40% for the other three layers.
+                sblock = await run_in_threadpool(
+                    summarizer.format_summary_block,
+                    sstate,
+                    min(
+                        summarizer.SUMMARY_BLOCK_MAX_TOKENS,
+                        int(inject_budget * 0.6),
+                    ),
                 )
-                log_parts.append(
-                    f"sum(L1={len(sstate.get('l1') or [])}"
-                    f"/L2={len(sstate.get('l2') or [])}"
-                    f"/L3={'y' if sstate.get('l3') else 'n'})"
-                )
+                if sblock:
+                    injected_blocks.append(
+                        (_INJECT_PRIORITY_SUMMARY, "summary", sblock)
+                    )
+                    log_parts.append(
+                        f"sum(L1={len(sstate.get('l1') or [])}"
+                        f"/L2={len(sstate.get('l2') or [])}"
+                        f"/L3={'y' if sstate.get('l3') else 'n'})"
+                    )
         except Exception as e:
             logger.warning(f"conv={conv_id}: summary load failed (non-fatal): {e}")
 

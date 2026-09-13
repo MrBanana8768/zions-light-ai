@@ -82,14 +82,27 @@ def _free_mb(path: str) -> float:
         return float("inf")
 
 
-def writes_allowed() -> tuple[bool, float]:
+def writes_allowed(*, fresh: bool = False) -> tuple[bool, float]:
     """Return (allowed, free_mb). Cached for _CHECK_TTL_S.
 
     Fails OPEN: if free space can't be read, writes are allowed (inf MB) —
     a broken probe must not silently stop all persistence.
+
+    `fresh=True` discards a cached reading that has not yet expired and
+    takes a new `statvfs`. hostile2-config: job 2 (fact extraction) and job
+    3 (hierarchy rollup) added their own `guard()` calls specifically to
+    catch a disk that fills WHILE they run — a vLLM extraction call or a
+    summarization call can take seconds, sometimes past the outer check
+    that ran at the top of the tail. Without `fresh`, that second call was
+    a cache read of the SAME `statvfs` the outer check already took, so it
+    could not see anything that changed in between; the TTL that exists to
+    keep a request burst cheap also made the second guard blind for the
+    entire window it was added to close.
     """
     global _cache, _last_logged_blocked
     now = time.monotonic()
+    if fresh:
+        _cache = None
     if _cache is not None and now < _cache[0]:
         return _cache[1], _cache[2]
 
@@ -116,11 +129,19 @@ def writes_allowed() -> tuple[bool, float]:
     return allowed, free
 
 
-def guard(operation: str) -> bool:
+def guard(operation: str, *, fresh: bool = False) -> bool:
     """Convenience for the call sites: returns True if `operation` may
     proceed. When blocked, logs at debug (the transition was already warned
-    in writes_allowed) and returns False so the caller skips the write."""
-    allowed, free = writes_allowed()
+    in writes_allowed) and returns False so the caller skips the write.
+
+    `fresh=True` forces a new `statvfs` rather than trusting a cached
+    reading from up to `COMPACTOR_DEGRADE_CHECK_TTL_S` ago — see
+    `writes_allowed`. Use it at a guard call that exists specifically to
+    catch pressure that developed SINCE an earlier check in the same
+    request/tail, not at the first (outer) check of a request, which is
+    exactly the case the cache exists to make cheap.
+    """
+    allowed, free = writes_allowed(fresh=fresh)
     if not allowed:
         logger.debug(
             f"skipping {operation}: disk pressure ({free:.0f} MB free)"

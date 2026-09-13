@@ -123,6 +123,67 @@ def test_cache_ttl_avoids_recheck():
     importlib.reload(degrade)
 
 
+def test_fresh_bypasses_cache_ttl():
+    print("\n[test] hostile2-config: fresh=True sees a disk that filled "
+          "INSIDE the TTL window, which a plain call cannot")
+    # Long TTL, deliberately, so a plain call is provably reading the cache
+    # and not coincidentally re-checking anyway.
+    os.environ["COMPACTOR_DEGRADE_CHECK_TTL_S"] = "60"
+    import importlib
+    importlib.reload(degrade)
+    readings = iter([10_000, 50])  # ample space, then below the 200 MB floor
+
+    def scripted_free(path):
+        return next(readings)
+
+    degrade._free_mb = scripted_free
+    degrade._reset_cache_for_tests()
+
+    allowed1, free1 = degrade.writes_allowed()
+    assert_eq(allowed1, True, "first reading: 10,000 MB free, allowed")
+    assert_eq(free1, 10_000, "and the first reading is reported")
+
+    # CONTROL: a plain call inside the TTL is a cache read - it must NOT
+    # see the second (real) reading yet, or [fresh] below proves nothing.
+    allowed2, free2 = degrade.writes_allowed()
+    assert_eq(allowed2, True, "CONTROL: a plain call still reads the CACHED "
+                              "10,000 MB, not the disk")
+    assert_eq(free2, 10_000, "CONTROL: and reports the cached number")
+
+    allowed3, free3 = degrade.writes_allowed(fresh=True)
+    assert_eq(allowed3, False,
+              "*** fresh=True re-reads and sees the disk that filled "
+              "inside the TTL window")
+    assert_eq(free3, 50, "and reports the real, freshly-read free-space number")
+
+    os.environ["COMPACTOR_DEGRADE_CHECK_TTL_S"] = "0"
+    importlib.reload(degrade)
+
+
+def test_guard_fresh_forwards_to_writes_allowed():
+    print("\n[test] guard(op, fresh=True) forwards fresh through to "
+          "writes_allowed, same as the bare call")
+    os.environ["COMPACTOR_DEGRADE_CHECK_TTL_S"] = "60"
+    import importlib
+    importlib.reload(degrade)
+    readings = iter([10_000, 50])
+
+    def scripted_free(path):
+        return next(readings)
+
+    degrade._free_mb = scripted_free
+    degrade._reset_cache_for_tests()
+
+    assert_eq(degrade.guard("op"), True, "primes the cache at 10,000 MB")
+    assert_eq(degrade.guard("op"), True,
+              "CONTROL: a plain guard() call is still the cached reading")
+    assert_eq(degrade.guard("op", fresh=True), False,
+              "*** guard(fresh=True) sees the real, fresh disk state")
+
+    os.environ["COMPACTOR_DEGRADE_CHECK_TTL_S"] = "0"
+    importlib.reload(degrade)
+
+
 def test_transition_logging_does_not_crash():
     print("\n[test] state transitions (block→clear→block) don't error")
     _set_free(10)      # block (logs warning)
@@ -145,6 +206,8 @@ def _all():
         test_write_state_shape_paused,
         test_write_state_free_mb_none_when_infinite,
         test_cache_ttl_avoids_recheck,
+        test_fresh_bypasses_cache_ttl,
+        test_guard_fresh_forwards_to_writes_allowed,
         test_transition_logging_does_not_crash,
     ]
 

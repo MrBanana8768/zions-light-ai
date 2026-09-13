@@ -210,7 +210,7 @@ print("[4] disk pressure does NOT roll up")
 # for BOTH callers rather than the one that remembered.
 rolled.clear()
 _real_guard = main.degrade.guard
-main.degrade.guard = lambda _label: False
+main.degrade.guard = lambda _label, fresh=False: False
 summarizer.maybe_rollup = _spy_rollup
 try:
     for coro, _label in [(main._rollup_hierarchy(CONV, list(HISTORY), None), None)]:
