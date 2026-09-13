@@ -2384,6 +2384,76 @@ _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s")
 _LINE_MIN_SPACES = 100
 
 
+def _fragment_line_breaks(line: str, *, min_chars: int = DEGENERATE_LINE_CHARS) -> int | None:
+    """The sentence/clause-break count `reply_is_degenerate`'s fragment-line
+    rule judges `line` on, or None if `line` is too short or too sparse to
+    even be a CANDIDATE (below `min_chars`, or under _LINE_MIN_SPACES spaces
+    — see the block comment above these constants).
+
+    v3.1.9 (hostile pass 3, F5). Split out of the per-line loop so BOTH the
+    line being judged AND the trailing-content exemption's own longest-line
+    check (see `_line_is_fragment_shaped` and the loop below) run the exact
+    same arithmetic — one function, not two copies that can drift the way
+    scripts/calibrate-structural-degeneracy.py's independent copy already
+    had (five drifts named in the finding; that script now imports this
+    one instead of re-implementing it).
+
+    `min_chars` defaults to DEGENERATE_LINE_CHARS (1500) — the primary
+    line-judging call site's own floor, unchanged from before this fix, and
+    a real statistical-significance floor: a short line's mean-fragment-
+    length ratio is too noisy to trust. The trailing-content exemption
+    check passes `min_chars=0` deliberately: a SECOND runaway cut short (the
+    finding's case D, ~600 characters) is exactly as diagnostic of the same
+    collapse as a full one — it is only shorter because whatever cut the
+    reply cut it earlier — so it must not need to independently clear the
+    1500-character floor to disqualify the exemption. `_LINE_MIN_SPACES`
+    still applies either way, which is what actually protects a short,
+    ordinary trailing sentence from being misread as a fragment (a real
+    sentence that short has nowhere near 100 spaces).
+
+    `line` must already be `.strip()`-ped — both call sites do that once,
+    on the same value, before calling this.
+    """
+    ln = len(line)
+    if ln < min_chars or line.count(" ") < _LINE_MIN_SPACES:
+        return None
+    # R24: "! " and "? " are always real ends (see _is_real_sentence_end),
+    # but "." needs the abbreviation and single-initial check
+    # trim_to_last_sentence uses, or "Dr. ", "Mrs. ", "9 a.m. " etc each
+    # register as a sentence break and collapse the computed mean on
+    # ordinary prose.
+    breaks = (
+        _count_real_period_breaks(line) + line.count("! ")
+        + line.count("? ") + line.count("… ")
+    )
+    if breaks == 0:
+        # No sentence at all in 1500+ characters: either a run-on, which is
+        # not this rule's shape, or a list whose separator has shrunk to a
+        # comma — judged the same way, on the commas.
+        breaks = line.count(", ")
+    return breaks
+
+
+def _line_is_fragment_shaped(line: str, *, min_chars: int = 0) -> bool:
+    """True if `line` alone would trip the fragment-collapse math (mean
+    fragment length at or under DEGENERATE_LINE_SENTENCE_CHARS). `line`
+    must already be `.strip()`-ped.
+
+    v3.1.9 (hostile pass 3, F5): used by the trailing-content exemption
+    below, to answer "is what follows a candidate fragment line ITSELF a
+    fragment" — case D in the finding (a runaway line followed by a SECOND
+    runaway cut at 600 characters) must stay caught even though 600
+    non-blank trailing characters alone would otherwise look "substantial".
+    `min_chars=0` (the default here, unlike `_fragment_line_breaks`'s own
+    default) is deliberate — see that function's docstring for why the
+    trailing check does not require the primary DEGENERATE_LINE_CHARS floor.
+    """
+    breaks = _fragment_line_breaks(line, min_chars=min_chars)
+    if breaks is None:
+        return False
+    return len(line) / (breaks + 1) <= DEGENERATE_LINE_SENTENCE_CHARS
+
+
 def reply_is_degenerate(text: str) -> str | None:
     """Why this reply looks like a repetition loop, or None if it looks fine.
 
@@ -2523,17 +2593,44 @@ def reply_is_degenerate(text: str) -> str | None:
     # completed replies): 23 flagged, 21 of them ARE the last non-empty
     # line (already accounted for by other signals — a tail loop in 16 of
     # them), and the 2 true false positives are exactly the two that are
-    # NOT the last line. Requiring last-line closes both without touching
-    # the case the rule exists for: a runaway that ends the reply, which is
-    # a last line by construction.
+    # NOT the last line.
+    #
+    # v3.1.9 (hostile pass 3, F5) NARROWS "last line by construction" TO
+    # "nothing substantial follows it". R25's fix required the fragment
+    # line to be the reply's literal last non-blank line, on the reasoning
+    # that decide_memory_tail's trim only removes the unterminated tail of
+    # the LAST line, so a cut reply's fragment line is its last line "by
+    # construction of the trim". That is true of the trim, and false of
+    # everything reply_is_degenerate is also asked to judge: a reply is
+    # judged on what it IS, not only on what a cut leaves behind, and a
+    # runaway followed by one short trailing line (a sign-off, an emoji,
+    # `---`, or a second cut runaway) is not the last line and sailed
+    # through untouched. Proof (SP\\p3-c\\p3c_fragment.py, frag1.log): a
+    # runaway line plus a short sign-off, an emoji line, or "---" all
+    # scored `stored` (memorized) instead of `skipped_degenerate`.
+    #
+    # The fix: a non-last candidate line is exempt ONLY when what follows it
+    # is SUBSTANTIAL (>= DEGENERATE_MIN_CHARS of non-blank trailing text —
+    # the same floor "nothing is judged structurally" already uses
+    # elsewhere in this function) AND that trailing content's own longest
+    # line is not ITSELF fragment-shaped (_line_is_fragment_shaped). Both
+    # conditions matter: char count alone would let a second, shorter
+    # runaway "look substantial" (case D in the finding: a 600-character cut
+    # runaway following the first), and fragment-shape alone would flag a
+    # real, finished narrative followed by ordinary short lines (a closing
+    # one-liner after a long paragraph). The two real corpus false
+    # positives (25,209 and 15,141 characters, real prose following) clear
+    # both bars and keep their exemption; every synthetic runaway-plus-
+    # trailer shape in the finding fails at least one and is caught.
+    lines = text.splitlines()
     last_nonblank_idx = -1
-    for _i, _raw in enumerate(text.splitlines()):
+    for _i, _raw in enumerate(lines):
         if _raw.strip():
             last_nonblank_idx = _i
 
     run = 0
     in_fence = False
-    for line_idx, raw in enumerate(text.splitlines()):
+    for line_idx, raw in enumerate(lines):
         line = raw.strip()
         if not line:
             continue  # a blank line between items does not end a list
@@ -2548,34 +2645,27 @@ def reply_is_degenerate(text: str) -> str | None:
             run += 1
         else:
             run = 0
-        ln = len(line)
-        if (
-            line_idx == last_nonblank_idx
-            and ln >= DEGENERATE_LINE_CHARS
-            and line.count(" ") >= _LINE_MIN_SPACES
-        ):
-            # R24: "! " and "? " are always real ends (see
-            # _is_real_sentence_end), but "." needs the abbreviation and
-            # single-initial check trim_to_last_sentence uses, or "Dr. ",
-            # "Mrs. ", "9 a.m. " etc each register as a sentence break and
-            # collapse the computed mean on ordinary prose.
-            breaks = (
-                _count_real_period_breaks(line) + line.count("! ")
-                + line.count("? ") + line.count("… ")
-            )
-            if breaks == 0:
-                # No sentence at all in 1500+ characters: either a run-on,
-                # which is not this rule's shape, or a list whose separator
-                # has shrunk to a comma — judged the same way, on the commas.
-                breaks = line.count(", ")
+        breaks = _fragment_line_breaks(line)
+        if breaks is not None:
+            ln = len(line)
             if ln / (breaks + 1) <= DEGENERATE_LINE_SENTENCE_CHARS:
-                return (
-                    f"an unbroken line of {ln} characters made of "
-                    f"{breaks + 1} fragments averaging "
-                    f"{ln / (breaks + 1):.0f} characters (limit "
-                    f"{DEGENERATE_LINE_SENTENCE_CHARS} over "
-                    f"{DEGENERATE_LINE_CHARS}+ characters)"
-                )
+                exempt = False
+                if line_idx != last_nonblank_idx:
+                    trailing_nonblank = [
+                        t.strip() for t in lines[line_idx + 1:] if t.strip()
+                    ]
+                    trailing_chars = sum(len(t) for t in trailing_nonblank)
+                    if trailing_chars >= DEGENERATE_MIN_CHARS:
+                        longest_trailing = max(trailing_nonblank, key=len)
+                        exempt = not _line_is_fragment_shaped(longest_trailing)
+                if not exempt:
+                    return (
+                        f"an unbroken line of {ln} characters made of "
+                        f"{breaks + 1} fragments averaging "
+                        f"{ln / (breaks + 1):.0f} characters (limit "
+                        f"{DEGENERATE_LINE_SENTENCE_CHARS} over "
+                        f"{DEGENERATE_LINE_CHARS}+ characters)"
+                    )
     # R19: gated on DEGENERATE_MIN_CHARS like the decoration-fraction rule
     # above — this file's own doctrine (see MIN_MEMORABLE_TRIMMED_CHARS)
     # calls that the floor below which nothing is judged structurally, and
@@ -7015,6 +7105,40 @@ async def admin_export_conversation(conv_id: str):
     return portability.export_conversation(conv_id)
 
 
+# v3.1.9 HIGH #1 (hostile pass 3, F1). `bool(body.get("overwrite", False))`
+# reads any non-empty JSON string as truthy, so a templated client sending
+# `"overwrite": "false"` (or "no", "0", "off" — everything a shell/jq
+# `"$OVERWRITE"` substitution produces from an unset or literally-"false"
+# variable) got `bool("false") is True` and the import OVERWROTE a live
+# conversation it was explicitly told not to touch: the facts file and
+# summary state replaced wholesale, then the episodic index emptied. This is
+# the exact truthiness shape f0a5aba fixed for `dry_run` and that fix was
+# never carried to the one admin boolean whose "yes" reading is destructive.
+#
+# Same rule as _dry_run_from, same direction of safety: only a value that
+# POSITIVELY spells an affirmative ever flips the flag on. Every other
+# shape — wrong type, empty string, unrecognised spelling, absent — reads
+# as the SAFE side (False / no-overwrite) rather than being coerced. For
+# `overwrite` that is the opposite polarity from `dry_run` (True is the safe
+# reading there; False is the safe reading here), but it is the identical
+# "ambiguous is never a license to do the dangerous thing" rule.
+_OVERWRITE_COMMIT_TOKENS = ("true", "1", "yes")
+
+
+def _strict_affirmative(value: Any, *, commit_tokens: tuple[str, ...]) -> bool:
+    """True only if `value` is bool True or a string that spells an
+    affirmative in `commit_tokens` (case/whitespace-insensitive). Every other
+    JSON shape — None, 0, [], {}, a float, an unrecognised string, an empty
+    string — reads as False. There is no "ambiguous -> True" branch: unlike
+    `bool()`, a present-but-unrecognised value never flips this on.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in commit_tokens
+    return False
+
+
 @app.post(
     "/admin/conversations/import",
     dependencies=[Depends(_require_localhost)],
@@ -7030,7 +7154,10 @@ async def admin_import_conversation(request: Request):
         }
 
     Refuses if target conv has existing state unless overwrite=true —
-    prevents accidental wipe of an active conversation.
+    prevents accidental wipe of an active conversation. `overwrite` is
+    parsed STRICTLY (see _strict_affirmative): only `true`, `"true"`, `"1"`
+    or `"yes"` ever overwrite. Every other spelling, including `"false"`,
+    `"no"`, `"0"` and `"off"`, is read as no-overwrite — the safe side.
     """
     try:
         body = await request.json()
@@ -7042,11 +7169,56 @@ async def admin_import_conversation(request: Request):
     bundle = body.get("bundle")
     if bundle is None:
         raise HTTPException(status_code=400, detail="missing required field: 'bundle'")
+    overwrite = _strict_affirmative(
+        body.get("overwrite", False), commit_tokens=_OVERWRITE_COMMIT_TOKENS
+    )
+    target_for_quarantine = body.get("target_conv_id")
+    if not target_for_quarantine and isinstance(bundle, dict):
+        target_for_quarantine = bundle.get("source_conv_id")
+    # v3.1.9 (F1 fix): take a quarantine copy before an overwrite lands, the
+    # same reversibility cleanup's quarantine-then-wipe already gives a test
+    # conv. import_conversation itself never had this — an overwrite replaced
+    # facts/summary/episodic wholesale with nothing recoverable but a backup
+    # cycle.
+    #
+    # A FAILED SNAPSHOT REFUSES THE OVERWRITE, with one exception. The lane
+    # that added this made it best-effort, so an unverifiable snapshot
+    # logged a warning and the overwrite replaced the store anyway: the
+    # data-loss path this snapshot exists to close, reopened on exactly the
+    # occasions the net was needed. The one case that proceeds is a store
+    # that is ALREADY unreadable (StoreUnreadable). There is nothing
+    # readable to lose, and an import is how an operator recovers it.
+    if overwrite and isinstance(target_for_quarantine, str) and target_for_quarantine.strip():
+        try:
+            portability.quarantine_conversation(
+                target_for_quarantine, reason="admin import overwrite"
+            )
+        except StoreUnreadable as e:
+            logger.warning(
+                f"conv={target_for_quarantine}: the existing store is unreadable "
+                f"({e}); nothing readable to snapshot, so the explicit "
+                f"overwrite proceeds as a recovery"
+            )
+        except Exception as e:
+            logger.error(
+                f"conv={target_for_quarantine}: pre-overwrite quarantine failed "
+                f"({type(e).__name__}: {e}); overwrite refused"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"refusing to overwrite conv_id {target_for_quarantine!r}: "
+                    f"a restorable snapshot of its current state could not be "
+                    f"written first ({type(e).__name__}: {e}). Nothing was "
+                    f"changed. Fix the quarantine location, or export the "
+                    f"conversation yourself, and retry."
+                ),
+            )
     try:
         result = portability.import_conversation(
             bundle,
             target_conv_id=body.get("target_conv_id"),
-            overwrite=bool(body.get("overwrite", False)),
+            overwrite=overwrite,
         )
     # v3.1.8: UnsafeConvId alongside ImportError_. A body-supplied
     # target_conv_id / new_conv_id is CLIENT INPUT that reaches the
@@ -7122,6 +7294,20 @@ async def admin_cleanup_test_conversations(dry_run: bool = True):
 # `default` says".
 _DRY_RUN_COMMIT_TOKENS = ("false", "0", "no")
 
+# v3.1.9 HIGH (hostile pass 3, F2). One check for "this key is trying to say
+# dry_run and getting it wrong", shared by the query-string side (which had
+# it) and the body side (which did not until this fix). Strips every
+# character that is not a letter or digit before comparing, not just "-" and
+# "_": the old query-only version stripped only those two, so `dry_run[]`
+# (what `?dry_run[]=true` sends — some HTTP clients array-ify a repeated-flag
+# convention) and `dry_run ` (a trailing space from `?dry_run%20=true`)
+# neither matched "dry_run" nor got caught as a typo, and fell through to
+# "absent" — on /compact, "absent" is the live default. Comparing against the
+# alnum-stripped form catches those alongside the case/hyphen/space variants
+# the original handled.
+def _looks_like_misspelled_dry_run(key: str) -> bool:
+    return key != "dry_run" and re.sub(r"[^a-z0-9]", "", key.lower()) == "dryrun"
+
 
 def _dry_run_from(request: Request, body: dict, *, default: bool) -> bool:
     """Read dry_run from the body, then the QUERY STRING, then the default.
@@ -7193,7 +7379,18 @@ def _dry_run_from(request: Request, body: dict, *, default: bool) -> bool:
     """
     def _body_verdict() -> bool | None:
         """True = dry, False = commit, None = the body carries no opinion
-        (the "dry_run" key is simply absent)."""
+        (the "dry_run" key is simply absent, and not even a misspelled key)."""
+        # v3.1.9 (hostile pass 3, F2). The query side had a misspelled-key
+        # rule from the gate review (below); the body side did not, so
+        # {"dryRun": true} / {"dry-run": true} / {"DRY_RUN": true} /
+        # {"dry_run ": true} all left "dry_run" absent from `body`, fell
+        # through with body_verdict=None, and — on /compact, whose default is
+        # live — committed a write the caller's key spelled "dry_run" wrong
+        # while trying to prevent. Same rule as the query side, one level up:
+        # a key that is a typo of "dry_run" is not an absent flag.
+        misspelled = any(_looks_like_misspelled_dry_run(k) for k in body.keys())
+        if misspelled:
+            return True  # ambiguous key: dry, regardless of what "dry_run" itself says
         if "dry_run" not in body:
             return None
         v = body["dry_run"]
@@ -7212,14 +7409,13 @@ def _dry_run_from(request: Request, body: dict, *, default: bool) -> bool:
     def _query_verdict() -> bool | None:
         """True = dry, False = commit, None = the query string carries no
         opinion (absent, and not even a misspelled key)."""
-        # A key that differs from "dry_run" only by case, a hyphen, or a
-        # missing separator (?dryrun=, ?dry-run=, ?DRY_RUN=) is a typo, not
-        # an absent flag, and must not fall through to `default` either —
-        # see the docstring. Both "-" and "_" are stripped (not just
-        # translated to "_") so "dryrun" without any separator is caught.
+        # A key that differs from "dry_run" only by case, a hyphen, a missing
+        # separator, or bracket/percent-encoded noise (?dryrun=, ?dry-run=,
+        # ?DRY_RUN=, ?dry_run[]=, ?dry_run%20=) is a typo, not an absent
+        # flag, and must not fall through to `default` either — see the
+        # docstring and _looks_like_misspelled_dry_run.
         misspelled = any(
-            k != "dry_run" and k.lower().replace("-", "").replace("_", "") == "dryrun"
-            for k in request.query_params.keys()
+            _looks_like_misspelled_dry_run(k) for k in request.query_params.keys()
         )
         if misspelled:
             return True  # ambiguous key: dry, regardless of what "dry_run" itself says
@@ -7270,15 +7466,26 @@ async def admin_merge(src_conv_id: str, dst_conv_id: str, request: Request):
     capping before a real merge is what makes the loss permanent.
 
     A POST with a query flag is what an operator reaches for under stress, and
-    a flag that is accepted-looking and inert is worse than one that 400s. The
-    body still wins when both are present: an explicit JSON body is the more
-    deliberate of the two.
+    a flag that is accepted-looking and inert is worse than one that 400s.
+    v3.1.9 (hostile pass 3, F12): when body and query DISAGREE, DRY wins, not
+    the body — commit only if every source that is present says commit; see
+    _dry_run_from's docstring (b). A body {"dry_run": false} next to
+    `?dry_run=true` stays dry, the safer of the two answers, not a silent
+    override in either direction.
 
     Merges FACTS and EPISODIC exchanges only. Summaries are deliberately not
     merged: the forked half re-derives its own hierarchy from the client's
     full array, so dst already covers the same history and folding src's in
     would double-count it. The source is left completely intact, so a merge
     that produces a bad result costs nothing but the re-embedding.
+
+    `refresh_last_used` (body or query, default false — v3.1.9, hostile pass
+    3, F6): opt-in only. Pass true for the id-migration/backfill recovery
+    (dst already holds a fresh backfill's re-extractions, src holds her real
+    older originals) — NOT for the runbook's "Older forks" step or any merge
+    into a conversation that is still being chatted in, where it would
+    outrank her own facts with the fork's. See portability.merge_conversation
+    for the full contract and why this stopped being automatic.
 
     See portability.merge_conversation for the full contract.
     """
@@ -7293,6 +7500,17 @@ async def admin_merge(src_conv_id: str, dst_conv_id: str, request: Request):
     # and an operator who meant to commit sees unchanged counts and tries
     # again, while the reverse mistake is not recoverable.
     dry_run = _dry_run_from(request, body, default=True)
+    # v3.1.9 (hostile pass 3, F6). Same strict-affirmative parsing as
+    # `overwrite` (_strict_affirmative): only true/"true"/"1"/"yes" from
+    # EITHER source ever turns this on; every other shape is the safe
+    # default (no floor). Either source asking for it is enough — unlike
+    # dry_run, this is not a "which side of a disagreement wins" question,
+    # because leaving it off is never the more dangerous reading.
+    refresh_last_used = _strict_affirmative(
+        body.get("refresh_last_used", False), commit_tokens=_OVERWRITE_COMMIT_TOKENS
+    ) or _strict_affirmative(
+        request.query_params.get("refresh_last_used"), commit_tokens=_OVERWRITE_COMMIT_TOKENS
+    )
 
     try:
         return await run_in_threadpool(
@@ -7300,6 +7518,7 @@ async def admin_merge(src_conv_id: str, dst_conv_id: str, request: Request):
             src_conv_id,
             dst_conv_id,
             dry_run=dry_run,
+            refresh_last_used=refresh_last_used,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -7443,12 +7662,59 @@ async def admin_compact(conv_id: str, request: Request):
     two things padding cannot fix: a store that does not reach the recorded
     position, and one with more gap than transcript.
     """
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
+    # v3.1.9 HIGH (hostile pass 3, F2). The old code was
+    # `try: body = await request.json() except Exception: body = {}` /
+    # `if not isinstance(body, dict): body = {}` — so a body that could not
+    # be read AT ALL (invalid JSON, a JSON value that is not an object, or
+    # `request.json()` itself raising — e.g. a 5000-digit integer, which
+    # trips CPython's int-string conversion limit inside json.loads) was
+    # treated EXACTLY like no body being sent. On /compact, whose documented
+    # default is LIVE, that means every one of these silently ran the drain:
+    # form-encoded `dry_run=true` (curl's default content-type), single- or
+    # un-quoted pseudo-JSON, a trailing comma, a JSON array instead of an
+    # object, and the 5000-digit-int case. The operator asked this endpoint
+    # for a plan and got up to `max_calls` live vLLM summarization calls that
+    # rewrote the state file and advanced the watermark.
+    #
+    # The fix distinguishes "no body was sent" (a real, common, and safe
+    # case — the documented live default applies) from "a body was sent and
+    # this endpoint could not read it" (which must never be silently treated
+    # as if the caller had said nothing): read the raw bytes first, and only
+    # a body that is empty (or all whitespace) collapses to {}. Anything
+    # else that fails to parse, or parses to something other than a JSON
+    # object, is a 400 — the same shape every other admin endpoint in this
+    # file already uses for a body it was actually given.
+    #
+    # Deliberately still `await request.json()` below, not a bare
+    # `json.loads(raw_body)`: Starlette caches the body on first read, so
+    # this re-reads the same bytes `request.body()` already fetched (no
+    # second I/O) — and test_surrogate_guard.py's structural check (every
+    # handler that calls `request.json()` must also call
+    # `_refuse_unpaired_surrogate`) finds this handler by that exact call,
+    # the same way it finds every sibling admin endpoint. Swapping in
+    # `json.loads` directly would silently drop this handler out of that
+    # audit's coverage — the AST detector has no way to know a differently-
+    # spelled parse call still needs the same guard.
+    raw_body = await request.body()
+    if raw_body.strip():
+        try:
+            body = await request.json()
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"body is present but could not be parsed as JSON "
+                    f"({type(e).__name__}: {e}); omit the body entirely for "
+                    f"the documented live default, or send a JSON object"
+                ),
+            )
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"body must be a JSON object, got {type(body).__name__}",
+            )
+    else:
+        body = {}  # truly absent body: the documented live default applies
     _refuse_unpaired_surrogate(body)
     # v3.1.9 (hostile pass 2, MEDIUM). `int(body.get("max_calls") or 200)`
     # used Python truthiness on the raw value, so an explicit
@@ -7465,9 +7731,24 @@ async def admin_compact(conv_id: str, request: Request):
     # ValueError uncaught, a 500 with no explanation for a caller-supplied
     # body that a 400 exists to handle everywhere else in this file.
     _raw_max_calls = body.get("max_calls", 200)
+    # v3.1.9 LOW (hostile pass 3, F3). Two more holes in the same int()
+    # conversion the comment above already tightened once:
+    #   - `bool` is a subclass of `int` in Python, so `int(True) == 1` ran
+    #     ONE live call for {"max_calls": true} instead of being refused like
+    #     every other non-integer shape. Checked explicitly, ahead of int().
+    #   - `1e999` / `Infinity` / `-Infinity` are values `json` happily parses
+    #     as `float`, and `int(float('inf'))` raises OverflowError, which the
+    #     old `except (TypeError, ValueError)` did not catch — an uncaught
+    #     500 with the fix's own comment claiming "non-integers are a 400".
+    #     `NaN` was already a 400: `int(float('nan'))` raises ValueError.
+    if isinstance(_raw_max_calls, bool):
+        raise HTTPException(
+            status_code=400,
+            detail=f"max_calls must be an integer, got {_raw_max_calls!r}",
+        )
     try:
         max_calls = 200 if _raw_max_calls is None else int(_raw_max_calls)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise HTTPException(
             status_code=400,
             detail=f"max_calls must be an integer, got {_raw_max_calls!r}",

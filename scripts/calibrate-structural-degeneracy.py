@@ -61,9 +61,46 @@ def say(m=""):
 
 # --------------------------------------------------------------------------
 # The rule. A stdlib COPY of the structural-collapse block in
-# reply_is_degenerate (compactor/main.py), kept here so the script has no
-# dependency on the service. The cross-check at the bottom of the report
-# proves the copy and the original agree on every reply in the backup.
+# reply_is_degenerate (compactor/main.py), kept here so the threshold SWEEP
+# below (which varies line_chars/sentence_chars/list_run/item_chars — values
+# reply_is_degenerate does not take as parameters, only as module constants)
+# has something to call. The cross-check at the bottom of the report proves
+# this copy and the original agree, AT THE SHIPPED DEFAULTS, on every reply
+# in the backup — that comparison is only meaningful if this stays a real,
+# independent reimplementation and not a thin wrapper around the import, so
+# resist the temptation to just call main.reply_is_degenerate here.
+#
+# v3.1.9 (hostile pass 3, F5) fixes FIVE drifts this finding named, so the
+# CROSS-CHECK's own report of mismatches means something again (before this,
+# it was comparing two rules that could legitimately disagree even when
+# neither had a bug):
+#
+#   1. ANY-LINE, not last-line-or-substantial-exempt. reply_is_degenerate
+#      only judges the reply's own last non-blank line UNCONDITIONALLY, and
+#      a non-last candidate line only when what follows it is short or is
+#      itself fragment-shaped (R25 / F5's own fix — see main.py's block
+#      comment above DEGENERATE_LINE_CHARS for the full reasoning). Ported
+#      below as the same two-pass shape: find last_nonblank_idx first, then
+#      apply the same trailing-content test main.py's loop does.
+#   2. A NAIVE ". " COUNT instead of _count_real_period_breaks, which
+#      excludes "Dr. ", "Mrs. ", "9 a.m. " etc. — imported from main.py
+#      directly when available (try_import_main), because unlike the four
+#      threshold constants below, this one takes no sweep parameter, so
+#      there is no reason to keep a second, lesser copy of it. Falls back to
+#      the naive count only when main.py cannot be imported at all (the
+#      genuinely stdlib-only path this script's docstring promises), with
+#      the resulting inaccuracy stated rather than hidden.
+#   3. best_run (the LONGEST run seen ANYWHERE) instead of the end-anchored
+#      `run` R9 fixed main.py to use — a run broken by later prose no longer
+#      counts. Fixed below by simply not tracking `best_run` at all.
+#   4. NO DEGENERATE_MIN_CHARS FLOOR on the list-run branch (R19) — added.
+#   5. AN EXTRA `breaks >= 2` CONJUNCT with no counterpart in main.py, and
+#      one that cannot fire anyway once `n >= line_chars` (>=1500 by
+#      default) and `sentence_chars` (40 by default) are both in play:
+#      `n / (breaks + 1) <= sentence_chars` already forces
+#      `breaks >= n / sentence_chars - 1`, which is >= 36 at the shipped
+#      defaults — `breaks >= 2` cannot be the binding constraint at any
+#      threshold combination this script's own sweep explores. Removed.
 # --------------------------------------------------------------------------
 def structural_collapse(
     text: str,
@@ -71,10 +108,36 @@ def structural_collapse(
     sentence_chars: int = LINE_SENTENCE_CHARS,
     list_run: int = LIST_RUN,
     item_chars: int = LIST_ITEM_CHARS,
+    min_chars: int = 300,
+    period_break_counter=None,
 ) -> str | None:
-    run = best_run = 0
+    def _breaks(line: str) -> int:
+        if period_break_counter is not None:
+            real = period_break_counter(line)
+        else:
+            # Fallback ONLY when main.py could not be imported at all (drift
+            # #2's residual case) — abbreviation-blind, same as before.
+            real = line.count(". ")
+        b = real + line.count("! ") + line.count("? ") + line.count("… ")
+        if b == 0:
+            b = line.count(", ")
+        return b
+
+    def _is_fragment(line: str, *, floor: int) -> bool:
+        n = len(line)
+        if n < floor or line.count(" ") < LINE_MIN_SPACES:
+            return False
+        return n / (_breaks(line) + 1) <= sentence_chars
+
+    lines = text.splitlines()
+    last_nonblank_idx = -1
+    for i, raw in enumerate(lines):
+        if raw.strip():
+            last_nonblank_idx = i
+
+    run = 0  # drift #3: end-anchored, not a running max
     in_fence = False
-    for raw in text.splitlines():
+    for line_idx, raw in enumerate(lines):
         line = raw.strip()
         if not line:
             continue
@@ -87,21 +150,23 @@ def structural_collapse(
             continue
         if len(line) <= item_chars and BULLET.match(line):
             run += 1
-            if run > best_run:
-                best_run = run
         else:
             run = 0
-        n = len(line)
-        if n >= line_chars and line.count(" ") >= LINE_MIN_SPACES:
-            breaks = (
-                line.count(". ") + line.count("! ") + line.count("? ")
-                + line.count("… ")
-            )
-            if breaks == 0:
-                breaks = line.count(", ")
-            if breaks >= 2 and n / (breaks + 1) <= sentence_chars:
+        if _is_fragment(line, floor=line_chars):
+            exempt = False
+            if line_idx != last_nonblank_idx:  # drift #1
+                trailing = [t.strip() for t in lines[line_idx + 1:] if t.strip()]
+                trailing_chars = sum(len(t) for t in trailing)
+                if trailing_chars >= min_chars:
+                    longest = max(trailing, key=len)
+                    # No length floor here (floor=0), matching main.py's
+                    # _line_is_fragment_shaped default: a SECOND runaway cut
+                    # short is exactly as diagnostic as a full one — see F5's
+                    # case D and main.py's own comment on this exact point.
+                    exempt = not _is_fragment(longest, floor=0)
+            if not exempt:
                 return "fragment-line"
-    if best_run >= list_run:
+    if len(text) >= min_chars and run >= list_run:  # drift #4
         return "list-run"
     return None
 
@@ -166,7 +231,11 @@ def rate(k: int, n: int) -> str:
 
 
 def try_import_main():
-    """The real detector, if this checkout (or the pod) can import it."""
+    """The real detector, if this checkout (or the pod) can import it. Also
+    returns the real period-break counter (main._count_real_period_breaks)
+    when available — see structural_collapse's docstring for why THAT one
+    piece is imported rather than approximated even in the local copy,
+    unlike the threshold-swept constants below."""
     os.environ.setdefault("MODEL_REPO", "")
     for cand in (HERE.parent / "compactor", Path("/app"), Path.cwd()):
         if (cand / "main.py").exists() and str(cand) not in sys.path:
@@ -174,12 +243,12 @@ def try_import_main():
     try:
         import main  # type: ignore
 
-        return main.reply_is_degenerate
+        return main.reply_is_degenerate, main._count_real_period_breaks
     except Exception:
-        return None
+        return None, None
 
 
-def report(db: Path, cut_line: int, real_detector) -> None:
+def report(db: Path, cut_line: int, real_detector, period_break_counter=None) -> None:
     replies = load_replies(db)
     rows = []
     for m in replies:
@@ -187,7 +256,7 @@ def report(db: Path, cut_line: int, real_detector) -> None:
         f = features(text)
         f["day"] = _mrh.day_of(m["timestamp"])
         f["cut"] = f["last_line"] > cut_line
-        f["rule"] = structural_collapse(text)
+        f["rule"] = structural_collapse(text, period_break_counter=period_break_counter)
         f["existing"] = None
         if real_detector is not None:
             f["real"] = real_detector(text)
@@ -252,8 +321,10 @@ def report(db: Path, cut_line: int, real_detector) -> None:
     texts_done = [m["content"] for m, r in zip(replies, rows) if not r["cut"]]
 
     def sweep(label, **kw):
-        fp_n = sum(1 for t in texts_done if structural_collapse(t, **kw))
-        tp_n = sum(1 for t in texts_cut if structural_collapse(t, **kw))
+        fp_n = sum(1 for t in texts_done
+                   if structural_collapse(t, period_break_counter=period_break_counter, **kw))
+        tp_n = sum(1 for t in texts_cut
+                   if structural_collapse(t, period_break_counter=period_break_counter, **kw))
         say(f"  {label:<34} FP {rate(fp_n, len(texts_done))}   TP {rate(tp_n, len(texts_cut))}")
 
     for v in (1000, 1200, 1500, 2000, 2500):
@@ -332,12 +403,29 @@ def main() -> int:
     args = ap.parse_args()
     LINE_CHARS, LINE_SENTENCE_CHARS = args.line_chars, args.sentence_chars
     LIST_RUN, LIST_ITEM_CHARS = args.list_run, args.item_chars
+    real, period_break_counter = try_import_main()
+    # v3.1.9 (hostile pass 3, F5): DEGENERATE_MIN_CHARS drift #4's fix reads
+    # the real constant when main.py is importable, the local stdlib default
+    # otherwise — same doctrine as period_break_counter above.
+    min_chars = 300
+    if real is not None:
+        try:
+            import main  # already on sys.path from try_import_main
+            min_chars = main.DEGENERATE_MIN_CHARS
+        except Exception:
+            pass
+    # __defaults__ reassignment must cover EVERY parameter that has a
+    # default, in signature order, or it silently misaligns later ones —
+    # structural_collapse's signature is
+    # (text, line_chars, sentence_chars, list_run, item_chars, min_chars,
+    #  period_break_counter), so all six trailing defaults are set here,
+    # not just the four CLI-swept ones.
     structural_collapse.__defaults__ = (
-        LINE_CHARS, LINE_SENTENCE_CHARS, LIST_RUN, LIST_ITEM_CHARS
+        LINE_CHARS, LINE_SENTENCE_CHARS, LIST_RUN, LIST_ITEM_CHARS,
+        min_chars, period_break_counter,
     )
-    real = try_import_main()
     for t in args.targets:
-        report(find_db(Path(t)), args.cut_line, real)
+        report(find_db(Path(t)), args.cut_line, real, period_break_counter)
     return 0
 
 
