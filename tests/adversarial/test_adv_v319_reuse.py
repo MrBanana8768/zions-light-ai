@@ -362,4 +362,11 @@ if FAILED:
     for f in FAILED:
         print(f"  - {f}")
 print("=" * 74)
-sys.exit(0)
+# BROKEN is the point of this script and does not affect the exit code — a
+# demonstration that reproduces a break did its job. FAILED is different: it
+# means the HARNESS itself could not stand up the scenario it needed (a
+# self-check, not an attack outcome), so the demonstration below it did not
+# run and its silence proves nothing. Exiting 0 regardless used to let a
+# broken harness look identical to "nothing to report" to anything reading
+# this script's exit code.
+sys.exit(1 if FAILED else 0)

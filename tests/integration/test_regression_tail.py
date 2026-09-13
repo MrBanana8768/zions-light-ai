@@ -251,21 +251,41 @@ def _settle() -> None:
     poll for — so it gets a flat wait, and a generous one. The tail is three
     jobs deep (episodic embed, extraction, rollup) and this suite's whole
     point is being right rather than quick.
+
+    max(H.TAIL_WAIT, 60), NOT a bare H.wait_for_async_tail(). TAIL_WAIT is
+    ZIONS_TEST_TAIL_WAIT, which the `model` profile sets to 240 but the
+    DEFAULT `integration-tests` service in docker-compose.integration.yml
+    never sets — so on every default-profile run this was a flat 8 SECONDS
+    for a three-job tail, on four call sites that guard a NEGATIVE assertion
+    (nothing landed). It was green only because the weightless fixture
+    answers in microseconds and the tail is usually done well inside 8s; it
+    was a wrong-reason pass waiting for the first slow run. 60s keeps the
+    fast profile fast enough while no longer being shorter than the tail
+    itself is documented to be; the `model` profile's 240 already clears it.
     """
-    H.wait_for_async_tail()
+    H.wait_for_async_tail(seconds=max(H.TAIL_WAIT, 60.0))
 
 
 def _stream_and_abort(conv_id: str, prompt: str) -> int:
     """Open a streaming completion and hang up WITHOUT reading a single byte
     of the body. Returns the HTTP status of the response headers.
 
-    Why this reliably interrupts the compactor mid-stream rather than racing
+    Why this USUALLY interrupts the compactor mid-stream rather than racing
     it: StreamingResponse commits its headers BEFORE the generator produces
     anything, and the generator's first chunk cannot exist until the
-    compactor's own request to vLLM has come back. So the client is holding
-    the headers, and closing, strictly before there is any reply text to
-    accumulate. Measured 3/3 on this stack; the ordering is structural, not
-    lucky.
+    compactor's own request to vLLM has come back. So the client is normally
+    holding the headers, and closing, before there is any reply text to
+    accumulate.
+
+    THIS IS NOT A GUARANTEE, and a docstring here once called it "structural,
+    not lucky" on the strength of 3/3 on an idle machine. That claim covers
+    only the header-commit half; the other half is the CLIENT's own
+    socket-close scheduling, which this function does not control, and one
+    measured run under load lost the race (`resp.close()` landed after the
+    first chunk arrived). Callers that depend on the abort beating the first
+    chunk must not assume it from this function's name — see
+    test_r26_interrupted_stream_still_produces_a_counted_named_decision for
+    the shape of a caller that accounts for both outcomes.
 
     _harness.chat() is non-streaming, so this is raw httpx against
     H.BASE_URL — the harness README's own instruction for streaming cases.
@@ -624,21 +644,51 @@ def test_r26_interrupted_stream_still_produces_a_counted_named_decision():
             f"before stored={before['stored']} skipped={before['skipped']}\n"
             f"after  stored={after['stored']} skipped={after['skipped']}"
         )
-        # And it was NAMED. Aborting before the first body byte means the
-        # accumulator holds nothing, so the honest label is skipped_empty —
-        # the one outcome tailhealth treats as lossless.
-        assert _outcome(after, "skipped_empty") > _outcome(before, "skipped_empty"), (
-            "the interrupted stream was counted but not under skipped_empty; "
-            f"outcome deltas: "
-            f"{ {k: v - before['outcomes'].get(k, 0) for k, v in after['outcomes'].items() if v != before['outcomes'].get(k, 0)} }"
+        # And it was NAMED — but WHICH label wins is a race, not a guarantee,
+        # and that used to be asserted as if it were structural.
+        # _stream_and_abort's docstring argued the client's close always
+        # lands before the compactor's first chunk because StreamingResponse
+        # commits its headers first; that covers the header commit but not
+        # the socket-close scheduling on the client's own side, and on one
+        # measured run the close lost the race: the outcome came back
+        # 'stored', not 'skipped_empty', because the accumulator already held
+        # the first chunk. A bare `skipped_empty > before` then fails and
+        # reads as an R26 regression when the actual cause is the harness
+        # losing a timing race it does not control.
+        #
+        # The R26 claim itself (a decision was made at all — the assertion
+        # above) is race-free and is not weakened by any of this. What is
+        # race-dependent is only WHICH label fired, so accept either winner
+        # and require it to agree with what the store actually holds — that
+        # agreement is the property worth pinning; a specific label winning a
+        # client-side timing race is not.
+        stored_delta = _outcome(after, "stored") - _outcome(before, "stored")
+        skipped_empty_delta = (
+            _outcome(after, "skipped_empty") - _outcome(before, "skipped_empty")
         )
-
-        # Per-conv, so concurrent traffic cannot mask it: there was no reply
-        # text, so nothing may have been written.
         state = _conv(conv_id)
-        assert state == {"facts": 0, "episodic": 0, "turns_seen": 0}, (
-            f"an aborted stream with no reply text wrote to the store: {state!r}"
-        )
+        if skipped_empty_delta > 0:
+            # The close won the race, as documented: nothing may have been
+            # written, since there was no reply text to write.
+            assert state == {"facts": 0, "episodic": 0, "turns_seen": 0}, (
+                f"an aborted stream labelled skipped_empty wrote to the "
+                f"store anyway: {state!r}"
+            )
+        elif stored_delta > 0:
+            # The close lost the race: the first chunk landed before the
+            # abort reached the server, so the honest label is 'stored', and
+            # the store must show the exchange really arrived.
+            assert state["episodic"] >= 1, (
+                f"the interrupted stream was labelled 'stored' but nothing "
+                f"reached the store: {state!r} — that combination is not a "
+                f"race, it is R26 with a different outcome name"
+            )
+        else:
+            raise AssertionError(
+                "the interrupted stream was counted (a decision fired) but "
+                "under neither 'skipped_empty' nor 'stored'; outcome deltas: "
+                f"{ {k: v - before['outcomes'].get(k, 0) for k, v in after['outcomes'].items() if v != before['outcomes'].get(k, 0)} }"
+            )
     finally:
         H.admin_safe_forget(conv_id)
 
@@ -686,7 +736,13 @@ def test_r27_a_harmless_skip_does_not_arm_the_degrade_flag():
 
         assert _outcome(after, "skipped_empty") > _outcome(before, "skipped_empty"), (
             "the setup did not actually produce a harmless skip, so the rest "
-            "of this test would be asserting nothing"
+            "of this test would be asserting nothing. NOTE: _stream_and_abort "
+            "is not guaranteed to beat the first chunk (see its docstring) — "
+            "if the outcome delta below shows 'stored' instead, the client "
+            "lost that race rather than R27 being broken; rerun to confirm "
+            "before treating this as a regression.\n"
+            f"outcome deltas: "
+            f"{ {k: v - before['outcomes'].get(k, 0) for k, v in after['outcomes'].items() if v != before['outcomes'].get(k, 0)} }"
         )
         # It really was harmless: nothing was lost, because nothing existed.
         assert _conv(conv_id) == {"facts": 0, "episodic": 0, "turns_seen": 0}

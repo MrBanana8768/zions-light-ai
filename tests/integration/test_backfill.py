@@ -70,7 +70,8 @@ def _facts_text(facts: list[dict]) -> str:
     return " ".join(str(f.get("text", "")) for f in facts).lower()
 
 
-def _settle(conv_id: str, *, quiet_for: float = 25.0, ceiling: float = 240.0) -> int:
+def _settle(conv_id: str, *, quiet_for: float = 25.0, ceiling: float = 240.0,
+            floor: float = 90.0) -> int:
     """Block until the fact count stops changing, and return it.
 
     NOT wait_for_facts(min_count=1). That returns on the FIRST fact to appear,
@@ -83,15 +84,31 @@ def _settle(conv_id: str, *, quiet_for: float = 25.0, ceiling: float = 240.0) ->
     'Stopped changing' is the only end-of-backfill signal available from out
     here: the facts/<id>.backfill.json sidecar lives inside the compactor's
     container and no admin endpoint exposes its state.
+
+    FLOOR, and why it exists. The quiet clock starts on the FIRST poll, before
+    anything the caller's trigger request set in motion has had a chance to
+    write anything. For the callers that assert a NEGATIVE ("nothing from the
+    history reached the store"), that made this function return in
+    quiet_for-ish seconds (~25-30s) whenever the count happened to be stable
+    on the first two polls — which is indistinguishable from "the backfill
+    correctly refused" and was giving those assertions roughly a third of the
+    90s flat sleep they replaced. `floor` makes _settle wait at LEAST as long
+    as that flat sleep before it is allowed to return on quiescence alone, so
+    an early "unchanged" reading can no longer stand in for "nothing is going
+    to happen". It does not slow the common (quick) case by much: `quiet_for`
+    still governs once `floor` has elapsed, and `floor` (90s) is below
+    `ceiling` (240s) so a genuinely slow backfill is still seen.
     """
-    deadline = time.time() + ceiling
+    t0 = time.time()
+    deadline = t0 + ceiling
     last = -1
     unchanged_since = 0.0
     while time.time() < deadline:
         n = len(H.admin_get_facts(conv_id))
         if n != last:
             last, unchanged_since = n, time.time()
-        elif time.time() - unchanged_since >= quiet_for:
+        elif (time.time() - unchanged_since >= quiet_for
+              and time.time() - t0 >= floor):
             return n
         time.sleep(5.0)
     return len(H.admin_get_facts(conv_id))
@@ -182,11 +199,13 @@ def _plant_then_send_history(conv_id: str) -> tuple[set[str], list[dict]]:
     # had not reached the store YET", which is the same assertion passing for
     # a completely different reason, on the slow CPU profile where the
     # difference is most likely. _settle waits until the fact count stops
-    # moving: it comes back in about 30s when nothing is happening (the
-    # refusal, and the common case), and keeps waiting for as long as anything
-    # is still saving. It is also FASTER than the 90s it replaces in the
-    # ordinary case, which matters — two 240s sleeps in one suite is what
-    # pushed the first real-weights run past its budget and got it SIGKILLed.
+    # moving AND at least `floor` (90s, matching the flat sleep it replaces)
+    # has passed since the trigger — the floor exists because the quiet clock
+    # starts on the FIRST poll, before anything the trigger set in motion has
+    # had a chance to write, so quiescence alone was returning in ~25-30s and
+    # a fast, wrongly-stable read was standing in for "nothing will happen".
+    # It still keeps waiting past the floor for as long as anything is still
+    # saving, and is no slower than the 90s it replaces in the ordinary case.
     #
     # BOUND, stated because it is the one way these can still go green for the
     # wrong reason: _settle gives up at its 240s ceiling, so a backfill slower
@@ -320,6 +339,18 @@ def test_backfill_does_not_duplicate_on_repeat_requests(conv_id):
         for f in H.admin_get_facts(conv_id)
     ]
     texts = [t for t in texts if t]
+    # LOAD-BEARING PRECONDITION. Without it, a backfill that never ran at all
+    # — maybe_start_backfill silently returning, extraction failing,
+    # needs_backfill inverted — leaves texts == [], dupes == [], and this
+    # test PASSES while reporting nothing about duplication. Every other test
+    # in this file states its precondition explicitly (see [1] and F3 above);
+    # this one is the one place that "does not duplicate" and "produced
+    # nothing" were indistinguishable.
+    assert texts, (
+        "the backfill produced no facts at all across two requests carrying "
+        "history; this test cannot observe duplication when there is nothing "
+        "to duplicate"
+    )
     dupes = sorted({t for t in texts if texts.count(t) > 1})
     assert not dupes, (
         f"the same fact text is stored more than once after a second request "

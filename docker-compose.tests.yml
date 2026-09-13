@@ -31,7 +31,17 @@ services:
     build:
       context: .
       dockerfile: testfixtures/unit-suite/Dockerfile
-    container_name: zla-unit-tests
+    # NO container_name. A fixed name collides across two concurrent `run
+    # --rm` invocations (different `-p` projects, or two agents on one
+    # machine), so the documented cleanup for a stuck run had to be a
+    # wildcard `docker rm -f` filter — which matches ANY project's
+    # in-flight container whose compose-generated name happens to contain
+    # the filter substring, killing a neighbour's run instead of this one's
+    # (measured: exit 137, SIGKILL, with no summary line — see
+    # hostile2-apparatus.md). Nothing reaches this service by a fixed name:
+    # it publishes no port and nothing else depends_on it, so compose's own
+    # per-project generated name is enough, and `-p <project>` now actually
+    # isolates concurrent runs the way it is supposed to.
     volumes:
       # Read-only, and copied to a scratch tree inside the container before
       # anything runs. The suites create state directories, sqlite files and

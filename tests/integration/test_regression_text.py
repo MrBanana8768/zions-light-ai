@@ -157,6 +157,18 @@ class adversarial_replies:
     decoration assertion into an assertion about the canned one-liner, which
     contains no decoration and would therefore pass having tested nothing.
     That is the exact failure this project has been bitten by twice.
+
+    ALL THREE keys __enter__ sets (reply_chars, reply_seq, reply_looping),
+    not two. __exit__ used to restore only reply_chars/reply_seq, so the
+    ONE looping=False use in this file (deliberately last, so it was masked
+    by being the last write before another suite's container) left
+    reply_looping=False on the shared fixture for the life of the process —
+    every later consumer of zla-integration-fixture would silently inherit
+    non-cycling padding instead of the fixture's own default. The entry
+    verification had the same asymmetry: box_chars(self.raw) proves
+    reply_chars took, but nothing proved reply_looping took, so a stale
+    fixture image whose set_mode whitelist silently drops an unrecognised
+    key would pass this check having set nothing.
     """
 
     def __init__(self, reply_chars: int, reply_seq: int,
@@ -176,21 +188,35 @@ class adversarial_replies:
         fixture_mode_set(reply_chars=self.reply_chars, reply_seq=self.reply_seq,
                          reply_looping=self.looping)
         self.raw = fixture_reply_text(self.reply_chars, self.reply_seq)
-        if not box_chars(self.raw):
+        # Verify BOTH halves of what __enter__ just set: box_chars proves
+        # reply_chars took (the reply is actually decorated); the mode
+        # readback proves reply_looping took too — that half has no
+        # observable effect on this one probe reply, so it cannot be
+        # inferred from self.raw the way reply_chars can.
+        now = fixture_mode_get()
+        looping_took = bool(now.get("reply_looping", True)) == self.looping
+        if not box_chars(self.raw) or not looping_took:
             self.__exit__(None, None, None)
             pytest.fail(
-                "the fixture is not producing decorated replies "
-                f"(reply_chars={self.reply_chars}, got {len(self.raw)} chars "
-                f"with no box-drawing characters). Everything downstream of "
-                f"this would assert nothing. Mode now: {fixture_mode_get()}"
+                "the fixture mode did not take as asked "
+                f"(reply_chars={self.reply_chars} -> got {len(self.raw)} chars "
+                f"with {len(box_chars(self.raw))} box-drawing char(s); "
+                f"reply_looping={self.looping} -> fixture reports "
+                f"{now.get('reply_looping')!r}). Everything downstream of "
+                f"this would assert nothing, or assert it against the wrong "
+                f"mode. Mode now: {now}"
             )
         return self
 
     def __exit__(self, *exc) -> None:
         # Restore rather than zero: another agent may have had a mode set.
+        # All THREE keys __enter__ can change, not two — see the class
+        # docstring for what an unrestored reply_looping does to every later
+        # consumer of this shared fixture container.
         fixture_mode_set(
             reply_chars=int(self._before.get("reply_chars") or 0),
             reply_seq=int(self._before.get("reply_seq") or 0),
+            reply_looping=bool(self._before.get("reply_looping", True)),
         )
 
 

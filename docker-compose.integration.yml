@@ -73,7 +73,12 @@ services:
     build:
       context: ./testfixtures/tokenizer-contract
       dockerfile: Dockerfile
-    container_name: zla-integration-fixture
+    # NO container_name — see the note on the same change in
+    # docker-compose.tests.yml. compactor reaches this by the compose
+    # SERVICE name (VLLM_URL: http://vllm-fixture:8000 below), never by a
+    # fixed container name, so dropping it changes nothing about how the
+    # stack wires together and lets `-p <project>` actually isolate two
+    # concurrent runs of this file instead of colliding on a fixed name.
     environment:
       FIXTURE_TOKENIZER: HuggingFaceTB/SmolLM2-135M-Instruct
       FIXTURE_SERVED_MODEL_NAME: fixture-model
@@ -97,7 +102,11 @@ services:
     build:
       context: .
       dockerfile: testfixtures/unit-suite/Dockerfile
-    container_name: zla-integration-compactor
+    # NO container_name — see the note on vllm-fixture above.
+    # integration-tests reaches this via network_mode: "service:compactor",
+    # not by container name, and the file's own top-of-file commands
+    # already address it by SERVICE name (`up -d --force-recreate
+    # compactor`), so nothing here depended on the fixed name.
     depends_on:
       vllm-fixture:
         condition: service_healthy
@@ -175,7 +184,8 @@ services:
     build:
       context: ./testfixtures/tokenizer-contract
       dockerfile: Dockerfile.model
-    container_name: zla-integration-model-fixture
+    # NO container_name — same reasoning as vllm-fixture above;
+    # compactor-model reaches this by the service name model-fixture.
     environment:
       FIXTURE_MAX_MODEL_LEN: "32768"
       FIXTURE_ERROR_STYLE: v010
@@ -195,7 +205,9 @@ services:
     build:
       context: .
       dockerfile: testfixtures/unit-suite/Dockerfile
-    container_name: zla-integration-compactor-model
+    # NO container_name — same reasoning as compactor above;
+    # integration-tests-model reaches this via
+    # network_mode: "service:compactor-model".
     depends_on:
       model-fixture:
         condition: service_healthy
@@ -248,7 +260,10 @@ services:
     build:
       context: ./tests/integration
       dockerfile: Dockerfile
-    container_name: zla-integration-tests-model
+    # NO container_name — see the note on unit-tests in
+    # docker-compose.tests.yml for why a fixed name on a `run --rm`
+    # test-runner service is actively harmful under concurrency (a wildcard
+    # cleanup filter matches it and kills a neighbour's in-flight run).
     depends_on:
       compactor-model:
         condition: service_healthy
@@ -283,7 +298,7 @@ services:
     build:
       context: ./tests/integration
       dockerfile: Dockerfile
-    container_name: zla-integration-tests
+    # NO container_name — see the note on the model-profile sibling above.
     depends_on:
       compactor:
         condition: service_healthy
