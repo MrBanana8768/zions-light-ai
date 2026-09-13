@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -212,6 +214,14 @@ def gather_memory_stats() -> dict:
     # already opens every state file, so the number costs nothing extra.
     worst_lag = 0
     worst_lag_conv = None
+    # v3.1.9 (hostile pass 2, H-1). What every readable state file says about
+    # how far its hierarchy has got - the same fields maybe_rollup compares to
+    # decide whether to write at all. hierarchy_lag cannot see a rollup that
+    # never runs (both of its numbers are written BY the rollup), so
+    # gather_health_full compares THIS, poll to poll, against the memory
+    # tail's decision count, which moves on every turn whether or not the
+    # rollup ran. See _hierarchy_progress.
+    progress: list[tuple] = []
     for cid in conv_ids:
         try:
             facts_total += len(facts.load_facts(cid))
@@ -248,6 +258,12 @@ def gather_memory_stats() -> dict:
                 _lag = _seen - _done
                 if _lag > worst_lag:
                     worst_lag, worst_lag_conv = _lag, cid
+            progress.append((
+                cid, _seen, _done, tuple(state.get("tail_fp") or ()),
+                state.get("head_fp"), state.get("window_turns"),
+                len(state.get("l1") or ()), len(state.get("l2") or ()),
+                state.get("l3") is not None,
+            ))
         except Exception as e:
             unreadable["summaries"] += 1
             if logsetup.log_once("health.stats.summaries"):
@@ -271,12 +287,22 @@ def gather_memory_stats() -> dict:
         "hierarchy_lag": worst_lag,
         "hierarchy_lag_conv": worst_lag_conv,
         "unreadable": unreadable,
+        # Private (leading underscore): an opaque in-process hash, compared
+        # for equality only and popped by gather_health_full before the
+        # payload is returned. It is a hash rather than the tuples because
+        # tail_fp is up to _ANCHOR_TURNS digests per conversation. Sorted by
+        # conv_id so a directory listing that comes back in a different order
+        # is not mistaken for progress.
+        "_hierarchy_fingerprint": hash(tuple(sorted(progress, key=lambda t: t[0]))),
     }
 
 
 # ---------------------------------------------------------------------------
 # Aggregated report
 # ---------------------------------------------------------------------------
+
+_CLOCK_TOLERANCE_S = 1.0
+
 
 def probe_snapshot() -> dict:
     """Is the durable copy of webui.db still being written?
@@ -298,9 +324,37 @@ def probe_snapshot() -> dict:
     """
     enabled = os.environ.get("WEBUIDB_SYNC_ENABLED", "").strip().lower() == "true"
     snap = os.environ.get("WEBUI_SNAPSHOT_DB", "/data/openwebui/webui.db")
+    # RANGED HERE, because envcfg does not range anything (its own docstring
+    # says so) and this value is arithmetic, not a label (v3.1.9, hostile pass
+    # 2 H-4). Measured before this: `inf` - reachable from a typo, `1e400`
+    # parses to it - made `round(interval)` raise OverflowError, `nan` raised
+    # ValueError, neither is an OSError, so the whole probe died into
+    # _gather_blocking's catch-all as {"stale": False} and /health/full said
+    # "ok" with the durability probe dead. `0` and `-1` failed the other way:
+    # a threshold of 0 or -3 made a snapshot written one second ago stale,
+    # permanently.
+    #
+    # The default rather than a refusal, with the bad value reported: the
+    # daemon reads the SAME variable, and what it does with it is what the
+    # age will show. `inf` never republishes, so the snapshot ages and the
+    # stale reason below fires on the default threshold, which is the true
+    # report; `0` republishes continuously, so the snapshot is fresh and
+    # nothing here should claim otherwise. Clamping to the default is what
+    # tailhealth._window_s and bgwork._window_s already do, for the same
+    # reason. Not a status reason on its own: the harm, when there is any, is
+    # a stale snapshot, and that already is one.
     interval = env_float("WEBUI_DB_SYNC_INTERVAL_S", 300.0)
+    interval_error = None
+    if not (math.isfinite(interval) and interval > 0):
+        interval_error = (
+            f"WEBUI_DB_SYNC_INTERVAL_S={os.environ.get('WEBUI_DB_SYNC_INTERVAL_S')!r} "
+            f"is not a positive finite number of seconds; judging staleness "
+            f"against the 300 s default"
+        )
+        interval = 300.0
     out: dict[str, Any] = {
         "watched": enabled, "path": snap, "interval_s": round(interval),
+        "interval_error": interval_error,
         "age_s": None, "stale": False, "error": None,
     }
     if not enabled:
@@ -315,6 +369,25 @@ def probe_snapshot() -> dict:
         out["stale"] = True
         return out
     out["age_s"] = round(age)
+    # A SNAPSHOT FROM THE FUTURE IS NOT FRESH (v3.1.9, webuidb hostile pass 2).
+    # webuidb stamps the snapshot with the LOCAL database's mtime and skips
+    # every cycle while the snapshot's mtime is >= the local one. So a
+    # snapshot stamped ahead of real time - a fast pod clock stepped back by
+    # NTP, and copy2 carries the poisoned stamp to every later pod - freezes
+    # the durable copy with no error and no log line, until wall-clock time
+    # catches up. `age > 3 * interval` read the negative age as the freshest
+    # snapshot possible: measured age_s=-3600, stale=False, status "ok".
+    #
+    # _CLOCK_TOLERANCE_S absorbs timestamp rounding only (a filesystem that
+    # stores whole seconds can round a just-written stamp up by under one);
+    # it is not a window for a clock that is actually wrong.
+    if age < -_CLOCK_TOLERANCE_S:
+        out["stale"] = True
+        out["future_s"] = round(-age)
+        out["error"] = (
+            f"clock: the snapshot's mtime is {round(-age)}s in the future"
+        )
+        return out
     out["stale"] = age > 3 * interval
     return out
 
@@ -388,6 +461,143 @@ def _gather_blocking() -> dict:
             "snapshot": snapshot}
 
 
+# ---------------------------------------------------------------------------
+# Is the summary hierarchy advancing at all? (v3.1.9, hostile pass 2 H-1)
+# ---------------------------------------------------------------------------
+
+# Rollup-eligible memory-tail decisions that may pass with NO summary state
+# changing anywhere before the pod reads degraded.
+#
+# WHY hierarchy_lag COULD NOT DO THIS. It is turns_seen - last_summarized_turn,
+# and both numbers are written by summarizer.maybe_rollup. Every way the
+# rollup can do nothing BEFORE maybe_rollup - the master switch, the degrade
+# guard, the gate's raw_chars and history conjuncts, a pool that shed it - and
+# every way its state write can fail after it (a full disk, a permission
+# change, the lone-surrogate C2 case), freezes both numbers, and a frozen pair
+# reads as lag 0: caught up. Measured: 25 real turns with every state write
+# failing, hierarchy_lag 0, status "ok".
+#
+# WHAT MOVES REGARDLESS. tailhealth counts every decision on the request path,
+# rollup or no rollup. On a healthy pod every accepted turn changes its
+# conversation's state file within one tail (maybe_rollup writes whenever the
+# position, the anchor or the window signature moved, which a new turn and a
+# regenerated reply both do), so "N decisions and nothing on disk changed" is
+# a hierarchy that has stopped - whatever stopped it. No main.py change is
+# needed: both halves are already observable from here.
+#
+# WHY 20. It is the existing lag reason's own tolerance, two L1 chunks of 20
+# turns = 40 turns = 20 exchanges, restated in exchanges. It is fixed rather
+# than derived from COMPACTOR_L1_CHUNK_SIZE because this signal is not about
+# chunks - a healthy pod writes state every turn - and because deriving it
+# from that unranged knob is H-7's defect. The decisions that legitimately
+# write nothing (a regenerate of a byte-identical window, a lossy skip on a
+# conversation with no history, a tail still in the queue when the poll
+# lands) do not come twenty in a row with no ordinary turn between them.
+#
+# HARMLESS_SKIP_OUTCOMES are not counted, for the same reason the gate
+# declines them: task traffic and empty replies never roll up, on a healthy
+# pod or a broken one. A run of empties is tailhealth.EMPTY_RUN_DEGRADE's
+# job, and counting them here too would report one outage twice.
+HIERARCHY_STALL_DECISIONS = 20
+
+# In-process, compared poll to poll. Written only from gather_health_full on
+# the event loop thread, with no await inside _hierarchy_progress, so two
+# concurrent /health/full calls cannot interleave inside it.
+_progress: dict[str, Any] = {"fingerprint": None, "eligible": 0}
+
+
+def _reset_hierarchy_progress_for_tests() -> None:
+    _progress["fingerprint"] = None
+    _progress["eligible"] = 0
+
+
+def _hierarchy_progress(fingerprint: Any, mt: dict) -> dict:
+    """checks.hierarchy: is the switch on, and how many rollup-eligible
+    decisions have passed since the summary state last changed.
+
+    POLL-RELATIVE, which is its one limit and is stated here rather than
+    discovered: the count starts at the first poll this process answers, and
+    progress is attributed to the poll that first sees it. The Docker
+    HEALTHCHECK polls every 30 s (Dockerfile), so the error is at most one
+    poll's worth of turns, and it errs toward quiet. A pod nobody polls
+    reports nothing until it has been polled twice.
+
+    SCOPE, also stated: this is a store-wide heartbeat. A rollup frozen on
+    ONE conversation while another conversation advances is masked - that
+    is what hierarchy_lag's per-conversation scan is for when maybe_rollup
+    runs. The failures this exists for (the switch, the gate, a write path
+    that is failing) are not per-conversation.
+    """
+    out: dict[str, Any] = {
+        "enabled": summarizer.enabled(),
+        "decisions_since_progress": None,
+        "limit": HIERARCHY_STALL_DECISIONS,
+        "stalled": False,
+    }
+    outcomes = mt.get("outcomes") if not mt.get("error") else None
+    if fingerprint is None or not isinstance(outcomes, dict):
+        # Either half unreadable: None ("not measured"), never 0 ("measured,
+        # fine"). A tail counter that raised has no outcomes at all, and the
+        # sum below would raise out of the endpoint. Both halves already carry
+        # their own "unobservable"/"unreadable" reasons.
+        return out
+    import tailhealth  # mt came from it, so it is importable
+    eligible = sum(
+        v for k, v in outcomes.items()
+        if k not in tailhealth.HARMLESS_SKIP_OUTCOMES and isinstance(v, int)
+    )
+    # A changed fingerprint is progress. A count that went DOWN is a counter
+    # that was reset (a restart cannot reach here, a test reset can), and
+    # measuring against the old base would read as negative.
+    if fingerprint != _progress["fingerprint"] or eligible < _progress["eligible"]:
+        _progress["fingerprint"] = fingerprint
+        _progress["eligible"] = eligible
+    since = eligible - _progress["eligible"]
+    out["decisions_since_progress"] = since
+    # Only while the switch is ON. A hierarchy switched off on purpose is not
+    # stalled, and reporting it as one is the always-on warning this module
+    # has already had to remove twice (see the COMPACTOR_HIERARCHICAL_SUMMARY
+    # note in gather_health_full).
+    out["stalled"] = bool(out["enabled"]) and since >= HIERARCHY_STALL_DECISIONS
+    return out
+
+
+def _tokenizer_state() -> dict:
+    """checks.tokenizer: main.tokenizer_state(), or why it cannot be read.
+
+    CONTRACT (the v3.1.9 config lane): main.tokenizer_state() -> {"loaded":
+    bool, "last_error": str | None, "failed_at": float | None,
+    "next_retry_at": float | None}, read-only and cheap.
+
+    HOW main IS REACHED. `import health` runs at main.py module scope, so a
+    module-scope `import main` here is a circular import. A call-time
+    `import main` would be safe INSIDE the app, where uvicorn has already
+    finished importing it - but in any other process that imports health
+    without the app, it would boot the whole compactor (logging config,
+    FastAPI app, every module main imports) as a side effect of a health
+    probe. sys.modules is the same object in the app and nothing at all
+    elsewhere, so it is read from there: this function never causes an
+    import.
+    """
+    main_mod = sys.modules.get("main")
+    if main_mod is None:
+        return {"available": False,
+                "reason": "main is not loaded in this process"}
+    fn = getattr(main_mod, "tokenizer_state", None)
+    if not callable(fn):
+        return {"available": False,
+                "reason": "main.tokenizer_state() is not present in this build"}
+    try:
+        st = fn()
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        return {"available": False, "reason": err, "error": err}
+    if not isinstance(st, dict):
+        err = f"main.tokenizer_state() returned {type(st).__name__}, not a dict"
+        return {"available": False, "reason": err, "error": err}
+    return {"available": True, **st}
+
+
 async def gather_health_full(
     vllm_url: str, target_tokens: int, tokenize: dict | None = None
 ) -> dict:
@@ -444,6 +654,15 @@ async def gather_health_full(
     except Exception as e:
         mt = {"error": f"{type(e).__name__}: {e}"}
 
+    # v3.1.9 (H-1). After the tail snapshot, never before it: the decisions
+    # are then counted no earlier than the scan that looked at the disk, so a
+    # write still in flight errs toward an undercount (quiet) and never
+    # toward a stall that did not happen. Popped so the opaque hash never
+    # reaches the payload.
+    hierarchy = _hierarchy_progress(stats.pop("_hierarchy_fingerprint", None), mt)
+    # Pure in-memory read of main's own state; see _tokenizer_state.
+    tokenizer = _tokenizer_state()
+
     # Why a reason list and not a bare string: `bg` used to be computed here,
     # placed in the payload, and never read. Sustained shedding — the pool
     # dropping fact extraction, episodic indexing and summary rollups because
@@ -496,6 +715,25 @@ async def gather_health_full(
                 f"recent {mt.get('seconds_since_last_skip')}s ago, last "
                 f"outcome {mt.get('last_skip_outcome')}). New memory is not "
                 f"being written for the turns that were skipped."
+            )
+        # v3.1.9 (H-2). Not an elif: a run of empty replies and a recent lossy
+        # skip are different faults and both can be true. skipped_recently is
+        # blind to this by design (SKIPPED_EMPTY is harmless ONE at a time,
+        # R27), /v1/models keeps answering while the backend generates
+        # nothing, and the rollup gate declines raw_chars == 0 - so before this
+        # a backend returning empty content read "ok" on every surface.
+        if mt.get("empty_replies_degraded"):
+            reasons.append(
+                f"the backend has returned no text for "
+                f"{mt.get('consecutive_empty_replies')} consecutive replies "
+                f"(limit {mt.get('empty_run_limit')}; most recent "
+                f"{mt.get('seconds_since_last_skip')}s ago). An empty 200, a "
+                f"rejected request and a Stop before the first token all look "
+                f"like this; that many in a row, with nothing in between that "
+                f"carried text, is not a person pressing Stop. Nothing from "
+                f"those turns reached memory. vLLM answering /v1/models (the "
+                f"vllm check) does not mean it is generating - send it one "
+                f"completion by hand."
             )
         # The counter the budget is computed from. When /tokenize is
         # unreachable the compactor keeps serving on a local estimate that has
@@ -569,6 +807,58 @@ async def gather_health_full(
                 f"grows. POST /admin/conversations/<id>/compact drains the "
                 f"backlog off the request path."
             )
+        # v3.1.9 (H-1). The half hierarchy_lag cannot see: the rollup is not
+        # running, or its writes are not landing, so both of the numbers the
+        # lag is made of are frozen. See HIERARCHY_STALL_DECISIONS.
+        if hierarchy.get("stalled"):
+            reasons.append(
+                f"the summary hierarchy has not advanced in "
+                f"{hierarchy.get('decisions_since_progress')} memory-tail "
+                f"decisions (limit {hierarchy.get('limit')}): replies are "
+                f"arriving and no conversation's summary state has changed. "
+                f"The rollup is being declined before it runs or its state "
+                f"write is failing, and hierarchy_lag cannot show either - it "
+                f"is written by the rollup itself. Grep the log for "
+                f"'rollup state write failed' and 'async rollup failed'."
+            )
+        # COMPACTOR_HIERARCHICAL_SUMMARY=false is reported in config and in
+        # checks.hierarchy, and is deliberately NOT a status reason (v3.1.9,
+        # H-3). It is a documented operator switch (RUNPOD_DEPLOY.md), and
+        # MEMORY_REVIEW.md §8.1 prescribes a session with it off as the
+        # isolation experiment for the double-summary hypothesis. A reason
+        # would pin every such pod "degraded" for as long as the experiment
+        # runs, and a status that is degraded for a known, chosen reason hides
+        # the next reason that is not - the always-on warning this module has
+        # removed before. What H-3 found was that the switch had NO observable;
+        # it has one now, next to vllm_url, where a leftover `false` in
+        # runpod.env is read on every look at the payload.
+        #
+        # v3.1.9. The local tokenizer, from main.tokenizer_state(). count_tokens
+        # is what the hard budget sheds turns by - per message, scaled - and
+        # it is the whole budget whenever /tokenize is down. A tokenizer that
+        # FAILED to load leaves that on the char/4 estimate, a different
+        # instrument from the one the budget was measured against; that is the
+        # 2026-08-28 class of degraded, so it is a reason. Only a FAILURE:
+        # "not loaded, no error" is the moment before the first load (lifespan
+        # warms it at boot), and an absent contract is a build that predates
+        # it, not a fault on the pod. Since the load now retries with backoff,
+        # the reason clears on the first retry that succeeds, which is what
+        # keeps it from being always-on.
+        if tokenizer.get("error"):
+            reasons.append(f"tokenizer state unobservable ({tokenizer['error']})")
+        elif tokenizer.get("loaded") is False and tokenizer.get("last_error"):
+            _retry = tokenizer.get("next_retry_at")
+            _retry_in = (
+                f"next retry in {max(0, round(_retry - time.time()))}s"
+                if isinstance(_retry, (int, float)) and math.isfinite(_retry)
+                else "no retry scheduled"
+            )
+            reasons.append(
+                f"the local tokenizer failed to load "
+                f"({tokenizer.get('last_error')}; {_retry_in}). Token counts "
+                f"that do not come from /tokenize are running on the char/4 "
+                f"estimate, and the request budget sheds turns by them."
+            )
         # A SNAPSHOT THAT HAS STOPPED REFRESHING is the one condition where
         # /data no longer holds a copy that survives a pod recreate, and
         # nothing anywhere reported it: sync_loop shouted three times and went
@@ -576,7 +866,25 @@ async def gather_health_full(
         # daemon owns that file - with WEBUI_DB_LOCAL=false the snapshot IS the
         # live database and its mtime moves on every message.
         _snap = blocking.get("snapshot") or {}
-        if _snap.get("stale"):
+        if _snap.get("future_s") is not None:
+            reasons.append(
+                f"the webui.db snapshot on /data has a modification time "
+                f"{_snap.get('future_s')}s in the FUTURE. The clock has "
+                f"stepped backwards since it was stamped, or it was stamped "
+                f"from a clock that ran fast. The sync daemon skips every "
+                f"cycle while the snapshot looks newer than the live database, "
+                f"so the durable copy is frozen, with no error, until the "
+                f"clock catches up - and a pod recreate in that window loses "
+                f"everything since. Check `date` against real time."
+            )
+        elif _snap.get("stale") and _snap.get("age_s") is None:
+            reasons.append(
+                f"the webui.db snapshot on /data cannot be read "
+                f"({_snap.get('error')}). The live database is on local disk, "
+                f"which a pod recreate destroys, and this is supposed to be "
+                f"its durable copy. Check `supervisorctl status webuidb-sync`."
+            )
+        elif _snap.get("stale"):
             reasons.append(
                 f"the webui.db snapshot on /data is {_snap.get('age_s')}s old "
                 f"against a {_snap.get('interval_s')}s sync interval. The live "
@@ -584,6 +892,14 @@ async def gather_health_full(
                 f"this is the durable copy and it is not being written. Check "
                 f"`supervisorctl status webuidb-sync`."
             )
+        elif _snap.get("error"):
+            # v3.1.9 (H-4). The branch every sibling probe had and this one did
+            # not (compare bg and mt above). _gather_blocking turns a probe
+            # that RAISED into {"watched": None, "stale": False, "error": ...},
+            # and reading only `stale` reported that as a healthy snapshot -
+            # which is how a non-finite interval killed the durability probe
+            # while the endpoint said "ok". Unknown is not fine.
+            reasons.append(f"snapshot probe unobservable ({_snap['error']})")
         status = "degraded" if reasons else "ok"
 
     return {
@@ -598,6 +914,10 @@ async def gather_health_full(
             # distinguishable from "we asked and it is fine" — the same
             # doctrine as indexed_exchanges_total above.
             "tokenize": tokenize,
+            # v3.1.9 (H-1/H-3): the switch, and the heartbeat.
+            "hierarchy": hierarchy,
+            # v3.1.9: main.tokenizer_state(), or {"available": false, ...}.
+            "tokenizer": tokenizer,
         },
         "stats": stats,
         "backups": backup_info,
@@ -607,6 +927,10 @@ async def gather_health_full(
         "config": {
             "vllm_url": vllm_url,
             "target_tokens": target_tokens,
+            # v3.1.9 (H-3). ENABLED is read once at import, so a leftover
+            # COMPACTOR_HIERARCHICAL_SUMMARY=false survives every redeploy;
+            # before this it had no observable anywhere.
+            "hierarchical_summary": summarizer.enabled(),
         },
     }
 
