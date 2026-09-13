@@ -236,15 +236,35 @@ def test_restore_round_trip_recovers_data():
     assert_eq(n, 1, "db row recovered")
 
 
-def test_backup_without_db_succeeds():
-    print("\n[test] missing webui.db → backup still succeeds (memory-only)")
+def test_backup_without_db_refuses_by_default():
+    print("\n[test] p3-b F12: missing webui.db refuses the cycle by default (used to succeed silently)")
+    # v3.1 F2's own doctrine ("an archive that holds nothing is a
+    # failure") was applied to the compactor store only, not its sibling
+    # webui.db — a missing db used to log one WARNING and publish a
+    # memory-only archive anyway. p3-b F12: with the store the SMALLER
+    # half of a real payload, that archive passed the payload-ratio guard
+    # and pruned the real archives behind it. Now it refuses, matching
+    # the store's own behavior a few lines above it in create_backup.
     _seed_sources(with_db=False)
     _clean_backups()
     rep = backup.run_once()
-    assert_true(rep["ok"], "memory-only backup ok")
-    ok, detail = backup.verify_backup(_BACKUPS / rep["archive"])
-    assert_true(ok, "verifies")
-    assert_true("absent" in detail, "detail notes db absent")
+    assert_true(not rep["ok"], "F12 fix: refuses instead of publishing memory-only")
+    assert_true("webui.db" in rep["detail"], "detail names webui.db")
+
+
+def test_backup_without_db_still_succeeds_with_the_escape_hatch():
+    print("\n[test] p3-b F12 CONTROL: COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB=1 restores the old behavior")
+    _seed_sources(with_db=False)
+    _clean_backups()
+    os.environ["COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB"] = "1"
+    try:
+        rep = backup.run_once()
+        assert_true(rep["ok"], "memory-only backup ok with the escape hatch set")
+        ok, detail = backup.verify_backup(_BACKUPS / rep["archive"])
+        assert_true(ok, "verifies")
+        assert_true("absent" in detail, "detail notes db absent")
+    finally:
+        os.environ.pop("COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB", None)
 
 
 # ---------------------------------------------------------------------------
@@ -524,10 +544,18 @@ def test_payload_collapse_is_refused_and_does_not_prune():
     assert_true(first["ok"], "fat baseline backup ok")
 
     # The store shrinks to almost nothing — the shape a half-mounted volume
-    # produces, and the shape a legitimate edit does not.
+    # produces, and the shape a legitimate edit does not. with_db=False
+    # here is about the STORE collapsing, not the db — p3-b F12 added its
+    # own refusal for a missing db and would otherwise preempt the
+    # payload-collapse check this test is actually about, so the escape
+    # hatch is set for this one cycle.
     _seed_sources(n_facts=1, pad=0, with_db=False)
-    with _CapturedAlerts() as alerts:
-        rep = backup.run_once()
+    os.environ["COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB"] = "1"
+    try:
+        with _CapturedAlerts() as alerts:
+            rep = backup.run_once()
+    finally:
+        os.environ.pop("COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB", None)
 
     assert_eq(rep["ok"], False, "collapsed payload → cycle fails")
     assert_true("PAYLOAD COLLAPSED" in rep["detail"], "detail flags the collapse")
@@ -710,7 +738,8 @@ def _all():
     return [
         test_create_verify_publish_round_trip,
         test_restore_round_trip_recovers_data,
-        test_backup_without_db_succeeds,
+        test_backup_without_db_refuses_by_default,
+        test_backup_without_db_still_succeeds_with_the_escape_hatch,
         test_verify_rejects_truncated_archive,
         test_verify_rejects_corrupt_memory_json,
         test_verify_rejects_bad_sqlite,

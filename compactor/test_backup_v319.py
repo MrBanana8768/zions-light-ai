@@ -132,7 +132,13 @@ def test_real_prune_facts_eviction_does_not_regress_the_census():
     facts.save_facts(conv_id, kept)
 
     new = backup._census(_STORE)
-    assert_eq(new[conv_id]["facts"], 40,
+    # p3-b F3: `facts` reverted to its OLD, active-only meaning (an older
+    # binary reads it after a rollback — see p3-b F3), so the union eviction
+    # must not disturb now lives in facts + archived_facts together.
+    assert_true(new[conv_id]["facts"] < 40,
+                "fixture: the ACTIVE-only field really did drop (that is "
+                "the point of eviction)")
+    assert_eq(new[conv_id]["facts"] + new[conv_id]["archived_facts"], 40,
               "F1 fix: active+archived UNION is unchanged — eviction moved "
               "facts, it did not lose them")
 
@@ -312,7 +318,7 @@ def test_a_conversation_disappearing_entirely_still_trips_the_guard():
 # ---------------------------------------------------------------------------
 
 def _make_hot_journal_pair(tmp_dir: Path, committed_rows, uncommitted_row):
-    """A REAL sqlite db with a genuine hot rollback journal — produced by
+    """A REAL sqlite db with a genuine HOT rollback journal — produced by
     actually SIGKILLing a child process mid-transaction (the same mechanism
     hostile317-c's own scripts/hotj.py used), not by copying files around a
     live connection in this process. That matters: while a connection is
@@ -320,6 +326,46 @@ def _make_hot_journal_pair(tmp_dir: Path, committed_rows, uncommitted_row):
     a hot journal needing recovery — hot-journal recovery is specifically
     what happens when the process that owns the lock is GONE. A same-
     process file copy cannot produce that; only losing the process can.
+
+    p3-b F1. "A real journal file" is not the same thing as "a HOT one",
+    and "a hot one" is not automatically enough to make a mutation THIS
+    TEST exists to catch observable, either — both had to be learned the
+    hard way, empirically, against this exact fixture:
+
+      1. SQLite (pager.c hasHotJournal) only calls a journal hot if its
+         first 8 bytes are the real magic, written ONLY when the journal
+         is synced (COMMIT phase 1, or a page-cache SPILL mid-transaction).
+         An earlier version of this fixture did one small uncommitted
+         INSERT: no spill, no sync, a zeroed header — SQLite ignores it
+         completely, `mode=ro` opens cleanly with no error at all, and the
+         test could only see the readonly failure by FAKING it (patching
+         sqlite3.connect). See hotj3.py's own proof table (SP\\p3-b\\
+         hotj3.py) for which writer shapes are actually hot.
+      2. Fixed that with `PRAGMA cache_size=10` and 200-3000 padding
+         INSERTs — a real, synced, hot journal, confirmed by its magic
+         bytes. But INSERTs APPEND new pages past the file's existing
+         "database size in pages" field (page 1, offset 28) — a field
+         only updated at COMMIT, never touched by a spill. A reader
+         opening the spilled file WITHOUT its journal still only sees the
+         OLD page count and never looks at the appended pages at all, so
+         the finding's own sidecar-copy-deleted mutation (mut_hotj.py)
+         stayed GREEN even at 3,000 padding rows: the row count the test
+         asserted on happened to come out right for the wrong reason
+         either way.
+      3. So: an UPDATE of EXISTING, already-committed rows, not an
+         INSERT of new ones. A spilled page holding an updated row is
+         WITHIN the old page-count boundary — visible to any reader, with
+         or without a journal — which is exactly what makes the
+         difference observable, and matches the finding's own
+         proven-working shapes (hotj3.py: "3,000-row UPDATE...";
+         test_p3b_restore_rollback.py's `_build_live_db_with_real_hot_
+         journal` in this same lane, proven against the real F5 rollback
+         bug the same way).
+
+    `committed_rows` seed the table; `uncommitted_row` REPLACES every one
+    of them inside the killed transaction — the snapshot this test builds
+    must show the ORIGINAL rows, not that replacement.
+
     Returns (db_bytes, journal_bytes) read back after the kill.
     """
     src = tmp_dir / "src.db"
@@ -329,26 +375,33 @@ def _make_hot_journal_pair(tmp_dir: Path, committed_rows, uncommitted_row):
         f"con = sqlite3.connect({str(src)!r}, isolation_level=None)\n"
         "con.execute('PRAGMA journal_mode=DELETE')\n"
         "con.execute('CREATE TABLE chat (id INTEGER PRIMARY KEY, body TEXT)')\n"
+        "con.execute('BEGIN')\n"
         f"for row in {list(committed_rows)!r}:\n"
         "    con.execute('INSERT INTO chat (body) VALUES (?)', (row,))\n"
         "con.commit()\n"
+        # p3-b F1: a tiny cache forces the UPDATE below to SPILL dirty
+        # pages to disk mid-transaction (syncing the journal header)
+        # WHILE rewriting pages that already exist — see this function's
+        # own docstring, point 3, for why that is load-bearing and a
+        # padding INSERT is not.
+        "con.execute('PRAGMA cache_size=10')\n"
         "con.execute('BEGIN')\n"
-        f"con.execute('INSERT INTO chat (body) VALUES (?)', ({uncommitted_row!r},))\n"
+        f"con.execute('UPDATE chat SET body = ?', ({uncommitted_row!r} + 'x' * 4000,))\n"
         f"open({str(ready)!r}, 'w').write('ready')\n"
         "import time\n"
         "time.sleep(60)\n"
     )
     proc = subprocess.Popen([sys.executable, "-u", "-c", script])
     try:
-        deadline = time.time() + 10
+        deadline = time.time() + 30
         while not ready.is_file():
             if time.time() > deadline:
                 raise RuntimeError("fixture: child never signaled ready")
             time.sleep(0.02)
-        # Give SQLite a moment past the INSERT to make sure the journal's
-        # page-before-image is actually flushed, not just in the OS page
-        # cache of a process about to disappear.
-        time.sleep(0.2)
+        # Give SQLite a moment past the last INSERT to make sure the spill
+        # and the journal header sync are actually on disk, not just in
+        # the OS page cache of a process about to disappear.
+        time.sleep(0.3)
         journal = src.with_name(src.name + "-journal")
         assert journal.is_file(), "fixture: sqlite really left a journal mid-transaction"
     finally:
@@ -359,35 +412,44 @@ def _make_hot_journal_pair(tmp_dir: Path, committed_rows, uncommitted_row):
         "fixture: the journal survived the kill (it must — nothing but the "
         "OS releasing the lock should have happened)"
     )
+    header = journal.read_bytes()[:8]
+    _HOT_MAGIC = bytes.fromhex("d9d505f920a163d7")
+    assert header == _HOT_MAGIC, (
+        f"fixture: the journal header must be the REAL synced magic (a "
+        f"genuinely hot journal), got {header.hex()!r} — a zeroed header "
+        f"means the transaction never spilled the cache, SQLite will "
+        f"ignore this journal entirely, and this test would prove nothing "
+        f"(p3-b F1)"
+    )
     db_bytes = src.read_bytes()
     journal_bytes = journal.read_bytes()
     return db_bytes, journal_bytes
 
 
 def test_hot_journal_falls_back_to_a_recovered_copy_instead_of_failing():
-    """v3.1.9 note on reproduction, stated rather than hidden: this test's
-    SQLite build (3.45.1, this unit-test image) rolls a hot journal back
-    purely in memory for a read-only connection and never raises at all —
-    confirmed with a standalone probe (both a plain SELECT and con.backup()
-    against a REAL SIGKILL-produced hot journal succeeded, silently, and
-    left the journal untouched). hostile317-c's "attempt to write a
-    readonly database" was demonstrated against the SHIPPED image
-    (angreg/zions-light-ai:v3.1.7-cu12 / v3.1.6.1-cu12), whose bundled
-    SQLite this unit-test image does not carry, and I could not reproduce
-    the exact raise here. Per the brief's own rule (do not fix blind what
-    you cannot reproduce), this test injects that exact failure signature
-    at the one call site named in the finding (backup.py:120-136's mode=ro
-    connect) — the same shape this suite's own ENOSPC/EIO tests already use
-    for triggers a real disk cannot be coaxed into on demand — and then
-    proves the FALLBACK against a REAL hot journal (SIGKILL, not fabricated
-    bytes): _snapshot_via_rollback_copy must actually recover the correct,
-    rolled-back data from it.
+    """p3-b F1. The PREVIOUS version of this test could not reproduce the
+    real "attempt to write a readonly database" error because its fixture
+    never produced a genuinely HOT journal (see _make_hot_journal_pair's
+    docstring) — so it had to FAKE the error by patching sqlite3.connect,
+    which meant it could never notice the fallback losing the journal: a
+    mutant that deleted the sidecar-copy line inside
+    _snapshot_via_rollback_copy stayed green (p3-b F1's own proof,
+    mut_hotj.py). Now that the fixture forces a real cache spill (a
+    synced, hot journal, asserted by its magic bytes), the SAME real error
+    SQLite raises in production (SQLITE_READONLY_ROLLBACK, "attempt to
+    write a readonly database" — confirmed independently on real user data
+    by hostile pass #3D) fires naturally on the real mode=ro connect
+    below. No patch on sqlite3.connect at all.
     """
     print("\n[test] F3: a hot rollback journal falls back to a recovered-copy snapshot")
     scratch = Path(tempfile.mkdtemp())
     try:
+        # Enough rows that an UPDATE touching all of them, under a 10-page
+        # cache, really spills — see _make_hot_journal_pair's docstring,
+        # point 3, for why an UPDATE (not an INSERT) is load-bearing here.
+        committed_rows = [f"original-row-{i:04d}" for i in range(2000)]
         db_bytes, journal_bytes = _make_hot_journal_pair(
-            scratch, ["row one", "row two"], "UNCOMMITTED — must not survive"
+            scratch, committed_rows, "UPDATED-MUST-NOT-SURVIVE-"
         )
         live_dir = scratch / "live"
         live_dir.mkdir()
@@ -398,17 +460,34 @@ def test_hot_journal_falls_back_to_a_recovered_copy_instead_of_failing():
 
         real_connect = sqlite3.connect
 
-        def _mode_ro_fails(*a, **k):
-            if a and isinstance(a[0], str) and a[0].startswith("file:") and "mode=ro" in a[0]:
-                raise sqlite3.OperationalError("attempt to write a readonly database")
-            return real_connect(*a, **k)
+        # p3-b F1: proves the journal was actually NEEDED, not merely
+        # present — opened WITHOUT it, the raw spilled file already shows
+        # the UPDATE's uncommitted values, because an UPDATE (unlike an
+        # INSERT past the old page count) rewrites pages already within
+        # the database's counted size and so is visible to any reader.
+        raw_copy = scratch / "raw_no_journal.db"
+        raw_copy.write_bytes(db_bytes)
+        con = real_connect(str(raw_copy))
+        try:
+            raw_rows = [r[0] for r in con.execute("SELECT body FROM chat ORDER BY id")]
+        finally:
+            con.close()
+        assert_true(
+            any(r.startswith("UPDATED-MUST-NOT-SURVIVE-") for r in raw_rows),
+            f"fixture: the raw db file WITHOUT its journal already shows the "
+            f"UPDATE's uncommitted values (got {raw_rows[:2]}...) — proves the "
+            f"cache really did spill dirty pages INTO the committed rows, and "
+            f"that the journal this test is about is not decorative"
+        )
 
         dest = scratch / "snapshot.db"
-        with patch.object(backup.sqlite3, "connect", side_effect=_mode_ro_fails), \
-             patch.object(backup, "_snapshot_via_rollback_copy",
+        with patch.object(backup, "_snapshot_via_rollback_copy",
                            wraps=backup._snapshot_via_rollback_copy) as spy:
             ok = backup._snapshot_sqlite(live_db, dest)
-            assert_true(spy.called, "F3 fix: the fallback path was actually used")
+            assert_true(spy.called,
+                        "F1/F3 fix: the fallback path was actually used — "
+                        "against the REAL SQLITE_READONLY_ROLLBACK error, "
+                        "no patched connect() involved")
         assert_true(ok, "F3 fix: the snapshot succeeded instead of raising")
         assert_true(dest.is_file(), "a snapshot file was written")
 
@@ -417,9 +496,10 @@ def test_hot_journal_falls_back_to_a_recovered_copy_instead_of_failing():
             rows = [r[0] for r in con.execute("SELECT body FROM chat ORDER BY id")]
         finally:
             con.close()
-        assert_eq(rows, ["row one", "row two"],
-                  "the snapshot holds the COMMITTED rows and the uncommitted "
-                  "one was correctly rolled back, not fabricated into it")
+        assert_eq(rows, committed_rows,
+                  "the snapshot holds the ORIGINAL committed values — the "
+                  "UPDATE was correctly rolled back, not fabricated into it, "
+                  "unlike the raw-file values above")
 
         assert_eq(live_db.read_bytes(), db_bytes,
                   "the LIVE database was only ever read, never modified")
