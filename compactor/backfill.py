@@ -359,61 +359,53 @@ async def _run_backfill(
         # facts backfill is still considered complete.
         try:
             if summarizer.enabled():
-                # `messages` has been redacted by start_backfill_if_needed, so
-                # it cannot feed the covered-turns digest; `raw_messages` is
-                # the same array snapshotted before redaction. None (a direct
-                # caller) leaves the digest unadvanced: reuse declines, which
-                # costs summarization calls and never a turn.
+                # `messages` has been redacted by start_backfill_if_needed;
+                # `raw_messages` is the same array snapshotted before
+                # redaction, and each chunk writes its covered-turn record
+                # from it (summarizer._record_chunk_fps). With None (a direct
+                # caller) the chunks record the redacted text they read, so a
+                # redacted reply is summarized fresh later rather than reused:
+                # it costs a summarization call and never a turn.
                 #
                 # hostile317-b F3: `messages`/`raw_messages` were snapshotted
-                # at kickoff, and this call can land MINUTES later — long
-                # enough for real chat to keep going on this same conv_id.
-                # `_observed_position` (called inside maybe_rollup) trusts
-                # whatever array it is handed as the CURRENT window and
-                # unconditionally overwrites state["tail_fp"] / ["head_fp"] /
-                # ["window_turns"] with that array's own tail. It has no way
-                # to tell "a short window because the client capped it" (a
-                # SUFFIX — its tail IS the true current tail) from "a short
-                # window because this snapshot predates turns that already
-                # landed" (a PREFIX — its tail is stale content). A live tail
-                # advancing the conversation while this snapshot's rollup is
-                # still pending produces exactly the second shape: the
-                # anchor gets pinned to old content, and every later chunk
-                # label is computed against a window_offset one turn short
-                # of the truth, permanently, until the conversation happens
-                # to re-align by chance (it doesn't).
+                # at kickoff, and this call lands MINUTES later. By then a
+                # live tail has usually rolled this conversation up already —
+                # in production order ALWAYS: the kickoff request's own reply
+                # streams in seconds, and its tail drains the whole hierarchy
+                # over the full array plus that reply (hostile pass #3,
+                # reviewer A F8). `_observed_position` trusts whatever array
+                # it is handed as the CURRENT window and overwrites the anchor
+                # with its tail, so a stale snapshot would pin the anchor to
+                # old content and put every later chunk label one turn off.
+                # The live tail owns the hierarchy; this rollup runs only when
+                # no tail has moved the conversation past the snapshot (the
+                # kickoff reply was skipped, shed, or never produced).
                 #
-                # The fix is not to make _observed_position smarter about
-                # telling prefix from suffix (both look identical in content
-                # once a partial anchor match lands at the array's own tail)
-                # — it is to never hand it a snapshot that is stale. Check
-                # the conversation's already-recorded position (read fresh,
-                # not the one implied by our own stale `messages`) against
-                # this snapshot's own turn count; if the conversation has
-                # already reached further than this snapshot could possibly
-                # represent, the snapshot cannot be this window's true tail,
-                # and calling maybe_rollup with it would only corrupt the
-                # anchor for every later request. The facts side of the
-                # backfill is unaffected (already committed above); only the
-                # summary rollup is skipped, and the very next live turn
-                # rolls up normally against the real, current window.
-                current_state = await run_in_threadpool(summarizer.load_state, conv_id)
-                recorded = summarizer.recorded_position(current_state)
+                # THE CHECK IS MADE UNDER THE LOCK THE ROLLUP HOLDS (hostile
+                # pass #3, reviewer E F3). It was read here, outside conv_lock,
+                # and then maybe_rollup took the lock: a live tail queued
+                # behind this backfill's facts merge ran in between, saved its
+                # position, and the stale snapshot then rolled up over it.
+                # maybe_rollup now compares the recorded position with
+                # `snapshot_turns` itself, after loading state under the lock,
+                # and reports the skip through `skipped`.
                 snapshot_turns = sum(1 for m in messages if m.get("role") != "system")
-                if recorded > snapshot_turns:
+                skipped: list[int] = []
+                await summarizer.maybe_rollup(
+                    conv_id, messages, vllm_url, model, raw_messages=raw_messages,
+                    skip_if_position_past=snapshot_turns, skipped_at=skipped,
+                )
+                if skipped:
                     logger.info(
                         f"conv={conv_id}: backfill's summary rollup skipped — "
-                        f"the conversation reached turn {recorded} while this "
-                        f"backfill's snapshot ({snapshot_turns} turns, taken "
-                        f"at kickoff) was still extracting facts. Calling "
-                        f"maybe_rollup with it would overwrite the position "
-                        f"anchor with this stale snapshot's tail "
-                        f"(hostile317-b F3); the next live turn will roll up "
-                        f"against the real, current window instead."
-                    )
-                else:
-                    await summarizer.maybe_rollup(
-                        conv_id, messages, vllm_url, model, raw_messages=raw_messages
+                        f"a live tail already rolled this conversation up to "
+                        f"turn {skipped[0]}, past this backfill's snapshot "
+                        f"({snapshot_turns} turns, taken at kickoff). In "
+                        f"production order that is the kickoff request's own "
+                        f"reply, and it is the expected case: the live tail "
+                        f"owns the hierarchy. Rolling up this snapshot would "
+                        f"overwrite the position anchor with a stale tail "
+                        f"(hostile317-b F3)."
                     )
         except Exception as e:
             logger.warning(f"conv={conv_id}: backfill summary rollup failed (non-fatal): {e}")
@@ -484,7 +476,7 @@ async def start_backfill_if_needed(
     # The array exactly as the client sent it, snapshotted BEFORE redaction:
     # the covered-turns digest must be folded from turns the next request will
     # carry, and redaction replaces degenerate replies with placeholders that
-    # no request ever does (see summarizer._catch_up_covered_fp).
+    # no request ever does (see summarizer._record_chunk_fps).
     raw_snapshot = [dict(m) for m in messages]
     if redact is not None:
         # Off the event loop: this is an async function awaited on the
