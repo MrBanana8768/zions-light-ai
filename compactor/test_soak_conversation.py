@@ -119,6 +119,7 @@ os.environ["COMPACTOR_L3_CHUNK_SIZE"] = os.environ.get("SOAK_L3_CHUNK_SIZE", "2"
 
 import asyncio  # noqa: E402
 import logging  # noqa: E402
+import re  # noqa: E402
 import time  # noqa: E402
 from unittest.mock import patch  # noqa: E402
 
@@ -458,6 +459,40 @@ def _rollup_input_problems(l1_inputs: list[tuple[int, int]]) -> list[str]:
     return []
 
 
+def _reuse_problems(rows: list[dict]) -> list[str]:
+    """Compaction must REUSE the hierarchy once one exists, and must never be
+    refused over the per-request call cap while it does.
+
+    The 112-turn soak of 2026-09-12 passed every assertion in this file while
+    reuse substituted nothing from turn ~58 on and the cap refused every
+    request after it: the production failure of that night, found by reading
+    the log rather than by any check. Two cuts of the reuse gate each did it
+    (a digest written from the redacted rollup input; l3 excluded from
+    coverage). So, per turn that starts with a watermark above 0:
+
+      * a "per-request cap" refusal is a failure outright — with the covered
+        span coming off the shelf, the fresh span is at most one chunk plus
+        the recent window, which fits the cap by construction;
+      * a turn that compacted and reused NOTHING is a failure — the covered
+        prefix starts at turn 1 and so does the span being compacted;
+      * and at least one such turn must exist, or none of this was exercised.
+    """
+    probs: list[str] = []
+    after = [r for r in rows if r.get("wm_before", 0) > 0]
+    for r in after:
+        if r.get("cap_refused"):
+            probs.append(f"turn {r['turn']}: compaction refused over the "
+                         f"per-request cap with a hierarchy covering "
+                         f"{r['wm_before']} turn(s)")
+        elif r.get("compacted") and not r.get("reused"):
+            probs.append(f"turn {r['turn']}: compacted with a hierarchy covering "
+                         f"{r['wm_before']} turn(s) and reused none of it")
+    if not any(r.get("compacted") or r.get("cap_refused") for r in after):
+        probs.append("no turn compacted after the first L1 chunk, so reuse was "
+                     "never exercised")
+    return probs
+
+
 def _oracle_selftest() -> tuple[list[str], int]:
     """Each oracle against the defect shape it exists for (must go RED) and a
     healthy control (must stay GREEN). Returns the cases that came out wrong.
@@ -676,6 +711,29 @@ def _oracle_selftest() -> tuple[list[str], int]:
            lambda: _rollup_input_problems([(10, 20), (11, 20)]), True)
     expect("A3 rollup input CONTROL: one chunk of real text",
            lambda: _rollup_input_problems([(0, 20), (11, 20)]), False)
+
+    def ru(n, wm, compacted=True, reused=10, cap=False):
+        return {"turn": n, "wm_before": wm, "compacted": compacted,
+                "reused": reused, "cap_refused": cap}
+    reuse_good = ([ru(n, 0, compacted=(n > 8), reused=0) for n in range(1, 11)]
+                  + [ru(n, 20 * ((n - 1) // 10)) for n in range(11, 60)])
+    expect("REUSE CONTROL: every compacting turn after the first chunk reused",
+           lambda: _reuse_problems(reuse_good), False)
+    capped = [dict(r) for r in reuse_good]
+    capped[57].update(compacted=False, reused=0, cap_refused=True)
+    expect("REUSE the 2026-09-12 shape: cap refusal with a hierarchy on disk",
+           lambda: _reuse_problems(capped), True)
+    dead = [dict(r) for r in reuse_good]
+    dead[40].update(reused=0)
+    expect("REUSE compacted with a hierarchy and reused nothing",
+           lambda: _reuse_problems(dead), True)
+    expect("REUSE never exercised: no compaction after the first chunk",
+           lambda: _reuse_problems([ru(n, 0, reused=0) for n in range(1, 10)]
+                                   + [ru(n, 20, compacted=False, reused=0)
+                                      for n in range(10, 20)]), True)
+    expect("REUSE CONTROL: cap refusal BEFORE any chunk is not this check's",
+           lambda: _reuse_problems([ru(1, 0, compacted=False, reused=0, cap=True)]
+                                   + reuse_good[1:]), False)
     return failures, cases[0]
 
 
@@ -1111,7 +1169,12 @@ for n in range(1, TURNS + 1):
     nonsys = [m for m in sent if m.get("role") != "system"]
     # `history` BEFORE the reply is appended: 2n-1, which is what both the lag
     # budget and _lag_guard_unreachable are computed against.
+    _reused = re.search(r"(\d+) covered by stored summaries", log)
     rows.append({"turn": n, "phase": phase, "sent_msgs": len(sent),
+                 "wm_before": _prev_watermark,
+                 "compacted": "compacted:" in log,
+                 "cap_refused": "per-request cap" in log,
+                 "reused": int(_reused.group(1)) if _reused else 0,
                  "sent_nonsys": len(nonsys), "history": len(history),
                  "watermark": _wm, "stored": _stored, "skipped": _skipped,
                  "tail_new_facts": _tail_new_facts[0] - _facts0,
@@ -1217,6 +1280,16 @@ print(f"  ok   the summarizer kept pace (worst lag {worst['history'] - worst['wa
       f"of {_LAG_BUDGET} at turn {worst['turn']}; final watermark "
       f"{substantive[-1]['watermark']}; a hierarchy that rolled up once and "
       f"died would have shown {(2 * TURNS - 1) - _L1})")
+
+_reuse_p = _reuse_problems(rows)
+if _reuse_p:
+    fail(f"compaction did not reuse the hierarchy ({len(_reuse_p)} turn(s))",
+         "; ".join(_reuse_p[:5]))
+_reusing = [r for r in rows if r["reused"]]
+print(f"  ok   compaction reused the hierarchy on {len(_reusing)} turn(s) "
+      f"(first at turn {_reusing[0]['turn'] if _reusing else None}, most "
+      f"{max((r['reused'] for r in _reusing), default=0)} turns off the shelf) "
+      f"and was never refused over the per-request cap once a chunk existed")
 
 # BOTH SIDES OF THE MEMORY TAIL (A3). The shipped soak's only memory
 # assertion was a non-empty fact store, which the backfill filled on a run
