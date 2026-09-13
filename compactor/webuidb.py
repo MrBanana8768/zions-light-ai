@@ -39,6 +39,7 @@ archive in backup.py is the second line. Postgres removes this trade
 entirely and is the strategic answer; this removes the instability today.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -353,6 +354,18 @@ RESTORE_EXIT_CODES = {
     "snapshot_unhealthy": 3,
     "restore_failed": 4,
     "error": 5,
+    # p3-b F4/F9: an interrupted backup.py::restore_backup() left an
+    # in-flight marker — see find_interrupted_restore(). Reuses "error"'s
+    # exit code (5) DELIBERATELY, not a new number: entrypoint.sh's `case`
+    # arm per value (test_webuidb_restore_guard.py [11]) lives in
+    # entrypoint.sh, which is outside this fix's file list (another lane
+    # owns it concurrently) — a genuinely distinct code needs a matching
+    # `case` arm added there. Reusing 5 costs only log-grep precision
+    # (marker vs. another startup error look the same in the exit code
+    # alone; the log LINE still names the marker) and needs no other
+    # lane's file. See this finding's fix-lane report for the exact arm
+    # to add if a distinct code is wanted later.
+    "restore_interrupted": 5,
 }
 
 
@@ -429,18 +442,36 @@ def integrity(path: Path) -> tuple[bool, str]:
 
 
 def _presence(path: Path) -> tuple[bool, bool]:
-    """(there, unstatable). `Path.exists()` swallows EVERY `OSError` and
-    answers `False` for both "nothing there" and "I could not look" - and on
-    the volume whose read reliability is this module's entire subject, those
-    two answer restore_on_boot's fresh-vs-restore decision in OPPOSITE
-    directions.
+    """(there, unstatable). `Path.exists()` does NOT have one uniform
+    behaviour to rely on, and BOTH of its behaviours are wrong for this
+    module on their own:
 
-    Hostile pass #2, C10, proved it reachable: an unstatable snapshot path
-    (`ENOTDIR`/`EIO` — a stalled or erroring MooseFS mount, once `entrypoint.sh`
-    has already confirmed /data itself is writable, is the production shape;
-    the test uses `ENOTDIR` because a root container cannot be denied by mode
-    bits) made `SNAPSHOT_DB.exists()` answer `False`, which restore_on_boot's
-    caller read as "no snapshot", falling straight through to `action="fresh"`.
+      * on CPython up to 3.7, `Path.exists()` caught every `OSError` and
+        answered `False` for both "nothing there" and "I could not look".
+      * on Python 3.12.3 (every image this project ships), it answers
+        `False` only for `ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`, and RAISES for
+        anything else — `EIO`, `ETIMEDOUT`, `ENOTCONN`, `EACCES` (p3-b F7).
+        A version of this docstring used to claim the OLD (pre-3.7)
+        behaviour applied here unconditionally; it does not, on the
+        interpreter this actually runs on, and a caller that believed it
+        (sync_once's mtime-skip check, before p3-b F7) crashed the whole
+        process on an EIO instead of getting a clean `False`.
+
+    Neither answer is safe alone: the old behaviour collapses "absent" and
+    "unreadable" into the same `False`, and on the volume whose read
+    reliability is this module's entire subject those two answer
+    restore_on_boot's fresh-vs-restore decision in OPPOSITE directions; the
+    3.12 behaviour instead lets an unreadable mount escape as an uncaught
+    exception. This function is the one place that decides, explicitly,
+    and never raises.
+
+    Hostile pass #2, C10, proved the collapsed-`False` shape reachable: an
+    unstatable snapshot path (`ENOTDIR`/`EIO` — a stalled or erroring
+    MooseFS mount, once `entrypoint.sh` has already confirmed /data itself
+    is writable, is the production shape; the test uses `ENOTDIR` because a
+    root container cannot be denied by mode bits) made
+    `SNAPSHOT_DB.exists()` answer `False`, which restore_on_boot's caller
+    read as "no snapshot", falling straight through to `action="fresh"`.
     `RESTORE_EXIT_CODES["fresh"] = 0`, so entrypoint.sh never reached the
     branch that writes `.empty-start` — the file its own banner calls "what
     protects /data, not the shrink ratio". OpenWebUI built an empty schema
@@ -454,7 +485,11 @@ def _presence(path: Path) -> tuple[bool, bool]:
     this function replaces.
 
     unstatable=True means "the OS refused to say" — the caller must refuse
-    rather than guess between "restore" and "fresh"; see restore_on_boot."""
+    rather than guess between "restore" and "fresh"; see restore_on_boot.
+    EVERY caller that decides something from a path's presence on /data
+    must go through this function, never a bare `.exists()` — p3-b F7 found
+    two more (sync_once's mtime-skip check, restore_backup's rollback
+    moves) that had not."""
     try:
         path.stat()
         return True, False
@@ -462,6 +497,114 @@ def _presence(path: Path) -> tuple[bool, bool]:
         return False, False
     except OSError:
         return False, True
+
+
+# p3-b F4/F9. backup.py::restore_backup's multi-step swap (set db aside,
+# land the new one, integrity-check it, set the store aside, land the new
+# store) has no single atomic operation covering it — a SIGKILL (a RunPod
+# redeploy, an OOM kill, a closed terminal) or an EIO between any two of
+# those steps can leave the live db missing, the live store missing, or a
+# MIXED generation (a NEW db beside an OLD store or vice versa), with
+# nothing on disk recording that a restore was ever in flight. The next
+# boot then starts normally onto whatever that half-finished state happens
+# to be — silently, since nothing refuses.
+#
+# Full transactional recovery (resume or fully undo an interrupted restore
+# from any step) is out of scope for this fix: it needs the same
+# step-by-step "what was I doing" log AND replay logic on both restore_
+# backup and restore_on_boot, which is a bigger change than this lane's
+# remaining budget covers. What IS implemented: a marker, written to the
+# SAME filesystem restore_backup already stages onto (QUARANTINE, i.e.
+# /data/forensics — never local disk, which a redeploy does not keep)
+# BEFORE the first live-path move, naming exactly what was about to
+# happen; removed only once every live move restore_backup attempted is
+# known to have either landed or been rolled back; and a LOUD refusal at
+# the next boot (restore_on_boot, below) while one is present, with the
+# marker's own content as the recovery instruction. A human reads it and
+# finishes the move by hand — see OPERATIONS.md (this lane cannot edit it,
+# so the note is not there yet; see the fix report). That is "detect and
+# refuse", not "recover automatically" — see this finding's report for
+# exactly what remains.
+_RESTORE_MARKER_GLOB = "restore-*.inprogress"
+
+
+def _restore_marker_path(stamp: str) -> Path:
+    return QUARANTINE / f"restore-{stamp}.inprogress"
+
+
+def write_restore_marker(stamp: str, plan: dict) -> Path | None:
+    """Write the in-flight marker for a restore_backup() run, atomically.
+    `plan` is whatever restore_backup wants recorded — target/aside/staged
+    path names — and is written back out VERBATIM by find_interrupted_
+    restore() for a human to read. Returns the marker path, or None if it
+    could not be written (logged loudly; restore_backup proceeds anyway —
+    refusing the restore because the ONE THING THAT COULD LATER DETECT A
+    KILL could not be written would be worse than the gap it is meant to
+    close).
+    """
+    try:
+        QUARANTINE.mkdir(parents=True, exist_ok=True)
+        path = _restore_marker_path(stamp)
+        tmp = path.with_suffix(".inprogress.tmp")
+        payload = {"stamp": stamp, "written_at": time.time(), "plan": plan}
+        tmp.write_bytes(json.dumps(payload, indent=1).encode("utf-8"))
+        os.replace(tmp, path)  # atomic on the same filesystem
+        try:
+            fd = os.open(str(QUARANTINE), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass  # best-effort directory fsync; the marker's own bytes are what matters
+        return path
+    except OSError as e:
+        logger.error(
+            f"could not write the in-flight restore marker for stamp "
+            f"{stamp} ({type(e).__name__}: {e}) — a SIGKILL during this "
+            f"restore will NOT be detectable at the next boot. Proceeding "
+            f"with the restore anyway."
+        )
+        return None
+
+
+def remove_restore_marker(stamp: str) -> None:
+    """Remove the in-flight marker — call ONLY once every live move
+    restore_backup attempted for this stamp is known to have landed or
+    been fully rolled back. A marker left behind after a handled failure
+    (one restore_backup's own except block rolled back, imperfectly or
+    not) is a deliberately conservative false positive: the alternative is
+    silently clearing evidence of a restore that might not, in fact, have
+    finished cleanly."""
+    try:
+        _restore_marker_path(stamp).unlink(missing_ok=True)
+    except OSError as e:
+        logger.error(
+            f"could not remove the in-flight restore marker for stamp "
+            f"{stamp} ({type(e).__name__}: {e}) — it will keep refusing "
+            f"boots until removed by hand: {_restore_marker_path(stamp)}"
+        )
+
+
+def find_interrupted_restore() -> dict | None:
+    """Any `restore-*.inprogress` marker in QUARANTINE, or None. Returns
+    the marker's own JSON content (stamp, when it was written, and the
+    plan restore_backup recorded) — that content IS the recovery
+    instruction. Never raises: an unreadable QUARANTINE dir reads as "none
+    found" rather than blocking a boot on a question this function cannot
+    answer (unlike the moves themselves, a missed marker here is a
+    detection gap, not data loss in progress)."""
+    try:
+        if not QUARANTINE.is_dir():
+            return None
+        for f in sorted(QUARANTINE.glob(_RESTORE_MARKER_GLOB)):
+            try:
+                return json.loads(f.read_bytes().decode("utf-8")) | {"marker_path": str(f)}
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        return None
+    return None
 
 
 def _has_rows(path: Path) -> int | None:
@@ -485,6 +628,53 @@ def _has_rows(path: Path) -> int | None:
             con.close()
     except Exception:
         return None
+
+
+def _snapshot_chat_state(path: Path) -> tuple[int | None, bool]:
+    """(row_count, confirmed_no_chat_table) — read TOGETHER, in ONE sqlite3
+    connection, instead of two separate reads seconds apart.
+
+    p3-b F6. sync_once used to compute `previous = _has_rows(path)` and,
+    when that came back None, open a SEPARATE connection via integrity()
+    a moment later to decide whether the file "opens cleanly but has no
+    chat table" — and if that second, unrelated read succeeded, treated
+    the snapshot as safely empty and published straight over it. A single
+    TRANSIENT failure on the first read ("disk I/O error", the stall this
+    module exists for) is exactly this shape: count() fails, previous is
+    None, and the second connection a moment later opens fine because
+    whatever glitched has already cleared. That coincidence switched off
+    the shrink ratio, the per-row loss limit and the generation guard
+    together and let a publish replace 400 chats with the local
+    database's one row (SP\\p3-b\\wdb_guards.py).
+
+    So: ask the schema directly, in the connection that already tried the
+    count, rather than inferring "no chat table" from that attempt's
+    failure. `confirmed_no_chat_table` is True ONLY when a query against
+    sqlite_master itself succeeds and reports zero matching rows — any
+    exception anywhere in this function means "could not confirm", which
+    the caller must treat as a refusal for this cycle, not as evidence of
+    emptiness.
+    """
+    try:
+        con = sqlite3.connect(str(path), timeout=30)
+    except Exception:
+        return None, False
+    try:
+        try:
+            count = con.execute("select count(*) from chat").fetchone()[0]
+            return count, False
+        except Exception:
+            pass
+        try:
+            row = con.execute(
+                "select count(*) from sqlite_master where type='table' "
+                "and name='chat'"
+            ).fetchone()
+        except Exception:
+            return None, False
+        return (None, True) if row and row[0] == 0 else (None, False)
+    finally:
+        con.close()
 
 
 def _content_bytes(path: Path) -> int | None:
@@ -817,6 +1007,30 @@ def restore_on_boot() -> dict:
     recoverable exactly as long as nothing publishes over it.
     """
     result = {"action": None, "local": str(LOCAL_DB), "snapshot": str(SNAPSHOT_DB)}
+
+    # p3-b F4/F9, checked FIRST, before any of this function's own local-
+    # vs-snapshot reconciliation touches anything: a SIGKILL or an EIO
+    # mid-restore_backup() can leave the live db missing, the live store
+    # missing, or the two at different generations, with nothing else on
+    # disk saying so. Booting normally onto that state is silent; this
+    # marker is the one thing that is NOT silent about it. See
+    # find_interrupted_restore()'s docstring for what remains
+    # unimplemented (resuming or auto-undoing the interrupted restore).
+    interrupted = find_interrupted_restore()
+    if interrupted is not None:
+        logger.error(
+            f"REFUSING to boot: an interrupted restore_backup() run left "
+            f"{interrupted.get('marker_path')} behind — the live database "
+            f"and/or compactor store may be missing or at a MIXED "
+            f"generation. This is NOT auto-recovered. Read the marker "
+            f"(it names exactly what was planned) and put the pieces back "
+            f"by hand, then remove the marker file to allow booting again: "
+            f"{json.dumps(interrupted, indent=1)}"
+        )
+        result["action"] = "restore_interrupted"
+        result["marker"] = interrupted
+        return result
+
     try:
         LOCAL_DB.parent.mkdir(parents=True, exist_ok=True)
     except Exception as e:
@@ -1100,40 +1314,78 @@ def sync_once(force: bool = False) -> dict:
         out["skipped"] = "no local database yet"
         return out
 
-    mtime = LOCAL_DB.stat().st_mtime
-    if not force and SNAPSHOT_DB.exists():
-        try:
-            snap_mtime = SNAPSHOT_DB.stat().st_mtime
-            ahead = snap_mtime - time.time()
-            if ahead > SNAPSHOT_MTIME_FUTURE_TOLERANCE_S:
-                # A SNAPSHOT DATED IN THE FUTURE IS NOT EVIDENCE OF ANYTHING
-                # (v3.1.9, hostile pass #2, N2). The skip below reads "the
-                # snapshot is at least as new as local" off the mtime, so a
-                # snapshot stamped by a clock that ran fast made EVERY cycle a
-                # skip until real time caught up - no error, so no failure
-                # count, and nothing logged at any level. And the state is
-                # durable: restore_on_boot's copy2 preserves the mtime, so a
-                # poisoned snapshot re-poisons every later pod. So: not a
-                # skip. Publish, which re-stamps it with a sane time, and say
-                # why, once per cycle it happens - a silent republish would
-                # hide the wrong clock exactly as the silent skip did.
-                logger.warning(
-                    f"the snapshot {SNAPSHOT_DB} is dated {ahead:.0f}s in the "
-                    f"FUTURE - a clock was wrong when it was stamped. Not "
-                    f"trusting it as 'unchanged since last sync'; publishing "
-                    f"now, which re-stamps it."
-                )
-            elif snap_mtime >= mtime:
-                # Nothing has been written since the last publish. Skipping
-                # matters: each sync writes the whole database onto the
-                # volume whose write reliability is the problem.
-                out["skipped"] = "unchanged since last sync"
-                return out
-        except Exception:
-            pass
-
     tmp = SNAPSHOT_DB.with_name(f"{SNAPSHOT_DB.name}.sync-{os.getpid()}")
     try:
+        # p3-b F8. "Off means off" enforced HERE, not only by supervisord's
+        # autostart=false line for this program. On a WEBUI_DB_LOCAL=false
+        # pod, LOCAL_DB is a STALE path nobody writes to any more — OpenWebUI
+        # is reading SNAPSHOT_DB directly (live_webui_db() says so) — and
+        # publishing LOCAL_DB over the snapshot would overwrite the LIVE
+        # database with old, disconnected content. This used to be
+        # preventable only by nobody ever manually starting this program on
+        # such a pod; restore_backup's own printed restart line used to name
+        # it unconditionally (see that function's fix, same finding), and
+        # autostart=false does not stop a manual `supervisorctl start`. A
+        # refusal here means the wrong command is merely wrong, not
+        # destructive.
+        if live_webui_db() != LOCAL_DB:
+            raise RuntimeError(
+                f"REFUSING to sync: WEBUI_DB_LOCAL says the live database "
+                f"is {SNAPSHOT_DB} (the snapshot itself), not {LOCAL_DB}. "
+                f"This daemon's job is to publish {LOCAL_DB} INTO the "
+                f"snapshot, which would overwrite the live database with "
+                f"whatever stale content is sitting at the local path on "
+                f"this placement. webuidb-sync should not be running on "
+                f"this pod at all — stop it: `supervisorctl stop "
+                f"webuidb-sync`."
+            )
+
+        # p3-b F7. This mtime-skip block USED TO run here, BEFORE this
+        # try — `SNAPSHOT_DB.exists()` on Python 3.12.3 (every image) RAISES
+        # for EIO/ETIMEDOUT/ENOTCONN/EACCES rather than returning False (it
+        # only returns False for ENOENT/ENOTDIR/EBADF/ELOOP), so a stalling
+        # mount escaped this function AND sync_loop entirely: the process
+        # exited 1, supervisord restarted it (autorestart=true), and
+        # consecutive_failures never reached 3 because it lives only in the
+        # process that just died — the "publish has failed N times" alarm
+        # never printed. Moved inside the try (whose `except Exception`
+        # below already turns a failure into out["error"] and a warning,
+        # never a crash) and reading presence through _presence() rather
+        # than a bare .exists(), so an unreadable snapshot HOLDS the
+        # publish (falls through to the real attempt below, which has its
+        # own _presence()-based refusal a few lines down) instead of
+        # killing the loop.
+        mtime = LOCAL_DB.stat().st_mtime
+        if not force:
+            snap_there_for_skip, _ = _presence(SNAPSHOT_DB)
+            if snap_there_for_skip:
+                snap_mtime = SNAPSHOT_DB.stat().st_mtime
+                ahead = snap_mtime - time.time()
+                if ahead > SNAPSHOT_MTIME_FUTURE_TOLERANCE_S:
+                    # A SNAPSHOT DATED IN THE FUTURE IS NOT EVIDENCE OF ANYTHING
+                    # (v3.1.9, hostile pass #2, N2). The skip below reads "the
+                    # snapshot is at least as new as local" off the mtime, so a
+                    # snapshot stamped by a clock that ran fast made EVERY cycle a
+                    # skip until real time caught up - no error, so no failure
+                    # count, and nothing logged at any level. And the state is
+                    # durable: restore_on_boot's copy2 preserves the mtime, so a
+                    # poisoned snapshot re-poisons every later pod. So: not a
+                    # skip. Publish, which re-stamps it with a sane time, and say
+                    # why, once per cycle it happens - a silent republish would
+                    # hide the wrong clock exactly as the silent skip did.
+                    logger.warning(
+                        f"the snapshot {SNAPSHOT_DB} is dated {ahead:.0f}s in the "
+                        f"FUTURE - a clock was wrong when it was stamped. Not "
+                        f"trusting it as 'unchanged since last sync'; publishing "
+                        f"now, which re-stamps it."
+                    )
+                elif snap_mtime >= mtime:
+                    # Nothing has been written since the last publish. Skipping
+                    # matters: each sync writes the whole database onto the
+                    # volume whose write reliability is the problem.
+                    out["skipped"] = "unchanged since last sync"
+                    return out
+
         if EMPTY_START_MARKER.exists() and SNAPSHOT_DB.exists():
             # THE RATIO CANNOT PROTECT THIS STATE. See EMPTY_START_MARKER: an
             # empty-started database is refused by the shrink guard only until
@@ -1255,21 +1507,26 @@ def sync_once(force: bool = False) -> dict:
                 f"investigate the mount if it does not."
             )
         if snap_there:
-            previous = _has_rows(SNAPSHOT_DB)
             prev_bytes = SNAPSHOT_DB.stat().st_size
+            # p3-b F6: `previous` and "is the chat table genuinely absent"
+            # are now read TOGETHER in one connection (_snapshot_chat_state)
+            # rather than inferred from two separate reads seconds apart —
+            # see that function's docstring for the coincidence this closes.
+            previous, confirmed_no_chat_table = _snapshot_chat_state(SNAPSHOT_DB)
             if previous is None:
-                prev_ok, prev_detail = integrity(SNAPSHOT_DB)
-                if prev_ok:
+                if confirmed_no_chat_table:
                     # WARNING, not info: this is a normal-looking sentence for
                     # an abnormal file. It is the right answer, and it is also
                     # what a snapshot destroyed by something else looks like on
                     # the cycle before we overwrite it.
                     logger.warning(
                         f"the snapshot {SNAPSHOT_DB} "
-                        f"({prev_bytes / 1e6:.1f} MB) opens cleanly but has no "
-                        f"readable `chat` table - a 0-byte file, or a schema "
-                        f"that never got one. There is no history there to "
-                        f"lose, so this publish goes ahead and replaces it."
+                        f"({prev_bytes / 1e6:.1f} MB) opens cleanly and its "
+                        f"`chat` table is CONFIRMED absent (checked directly "
+                        f"against sqlite_master, not inferred from a failed "
+                        f"count) - a 0-byte file, or a schema that never got "
+                        f"one. There is no history there to lose, so this "
+                        f"publish goes ahead and replaces it."
                     )
                 elif not ALLOW_PUBLISH_OVER_UNREADABLE:
                     # Deliberately NO forensic copy of the local database here,
@@ -1285,6 +1542,32 @@ def sync_once(force: bool = False) -> dict:
                     # ordinary advice, and a single flag covering both meant
                     # the operator who took that advice silently disarmed THIS
                     # refusal too - the one the module exists for.
+                    prev_ok, prev_detail = integrity(SNAPSHOT_DB)
+                    if prev_ok:
+                        # p3-b F6. quick_check passing does NOT mean "safe to
+                        # treat as empty" - it only means the pages are
+                        # well-formed. _snapshot_chat_state already tried and
+                        # failed to confirm the chat table's state directly;
+                        # this used to be the exact branch that published
+                        # unguarded on a coincidence (a transient read failure
+                        # on the FIRST connection followed by a clean SECOND
+                        # one). Refuse; the finding's own rule is "any
+                        # exception is a refusal for this cycle".
+                        raise RuntimeError(
+                            f"REFUSING to publish: {SNAPSHOT_DB} exists and "
+                            f"passes quick_check, but its `chat` table's "
+                            f"state could not be confirmed either way (a "
+                            f"transient read failure, not a genuinely empty "
+                            f"schema). Treating an unconfirmed read as "
+                            f"'nothing to lose' is exactly how a publish "
+                            f"used to go out with the shrink ratio, the "
+                            f"per-row loss limit and the generation guard "
+                            f"ALL skipped. The live database is local and "
+                            f"unaffected. Retry once the volume responds; "
+                            f"investigate the mount if this persists. To "
+                            f"publish over it deliberately, set "
+                            f"WEBUI_DB_ALLOW_PUBLISH_OVER_UNREADABLE=1."
+                        )
                     raise RuntimeError(
                         f"REFUSING to publish: {SNAPSHOT_DB} exists and failed "
                         f"quick_check ({prev_detail}) - a hot rollback journal, "
@@ -1297,6 +1580,16 @@ def sync_once(force: bool = False) -> dict:
                         f"move it aside and the next sync will republish from "
                         f"local. To publish over it deliberately, set "
                         f"WEBUI_DB_ALLOW_PUBLISH_OVER_UNREADABLE=1."
+                    )
+                else:
+                    # ALLOW_PUBLISH_OVER_UNREADABLE=1: the escape hatch still
+                    # works for both a genuinely corrupt snapshot AND one
+                    # whose chat table's state could merely not be confirmed.
+                    logger.warning(
+                        f"publishing over {SNAPSHOT_DB} ({prev_bytes / 1e6:.1f} "
+                        f"MB) despite its `chat` table's state being "
+                        f"unreadable/unconfirmed, because "
+                        f"WEBUI_DB_ALLOW_PUBLISH_OVER_UNREADABLE=1 is set"
                     )
 
         if previous is not None:
@@ -1612,6 +1905,25 @@ def sync_loop() -> None:
     consecutive_no_local = 0
     while True:
         time.sleep(SYNC_INTERVAL_S)
+        # p3-b F7. sync_once's own try/except already covers everything
+        # from staging onward, and moving the mtime-skip block inside it
+        # (the actual F7 fix) closed the one gap that used to let an
+        # OSError escape sync_once entirely and kill this loop.
+        #
+        # A belt-and-braces try/except HERE too was tried and reverted:
+        # it silently swallowed test_webuidb_publish_guards.py's own
+        # `_drive_sync_loop` sentinel (`_StopLoop`, an Exception subclass
+        # used to end the otherwise-infinite `while True:` in a test with
+        # `time.sleep` patched to a no-op) — turning "stop the loop" into
+        # "log a failure and spin at full CPU forever", a real hang this
+        # was caught doing on a real run (the whole-unit-suite pass this
+        # lane finished with). A bare `except Exception` at a `while True:`
+        # boundary cannot tell a genuine escaped error from a caller's own
+        # control-flow exception, and the loop already has no story for
+        # how a *test* is supposed to stop it short of that. sync_once()
+        # not raising is the actual contract now; if a future change
+        # breaks that again, the fix belongs inside sync_once's own try,
+        # the same place this one did.
         r = sync_once()
         if r["error"]:
             consecutive_failures += 1

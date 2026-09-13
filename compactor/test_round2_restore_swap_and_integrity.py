@@ -227,7 +227,15 @@ def test_a_completely_failed_store_swap_with_no_db_in_the_archive():
     _BACKUPS.mkdir(parents=True, exist_ok=True)
     for old in _BACKUPS.glob("*.tar.gz"):
         old.unlink()
-    rep = backup.run_once()
+    # p3-b F12: a missing webui.db now refuses the cycle by default (a
+    # sibling of the store-missing guard a few lines above it in
+    # create_backup). This fixture's whole point is a store-only archive
+    # (have_db False) — the deliberate escape hatch.
+    os.environ["COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB"] = "1"
+    try:
+        rep = backup.run_once()
+    finally:
+        os.environ.pop("COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB", None)
     assert rep["ok"], f"fixture archive creation failed: {rep}"
     arch = _BACKUPS / rep["archive"]
 

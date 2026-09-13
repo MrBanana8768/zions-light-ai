@@ -49,6 +49,7 @@ history to /data at all, which is the same data loss taking longer.
 """
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -645,6 +646,25 @@ _blocked_quar.write_bytes(b"a regular file, so mkdir(parents=True) cannot pass")
 _cases.append(("error", 5, run_restore(
     _e / "openwebui" / "webui.db", _e / "snap" / "webui.db",
     _blocked_quar / "forensics")))
+
+# restore_interrupted -> 5 (p3-b F4/F9; reuses "error"'s code deliberately
+# — see RESTORE_EXIT_CODES's own comment for why a distinct number needs a
+# `case` arm in entrypoint.sh, outside this lane's file list). An in-flight
+# marker left by a killed backup.py::restore_backup() refuses the boot
+# outright, before any of restore_on_boot's own local-vs-snapshot
+# reconciliation runs — driven for real here exactly like every other row.
+_mk = Path(tempfile.mkdtemp(prefix="rc-interrupted-"))
+make_db(_mk / "openwebui" / "webui.db", 5, "LOCAL-IS-NEWER")
+_mk_quar = Path(tempfile.mkdtemp(prefix="rc-interrupted-q-"))
+_mk_quar.mkdir(parents=True, exist_ok=True)
+(_mk_quar / "restore-20260101-000000-000.inprogress").write_bytes(
+    json.dumps({
+        "stamp": "20260101-000000-000", "written_at": 0,
+        "plan": {"archive": "zions-backup-test.tar.gz", "target_db": None},
+    }).encode()
+)
+_cases.append(("restore_interrupted", 5, run_restore(
+    _mk / "openwebui" / "webui.db", _mk / "snap" / "webui.db", _mk_quar)))
 
 for _action, _want, (_rc, _out) in _cases:
     check(
