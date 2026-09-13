@@ -39,10 +39,23 @@ the thing that shipped the bug.
 
 EXIT CODES
     0   every selected suite ran and passed
-    1   at least one suite failed
+    1   at least one suite failed, OR at least one suite was INCONCLUSIVE
     2   the runner itself could not proceed (bad interpreter, no suites)
     3   everything that ran passed, but something was SKIPPED
         (--allow-skips downgrades this to 0)
+
+A suite is INCONCLUSIVE when its subprocess exits with anything other than
+0 (pass), 1 (fail) or 3 (skip) — most often 137 (128+9, SIGKILL). Every
+compose test stack used to pin a fixed container_name, and the documented
+cleanup for a stuck run used to be a wildcard `docker rm -f` filter that matches ANY
+project's in-flight container sharing that substring — under concurrent
+runs that kills a NEIGHBOUR's suite mid-run, not the stuck one, and an
+unexplained exit code is not evidence either way (see
+hostile2-apparatus.md, "every stack pins container_name"). Folding that into
+FAIL used to let a killed run be read as a real defect; run-tests.py now
+prints it under its own INCONCLUSIVE heading and counts it separately, but
+still returns exit 1 overall — this runner cannot claim a clean pass (0)
+when it could not tell whether a suite passed.
 
 WHY NOT pytest. These suites are plain scripts that own their own process:
 each sets environment variables BEFORE importing `main`, and several patch
@@ -116,7 +129,7 @@ FAST_CUTOFF_S = 15
 # usable during development.
 SATURATION = {"test_saturation.py", "test_soak_conversation.py"}
 
-PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
+PASS, FAIL, SKIP, INCONCLUSIVE = "PASS", "FAIL", "SKIP", "INCONCLUSIVE"
 
 
 def discover(only: str | None) -> list[tuple[Path, Path]]:
@@ -143,7 +156,6 @@ def run_one(py: Path, cwd: Path, script: Path, timeout: int) -> tuple[str, float
     if r.returncode == 0:
         return PASS, dt, ""
     if r.returncode == 3:
-        
         # The reason line, not the "SKIPPED: <file>" banner above it.
         reason = next(
             (ln.split("reason:", 1)[-1].strip()
@@ -154,6 +166,26 @@ def run_one(py: Path, cwd: Path, script: Path, timeout: int) -> tuple[str, float
             body = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
             reason = next((ln for ln in body if not ln.startswith("SKIPPED")), "fixture unavailable")
         return SKIP, dt, reason[:120]
+    if r.returncode != 1:
+        # This suite's own contract is 0/3/1 (pass/skip/fail — see the module
+        # docstring). Anything else is not this suite telling us it failed;
+        # it is the PROCESS ending some other way — most often 137 (128+9,
+        # SIGKILL), which the compose stacks' fixed container_names (since
+        # removed) made a real hazard: a second concurrent run's cleanup filter could kill a
+        # first run's still-in-flight container. Folding that into FAIL used
+        # to let an operator read "the suite failed" off a kill it never
+        # asked for; a negative Python returncode (POSIX: killed by signal
+        # -N) is the same situation from this side of the subprocess call.
+        # Reporting it as its own status means a 137 can no longer be
+        # silently scored as either a pass or a fail — see
+        # hostile2-apparatus.md, "every stack pins container_name".
+        sig = f" (signal {-r.returncode})" if r.returncode < 0 else ""
+        # ASCII only, same reason as the SKIP banner below: an em dash here
+        # renders as a replacement character on the Windows console.
+        return (INCONCLUSIVE, dt,
+                f"exited {r.returncode}{sig}, not 0/1/3 - the process ended "
+                f"some other way (killed? crashed before the harness could "
+                f"report?), not this suite reporting pass/fail/skip")
     body = (r.stdout or "") + (r.stderr or "")
     hit = next((ln for ln in body.splitlines() if ln.startswith("FAIL")), "")
     if not hit:
@@ -222,19 +254,28 @@ def main() -> int:
         ceiling = max(args.timeout, SLOW_S.get(script.name, 0) * 2)
         status, dt, note = run_one(py, cwd, script, ceiling)
         results.append((status, script.name, dt, note))
-        mark = {PASS: "ok  ", FAIL: "FAIL", SKIP: "SKIP"}[status]
+        mark = {PASS: "ok  ", FAIL: "FAIL", SKIP: "SKIP",
+                INCONCLUSIVE: "????"}[status]
         line = f"  {mark} {script.name:<44}{dt:6.1f}s"
         print(line + (f"  {note}" if note else ""), flush=True)
 
-    n = {s: sum(1 for r in results if r[0] == s) for s in (PASS, FAIL, SKIP)}
+    n = {s: sum(1 for r in results if r[0] == s)
+         for s in (PASS, FAIL, SKIP, INCONCLUSIVE)}
     print("-" * 72)
-    print(f"{n[PASS]} passed, {n[FAIL]} failed, {n[SKIP]} skipped "
-          f"in {time.monotonic() - t_all:.0f}s")
+    print(f"{n[PASS]} passed, {n[FAIL]} failed, {n[SKIP]} skipped, "
+          f"{n[INCONCLUSIVE]} inconclusive in {time.monotonic() - t_all:.0f}s")
 
     if n[FAIL]:
         print("\nFAILED:")
         for s, name, _, note in results:
             if s == FAIL:
+                print(f"  {name}: {note}")
+    if n[INCONCLUSIVE]:
+        print("\nINCONCLUSIVE - these did not report pass, fail or skip; "
+              "the process ended some other way (see notes) and this is "
+              "NOT evidence of anything, including a failure:")
+        for s, name, _, note in results:
+            if s == INCONCLUSIVE:
                 print(f"  {name}: {note}")
     if n[SKIP]:
         # ASCII only: the Windows console this runs on renders an em dash as a
@@ -247,7 +288,14 @@ def main() -> int:
         print("  Start the fixture:  docker compose -f "
               "docker-compose.tokenizer-contract.yml up -d tokenize-fixture")
 
-    if n[FAIL]:
+    if n[FAIL] or n[INCONCLUSIVE]:
+        # INCONCLUSIVE folds into the same exit code as FAIL rather than
+        # getting a fifth code of its own: this runner's own exit-code
+        # contract (0/1/2/3, documented above) is read by other scripts, and
+        # a run that could not tell whether a suite passed must not be able
+        # to report 0. It is kept OUT of n[FAIL]'s own count and printed
+        # under its own heading above precisely so a reader does not mistake
+        # it for a suite that actually failed its checks.
         return 1
     if n[SKIP] and not args.allow_skips:
         return 3

@@ -53,7 +53,9 @@ services:
     build:
       context: .
       dockerfile: testfixtures/unit-suite/Dockerfile
-    container_name: zla-bench-compaction
+    # NO container_name — see the note on unit-tests in
+    # docker-compose.tests.yml. network_mode: none and nothing depends_on
+    # this service, so nothing needed the fixed name.
     volumes:
       # Read-only, and NOT copied to a scratch tree the way the unit suite
       # copies it. The suites write sqlite files and chromadb stores next to
