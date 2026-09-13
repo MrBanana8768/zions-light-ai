@@ -37,6 +37,16 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 #   released since the base image was published.
 # - apt-get clean + autoremove + lists prune keeps the layer slim.
 # ~200 MB total — necessary tax for vLLM on a slim base.
+# - ffmpeg (v3.1.9): OpenWebUI's own audio router shells out to ffmpeg/ffprobe
+#   through pydub. That covers the read-aloud button (it transcodes the TTS
+#   server's WAV to MP3 on every call), splitting a recording over its 20 MB
+#   limit, and probing uploads. None of it was installed. The Whisper venv's
+#   `av` wheel bundles its own ffmpeg libraries for faster-whisper, but that
+#   is not a binary on PATH, and pydub needs the binary. Measured on
+#   v3.1.6.1-cu12 through OpenWebUI's API:
+#   - read-aloud returned HTTP 200 with a JSON "No such file or directory:
+#     'ffprobe'" body instead of audio, on every reply;
+#   - any recording over 20 MB failed in ~4 s.
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
@@ -50,7 +60,8 @@ RUN apt-get update && \
         libgomp1 \
         supervisor \
         binutils \
-        build-essential && \
+        build-essential \
+        ffmpeg && \
     apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
@@ -177,9 +188,11 @@ RUN /opt/compactor-venv/bin/python -c \
 # =============================================================================
 # Whisper (STT) venv — V3.2. Fully decoupled from vLLM AND the compactor:
 # faster-whisper pulls ctranslate2 + av + onnxruntime into its OWN venv, so its
-# deps can never disturb vLLM's torch pins or the compactor's. av ships ffmpeg
-# in its wheel, so no apt ffmpeg is needed. Same install+strip+clean atomic
-# pattern as the other venvs.
+# deps can never disturb vLLM's torch pins or the compactor's. av ships the
+# ffmpeg LIBRARIES faster-whisper needs in its wheel. That covers this venv
+# only: OpenWebUI's pydub needs the ffmpeg/ffprobe BINARIES, which the apt
+# layer above installs (v3.1.9). Same install+strip+clean atomic pattern as
+# the other venvs.
 # =============================================================================
 COPY stt/requirements.txt /opt/stt/requirements.txt
 RUN python3 -m venv /opt/whisper-venv && \
