@@ -392,6 +392,45 @@ check(short_list, False,
       "and must not trip the structural block at all")
 
 print()
+print("[9b] R25 (hostile317-a F5) — the fragment-line rule must reach the "
+      "reply's own end, same as the list backstop above")
+# Calibration (scripts/calibrate-structural-degeneracy.py, 2026-09-01, 332
+# completed replies): the fragment-line rule flagged 23 of them. 21 are
+# explained by another signal (16 carry a tail loop) and their fragment
+# line IS the reply's own last line — a real cut tail looks exactly like
+# this. The remaining 2 (25,209 and 15,141 chars) are the true false
+# positives, and what distinguishes them is that the fragment-shaped block
+# is NOT the last line: the reply goes on afterward, the shape the list
+# backstop was already fixed for in [9].
+#
+# A FINISHED reply whose one paragraph happens to be built of short
+# sentences ("Lyra laughs. Mrs. Hale nods slowly. The rain stops. ...", an
+# ordinary roleplay beat) must not be refused from memory just because it
+# sits ahead of other content, the same way a 66-item Bible list that
+# closes in prose is not a runaway.
+check(fragments(110, 15) + "\n\nAnd that was the end of it, for now.", False,
+      "a 1,600+ character fragment line followed by a closing sentence is "
+      "not a runaway - the fragment line does not reach the reply's own end")
+check(
+    "Before I answer, one note.\n\n" + fragments(110, 15),
+    True,
+    "the SAME fragment line, with unrelated content BEFORE it but nothing "
+    "after, still fires - it is still the reply's own last line",
+)
+# The comma-separated shape (no sentence break at all) must obey the same
+# rule - it is the same collapse with a smaller separator (see the module
+# comment above DEGENERATE_LINE_CHARS).
+check(comma_long + "\n\nThanks for asking.", False,
+      "the same comma-separated collapse followed by a closing line is not "
+      "a runaway either")
+# CONTROL: a genuine runaway that ends the reply (nothing after it, as the
+# corpus shape always is) is caught with or without this fix - proves R25
+# narrows the rule rather than disabling it.
+check(fragments(110, 15), True,
+      "fixture ok   CONTROL: the same fragment line with nothing after it "
+      "(the corpus shape) is still caught")
+
+print()
 print("[R-TAIL] a PHRASE repeating to the end of the reply (v3.1.8)")
 # Reported as "the repeating tail thing", intermittent, and measured in the
 # 2026-09-07 backup: 1,165 stored replies, the shipped detector firing on

@@ -105,10 +105,17 @@ L1_MAX_TOKENS = env_int("COMPACTOR_L1_MAX_TOKENS", 500)
 L2_MAX_TOKENS = env_int("COMPACTOR_L2_MAX_TOKENS", 1200)
 L3_MAX_TOKENS = env_int("COMPACTOR_L3_MAX_TOKENS", 2000)
 
-# Same env var and default main.py reads for its own /tokenize call sites
-# (main.py:693, TOKENIZE_WARN_INTERVAL_S) — deliberately, not independently
-# tuned: an operator setting this once should govern every /tokenize
-# dependency in the process, not just the ones main.py happens to own.
+# Same env var and default main.py reads for its own /tokenize call sites,
+# under its own module-level TOKENIZE_WARN_INTERVAL_S — deliberately, not
+# independently tuned: an operator setting this once should govern every
+# /tokenize dependency in the process, not just the ones main.py happens to
+# own. (hostile2-config: this pair used to disagree — main.py parsed the
+# variable with int(), so any non-integer value there silently reverted to
+# the 300 default while this module applied it correctly. Fixed by reading
+# it with env_float in both places; test_tail_tokenize_warn_interval.py
+# pins the two modules' parsing against each other directly. A line-number
+# citation was here and went stale the first time either file was edited
+# above it — the constant's own name does not.)
 TOKENIZE_WARN_INTERVAL_S = env_float("COMPACTOR_TOKENIZE_WARN_INTERVAL_S", 300)
 
 # Hard ceiling on the rendered injection block (see format_summary_block).
@@ -1112,6 +1119,22 @@ def _recorded_position(state: dict) -> int:
         int(state.get("last_summarized_turn") or 0),
         _highest_chunk_turn(state),
     )
+
+
+def recorded_position(state: dict) -> int:
+    """Public wrapper over `_recorded_position`, for callers outside this
+    module that need to know how far a conversation has already been
+    tracked WITHOUT calling `maybe_rollup` (v3.1.9.3 / hostile317-b F3).
+
+    backfill.py is the one caller: it snapshots a conversation's messages at
+    kickoff and runs for minutes off the request path, so by the time its
+    own `maybe_rollup` call would run, `state` may already reflect turns the
+    snapshot knows nothing about. Comparing this against the snapshot's own
+    turn count is how it decides whether calling `maybe_rollup` with that
+    snapshot is still safe — see `_observed_position`'s docstring and
+    backfill._run_backfill for why an out-of-order call is not.
+    """
+    return _recorded_position(state)
 
 
 def _repair_watermark_below_chunks(conv_id: str, state: dict) -> bool:

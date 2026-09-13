@@ -35,7 +35,9 @@ the backfill — and assert reuse still fires afterwards.
 """
 
 import asyncio
+import contextlib
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -52,6 +54,7 @@ import memory  # noqa: E402
 memory.ensure_storage_layout()
 
 import backfill  # noqa: E402
+import logsetup  # noqa: E402
 import main  # noqa: E402
 import summarizer  # noqa: E402
 
@@ -64,6 +67,35 @@ def check(cond, label):
     else:
         print(f"FAIL {label}")
         FAILED.append(label)
+
+
+# Log capture on main's logger ("compactor"), same shape as
+# test_truncated_tail.py — used by [12c] to pin the H9 decline log.
+class _Collector(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+@contextlib.contextmanager
+def capture(logger_name: str = "compactor"):
+    lg = logging.getLogger(logger_name)
+    handler = _Collector()
+    prev_level = lg.level
+    lg.addHandler(handler)
+    lg.setLevel(logging.DEBUG)
+    try:
+        yield handler
+    finally:
+        lg.removeHandler(handler)
+        lg.setLevel(prev_level)
+
+
+def _find(records, needle):
+    return next((r for r in records if needle in r.getMessage()), None)
 
 
 def history(n_exchanges: int, tag: str = "") -> list[dict]:
@@ -360,6 +392,76 @@ check(not any("TRUNC-CHUNK" in str(m.get("content", "")) for m in out),
 check(len(CALLS) == 1 and any("question 0" in t for t in CALLS[0]),
       "and its oldest turn went to summarize() rather than being replaced")
 
+print("[12b] hostile2-reuse H7: padding with tool-role turns must not lift "
+      "_n over the length gate")
+# `_n` used to count every non-"system" role, including tool/developer/other
+# roles the hierarchy never tracks. A genuine capped window aligns by
+# construction (a cap always sends the previous anchor's own tail), so [12]'s
+# refusal is the interesting case: EVERYTHING else about the array is
+# unchanged from [12] (same genuine truncated head, same content, same
+# recorded position) except 30 tool-role messages appended after the real
+# turns, which is enough to push a broad "!= system" _n from 20 to 50 — over
+# the recorded position of 48 — even though the true conversation is still
+# only 20 turns of real content plus 30 turns of nothing the hierarchy has
+# ever seen. OpenWebUI never sends tool-role messages today, so this is not
+# reachable on the one client this pod serves; the compactor is a generic
+# OpenAI-compatible proxy, so nothing gates it for another one.
+CONV_TOOLPAD = "reuse_toolpad_h7"
+_seed(CONV_TOOLPAD, _TRUNC, [{"text": "TOOLPAD-CHUNK", "first_turn": 1, "last_turn": 10}])
+_st_tp = summarizer.load_state(CONV_TOOLPAD)
+_st_tp["turns_seen"] = 48
+summarizer.save_state(CONV_TOOLPAD, _st_tp)
+_PADDED = list(_TRUNC) + [
+    {"role": "tool", "content": f"tool-pad-{i}", "tool_call_id": f"t{i}"}
+    for i in range(30)
+]
+_n_padded = len([m for m in _PADDED if m.get("role") != "system"])
+check(_n_padded >= 48,
+      f"fixture: a broad != 'system' count reads {_n_padded} turns — over "
+      f"the recorded position of 48 — from 20 real turns and 30 that are not")
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(list(_PADDED), CONV_TOOLPAD))
+check(not any("TOOLPAD-CHUNK" in str(m.get("content", "")) for m in out),
+      "*** H7: 30 tool-role turns must not talk the length gate into "
+      "treating this truncated-head array as long enough to trust — the "
+      "same array [12] refuses without them")
+check(len(CALLS) == 1 and any("question 0" in t for t in CALLS[0]),
+      "and turn 1 still goes to summarize() rather than being replaced")
+
+print("[12c] hostile2-reuse H9: the length-gate decline is no longer silent")
+# [12]'s own fixture IS the silent case: _covered=10 > 0, nothing changed
+# (_changed is empty), so neither of the two decline logs above it fired -
+# the log line this produced was byte-identical in SHAPE to a healthy
+# no-hierarchy turn ("compacted: summarized N text turn(s) ..." with no
+# mention of the stored summaries at all). Fresh conv_id so log_once's
+# per-conversation gate has not already fired for it.
+CONV_SILENT = "reuse_silent_length_decline"
+_SILENT = [_FULL[0]] + _ns_full[:20]          # genuine head, same shape as [12]
+_seed(CONV_SILENT, _SILENT, [{"text": "SILENT-CHUNK", "first_turn": 1, "last_turn": 10}])
+_st_sil = summarizer.load_state(CONV_SILENT)
+_st_sil["turns_seen"] = 48
+summarizer.save_state(CONV_SILENT, _st_sil)
+check(_plan(CONV_SILENT, _SILENT) == (10, set()),
+      "fixture: covered > 0 and NOTHING changed - the silent shape")
+with capture() as records:
+    CALLS.clear()
+    out = asyncio.run(main.compact_if_needed(list(_SILENT), CONV_SILENT))
+check(not any("SILENT-CHUNK" in str(m.get("content", "")) for m in out),
+      "fixture: the length gate still refuses (same as [12])")
+hit = _find(records.records, "recorded position of")
+check(hit is not None,
+      f"*** H9: a length-gate decline whose content genuinely matched must "
+      f"log SOMETHING - the reuse feature can go permanently dead with no "
+      f"other symptom (got {[r.getMessage() for r in records.records]!r})")
+if hit:
+    msg = hit.getMessage()
+    check(str(10) in msg or "10 " in msg or "covers 10" in msg,
+          f"and it names the numbers that decided it, not just that it "
+          f"happened (got: {msg!r})")
+check(logsetup.log_once(f"compact.reuse.length_declined.{CONV_SILENT}") is False,
+      "the decline log is log_once-gated per conversation, not per request - "
+      "a stuck conversation logs it once, not on every turn forever")
+
 print("[13] a HOLE in the stored coverage stops the substitution at the hole")
 # Chunks cover 1-10 and 31-44. _highest_chunk_turn says 44; the real coverage
 # is 10, and turns 11-30 are represented by nothing at all.
@@ -491,6 +593,63 @@ _raw["covered_fps"] = "0123456789abcdef" * 39 + "01234567"
 summarizer.summary_path(CONV_OLD).write_text(json.dumps(_raw), encoding="utf-8")
 check(summarizer.load_state(CONV_OLD).get("covered_fps") == "",
       "a torn record on disk loads as no record at all")
+
+print("[16b] hostile2-reuse M1: stored_turns_out reports exactly what was "
+      "reused, so the caller can skip its own second render")
+# main.py's chat_completions injects a SEPARATE copy of the summary
+# hierarchy as its own system block, independently trimmed to a different
+# budget. On a reusing turn that used to render the same hierarchy TWICE,
+# disagreeing about which scenes survived each trim - the six they shared
+# got sent to the model twice. The fix has the caller skip its own copy
+# when compact_if_needed already put one in the array; this pins the
+# CONTRACT that decision is made from: stored_turns_out receives exactly
+# how many turns were reused, 0 (or nothing at all) when none were.
+CONV_M1 = "reuse_m1_outparam"
+_seed(CONV_M1, MSGS, [
+    {"text": "M1-CHUNK-ONE", "first_turn": 1, "last_turn": 20},
+    {"text": "M1-CHUNK-TWO", "first_turn": 21, "last_turn": 40},
+])
+_out_reused: list = []
+CALLS.clear()
+out = asyncio.run(main.compact_if_needed(
+    list(MSGS), CONV_M1, stored_turns_out=_out_reused))
+check(any("M1-CHUNK" in str(m.get("content", "")) for m in out),
+      "fixture: this call DID reuse the stored hierarchy")
+check(_out_reused == [40],
+      f"*** M1: stored_turns_out must report the 40 turns actually reused "
+      f"(got {_out_reused})")
+
+# CONTROL 1: no conv_id (today's behaviour) never reuses, so the out-param
+# must say so - if it silently stayed empty for every caller the M1 fix
+# would always skip the injected copy, exactly the "reuse permanently
+# looks like it happened when it did not" failure shape.
+_out_none_conv: list = []
+CALLS.clear()
+asyncio.run(main.compact_if_needed(
+    list(MSGS), None, stored_turns_out=_out_none_conv))
+check(_out_none_conv == [0],
+      f"CONTROL: no conv_id -> stored_turns_out reports 0, not nothing "
+      f"(got {_out_none_conv})")
+
+# CONTROL 2: a capped, refused window (same shape as [5]/[12]) reuses
+# nothing, and the out-param must say 0 here too, or the caller would wrongly
+# skip injecting the summary block on a turn that needed it.
+_out_declined: list = []
+CALLS.clear()
+asyncio.run(main.compact_if_needed(
+    list(SHORT), CONV_M1, stored_turns_out=_out_declined))
+check(_out_declined == [0],
+      f"CONTROL: a declined (capped) window -> stored_turns_out reports 0 "
+      f"(got {_out_declined})")
+
+# CONTROL 3: omitting the kwarg entirely (every OTHER call in this file, and
+# the only call site before this fix existed) must behave exactly as before
+# - a default-None out-param that is never touched.
+CALLS.clear()
+out_default = asyncio.run(main.compact_if_needed(list(MSGS), CONV_M1))
+check(any("M1-CHUNK" in str(m.get("content", "")) for m in out_default),
+      "CONTROL: omitting stored_turns_out entirely still reuses normally - "
+      "the parameter is additive, not a behaviour change")
 
 
 # ---------------------------------------------------------------------------

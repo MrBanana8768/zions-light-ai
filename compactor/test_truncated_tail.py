@@ -690,12 +690,12 @@ import degrade  # noqa: E402
 
 
 def _post_nonstream_no_disk(conv_id, reply):
-    with patch.object(degrade, "guard", lambda op: False):
+    with patch.object(degrade, "guard", lambda op, fresh=False: False):
         return _post_nonstream(conv_id, reply)
 
 
 def _post_stream_no_disk(conv_id, chunks):
-    with patch.object(degrade, "guard", lambda op: False):
+    with patch.object(degrade, "guard", lambda op, fresh=False: False):
         return _post_stream(conv_id, chunks)
 
 
@@ -935,7 +935,7 @@ assert_eq(len(_ROLLUPS), 0, "whitespace reply: and no rollup")
 
 _ROLLUPS.clear()
 _INDEXED.clear()
-with patch.object(degrade, "guard", lambda op: False), \
+with patch.object(degrade, "guard", lambda op, fresh=False: False), \
      patch.object(facts, "extraction_enabled", lambda: True), \
      patch.object(facts, "load_facts", lambda c: []), \
      patch.object(summarizer, "enabled", lambda: True), \
@@ -1032,7 +1032,8 @@ def _run_job2(conv_id, *, extraction=True, user_text="a real question",
     _ROLLUPS.clear()
     _INDEXED.clear()
     touched = [{**_STORED_FACT, "last_used": 99}]
-    with patch.object(degrade, "guard", lambda op: op != blocked_label), \
+    with patch.object(degrade, "guard",
+                      lambda op, fresh=False: op != blocked_label), \
          patch.object(facts, "extraction_enabled", lambda: extraction), \
          patch.object(facts, "load_facts", lambda c: [dict(_STORED_FACT)]), \
          patch.object(facts, "save_facts",
@@ -1108,19 +1109,30 @@ assert_eq(len(_EXTRACTED), 0,
 # guard() cannot answer differently for two labels at one instant. A hostile
 # review made that point the day [E10c] was written and it is correct.
 #
-# This is the reachable version. degrade.guard() calls writes_allowed(), whose
-# reading is cached for COMPACTOR_DEGRADE_CHECK_TTL_S (10 s) — so the two
-# checks differ only when more than the TTL passes between them, which is a
-# tail re-queued behind a bgwork.pool backlog or a slow extraction round trip.
-# Patch writes_allowed, NOT guard, and let the shipped guard() run: first call
-# allowed (the outer check), every call after it blocked (the disk filled and
-# the TTL expired).
-_WA_CALLS: list = []
+# This is the reachable version — patching degrade._free_mb, the ONE thing
+# genuinely external to this module, and letting writes_allowed()'s REAL
+# caching, guard()'s REAL delegation and _facts_tail/_rollup_hierarchy's REAL
+# fresh=True calls all run unmodified. hostile2-config named this exact
+# construction ("patch degrade._free_mb ... so that the first call reports
+# space and a later one does not, which is what the TTL expiring on a slow
+# tail actually looks like") over the version this file shipped first
+# (patching writes_allowed() directly) — that version happened to still pass
+# every assertion below with fresh=True removed from both call sites (proven
+# by hand while writing this fix), because replacing writes_allowed()
+# wholesale bypasses the real _cache entirely and so cannot tell "fresh"
+# from "cached" apart. Patching _free_mb does not have that hole: it is the
+# one function degrade.py's own cache sits in front of, so a plain
+# (non-fresh) second call inside the TTL genuinely reads the CACHED first
+# value, and only fresh=True reaches this scripted function again.
+_FREE_MB_CALLS: list = []
 
 
-def _flip_writes_allowed():
-    _WA_CALLS.append(1)
-    return (len(_WA_CALLS) == 1, 10.0)
+def _flip_free_mb(path):
+    _FREE_MB_CALLS.append(1)
+    # First call (the outer, non-fresh request-path check): ample space.
+    # Every call after it (job 2's and job 3's fresh=True calls): below the
+    # 200 MB floor — the disk that filled while the extraction call ran.
+    return 10_000.0 if len(_FREE_MB_CALLS) == 1 else 50.0
 
 
 def _run_job2_flip(conv_id, *, always=False):
@@ -1128,10 +1140,10 @@ def _run_job2_flip(conv_id, *, always=False):
     _SAVED.clear()
     _ROLLUPS.clear()
     _INDEXED.clear()
-    _WA_CALLS.clear()
+    _FREE_MB_CALLS.clear()
     degrade._reset_cache_for_tests()
-    _wa = (lambda: (True, 10.0)) if always else _flip_writes_allowed
-    with patch.object(degrade, "writes_allowed", _wa), \
+    _fm = (lambda path: 10_000.0) if always else _flip_free_mb
+    with patch.object(degrade, "_free_mb", _fm), \
          patch.object(facts, "extraction_enabled", lambda: True), \
          patch.object(facts, "load_facts", lambda c: [dict(_STORED_FACT)]), \
          patch.object(facts, "save_facts",
@@ -1161,15 +1173,18 @@ assert_eq(len(_ROLLUPS), 1, "control: and job 3 still rolls up")
 
 _run_job2_flip("tt-job2-flip")
 assert_eq(len(_INDEXED), 1,
-          "the TTL expired and the disk filled: job 1 ran, so the OUTER guard "
-          "passed and we are genuinely past it")
-assert_true(len(_WA_CALLS) >= 2,
-            "...and something asked writes_allowed() a second time after it "
-            "(got %d call(s)) — measured through the shipped guard(), not a "
-            "patched one" % len(_WA_CALLS))
+          "the disk fills after the outer check: job 1 ran, so the OUTER "
+          "guard passed and we are genuinely past it")
+assert_true(len(_FREE_MB_CALLS) >= 2,
+            "...and something asked _free_mb (the REAL statvfs path, not a "
+            "patched writes_allowed) a second time after it — INSIDE the "
+            "10s TTL, not because it expired (got %d call(s))"
+            % len(_FREE_MB_CALLS))
 assert_eq(len(_EXTRACTED), 0,
-          "...and job 2 refused: no extraction call once the second reading "
-          "came back blocked")
+          "*** and job 2 refused: no extraction call once its fresh=True "
+          "read came back blocked — this is exactly what fresh=True fixes; "
+          "with it removed, job 2's plain call would read the OUTER check's "
+          "CACHED (ample) reading and extract anyway")
 assert_eq(len(_SAVED), 0, "...and wrote nothing")
 assert_eq(len(_ROLLUPS), 0,
           "...and job 3 refused too, which is correct — by then the disk "
