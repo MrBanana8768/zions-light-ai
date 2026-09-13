@@ -680,6 +680,147 @@ check(r.json().get("dry_run") is False, "?dry_run=false means commit")
 check(snapshot() != _before_false, "and it wrote")
 
 
+# ---------------------------------------------------------------------------
+# 9b. v3.1.9 HIGH #1: an AMBIGUOUS present flag is a DRY RUN on the real
+# endpoint too - not just in _dry_run_from's own unit table
+# (test_config_dryrun.py). Each of these used to be a LIVE run because an
+# empty/malformed PRESENT value took `default`, and this endpoint's default
+# is live. Proved here end-to-end (real HTTP round trip through the app,
+# real snapshot of what did or did not get written) so the fix is checked at
+# the wire, not only inside the parser.
+# ---------------------------------------------------------------------------
+
+print()
+print("[9b] an ambiguous PRESENT dry_run (empty, bare, or a misspelled key) "
+      "is a DRY RUN, never the write")
+
+
+def _ambiguous_case(qs, label):
+    cid = f"dryrun-ambig-{len(_AMBIG_CIDS)}"
+    _AMBIG_CIDS.append(cid)
+    set_store(exchanges(60))
+    before = snapshot()
+    r = admin.post(f"/admin/conversations/{cid}/compact{qs}", json={})
+    check(r.status_code == 200, f"{label}: HTTP 200 (got {r.status_code})")
+    check(r.json().get("dry_run") is True,
+          f"{label}: reported dry_run: true (got {r.json().get('dry_run')!r})")
+    check(snapshot() == before, f"{label}: not one byte under the storage root changed")
+
+
+_AMBIG_CIDS = []
+_ambiguous_case("?dry_run=", "?dry_run= (present, empty)")
+_ambiguous_case("?dry_run", "?dry_run (bare flag)")
+_ambiguous_case("?dryrun=true", "?dryrun=true (misspelled key)")
+_ambiguous_case("?dry_run=true&dry_run=", "?dry_run=true&dry_run= (last-wins empty)")
+
+
+# ---------------------------------------------------------------------------
+# 9c. v3.1.9 HIGH #2: the BODY dialect now agrees with the query-string
+# dialect on the real endpoint. {"dry_run": null} used to COMMIT (the compact
+# endpoint's own default, read through `bool(None) is False`); it must not.
+# And {"dry_run": "false"} used to stay a DRY RUN (a non-empty string is
+# truthy) while ?dry_run=false committed on the very same endpoint; they must
+# now agree.
+# ---------------------------------------------------------------------------
+
+print()
+print("[9c] the body dialect for dry_run now agrees with the query dialect")
+
+CID_NULL = "dryrun-body-null"
+set_store(exchanges(60))
+_before_null = snapshot()
+r = admin.post(f"/admin/conversations/{CID_NULL}/compact", json={"dry_run": None})
+check(r.status_code == 200, f"{{'dry_run': None}}: HTTP 200 (got {r.status_code})")
+check(r.json().get("dry_run") is True,
+      "{'dry_run': None}: reported dry_run: true - it used to COMMIT "
+      "(got %r)" % (r.json().get("dry_run"),))
+check(snapshot() == _before_null, "{'dry_run': None}: not one byte changed")
+
+CID_STR_FALSE = "dryrun-body-str-false"
+set_store(exchanges(60))
+_before_strfalse = snapshot()
+r = admin.post(f"/admin/conversations/{CID_STR_FALSE}/compact", json={"dry_run": "false"})
+check(r.json().get("dry_run") is False,
+      "{'dry_run': \"false\"}: reported dry_run: false - it used to stay DRY "
+      "while ?dry_run=false committed on the same endpoint "
+      "(got %r)" % (r.json().get("dry_run"),))
+check(snapshot() != _before_strfalse, "{'dry_run': \"false\"}: and it wrote")
+
+
+# ---------------------------------------------------------------------------
+# 9d. GATE REVIEW round: conflicting repeated query values, and body-vs-query
+# disagreement, on the REAL endpoint (not just the unit table in
+# test_config_dryrun.py). Both used to COMMIT.
+# ---------------------------------------------------------------------------
+
+print()
+print("[9d] gate review: conflicting repeated values and body-vs-query "
+      "disagreement both resolve to DRY, not the write")
+
+CID_CONFLICT_Q = "dryrun-conflict-query"
+set_store(exchanges(60))
+_before_conflict_q = snapshot()
+r = admin.post(f"/admin/conversations/{CID_CONFLICT_Q}/compact?dry_run=true&dry_run=false", json={})
+check(r.status_code == 200, f"?dry_run=true&dry_run=false: HTTP 200 (got {r.status_code})")
+check(r.json().get("dry_run") is True,
+      "?dry_run=true&dry_run=false: reported dry_run: true - it used to COMMIT "
+      "(request.query_params.get is last-wins, so 'false' used to win) "
+      "(got %r)" % (r.json().get("dry_run"),))
+check(snapshot() == _before_conflict_q, "?dry_run=true&dry_run=false: not one byte changed")
+
+# CONTROL: repeated but AGREEING values still commit - this is not
+# "any repeated query key means dry now".
+CID_AGREE_Q = "dryrun-agree-query"
+set_store(exchanges(60))
+_before_agree_q = snapshot()
+r = admin.post(f"/admin/conversations/{CID_AGREE_Q}/compact?dry_run=false&dry_run=false", json={})
+check(r.json().get("dry_run") is False,
+      "?dry_run=false&dry_run=false: CONTROL - repeated AGREEING commit "
+      "tokens still commit (got %r)" % (r.json().get("dry_run"),))
+check(snapshot() != _before_agree_q, "?dry_run=false&dry_run=false: and it wrote")
+
+CID_CONFLICT_BQ = "dryrun-conflict-body-query"
+set_store(exchanges(60))
+_before_conflict_bq = snapshot()
+r = admin.post(f"/admin/conversations/{CID_CONFLICT_BQ}/compact?dry_run=true",
+                json={"dry_run": False})
+check(r.status_code == 200, f"body False + ?dry_run=true: HTTP 200 (got {r.status_code})")
+check(r.json().get("dry_run") is True,
+      "body False + ?dry_run=true: reported dry_run: true - the body used to "
+      "win outright and COMMIT without the query ever being consulted "
+      "(got %r)" % (r.json().get("dry_run"),))
+check(snapshot() == _before_conflict_bq, "body False + ?dry_run=true: not one byte changed")
+
+# CONTROL: body alone, query alone, and both-agree-on-commit ALL still
+# commit - the fix is "any present source can veto", not "two sources
+# present means dry no matter what".
+CID_BODY_ALONE = "dryrun-body-alone-commit"
+set_store(exchanges(60))
+_before_body_alone = snapshot()
+r = admin.post(f"/admin/conversations/{CID_BODY_ALONE}/compact", json={"dry_run": False})
+check(r.json().get("dry_run") is False,
+      "CONTROL: {'dry_run': False} alone still commits (got %r)" % (r.json().get("dry_run"),))
+check(snapshot() != _before_body_alone, "and it wrote")
+
+CID_QUERY_ALONE = "dryrun-query-alone-commit"
+set_store(exchanges(60))
+_before_query_alone = snapshot()
+r = admin.post(f"/admin/conversations/{CID_QUERY_ALONE}/compact?dry_run=false", json={})
+check(r.json().get("dry_run") is False,
+      "CONTROL: ?dry_run=false alone still commits (got %r)" % (r.json().get("dry_run"),))
+check(snapshot() != _before_query_alone, "and it wrote")
+
+CID_BOTH_AGREE = "dryrun-both-agree-commit"
+set_store(exchanges(60))
+_before_both_agree = snapshot()
+r = admin.post(f"/admin/conversations/{CID_BOTH_AGREE}/compact?dry_run=false",
+                json={"dry_run": False})
+check(r.json().get("dry_run") is False,
+      "CONTROL: body False AND ?dry_run=false together still commit "
+      "(got %r)" % (r.json().get("dry_run"),))
+check(snapshot() != _before_both_agree, "and it wrote")
+
+
 if FAILED:
     print(f"{len(FAILED)} assertion(s) failed:")
     for label in FAILED:

@@ -22,6 +22,7 @@ import logging
 import warnings
 import os
 import re
+import threading
 import time
 import unicodedata
 from contextlib import asynccontextmanager
@@ -285,14 +286,46 @@ logsetup.configure()  # V2.3 Theme 4: text (default) or JSON via COMPACTOR_LOG_F
 logger = logging.getLogger("compactor")
 
 _tokenizer = None
-# Whether get_tokenizer has ALREADY tried and failed. See its docstring:
-# caching only the success made every later count_tokens re-enter
-# from_pretrained, 238x slower per call.
+# Whether get_tokenizer has ALREADY tried (and possibly failed) at least
+# once. See the docstring below: caching only the success made every later
+# count_tokens re-enter from_pretrained, 238x slower per call — that is what
+# this flag was added to stop. It no longer means "never try again"; see
+# _TOKENIZER_NEXT_RETRY_AT.
 _TOKENIZER_TRIED = False
+# get_tokenizer takes no lock before v3.1.9 HIGH #3 (hostile pass 2 on
+# 843bf9d): under uvicorn, count_tokens runs from the threadpool, so two
+# requests can enter concurrently. Thread A used to latch _TOKENIZER_TRIED
+# and then block inside from_pretrained; thread B would see the flag already
+# set and return the char/4 estimator for a tokenizer that was about to load
+# successfully — a wrong answer, not a crash, so nothing noticed. tokens.py's
+# sibling singleton (_load, same file) already gets this right with a
+# threading.Lock and a double-checked read; this mirrors that pattern.
+# threading.Lock (not asyncio.Lock) because this is called both from the
+# event loop and from run_in_threadpool workers — an asyncio.Lock only
+# coordinates coroutines on one loop and would not see threadpool callers.
+_TOKENIZER_LOCK = threading.Lock()
+# Failure-cache bookkeeping (v3.1.9 HIGH #3). A hostile pass found that
+# caching a MISS forever converts a transient fault — the MooseFS /data
+# blip this repo has documented twice (2026-08-31), or an HF cache that
+# is not warm yet at boot — into a PERMANENT one, because nothing in the
+# tree ever clears _TOKENIZER_TRIED. count_tokens drives compact_if_needed's
+# trigger and the hard budget guard, so a process pinned on char/4 for its
+# whole life silently discards content that should have been compressed
+# instead (the shape of the 2026-08-28 incident, worse). The fix is a
+# monotonic-clock retry window instead of "forever" or "every call": doubling
+# from _TOKENIZER_RETRY_FLOOR_S to _TOKENIZER_RETRY_CAP_S bounds the cost at
+# one 2.9 ms attempt per window — at the floor that is 0.01% of the 6.6
+# s/compaction the original fix measured — while still self-healing.
+_TOKENIZER_LAST_ERROR: str | None = None
+_TOKENIZER_FAILED_AT: float | None = None       # time.monotonic() of the last miss
+_TOKENIZER_NEXT_RETRY_AT: float | None = None   # time.monotonic() gate; None = no gate (untried, or loaded)
+_TOKENIZER_RETRY_S = 30.0        # current backoff interval; doubles on each consecutive miss
+_TOKENIZER_RETRY_FLOOR_S = 30.0  # first retry ~30s after a miss
+_TOKENIZER_RETRY_CAP_S = 600.0   # ...never further apart than 10 minutes
 
 
 def get_tokenizer():
-    """The local tokenizer, or None. THE FAILURE IS CACHED TOO (v3.1.9).
+    """The local tokenizer, or None. THE FAILURE IS CACHED, ON A TIMER (v3.1.9).
 
     `if _tokenizer is not None: return` caches only a SUCCESS. The except
     below sets `_tokenizer = None`, which fails that same test, so every later
@@ -301,34 +334,115 @@ def get_tokenizer():
     against 2.859 ms per call after a miss, and `_chunk_to_budget` calls
     count_tokens once PER MESSAGE, so one 2,301-message compaction spends about
     6.6 seconds re-failing to load the same tokenizer. That is the FAST failure
-    (HF_HUB_OFFLINE=1); a cold cache reaching for the network is worse.
+    (HF_HUB_OFFLINE=1); a cold cache reaching for the network is worse. That
+    cost is why a miss is cached at all.
 
-    Latent rather than live on the pod today — the live logs show one
-    "loaded tokenizer" per boot and zero failures — but the whole point is that
-    it arms itself the first time the cache is evicted or /data hiccups, which
-    is exactly when the compactor is least able to spare six seconds a turn.
+    Caching the miss FOREVER (843bf9d's shape) traded that latency bug for a
+    worse one: a five-second I/O blip at the moment of the first count_tokens
+    call pins the char/4 estimator for the rest of the process, silently,
+    with no field in /health/full to see it by (see tokenizer_state() below).
+    So the miss is cached only until _TOKENIZER_NEXT_RETRY_AT, which backs off
+    from _TOKENIZER_RETRY_FLOOR_S and doubles up to _TOKENIZER_RETRY_CAP_S on
+    each consecutive miss, and resets the moment a load succeeds. Between
+    misses this is a float comparison under a held lock, not a filesystem
+    walk — the per-call cost the original fix was written to kill stays dead.
 
     _TOKENIZER_TRIED is a separate flag rather than a sentinel object because
     `None` is a legitimate return here: it means "use the char/4 estimator",
-    and several callers check for it.
-    """
-    global _tokenizer, _TOKENIZER_TRIED
-    if _tokenizer is not None or _TOKENIZER_TRIED:
-        return _tokenizer
-    if not MODEL_REPO:
-        logger.warning("MODEL_REPO not set; falling back to char/4 token estimator")
-        _TOKENIZER_TRIED = True
-        return None
-    _TOKENIZER_TRIED = True
-    try:
-        from transformers import AutoTokenizer
+    and several callers check for it. It now means "at least one attempt has
+    been made", not "never try again" — MODEL_REPO absent is the one
+    exception (a static config value that cannot change without a process
+    restart, which resets this module anyway), so that path still latches
+    permanently rather than spinning a retry clock that can never help.
 
-        _tokenizer = AutoTokenizer.from_pretrained(MODEL_REPO)
-        logger.info(f"loaded tokenizer for {MODEL_REPO}")
-    except Exception as e:
-        logger.warning(f"could not load tokenizer for {MODEL_REPO}: {e}; using char/4 estimator")
-        _tokenizer = None
-    return _tokenizer
+    Locking: the whole read-test-and-maybe-load body runs under
+    _TOKENIZER_LOCK so a concurrent caller during an in-flight first load
+    blocks and then re-reads the resolved state, instead of observing the
+    latched-but-not-yet-resolved flag and returning a wrong answer (the LOW
+    finding paired with this one). The fast, no-lock check below is the
+    steady-state path (already loaded) and never itself the source of a wrong
+    answer, because it only ever short-circuits toward re-checking, not away
+    from it.
+    """
+    global _tokenizer, _TOKENIZER_TRIED, _TOKENIZER_LAST_ERROR
+    global _TOKENIZER_FAILED_AT, _TOKENIZER_NEXT_RETRY_AT, _TOKENIZER_RETRY_S
+    if _tokenizer is not None:
+        return _tokenizer
+    with _TOKENIZER_LOCK:
+        if _tokenizer is not None:  # double-checked: another thread may have
+            return _tokenizer       # finished loading while we waited for the lock
+        now = time.monotonic()
+        if (_TOKENIZER_TRIED and _TOKENIZER_NEXT_RETRY_AT is not None
+                and now < _TOKENIZER_NEXT_RETRY_AT):
+            return None  # still inside the backoff window from the last miss
+        if not MODEL_REPO:
+            if not _TOKENIZER_TRIED:
+                logger.warning("MODEL_REPO not set; falling back to char/4 token estimator")
+            _TOKENIZER_TRIED = True
+            _TOKENIZER_LAST_ERROR = "MODEL_REPO not set"
+            _TOKENIZER_FAILED_AT = now
+            # Not a transient fault -- nothing will make MODEL_REPO appear
+            # without a restart, and a restart re-imports this module anyway.
+            # A real (finite) retry clock here would just re-log the same
+            # warning forever for no chance of success.
+            _TOKENIZER_NEXT_RETRY_AT = float("inf")
+            return None
+        try:
+            from transformers import AutoTokenizer
+
+            _tokenizer = AutoTokenizer.from_pretrained(MODEL_REPO)
+            logger.info(f"loaded tokenizer for {MODEL_REPO}")
+            _TOKENIZER_LAST_ERROR = None
+            _TOKENIZER_FAILED_AT = None
+            _TOKENIZER_NEXT_RETRY_AT = None
+            _TOKENIZER_RETRY_S = _TOKENIZER_RETRY_FLOOR_S  # a recovered process earns back the short interval
+        except Exception as e:
+            _TOKENIZER_LAST_ERROR = str(e)
+            _TOKENIZER_FAILED_AT = now
+            _TOKENIZER_NEXT_RETRY_AT = now + _TOKENIZER_RETRY_S
+            logger.warning(
+                f"could not load tokenizer for {MODEL_REPO}: {e}; using char/4 "
+                f"estimator (retrying in {_TOKENIZER_RETRY_S:.0f}s)"
+            )
+            _tokenizer = None
+            _TOKENIZER_RETRY_S = min(_TOKENIZER_RETRY_S * 2, _TOKENIZER_RETRY_CAP_S)
+        _TOKENIZER_TRIED = True
+        return _tokenizer
+
+
+def tokenizer_state() -> dict:
+    """Snapshot of get_tokenizer's cache for /health/full (v3.1.9 HIGH #3).
+
+    Before this, the one degradation that could be PERMANENT (a cached
+    tokenizer-load failure) was also the one with no field anywhere in
+    /health/full — `tokenize` is vLLM's /tokenize HTTP endpoint and
+    `tokens.is_available()` is the separate mistral_common tekken tokenizer;
+    neither says anything about this cache. The health lane reads exactly
+    these four keys — do not rename or add to them without updating it.
+
+    WALL-CLOCK TIMES OUT, MONOTONIC INSIDE. The backoff gate is kept on
+    time.monotonic() so a clock step cannot shorten or stretch it, but a
+    monotonic reading is seconds since an arbitrary origin and means nothing
+    to a caller. health.py prints `next_retry_at - time.time()`, and handed
+    the raw monotonic value that was always "next retry in 0s" (monotonic is
+    far smaller than an epoch timestamp, so max(0, ...) floored it). Found at
+    merge, where the two lanes met: each was right against its own brief, and
+    the brief had said "monotonic" for the gate and "float" for the field
+    without saying which clock the field is on. `inf` (no retry will ever
+    happen - MODEL_REPO unset) passes through; health renders it as "no retry
+    scheduled".
+    """
+    def _wall(t: float | None) -> float | None:
+        if t is None or t == float("inf"):
+            return t
+        return time.time() + (t - time.monotonic())
+
+    return {
+        "loaded": _tokenizer is not None,
+        "last_error": _TOKENIZER_LAST_ERROR,
+        "failed_at": _wall(_TOKENIZER_FAILED_AT),
+        "next_retry_at": _wall(_TOKENIZER_NEXT_RETRY_AT),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -6720,6 +6834,14 @@ async def admin_cleanup_test_conversations(dry_run: bool = True):
     )
 
 
+# v3.1.9 HIGH #1/#2 (hostile pass 2). Tokens that mean COMMIT, in both the
+# query string and the JSON body — one vocabulary, not two. Everything that
+# is not one of these three, in either dialect, is DRY: see _dry_run_from's
+# docstring for why ambiguous now always means dry rather than "whatever
+# `default` says".
+_DRY_RUN_COMMIT_TOKENS = ("false", "0", "no")
+
+
 def _dry_run_from(request: Request, body: dict, *, default: bool) -> bool:
     """Read dry_run from the body, then the QUERY STRING, then the default.
 
@@ -6737,16 +6859,110 @@ def _dry_run_from(request: Request, body: dict, *, default: bool) -> bool:
     its sibling is this project's most expensive recurring defect, and two
     copies of this parsing would be a third instance waiting to happen.
 
-    "false"/"0"/"no" mean commit; anything else, INCLUDING A TYPO, leaves the
-    caller in whatever direction is safe for that endpoint. `default` is what
-    an absent flag means, not what a malformed one does.
+    v3.1.9 HIGH #1 (hostile pass 2). The rule above turned out to have a hole
+    of the identical shape one level down: `?dry_run=` (what
+    `curl ".../compact?dry_run=$FLAG"` sends when $FLAG is unset), a bare
+    `?dry_run` (how most CLIs spell a boolean flag), and
+    `?dry_run=true&dry_run=` (Starlette's QueryParams.get is last-wins, so the
+    empty repeat silently discards the `true`) are all PRESENT — not absent —
+    query strings, and the old code returned `default` for an empty raw value
+    exactly like it did for a missing key. On /compact, default is a live
+    run: an operator who typed a flag at all, however malformed, got the
+    write they were explicitly trying not to get. `default` is what an ABSENT
+    flag means; it is no longer what an empty or malformed PRESENT one means.
+    A key that only differs from "dry_run" by case or a hyphen (?dryrun=,
+    ?dry-run=) gets the same treatment as an empty value, because a typo in
+    the key is not an absent flag either and must not silently commit.
+
+    v3.1.9 HIGH #2 (hostile pass 2). The body side had its own, incompatible
+    dialect: `bool(body["dry_run"])` treats every JSON value present under
+    the key as Python truthiness, so `{"dry_run": null}` / `""` / `0` / `[]`
+    — all of which a templated client (`{"dry_run": $FLAG}` through jq or
+    envsubst) produces from an unset variable — are FALSY and therefore
+    COMMIT, while `{"dry_run": "false"}` is a non-empty string, therefore
+    TRUTHY, therefore DRY — the opposite of what `?dry_run=false` does on the
+    same endpoint. That is the exact defect shape this function exists to
+    end, one level down inside its own body. Now both dialects share
+    _DRY_RUN_COMMIT_TOKENS and the same rule: only a value that positively
+    spells "commit" ever writes; every other shape — wrong type, empty
+    string, unrecognised spelling — is dry, never a coercion.
+
+    v3.1.9 gate review, two more holes of the same shape:
+
+    (a) CONFLICTING REPEATED QUERY VALUES COMMIT. The first cut of this fix
+    read `request.query_params.get("dry_run")`, which is last-wins, so
+    `?dry_run=true&dry_run=false` read "false" and committed — an operator
+    who sent both a true and a false in the same request got the write, not
+    the safer of the two answers. Fixed by reading EVERY value with
+    `getlist` and requiring ALL of them to be a commit token before the
+    query source says commit; any empty, unrecognised, or disagreeing value
+    in the list makes the query source say dry.
+
+    (b) BODY AND QUERY DISAGREE -> THE BODY SILENTLY WON. The first cut
+    returned from the body branch immediately, so `{"dry_run": false}` with
+    `?dry_run=true` on the same request committed without the query string
+    ever being consulted — an explicit dry in the query was overridden by
+    the body with no indication either happened. Fixed by evaluating BOTH
+    sources that are actually present to a verdict (dry/commit) and
+    combining them: commit only if every PRESENT source says commit; if any
+    present source says dry, the whole call is dry; `default` is read only
+    when NEITHER source is present at all. This is the same rule as (a) one
+    level up — a single source that disagrees with itself is treated exactly
+    like two sources that disagree with each other.
     """
-    if "dry_run" in body:
-        return bool(body["dry_run"])
-    raw = str(request.query_params.get("dry_run", "")).strip().lower()
-    if not raw:
-        return default
-    return raw not in ("false", "0", "no")
+    def _body_verdict() -> bool | None:
+        """True = dry, False = commit, None = the body carries no opinion
+        (the "dry_run" key is simply absent)."""
+        if "dry_run" not in body:
+            return None
+        v = body["dry_run"]
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s:
+                return s not in _DRY_RUN_COMMIT_TOKENS
+            return True  # empty string: ambiguous, dry
+        # None, 0, [], {}, a float, ... — every other JSON shape, including
+        # the ones `bool(...)` used to read as "commit". Ambiguous PRESENT
+        # values are dry now, never a write.
+        return True
+
+    def _query_verdict() -> bool | None:
+        """True = dry, False = commit, None = the query string carries no
+        opinion (absent, and not even a misspelled key)."""
+        # A key that differs from "dry_run" only by case, a hyphen, or a
+        # missing separator (?dryrun=, ?dry-run=, ?DRY_RUN=) is a typo, not
+        # an absent flag, and must not fall through to `default` either —
+        # see the docstring. Both "-" and "_" are stripped (not just
+        # translated to "_") so "dryrun" without any separator is caught.
+        misspelled = any(
+            k != "dry_run" and k.lower().replace("-", "").replace("_", "") == "dryrun"
+            for k in request.query_params.keys()
+        )
+        if misspelled:
+            return True  # ambiguous key: dry, regardless of what "dry_run" itself says
+        if "dry_run" not in request.query_params:
+            return None  # truly absent: no opinion
+        # EVERY repeated value must be a commit token for the query source
+        # to say commit — a single unrecognised, empty, or disagreeing value
+        # anywhere in the list makes the whole source say dry. This is what
+        # makes ?dry_run= (a value of "") and ?dry_run=true&dry_run=false
+        # (values ["true", "false"]) both dry: "" and "true" are not commit
+        # tokens, so "every value is a commit token" is already false.
+        values = [str(v).strip().lower() for v in request.query_params.getlist("dry_run")]
+        return not (len(values) > 0 and all(v in _DRY_RUN_COMMIT_TOKENS for v in values))
+
+    body_verdict = _body_verdict()
+    query_verdict = _query_verdict()
+    if body_verdict is None and query_verdict is None:
+        return default  # neither source has an opinion: fall back to the endpoint's own default
+    verdicts = [v for v in (body_verdict, query_verdict) if v is not None]
+    # Commit only if EVERY present source says commit (False). If any
+    # present source says dry (True), the whole call is dry — a single
+    # disagreeing source, whether that's two sources disagreeing with each
+    # other or one source disagreeing with itself (a), always loses to dry.
+    return any(verdicts)
 
 
 @app.post(
