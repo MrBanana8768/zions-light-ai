@@ -153,8 +153,15 @@ def _make_real_backup():
     """One genuine backup.py archive, via the daemon's own create -> verify
     -> publish path (backup.run_once, not a hand-built dict). The compactor
     store is whatever COMPACTOR_STORAGE_ROOT already has (ensure_storage_layout
-    made it a directory; empty is a valid, verifiable archive)."""
-    report = backup.run_once(_BACKUP_DIR)
+    made it a directory; empty is a valid, verifiable archive).
+
+    No webui.db exists in this fixture, and since pass-3 F12 a cycle that
+    cannot find one fails rather than publishing an archive without chat
+    history. This test is about health reading a REAL archive, not about the
+    database, so it uses that fix's explicit escape hatch for the duration of
+    the one call."""
+    with patch.dict(os.environ, {"COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB": "1"}):
+        report = backup.run_once(_BACKUP_DIR)
     if not report.get("ok"):
         raise AssertionError(f"real backup.run_once() failed: {report}")
     return report
