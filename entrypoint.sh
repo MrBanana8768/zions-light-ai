@@ -371,6 +371,76 @@ else
     echo "      path and a hot rollback journal remains possible."
 fi
 
+# =============================================================================
+# v3.1.9 HIGH #4 (hostile pass 2). supervisord.conf gates five programs on
+# `autostart=%(ENV_x)s`. supervisord's own boolean() parser
+# (supervisor/datatypes.py) accepts only {yes,true,on,1}/{no,false,off,0},
+# case-insensitively, and does NOT strip whitespace - anything else raises
+# ValueError DURING CONFIG LOAD, before any program starts. `exec supervisord`
+# below is this container's PID 1, so that raise takes vLLM, OpenWebUI, the
+# compactor, STT, TTS and the backup daemon down together - not just the one
+# program whose flag was wrong. `true ` (a trailing space, which is exactly
+# what a copy-paste into a RunPod template field leaves behind), `enabled`,
+# `y`, `t`, `2` and an empty string are all fatal. Compare: the ten sites
+# 91d8463 fixed the same way for Python int()/float() reads each crash ONE
+# supervised program under autorestart=true while the rest of the pod keeps
+# serving; these five crash everything, which is why this is HIGH rather than
+# the same MEDIUM as that commit.
+#
+# BEGIN SUPERVISORD BOOL NORMALIZATION (test_config_supervisord_bool.py reads
+# this exact block by its BEGIN/END markers and runs it under `sh` with bad
+# spellings - keep it POSIX sh, no bash-only syntax, if you touch it).
+#
+# _bool NAME DEFAULT: read env var NAME, trim whitespace (leading, trailing,
+# and an embedded trailing newline), lowercase it, and echo "true" or "false"
+# for any of supervisord's own accepted spellings (plus a couple of common
+# near-misses that are unambiguous); anything else - a typo, a stray word, an
+# empty value - echoes DEFAULT and PRINTS the raw value it saw to stderr, so
+# a wrong template field is loud in the boot log instead of a silent
+# never-boots. DEFAULT is chosen per variable below, not once for all four:
+# every one of them defaults to keeping the pod's current documented
+# behaviour (the service runs) rather than guessing "off is always safer" -
+# an operator who typo'd a value meant to CHANGE the default, and the two
+# services this gates (voice, backups, the self-test net, the compactor
+# itself) are all things the pod already runs by default in Dockerfile ENV.
+_bool() {
+    name="$1"; default="$2"
+    raw=$(eval "printf '%s' \"\${$name:-}\"")
+    norm=$(printf '%s' "$raw" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    case "$norm" in
+        true|yes|on|1|y|t) echo "true" ;;
+        false|no|off|0|n|f) echo "false" ;;
+        "") echo "$default" ;;
+        *)
+            # Brackets, not quotes, and no bash-only ${var@Q}: this block is
+            # sourced and run under plain `sh` by the unit test, and quoting
+            # operators like @Q are bash-only. Brackets still make a leading/
+            # trailing space or an empty value visible in the log.
+            echo "      WARNING: ${name}=[${raw}] is not a recognised boolean" \
+                 "(supervisord.conf autostarts a program on it) - using the" \
+                 "safe default ${name}=${default}" >&2
+            echo "$default"
+            ;;
+    esac
+}
+export STT_ENABLED="$(_bool STT_ENABLED true)"
+export TTS_ENABLED="$(_bool TTS_ENABLED true)"
+export COMPACTOR_SELFTEST_ON_BOOT="$(_bool COMPACTOR_SELFTEST_ON_BOOT true)"
+export COMPACTOR_BACKUP_ENABLED="$(_bool COMPACTOR_BACKUP_ENABLED true)"
+# WEBUIDB_SYNC_ENABLED is the fifth autostart=%(ENV_x)s boolean in
+# supervisord.conf but is DELIBERATELY NOT routed through _bool here: unlike
+# the four above, it is never a raw operator-facing env var - both branches
+# of the `if [ "${WEBUI_DB_LOCAL}" = "true" ]` block above set it themselves,
+# a few lines up, to the exact literal "true" or "false", never from
+# something an operator typed. Normalising it again would be a harmless
+# no-op today but test_webuidb_gate.py [6] pins the `export` of this
+# variable occurring exactly TWICE in this file (once per branch) as the
+# property that actually matters here - always exported, on both paths, so
+# supervisord never sees an unresolved %(ENV_x)s - and a third occurrence
+# from routing it through _bool as well would only add a place for the two
+# to drift apart.
+# END SUPERVISORD BOOL NORMALIZATION
+
 echo ""
 echo "[3/3] Starting services..."
 echo "      - vLLM             on port ${VLLM_PORT}      (internal)"
