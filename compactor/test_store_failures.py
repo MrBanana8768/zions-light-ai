@@ -41,6 +41,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -622,40 +623,121 @@ def test_invalid_utf8_is_unreadable_not_a_crash():
 
 
 def test_get_tokenizer_caches_the_failure_too():
-    """One attempt per process, not one per count_tokens call.
+    """One attempt per BACKOFF WINDOW, not one per process and not one per
+    count_tokens call (v3.1.9 HIGH #3, hostile pass 2 on 843bf9d).
 
     `if _tokenizer is not None: return` caches only a SUCCESS; the except sets
-    _tokenizer = None, which fails that same test, so every later call
-    re-entered AutoTokenizer.from_pretrained. Measured at 0.012 ms cached
+    _tokenizer = None, which fails that same test, so pre-843bf9d every later
+    call re-entered AutoTokenizer.from_pretrained. Measured at 0.012 ms cached
     against 2.859 ms per call after a miss, and _chunk_to_budget calls
     count_tokens once PER MESSAGE - about 6.6 seconds inside one 2,301-message
-    compaction, and that is the FAST failure.
+    compaction, and that is the FAST failure. 843bf9d fixed that by caching
+    the miss FOREVER, which traded it for a worse bug: a transient /data blip
+    (documented twice in this repo, 2026-08-31) permanently pins the char/4
+    estimator for the rest of the process, with no way to clear it and no
+    field in /health/full to see it by. This test used to pin "one attempt
+    per process"; it now pins "one attempt per backoff window, and a retry
+    once the window passes" — with a FAKE clock, not sleeps, so it runs in
+    milliseconds and cannot flake on timing.
     """
     print("")
-    print("[test] get_tokenizer stops re-entering from_pretrained after a miss")
+    print("[test] get_tokenizer retries after its backoff window, not forever")
     calls = []
+    state = {"fail": True}
 
-    class _Boom:
+    class _Loader:
         @staticmethod
         def from_pretrained(repo):
             calls.append(repo)
-            raise OSError("no weights here")
+            if state["fail"]:
+                raise OSError("no weights here")
+            return f"<tokenizer {repo}>"
 
     import types
-    fake = types.ModuleType("transformers")
-    fake.AutoTokenizer = _Boom
+    fake_mod = types.ModuleType("transformers")
+    fake_mod.AutoTokenizer = _Loader
     saved_mod = sys.modules.get("transformers")
     saved_tok = main._tokenizer
     saved_tried = main._TOKENIZER_TRIED
     saved_repo = main.MODEL_REPO
-    sys.modules["transformers"] = fake
+    saved_last_error = main._TOKENIZER_LAST_ERROR
+    saved_failed_at = main._TOKENIZER_FAILED_AT
+    saved_next_retry = main._TOKENIZER_NEXT_RETRY_AT
+    saved_retry_s = main._TOKENIZER_RETRY_S
+    saved_monotonic = main.time.monotonic
+
+    clock = {"t": 1_000.0}
+    main.time.monotonic = lambda: clock["t"]
+
+    sys.modules["transformers"] = fake_mod
     main._tokenizer = None
     main._TOKENIZER_TRIED = False
     main.MODEL_REPO = "does/not-exist"
+    main._TOKENIZER_LAST_ERROR = None
+    main._TOKENIZER_FAILED_AT = None
+    main._TOKENIZER_NEXT_RETRY_AT = None
+    main._TOKENIZER_RETRY_S = main._TOKENIZER_RETRY_FLOOR_S
     try:
         first = main.get_tokenizer()
         second = main.get_tokenizer()
         third = main.get_tokenizer()
+        assert_eq(len(calls), 1,
+                  "from_pretrained was attempted ONCE across three calls "
+                  "inside the same backoff window (got %d)" % len(calls))
+        # CONTROL: it still answers None every time inside the window, so
+        # callers keep falling back to the char/4 estimator rather than
+        # getting a stale object.
+        assert_true(first is None and second is None and third is None,
+                    "and every call inside the window still returns None")
+        st = main.tokenizer_state()
+        assert_eq(st["loaded"], False, "tokenizer_state: not loaded")
+        assert_true(st["last_error"] and "no weights here" in st["last_error"],
+                    "tokenizer_state: last_error names the failure "
+                    "(got %r)" % (st["last_error"],))
+        # WALL CLOCK, not the monotonic gate. health.py computes
+        # `next_retry_at - time.time()`; the first version of this contract
+        # returned the monotonic reading (here the fake 1000.0), which that
+        # arithmetic floors to "next retry in 0s" forever. The fake monotonic
+        # clock is still at the miss, so failed_at must read as NOW and
+        # next_retry_at as NOW + the floor, on the wall clock.
+        _now = time.time()
+        assert_true(abs(st["failed_at"] - _now) < 5,
+                    "tokenizer_state: failed_at is a wall-clock time near now "
+                    "(got %r, now %.0f)" % (st["failed_at"], _now))
+        assert_true(abs(st["next_retry_at"] - (_now + main._TOKENIZER_RETRY_FLOOR_S)) < 5,
+                    "tokenizer_state: next_retry_at is now + the floor interval, "
+                    "on the wall clock (got %r)" % (st["next_retry_at"],))
+
+        # F15-equivalent: a moment BEFORE the window closes is still cached.
+        clock["t"] = 1_000.0 + main._TOKENIZER_RETRY_FLOOR_S - 0.001
+        still_cached = main.get_tokenizer()
+        assert_eq(still_cached, None, "one millisecond before the window closes: still cached, no new attempt")
+        assert_eq(len(calls), 1, "...and still only the one attempt (got %d)" % len(calls))
+
+        # Past the window: the fault has cleared (the flaky loader now
+        # succeeds), so THIS is the self-healing property 843bf9d removed.
+        clock["t"] = 1_000.0 + main._TOKENIZER_RETRY_FLOOR_S + 0.001
+        state["fail"] = False
+        fourth = main.get_tokenizer()
+        assert_eq(len(calls), 2,
+                  "a retry fires once the backoff window has passed "
+                  "(got %d attempts)" % len(calls))
+        assert_eq(fourth, f"<tokenizer {main.MODEL_REPO}>",
+                  "and it returns the real tokenizer once the load succeeds "
+                  "(got %r)" % (fourth,))
+        st2 = main.tokenizer_state()
+        assert_true(st2["loaded"], "tokenizer_state: loaded after the retry succeeds")
+        assert_eq(st2["last_error"], None, "tokenizer_state: last_error cleared on recovery")
+        assert_eq(st2["next_retry_at"], None, "tokenizer_state: no retry pending once loaded")
+
+        # And a SUCCESS is cached for good (this part is unchanged from
+        # before 843bf9d): a later call does not re-enter from_pretrained
+        # even though state["fail"] could flip back.
+        state["fail"] = True
+        clock["t"] += 10_000.0
+        fifth = main.get_tokenizer()
+        assert_eq(len(calls), 2, "a loaded tokenizer is never re-fetched (got %d attempts)" % len(calls))
+        assert_eq(fifth, fourth, "and the same object is returned")
     finally:
         if saved_mod is None:
             sys.modules.pop("transformers", None)
@@ -664,14 +746,97 @@ def test_get_tokenizer_caches_the_failure_too():
         main._tokenizer = saved_tok
         main._TOKENIZER_TRIED = saved_tried
         main.MODEL_REPO = saved_repo
+        main._TOKENIZER_LAST_ERROR = saved_last_error
+        main._TOKENIZER_FAILED_AT = saved_failed_at
+        main._TOKENIZER_NEXT_RETRY_AT = saved_next_retry
+        main._TOKENIZER_RETRY_S = saved_retry_s
+        main.time.monotonic = saved_monotonic
 
-    assert_eq(len(calls), 1,
-              "from_pretrained was attempted ONCE across three calls "
-              "(got %d)" % len(calls))
-    # CONTROL: it still answers None every time, so callers keep falling back
-    # to the char/4 estimator rather than getting a stale object.
-    assert_true(first is None and second is None and third is None,
-                "and every call still returns None, so callers still degrade")
+
+def test_get_tokenizer_concurrent_caller_during_first_load_waits_not_wrong():
+    """v3.1.9 LOW (paired with HIGH #3): _TOKENIZER_TRIED used to latch
+    BEFORE from_pretrained resolved, so a second thread arriving while the
+    first load was still in flight saw the flag already set and returned the
+    char/4 estimator for a tokenizer that was about to load successfully.
+    get_tokenizer now holds _TOKENIZER_LOCK for the whole read-test-load body
+    (mirroring tokens.py's sibling singleton), so the second caller BLOCKS
+    and then re-reads the resolved state instead of racing it.
+    """
+    print("")
+    print("[test] a concurrent caller during the first load gets the real "
+          "tokenizer, not a wrong answer")
+    import threading
+    import time as _time
+    import types
+
+    started = threading.Event()
+    b_calling = threading.Event()
+    gate = threading.Event()
+    load_calls = []
+
+    class _Slow:
+        @staticmethod
+        def from_pretrained(repo):
+            load_calls.append(repo)
+            started.set()
+            gate.wait(5)
+            return f"<tokenizer {repo}>"
+
+    fake_mod = types.ModuleType("transformers")
+    fake_mod.AutoTokenizer = _Slow
+    saved_mod = sys.modules.get("transformers")
+    saved_tok = main._tokenizer
+    saved_tried = main._TOKENIZER_TRIED
+    saved_repo = main.MODEL_REPO
+    saved_next_retry = main._TOKENIZER_NEXT_RETRY_AT
+
+    sys.modules["transformers"] = fake_mod
+    main._tokenizer = None
+    main._TOKENIZER_TRIED = False
+    main.MODEL_REPO = "org/model"
+    main._TOKENIZER_NEXT_RETRY_AT = None
+    out = {}
+    try:
+        t_a = threading.Thread(target=lambda: out.__setitem__("A", main.get_tokenizer()))
+        t_a.start()
+        assert_true(started.wait(5),
+                    "the loading thread entered from_pretrained (holding _TOKENIZER_LOCK)")
+
+        def _call_b():
+            b_calling.set()
+            out["B"] = main.get_tokenizer()
+
+        t_b = threading.Thread(target=_call_b)
+        t_b.start()
+        assert_true(b_calling.wait(5), "the second thread started its call")
+        # Best-effort: give B a moment to actually reach _TOKENIZER_LOCK's
+        # acquire() call and block on it before A is allowed to finish. Not
+        # required for correctness (the lock serializes regardless of
+        # interleaving), but it is what makes this test actually exercise
+        # the contended path rather than two calls that happen not to overlap.
+        _time.sleep(0.05)
+        gate.set()  # let A's from_pretrained return; B was blocked on the lock, not racing it
+        t_a.join(5)
+        t_b.join(5)
+    finally:
+        if saved_mod is None:
+            sys.modules.pop("transformers", None)
+        else:
+            sys.modules["transformers"] = saved_mod
+        main._tokenizer = saved_tok
+        main._TOKENIZER_TRIED = saved_tried
+        main.MODEL_REPO = saved_repo
+        main._TOKENIZER_NEXT_RETRY_AT = saved_next_retry
+
+    assert_eq(out["A"], "<tokenizer org/model>", "the loading thread gets the real tokenizer")
+    assert_eq(out["B"], "<tokenizer org/model>",
+              "F18-fixed: the concurrent caller gets the REAL tokenizer too "
+              "(pre-fix it got None, the char/4 estimator, for a load that "
+              "was about to succeed)")
+    assert_eq(len(load_calls), 1,
+              "and only ONE from_pretrained call happened — B BLOCKED on "
+              "_TOKENIZER_LOCK instead of racing A into a second concurrent "
+              "load (got %d calls)" % len(load_calls))
 
 
 def _raises_unreadable(fn):
@@ -817,6 +982,7 @@ if __name__ == "__main__":
         # v3.1.9: two handlers that read as covered and were not.
         test_invalid_utf8_is_unreadable_not_a_crash()
         test_get_tokenizer_caches_the_failure_too()
+        test_get_tokenizer_concurrent_caller_during_first_load_waits_not_wrong()
         # v3.1.9, A3-1: the one-level-down rule at all five loaders.
         test_wrong_type_inner_key_raises_at_every_loader()
 
