@@ -493,6 +493,31 @@ def _reuse_problems(rows: list[dict]) -> list[str]:
     return probs
 
 
+# The one log phrase the row builder still reads for the REUSE oracle, and the
+# counter it reads instead of a phrase. hostile pass #3 (reviewer E F2): the
+# cap-refusal half keyed on "per-request cap", a phrase no real run had fed, and
+# rewording that one warning passed the 2026-09-12 regression green. Refusals
+# are now counted by main.compaction_counters(); the two log needles that stay
+# are pinned to the REAL log lines by test_p3a_soak_signals.py, so a rewording
+# goes red in the unit suite instead of silently here.
+_REUSED_RE = r"(\d+) covered by stored summaries"
+_COMPACTED_NEEDLE = "compacted:"
+
+
+def _turn_signals(log: str, counters_before: dict, counters_after: dict) -> dict:
+    """What one turn's compaction did, for _reuse_problems. Pure.
+
+    `counters_*` are main.compaction_counters() read around the request."""
+    import re as _re
+    reused = _re.search(_REUSED_RE, log)
+    return {
+        "compacted": _COMPACTED_NEEDLE in log,
+        "cap_refused": (int(counters_after.get("cap_refused", 0))
+                        > int(counters_before.get("cap_refused", 0))),
+        "reused": int(reused.group(1)) if reused else 0,
+    }
+
+
 def _oracle_selftest() -> tuple[list[str], int]:
     """Each oracle against the defect shape it exists for (must go RED) and a
     healthy control (must stay GREEN). Returns the cases that came out wrong.
@@ -731,6 +756,21 @@ def _oracle_selftest() -> tuple[list[str], int]:
            lambda: _reuse_problems([ru(n, 0, reused=0) for n in range(1, 10)]
                                    + [ru(n, 20, compacted=False, reused=0)
                                       for n in range(10, 20)]), True)
+    # The wiring, not only the oracle: a refusal is read from the COUNTER, so a
+    # log with no "per-request cap" phrase at all still reads as refused, and
+    # a phrase with no counter movement does not.
+    def sig(log, before, after):
+        s_ = _turn_signals(log, before, after)
+        return [f"cap_refused={s_['cap_refused']} reused={s_['reused']} "
+                f"compacted={s_['compacted']}"] if (
+            s_["cap_refused"] or not s_["compacted"] or s_["reused"] != 7) else []
+    expect("SIGNALS a refusal counted with no refusal phrase in the log",
+           lambda: sig("compacted: summarized 0 text turn(s), 7 covered by stored summaries",
+                       {"cap_refused": 2}, {"cap_refused": 3}), True)
+    expect("SIGNALS CONTROL: the old phrase with no counter movement is not a refusal",
+           lambda: sig("... per-request cap ... compacted: summarized 1 text turn(s), "
+                       "7 covered by stored summaries",
+                       {"cap_refused": 3}, {"cap_refused": 3}), False)
     expect("REUSE CONTROL: cap refusal BEFORE any chunk is not this check's",
            lambda: _reuse_problems([ru(1, 0, compacted=False, reused=0, cap=True)]
                                    + reuse_good[1:]), False)
@@ -1086,9 +1126,11 @@ for n in range(1, TURNS + 1):
                     "content": f"Turn {n}. Tell me about item {n} in detail."})
     _th0 = tailhealth.snapshot()
     _facts0 = _tail_new_facts[0]
+    _cc0 = main.compaction_counters()
     _t0 = time.monotonic()
     status, log, sent, reply, _calls = _turn(n, history,
                                               looping=(phase == "refuse"))
+    _cc1 = main.compaction_counters()
     _elapsed = time.monotonic() - _t0
     _th1 = tailhealth.snapshot()
 
@@ -1169,12 +1211,9 @@ for n in range(1, TURNS + 1):
     nonsys = [m for m in sent if m.get("role") != "system"]
     # `history` BEFORE the reply is appended: 2n-1, which is what both the lag
     # budget and _lag_guard_unreachable are computed against.
-    _reused = re.search(r"(\d+) covered by stored summaries", log)
     rows.append({"turn": n, "phase": phase, "sent_msgs": len(sent),
                  "wm_before": _prev_watermark,
-                 "compacted": "compacted:" in log,
-                 "cap_refused": "per-request cap" in log,
-                 "reused": int(_reused.group(1)) if _reused else 0,
+                 **_turn_signals(log, _cc0, _cc1),
                  "sent_nonsys": len(nonsys), "history": len(history),
                  "watermark": _wm, "stored": _stored, "skipped": _skipped,
                  "tail_new_facts": _tail_new_facts[0] - _facts0,
@@ -1381,8 +1420,102 @@ print(f"  ok   on all {TURNS} turns, every message-unit older than one L1 chunk 
       f" + L1 {[(c['first_turn'], c['last_turn']) for c in state.get('l1') or []]}"
       f" of {len(history)} units")
 
+# ---------------------------------------------------------------------------
+# THE TRAFFIC PHASE: regenerate, delete, edit (hostile pass #3)
+#
+# The run above only ever APPENDS. Every defect the third cut of the reuse
+# gate shipped lived in the other operations OpenWebUI offers: a delete or
+# regenerate right after a chunk closed blessed a different turn (reviewer A
+# F1), and one delete, edit-and-resend or regenerate switched reuse off for the
+# life of the conversation (A F2/F3; reviewer D counted five deep edits in
+# seven days of her real chat). None of those was ever driven through the real
+# route against a real token-counting server.
+#
+# Run AFTER the end-of-run checks, on purpose: those tile the hierarchy
+# against the soak's own count of message-units shown, and a delete or an
+# edit makes the array shorter than that count by design (the compactor's
+# position is monotonic; see summarizer._observed_position). What this phase
+# asserts is what those operations must not break: every request answers,
+# nothing falls through or overflows, the call budget holds, and compaction
+# REUSES the hierarchy on every compacting turn — never "compacted and reused
+# none", never refused over the cap (_reuse_problems, the same oracle as
+# above). The calls-per-message it prints are reviewer D F6's evidence.
+# ---------------------------------------------------------------------------
+
 print()
-print(f"All soak checks passed over {TURNS} turns.")
+print("[soak] traffic phase: regenerate, delete and edit, then keep chatting")
+_traffic_rows: list[dict] = []
+_traffic_log: list[str] = []
+_tn = [TURNS]
+
+
+def _traffic_turn(label: str, req: list[dict]) -> str:
+    """One request of the traffic phase. Returns the reply text; `req` is
+    the array sent (ending on a user turn)."""
+    global _prev_watermark
+    _tn[0] += 1
+    _cc0 = main.compaction_counters()
+    status, log, sent, reply, calls = _turn(_tn[0], req, looping=False)
+    _cc1 = main.compaction_counters()
+    if status != 200:
+        fail(f"traffic {label}: HTTP {status}")
+    for needle in ("compaction failed", "hard budget FAILED to fit", "REQUEST REJECTED"):
+        if needle in log:
+            fail(f"traffic {label}: {needle!r} appeared")
+    _budget = main.MAX_SUMMARY_CALLS_PER_REQUEST + 1
+    if calls > _budget:
+        fail(f"traffic {label}: one request made {calls} LLM calls (budget {_budget})")
+    if not reply:
+        fail(f"traffic {label}: the backend returned no assistant text")
+    _st = summarizer.load_state(CONV)
+    _traffic_rows.append({"turn": _tn[0], "label": label, "wm_before": _prev_watermark,
+                          "calls": calls, **_turn_signals(log, _cc0, _cc1)})
+    _prev_watermark = _st.get("last_summarized_turn", 0)
+    _traffic_log.append(f"{label}:{calls}")
+    return reply
+
+
+def _traffic_exchange(label: str) -> None:
+    history.append({"role": "user",
+                    "content": f"Turn {_tn[0] + 1}. Tell me about item {_tn[0] + 1} in detail."})
+    history.append({"role": "assistant", "content": _traffic_turn(label, history)})
+
+
+# 1. REGENERATE the newest reply: the same array up to her last message.
+_regen = _traffic_turn("regenerate", history[:-1])
+history[-1] = {"role": "assistant", "content": _regen}
+for _ in range(3):
+    _traffic_exchange("after-regenerate")
+# 2. DELETE the newest exchange, then send a new message.
+del history[-2:]
+for _ in range(3):
+    _traffic_exchange("after-delete-last")
+# 3. DELETE one older exchange inside the covered span.
+del history[20:22]
+for _ in range(3):
+    _traffic_exchange("after-delete-old")
+# 4. EDIT a user message 40 turns back and re-send: OpenWebUI branches there.
+_edit_at = len(history) - 40
+while history[_edit_at]["role"] != "user":
+    _edit_at -= 1
+history[:] = history[:_edit_at] + [{"role": "user", "content":
+                                    history[_edit_at]["content"] + " (edited)"}]
+history.append({"role": "assistant", "content": _traffic_turn("edit-resend", history)})
+for _ in range(8):
+    _traffic_exchange("after-edit")
+
+_traffic_p = _reuse_problems(_traffic_rows)
+if _traffic_p:
+    fail(f"compaction did not reuse the hierarchy through regenerate/delete/edit "
+         f"({len(_traffic_p)} turn(s))", "; ".join(_traffic_p[:5]))
+_t_reusing = [r for r in _traffic_rows if r["reused"]]
+print(f"  ok   {len(_traffic_rows)} traffic turn(s) (regenerate, delete last, delete "
+      f"old, edit 40 back): all answered, reuse on {len(_t_reusing)} compacting "
+      f"turn(s), never refused over the cap, never compacted without reusing")
+print(f"  ok   request-path LLM calls per message (label:calls): {' '.join(_traffic_log)}")
+
+print()
+print(f"All soak checks passed over {TURNS} turns and {_tn[0] - TURNS} traffic turns.")
 print("REMINDER: the fixture's tokenizer is not Cydonia's. This proves the "
       "system holds together over a growing conversation, NOT that the "
       "production token numbers are right. The fixture's summaries are "

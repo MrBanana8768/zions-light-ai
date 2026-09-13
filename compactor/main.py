@@ -153,6 +153,19 @@ TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(HARD_INPUT_LIMIT * 0.75)
 # work on a request path is not thoroughness, it is an outage.
 MAX_SUMMARY_CALLS_PER_REQUEST = _env_int("COMPACTOR_MAX_SUMMARY_CALLS", 4)
 
+# How many times summarize() has refused a request over the cap above, since
+# the process started. hostile pass #3 (reviewer E, F2): the soak's check that
+# a reusing turn is never cap-refused keyed on one phrase of that WARNING, no
+# real run had ever produced the phrase, and rewording it passed the
+# 2026-09-12 regression green. A counter cannot be reworded out from under
+# its reader. Read with compaction_counters(); written only by summarize().
+_COMPACTION_COUNTERS = {"cap_refused": 0}
+
+
+def compaction_counters() -> dict:
+    """A copy of the request-path compaction counters (see above)."""
+    return dict(_COMPACTION_COUNTERS)
+
 # env_float from envcfg, NOT the local _env_float: that one is defined ~30
 # lines BELOW this line, so calling it here is a NameError at import — an
 # unconditional boot failure in place of the conditional one being fixed.
@@ -1635,6 +1648,7 @@ async def summarize(
         # summarizes into memory on the background tail and is injected
         # separately, and the hard-budget guard sheds the rest in
         # milliseconds. Repeating work every turn helps neither.
+        _COMPACTION_COUNTERS["cap_refused"] += 1
         logger.warning(
             f"compaction skipped: {len(to_summarize)} turns need "
             f"{len(batches)} summarization calls, over the "
@@ -1791,15 +1805,28 @@ def split_messages(messages: list[dict]) -> tuple[list[dict], list[dict], list[d
     return system_msgs, to_summarize, keep_recent
 
 
+# The first line of the system block compaction puts in the array it returns,
+# carrying the stored summaries and the fresh summary of the turns it removed.
+# One constant because _enforce_hard_budget recognises the block by it (see
+# _is_compaction_standin): the guard must spend injected memory before the
+# turns this block leaves in the array, none of which any summary covers.
+COMPACTION_SUMMARY_HEADER = "[Summary of earlier conversation]"
+
+
 async def compact_if_needed(
     messages: list[dict], conv_id: str | None = None,
     *, stored_turns_out: list | None = None,
 ) -> list[dict]:
     """
-    `stored_turns_out`, if given, receives exactly one `int` — how many
-    older turns this call replaced with a stand-in FROM STORED SUMMARIES
-    (0 if none, including every early-return path below, which never touch
-    it). hostile2-reuse M1: the caller also injects its OWN copy of the
+    `stored_turns_out`, if given, receives one `int` — how many older turns
+    the RETURNED array replaced with a stand-in FROM STORED SUMMARIES — and
+    only at the final return, beside that array. Every early return (nothing
+    compacted) and every exception leaves it EMPTY, which the caller reads as
+    0: written before summarize() ran, it survived summarize() raising and
+    told the caller that a discarded array carried the hierarchy (hostile
+    pass #3, reviewer A F4 / reviewer E F1).
+
+    hostile2-reuse M1: the caller also injects its OWN copy of the
     summary hierarchy as a separate system block (see the `format_summary_
     block` call beside `sstate` in chat_completions), and on a reusing turn
     that produced TWO renders of one hierarchy that could disagree — one
@@ -1857,20 +1884,24 @@ async def compact_if_needed(
     if conv_id:
         try:
             _st = summarizer.load_state(conv_id)
-            # WHAT MAY BE REPLACED, decided by CONTENT (v3.1.9).
+            # WHAT MAY BE REPLACED, decided by CONTENT (v3.1.9; realigned
+            # in hostile pass #3).
             #
-            # _coverage_plan compares the turns about to be removed, one by
-            # one, against the fingerprints recorded when the stored chunks
-            # covered them. It returns how many leading turns are covered —
-            # stopped by a hole in the chain (_covered_prefix, B3/B4) and by
-            # the end of the record — and WHICH of those changed since. A
-            # changed turn is summarized fresh below instead of being replaced
-            # by a summary of other text: an edited turn keeps its correction
-            # (B1), a turn from another branch under the same conversation id
-            # keeps its content (B2). Every unchanged turn around it still
-            # comes off the shelf.
+            # _coverage_plan fingerprints the turns about to be removed and
+            # pairs them, by content, with the covered-turn record. Every record
+            # entry was written by the chunk that covers its position, from
+            # the text that chunk read (summarizer._record_chunk_fps), so a
+            # paired turn's content IS in the stored summary. It returns how
+            # many leading turns are in play — capped by a hole in the chain
+            # (_covered_prefix, B3/B4) — and WHICH of those did not pair. An
+            # unpaired turn is summarized fresh below instead of being
+            # replaced by a summary of other text: an edited turn keeps its
+            # correction (B1), a turn from another branch keeps its content
+            # (B2), a turn written after a delete or a regenerate keeps its
+            # own text (F1). Every paired turn around it still comes off the
+            # shelf.
             #
-            # THIS REPLACED THREE GATES, each of which declined on ordinary
+            # THIS REPLACED FOUR GATES, each of which failed on ordinary
             # traffic. The tail anchor (`tail_fp`) and the first digest were
             # both written from the ROLLUP input — degenerate replies redacted,
             # this turn's reply as streamed and possibly trimmed — which no
@@ -1879,91 +1910,50 @@ async def compact_if_needed(
             # 4-call cap refused every request, the 2026-09-12 production
             # failure on the code built to fix it. Checkpointed digests fixed
             # that and declined everything past the first edited turn or
-            # demoted image, forever. Per-turn fingerprints make the cost of an
-            # edit the edited turn.
+            # demoted image, forever. Per-turn fingerprints compared BY
+            # POSITION, behind a length gate (`len(request) >= recorded
+            # position`), fixed that and failed twice more (hostile pass #3):
+            # the record was written from a LATER request than its chunk, so a
+            # delete or regenerate right after a chunk closed blessed a
+            # different turn (F1, and F9 for the admin rebuild); and the
+            # position is monotonic while the array is not, so one delete,
+            # edit-and-resend, regenerate or pair of tool messages declined
+            # reuse or refreshed a growing span for good (F2/F3/F7).
             #
-            # Hashing is O(turns), so it runs in the threadpool.
+            # WHY THERE IS NO LENGTH GATE. It existed so that a capped window
+            # or a truncated head, whose turn N is not conversation turn N,
+            # could not be replaced by position. Nothing is replaced by
+            # position any more: a turn goes only if its own content was
+            # summarized. A capped window's turns the record holds are
+            # summarized; the ones it does not hold pair with nothing. The
+            # stand-in may also describe turns this array does not carry (a
+            # truncated head, an abandoned branch) — so does the separately
+            # injected summary block on every request that does not reuse, so
+            # that is not new, and it removes nothing.
+            #
+            # Hashing is memoized and O(turns); it runs in the threadpool.
             _covered, _changed = await run_in_threadpool(
                 summarizer._coverage_plan, _st, to_summarize
             )
             if _covered == 0 and summarizer._covered_fps(_st):
                 logger.info(
-                    f"conv={conv_id}: none of the turns the stored summaries "
-                    f"cover match this request (a different branch, or a "
-                    f"window that does not start at turn 1); summarizing "
-                    f"from scratch rather than replacing them"
+                    f"conv={conv_id}: none of the turns this request would "
+                    f"compact appear in the stored summaries' covered-turn "
+                    f"record (a different branch, or a window the record "
+                    f"does not reach); summarizing from scratch rather than "
+                    f"replacing them"
                 )
             elif _changed:
+                # Every request, not once: a refreshed span that is growing is
+                # the early warning of the cap refusal, and this is the only
+                # line that shows it.
                 logger.info(
-                    f"conv={conv_id}: {len(_changed)} of the {_covered} turn(s) "
-                    f"the stored summaries cover changed since they were "
-                    f"summarized (edited, or another branch); summarizing "
-                    f"those fresh rather than replacing them"
-                )
-            # ONLY WHEN THE ARRAY IS NOT A SUFFIX. Turn numbers are not array
-            # indices once a client sends a bounded window, and a request
-            # shorter than the conversation is known to be is a truncated or
-            # capped window. The fingerprints would usually mark most of such
-            # an array changed (its head is not turn 1), but a sliding window
-            # over repetitive turns can match by position here and there, and
-            # a truncated array whose head IS genuine matches outright; this
-            # is cheap, so it stays: [12] in test_compaction_reuse is the case
-            # where it alone decides.
-            #
-            # hostile2-reuse H7: `_n` must count only turns the hierarchy
-            # could ever have summarized. A `!= "system"` count also counts
-            # `tool`/`developer`/other roles, which add nothing the hierarchy
-            # tracks but still lift `_n` — and a genuine capped window
-            # aligns by construction (a cap sends the previous anchor's own
-            # tail), so padding a capped-but-refused window with extra
-            # non-conversational turns re-enables the substitution the same
-            # window was refused for, deleting real turns under a summary
-            # that never covered them. OpenWebUI never sends such roles
-            # today, so this is not live on the one client this pod serves,
-            # but the compactor is a generic OpenAI-compatible proxy and
-            # nothing gates it. Narrowing `_n` alone (not `to_summarize` or
-            # `_coverage_plan`, which still track every non-system turn) can
-            # only make this gate MORE conservative than before: a real
-            # historical tool turn no longer counts toward `_n`, so at worst
-            # reuse declines where it previously would have allowed — the
-            # same "costs a call, never a turn" trade this gate already
-            # makes elsewhere. It cannot become more permissive, because a
-            # turn this undercounts was never something `_recorded_position`
-            # could be inflated by either (see summarizer._turn_fingerprints,
-            # which still fingerprints every non-system role — deliberately
-            # left as is, since narrowing that definition is a much larger,
-            # cross-cutting change to the position-tracking primitive this
-            # gate borrows and does not need to fix this hole).
-            _conversational = [
-                m for m in messages if m.get("role") in ("user", "assistant")
-            ]
-            _n = len(_conversational)
-            _recorded = summarizer._recorded_position(_st)
-
-            # hostile2-reuse H9: this is the one decline path that used to log
-            # NOTHING. `_covered > 0` with `_changed` empty means the content
-            # genuinely matches — the two log branches above only fire on a
-            # MISMATCH — so a length-gate refusal here produced a compaction
-            # line indistinguishable from "no hierarchy yet" or "conv_id was
-            # None". `turns_seen` is monotonic and can end up ahead of what a
-            # request actually carries (an admin drain loop that idles, a
-            # cap installed mid-conversation); when it does, THIS is the gate
-            # that then declines every request forever, silently, which is
-            # the 117-second regression this whole feature exists to fix,
-            # reached by a route with no log line to find it by.
-            if _covered > 0 and _n < _recorded and logsetup.log_once(
-                f"compact.reuse.length_declined.{conv_id}"
-            ):
-                logger.info(
-                    f"conv={conv_id}: the stored summaries cover {_covered} "
-                    f"turn(s) whose content matches this request, but the "
-                    f"request itself carries only {_n} turn(s) against a "
-                    f"recorded position of {_recorded} — the array is "
-                    f"shorter than the conversation is known to have "
-                    f"reached, so reuse declines rather than risk treating "
-                    f"a capped or truncated window as the full history "
-                    f"(logged once per conversation; repeats mean this is "
-                    f"not recovering on its own)"
+                    f"conv={conv_id}: {len(_changed)} of the first {_covered} "
+                    f"turn(s) this request would compact are not in the "
+                    f"stored summaries' covered-turn record (edited, "
+                    f"regenerated, written after a delete, or on another "
+                    f"branch); summarizing those fresh rather than replacing "
+                    f"them"
                 )
 
             # OPEN_ISSUES2 LOW, re-checked against this gate: `_covered > 0`
@@ -1973,10 +1963,8 @@ async def compact_if_needed(
             # "" and the `if not stored_text` fallback a few lines down
             # resets both). Kept explicit anyway: a reader should not have
             # to trace that chain to know a zero-coverage state cannot
-            # substitute anything, and the two states DO mean different
-            # things worth naming separately ("nothing is covered" vs "not
-            # enough of the array is present to trust what is").
-            if _covered > 0 and _n >= _recorded:
+            # substitute anything.
+            if _covered > 0:
                 # TURN NUMBERS ARE NOT text_only INDICES. _covered counts every
                 # non-system turn; text_only has image turns removed, so
                 # `min(_covered, len(text_only))` overruns by the image count
@@ -2000,15 +1988,53 @@ async def compact_if_needed(
                     len(text_only),
                 )
                 if stored_turns > 0:
-                    # all_or_nothing: a squeezed block drops the OLDEST scenes,
-                    # which are the same turns removed below. See the kwarg's
-                    # docstring - this is the caller it exists for.
-                    stored_text = await run_in_threadpool(
-                        summarizer.format_summary_block,
-                        _st,
+                    # BUDGETED AGAINST WHAT ELSE THIS ARRAY MUST HOLD (hostile
+                    # pass #3, F5; pass #2's H5). The stand-in was rendered
+                    # against the flat SUMMARY_BLOCK_MAX_TOKENS (12,000)
+                    # whatever else the request held. At the shipped numbers
+                    # (limit 20,768, TARGET 15,576) a hierarchy at capacity
+                    # renders ~11.5k tokens, and one long reply in the recent
+                    # window put compaction's own output at the limit: the
+                    # guard then shed her previous message and the reply she
+                    # was answering — turns no summary covers — and halved
+                    # the stand-in on top. So the stand-in gets what TARGET
+                    # leaves after the system prompt, the preserved images,
+                    # the recent turns and one fresh summary. all_or_nothing
+                    # stays: a block that cannot fit whole declines reuse, and
+                    # the declined path puts the whole older span through
+                    # summarize() and the injected block, where the guard
+                    # sheds the OLDEST verbatim turns first, never the recent
+                    # ones this budget exists to keep.
+                    _others = await run_in_threadpool(
+                        count_tokens, system_msgs + preserved_images + keep_recent
+                    )
+                    _standin_budget = min(
                         summarizer.SUMMARY_BLOCK_MAX_TOKENS,
-                        all_or_nothing=True,
-                    ) or ""
+                        TARGET_TOKENS - _others - SUMMARY_MAX_TOKENS,
+                    )
+                    if _standin_budget > 0:
+                        # all_or_nothing: a squeezed block drops the OLDEST
+                        # scenes, which are the same turns removed below. See
+                        # the kwarg's docstring - this is the caller it exists
+                        # for.
+                        stored_text = await run_in_threadpool(
+                            summarizer.format_summary_block,
+                            _st,
+                            _standin_budget,
+                            all_or_nothing=True,
+                        ) or ""
+                    if not stored_text:
+                        logger.info(
+                            f"conv={conv_id}: the stored summaries cover "
+                            f"{stored_turns - len(_changed)} of the turns this "
+                            f"request would compact, but they do not fit whole "
+                            f"in the {max(0, _standin_budget)} token(s) TARGET "
+                            f"({TARGET_TOKENS}) leaves beside the system prompt, "
+                            f"images and recent turns ({_others}) and one fresh "
+                            f"summary ({SUMMARY_MAX_TOKENS}); summarizing from "
+                            f"scratch rather than letting the stand-in push the "
+                            f"recent turns out of the window"
+                        )
                     # Image turns are preserved verbatim whatever their
                     # fingerprint says, so only text turns can need it.
                     refreshed = [
@@ -2028,9 +2054,6 @@ async def compact_if_needed(
             stored_text = ""
             stored_turns = 0
             refreshed = []
-
-    if stored_turns_out is not None:
-        stored_turns_out.append(stored_turns)
 
     fresh_input = refreshed + text_only[stored_turns:]
     async with httpx.AsyncClient() as client:
@@ -2054,7 +2077,7 @@ async def compact_if_needed(
     _parts = [q for q in (stored_text.strip(), summary.strip()) if q]
     summary_blocks = ([{
         "role": "system",
-        "content": "[Summary of earlier conversation]\n"
+        "content": COMPACTION_SUMMARY_HEADER + "\n"
                    + "\n\n".join(_parts),
     }] if _parts else [])
     # Order: system → summary-of-oldest → deferred turns → images → recent.
@@ -2088,6 +2111,17 @@ async def compact_if_needed(
         + ("" if (_summarized or stored_turns)
            else "  [NO SUMMARIZATION HAPPENED]")
     )
+    # THE OUT-PARAM IS WRITTEN HERE, beside the return of the array that
+    # carries the stand-in, and nowhere earlier (hostile pass #3: reviewer A
+    # F4, reviewer E F1). It was written before summarize() ran; a summarize()
+    # that raised (a vLLM 400/5xx, a read timeout) left it saying N > 0 while
+    # chat_completions threw this array away and forwarded the original
+    # messages — and then skipped its own injected summary because the
+    # out-param said the array carried one. 56 turns shed with nothing
+    # standing in for them. Every return above this one, and every raise,
+    # leaves it empty, which the caller reads as "inject".
+    if stored_turns_out is not None:
+        stored_turns_out.append(stored_turns)
     return new_messages
 
 
@@ -3561,6 +3595,21 @@ def _droppable_system_indices(msgs: list[dict], protect_system: int) -> list[int
     return sys_idxs[max(1, protect_system):]
 
 
+def _is_compaction_standin(m: dict) -> bool:
+    """Is `m` the summary block compact_if_needed put in its returned array?
+
+    Recognised by COMPACTION_SUMMARY_HEADER, which only compact_if_needed
+    writes. A client could send a system message starting with the same
+    words; the guard would then spend injected memory before that client's
+    turns, which is the conservative order anyway (hostile pass #3, F5)."""
+    content = m.get("content") if isinstance(m, dict) else None
+    return (
+        m.get("role") == "system"
+        and isinstance(content, str)
+        and content.startswith(COMPACTION_SUMMARY_HEADER)
+    ) if isinstance(m, dict) else False
+
+
 def _has_sheddable_content(msgs: list[dict], protect_system: int) -> bool:
     """Is there anything left the guard is permitted to remove?
 
@@ -3599,7 +3648,10 @@ def _enforce_hard_budget(
 
     Shedding order is by value: oldest turns first (already summarized, and the
     memory layers exist precisely to carry that content forward), then the
-    injected memory blocks, trimmed largest-first. The newest turn is never
+    injected memory blocks, trimmed largest-first — EXCEPT on an array
+    compaction already reduced (its summary block is present): there the
+    turns left are the ones no summary covers, so injected memory goes first
+    and compaction's own block last (hostile pass #3, F5). The newest turn is never
     dropped — losing the message the user just typed is worse than any
     truncation. After shedding, role alternation is REPAIRED (first non-system
     message must be a user turn) — the first cut of this guard could stop
@@ -3782,6 +3834,59 @@ def _enforce_hard_budget(
     sys_dropped = 0
 
     for _round in range(6):
+        # --- a COMPACTED array: spend injected memory before any turn ---
+        #
+        # hostile pass #3 (reviewer A F5; pass #2's H5). "Oldest turns first"
+        # rests on the oldest turns being already summarized. That is true of
+        # an array compaction did not touch, and false of one it did: its
+        # stand-in block already carries every turn it removed, and the turns
+        # it LEFT — her last message, the reply she is answering, whatever
+        # was deferred — are exactly the ones no summary covers. Measured at
+        # the shipped numbers with ~10k tokens of injected memory beside an
+        # ~11.5k-token stand-in: this loop dropped her previous message and
+        # the reply she was answering, then halved the stand-in (its newest
+        # half, every L1 scene and the fresh summary, for turns already
+        # removed). So when the stand-in is present, the injected blocks
+        # around it are trimmed and then dropped FIRST, the stand-in itself
+        # untouched; turns, and then the stand-in, only after that.
+        if any(
+            _is_compaction_standin(msgs[i])
+            for i in _droppable_system_indices(msgs, protect_system)
+        ):
+            while running > limit and trimmed < 32:
+                big = [
+                    i
+                    for i in _droppable_system_indices(msgs, protect_system)
+                    if not _is_compaction_standin(msgs[i])
+                    and isinstance(msgs[i].get("content"), str)
+                    and len(msgs[i]["content"]) > 400
+                ]
+                if not big:
+                    break
+                i = max(big, key=lambda j: len(msgs[j]["content"]))
+                c = msgs[i]["content"]
+                msgs[i] = {
+                    **msgs[i],
+                    "content": c[: len(c) // 2].rstrip()
+                    + "\n[...trimmed to fit the context budget]",
+                }
+                running -= per[i]
+                per[i] = int(count_tokens([msgs[i]]) * scale)
+                running += per[i]
+                trimmed += 1
+            while running > limit:
+                spendable = [
+                    i for i in _droppable_system_indices(msgs, protect_system)
+                    if not _is_compaction_standin(msgs[i])
+                ]
+                if not spendable:
+                    break
+                i = spendable[-1]
+                running -= per[i]
+                del msgs[i]
+                del per[i]
+                sys_dropped += 1
+
         # --- shed oldest non-system turns (arithmetic only) ---
         while running > limit:
             idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
@@ -4547,6 +4652,7 @@ async def _async_tail(
     original_messages: list[dict],
     *,
     injected_facts: list[dict] | None = None,
+    reply_as_streamed: str | None = None,
 ) -> None:
     """Post-response work, fired after the assistant's reply is fully
     streamed/received. Three independent jobs:
@@ -4587,6 +4693,13 @@ async def _async_tail(
     `injected_facts` is keyword-only with a default so no caller is broken by
     its omission; omitting it costs only the union above, because the store
     cap is applied either way.
+
+    `reply_as_streamed` is the reply as the CLIENT received it, passed only
+    when it differs from `assistant_text` (a stopped or ceiling-cut reply,
+    which decide_memory_tail trims to its last sentence). Memory stores the
+    trimmed text; the covered-turn record must describe what OpenWebUI keeps
+    and re-sends, which is what streamed (hostile pass #3, F1). See
+    _rollup_hierarchy.
     """
     # V2.3 Theme 2: under disk pressure, stop GROWING memory but keep
     # serving. The chat response already went out; this tail is pure
@@ -4664,18 +4777,29 @@ async def _async_tail(
     # copied: the skip path below needs exactly this, and a second copy of
     # it is the fix-one-site-miss-the-sibling defect this file has paid
     # for eighteen times.
-    await _rollup_hierarchy(conv_id, original_messages, assistant_text)
+    await _rollup_hierarchy(
+        conv_id, original_messages, assistant_text,
+        reply_as_streamed=reply_as_streamed,
+    )
 
 
 async def _rollup_hierarchy(
     conv_id: str,
     messages: list[dict],
     assistant_text: str | None,
+    *,
+    reply_as_streamed: str | None = None,
 ) -> None:
     """Advance the hierarchical summary. Both tail paths call this.
 
     `assistant_text` is the reply to roll up WITH the history, or None to
     roll up the history alone — which is what the skipped-tail path passes.
+
+    `reply_as_streamed` is that reply as the client received it, when it
+    differs (a stopped reply trimmed for memory). The chunk summarizes
+    `assistant_text`; the covered-turn record it writes describes the
+    streamed text, because that is what every later request carries
+    (hostile pass #3, F1 — see summarizer._record_chunk_fps).
 
     WHY None IS A CASE AT ALL (v3.1.8). A reply that trips
     reply_is_degenerate must not enter memory: the fact extractor would
@@ -4757,12 +4881,22 @@ async def _rollup_hierarchy(
         # snapshot for the log line below, and it runs on every turn the tail
         # runs — a blocking disk read on the loop to decide whether to print.
         before = await run_in_threadpool(summarizer.load_state, conv_id)
+        # The covered-turn record is written by each chunk, in the same
+        # call, from what the client SENT plus the reply as the client
+        # RECEIVED it — not from full_messages, whose redaction and trimmed
+        # reply no request carries. Passed only when it differs, so a caller
+        # (or test double) of maybe_rollup that predates the kwarg is
+        # unaffected on every reply that was not cut.
+        _rollup_kwargs: dict = {"raw_messages": list(messages)}
+        if (
+            assistant_text is not None
+            and reply_as_streamed is not None
+            and reply_as_streamed != assistant_text
+        ):
+            _rollup_kwargs["reply_as_streamed"] = reply_as_streamed
         state = await summarizer.maybe_rollup(
             conv_id, full_messages, VLLM_URL, MODEL_REPO or "",
-            # The covered-turns digest is built from what the client SENT,
-            # not from full_messages: redaction and the streamed reply are
-            # rollup-input transformations the next request does not carry.
-            raw_messages=list(messages),
+            **_rollup_kwargs,
         )
         if (
             len(state.get("l1") or []) != len(before.get("l1") or [])
@@ -5024,6 +5158,14 @@ def _run_memory_tail(
             f"{len(decision.text)} of {decision.raw_chars} chars that end "
             f"on a sentence boundary"
         )
+    # hostile pass #3 (F1): the covered-turn record must describe the reply
+    # as the client RECEIVED it — `text`, the accumulator's whole stream or
+    # the non-stream body — not `decision.text`, which is trimmed for memory.
+    # Passed only when the two differ (a trimmed store), so test doubles of
+    # _async_tail that predate the kwarg keep working on every other reply.
+    _tail_kwargs: dict = {"injected_facts": injected_facts}
+    if text != decision.text:
+        _tail_kwargs["reply_as_streamed"] = text
     accepted = _fire_and_forget(
         _async_tail(
             conv_id,
@@ -5032,7 +5174,7 @@ def _run_memory_tail(
             decision.text,
             turn_index,
             messages,  # original request messages, for rollup
-            injected_facts=injected_facts,
+            **_tail_kwargs,
         ),
         label=f"tail conv={conv_id}",
     )

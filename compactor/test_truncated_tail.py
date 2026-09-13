@@ -266,11 +266,12 @@ _fired: list = []
 
 
 def _spy_tail(conv_id, touched_facts, last_user_text, assistant_text, turn_index,
-              original_messages, *, injected_facts=None):
+              original_messages, *, injected_facts=None, reply_as_streamed=None):
     # Stands in for _async_tail. Returns a plain record instead of a
     # coroutine; _spy_fire records it. So `_fired` holds exactly what the
     # memory tail would have been given, byte for byte.
-    return {"conv_id": conv_id, "assistant_text": assistant_text}
+    return {"conv_id": conv_id, "assistant_text": assistant_text,
+            "reply_as_streamed": reply_as_streamed}
 
 
 def _spy_fire(obj, label=None):
@@ -453,6 +454,8 @@ print("[E1] control — a finished reply reaches the tail byte-identical, untrim
 r, _ = _post_nonstream("tt-control-ns", CUT)
 assert_eq(r.status_code, 200, "non-stream: 200")
 assert_eq(_fired_text(), CUT, "non-stream: the tail got the whole reply, fragment included")
+assert_eq(_fired[0]["reply_as_streamed"], None,
+          "non-stream: a verbatim store passes no separate streamed text")
 
 r, _ = _post_stream("tt-control-s", _stream_of(CUT))
 assert_eq(r.status_code, 200, "stream: 200")
@@ -468,6 +471,10 @@ tailhealth._reset_for_tests()
 r, recs = _post_nonstream("tt-length-ns", CUT, finish_reason="length")
 assert_eq(r.status_code, 200, "non-stream: 200")
 assert_eq(_fired_text(), PROSE, "non-stream: the tail got the TRIMMED reply")
+# hostile pass #3 (F1): memory keeps the trimmed text, but the covered-turn
+# record must describe what the client received and will re-send.
+assert_eq(_fired[0]["reply_as_streamed"], CUT,
+          "non-stream: ...and the reply AS RECEIVED, for the covered-turn record")
 line = _find(recs, "memorizing the")
 assert_true(line is not None and line.levelno == logging.INFO,
             "non-stream: an INFO line says what was kept")
@@ -546,6 +553,8 @@ tailhealth._reset_for_tests()
 r, recs = _post_stream("tt-stop-s", [_content(PROSE), _content(FRAGMENT)])
 assert_eq(r.status_code, 200, "stream: 200")
 assert_eq(_fired_text(), PROSE, "stream: the tail got the TRIMMED reply after a cancel")
+assert_eq(_fired[0]["reply_as_streamed"], PROSE + FRAGMENT,
+          "stream: ...and the whole stream as she saw it, for the covered-turn record")
 line = _find(recs, "memorizing the")
 assert_true(line is not None and "stream ended without completion" in line.getMessage(),
             "stream: the INFO line uses the cancel phrase")
