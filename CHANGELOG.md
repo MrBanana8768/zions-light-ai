@@ -17,20 +17,31 @@ git tag messages. Every item links to the runbook that carries the commands.
 
 ### Before deploying
 
-- **`WEBUI_DB_LOCAL=false` is a hard precondition** of this and every deploy,
-  and a row that is present but EMPTY means `true` (the database gets moved to
-  local disk). Check the template row, then after boot run the check in
+- **`WEBUI_DB_LOCAL=false` is a hard precondition** of this and every deploy.
+  Write it as exactly `false`. A missing or EMPTY row still means `true` (the
+  database gets moved to local disk). New in v3.1.9: `1`/`yes`/`on`/`True`
+  now also mean `true` (older images read them as false), `0`/`no`/`off`
+  mean `false`, and any other value **refuses to boot** with a
+  `REFUSING TO START` banner in the RunPod Logs tab — fix the row and
+  redeploy; nothing was touched. After boot, the Logs tab must show
+  `WEBUI_DB_LOCAL=false (explicitly set (false))`; the full check is in
   [RUNPOD_DEPLOY.md → WEBUI_DB_LOCAL](RUNPOD_DEPLOY.md#webui_db_local--a-hard-deploy-precondition).
-  <!-- LANE-DEP: webuidb WEBUI_DB_LOCAL parsing -->
-- **Take a backup by hand** and confirm it prints `[OK]`:
+- **Take a backup by hand on the old image** and confirm it prints `[OK]`:
   `/opt/compactor-venv/bin/python /opt/compactor/backup.py --once; echo "EXIT=$?"`.
+- **If the volume is tight, prune old backups by hand before deploying.** The
+  old image has not pruned since 2026-08-30 (its "memory shrank" check is
+  noise); v3.1.9 resumes pruning by itself, but only on its first nightly
+  cycle. The previewed manual prune is in
+  [OPERATIONS.md → Nightly "memory shrank" alert](OPERATIONS.md#nightly-memory-shrank-alert--noise-on-v3161-to-v318-a-real-signal-from-v319).
 
 ### Verifying the deploy
 
 - `/health/full` status is `ok`, or `degraded` only for `memory tail skipping`
   (see below) — and read the unreadable-memory and newest-backup lines in
-  [OPERATIONS.md → Reading /health/full](OPERATIONS.md#reading-healthfull--do-not-trust-status-alone),
-  because `ok` does not cover stopped backups.
+  [OPERATIONS.md → Reading /health/full](OPERATIONS.md#reading-healthfull--do-not-trust-status-alone).
+  From v3.1.9 `status` also degrades on a backup older than 36 hours or no
+  backups after a day of uptime, so a backup reason right after the deploy
+  means the pre-deploy backup did not happen.
 - `cat /data/logs/selftest.log` ends `=== N/N passed, 0 failed ===`.
 - After her first message: `/health/full`'s `memory_tail.stored` (or
   `stored_trimmed`) has gone up, and the compactor log has an
@@ -50,7 +61,8 @@ git tag messages. Every item links to the runbook that carries the commands.
   off without a full sentence is kept out of memory on purpose. Which outcomes
   are faults is in
   [OPERATIONS.md → What "memory tail skipping" means](OPERATIONS.md#what-memory-tail-skipping-means).
-  <!-- LANE-DEP: health memory-tail reason -->
+  This reason is new to the pod (v3.1.6.1 has no memory-tail tracking) and is
+  unchanged in v3.1.9 by design.
 
 ### Her conversation's identity
 
@@ -71,26 +83,40 @@ git tag messages. Every item links to the runbook that carries the commands.
 - **Set the History cap's `max_turns` to 0 BEFORE redeploying an older image**,
   and leave it at 0 until the newer image is back and has served one uncapped
   message. Rolling back with the cap on leaves a permanent, unlogged hole in
-  her summary hierarchy (reviewer C, F5). Keep `WEBUI_DB_LOCAL=false`.
+  her summary hierarchy (reviewer C, F5). Keep `WEBUI_DB_LOCAL=false`, spelled
+  exactly that way: the older images read `1`/`yes`/`True` as false and
+  v3.1.9 reads them as true.
 
-### Backups — what the alarms mean today
+### Backups — what changes with v3.1.9
 
-<!-- LANE-DEP: backup restore rewrite, census guard, retry-on-failure -->
-
-- **Do NOT run `backup.py --restore`.** It can leave `webui.db` malformed and
-  deletes the live memory store before copying the archive in. Use the manual
-  move-aside procedure in
+- **The "memory shrank … NOT pruning" alert now means something.** On
+  v3.1.6.1–v3.1.8 it fired every night on normal fact eviction and summary
+  rollups, so nothing pruned after 2026-08-30. v3.1.9 compares what cannot come
+  back (active + archived facts together, the highest summarized turn, archived
+  chapters, indexed exchanges), so on v3.1.9 **treat every `NOT pruning —
+  memory shrank` as a real loss** and ask for help before pruning anything.
+  **After the deploy, look for the first nightly cycle** (within about a day):
+  `grep -aE "NOT pruning|pruned [0-9]+" /data/logs/backup.log | tail -3` should
+  show `backup ok: … pruned N; …` (N may be 0). Details:
+  [OPERATIONS.md → Nightly "memory shrank" alert](OPERATIONS.md#nightly-memory-shrank-alert--noise-on-v3161-to-v318-a-real-signal-from-v319).
+- **A failed backup is retried after 15 minutes**, not 24 hours (log:
+  `backup cycle failed: …; retrying in 15 min`), and `/health/full` degrades
+  on a stale or missing backup. A hot rollback journal no longer has to fail
+  the backup: v3.1.9 backs up from a copy and logs a WARNING containing `this
+  is the hot rollback journal signature` — the live journal still needs the
+  repair in OPERATIONS.md. That fallback is not yet confirmed against the
+  production image's SQLite, so **after any "readonly database" or "database
+  is locked" episode, still run a backup by hand and read its output**
+  ([OPERATIONS.md → Backups stopped or failing](OPERATIONS.md#backups-stopped-or-failing-readonly-database--database-is-locked)).
+- **Restore: use the manual move-aside procedure** in
   [OPERATIONS.md → Restore from a backup](OPERATIONS.md#-restore-from-a-backup-recover-lostcorrupted-memory),
   which stops all four writers (`openwebui compactor backup webuidb-sync`).
-- **The nightly "memory shrank … NOT pruning" alert is currently noise**: normal
-  fact eviction and summary rollups trip it, so no nightly run has pruned since
-  2026-08-30 and archives are accumulating. How to tell noise from a real loss,
-  the safe manual prune, and the disk check are in
-  [OPERATIONS.md → Nightly "memory shrank" alert](OPERATIONS.md#nightly-memory-shrank-alert--currently-noise-and-it-has-stopped-pruning).
-- **After any "attempt to write a readonly database" or "database is locked"
-  episode, run a backup by hand and read its output.** A failed run makes the
-  daemon wait 24 hours, and `/health/full` stays `ok`
-  ([OPERATIONS.md → Backups stopped or failing](OPERATIONS.md#backups-stopped-or-failing-readonly-database--database-is-locked)).
+  `backup.py --restore` is rewritten in v3.1.9 (it stages everything first and
+  sets the old database journal and memory store aside in `/data/forensics`;
+  `backup.py --list-pre-restore` lists them) but has not yet passed the final
+  hostile review, so it is available, not recommended. On v3.1.6.1–v3.1.8,
+  including an image you roll back to, **never run `backup.py --restore`**: it
+  can leave `webui.db` malformed and deletes the live store before copying.
 - `df -h /data` shows the whole MooseFS cluster, not your volume's quota; use
   `du -sh /data/*`.
 - Service logs are in `/data/logs/`, not `/var/log/supervisor/`.

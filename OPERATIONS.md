@@ -24,8 +24,9 @@ supervisorctl status
 (`jq` is not installed in the image; `python3 -m json.tool` is.)
 
 `/health/full` returns one of:
-- `"status": "ok"` — no reason fired. **Not the same as "everything works"**:
-  see "Reading /health/full" below for the two things it does not check.
+- `"status": "ok"` — no reason fired. **Not the same as "everything works"**,
+  especially on the image the pod runs today: see "Reading /health/full" below
+  for what each release does and does not check.
 - `"status": "degraded"` — one or more reasons in `status_reasons`. Read them;
   each names its cause (vLLM unreachable, background work shedding, memory
   tail skipping, a hot SQLite journal, unreadable memory, ...). HTTP 200 (the
@@ -42,8 +43,24 @@ cat /data/logs/selftest.log                                         # the boot s
 
 ### Reading /health/full — do not trust `.status` alone
 
-`status: ok` has two known blind spots (hostile review of v3.1.7, reviewer C,
-F4). Run this and read all three lines, whatever `status` says:
+Which release the pod runs changes what `status` notices (hostile review of
+v3.1.7, reviewer C, F4):
+
+| problem | v3.1.6.1 (the pod today) and v3.1.7 | v3.1.8 | from v3.1.9 |
+|---|---|---|---|
+| a memory file is unreadable | `status: ok` | degrades | degrades |
+| a hot SQLite journal beside `webui.db` | `status: ok` | degrades | degrades |
+| no backup archives at all | `status: ok` | `status: ok` | degrades once the compactor has been up one backup interval (24 h) |
+| newest backup too old | `status: ok` | `status: ok` | degrades when older than 1.5 × the interval (36 h by default) |
+| the backup directory cannot be read | `status: ok` | `status: ok` | degrades: `backup status unobservable` |
+
+(The 24 h / 36 h figures assume the default `COMPACTOR_BACKUP_INTERVAL_HOURS=24`;
+if the template sets another interval, both scale with it, and so should the
+30 hours below.)
+
+So on every release, run this and read all three lines, whatever `status`
+says — it is the only check that works the same on today's image and on
+v3.1.9, and its 30-hour line warns six hours before v3.1.9's own reason does:
 
 ```bash
 curl -s localhost:8080/health/full | python3 -c "
@@ -56,21 +73,24 @@ print('newest backup:', b.get('latest'), '| age (hours):', round((time.time()-m)
 
 - **`unreadable memory files`** must be `{'facts': 0, 'summaries': 0, ...}` —
   every number 0. Anything above 0 is a corrupt memory file: those
-  conversations are not being read and must not be written over. Since v3.1.8
-  this also degrades `status`; check it anyway.
+  conversations are not being read and must not be written over. Ask for
+  help before restarting anything.
 - **`newest backup`** must name an archive, and its age must be under about
   **30 hours** (the daemon runs every 24 h). `None`, or an age over 30 hours,
-  means backups have stopped — and `status` still says `ok`. Go to "Backups
+  means backups have stopped. On v3.1.6.1 `status` still says `ok` when that
+  happens; from v3.1.9 it degrades past 36 hours. Either way, go to "Backups
   stopped or failing" below.
-<!-- LANE-DEP: health backup-age and unreadable reasons may land in status; keep reading both lines explicitly -->
 
 #### What "memory tail skipping" means
 
 v3.1.7 added a reason that reads `memory tail skipping: N reply(ies) not
 memorized (... last outcome <label>)`. It degrades `status` for 5 minutes after
-a reply did not go into memory, then clears itself. **Most of the time it is
-the new signal working, not a fault.** To see which outcomes actually
-happened since the compactor started:
+a reply did not go into memory, then clears itself. It is unchanged in v3.1.9:
+the degraded windows are deliberate, because every one of these skips is a
+reply she read that did not reach memory. **Most of the time it is the new
+signal working, not a fault.** (v3.1.6.1, the image the pod runs today, has no
+memory-tail tracking at all: the command below prints a `KeyError` there.)
+To see which outcomes actually happened since the compactor started:
 
 ```bash
 curl -s localhost:8080/health/full | python3 -c "import json,sys; o=json.load(sys.stdin)['memory_tail']['outcomes']; [print(f'{k:30} {v}') for k,v in o.items() if v]"
@@ -89,8 +109,8 @@ curl -s localhost:8080/health/full | python3 -c "import json,sys; o=json.load(sy
 
 The reason's own `last outcome` names the last skip of ANY kind, including a
 harmless `skipped_empty`, so read the table above rather than that label. A
-separate reason, `the backend has returned no text for N consecutive
-replies`, is always a fault. Send vLLM one completion by hand (answering
+separate reason (from v3.1.9), `the backend has returned no text for N
+consecutive replies`, is always a fault. Send vLLM one completion by hand (answering
 `/v1/models` does not prove it is generating):
 
 ```bash
@@ -101,7 +121,6 @@ curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' -d '{"
 an error, or empty text — read `tail -100 /data/logs/vllm.log`. If `$MODEL_REPO`
 is empty in your terminal, replace `"'"$MODEL_REPO"'"` with the model name in
 quotes, e.g. `"coder3101/Cydonia-24B-v4.3-heretic-v4"`.
-<!-- LANE-DEP: health may change the memory-tail reason wording or which outcomes degrade -->
 
 (In the `grep` commands in the table, type `|` where it shows `\|`.)
 
@@ -188,35 +207,41 @@ warning, because the backup daemon's 500 MB free-space guard reads the same
 misleading number and can never fire here.
 
 - Backups (`/data/backups`) are usually the fastest-growing directory: ~116 MB
-  each, and **nothing has pruned them since 2026-08-30** (see "Nightly
-  'memory shrank' alert" below).
+  each. **On v3.1.6.1 (the pod today) nothing has pruned them since
+  2026-08-30**; v3.1.9 fixes the cause (see "Nightly 'memory shrank' alert"
+  below).
 - Model weights under `/data/models` are the other space hog; remove unused
   ones with `/opt/clean-models.sh` (see
   [Cleaning up old model weights](#cleaning-up-old-model-weights-on-the-volume)).
 
-### Nightly "memory shrank" alert — currently noise, and it has stopped pruning
+### Nightly "memory shrank" alert — noise on v3.1.6.1 to v3.1.8, a real signal from v3.1.9
 
-<!-- LANE-DEP: backup the census guard may be fixed; re-check this section against backup.py run_once at merge -->
-
-**What you see:** `backup.log` says, every night,
+**What you see:** `backup.log` says
 
 ```
 backup ok: zions-backup-….tar.gz (…); NOT pruning — memory shrank since zions-backup-…: <id>.facts 193->139, <id>.summaries 8->3
 ```
 
 and, if `COMPACTOR_ALERT_WEBHOOK` is set, a failure alert saying
-`backup published but memory shrank …`.
+`backup published but memory shrank …`. Either way the backup WAS made and
+verified; only the cleanup of old archives was skipped.
 
-**What it means today:** the backup WAS made and verified — only the cleanup of
-old archives was skipped. The check compares fact and summary counts with the
-previous night and calls any decrease "memory shrank". But decreases are
-normal: when a conversation's facts reach their size cap the oldest move to an
-archive file, and when 20 summaries are rolled into one chapter the count
-drops. On this pod it has fired on every nightly run since 2026-08-31, so no
-nightly run has pruned since 2026-08-30 (hostile review of v3.1.7, reviewer C,
-F1). Archives pile up until the volume quota is hit.
+```bash
+grep -aE "NOT pruning|pruned [0-9]+" /data/logs/backup.log | tail -3
+```
 
-**How to tell noise from a real loss** — look at the list after `memory shrank since …:`
+#### On v3.1.6.1, v3.1.7 and v3.1.8 (the pod today): mostly noise, and nothing prunes
+
+The check on these releases compares raw fact and summary counts with the
+previous night and calls any decrease "memory shrank". Decreases are normal:
+when a conversation's facts reach their size cap the oldest move to an archive
+file, and when 20 summaries are rolled into one chapter the count drops. On
+this pod it has fired on every nightly run since 2026-08-31, so no nightly run
+has pruned since 2026-08-30 (hostile review of v3.1.7, reviewer C, F1).
+Archives pile up until the volume quota is hit.
+
+How to tell noise from a real loss on these releases — read the list after
+`memory shrank since …:`
 
 - **Noise:** every item ends in `.facts N->M` or `.summaries N->M` with `M`
   above 0.
@@ -225,12 +250,43 @@ F1). Archives pile up until the volume quota is hit.
   operation). Leave the archives alone and ask for help; the older archives
   are the ones that hold what was lost.
 
-```bash
-grep -a "NOT pruning" /data/logs/backup.log | tail -3
+#### From v3.1.9: the alert means something, and pruning resumes by itself
+
+v3.1.9 counts what cannot come back rather than raw numbers: facts in the
+active file AND its archive file together (eviction moves facts between the
+two, so the total does not drop), the highest summarized turn (a rollup never
+lowers it), and the archived-chapter file. So the items it can name are:
+
+| item in the list | meaning |
+|---|---|
+| `<id>.facts N->0 (emptied)` | every fact of that conversation, active and archived, is gone |
+| `<id>.summary_turn N->M` | that conversation's summaries now cover fewer turns than yesterday |
+| `<id>.archived_chapters N->M` | archived chapter summaries were lost |
+| `<id>.episodic N->M` | indexed exchanges were lost (a `/forget` or a memory reset can also do this) |
+
+**On v3.1.9, treat every `NOT pruning — memory shrank` as real.** Do not prune
+by hand; leave the archives alone and ask for help, unless you know the named
+conversation was deliberately reset.
+
+**What to look for after the v3.1.9 deploy:** the first nightly cycle (within
+about 24 hours of the boot — the daemon skips the boot-time run if a backup
+is less than 12 hours old) should end in
+
+```
+backup ok: zions-backup-….tar.gz (…); pruned N; …s
 ```
 
-**Safe manual prune** (only when the check above says noise). First see what
-it WOULD delete — this deletes nothing:
+`N` can be 0 — that only means every archive still falls inside the
+retention rules — but the line must say `pruned`, not `NOT pruning`. The
+comparison against the last v3.1.6.1 archive is safe: the new fields read as 0
+in the old manifest, so only a real episodic loss can trip it that night. If
+the first v3.1.9 night says `NOT pruning`, read its list with the table above.
+
+#### Safe manual prune (v3.1.6.1 to v3.1.8 only, and only when the check says noise)
+
+Run it on the old image to free space before the v3.1.9 deploy if the volume
+is tight; after v3.1.9 the daemon does this itself. First see what it WOULD
+delete — this deletes nothing:
 
 ```bash
 /opt/compactor-venv/bin/python -c "
@@ -261,26 +317,38 @@ floor.
 
 ### Backups stopped or failing ("readonly database" / "database is locked")
 
-<!-- LANE-DEP: backup a retry-on-failure and a health backup-age reason may land -->
-
 **What you see:** `backup.log` has `backup failed: OperationalError: attempt
 to write a readonly database` or `… database is locked`, or the "newest
 backup" age from "Reading /health/full" is over 30 hours.
 
-**Why it matters:** after a failed run the daemon waits a full 24 hours before
-trying again, and `/health/full` still says `ok` (reviewer C, F3). A hot
-rollback journal beside `webui.db` makes every attempt fail this way, and that
-is exactly the state that precedes needing a backup.
+**On v3.1.6.1 to v3.1.8 (the pod today):** after a failed run the daemon waits
+a full 24 hours before trying again, and `/health/full` still says `ok`
+(reviewer C, F3). A hot rollback journal beside `webui.db` makes every attempt
+fail with `readonly database`, and that is exactly the state that precedes
+needing a backup.
 
-**Every time you see one of those errors, or after any "database is locked"
-episode in the OpenWebUI log, run a backup by hand and read what it says:**
+**From v3.1.9:** a failed run is retried after 15 minutes — the log says
+`backup cycle failed: …; retrying in 15 min instead of the full 24.0h
+interval` — and `/health/full` degrades once the newest archive is older than
+36 hours. For a hot journal, v3.1.9 also tries to back up from a copy of the
+database and its journal instead of failing; when it does, `backup.log` shows
+a WARNING containing `this is the hot rollback journal signature`. That backup
+is fine, but **the journal on the live database is still there**: repair it
+("A HOT SQLite rollback journal" below). That fallback has been tested on
+the unit-test image's SQLite but not yet confirmed against the SQLite in the
+production image, so do not rely on it: check by hand as below.
+
+**On every release — every time you see one of those errors, or after any
+"database is locked" episode in the OpenWebUI log, run a backup by hand and
+read what it says:**
 
 ```bash
 /opt/compactor-venv/bin/python /opt/compactor/backup.py --once; echo "EXIT=$?"
 ```
 
 - **`[OK] zions-backup-….tar.gz …` and `EXIT=0`:** fine, a fresh backup
-  exists. (If the line also says `memory shrank`, see the section above.)
+  exists. (If the line also says `memory shrank`, see the section above —
+  which release you are on decides what it means.)
 - **`[FAIL] … readonly database` and `EXIT=1`:** check for a hot journal —
   "A HOT SQLite rollback journal beside `webui.db`" below — repair it, then run
   the backup command again until it prints `[OK]`.
@@ -345,7 +413,10 @@ print('HOT - uncommitted transaction pending' if b.hex()=='d9d505f920a163d7' els
 or no file — is debris or nothing. Reading takes no lock and cannot be
 confused by a healthy writer.
 
-Since v3.1.8 `/health/full` does this itself and degrades on it:
+Since v3.1.8 `/health/full` does this itself and degrades on it. v3.1.6.1, the
+image the pod runs today, does not report it at all (the command below prints a
+`KeyError` there), so on v3.1.6.1 use the eight-byte check above. On v3.1.8
+and later:
 
 ```bash
 curl -s localhost:8080/health/full | python3 -c "import json,sys; print(json.load(sys.stdin)['checks']['sqlite_journal'])"
@@ -500,15 +571,34 @@ above). `--verify` prints `[OK] db=ok, …` for a good archive.
 
 ### 🔥 Restore from a backup (recover lost/corrupted memory)
 
-> **Do NOT run `backup.py --restore`.** As shipped it copies the archived
-> database over the live one while leaving the live file's rollback journal
-> beside it (the restored database then opens as "malformed"), and it deletes
-> the whole live memory store BEFORE copying the archive's in — a restart or a
-> full volume in between leaves no memory at all (hostile review of v3.1.7,
-> reviewer C, F2 and Attack 5; hostile pass 2, A3-2 and A3-3). Use the manual
-> procedure below. It never deletes anything: the live state is RENAMED aside,
-> and a rename on the same volume cannot be left half done.
-> <!-- LANE-DEP: backup restore_backup is being rewritten; if the backup lane lands a set-aside restore, this banner and the manual procedure are reconciled at merge -->
+**Use the manual procedure below on every release.** It never deletes
+anything: the live state is RENAMED aside, and a rename on the same volume
+cannot be left half done.
+
+> **On v3.1.6.1, v3.1.7 and v3.1.8 — the image the pod runs today — NEVER run
+> `backup.py --restore`.** On those images it copies the archived database
+> over the live one while leaving the live file's rollback journal beside it
+> (the restored database then opens as "malformed"), and it deletes the whole
+> live memory store BEFORE copying the archive's in — a restart or a full
+> volume in between leaves no memory at all (hostile review of v3.1.7,
+> reviewer C, F2 and Attack 5, run against the v3.1.6.1 and v3.1.7 images;
+> v3.1.8 carries the same code).
+>
+> **From v3.1.9, `backup.py --restore` is rewritten, available, and not yet
+> reviewed.** It now copies everything it will restore next to its destination
+> first, moves
+> the old database's journal and the old memory store into `/data/forensics`
+> instead of deleting them, checks free space first, refuses to start if a
+> writer is holding the database mid-write, and can list what it set aside
+> (`backup.py --list-pre-restore`). It is still not the documented path, for
+> reasons in the code as well as the calendar: the final hostile review of
+> v3.1.9 has not cleared it; it cannot see a writer when a journal already
+> exists (exactly the incident state), so stopping the writers is still on you;
+> if its last step fails it can leave the restored database with the old
+> memory store; its free-space check reads MooseFS's cluster-wide number; and
+> it does not integrity-check the result or tell you what to start. The manual
+> procedure does all of those explicitly. Until that review clears it, use the
+> manual procedure on v3.1.9 too.
 
 **This procedure is for the production placement, `WEBUI_DB_LOCAL=false`**,
 where the live chat database IS `/data/openwebui/webui.db`. Every line runs in
@@ -556,8 +646,9 @@ du -sh /data/openwebui/compactor /data/openwebui/webui.db /data/backups/<archive
 
 Add the first two numbers. Your volume's quota (the size set in the RunPod
 console) minus the total of `du -sh /data/* 2>/dev/null` must be at least that
-much. If it is not, prune old backups first ("Nightly 'memory shrank' alert"
-above) or ask for help. Do not rely on `df`; see "Disk is filling up".
+much. If it is not, ask for help. Do not prune backups to make room during a
+restore: the older archives may be exactly the ones you need. Do not rely on
+`df`; see "Disk is filling up".
 
 **4. Stop all four writers and make sure they are gone.**
 
@@ -669,6 +760,11 @@ the header is gone and her chat is back on its hash id. Before she chats, check
 Admin Panel → Settings → Connections → the `localhost:8080` connection →
 Headers. If it is empty, redo RUNBOOK_MEMORY_IDENTITY.md from step 1.
 
+**The next backup cycle will say `NOT pruning — memory shrank`.** It compares
+the restored (older) memory with the newest archive, taken before the restore,
+so on v3.1.9 it names the turns and exchanges the restore rolled back. That is
+expected once, right after a restore; the cycle after it should prune again.
+
 **11. Clean up — only after she has confirmed** her history and memory are
 right (a day later is fine):
 
@@ -754,8 +850,13 @@ Image tags are immutable snapshots (see
    her summary hierarchy (hostile review of v3.1.7, reviewer C, F5). See
    RUNBOOK_MEMORY_IDENTITY.md "Rolling the IMAGE back".
 2. In the RunPod template, change **Container Image** to the last-good tag
-   (e.g. `angreg/zions-light-ai:v3.1.8-cu12`). **Leave `WEBUI_DB_LOCAL=false`
-   exactly as it is** — see RUNPOD_DEPLOY.md "WEBUI_DB_LOCAL".
+   (from v3.1.9 that is `angreg/zions-light-ai:v3.1.6.1-cu12`, the image the
+   pod ran before). **Leave `WEBUI_DB_LOCAL=false` exactly as it is, spelled
+   `false`** — v3.1.9 also accepts `0`/`no`/`off` and `1`/`yes`/`True`, but
+   the older images read only the exact word `true` as true, so any other
+   spelling can mean different things on the two sides of a rollback. See
+   RUNPOD_DEPLOY.md "WEBUI_DB_LOCAL".
+   A rollback is an image change only; do not restore a backup as part of it.
 3. Restart the pod. The Network Volume (and all memory) is unaffected —
    only the code image changes. The `X-Conversation-Id` connection header
    lives in OpenWebUI's database, not the image, so it stays set.
