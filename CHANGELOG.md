@@ -9,6 +9,94 @@ on Docker Hub.
 
 ---
 
+## [3.1.9] — operator notes (the last V3 release)
+
+Operator-facing notes only: what to check on the pod, what not to run, and
+what the alarms currently mean. The code changes of the v3.1.x line are in the
+git tag messages. Every item links to the runbook that carries the commands.
+
+### Before deploying
+
+- **`WEBUI_DB_LOCAL=false` is a hard precondition** of this and every deploy,
+  and a row that is present but EMPTY means `true` (the database gets moved to
+  local disk). Check the template row, then after boot run the check in
+  [RUNPOD_DEPLOY.md → WEBUI_DB_LOCAL](RUNPOD_DEPLOY.md#webui_db_local--a-hard-deploy-precondition).
+  <!-- LANE-DEP: webuidb WEBUI_DB_LOCAL parsing -->
+- **Take a backup by hand** and confirm it prints `[OK]`:
+  `/opt/compactor-venv/bin/python /opt/compactor/backup.py --once; echo "EXIT=$?"`.
+
+### Verifying the deploy
+
+- `/health/full` status is `ok`, or `degraded` only for `memory tail skipping`
+  (see below) — and read the unreadable-memory and newest-backup lines in
+  [OPERATIONS.md → Reading /health/full](OPERATIONS.md#reading-healthfull--do-not-trust-status-alone),
+  because `ok` does not cover stopped backups.
+- `cat /data/logs/selftest.log` ends `=== N/N passed, 0 failed ===`.
+- After her first message: `/health/full`'s `memory_tail.stored` (or
+  `stored_trimmed`) has gone up, and the compactor log has an
+  `injected memory [...]` line for her conversation.
+- **Do not judge the deploy by "hard budget enforced" lines.** The v3.1.7 tag's
+  VERIFY step ("tokenize.ok; the hard budget enforced warnings drop sharply")
+  cannot show the change it names: the token counting and budget path were
+  unchanged in v3.1.7, so on her long chat `compaction skipped: … need N
+  summarization calls` followed by `hard budget enforced: … dropped ~200 old
+  turn(s)` continued after that deploy, and a drop in them can come from an
+  unrelated cause (a new or shorter chat). Those lines are the context
+  starvation that the identity + optional cap procedure addresses; they are not
+  a deploy failure, and their disappearing is not proof of success. (hostile
+  review of v3.1.7, reviewer A, F3.)
+- **`memory tail skipping` degrading `/health/full` for 5 minutes at a time is
+  expected** several times a day on her traffic: a reply that looped or was cut
+  off without a full sentence is kept out of memory on purpose. Which outcomes
+  are faults is in
+  [OPERATIONS.md → What "memory tail skipping" means](OPERATIONS.md#what-memory-tail-skipping-means).
+  <!-- LANE-DEP: health memory-tail reason -->
+
+### Her conversation's identity
+
+- The OpenWebUI filter `pipelines/conversation_id_header.py` **cannot** deliver
+  the chat id on OpenWebUI 0.11.0 (OpenWebUI discards the metadata it writes).
+  Its docstring's "interlock enforced in code" did not exist. The working route
+  is an OpenWebUI connection header,
+  `{"X-Conversation-Id": "{{CHAT_ID}}{{TASK}}"}` — with `{{TASK}}`, or her
+  title/tag/follow-up traffic is memorized as her conversation.
+- The order is: merge the old hash id into the chat uuid **before** her next
+  message, then add the header, then verify `source=header`, and only then
+  (optionally) the history cap, sized from her data (start at 40, not 60).
+  Full procedure: [RUNBOOK_MEMORY_IDENTITY.md](RUNBOOK_MEMORY_IDENTITY.md).
+- Rollback order: cap to 0 → remove the header → reverse merge.
+
+### Rolling back to an older image
+
+- **Set the History cap's `max_turns` to 0 BEFORE redeploying an older image**,
+  and leave it at 0 until the newer image is back and has served one uncapped
+  message. Rolling back with the cap on leaves a permanent, unlogged hole in
+  her summary hierarchy (reviewer C, F5). Keep `WEBUI_DB_LOCAL=false`.
+
+### Backups — what the alarms mean today
+
+<!-- LANE-DEP: backup restore rewrite, census guard, retry-on-failure -->
+
+- **Do NOT run `backup.py --restore`.** It can leave `webui.db` malformed and
+  deletes the live memory store before copying the archive in. Use the manual
+  move-aside procedure in
+  [OPERATIONS.md → Restore from a backup](OPERATIONS.md#-restore-from-a-backup-recover-lostcorrupted-memory),
+  which stops all four writers (`openwebui compactor backup webuidb-sync`).
+- **The nightly "memory shrank … NOT pruning" alert is currently noise**: normal
+  fact eviction and summary rollups trip it, so no nightly run has pruned since
+  2026-08-30 and archives are accumulating. How to tell noise from a real loss,
+  the safe manual prune, and the disk check are in
+  [OPERATIONS.md → Nightly "memory shrank" alert](OPERATIONS.md#nightly-memory-shrank-alert--currently-noise-and-it-has-stopped-pruning).
+- **After any "attempt to write a readonly database" or "database is locked"
+  episode, run a backup by hand and read its output.** A failed run makes the
+  daemon wait 24 hours, and `/health/full` stays `ok`
+  ([OPERATIONS.md → Backups stopped or failing](OPERATIONS.md#backups-stopped-or-failing-readonly-database--database-is-locked)).
+- `df -h /data` shows the whole MooseFS cluster, not your volume's quota; use
+  `du -sh /data/*`.
+- Service logs are in `/data/logs/`, not `/var/log/supervisor/`.
+
+---
+
 ## [3.0.1] — patch: one image no longer poisons a conversation (2026-08-24)
 
 **The bug (found by the test user):** uploading a picture on a text-only

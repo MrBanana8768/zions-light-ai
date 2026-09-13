@@ -1,23 +1,53 @@
 """
-title: Zion's Light AI — Conversation ID propagation + history cap
+title: Zion's Light AI — history cap (its chat_id stamp is discarded by OpenWebUI 0.11.0)
 author: Zion's Light AI project
 author_url: https://github.com/MrBanana8768/zions-light-ai
 funding_url: https://github.com/MrBanana8768/zions-light-ai
-version: 1.1.0
+version: 1.1.1
 required_open_webui_version: 0.4.0
 license: same as parent project
 
-OpenWebUI Function (Filter type) that does two things, in this order and
-for one reason each:
+OpenWebUI Function (Filter type). Read "WHAT THIS FILTER CAN AND CANNOT DO"
+before installing it: the first job this file was written for does not work
+on the OpenWebUI this project ships.
 
-  1. Propagates OpenWebUI's internal chat_id to the context-compactor so
-     it has a STABLE conv_id for memory (facts, RAG, hierarchical
-     summaries) instead of a hash of the conversation's opening.
+== WHAT THIS FILTER CAN AND CANNOT DO (v3.1.9, verified on OpenWebUI 0.11.0) ==
 
-  2. Optionally caps how many turns OpenWebUI resends, so the compactor
-     is not handed the entire transcript on every single message.
+  1. It CANNOT give the compactor a stable conversation id.
 
-== WHY (2) EXISTS ==
+     inlet() writes chat_id into body["metadata"]. On OpenWebUI 0.11.0 that
+     write never leaves OpenWebUI, twice over: utils/middleware.py runs the
+     inlet filters and THEN assigns `form_data['metadata'] = metadata`,
+     replacing whatever a filter put there, and routers/openai.py does
+     `payload.pop('metadata', None)` before the request is POSTed to the
+     compactor. Reproduced with the real 0.11.0 and this filter enabled
+     globally: every request, capped or not, arrived with no metadata and the
+     compactor logged `source=hash` (hostile review of v3.1.7, reviewer B,
+     F1). The metadata stamp in inlet() is DEAD CODE on this OpenWebUI. It is
+     left in place only because it is harmless and its tests pin it; do not
+     read it as doing anything.
+
+     The route that works is configuration, not code: in OpenWebUI, Admin
+     Panel -> Settings -> Connections -> the compactor connection
+     (http://localhost:8080/v1) -> Headers:
+
+         {"X-Conversation-Id": "{{CHAT_ID}}{{TASK}}"}
+
+     `{{TASK}}` is not decoration. OpenWebUI sends its title, tag and
+     follow-up generation for a chat through the same connection with the
+     same chat_id; plain `{{CHAT_ID}}` would memorize every one of those as
+     part of her conversation (reviewer B, F2). `{{TASK}}` is empty for a real
+     chat message and the task name for a background call, so those land on
+     `<uuid>title_generation` and similar ids instead. The full, ordered
+     procedure - merge FIRST, then the header, then verify - is
+     RUNBOOK_MEMORY_IDENTITY.md in the repository root. Follow that, not this
+     docstring.
+
+  2. It CAN cap how many turns OpenWebUI resends (`max_turns`). That is the
+     only reason to install it, and only after the header route above is
+     verified: the compactor log must show `source=header` for her chat.
+
+== WHY THE CAP EXISTS ==
 
 Measured in production, 2026-09-01, on a conversation at 664 messages:
 
@@ -27,144 +57,83 @@ Measured in production, 2026-09-01, on a conversation at 664 messages:
 OpenWebUI re-sends the FULL history with every message. At 1.13M tokens
 the compactor's hard-budget guard was discarding 651 of 659 turns on
 every request, so the model received about eight turns plus a fixed
-memory block — and answered nearly the same prompt every time. The user's
-report was "it just gives the last response again". It was not repeating
-itself; it was being starved.
+memory block. The user's report was "it just gives the last response
+again". It was not repeating itself; it was being starved.
 
-Every mechanism downstream — the budget guard, the summarization cap, two
-full tokenizations per request that pushed replies to 53-60 minutes — is
-compensation for a payload that should never have been that large. This
-valve removes the cause instead of compensating for it.
+Memory is NOT affected by capping, PROVIDED the conversation id does not
+depend on the payload. Facts, the episodic index and the L1/L2/L3 summaries
+are keyed on conv_id and live in the compactor's own storage.
 
-Memory is NOT affected by capping. Facts, the episodic index and the
-L1/L2/L3 summaries are keyed on conv_id and live in the compactor's own
-storage. They are exactly what makes trimming the transcript safe.
+v3.1.9 may make the cap unnecessary: uncapped, the compactor reuses its
+stored summaries for the older turns instead of re-summarizing them. Under a
+cap it cannot (the window no longer starts at turn 1), so every capped
+request summarizes its whole window from scratch. Check the uncapped logs
+first (RUNBOOK_MEMORY_IDENTITY.md step 5).
 
-== THE ORDERING TRAP, ENFORCED IN CODE ==
+== THE ORDERING TRAP - NOT ENFORCED BY THIS CODE ==
 
-Do not cap history until chat_id propagation is verified working.
-
-Without (1), the compactor derives conv_id from
+Without a stable id, the compactor derives conv_id from
 `sha256(system ||| first_user[:512])`. Cap the history and the FIRST USER
-MESSAGE in the payload changes — which changes the hash, which mints a
-brand-new conv_id and orphans every fact, embedding and summary under the
-old one. Truncating on a hash-derived conv_id is a memory wipe with extra
-steps.
+MESSAGE in the payload changes on every exchange - which changes the hash,
+which mints a brand-new conv_id on EVERY message. Truncating on a
+hash-derived conv_id is a memory fork per turn.
 
-So `max_turns` defaults to 0 (off), and `inlet` REFUSES to truncate on
-any request where it did not successfully stamp chat_id. The refusal
-means a request that somehow arrives without metadata cannot fork the
-conversation even if the valve is on.
+An earlier version of this docstring said this trap was "ENFORCED IN CODE"
+because inlet refuses to truncate when it did not stamp chat_id. That was
+false, and it is the sentence most likely to hurt her: the check only looks
+at this filter's own local write, which always succeeds and is then thrown
+away by OpenWebUI (point 1). The refusal still means one true thing -
+OpenWebUI had no chat_id for this request, so the header would have been
+empty too - but it cannot tell whether the header is configured, and so it
+cannot tell whether capping is safe. Only the compactor log can:
 
-BUT BE CLEAR ABOUT WHAT THE DEFAULT DOES NOT PROTECT YOU FROM. An earlier
-draft of this file claimed "installing this filter changes nothing until
-you opt in". That is FALSE, and it is the most dangerous sentence that
-could sit in these instructions. Installing this filter switches conv_id
-from the hash to chat_id on the VERY FIRST REQUEST. That switch is itself
-a fork: everything written under the old hash id - facts, episodic
-embeddings, the whole summary hierarchy - stops being reachable under the
-id the compactor now resolves. `max_turns=0` gates the TRUNCATION, not
-the IDENTITY CHANGE.
+    grep -aE "conv_id=[^ ]+ source=[^ ]+ msgs=" /data/logs/compactor.log | tail -5
 
-Nothing is destroyed by that fork (both halves sit on disk) and the
-install sequence below folds them back together. But the fork happens
-whether or not you are ready for it, the compactor's own fork detector
-CANNOT warn you (it returns early unless the id came from the hash), and
-the merge does not carry everything - see MERGE LIMITS below.
+Her chat must show `source=header`. If it shows `source=hash` while
+max_turns is above 0, set max_turns to 0 IMMEDIATELY.
 
-== INSTALLATION ==
+== INSTALLING IT, FOR THE CAP ONLY ==
 
-1. In OpenWebUI: Settings → Admin → Functions
-2. Click "+" to add a new function
-3. Paste this entire file
-4. Name: "Conversation ID propagation"
-5. Save, then toggle ON globally (or per-model)
-6. VERIFY before going further:
-     grep -a "conv_id=" /data/logs/compactor.log | tail -5
-   You must see `source=body_metadata.chat_id`. If it still says
-   `source=hash`, stop here — the filter is not reaching the compactor,
-   and turning on max_turns would fork her memory.
-7. NOTE THE NEW conv_id from that same log line. It is OpenWebUI's chat
-   UUID. Everything from before the install lives under the OLD id (the
-   16-hex hash) and is not reachable from the new one yet.
-8. MERGE the old memory into the new id. Dry run first - it is the
-   default - and read the counts before committing:
-     curl -s -X POST "localhost:8080/admin/conversations/<old-hash-id>/merge-into/<new-uuid>"
-     curl -s -X POST "localhost:8080/admin/conversations/<old-hash-id>/merge-into/<new-uuid>" \
-          -H 'Content-Type: application/json' -d '{"dry_run": false}'
+Prerequisite: RUNBOOK_MEMORY_IDENTITY.md steps 0-4 done, and her chat logging
+`source=header`.
 
-   READ THE COUNTS ON THE SECOND COMMAND, not just its status. Until v3.1.7
-   the handler read `dry_run` from the JSON body only, so the `?dry_run=false`
-   this runbook used to print was silently ignored: the commit was a second
-   dry run that returned 200 with plausible numbers and changed nothing. Both
-   forms work now, and the body form is the one written here because it is the
-   one that has always been read. A merge that did not happen is invisible
-   until step 10 makes the loss permanent.
-9. VERIFY the facts landed before going any further:
-     curl -s "localhost:8080/admin/conversations" | grep -A3 "<new-uuid>"
-   The fact count under the new id should be close to what the old id
-   held. If it is 0, STOP - do not set max_turns, because capping is what
-   makes the remaining gap permanent.
-10. ONLY THEN set the `max_turns` valve. USE 60. That number is chosen,
-   not rounded, and both neighbours are worse:
+1. OpenWebUI: Admin Panel -> Functions -> "+"
+2. Paste this entire file. Name it "History cap". Save.
+3. Toggle it ON and set it Global. With max_turns at 0 (the default) it
+   changes nothing.
+4. Set the max_turns valve to 40 - NOT 60. The old 60 was computed for turns
+   of ~1,000 tokens; hers average ~1,650, and at 60 every message needs 4-5
+   summarization calls (reviewer B, F7). Valve units are NON-SYSTEM messages
+   (40 = ~20 exchanges).
+5. After her next message:
+     grep -aE "compaction skipped: [0-9]+ turns need [0-9]+ summarization calls|summarize: [0-9]+ turns exceed .* map-reduce over [0-9]+ batches|compacted: summarized" /data/logs/compactor.log | tail -3
+   Success: "map-reduce over 2 batches" (or 1), or "compacted: summarized"
+   with no map-reduce line. If it needs 3 or more calls/batches, lower
+   max_turns by 10 and check again. Never below 30: the window must hold a
+   full 20-turn L1 chunk with room to spare.
 
-     100  the compactor's INLINE summarizer needs <= 4 batches per request
-          (COMPACTOR_MAX_SUMMARY_CALLS). 96 turns of ~1000 tokens is 4
-          batches exactly - and 7 under the PESSIMISTIC 2.0x fallback that
-          fires whenever /tokenize refuses. On 2026-09-01 that was every
-          single request. So a 100-turn cap re-latches inline summarization
-          precisely when things are already going wrong.
+== ROLLBACK - IN THIS ORDER ==
 
-      25  works for the summarizer (1 batch, 2 pessimistic) but leaves only
-          1.2x margin over L1_CHUNK_SIZE=20. The window must always hold a
-          full L1 chunk plus whatever accumulated since, or the rollup
-          cannot see the text it needs. One failed rollup puts you 40 turns
-          behind with 25 visible, and the oldest 20 are gone for good.
+1. max_turns -> 0, and let her send one message.
+2. Only then remove the connection header. Removing the header while
+   max_turns is above 0 sends a capped window with no id: a new conv_id on
+   every message (reviewer B, F8). Removing the header is an IDENTITY change,
+   not a cap change.
+3. Reverse-merge <uuid> -> <old-hash-id> (RUNBOOK_MEMORY_IDENTITY.md R3), so
+   what she said under the uuid is not stranded there. Use the JSON BODY
+   form, and confirm the response carries `facts_added` (only a real commit
+   has it; a dry run's `facts_to_add` proves nothing):
 
-      60  2 batches, 4 under the pessimistic fallback, and 3x the L1 chunk -
-          about two failed rollups of recovery room. Turns sent drop from
-          ~1.13M tokens to ~60k, which is the latency fix; the hard-budget
-          guard still trims to ~5 exchanges verbatim either way, so this
-          buys SUMMARIES of the turns between, not more raw context.
+     curl -s -X POST "localhost:8080/admin/conversations/<uuid>/merge-into/<old-hash-id>" -H 'Content-Type: application/json' -d '{"dry_run": false}'
 
-Steps 1-6 are safe on their own and can sit indefinitely: the identity
-has moved but nothing is capped, so the client still sends everything and
-the new id rebuilds its own summaries as it goes. Step 10 is the one that
-is hard to undo.
+Rolling the compactor IMAGE back to an older release: set max_turns to 0
+BEFORE redeploying the older image, and leave it at 0 until the newer image is
+back and has served one uncapped message. Rolling back with the cap on leaves
+a permanent, unlogged hole in her summary hierarchy (hostile review of v3.1.7,
+reviewer C, F5).
 
-== MERGE LIMITS - READ BEFORE YOU CAP ==
-
-`POST /admin/conversations/<old>/merge-into/<new>` moves FACTS and
-EPISODIC exchanges. It does NOT move:
-
-  * SUMMARIES. merge_conversation refuses them deliberately, and its
-    docstring justifies that by saying the new id re-derives its own
-    hierarchy "from the client's full array". That is true only while
-    max_turns is 0. Cap the history and the new id can never see past the
-    last N turns, so a long conversation's L1/L2/L3 narrative is stranded
-    under the old id with no tooling to move it.
-  * The ARCHIVED-FACT sidecar (facts/<conv>.archive.json). The export
-    bundle carries facts, summary_state and episodic only, so /list-archive
-    on the new id reads empty.
-  * An admin-set PERSONA. auto_capture usually re-takes it from the
-    client's system message, so this is rarely visible - unless the stored
-    record was hand-set.
-
-CAP LAST, AND ONLY AFTER THE MERGE HAS RUN. Enabling max_turns before
-merging does not wipe memory - the interlock holds - but it seeds the new
-id's episodic turn_index near N instead of past the old id's maximum. A
-later merge then reads the old id's exchanges at those same indices as
-"already existing" and SKIPS them, reporting only a count. That loss is
-striped, silent, and re-running the merge will not repair it.
-
-== ROLLBACK ==
-
-The CAP rolls back cleanly: set max_turns to 0 and the next request sends
-the full history again. Nothing persists.
-
-The IDENTITY SWITCH does not. Disabling or deleting this filter reverts
-conv_id to the hash, orphaning everything written under chat_id since
-install. The only way back is another merge, in the other direction.
+Disabling or deleting this filter only removes the cap. It does not change
+the conversation id - on OpenWebUI 0.11.0 it never did.
 """
 
 from pydantic import BaseModel, Field
@@ -180,10 +149,12 @@ class Filter:
         max_turns: int = Field(
             default=0,
             description=(
-                "Max NON-SYSTEM messages to forward (100 = ~50 exchanges). "
+                "Max NON-SYSTEM messages to forward (40 = ~20 exchanges). "
                 "0 disables capping. Do not enable until the compactor log "
-                "shows source=body_metadata.chat_id — see this filter's "
-                "docstring for why."
+                "shows source=header for this chat (the X-Conversation-Id "
+                "connection header, RUNBOOK_MEMORY_IDENTITY.md). This filter "
+                "cannot set the id itself on OpenWebUI 0.11.0 - see its "
+                "docstring."
             ),
         )
 
@@ -236,22 +207,30 @@ class Filter:
         """
         try:
             if not __metadata__:
-                return body  # nothing to propagate, and so nothing to cap
+                return body  # no chat_id: the header would be empty too, so do not cap
 
             chat_id = __metadata__.get("chat_id")
             if not chat_id:
                 return body
 
-            # (1) Stamp the stable id. This must succeed before (2) may run.
+            # (1) Stamp chat_id into body.metadata. DEAD ON OpenWebUI 0.11.0:
+            # middleware.py replaces form_data['metadata'] after the inlet
+            # filters run and openai.py pops it before the POST, so the
+            # compactor never sees this (hostile review v3.1.7, B/F1). Kept
+            # because it is harmless and pinned by the tests; the working id
+            # route is the X-Conversation-Id connection header.
             meta = body.get("metadata")
             if not isinstance(meta, dict):
                 meta = {}
                 body["metadata"] = meta
             meta["chat_id"] = str(chat_id)
 
-            # (2) Cap the history. Reachable ONLY below a successful stamp:
-            # with chat_id set, conv_id no longer depends on the payload's
-            # first user message, so trimming it cannot fork her memory.
+            # (2) Cap the history. Reachable only when OpenWebUI supplied a
+            # chat_id. That is NOT proof the compactor receives an id: this
+            # check sees only the local stamp above, which OpenWebUI 0.11.0
+            # discards. Capping is safe only while the compactor log shows
+            # source=header for this chat; with source=hash every capped
+            # request mints a new conv_id. See the docstring.
             max_turns = int(getattr(self.valves, "max_turns", 0) or 0)
             if max_turns > 0:
                 messages = body.get("messages")

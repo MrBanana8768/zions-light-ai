@@ -177,11 +177,30 @@ curl -s localhost:8080/health/full | python3 -m json.tool | head -40
 ```
 
 ```bash
+# status alone is not enough: unreadable memory must be all 0, and the newest
+# backup must be under ~30 hours old (status stays "ok" when backups stop)
+curl -s localhost:8080/health/full | python3 -c "
+import json,sys,time
+d=json.load(sys.stdin); b=d.get('backups') or {}; m=b.get('latest_mtime')
+print('status:', d['status'], d['status_reasons'])
+print('unreadable memory files:', d['stats'].get('unreadable'))
+print('newest backup:', b.get('latest'), '| age (hours):', round((time.time()-m)/3600,1) if m else None)"
+```
+<!-- LANE-DEP: health backup-age reason may land in status -->
+
+```bash
+# which id her chat resolves to: source=header is the stable id
+grep -aE "conv_id=[^ ]+ source=[^ ]+ msgs=" /data/logs/compactor.log | tail -5
+```
+
+```bash
 supervisorctl status
 ```
 
 ```bash
-df -h /data; du -sh /data/* 2>/dev/null | sort -h | tail -10
+# du is your usage; compare its total with the volume size set in RunPod.
+# df on /data reports the whole MooseFS cluster, not your quota.
+du -sh /data/* 2>/dev/null | sort -h | tail -10
 ```
 
 ```bash
@@ -242,16 +261,36 @@ ls -1t /data/backups/ | head
 ```
 
 ```bash
-/opt/compactor-venv/bin/python /opt/compactor/backup.py --verify
+# --verify needs the archive path; it prints [OK] db=ok, ... for a good one
+/opt/compactor-venv/bin/python /opt/compactor/backup.py --verify /data/backups/<archive>.tar.gz
 ```
 
 ```bash
-supervisorctl stop openwebui compactor backup
-/opt/compactor-venv/bin/python /opt/compactor/backup.py --restore /data/backups/<archive>.tar.gz --yes
-supervisorctl start compactor openwebui backup
+# a backup by hand: [OK] + EXIT=0 is success. Run one after any
+# "readonly database" / "database is locked" episode and read the line.
+/opt/compactor-venv/bin/python /opt/compactor/backup.py --once; echo "EXIT=$?"
 ```
 
-Restore is destructive and refuses an archive that does not verify.
+```bash
+# is the newest backup recent? the first archive line (under "total") should be under ~30 hours old
+ls -lt /data/backups | head -3
+```
+
+**Do NOT run `backup.py --restore`** until the rewritten restore ships: as
+shipped it can leave `webui.db` malformed (a stale rollback journal left
+beside the restored file) and deletes the live memory store before copying
+the archive's in. Restore by hand with the move-aside procedure in
+[OPERATIONS.md → Restore from a backup](OPERATIONS.md#-restore-from-a-backup-recover-lostcorrupted-memory),
+which stops all FOUR writers first:
+<!-- LANE-DEP: backup restore_backup is being rewritten; reconcile this block at merge -->
+
+```bash
+supervisorctl stop openwebui compactor backup webuidb-sync
+```
+
+(`webuidb-sync: ERROR (not running)` is the expected answer on a
+`WEBUI_DB_LOCAL=false` pod. When done, start only
+`supervisorctl start compactor openwebui backup` there — never `webuidb-sync`.)
 
 ### Shadow deploy (test a build beside the live compactor)
 
