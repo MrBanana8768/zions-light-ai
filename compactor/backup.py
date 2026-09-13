@@ -170,6 +170,14 @@ INTERVAL_HOURS = env_float("COMPACTOR_BACKUP_INTERVAL_HOURS", 24)
 # Prevents the backup process from being the thing that fills the disk.
 MIN_FREE_MB = env_int("COMPACTOR_BACKUP_MIN_FREE_MB", 500)
 
+# v3.1.9 (hostile317-c F3). How long run_daemon waits before retrying a
+# FAILED cycle, instead of sleeping the full INTERVAL_HOURS. A hot MooseFS
+# rollback journal or a "database is locked" episode used to cost a full 24h
+# retry — exactly the state that precedes needing a backup most. Capped at
+# the configured interval so a short test/dev interval is never lengthened
+# by this constant.
+RETRY_BACKOFF_S = env_float("COMPACTOR_BACKUP_RETRY_BACKOFF_S", 900)
+
 # Optional off-volume target (future work). When unset, local only.
 REMOTE_TARGET = os.environ.get("COMPACTOR_BACKUP_REMOTE", "").strip()
 
@@ -229,20 +237,85 @@ def _free_mb(path: Path) -> float:
 def _snapshot_sqlite(src: Path, dest: Path) -> bool:
     """Consistent online snapshot of a (possibly live) SQLite db via the
     backup API. Returns True if a snapshot was written, False if the source
-    doesn't exist. Raises on a real failure."""
+    doesn't exist. Raises on a real failure.
+
+    v3.1.9 (hostile317-c F3). A HOT ROLLBACK JOURNAL beside `src` — the
+    documented MooseFS failure under WEBUI_DB_LOCAL=false, a stall that
+    lands mid-transaction — makes the mode=ro open below raise
+    "attempt to write a readonly database": finishing a rollback requires
+    writing, and a read-only handle cannot. Before this fix that exception
+    propagated out of create_backup, run_once reported ok=False, and
+    run_daemon slept the FULL interval (24h default, see run_daemon) before
+    trying again — so the state that precedes needing a backup most is the
+    one state in which backups stopped.
+
+    recover-webui-db.py's rule for this exact failure is the fix: a journal
+    and its database are a matched pair, so copy BOTH aside and let SQLite
+    finish the rollback on the disposable copy, never on the live pair. Only
+    the specific readonly-database signature falls back to that path;
+    anything else still raises as before, unchanged.
+    """
     if not src.is_file():
         return False
     # Open read-only-ish; the backup API handles WAL + concurrent writers.
-    con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
     try:
-        dst = sqlite3.connect(str(dest))
+        con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
         try:
-            con.backup(dst)
+            dst = sqlite3.connect(str(dest))
+            try:
+                con.backup(dst)
+            finally:
+                dst.close()
         finally:
-            dst.close()
+            con.close()
+        return True
+    except sqlite3.OperationalError as e:
+        if "readonly database" not in str(e):
+            raise
+        logger.warning(
+            f"{src} could not be backed up read-only ({e}) — this is the hot "
+            f"rollback journal signature (recover-webui-db.py), so copying "
+            f"it and its sidecars aside to finish the rollback on a "
+            f"disposable copy rather than touching the live pair"
+        )
+        return _snapshot_via_rollback_copy(src, dest)
+
+
+def _snapshot_via_rollback_copy(src: Path, dest: Path) -> bool:
+    """Fallback for _snapshot_sqlite when `src` has a hot rollback journal.
+
+    Copies `src` and its SIDECARS to a scratch dir — the matched pair, never
+    the live files — opens the COPY read-write so SQLite performs the same
+    rollback it would perform on any ordinary open (just against disposable
+    bytes this time), verifies it, then takes the online backup from that
+    recovered copy. The live database and journal are only ever read here,
+    never opened for writing, renamed, or deleted.
+    """
+    scratch = Path(tempfile.mkdtemp(prefix="zions-hotjournal-"))
+    try:
+        scratch_src = scratch / src.name
+        shutil.copy2(src, scratch_src)
+        for suffix in SIDECARS:
+            side = src.with_name(src.name + suffix)
+            if side.is_file():
+                shutil.copy2(side, scratch / side.name)
+        con = sqlite3.connect(str(scratch_src))
+        try:
+            row = con.execute("PRAGMA integrity_check").fetchone()
+            if not row or row[0] != "ok":
+                raise RuntimeError(
+                    f"recovered copy of {src} failed integrity_check: {row}"
+                )
+            dst = sqlite3.connect(str(dest))
+            try:
+                con.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            con.close()
+        return True
     finally:
-        con.close()
-    return True
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _tree_bytes(p: Path) -> int:
@@ -330,12 +403,43 @@ def _census(store: Path) -> dict:
     Per-conversation rather than a total: a total hides one conversation
     emptying while another grows, and one conversation is the whole product
     here. (v3.1 F2.)
+
+    v3.1.9 (hostile317-c F1). The fields here used to be RAW COUNTS — active
+    facts only, and len(l1)+len(l2)+bool(l3) chunks — and run_once's
+    cross-cycle comparison flagged any decrease. That fires on the daemon's
+    own designed steady
+    state: facts.prune_facts(conv_id=...) moves evicted facts into the
+    `.archive.json` sidecar rather than deleting them (active count drops,
+    nothing is lost); dedup permanently merges duplicate facts (a smaller
+    number of entries, same information); and every L1->L2 or L2->L3 rollup
+    replaces N chunks with one chapter (chunk count drops, nothing is lost —
+    that IS the hierarchy). Her real logs (hostile317-c) show every nightly
+    cycle from 2026-08-31 through 2026-09-11 reading "memory shrank" and
+    skipping the prune, on exactly this shape. So what is recorded now is
+    what is actually unrecoverable if the archive did not carry it:
+
+      * facts     — active + archived, UNIONED. Eviction moves an entry
+        between the two files this reads; the union does not move with it.
+        Dedup still reduces the union (two entries become one merged one),
+        which is why the loss test is "went to zero", not "went down" — see
+        _census_regressions.
+      * summary_turn — `last_summarized_turn`, the highest turn any L1 chunk
+        covers. Every rollup writer advances this to a chunk's own last_turn
+        and none of them retreats it (summarizer.py); it is a high-water
+        mark, not a count, so folding ten chunks into one chapter does not
+        move it.
+      * archived_chapters — the L2 chapter cold-storage sidecar
+        (`summaries/<id>.archive.json`, written by _archive_chapters once L3
+        has paraphrased a span). Append-only: this is the ONLY remaining
+        copy of chapter-level detail once L3 absorbs it (summarizer.py:250),
+        so a decrease here is real loss, not a rollup doing its job.
     """
     census: dict[str, dict] = {}
 
     def slot(conv_id: str) -> dict:
         return census.setdefault(
-            conv_id, {"facts": 0, "summaries": 0, "episodic": 0}
+            conv_id,
+            {"facts": 0, "summary_turn": 0, "archived_chapters": 0, "episodic": 0},
         )
 
     facts_dir = store / _FACTS_SUBDIR
@@ -347,7 +451,16 @@ def _census(store: Path) -> dict:
                 continue
             data = _read_json(f)
             if isinstance(data, dict) and isinstance(data.get("facts"), list):
-                slot(f.stem)["facts"] = len(data["facts"])
+                slot(f.stem)["facts"] += len(data["facts"])
+        # Archived facts count toward the same conversation's total — see the
+        # docstring above. Eviction (prune_facts with conv_id) moves entries
+        # here; without this loop the census watched only the half of the
+        # store the daemon's own steady state empties every day.
+        for f in sorted(facts_dir.glob("*.archive.json")):
+            conv_id = f.name[: -len(".archive.json")]
+            data = _read_json(f)
+            if isinstance(data, dict) and isinstance(data.get("facts"), list):
+                slot(conv_id)["facts"] += len(data["facts"])
 
     summaries_dir = store / _SUMMARIES_SUBDIR
     if summaries_dir.is_dir():
@@ -357,13 +470,14 @@ def _census(store: Path) -> dict:
             data = _read_json(f)
             if not isinstance(data, dict):
                 continue
-            n = 0
-            for tier in ("l1", "l2"):
-                if isinstance(data.get(tier), list):
-                    n += len(data[tier])
-            if isinstance(data.get("l3"), dict):
-                n += 1
-            slot(f.stem)["summaries"] = n
+            turn = data.get("last_summarized_turn")
+            if isinstance(turn, int):
+                slot(f.stem)["summary_turn"] = turn
+        for f in sorted(summaries_dir.glob("*.archive.json")):
+            conv_id = f.name[: -len(".archive.json")]
+            data = _read_json(f)
+            if isinstance(data, dict) and isinstance(data.get("chapters"), list):
+                slot(conv_id)["archived_chapters"] = len(data["chapters"])
 
     episodic = _episodic_counts(store / _CHROMA_SUBDIR / _CHROMA_DB_NAME)
     if episodic:
@@ -376,9 +490,18 @@ def _census(store: Path) -> dict:
 def _census_shortfalls(expected: dict, actual: dict) -> list[str]:
     """Conversations where `actual` holds fewer of a layer than `expected`.
 
-    One-directional on purpose. More is fine — the live store grows between
-    two archives, and growth is never the failure. Less is the entire signal
-    this module exists to catch.
+    One-directional on purpose. More is fine. Less is the entire signal.
+
+    This is the STRICT comparison — every layer, any decrease — and it has
+    exactly one caller: verify_backup, contradicting an archive's own
+    manifest with what verify_backup just recomputed from that SAME
+    archive's extracted contents. Both readings are taken from one static
+    tree a few seconds apart, so there is no eviction, no dedup and no
+    rollup that can happen in between — any shortfall here is the archive
+    not containing what it claims to, i.e. truncation or corruption, and
+    NONE of the tolerances _census_regressions (below) applies across two
+    different nightly cycles belong here. Do not point run_once at this
+    function — that was v3.1.9 hostile317-c F1 (see _census_regressions).
     """
     out: list[str] = []
     if not isinstance(expected, dict) or not isinstance(actual, dict):
@@ -388,9 +511,66 @@ def _census_shortfalls(expected: dict, actual: dict) -> list[str]:
         have = actual.get(conv_id) or {}
         if not isinstance(want, dict):
             continue
-        for layer in ("facts", "summaries", "episodic"):
+        have = have if isinstance(have, dict) else {}
+        for layer in ("facts", "summary_turn", "archived_chapters", "episodic"):
             w = int(want.get(layer) or 0)
-            h = int(have.get(layer) or 0) if isinstance(have, dict) else 0
+            h = int(have.get(layer) or 0)
+            if h < w:
+                out.append(f"{conv_id}.{layer} {w}->{h}")
+    return out
+
+
+def _census_regressions(expected: dict, actual: dict) -> list[str]:
+    """Conversations where `actual` lost something `expected` had that the
+    daemon's OWN normal operation, between two nightly cycles, does not
+    explain.
+
+    v3.1.9 (hostile317-c F1). This is run_once's cross-cycle comparison —
+    the previous archive's census against the new one — and it is NOT the
+    same question _census_shortfalls answers. Between two cycles, normal
+    operation legitimately shrinks the raw numbers: facts.prune_facts(conv_
+    id=...) moves evicted facts into the `.archive.json` sidecar rather than
+    deleting them; dedup permanently merges duplicate facts into fewer,
+    denser entries; and every L1->L2 or L2->L3 rollup replaces N chunks with
+    one chapter. Her real logs (hostile317-c) show every nightly cycle from
+    2026-08-31 through 2026-09-11 reading "memory shrank" and skipping the
+    prune, on exactly this shape — because the daemon was using
+    _census_shortfalls's STRICT rule for a question it does not answer here.
+    So what is flagged is what is actually unrecoverable (see _census's
+    docstring for what each field means):
+
+      * facts — eviction and dedup both legitimately shrink the raw count
+        (eviction moves it into the union _census now reads; dedup merges
+        duplicates into fewer, denser entries). Neither can take the union
+        to exactly zero while it held something — only a truly empty facts
+        file AND an empty archive sidecar look like that. So this layer
+        flags only w > 0 and h == 0: "the facts are gone", not "there are
+        fewer of them today".
+      * summary_turn / archived_chapters — both are designed to be
+        monotonic (a high-water mark; an append-only sidecar), so ANY
+        decrease is a regression: a rollup does not undo them, only real
+        loss does.
+      * episodic — unchanged: nothing in the daemon's own cycle prunes
+        ChromaDB rows, so any decrease is still worth naming.
+    """
+    out: list[str] = []
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return out
+    for conv_id in sorted(expected):
+        want = expected.get(conv_id) or {}
+        have = actual.get(conv_id) or {}
+        if not isinstance(want, dict):
+            continue
+        have = have if isinstance(have, dict) else {}
+
+        w_facts = int(want.get("facts") or 0)
+        h_facts = int(have.get("facts") or 0)
+        if w_facts > 0 and h_facts == 0:
+            out.append(f"{conv_id}.facts {w_facts}->{h_facts} (emptied)")
+
+        for layer in ("summary_turn", "archived_chapters", "episodic"):
+            w = int(want.get(layer) or 0)
+            h = int(have.get(layer) or 0)
             if h < w:
                 out.append(f"{conv_id}.{layer} {w}->{h}")
     return out
@@ -925,7 +1105,12 @@ def run_once(backup_dir: Path | None = None) -> dict:
         new_census = ((new_manifest or {}).get("sources", {})
                       .get("compactor", {}) or {}).get("conversations")
         if isinstance(prev_census, dict) and isinstance(new_census, dict):
-            losses = _census_shortfalls(prev_census, new_census)
+            # v3.1.9 (hostile317-c F1): _census_regressions, NOT
+            # _census_shortfalls — this is a cross-CYCLE comparison, where
+            # normal eviction/dedup/rollup legitimately shrinks the raw
+            # numbers; _census_shortfalls's strict "any decrease" rule is
+            # for verify_backup's within-one-archive integrity check only.
+            losses = _census_regressions(prev_census, new_census)
         report["census_regressions"] = losses
         report["ok"] = True
         report["elapsed_s"] = round(time.monotonic() - t0, 1)
@@ -1034,6 +1219,7 @@ def restore_backup(
         # caller in the tree ever passed it. The parameter stays so an old
         # call does not break; it is simply not evidence.
         target = webui_db or live_webui_db()
+        _require_no_active_writer(target)
         stamp = _restore_stamp()
 
         # ------------------------------------------------------------------
@@ -1092,9 +1278,10 @@ def restore_backup(
             f"{'webui.db -> ' + db_tmp.name if have_db else 'no webui.db'} and "
             f"{'store -> ' + store_incoming.name if have_store else 'no store'}. "
             f"If this process dies before 'restored' is logged, nothing was "
-            f"deleted: the pre-restore originals are named *.pre-restore-{stamp} "
-            f"beside their targets, and the staged copies are the "
-            f"*.restore-{stamp} / *.incoming-{stamp} names above."
+            f"deleted: any pre-restore originals are named *.pre-restore-"
+            f"{stamp} under {_quarantine_dir()}, and the staged copies are "
+            f"the *.restore-{stamp} / *.incoming-{stamp} names beside their "
+            f"targets."
         )
 
         if have_db:
@@ -1108,11 +1295,10 @@ def restore_backup(
             for suffix in SIDECARS:
                 side = target.with_name(target.name + suffix)
                 if side.exists():
-                    aside = _free_name(side.with_name(f"{side.name}.pre-restore-{stamp}"))
-                    side.rename(aside)
+                    aside = _quarantine_aside(side, stamp)
                     moved.append((side, aside))
                     logger.warning(
-                        f"moved {side.name} aside to {aside.name} before "
+                        f"moved {side.name} aside to {aside} before "
                         f"restoring — it belongs to the database being "
                         f"replaced, and SQLite would have applied it to the "
                         f"restored one"
@@ -1122,10 +1308,10 @@ def restore_backup(
             except BaseException:
                 for side, aside in reversed(moved):
                     try:
-                        aside.rename(side)
+                        shutil.move(str(aside), str(side))
                     except OSError as e:
                         logger.error(
-                            f"could not put {aside.name} back as {side.name} "
+                            f"could not put {aside} back as {side.name} "
                             f"after a failed restore ({e}); move it back by "
                             f"hand BEFORE anything opens {target.name}"
                         )
@@ -1145,15 +1331,12 @@ def restore_backup(
             # nobody can tell yet whether they did.
             store_aside = None
             if sroot.exists():
-                store_aside = _free_name(
-                    sroot.with_name(f"{sroot.name}.pre-restore-{stamp}")
-                )
-                os.replace(sroot, store_aside)
+                store_aside = _quarantine_aside(sroot, stamp)
             try:
                 os.replace(store_incoming, sroot)
             except BaseException:
                 if store_aside is not None:
-                    os.replace(store_aside, sroot)
+                    shutil.move(str(store_aside), str(sroot))
                 raise
             _fsync_dir(sroot.parent)
             if store_aside is not None:
@@ -1205,6 +1388,190 @@ def _free_name(p: Path) -> Path:
 
 def _tree_bytes(root: Path) -> int:
     return sum(f.stat().st_size for f in root.rglob("*") if f.is_file())
+
+
+def _quarantine_dir() -> Path:
+    """webuidb.QUARANTINE, imported lazily.
+
+    Not at module scope: backup.py is loaded by the CLI and the supervisord
+    sidecar and must not drag in webuidb's own imports (which pull the sync
+    daemon's config surface) just to learn one path — the same reasoning
+    SIDECARS above gives for duplicating its three strings rather than
+    importing it. This one constant is worth importing rather than
+    duplicating: unlike SIDECARS it is operator-configurable
+    (WEBUI_DB_QUARANTINE), and a copied default would silently drift from a
+    changed one.
+    """
+    import webuidb
+    return webuidb.QUARANTINE
+
+
+def _quarantine_aside(path: Path, stamp: str) -> Path:
+    """Move `path` (a file or a directory) to webuidb.QUARANTINE under the
+    same `<name>.pre-restore-<stamp>` convention this module already used
+    for a plain sibling rename, falling back to a sibling of `path` only if
+    QUARANTINE itself cannot be used.
+
+    v3.1.9 (hostile2-backup A3-10). A sibling of the RESTORE TARGET is a
+    sibling of /var/lib/openwebui under the shipped default — the container
+    OVERLAY, which a pod recreate destroys, and a restore runs during an
+    incident, after which what follows on RunPod is a redeploy.
+    webuidb.QUARANTINE (/data/forensics) is the directory this project
+    already uses so a set-aside survives the incident it was set aside FOR —
+    webuidb._set_aside documents exactly the same reasoning for the sync
+    daemon's own set-asides, and this function copies its destination, not
+    just its naming convention. shutil.move (not Path.rename / os.replace)
+    because QUARANTINE is not guaranteed to share a filesystem with the
+    restore target.
+    """
+    name = f"{path.name}.pre-restore-{stamp}"
+    try:
+        qdir = _quarantine_dir()
+        qdir.mkdir(parents=True, exist_ok=True)
+        dest = _free_name(qdir / name)
+        shutil.move(str(path), str(dest))
+        return dest
+    except OSError as e:
+        # QUARANTINE unusable — e.g. /data itself is the volume in trouble,
+        # which is plausible: it is the same volume the restore is staging
+        # onto. Falling back to a sibling rather than refusing the restore
+        # outright keeps the destructive path available when it is needed
+        # most; it is still never deleted and still findable, just not
+        # survivable across a pod recreate from there. Logged loudly, not
+        # silently — that silence is A3-11's other half.
+        logger.error(
+            f"could not move {path.name} to {_quarantine_dir()} "
+            f"({type(e).__name__}: {e}); setting it aside beside {path} "
+            f"instead — it will NOT survive a pod recreate from there"
+        )
+        dest = _free_name(path.with_name(name))
+        if path.is_dir():
+            shutil.move(str(path), str(dest))
+        else:
+            path.rename(dest)
+        return dest
+
+
+def list_pre_restore_asides(quarantine_dir: Path | None = None) -> list[dict]:
+    """Every set-aside a restore has left in webuidb.QUARANTINE, newest
+    first: [{name, path, size_bytes, mtime}]. Directories (a set-aside
+    compactor store) report the size of their whole tree.
+
+    v3.1.9 (hostile2-backup A3-11). Before this fix nothing in the tree ever
+    listed, reported or pruned a `.pre-restore-*` entry — one per restored
+    sidecar/store, forever, owned by nobody, and each one counts toward
+    _dir_size and so toward the space MIN_FREE_MB eventually refuses a
+    *backup* over. This does not delete anything; it is the visibility the
+    A3-10 move to QUARANTINE was missing without it.
+    """
+    d = quarantine_dir or _quarantine_dir()
+    if not d.exists():
+        return []
+    out: list[dict] = []
+    for f in d.glob("*.pre-restore-*"):
+        try:
+            st = f.stat()
+            size = st.st_size if f.is_file() else _tree_bytes(f)
+        except OSError:
+            continue
+        out.append({
+            "name": f.name, "path": str(f), "size_bytes": size,
+            "mtime": int(st.st_mtime),
+        })
+    out.sort(key=lambda r: r["mtime"], reverse=True)
+    return out
+
+
+def prune_pre_restore_asides(
+    older_than_days: float = 30, quarantine_dir: Path | None = None
+) -> list[str]:
+    """Delete `.pre-restore-*` set-asides older than `older_than_days`.
+    Returns names removed.
+
+    v3.1.9 (hostile2-backup A3-11). Never called automatically — unlike
+    prune_old_backups (which prunes REDUNDANT good copies), a pre-restore
+    set-aside exists because a human already decided to overwrite something,
+    and only a human recovering from a bad restore knows whether it is still
+    needed. This is the tool for making that call explicit, not a background
+    sweep that could delete the one copy of what a restore was about to
+    replace before anyone confirmed the restore was right.
+    """
+    removed: list[str] = []
+    for entry in list_pre_restore_asides(quarantine_dir):
+        age_days = (time.time() - entry["mtime"]) / 86400.0
+        if age_days < older_than_days:
+            continue
+        p = Path(entry["path"])
+        try:
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+            removed.append(entry["name"])
+        except OSError as e:
+            logger.warning(f"could not prune {entry['name']}: {e}")
+    return removed
+
+
+def _require_no_active_writer(target: Path) -> None:
+    """Refuse to restore if something currently holds a WRITE lock on
+    `target`.
+
+    v3.1.9 (hostile2-backup A3-6b). The atomicity fix (A3-2/A3-3) changed
+    the restore from "overwrite the bytes of the live inode" to "swap in a
+    new inode" (os.replace). A process that already has `target` open keeps
+    writing to the OLD, now-unlinked inode and never sees the restore — and
+    its next rollback journal is named from the PATH, so it lands beside the
+    NEW file while describing the OLD file's page layout. That journal,
+    applied to the restored database on its next open, is precisely the
+    corruption this whole function exists to prevent, arriving from the
+    other end.
+
+    A `BEGIN IMMEDIATE` with no busy wait is not a perfect test — an idle
+    reader that is not mid-write holds no lock SQLite can see, so
+    `supervisorctl stop` (which OPERATIONS.md already documents before a
+    restore) is still the real guarantee. But it catches the case that
+    matters most — something actively writing through the restore — for
+    the cost of one connection, and it fails LOUD instead of failing silent
+    hours later.
+
+    Skipped entirely when a sidecar already sits beside `target`. That is
+    deliberate, not a gap: opening ANY read-write connection is how SQLite
+    performs hot-journal recovery, which DELETES the journal as a side
+    effect of the very check meant to be advisory — proven while building
+    this fix, where an earlier version of this probe consumed a live
+    journal before restore_backup's own sidecar-preserving code ever saw
+    it. A sidecar present is either a hot rollback journal (F3's
+    stalled-recovery signature) or a transaction genuinely in progress
+    right now, and there is no way to tell those apart from outside without
+    that same side effect — so this check stands down and leaves the
+    sidecar exactly as it is for the code below to move aside intact.
+    `supervisorctl stop` before a restore (OPERATIONS.md) is what actually
+    closes that narrower race.
+    """
+    if not target.is_file():
+        return
+    if any(target.with_name(target.name + suffix).is_file() for suffix in SIDECARS):
+        return
+    try:
+        con = sqlite3.connect(str(target), timeout=0)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("COMMIT")
+        finally:
+            con.close()
+    except sqlite3.OperationalError as e:
+        if "locked" not in str(e):
+            return
+        raise RuntimeError(
+            f"refusing to restore: {target} is locked by an active writer "
+            f"({e}). Stop the writers first: `supervisorctl stop openwebui "
+            f"compactor backup webuidb-sync`, confirm the process has "
+            f"actually exited (a stop is a SIGTERM, not a guarantee), then "
+            f"retry."
+        ) from e
+    except sqlite3.Error:
+        return
 
 
 def _require_free_space(needed: list[tuple[Path, int]]) -> None:
@@ -1341,7 +1708,21 @@ def run_daemon(interval_hours: float | None = None) -> None:
                 continue
         report = run_once()
         if not report["ok"]:
-            logger.error(f"backup cycle failed: {report['detail']}")
+            # v3.1.9 (hostile317-c F3). This used to fall through to the
+            # same `time.sleep(interval)` a SUCCESSFUL cycle takes — up to
+            # 24h by default. A hot rollback journal or a transient
+            # "database is locked" (both live, both self-healing) turned
+            # into a day-long blackout on the one signal an operator has
+            # that backups stopped. Retry soon instead, capped at the
+            # configured interval so this can never make a SHORT interval
+            # (tests, a tuned-down deployment) longer than it already is.
+            logger.error(
+                f"backup cycle failed: {report['detail']}; retrying in "
+                f"{min(interval, RETRY_BACKOFF_S) / 60:.0f} min instead of "
+                f"the full {interval / 3600:.1f}h interval"
+            )
+            time.sleep(min(interval, RETRY_BACKOFF_S))
+            continue
         time.sleep(interval)
 
 
@@ -1359,6 +1740,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--restore", metavar="ARCHIVE", help="Restore from an archive (DESTRUCTIVE).")
     p.add_argument("--yes", action="store_true", help="Confirm a destructive --restore.")
     p.add_argument("--json", action="store_true", help="Machine-readable output.")
+    p.add_argument("--list-pre-restore", action="store_true",
+                    help="List set-asides a restore has left in quarantine.")
+    p.add_argument("--prune-pre-restore", metavar="DAYS", type=float,
+                    help="Delete quarantined pre-restore set-asides older than DAYS.")
     args = p.parse_args(argv)
 
     import logsetup
@@ -1368,6 +1753,16 @@ def main(argv: list[str] | None = None) -> int:
         archives = list_backups()
         print(json.dumps(archives, indent=2) if args.json else
               "\n".join(f"{a['name']}  {a['size_bytes']} B" for a in archives) or "(none)")
+        return 0
+    if args.list_pre_restore:
+        asides = list_pre_restore_asides()
+        print(json.dumps(asides, indent=2) if args.json else
+              "\n".join(f"{a['name']}  {a['size_bytes']} B" for a in asides) or "(none)")
+        return 0
+    if args.prune_pre_restore is not None:
+        removed = prune_pre_restore_asides(args.prune_pre_restore)
+        print(json.dumps(removed) if args.json else
+              "\n".join(removed) or "(nothing to prune)")
         return 0
     if args.verify:
         ok, detail = verify_backup(Path(args.verify))

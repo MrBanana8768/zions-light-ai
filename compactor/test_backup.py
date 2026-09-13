@@ -33,12 +33,18 @@ _DATA = _TMP / "data" / "openwebui"
 _STORE = _DATA / "compactor"
 _BACKUPS = _TMP / "data" / "backups"
 _DB = _DATA / "webui.db"
+# v3.1.9 (A3-10): restore set-asides now land in webuidb.QUARANTINE, not
+# beside their targets. Set BEFORE backup.py can lazily `import webuidb`
+# (the first restore_backup call), or the module default (/data/forensics)
+# would apply and tests would write outside the sandbox.
+_QUARANTINE = _TMP / "quarantine"
 
 os.environ["DATA_DIR"] = str(_DATA)
 os.environ["COMPACTOR_STORAGE_ROOT"] = str(_STORE)
 os.environ["COMPACTOR_BACKUP_DIR"] = str(_BACKUPS)
 os.environ["COMPACTOR_BACKUP_WEBUI_DB"] = str(_DB)
 os.environ["COMPACTOR_BACKUP_RETAIN"] = "3"
+os.environ["WEBUI_DB_QUARANTINE"] = str(_QUARANTINE)
 
 import backup  # noqa: E402
 
@@ -95,7 +101,11 @@ def _seed_sources(*, with_db=True, facts_text="seed fact", n_facts=1,
             json.dumps({"conv_id": "conv1", "l1": [
                 {"text": f"chunk {i}", "first_turn": i, "last_turn": i + 1}
                 for i in range(n_summaries)
-            ], "l2": [], "l3": None}),
+            ], "l2": [], "l3": None,
+                # v3.1.9 (F1): the census reads this watermark now, not chunk
+                # count — see backup._census. n_summaries chunks of one turn
+                # each cover turns 1..n_summaries.
+                "last_summarized_turn": n_summaries}),
             encoding="utf-8",
         )
     if episodic is not None:
@@ -464,7 +474,9 @@ def test_manifest_records_the_per_conversation_census():
     man = backup.read_manifest(_BACKUPS / rep["archive"])
     src = man["sources"]["compactor"]
     assert_eq(src["conversations"]["conv1"]["facts"], 4, "fact count recorded")
-    assert_eq(src["conversations"]["conv1"]["summaries"], 3, "summary count recorded")
+    # v3.1.9 (F1): "summaries" (chunk count) was replaced by "summary_turn"
+    # (coverage) — see backup._census's docstring.
+    assert_eq(src["conversations"]["conv1"]["summary_turn"], 3, "summary coverage recorded")
     assert_eq(src["conversations"]["conv1"]["episodic"], 6, "episodic count recorded")
     assert_eq(src["conversations"]["conv2"]["episodic"], 2, "second conversation too")
     assert_eq(src["chroma_sqlite"], True, "chroma.sqlite3 snapshotted")
@@ -525,24 +537,40 @@ def test_payload_collapse_is_refused_and_does_not_prune():
 
 
 def test_census_regression_publishes_but_refuses_to_prune():
+    """v3.1.9 (F1): this fixture used to be 6 facts -> 5, with no archive
+    sidecar touched — the exact false-positive shape hostile317-c F1 found
+    live in production (facts.prune_facts moving evictions to the archive,
+    or dedup merging duplicates, both shrink the ACTIVE count the same way
+    and neither is a loss). That shape is now covered — without regressing
+    — by test_backup_v319.py's real-writer tests. This test keeps its own
+    name and structure (publish-but-don't-prune-and-alert) but drives it
+    with a fixture that IS unrecoverable loss under the new rule: the
+    facts union going to zero, which backup._census_regressions still
+    flags (see its docstring)."""
     print("\n[test] F2: memory shrank → archive published, prune skipped, alert sent")
-    _seed_sources(n_facts=6, pad=2000)
+    # No padding on the facts themselves: webui.db's own page allocation
+    # dominates the archive's total payload either way, so zeroing 6 tiny
+    # fact entries stays comfortably above the payload-collapse guard's 50%
+    # floor — this test is about the CENSUS catching a loss the payload
+    # guard cannot see, so the fixture must not also trip THAT guard first.
+    _seed_sources(n_facts=6, pad=0)
     _clean_backups()
     first = backup.run_once()
     assert_true(first["ok"], "baseline ok")
 
     import time
     time.sleep(1.05)
-    # One fact fewer, but more bytes overall — the payload guard cannot see
-    # this, which is exactly why the census exists.
-    _seed_sources(n_facts=5, pad=4000)
+    # Every fact gone — not "one fewer", which normal eviction/dedup can
+    # produce with no loss at all (v3.1.9 F1) — which the census exists to
+    # catch even though the payload guard (checked above) cannot.
+    _seed_sources(n_facts=0, pad=0)
     with _CapturedAlerts() as alerts:
         rep = backup.run_once()
 
     assert_true(rep["ok"], "the archive still publishes — it is real data")
     assert_true(rep["archive"] is not None, "published")
     assert_eq(rep["pruned"], [], "nothing pruned on a cycle that saw a loss")
-    assert_true("conv1.facts 6->5" in rep["detail"], "detail names the loss")
+    assert_true("conv1.facts 6->0" in rep["detail"], "detail names the loss")
     assert_eq(len(alerts.sent), 1, "an alert fired")
     assert_eq(len(backup.list_backups()), 2, "both archives on disk")
 
@@ -755,7 +783,9 @@ def test_restore_moves_sqlite_sidecars_aside():
                 "the -journal is gone from beside the restored database")
     assert_true(not wal.exists(), "and so is the -wal")
 
-    aside = sorted(_DATA.glob("webui.db-journal.pre-restore-*"))
+    assert_eq(sorted(_DATA.glob("webui.db-journal.pre-restore-*")), [],
+              "v3.1.9 (A3-10): not left beside the target any more")
+    aside = sorted(_QUARANTINE.glob("webui.db-journal.pre-restore-*"))
     assert_true(len(aside) == 1,
                 "it was RENAMED rather than deleted (found %d)" % len(aside))
     assert_eq(aside[0].read_bytes()[:8], hot,
@@ -819,7 +849,8 @@ _HOT = bytes.fromhex("d9d505f920a163d7")
 
 
 def _clear_asides():
-    for root in (_DATA, _DATA.parent, _TMP / "live", _TMP / "local", _TMP / "snap"):
+    for root in (_DATA, _DATA.parent, _TMP / "live", _TMP / "local", _TMP / "snap",
+                 _QUARANTINE):
         if not root.exists():
             continue
         for p in list(root.iterdir()):
@@ -957,8 +988,11 @@ def test_successful_store_restore_keeps_the_old_store():
     assert_true(res["ok"] and "compactor" in res["restored"], "restore ok")
     assert_true("the ARCHIVED store" in (_store_text() or ""),
                 "CONTROL: the archive's store is what is live now")
-    asides = sorted(_DATA.glob("compactor.pre-restore-*"))
-    assert_eq(len(asides), 1, "the previous store was set aside")
+    assert_eq(sorted(_DATA.glob("compactor.pre-restore-*")), [],
+              "v3.1.9 (A3-10): not left beside the target any more — the "
+              "overlay a pod recreate destroys")
+    asides = sorted(_QUARANTINE.glob("compactor.pre-restore-*"))
+    assert_eq(len(asides), 1, "the previous store was set aside in quarantine")
     kept = (asides[0] / "facts" / "conv1.json").read_text(encoding="utf-8")
     assert_true("the LIVE store" in kept,
                 "and it holds what was live before the restore")
@@ -990,11 +1024,12 @@ def test_back_to_back_set_asides_do_not_overwrite_each_other():
         # reached the journal assertion below. The journal is a FILE, and a
         # rename onto an existing file is the SILENT replace this test exists
         # for. The store half being loud is fine; this isolates the quiet one.
-        for _d in _DATA.glob("compactor.pre-restore-*"):
+        # v3.1.9 (A3-10): set-asides land in quarantine now, not beside _DATA.
+        for _d in _QUARANTINE.glob("compactor.pre-restore-*"):
             shutil.rmtree(_d)
         journal.write_bytes(_HOT + b"SECOND journal")
         backup.restore_backup(arch, confirm=True)
-    kept = sorted(_DATA.glob("webui.db-journal.pre-restore-*"))
+    kept = sorted(_QUARANTINE.glob("webui.db-journal.pre-restore-*"))
     bodies = {p.read_bytes()[8:] for p in kept}
     assert_eq(len(kept), 2, "two restores, two set-aside files")
     assert_true(b"FIRST journal" in bodies and b"SECOND journal" in bodies,
