@@ -688,13 +688,21 @@ def test_an_empty_reply_skip_does_not_degrade_status():
     these — the release's own figure is 51 of 63 skips in one window were
     manual stops — pin /health/full degraded for a turn that lost nothing.
     Mirrors test_tail_skips_degrade_the_status exactly except for the
-    outcome label, so the only variable is whether that label degrades."""
+    outcome label, so the only variable is whether that label degrades.
+
+    v3.1.9 (H-2): 63 skips, but the CURRENT RUN of empties is one short of
+    tailhealth.EMPTY_RUN_DEGRADE. A run at the limit is an outage and does
+    degrade - test_health_signals.py pins that side. This used to put the
+    run at 63 as well, which asserted exactly the state H-2 found: a backend
+    returning nothing, reply after reply, reading "ok"."""
     print("\n[test] an empty-reply skip alone does NOT degrade /health/full")
+    below = tailhealth.EMPTY_RUN_DEGRADE - 1
 
     async def go():
         with _healthy_vllm(), _pool_reporting(_quiet_pool()), _tail_reporting(_quiet_tail(
-            skipped=63, consecutive_skips=63, seconds_since_last_skip=0.0,
+            skipped=63, consecutive_skips=below, seconds_since_last_skip=0.0,
             skipped_recently=False, last_skip_outcome="skipped_empty",
+            consecutive_empty_replies=below, empty_replies_degraded=False,
         )):
             return await health.gather_health_full("http://fake", 4096)
 
@@ -710,20 +718,35 @@ def test_the_real_counter_does_not_degrade_on_empty_skips_alone():
     the way test_the_real_counter_is_wired drives it with lossy outcomes. A
     health.py/tailhealth.py pair that passed every mocked test above but
     still computed `skipped_recently` off ANY skip internally would be blind
-    to this."""
+    to this.
+
+    v3.1.9 (H-2): the empties are split into runs shorter than
+    tailhealth.EMPTY_RUN_DEGRADE by a reply that carried text, which is what
+    a person pressing Stop now and then looks like. 63 empties IN A ROW is a
+    backend that has stopped generating, and degrades by design (pinned in
+    test_health_signals.py); this used to assert that it read "ok"."""
     print("\n[test] the REAL tailhealth counter: empty skips alone stay 'ok'")
     tailhealth._reset_for_tests()
     try:
+        run = tailhealth.EMPTY_RUN_DEGRADE - 1
+
         async def go():
             with _healthy_vllm(), _pool_reporting(_quiet_pool()):
-                for _ in range(63):
-                    tailhealth.note(tailhealth.SKIPPED_EMPTY, raw_chars=0, kept_chars=0)
+                n = 0
+                while n < 63:
+                    for _ in range(min(run, 63 - n)):
+                        tailhealth.note(tailhealth.SKIPPED_EMPTY, raw_chars=0, kept_chars=0)
+                        n += 1
+                    if n < 63:
+                        tailhealth.note(tailhealth.STORED, raw_chars=900, kept_chars=900)
                 return await health.gather_health_full("http://fake", 4096)
 
         r = asyncio.run(go())
-        assert_eq(r["status"], "ok", "63 real empty skips: still ok")
+        assert_eq(r["status"], "ok", "63 real empty skips, in short runs: still ok")
         assert_eq(r["status_reasons"], [], "nothing reported")
-        assert_eq(r["memory_tail"]["skipped"], 63, "but the record shows all 63")
+        assert_eq(r["memory_tail"]["outcomes"]["skipped_empty"], 63,
+                  "but the record shows all 63")
+        assert_eq(r["memory_tail"]["skipped"], 63, "and they are the only skips")
         assert_eq(r["memory_tail"]["last_skip_outcome"], "skipped_empty",
                   "with the real last outcome")
 

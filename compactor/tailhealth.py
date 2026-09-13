@@ -42,6 +42,12 @@ window were manual stops, so a run of those alone used to pin /health/full
 degraded for the full window on every one of them, over a turn that lost
 nothing.
 
+ONE empty reply is harmless; a RUN of them is not (v3.1.9, H-2). A backend
+that answers 200 with no content, or rejects every request, produces nothing
+but SKIPPED_EMPTY, and under R27 that read "ok" on every surface at once.
+`empty_replies_degraded` is the separate field for that: EMPTY_RUN_DEGRADE
+consecutive empties with nothing in between that carried text.
+
 No conversation text and no conv_id reaches this module — only outcome
 labels and character counts. /health/full is not localhost-gated the way
 the /admin endpoints are (bgwork.submit's docstring makes the same point
@@ -96,6 +102,42 @@ def _window_s(name: str, default: float) -> float:
 
 
 SKIP_DEGRADE_WINDOW_S = _window_s("COMPACTOR_TAIL_SKIP_DEGRADE_WINDOW_S", 300.0)
+
+# v3.1.9 (hostile pass 2, H-2). How many CONSECUTIVE SKIPPED_EMPTY decisions
+# make a run that is an outage rather than a handful of Stops.
+#
+# ONE empty reply is harmless, and v3.1.7 (R27) was right to keep it quiet.
+# A RUN is not: a backend that answers 200 with no content (a broken chat
+# template, max_tokens=0, a guided-decoding failure) or rejects every
+# request (the 4xx stream branch also decides SKIPPED_EMPTY - main.py says so
+# at the call site) produces nothing but SKIPPED_EMPTY, on every turn, for as
+# long as it lasts. Measured before this: 30 in a row on a 60-turn
+# conversation, 0 rollups, nothing stored, /v1/models still answering, and
+# /health/full "ok" with an empty reason list.
+#
+# WHY 10, AND WHY A RUN RATHER THAN A RATE. Two things end a run, and on a
+# healthy pod they arrive constantly: any reply with text (a stored reply, a
+# cut one, a degenerate one - anything the model generated), and OpenWebUI's
+# own title/tag/follow-up calls, which V314_BACKLOG's N4b window measured at
+# 99 requests, one roughly every 90 seconds after every real turn, and which
+# carry text whenever the backend is generating. A backend that is broken breaks those too, so they cannot
+# interrupt its run. So ten in a row means ten times running she pressed Stop
+# before the first token AND no background call in between got an answer
+# either. The R27 figure (51 of 63 skips in one window were stops) was a
+# COUNT across a window, not a run, and stops are separated by the replies
+# she did let finish. Nobody has measured the longest run of deliberate stops
+# (the logs record skips, not runs), so this is a judgement and says so: a
+# threshold of 1-3 would re-open R27 through the other door - the cried-wolf
+# shape that trained the operator to ignore this endpoint once already - and
+# ten stops in a row with not one background call answered is not a person
+# changing her mind. During a real outage her background calls fail too and
+# add to the run, so it fills faster than one per exchange.
+#
+# Deliberately NOT an env knob. Every threshold this module and health.py
+# derive from an environment value has shipped at least one unranged failure
+# (H-7: `2 * L1_CHUNK_SIZE` at 0 degrades an empty pod), and there is no
+# operator decision this number encodes.
+EMPTY_RUN_DEGRADE = 10
 
 # Machine outcome labels. decide_memory_tail returns one of the first eight per
 # decision; the first two store, the rest skip.
@@ -184,6 +226,7 @@ class _State:
         "outcomes", "stored", "skipped", "raw_chars", "kept_chars",
         "trimmed_raw_chars", "trimmed_kept_chars", "consecutive_skips",
         "last_skip_at", "last_skip_outcome", "last_lossy_skip_at",
+        "consecutive_empty",
     )
 
     def __init__(self) -> None:
@@ -211,6 +254,12 @@ class _State:
         # even while last_skip_at (any skip, kept as the general record) is
         # still fresh.
         self.last_lossy_skip_at: float | None = None
+        # v3.1.9 (H-2). The current run of SKIPPED_EMPTY decisions; any other
+        # outcome ends it. Separate from consecutive_skips, which a lossy skip
+        # also extends - a run of empties interleaved with degenerate replies
+        # is a backend that IS generating, and must not read as one that is
+        # not. See EMPTY_RUN_DEGRADE.
+        self.consecutive_empty = 0
 
 
 _state = _State()
@@ -287,6 +336,15 @@ def note(outcome: str, *, raw_chars: int, kept_chars: int) -> str | None:
                 and outcome not in HARMLESS_SKIP_OUTCOMES):
             s.last_lossy_skip_at = time.monotonic()
         result = f"{s.consecutive_skips} consecutive memory-tail skip(s)"
+    # v3.1.9 (H-2). Keyed on the label, not on raw_chars == 0: a reply of
+    # nothing but whitespace is SKIPPED_EMPTY with raw_chars > 0, and a
+    # backend emitting only "\n" has stopped generating just as surely as one
+    # emitting "". Anything else - including task traffic that came back
+    # WITH text - proves the backend answered, so it ends the run.
+    if outcome == SKIPPED_EMPTY:
+        s.consecutive_empty += 1
+    else:
+        s.consecutive_empty = 0
     # v3.1.7 (R28). The outcome tally is the LAST mutation in this function,
     # on purpose: everything above it is now raise-proof (_safe_int), but if
     # some future line between here and the top ever raises anyway, the
@@ -375,6 +433,15 @@ def snapshot(*, window_s: float | None = None) -> dict:
         "seconds_since_last_lossy_skip": since_lossy,
         "skipped_recently": since_lossy is not None and since_lossy <= window,
         "skip_window_s": window,
+        # v3.1.9 (H-2). NOT windowed, unlike skipped_recently, and that is
+        # deliberate: a run ends only when a reply with text arrives, so "the
+        # last ten replies were empty and nothing has answered since" stays
+        # true until something proves otherwise. It clears itself on the
+        # first real reply, which is why it cannot pin the endpoint the way a
+        # cumulative count would.
+        "consecutive_empty_replies": s.consecutive_empty,
+        "empty_run_limit": EMPTY_RUN_DEGRADE,
+        "empty_replies_degraded": s.consecutive_empty >= EMPTY_RUN_DEGRADE,
         "raw_chars": s.raw_chars,
         "kept_chars": s.kept_chars,
         "trimmed_raw_chars": s.trimmed_raw_chars,
