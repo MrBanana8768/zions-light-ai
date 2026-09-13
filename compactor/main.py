@@ -7122,7 +7122,39 @@ async def admin_compact(conv_id: str, request: Request):
     if not isinstance(body, dict):
         body = {}
     _refuse_unpaired_surrogate(body)
-    max_calls = int(body.get("max_calls") or 200)
+    # v3.1.9 (hostile pass 2, MEDIUM). `int(body.get("max_calls") or 200)`
+    # used Python truthiness on the raw value, so an explicit
+    # {"max_calls": 0} — an operator asking this endpoint to run its guards
+    # and refusals with ZERO summarization calls, a legitimate "just check
+    # the plan against the real store" probe distinct from dry_run — was
+    # `0 or 200`, silently replaced by the 200-call LIVE default. Reproduced
+    # against the unfixed code: {"max_calls": 0} on a 60-exchange backlog
+    # ran 2 rollup calls and moved the watermark 0 -> 120, exactly the write
+    # the caller's explicit 0 was asking this loop not to make — the same
+    # "ambiguous-or-falsy value quietly becomes the write" shape as the
+    # dry_run HIGH #1/#2 fixes just above this function. A non-numeric value
+    # (`{"max_calls": "abc"}`) took the other failure direction: int() raised
+    # ValueError uncaught, a 500 with no explanation for a caller-supplied
+    # body that a 400 exists to handle everywhere else in this file.
+    _raw_max_calls = body.get("max_calls", 200)
+    try:
+        max_calls = 200 if _raw_max_calls is None else int(_raw_max_calls)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail=f"max_calls must be an integer, got {_raw_max_calls!r}",
+        )
+    # Clamped both directions rather than trusted outright. Below zero has no
+    # meaning for a count of calls (the loop already treats 0 as "run the
+    # guards, make no calls" via `while calls < max_calls`, so negative would
+    # be the same thing under a misleading number). Above 1000 is a real
+    # operational bound, not a formality: this loop is one vLLM call plus two
+    # state loads per iteration, on a conversation an operator runs WHILE she
+    # is chatting (see the endpoint's own docstring), so a mistyped
+    # max_calls: 9999999999 must not be able to run for hours unattended.
+    # 1000 is 5x the documented 200 default and far above the worst backlog
+    # on record in this codebase's incidents (33 calls).
+    max_calls = max(0, min(max_calls, 1000))
     # Absent means LIVE for compact, which is the documented contract and
     # stays — but ?dry_run=true is honoured now instead of ignored.
     dry_run = _dry_run_from(request, body, default=False)

@@ -1021,7 +1021,25 @@ def _merge_fact_pin_and_recency(dst_fact: dict, src_fact: dict) -> dict:
     }
 
 
-def _merge_fact_lists(dst_facts: list[dict], src_facts: list[dict]) -> tuple[list[dict], dict]:
+def _dst_last_used_floor(dst_facts: list[dict]) -> int:
+    """The `last_used_floor` to hand `_merge_fact_lists` for THIS dst read.
+
+    v3.1.9 F6 (hostile pass 2, review B). See `_merge_fact_lists`'
+    `last_used_floor` doc for the mechanism; this just picks the number:
+    the newest `last_used` already active in dst, or 0 if dst has no facts
+    yet (the recommended-order case — merge before her first message — where
+    there is nothing in dst to be older than, and nothing has raced it yet
+    either).
+    """
+    return max((int(f.get("last_used", 0) or 0) for f in dst_facts), default=0)
+
+
+def _merge_fact_lists(
+    dst_facts: list[dict],
+    src_facts: list[dict],
+    *,
+    last_used_floor: int | None = None,
+) -> tuple[list[dict], dict]:
     """Union src into dst by _fact_key. Pure function — callers decide
     whether/when to persist the result, so this is safe to call once against
     a stale read for a dry-run preview and again against a freshly re-read
@@ -1033,6 +1051,41 @@ def _merge_fact_lists(dst_facts: list[dict], src_facts: list[dict]) -> tuple[lis
     (dst's wording is what's live in the destination) but folds pin/last_used
     across both copies with _merge_fact_pin_and_recency — see that function
     for why pin is unioned, last_used is maxed, and added_turn is left alone.
+
+    `last_used_floor` (v3.1.9 F6, hostile pass 2 review B): applied ONLY to
+    brand-new (non-colliding) facts, stamping each one's last_used to
+    max(its own last_used, last_used_floor) before it is appended.
+
+    Why this exists, and why it is scoped to "added" and not "updated":
+    a merged-in fact that does not collide with anything already in dst
+    keeps whatever last_used it carried in the SOURCE conversation — often
+    hours old by the time an operator runs the merge, because it is exactly
+    as old as the fork that made the merge necessary in the first place. If
+    the destination has already had a backfill (or any extraction) run
+    under it before the merge lands, THOSE facts were minted with
+    last_used at (or near) the merge's own wall-clock moment. facts.
+    prune_facts's LRU eviction then treats the source's hours-old facts as
+    the oldest thing in the whole store and archives them first on the
+    very next write — reviewed at 115 of a real user's 136 original facts
+    archived on her next exchange, in a store that merge left looking
+    intact. Flooring every newly merged fact to at least the destination's
+    own current newest last_used puts it in the same race the
+    destination's own facts are already running, instead of a race it was
+    never a real participant in — it does not fabricate an eviction
+    exemption, it only stops the merge itself from handing a fact a
+    last_used that makes it look OLDER than the moment it actually landed
+    in this store.
+
+    The COLLISION path (an existing dst row) is deliberately NOT touched by
+    this floor. _merge_fact_pin_and_recency already computes max(dst, src)
+    for that row, which is the correct answer on its own terms — forcing a
+    floor on top of it would let one merge silently "refresh" an otherwise
+    genuinely stale destination fact for a reason that has nothing to do
+    with the merge (the row was already live in dst; the merge only
+    touched its pin/last_used metadata, not its existence). The reviewed
+    incident's own numbers bear this out: facts_added=135 versus 0
+    collisions — the archived facts were overwhelmingly the newly-added
+    ones this floor protects, not folded collisions.
 
     Returns (merged_list, stats): "added" is brand-new keys, "updated" is
     existing keys whose dst row actually changed (pin/last_used moved),
@@ -1055,8 +1108,13 @@ def _merge_fact_lists(dst_facts: list[dict], src_facts: list[dict]) -> tuple[lis
             continue
         idx = key_to_index.get(k)
         if idx is None:
+            new_fact = dict(f)
+            if last_used_floor is not None:
+                new_fact["last_used"] = max(
+                    int(new_fact.get("last_used", 0) or 0), last_used_floor
+                )
             key_to_index[k] = len(merged)
-            merged.append(f)
+            merged.append(new_fact)
             added += 1
         else:
             folded = _merge_fact_pin_and_recency(merged[idx], f)
@@ -1130,8 +1188,12 @@ def merge_conversation(
 
     # Preview only, against this (possibly stale) read — the actual write
     # below re-reads dst and re-runs this same fold so a tail that wrote
-    # between here and there is not clobbered or ignored.
-    _preview_merged, fact_stats = _merge_fact_lists(dst_facts, src_facts)
+    # between here and there is not clobbered or ignored. The floor is
+    # recomputed from that same fresh read down there (F6) rather than
+    # reused from here, for the identical reason.
+    _preview_merged, fact_stats = _merge_fact_lists(
+        dst_facts, src_facts, last_used_floor=_dst_last_used_floor(dst_facts)
+    )
 
     try:
         dst_episodic = retrieval.export_indexed_exchanges(dst_conv_id)
@@ -1157,6 +1219,25 @@ def merge_conversation(
         "exchanges_skipped_existing": len(src_episodic) - len(new_exchanges),
         "summaries": "not merged (dst re-derived its own; see docstring)",
     }
+    # v3.1.9 F6 (hostile pass 2, review B), second half of the finding's
+    # "and/or": even with the last_used_floor above, dst's own store can
+    # already be over facts.prune_facts's budget before this merge does
+    # anything at all — the reviewed real store was ~2x COMPACTOR_MAX_
+    # FACTS_TOKENS on its own — and step 9 of the runbook reads this
+    # response immediately after the merge, before any tail has pruned
+    # anything, so a silently-already-over-budget result would still read
+    # as "the merge worked." This runs the SAME LRU split prune_facts uses
+    # (facts._lru_split — read-only, no archive write, no log line: a pure
+    # preview) against the set this call actually produced, so the operator
+    # sees it in the same response rather than discovering it on the next
+    # exchange. It cannot predict facts a not-yet-run extraction or backfill
+    # will add after this call returns — nothing here can — it answers "is
+    # the destination already over budget right after this merge", which is
+    # exactly the number that was invisible before.
+    _kept_preview, _evicted_preview = facts._lru_split(
+        _preview_merged, facts._MAX_FACTS_TOKENS
+    )
+    result["facts_over_budget_after_merge"] = len(_evicted_preview)
     if dry_run:
         return result
 
@@ -1182,11 +1263,18 @@ def merge_conversation(
     # the preview ran) still has to have its pin/last_used folded, not just
     # its "already present" status re-checked.
     current = facts.load_facts(dst_conv_id)
-    merged, actual_stats = _merge_fact_lists(current, src_facts)
+    merged, actual_stats = _merge_fact_lists(
+        current, src_facts, last_used_floor=_dst_last_used_floor(current)
+    )
     if merged != current:
         facts.save_facts(dst_conv_id, merged)
     result["facts_added"] = actual_stats["added"]
     result["facts_pin_or_recency_updated"] = actual_stats["updated"]
+    # Re-measured against the set actually written (the preview above was
+    # against the pre-lock, possibly-stale read) — same reasoning as
+    # re-running _merge_fact_lists itself against `current`.
+    _kept_actual, _evicted_actual = facts._lru_split(merged, facts._MAX_FACTS_TOKENS)
+    result["facts_over_budget_after_merge"] = len(_evicted_actual)
 
     added = 0
     for e in new_exchanges:
