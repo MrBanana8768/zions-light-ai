@@ -106,12 +106,29 @@ def live_webui_db() -> Path:
          re-deriving it. Present for the daemon (supervisord inherits
          entrypoint's exports); ABSENT for `docker exec ... backup.py`, which
          gets only the image and pod environment, so:
-      3. the gate, compared EXACTLY as entrypoint.sh compares it
-         (`[ "${WEBUI_DB_LOCAL}" = "true" ]`, default true). Deliberately not a
-         folded boolean: `True` means MooseFS to the shell, and a reader that
-         disagreed with the writer about which file is live is the defect
-         being fixed. The dialect itself is M9's problem, and the fix for it
-         must change both sides at once.
+      3. the gate — v3.1.9 round 2: THIS is where this function used to
+         re-derive WEBUI_DB_LOCAL a SECOND time
+         (`os.environ.get("WEBUI_DB_LOCAL", "true") == "true"`), independently
+         of webuidb.live_webui_db(), which entrypoint.sh's own boot refusal
+         (finding 3, fix-webuidb.md) now normalises this same variable for —
+         fold case/whitespace, accept 1/yes/on and 0/no/off, refuse to boot on
+         anything else. A narrow `== "true"` compare agreed with entrypoint.sh
+         for every SUPERVISED child (which only ever inherits the already-
+         normalised value), but `docker exec ... backup.py` — the one case
+         DATABASE_URL above is NOT inherited either, named in the case above
+         as the reason this level exists — runs OUTSIDE that normalisation
+         entirely, in whatever the operator's own shell has. There, this used
+         to disagree with webuidb.live_webui_db() (the one other place this
+         same rule is read) on `WEBUI_DB_LOCAL=1` or any other folded
+         spelling: two independent readers of one rule is exactly the
+         reader-disagrees-with-writer defect this function exists to close,
+         reintroduced one level down from the fix. Delegates to
+         webuidb.live_webui_db() now, so there is exactly one place that
+         answers "which file is live" from the gate. Imported LAZILY, not at
+         module scope — same reasoning _quarantine_dir gives for its own lazy
+         `import webuidb`: backup.py is loaded by the CLI and the supervisord
+         sidecar and must not drag in webuidb's own config surface just to
+         learn one path.
     """
     explicit = os.environ.get("COMPACTOR_BACKUP_WEBUI_DB")
     if explicit:
@@ -120,9 +137,8 @@ def live_webui_db() -> Path:
     if url.startswith("sqlite:///"):
         # sqlite:////var/lib/x.db -> /var/lib/x.db; sqlite:///rel.db -> rel.db
         return Path(url[len("sqlite:///"):])
-    if os.environ.get("WEBUI_DB_LOCAL", "true") == "true":
-        return Path(os.environ.get("WEBUI_LOCAL_DB", "/var/lib/openwebui/webui.db"))
-    return Path(os.environ.get("WEBUI_SNAPSHOT_DB", str(DATA_DIR / "webui.db")))
+    import webuidb
+    return webuidb.live_webui_db()
 
 
 # The same three suffixes webuidb.SIDECARS sweeps, for the same reason:
@@ -1284,7 +1300,25 @@ def restore_backup(
             f"targets."
         )
 
+        # v3.1.9 round 2 (finding 8): tracked OUTSIDE the `if have_db:` block
+        # below so the `if have_store:` block's own failure handler can roll
+        # the database back too, if the store swap fails AFTER the database
+        # swap already landed — see that block for why.
+        db_aside: Path | None = None
+
         if have_db:
+            # v3.1.9 round 2 (finding 8). The ORIGINAL database is now
+            # quarantined too, the SAME way the store already is a few lines
+            # down — not just its sidecars. Without this, os.replace(db_tmp,
+            # target) was a single atomic swap with no way back: if the
+            # STORE swap that follows it then failed, the live state was
+            # stuck at (NEW db, OLD store) — a mixed generation with nothing
+            # to roll back to, because the old db's bytes were simply gone.
+            # Preserving it here lets that failure roll the db back too,
+            # matching the store's own doctrine exactly.
+            if target.exists():
+                db_aside = _quarantine_aside(target, stamp)
+
             # SIDECARS TRAVEL WITH THE DATABASE. A -journal or -wal beside the
             # target belongs to the database being REPLACED, and SQLite applies
             # it to whatever file carries that name on the next open. Renamed,
@@ -1306,6 +1340,8 @@ def restore_backup(
             try:
                 os.replace(db_tmp, target)
             except BaseException:
+                if db_aside is not None:
+                    shutil.move(str(db_aside), str(target))
                 for side, aside in reversed(moved):
                     try:
                         shutil.move(str(aside), str(side))
@@ -1322,6 +1358,52 @@ def restore_backup(
                 shutil.rmtree(store_incoming, ignore_errors=True)
                 raise
             _fsync_dir(target.parent)
+
+            # v3.1.9 round 2 (finding 10). verify_backup already ran
+            # PRAGMA integrity_check against the ARCHIVE's own extracted
+            # copy before any of this staging began — this checks the file
+            # that actually ENDED UP live, which is a different question: a
+            # bad copy2, a race, or a filesystem problem during staging or
+            # the rename itself would not show up in the archive-level
+            # check at all. Import lazily (same reasoning as
+            # _quarantine_dir above): webuidb.integrity() is the ONE
+            # existing implementation of this check, reused rather than
+            # duplicated.
+            import webuidb
+            db_ok, db_detail = webuidb.integrity(target)
+            if not db_ok:
+                # LOUD, and the set-aside is left exactly where it landed —
+                # NOT auto-restored: this is the only known-good pre-restore
+                # copy, and silently overwriting the just-landed (corrupt)
+                # file would destroy the evidence of what actually went
+                # wrong. The store swap below does not run: proceeding to
+                # replace the store on top of a database already known bad
+                # would compound the failure, not just report it.
+                logger.error(
+                    f"the RESTORED database at {target} FAILED "
+                    f"PRAGMA integrity_check immediately after landing "
+                    f"({db_detail}). This is NOT rolled back automatically: "
+                    f"the pre-restore original is preserved at {db_aside} "
+                    f"(nothing will delete it) for you to restore by hand — "
+                    f"`supervisorctl stop openwebui compactor backup "
+                    f"webuidb-sync`, move it back over {target}, then "
+                    f"restart. The store was NOT touched."
+                )
+                # The store's own staged copy was already built and fsynced
+                # during the earlier staging phase (it runs whenever
+                # have_store, unconditionally, before either swap) — this
+                # raise happens BETWEEN staging and the store's own swap, so
+                # nothing else would ever clean it up. Same reasoning as the
+                # db-swap failure handler a few lines up: leaving it would be
+                # a multi-gigabyte `.incoming` nobody is told about. Found by
+                # this fix's OWN test on the real Linux container — a first
+                # version of this raise left exactly this debris behind.
+                shutil.rmtree(store_incoming, ignore_errors=True)
+                raise RuntimeError(
+                    f"restored database failed integrity_check after "
+                    f"landing: {db_detail}. See the log above for the "
+                    f"pre-restore copy's location."
+                )
             restored.append("webui.db")
 
         if have_store:
@@ -1337,6 +1419,31 @@ def restore_backup(
             except BaseException:
                 if store_aside is not None:
                     shutil.move(str(store_aside), str(sroot))
+                # v3.1.9 round 2 (found while testing finding 8, not itself
+                # one of the four named findings — the same "clean up
+                # staged debris on failure" doctrine this whole function
+                # already uses everywhere else, missed here). os.replace
+                # (store_incoming, sroot) failing leaves its SOURCE,
+                # store_incoming, untouched on disk regardless of whether
+                # sroot itself had something to restore — a multi-gigabyte
+                # `.incoming` directory nobody is told about and nothing
+                # lists or prunes (the same *shape* as hostile317-c Attack 3
+                # LOW's .tmp files, a different, previously-undiscovered
+                # instance).
+                shutil.rmtree(store_incoming, ignore_errors=True)
+                # v3.1.9 round 2 (finding 8): the store swap failed AFTER
+                # the database swap already landed (have_db and db_aside is
+                # only set in that case). Roll the database back too, so
+                # the live state returns to the FULL pre-restore generation
+                # instead of stranding a mix of (NEW db, OLD store).
+                if have_db and db_aside is not None:
+                    shutil.move(str(db_aside), str(target))
+                    logger.error(
+                        f"the store swap failed after the database swap "
+                        f"already landed; rolled the database back to its "
+                        f"pre-restore state too ({target}), so nothing is "
+                        f"left at a mixed generation"
+                    )
                 raise
             _fsync_dir(sroot.parent)
             if store_aside is not None:
@@ -1347,8 +1454,23 @@ def restore_backup(
                 )
             restored.append("compactor")
 
-        logger.info(f"restored {restored} from {archive_path.name}")
-        return {"ok": True, "restored": restored, "archive": archive_path.name}
+        # v3.1.9 round 2 (finding 10). Every service that has the old
+        # generation open, cached, or watching these paths needs a restart
+        # to see the restored one at all — the same list
+        # _require_no_active_writer already tells an operator to STOP before
+        # running this. Named here too, so the happy path does not require
+        # already knowing that list from a different error message.
+        restart_cmd = "supervisorctl start openwebui compactor backup webuidb-sync"
+        logger.info(
+            f"restored {restored} from {archive_path.name} — restart the "
+            f"services that read it: `{restart_cmd}`"
+        )
+        return {
+            "ok": True,
+            "restored": restored,
+            "archive": archive_path.name,
+            "restart": restart_cmd,
+        }
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -1513,6 +1635,73 @@ def prune_pre_restore_asides(
     return removed
 
 
+# SQLite's own locking-byte offsets (sqlite3's os_unix.c / os_win.c), the
+# same on every platform its default VFS runs on, independent of page size
+# or schema: PENDING_BYTE = 0x40000000, RESERVED_BYTE = PENDING_BYTE + 1.
+# A write transaction between BEGIN IMMEDIATE (or the first write of a plain
+# BEGIN) and COMMIT/ROLLBACK holds an exclusive fcntl() record lock at
+# RESERVED_BYTE. See _probe_reserved_lock.
+_SQLITE_PENDING_BYTE = 0x40000000
+_SQLITE_RESERVED_BYTE = _SQLITE_PENDING_BYTE + 1
+
+
+def _probe_reserved_lock(target: Path) -> bool:
+    """True if another process currently holds SQLite's RESERVED lock on
+    `target` — a write transaction actively in progress right now.
+
+    v3.1.9 round 2 (hostile2-backup, finding 7). _require_no_active_writer's
+    own `BEGIN IMMEDIATE` probe stands down whenever a sidecar already
+    exists beside `target` — precisely the incident-in-progress state a
+    restore is most dangerous against, per that function's own docstring,
+    because opening ANY real SQLite connection there can replay a hot
+    journal as a side effect of the very check meant to be advisory (proven
+    while building A3-6b, see that docstring).
+
+    This probes the SAME lock a `BEGIN IMMEDIATE` takes — a raw POSIX
+    fcntl() byte-range record lock at SQLite's own RESERVED_BYTE offset —
+    but opens the file with a plain `os.open()`, never `sqlite3.connect()`.
+    A raw file descriptor never invokes SQLite's pager/VFS layer, which is
+    the ONLY thing that ever performs hot-journal recovery; a byte-range
+    lock request touches no file content at all. This is therefore safe to
+    run in EXACTLY the state the existing probe must stand down for.
+
+    NOT a full replacement for `supervisorctl stop` (OPERATIONS.md, already
+    documented before a restore): an idle reader holding only a SHARED
+    lock, or a writer between BEGIN and its first actual write, holds no
+    RESERVED lock yet and is invisible here too — this narrows the gap, it
+    does not close it. It catches the specific, common case that matters
+    most: a write transaction genuinely in flight while a journal from it
+    already sits on disk, which the existing probe could not see at all in
+    this state.
+
+    Fails OPEN (returns False, "no lock detected") on any platform without
+    `fcntl` (Windows — a real target only for local dev/tests here;
+    production is Linux) or if the file cannot even be opened for this
+    probe, since this is a best-effort ADD-ON to the real guarantee
+    (`supervisorctl stop`), not a replacement for it.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return False
+    try:
+        fd = os.open(str(target), os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, _SQLITE_RESERVED_BYTE, 0)
+        except OSError:
+            return True  # someone else holds the RESERVED byte right now
+        else:
+            # We just acquired it ourselves proving no one else held it —
+            # release immediately, this is a probe, not a lock we want.
+            fcntl.lockf(fd, fcntl.LOCK_UN, 1, _SQLITE_RESERVED_BYTE, 0)
+            return False
+    finally:
+        os.close(fd)
+
+
 def _require_no_active_writer(target: Path) -> None:
     """Refuse to restore if something currently holds a WRITE lock on
     `target`.
@@ -1552,6 +1741,23 @@ def _require_no_active_writer(target: Path) -> None:
     if not target.is_file():
         return
     if any(target.with_name(target.name + suffix).is_file() for suffix in SIDECARS):
+        # v3.1.9 round 2 (finding 7): this used to stand down completely
+        # here — exactly the incident state (a hot journal beside the
+        # target) a restore is most likely to be run to recover FROM, and
+        # therefore the state where an active writer matters most. A raw
+        # fcntl() lock probe (see _probe_reserved_lock) works precisely
+        # where the BEGIN IMMEDIATE probe below cannot enter.
+        if _probe_reserved_lock(target):
+            raise RuntimeError(
+                f"refusing to restore: {target} is held by an active "
+                f"writer (a RESERVED lock is currently set) WHILE a "
+                f"sidecar also sits beside it — a write transaction in "
+                f"flight during exactly the incident a restore is most "
+                f"dangerous to run against. Stop the writers first: "
+                f"`supervisorctl stop openwebui compactor backup "
+                f"webuidb-sync`, confirm the process has actually exited "
+                f"(a stop is a SIGTERM, not a guarantee), then retry."
+            )
         return
     try:
         con = sqlite3.connect(str(target), timeout=0)
@@ -1574,6 +1780,20 @@ def _require_no_active_writer(target: Path) -> None:
         return
 
 
+def _is_under(path: Path, root: Path) -> bool:
+    """True if `path` resolves to `root` or somewhere below it."""
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+# v3.1.9 round 2 (finding 9). See _require_free_space's own docstring for
+# why this exists and why it is OFF (0) by default.
+COMPACTOR_DATA_VOLUME_QUOTA_MB = env_int("COMPACTOR_DATA_VOLUME_QUOTA_MB", 0)
+
+
 def _require_free_space(needed: list[tuple[Path, int]]) -> None:
     """Refuse BEFORE staging if a target volume cannot hold its copy.
 
@@ -1587,6 +1807,37 @@ def _require_free_space(needed: list[tuple[Path, int]]) -> None:
     Totals per volume: when the database and the store share one, both copies
     need room at once. 10% headroom plus MIN_FREE_MB, the same floor
     create_backup keeps.
+
+    v3.1.9 round 2 (finding 9): THIS CHECK DOES NOT MEAN WHAT IT LOOKS LIKE
+    IT MEANS ON THIS POD'S ACTUAL PRODUCTION STORAGE. `shutil.disk_usage()`
+    calls `statvfs()`, and on MooseFS (WEBUI_DB_LOCAL=false, this pod's real
+    config — see MEMORY.md) that reports the CLUSTER-WIDE figure — measured
+    at ~217 TB free — not this pod's own RunPod volume quota. A pod whose
+    OWN allotment is genuinely full still sees ~217 TB "free" right up until
+    the write that fails with ENOSPC/EDQUOT anyway. This function cannot
+    tell the difference, and nothing in the MooseFS FUSE mount this process
+    can see exposes the real per-pod quota to ask instead.
+
+    The only ADDITIONAL check available that is honest about what it can
+    and cannot promise: `COMPACTOR_DATA_VOLUME_QUOTA_MB`, a number the
+    OPERATOR types in (read off the RunPod dashboard), OFF (0) by default —
+    most deployments have no quota concept, and a wrong guess here is worse
+    than no check at all. When set, this walks `DATA_DIR`'s own actual
+    on-disk usage (`_tree_bytes`, a real `du`, NOT `statvfs` — meaningful on
+    MooseFS where `statvfs` is cluster-wide and a directory walk is not) and
+    compares it plus what this restore is about to add against that
+    configured ceiling.
+
+    NOT implemented, considered and rejected: a PROBE WRITE
+    (`os.posix_fallocate` for the needed size) would exercise a real
+    reservation instead of trusting a human-typed number — but this dev
+    environment has no live MooseFS mount to verify whether MooseFS's FUSE
+    implementation actually HONOURS `posix_fallocate` or merely accepts and
+    ignores the call (a documented failure mode of several FUSE
+    filesystems), and shipping an ENOSPC guard that LOOKS like it checked
+    something real and silently does not would be worse than stating the
+    limitation plainly. Per the brief: implement only what is honest: not
+    built.
     """
     by_dev: dict[int, tuple[Path, int]] = {}
     for where, nbytes in needed:
@@ -1611,6 +1862,31 @@ def _require_free_space(needed: list[tuple[Path, int]]) -> None:
                 f"and staging this archive there needs about "
                 f"{want / 1048576:.0f} MB. Nothing has been touched."
             )
+
+    if COMPACTOR_DATA_VOLUME_QUOTA_MB > 0 and DATA_DIR.is_dir():
+        added = sum(nbytes for where, nbytes in needed if _is_under(where, DATA_DIR))
+        try:
+            used_bytes = _tree_bytes(DATA_DIR)
+        except OSError as e:
+            logger.warning(
+                f"COMPACTOR_DATA_VOLUME_QUOTA_MB is set but {DATA_DIR} "
+                f"could not be walked to measure current usage ({e}); "
+                f"quota check skipped, statvfs-based check above still "
+                f"applies"
+            )
+        else:
+            want_mb = (used_bytes + added) / 1048576
+            if want_mb > COMPACTOR_DATA_VOLUME_QUOTA_MB:
+                raise RuntimeError(
+                    f"refusing to restore: COMPACTOR_DATA_VOLUME_QUOTA_MB="
+                    f"{COMPACTOR_DATA_VOLUME_QUOTA_MB}, {DATA_DIR} already "
+                    f"holds about {used_bytes / 1048576:.0f} MB, and staging "
+                    f"this archive there adds about {added / 1048576:.0f} MB "
+                    f"more ({want_mb:.0f} MB total, over the configured "
+                    f"quota). Nothing has been touched. (statvfs-based free "
+                    f"space above this pod's own quota is NOT a reliable "
+                    f"signal on MooseFS — see this function's docstring.)"
+                )
 
 
 def _fsync_file(p: Path) -> None:
@@ -1771,7 +2047,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.restore:
         try:
             rep = restore_backup(Path(args.restore), confirm=args.yes)
-            print(json.dumps(rep) if args.json else f"restored: {rep['restored']}")
+            if args.json:
+                print(json.dumps(rep))
+            else:
+                print(f"restored: {rep['restored']}")
+                # v3.1.9 round 2 (finding 10): the CLI's own restore output
+                # names what to restart, not just the log line — this is
+                # what a human doing --json=false actually reads.
+                if rep.get("restart"):
+                    print(f"restart the services that read it: "
+                          f"`{rep['restart']}`")
             return 0
         except Exception as e:
             print(f"restore failed: {e}", file=sys.stderr)

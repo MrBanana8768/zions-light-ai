@@ -693,6 +693,86 @@ def test_pre_restore_asides_empty_quarantine_is_not_an_error():
     assert_eq(backup.prune_pre_restore_asides(30, missing), [], "empty prune, not an exception")
 
 
+def test_live_webui_db_agrees_with_webuidb_across_every_gate_spelling():
+    """v3.1.9 round 2 (fix-webuidb.md finding 3 / "two live-db resolvers").
+
+    backup.live_webui_db() used to re-derive the WEBUI_DB_LOCAL gate a
+    second, narrower way (`os.environ.get("WEBUI_DB_LOCAL", "true") ==
+    "true"`) instead of asking webuidb.live_webui_db(), the one place this
+    rule is actually owned - two independent readers of one rule is the
+    reader-disagrees-with-writer defect this module was already fixed for
+    once (A3-4/A3-9). Proves they now agree for every spelling
+    entrypoint.sh's own WEBUI_DB_LOCAL normaliser recognises, and that an
+    unrecognised value raises the SAME way in both rather than one silently
+    guessing while the other refuses.
+    """
+    import webuidb
+    print("\n[test] backup.live_webui_db() and webuidb.live_webui_db() agree, "
+          "for every gate spelling")
+    # webuidb.LOCAL_DB / .SNAPSHOT_DB are module constants read ONCE at
+    # import (webuidb has almost certainly already been imported by an
+    # earlier test in this file's own suite, or by backup.py's own lazy
+    # `import webuidb` elsewhere) - unlike WEBUI_DB_LOCAL (the gate), which
+    # both functions deliberately re-read fresh on every call. So this test
+    # compares against webuidb.LOCAL_DB/webuidb.SNAPSHOT_DB AS THEY ACTUALLY
+    # ARE right now, rather than trying to override WEBUI_LOCAL_DB /
+    # WEBUI_SNAPSHOT_DB via the environment post-import, which webuidb.py's
+    # own design does not pick up (and rightly not: those two paths are
+    # static config for the life of a process; only the gate between them
+    # flips at runtime).
+    keys = ("COMPACTOR_BACKUP_WEBUI_DB", "DATABASE_URL", "WEBUI_DB_LOCAL")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        os.environ.pop("COMPACTOR_BACKUP_WEBUI_DB", None)
+        os.environ.pop("DATABASE_URL", None)
+
+        true_spellings = ("true", "TRUE", "True", "1", "yes", "YES", "on", " true ", "")
+        false_spellings = ("false", "FALSE", "False", "0", "no", "off", " false\n")
+        for spelling in true_spellings:
+            os.environ["WEBUI_DB_LOCAL"] = spelling
+            got = backup.live_webui_db()
+            assert_eq(got, webuidb.live_webui_db(),
+                      f"agree on WEBUI_DB_LOCAL={spelling!r} (true-family)")
+            assert_eq(got, webuidb.LOCAL_DB,
+                      f"and both resolve to webuidb.LOCAL_DB for {spelling!r}")
+        for spelling in false_spellings:
+            os.environ["WEBUI_DB_LOCAL"] = spelling
+            got = backup.live_webui_db()
+            assert_eq(got, webuidb.live_webui_db(),
+                      f"agree on WEBUI_DB_LOCAL={spelling!r} (false-family)")
+            assert_eq(got, webuidb.SNAPSHOT_DB,
+                      f"and both resolve to webuidb.SNAPSHOT_DB for {spelling!r}")
+
+        os.environ["WEBUI_DB_LOCAL"] = "maybe"
+        assert_raises(backup.live_webui_db, RuntimeError,
+                      "an unrecognised gate value raises in backup.py too, "
+                      "not a silent guess")
+        assert_raises(webuidb.live_webui_db, RuntimeError,
+                      "...the SAME way webuidb.py itself already did")
+
+        # CONTROL: the two operator-facing overrides that ONLY backup.py
+        # honors still work, unaffected by the delegation - they deliberately
+        # diverge from webuidb.live_webui_db(), documented in this
+        # function's own docstring, and this must not have collapsed them
+        # into the gate too.
+        os.environ["WEBUI_DB_LOCAL"] = "false"  # would otherwise resolve SNAPSHOT_DB
+        os.environ["COMPACTOR_BACKUP_WEBUI_DB"] = str(webuidb.LOCAL_DB)
+        assert_eq(backup.live_webui_db(), webuidb.LOCAL_DB,
+                  "CONTROL: COMPACTOR_BACKUP_WEBUI_DB still outranks the "
+                  "gate")
+        os.environ.pop("COMPACTOR_BACKUP_WEBUI_DB", None)
+        os.environ["DATABASE_URL"] = f"sqlite:///{webuidb.LOCAL_DB}"
+        assert_eq(backup.live_webui_db(), webuidb.LOCAL_DB,
+                  "CONTROL: a sqlite DATABASE_URL still outranks the gate too")
+        os.environ.pop("DATABASE_URL", None)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def _all():
     return [
         test_real_prune_facts_eviction_does_not_regress_the_census,
@@ -716,6 +796,7 @@ def _all():
         test_quarantine_aside_uses_quarantine_when_it_is_usable,
         test_pre_restore_asides_are_listable_and_prunable,
         test_pre_restore_asides_empty_quarantine_is_not_an_error,
+        test_live_webui_db_agrees_with_webuidb_across_every_gate_spelling,
     ]
 
 

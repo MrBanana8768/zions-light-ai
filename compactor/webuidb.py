@@ -836,10 +836,30 @@ def restore_on_boot() -> dict:
         # where a 0-byte local file was kept and 400 chats on the volume were
         # ignored.
         local_chats = _has_rows(LOCAL_DB) if ok else None
-        snap_chats = (
-            _has_rows(SNAPSHOT_DB) if SNAPSHOT_DB.exists() else None
-        )
-        if ok and not local_chats and SNAPSHOT_DB.exists() and snap_chats is None:
+        # v3.1.9 round 2: SNAPSHOT_DB.exists() swallows every OSError and
+        # answers False for "I could not stat it" exactly as it does for
+        # "genuinely absent" (see _presence's own docstring). This branch
+        # used to read that False as "no snapshot to worry about" and fall
+        # through to `elif ok:` a few lines down, handing OpenWebUI an EMPTY
+        # local database while a snapshot that might hold her whole history
+        # sat behind an unexamined stat error. _presence() tells the two
+        # apart; see the refusal below for the unstatable case.
+        snap_there, snap_unstatable = _presence(SNAPSHOT_DB)
+        snap_chats = _has_rows(SNAPSHOT_DB) if snap_there else None
+        if ok and not local_chats and snap_unstatable:
+            logger.error(
+                f"local database opens cleanly but holds {local_chats!r} "
+                f"chat(s), and {SNAPSHOT_DB} could not be examined (a stat "
+                f"error, not 'file not found'). REFUSING to hand OpenWebUI "
+                f"an empty database while the durable copy's state is "
+                f"unknown: it would build a fresh schema, and if the mount "
+                f"was only stalling the snapshot's history would be gone "
+                f"for nothing. Retry once the volume responds; investigate "
+                f"the mount if it does not."
+            )
+            result["action"] = "error"
+            return result
+        if ok and not local_chats and snap_there and snap_chats is None:
             # THE SIBLING OF THE SHRINK GUARD, and it arrives at the same
             # silently-empty boot by a different road. Local holds nothing to
             # serve, and the count we would have compared it against could not
@@ -1210,7 +1230,31 @@ def sync_once(force: bool = False) -> dict:
         #                             become readable on its own
         previous = None
         prev_bytes = 0
-        if SNAPSHOT_DB.exists():
+        # v3.1.9 round 2: the SAME absent-vs-unstatable collapse _presence()
+        # was added for, one guard scan over. SNAPSHOT_DB.exists() answers
+        # False for "the mount errored" exactly as it does for "nothing
+        # published yet" -- and `previous is None` a few lines below means
+        # "first publish, nothing to compare against, every guard stands
+        # down" (see the block comment above this one). A TRANSIENT stat
+        # failure on the flakiest volume in the system therefore used to let
+        # a publish through with the shrink ratio, the per-row loss limit
+        # and the generation guard ALL skipped -- worse than the
+        # restore_on_boot site this same fix closes, because that one only
+        # misclassifies a boot action; this one can publish completely
+        # unguarded.
+        snap_there, snap_unstatable = _presence(SNAPSHOT_DB)
+        if snap_unstatable:
+            raise RuntimeError(
+                f"REFUSING to publish: cannot stat {SNAPSHOT_DB} (the mount "
+                f"answered an error rather than 'file not found'). This is "
+                f"NOT the same as no snapshot existing -- treating it that "
+                f"way would publish with every shrink/row-loss/generation "
+                f"guard skipped, since none of them run when there is "
+                f"nothing to compare against. The live database is local "
+                f"and unaffected. Retry once the volume responds; "
+                f"investigate the mount if it does not."
+            )
+        if snap_there:
             previous = _has_rows(SNAPSHOT_DB)
             prev_bytes = SNAPSHOT_DB.stat().st_size
             if previous is None:

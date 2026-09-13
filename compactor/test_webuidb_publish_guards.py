@@ -1000,6 +1000,85 @@ check(
     "shadow it",
 )
 
+# ---------------------------------------------------------------------------
+print()
+print("[SYNC_UNSTATABLE] sync_once's own guard-scan refuses an UNSTATABLE "
+      "snapshot instead of guessing 'no previous copy, nothing to compare'")
+# ===========================================================================
+# v3.1.9 round 2 (fix-webuidb.md's own "Found, not fixed" #3, second bullet -
+# arguably higher severity than the restore_on_boot site fixed alongside it:
+# this one can publish COMPLETELY UNGUARDED). SNAPSHOT_DB.exists() swallows
+# every OSError and answers False for "the mount errored" exactly as it does
+# for "nothing published yet" - and `previous is None` a few lines below
+# means "first publish, nothing to compare against", which stands EVERY
+# content guard down (shrink ratio, per-row loss, generation). A TRANSIENT
+# stat failure on the flakiest volume in the system used to let a publish
+# through with none of them running at all.
+wipe()
+owui(LOCAL, [("c1", 100, conversation(20))])
+owui(SNAP, [("c1", 90, conversation(20))])
+_before = snap_bytes()
+_orig_presence = webuidb._presence
+
+
+def _unstatable_presence(path):
+    # Only SNAPSHOT_DB is simulated as unstatable - LOCAL_DB's own
+    # _presence() calls (there are none on this path today, but a future
+    # caller should not be silently redirected) fall through to the real
+    # implementation.
+    if path is SNAP:
+        return (False, True)
+    return _orig_presence(path)
+
+
+CAP.records.clear()
+webuidb._presence = _unstatable_presence
+try:
+    r = webuidb.sync_once(force=True)
+finally:
+    webuidb._presence = _orig_presence
+check(
+    r["synced"] is False and bool(r["error"]),
+    f"REFUSES the publish rather than treating an unstatable snapshot as "
+    f"'absent, nothing to compare' (synced={r['synced']!r}, "
+    f"error={r['error']!r})",
+)
+check(
+    "cannot stat" in (r["error"] or ""),
+    f"and names the reason (got: {r['error']!r})",
+)
+check(
+    snap_bytes() == _before,
+    "and the snapshot file on disk is byte-for-byte untouched - the refusal "
+    "happens before os.replace, same as every other guard in this function",
+)
+
+print("    CONTROL: the SAME local/snapshot pair, real _presence(), "
+      "publishes normally")
+# Without this, [SYNC_UNSTATABLE] could be passing because sync_once now
+# refuses EVERY publish against this fixture for some unrelated reason (a
+# typo in the fixture, an unrelated guard tripping) rather than specifically
+# because of the simulated stat failure.
+r2 = webuidb.sync_once(force=True)
+check(
+    r2["synced"] is True,
+    f"unpatched, this exact local/snapshot pair publishes fine (r={r2}) - "
+    f"the refusal above was specific to the simulated stat failure, not "
+    f"something else about this fixture",
+)
+
+print("    CONTROL: a genuinely ABSENT snapshot is still 'first publish, "
+      "go' (A8) - this fix must not turn into 'refuse whenever previous "
+      "state is uncertain'")
+wipe()
+owui(LOCAL, [("c1", 100, conversation(20))])
+r3 = webuidb.sync_once(force=True)
+check(
+    r3["synced"] is True and SNAP.exists(),
+    f"a real first publish (no snapshot anywhere) still goes through "
+    f"(r={r3})",
+)
+
 
 print()
 if FAILED:

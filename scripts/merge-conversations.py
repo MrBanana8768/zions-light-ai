@@ -35,7 +35,6 @@ nothing but the re-embedding.
 """
 import argparse
 import json
-import os
 import pathlib
 import shutil
 import sys
@@ -70,8 +69,19 @@ def main() -> int:
     ap.add_argument("--dst", required=True, help="conv_id to merge INTO")
     ap.add_argument("--apply", action="store_true",
                     help="commit. Without this it is a dry run.")
-    ap.add_argument("--port", type=int,
-                    default=int(os.environ.get("COMPACTOR_PORT", "8080")))
+    # v3.1.9 round 2 (hostile2-config MEDIUM): this used to be
+    # `default=int(os.environ.get("COMPACTOR_PORT", "8080"))` — evaluated at
+    # ARGPARSE-SETUP time, before this script has even looked at its own
+    # arguments, let alone whether the compactor package it needs (and
+    # envcfg with it) is present. A typo in COMPACTOR_PORT raised ValueError
+    # before `--help` could even run — the exact failure class the rest of
+    # this tree routes through envcfg for (compactor/test_envcfg.py section
+    # 5), just in a file that scan's SHIPPED_DIRS does not cover. `default`
+    # stays None here; the real default is resolved below, AFTER envcfg is
+    # importable, softened the same way every other module in this tree
+    # reads its env-driven config — see the comment there.
+    ap.add_argument("--port", type=int, default=None,
+                    help="compactor's port (default: $COMPACTOR_PORT, or 8080)")
     ap.add_argument("--allow-live", action="store_true",
                     help=argparse.SUPPRESS)  # escape hatch; see the docstring
     args = ap.parse_args()
@@ -80,6 +90,19 @@ def main() -> int:
         print(f"ERROR: no compactor package beside this script ({PKG}).")
         print("Run it from a clone:  git clone -b v3.1.8 <repo-url> /data/hotfix")
         return 2
+
+    sys.path.insert(0, str(PKG))
+    try:
+        import envcfg  # noqa: E402
+        import memory  # noqa: E402
+        import portability  # noqa: E402
+    except Exception as e:
+        print(f"ERROR importing the compactor package from {PKG}: "
+              f"{type(e).__name__}: {e}")
+        return 2
+
+    if args.port is None:
+        args.port = envcfg.env_int("COMPACTOR_PORT", 8080)
 
     if _compactor_is_live(args.port) and not args.allow_live:
         print(f"REFUSING: something is answering on :{args.port}.")
@@ -91,15 +114,6 @@ def main() -> int:
         print("  supervisorctl stop compactor")
         print("  ...run this...")
         print("  supervisorctl start compactor")
-        return 2
-
-    sys.path.insert(0, str(PKG))
-    try:
-        import memory  # noqa: E402
-        import portability  # noqa: E402
-    except Exception as e:
-        print(f"ERROR importing the compactor package from {PKG}: "
-              f"{type(e).__name__}: {e}")
         return 2
 
     root = memory.storage_root()
