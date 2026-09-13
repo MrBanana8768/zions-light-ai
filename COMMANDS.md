@@ -178,7 +178,8 @@ curl -s localhost:8080/health/full | python3 -m json.tool | head -40
 
 ```bash
 # status alone is not enough: unreadable memory must be all 0, and the newest
-# backup must be under ~30 hours old (status stays "ok" when backups stop)
+# backup must be under ~30 hours old. On v3.1.6.1 (the pod today) status stays
+# "ok" for both; from v3.1.9 it degrades on either (backups past 36 h).
 curl -s localhost:8080/health/full | python3 -c "
 import json,sys,time
 d=json.load(sys.stdin); b=d.get('backups') or {}; m=b.get('latest_mtime')
@@ -186,7 +187,6 @@ print('status:', d['status'], d['status_reasons'])
 print('unreadable memory files:', d['stats'].get('unreadable'))
 print('newest backup:', b.get('latest'), '| age (hours):', round((time.time()-m)/3600,1) if m else None)"
 ```
-<!-- LANE-DEP: health backup-age reason may land in status -->
 
 ```bash
 # which id her chat resolves to: source=header is the stable id
@@ -225,7 +225,9 @@ print('HOT - uncommitted transaction pending' if b.hex()=='d9d505f920a163d7' els
 ```
 
 Since v3.1.8 `/health/full` reports this itself under
-`checks.sqlite_journal` and degrades on it, so on a current build:
+`checks.sqlite_journal` and degrades on it (v3.1.6.1, the pod today, has no
+such field — the command KeyErrors — so use the eight-byte check above there).
+On v3.1.8 and later:
 
 ```bash
 curl -s localhost:8080/health/full | python3 -c "import json,sys; print(json.load(sys.stdin)['checks']['sqlite_journal'])"
@@ -276,13 +278,14 @@ ls -1t /data/backups/ | head
 ls -lt /data/backups | head -3
 ```
 
-**Do NOT run `backup.py --restore`** until the rewritten restore ships: as
-shipped it can leave `webui.db` malformed (a stale rollback journal left
-beside the restored file) and deletes the live memory store before copying
-the archive's in. Restore by hand with the move-aside procedure in
+**Restore by hand**, with the move-aside procedure in
 [OPERATIONS.md → Restore from a backup](OPERATIONS.md#-restore-from-a-backup-recover-lostcorrupted-memory),
-which stops all FOUR writers first:
-<!-- LANE-DEP: backup restore_backup is being rewritten; reconcile this block at merge -->
+on every release. **Never run `backup.py --restore` on v3.1.6.1–v3.1.8** (the
+pod today): there it can leave `webui.db` malformed and deletes the live
+memory store before copying the archive's in. From v3.1.9 `--restore` is
+rewritten (stages first, sets the old state aside in `/data/forensics`) but
+has not passed the final review yet; OPERATIONS.md says why the manual path
+stays the documented one. The manual procedure stops all FOUR writers first:
 
 ```bash
 supervisorctl stop openwebui compactor backup webuidb-sync

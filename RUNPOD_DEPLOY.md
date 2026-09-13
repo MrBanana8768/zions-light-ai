@@ -118,8 +118,6 @@ Go to [Runpod Templates](https://www.runpod.io/console/user/templates) → New T
 
 ### WEBUI_DB_LOCAL — a hard deploy precondition
 
-<!-- LANE-DEP: webuidb WEBUI_DB_LOCAL parsing is being changed (empty value / other spellings); this section describes entrypoint.sh at 604ac8d -->
-
 **Production runs with `WEBUI_DB_LOCAL=false`, and every deploy must keep it
 that way.** It decides where her chat history physically lives. `false` keeps
 `webui.db` on the `/data` volume, where it has always been. `true` moves the
@@ -127,12 +125,25 @@ live database to the pod's local disk at boot and starts a sync daemon that
 copies it back to `/data` every few minutes. That move is the one change in the
 v3.1.x line whose rollback is not clean, and it has not been scheduled.
 
-**The trap: an EMPTY value means `true`.** `entrypoint.sh` reads the variable
-as `${WEBUI_DB_LOCAL:-true}`, and in the shell `:-` replaces an unset value AND
-an empty one. A RunPod template row that is present but blank (`WEBUI_DB_LOCAL`
-with nothing after the `=`) therefore boots with the database moved. Only the
-exact lowercase word `true` moves it; any other non-empty value (`false`,
-`False`, `0`, a typo) keeps it on `/data`. Do not rely on that: write `false`.
+**The trap on every release: a MISSING or EMPTY value means `true`.** A RunPod
+template with no `WEBUI_DB_LOCAL` row, or a row that is present but blank
+(nothing after the `=`), boots with the database moved.
+
+**How other spellings are read changed in v3.1.9:**
+
+| template value | v3.1.6.1 – v3.1.8 (the pod today) | from v3.1.9 |
+|---|---|---|
+| missing, or empty | `true` — database moved | `true` — database moved |
+| `false` | `false` | `false` |
+| `False`, `0`, `no`, `off` (any case, spaces around) | `false` (anything that is not exactly `true`) | `false` |
+| `True`, `TRUE`, `1`, `yes`, `on` | **`false`** (only the exact word `true` counted) | **`true` — database moved** |
+| anything else (a typo such as `flase`) | `false` | **the pod refuses to boot** |
+
+A refused boot prints a banner in the RunPod **Logs** tab starting
+`WEBUI_DB_LOCAL=[<your value>] is not true/1/yes/on or false/0/no/off -
+REFUSING TO START.` and the container exits before anything starts, so nothing
+is touched. Fix the row and redeploy. The one spelling that means the same on
+both sides of an upgrade or a rollback is the exact lowercase word `false`.
 
 **Before every deploy**, in the RunPod template's environment variables, check
 there is a row reading exactly:
@@ -144,7 +155,17 @@ WEBUI_DB_LOCAL=false
 lowercase, no spaces, no quotes, not blank. The deploy tag's own VERIFY step
 may not repeat this; it applies to every release anyway.
 
-**After every boot**, in the Web Terminal:
+**After every boot**, first in the RunPod **Logs** tab (the container's boot
+output). From v3.1.9 it names the value it resolved and why:
+
+```
+      WEBUI_DB_LOCAL=false (explicitly set (false))
+[2b/3] WEBUI_DB_LOCAL=false - webui.db stays on /data/openwebui/webui.db
+```
+
+On v3.1.6.1 only the `[2b/3]` line is printed. If v3.1.9 prints
+`WEBUI_DB_LOCAL=true (unset/empty -> true …)`, the row is missing or blank.
+Then, in the Web Terminal (works on every release):
 
 ```bash
 tr '\0' '\n' < /proc/1/environ | grep -E '^(WEBUI_DB_LOCAL|WEBUIDB_SYNC_ENABLED|DATABASE_URL)='; supervisorctl status webuidb-sync
@@ -159,9 +180,7 @@ DATABASE_URL=sqlite:////data/openwebui/webui.db
 webuidb-sync                     STOPPED   Not started
 ```
 
-(the first three may print in a different order). The pod's boot output in the
-RunPod **Logs** tab also says `[2b/3] WEBUI_DB_LOCAL=false - webui.db stays on
-/data/openwebui/webui.db`.
+(the first three may print in a different order).
 
 **If you see `WEBUI_DB_LOCAL=true`, a `/var/lib/openwebui/webui.db` in
 `DATABASE_URL`, or `webuidb-sync RUNNING`:** the database was moved to local
@@ -375,7 +394,7 @@ Override these in your Runpod template if needed:
 | `COMPACTOR_MIN_FREE_MB_WRITES` | `200` | Pause new-memory writes (keep serving) below this free space on `/data` (V2.3) |
 | `COMPACTOR_LOG_FORMAT` | `text` | `text` (human) or `json` (one object/line for aggregation) |
 | `COMPACTOR_ALERT_WEBHOOK` | *(unset)* | If set, self-test + backup POST a failure alert here (Slack/Discord/generic) |
-| `WEBUI_DB_LOCAL` | `true` (also when set but EMPTY) | **Production: `false`, and it is a hard precondition** — see [WEBUI_DB_LOCAL](#webui_db_local--a-hard-deploy-precondition). `false` keeps `webui.db` on `/data`; `true` moves it to local disk with a sync daemon. |
+| `WEBUI_DB_LOCAL` | `true` (also when set but EMPTY) | **Production: exactly `false`, and it is a hard precondition** — see [WEBUI_DB_LOCAL](#webui_db_local--a-hard-deploy-precondition). `false` keeps `webui.db` on `/data`; `true` moves it to local disk with a sync daemon. From v3.1.9 an unrecognised value refuses to boot, and `1`/`yes`/`True` mean true. |
 | `LOG_DIR` | `/data/logs` | Where every service log is written (on the volume, so logs survive a redeploy) |
 
 ## API Usage

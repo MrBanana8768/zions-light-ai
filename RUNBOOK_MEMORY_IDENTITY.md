@@ -58,8 +58,8 @@ supervisorctl status webuidb-sync
 `WEBUI_DB_LOCAL=false` took effect and her chat history is on `/data`.
 **If it says `RUNNING`:** stop. The pod booted with the database moved to local
 disk, which is not the production placement. Do not continue with this runbook;
-see RUNPOD_DEPLOY.md "WEBUI_DB_LOCAL".
-<!-- LANE-DEP: webuidb WEBUI_DB_LOCAL parsing (empty value currently means true) -->
+see RUNPOD_DEPLOY.md "WEBUI_DB_LOCAL" (it also shows the boot-log line that
+names the value v3.1.9 resolved and why).
 
 Make a backup now, so there is a copy from immediately before the change:
 
@@ -69,11 +69,14 @@ Make a backup now, so there is a copy from immediately before the change:
 
 It can take several minutes; wait for the prompt to come back.
 **Success:** `EXIT=0`, `"ok": true` and an `"archive": "zions-backup-…tar.gz"`
-name. Write that archive name down. **If `EXIT=1`:** read the `"detail"` line.
-`database is locked` or `readonly database` means OpenWebUI was mid-write;
-wait one minute and run it again. Anything else: stop and ask for help. Do not
-continue without a backup.
-<!-- LANE-DEP: backup run_once report shape / census guard wording -->
+name. Write that archive name down. **If `"detail"` also contains `memory
+shrank since`:** on v3.1.9 that means something really was lost (the check no
+longer fires on normal eviction or rollups) — stop and read OPERATIONS.md
+"Nightly 'memory shrank' alert" before changing anything. **If `EXIT=1`:** read
+the `"detail"` line. `database is locked` means OpenWebUI was mid-write; wait
+one minute and run it again. `readonly database` means a hot rollback journal:
+OPERATIONS.md "A HOT SQLite rollback journal". Anything else: stop and ask for
+help. Do not continue without a backup.
 
 ---
 
@@ -123,9 +126,8 @@ Write down `facts.count`, `episodic.indexed_exchanges` and
 `summary.last_summarized_turn`.
 
 > Do NOT use `GET /admin/conversations` (the list) to check any of this. It
-> returns ids only, with no counts, so a merge that did not happen looks
-> exactly like one that did (hostile review B, F4).
-> <!-- LANE-DEP: admincounts the list endpoint may gain counts; the per-id endpoint stays the check -->
+> returns ids only, with no counts — still true on v3.1.9 — so a merge that did
+> not happen looks exactly like one that did (hostile review B, F4).
 
 ---
 
@@ -160,6 +162,9 @@ curl -s -X POST "localhost:8080/admin/conversations/<old-hash-id>/merge-into/<ne
 **Success:** the response contains `"dry_run": false` AND the keys
 `"facts_added"` and `"exchanges_added"`. Those two keys exist only on a real
 commit (a dry run also shows `facts_to_add`, so that key proves nothing).
+Write down `"facts_over_budget_after_merge"` too: it is how many facts will
+move to the archive file on the next write, because her store is already over
+its size cap. A large number here is expected and is not a failed merge.
 **If `dry_run` is `true` or `facts_added` is missing:** it was another dry run;
 check the body was typed exactly as above and run it again. Running a merge
 twice is safe (the second run adds nothing).
@@ -261,8 +266,9 @@ curl -s localhost:8080/admin/conversations/<new-uuid> | python3 -m json.tool
 **Success:** `summary.turns_seen` is within 2 of the `msgs=` number on her
 message's log line, and `facts.count` is above 0.
 
-**Expect `facts.count` to DROP after her first message**, by a third or more
-(in the rehearsal on a copy, from 136 merged to about 80). That is not loss:
+**Expect `facts.count` to DROP after her first message**, by about the
+`facts_over_budget_after_merge` number from step 2, plus a few (in the
+rehearsal on a copy, from 136 merged to about 80). That is not loss:
 her fact store was already about twice the 1,500-token cap before any of this,
 and the first write moves the least recently used facts to
 `facts/<new-uuid>.archive.json` (hostile review B, F6). Read the count after
