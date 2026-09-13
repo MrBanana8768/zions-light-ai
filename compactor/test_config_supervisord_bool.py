@@ -31,6 +31,7 @@ unit-tests container has and a bare Windows checkout does not:
     python test_config_supervisord_bool.py
 """
 
+import os
 import re
 import shutil
 import subprocess
@@ -217,6 +218,99 @@ for name in declared:
 check(set(declared) == {"STT_ENABLED", "TTS_ENABLED", "COMPACTOR_SELFTEST_ON_BOOT",
                          "COMPACTOR_BACKUP_ENABLED", "WEBUIDB_SYNC_ENABLED"},
       f"declared set matches the finding's inventory exactly (got {declared})")
+
+
+# ---------------------------------------------------------------------------
+print()
+print("[C] MEDIUM (hostile2-config): STT_ENABLED/TTS_ENABLED=1 used to start "
+      "the service while dropping its probe from the boot self-test")
+print()
+# The break, as filed: supervisord's own boolean() accepts {yes,true,on,1}
+# case-insensitively, so STT_ENABLED=1 (or yes, or on) starts `stt` - but
+# compactor/selftest.py read STT_ENABLED with a plain
+# `.strip().lower() == "true"`, which "1"/"yes"/"on" all fail. So the
+# service started, unprobed, and the self-test's own summary total is
+# `len(checks)` - a denominator that shrinks with the check list, so
+# "N/N passed" never signals the missing check either.
+#
+# ALREADY FIXED, as a side effect of [A]/[B] above, not by a change to
+# selftest.py (which is not this lane's file): entrypoint.sh's `_bool`
+# normalizes STT_ENABLED/TTS_ENABLED to a canonical "true"/"false" BEFORE
+# `exec supervisord`, and every child supervisord starts - selftest
+# included; see supervisord.conf's `environment=` under [program:selftest],
+# which sets COMPACTOR_URL/VLLM_URL/MODEL_REPO but does NOT override
+# STT_ENABLED or TTS_ENABLED, so those two are inherited from the
+# already-normalized parent environment. Both consumers therefore see the
+# SAME canonical string, never the raw one - proven end-to-end below: the
+# REAL entrypoint.sh normalizer, then selftest.py's OWN comparison line
+# (extracted from its source, not reimplemented, so a change to that line
+# is caught here too), fed the normalized value.
+SELFTEST = ROOT / "compactor" / "selftest.py"
+SELFTEST_SRC = SELFTEST.read_text(encoding="utf-8")
+
+
+def extract_selftest_bool_expr(var: str) -> str | None:
+    m = re.search(
+        rf'{var}\s*=\s*os\.environ\.get\("{var}",\s*"false"\)\.strip\(\)\.lower\(\)\s*==\s*"true"',
+        SELFTEST_SRC,
+    )
+    check(
+        m is not None,
+        f"selftest.py still reads {var} as "
+        f'os.environ.get("{var}", "false").strip().lower() == "true" '
+        f"(if this line changed, re-verify this check by hand rather than "
+        f"trusting it)",
+    )
+    return m.group(0) if m else None
+
+
+for _var in ("STT_ENABLED", "TTS_ENABLED"):
+    _expr = extract_selftest_bool_expr(_var)
+    if _expr is None:
+        continue
+    # The finding's own unprobed spellings ([A5-3]'s table): supervisord
+    # starts the service on every one of these, and selftest's RAW
+    # `== "true"` read would not - NOT "TRUE" or "true " (with whitespace),
+    # which selftest's own `.strip().lower()` already handled before this
+    # fix existed; the CONTROL below would be vacuously true for those and
+    # prove nothing about the mismatch this section is about.
+    for _raw in ("1", "yes", "on"):
+        _normalized, _rc = run_normalizer(_var, _raw)
+        check(_rc == 0 and _normalized == "true",
+              f"{_var}={_raw!r}: entrypoint.sh normalizes to true "
+              f"(got {_normalized!r}, rc={_rc})")
+        # Execute selftest.py's OWN line against the NORMALIZED value - what
+        # selftest.py actually sees once supervisord has started it, because
+        # entrypoint.sh exported the normalized string before `exec
+        # supervisord`, never the raw one.
+        _ns = {"os": os}
+        os.environ[_var] = _normalized
+        try:
+            exec(compile(_expr, "<selftest.py extract>", "exec"), _ns)
+        finally:
+            del os.environ[_var]
+        check(_ns[_var] is True,
+              f"{_var}={_raw!r} -> normalized {_normalized!r} -> selftest.py's "
+              f"own comparison now reads True (the probe runs): got "
+              f"{_ns[_var]!r}")
+
+        # CONTROL, and the point of the whole check: the SAME raw value fed
+        # DIRECTLY to selftest's line (bypassing entrypoint.sh) still reads
+        # False - proving the fix is the normalization step sitting in
+        # front of both consumers, not some change to selftest.py's own
+        # comparison.
+        _ns2 = {"os": os}
+        os.environ[_var] = _raw
+        try:
+            exec(compile(_expr, "<selftest.py extract>", "exec"), _ns2)
+        finally:
+            del os.environ[_var]
+        check(_ns2[_var] is False,
+              f"CONTROL: {_var}={_raw!r} fed directly to selftest.py's own "
+              f"comparison, bypassing entrypoint.sh, still reads False - "
+              f"confirming the mismatch the finding described exists at "
+              f"that line, and that the fix is normalizing BEFORE that "
+              f"line runs, not changing the line itself")
 
 
 if FAILED:

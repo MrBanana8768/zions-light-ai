@@ -197,7 +197,85 @@ fi
 # The flag is not rollout scaffolding to be deleted afterwards - it is the
 # kill switch for the one subsystem here that owns where her chat history
 # physically lives.
-export WEBUI_DB_LOCAL="${WEBUI_DB_LOCAL:-true}"
+# v3.1.9 (hostile pass #2, LOW): this used to be `[ "${WEBUI_DB_LOCAL}" =
+# "true" ]` — a byte comparison, no folding, no trimming — while every
+# sibling boolean in this subsystem (WEBUI_DB_ALLOW_SHRINK,
+# ALLOW_PUBLISH_OVER_UNREADABLE, ALLOW_ROW_LOSS, ALLOW_OLDER_GENERATION in
+# webuidb.py; WEBUIDB_SYNC_ENABLED in health.py) folds case and trims
+# whitespace. So `True`, `TRUE`, `1`, `yes`, `on`, or `" true"` — the exact
+# shape a copy-paste into a RunPod template field leaves — all meant FALSE:
+# keep the live database on MooseFS, sync daemon off, the 2026-08-31
+# placement this whole module exists to retire, with the boot banner
+# printing `WEBUI_DB_LOCAL=false` as if the operator had asked for it.
+#
+# Folded the same way below, but NOT through the `_bool` helper defined
+# later in this file: `_bool` falls back to a SAFE DEFAULT on anything it
+# does not recognise, and that is right for STT/TTS/selftest/backup, where
+# the worst a wrong guess costs is one supervised program starting or not —
+# visible in `supervisorctl status`, correctable by a redeploy. There is no
+# equivalent safe guess here. This flag decides which PHYSICAL DISK holds
+# her live SQLite file — webuidb.py's own header calls it "the only
+# irreversible step in the line" — and the two wrong guesses are not
+# equally bad but both are bad: silently resolving an unrecognised value to
+# false re-admits the MooseFS rollback-journal corruption this release
+# exists to remove, for the life of the pod, with nothing in any log to say
+# so; silently resolving it to true moves the live database and starts the
+# sync daemon publishing to /data on a placement nobody chose. So an
+# unrecognised, NON-EMPTY value REFUSES TO BOOT instead of guessing between
+# them — the same principle as the /data-writable and driver checks in
+# [1/3] above: a boot that cannot end in an honest system does not get to
+# proceed halfway.
+#
+# UNSET OR EMPTY IS NOT "UNRECOGNISED" and keeps meaning true, unchanged.
+# Production sets this flag EXPLICITLY — WEBUI_DB_LOCAL=false is a required
+# RunPod template field there for the pods still mid-rollout — so empty only
+# happens on a fresh boot with no template at all, where true is the
+# architecture every pod in this series is migrating towards; refusing to
+# boot on nothing set would break that default path for no reason. Explicit
+# `true` and explicit `false` resolve exactly as they always did — this
+# folds spelling and whitespace, it does not change either literal's
+# meaning.
+#
+# test_webuidb_gate.py reads this exact block by its BEGIN/END markers and
+# runs it under `sh` with the finding's own spellings — keep it POSIX sh.
+# BEGIN WEBUI_DB_LOCAL NORMALIZATION
+_webui_db_local_raw="${WEBUI_DB_LOCAL:-}"
+if [ -z "${_webui_db_local_raw}" ]; then
+    WEBUI_DB_LOCAL=true
+    _webui_db_local_why="unset/empty -> true (the local-disk move stays the default)"
+else
+    _webui_db_local_norm=$(printf '%s' "${_webui_db_local_raw}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    case "${_webui_db_local_norm}" in
+        true|1|yes|on)
+            WEBUI_DB_LOCAL=true
+            _webui_db_local_why="explicitly set (${_webui_db_local_raw})"
+            ;;
+        false|0|no|off)
+            WEBUI_DB_LOCAL=false
+            _webui_db_local_why="explicitly set (${_webui_db_local_raw})"
+            ;;
+        *)
+            echo ""
+            echo "      ============================================================"
+            echo "      WEBUI_DB_LOCAL=[${_webui_db_local_raw}] is not true/1/yes/on"
+            echo "      or false/0/no/off - REFUSING TO START."
+            echo ""
+            echo "      This flag decides which disk holds her live chat database."
+            echo "      Guessing is worse than stopping: reading it as false would"
+            echo "      silently re-expose the MooseFS rollback-journal corruption"
+            echo "      this release exists to remove; reading it as true would move"
+            echo "      the live database and start publishing to /data on a"
+            echo "      placement nobody chose. Set WEBUI_DB_LOCAL to exactly true"
+            echo "      or false on the RunPod template and redeploy."
+            echo "      ============================================================"
+            echo ""
+            exit 1
+            ;;
+    esac
+fi
+export WEBUI_DB_LOCAL
+echo "      WEBUI_DB_LOCAL=${WEBUI_DB_LOCAL} (${_webui_db_local_why})"
+# END WEBUI_DB_LOCAL NORMALIZATION
 export WEBUI_LOCAL_DB="${WEBUI_LOCAL_DB:-/var/lib/openwebui/webui.db}"
 export WEBUI_SNAPSHOT_DB="${WEBUI_SNAPSHOT_DB:-${DATA_DIR:-/data/openwebui}/webui.db}"
 # The escape hatch for the boot refusal below. Default false: a restore that
@@ -281,7 +359,10 @@ if [ "${WEBUI_DB_LOCAL}" = "true" ]; then
                 echo "      touched." ;;
             5)  echo "      Local disk could not be prepared: either ${WEBUI_LOCAL_DB%/*}"
                 echo "      could not be created, or an existing local database could not"
-                echo "      be moved aside and so must not be overwritten. The log line"
+                echo "      be moved aside and so must not be overwritten - OR the snapshot"
+                echo "      on /data could not even be checked (a stalled or erroring mount"
+                echo "      answering neither 'found' nor 'not found'), which webuidb.py"
+                echo "      now refuses rather than treating as 'no snapshot'. The log line"
                 echo "      just above this banner says which." ;;
             *)  echo "      webuidb.py reported a failure this script has no text for."
                 echo "      Treated as fatal deliberately - an unrecognised failure on"

@@ -76,6 +76,13 @@ def wipe():
             f = p.with_name(p.name + suffix)
             if f.exists():
                 f.unlink()
+    # Each scenario below is its own incident and expects its own forensic
+    # copy (see FORENSIC_COPY_MIN_INTERVAL_S) — several run within
+    # milliseconds of each other in this one process, well inside the
+    # default 3600s throttle window, so without this reset [A7]'s refusal
+    # would be silently rate-limited by [A6]'s two calls just above it and
+    # fail for a reason that has nothing to do with what [A7] tests.
+    webuidb._forensic_copy_last_monotonic = None
 
 
 print("=" * 66)
@@ -132,6 +139,41 @@ make_db(SNAP, 400, "HER-REAL-HISTORY")
 make_db(LOCAL, 0, "EMPTY")
 r = webuidb.sync_once(force=True)
 check(chats(SNAP) == 400 and not r["synced"], "zero-chat database refused")
+
+# ---------------------------------------------------------------------------
+print()
+print("[A3b] the SAME refusal, isolated from the shrink guard entirely")
+# hostile pass #2's own surviving mutant (M12): `if not chats:` -> `if
+# chats is None:` left [A3] above green, because [A3] ALSO trips the
+# shrink (count/ratio) guard - 400 -> 0 is a 100% loss, so `previous is
+# not None` and the ratio comparison refuse it independently of whether
+# the explicit "reports 0 chats" check does anything at all. That guard is
+# `if previous is not None: ...` - so with NO snapshot yet, it does not
+# run at all, and the zero-chats check is the ONLY thing that can refuse.
+wipe()
+check(not SNAP.exists(), "PRECONDITION: no snapshot - `previous is not None` cannot fire")
+make_db(LOCAL, 0, "EMPTY-FIRST-BOOT")
+r = webuidb.sync_once(force=True)
+check(
+    not r["synced"] and not SNAP.exists(),
+    f"refused with no snapshot to shadow it (synced={r['synced']}, "
+    f"snapshot exists={SNAP.exists()})",
+)
+check(
+    bool(r["error"]) and "0" in r["error"] and "chats" in r["error"],
+    f"and the reason names the chat count (error={(r['error'] or '')[:80]!r})",
+)
+
+print("    CONTROL: the identical first-publish shape with ONE chat "
+      "succeeds - this is not 'refuse every first publish'")
+wipe()
+make_db(LOCAL, 1, "FIRST-REAL-CHAT")
+r = webuidb.sync_once(force=True)
+check(
+    r["synced"] is True and chats(SNAP) == 1,
+    f"a genuine first publish with real content still works (synced="
+    f"{r['synced']}, snapshot chats={chats(SNAP) if SNAP.exists() else None})",
+)
 
 # ---------------------------------------------------------------------------
 print()
