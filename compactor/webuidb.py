@@ -64,6 +64,64 @@ QUARANTINE = Path(os.environ.get("WEBUI_DB_QUARANTINE", "/data/forensics"))
 
 SIDECARS = ("-journal", "-wal", "-shm")
 
+
+def live_webui_db() -> Path:
+    """Where OpenWebUI's live database is RIGHT NOW - LOCAL_DB or
+    SNAPSHOT_DB - read from the gate at CALL time. Not a guess.
+
+    v3.1.9 (hostile pass #2, A3-4/A3-9, "the webuidb half"). `backup.py`
+    picked the live database with `_LIVE_DB.exists()` instead of asking
+    this gate: entrypoint.sh's `WEBUI_DB_LOCAL` decides where OpenWebUI's
+    database physically lives, and the string `WEBUI_DB_LOCAL` did not
+    appear anywhere in backup.py. The trigger is this project's own
+    documented rollback - setting the flag `false` repoints DATABASE_URL at
+    the snapshot but leaves the ABANDONED local file sitting on the
+    container overlay, and a container restart (not a redeploy) keeps that
+    overlay, so the stale file still `exists()`. Every nightly backup
+    archived a database nobody had written to since the flag flipped, and
+    the CLI `--restore` wrote an archive back ONTO that same abandoned
+    file - OpenWebUI, reading the snapshot, never saw it.
+
+    A3-9 is the sibling half of the same defect: `backup.py` read this at
+    IMPORT and froze it in a module constant, so even the two processes
+    that live for the whole life of the pod (`backup --daemon` and
+    `main.py`, both started once by supervisord and never re-imported)
+    could not see the flag change during their own lifetime - a constant
+    cannot express "where the live database is right now" in a process the
+    deployment's own kill switch can repoint under it.
+
+    So: no caching, no import-time freeze, no existence guess. Read fresh,
+    every call, and fold the value the SAME WAY entrypoint.sh's own
+    WEBUI_DB_LOCAL NORMALIZATION block does (trimmed, case-insensitive,
+    1/yes/on and 0/no/off) so this function and the boot script always
+    agree on what a given spelling means.
+
+    UNRECOGNISED RAISES, deliberately, rather than guessing between the two
+    files the way this function exists to stop doing. In production this
+    is unreachable: entrypoint.sh normalises WEBUI_DB_LOCAL to an exact
+    "true" or "false" and refuses to BOOT on anything else (see its own
+    block), so by the time any child process - including this one - can
+    run, the environment already carries a canonical value. Reaching this
+    branch means the caller is running outside that boot path entirely (a
+    bare CLI invocation, a test with a stray value) - exactly the situation
+    where silently picking a file has, historically, been how this defect
+    shipped.
+    """
+    raw = os.environ.get("WEBUI_DB_LOCAL", "").strip().lower()
+    if raw in ("", "true", "1", "yes", "on"):
+        return LOCAL_DB
+    if raw in ("false", "0", "no", "off"):
+        return SNAPSHOT_DB
+    raise RuntimeError(
+        f"WEBUI_DB_LOCAL={raw!r} is neither a recognised true spelling "
+        f"(true/1/yes/on) nor a recognised false spelling (false/0/no/off). "
+        f"entrypoint.sh refuses to boot on exactly this state, so reaching "
+        f"here means this process started outside that boot path. Refusing "
+        f"to guess which physical file is 'live' - that guess is the "
+        f"defect this function replaces (hostile pass #2, A3-4/A3-9)."
+    )
+
+
 # REGRESSION GUARD. Refuse to publish a snapshot holding less than this
 # fraction of the chats the previous snapshot had.
 #
@@ -202,6 +260,50 @@ ALLOW_OLDER_GENERATION = (
     os.environ.get("WEBUI_DB_ALLOW_OLDER_GENERATION", "").strip().lower()
     in ("1", "true", "yes")
 )
+# THE SHRINK REFUSAL'S FORENSIC COPY, RATE-LIMITED (hostile-lane fix, found
+# by SP\lane-webuidb.md "Found, not fixed" #3, never a numbered N-finding of
+# its own). "Keep the refused database" below used to run unconditionally,
+# on EVERY cycle a shrink refusal (lost_chats or lost_content) stayed
+# tripped, and a refusal is not a one-shot event - it repeats every
+# SYNC_INTERVAL_S until an operator acts. At the measured live size (33 MB)
+# and the default interval (300 s) that is ~9.5 GB/day copied onto the
+# MooseFS volume this module exists to protect, for as long as the
+# regression goes unaddressed - which, un-noticed, is indefinitely. The
+# guard was defending her history from a bad publish and, in the same
+# breath, filling the disk that publish lives on.
+#
+# The FIRST copy of a new refusal is still unconditional (see sync_once): it
+# is the earliest evidence of whatever went wrong, and this module's own
+# rule is that nothing protective is deleted or skipped outright (compare
+# _set_aside: "never delete"). What is bounded is every copy AFTER that, for
+# the SAME ongoing refusal, which proves nothing the first copy did not
+# already prove and costs the same 33 MB again. Default 3600s (one hour)
+# deliberately matches sync_loop's own "shout on the first, then hourly
+# forever" cadence for consecutive publish failures, a few lines down in
+# this same file - one operator-facing rhythm for this module's two
+# stuck-in-a-loop alarms rather than two unrelated numbers. At the default
+# SYNC_INTERVAL_S (300s) that bounds the cost to 33 MB/hour (~792 MB/day)
+# worst case instead of ~9.5 GB/day, while a slowly worsening state still
+# leaves an hourly trail of samples rather than one.
+#
+# time.monotonic(), never time.time() — deliberately, given this exact file
+# already shipped one wall-clock defect (N2, a snapshot mtime in the
+# future). The question this interval answers is only "how long has this
+# process been retrying", which monotonic answers correctly through a clock
+# step in either direction; wall-clock arithmetic would not, and getting the
+# rate limit itself wrong on the flakiest volume in the system would be a
+# poor place to reintroduce that bug.
+FORENSIC_COPY_MIN_INTERVAL_S = max(
+    0.0, env_float("WEBUI_DB_FORENSIC_COPY_MIN_INTERVAL_S", 3600)
+)
+# Monotonic timestamp of the last forensic copy this process made, or None
+# before the first one. Deliberately NOT reset by _reload_env: that function
+# re-reads ENV-DRIVEN KNOBS, and this is runtime state, not a knob - a test
+# that wants a clean streak sets this back to None directly (white-box,
+# consistent with how the suites already reach into EMPTY_START_MARKER and
+# the ALLOW_* globals), the same way a real process only gets a clean streak
+# from actually restarting.
+_forensic_copy_last_monotonic: float | None = None
 # How far in the future a snapshot's mtime may be before the skip stops
 # trusting it (N2). Not a knob: a few seconds ahead is filesystem timestamp
 # granularity or ordinary skew and costs one skipped cycle at most, and an
@@ -260,7 +362,7 @@ def _reload_env() -> None:
     global SHRINK_REFUSE_BELOW, SHRINK_GUARD_MIN_CHATS, ALLOW_SHRINK
     global SHRINK_GUARD_MIN_BYTES, ALLOW_PUBLISH_OVER_UNREADABLE
     global SYNC_INTERVAL_S, MAX_ROW_LOSS_BYTES, ALLOW_ROW_LOSS
-    global ALLOW_OLDER_GENERATION
+    global ALLOW_OLDER_GENERATION, FORENSIC_COPY_MIN_INTERVAL_S
     SHRINK_REFUSE_BELOW = env_float("WEBUI_DB_SHRINK_REFUSE_BELOW", 0.5)
     SHRINK_GUARD_MIN_CHATS = env_int("WEBUI_DB_SHRINK_GUARD_MIN_CHATS", 2)
     # The sibling knob. Every constant this function forgets is a knob that
@@ -294,6 +396,12 @@ def _reload_env() -> None:
         os.environ.get("WEBUI_DB_ALLOW_OLDER_GENERATION", "").strip().lower()
         in ("1", "true", "yes")
     )
+    # The forensic-copy rate limit (see its own comment at the definition).
+    # Deliberately does NOT reset _forensic_copy_last_monotonic - that is
+    # runtime state, not a knob; see the comment beside it.
+    FORENSIC_COPY_MIN_INTERVAL_S = max(
+        0.0, env_float("WEBUI_DB_FORENSIC_COPY_MIN_INTERVAL_S", 3600)
+    )
 
 
 def _stamp() -> str:
@@ -318,6 +426,42 @@ def integrity(path: Path) -> tuple[bool, str]:
         return verdict == "ok", verdict
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
+
+
+def _presence(path: Path) -> tuple[bool, bool]:
+    """(there, unstatable). `Path.exists()` swallows EVERY `OSError` and
+    answers `False` for both "nothing there" and "I could not look" - and on
+    the volume whose read reliability is this module's entire subject, those
+    two answer restore_on_boot's fresh-vs-restore decision in OPPOSITE
+    directions.
+
+    Hostile pass #2, C10, proved it reachable: an unstatable snapshot path
+    (`ENOTDIR`/`EIO` — a stalled or erroring MooseFS mount, once `entrypoint.sh`
+    has already confirmed /data itself is writable, is the production shape;
+    the test uses `ENOTDIR` because a root container cannot be denied by mode
+    bits) made `SNAPSHOT_DB.exists()` answer `False`, which restore_on_boot's
+    caller read as "no snapshot", falling straight through to `action="fresh"`.
+    `RESTORE_EXIT_CODES["fresh"] = 0`, so entrypoint.sh never reached the
+    branch that writes `.empty-start` — the file its own banner calls "what
+    protects /data, not the shrink ratio". OpenWebUI built an empty schema
+    with nothing guarding it but a ratio the same banner says "only delays
+    an empty database, it does not stop one" (about ten days at the measured
+    live size).
+
+    This is also `_has_rows`'s own docstring arguing the reader into the
+    bug: "this function cannot tell you whether the file is ABSENT — only
+    path.exists() can". `path.exists()` cannot either — that claim is what
+    this function replaces.
+
+    unstatable=True means "the OS refused to say" — the caller must refuse
+    rather than guess between "restore" and "fresh"; see restore_on_boot."""
+    try:
+        path.stat()
+        return True, False
+    except FileNotFoundError:
+        return False, False
+    except OSError:
+        return False, True
 
 
 def _has_rows(path: Path) -> int | None:
@@ -786,7 +930,28 @@ def restore_on_boot() -> dict:
         result["action"] = "error"
         return result
 
-    if SNAPSHOT_DB.exists():
+    # v3.1.9 (hostile pass #2, MEDIUM): "there is no snapshot" and "I could
+    # not look at the snapshot" must not reach the same branch below. See
+    # _presence — an unstatable path used to fall straight through to
+    # `action="fresh"`, exit 0, an empty schema and no .empty-start marker.
+    snap_there, snap_unstatable = _presence(SNAPSHOT_DB)
+    if snap_unstatable:
+        logger.error(
+            f"cannot stat {SNAPSHOT_DB}: the mount answered an error rather "
+            f"than 'file not found'. That is NOT the same as no snapshot "
+            f"existing, and treating it that way is how a stalled or "
+            f"erroring mount used to boot as a 'fresh' deployment - exit 0, "
+            f"an empty schema, and (because the exit code was 0) "
+            f".empty-start never written, so nothing but the shrink ratio "
+            f"would have stood between OpenWebUI and her history on /data. "
+            f"Refusing to boot rather than guess whether her history is "
+            f"there. Retry once the volume responds; if it does not, "
+            f"investigate the mount before anything else."
+        )
+        result["action"] = "error"
+        return result
+
+    if snap_there:
         ok, detail = integrity(SNAPSHOT_DB)
         if not ok:
             # The snapshot lives on the flaky volume, so a hot journal here
@@ -1203,13 +1368,55 @@ def sync_once(force: bool = False) -> dict:
                 # Keep the refused database. It may hold the only copy of
                 # anything written since the last good sync, and this path
                 # fires precisely when something has already gone wrong.
-                try:
-                    QUARANTINE.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(
-                        LOCAL_DB, QUARANTINE / f"{LOCAL_DB.name}.refused-{_stamp()}"
-                    )
-                except Exception:
-                    pass
+                #
+                # RATE-LIMITED (see FORENSIC_COPY_MIN_INTERVAL_S). This
+                # refusal repeats every SYNC_INTERVAL_S until an operator
+                # acts, and this used to copy the WHOLE local database here
+                # on every one of those cycles - ~9.5 GB/day at the live
+                # size, onto the volume this module exists to protect. The
+                # FIRST copy of a new refusal (last_monotonic is None, or the
+                # interval has elapsed since the last one) is unconditional -
+                # it is the earliest evidence of whatever went wrong, and is
+                # never skipped. Every copy after that, for the SAME ongoing
+                # refusal, is throttled.
+                global _forensic_copy_last_monotonic
+                _forensic_now = time.monotonic()
+                if (
+                    _forensic_copy_last_monotonic is None
+                    or _forensic_now - _forensic_copy_last_monotonic
+                    >= FORENSIC_COPY_MIN_INTERVAL_S
+                ):
+                    try:
+                        QUARANTINE.mkdir(parents=True, exist_ok=True)
+                        # SIDECARS TOO (hostile pass #2 LOW, "what I checked
+                        # and found sound" §sidecar audit): this copied only
+                        # the main file, never `-wal`/`-shm`/`-journal`. In
+                        # WAL mode recently-committed rows can live in the
+                        # `-wal` file until the next checkpoint, so a plain
+                        # copy of the main file can be MISSING data that is
+                        # not "lost" at all - it just has not been
+                        # checkpointed yet - which is exactly the wrong thing
+                        # for evidence collected because something looked
+                        # like loss. One stamp for the whole set, so the main
+                        # file and its sidecars are named as one snapshot.
+                        _forensic_stamp = _stamp()
+                        shutil.copy2(
+                            LOCAL_DB,
+                            QUARANTINE / f"{LOCAL_DB.name}.refused-{_forensic_stamp}",
+                        )
+                        for _sidecar_suffix in SIDECARS:
+                            _sidecar = LOCAL_DB.with_name(
+                                LOCAL_DB.name + _sidecar_suffix
+                            )
+                            if _sidecar.exists():
+                                shutil.copy2(
+                                    _sidecar,
+                                    QUARANTINE
+                                    / f"{_sidecar.name}.refused-{_forensic_stamp}",
+                                )
+                        _forensic_copy_last_monotonic = _forensic_now
+                    except Exception:
+                        pass
                 _prev_desc = (
                     f"{previous} chat(s) holding {prev_content / 1e6:.1f} MB "
                     f"of content in a {prev_bytes / 1e6:.1f} MB file"
@@ -1345,11 +1552,26 @@ def sync_loop() -> None:
         f"{SYNC_INTERVAL_S:.0f}s"
     )
     consecutive_failures = 0
+    # v3.1.9 (hostile pass #2, MEDIUM): "sync_loop never logs or counts a
+    # skip, so a permanently idle daemon is invisible." sync_once has TWO
+    # skip reasons and they are not alike. "unchanged since last sync" is
+    # what her being asleep looks like, correctly, every quiet night this
+    # pod runs — counting or alarming on it would train an operator to
+    # ignore this log within a week. "no local database yet" is not: it
+    # means LOCAL_DB has never once existed this run, which is what a wrong
+    # WEBUI_LOCAL_DB (or WEBUI_DB_LOCAL=false pointing the sync daemon at
+    # nothing) looks like — supervisord shows RUNNING, sync_once returns
+    # cleanly every cycle (error=None), and the one startup line above is
+    # the only evidence for the life of the pod otherwise. Only THAT reason
+    # is counted, on the same shout-on-first-then-hourly-forever shape as
+    # the failure counter below.
+    consecutive_no_local = 0
     while True:
         time.sleep(SYNC_INTERVAL_S)
         r = sync_once()
         if r["error"]:
             consecutive_failures += 1
+            consecutive_no_local = 0
             # `in (3, 12, 48)` MEANT THE LOG WENT QUIET AFTER FOUR HOURS, on
             # the one condition where /data holds the only copy that survives
             # a pod recreate. A membership test says it three times and then
@@ -1368,8 +1590,27 @@ def sync_loop() -> None:
                     f"minutes without a durable copy of chat history). The "
                     f"volume is probably degraded; the live database is fine."
                 )
-        elif r["synced"]:
+        elif r["skipped"] == "no local database yet":
             consecutive_failures = 0
+            consecutive_no_local += 1
+            if consecutive_no_local == 3 or (
+                consecutive_no_local > 3 and consecutive_no_local % 12 == 0
+            ):
+                logger.error(
+                    f"no local database at {LOCAL_DB} for "
+                    f"{consecutive_no_local} cycles in a row "
+                    f"({consecutive_no_local * SYNC_INTERVAL_S / 60:.0f} "
+                    f"minutes) — nothing has been published this run. This is "
+                    f"what a wrong WEBUI_LOCAL_DB (or WEBUI_DB_LOCAL) looks "
+                    f"like from in here: no error, supervisord shows RUNNING, "
+                    f"and otherwise nothing says so. Check the path exists "
+                    f"and OpenWebUI is actually writing to it."
+                )
+        else:
+            # Either published, or the ordinary "unchanged since last sync"
+            # skip — both mean nothing is currently wrong.
+            consecutive_failures = 0
+            consecutive_no_local = 0
 
 
 if __name__ == "__main__":

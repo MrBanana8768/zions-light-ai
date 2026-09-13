@@ -84,6 +84,10 @@ def wipe():
             f = p.with_name(p.name + suffix)
             if f.exists():
                 f.unlink()
+    # Each scenario is its own incident and expects its own forensic copy
+    # (FORENSIC_COPY_MIN_INTERVAL_S) — several can run within the same
+    # process well inside the default 3600s throttle window.
+    webuidb._forensic_copy_last_monotonic = None
 
 
 print("two volumes:")
@@ -266,6 +270,70 @@ check(
     f"a genuine change is published ({r2['skipped'] or r2['error']}) - the "
     f"skip must not be able to strand the snapshot",
 )
+
+print()
+print("[10] live_webui_db() reads WEBUI_DB_LOCAL fresh, never a frozen guess")
+# hostile pass #2, A3-4/A3-9 ("the webuidb half"). backup.py picked the
+# live database by Path.exists() and froze it in a module constant at
+# import - so a stale local file left behind by the documented rollback
+# (WEBUI_DB_LOCAL true -> false, a container RESTART not a redeploy, so
+# the overlay and its abandoned webui.db both survive) was archived and
+# restored to forever, and the two long-lived processes (backup --daemon,
+# main.py) could not see the flag change during their own lifetime even if
+# the guess had been right. This function is the replacement primitive:
+# no caching, folded the same way entrypoint.sh's own WEBUI_DB_LOCAL
+# NORMALIZATION block folds spellings.
+_saved_gate = os.environ.get("WEBUI_DB_LOCAL")
+try:
+    for _raw, _want in (
+        ("true", webuidb.LOCAL_DB), ("True", webuidb.LOCAL_DB),
+        ("1", webuidb.LOCAL_DB), ("yes", webuidb.LOCAL_DB),
+        ("on", webuidb.LOCAL_DB), (" TRUE ", webuidb.LOCAL_DB),
+        ("false", webuidb.SNAPSHOT_DB), ("False", webuidb.SNAPSHOT_DB),
+        ("0", webuidb.SNAPSHOT_DB), ("no", webuidb.SNAPSHOT_DB),
+        ("off", webuidb.SNAPSHOT_DB),
+    ):
+        os.environ["WEBUI_DB_LOCAL"] = _raw
+        check(
+            webuidb.live_webui_db() == _want,
+            f"WEBUI_DB_LOCAL={_raw!r} -> {_want} (got {webuidb.live_webui_db()})",
+        )
+    os.environ.pop("WEBUI_DB_LOCAL", None)
+    check(
+        webuidb.live_webui_db() == webuidb.LOCAL_DB,
+        "unset defaults to LOCAL_DB, matching entrypoint.sh's own default "
+        "(WEBUI_DB_LOCAL:-true)",
+    )
+
+    print("    CONTROL: it is NOT cached - the same process sees a flag "
+          "flip mid-run, unlike backup.py's frozen constant")
+    os.environ["WEBUI_DB_LOCAL"] = "true"
+    _first = webuidb.live_webui_db()
+    os.environ["WEBUI_DB_LOCAL"] = "false"
+    _second = webuidb.live_webui_db()
+    check(
+        _first == webuidb.LOCAL_DB and _second == webuidb.SNAPSHOT_DB
+        and _first != _second,
+        f"the SAME process, no re-import, sees the flag change "
+        f"({_first} -> {_second}) - this is exactly what a frozen module "
+        f"constant cannot do",
+    )
+
+    print("    CONTROL: an unrecognised value RAISES rather than guessing")
+    os.environ["WEBUI_DB_LOCAL"] = "enabled"
+    try:
+        webuidb.live_webui_db()
+        check(False, "WEBUI_DB_LOCAL='enabled' should have raised")
+    except RuntimeError as e:
+        check(
+            "enabled" in str(e),
+            f"raises RuntimeError naming the bad value ({e})",
+        )
+finally:
+    if _saved_gate is None:
+        os.environ.pop("WEBUI_DB_LOCAL", None)
+    else:
+        os.environ["WEBUI_DB_LOCAL"] = _saved_gate
 
 print()
 if FAILED:

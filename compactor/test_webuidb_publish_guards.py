@@ -148,6 +148,12 @@ def wipe():
     if webuidb.EMPTY_START_MARKER.exists():
         webuidb.EMPTY_START_MARKER.unlink()
     CAP.records.clear()
+    # Each scenario is its own incident and expects its own forensic copy
+    # (FORENSIC_COPY_MIN_INTERVAL_S) — several run within the same process
+    # well inside the default 3600s throttle window; without this reset a
+    # later case's "nothing new copied" / "one copy landed" assertion would
+    # depend on execution order rather than on what that case tests.
+    webuidb._forensic_copy_last_monotonic = None
 
 
 def owui(path: Path, rows) -> None:
@@ -663,6 +669,185 @@ check(
 
 # ===========================================================================
 print()
+print("[FORENSIC] the shrink refusal's forensic copy is rate-limited, not")
+print("           made on every refused cycle (SP\\lane-webuidb.md #3)")
+# ===========================================================================
+# UNBOUNDED, BEFORE THIS FIX: every refused cycle (lost_chats or
+# lost_content) copied the WHOLE local database to QUARANTINE, and a
+# refusal repeats every SYNC_INTERVAL_S until an operator acts - so an
+# unaddressed regression copied the live-sized database onto /data forever
+# (~9.5 GB/day measured at the live 33 MB size and the default 300 s
+# interval). The FIRST copy of a new refusal must still be unconditional -
+# it is the earliest evidence of whatever went wrong - and every copy after
+# that, for the SAME ongoing refusal, is throttled to at most one per
+# FORENSIC_COPY_MIN_INTERVAL_S.
+check(
+    webuidb.FORENSIC_COPY_MIN_INTERVAL_S == 3600,
+    f"CONTROL: the default interval is 3600s (one hour), matching "
+    f"sync_loop's own failure-alarm cadence a few lines down in the same "
+    f"file (got {webuidb.FORENSIC_COPY_MIN_INTERVAL_S})",
+)
+
+wipe()
+owui(SNAP, [(f"conv-{i}", 1000 + i, conversation(200)) for i in range(20)])
+owui(LOCAL, [(f"conv-{i}", 1000 + i, conversation(200)) for i in range(2)])
+check(
+    chats(LOCAL) < chats(SNAP) * webuidb.SHRINK_REFUSE_BELOW
+    and chats(SNAP) >= webuidb.SHRINK_GUARD_MIN_CHATS,
+    f"PRECONDITION: 20 -> 2 chats trips the SHRINK (count) refusal "
+    f"({chats(LOCAL)} < {chats(SNAP)} * {webuidb.SHRINK_REFUSE_BELOW})",
+)
+_before = len(list(_QUAR.glob(f"{LOCAL.name}.refused-*")))
+r = webuidb.sync_once(force=True)
+check(r["synced"] is False, f"refused (synced={r['synced']})")
+_after_first = len(list(_QUAR.glob(f"{LOCAL.name}.refused-*")))
+check(
+    _after_first == _before + 1,
+    f"the FIRST refusal of a new incident copies unconditionally - it is "
+    f"the earliest evidence of whatever went wrong ({_before} -> {_after_first})",
+)
+
+print("    the SAME ongoing refusal, retried immediately, does NOT copy again")
+for _ in range(5):
+    r = webuidb.sync_once(force=True)
+    check(r["synced"] is False, f"still refused (synced={r['synced']})")
+_after_retries = len(list(_QUAR.glob(f"{LOCAL.name}.refused-*")))
+check(
+    _after_retries == _after_first,
+    f"5 more refused cycles, 0 more forensic copies ({_after_first} -> "
+    f"{_after_retries}) - unbounded, this would be +5 (~165 MB in this "
+    f"fixture, ~9.5 GB/day at the live 33 MB conversation size)",
+)
+
+print("    CONTROL: a DIFFERENT, later incident still gets its own copy once "
+      "the interval elapses - this is a rate limit, not a one-shot switch")
+# Manipulating the module's own monotonic bookkeeping directly (white-box,
+# consistent with how these suites already reach into EMPTY_START_MARKER
+# and the ALLOW_* globals) to simulate real time passing without an actual
+# 3600s sleep.
+webuidb._forensic_copy_last_monotonic = (
+    time.monotonic() - webuidb.FORENSIC_COPY_MIN_INTERVAL_S - 1
+)
+r = webuidb.sync_once(force=True)
+check(r["synced"] is False, f"still refused (synced={r['synced']})")
+_after_elapsed = len(list(_QUAR.glob(f"{LOCAL.name}.refused-*")))
+check(
+    _after_elapsed == _after_retries + 1,
+    f"once the interval has elapsed, the NEXT refused cycle copies again "
+    f"({_after_retries} -> {_after_elapsed}) - a slowly worsening state "
+    f"still leaves a trail of samples, it is not silenced forever",
+)
+
+print("    the interval is a knob, and _reload_env reloads it")
+r = with_env(
+    {"WEBUI_DB_FORENSIC_COPY_MIN_INTERVAL_S": "0"},
+    lambda: webuidb.sync_once(force=True),
+)
+check(r["synced"] is False, f"still refused (synced={r['synced']})")
+_after_zero = len(list(_QUAR.glob(f"{LOCAL.name}.refused-*")))
+check(
+    _after_zero == _after_elapsed + 1,
+    f"interval=0 copies on every refused cycle - a knob a test (or an "
+    f"operator) forgot _reload_env would ignore this until the process "
+    f"restarted ({_after_elapsed} -> {_after_zero})",
+)
+check(
+    webuidb.FORENSIC_COPY_MIN_INTERVAL_S == 3600,
+    "and the default is back afterwards (with_env restores it)",
+)
+
+print("    the forensic copy takes sidecars too, not just the main file")
+# hostile pass #2 LOW ("what I checked and found sound", sidecar audit):
+# this copied only LOCAL_DB, never -wal/-shm/-journal. In WAL mode recently
+# committed rows can live in -wal until the next checkpoint, so a copy of
+# the main file alone can be MISSING data that was never actually lost -
+# the wrong gap for evidence collected because something looked like loss.
+#
+# A plain "write garbage bytes to a -wal path" fixture does NOT reproduce
+# this: sync_once's own backup step opens and closes LOCAL_DB, and SQLite
+# checkpoints-and-deletes a WAL file when its connection is the LAST one
+# to close a WAL-mode database (verified directly, single-connection
+# script: a stray -wal survives the OPEN but is gone the instant the one
+# connection that touched it closes). In production it is never the last
+# connection - OpenWebUI holds LOCAL_DB open the whole time - so a SECOND,
+# still-open connection is what actually leaves committed-but-not-yet-
+# checkpointed data in -wal while sync_once's own connection comes and
+# goes. That is the fixture below, not a garbage byte string.
+wipe()
+owui(SNAP, [(f"conv-{i}", 1000 + i, conversation(200)) for i in range(20)])
+owui(LOCAL, [(f"conv-{i}", 1000 + i, conversation(200)) for i in range(2)])
+_wal = LOCAL.with_name(LOCAL.name + "-wal")
+_owui_con = sqlite3.connect(str(LOCAL))
+_owui_con.execute("PRAGMA journal_mode=WAL")
+# UPDATE, not INSERT: OWUI_CHAT declares 16 columns and this only needs to
+# generate real WAL content, not build a valid new row.
+_owui_con.execute("update chat set updated_at = updated_at + 1")
+_owui_con.commit()
+try:
+    check(
+        _wal.exists() and _wal.stat().st_size > 0,
+        f"PRECONDITION: OpenWebUI's still-open connection left real "
+        f"committed data in -wal ({_wal.stat().st_size if _wal.exists() else 0} bytes)",
+    )
+    _wal_bytes_before = _wal.read_bytes()
+    webuidb._forensic_copy_last_monotonic = None
+    r = webuidb.sync_once(force=True)
+    check(r["synced"] is False, f"refused (synced={r['synced']})")
+    check(
+        _wal.exists(),
+        "and the ORIGINAL -wal is untouched - OpenWebUI's connection is "
+        "still open, so sync_once's own connect+close did not checkpoint "
+        "it away (the precondition this case depends on)",
+    )
+finally:
+    _owui_con.close()  # simulate OpenWebUI eventually closing too
+
+_before_delta = len(list(_QUAR.glob(f"{LOCAL.name}.refused-*")))
+_main_copies = sorted(_QUAR.glob(f"{LOCAL.name}.refused-*"))
+_wal_copies = sorted(_QUAR.glob(f"{LOCAL.name}-wal.refused-*"))
+check(len(_main_copies) >= 1, f"the main file was copied ({len(_main_copies)})")
+check(
+    len(_wal_copies) >= 1 and _wal_copies[-1].read_bytes() == _wal_bytes_before,
+    f"and so was its -wal sidecar, with byte-identical content "
+    f"({len(_wal_copies)} copies)",
+)
+# Guarded, not chained onto the check above: an empty _wal_copies here means
+# the previous check already failed and recorded it - indexing [-1] into an
+# empty list would be a crash reported as this suite's own bug, not a red
+# for the property being tested (brief: "a traceback ... is a wrong-reason
+# red").
+if _main_copies and _wal_copies:
+    check(
+        _main_copies[-1].name.rsplit(".refused-", 1)[1]
+        == _wal_copies[-1].name.rsplit(".refused-", 1)[1],
+        f"and they share ONE stamp, so the two files are identifiable as "
+        f"one snapshot ({_main_copies[-1].name} / {_wal_copies[-1].name})",
+    )
+else:
+    check(False, "cannot compare stamps - no sidecar copy exists to compare")
+
+print("    CONTROL: row-loss and generation refusals still copy NOTHING - "
+      "unaffected by this fix, unlike the shrink refusal above")
+wipe()
+owui(SNAP, [("the-conversation", 1000, conversation(4000))])
+owui(LOCAL, [("the-conversation", 2000, conversation(2020))])
+webuidb._forensic_copy_last_monotonic = None
+_before_rowloss = len(list(_QUAR.glob(f"{LOCAL.name}.refused-*")))
+r = webuidb.sync_once(force=True)
+check(
+    r["synced"] is False and bool(r["error"]) and "WEBUI_DB_ALLOW_ROW_LOSS" in r["error"],
+    f"refused on row loss, not shrink (error={(r['error'] or '')[:60]!r})",
+)
+check(
+    len(list(_QUAR.glob(f"{LOCAL.name}.refused-*"))) == _before_rowloss,
+    "and still nothing copied - the row-loss/generation refusals were "
+    "already deliberately copy-free (the snapshot, not the local database, "
+    "holds the content in question there) and this fix must not change that",
+)
+
+
+# ===========================================================================
+print()
 print("[13b] _reload_env reloads every WEBUI_DB_* knob read at import")
 # ===========================================================================
 _src = (HERE / "webuidb.py").read_text(encoding="utf-8")
@@ -677,6 +862,143 @@ check(
 )
 _missing = sorted(k for k in _knobs if k not in _reload)
 check(not _missing, f"and every one is re-read by _reload_env (missing: {_missing})")
+
+
+# ===========================================================================
+print()
+print("[SYNC_LOOP] a run of 'no local database yet' skips is counted and "
+      "shouted; 'unchanged since last sync' never is")
+# ===========================================================================
+# hostile pass #2, MEDIUM: sync_loop never logged or counted a skip, so a
+# daemon idle for the life of the pod was invisible - only the one startup
+# line. That is exactly what a wrong WEBUI_LOCAL_DB looks like from in
+# here: supervisord shows RUNNING, sync_once returns cleanly every cycle
+# (error=None), nothing is ever published. The other skip reason,
+# "unchanged since last sync", is NOT the same thing and must stay silent -
+# it is what her being asleep looks like, correctly, every quiet night this
+# pod runs, and alarming on it would train an operator to ignore this log
+# within a week.
+
+
+class _StopLoop(Exception):
+    pass
+
+
+def _drive_sync_loop(results):
+    """Run the REAL sync_loop() with time.sleep patched to a no-op and
+    sync_once patched to return each of `results` in turn, stopping via a
+    sentinel exception once exhausted - sync_loop has no exit condition of
+    its own. Returns nothing; assert on CAP.records afterward."""
+    it = iter(results)
+
+    def fake_sync_once(*_a, **_kw):
+        try:
+            return next(it)
+        except StopIteration:
+            raise _StopLoop()
+
+    orig_sleep, orig_sync_once = time.sleep, webuidb.sync_once
+    time.sleep = lambda _s: None
+    webuidb.sync_once = fake_sync_once
+    try:
+        webuidb.sync_loop()
+    except _StopLoop:
+        pass
+    finally:
+        time.sleep = orig_sleep
+        webuidb.sync_once = orig_sync_once
+
+
+_NO_LOCAL = {"synced": False, "skipped": "no local database yet", "error": None, "bytes": 0}
+_UNCHANGED = {"synced": False, "skipped": "unchanged since last sync", "error": None, "bytes": 0}
+_SYNCED = {"synced": True, "skipped": None, "error": None, "bytes": 1000}
+
+# `consecutive_no_local` is a LOCAL inside sync_loop(), reset to 0 on every
+# call - so each scenario below drives ONE call with the WHOLE sequence of
+# cycles it needs, never several short calls expecting the count to carry
+# over between them (it cannot: there is nothing for it to live in between
+# calls, which is also exactly why this counter cannot leak past a real
+# process restart).
+CAP.records.clear()
+_drive_sync_loop([_NO_LOCAL] * 2)
+check(
+    not logged(logging.ERROR, "no local database"),
+    "2 skips in a row: silent, same as the failure counter's own first-two "
+    "grace period",
+)
+
+CAP.records.clear()
+_drive_sync_loop([_NO_LOCAL] * 3)
+check(
+    logged(logging.ERROR, "no local database at") and logged(logging.ERROR, "3 cycles"),
+    "the 3rd consecutive 'no local database yet' skip shouts, naming the "
+    "path and the count - this is the reason [C8]'s wrong-WEBUI_LOCAL_DB "
+    "case was invisible",
+)
+check(
+    sum(1 for lv, msg in CAP.records if lv >= logging.ERROR and "no local database" in msg) == 1,
+    "and shouts exactly ONCE for cycles 1-3, not once per cycle",
+)
+
+CAP.records.clear()
+_drive_sync_loop([_NO_LOCAL] * 11)
+check(
+    sum(1 for lv, msg in CAP.records if lv >= logging.ERROR and "no local database" in msg) == 1,
+    "cycles 4-11: still exactly the one shout from cycle 3 - quiet again, "
+    "same shout-then-wait shape as the failure counter (3, then every 12th)",
+)
+
+CAP.records.clear()
+_drive_sync_loop([_NO_LOCAL] * 12)
+check(
+    logged(logging.ERROR, "12 cycles"),
+    "the 12th consecutive skip shouts again - not silent forever after the "
+    "first shout, which is the ORIGINAL failure-counter defect this mirrors",
+)
+check(
+    sum(1 for lv, msg in CAP.records if lv >= logging.ERROR and "no local database" in msg) == 2,
+    "exactly two shouts across 12 cycles (at 3 and at 12), not more",
+)
+
+print("    CONTROL: 'unchanged since last sync' is NEVER counted or shouted")
+CAP.records.clear()
+_drive_sync_loop([_UNCHANGED] * 40)
+check(
+    not any(lv >= logging.WARNING for lv, _msg in CAP.records),
+    f"40 ordinary 'unchanged' skips in a row: silent at WARNING or above "
+    f"({len(CAP.records)} record(s) at any level, all INFO or below) - this "
+    f"is what her being asleep looks like, and alarming on it is the noise "
+    f"that gets a real alarm ignored",
+)
+
+print("    CONTROL: a successful publish resets the streak - the NEXT "
+      "incident shouts at its own 3rd cycle, not immediately")
+CAP.records.clear()
+_drive_sync_loop([_NO_LOCAL, _NO_LOCAL, _SYNCED, _NO_LOCAL, _NO_LOCAL])
+check(
+    not logged(logging.ERROR, "no local database"),
+    "2 skips, a real publish, then 2 more skips of a NEW incident: still "
+    "quiet - proves the counter was reset by the successful publish rather "
+    "than continuing from 2",
+)
+CAP.records.clear()
+_drive_sync_loop([_NO_LOCAL, _NO_LOCAL, _SYNCED, _NO_LOCAL, _NO_LOCAL, _NO_LOCAL])
+check(
+    logged(logging.ERROR, "no local database at") and logged(logging.ERROR, "3 cycles"),
+    "...and that new incident's OWN 3rd cycle shouts, exactly like the "
+    "first incident did - the counter restarted, it did not resume from 2",
+)
+
+print("    CONTROL: an actual publish FAILURE still uses the pre-existing "
+      "counter and cadence, unchanged by this fix")
+CAP.records.clear()
+_FAILED_R = {"synced": False, "skipped": None, "error": "RuntimeError: boom", "bytes": 0}
+_drive_sync_loop([_FAILED_R] * 3)
+check(
+    logged(logging.ERROR, "snapshot publish has failed 3 times"),
+    "the failure counter's own shout-at-3 still fires - this fix must not "
+    "shadow it",
+)
 
 
 print()

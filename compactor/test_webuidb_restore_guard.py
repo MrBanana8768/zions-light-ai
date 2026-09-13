@@ -119,6 +119,12 @@ def wipe():
             f = p.with_name(p.name + suffix)
             if f.exists():
                 f.unlink()
+    # Each scenario is its own incident and expects its own forensic copy
+    # (FORENSIC_COPY_MIN_INTERVAL_S) — several run within the same process
+    # well inside the default 3600s throttle window; without this reset a
+    # later refusal's "NOTHING new copied" or "a copy was made" assertion
+    # would depend on execution order rather than on what that case tests.
+    webuidb._forensic_copy_last_monotonic = None
     # The empty-start marker refuses EVERY publish while it exists, so a case
     # that leaks one turns every later control into a false refusal. Same
     # reason [6] asserts the override flag is back off afterwards.
@@ -987,6 +993,99 @@ check(
     "refuse every route out of this state, it refused them until local grew "
     "past half the snapshot and then published over it at 51%",
 )
+
+# ---------------------------------------------------------------------------
+print()
+print("[16] a snapshot that cannot be STAT'ED is refused, not read as 'fresh'")
+# hostile pass #2, MEDIUM. Path.exists() swallows every OSError and answers
+# False for both "nothing there" and "I could not look" - and on the volume
+# whose read reliability is this module's entire subject, restore_on_boot's
+# fresh-vs-restore decision read those as the SAME thing. An unstatable
+# snapshot fell straight through to action="fresh", exit 0, OpenWebUI builds
+# an empty schema, and because the exit code was 0 entrypoint.sh never wrote
+# .empty-start - the file its own banner calls "what protects /data, not the
+# shrink ratio". See _presence().
+#
+# The hostile pass's own proof (C10) used an ENOTDIR path (a directory
+# component that is actually a file) under Linux, where stat() raises
+# NotADirectoryError. VERIFIED NOT PORTABLE: on Windows the identical setup
+# raises FileNotFoundError instead (WinError 3 reads as "the path does not
+# exist", not "I could not check") - so that specific reproduction is
+# platform-dependent for a reason that has nothing to do with the code under
+# test. A fake stat() that raises a chosen OSError tests the same property
+# (restore_on_boot must not collapse "cannot stat" into "absent") without
+# depending on what a given OS reports for a filesystem shape no test
+# environment can make a real stalled mount produce anyway.
+
+
+class _UnstatableSnapshot:
+    """Stands in for webuidb.SNAPSHOT_DB: .stat() always raises the given
+    OSError, simulating a mount that answers an error rather than 'found'
+    or 'not found'. Everything restore_on_boot does with a snapshot that
+    DOES exist is unreachable through this fake (it only reaches
+    _presence(), which calls .stat() and nothing else), which is exactly
+    the point - this proves the FIRST branch point, not the rest of the
+    restore."""
+
+    def __init__(self, exc: OSError):
+        self._exc = exc
+
+    def stat(self):
+        raise self._exc
+
+    def __str__(self):
+        return "<unstatable-snapshot-for-testing>"
+
+
+wipe()  # LOCAL absent too - this is exactly the fresh-vs-restore fork
+_orig_snapshot_db = webuidb.SNAPSHOT_DB
+webuidb.SNAPSHOT_DB = _UnstatableSnapshot(
+    OSError(5, "simulated I/O error: stalled mount")
+)
+try:
+    r = webuidb.restore_on_boot()
+finally:
+    webuidb.SNAPSHOT_DB = _orig_snapshot_db
+check(
+    r["action"] == "error",
+    f"refuses to boot rather than guess (action={r['action']!r})",
+)
+check(
+    r["action"] != "fresh",
+    "and specifically does NOT take the dangerous wrong answer - 'fresh' "
+    "means OpenWebUI builds an empty schema and RESTORE_EXIT_CODES['fresh'] "
+    "is 0, so entrypoint.sh would never reach the branch that writes "
+    ".empty-start",
+)
+check(
+    webuidb.RESTORE_EXIT_CODES.get(r["action"]) == 5,
+    f"and that action exits 5 (error), the same code the OTHER unexpected-"
+    f"filesystem-state branches in this function use (got "
+    f"{webuidb.RESTORE_EXIT_CODES.get(r['action'])})",
+)
+
+print("    CONTROL: a snapshot that genuinely does not exist is still 'fresh'")
+# Without this, [16] could be passing because restore_on_boot now refuses
+# EVERY boot with no local database - which would "fix" the finding by
+# breaking every brand-new deployment instead.
+wipe()
+r = webuidb.restore_on_boot()
+check(
+    r["action"] == "fresh",
+    f"a real first boot (nothing anywhere) is still 'fresh', unchanged "
+    f"(action={r['action']!r})",
+)
+
+print("    CONTROL: a snapshot that genuinely exists still restores normally")
+wipe()
+make_db(SNAP, 40, "HER-REAL-HISTORY")
+r = webuidb.restore_on_boot()
+check(
+    r["action"] == "restored_from_snapshot" and chats(LOCAL) == 40,
+    f"an ordinary healthy snapshot still restores (action={r['action']!r}, "
+    f"chats={chats(LOCAL) if LOCAL.exists() else None!r})",
+)
+
 
 print()
 if FAILED:

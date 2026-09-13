@@ -29,6 +29,8 @@ a property of what those files SAY.
 
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
 
 FAILED: list[str] = []
@@ -55,13 +57,146 @@ def _gate_block(branch: str) -> str:
     return ENTRY[start:else_at] if branch == "on" else ENTRY[else_at:end]
 
 
-print("[1] the flag exists and defaults to the fix being ON")
-check('WEBUI_DB_LOCAL="${WEBUI_DB_LOCAL:-true}"' in ENTRY,
-      "WEBUI_DB_LOCAL defaults to true — the local-disk move is the right "
-      "default and stays it; the rollout opts OUT for a few steps rather than "
-      "the image shipping the bug by default")
+print("[1] WEBUI_DB_LOCAL is normalised before the boot branch ever reads it")
+# v3.1.9 (hostile pass #2, LOW). This used to assert the literal source text
+# `WEBUI_DB_LOCAL="${WEBUI_DB_LOCAL:-true}"` and `[ "${WEBUI_DB_LOCAL}" =
+# "true" ]` — i.e. it PINNED the strict byte comparison that WAS the finding
+# (`True`/`TRUE`/`1`/`yes`/`on`/`" true"` all silently meant false, while
+# every sibling flag in this subsystem folds case and trims whitespace).
+# Asserting the exact string that is the bug in place is not a regression
+# test for it; it is the opposite. Updated deliberately: this now runs the
+# REAL entrypoint.sh block under `sh`, the same technique
+# test_config_supervisord_bool.py uses for its four booleans, and checks the
+# PROPERTY that matters — every spelling the subsystem's other flags accept
+# resolves to the same true/false, unset/empty still defaults to true
+# unchanged, and an unrecognised value is refused rather than guessed.
 check('if [ "${WEBUI_DB_LOCAL}" = "true" ]; then' in ENTRY,
-      "and the boot block branches on it")
+      "the boot block still branches on a strict, canonical comparison — "
+      "correct AFTER normalisation, which is what makes a strict comparison "
+      "safe here")
+
+
+def extract_block(text: str, begin: str, end: str) -> str | None:
+    # None, not a raised exception, when the markers are absent — the
+    # REVERT of this whole fix (the mutation-testing baseline: "the code AS
+    # IT SHIPPED" before this finding was fixed) has no such block at all,
+    # and a test that can only fail by crashing has not demonstrated
+    # anything about the property it claims to check (brief rule: "a
+    # traceback ... is a wrong-reason red — fix the test").
+    if begin not in text:
+        return None
+    i = text.index(begin)
+    line_end = text.index("\n", i)
+    j = text.index(end, line_end)
+    return text[line_end + 1:j]
+
+
+WDB_BLOCK = extract_block(
+    ENTRY,
+    "# BEGIN WEBUI_DB_LOCAL NORMALIZATION",
+    "# END WEBUI_DB_LOCAL NORMALIZATION",
+)
+check(WDB_BLOCK is not None,
+      "the WEBUI_DB_LOCAL normaliser block (BEGIN/END markers) is present "
+      "in entrypoint.sh")
+
+
+def _sh_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+_MARK = "===WEBUI_DB_LOCAL_RESULT==="
+
+
+def run_wdb_normalizer(raw_value: str | None) -> tuple[str, str, int]:
+    """Run the REAL block under `sh` with WEBUI_DB_LOCAL=raw_value (unset
+    entirely if raw_value is None — a distinct case from the empty string),
+    and return (full stdout — the block's own banner/echo, if any; the
+    exported value after the marker, '' if the script never reached it;
+    exit code). `env -i` is not used here (unlike
+    test_config_supervisord_bool.py's run_normalizer) because the block's
+    own unset-vs-empty branch needs to observe a truly ABSENT variable,
+    which a `VAR=''` assignment cannot represent.
+
+    A MARKER, not "take the last line": unlike the supervisord `_bool`
+    block (silent on success, WARNING to stderr only on a fallback), this
+    block echoes a confirmation line to STDOUT on every path that does not
+    exit — so the raw exported value and the block's own prose share one
+    stream and a plain trailing-printf would run the two together."""
+    setup = "" if raw_value is None else f"WEBUI_DB_LOCAL={_sh_quote(raw_value)}\n"
+    script = f'{setup}{WDB_BLOCK}\nprintf "{_MARK}%s" "${{WEBUI_DB_LOCAL}}"\n'
+    proc = subprocess.run(
+        ["sh", "-c", script], capture_output=True, text=True, timeout=10,
+    )
+    if _MARK in proc.stdout:
+        banner, _, value = proc.stdout.partition(_MARK)
+    else:
+        banner, value = proc.stdout, ""
+    return banner, value, proc.returncode
+
+
+if WDB_BLOCK is None:
+    print("  FAIL cannot run the normaliser checks below — the block itself "
+          "is missing (see the check just above)")
+    FAILED.append("WEBUI_DB_LOCAL NORMALIZATION block is missing from entrypoint.sh")
+elif shutil.which("sh") is None:
+    print("  SKIP (no `sh` on PATH — needs the unit-tests container or any "
+          "POSIX shell): the WEBUI_DB_LOCAL normaliser checks below did not "
+          "run. The text checks in this file still did.")
+else:
+    print("    unset/empty keeps meaning true, unchanged")
+    for raw, label in ((None, "unset"), ("", "empty string")):
+        _banner, value, rc = run_wdb_normalizer(raw)
+        check(rc == 0 and value == "true",
+              f"WEBUI_DB_LOCAL {label}: resolves to true, exit 0 "
+              f"(got {value!r}, rc={rc})")
+
+    print("    explicit true/false are UNCHANGED — the one thing this fix "
+          "must not touch")
+    for raw in ("true", "false"):
+        _banner, value, rc = run_wdb_normalizer(raw)
+        check(rc == 0 and value == raw,
+              f"WEBUI_DB_LOCAL={raw!r}: resolves to {raw!r} exactly, exit 0 "
+              f"(got {value!r}, rc={rc})")
+
+    print("    folded the same way this subsystem's other flags fold "
+          "(trimmed, case-insensitive, 1/yes/on and 0/no/off)")
+    FOLD_CASES = [
+        ("True", "true"), ("TRUE", "true"), ("1", "true"),
+        ("yes", "true"), ("YES", "true"), ("on", "true"),
+        (" true", "true"), ("true ", "true"), ("true\n", "true"),
+        ("False", "false"), ("0", "false"), ("no", "false"),
+        ("off", "false"), (" false ", "false"),
+    ]
+    for raw, want in FOLD_CASES:
+        _banner, value, rc = run_wdb_normalizer(raw)
+        check(rc == 0 and value == want,
+              f"WEBUI_DB_LOCAL={raw!r}: folds to {want!r} — the finding's own "
+              f"table named this spelling as silently meaning false before "
+              f"this fix (got {value!r}, rc={rc})")
+
+    print("    an UNRECOGNISED, non-empty value refuses to boot rather than "
+          "guessing which placement is safe")
+    for raw in ("enabled", "2", "y", "t", "maybe", "TrueFalse"):
+        banner, value, rc = run_wdb_normalizer(raw)
+        check(rc == 1,
+              f"WEBUI_DB_LOCAL={raw!r}: exits 1 (got rc={rc}, "
+              f"stdout={banner[:60]!r})")
+        check(value == "",
+              f"WEBUI_DB_LOCAL={raw!r}: the script exits before ever "
+              f"exporting a value — does NOT silently resolve to either "
+              f"placement (got {value!r}) — a guess in either direction is "
+              f"worse than refusing, per the comment beside the block")
+
+    print("    CONTROL: the refusal names the raw value and both wrong "
+          "guesses, so an operator reading the boot log knows what to fix")
+    banner, _value, _rc = run_wdb_normalizer("enabled")
+    check(
+        "WEBUI_DB_LOCAL=[enabled]" in banner and "REFUSING" in banner
+        and "false" in banner and "true" in banner,
+        f"the banner quotes the raw value and explains both directions "
+        f"(got {banner[:200]!r})",
+    )
 
 print("[2] gate ON does what v3.1.6 always did")
 on = _gate_block("on")
