@@ -683,6 +683,73 @@ def test_tok_state_that_raises_is_unobservable():
           "TOK FIRES: a tokenizer_state() that breaks its contract is unobservable")
 
 
+def test_tok_real_contract_end_to_end():
+    """MERGE-LEVEL: the config lane's REAL tokenizer_state() feeding the health
+    lane's REAL reason, with nothing mocked between them.
+
+    Every TOK test above substitutes a hand-built state dict, and the config
+    lane's own tests assert on the dict without ever rendering it. So each lane
+    was proven against its own idea of the other. They disagreed: the config
+    lane stored next_retry_at on time.monotonic(), this lane computes
+    `next_retry_at - time.time()`, and the rendered reason read "next retry in
+    0s" for the life of the process. Found at the merge, fixed there (the state
+    is now converted to wall clock), and pinned here, because a contract
+    between two lanes is checked by nobody except whoever joins them.
+    """
+    print("\n[TOK] MERGE: real get_tokenizer miss -> real tokenizer_state -> real reason")
+    _reset_all()
+    import re
+    import types
+
+    calls = []
+
+    class _Boom:
+        @staticmethod
+        def from_pretrained(repo):
+            calls.append(repo)
+            raise OSError("no weights here (merge test)")
+
+    fake = types.ModuleType("transformers")
+    fake.AutoTokenizer = _Boom
+    saved = {k: getattr(main, k) for k in (
+        "_tokenizer", "_TOKENIZER_TRIED", "MODEL_REPO", "_TOKENIZER_LAST_ERROR",
+        "_TOKENIZER_FAILED_AT", "_TOKENIZER_NEXT_RETRY_AT", "_TOKENIZER_RETRY_S")}
+    saved_mod = sys.modules.get("transformers")
+    sys.modules["transformers"] = fake
+    main._tokenizer = None
+    main._TOKENIZER_TRIED = False
+    main.MODEL_REPO = "does/not-exist"
+    main._TOKENIZER_LAST_ERROR = None
+    main._TOKENIZER_FAILED_AT = None
+    main._TOKENIZER_NEXT_RETRY_AT = None
+    main._TOKENIZER_RETRY_S = main._TOKENIZER_RETRY_FLOOR_S
+    try:
+        check(hasattr(main, "tokenizer_state"),
+              "MERGE: main.tokenizer_state exists on the merged tree")
+        check(main.get_tokenizer() is None and len(calls) == 1,
+              "MERGE fixture: one real failed load happened")
+        st = main.tokenizer_state()
+        check(sorted(st) == ["failed_at", "last_error", "loaded", "next_retry_at"],
+              f"MERGE: the contract carries exactly the four agreed keys (got {sorted(st)})")
+        r = full()
+    finally:
+        for k, v in saved.items():
+            setattr(main, k, v)
+        if saved_mod is None:
+            sys.modules.pop("transformers", None)
+        else:
+            sys.modules["transformers"] = saved_mod
+    print(f"      reasons={r['status_reasons']}")
+    check(r["status"] == "degraded" and _has(r, "local tokenizer"),
+          "MERGE: the real failure reaches /health/full as the tokenizer reason")
+    text = " ".join(r["status_reasons"])
+    m = re.search(r"next retry in (\d+)s", text)
+    floor = main._TOKENIZER_RETRY_FLOOR_S
+    check(m is not None and floor - 5 <= int(m.group(1)) <= floor + 1,
+          f"MERGE: the countdown is the real backoff (~{floor:.0f}s), not the "
+          f"monotonic/wall mismatch's permanent 0s (got {m.group(0) if m else None!r})")
+
+
 TESTS = [
     test_n6_a_state_write_that_never_lands_degrades,
     test_n6_control_healthy_turns_stay_ok,
@@ -704,6 +771,7 @@ TESTS = [
     test_tok_loaded_is_reported_and_ok,
     test_tok_failed_load_is_a_status_reason,
     test_tok_state_that_raises_is_unobservable,
+    test_tok_real_contract_end_to_end,
 ]
 
 
