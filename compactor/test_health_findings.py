@@ -176,7 +176,14 @@ def test_f1_zero_backups_is_ok_during_the_grace_window():
 
 
 def test_f1_zero_backups_after_the_grace_window_degrades():
-    print("\n[F1] the same pod, one interval later, still zero archives")
+    print("\n[F1] the same pod, past the grace window, still zero archives")
+    # v3.1.9 (hostile pass 3, F7, part 1): the grace used to be a FULL
+    # COMPACTOR_BACKUP_INTERVAL_HOURS (24h here). It is now min(interval, 2h)
+    # — a cycle plus several retries, not a whole day of silence over the
+    # worst durability state there is. The boundary below moves from
+    # 23h/25h to just under/over 2h accordingly; see health._container_
+    # started_at's docstring for why the CLOCK also changed (F7 part 2,
+    # exercised separately in test_f7_grace_survives_a_compactor_only_respawn).
     _reset_all()
     with patch.dict(os.environ, {
         "COMPACTOR_BACKUP_ENABLED": "true",
@@ -186,20 +193,154 @@ def test_f1_zero_backups_after_the_grace_window_degrades():
         r = full()
     print(f"      reasons={r['status_reasons']}")
     check(r["status"] == "degraded" and _has(r, "zero archives"),
-          "F1 FIRES: zero backups past one full interval degrades the pod")
+          "F1 FIRES: zero backups well past the grace degrades the pod")
 
-    # BOUNDARY, both sides of the same clock. Reproduces hostile317-c F4:
-    # her real store, zero archives, status ok, reasons [] — that exact
-    # unfixed state is what the grace window's LEFT side still has to permit
-    # on purpose; only the right side is the actual finding.
+    # BOUNDARY, both sides of the same clock: just under vs. just over the
+    # new min(interval, 2h) = 7200s grace (interval is 24h here, so the cap
+    # binds). Reproduces hostile317-c F4's own left side on purpose (zero
+    # archives inside the grace is still "ok"); the right side is F7.
     with patch.dict(os.environ, {
         "COMPACTOR_BACKUP_ENABLED": "true",
         "COMPACTOR_BACKUP_INTERVAL_HOURS": "24",
     }):
-        health._reset_process_started_at_for_tests(time.time() - 23 * 3600)
+        health._reset_process_started_at_for_tests(time.time() - (7200 - 600))
         under = full()
     check(under["status"] == "ok",
-          "F1 BOUNDARY: one hour short of the interval is still grace")
+          "F1/F7 BOUNDARY: ten minutes short of the 2h grace cap is still grace")
+
+    with patch.dict(os.environ, {
+        "COMPACTOR_BACKUP_ENABLED": "true",
+        "COMPACTOR_BACKUP_INTERVAL_HOURS": "24",
+    }):
+        health._reset_process_started_at_for_tests(time.time() - (7200 + 600))
+        over = full()
+    check(over["status"] == "degraded" and _has(over, "zero archives"),
+          "F7 BOUNDARY: ten minutes past the 2h grace cap degrades")
+
+
+def test_f7_grace_uses_the_shorter_interval_when_configured_below_2h():
+    print("\n[F7] a 1h backup interval caps the grace at the INTERVAL, not "
+          "always at 2h — min(interval, 2h)")
+    _reset_all()
+    with patch.dict(os.environ, {
+        "COMPACTOR_BACKUP_ENABLED": "true",
+        "COMPACTOR_BACKUP_INTERVAL_HOURS": "1",
+    }):
+        health._reset_process_started_at_for_tests(time.time() - 3500)  # < 1h
+        under = full()
+        health._reset_process_started_at_for_tests(time.time() - 3700)  # > 1h
+        over = full()
+    check(under["status"] == "ok",
+          "F7: under the 1h interval (which is below the 2h cap) is still grace")
+    check(over["status"] == "degraded" and _has(over, "zero archives"),
+          "F7: past the 1h interval degrades — the grace did not silently "
+          "widen to 2h just because the cap exists")
+
+
+def test_f7_grace_survives_a_compactor_only_respawn():
+    print("\n[F7] part 2: a compactor-only respawn (this process's own start "
+          "time jumping to 'now') must NOT reset the grace — the container's "
+          "own clock, which does not restart with the compactor, is what "
+          "the grace is measured from")
+    _reset_all()
+    try:
+        # But THIS process (the compactor) just respawned a moment ago —
+        # exactly what a crash loop or a burst of hot-patch restarts does.
+        # Before this fix, _PROCESS_STARTED_AT WAS the only clock, so this
+        # alone reset the grace to fresh every time, and a pod whose backups
+        # had never succeeded could sit at "ok" forever through a crash loop.
+        health._reset_process_started_at_for_tests(time.time())
+        # The CONTAINER (backup daemon's actual environment) has been up for
+        # 3 hours — well past the 2h grace — and never produced an archive.
+        # Set AFTER _reset_process_started_at_for_tests, which moves BOTH
+        # signals together — this independently overrides just the
+        # container one, so the two clocks actually disagree, which is the
+        # whole point of this test.
+        health._set_container_started_at_for_tests(time.time() - 3 * 3600)
+        with patch.dict(os.environ, {
+            "COMPACTOR_BACKUP_ENABLED": "true",
+            "COMPACTOR_BACKUP_INTERVAL_HOURS": "24",
+        }):
+            r = full()
+        print(f"      reasons={r['status_reasons']}")
+        check(r["status"] == "degraded" and _has(r, "zero archives"),
+              "F7 FIXED: the container's real uptime (3h) still degrades the "
+              "pod even though the compactor process itself just started — "
+              "before this fix, a fresh _PROCESS_STARTED_AT alone made this 'ok'")
+    finally:
+        health._clear_container_started_at_override_for_tests()
+
+
+def test_f7_unreadable_backup_dir_is_unobservable_not_zero():
+    print("\n[F7] part 3: a backup dir this process cannot LIST reads as "
+          "unobservable, not as zero archives")
+    if os.name != "posix":
+        print("  SKIPPED: chmod-based unreadable-directory simulation needs "
+              "POSIX permission bits (Windows dev box). Linux container run "
+              "exercises this for real.")
+        return
+    _reset_all()
+    import tempfile
+    locked_dir = Path(tempfile.mkdtemp(prefix="p3c-f7-locked-"))
+    os.chmod(locked_dir, 0o000)
+    try:
+        # Root (and some container setups) ignore directory permission bits
+        # entirely — confirm the lockout actually holds before trusting the
+        # rest of this test, same doctrine the brief asks for everywhere
+        # else (a mutation/permission change that did not apply has no
+        # result).
+        try:
+            list(os.scandir(locked_dir))
+            print("  SKIPPED: running with enough privilege that chmod 000 "
+                  "did not actually block listing (root?) — cannot simulate "
+                  "an unreadable directory here.")
+            return
+        except PermissionError:
+            pass
+
+        with patch.object(backup, "latest_backup_info",
+                           lambda: {"count": 0, "latest": None,
+                                    "latest_mtime": None, "dir": str(locked_dir),
+                                    "error": None}), \
+             patch.dict(os.environ, {
+                 "COMPACTOR_BACKUP_ENABLED": "true",
+                 "COMPACTOR_BACKUP_INTERVAL_HOURS": "24",
+             }):
+            health._reset_process_started_at_for_tests(time.time() - 25 * 3600)
+            r = full()
+        print(f"      reasons={r['status_reasons']}")
+        check(r["status"] == "degraded" and _has(r, "backup status unobservable"),
+              "F7 FIXED: an unreadable backup dir is 'unobservable', not "
+              "silently treated as zero archives")
+        check(not _has(r, "holds zero archives"),
+              "F7: and specifically NOT the 'zero archives, nothing to "
+              "restore' claim, which this process cannot actually verify")
+    finally:
+        os.chmod(locked_dir, 0o755)
+        locked_dir.rmdir()
+
+
+def test_f8_nonpositive_backup_interval_is_named_as_a_reason():
+    print("\n[F8] COMPACTOR_BACKUP_INTERVAL_HOURS=0 (or negative, or non-"
+          "finite) is named as its own reason, not silently clamped away")
+    _reset_all()
+    for bad in ("0", "-5", "nan", "inf"):
+        with patch.dict(os.environ, {
+            "COMPACTOR_BACKUP_ENABLED": "true",
+            "COMPACTOR_BACKUP_INTERVAL_HOURS": bad,
+        }):
+            health._reset_process_started_at_for_tests(time.time())
+            r = full()
+        check(_has(r, "COMPACTOR_BACKUP_INTERVAL_HOURS"),
+              f"F8: {bad!r} is named as a reason")
+    with patch.dict(os.environ, {
+        "COMPACTOR_BACKUP_ENABLED": "true",
+        "COMPACTOR_BACKUP_INTERVAL_HOURS": "24",
+    }):
+        health._reset_process_started_at_for_tests(time.time())
+        control = full()
+    check(not _has(control, "COMPACTOR_BACKUP_INTERVAL_HOURS"),
+          "F8 CONTROL: a normal positive interval names no such reason")
 
 
 def test_f1_backups_disabled_is_not_a_fault():
@@ -702,6 +843,10 @@ def test_f5_quality_gate_skips_are_intended_to_degrade_status():
 TESTS = [
     test_f1_zero_backups_is_ok_during_the_grace_window,
     test_f1_zero_backups_after_the_grace_window_degrades,
+    test_f7_grace_uses_the_shorter_interval_when_configured_below_2h,
+    test_f7_grace_survives_a_compactor_only_respawn,
+    test_f7_unreadable_backup_dir_is_unobservable_not_zero,
+    test_f8_nonpositive_backup_interval_is_named_as_a_reason,
     test_f1_backups_disabled_is_not_a_fault,
     test_f1_stale_latest_backup_degrades_and_fresh_does_not,
     test_f1_backup_probe_error_is_unobservable,

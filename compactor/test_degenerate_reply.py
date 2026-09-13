@@ -408,9 +408,21 @@ print("[9b] R25 (hostile317-a F5) — the fragment-line rule must reach the "
 # ordinary roleplay beat) must not be refused from memory just because it
 # sits ahead of other content, the same way a 66-item Bible list that
 # closes in prose is not a runaway.
-check(fragments(110, 15) + "\n\nAnd that was the end of it, for now.", False,
-      "a 1,600+ character fragment line followed by a closing sentence is "
-      "not a runaway - the fragment line does not reach the reply's own end")
+#
+# v3.1.9 (hostile pass 3, F5) NARROWS THIS FURTHER: "nothing after it" was
+# too generous a reading of "not the last line". The two real false
+# positives this rule protects were 25,209- and 15,141-CHARACTER replies —
+# substantial prose followed the fragment block, not one short sentence.
+# The trailing text below is now built to that real shape (several hundred
+# characters of ordinary prose, at least DEGENERATE_MIN_CHARS), and a
+# SEPARATE case right after it proves a SHORT trailing line (a sign-off,
+# the exact shape this rule used to wrongly exempt) is caught again.
+_substantial_close = (prose_sentence + " ") * 4  # ~350 chars, well over
+assert len(_substantial_close) >= main.DEGENERATE_MIN_CHARS
+check(fragments(110, 15) + "\n\n" + _substantial_close, False,
+      "a 1,600+ character fragment line followed by a SUBSTANTIAL closing "
+      "paragraph (the real corpus shape, ~350 chars of ordinary prose) is "
+      "not a runaway")
 check(
     "Before I answer, one note.\n\n" + fragments(110, 15),
     True,
@@ -420,15 +432,42 @@ check(
 # The comma-separated shape (no sentence break at all) must obey the same
 # rule - it is the same collapse with a smaller separator (see the module
 # comment above DEGENERATE_LINE_CHARS).
-check(comma_long + "\n\nThanks for asking.", False,
-      "the same comma-separated collapse followed by a closing line is not "
-      "a runaway either")
+check(comma_long + "\n\n" + _substantial_close, False,
+      "the same comma-separated collapse followed by a substantial closing "
+      "paragraph is not a runaway either")
 # CONTROL: a genuine runaway that ends the reply (nothing after it, as the
 # corpus shape always is) is caught with or without this fix - proves R25
 # narrows the rule rather than disabling it.
 check(fragments(110, 15), True,
       "fixture ok   CONTROL: the same fragment line with nothing after it "
       "(the corpus shape) is still caught")
+
+print()
+print("[9c] hostile pass 3, F5 — a runaway followed by only a SHORT trailing "
+      "line (well under DEGENERATE_MIN_CHARS) must still be caught, not "
+      "exempted just because it is technically not the last line")
+# Proof (SP\\p3-c\\p3c_fragment.py, frag1.log): before this fix, all of B-F
+# below scored 'stored' (memorized) instead of 'skipped_degenerate'.
+check(fragments(110, 15) + "\n\nAlways yours.", True,
+      "B: runaway line + a short sign-off line is still caught")
+check(fragments(110, 15) + "\n\n\U0001F60A", True,
+      "C: runaway line + a lone emoji line is still caught")
+check(fragments(110, 15) + "\n\n---", True,
+      "F: runaway line + a bare '---' is still caught")
+# D: the trailing content is not SHORT (about 600 chars, over
+# DEGENERATE_MIN_CHARS) but IS itself fragment-shaped - a second, shorter
+# cut runaway. Char count alone must not be enough to exempt: the longest
+# trailing line must also fail _line_is_fragment_shaped.
+_second_runaway = fragments(40, 15)  # ~600 chars, same collapse shape
+assert len(_second_runaway) >= main.DEGENERATE_MIN_CHARS
+assert main._line_is_fragment_shaped(_second_runaway)
+check(fragments(110, 15) + "\n\n" + _second_runaway, True,
+      "D: runaway line + a SECOND runaway (600+ chars, but itself "
+      "fragment-shaped) is still caught - trailing char count alone is not "
+      "an exemption")
+# E: the comma-separated collapse shape gets the identical treatment.
+check(comma_long + "\n\nThanks for asking.", True,
+      "E: comma collapse + a short trailing line is still caught")
 
 print()
 print("[R-TAIL] a PHRASE repeating to the end of the reply (v3.1.8)")

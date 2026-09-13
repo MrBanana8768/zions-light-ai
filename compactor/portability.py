@@ -61,21 +61,50 @@ BUNDLE_VERSION = "v2.1"
 # Export
 # ---------------------------------------------------------------------------
 
-def export_conversation(conv_id: str) -> dict:
+def export_conversation(conv_id: str, *, strict: bool = False) -> dict:
     """Snapshot one conv's full V2 state as a single JSON-serializable dict.
 
-    Best-effort per layer: a failure in one layer doesn't poison the
-    bundle — it just gets an empty value. The bundle always has every
-    expected key so import logic doesn't need defensive .get() calls.
+    Best-effort per layer BY DEFAULT: a failure in one layer doesn't poison
+    the bundle — it just gets an empty value. The bundle always has every
+    expected key so import logic doesn't need defensive .get() calls. This
+    is the right contract for GET /admin/.../export (an operator inspecting
+    or backing up a conv wants whatever CAN be read, not a hard failure).
+
+    v3.1.9 (hostile pass 3, F9). `strict=True` is for callers that DECIDE
+    something based on the fact/summary counts this returns: merge_
+    conversation reports `src_facts` and folds them into dst, and
+    fork_conversation writes them into a brand-new conv_id via
+    import_conversation. Both used to inherit the best-effort default, so a
+    SOURCE whose facts file held a torn write (StoreUnreadable) merged or
+    forked as "0 facts" — silently, with no error, exactly the "unknown read
+    as empty" hazard this codebase's own doctrine rejects everywhere else
+    (import's pre-flight, health's `unreadable` counts, quarantine's
+    `unverified_layers`). In strict mode, `facts.load_facts` and
+    `summarizer.load_state` raising `memory.StoreUnreadable` PROPAGATES
+    rather than being caught — callers map that to a 400, the same shape
+    import_conversation already uses for "cannot verify, refusing". Episodic
+    is unchanged either way: `retrieval.export_indexed_exchanges` is
+    contractually never-raising (its own docstring), a retrieval.py contract
+    this module does not own or override.
     """
     try:
         loaded_facts = facts.load_facts(conv_id)
+    except memory.StoreUnreadable:
+        if strict:
+            raise
+        logger.warning(f"conv={conv_id}: export facts failed, StoreUnreadable")
+        loaded_facts = []
     except Exception as e:
         logger.warning(f"conv={conv_id}: export facts failed: {e}")
         loaded_facts = []
 
     try:
         summary_state = summarizer.load_state(conv_id)
+    except memory.StoreUnreadable:
+        if strict:
+            raise
+        logger.warning(f"conv={conv_id}: export summary failed, StoreUnreadable")
+        summary_state = {}
     except Exception as e:
         logger.warning(f"conv={conv_id}: export summary failed: {e}")
         summary_state = {}
@@ -1030,6 +1059,10 @@ def _dst_last_used_floor(dst_facts: list[dict]) -> int:
     yet (the recommended-order case — merge before her first message — where
     there is nothing in dst to be older than, and nothing has raced it yet
     either).
+
+    v3.1.9 (hostile pass 3, F6): only ever called now when the caller passed
+    `refresh_last_used=True` — see merge_conversation's docstring for why
+    this stopped being automatic.
     """
     return max((int(f.get("last_used", 0) or 0) for f in dst_facts), default=0)
 
@@ -1127,8 +1160,35 @@ def _merge_fact_lists(
     return merged, {"added": added, "updated": updated, "unchanged": unchanged}
 
 
+def _evicted_by_origin(
+    merged: list[dict], dst_len: int, evicted: list[dict]
+) -> tuple[int, int]:
+    """Split an `_lru_split` eviction list by which side of the merge each
+    fact came from. Returns (dst_evicted, merged_in_evicted).
+
+    v3.1.9 (hostile pass 3, F6): `facts_over_budget_after_merge` used to be a
+    bare count, so an operator reading "54 over budget" could not tell
+    whether that was 54 of the FORK's old facts (expected, fine) or 54 of
+    HER OWN (the failure mode this whole finding is about) — exactly the
+    distinction the runbook's "Older forks" step needs before trusting its
+    own "expect most of what they add to be evicted" promise.
+
+    `_merge_fact_lists` builds `merged` as `list(dst_facts)` first (so
+    indices [0, dst_len) are always dst's own rows, updated in place on a
+    collision but never reordered or removed) and only APPENDS brand-new
+    src-only facts after that boundary — see its docstring. So origin is a
+    plain index-boundary check, not a per-fact tag: identity (`id()`) is
+    used to test evicted-list membership against that same object list, the
+    same pattern `facts._lru_split` itself uses for `kept_ids`.
+    """
+    dst_ids = {id(f) for f in merged[:dst_len]}
+    dst_evicted = sum(1 for f in evicted if id(f) in dst_ids)
+    return dst_evicted, len(evicted) - dst_evicted
+
+
 def merge_conversation(
-    src_conv_id: str, dst_conv_id: str, *, dry_run: bool = True
+    src_conv_id: str, dst_conv_id: str, *, dry_run: bool = True,
+    refresh_last_used: bool = False,
 ) -> dict:
     """Fold src's FACTS and EPISODIC memory into dst. Both survive.
 
@@ -1149,7 +1209,12 @@ def merge_conversation(
         history src's does. Merging them would double-count the narrative
         and corrupt the very layer that survived the fork intact.
       * SRC. Read-only throughout. A merge that damages its source is not
-        recoverable if the result is wrong.
+        recoverable if the result is wrong. "Read-only" does not mean
+        unguarded, though (v3.1.9, hostile pass 3, reviewer D F5): a memory
+        write in flight on src (conv_lock(src_conv_id).locked()) refuses
+        the merge just like one on dst does, because a merge that reads src
+        while a tail is mid-drain silently omits whatever that tail was
+        about to write.
 
     Facts are unioned on _fact_key; dst's wording wins on collision, but pin
     and last_used are folded across BOTH copies (see _merge_fact_pin_and_recency)
@@ -1166,13 +1231,70 @@ def merge_conversation(
     `dry_run` defaults to TRUE. The compact endpoint defaults the other way
     and that surprised an operator into a live run; this one touches two
     conversations at once and gets the safer default.
+
+    `refresh_last_used` (v3.1.9, hostile pass 3, F6; opt-in, default FALSE).
+    When True, every brand-new (non-colliding) merged-in fact has its
+    last_used floored to dst's own current newest last_used before it is
+    written — see `_merge_fact_lists`'s `last_used_floor` doc for the
+    mechanism. This existed unconditionally in 3005438, built for ONE shape:
+    an id-migration where dst already holds a BACKFILL's fresh
+    re-extractions (minted at ~merge time) and src holds her real, genuinely
+    older originals — there, leaving last_used alone made the originals look
+    artificially ancient next to an artifact of extraction timing, and
+    facts.prune_facts archived the large majority of them on the very next
+    write (reviewed: 115 of 136).
+
+    Hostile pass 3 (F6) found the SAME unconditional floor breaks the
+    opposite-order, equally documented workflow: RUNBOOK_MEMORY_IDENTITY.md's
+    "Older forks" step merges an abandoned fork's facts into the primary
+    conversation SHE IS STILL CHATTING IN, no backfill involved. There dst's
+    last_used values are GENUINE — real recency of real use, not a backfill
+    artifact — and the floor stamps every merged-in (old, correctly
+    lower-priority) fork fact up to "the time of her last message", which
+    outranks every one of HER OWN facts not touched on that exact turn.
+    Measured: floor OFF correctly archives the 14-day-old fork facts on the
+    next exchange (matching what the runbook tells the operator to expect);
+    floor ON archives 55 of her 85 real facts instead and keeps every one of
+    the fork's.
+
+    A boolean signal that distinguishes the two shapes without guessing
+    (dst's last_used SPREAD is not reliable — an actively-chatted dst can
+    have a spread as wide as a stale-backfill dst does, see the finding) does
+    not exist without reading backfill.py's own completion state, which this
+    module does not own. So the floor is now OPT-IN rather than automatic:
+    default False leaves last_used alone (correct for "Older forks", fork
+    reconcile, and any merge into a store that already reflects real usage —
+    which is the more common shape, and the one where guessing wrong is
+    silent data-priority loss on HER side). Pass refresh_last_used=True
+    explicitly for the id-migration/backfill recovery this was built for,
+    where the caller (the runbook step, or an operator who just ran a
+    backfill under the new id) KNOWS dst's freshness is an extraction
+    artifact rather than real use.
+
+    Either way, `facts_over_budget_after_merge` in the result is now split by
+    origin (`dst_facts_evicted_after_merge` / `merged_facts_evicted_after_merge`)
+    so the operator can see WHICH side would be archived before choosing.
     """
     if not src_conv_id or not dst_conv_id:
         raise ValueError("both src_conv_id and dst_conv_id are required")
     if src_conv_id == dst_conv_id:
         raise ValueError("src and dst are the same conversation")
 
-    src = export_conversation(src_conv_id)
+    # v3.1.9 (hostile pass 3, F9). strict=True: an unreadable src facts file
+    # (a torn write, StoreUnreadable) must not merge as "0 facts" — silently
+    # proceeding on episodic alone, or refusing with the wrong reason
+    # ("nothing to merge") when facts genuinely exist but could not be read.
+    # See export_conversation's own docstring for why this is scoped to
+    # facts/summary and not episodic (retrieval.py's own never-raises
+    # contract, not owned here).
+    try:
+        src = export_conversation(src_conv_id, strict=True)
+    except memory.StoreUnreadable as e:
+        raise ValueError(
+            f"conv {src_conv_id}: could not read facts or summary state "
+            f"({e}) — refusing to merge on an unknown source rather than "
+            f"treating an unreadable file as empty"
+        ) from e
     src_facts = src.get("facts") or []
     src_episodic = src.get("episodic") or []
     if not src_facts and not src_episodic:
@@ -1191,8 +1313,14 @@ def merge_conversation(
     # between here and there is not clobbered or ignored. The floor is
     # recomputed from that same fresh read down there (F6) rather than
     # reused from here, for the identical reason.
+    #
+    # v3.1.9 (hostile pass 3, F6): floor is OPT-IN now — see the docstring.
+    # None means _merge_fact_lists leaves every merged-in fact's own
+    # last_used alone, which is what makes real LRU comparison (dst's actual
+    # usage vs src's actual usage) possible again for the non-backfill shape.
     _preview_merged, fact_stats = _merge_fact_lists(
-        dst_facts, src_facts, last_used_floor=_dst_last_used_floor(dst_facts)
+        dst_facts, src_facts,
+        last_used_floor=_dst_last_used_floor(dst_facts) if refresh_last_used else None,
     )
 
     try:
@@ -1208,6 +1336,7 @@ def merge_conversation(
         "src_conv_id": src_conv_id,
         "dst_conv_id": dst_conv_id,
         "dry_run": dry_run,
+        "refresh_last_used": refresh_last_used,
         "src_facts": len(src_facts),
         "dst_facts_before": len(dst_facts),
         "facts_to_add": fact_stats["added"],
@@ -1238,6 +1367,17 @@ def merge_conversation(
         _preview_merged, facts._MAX_FACTS_TOKENS
     )
     result["facts_over_budget_after_merge"] = len(_evicted_preview)
+    # v3.1.9 (hostile pass 3, F6): WHICH side would be archived, not just how
+    # many — see _evicted_by_origin's docstring. This is the number the
+    # runbook's "Older forks" step needs to see before trusting its own
+    # "expect most of what they add to be evicted" line, and the number that
+    # would have shown the F6 regression (55 of hers, not the fork's) in the
+    # response itself instead of only on the next exchange.
+    _dst_evicted, _merged_evicted = _evicted_by_origin(
+        _preview_merged, len(dst_facts), _evicted_preview
+    )
+    result["dst_facts_evicted_after_merge"] = _dst_evicted
+    result["merged_facts_evicted_after_merge"] = _merged_evicted
     if dry_run:
         return result
 
@@ -1255,6 +1395,35 @@ def merge_conversation(
             f"underneath it - that writer would overwrite the merged facts on "
             f"its next save. Retry in a moment."
         )
+    # v3.1.9 (hostile pass 3, reviewer D F5). SOURCE holds the identical
+    # hazard, one step earlier, and this used to check only dst — merge is
+    # read-only on src, and "read-only" was read as "nothing to guard". It
+    # is not, on the identity runbook's own R3 (reverse merge): R2's first
+    # message under the new uuid starts a summary rebuild that holds
+    # conv_lock(uuid) for the WHOLE drain (10-30 minutes, the runbook's own
+    # estimate; 23 summarization calls measured on one branch), and her
+    # NEXT messages under the uuid queue their episodic-index and fact-
+    # extraction tails behind that same lock. Running R3 (src=uuid) in that
+    # window reads the uuid's store AS IT STANDS mid-rebuild, commits, and
+    # reports success (`exchanges_added: 1`) — then the queued tails finish
+    # and write turns 214, 216 and two facts under the uuid, AFTER the
+    # header is gone and the reverse merge already declared done (reviewer
+    # D, run ident3k: 17:12:52.069 merge logs success, 17:12:52.775 and
+    # 17:13:09.509 the queued tail's writes land). Nothing is destroyed —
+    # a second reverse merge recovers them — but R3's own success check
+    # (facts_added present) passes while the copy is silently incomplete.
+    # Same refusal, same message shape, for the same reason one call
+    # earlier: a merge that read src while its own writer was mid-drain
+    # would silently omit whatever that writer was about to add.
+    if memory.conv_lock(src_conv_id).locked():
+        raise ValueError(
+            f"conv_id {src_conv_id!r} has a memory write in flight (extraction "
+            f"tail, archive, restore or dedup). Refusing rather than merging "
+            f"FROM it while incomplete - the source's own queued writes would "
+            f"land after this merge already reported success, stranding them "
+            f"under the source instead of copying them across. Retry in a "
+            f"moment."
+        )
 
     # Re-read rather than trusting the counters computed above: the tail may
     # have added facts between the pre-flight read and here. Re-run the same
@@ -1264,7 +1433,8 @@ def merge_conversation(
     # its "already present" status re-checked.
     current = facts.load_facts(dst_conv_id)
     merged, actual_stats = _merge_fact_lists(
-        current, src_facts, last_used_floor=_dst_last_used_floor(current)
+        current, src_facts,
+        last_used_floor=_dst_last_used_floor(current) if refresh_last_used else None,
     )
     if merged != current:
         facts.save_facts(dst_conv_id, merged)
@@ -1275,6 +1445,9 @@ def merge_conversation(
     # re-running _merge_fact_lists itself against `current`.
     _kept_actual, _evicted_actual = facts._lru_split(merged, facts._MAX_FACTS_TOKENS)
     result["facts_over_budget_after_merge"] = len(_evicted_actual)
+    _dst_evicted, _merged_evicted = _evicted_by_origin(merged, len(current), _evicted_actual)
+    result["dst_facts_evicted_after_merge"] = _dst_evicted
+    result["merged_facts_evicted_after_merge"] = _merged_evicted
 
     added = 0
     for e in new_exchanges:
@@ -1318,7 +1491,22 @@ def fork_conversation(
         suffix = uuid.uuid4().hex[:6]
         new_conv_id = f"{src_conv_id}__fork_{suffix}"
 
-    bundle = export_conversation(src_conv_id)
+    # v3.1.9 (hostile pass 3, F9). strict=True — same reasoning as
+    # merge_conversation: an unreadable src facts/summary file must not
+    # silently fork as an empty-facts tombstone (which also then blocks
+    # needs_backfill from ever rebuilding it — see the finding). Mapped to
+    # ImportError_ rather than a bare StoreUnreadable so the existing
+    # main.py catch clause on admin_fork_conversation (`except
+    # (portability.ImportError_, UnsafeConvId)`) already handles this as a
+    # 400 with no endpoint change needed.
+    try:
+        bundle = export_conversation(src_conv_id, strict=True)
+    except memory.StoreUnreadable as e:
+        raise ImportError_(
+            f"conv {src_conv_id}: could not read facts or summary state "
+            f"({e}) — refusing to fork an unknown source rather than "
+            f"produce an empty-facts copy"
+        ) from e
     bundle["source_conv_id"] = src_conv_id
     result = import_conversation(bundle, target_conv_id=new_conv_id, overwrite=False)
     result["forked_from"] = src_conv_id

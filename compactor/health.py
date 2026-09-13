@@ -70,9 +70,119 @@ _VLLM_PROBE_TIMEOUT_S = env_float("COMPACTOR_HEALTH_PROBE_TIMEOUT_S", 3.0)
 _PROCESS_STARTED_AT = time.time()
 
 
+# v3.1.9 (hostile pass 3, F7). Test-only override for _container_started_at,
+# so existing tests that drive the grace window via
+# _reset_process_started_at_for_tests keep working unchanged — see that
+# function and _container_started_at's docstring. None (the default) means
+# "read the real /proc files"; production never sets this.
+_CONTAINER_STARTED_AT_OVERRIDE: float | None = None
+_CONTAINER_STARTED_AT_OVERRIDE_SET = False
+
+
 def _reset_process_started_at_for_tests(t: float | None = None) -> None:
-    global _PROCESS_STARTED_AT
-    _PROCESS_STARTED_AT = time.time() if t is None else t
+    """Reset BOTH uptime signals health.py can consult to the same value:
+    `_PROCESS_STARTED_AT` (the pre-F7 clock, still the fallback) and the
+    `_container_started_at()` override (the new primary clock). One lever,
+    same as before this fix — a test that wants the two signals to DISAGREE
+    (proving F7's actual point: a compactor-only respawn must not reset the
+    grace) uses `_set_container_started_at_for_tests` instead, independently.
+    """
+    global _PROCESS_STARTED_AT, _CONTAINER_STARTED_AT_OVERRIDE, _CONTAINER_STARTED_AT_OVERRIDE_SET
+    v = time.time() if t is None else t
+    _PROCESS_STARTED_AT = v
+    _CONTAINER_STARTED_AT_OVERRIDE = v
+    _CONTAINER_STARTED_AT_OVERRIDE_SET = True
+
+
+def _set_container_started_at_for_tests(t: float | None) -> None:
+    """Independently override `_container_started_at()`'s return value.
+    `t=None` clears the override (falls back to the real /proc read, or to
+    `_PROCESS_STARTED_AT` if that also fails) — distinct from
+    `_reset_process_started_at_for_tests`, which moves BOTH signals
+    together. This one exists so a test can hold the container's start
+    fixed while `_PROCESS_STARTED_AT` moves (simulating a compactor-only
+    respawn) — the exact scenario F7 part 2 is about.
+    """
+    global _CONTAINER_STARTED_AT_OVERRIDE, _CONTAINER_STARTED_AT_OVERRIDE_SET
+    _CONTAINER_STARTED_AT_OVERRIDE = t
+    _CONTAINER_STARTED_AT_OVERRIDE_SET = t is not None
+
+
+def _clear_container_started_at_override_for_tests() -> None:
+    """Fully clear the override (distinct from passing t=None to
+    _set_container_started_at_for_tests, which also clears it — this name
+    exists for readability at call sites that just want 'stop overriding,
+    go back to the real /proc read')."""
+    global _CONTAINER_STARTED_AT_OVERRIDE, _CONTAINER_STARTED_AT_OVERRIDE_SET
+    _CONTAINER_STARTED_AT_OVERRIDE = None
+    _CONTAINER_STARTED_AT_OVERRIDE_SET = False
+
+
+def _container_started_at() -> float | None:
+    """Best-effort wall-clock epoch of PID 1's start — i.e. this CONTAINER's
+    own start, not this process's. None if it cannot be read (non-Linux, no
+    /proc, permission denied, or a malformed stat line).
+
+    v3.1.9 (hostile pass 3, F7). `_PROCESS_STARTED_AT` above is read at
+    health.py's OWN import time, inside the COMPACTOR process specifically —
+    and the compactor is not the backup daemon. Production supervisord logs
+    show compactor-only respawns with no backup-daemon restart alongside
+    them (2026-08-31, 2026-09-01) and deploy windows with 6 pod boots inside
+    25 minutes; on a genuinely FRESH pod either clock is fine, but on a
+    compactor crash-loop or a burst of hot-patch restarts,
+    `_PROCESS_STARTED_AT` keeps sliding forward to "now" on every respawn —
+    so a pod whose backups have NEVER succeeded, ever, can sit at
+    `status: ok` indefinitely, because the grace window's clock never
+    accumulates real elapsed time. The daemon itself would be the honest
+    clock (a `.daemon_started` stamp, or a last-cycle timestamp it writes)
+    but backup.py is not a file this lane may edit — see the report for
+    exactly what such a stamp would need.
+
+    PID 1 is the closest available proxy that does NOT reset on a
+    compactor-only respawn: under supervisord (this project's entrypoint)
+    PID 1 is supervisord itself, alive for the container's whole life
+    regardless of how many times any one of its children — compactor OR
+    backup — gets restarted. It DOES reset on what actually matters here: a
+    pod recreate, a full container restart. That is exactly the survives-a-
+    child-restart, resets-on-a-real-reboot signal this grace window needs.
+
+    Mechanism: /proc/uptime's first field is seconds-since-boot (of the
+    kernel the container's namespace shares with the host, monotonic and
+    independent of wall-clock changes), and /proc/1/stat's 22nd
+    whitespace-separated field (after skipping the parenthesized comm name,
+    which can itself contain spaces or parens) is PID 1's start time in
+    clock ticks since boot. `os.sysconf("SC_CLK_TCK")` converts ticks to
+    seconds (typically 100 on Linux). PID1_start_epoch = now - uptime_s +
+    (start_ticks / clk_tck) is then an absolute wall-clock estimate of when
+    PID 1 (the container) started.
+
+    Best-effort per this module's own doctrine: ANY failure (file missing,
+    permission denied, unexpected format) returns None, and callers fall
+    back to `_PROCESS_STARTED_AT` — the exact pre-fix behavior — rather than
+    raising into a health poll or guessing a value that looks precise and
+    is not.
+    """
+    if _CONTAINER_STARTED_AT_OVERRIDE_SET:
+        return _CONTAINER_STARTED_AT_OVERRIDE
+    try:
+        with open("/proc/uptime", "r", encoding="ascii") as fh:
+            uptime_s = float(fh.read().split()[0])
+        with open("/proc/1/stat", "r", encoding="ascii") as fh:
+            stat_line = fh.read()
+        # comm (field 2) is parenthesized and may itself contain ")" or
+        # spaces (a process renamed via prctl); fields are unambiguous only
+        # after the LAST ")", per proc(5).
+        after_comm = stat_line.rsplit(")", 1)[1].split()
+        # after_comm[0] is field 3 (state); starttime is field 22, i.e.
+        # index 22 - 3 = 19 into this remainder.
+        start_ticks = float(after_comm[19])
+        clk_tck = os.sysconf("SC_CLK_TCK")
+        if clk_tck <= 0:
+            return None
+        now = time.time()
+        return now - uptime_s + (start_ticks / clk_tck)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +300,32 @@ def _resolve_live_webui_db() -> tuple[Any, str | None]:
 def _check_one_journal(db_path: str) -> dict:
     """The magic-header check, isolated to one candidate path so
     probe_sqlite_journal can run it against more than one file without
-    duplicating the read/parse logic."""
+    duplicating the read/parse logic.
+
+    v3.1.9 (hostile pass 3, F4). The magic header alone is NOT "an
+    uncommitted transaction, never a healthy writer" the way
+    probe_sqlite_journal's own docstring used to claim. SQLite writes the
+    magic into the journal header at commit AND at every mid-transaction
+    page-cache spill (the default `synchronous` syncs the journal before it
+    touches the database), and OpenWebUI stores a whole conversation in one
+    `chat` row (27-33MB for the production one), so a single UPDATE of that
+    row spills and carries the magic header for the ENTIRE write, seconds
+    long, while the writer holds SQLite's RESERVED lock throughout. Measured
+    (reviewer, local disk): 72% of the time spent writing that row read as a
+    hot journal. That is a live transaction, not the debris this reason
+    exists to catch, and reporting it "degraded... stop openwebui" trains
+    the operator to ignore the one reason that exists for the 2026-08-31
+    outage class.
+    backup._probe_reserved_lock (added in 6171faf for restore, same
+    underlying SQLite fact: RESERVED means a write transaction is active
+    right now) is the second half of SQLite's own definition of "hot" — no
+    process holds RESERVED, AND the journal's first byte is non-zero — the
+    magic-header check alone only ever implemented the second half. Imported
+    rather than re-implemented: one raw fcntl() byte-range probe, used by
+    both the restore guard and this one, so they cannot drift apart on what
+    "hot" means the way the magic-only check and pager.c's own definition
+    already had (reviewer B, "The open discrepancy").
+    """
     journal = db_path + "-journal"
     try:
         if not os.path.exists(journal):
@@ -200,8 +335,51 @@ def _check_one_journal(db_path: str) -> dict:
     except OSError as e:
         return {"ok": None, "hot": None, "path": journal,
                 "error": f"{type(e).__name__}: {e}"}
-    hot = head == _SQLITE_JOURNAL_MAGIC
-    return {"ok": not hot, "hot": hot, "path": journal, "header": head.hex()}
+    magic_present = head == _SQLITE_JOURNAL_MAGIC
+    # v3.1.9 (F4): a live writer holding RESERVED while the magic header is
+    # present is a transaction IN PROGRESS, not a stalled recovery — see the
+    # docstring. `_probe_reserved_lock` fails OPEN (returns False, "no lock
+    # detected") on any platform/mount without POSIX fcntl byte-range locks
+    # (Windows; a network filesystem whose client doesn't implement them) —
+    # the SAFE direction here, deliberately: on such a mount `writer_active`
+    # is always False and `hot` collapses back to the magic-only check this
+    # probe has always run, so a real hot journal is never masked by an
+    # inability to prove a writer is active. The cost is the false-positive
+    # this finding is about staying possible on THAT class of mount — a
+    # known, pre-existing gap `_probe_reserved_lock`'s own docstring already
+    # names — never a false negative on a genuinely hot journal.
+    writer_active = magic_present and _probe_reserved_lock_from_backup(db_path)
+    hot = magic_present and not writer_active
+    result = {
+        "ok": not hot, "hot": hot, "path": journal, "header": head.hex(),
+    }
+    if magic_present:
+        # Surfaced only when it is actually informative (the magic header is
+        # present) — a quiet False on every other probe would just be noise.
+        result["writer_active"] = writer_active
+    return result
+
+
+def _probe_reserved_lock_from_backup(db_path: str) -> bool:
+    """Thin wrapper around backup._probe_reserved_lock so _check_one_journal
+    has one call site and this module never copies the fcntl logic itself
+    (the brief for F4: "import it; do not copy it"). A lazy import, matching
+    _resolve_live_webui_db's own pattern just above — backup.py is already
+    imported in this same request by _gather_blocking for latest_backup_info,
+    so this costs nothing extra in the request path that matters (the health
+    poll), and keeps health.py free of a module-level dependency on backup.py
+    for the (rarer) callers that only want the cheap probes.
+    """
+    try:
+        import backup as backup_module
+        return bool(backup_module._probe_reserved_lock(Path(db_path)))
+    except Exception:
+        # Best-effort by this module's own contract (see probe_sqlite_
+        # journal's docstring): if the probe itself cannot run (backup.py
+        # failed to import, the path is bogus), that is "could not prove a
+        # writer is active", not "one is" — same fail-open direction
+        # _probe_reserved_lock takes internally on its own missing-fcntl case.
+        return False
 
 
 def probe_sqlite_journal() -> dict:
@@ -226,8 +404,20 @@ def probe_sqlite_journal() -> dict:
     hot journal from one belonging to a live writer: it has to take a write
     lock to find out, OpenWebUI holds that lock, so the probe fails with the
     same 'readonly database' text whether or not anything is wrong. That
-    ambiguity cost real time on 2026-09-07. Reading 8 bytes takes no lock,
-    blocks nothing, and cannot be confused by a healthy writer.
+    ambiguity cost real time on 2026-09-07. Reading 8 bytes takes no lock and
+    blocks nothing.
+
+    v3.1.9 (hostile pass 3, F4) CORRECTS THE CLAIM ABOVE. The magic header
+    by itself CAN be confused by a healthy writer, and routinely is: SQLite
+    writes it at every mid-transaction page-cache spill, not only at
+    interrupted commit, and OpenWebUI's one-row-per-conversation schema
+    spills on every save of a large chat. _check_one_journal now also checks
+    whether a RESERVED lock is held (backup._probe_reserved_lock) before
+    calling a magic header "hot" — see that function's docstring for the
+    mechanism and the measured false-positive rate. The header read is still
+    what makes this lock-free and non-blocking; the lock PROBE (a
+    non-blocking fcntl try-lock, not a SQLite connection) is what tells a
+    live transaction from actual debris.
 
     Best-effort by the module's own contract: a probe that cannot answer
     reports that it could not, and never raises into the endpoint.
@@ -971,12 +1161,34 @@ async def gather_health_full(
             # windowed field (tailhealth.SKIP_DEGRADE_WINDOW_S), so a skip
             # degrades while it is happening and for a while after, then
             # clears itself — the cumulative `skipped` is history, not status.
+            # v3.1.9 (hostile pass 3, F10, LOW — wording only). All FOUR
+            # numbers below are keyed on ANY skip, harmless ones (task
+            # traffic, a deliberate /forget, a duplicate) included, not just
+            # lossy ones — only the TRIGGER (skipped_recently) uses
+            # HARMLESS_SKIP_OUTCOMES-aware windowing. OPERATIONS.md already
+            # warns the `last outcome` alone can read harmless; it does not
+            # say the COUNT and the "most recent" age can be inflated by the
+            # same harmless traffic — under the connection-header identity
+            # route, OpenWebUI's own follow-up call lands seconds after every
+            # real turn as skipped_task_traffic, so by the time anyone reads
+            # this reason all four fields typically describe THAT, not the
+            # one lossy skip that actually triggered it (measured: 1,500
+            # task-traffic skips against 1 real one gave "1503 reply(ies)
+            # not memorized... last outcome skipped_task_traffic"). A
+            # genuinely lossy-only count/clock/outcome needs tailhealth.py
+            # (not this lane's file) to track them separately — see the
+            # report for exactly what that needs. This wording caveat is the
+            # health-side half: honest about what the numbers already are,
+            # without fabricating precision this module does not have.
             reasons.append(
                 f"memory tail skipping: {mt.get('skipped')} reply(ies) not "
-                f"memorized ({mt.get('consecutive_skips')} consecutive, most "
-                f"recent {mt.get('seconds_since_last_skip')}s ago, last "
-                f"outcome {mt.get('last_skip_outcome')}). New memory is not "
-                f"being written for the turns that were skipped."
+                f"memorized since start ({mt.get('consecutive_skips')} "
+                f"consecutive skips of ANY kind, most recent "
+                f"{mt.get('seconds_since_last_skip')}s ago, that skip's "
+                f"outcome {mt.get('last_skip_outcome')}) — these counts "
+                f"include harmless skips (task traffic, /forget, duplicates), "
+                f"not only lossy ones; see OPERATIONS.md. New memory is not "
+                f"being written for the turns that were actually skipped."
             )
         # v3.1.9 (H-2). Not an elif: a run of empty replies and a recent lossy
         # skip are different faults and both can be true. skipped_recently is
@@ -1058,9 +1270,46 @@ async def gather_health_full(
             # Same clamp probe_snapshot already applies to
             # WEBUI_DB_SYNC_INTERVAL_S, for the same reason: this value is
             # arithmetic, not a label, and envcfg does not range it.
-            _bk_interval_h = env_float("COMPACTOR_BACKUP_INTERVAL_HOURS", 24.0)
-            if not (math.isfinite(_bk_interval_h) and _bk_interval_h > 0):
-                _bk_interval_h = 24.0
+            #
+            # v3.1.9 (hostile pass 3, F8, LOW). THIS CLAMP IS FOR HEALTH'S OWN
+            # ARITHMETIC ONLY — it does NOT mean the backup DAEMON (backup.py,
+            # not a file this lane may edit) is protected the same way. The
+            # daemon reads COMPACTOR_BACKUP_INTERVAL_HOURS unranged and uses
+            # it AS GIVEN: 0 or negative makes `time.sleep(min(interval,
+            # RETRY_BACKOFF_S))` / `time.sleep(interval)` publish back-to-back
+            # with no real pause (measured: 21 archives in 20s), filling
+            # /data until COMPACTOR_BACKUP_MIN_FREE_MB trips a failure loop;
+            # a non-finite value crashes `time.sleep` outright under
+            # supervisord. Clamping SILENTLY here means that misconfiguration
+            # produced no reason at all — freshness looked "ok" (archives a
+            # few seconds old) throughout. This is the health-only half of
+            # the fix: name the misconfiguration itself as a reason, since
+            # this module cannot range the DAEMON's own reading without
+            # editing backup.py. What backup.py would need instead: range
+            # INTERVAL_HOURS once, at its own definition (`h if
+            # math.isfinite(h) and h > 0 else 24`, floored around 0.1h so an
+            # operator CAN legitimately configure sub-hourly backups without
+            # tripping this), and have health read `backup.INTERVAL_HOURS`
+            # directly instead of re-reading the environment, so the two
+            # cannot disagree again.
+            _bk_interval_h_raw = env_float("COMPACTOR_BACKUP_INTERVAL_HOURS", 24.0)
+            if not (math.isfinite(_bk_interval_h_raw) and _bk_interval_h_raw > 0):
+                reasons.append(
+                    f"COMPACTOR_BACKUP_INTERVAL_HOURS={_bk_interval_h_raw!r} "
+                    f"is not a positive, finite number of hours. The backup "
+                    f"daemon uses this value exactly as given, unlike this "
+                    f"health check (which clamps to 24h for its own "
+                    f"freshness arithmetic below): zero or negative makes it "
+                    f"publish archives back-to-back with no pause until the "
+                    f"volume fills; a non-finite value crashes the daemon "
+                    f"outright. Fix the environment variable; do not rely on "
+                    f"this check's own clamp to mean the daemon is safe."
+                )
+            _bk_interval_h = (
+                _bk_interval_h_raw
+                if math.isfinite(_bk_interval_h_raw) and _bk_interval_h_raw > 0
+                else 24.0
+            )
             _bk_interval_s = _bk_interval_h * 3600.0
             _bk_now = time.time()
             if backup_info.get("error"):
@@ -1073,31 +1322,103 @@ async def gather_health_full(
                     f"backup status unobservable ({backup_info['error']})"
                 )
             elif backup_info.get("count") == 0:
-                # GRACE, NOT A REFUSAL. A pod that just booted has not had a
-                # full COMPACTOR_BACKUP_INTERVAL_HOURS yet — run_daemon fires
-                # a first cycle almost immediately on a truly empty backup
-                # dir, but "almost immediately" still means staging,
-                # verifying and publishing an archive, which takes real time
-                # (measured, cross-mount, up to ~1,790s for her real store;
-                # native-volume is unmeasured here but not instant). Reporting
-                # zero backups as a fault on turn one of a pod's life would
-                # make every fresh deploy read degraded for no reason — the
-                # exact cried-wolf shape this module keeps having to undo.
-                # _PROCESS_STARTED_AT is this process's own best guess at pod
-                # boot (see its comment); the grace window is exactly one
-                # backup interval, per the brief's own framing ("must not
-                # degrade for its first interval").
-                _uptime = _bk_now - _PROCESS_STARTED_AT
-                if _uptime >= _bk_interval_s:
+                # v3.1.9 (hostile pass 3, F7, part 3). list_backups (backup.py)
+                # uses Path.glob, which swallows PermissionError and returns
+                # an empty result — so an unreadable backup directory reads
+                # here as "count: 0" with no error, exactly like a genuinely
+                # empty one. backup.py is not a file this lane may edit (its
+                # own fix is a `os.scandir` rewrite so the OSError propagates
+                # — noted below), so this checks readability INDEPENDENTLY,
+                # from health.py's side, before trusting a zero count: a
+                # directory this process cannot even list is unobservable,
+                # not "zero archives, if a restore were needed right now
+                # there is nothing to restore" — a materially different and
+                # more alarming claim than "I could not check."
+                _bk_dir = backup_info.get("dir")
+                _bk_dir_err: str | None = None
+                if _bk_dir:
+                    try:
+                        with os.scandir(_bk_dir):
+                            pass
+                    except FileNotFoundError:
+                        # The directory does not exist YET — a genuinely
+                        # fresh pod that has not run its first backup cycle
+                        # at all (run_daemon creates BACKUP_DIR on its first
+                        # write). This is the SAME "zero archives" case the
+                        # grace below already handles, not an unreadable
+                        # one — Path.glob (backup.py's own list_backups)
+                        # treats a missing directory as empty too, so
+                        # disagreeing here would make this process refuse to
+                        # boot cleanly on turn one for no reason.
+                        pass
+                    except OSError as e:
+                        # PermissionError and everything else genuinely
+                        # means "this process could not read a directory
+                        # that DOES exist" — the actual F7 part-3 case.
+                        _bk_dir_err = f"{type(e).__name__}: {e}"
+                if _bk_dir_err is not None:
                     reasons.append(
-                        f"COMPACTOR_BACKUP_ENABLED is true, this pod has been "
-                        f"up {round(_uptime)}s (past one "
-                        f"{round(_bk_interval_s)}s backup interval), and "
-                        f"{backup_info.get('dir')} holds zero archives. If a "
-                        f"restore were needed right now there is nothing to "
-                        f"restore. Run `backup.py --once` by hand and read "
-                        f"its output."
+                        f"backup status unobservable: {_bk_dir} could not be "
+                        f"listed ({_bk_dir_err}). latest_backup_info() reports "
+                        f"this as zero archives, which is not the same claim — "
+                        f"an unreadable directory means this pod cannot tell "
+                        f"whether backups exist, not that they don't."
                     )
+                else:
+                    # GRACE, NOT A REFUSAL. A pod that just booted has not had
+                    # a full cycle yet — run_daemon fires almost immediately
+                    # on a truly empty backup dir, but "almost immediately"
+                    # still means staging, verifying and publishing an
+                    # archive, which takes real time (measured, cross-mount,
+                    # up to ~1,790s for her real store). Reporting zero
+                    # backups as a fault on turn one of a pod's life would
+                    # make every fresh deploy read degraded for no reason.
+                    #
+                    # v3.1.9 (hostile pass 3, F7, parts 1-2). TWO separate
+                    # fixes to the grace itself:
+                    #
+                    # (1) THE WINDOW WAS A FULL BACKUP INTERVAL (24h default).
+                    # run_daemon retries a failed cycle every
+                    # COMPACTOR_BACKUP_RETRY_BACKOFF_S (900s = 15min), and a
+                    # cycle on her real store takes 13-40s — so "still zero
+                    # archives" after even two hours already means roughly
+                    # eight consecutive failed cycles, not a pod still
+                    # waiting on its first one. Waiting a full 24h to say so
+                    # is the worst durability state there is (nothing at all
+                    # to restore) staying silent for a day. The window is now
+                    # `min(interval, 2h)` — a cycle plus several retries, per
+                    # the finding's own framing — capped at 2h regardless of
+                    # how long COMPACTOR_BACKUP_INTERVAL_HOURS is configured,
+                    # since the retry cadence that bounds "how long is one
+                    # legitimate attempt" does not get slower just because the
+                    # SUCCESS cadence is configured slower.
+                    #
+                    # (2) THE CLOCK WAS THE COMPACTOR'S OWN IMPORT TIME, not
+                    # the backup daemon's, so a compactor-only respawn (crash
+                    # loop, a burst of hot-patch restarts) reset the grace
+                    # window to full every time even though the backup daemon
+                    # itself never restarted and never got closer to
+                    # succeeding. `_container_started_at()` (PID 1 / the
+                    # container's own start) survives that respawn and only
+                    # resets on an actual pod recreate — see its docstring.
+                    # Falls back to `_PROCESS_STARTED_AT` (the pre-fix clock)
+                    # when unreadable (non-Linux, no /proc), so this is never
+                    # WORSE than before, only more honest where it can be.
+                    _uptime_anchor = _container_started_at()
+                    if _uptime_anchor is None:
+                        _uptime_anchor = _PROCESS_STARTED_AT
+                    _uptime = _bk_now - _uptime_anchor
+                    _bk_grace_s = min(_bk_interval_s, 2 * 3600.0)
+                    if _uptime >= _bk_grace_s:
+                        reasons.append(
+                            f"COMPACTOR_BACKUP_ENABLED is true, this pod has "
+                            f"been up {round(_uptime)}s (past the "
+                            f"{round(_bk_grace_s)}s grace for a first "
+                            f"archive), and {backup_info.get('dir')} holds "
+                            f"zero archives. If a restore were needed right "
+                            f"now there is nothing to restore. Run "
+                            f"`backup.py --once` by hand and read its output."
+                        )
             else:
                 _latest_mtime = backup_info.get("latest_mtime")
                 if isinstance(_latest_mtime, (int, float)):
