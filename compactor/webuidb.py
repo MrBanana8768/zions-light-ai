@@ -121,13 +121,16 @@ SHRINK_GUARD_MIN_CHATS = env_int("WEBUI_DB_SHRINK_GUARD_MIN_CHATS", 2)
 # documented recovery - every SYNC_INTERVAL_S, forever - and the only escape
 # it offered was a flag that also disarmed the corruption guard.
 #
-# So compare what is STORED: the summed length of every column of `chat`
-# (_content_bytes). A VACUUM rewrites the whole file and cannot change that
-# sum; neither can free-list churn, page size, auto_vacuum, or the backup API.
-# Deleting a conversation does, which is the entire point. st_size survives
-# only as the cheap pre-filter for this floor - it is a stat() rather than a
-# table scan, and stored content can never exceed the file holding it, so a
-# file under the floor is under it on both measures and the scan is skipped.
+# So compare what is STORED: the summed length IN BYTES of every column of
+# `chat` (_content_bytes). A VACUUM rewrites the whole file and cannot change
+# that sum; neither can free-list churn, page size, auto_vacuum, or the backup
+# API. Deleting a conversation does, which is the entire point.
+#
+# st_size USED to survive as a pre-filter for this floor, skipping the table
+# scan for a small snapshot. v3.1.9 removed it: the per-conversation and
+# generation guards (MAX_ROW_LOSS_BYTES, ALLOW_OLDER_GENERATION) read the
+# same scan and have no floor, so the pre-filter no longer saved anything but
+# the scan of a file under 64 KB.
 SHRINK_GUARD_MIN_BYTES = env_int("WEBUI_DB_SHRINK_GUARD_MIN_BYTES", 65536)
 # The deliberate override for the SHRINK refusal, and for nothing else: she
 # really did clear her history and the snapshot must follow. Refusing forever
@@ -153,6 +156,59 @@ ALLOW_PUBLISH_OVER_UNREADABLE = (
     os.environ.get("WEBUI_DB_ALLOW_PUBLISH_OVER_UNREADABLE", "").strip().lower()
     in ("1", "true", "yes")
 )
+# PER-CONVERSATION LOSS LIMIT (v3.1.9, hostile pass #2, N4). Refuse when any
+# conversation that EXISTS ON BOTH SIDES lost more than this many bytes of
+# stored content, whatever the table-wide ratio says.
+#
+# The ratio above is the wrong instrument for this pod's table, and not by a
+# margin. OpenWebUI keeps a whole conversation in ONE row of `chat`, and the
+# live one was measured at 32.95 MB, so "1 row -> 1 row" is every sync, and
+# a row that loses 49.5% of itself leaves the table above 0.5. Demonstrated:
+# 2,020 of 4,000 messages gone from her only conversation, content ratio
+# 0.505, synced=True, nothing above INFO - 16.3 MB per cycle at the live size,
+# and repeatable on the remainder next cycle. The 0.5 above was justified
+# entirely in counts of conversations ("ordinary use never halves a chat
+# count"); nothing reasoned about content INSIDE one.
+#
+# Absolute, not a second ratio, because the thing being protected is an
+# amount of her history, and a per-row ratio loose enough for a 30 KB chat
+# would wave through megabytes of the 33 MB one. A row that is GONE is not
+# covered here: that is a deletion, and deletions stay governed by the chat
+# count and the content ratio (a missing row counted as "shrank to zero"
+# would refuse deleting any large conversation).
+#
+# THE COST, named: deleting a long branch of her one conversation - more than
+# about a megabyte, a few hundred long messages - is refused too, every
+# SYNC_INTERVAL_S, until a human publishes it once (see ALLOW_ROW_LOSS). No
+# measure of size can tell "she deleted it" from "it was truncated"; a person
+# can, and the refusal tells them how. Clamped at 0: a negative limit would
+# refuse every unchanged row.
+MAX_ROW_LOSS_BYTES = max(0, env_int("WEBUI_DB_MAX_ROW_LOSS_BYTES", 1_000_000))
+# The override for the per-row refusal and for nothing else - same split, same
+# reason, as the two above: an operator who sets the flag the SHRINK refusal
+# names must not disarm this one in the same keystroke, and the other way
+# round. The refusal text tells the operator to set it for ONE invocation
+# (`WEBUI_DB_ALLOW_ROW_LOSS=1 webuidb.py --sync-once`), not on the RunPod
+# template, where it would outlive the deletion it was set for.
+ALLOW_ROW_LOSS = (
+    os.environ.get("WEBUI_DB_ALLOW_ROW_LOSS", "").strip().lower()
+    in ("1", "true", "yes")
+)
+# The override for the OLDER-GENERATION refusal (N5), and for nothing else.
+# Its legitimate use is exactly one act: an operator restored an archive on
+# purpose and needs that older database to become the durable copy. Same
+# one-invocation advice as ALLOW_ROW_LOSS.
+ALLOW_OLDER_GENERATION = (
+    os.environ.get("WEBUI_DB_ALLOW_OLDER_GENERATION", "").strip().lower()
+    in ("1", "true", "yes")
+)
+# How far in the future a snapshot's mtime may be before the skip stops
+# trusting it (N2). Not a knob: a few seconds ahead is filesystem timestamp
+# granularity or ordinary skew and costs one skipped cycle at most, and an
+# hour ahead is a clock that was wrong. Without any tolerance, a filesystem
+# that rounds an mtime UP would turn every cycle into a whole-database write
+# onto /data - the cost the skip exists to avoid.
+SNAPSHOT_MTIME_FUTURE_TOLERANCE_S = 60
 # Written by entrypoint.sh when a restore failed and the operator set
 # WEBUI_DB_ALLOW_EMPTY_START=true to boot anyway, onto a schema OpenWebUI
 # builds from nothing. While it exists, sync_once refuses outright.
@@ -203,7 +259,8 @@ def _reload_env() -> None:
     them without restarting the process."""
     global SHRINK_REFUSE_BELOW, SHRINK_GUARD_MIN_CHATS, ALLOW_SHRINK
     global SHRINK_GUARD_MIN_BYTES, ALLOW_PUBLISH_OVER_UNREADABLE
-    global SYNC_INTERVAL_S
+    global SYNC_INTERVAL_S, MAX_ROW_LOSS_BYTES, ALLOW_ROW_LOSS
+    global ALLOW_OLDER_GENERATION
     SHRINK_REFUSE_BELOW = env_float("WEBUI_DB_SHRINK_REFUSE_BELOW", 0.5)
     SHRINK_GUARD_MIN_CHATS = env_int("WEBUI_DB_SHRINK_GUARD_MIN_CHATS", 2)
     # The sibling knob. Every constant this function forgets is a knob that
@@ -225,6 +282,18 @@ def _reload_env() -> None:
         in ("1", "true", "yes")
     )
     SYNC_INTERVAL_S = env_float("WEBUI_DB_SYNC_INTERVAL_S", 300)
+    # v3.1.9 (N4, N5): the per-row limit and both of its siblings' overrides.
+    # test_webuidb_publish_guards.py [13b] reads this function's source for
+    # every WEBUI_DB_* knob read at import, not only the ALLOW_ flags.
+    MAX_ROW_LOSS_BYTES = max(0, env_int("WEBUI_DB_MAX_ROW_LOSS_BYTES", 1_000_000))
+    ALLOW_ROW_LOSS = (
+        os.environ.get("WEBUI_DB_ALLOW_ROW_LOSS", "").strip().lower()
+        in ("1", "true", "yes")
+    )
+    ALLOW_OLDER_GENERATION = (
+        os.environ.get("WEBUI_DB_ALLOW_OLDER_GENERATION", "").strip().lower()
+        in ("1", "true", "yes")
+    )
 
 
 def _stamp() -> str:
@@ -275,7 +344,50 @@ def _has_rows(path: Path) -> int | None:
 
 
 def _content_bytes(path: Path) -> int | None:
-    """Stored length of every column of `chat`, or None if it cannot be read.
+    """Stored BYTES of every column of `chat`, or None if it cannot be read.
+    A view of _scan_chat(); see there for the unit and the cost."""
+    scan = _scan_chat(path)
+    return None if scan is None else scan["total"]
+
+
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _scan_chat(path: Path) -> dict | None:
+    """One pass over `chat`: stored bytes per conversation and in total, and
+    each conversation's updated_at. None if there is no `chat` table or it
+    cannot be read.
+
+        {"total": int,                       # bytes, every column, every row
+         "rows": {id: (bytes, updated_at)},  # or None - see "why_no_rows"
+         "why_no_rows": str | None,
+         "has_updated_at": bool,
+         "newest": number | None}            # max numeric updated_at
+
+    BYTES, NOT CHARACTERS (v3.1.9, hostile pass #2, N3). This summed
+    `length("col")`, and SQLite's length() on a TEXT value counts CHARACTERS;
+    only on a BLOB does it count bytes. The result was named bytes, compared
+    as bytes, and printed as MB by the shrink refusal and by --status. So a
+    conversation of 300,000 CJK characters (900 KB stored) replaced by 300,000
+    ASCII characters (300 KB) measured a ratio of 1.0000 and published, and
+    no suite could see it: every fixture padded with ASCII, where the two
+    units are the same number. `cast(x as blob)` of a TEXT value is its
+    encoded bytes (UTF-8 in any database OpenWebUI creates); of an INTEGER or
+    REAL it is the decimal text, exactly as length() already treated them.
+    How live it is, measured rather than assumed: open-webui 0.11.0 writes
+    its JSON columns (`chat`, `meta`, `tasks`, `variables`) through
+    SQLAlchemy's default json.dumps, which escapes every non-ASCII character,
+    so those columns ARE ascii and the error reached only the TEXT columns
+    (title, summary, ...). A writer with ensure_ascii=False would expose all
+    of it.
+
+    PER ROW, keyed on `chat`.`id`, because the guards that read this need to
+    compare a conversation against ITSELF: the per-row loss limit (N4) and the
+    generation check (N5). "rows" is None - and the reason is in
+    "why_no_rows" - when there is no `id` column or an id repeats, because a
+    per-row comparison keyed on a non-identity is a comparison of nothing.
+    OpenWebUI declares `id` the primary key; the suites' older fixtures do not.
 
     THE SECOND MEASURE OF THE SHRINK GUARD, and it is deliberately not
     os.stat().st_size. A SQLite file's size is a function of its page churn as
@@ -299,13 +411,12 @@ def _content_bytes(path: Path) -> int | None:
     COSTS A FULL TABLE SCAN, unlike _has_rows()'s count(*), which SQLite can
     serve from an index. Both files sync_once measures live on /data, so a
     publishing cycle at 41 MB reads roughly 82 MB more off the volume whose
-    read reliability is this module's whole subject - call it double. That is
-    why sync_once gates the call behind the st_size floor rather than
-    measuring every cycle, and why it is not called at all on a cycle the
-    mtime check skips. It is a real cost, accepted knowingly: the measure it
-    replaced was free and wrong, and being wrong here means either refusing a
-    documented recovery forever or publishing an empty database over her
-    history.
+    read reliability is this module's whole subject - call it double. It is
+    not called at all on a cycle the mtime check skips, and since v3.1.9 it is
+    ONE scan per file for all three content guards rather than one per guard.
+    It is a real cost, accepted knowingly: the measure it replaced was free
+    and wrong, and being wrong here means either refusing a documented
+    recovery forever or publishing an empty database over her history.
     """
     try:
         con = sqlite3.connect(str(path), timeout=30)
@@ -313,22 +424,91 @@ def _content_bytes(path: Path) -> int | None:
             cols = [r[1] for r in con.execute("PRAGMA table_info(chat)").fetchall()]
             if not cols:
                 return None
-            # length() is NULL for a NULL column and sum() skips a NULL row, so
-            # without the coalesce a single NULL anywhere drops that whole row
-            # from the measure - which is loss-shaped, in the direction that
-            # makes the guard stand down.
+            # length() is NULL for a NULL column, so without the coalesce a
+            # single NULL anywhere drops that whole row from the measure -
+            # which is loss-shaped, in the direction that makes the guard
+            # stand down.
             expr = " + ".join(
-                'coalesce(length("{}"), 0)'.format(c.replace('"', '""'))
+                'coalesce(length(cast("{}" as blob)), 0)'.format(c.replace('"', '""'))
                 for c in cols
             )
-            row = con.execute(
-                f"select coalesce(sum({expr}), 0) from chat"  # noqa: S608
-            ).fetchone()
-            return int(row[0])
+            has_id = "id" in cols
+            has_updated_at = "updated_at" in cols
+            select = ", ".join((
+                '"id"' if has_id else "NULL",
+                '"updated_at"' if has_updated_at else "NULL",
+                expr,
+            ))
+            total = 0
+            newest = None
+            rows: dict | None = {} if has_id else None
+            why = None if has_id else "the `chat` table has no id column"
+            for rid, updated_at, n in con.execute(
+                f"select {select} from chat"  # noqa: S608
+            ):
+                total += int(n)
+                if _is_number(updated_at) and (newest is None or updated_at > newest):
+                    newest = updated_at
+                if rows is not None:
+                    if rid in rows:
+                        rows = None
+                        why = f"the id {str(rid)[:12]!r} appears more than once"
+                    else:
+                        rows[rid] = (int(n), updated_at)
+            return {
+                "total": total,
+                "rows": rows,
+                "why_no_rows": why,
+                "has_updated_at": has_updated_at,
+                "newest": newest,
+            }
         finally:
             con.close()
     except Exception:
         return None
+
+
+def _row_losses(prev_rows: dict, new_rows: dict) -> list[tuple]:
+    """Conversations present on BOTH sides that lost more than
+    MAX_ROW_LOSS_BYTES of stored content: [(id, prev_bytes, new_bytes)],
+    largest loss first. A conversation missing from `new_rows` is a deletion
+    and is deliberately not here - see MAX_ROW_LOSS_BYTES."""
+    out = []
+    for rid, (prev_n, _) in prev_rows.items():
+        if rid not in new_rows:
+            continue
+        new_n = new_rows[rid][0]
+        if prev_n - new_n > MAX_ROW_LOSS_BYTES:
+            out.append((rid, prev_n, new_n))
+    return sorted(out, key=lambda t: t[2] - t[1])
+
+
+def _went_backwards(prev_rows: dict, new_rows: dict) -> tuple[list[tuple], int, int]:
+    """Conversations present on BOTH sides whose updated_at is EARLIER in the
+    new image than in the snapshot: ([(id, prev_updated_at, new_updated_at)],
+    compared, uncomparable).
+
+    PER CONVERSATION, NOT max(updated_at) OF THE TABLE, and the difference is
+    a false refusal on ordinary use. Deleting her newest conversation lowers
+    the table's maximum with nothing going backwards, and a table-wide
+    comparison refuses that every cycle until her next message. A
+    conversation compared against ITSELF cannot be fooled by a deletion:
+    open-webui only ever writes updated_at = int(time.time()) to an existing
+    row (models/chats.py, 0.11.0), so the same id carrying an earlier value is
+    an earlier copy of the database, or a clock that stepped backwards.
+    A value that is not a number on either side is counted, not compared."""
+    back, compared, uncomparable = [], 0, 0
+    for rid, (_, prev_ts) in prev_rows.items():
+        if rid not in new_rows:
+            continue
+        new_ts = new_rows[rid][1]
+        if not (_is_number(prev_ts) and _is_number(new_ts)):
+            uncomparable += 1
+            continue
+        compared += 1
+        if new_ts < prev_ts:
+            back.append((rid, prev_ts, new_ts))
+    return sorted(back, key=lambda t: t[2] - t[1]), compared, uncomparable
 
 
 def _set_aside(path: Path, why: str) -> bool:
@@ -457,8 +637,19 @@ def restore_on_boot() -> dict:
     Order matters and each branch is a real case:
 
       1. A healthy local database wins outright. Within one container this is
-         just a service restart, and local is by definition newer than any
-         snapshot.
+         usually just a service restart, where local is newer than any
+         snapshot - but NOT "by definition", which is what this used to say.
+         A local file can be OLDER than the snapshot: an archive restored by
+         backup.py lands here, and so does anything put back by hand or by
+         scripts/switch-webui-db-to-local.py. Keeping it is still the right
+         BOOT action - it is healthy, it is what the operator put there, and
+         refusing a boot on that comparison would block the documented
+         restore runbook. The durable copy is guarded one step later instead:
+         sync_once refuses to publish a conversation older than the
+         snapshot's copy of it (ALLOW_OLDER_GENERATION), or one that lost
+         more than MAX_ROW_LOSS_BYTES. Not completely - once she writes to a
+         conversation its updated_at is new again, so a small enough loss in
+         a conversation she keeps using is invisible to both.
       2. A local database that fails quick_check is set aside (not deleted)
          and we fall through to the snapshot.
       3. The snapshot is copied down on a fresh container — the pod-recreate
@@ -688,7 +879,7 @@ def restore_on_boot() -> dict:
 def sync_once(force: bool = False) -> dict:
     """Publish LOCAL_DB to SNAPSHOT_DB, safely, while OpenWebUI is running.
 
-    Five guards, each earned:
+    Six guards, each earned:
 
       * sqlite3's backup API, not a file copy. It takes a read lock and
         produces a consistent image of a database being written to. A cp of a
@@ -708,6 +899,11 @@ def sync_once(force: bool = False) -> dict:
       * An empty start refuses outright while its marker exists, because a
         ratio cannot protect that state - it only delays it (see
         EMPTY_START_MARKER).
+      * A conversation that exists on both sides may not lose more than
+        MAX_ROW_LOSS_BYTES, and may not go BACKWARDS in updated_at (v3.1.9).
+        The count and the ratio are magnitudes of the whole table; on a pod
+        whose history is one row, neither can see half of that row going, and
+        no magnitude can see an older copy of the same database.
 
     EVERY ONE OF THOSE REFUSALS HAS A WAY OUT, and that is not softness. A
     guard with no exit becomes the data-loss mode it was written against: it
@@ -722,7 +918,27 @@ def sync_once(force: bool = False) -> dict:
     mtime = LOCAL_DB.stat().st_mtime
     if not force and SNAPSHOT_DB.exists():
         try:
-            if SNAPSHOT_DB.stat().st_mtime >= mtime:
+            snap_mtime = SNAPSHOT_DB.stat().st_mtime
+            ahead = snap_mtime - time.time()
+            if ahead > SNAPSHOT_MTIME_FUTURE_TOLERANCE_S:
+                # A SNAPSHOT DATED IN THE FUTURE IS NOT EVIDENCE OF ANYTHING
+                # (v3.1.9, hostile pass #2, N2). The skip below reads "the
+                # snapshot is at least as new as local" off the mtime, so a
+                # snapshot stamped by a clock that ran fast made EVERY cycle a
+                # skip until real time caught up - no error, so no failure
+                # count, and nothing logged at any level. And the state is
+                # durable: restore_on_boot's copy2 preserves the mtime, so a
+                # poisoned snapshot re-poisons every later pod. So: not a
+                # skip. Publish, which re-stamps it with a sane time, and say
+                # why, once per cycle it happens - a silent republish would
+                # hide the wrong clock exactly as the silent skip did.
+                logger.warning(
+                    f"the snapshot {SNAPSHOT_DB} is dated {ahead:.0f}s in the "
+                    f"FUTURE - a clock was wrong when it was stamped. Not "
+                    f"trusting it as 'unchanged since last sync'; publishing "
+                    f"now, which re-stamps it."
+                )
+            elif snap_mtime >= mtime:
                 # Nothing has been written since the last publish. Skipping
                 # matters: each sync writes the whole database onto the
                 # volume whose write reliability is the problem.
@@ -874,12 +1090,22 @@ def sync_once(force: bool = False) -> dict:
                         f"WEBUI_DB_ALLOW_PUBLISH_OVER_UNREADABLE=1."
                     )
 
-        if previous is not None and not ALLOW_SHRINK:
+        if previous is not None:
             new_bytes = tmp.stat().st_size
-            # TWO MEASURES, because on this pod the row count alone cannot see
-            # the loss: one conversation is one row (see SHRINK_GUARD_MIN_BYTES).
+            # ONE SCAN PER FILE FEEDS EVERY CONTENT GUARD BELOW: the ratio,
+            # the per-conversation loss limit and the generation check all
+            # read the same _scan_chat result. See _content_bytes for the
+            # cost, and for why the unit is BYTES.
+            prev_scan = _scan_chat(SNAPSHOT_DB)
+            new_scan = _scan_chat(tmp)
+            prev_content = None if prev_scan is None else prev_scan["total"]
+            new_content = None if new_scan is None else new_scan["total"]
+            # TWO MEASURES OF THE WHOLE TABLE, because on this pod the row
+            # count alone cannot see the loss: one conversation is one row
+            # (see SHRINK_GUARD_MIN_BYTES). Both are opened by ALLOW_SHRINK.
             lost_chats = (
-                previous >= SHRINK_GUARD_MIN_CHATS
+                not ALLOW_SHRINK
+                and previous >= SHRINK_GUARD_MIN_CHATS
                 and chats < previous * SHRINK_REFUSE_BELOW
             )
             # THE SECOND MEASURE IS STORED CONTENT, NOT st_size, AND THE
@@ -890,32 +1116,89 @@ def sync_once(force: bool = False) -> dict:
             # the backup API copies free-list pages. So the file size answered
             # "has this been repacked lately" and the guard needed "is her
             # conversation still in there". _content_bytes asks the second.
-            #
-            # st_size survives ONLY as the pre-filter for the floor: it is a
-            # stat() rather than two table scans, and stored content can never
-            # exceed the file holding it, so a snapshot under the floor by file
-            # size is under it by content too and nothing is skipped that the
-            # floor would not have excluded anyway.
             lost_content = False
-            prev_content = new_content = None
-            if prev_bytes >= SHRINK_GUARD_MIN_BYTES:
-                prev_content = _content_bytes(SNAPSHOT_DB)
-                new_content = _content_bytes(tmp)
-                if prev_content is None or new_content is None:
-                    # "I could not measure" is NOT a refusal. Turning an
-                    # unreadable measurement into a permanent stop is the exact
-                    # defect being repaired thirty lines above, and it costs the
-                    # durable copy outright. Say so loudly and let the chat
-                    # count decide - a narrower guard, honestly narrower.
-                    logger.warning(
-                        f"could not measure stored content (snapshot="
-                        f"{prev_content!r}, new={new_content!r}); the shrink "
-                        f"guard is running on chat count alone this cycle, "
-                        f"which cannot see a one-row conversation being "
-                        f"replaced by a one-row empty one."
-                    )
-                elif prev_content >= SHRINK_GUARD_MIN_BYTES:
+            row_losses: list[tuple] = []
+            went_back: list[tuple] = []
+            if prev_content is None or new_content is None:
+                # "I could not measure" is NOT a refusal. Turning an
+                # unreadable measurement into a permanent stop is the exact
+                # defect being repaired above, and it costs the durable copy
+                # outright. Say so loudly and let the chat count decide - a
+                # narrower guard, honestly narrower.
+                logger.warning(
+                    f"could not measure stored content (snapshot="
+                    f"{prev_content!r}, new={new_content!r}); the shrink "
+                    f"guard is running on chat count alone this cycle, "
+                    f"which cannot see a one-row conversation being "
+                    f"replaced by a one-row empty one, and the per-"
+                    f"conversation loss and generation guards are not "
+                    f"running at all."
+                )
+            else:
+                if not ALLOW_SHRINK and prev_content >= SHRINK_GUARD_MIN_BYTES:
                     lost_content = new_content < prev_content * SHRINK_REFUSE_BELOW
+                prev_rows, new_rows = prev_scan["rows"], new_scan["rows"]
+                if prev_rows is None or new_rows is None:
+                    # Same principle as above: cannot compare is visible and
+                    # is not a refusal.
+                    logger.warning(
+                        f"cannot compare conversations one by one "
+                        f"({prev_scan['why_no_rows'] or new_scan['why_no_rows']}); "
+                        f"the per-conversation loss limit and the generation "
+                        f"guard are not running this cycle."
+                    )
+                else:
+                    # PER CONVERSATION (N4). See MAX_ROW_LOSS_BYTES.
+                    row_losses = _row_losses(prev_rows, new_rows)
+                    # GENERATION (N5): the fifth state of `previous`. The
+                    # four above are absent / readable / unreadable /
+                    # schema-only, and every guard so far measures a
+                    # MAGNITUDE. A healthy, right-sized, week-old copy of the
+                    # same database is none of those - it was demonstrated
+                    # publishing 380 chats over 400. Going backwards in time
+                    # is not a change in size.
+                    if not (prev_scan["has_updated_at"] and new_scan["has_updated_at"]):
+                        # NOT a refusal. A guard that refuses every publish
+                        # because a column is missing is an outage built out
+                        # of a guard; the suites' own older fixtures have no
+                        # updated_at, and neither might a future schema.
+                        # --status reports the same fact.
+                        logger.warning(
+                            f"no updated_at column in "
+                            f"{'the snapshot' if not prev_scan['has_updated_at'] else 'the new image'}"
+                            f"; the generation guard cannot tell an older copy "
+                            f"of this database from the current one and is not "
+                            f"running this cycle."
+                        )
+                    else:
+                        went_back, compared, uncomparable = _went_backwards(
+                            prev_rows, new_rows
+                        )
+                        if uncomparable:
+                            logger.warning(
+                                f"{uncomparable} conversation(s) have no numeric "
+                                f"updated_at on one side and were not compared "
+                                f"by the generation guard ({compared} were)."
+                            )
+            refuse_row_loss = bool(row_losses) and not ALLOW_ROW_LOSS
+            refuse_generation = bool(went_back) and not ALLOW_OLDER_GENERATION
+            # An override that OPENS a tripped refusal says so. These two are
+            # meant to be set for one invocation; if one has been left on a
+            # template, this line is how anyone finds out.
+            if row_losses and ALLOW_ROW_LOSS:
+                logger.warning(
+                    f"WEBUI_DB_ALLOW_ROW_LOSS is set: publishing although "
+                    f"{len(row_losses)} conversation(s) lost more than "
+                    f"{MAX_ROW_LOSS_BYTES / 1e6:.1f} MB each. Unset it once "
+                    f"this publish is done."
+                )
+            if went_back and ALLOW_OLDER_GENERATION:
+                logger.warning(
+                    f"WEBUI_DB_ALLOW_OLDER_GENERATION is set: publishing although "
+                    f"{len(went_back)} conversation(s) are older than the "
+                    f"snapshot's copy. Unset it once this publish is done."
+                )
+            reasons: list[str] = []
             if lost_chats or lost_content:
                 # Keep the refused database. It may hold the only copy of
                 # anything written since the last good sync, and this path
@@ -939,8 +1222,8 @@ def sync_once(force: bool = False) -> dict:
                     if new_content is not None
                     else f"{chats} chat(s) in a {new_bytes / 1e6:.1f} MB file"
                 )
-                raise RuntimeError(
-                    f"REFUSING to publish: the local database has {_new_desc} "
+                reasons.append(
+                    f"the local database has {_new_desc} "
                     f"but the snapshot has {_prev_desc} "
                     f"({'chat count' if lost_chats else 'stored content'} "
                     f"tripped it). That is not ordinary use - it is what a "
@@ -956,6 +1239,61 @@ def sync_once(force: bool = False) -> dict:
                     f"opens THIS refusal only - an unreadable snapshot still "
                     f"stops the publish)."
                 )
+            if refuse_row_loss:
+                # NO forensic copy, unlike the shrink refusal: this one is
+                # reachable by ordinary use (a deleted branch), it repeats
+                # every SYNC_INTERVAL_S until a human acts, and the file that
+                # holds the content in question - the snapshot - is exactly
+                # the one being left untouched. A 33 MB copy onto /data every
+                # five minutes would fill the volume to protect nothing.
+                rid, prev_n, new_n = row_losses[0]
+                reasons.append(
+                    f"{len(row_losses)} conversation(s) that still exist lost "
+                    f"more than {MAX_ROW_LOSS_BYTES / 1e6:.1f} MB of stored "
+                    f"content each - the largest, {str(rid)[:12]!r}, went from "
+                    f"{prev_n / 1e6:.1f} MB to {new_n / 1e6:.1f} MB. OpenWebUI "
+                    f"keeps a whole conversation in one row, so no chat count "
+                    f"can see this, and a loss under half the table does not "
+                    f"move the content ratio. It is what a truncated or "
+                    f"half-written conversation looks like; it is ALSO what "
+                    f"deleting a long branch of one conversation looks like, "
+                    f"and only a person can tell those apart. If she really "
+                    f"did delete it, publish it once, deliberately: "
+                    f"`WEBUI_DB_ALLOW_ROW_LOSS=1 /opt/compactor-venv/bin/python "
+                    f"/opt/compactor/webuidb.py --sync-once` - set in that "
+                    f"shell, NOT on the RunPod template, where it would stay "
+                    f"set and wave through the next truncation too. It opens "
+                    f"this refusal only."
+                )
+            if refuse_generation:
+                rid, prev_ts, new_ts = went_back[0]
+                reasons.append(
+                    f"{len(went_back)} conversation(s) in the local database "
+                    f"are OLDER than the same conversation in the snapshot - "
+                    f"{str(rid)[:12]!r} has updated_at {prev_ts} in the "
+                    f"snapshot and {new_ts} locally. OpenWebUI only ever moves "
+                    f"updated_at forward, so this is an EARLIER COPY of the "
+                    f"database standing where the current one should be: a "
+                    f"file put back by hand, an archive from /data/backups, a "
+                    f"recovery script's output. Publishing it removes "
+                    f"everything since that copy from the only durable one. "
+                    f"(A system clock that stepped backwards does this too, "
+                    f"for as long as the step.) If the older database is "
+                    f"deliberate - you restored an archive on purpose - "
+                    f"publish it once: `WEBUI_DB_ALLOW_OLDER_GENERATION=1 "
+                    f"/opt/compactor-venv/bin/python /opt/compactor/webuidb.py "
+                    f"--sync-once`, in that shell and not on the template "
+                    f"(OPERATIONS.md, 'Restore from a backup'). It opens this "
+                    f"refusal only."
+                )
+            if reasons:
+                # Every ground at once, each with its own way out. Naming only
+                # the first would send the operator round the loop once per
+                # guard, and an older copy of the database typically trips
+                # both of the last two.
+                raise RuntimeError(
+                    "REFUSING to publish: " + " || AND, SEPARATELY: ".join(reasons)
+                )
 
         os.replace(tmp, SNAPSHOT_DB)
         # Stamp the snapshot with the LOCAL mtime this image was taken from,
@@ -965,8 +1303,15 @@ def sync_once(force: bool = False) -> dict:
         # (writes continue during the backup), and the skip never fires - so
         # every cycle rewrites the whole database onto the volume whose write
         # reliability is the entire problem.
+        #
+        # NEVER LATER THAN NOW (v3.1.9, N2). A local mtime from a clock that
+        # ran fast used to be copied onto the durable file, where it froze
+        # every later cycle as a skip and survived redeploys through copy2.
+        # Clamped, a future local mtime costs a republish per cycle until the
+        # clock passes it - a cost, never a freeze.
+        stamp = min(mtime, time.time())
         try:
-            os.utime(SNAPSHOT_DB, (mtime, mtime))
+            os.utime(SNAPSHOT_DB, (stamp, stamp))
         except Exception:
             pass  # a filesystem that refuses utime costs an extra sync, no more
         out["synced"] = True
@@ -1078,11 +1423,25 @@ if __name__ == "__main__":
             # guard now compares: a VACUUMed 4 MB file and a bloated 41 MB one
             # can hold identical history, and this is where an operator sees
             # that before believing a size.
-            content = _content_bytes(p) if p.exists() else None
-            content_s = "-" if content is None else f"{content / 1e6:.1f} MB"
+            # BYTES since v3.1.9 (see _scan_chat) - this printed a character
+            # count as MB.
+            scan = _scan_chat(p) if p.exists() else None
+            content_s = "-" if scan is None else f"{scan['total'] / 1e6:.1f} MB"
+            # The generation guard's input, and - more to the point - whether
+            # it CAN run. "Cannot compare" is logged by sync_once and is not a
+            # refusal; this is where it is visible without reading a log.
+            if scan is None:
+                newest_s = "-"
+            elif not scan["has_updated_at"]:
+                newest_s = "- (no updated_at column: the generation guard cannot run)"
+            elif scan["newest"] is None:
+                newest_s = "- (no numeric updated_at: the generation guard cannot run)"
+            else:
+                newest_s = str(scan["newest"])
             print(
                 f"{label:9} {str(p):34} {size:>10}  quick_check={detail}  "
-                f"chats={_has_rows(p)}  content={content_s}"
+                f"chats={_has_rows(p)}  content={content_s}  "
+                f"newest_update={newest_s}"
             )
         # The refusal an operator is most likely to be staring at when they
         # run this, and the only one whose cause is a file rather than a
