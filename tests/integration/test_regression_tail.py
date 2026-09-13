@@ -266,6 +266,26 @@ def _settle() -> None:
     H.wait_for_async_tail(seconds=max(H.TAIL_WAIT, 60.0))
 
 
+# Slack for "the newest skip happened after this test fired its trigger":
+# seconds_since_last_skip is rounded to 0.1 s by the endpoint, and the two
+# clocks being compared are the same host's.
+_SKIP_CLOCK_SLACK_S = 2.0
+
+
+def _newest_skip_is_ours(since_any, triggered_at: float) -> bool:
+    """True when the most recent skip (of the clock read) happened AFTER
+    `triggered_at` (a time.monotonic() taken just before this test's trigger).
+
+    It used to be `since_any <= 60`. That was only ever a proxy for "after
+    the trigger", and it stopped being one the moment _settle became a
+    60-second wait: every run then read 60.1-60.2 s and failed by
+    construction (merged v3.1.9 integration run). Measuring the bound from
+    the trigger keeps the check exactly as strict however long _settle is.
+    """
+    return (isinstance(since_any, (int, float))
+            and since_any <= (time.monotonic() - triggered_at) + _SKIP_CLOCK_SLACK_S)
+
+
 def _stream_and_abort(conv_id: str, prompt: str) -> int:
     """Open a streaming completion and hang up WITHOUT reading a single byte
     of the body. Returns the HTTP status of the response headers.
@@ -728,6 +748,7 @@ def test_r27_a_harmless_skip_does_not_arm_the_degrade_flag():
         time.sleep(5)
 
         before = _tail()
+        triggered_at = time.monotonic()
         status = _stream_and_abort(conv_id, "Stop me before I start.")
         assert status == 200, status
         _settle()
@@ -752,9 +773,10 @@ def test_r27_a_harmless_skip_does_not_arm_the_degrade_flag():
         assert isinstance(since_any, (int, float)), (
             f"the general skip clock did not move for a skip: {after!r}"
         )
-        assert since_any <= 60, (
-            f"seconds_since_last_skip is {since_any}s — the skip this test "
-            f"just caused is not the most recent one, so the comparison below "
+        assert _newest_skip_is_ours(since_any, triggered_at), (
+            f"seconds_since_last_skip is {since_any}s, more than has passed "
+            f"since this test fired its trigger — the skip this test just "
+            f"caused is not the most recent one, so the comparison below "
             f"would be about someone else's skip"
         )
         assert since_lossy is None or since_lossy > since_any, (
@@ -777,6 +799,7 @@ def test_r27_a_harmless_skip_does_not_arm_the_degrade_flag():
         # not. Without this, "the lossy clock stayed old" would be equally
         # consistent with a lossy clock that never moves at all.
         lossy_before = _tail()
+        lossy_triggered_at = time.monotonic()
         status = _post_raw(lossy_conv, [{"role": "user", "content": "   "}])
         assert status == 200, status
         _settle()
@@ -785,7 +808,7 @@ def test_r27_a_harmless_skip_does_not_arm_the_degrade_flag():
             lossy_before, "skipped_no_user_text"
         ), "the lossy control did not produce a lossy skip"
         lossy_since = lossy_after["seconds_since_last_lossy_skip"]
-        assert isinstance(lossy_since, (int, float)) and lossy_since <= 60, (
+        assert _newest_skip_is_ours(lossy_since, lossy_triggered_at), (
             f"a LOSSY skip left the lossy clock at {lossy_since!r}. The clock "
             f"is not tracking loss at all, which would make the harmless-skip "
             f"assertion above meaningless."
@@ -976,6 +999,7 @@ def test_n4b_repeat_task_traffic_past_the_threshold_is_skipped_and_counted():
         )
         state_before = _conv(conv_id)
         before = _tail()
+        triggered_at = time.monotonic()
 
         # The real shape: OpenWebUI's title generator, one user message, no
         # assistant turn, on the conv_id it has been shadowing all along.
@@ -1017,10 +1041,10 @@ def test_n4b_repeat_task_traffic_past_the_threshold_is_skipped_and_counted():
         # health. Same two-clock argument as the R27 case.
         since_any = after["seconds_since_last_skip"]
         since_lossy = after["seconds_since_last_lossy_skip"]
-        assert isinstance(since_any, (int, float)) and since_any <= 60, (
+        assert _newest_skip_is_ours(since_any, triggered_at), (
             f"the skip this test caused is not the most recent one "
-            f"(since_any={since_any}); the clock comparison below would be "
-            f"about someone else's skip"
+            f"(since_any={since_any}, older than this test's trigger); the "
+            f"clock comparison below would be about someone else's skip"
         )
         assert since_lossy is None or since_lossy > since_any, (
             f"a task-traffic skip advanced the LOSSY clock "
