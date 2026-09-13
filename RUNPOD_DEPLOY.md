@@ -320,9 +320,12 @@ compactor isn't involved (text → audio only).
   [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices)); set
   `TTS_VOICE_DIR=/data/tts-voices` so a non-default voice persists across pod
   recreation.
-- **Output format:** the service produces **WAV** natively (what OpenWebUI
-  plays). mp3/opus/aac/flac work only if `ffmpeg` is present (not bundled, to
-  keep the image lean); without it, those requests gracefully return WAV.
+- **Output format:** the service produces **WAV** natively, and OpenWebUI
+  converts it to MP3 before playing it. That conversion needs the `ffmpeg`
+  and `ffprobe` binaries. **Before v3.1.9 the image did not include them, so
+  the read-aloud button never worked**: OpenWebUI answered HTTP 200 with an
+  error body instead of audio. From v3.1.9 `ffmpeg` is installed, and the same
+  binaries let OpenWebUI transcribe recordings over 20 MB.
 - **Turn it off** per-pod with `TTS_ENABLED=false` (and/or `AUDIO_TTS_ENGINE=""`
   to hide the read-aloud control while leaving the service running).
 - Port `9001` does **not** need external exposure for the UI to work (OpenWebUI
@@ -330,6 +333,39 @@ compactor isn't involved (text → audio only).
 
 The boot self-test confirms the service actually synthesizes audio, not just
 that the port is open.
+
+### Audio and video FILES attached to a chat
+
+Attaching an audio file (WAV, MP3, M4A, OGG, WEBM) to a chat works like the
+microphone: OpenWebUI transcribes it and the model receives the transcript.
+**Video is different.** Out of the box OpenWebUI transcribes only `.webm`
+video. An `.mp4` or an iPhone `.mov` is stored with no text at all, so the
+model receives nothing from it, and nothing tells the user.
+
+To have the soundtrack of `.mp4` and `.mov` files transcribed (v3.1.9 or
+later, which has `ffmpeg`), change the setting **in OpenWebUI's Admin Panel,
+under the Audio settings, in the speech-to-text supported content types
+field**, to exactly:
+
+```text
+audio/*,video/webm,video/mp4,video/quicktime
+```
+
+Two traps, both verified on a test copy of this stack:
+- **Setting `AUDIO_STT_SUPPORTED_CONTENT_TYPES` as a RunPod template variable
+  does nothing on an existing pod.** OpenWebUI reads that variable only on its
+  very first boot and keeps the value in its database after that, so the
+  Admin Panel is the only place the change takes effect. It applies
+  immediately, with no restart.
+- **Keep `audio/*` in the list.** An empty field silently means
+  `audio/*,video/webm`. Typing only the video types removes that default, and
+  every ordinary voice recording then fails with "It seems like the file
+  format is not supported".
+
+Only the soundtrack is transcribed; the pictures are not described (that is a
+V4 roadmap item, see [V4_ROADMAP.md](V4_ROADMAP.md) §1.3). A long video takes
+a while: a 26 MB MP4 took about 48 s just to extract its audio, before
+transcription.
 
 ## Access Your Deployment
 

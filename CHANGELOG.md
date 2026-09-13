@@ -64,6 +64,20 @@ git tag messages. Every item links to the runbook that carries the commands.
   This reason is new to the pod (v3.1.6.1 has no memory-tail tracking) and is
   unchanged in v3.1.9 by design.
 
+### Voice
+
+- **Read-aloud works from v3.1.9.** On v3.1.6.1-v3.1.8 the speaker button never
+  played anything, because the image had no `ffmpeg` (OpenWebUI converts the
+  speech to MP3 with it). After deploying, press read-aloud on any reply and
+  hear audio.
+- **Long recordings** (over 20 MB, about 7-8 minutes) now transcribe instead
+  of failing within seconds. An 11-minute recording took about 5 minutes on
+  CPU.
+- **Video files:** only `.webm` video is transcribed by default. To include
+  `.mp4` and iPhone `.mov` soundtracks, change the setting in the Admin Panel,
+  not the RunPod template, and keep `audio/*` in it. See
+  [RUNPOD_DEPLOY.md → Audio and video FILES](RUNPOD_DEPLOY.md#audio-and-video-files-attached-to-a-chat).
+
 ### Her conversation's identity
 
 - The OpenWebUI filter `pipelines/conversation_id_header.py` **cannot** deliver
