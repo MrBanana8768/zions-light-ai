@@ -389,6 +389,17 @@ def _env_string_sources(tree: ast.AST) -> set[str]:
     return out
 
 
+def _taint_target(target: ast.AST, out: set[str]) -> None:
+    """Add every Name bound by `target` to `out`. A comprehension/for-loop
+    target can itself be a Tuple/List (`for k, v in pairs:`), so this
+    recurses rather than assuming a bare Name."""
+    if isinstance(target, ast.Name):
+        out.add(target.id)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            _taint_target(elt, out)
+
+
 def _env_tainted_names(tree: ast.AST) -> set[str]:
     """Names bound directly to an environment read, anywhere in the file.
 
@@ -396,18 +407,41 @@ def _env_tainted_names(tree: ast.AST) -> set[str]:
         raw = os.environ.get("X", "3")
         TIMEOUT = float(raw)          # <- still a ValueError on a typo
 
-    THREE BINDING FORMS, not one, because the first version only handled
-    `ast.Name` targets on an `ast.Assign` and the other two are ordinary
-    Python that reads as equivalent to anyone writing it:
+    SEVEN BINDING FORMS, not one, because the first version only handled
+    `ast.Name` targets on an `ast.Assign` and the rest are ordinary Python
+    that reads as equivalent to anyone writing it:
 
         if (raw := os.environ.get("X")): V = int(raw)      # ast.NamedExpr
-        HOST, PORT = os.environ.get(...), os.environ.get(...)   # tuple target
+        HOST, PORT = os.environ.get(...), os.environ.get(...)   # tuple target,
+            literal RHS, paired element-by-element
+        _h, _p = os.environ.get("ADDR", "h:1").split(":")   # tuple target,
+            NON-literal (Call) RHS — v3.1.9 round 2 (hostile2-apparatus.md):
+            c0ff9db's message claimed this shape ("element-wise tuple
+            unpacking") was closed, but the code only ever paired a LITERAL
+            tuple/list RHS element-by-element; a `.split(...)` RHS is a
+            Call, so neither branch above matched and NEITHER NAME was
+            tainted. There is no per-element value to pair against here
+            (unlike the literal-tuple case), so every name in the target is
+            tainted when the WHOLE RHS reads the environment.
+        [int(p) for p in os.environ.get(...).split(",")]    # ast.comprehension
+        for p in os.environs.get(...).split(","): ...       # ast.For — v3.1.9
+            round 2: a comma-separated env list is the obvious spelling for
+            multiple ports/hosts, and neither a comprehension's nor a
+            for-loop's target was tainted at all before this.
+        X = "0"; X += os.environ.get("EXTRA", "1")           # ast.AugAssign —
+            v3.1.9 round 2: the augmented form binds the same name a plain
+            Assign would; unhandled before this.
 
-    The tuple form pairs targets with values ELEMENT BY ELEMENT rather than
-    tainting every name on the left. `_reads_env` walks the whole subtree, so
-    `a, b = os.environ.get("X"), compute()` would otherwise mark `b` tainted
-    and report `int(b)` — a false positive, and a false positive here is how
-    this whole check gets deleted.
+    THE TUPLE FORM'S TWO BRANCHES ARE DELIBERATELY SEPARATE, not merged: a
+    LITERAL tuple/list RHS pairs targets with values ELEMENT BY ELEMENT
+    (`_reads_env` walks the whole subtree, so `a, b = os.environ.get("X"),
+    compute()` would otherwise mark `b` tainted and report `int(b)` — a
+    false positive, and a false positive here is how this whole check gets
+    deleted); a NON-literal RHS (a single Call being unpacked, e.g.
+    `.split(":")`) has no per-element value to check, so every bound name is
+    tainted instead. Combining them would either lose the mixed-source
+    precision (false positive) or miss the `.split()` shape (the round-2
+    bypass) — one rule cannot do both jobs.
     """
     out = set()
     for n in ast.walk(tree):
@@ -423,11 +457,25 @@ def _env_tainted_names(tree: ast.AST) -> set[str]:
                     for target, value in zip(t.elts, n.value.elts):
                         if isinstance(target, ast.Name) and _reads_env(value):
                             out.add(target.id)
+                elif isinstance(t, (ast.Tuple, ast.List)) and not isinstance(
+                    n.value, (ast.Tuple, ast.List)
+                ):
+                    # e.g. `_h, _p = os.environ.get("ADDR", "h:1").split(":")`
+                    # — see the docstring above for why this is a SEPARATE
+                    # branch, not folded into the literal-tuple one.
+                    _taint_target(t, out)
         elif isinstance(n, ast.AnnAssign) and n.value is not None and _reads_env(n.value):
             if isinstance(n.target, ast.Name):
                 out.add(n.target.id)
         elif isinstance(n, ast.NamedExpr) and _reads_env(n.value):
             out.add(n.target.id)
+        elif isinstance(n, ast.AugAssign) and _reads_env(n.value):
+            if isinstance(n.target, ast.Name):
+                out.add(n.target.id)
+        elif isinstance(n, ast.comprehension) and _reads_env(n.iter):
+            _taint_target(n.target, out)
+        elif isinstance(n, ast.For) and _reads_env(n.iter):
+            _taint_target(n.target, out)
     return out
 
 
@@ -523,6 +571,36 @@ def _unsoftened_env_conversions(src: str, label: str) -> list[str]:
       * Anything outside compactor/, tts/, stt/ and pipelines/ — scripts/ and
         the shell are not scanned, and entrypoint.sh does its own parsing in
         a dialect this cannot see (see V319 report, the env_bool note).
+      * `map`/`filter` INDIRECTION — v3.1.9 round 2 (hostile2-apparatus.md):
+        `list(map(int, os.environ.get("PORTS", "1,2").split(",")))` has no
+        `int(...)` Call node whose argument reads the environment; the env
+        read is an argument to `map`, and `int` itself is only ever passed
+        AS a value, never called with one. Closing this needs the detector
+        to know that `map`'s first argument is later invoked once per
+        element of its second — genuine data-flow through an arbitrary
+        higher-order call, not a one-hop taint. Deliberately not chased:
+        rare in this codebase's own house style (a comprehension, caught
+        above, is what this project actually writes), and worth documenting
+        as a known gap rather than the false-positive risk of guessing at
+        which higher-order calls "count".
+      * AN ENV-DEFAULTED FUNCTION PARAMETER, used inside the function body —
+        v3.1.9 round 2 (hostile2-apparatus.md):
+            def start(port: str = os.environ.get("PORT", "9000")):
+                return int(port)
+        The parameter's OWN default expression is an ordinary env read this
+        detector already sees and does not itself flag on its own (a bare
+        `os.environ.get(...)` is not a conversion). The bug is the USE
+        inside the function body: `port` is bound by the function's own
+        argument-binding, not by any Assign/AnnAssign/NamedExpr/AugAssign/
+        comprehension/for-loop target this detector tracks, so `int(port)`
+        reads as an ordinary local and is invisible. Closing this needs
+        function-scope tracking (which parameter belongs to which function,
+        and that a same-named local elsewhere is NOT the same binding) that
+        the rest of this detector deliberately does not carry — it is
+        file-wide taint, not scope-aware. Documented rather than chased for
+        the same reason as the try-that-never-rebinds case above: getting
+        scope wrong in the strict direction flags correct code, and that is
+        how a check this loud gets deleted.
     """
     tree = ast.parse(src, filename=label)
     tainted = _env_tainted_names(tree)
@@ -759,6 +837,102 @@ except ValueError:
     assert_eq(hits, [], f"detector is silent on legitimate code (got: {hits})")
 
 
+def test_v319_round2_closes_four_more_tainted_binding_forms():
+    """(v3.1.9 round 2, hostile2-apparatus.md) 16 shapes were run through the
+    shipped detector; 12 bypassed it, 6 of the 12 undocumented. Of those 6,
+    4 are cheap to close by widening _env_tainted_names to more binding
+    forms — closed here. The other 2 (map/filter indirection, an
+    env-defaulted function parameter) are documented, deliberate gaps — see
+    test_v319_round2_two_remaining_bypasses_are_documented_known_gaps.
+
+    The sharpest of the 4: c0ff9db's own commit message claimed it closed
+    "element-wise tuple unpacking", but the code only ever paired a LITERAL
+    tuple/list RHS element-by-element — `_host, _port =
+    os.environ.get("ADDR", "h:1").split(":")`, how anyone actually splits
+    one variable, has a Call RHS and bypassed it completely. The control at
+    the end pins that the ORIGINAL literal-tuple case still stays precise
+    (element-wise, not "taint everything"), since that precision is what a
+    combined rule would have to give up to catch the Call-RHS shape.
+    """
+    print("\n[8] four more tainted-binding forms are now caught "
+          "(hostile2-apparatus.md, round 2)")
+    src = '''
+import os
+# 1. a comma-separated env list through a comprehension
+PORTS = [int(p) for p in os.environ.get("STT_PORTS", "9000,9001").split(",")]
+# 2. the same through a for loop
+for q in os.environ.get("STT_PORTS2", "9000,9001").split(","):
+    R = int(q)
+# 3. tuple unpacking whose RHS is a CALL, not a tuple literal
+_host, _port = os.environ.get("ADDR", "h:1").split(":")
+S = int(_port)
+# 4. an augmented assignment binding
+T = "0"
+T += os.environ.get("EXTRA", "1")
+U = int(T)
+'''
+    hits = _unsoftened_env_conversions(src, "<closed>")
+    assert_eq(
+        len(hits), 4,
+        f"exactly the 4 planted defects are found, no more, no fewer (got: {hits})",
+    )
+    for want in ("int(p)", "int(q)", "int(_port)", "int(T)"):
+        assert_true(any(want in h for h in hits), f"now caught: {want}")
+
+    print("    CONTROL: a MIXED tuple RHS (one env source, one not) is "
+          "still element-wise, not 'taint everything'")
+    # Without this, the fix for #3 above could have been "any Tuple target
+    # whose RHS reads env anywhere taints every name" — which is exactly the
+    # false positive _env_tainted_names' own original docstring warns
+    # against, and precisely why the Call-RHS branch is kept SEPARATE from
+    # the literal-tuple branch rather than merged into it.
+    control = '''
+import os
+def compute():
+    return 5
+a, b = os.environ.get("X", "1"), compute()
+C = int(b)
+'''
+    hits = _unsoftened_env_conversions(control, "<control>")
+    assert_eq(
+        hits, [],
+        f"a, b = env(), compute() still taints only 'a', not 'b' (got: {hits})",
+    )
+
+
+def test_v319_round2_two_remaining_bypasses_are_documented_known_gaps():
+    """(v3.1.9 round 2, hostile2-apparatus.md) The 2 bypasses NOT closed by
+    the fix above, pinned so a future change to the detector's behaviour on
+    either shape is a deliberate decision, not a silent regression in
+    either direction. See _unsoftened_env_conversions' own docstring,
+    "WHAT IT DOES NOT CATCH", for why each is a documented gap rather than a
+    chased fix.
+    """
+    print("\n[9] CONTROL: two remaining bypasses are still, deliberately, "
+          "documented gaps (round 2)")
+    map_indirection = '''
+import os
+PORTS = list(map(int, os.environ.get("STT_PORTS", "9000,9001").split(",")))
+'''
+    hits = _unsoftened_env_conversions(map_indirection, "<map>")
+    assert_eq(
+        hits, [],
+        "map(int, ...) indirection is a KNOWN, documented gap (not caught)",
+    )
+
+    env_default_param = '''
+import os
+def start(port: str = os.environ.get("PORT", "9000")):
+    return int(port)
+'''
+    hits = _unsoftened_env_conversions(env_default_param, "<param>")
+    assert_eq(
+        hits, [],
+        "an env-defaulted function parameter, used in the function body, is "
+        "a KNOWN, documented gap (not caught)",
+    )
+
+
 def test_no_unsoftened_env_conversion_survives_anywhere():
     print("\n[7] no shipped module converts an env value without softening it")
 
@@ -823,6 +997,8 @@ if __name__ == "__main__":
     test_each_routed_module_survives_bad_values()
     test_the_original_crash_reproduction_no_longer_crashes()
     test_detector_can_actually_say_no()
+    test_v319_round2_closes_four_more_tainted_binding_forms()
+    test_v319_round2_two_remaining_bypasses_are_documented_known_gaps()
     test_no_unsoftened_env_conversion_survives_anywhere()
 
     if FAILED:

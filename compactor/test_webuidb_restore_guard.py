@@ -1086,6 +1086,55 @@ check(
     f"chats={chats(LOCAL) if LOCAL.exists() else None!r})",
 )
 
+# ---------------------------------------------------------------------------
+print()
+print("[17] the SAME unstatable-snapshot collapse, one branch earlier: local "
+      "healthy but EMPTY")
+# v3.1.9 round 2 (fix-webuidb.md's own "Found, not fixed" #3, first bullet).
+# [12] proves the boot refuses when LOCAL is empty and the snapshot EXISTS
+# but is unreadable (fails quick_check). This is the sibling one branch
+# earlier: the snapshot cannot be STAT'ED at all. Before this fix,
+# SNAPSHOT_DB.exists() answered False for that - same collapse [16] closes
+# for the fresh-vs-restore fork - so this branch never even looked: it fell
+# straight through to `elif ok:` and handed OpenWebUI an EMPTY local
+# database while a snapshot that might hold her whole history sat behind an
+# unexamined stat error.
+wipe()
+make_db(LOCAL, 0, "EMPTY-SHELL")
+_orig_snapshot_db = webuidb.SNAPSHOT_DB
+webuidb.SNAPSHOT_DB = _UnstatableSnapshot(
+    OSError(5, "simulated I/O error: stalled mount")
+)
+try:
+    r = webuidb.restore_on_boot()
+finally:
+    webuidb.SNAPSHOT_DB = _orig_snapshot_db
+check(
+    r["action"] == "error",
+    f"refuses to boot rather than hand over an empty database while the "
+    f"snapshot's state is unknown (action={r['action']!r})",
+)
+check(
+    r["action"] != "kept_local",
+    "and specifically does not take the dangerous wrong answer - "
+    "'kept_local' here means OpenWebUI gets an empty schema and the "
+    "snapshot's real state was never looked at",
+)
+
+print("    CONTROL: local healthy but empty, snapshot genuinely ABSENT, is "
+      "still kept_local")
+# Without this, [17] could be passing because the fix now refuses every
+# empty-local boot regardless of the snapshot's situation - breaking a
+# genuinely-absent-snapshot boot instead of only the unstatable one.
+wipe()
+make_db(LOCAL, 0, "EMPTY-SHELL")
+r = webuidb.restore_on_boot()
+check(
+    r["action"] == "kept_local" and chats(LOCAL) == 0,
+    f"an empty local database with no snapshot at all is still kept as-is "
+    f"(action={r['action']!r}) - there is nothing to restore from",
+)
+
 
 print()
 if FAILED:

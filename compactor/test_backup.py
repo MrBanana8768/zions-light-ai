@@ -1131,6 +1131,23 @@ def test_live_database_follows_the_gate_not_existence():
     keys = ("COMPACTOR_BACKUP_WEBUI_DB", "DATABASE_URL", "WEBUI_DB_LOCAL",
             "WEBUI_LOCAL_DB", "WEBUI_SNAPSHOT_DB")
     saved = {k: os.environ.get(k) for k in keys}
+    # v3.1.9 round 2: backup.live_webui_db() now DELEGATES its gate-fallback
+    # branch to webuidb.live_webui_db() (finding 3, "two live-db
+    # resolvers"), which returns webuidb.LOCAL_DB / webuidb.SNAPSHOT_DB —
+    # MODULE CONSTANTS read once at webuidb.py's own import, not
+    # WEBUI_LOCAL_DB/WEBUI_SNAPSHOT_DB re-read fresh from the environment
+    # the way this test used to assume (and the way the OLD, pre-fix
+    # backup.live_webui_db() genuinely did). Setting those two env vars
+    # below no longer has any effect on an ALREADY-imported webuidb module
+    # (almost certainly already imported by an earlier test in this file via
+    # backup.py's own lazy `import webuidb`) — so this test now patches
+    # webuidb.LOCAL_DB/.SNAPSHOT_DB directly for its duration instead,
+    # exactly the same way test_backup_v319.py's own agreement test does.
+    # The env vars are still set too (harmless, and correct for anything
+    # that reads them directly rather than through webuidb's constants).
+    import webuidb
+    saved_webuidb = (webuidb.LOCAL_DB, webuidb.SNAPSHOT_DB)
+    webuidb.LOCAL_DB, webuidb.SNAPSHOT_DB = local, snap
     try:
         os.environ.pop("COMPACTOR_BACKUP_WEBUI_DB", None)
         os.environ.pop("DATABASE_URL", None)
@@ -1148,14 +1165,20 @@ def test_live_database_follows_the_gate_not_existence():
                   "gate flipped to true in the SAME process -> local; the "
                   "answer is not frozen at import")
 
-        # Byte-for-byte the shell's comparison, deliberately: `True` is not
-        # "true" to entrypoint.sh, which then places the database on the
-        # snapshot. A reader that folded case would disagree with the writer
-        # about which file is live — the defect being fixed. M9 owns changing
-        # the dialect, and must change both sides at once.
+        # v3.1.9 round 2: this USED to pin the byte-exact shell comparison
+        # deliberately ("`True` is not `true` to entrypoint.sh"). That
+        # justification no longer holds: entrypoint.sh's own WEBUI_DB_LOCAL
+        # NORMALIZATION block (fix-webuidb.md finding 3) now folds case and
+        # whitespace before any SUPERVISED child ever sees the variable, and
+        # this function now delegates its own gate reading to
+        # webuidb.live_webui_db() (see this function's docstring) instead of
+        # re-deriving the rule a second, narrower way — so `True` now folds
+        # to true here too, exactly as entrypoint.sh's own normaliser and
+        # webuidb.live_webui_db() already agree it should.
         os.environ["WEBUI_DB_LOCAL"] = "True"
-        assert_eq(backup.live_webui_db(), snap,
-                  "`True` means the snapshot, exactly as entrypoint.sh reads it")
+        assert_eq(backup.live_webui_db(), local,
+                  "`True` folds to true now - no longer a second, "
+                  "disagreeing reader of the same rule (v3.1.9 round 2)")
 
         # DATABASE_URL is what OpenWebUI actually opens, and outranks the gate.
         os.environ["WEBUI_DB_LOCAL"] = "true"
@@ -1208,6 +1231,7 @@ def test_live_database_follows_the_gate_not_existence():
         assert_true(untouched.startswith("STALE"),
                     "CONTROL: the abandoned local file was never written")
     finally:
+        webuidb.LOCAL_DB, webuidb.SNAPSHOT_DB = saved_webuidb
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
