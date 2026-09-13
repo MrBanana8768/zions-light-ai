@@ -109,10 +109,73 @@ Go to [Runpod Templates](https://www.runpod.io/console/user/templates) → New T
 - **Environment Variables:** paste the block from
   [runpod.env.template](runpod.env.template) — it carries all 42 vars with
   the ones that matter marked. As of rc8 the image's built-in default IS the
-  production A40 config (Cydonia-24B + runtime fp8), so the only var that
-  strictly MUST be set is `WEBUI_SECRET_KEY`; the template pins the model
+  production A40 config (Cydonia-24B + runtime fp8), so the vars that
+  strictly MUST be set are `WEBUI_SECRET_KEY` and **`WEBUI_DB_LOCAL=false`**
+  (see the next section — runpod.env.template does not carry that row, so add
+  it by hand); the template pins the model
   vars explicitly anyway so a future default change can never surprise a
   deploy (see GPU sizing for alternatives).
+
+### WEBUI_DB_LOCAL — a hard deploy precondition
+
+<!-- LANE-DEP: webuidb WEBUI_DB_LOCAL parsing is being changed (empty value / other spellings); this section describes entrypoint.sh at 604ac8d -->
+
+**Production runs with `WEBUI_DB_LOCAL=false`, and every deploy must keep it
+that way.** It decides where her chat history physically lives. `false` keeps
+`webui.db` on the `/data` volume, where it has always been. `true` moves the
+live database to the pod's local disk at boot and starts a sync daemon that
+copies it back to `/data` every few minutes. That move is the one change in the
+v3.1.x line whose rollback is not clean, and it has not been scheduled.
+
+**The trap: an EMPTY value means `true`.** `entrypoint.sh` reads the variable
+as `${WEBUI_DB_LOCAL:-true}`, and in the shell `:-` replaces an unset value AND
+an empty one. A RunPod template row that is present but blank (`WEBUI_DB_LOCAL`
+with nothing after the `=`) therefore boots with the database moved. Only the
+exact lowercase word `true` moves it; any other non-empty value (`false`,
+`False`, `0`, a typo) keeps it on `/data`. Do not rely on that: write `false`.
+
+**Before every deploy**, in the RunPod template's environment variables, check
+there is a row reading exactly:
+
+```
+WEBUI_DB_LOCAL=false
+```
+
+lowercase, no spaces, no quotes, not blank. The deploy tag's own VERIFY step
+may not repeat this; it applies to every release anyway.
+
+**After every boot**, in the Web Terminal:
+
+```bash
+tr '\0' '\n' < /proc/1/environ | grep -E '^(WEBUI_DB_LOCAL|WEBUIDB_SYNC_ENABLED|DATABASE_URL)='; supervisorctl status webuidb-sync
+```
+
+**Success** — all four of these:
+
+```
+WEBUI_DB_LOCAL=false
+WEBUIDB_SYNC_ENABLED=false
+DATABASE_URL=sqlite:////data/openwebui/webui.db
+webuidb-sync                     STOPPED   Not started
+```
+
+(the first three may print in a different order). The pod's boot output in the
+RunPod **Logs** tab also says `[2b/3] WEBUI_DB_LOCAL=false - webui.db stays on
+/data/openwebui/webui.db`.
+
+**If you see `WEBUI_DB_LOCAL=true`, a `/var/lib/openwebui/webui.db` in
+`DATABASE_URL`, or `webuidb-sync RUNNING`:** the database was moved to local
+disk on this boot.
+
+- **If she has not sent a message since the pod booted:** nothing was written
+  to the moved copy. Fix the template row to `WEBUI_DB_LOCAL=false` and
+  redeploy. Run the check again after the boot.
+- **If she has:** her newest messages are on local disk and reach `/data` only
+  when the sync daemon publishes. Ask her to stop chatting, do NOT redeploy
+  yet, and run
+  `/opt/compactor-venv/bin/python /opt/compactor/webuidb.py --status`; ask for
+  help with its output before changing anything. A redeploy at this point can
+  lose everything written since the last sync.
 
 ### Step 5: Deploy the Pod
 
@@ -306,12 +369,14 @@ Override these in your Runpod template if needed:
 
 | Variable | Default | Description |
 |---|---|---|
-| `COMPACTOR_SELFTEST_ON_BOOT` | `true` | Run the live-stack self-test after boot, logging to `/var/log/supervisor/selftest.log` |
+| `COMPACTOR_SELFTEST_ON_BOOT` | `true` | Run the live-stack self-test after boot, logging to `/data/logs/selftest.log` |
 | `COMPACTOR_ADMIN_BIND` | `127.0.0.1` | Admin-endpoint bind address. **Keep localhost** unless you have auth/firewall in front — admin endpoints are unauthenticated. |
 | `COMPACTOR_BACKUP_ENABLED` | `true` | Run the periodic verified-backup daemon (V2.3) |
 | `COMPACTOR_MIN_FREE_MB_WRITES` | `200` | Pause new-memory writes (keep serving) below this free space on `/data` (V2.3) |
 | `COMPACTOR_LOG_FORMAT` | `text` | `text` (human) or `json` (one object/line for aggregation) |
 | `COMPACTOR_ALERT_WEBHOOK` | *(unset)* | If set, self-test + backup POST a failure alert here (Slack/Discord/generic) |
+| `WEBUI_DB_LOCAL` | `true` (also when set but EMPTY) | **Production: `false`, and it is a hard precondition** — see [WEBUI_DB_LOCAL](#webui_db_local--a-hard-deploy-precondition). `false` keeps `webui.db` on `/data`; `true` moves it to local disk with a sync daemon. |
+| `LOG_DIR` | `/data/logs` | Where every service log is written (on the volume, so logs survive a redeploy) |
 
 ## API Usage
 
@@ -330,38 +395,46 @@ curl https://{POD_ID}-8080.proxy.runpod.net/v1/models
 
 Long conversations are automatically compacted and memory is maintained
 per-conversation — no client changes needed. To get stable per-conversation
-memory through OpenWebUI, the bundled `pipelines/conversation_id_header.py`
-filter propagates the chat ID; direct API callers can set an
-`X-Conversation-Id` header (otherwise the compactor falls back to a content
-hash). See [USER_GUIDE.md](USER_GUIDE.md).
+memory through OpenWebUI, add a connection header in OpenWebUI (Admin Panel →
+Settings → Connections → the `http://localhost:8080/v1` connection → Headers):
+`{"X-Conversation-Id": "{{CHAT_ID}}{{TASK}}"}`. Follow
+[RUNBOOK_MEMORY_IDENTITY.md](RUNBOOK_MEMORY_IDENTITY.md) to do it on a pod that
+already has conversations: the order matters. The bundled
+`pipelines/conversation_id_header.py` filter does **not** deliver the chat ID
+on OpenWebUI 0.11.0 (OpenWebUI discards the metadata it writes); it is only a
+history cap now. Direct API callers set `X-Conversation-Id` themselves
+(otherwise the compactor falls back to a content hash). See
+[USER_GUIDE.md](USER_GUIDE.md).
 
 ## Troubleshooting
 
 ### Is the deploy healthy?
 ```bash
 # Deep health probe (200 = ok/degraded, 503 = storage down)
-curl -s http://localhost:8080/health/full | jq
+curl -s http://localhost:8080/health/full | python3 -m json.tool
+# "ok" does not cover stopped backups: see OPERATIONS.md "Reading /health/full"
 
 # Post-boot self-test result — runs automatically on every start
-cat /var/log/supervisor/selftest.log
+cat /data/logs/selftest.log
 # Expect: "=== N/N passed, 0 failed ==="
 
 # On-demand self-test (real chat round-trip + facts read/write)
-curl -s http://localhost:8080/admin/selftest | jq
+curl -s http://localhost:8080/admin/selftest | python3 -m json.tool
 ```
 
 ### Check Logs
 ```bash
 # Via Runpod web terminal
-cat /var/log/supervisor/vllm.log         # inference engine
-cat /var/log/supervisor/compactor.log    # memory + compaction events
-cat /var/log/supervisor/openwebui.log    # frontend
-cat /var/log/supervisor/selftest.log     # boot self-test
+tail -100 /data/logs/vllm.log         # inference engine
+tail -100 /data/logs/compactor.log    # memory + compaction events
+tail -100 /data/logs/openwebui.log    # frontend
+cat /data/logs/selftest.log           # boot self-test
+cat /data/logs/boot.log               # one line per container boot
 ```
 
 ### Watch memory in real time
 ```bash
-tail -f /var/log/supervisor/compactor.log
+tail -f /data/logs/compactor.log
 # Look for, per conversation:
 #   "injected memory [persona(...) Nfact(s) Mretr sum(L1=.../L2=.../L3=...)]"
 #   "extracted N new fact(s)"  /  "extracted 0 fact(s) — model returned: ..."
