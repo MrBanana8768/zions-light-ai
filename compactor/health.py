@@ -58,6 +58,22 @@ logger = logging.getLogger("compactor.health")
 # `3.0` are the same double.
 _VLLM_PROBE_TIMEOUT_S = env_float("COMPACTOR_HEALTH_PROBE_TIMEOUT_S", 3.0)
 
+# v3.1.9 (hostile317-c F4, HIGH). The best proxy this module has for "how
+# long has this pod been up", read at IMPORT time. health.py is imported by
+# main.py near the top of boot (module scope), and the backup daemon is
+# started by the same entrypoint.sh within moments of it — there is no IPC
+# between the two processes, so this is an approximation, stated here rather
+# than hidden, the same way _hierarchy_progress states that it is
+# poll-relative. Used only for the backup-freshness grace window below: a
+# pod that has not been up for one whole COMPACTOR_BACKUP_INTERVAL_HOURS yet
+# has not necessarily had time for its first cycle to run and publish.
+_PROCESS_STARTED_AT = time.time()
+
+
+def _reset_process_started_at_for_tests(t: float | None = None) -> None:
+    global _PROCESS_STARTED_AT
+    _PROCESS_STARTED_AT = time.time() if t is None else t
+
 
 # ---------------------------------------------------------------------------
 # Individual probes
@@ -140,6 +156,54 @@ def probe_storage() -> dict:
 _SQLITE_JOURNAL_MAGIC = bytes.fromhex("d9d505f920a163d7")
 
 
+def _resolve_live_webui_db() -> tuple[Any, str | None]:
+    """The SQLite file OpenWebUI actually has open, or (None, why-not).
+
+    v3.1.9 (hostile2-backup A3-8). Calls backup.live_webui_db() rather than
+    re-deriving the same rule a third time: webuidb.py's own module docstring
+    is where the LOCAL_DB / SNAPSHOT_DB split is explained, and
+    backup.live_webui_db() (1ecd4b6) is the one place that already resolves
+    "which of those OpenWebUI is reading right now" the way entrypoint.sh
+    decides it — explicit override, then DATABASE_URL, then the gate compared
+    EXACTLY as entrypoint.sh compares it. A second, independent reading of
+    WEBUI_DB_LOCAL here could disagree with that one on a typo or a future
+    edit, which is precisely the reader-disagrees-with-writer defect
+    live_webui_db()'s own docstring was written to close. backup.py is
+    already imported in this same request (_gather_blocking imports it for
+    latest_backup_info()), so this costs nothing extra.
+
+    CAVEAT, stated rather than hidden: backup.live_webui_db() also honors
+    COMPACTOR_BACKUP_WEBUI_DB, an override meant for "where backup.py reads
+    from", not "where OpenWebUI writes to". An operator who sets it to
+    something other than the live database would make this probe watch that
+    same, deliberately different, file. That is an intentional operator
+    override read the way its own module documents it, not a defect this
+    probe introduces.
+    """
+    try:
+        import backup as backup_module
+        return backup_module.live_webui_db(), None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _check_one_journal(db_path: str) -> dict:
+    """The magic-header check, isolated to one candidate path so
+    probe_sqlite_journal can run it against more than one file without
+    duplicating the read/parse logic."""
+    journal = db_path + "-journal"
+    try:
+        if not os.path.exists(journal):
+            return {"ok": True, "hot": False, "path": journal}
+        with open(journal, "rb") as fh:
+            head = fh.read(8)
+    except OSError as e:
+        return {"ok": None, "hot": None, "path": journal,
+                "error": f"{type(e).__name__}: {e}"}
+    hot = head == _SQLITE_JOURNAL_MAGIC
+    return {"ok": not hot, "hot": hot, "path": journal, "header": head.hex()}
+
+
 def probe_sqlite_journal() -> dict:
     """Is OpenWebUI's database sitting next to a HOT rollback journal?
 
@@ -167,20 +231,94 @@ def probe_sqlite_journal() -> dict:
 
     Best-effort by the module's own contract: a probe that cannot answer
     reports that it could not, and never raises into the endpoint.
+
+    v3.1.9 (hostile2-backup A3-8, MEDIUM). THIS PROBE CHECKED THE WRONG FILE
+    UNDER THE SHIPPED DEFAULT. It read WEBUI_SNAPSHOT_DB unconditionally, but
+    that is only where SQLite writes when WEBUI_DB_LOCAL=false. Under the
+    shipped default (WEBUI_DB_LOCAL=true, entrypoint.sh + backup.py both
+    default it there), OpenWebUI's hot writer is WEBUI_LOCAL_DB on local
+    disk, and WEBUI_SNAPSHOT_DB is a periodically-refreshed COPY that
+    webuidb.sync_once() writes with its own sqlite3 backup() connection - a
+    second, independent place a hot journal can appear, and the one place
+    this probe was NOT looking under the default gate. It happened to look
+    at the right file in THIS pod's actual production configuration only
+    because WEBUI_DB_LOCAL is forced to false here (see MEMORY.md) - which
+    made the miss invisible without making it correct.
+
+    Now checks BOTH candidates that can matter: whichever file
+    backup.live_webui_db() resolves as the one OpenWebUI has open (see
+    _resolve_live_webui_db - this is the file the 2026-08-31 and 2026-09-07
+    incidents were both about), and WEBUI_SNAPSHOT_DB when it names a
+    DIFFERENT file (webuidb-sync's own writer, "if that still matters" per
+    the brief - it is a real SQLite writer whenever WEBUI_DB_LOCAL=true).
+    When the two resolve to the SAME path (WEBUI_DB_LOCAL=false: the
+    snapshot IS the live db) it is checked once, not twice.
+
+    The merged, top-level `ok`/`hot`/`path` stay the SAME SHAPE this probe
+    has always returned (existing callers - the status reason below, and
+    test_sqlite_journal.py, which is not this lane's file to edit - read
+    only those three keys): hot wins if either candidate is hot; otherwise
+    an unreadable candidate wins over 'clean', so a probe that could not
+    read ONE of the two files is never reported as if both were fine. Every
+    candidate's own result is also kept, in full, under `checked`, so an
+    operator (or a future caller) can tell which file the health reason is
+    actually about.
     """
-    db = os.environ.get("WEBUI_SNAPSHOT_DB", "/data/openwebui/webui.db")
-    journal = db + "-journal"
-    try:
-        if not os.path.exists(journal):
-            return {"ok": True, "hot": False, "path": journal}
-        with open(journal, "rb") as fh:
-            head = fh.read(8)
-    except OSError as e:
-        return {"ok": None, "hot": None, "path": journal,
-                "error": f"{type(e).__name__}: {e}"}
-    hot = head == _SQLITE_JOURNAL_MAGIC
-    return {"ok": not hot, "hot": hot, "path": journal,
-            "header": head.hex()}
+    live_db, live_err = _resolve_live_webui_db()
+    live_path = str(live_db) if live_db is not None else None
+    snap = os.environ.get("WEBUI_SNAPSHOT_DB", "/data/openwebui/webui.db")
+
+    checked: dict[str, dict] = {}
+    if live_path is not None:
+        checked["live"] = _check_one_journal(live_path)
+    else:
+        # live_webui_db() could not be resolved at all (backup.py itself
+        # failed to import, or raised) - unreadable, not "clean", same
+        # doctrine as every other probe in this module.
+        checked["live"] = {
+            "ok": None, "hot": None, "path": None,
+            "error": live_err or "the live webui.db path could not be resolved",
+        }
+    # normcase + abspath: the two env vars are free-form operator strings
+    # (a trailing slash, a relative path, a different case on a
+    # case-insensitive test filesystem) and a false "different file" would
+    # silently double-check the same journal under two names, which is
+    # harmless, while a false "same file" would silently DROP the snapshot
+    # check the brief asked for. Comparing loosely favors checking twice.
+    same_file = (
+        live_path is not None
+        and os.path.normcase(os.path.abspath(snap))
+        == os.path.normcase(os.path.abspath(live_path))
+    )
+    if not same_file:
+        checked["snapshot"] = _check_one_journal(snap)
+
+    hot_entry = next((v for v in checked.values() if v.get("hot")), None)
+    if hot_entry is not None:
+        result = dict(hot_entry)
+    else:
+        unread_entry = next(
+            (v for v in checked.values() if v.get("hot") is None), None
+        )
+        result = dict(unread_entry) if unread_entry is not None else dict(
+            checked.get("live") or checked.get("snapshot")
+        )
+    result["checked"] = checked
+    return result
+
+
+# v3.1.9 (health H-6). One day. A healthy pod writes its summary state on
+# every accepted turn (the H-1 comment's own claim, which this reuses), so a
+# conversation genuinely lagging RIGHT NOW has had its state file touched
+# within the current session - minutes to a few hours, not days. A full day
+# is generous headroom for someone who chats once in the morning and once at
+# night, and is still nowhere near the "400-day-old junk namespace" shape
+# hostile pass 2 measured. A conversation that goes quiet for longer than
+# this simply drops out of contention for the reason's conv= name until she
+# writes to it again - which is correct: it is not "live" in the sense this
+# reason exists to flag, and picking it back up brings it back into scope on
+# the next write.
+_WORST_LAG_RECENCY_S = 24 * 3600.0
 
 
 def gather_memory_stats() -> dict:
@@ -214,6 +352,30 @@ def gather_memory_stats() -> dict:
     # already opens every state file, so the number costs nothing extra.
     worst_lag = 0
     worst_lag_conv = None
+    # v3.1.9 (hostile pass 2 MEDIUM, health H-6). worst_lag ABOVE is kept as
+    # the true, unfiltered maximum over every readable conversation - a
+    # diagnostic number, and shrinking it silently would make stats.hierarchy_lag
+    # lie by omission. But it is not what the status REASON below should
+    # name: turns_seen and last_summarized_turn are BOTH written only by
+    # maybe_rollup (see the H-1 comment above _hierarchy_progress), so a
+    # conversation whose summary STATE FILE has not been touched in a long
+    # time has a FROZEN lag number, not a growing one - it stopped changing
+    # the day its rollup last ran, whatever that number says today. On a
+    # store that is 62% abandoned test/junk namespaces (hostile pass 2's own
+    # figure), one such conversation can sit at a huge, permanently-frozen
+    # lag and win the `_lag > worst_lag` comparison over every conversation
+    # actually being chatted in right now - so the reason always named the
+    # ancient one and an operator chasing "the summary hierarchy is behind
+    # on conv=X" investigated a namespace nobody has touched in over a year
+    # while a live one, genuinely falling behind today, was never named.
+    #
+    # worst_lag_recent tracks the same maximum, but only among conversations
+    # whose summary state file's own mtime is within _WORST_LAG_RECENCY_S -
+    # the file mtime is the only "when was this touched" signal available
+    # without editing summarizer.py (out of this lane's file list; see the
+    # report). This is what the status reason uses.
+    worst_lag_recent = 0
+    worst_lag_recent_conv = None
     # v3.1.9 (hostile pass 2, H-1). What every readable state file says about
     # how far its hierarchy has got - the same fields maybe_rollup compares to
     # decide whether to write at all. hierarchy_lag cannot see a rollup that
@@ -222,6 +384,7 @@ def gather_memory_stats() -> dict:
     # tail's decision count, which moves on every turn whether or not the
     # rollup ran. See _hierarchy_progress.
     progress: list[tuple] = []
+    _lag_scan_now = time.time()
     for cid in conv_ids:
         try:
             facts_total += len(facts.load_facts(cid))
@@ -258,6 +421,21 @@ def gather_memory_stats() -> dict:
                 _lag = _seen - _done
                 if _lag > worst_lag:
                     worst_lag, worst_lag_conv = _lag, cid
+                if _lag > worst_lag_recent:
+                    try:
+                        _state_mtime = summarizer.summary_path(cid).stat().st_mtime
+                        _recent = (
+                            (_lag_scan_now - _state_mtime) <= _WORST_LAG_RECENCY_S
+                        )
+                    except OSError:
+                        # A lag was computed FROM this state, so the file
+                        # exists; an OSError here is a race (deleted between
+                        # load_state and this stat) or a permissions change.
+                        # Excluded, the same safe direction as "could not
+                        # tell" everywhere else in this module.
+                        _recent = False
+                    if _recent:
+                        worst_lag_recent, worst_lag_recent_conv = _lag, cid
             progress.append((
                 cid, _seen, _done, tuple(state.get("tail_fp") or ()),
                 state.get("head_fp"), state.get("window_turns"),
@@ -286,6 +464,10 @@ def gather_memory_stats() -> dict:
         "summaries_with_l3": summaries_with_l3,
         "hierarchy_lag": worst_lag,
         "hierarchy_lag_conv": worst_lag_conv,
+        # v3.1.9 (H-6). The recency-filtered pair the status reason actually
+        # uses; see the comment above worst_lag_recent's initialization.
+        "hierarchy_lag_recent": worst_lag_recent,
+        "hierarchy_lag_recent_conv": worst_lag_recent_conv,
         "unreadable": unreadable,
         # Private (leading underscore): an opaque in-process hash, compared
         # for equality only and popped by gather_health_full before the
@@ -360,7 +542,8 @@ def probe_snapshot() -> dict:
     if not enabled:
         return out
     try:
-        age = time.time() - os.path.getmtime(snap)
+        snap_mtime = os.path.getmtime(snap)
+        age = time.time() - snap_mtime
     except OSError as e:
         # The snapshot is supposed to exist whenever the daemon runs. Missing
         # is worse than stale, not better, so it reports as stale with the
@@ -388,7 +571,62 @@ def probe_snapshot() -> dict:
             f"clock: the snapshot's mtime is {round(-age)}s in the future"
         )
         return out
-    out["stale"] = age > 3 * interval
+    # v3.1.9 (OPEN_ISSUES2 webuidb MEDIUM, "the one durability alarm
+    # measures her IDLE TIME"). webuidb.sync_once() stamps the published
+    # snapshot with `min(local_mtime, time.time())` - the LOCAL database's
+    # own last-WRITE time, not the moment of publish (see its comment at the
+    # os.replace/os.utime call: the stamp exists so "has anything changed
+    # since the last publish" is answerable next cycle, not to record when
+    # the publish happened). So `age = now - snapshot_mtime`, above, measures
+    # how long it has been since she last sent a message, not how long it
+    # has been since the daemon last ran: a publish that succeeded THIS
+    # SECOND, on a pod that has been quiet for eight hours, reports
+    # age_s=28800 and (with the un-fixed `age > 3 * interval` below) stale
+    # True — measured exactly that shape. And sync_once()'s "unchanged since
+    # last sync" branch returns BEFORE os.replace/os.utime, so on a quiet
+    # night the snapshot's own ctime goes just as stale as its mtime: no
+    # timestamp ON THIS FILE distinguishes "healthy, nothing new to publish"
+    # from "the daemon died N hours ago" - which is exactly why this was
+    # crying wolf every quiet night.
+    #
+    # WHAT DOES DISTINGUISH THEM, without webuidb.py writing anything new:
+    # WEBUI_LOCAL_DB's own mtime is the live source sync_once() reads FROM,
+    # and its own skip condition is `snapshot_mtime >= local_mtime` - so
+    # "is the durable copy caught up" is the SAME comparison the daemon
+    # itself makes, not "how old is the snapshot in wall-clock time". A
+    # quiet night moves neither file, so local_lag_s stays ~0 and nothing
+    # fires; real unpublished activity moves the local file and not the
+    # snapshot, and THAT growing lag is the unbounded-durability-gap this
+    # probe was built to catch in the first place (see the module
+    # docstring: "sync_loop shouted three times and went quiet").
+    #
+    # FALLS BACK SAFELY when WEBUI_LOCAL_DB cannot be read (the daemon is
+    # watching but the local overlay is gone, or WEBUI_DB_LOCAL disagrees
+    # with what actually exists on disk): local_lag_s stays None and
+    # staleness reverts to the exact wall-clock comparison this probe has
+    # always made — the known idle-time limitation, not a crash and not
+    # silently "fixed" for a case this process cannot see into.
+    #
+    # SPECIFIED, NOT BUILT HERE (per the brief: do not edit webuidb.py). A
+    # signal that survives even the fallback case needs webuidb.py to stamp
+    # something OTHER than content mtime - e.g. a sibling file such as
+    # `f"{SNAPSHOT_DB}.synced_at"`, written with the WALL-CLOCK time of every
+    # completed sync_once() call (published OR skipped-because-unchanged, so
+    # a live daemon still "checks in" on a quiet night), containing just the
+    # epoch float. If that file starts existing, prefer it outright over
+    # both age_s and local_lag_s; nothing here reads it because it does not
+    # exist yet.
+    local_db = os.environ.get("WEBUI_LOCAL_DB", "/var/lib/openwebui/webui.db")
+    local_lag_s: float | None
+    try:
+        local_lag_s = os.path.getmtime(local_db) - snap_mtime
+    except OSError:
+        local_lag_s = None
+    out["local_lag_s"] = None if local_lag_s is None else round(local_lag_s)
+    if local_lag_s is not None:
+        out["stale"] = local_lag_s > 3 * interval
+    else:
+        out["stale"] = age > 3 * interval
     return out
 
 
@@ -431,7 +669,20 @@ def _gather_blocking() -> dict:
     storage = probe_storage()
     stats = gather_memory_stats()
 
-    sqlite_journal = probe_sqlite_journal()
+    # v3.1.9 (hostile2-health, sibling of H-4). This call was the one probe
+    # in this function with no try/except around it: every other probe here
+    # (writes, backups, snapshot) catches its own exception because a thread
+    # hop must not turn one broken probe into a 500 from the whole endpoint —
+    # the module docstring's own promise. probe_sqlite_journal() now also
+    # imports backup (_resolve_live_webui_db), which is one more way it can
+    # raise something that is not the OSError its own internals already
+    # catch. Same shape as the others: an exception here degrades this one
+    # check, never the endpoint.
+    try:
+        sqlite_journal = probe_sqlite_journal()
+    except Exception as e:
+        sqlite_journal = {"ok": None, "hot": None,
+                           "error": f"{type(e).__name__}: {e}"}
 
     # V2.3 Theme 2: disk-pressure write state. "paused" means we're still
     # serving but no longer persisting new memory — a degraded condition the
@@ -686,6 +937,17 @@ async def gather_health_full(
                 f"new-memory writes paused under disk pressure "
                 f"(free_mb={writes.get('free_mb')})"
             )
+        elif writes.get("new_memory_writes") == "unknown":
+            # v3.1.9 (hostile2-health, sibling of H-4). _gather_blocking's
+            # except turns a raising degrade.write_state() into
+            # {"new_memory_writes": "unknown", "error": ...} and only the
+            # "paused" branch above ever read this field. A degrade probe
+            # that cannot answer is not the same as one that answered "we are
+            # writing fine" - same doctrine as bg/mt below.
+            reasons.append(
+                f"new-memory write state unobservable "
+                f"({writes.get('error')})"
+            )
         if bg.get("error"):
             # We could not read the pool at all. Same doctrine as
             # indexed_exchanges_total: unknown is not the same as fine, and a
@@ -767,6 +1029,93 @@ async def gather_health_full(
                 + ". Those conversations are not being read and must not be "
                 "written over; see stats.unreadable."
             )
+        # v3.1.9 (hostile317-c F4, HIGH — live in production; re-checked at
+        # this HEAD, where the stats.unreadable half above was already fixed
+        # in v3.1.8, and only THIS half was still open). `backups` has been
+        # in the payload since V2.3 Theme 1 and nothing ever turned it into a
+        # reason: `.stats.unreadable` above is the OTHER half of the same
+        # finding and it was fixed; `.backups` was not. Demonstrated on her
+        # real store both with unreadable memory files present AND with
+        # `backups: {count: 0, latest: null}` — status "ok" either way.
+        #
+        # ENV NAMES AND DEFAULTS ARE THE DAEMON'S OWN (backup.py, read via
+        # envcfg the same way the rest of this module reads config; and
+        # entrypoint.sh, which normalizes COMPACTOR_BACKUP_ENABLED through
+        # _bool before this process ever sees it, default true, so a bare
+        # `== "true"` compare here agrees with the writer exactly — the same
+        # reasoning WEBUIDB_SYNC_ENABLED's compare above already uses, and
+        # unlike it COMPACTOR_BACKUP_ENABLED IS operator-facing, which is
+        # exactly why entrypoint.sh runs it through _bool first). A pod
+        # deployed with backups turned off on purpose is not a fault, the
+        # same doctrine as COMPACTOR_HIERARCHICAL_SUMMARY=false (H-3): the
+        # switch is documented, and a reason that fires on a chosen
+        # configuration trains the operator to ignore this endpoint.
+        _backup_enabled = (
+            os.environ.get("COMPACTOR_BACKUP_ENABLED", "true").strip().lower()
+            == "true"
+        )
+        if _backup_enabled:
+            # Same clamp probe_snapshot already applies to
+            # WEBUI_DB_SYNC_INTERVAL_S, for the same reason: this value is
+            # arithmetic, not a label, and envcfg does not range it.
+            _bk_interval_h = env_float("COMPACTOR_BACKUP_INTERVAL_HOURS", 24.0)
+            if not (math.isfinite(_bk_interval_h) and _bk_interval_h > 0):
+                _bk_interval_h = 24.0
+            _bk_interval_s = _bk_interval_h * 3600.0
+            _bk_now = time.time()
+            if backup_info.get("error"):
+                # v3.1.9 (sibling of H-4). latest_backup_info() raising is
+                # caught in _gather_blocking as {"count": None, "latest":
+                # None, "error": ...} and, like sqlite_journal/writes above,
+                # nothing here ever read the error half — a probe that could
+                # not answer read exactly like an empty-but-fine backup dir.
+                reasons.append(
+                    f"backup status unobservable ({backup_info['error']})"
+                )
+            elif backup_info.get("count") == 0:
+                # GRACE, NOT A REFUSAL. A pod that just booted has not had a
+                # full COMPACTOR_BACKUP_INTERVAL_HOURS yet — run_daemon fires
+                # a first cycle almost immediately on a truly empty backup
+                # dir, but "almost immediately" still means staging,
+                # verifying and publishing an archive, which takes real time
+                # (measured, cross-mount, up to ~1,790s for her real store;
+                # native-volume is unmeasured here but not instant). Reporting
+                # zero backups as a fault on turn one of a pod's life would
+                # make every fresh deploy read degraded for no reason — the
+                # exact cried-wolf shape this module keeps having to undo.
+                # _PROCESS_STARTED_AT is this process's own best guess at pod
+                # boot (see its comment); the grace window is exactly one
+                # backup interval, per the brief's own framing ("must not
+                # degrade for its first interval").
+                _uptime = _bk_now - _PROCESS_STARTED_AT
+                if _uptime >= _bk_interval_s:
+                    reasons.append(
+                        f"COMPACTOR_BACKUP_ENABLED is true, this pod has been "
+                        f"up {round(_uptime)}s (past one "
+                        f"{round(_bk_interval_s)}s backup interval), and "
+                        f"{backup_info.get('dir')} holds zero archives. If a "
+                        f"restore were needed right now there is nothing to "
+                        f"restore. Run `backup.py --once` by hand and read "
+                        f"its output."
+                    )
+            else:
+                _latest_mtime = backup_info.get("latest_mtime")
+                if isinstance(_latest_mtime, (int, float)):
+                    _bk_age = _bk_now - _latest_mtime
+                    # 1.5x, not 1x: a single cycle that overran (a slow
+                    # volume, a large store) is ordinary and must not fire on
+                    # its own — hostile317-c F4's own suggested threshold.
+                    if _bk_age > 1.5 * _bk_interval_s:
+                        reasons.append(
+                            f"the newest backup ({backup_info.get('latest')}) "
+                            f"is {round(_bk_age)}s old against a "
+                            f"{round(_bk_interval_s)}s backup interval "
+                            f"(limit {round(1.5 * _bk_interval_s)}s). The "
+                            f"daemon has not published a new archive in over "
+                            f"one and a half cycles. Check "
+                            f"`supervisorctl status backup` and the tail of "
+                            f"its log."
+                        )
         # A hot journal is not a maybe: it is an uncommitted transaction
         # that the next process to open the database will try to roll back,
         # and on a network filesystem that rollback is what wedged the pod
@@ -784,6 +1133,15 @@ async def gather_health_full(
                 f"pair, and separating them turns a recoverable file into "
                 f"a corrupt one."
             )
+        elif _sj.get("error"):
+            # v3.1.9 (hostile2-health, sibling of H-4). probe_sqlite_journal
+            # returns {"ok": None, "hot": None, "error": ...} on an OSError
+            # reading a candidate's journal (a permission change, an
+            # unmounted volume) and only `hot` was ever read here - so a
+            # probe that could not answer read exactly like a probe that
+            # answered "clean". Unknown is not fine, same doctrine as bg,
+            # mt, backups and writes below.
+            reasons.append(f"sqlite journal probe unobservable ({_sj['error']})")
         # THE ROLLUP IS OTHERWISE UNOBSERVABLE. v3.1.8's skip-path rollup has
         # six ways to do nothing and five are silent: raw_chars == 0, no
         # conversational history, task traffic, the summarizer disabled, an
@@ -796,15 +1154,38 @@ async def gather_health_full(
         # Two chunks of lag, because one chunk of drift is ordinary: the
         # rollup fires on the tail, so the newest turns are always ahead of
         # the watermark. Twice that is a hierarchy that has stopped keeping up.
-        _lag = stats.get("hierarchy_lag")
+        #
+        # v3.1.9 (health H-6). Named from hierarchy_lag_RECENT, not the raw
+        # hierarchy_lag: see gather_memory_stats' worst_lag_recent comment.
+        # The raw max stays in stats for anyone reading the payload directly;
+        # the reason names only a conversation whose state file was touched
+        # in the last day, so a permanently-frozen ancient conversation
+        # cannot mask a live one from the operator investigating this line.
+        _lag = stats.get("hierarchy_lag_recent")
+        # v3.1.9 (health H-7). env_int does not range anything (its own
+        # docstring says so - callers disagree about what a legal range is),
+        # and L1_CHUNK_SIZE is read through it unranged. A `0` here made
+        # `2 * 0 == 0` a limit that fires on lag 1 - one turn of ordinary
+        # drift degrading the pod - and a NEGATIVE L1_CHUNK_SIZE made the
+        # limit negative, which degrades a pod with ZERO conversations: with
+        # no conv_ids the scan above never runs, hierarchy_lag stays its
+        # init value 0, and `0 > -N` is true, printing "conv=None" in the
+        # reason below - a store with nothing in it, reported as behind.
+        # Floored at the computation this project's own default
+        # (COMPACTOR_L1_CHUNK_SIZE=20) produces, the same shape as
+        # backup.MIN_KEEP and pgarchive.MIN_KEEP: a bad env value degrades to
+        # a sane number, never to a value that cannot decide anything.
         _lag_limit = 2 * summarizer.L1_CHUNK_SIZE
+        if _lag_limit <= 0:
+            _lag_limit = 2 * 20
         if isinstance(_lag, int) and _lag > _lag_limit:
             reasons.append(
                 f"the summary hierarchy is {_lag} turns behind on "
-                f"conv={stats.get('hierarchy_lag_conv')} (limit {_lag_limit}). "
-                f"Turns past the watermark are carried by the raw window "
-                f"alone, so the oldest of them fall out of the request as it "
-                f"grows. POST /admin/conversations/<id>/compact drains the "
+                f"conv={stats.get('hierarchy_lag_recent_conv')} "
+                f"(limit {_lag_limit}). Turns past the watermark are carried "
+                f"by the raw window alone, so the oldest of them fall out of "
+                f"the request as it grows. "
+                f"POST /admin/conversations/<id>/compact drains the "
                 f"backlog off the request path."
             )
         # v3.1.9 (H-1). The half hierarchy_lag cannot see: the rollup is not
@@ -885,13 +1266,33 @@ async def gather_health_full(
                 f"its durable copy. Check `supervisorctl status webuidb-sync`."
             )
         elif _snap.get("stale"):
-            reasons.append(
-                f"the webui.db snapshot on /data is {_snap.get('age_s')}s old "
-                f"against a {_snap.get('interval_s')}s sync interval. The live "
-                f"database is on local disk, which a pod recreate destroys, so "
-                f"this is the durable copy and it is not being written. Check "
-                f"`supervisorctl status webuidb-sync`."
-            )
+            # v3.1.9 (webuidb MEDIUM, "measures her IDLE TIME"). When
+            # local_lag_s decided this (the normal case - see probe_snapshot),
+            # say THAT number: it is "how far behind the live database this
+            # copy is", which is the actual durability gap. age_s alone ("how
+            # long since anything changed") is what cried wolf every quiet
+            # night, so it is named only as extra context here, not as the
+            # headline number.
+            _lag = _snap.get("local_lag_s")
+            if _lag is not None:
+                reasons.append(
+                    f"the webui.db snapshot on /data is {_lag}s behind the "
+                    f"live database on local disk (unchanged for {_snap.get('age_s')}s, "
+                    f"sync interval {_snap.get('interval_s')}s). The live "
+                    f"database is on local disk, which a pod recreate "
+                    f"destroys, so this is the durable copy and it is not "
+                    f"catching up. Check `supervisorctl status webuidb-sync`."
+                )
+            else:
+                reasons.append(
+                    f"the webui.db snapshot on /data is {_snap.get('age_s')}s "
+                    f"old against a {_snap.get('interval_s')}s sync interval "
+                    f"(WEBUI_LOCAL_DB could not be read, so this is judged by "
+                    f"age alone and may simply mean nobody has chatted "
+                    f"recently). The live database is on local disk, which a "
+                    f"pod recreate destroys, so this is supposed to be its "
+                    f"durable copy. Check `supervisorctl status webuidb-sync`."
+                )
         elif _snap.get("error"):
             # v3.1.9 (H-4). The branch every sibling probe had and this one did
             # not (compare bg and mt above). _gather_blocking turns a probe
