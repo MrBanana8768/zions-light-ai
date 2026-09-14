@@ -643,6 +643,32 @@ print("[6] health.py: the catch-up verdict is evidence-based, stable "
       "across many polls, never hides real lag")
 
 
+def _clear_all_conv_state() -> None:
+    """hostile pass #5 (E6): this section's checks depend on the health
+    scan seeing ONLY the conversation(s) each check sets up -- e.g. "a
+    converging catch-up does not fire the actionable reason" assumes
+    nothing else on disk is a DIFFERENT, non-converging conversation over
+    the lag limit. That was true by ACCIDENT before this fix, because the
+    scan only ever named the single largest-lag conversation (E6's own
+    defect: a smaller stuck lag could never surface once anything larger
+    existed). Now every over-limit recent conversation is judged, so a
+    leftover conv_id from an EARLIER section above (its state file still
+    on disk, mtime still "recent") with no catch-up evidence would read
+    'unknown' and correctly fire its own reason -- correct behaviour, but
+    it would contaminate an isolation test that never meant to exercise
+    it. Clearing every summary state file before this section starts (the
+    same technique test_health_findings.py's own _reset_all uses) keeps
+    this section about the ONE conversation it is actually testing.
+    """
+    d = memory.storage_root() / "summaries"
+    if d.exists():
+        for f in d.glob("*.json"):
+            f.unlink()
+
+
+_clear_all_conv_state()
+
+
 async def _poll_health() -> dict:
     return await health.gather_health_full(main.VLLM_URL, 4000)
 
@@ -783,13 +809,31 @@ _restart_payload = asyncio.run(_poll_health())
 check((_catching_up(_restart_payload) or {}).get("verdict") == "unknown",
       "right after a (simulated) restart, no evidence yet: unknown")
 check(bool(_lag_reason(_restart_payload)),
-      "unknown defaults to the SAME actionable reason 'stuck' gets -- a "
-      "restart must never let a genuinely stuck backlog read as "
-      "self-healing just because nothing has been observed about it yet "
-      "in the new process (does not hide a stuck lag forever)")
-check(_lag_reason(_restart_payload) == _lag_reason(_stuck_payload),
-      "unknown and stuck fire the IDENTICAL reason text -- there is only "
-      "one actionable wording, not two an operator has to learn apart")
+      "unknown degrades status the SAME way 'stuck' does -- a restart "
+      "must never let a genuinely stuck backlog read as self-healing "
+      "just because nothing has been observed about it yet in the new "
+      "process (does not hide a stuck lag forever)")
+# hostile pass #5 (C5-7): the text is no longer identical, ON PURPOSE.
+# "Unknown" is NOT evidence of a stall (most often a recent restart with
+# no catch-up passes recorded yet) and must not assert one as fact the
+# way the old shared wording did; "stuck" is real evidence, so it still
+# gets the actionable /compact wording (or, when a tier is known to be
+# failing, names that tier instead -- see health._catchup_reason). Both
+# still DEGRADE STATUS identically (checked above and by [F3a]/[F3b] in
+# test_health_findings.py) -- what changed is the wording, not whether it
+# alarms.
+check(_lag_reason(_restart_payload) != _lag_reason(_stuck_payload),
+      "unknown and stuck now fire DIFFERENT reason text -- 'unknown' says "
+      "there is no evidence yet rather than asserting a stall that was "
+      "never observed, while 'stuck' keeps the actionable wording (or "
+      "names the failing tier)")
+check("No catch-up evidence" in _lag_reason(_restart_payload),
+      f"the unknown reason says plainly that nothing has been observed "
+      f"yet, rather than reusing 'stuck''s wording (got "
+      f"{_lag_reason(_restart_payload)!r})")
+check("/compact" in _lag_reason(_stuck_payload),
+      f"the stuck reason (no tier failure on record for this conv) still "
+      f"names /compact as the remedy (got {_lag_reason(_stuck_payload)!r})")
 
 health._reset_hierarchy_progress_for_tests()
 summarizer._reset_catchup_progress_for_tests()

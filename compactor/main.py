@@ -173,13 +173,22 @@ MAX_SUMMARY_CALLS_PER_REQUEST = _env_int("COMPACTOR_MAX_SUMMARY_CALLS", 4)
 #
 # Default 4: at L1_MAX_TOKENS=500 and the ~1,650-token turns measured on her
 # real replies, one 20-turn L1 chunk needs 2 map batches + 1 reduce = 3 real
-# calls (more under the pessimistic /tokenize-down scale) — so 4 leaves
-# headroom for one whole chunk plus a little, without letting one turn's
-# tail run long enough to compete for the GPU with the reply she is waiting
-# on. See summarizer._budget_allows_unit for how a budget smaller than one
-# chunk's own cost still guarantees progress (checked at the UNIT boundary,
-# not per real call) rather than livelocking on a too-expensive chunk every
-# turn forever.
+# calls WHEN /tokenize IS UP — so 4 leaves headroom for one whole chunk plus
+# a little, without letting one turn's tail run long enough to compete for
+# the GPU with the reply she is waiting on.
+#
+# hostile pass #5 (C5-7/E8): "3 (more under the pessimistic /tokenize-down
+# scale)" understated it badly and is corrected here with a measured number.
+# With /tokenize down, pieces price at the pessimistic _WORST_TOKENS_PER_CHAR
+# fallback, which over-splits every oversized piece into more, smaller
+# batches — SP\p5-c\sim_cost.py measured one unit's real cost at 6-16 calls
+# on her turn shape (150-700 char user turns, 5,200-8,000 char replies), not
+# 3. This knob still bounds where a unit is allowed to START (see
+# summarizer._budget_allows_unit): a unit that starts always finishes, so
+# the actual overshoot on a turn whose due unit costs 16 calls is (this
+# knob - 1) + 16, not "a little". "4 leaves headroom for one whole chunk
+# plus a little" was only ever true with /tokenize answering; treat it as a
+# floor on the overshoot, not a ceiling.
 TAIL_ROLLUP_MAX_CALLS = _env_int("COMPACTOR_TAIL_ROLLUP_MAX_CALLS", 4)
 
 # How many times summarize() has refused a request over the cap above, since
@@ -5644,21 +5653,62 @@ async def _rollup_hierarchy(
                 # of reporting a bogus ETA — the "does not hide a stuck
                 # catch-up" half of this feature's requirement; the gate
                 # above is the "does not alarm on an ordinary turn" half.
-                _turns_behind = max(0, _turns_seen - _after_wm)
+                #
+                # hostile pass #5 (C5-7/E8): the OLD line described ONLY
+                # L1's watermark ("N turn(s) still uncovered ... ~K more
+                # turn(s)"), even on a turn where `_work_due` is True
+                # because an L2 fold or the L3 refresh is left pending
+                # while L1 itself is fully current — the drain's own L3 >
+                # L2 > L1 priority (see the loop above) means the budget
+                # can run out on exactly that boundary. The old line then
+                # printed "0 turn(s) still uncovered ... ~0 more turn(s)":
+                # a catch-up "in progress" with nothing to report and a
+                # bogus zero ETA, on every such turn (measured 3 times in
+                # SP\final-soak.log's own run). `rollup_due_tiers` names
+                # EVERY tier actually pending, not just L1's turn count.
+                _due = summarizer.rollup_due_tiers(state, _turns_seen)
+                _turns_behind = max(0, _turns_seen - _after_wm) if _due["l1"] else 0
+                _pending = []
+                if _due["l1"]:
+                    _pending.append(f"L1 {_turns_behind} turn(s) still uncovered")
+                if _due["l2"]:
+                    _pending.append("an L2 fold pending")
+                if _due["l3"]:
+                    _pending.append("an L3 refresh pending")
+                # `_work_due` (summarizer.needs_rollup, computed a moment
+                # ago from this same `state`) already means at least one of
+                # the three is True — `rollup_due_tiers` delegates to the
+                # identical per-tier gates needs_rollup ORs together (see
+                # its own docstring), so `_pending` cannot really be empty
+                # here. The fallback exists only so a future drift between
+                # the two checks degrades to a vague line instead of a
+                # crash on the request path.
+                _pending_desc = ", ".join(_pending) if _pending else "a tier pending"
                 _calls_spent = TAIL_ROLLUP_MAX_CALLS - _budget["remaining"]
                 _advanced = _after_wm - _before_wm
-                _eta = (
-                    f"~{-(-_turns_behind // _advanced)} more turn(s) at this "
-                    f"turn's rate"
-                    if _advanced > 0
-                    else "no turns advanced this pass — see the rollup log "
-                         "line above, or the absence of one, for why"
-                )
+                if _due["l1"] and _advanced > 0:
+                    _eta = (
+                        f"~{-(-_turns_behind // _advanced)} more turn(s) at "
+                        f"this turn's rate"
+                    )
+                elif _advanced > 0:
+                    # L1 itself is current; what is left is an L2 fold
+                    # and/or the L3 refresh, neither counted in turns, so
+                    # there is no turn-count ETA to give — it runs on the
+                    # next pass with budget left for it.
+                    _eta = (
+                        "no turn-count ETA — L1 is current, waiting on the "
+                        "fold/refresh above"
+                    )
+                else:
+                    _eta = (
+                        "no turns advanced this pass — see the rollup log "
+                        "line above, or the absence of one, for why"
+                    )
                 logger.info(
                     f"conv={conv_id}: hierarchy catch-up in progress — "
-                    f"{_turns_behind} turn(s) still uncovered, {_calls_spent} "
-                    f"vLLM call(s) spent this turn (budget "
-                    f"{TAIL_ROLLUP_MAX_CALLS}), {_eta}"
+                    f"{_pending_desc}, {_calls_spent} vLLM call(s) spent "
+                    f"this turn (budget {TAIL_ROLLUP_MAX_CALLS}), {_eta}"
                 )
         except Exception as e:
             logger.warning(

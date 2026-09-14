@@ -979,6 +979,7 @@ import memory  # noqa: E402
 memory.ensure_storage_layout()
 
 import facts as facts_mod  # noqa: E402
+import health  # noqa: E402 (hostile pass #5, C5-3/E4: the catch-up health-verdict check)
 import main  # noqa: E402
 import summarizer  # noqa: E402
 
@@ -2017,12 +2018,25 @@ _reset_fixture()
 _set_reply(seq=90001, looping=False)
 
 _CATCHUP_L1 = summarizer.L1_CHUNK_SIZE
-# 8 L1 chunks' worth: deep enough that ONE bounded pass cannot possibly
-# clear it (proving the "successive passes" behaviour, not the "small
-# backlog clears in one turn" behaviour test_tail_catchup.py's CONTROL
-# already covers), shallow enough to stay well under this soak's own
-# per-suite time budget against a real HTTP fixture.
-_CATCHUP_TURNS = 8 * _CATCHUP_L1
+# hostile pass #5 (C5-3/E4): sized against the PRODUCTION per-turn budget
+# (main.TAIL_ROLLUP_MAX_CALLS), not against this suite's own L1_CHUNK_SIZE
+# — the earlier version drove the recovery loop at budget=_CATCHUP_L1 (20)
+# with an 8*_CATCHUP_L1-turn backlog, which drained the WHOLE thing in 29
+# real calls; a "the budget was silently ignored" mutation still fits that
+# in one pass under the old 80-call ceiling, so no check here could ever
+# fail from it. 40 chunks' worth, drained at the production default (4),
+# needs many more passes than that — "a backlog larger than the ceiling
+# many times over", not merely deeper than one pass.
+_CATCHUP_TURNS = 40 * _CATCHUP_L1
+# This project's "turn" is one MESSAGE (_turn_pieces counts per message;
+# see test_tail_catchup.py's build_messages for the same point) —
+# _catchup_history below appends a user AND an assistant message per loop
+# iteration, so the watermark this backlog can reach is 2x _CATCHUP_TURNS,
+# not _CATCHUP_TURNS. The oracle's own target_turn used the exchange count
+# directly (E4's finding #2): "reached turn 320 of 160" could never read
+# as LIVELOCK once half the real backlog was done, because the target was
+# already half of what the array actually contained.
+_CATCHUP_MSG_TOTAL = 2 * _CATCHUP_TURNS
 
 
 def _catchup_history(n_turns: int) -> list[dict]:
@@ -2094,43 +2108,121 @@ if summarizer.load_state(_CATCHUP_CONV).get("l1"):
 print(f"  ok   {len(_failing_watermarks)} failing pass(es) against an "
       f"unreachable vLLM: watermark stayed at 0, nothing partial recorded")
 
-# ---- recover: bounded passes catch up, one turn at a time ----------------
+# ---- recover: bounded passes catch up, one turn at a time, through the
+# REAL tail path (main._rollup_hierarchy), at the PRODUCTION budget -------
+# hostile pass #5 (C5-3/E4): the old version called summarizer.maybe_rollup
+# directly with a hand-built budget dict -- main.TAIL_ROLLUP_MAX_CALLS,
+# summarizer.record_catchup_pass and health's own verdict were never on
+# this soak's path at all. Driving main._rollup_hierarchy (the exact
+# function both `_async_tail` call sites use in production) puts all three
+# on this path, and main.TAIL_ROLLUP_MAX_CALLS is now set to the
+# PRODUCTION default rather than this suite's own (usually larger)
+# L1_CHUNK_SIZE. Real calls are counted from the fixture's own /_fixture/
+# stats (chat_completions), not a returned budget dict -- _rollup_hierarchy
+# manages its budget internally via the context-manager form and does not
+# hand one back.
 # main.VLLM_URL is already restored (the `finally` above); the fixture's own
 # mode was never touched by the outage simulation, so nothing to reset there.
+_orig_tail_budget = main.TAIL_ROLLUP_MAX_CALLS
+_PROD_BUDGET = _orig_tail_budget
+
+# Measure ONE unit's real call cost against THIS fixture's actual reply
+# shape first, on a throwaway conversation -- the per-pass overshoot bound
+# below is measured against this, not a blanket guess (a generous fixed
+# multiple, e.g. the old 4x, is exactly what let "the budget was silently
+# ignored" pass unnoticed at the old, shallower backlog: C5-3's own
+# finding). budget=1 guarantees _budget_allows_unit lets exactly ONE unit
+# start and no more (summarizer._budget_allows_unit's own docstring), so
+# whatever this pass spends is one real unit's true cost here.
+_UNIT_COST_CONV = f"{CONV}_catchup_unitcost"
+summarizer.save_state(_UNIT_COST_CONV,
+                       {"l1": [], "l2": [], "l3": None, "last_summarized_turn": 0})
+_unit_cost_msgs = _catchup_history(_CATCHUP_L1)
+_before_uc = _fixture_stats().get("chat_completions", 0)
+main.TAIL_ROLLUP_MAX_CALLS = 1
+try:
+    asyncio.run(main._rollup_hierarchy(_UNIT_COST_CONV, _unit_cost_msgs, None))
+finally:
+    main.TAIL_ROLLUP_MAX_CALLS = _orig_tail_budget
+_measured_unit_cost = _fixture_stats().get("chat_completions", 0) - _before_uc
+if _measured_unit_cost < 1:
+    fail("catch-up: the unit-cost measurement pass made no real call at all "
+         "-- the per-pass overshoot bound below cannot be trusted",
+         repr(_measured_unit_cost))
+print(f"      measured one unit's real call cost against this fixture: "
+      f"{_measured_unit_cost}")
+
 _watermarks: list[int] = []
 _calls_per_pass: list[int] = []
-_MAX_PASSES = _CATCHUP_TURNS // _CATCHUP_L1 + 6  # generous: chunks + headroom
-for _p in range(_MAX_PASSES):
-    _budget = {"remaining": _CATCHUP_L1, "exhausted": False}
-    _st = asyncio.run(summarizer.maybe_rollup(
-        _CATCHUP_CONV, _catchup_msgs, main.VLLM_URL, main.MODEL_REPO,
-        vllm_call_budget=_budget,
-    ))
-    _wm = _st.get("last_summarized_turn", 0)
-    _watermarks.append(_wm)
-    _calls_per_pass.append(_CATCHUP_L1 - _budget["remaining"])
-    if not summarizer.needs_rollup(_st, _st.get("turns_seen", 0)):
-        break
+# Generous but still bounded: at the production budget, worst case is
+# roughly one unit per pass (see test_tail_catchup.py [b]'s livelock
+# proof), so this backlog needs on the order of _CATCHUP_MSG_TOTAL /
+# _CATCHUP_L1 passes -- times a headroom factor for L2/L3 folds, which
+# also consume budget without advancing the L1 watermark on their own pass.
+_MAX_PASSES = (_CATCHUP_MSG_TOTAL // max(1, _CATCHUP_L1)) * 3 + 20
+main.TAIL_ROLLUP_MAX_CALLS = _PROD_BUDGET
+try:
+    for _p in range(_MAX_PASSES):
+        _before = _fixture_stats().get("chat_completions", 0)
+        asyncio.run(main._rollup_hierarchy(_CATCHUP_CONV, _catchup_msgs, None))
+        _after = _fixture_stats().get("chat_completions", 0)
+        _st = summarizer.load_state(_CATCHUP_CONV)
+        _wm = _st.get("last_summarized_turn", 0)
+        _watermarks.append(_wm)
+        _calls_per_pass.append(_after - _before)
+        if _p == 0:
+            # A health-verdict check (C5-3/E4's own ask): mid-catchup,
+            # right after the FIRST real advance, health's evidence-based
+            # verdict for THIS conversation must read "converging" -- the
+            # same real record_catchup_pass write main._rollup_hierarchy
+            # makes in production, read back the same way health.py does.
+            # Read from `catching_up_all` (hostile pass #5, E6), not the
+            # single-worst `catching_up` field -- this soak's other
+            # conversations (CONV, and whatever the traffic phase built)
+            # may legitimately have a larger lag than this one at this
+            # point without that meaning anything is wrong with THIS
+            # conversation's own verdict, which is the thing this check
+            # is actually about.
+            _hp = asyncio.run(health.gather_health_full(main.VLLM_URL, 4000))
+            _hv_all = (
+                (_hp.get("checks") or {}).get("hierarchy", {}).get("catching_up_all")
+                or []
+            )
+            _hv = next((v for v in _hv_all if v.get("conv") == _CATCHUP_CONV), None)
+            if _hv is None or _hv.get("verdict") != "converging":
+                fail("catch-up: health did not read this actively-draining "
+                     "conversation as converging on its first real pass",
+                     f"catching_up_all={_hv_all!r}")
+        if not summarizer.needs_rollup(_st, _st.get("turns_seen", 0)):
+            break
+finally:
+    main.TAIL_ROLLUP_MAX_CALLS = _orig_tail_budget
 
-_cu_p = _catchup_progress_problems(_watermarks, _CATCHUP_TURNS, _MAX_PASSES)
+_cu_p = _catchup_progress_problems(_watermarks, _CATCHUP_MSG_TOTAL, _MAX_PASSES)
 if _cu_p:
     fail("catch-up: bounded recovery did not converge as required",
          "; ".join(_cu_p))
+if len(_watermarks) <= 1:
+    fail("catch-up: the WHOLE backlog cleared in a single pass -- this "
+         "proves nothing about SUCCESSIVE-pass behaviour; the backlog "
+         "above is sized to need more than one pass at the production "
+         "budget and did not", repr(_watermarks))
 # Bounded, not merely eventual: no single pass may spend more than one
-# UNIT's overshoot beyond the per-pass budget. Since this fixture's chunks
-# are real prose (REPLY_CHARS-sized), a chunk can cost more than one
-# real call (map-reduce) -- so calls_per_pass can exceed _CATCHUP_L1, but
-# not by an unbounded amount. A generous multiple (4x) catches "the budget
-# was silently ignored" (the overshoot-unbounded mutation) without pinning
-# this soak to this fixture's exact batch-sizing arithmetic.
-_over = [c for c in _calls_per_pass if c > 4 * _CATCHUP_L1]
+# UNIT's overshoot beyond the per-pass budget -- MEASURED above against
+# this fixture's own reply shape, not a blanket multiple (C5-3/E4: the old
+# "4x _CATCHUP_L1" ceiling was set so high against so shallow a backlog
+# that an unbounded drain of the whole thing still fit under it).
+_ceiling = (_PROD_BUDGET - 1) + _measured_unit_cost
+_over = [c for c in _calls_per_pass if c > _ceiling]
 if _over:
-    fail("catch-up: at least one pass spent far more than its budget plus "
-         "one unit's documented overshoot",
+    fail(f"catch-up: at least one pass spent more than its budget "
+         f"({_PROD_BUDGET}) plus one measured unit's overshoot "
+         f"({_measured_unit_cost}) = {_ceiling}",
          f"calls per pass: {_calls_per_pass}")
 print(f"  ok   {len(_watermarks)} recovery pass(es) reached turn "
-      f"{_watermarks[-1]} of {_CATCHUP_TURNS}: watermark strictly advanced, "
-      f"calls per pass {_calls_per_pass}, never over budget's overshoot bound")
+      f"{_watermarks[-1]} of {_CATCHUP_MSG_TOTAL}: watermark strictly "
+      f"advanced, calls per pass {_calls_per_pass}, never over the "
+      f"measured overshoot bound ({_ceiling})")
 
 # ---- CONTROL: the same backlog, drained in one unbounded pass -----------
 _unbounded_state = asyncio.run(

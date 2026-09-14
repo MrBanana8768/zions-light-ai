@@ -566,6 +566,28 @@ def gather_memory_stats() -> dict:
     # report). This is what the status reason uses.
     worst_lag_recent = 0
     worst_lag_recent_conv = None
+    # v3.1.9 (hostile pass #5, E6). EVERY recent conversation over the same
+    # limit gather_health_full uses for the "behind" reason, not just the
+    # single worst one above. Before this, a CONVERGING catch-up with a
+    # LARGER lag (a fresh identity-merge uuid rebuilding its hierarchy from
+    # nothing, RUNBOOK_MEMORY_IDENTITY step 4; a hash-forked chat after a
+    # system-prompt edit; any fresh long import) always won the
+    # `_lag > worst_lag_recent` comparison and became the one name
+    # `hierarchy_lag_recent_conv` carries — so a conversation that is
+    # genuinely STUCK (verdict "stuck", e.g. C5-1/E1's frozen hierarchy)
+    # had no reason printed at all for as long as the converging one
+    # stayed bigger and kept advancing at least once every
+    # `_CATCHUP_RECENT_S`. Collected as (conv_id, lag) so gather_health_full
+    # can compute a verdict for EACH one and name the worst that is NOT
+    # converging — the single winner above stays for stats.hierarchy_lag_
+    # recent (an existing observable other code reads; see the call site),
+    # this list is additive. Gated on the SAME limit as the reason itself,
+    # not "any lag > 0": an ordinary conversation's routine one-chunk drift
+    # is not worth an extra stat() call on every 30s healthcheck poll.
+    _lag_limit_for_scan = 2 * summarizer.L1_CHUNK_SIZE
+    if _lag_limit_for_scan <= 0:
+        _lag_limit_for_scan = 2 * 20
+    recent_lags_over_limit: list[tuple[str, int]] = []
     # v3.1.9 (hostile pass 2, H-1). What every readable state file says about
     # how far its hierarchy has got - the same fields maybe_rollup compares to
     # decide whether to write at all. hierarchy_lag cannot see a rollup that
@@ -611,7 +633,18 @@ def gather_memory_stats() -> dict:
                 _lag = _seen - _done
                 if _lag > worst_lag:
                     worst_lag, worst_lag_conv = _lag, cid
-                if _lag > worst_lag_recent:
+                # hostile pass #5 (E6): gated on the SCAN limit (fixed,
+                # same value the reason uses) rather than on
+                # `_lag > worst_lag_recent` (a running max that only grows).
+                # The old gate meant the expensive stat() — and therefore
+                # candidacy for worst_lag_recent at all — only ever ran for
+                # whichever conversation was ahead so far, so a conversation
+                # under the limit could never win it either way: the
+                # single-conversation behaviour at the call site
+                # (`_lag > _lag_limit`) is unchanged, and this is what makes
+                # collecting every over-limit conversation below possible
+                # without a stat() call on every ordinarily-drifting one.
+                if _lag > _lag_limit_for_scan:
                     try:
                         _state_mtime = summarizer.summary_path(cid).stat().st_mtime
                         _recent = (
@@ -625,7 +658,9 @@ def gather_memory_stats() -> dict:
                         # tell" everywhere else in this module.
                         _recent = False
                     if _recent:
-                        worst_lag_recent, worst_lag_recent_conv = _lag, cid
+                        recent_lags_over_limit.append((cid, _lag))
+                        if _lag > worst_lag_recent:
+                            worst_lag_recent, worst_lag_recent_conv = _lag, cid
             progress.append((
                 cid, _seen, _done, tuple(state.get("tail_fp") or ()),
                 state.get("head_fp"), state.get("window_turns"),
@@ -658,6 +693,12 @@ def gather_memory_stats() -> dict:
         # uses; see the comment above worst_lag_recent's initialization.
         "hierarchy_lag_recent": worst_lag_recent,
         "hierarchy_lag_recent_conv": worst_lag_recent_conv,
+        # v3.1.9 (hostile pass #5, E6). Private (leading underscore, same
+        # convention as _hierarchy_fingerprint below): an input to
+        # gather_health_full's per-conversation verdict computation, popped
+        # before the payload is returned — see the call site for what it
+        # becomes in the public response (`checks.hierarchy.catching_up`).
+        "_hierarchy_lag_recent_all": recent_lags_over_limit,
         "unreadable": unreadable,
         # Private (leading underscore): an opaque in-process hash, compared
         # for equality only and popped by gather_health_full before the
@@ -1024,14 +1065,20 @@ def _catchup_verdict(conv_id: str | None) -> str:
     "unknown": no evidence either way — every conv_id starts here, and a
     conv_id NOT in the record (no budgeted pass has run for it in THIS
     process) is "unknown" too, most commonly right after a restart. See the
-    call site for what "unknown" means for the reason: the SAME actionable
-    wording "stuck" gets, not "converging" — the safe direction, because a
-    restart losing this process-local evidence must not let an operator
+    call site for what "unknown" means for `status`: the SAME degrading
+    treatment "stuck" gets, not "converging" — the safe direction, because
+    a restart losing this process-local evidence must not let an operator
     believe a genuinely stuck backlog is self-healing just because nothing
     has been observed about it yet in the new process. The tail's very next
     budgeted pass on this conversation (her next message) starts building
     real evidence again; there is no other way to recover it, and none is
     needed — this is a live-process diagnostic, not a durable record.
+
+    hostile pass #5 (C5-7): `status` treating "unknown" the same as
+    "stuck" does NOT mean the REASON text should too — see
+    `_catchup_reason`, which the call site uses instead of inlining the
+    wording here. "Unknown" is not evidence of a stall; recommending
+    /compact for it states as fact something that was never observed.
     """
     if conv_id is None:
         return "unknown"
@@ -1046,6 +1093,66 @@ def _catchup_verdict(conv_id: str | None) -> str:
     if isinstance(passes, int) and passes >= HIERARCHY_STALL_DECISIONS:
         return "stuck"
     return "unknown"
+
+
+def _catchup_reason(conv_id: str, lag: int, limit: int, verdict: str) -> str:
+    """One status-reason line for a non-converging (`verdict` "stuck" or
+    "unknown") over-limit conversation (hostile pass #5, C5-1/E1, C5-7).
+
+    Verdict-specific, on purpose. The line this replaced said the SAME
+    thing — "POST /admin/conversations/<id>/compact drains the backlog" —
+    for both "stuck" and "unknown", and that is wrong two different ways:
+
+    - For "unknown" (no catch-up evidence for this process, almost always
+      a recent restart — see _catchup_verdict), nothing has actually been
+      OBSERVED to stall; stating "/compact drains the backlog" as fact
+      asserts a diagnosis this function never made. The honest line is
+      "no evidence yet either way", with what actually resolves it (her
+      next message starts building real evidence again) rather than an
+      instruction to act on an unconfirmed guess.
+
+    - For "stuck", when a tier is known to be failing on every attempt
+      (summarizer.failing_tier_for — see C5-1/E1's fix in the L3>L2>L1
+      drain, `_mark_tier_failed`), "/compact drains the backlog" is not
+      merely unhelpful, it is FALSE: /compact runs the identical drain
+      through the identical failing tier and stops at the identical
+      point (`stopped_because: "the watermark stopped advancing"`). Naming
+      the tier tells the operator where to actually look. When no tier
+      failure is on record (a genuinely large backlog under a tight
+      budget, not a broken tier — the case this advice was originally
+      written for), the /compact advice still applies and is kept.
+    """
+    base = (
+        f"the summary hierarchy is {lag} turns behind on conv={conv_id} "
+        f"(limit {limit}). Turns past the watermark are carried by the raw "
+        f"window alone, so the oldest of them fall out of the request as "
+        f"it grows."
+    )
+    if verdict == "unknown":
+        return (
+            f"{base} No catch-up evidence for this conversation in this "
+            f"process yet (most often a recent restart, or it has simply "
+            f"not sent a message since) — this is not itself evidence of "
+            f"a stall. It resumes building evidence, and typically starts "
+            f"advancing, on her very next message. POST "
+            f"/admin/conversations/<id>/compact catches it up immediately, "
+            f"off the request path, if it should not wait for that."
+        )
+    tier = summarizer.failing_tier_for(conv_id)
+    if tier is not None:
+        return (
+            f"{base} The {tier.upper()} tier has failed every attempt "
+            f"this process has made for it — see the '{tier.upper()} ... "
+            f"failed' ERROR log line above for why (a torn archive "
+            f"sidecar or a model reply stripping to empty are the known "
+            f"causes). POST /admin/conversations/<id>/compact runs the "
+            f"SAME drain and will hit the SAME failure first — it will "
+            f"NOT clear this backlog until the underlying cause is fixed."
+        )
+    return (
+        f"{base} POST /admin/conversations/<id>/compact drains the "
+        f"backlog off the request path."
+    )
 
 
 def _hierarchy_progress(fingerprint: Any, mt: dict) -> dict:
@@ -1644,24 +1751,57 @@ async def gather_health_full(
         # backlog read as self-healing just because nothing has been
         # observed about it yet. See _catchup_verdict's own docstring.
         _lag_conv = stats.get("hierarchy_lag_recent_conv")
+        # hostile pass #5 (E6): popped here (same pattern as
+        # _hierarchy_fingerprint above) so this internal input never
+        # reaches the payload — `catching_up`/`catching_up_all` below are
+        # what the endpoint actually publishes.
+        _recent_all = stats.pop("_hierarchy_lag_recent_all", [])
         if isinstance(_lag, int) and _lag > _lag_limit:
             _verdict = _catchup_verdict(_lag_conv)
             hierarchy["catching_up"] = {
                 "conv": _lag_conv, "lag": _lag, "limit": _lag_limit,
                 "verdict": _verdict,
             }
-            if _verdict != "converging":
-                reasons.append(
-                    f"the summary hierarchy is {_lag} turns behind on "
-                    f"conv={_lag_conv} "
-                    f"(limit {_lag_limit}). Turns past the watermark are carried "
-                    f"by the raw window alone, so the oldest of them fall out of "
-                    f"the request as it grows. "
-                    f"POST /admin/conversations/<id>/compact drains the "
-                    f"backlog off the request path."
-                )
+            # hostile pass #5 (E6): judge EVERY recent conversation over
+            # the limit, not only the single worst-lag one above. Before
+            # this, a CONVERGING catch-up with a LARGER lag (a fresh
+            # identity-merge uuid rebuilding its hierarchy, say) always won
+            # the single-winner comparison in gather_memory_stats, so a
+            # conversation that was genuinely STUCK with a SMALLER lag had
+            # no reason printed at all for as long as the converging one
+            # stayed on top and kept advancing within _CATCHUP_RECENT_S.
+            # `catching_up` above keeps its pre-existing shape (the single
+            # worst, whatever its own verdict) for anything already reading
+            # it; `catching_up_all` is additive. `_recent_all` can be empty
+            # even though `_lag > _lag_limit` (e.g. a test that sets
+            # `stats["hierarchy_lag_recent"]` directly without going
+            # through the scan) — falling back to the single winner keeps
+            # that shape covered too.
+            _all_verdicts = [
+                {
+                    "conv": _c, "lag": _l, "limit": _lag_limit,
+                    "verdict": _catchup_verdict(_c),
+                }
+                for _c, _l in _recent_all
+            ] or [hierarchy["catching_up"]]
+            hierarchy["catching_up_all"] = _all_verdicts
+            # The worst (largest-lag) conversation that is NOT converging —
+            # a converging entry needs no reason and no operator action;
+            # this is what stops a converging conversation from masking a
+            # stuck one, the actual E6 defect.
+            _not_converging = sorted(
+                (v for v in _all_verdicts if v["verdict"] != "converging"),
+                key=lambda v: v["lag"], reverse=True,
+            )
+            if _not_converging:
+                _worst = _not_converging[0]
+                reasons.append(_catchup_reason(
+                    _worst["conv"], _worst["lag"], _worst["limit"],
+                    _worst["verdict"],
+                ))
         else:
             hierarchy["catching_up"] = None
+            hierarchy["catching_up_all"] = []
         # v3.1.9 (H-1). The half hierarchy_lag cannot see: the rollup is not
         # running, or its writes are not landing, so both of the numbers the
         # lag is made of are frozen. See HIERARCHY_STALL_DECISIONS.

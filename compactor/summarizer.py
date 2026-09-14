@@ -652,6 +652,25 @@ def needs_rollup(state: dict, current_turn_count: int) -> bool:
     )
 
 
+def rollup_due_tiers(state: dict, current_turn_count: int) -> dict[str, bool]:
+    """Public: which tier(s) need work, individually — {"l1": bool, "l2":
+    bool, "l3": bool}. For a DIAGNOSTIC that must describe what is
+    actually pending (main._rollup_hierarchy's catch-up INFO line,
+    hostile pass #5 C5-7/E8), not for the drain itself, which reads the
+    private `_needs_*` gates directly against a `state` that changes
+    mid-call — this is a point-in-time snapshot a caller takes AFTER a
+    pass, when it is safe to read once. One seam so a future rule change
+    to any `_needs_*` gate cannot drift from what this reports, the same
+    fix-one-site-miss-the-sibling concern `needs_rollup` above already
+    avoids by delegating rather than re-deriving.
+    """
+    return {
+        "l1": _needs_l1_rollup(state, current_turn_count),
+        "l2": _needs_l2_rollup(state),
+        "l3": _needs_l3_rollup(state),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Message ↔ turn helpers
 # ---------------------------------------------------------------------------
@@ -2152,11 +2171,18 @@ async def _batch_to_budget(
             if current:
                 batches.append(current)
                 current, current_tokens = [], 0
+            # hostile pass #5 (C5-2): this fires for ANY oversized piece
+            # this function is handed, not only a literal conversation
+            # turn — L3's stage 2 (_do_l3_rollup) passes a prior-L3 body or
+            # a chapter-summary part here too, and "a single turn measures
+            # N tokens" pointed an operator investigating an L3 loss at her
+            # chat instead of at the rollup's own intermediate summaries.
             logger.warning(
-                f"conv={conv_id}: a single turn measures {t} tokens against a "
-                f"{budget}-token summarization budget; it has been truncated "
-                f"for the rollup so the hierarchy keeps advancing — the stored "
-                f"summary covers only the beginning of that turn"
+                f"conv={conv_id}: a single rollup input piece measures {t} "
+                f"tokens against a {budget}-token summarization budget; it "
+                f"has been truncated for the rollup so the hierarchy keeps "
+                f"advancing — the stored summary covers only the beginning "
+                f"of that piece"
             )
             batches.append([
                 await _truncate_to_budget(client, vllm_url, model, p, t, budget)
@@ -2285,25 +2311,43 @@ _vllm_call_budget: "contextvars.ContextVar[dict | None]" = contextvars.ContextVa
 
 @contextlib.contextmanager
 def vllm_call_budget_ctx(max_calls: int):
-    """Bound the number of REAL vLLM summarization calls made by anything
-    that runs inside this block — a maybe_rollup call, or a direct call
-    into _do_l1_rollup/_do_l2_rollup/_do_l3_rollup — to at most `max_calls`.
+    """Bound the number of REAL vLLM summarization calls a `maybe_rollup`
+    call spends, to AT MOST `max_calls` PLUS one unit's own call cost —
+    never a hard per-call ceiling. (hostile pass #5, E9: this docstring
+    used to promise per-call refusal; the tail catch-up feature moved the
+    gate to the UNIT boundary, and this is the corrected contract.)
 
     Yields the mutable dict `{"remaining": int, "exhausted": bool}`; read it
-    after the block to see how many calls are left (0 if the budget bound)
-    and whether anything was still due when it ran out. `remaining` is
-    decremented once per REAL call to `_llm_summarize`, wherever in the
-    L1/L2/L3 drain (including a map-reduce split within any one tier) it
-    happens — never once per rollup pass or per tier, both of which can
-    spend zero-or-more real calls.
+    after the block to see how many calls are left (0 or negative if the
+    budget was spent, possibly past zero — see the overshoot note below)
+    and whether anything was still due when the drain stopped checking.
+    `remaining` is decremented once per REAL call to `_llm_summarize`,
+    wherever in the L1/L2/L3 drain (including a map-reduce split within any
+    one tier) it happens — never once per rollup pass or per tier, both of
+    which can spend zero-or-more real calls.
+
+    THE GATE IS AT THE UNIT BOUNDARY, NOT PER CALL. The only reader that
+    refuses anything is `_budget_allows_unit`, checked by the L1/L2/L3
+    drain in `_maybe_rollup_body` immediately before a unit (one L1 chunk,
+    one L2 fold, the L3 refresh) is allowed to START — never inside
+    `_call` itself, which only decrements. A unit that is allowed to start
+    is GUARANTEED to finish, so the true overshoot on a call that spends
+    down to (or past) zero is AT MOST one unit's own calls, not zero — see
+    `_budget_allows_unit`'s own docstring for why a strict per-call refusal
+    livelocked a budget smaller than one unit's cost. A DIRECT call into
+    `_do_l1_rollup`/`_do_l2_rollup`/`_do_l3_rollup`, or into
+    `_summarize_pieces`/`_summarize_pieces_raw`, from inside this block
+    is NOT bounded at all — those functions do not check
+    `_budget_allows_unit` themselves, only `_maybe_rollup_body`'s drain
+    does, so a caller reaching for a bounded direct tier call must go
+    through `maybe_rollup` (or replicate the unit-boundary check itself).
 
     A state mutation for a chunk/chapter/refresh is only ever written AFTER
     its summarize call returns non-empty text (see _do_l1_rollup,
-    _do_l2_rollup, _do_l3_rollup) — that ordering already exists for
-    unrelated reasons (an LLM failure must not record a chunk it did not
-    produce) and is exactly what this budget needs too: the call this
-    exhausts on returns "" without an HTTP call, its tier reads that as "no
-    progress" and stops, and nothing records covering turns it did not
+    _do_l2_rollup, _do_l3_rollup) — an LLM failure must not record a chunk
+    it did not produce — so a call that ran out of budget mid-unit and
+    still finished (the guaranteed-finish trade above) either records real
+    progress or records nothing, never a chunk covering text it did not
     summarize. A resumed call (the next /compact request, or the next
     chat-path tail) re-reads state from disk and continues from the real
     watermark, same as any other partial-progress rollup already does.
@@ -2491,17 +2535,47 @@ async def _summarize_pieces_raw(
     parts = list(raw)
 
     # Reduce, in bounded rounds, never handing a call more than it can take.
-    # If folding can make no further progress the parts are concatenated: a
-    # longer chunk than the tier intended, but a complete one, and the rollup
-    # still advances the watermark. Silence would not.
+    #
+    # v3.1.9 (hostile pass #5, C5-2). A give-up here (every batch already a
+    # singleton -- the parts on hand do not fit TOGETHER under `budget`,
+    # routine whenever /tokenize is down) used to concatenate on the spot.
+    # That let a tier's own output grow by roughly one part's width every
+    # time this ran, and a caller that feeds its own output back in as a
+    # LATER input (_do_l3_rollup's prior-L3 fold is the one that does)
+    # compounded it further, refresh after refresh, without limit -- the
+    # reduce's own "give up and concatenate" being the source of the
+    # unbounded growth a downstream truncate-to-budget was then silently
+    # cutting back down (C5-2's original finding). Now a give-up first
+    # tries PAIRING adjacent parts and folding two at a time, TOLERATING
+    # that a pair may price over `budget` under the pessimistic per-char
+    # estimate: `_WORST_TOKENS_PER_CHAR` is a worst-case INPUT-budgeting
+    # guess, not a measurement of what the model's REAL context window
+    # (MAX_MODEL_LEN) can actually hold, and two of this reduce's own
+    # bounded-output parts (each capped at `max_tokens` real model tokens)
+    # fit the real window far more often than the pessimistic estimate
+    # admits. Pairwise folding converges to ONE part in ceil(log2(N))
+    # rounds regardless of how oversized the pessimistic estimate makes
+    # each part look. This only changes behaviour ON THE GIVE-UP PATH -- a
+    # healthy /tokenize essentially never reaches it, so L1/L2's ordinary
+    # folding (and L3's, when /tokenize is up) is unaffected. If pairing
+    # still leaves one part with nothing left to fold against (an odd
+    # leftover with no partner), that is as far as this reduce can bring
+    # it, and it is concatenated same as before -- see the round-count
+    # ceiling below, sized for pairwise convergence rather than the
+    # smaller ordinary case.
     rounds = 0
-    while len(parts) > 1 and rounds < 3:
+    max_rounds = max(3, len(parts).bit_length() + 1)
+    while len(parts) > 1 and rounds < max_rounds:
         rounds += 1
         groups = await _batch_to_budget(
             conv_id, client, vllm_url, model, parts, budget
         )
         if all(len(g) == 1 for g in groups):
-            break
+            groups = [parts[i:i + 2] for i in range(0, len(parts), 2)]
+            if all(len(g) == 1 for g in groups):
+                # Only reachable with a single leftover part and nothing
+                # to pair it against -- already as folded as it gets.
+                break
         try:
             folded = await asyncio.gather(
                 *(_bounded(_PROMPT_REDUCE, g) for g in groups)
@@ -2916,9 +2990,70 @@ async def _do_l3_rollup(
         [_chapter_piece(c) for c in l2], L3_MAX_TOKENS,
     )
     if text and prior_piece:
+        # hostile pass #5 (C5-2): BOTH halves of stage 2's input are split
+        # back into pieces on their own "\n\n" join points before being
+        # handed to stage 2's map-reduce — not just the newer-chapters
+        # half. Stage 1's own map-reduce (_summarize_pieces_raw, shared
+        # with every tier) already gives up and CONCATENATES its parts,
+        # with "\n\n" as the join, whenever its reduce cannot fold them
+        # further — routine whenever /tokenize is down and the chapter
+        # count is not tiny (measured: 2-3 parts, each already at or near
+        # L3_MAX_TOKENS, so the concatenation is 2-3x one part's own
+        # bound). The first cut of this fix split only `text` (this
+        # refresh's newer-chapters half) and left `prior_piece` (the
+        # PREVIOUS refresh's stored L3 text) as one atomic string — which
+        # still broke, one refresh later: a give-up concatenation is
+        # exactly what gets STORED as state["l3"]["text"] below, so the
+        # NEXT refresh's `prior` is frequently ALREADY an oversized
+        # multi-part blob, and wrapping THAT as one piece is the identical
+        # "one blob priced as a whole and hard-truncated" failure, just
+        # moved from the newer half to the prior half (measured: 0/4
+        # refreshes truncated with only the newer half split; 3/4 with
+        # both, once a give-up concatenation had a chance to compound).
+        # Splitting BOTH halves the same way is symmetric and self-
+        # healing across any number of refreshes: whatever shape a PRIOR
+        # refresh's own give-up left in storage, splitting on its join
+        # recovers pieces that individually fit the budget by
+        # construction (each is itself the bounded output of one map or
+        # reduce call), so nothing is ever handed to `_batch_to_budget` as
+        # a piece larger than one of those calls could have produced —
+        # not on this refresh, and not on any refresh after it.
+        #
+        # No harm in the ordinary case: an unsplit single-call answer that
+        # happens to contain its own blank-line paragraph breaks is only
+        # split into SMALLER pieces, which `_batch_to_budget` batches back
+        # together under budget the same way it always groups any
+        # ordinary multi-piece input. This is a split of TEXT ALREADY
+        # PRODUCED (an ordinary string operation on `prior["text"]`), not
+        # a second seam alongside `_summarize_pieces` — test_l3_
+        # coverage.py's own monkeypatch of that ONE name is what every
+        # caller of this function must keep working through.
+        _prior_body = (prior.get("text") or "").strip() if prior else ""
+        _prior_parts = (
+            [p for p in _prior_body.split("\n\n") if p.strip()] or [_prior_body]
+        )
+        _prior_header = (
+            f"the story so far (turns {prior.get('first_turn','?')}-"
+            f"{prior.get('last_turn','?')})" if prior else "the story so far"
+        )
+        _prior_pieces = [
+            (
+                f"--- {_prior_header} (part {i} of {len(_prior_parts)}) ---"
+                if len(_prior_parts) > 1 else f"--- {_prior_header} ---"
+            ) + f"{chr(10)}{p}"
+            for i, p in enumerate(_prior_parts, 1)
+        ]
+        _newer_parts = [p for p in text.split("\n\n") if p.strip()] or [text]
+        _newer_pieces = [
+            (
+                f"--- newer chapters (part {i} of {len(_newer_parts)}) ---"
+                if len(_newer_parts) > 1 else "--- newer chapters ---"
+            ) + f"{chr(10)}{p}"
+            for i, p in enumerate(_newer_parts, 1)
+        ]
         text = await _summarize_pieces(
             conv_id, client, vllm_url, model, _PROMPT_L3,
-            [prior_piece, f"--- newer chapters ---{chr(10)}{text}"],
+            _prior_pieces + _newer_pieces,
             L3_MAX_TOKENS,
         )
     if not text:
@@ -3267,24 +3402,95 @@ async def _maybe_rollup_body(
                     # under a tight budget, or an admin/backfill rebuild
                     # from the episodic store — never steady, one-exchange-
                     # at-a-time chat, which is what "not behind" means.
+                    #
+                    # v3.1.9 (hostile pass #5, C5-1/E1). `_l3_failed` /
+                    # `_l2_failed` — a failed unit no longer ends the whole
+                    # pass. Before this fix, ANY upper-tier failure (a torn
+                    # summaries/<conv>.archive.json sidecar, A3-1's
+                    # deliberate raise on a wrong-typed "chapters"; an
+                    # archive write that keeps failing; an L3/L2 reply that
+                    # strips to empty) hit the `break` that used to sit in
+                    # its branch below and exited the loop for the rest of
+                    # THIS call — and because the SAME drain runs on every
+                    # later call too, a persistently failing tier froze
+                    # every LOWER tier forever: L1 stopped advancing from
+                    # that turn on, hierarchy_lag grew without bound, and
+                    # the "/compact drains the backlog" advice health gives
+                    # for a stuck hierarchy runs this identical drain and
+                    # hits the identical abort first, doing nothing.
+                    # Regression against v3.1.7/v3.1.8/21645f2, which ran
+                    # three SEPARATE `while`/`if` loops (L1 then L2 then
+                    # L3) — a broken upper tier there could only ever defer
+                    # ITSELF, never block a tier checked earlier.
+                    #
+                    # `_needs_l3_rollup(state)` (and `_needs_l2_rollup`)
+                    # already guarantee something was due before
+                    # `_do_l3_rollup`/`_do_l2_rollup` was called, so a
+                    # False return here is ALWAYS a real failure, never
+                    # "nothing to do" — see those functions' own early
+                    # returns, which are the same conditions these gates
+                    # check. Marking the tier failed FOR THIS CALL and
+                    # `continue`ing to the tier below (instead of `break`)
+                    # restores the old shape: a broken tier costs only its
+                    # own retries next call, and every lower tier keeps
+                    # covering every turn the way the three-loop version
+                    # always did. L1 has no lower tier to fall through to,
+                    # so its own failure still ends the pass, unchanged.
                     _l3_done = False
+                    _l3_failed = False
+                    _l2_failed = False
                     while True:
-                        if not _l3_done and _needs_l3_rollup(state):
+                        if not _l3_done and not _l3_failed and _needs_l3_rollup(state):
                             if not _budget_allows_unit():
                                 break
                             _l3_done = True
                             if not await _do_l3_rollup(
                                 conv_id, client, vllm_url, model, state
                             ):
-                                break
+                                _l3_failed = True
+                                _mark_tier_failed(conv_id, "l3")
+                                if logsetup.log_once(
+                                    f"summarizer.tier_stuck.l3.{conv_id}"
+                                ):
+                                    logger.error(
+                                        f"conv={conv_id}: L3 refresh failed "
+                                        f"and will be retried next turn "
+                                        f"without blocking L1/L2 — see the "
+                                        f"archive-abort or empty-reply "
+                                        f"warning above (or its absence) "
+                                        f"for why; a refresh failing on "
+                                        f"EVERY attempt usually means a "
+                                        f"torn archive sidecar that needs "
+                                        f"an operator (this message prints "
+                                        f"once per conversation)"
+                                    )
+                                continue
+                            _mark_tier_recovered(conv_id, "l3")
                             changed = True
-                        elif _needs_l2_rollup(state):
+                        elif not _l2_failed and _needs_l2_rollup(state):
                             if not _budget_allows_unit():
                                 break
                             if not await _do_l2_rollup(
                                 conv_id, client, vllm_url, model, state
                             ):
-                                break
+                                _l2_failed = True
+                                _mark_tier_failed(conv_id, "l2")
+                                if logsetup.log_once(
+                                    f"summarizer.tier_stuck.l2.{conv_id}"
+                                ):
+                                    logger.error(
+                                        f"conv={conv_id}: L2 fold failed "
+                                        f"and will be retried next turn "
+                                        f"without blocking L1 — a fold "
+                                        f"failing on EVERY attempt usually "
+                                        f"means the model is returning "
+                                        f"empty content for this "
+                                        f"conversation's chapters (this "
+                                        f"message prints once per "
+                                        f"conversation)"
+                                    )
+                                continue
+                            _mark_tier_recovered(conv_id, "l2")
                             changed = True
                         elif _needs_l1_rollup(state, current_turns):
                             if not _budget_allows_unit():
@@ -3293,16 +3499,20 @@ async def _maybe_rollup_body(
                                 conv_id, client, vllm_url, model, state, messages,
                                 window_offset, raw_turns, _patch,
                             ):
+                                # L1 has no lower tier to fall through to;
+                                # unchanged from before this fix.
                                 break
                             _patch = []
                             changed = True
                         else:
-                            # Nothing due at all — caught up (or every due
-                            # tier already ran this call). The ONLY exit
-                            # that means "no work is outstanding"; every
-                            # other `break` above means "work remains but
-                            # the budget said stop" or "a unit's own LLM
-                            # call returned empty and recorded nothing".
+                            # Nothing left DUE, or every due tier this call
+                            # already ran or has already failed once. The
+                            # ONLY exit that means "no work is
+                            # outstanding"; every other `break` above means
+                            # "work remains but the budget said stop" or
+                            # "L1 itself failed" — a failed L2/L3 no longer
+                            # reaches this branch on its own; it falls
+                            # through to the tier below instead (see above).
                             break
             except Exception as e:
                 logger.exception(f"conv={conv_id}: rollup failed mid-flight: {e}")
@@ -3438,6 +3648,51 @@ def catchup_progress_for(conv_id: str) -> dict[str, Any] | None:
 
 def _reset_catchup_progress_for_tests() -> None:
     _catchup_progress.clear()
+    _tier_failure.clear()
+
+
+# ---------------------------------------------------------------------------
+# Which tier, if any, is stuck? (v3.1.9, hostile pass #5, C5-1/E1)
+# ---------------------------------------------------------------------------
+#
+# Companion to _catchup_progress above — same contract: in-process only,
+# keyed by conv_id, lost on restart. WHY IT EXISTS: the L3>L2>L1 drain in
+# `_maybe_rollup_body` now falls through past a failed upper tier instead
+# of freezing the whole hierarchy behind it (see that loop's own comment),
+# which fixes the freeze but leaves a NEW question an operator needs
+# answered: which tier is the one that keeps failing? `passes_since_
+# advance` (_catchup_progress) cannot say — a conversation can rack up
+# stalled passes for a reason that has nothing to do with any tier being
+# broken (no budget ever allocated, a degrade-guard pause). This dict
+# exists so health.py's "stuck" reason can name the actual failing tier
+# instead of pointing at `/compact`, which runs this identical drain and
+# hits the identical failure first — advice that cannot help.
+#
+# Set the moment a tier's unit fails; cleared the moment that SAME tier
+# next succeeds (not cleared by a different tier succeeding — L1 advancing
+# while L3 keeps failing says nothing about L3). A conv_id with no entry
+# means "no tier has failed for it in THIS process" — the same safe
+# default `catchup_progress_for`'s own docstring gives its sibling.
+_tier_failure: dict[str, str] = {}
+
+
+def _mark_tier_failed(conv_id: str, tier: str) -> None:
+    _tier_failure[conv_id] = tier
+
+
+def _mark_tier_recovered(conv_id: str, tier: str) -> None:
+    if _tier_failure.get(conv_id) == tier:
+        del _tier_failure[conv_id]
+
+
+def failing_tier_for(conv_id: str) -> str | None:
+    """"l2" or "l3" if that tier's unit most recently failed for this
+    conversation, in THIS process, and has not since succeeded; None if no
+    failure is on record (including "never observed" — a restart or a
+    conv_id this process has not rolled up). See the _tier_failure block
+    comment above for the full contract.
+    """
+    return _tier_failure.get(conv_id)
 
 
 # ---------------------------------------------------------------------------
