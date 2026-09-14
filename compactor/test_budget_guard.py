@@ -1083,7 +1083,11 @@ def test_call_site_passes_the_callers_system_count():
 
     seen = {}
 
-    def recorder(messages, limit=None, protect_system=None, report=None):
+    def recorder(messages, limit=None, protect_system=None, report=None, reserve=0):
+        # reserve (hostile pass #5 F3): a real parameter of the guard now,
+        # not asserted here — this test is about protect_system (M9), and a
+        # recorder that cannot accept every argument the request path
+        # actually passes would TypeError instead of testing anything.
         seen["messages"] = list(messages)
         seen["limit"] = limit
         seen["protect_system"] = protect_system

@@ -108,15 +108,33 @@ async def _no_compaction(messages, conv_id, stored_turns_out=None):
 
 
 _guard_limits: list[int] = []
+_guard_reserves: list[int] = []
 _guard_reports: list[dict] = []
 _real_guard = main._enforce_hard_budget
 
 
-def _spy_guard(msgs, limit=None, protect_system=1, report=None):
+def _spy_guard(msgs, limit=None, protect_system=1, report=None, reserve=0):
+    # `reserve` (hostile pass #5 F3) is a real parameter of the guard now,
+    # not a spy-only addition: passed through so this file still exercises
+    # the guard's actual reserve-band handling instead of silently dropping
+    # the argument the request path sends and testing a call it never makes.
     _guard_limits.append(limit)
-    out = _real_guard(msgs, limit, protect_system, report)
+    _guard_reserves.append(reserve)
+    out = _real_guard(msgs, limit, protect_system, report, reserve)
     _guard_reports.append(dict(report or {}))
     return out
+
+
+class _Lines(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, r):
+        self.records.append(r)
+
+    def text(self):
+        return "\n".join(r.getMessage() for r in self.records)
 
 
 client = TestClient(main.app, client=("127.0.0.1", 12345), raise_server_exceptions=False)
@@ -124,7 +142,11 @@ client = TestClient(main.app, client=("127.0.0.1", 12345), raise_server_exceptio
 
 def post(msgs, conv="budget-conv", enabled=True):
     _Backend.bodies = []
-    cap = logging.getLogger("compactor")
+    lg = logging.getLogger("compactor")
+    cap = _Lines()
+    prev = lg.level
+    lg.addHandler(cap)
+    lg.setLevel(logging.DEBUG)
     with patch.object(main.httpx, "AsyncClient", _Backend), \
          patch.object(main, "compact_if_needed", _no_compaction), \
          patch.object(main, "_enforce_hard_budget", _spy_guard), \
@@ -135,9 +157,10 @@ def post(msgs, conv="budget-conv", enabled=True):
         r = client.post("/v1/chat/completions",
                         json={"model": "test-model", "messages": msgs, "stream": False},
                         headers={"X-Conversation-Id": conv})
-    del cap
+    lg.removeHandler(cap)
+    lg.setLevel(prev)
     fwd = _Backend.bodies[-1]["messages"] if _Backend.bodies else []
-    return r.status_code, fwd
+    return r.status_code, fwd, cap.text()
 
 
 def convo(n_exchanges, newest_pad):
@@ -163,7 +186,7 @@ check(RESERVE >= len((LINE + "\n\n").encode("utf-8")) + 4,
 # ===========================================================================
 print("[1] the limit the guard is handed")
 _guard_limits.clear()
-status, fwd = post(convo(3, 10))
+status, fwd, _ = post(convo(3, 10))
 check(status == 200 and _guard_limits == [EFFECTIVE - RESERVE],
       f"feature on: guard limit {_guard_limits} == {EFFECTIVE} - {RESERVE}")
 _guard_limits.clear()
@@ -187,7 +210,7 @@ print("[2] a sweep across the limit")
 over, missing, shed_seen, fits_exactly = [], [], 0, 0
 for pad in range(0, 420, 3):
     msgs = convo(9, pad)
-    status, fwd = post(msgs, conv=f"sweep-{pad}")
+    status, fwd, _ = post(msgs, conv=f"sweep-{pad}")
     if status != 200 or not fwd:
         missing.append((pad, status))
         continue
@@ -214,16 +237,84 @@ print("[3] a payload that cannot fit is not made larger")
 BIG = [{"role": "system", "content": "You are a patient assistant."},
        {"role": "user", "content": "Item. " + "w" * (EFFECTIVE + 400)}]
 _guard_reports.clear()
-status, fwd = post(BIG, conv="too-big")
+status, fwd, big_log = post(BIG, conv="too-big")
 check(_guard_reports and _guard_reports[-1].get("fits") is False,
       f"fixture: the guard measured this payload as not fitting ({_guard_reports[-1:]})")
 check(fwd and json.dumps(fwd).count(NEEDLE) == 0,
       "no line was added to a payload already over the window")
+check("hard budget FAILED to fit" in big_log,
+      "fixture: this genuine overflow (well past the reserve too) still logs "
+      "the guard's ERROR — F3 narrows the false case, it does not silence the real one")
 _guard_reports.clear()
-status, fwd = post(convo(2, 5), conv="fits")
+status, fwd, _ = post(convo(2, 5), conv="fits")
 check(_guard_reports and _guard_reports[-1].get("fits") is True
       and json.dumps(fwd).count(NEEDLE) == 1,
       "CONTROL: a payload that fits carries its line")
+
+
+# ===========================================================================
+print("[4] the reserve band: nothing sheddable, but the REAL window is fine (F3)")
+# hostile pass #5 F3. One system message (protected, protect_system=1) and
+# one user turn (never dropped): nothing here is sheddable. A payload in this
+# shape that measures over `EFFECTIVE - RESERVE` (the guard's narrowed limit)
+# but not over `EFFECTIVE` itself (the real window) fits fine and vLLM will
+# accept it — but before this fix the guard's own ERROR fired anyway, because
+# it only ever compared against the narrowed limit. The soak
+# (test_soak_conversation.py) and the adversarial suite both treat that ERROR
+# as a real failure.
+sysm = {"role": "system", "content": "You are a patient assistant."}
+
+
+def band_msgs(gap):
+    base = tokens([sysm, {"role": "user", "content": ""}])
+    return [sysm, {"role": "user", "content": "q" * (EFFECTIVE - gap - base)}]
+
+
+check(RESERVE >= 2, f"fixture: the reserve ({RESERVE}) leaves room for a 1-token band")
+main._BUDGET_MARGIN = 0
+_guard_reports.clear()
+status, fwd, band_log = post(band_msgs(RESERVE - 1), conv="band-tight")
+check(status == 200 and fwd, f"fixture: the request completed ({status})")
+check(_guard_reports and _guard_reports[-1].get("fits") is False,
+      f"fixture: the reserve-narrowed guard call reports fits=False "
+      f"({_guard_reports[-1:]})")
+check(tokens(fwd) <= EFFECTIVE,
+      f"the forwarded payload fits the real {EFFECTIVE}-token window "
+      f"({tokens(fwd)})")
+check(json.dumps(fwd).count(NEEDLE) == 0,
+      "no line was added — nothing reserved the room for it")
+check("hard budget FAILED to fit" not in band_log,
+      f"*** F3: no false ERROR for a payload that fits the real window: {band_log!r}")
+check("but not with room left for the current-time line" in band_log,
+      f"an INFO line explains why the line was skipped: {band_log!r}")
+check(band_log.count("payload fits the") == 1, "said once for this conversation")
+_guard_reports.clear()
+status, fwd, band_log2 = post(band_msgs(RESERVE - 1), conv="band-tight")
+check(status == 200 and "payload fits the" not in band_log2
+      and "hard budget FAILED" not in band_log2,
+      "a second request on the SAME conversation does not repeat the INFO line "
+      "(log_once is keyed per conversation) and still logs no ERROR")
+
+# CONTROL: a different conversation in the same band DOES get its own line.
+_guard_reports.clear()
+status, fwd, band_log3 = post(band_msgs(RESERVE - 1), conv="band-tight-other")
+check(status == 200 and "payload fits the" in band_log3,
+      "CONTROL: a DIFFERENT conversation in the same band gets its own INFO line")
+
+# CONTROL: comfortably inside the reserve — the line is added, no special log.
+_guard_reports.clear()
+status, fwd, ok_log = post(band_msgs(RESERVE + 40), conv="band-fits")
+check(status == 200 and json.dumps(fwd).count(NEEDLE) == 1,
+      "CONTROL: with room for the reserve, the line is added as usual")
+check("hard budget FAILED" not in ok_log and "payload fits the" not in ok_log,
+      "CONTROL: neither the ERROR nor the reserve-band INFO fires when there "
+      "was room to begin with")
+
+# CONTROL (repeats [3] with the log now inspected): a payload well past the
+# reserve too still gets the real ERROR — F3 narrows the false case, it does
+# not silence the guard when the request truly will not fit.
+check("hard budget FAILED to fit" in big_log,
+      "CONTROL: a genuine overflow (see [3] BIG) still logs the real ERROR")
 
 
 print()

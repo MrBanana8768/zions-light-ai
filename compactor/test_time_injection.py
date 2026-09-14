@@ -223,6 +223,31 @@ if _resolve_impl:
         z, name, source, err = resolve({"COMPACTOR_TIMEZONE": "America/Phoenix"})
         check(name == "UTC" and err, "no tzdata: a real zone falls back to UTC, recorded")
 
+    # hostile pass #5 F1: the shipped image (Ubuntu 24.04, no tzdata-legacy)
+    # resolves a zone's CURRENT name but not its "backward" links -
+    # SP\p5-a\tzprobe.out measured America/Phoenix OK, US/Arizona FAIL, on
+    # that exact image. Simulated here (rather than depending on this test
+    # host's own tzdata) so the check holds on Windows and on a host that DID
+    # install tzdata-legacy: only the split matters, not which names.
+    def _legacy_split(key):
+        if key in main._LEGACY_ZONE_ALIASES.values():
+            return _zi.ZoneInfo(key)
+        raise _zi.ZoneInfoNotFoundError(f"No time zone found with key {key}")
+
+    if HAVE_TZDATA:
+        with patch.object(main, "ZoneInfo", _legacy_split, create=True):
+            z, name, source, err = resolve({"COMPACTOR_TIMEZONE": "US/Arizona"})
+            check(name == "UTC" and err and "America/Phoenix" in err
+                  and "resolves" in err,
+                  f"a backward-link name's error suggests the canonical "
+                  f"replacement that resolves here: {err!r}")
+            z, name, source, err = resolve({"COMPACTOR_TIMEZONE": "Mars/Olympus_Mons"})
+            check(name == "UTC" and err and "did you mean" not in err,
+                  f"CONTROL: a name with no known alias gets no suggestion: {err!r}")
+            z, name, source, err = resolve({"COMPACTOR_TIMEZONE": "Asia/Calcutta"})
+            check(name == "UTC" and err and "Asia/Kolkata" in err,
+                  f"a second alias, same table: {err!r}")
+
 # Import never fails on a bad zone, and the operator hears about it ONCE, at
 # ERROR, from the first chat request if nothing announced it at boot.
 _CHILD = r'''
@@ -676,6 +701,50 @@ check(_o_on == _o_off == ([tailhealth.SKIPPED_TASK_TRAFFIC], {"stored": 0, "skip
 check(_outcome("fresh-first-turn", TASK_REQ, True)[1]
       == _outcome("fresh-first-turn-2", TASK_REQ, False)[1] == {"stored": 1, "skipped": 0},
       "a real first turn: stored, on and off")
+
+
+# ===========================================================================
+print("[6b] a hash-identity collision must not read as task traffic (F2)")
+# hostile pass #5 F2. Under hash identity (production today) a brand-new
+# chat's conv_id is sha256(system|||first_user[:512]) — the SAME id an OLDER
+# chat gets if it opened with the same line. _is_repeat_task_traffic cannot
+# tell "task call, forever" from "new chat, unlucky opener" from history
+# alone; only the message's SHAPE can (_looks_like_openwebui_task_prompt).
+# An ordinary, non-task-shaped opener must still be dated even though it
+# collides, by id, with an older and already-deep conversation. The opener
+# text below is a synthetic placeholder, not a real message — deliberately
+# generic so it stays that way; only its SHAPE (not task-shaped) matters
+# to this test.
+OPENER_SYS = "You are a patient assistant."
+_opener = [{"role": "system", "content": OPENER_SYS},
+           {"role": "user", "content": "What is on the schedule today?"}]
+_coll_id, _coll_src = memory.resolve_conv_id({}, _opener, body={})
+check(_coll_src == "hash", f"fixture: this request resolves by hash ({_coll_src})")
+_coll_st = summarizer.load_state(_coll_id)
+_coll_st["turns_seen"] = main.TASK_TRAFFIC_MIN_POSITION + 2   # an older, deep chat
+summarizer.save_state(_coll_id, _coll_st)
+check(main._is_repeat_task_traffic(_coll_id, _opener),
+      "fixture: history alone marks this id as repeat task traffic")
+_, bodies, _ = post(_opener, conv=None)
+check(bodies and count_line(bodies[-1]["messages"]) == 1,
+      "F2: a real opener that hash-collides with an older, deep chat IS dated "
+      "(the message's shape, not history alone, gates the dating skip)")
+_, bodies, _ = post([{"role": "system", "content": OPENER_SYS},
+                     {"role": "user", "content": "What is on the schedule tomorrow?"}], conv=None)
+check(bodies and count_line(bodies[-1]["messages"]) == 1,
+      "CONTROL: a different opener (no collision, a fresh id) is dated too")
+# CONTROL: genuine task-shaped text on an equally "deep" colliding id is
+# still not dated — the shape check narrows the skip, it does not remove it.
+_task_opener = [{"role": "system", "content": OPENER_SYS}] + TASK_REQ
+_task_coll_id, _ = memory.resolve_conv_id({}, _task_opener, body={})
+_tst = summarizer.load_state(_task_coll_id)
+_tst["turns_seen"] = main.TASK_TRAFFIC_MIN_POSITION + 2
+summarizer.save_state(_task_coll_id, _tst)
+check(main._looks_like_openwebui_task_prompt(_task_opener),
+      "fixture: this one IS task-shaped")
+_, bodies, _ = post(_task_opener, conv=None)
+check(bodies and count_line(bodies[-1]["messages"]) == 0,
+      "CONTROL: task-SHAPED text on an equally deep colliding id is still not dated")
 
 
 # ===========================================================================
