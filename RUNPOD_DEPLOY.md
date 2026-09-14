@@ -473,6 +473,7 @@ Override these in your Runpod template if needed:
 | `COMPACTOR_RAG_TOP_K` | `5` | How many past exchanges to retrieve per turn |
 | `COMPACTOR_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (prebaked ONNX in the image) |
 | `COMPACTOR_HIERARCHICAL_SUMMARY` | `true` | L1→L2→L3 rolling summaries. Set `false` to disable. |
+| `COMPACTOR_TAIL_ROLLUP_MAX_CALLS` | `4` | Real vLLM summarization calls the background tail (and the one-shot backfill rollup) may spend catching up the summary hierarchy on ONE turn. A hierarchy that has fallen far behind (a vLLM outage, days of rollup failures) then catches up over successive turns instead of draining the whole backlog — however many calls that needs — on one turn while she is chatting (v3.1.9). |
 | `COMPACTOR_DEDUP_SIMILARITY` | `0.75` | Cosine threshold for fact-dedup candidate clustering |
 | `COMPACTOR_DEDUP_MAX_LLM_CALLS` | `10` | Cap on LLM merge calls per dedup pass |
 | `COMPACTOR_ARCHIVE_DEFAULT_DAYS` | `90` | Default staleness cutoff for fact archival |

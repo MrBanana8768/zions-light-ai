@@ -109,6 +109,21 @@ git tag messages. Every item links to the runbook that carries the commands.
   Full procedure: [RUNBOOK_MEMORY_IDENTITY.md](RUNBOOK_MEMORY_IDENTITY.md).
 - Rollback order: cap to 0 → remove the header → reverse merge.
 
+### Summary hierarchy catch-up
+
+- **A summary hierarchy that has fallen far behind (days of rollup failures, a
+  vLLM outage, an upgrade that finds a stale watermark) now catches up in
+  bounded steps instead of all at once.** Before v3.1.9, the background tail
+  (and the one-shot backfill rollup for a newly-discovered V1 conversation)
+  drained every L1/L2/L3 rollup a backlog needed in ONE pass — however many
+  vLLM calls that took, on the same single GPU she is chatting on. Both now
+  spend at most `COMPACTOR_TAIL_ROLLUP_MAX_CALLS` (default 4) real vLLM
+  calls per turn and resume on the next one — the watermark is persisted, so
+  this always converges, logging one INFO line per turn while it is still
+  behind — and `/health/full`'s "summary hierarchy is N turns behind" reason
+  stays visible the whole time but is worded as CONVERGING (dropping the
+  "run `/compact`" advice) once it can see the lag shrinking poll to poll.
+
 ### Rolling back to an older image
 
 - **Set the History cap's `max_turns` to 0 BEFORE redeploying an older image**,

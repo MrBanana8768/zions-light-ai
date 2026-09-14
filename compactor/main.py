@@ -155,6 +155,33 @@ TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(HARD_INPUT_LIMIT * 0.75)
 # work on a request path is not thoroughness, it is an outage.
 MAX_SUMMARY_CALLS_PER_REQUEST = _env_int("COMPACTOR_MAX_SUMMARY_CALLS", 4)
 
+# v3.1.9 (tail catch-up). How many REAL vLLM summarization calls the
+# background tail (_rollup_hierarchy, below) may spend on the L1/L2/L3
+# hierarchy on ONE turn. NOT the same knob as MAX_SUMMARY_CALLS_PER_REQUEST
+# above, and not interchangeable with it: that one bounds request-path
+# PREFIX summarization, which REFUSES outright once the backlog exceeds it
+# (see summarize()'s own "Self-healing was the wrong shape for this" —
+# compact_if_needed is a pure function of the client's array with nowhere to
+# persist where it stopped, so a bounded partial attempt there would
+# re-summarize the identical oldest batches every turn forever and never
+# converge). The hierarchy is different in exactly the way that matters:
+# maybe_rollup persists its watermark, its L1/L2/L3 lists and its
+# covered-turn record to disk on every call, so a bounded tail genuinely
+# advances and the NEXT tail resumes from where this one stopped — the same
+# property that already lets /admin/conversations/<id>/compact's own
+# max_calls drain a backlog over several passes instead of one.
+#
+# Default 4: at L1_MAX_TOKENS=500 and the ~1,650-token turns measured on her
+# real replies, one 20-turn L1 chunk needs 2 map batches + 1 reduce = 3 real
+# calls (more under the pessimistic /tokenize-down scale) — so 4 leaves
+# headroom for one whole chunk plus a little, without letting one turn's
+# tail run long enough to compete for the GPU with the reply she is waiting
+# on. See summarizer._budget_allows_unit for how a budget smaller than one
+# chunk's own cost still guarantees progress (checked at the UNIT boundary,
+# not per real call) rather than livelocking on a too-expensive chunk every
+# turn forever.
+TAIL_ROLLUP_MAX_CALLS = _env_int("COMPACTOR_TAIL_ROLLUP_MAX_CALLS", 4)
+
 # How many times summarize() has refused a request over the cap above, since
 # the process started. hostile pass #3 (reviewer E, F2): the soak's check that
 # a reusing turn is never cap-refused keyed on one phrase of that WARNING, no
@@ -5525,10 +5552,37 @@ async def _rollup_hierarchy(
         _rollup_kwargs: dict = {"raw_messages": list(messages)}
         if _streamed_differs:
             _rollup_kwargs["reply_as_streamed"] = reply_as_streamed
-        state = await summarizer.maybe_rollup(
-            conv_id, full_messages, VLLM_URL, MODEL_REPO or "",
-            **_rollup_kwargs,
-        )
+        # v3.1.9 (tail catch-up). The CONTEXT-MANAGER form
+        # (summarizer.vllm_call_budget_ctx), not the `vllm_call_budget=`
+        # keyword — same reason admin_compact already uses it (see that
+        # function's own comment on this exact point): `summarizer.
+        # maybe_rollup` is monkeypatched WHOLESALE, with a fixed signature
+        # that predates this feature, by test doubles this file does not
+        # own (test_degenerate_skip.py's `spy_maybe_rollup` is one; there
+        # are others — see the block comment above `_vllm_call_budget` in
+        # summarizer.py for the enumerated list). A `vllm_call_budget=`
+        # keyword on THIS call breaks every one of them with a TypeError,
+        # swallowed by this function's own `except Exception` below, so the
+        # spy is never entered and the test reads as "maybe_rollup was never
+        # invoked" — reproduced against the unfixed shape of this line.
+        # The context-manager form sets a contextvar around the call
+        # instead, so the call itself keeps today's exact signature; a stub
+        # that replaces `maybe_rollup` wholesale never reads the contextvar
+        # either, which is exactly correct — a stub making no real vLLM
+        # calls has nothing to bound.
+        #
+        # A FRESH budget every tail — the whole point is bounded work PER
+        # TURN, so nothing here carries unspent calls forward (a light turn
+        # does not bank them) or borrows against a future one (an overshot
+        # turn does not shrink the next turn's budget). See
+        # TAIL_ROLLUP_MAX_CALLS' own comment for what "bounded" means here
+        # and why it is safe from the livelock a strict per-call bound would
+        # have caused.
+        with summarizer.vllm_call_budget_ctx(TAIL_ROLLUP_MAX_CALLS) as _budget:
+            state = await summarizer.maybe_rollup(
+                conv_id, full_messages, VLLM_URL, MODEL_REPO or "",
+                **_rollup_kwargs,
+            )
         if (
             len(state.get("l1") or []) != len(before.get("l1") or [])
             or len(state.get("l2") or []) != len(before.get("l2") or [])
@@ -5539,6 +5593,79 @@ async def _rollup_hierarchy(
                 f"L2={len(state.get('l2') or [])} "
                 f"L3={'y' if state.get('l3') else 'n'} "
                 f"last_turn={state.get('last_summarized_turn', 0)}"
+            )
+        # v3.1.9 (tail catch-up, hostile follow-up). Own try/except, not just
+        # the one already wrapping this whole function: `state` above is
+        # already SAVED by the time execution reaches here (maybe_rollup
+        # persists before returning), so a failure computing or logging the
+        # catch-up line must never be reported as "async rollup failed" —
+        # that phrase means the rollup itself did not complete, and it did.
+        # It also must never stop record_catchup_pass from running: that
+        # write is what makes the NEXT poll's converging/stuck verdict
+        # correct, and a tail that skips it on a formatting fluke would
+        # quietly go back to the poll-cadence-dependent flapping this
+        # follow-up exists to fix.
+        #
+        # DEFENSIVE, not decorative: maybe_rollup's contract promises
+        # `turns_seen`/`last_summarized_turn` are always present ints on any
+        # state it returns, but a caller relying on that promise is exactly
+        # how a future change three call-levels away turns into a crashed
+        # tail here — isinstance-checked rather than trusted, so a state
+        # shaped unexpectedly degrades this diagnostic instead of raising it
+        # into the reply she is waiting for.
+        try:
+            _turns_seen = state.get("turns_seen", 0)
+            if not isinstance(_turns_seen, int):
+                _turns_seen = 0
+            _before_wm = before.get("last_summarized_turn", 0)
+            if not isinstance(_before_wm, int):
+                _before_wm = 0
+            _after_wm = state.get("last_summarized_turn", 0)
+            if not isinstance(_after_wm, int):
+                _after_wm = 0
+            _work_due = summarizer.needs_rollup(state, _turns_seen)
+            # Recorded EVERY pass (not only while behind): this is what lets
+            # health.py tell "converging" from "stuck" without depending on
+            # how often it happens to poll — see summarizer.
+            # record_catchup_pass's own docstring.
+            summarizer.record_catchup_pass(conv_id, _before_wm, _after_wm, _work_due)
+            if _work_due:
+                # Visible progress while the hierarchy is behind by more
+                # than one bounded pass can clear. Gated on needs_rollup
+                # AFTER this call, which is true only when a tier is STILL
+                # due — an ordinary turn (at most one L1 chunk due,
+                # comfortably inside budget) clears it and never prints this
+                # line; a hierarchy days behind a vLLM outage prints it
+                # every turn until it doesn't. `_advanced` is measured
+                # against `before` (loaded above, prior to this call), not
+                # estimated, so a turn that spent calls without moving the
+                # watermark (every batch this pass touched came back empty,
+                # or the material due was skipped as blank) says so instead
+                # of reporting a bogus ETA — the "does not hide a stuck
+                # catch-up" half of this feature's requirement; the gate
+                # above is the "does not alarm on an ordinary turn" half.
+                _turns_behind = max(0, _turns_seen - _after_wm)
+                _calls_spent = TAIL_ROLLUP_MAX_CALLS - _budget["remaining"]
+                _advanced = _after_wm - _before_wm
+                _eta = (
+                    f"~{-(-_turns_behind // _advanced)} more turn(s) at this "
+                    f"turn's rate"
+                    if _advanced > 0
+                    else "no turns advanced this pass — see the rollup log "
+                         "line above, or the absence of one, for why"
+                )
+                logger.info(
+                    f"conv={conv_id}: hierarchy catch-up in progress — "
+                    f"{_turns_behind} turn(s) still uncovered, {_calls_spent} "
+                    f"vLLM call(s) spent this turn (budget "
+                    f"{TAIL_ROLLUP_MAX_CALLS}), {_eta}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"conv={conv_id}: could not compute/log hierarchy catch-up "
+                f"progress ({type(e).__name__}: {e}) — the rollup pass "
+                f"above already completed and its state is already saved; "
+                f"this is a diagnostic failure only"
             )
     except Exception as e:
         logger.exception(f"conv={conv_id}: async rollup failed: {e}")
@@ -8474,15 +8601,29 @@ async def admin_compact(conv_id: str, request: Request):
     rather than silently ignored.
 
     `max_calls` bounds REAL vLLM summarization calls (hostile pass 4, F5) —
-    `{"max_calls": 1}` makes at most one vLLM HTTP call, however deep the
-    backlog, via `summarizer.vllm_call_budget_ctx` wrapping the whole drain
-    below. This closes the earlier hole where `max_calls` counted PASSES
-    (calls to summarizer.maybe_rollup) instead: one pass drains every L1
-    and L2 tier due in its own internal loop, so a deep backlog could spend
-    far more than `max_calls` real calls in a single pass. The response
-    reports both: `vllm_calls` is the number this parameter now actually
-    bounds; `rollup_calls` (unchanged) is the number of PASSES this loop
-    itself made, kept for existing callers that read it that way.
+    `{"max_calls": 1}` makes at most one vLLM HTTP call for a backlog whose
+    next unit (one L1 chunk, one L2 fold, or the L3 refresh) costs one call,
+    however deep the backlog is BEHIND that unit, via
+    `summarizer.vllm_call_budget_ctx` wrapping the whole drain below. This
+    closes the earlier hole where `max_calls` counted PASSES (calls to
+    summarizer.maybe_rollup) instead: one pass drains every L1 and L2 tier
+    due in its own internal loop, so a deep backlog could spend far more
+    than `max_calls` real calls in a single pass. The response reports
+    both: `vllm_calls` is the number this parameter now actually bounds;
+    `rollup_calls` (unchanged) is the number of PASSES this loop itself
+    made, kept for existing callers that read it that way.
+
+    v3.1.9 (tail catch-up): the budget is enforced at the UNIT boundary, not
+    per real call — see `summarizer._budget_allows_unit`'s docstring for
+    why a per-call bound livelocks whenever a unit costs more than one call
+    (a strict `{"max_calls": 1}` against a 3-call L1 chunk never advanced,
+    forever). The consequence here: `max_calls` is a bound with a
+    documented overshoot of AT MOST one unit's own calls, never unbounded —
+    once a unit has been allowed to start it always finishes, and no
+    FURTHER unit starts once the budget reads empty. `{"max_calls": 0}`
+    still means exactly what hostile pass 2 fixed it to mean — "run the
+    guards, make no real calls" — because 0 never has room to start even
+    one unit.
 
     The transcript is reconstructed from the EPISODIC store, which is the only
     ordered record of the conversation the compactor owns — OpenWebUI holds the
