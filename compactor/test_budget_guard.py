@@ -1090,12 +1090,24 @@ def test_call_site_passes_the_callers_system_count():
         seen["report"] = report
         return messages
 
-    with patch.object(main, "_enforce_hard_budget", recorder):
+    # v3.1.9: the clock is pinned, because the guard is now handed the
+    # effective limit LESS the current-time line's reserve (the line is added
+    # after the guard; see main._inject_time_line), and the reserve is the
+    # line's byte length, which moves with the date.
+    import datetime as _dt
+    _at = _dt.datetime(2026, 9, 14, 16, 41, tzinfo=_dt.timezone.utc)
+    with patch.object(main, "_enforce_hard_budget", recorder), \
+         patch.object(main, "_now_utc", lambda: _at):
         r, forwarded, _records = _post_chat(msgs, cid)
 
     assert_eq(r.status_code, 200, f"the request completed (body: {r.text[:200]!r})")
     assert_true("messages" in seen, "the guard was called on the request path")
-    assert_eq(seen["limit"], main.HARD_INPUT_LIMIT, "with the request's effective limit")
+    assert_eq(
+        seen["limit"],
+        main.HARD_INPUT_LIMIT
+        - main._time_line_token_reserve(main.current_time_line(_at)),
+        "with the request's effective limit, less the time line's reserve",
+    )
     # 2, not 1 (the signature default, i.e. the M9 mutation) and not 3 (the
     # count of what was actually passed, i.e. counting the wrong array).
     assert_eq(

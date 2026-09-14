@@ -64,6 +64,23 @@ git tag messages. Every item links to the runbook that carries the commands.
   This reason is new to the pod (v3.1.6.1 has no memory-tail tracking) and is
   unchanged in v3.1.9 by design.
 
+### The current date and time
+
+- **The model now knows the date and time, in her browser's time zone.**
+  After the deploy, and only once her chat logs `source=header`, add the line
+  `User timezone: {{CURRENT_TIMEZONE}}` to her model's System Prompt in
+  OpenWebUI (Admin Panel → Settings → Models). Editing the system prompt of a
+  chat still on `source=hash` forks its memory. **While her chat is on
+  `source=hash`, leave the system prompt alone and set
+  `COMPACTOR_TIMEZONE=<her IANA zone>` (for example `America/Phoenix`) in the
+  RunPod template instead:** the model is told the right time, it just does
+  not follow her device if she travels. With neither, UTC.
+- **Check:** after her next message, `/health/full` →
+  `config.time_injection.last_source` is `browser` and `current_line` shows
+  her local time.
+- To switch it off: `COMPACTOR_TIME_INJECTION=false`. Details:
+  [RUNPOD_DEPLOY.md → The current date and time](RUNPOD_DEPLOY.md#the-current-date-and-time).
+
 ### Voice
 
 - **Read-aloud works from v3.1.9.** On v3.1.6.1-v3.1.8 the speaker button never

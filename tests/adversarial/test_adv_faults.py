@@ -155,6 +155,13 @@ def _forwarded_prompt_tokens(resp) -> int | None:
         return None
 
 
+def _current_time_line(client) -> str | None:
+    """The current-time line the compactor is adding right now (v3.1.9), or
+    None when the feature is off or the field is absent."""
+    ti = (client.get("/health/full").json().get("config") or {}).get("time_injection") or {}
+    return ti.get("current_line") if ti.get("enabled") else None
+
+
 def _health(client) -> dict:
     r = client.get("/health/full")
     assert r.status_code in (200, 503), f"/health/full answered {r.status_code}"
@@ -340,11 +347,25 @@ def test_budget_boundaries_are_exact(client, fixture_client, target):
     msgs = _user_turn_of(fixture_client, target)
     assert _true_count(fixture_client, msgs) == target
 
+    # v3.1.9: the compactor dates the newest user turn with one line
+    # (main._inject_time_line) whenever the payload fits beside the line's
+    # reserve, so a payload of `target` tokens is charged `target` plus that
+    # line's exact cost. The line is read from /health/full on both sides of
+    # the request, because it carries the minute; a payload the guard measured
+    # into the reserve band or over the limit is forwarded undated, at exactly
+    # `target`. Either way the count is EXACT - the boundary property holds.
+    lines = {_current_time_line(client)}
     r = _chat(client, msgs, f"advf-edge-{target}")
+    lines.add(_current_time_line(client))
     assert r.status_code == 200, f"HTTP {r.status_code}: {r.text[:200]}"
-    assert _forwarded_prompt_tokens(r) == target, (
+    allowed = {target}
+    for line in lines - {None}:
+        dated = [{**msgs[-1], "content": line + "\n\n" + msgs[-1]["content"]}]
+        allowed.add(_true_count(fixture_client, dated))
+    assert _forwarded_prompt_tokens(r) in allowed, (
         f"the compactor forwarded {_forwarded_prompt_tokens(r)} tokens for a "
-        f"payload of exactly {target}"
+        f"payload of exactly {target} (allowed: {sorted(allowed)}, undated or "
+        f"dated with {sorted(lines - {None})})"
     )
 
 
