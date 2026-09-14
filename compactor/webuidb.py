@@ -39,9 +39,11 @@ archive in backup.py is the second line. Postgres removes this trade
 entirely and is the strategic answer; this removes the instability today.
 """
 
+import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import time
@@ -1275,14 +1277,299 @@ def restore_on_boot() -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# sync_once support: the mutual-exclusion lock, deterministic temp names and
+# their sweep, and the hash/fsync helpers for the /data staging copy.
+# v3.1.9, hostile pass (r318-b) F3/F4.
+# ---------------------------------------------------------------------------
+
+# Deterministic, NOT pid-keyed (F4). The old name
+# (`{SNAPSHOT_DB.name}.sync-{os.getpid()}`) meant a SIGKILLed sync (a RunPod
+# redeploy mid-sync is exactly a SIGKILL) left a ~138 MB temp file — and its
+# -journal — on /data FOREVER: nothing could find it again, because the next
+# process to run has a different pid, and the cleanup that existed only ran
+# in an `except` block a SIGKILL never reaches. A deterministic name means
+# the NEXT sync_once can find and remove its own previous leftover (see
+# _sweep_stale_sync_temps) — which only stays safe with the lock below: two
+# deterministic-named temps sharing one name, with no mutual exclusion,
+# would let one call delete or truncate the other's in-flight file instead
+# of ever only its own debris.
+_SYNC_TMP_SUFFIX = ".sync-tmp"
+# The legacy pid-keyed name, v3.1.7/v3.1.8 pods only: `webui.db.sync-<digits>`
+# and its `-journal`. Anchored to SNAPSHOT_DB's own name and requiring the
+# suffix to be ALL DIGITS, deliberately — a bare `webui.db.sync-*` glob would
+# also match this module's own new deterministic `.sync-tmp` name (not a
+# problem by itself) but, more importantly, is the shape of glob that has
+# swept unrelated files in this codebase before (see _RESTORE_MARKER_GLOB's
+# own exact-pattern discipline). This must never match SNAPSHOT_DB itself or
+# anything an operator staged by hand.
+_LEGACY_SYNC_TMP_RE = re.compile(
+    r"^" + re.escape(SNAPSHOT_DB.name) + r"\.sync-\d+(-journal)?$"
+)
+
+# Sentinel: flock could not be used at all on this platform/mount (see
+# _acquire_sync_lock), so sync_once proceeds WITHOUT mutual exclusion. Kept
+# distinct from `None` (which means "another sync holds the lock right
+# now" — the caller must return immediately) and from a real file handle
+# (which the caller must release).
+_LOCK_DEGRADED = object()
+
+
+def _sync_lock_path() -> Path:
+    # ON LOCAL DISK, DELIBERATELY — never /data. A lock file on the network
+    # volume would itself be subject to the same stalls this whole module
+    # exists to route around (a stuck flock on a stalling MooseFS mount
+    # would block every future sync forever, which is a worse failure than
+    # the race this lock prevents), and a lock scoped to LOCAL_DB's own
+    # directory is exactly the resource sync_once needs exclusive use of —
+    # the SOURCE it is about to open a SHARED lock against.
+    return LOCAL_DB.with_name(LOCAL_DB.name + ".sync.lock")
+
+
+def _acquire_sync_lock():
+    """Take an exclusive, non-blocking flock so two sync_once calls never
+    overlap (F4: a manual `webuidb.py --sync-once` can run while the
+    webuidb-sync daemon's own loop is mid-cycle).
+
+    Returns:
+      * an open file object — the lock is held; call _release_sync_lock()
+        with it when the sync ends.
+      * `_LOCK_DEGRADED` — flock could not be used at all (see below); the
+        caller proceeds WITHOUT mutual exclusion this cycle.
+      * `None` — another process holds the lock right now; the caller MUST
+        return immediately without sweeping or touching any temp file.
+
+    DEGRADES SAFELY where flock is unavailable: on any platform without
+    `fcntl` (Windows — a real target only for this project's own unit
+    suite; production is Linux, where LOCAL_DB's filesystem — an overlay or
+    a tmpfs — always implements flock) this never refuses a sync. That is
+    the safe direction for THIS lock specifically: losing mutual exclusion
+    here reproduces the pre-fix behaviour (pid-keyed temp names could not
+    collide because no two processes ever shared one), not a new failure
+    mode, and a lock that could HANG (a blocking flock on a bad mount)
+    would be strictly worse than the race it prevents — which is why this
+    is LOCK_EX | LOCK_NB, never a blocking flock, even on the platform
+    where it is real.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        logger.info(
+            "sync lock: fcntl is not available on this platform (expected "
+            "on Windows — production is Linux); proceeding WITHOUT mutual "
+            "exclusion for sync_once. See _acquire_sync_lock's docstring."
+        )
+        return _LOCK_DEGRADED
+
+    path = _sync_lock_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+")
+    except OSError as e:
+        logger.warning(
+            f"sync lock: could not open {path} ({type(e).__name__}: {e}) — "
+            f"proceeding WITHOUT mutual exclusion this cycle. A manual "
+            f"--sync-once run at the same moment as the daemon could now "
+            f"race with this one."
+        )
+        return _LOCK_DEGRADED
+
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None  # another sync_once holds it right now
+    return fh
+
+
+def _release_sync_lock(lock) -> None:
+    if lock is None or lock is _LOCK_DEGRADED:
+        return
+    try:
+        import fcntl
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        lock.close()
+    except Exception:
+        pass
+
+
+def _sweep_stale_sync_temps() -> None:
+    """Remove leftover sync temp files — this module's own (both locations)
+    and the legacy pid-keyed ones on /data — before starting a new sync.
+
+    MUST be called only while holding the sync lock (see _acquire_sync_lock)
+    or with mutual exclusion genuinely unavailable (_LOCK_DEGRADED): sweeping
+    a name that another sync_once is actively writing to would delete or
+    truncate ITS in-flight temp file, not only ever stale debris. That is
+    exactly what deterministic names would otherwise risk (see
+    _SYNC_TMP_SUFFIX's own comment) — the lock is what keeps this safe.
+
+    Never raises: a sweep that cannot run is a housekeeping miss, not a
+    reason to refuse the sync it is about to make room for.
+    """
+    for p in (
+        LOCAL_DB.with_name(LOCAL_DB.name + _SYNC_TMP_SUFFIX),
+        LOCAL_DB.with_name(LOCAL_DB.name + _SYNC_TMP_SUFFIX + "-journal"),
+        SNAPSHOT_DB.with_name(SNAPSHOT_DB.name + _SYNC_TMP_SUFFIX),
+        SNAPSHOT_DB.with_name(SNAPSHOT_DB.name + _SYNC_TMP_SUFFIX + "-journal"),
+    ):
+        try:
+            if p.exists():
+                p.unlink()
+                logger.info(f"swept stale sync temp file {p}")
+        except OSError as e:
+            logger.warning(
+                f"could not sweep stale sync temp file {p}: "
+                f"{type(e).__name__}: {e}"
+            )
+
+    # Legacy pid-keyed debris from v3.1.7/v3.1.8 pods, /data only (the old
+    # code never staged anything on local disk). Matched by the EXACT
+    # pattern only — see _LEGACY_SYNC_TMP_RE's own comment for why this must
+    # never be a bare glob.
+    try:
+        snap_dir = SNAPSHOT_DB.parent
+        if snap_dir.is_dir():
+            for entry in snap_dir.iterdir():
+                if _LEGACY_SYNC_TMP_RE.match(entry.name):
+                    try:
+                        entry.unlink()
+                        logger.info(f"swept legacy sync temp file {entry}")
+                    except OSError as e:
+                        logger.warning(
+                            f"could not sweep legacy sync temp {entry}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+    except OSError as e:
+        logger.warning(
+            f"could not scan {SNAPSHOT_DB.parent} for legacy sync temps: "
+            f"{type(e).__name__}: {e}"
+        )
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _fsync_file_and_dir(path: Path) -> None:
+    """fsync `path` itself — REFUSING on failure — then best-effort fsync
+    its parent directory.
+
+    THE TWO DIFFER ON PURPOSE (found in review after this lane's first
+    pass, before it shipped: the file fsync used to log a warning and
+    carry on, same as the directory one below it). An EIO on a stalling
+    MooseFS mount means the pages this function just asked to be written
+    may never have reached the volume — and the read-back sync_once does
+    right after this, to hash-compare `data_tmp` against `local_tmp`
+    before publishing, can be served straight from the page cache. A
+    cache hit hashes identically to the file the guards already approved
+    REGARDLESS of what actually made it to disk, so "warn and continue"
+    let a file whose durable bytes might not exist replace the last good
+    snapshot, with the hash check giving false confidence that it hadn't.
+    So: a failed FILE fsync RAISES, which reaches sync_once's existing
+    `except Exception` — out["error"] is set, the OLD snapshot is left
+    exactly where it was (this runs before `os.replace`), and both temps
+    are still cleaned up in the `finally`, the same as any other publish
+    refusal in that function.
+
+    The DIRECTORY fsync stays best-effort and does NOT raise: it exists to
+    persist the directory ENTRY (so a crash right after this can't leave a
+    file with no name pointing at it), not to prove the FILE's bytes are
+    durable — and many filesystems, FUSE mounts (this project's own /data)
+    very much included, refuse or silently no-op an fsync on a directory
+    descriptor. That refusal says nothing about whether `path` itself is
+    safe to hash and publish, which is the question this function actually
+    needs answered before sync_once compares hashes.
+
+    Opens the file O_RDWR, not O_RDONLY: fsync on a read-only-opened fd is
+    a genuine Windows CRT limitation (`[Errno 9] Bad file descriptor`,
+    reproducible on a file that exists and is fully readable — verified:
+    O_RDWR fsyncs correctly on the same file where O_RDONLY does not) with
+    nothing to do with whether the underlying bytes are durable; O_RDWR
+    works on both platforms this project's suites run on.
+    """
+    try:
+        fd = os.open(str(path), os.O_RDWR)
+    except OSError as e:
+        raise RuntimeError(
+            f"REFUSING to publish: could not open {path} to fsync it "
+            f"({type(e).__name__}: {e}) — cannot confirm the bytes just "
+            f"written to it are durable. The live database is unaffected; "
+            f"the previous snapshot is untouched."
+        ) from e
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        raise RuntimeError(
+            f"REFUSING to publish: fsync of {path} failed "
+            f"({type(e).__name__}: {e}) — the bytes just written to it may "
+            f"not have reached the volume, and a hash comparison right "
+            f"after this could still match a page-cache copy of content "
+            f"that never landed on disk. The live database is unaffected; "
+            f"the previous snapshot is untouched."
+        ) from e
+    finally:
+        os.close(fd)
+    try:
+        dfd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass  # best-effort; matches write_restore_marker's own directory fsync
+
+
 def sync_once(force: bool = False) -> dict:
     """Publish LOCAL_DB to SNAPSHOT_DB, safely, while OpenWebUI is running.
 
-    Six guards, each earned:
+    TWO STAGES, and the SOURCE's lock never crosses into the slow one
+    (v3.1.9, hostile pass r318-b F3). This used to be one `src.backup(dst)`
+    straight onto /data: Python's `Connection.backup` defaults to
+    `pages=-1`, one `sqlite3_backup_step(-1)` that holds a SHARED lock on
+    the SOURCE (LOCAL_DB, the database OpenWebUI is actively writing) until
+    the LAST destination page is written — and the destination was MooseFS.
+    In rollback-journal mode a writer cannot commit while a SHARED lock is
+    held elsewhere, and OpenWebUI's own busy timeout is 10s
+    (DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT), so a /data write slower than
+    that turned every save into "database is locked" for the whole of it —
+    measured losing 2 of 3 writer commits at a 10 MB/s throttle, for the
+    entire length of the sync. That is the OPPOSITE of what WEBUI_DB_LOCAL
+    exists to buy: taking MooseFS OUT of the live write path, and for the
+    length of every sync it was back in that path. So:
 
-      * sqlite3's backup API, not a file copy. It takes a read lock and
-        produces a consistent image of a database being written to. A cp of a
-        live SQLite file can capture a torn page.
+      1. `src.backup()` into a temp file ON LOCAL DISK, beside LOCAL_DB
+         (`local_tmp` below) — source and destination share a filesystem,
+         so this is fast regardless of /data's mood (~1s at 138 MB,
+         measured, not tens of seconds), and the SHARED lock on LOCAL_DB is
+         released the moment this returns. Every guard below (integrity,
+         chat count, shrink ratio, per-row loss, generation) runs against
+         THIS file — by the time any of them look, LOCAL_DB is already free
+         and OpenWebUI can commit again no matter how this cycle ends.
+      2. Only once every guard has passed: a plain byte copy of the
+         VERIFIED local file to a temp path on /data (`data_tmp`) with NO
+         sqlite3 connection open anywhere — a copy touches no lock at all,
+         so a stalling volume here costs time, never a lock OpenWebUI is
+         waiting behind. fsynced, hash-compared against the local file it
+         came from, then `os.replace`d onto SNAPSHOT_DB exactly as before.
+
+    Six content/identity guards, each earned (all run against `local_tmp`,
+    stage 1's output — see above for why that is now the right file to
+    validate rather than a file already sitting on /data):
+
+      * sqlite3's backup API, not a file copy, for STAGE 1. It takes a read
+        lock and produces a consistent image of a database being written
+        to. A cp of a live SQLite file can capture a torn page. (STAGE 2 is
+        a plain copy deliberately — see above: by then the source is a
+        finished, static local file, not a live database, so there is
+        nothing left to tear.)
       * The snapshot is verified BEFORE it replaces the previous one, and a
         snapshot reporting zero chats is refused. Publishing a broken image
         over a good one would turn a local problem into a durable one.
@@ -1308,13 +1595,29 @@ def sync_once(force: bool = False) -> dict:
     guard with no exit becomes the data-loss mode it was written against: it
     stops publishing her history to /data at all, which is the same loss
     taking longer, announced only in a log line nobody is reading.
+
+    MUTUAL EXCLUSION (F4): the whole of both stages runs under an exclusive
+    flock (see _acquire_sync_lock) so a manual `--sync-once` overlapping the
+    daemon's own cycle gets a clean "another sync is in progress" skip
+    instead of racing this function's now-DETERMINISTIC temp names (see
+    _SYNC_TMP_SUFFIX) — a stale one from either location is swept at the
+    start of every cycle, under the same lock.
     """
     out = {"synced": False, "skipped": None, "error": None, "bytes": 0}
     if not LOCAL_DB.exists():
         out["skipped"] = "no local database yet"
         return out
 
-    tmp = SNAPSHOT_DB.with_name(f"{SNAPSHOT_DB.name}.sync-{os.getpid()}")
+    lock = _acquire_sync_lock()
+    if lock is None:
+        # F4: the other sync_once is doing the same job right now - this is
+        # not a failure, so it is a skip (out["error"] stays None), the same
+        # way "unchanged since last sync" is a skip and not an error.
+        out["skipped"] = "another sync is in progress"
+        return out
+
+    local_tmp = LOCAL_DB.with_name(LOCAL_DB.name + _SYNC_TMP_SUFFIX)
+    data_tmp = SNAPSHOT_DB.with_name(SNAPSHOT_DB.name + _SYNC_TMP_SUFFIX)
     try:
         # p3-b F8. "Off means off" enforced HERE, not only by supervisord's
         # autostart=false line for this program. On a WEBUI_DB_LOCAL=false
@@ -1328,6 +1631,15 @@ def sync_once(force: bool = False) -> dict:
         # autostart=false does not stop a manual `supervisorctl start`. A
         # refusal here means the wrong command is merely wrong, not
         # destructive.
+        #
+        # CHECKED BEFORE THE SWEEP BELOW, deliberately (coordinator
+        # follow-up, this lane): a pod where this refusal is about to fire
+        # should not be syncing AT ALL, and the sweep — while it only ever
+        # touches this module's own temp names and the exact legacy
+        # pid-keyed pattern, never the live snapshot — still means an
+        # unlink() on /data. "Should not be running here at all" is not the
+        # same claim as "safe to touch /data first", and the refusal is
+        # free to check before anything is.
         if live_webui_db() != LOCAL_DB:
             raise RuntimeError(
                 f"REFUSING to sync: WEBUI_DB_LOCAL says the live database "
@@ -1339,6 +1651,13 @@ def sync_once(force: bool = False) -> dict:
                 f"this pod at all — stop it: `supervisorctl stop "
                 f"webuidb-sync`."
             )
+
+        # Sweep stale temps from a previous SIGKILLed cycle (F4) - safe only
+        # because we are holding the lock (or it is genuinely unavailable,
+        # in which case there is nothing safer to do than proceed anyway).
+        # After the refusal above, not before it - see that check's own
+        # comment.
+        _sweep_stale_sync_temps()
 
         # p3-b F7. This mtime-skip block USED TO run here, BEFORE this
         # try — `SNAPSHOT_DB.exists()` on Python 3.12.3 (every image) RAISES
@@ -1420,10 +1739,13 @@ def sync_once(force: bool = False) -> dict:
                 f"the durable one, delete {EMPTY_START_MARKER} - deliberately, "
                 f"and knowing that the next sync overwrites the snapshot."
             )
-        SNAPSHOT_DB.parent.mkdir(parents=True, exist_ok=True)
+        # STAGE 1 (F3): local disk to local disk. LOCAL_DB's SHARED lock is
+        # held only for as long as THIS takes — source and destination share
+        # a filesystem, so it is fast no matter how /data is behaving. See
+        # this function's own docstring for the failure this replaces.
         src = sqlite3.connect(str(LOCAL_DB), timeout=60)
         try:
-            dst = sqlite3.connect(str(tmp), timeout=60)
+            dst = sqlite3.connect(str(local_tmp), timeout=60)
             try:
                 src.backup(dst)
             finally:
@@ -1431,8 +1753,8 @@ def sync_once(force: bool = False) -> dict:
         finally:
             src.close()
 
-        ok, detail = integrity(tmp)
-        chats = _has_rows(tmp)
+        ok, detail = integrity(local_tmp)
+        chats = _has_rows(local_tmp)
         if not ok:
             raise RuntimeError(f"snapshot failed quick_check: {detail}")
         if not chats:
@@ -1447,8 +1769,8 @@ def sync_once(force: bool = False) -> dict:
         # "the snapshot is right there and I could not read it". So an
         # UNREADABLE durable copy - the precise failure this module exists for
         # - made the guard FALSY and the publish went straight over it. The
-        # integrity checks above validate `tmp`, the new image; nothing in
-        # this function was ever looking at the file about to be destroyed.
+        # integrity checks above validate `local_tmp`, the new image; nothing
+        # in this function was ever looking at the file about to be destroyed.
         #
         # Split apart, the two states want opposite answers: absent means
         # first publish, so go (test_webuidb_migration A8); unreadable means
@@ -1593,13 +1915,13 @@ def sync_once(force: bool = False) -> dict:
                     )
 
         if previous is not None:
-            new_bytes = tmp.stat().st_size
+            new_bytes = local_tmp.stat().st_size
             # ONE SCAN PER FILE FEEDS EVERY CONTENT GUARD BELOW: the ratio,
             # the per-conversation loss limit and the generation check all
             # read the same _scan_chat result. See _content_bytes for the
             # cost, and for why the unit is BYTES.
             prev_scan = _scan_chat(SNAPSHOT_DB)
-            new_scan = _scan_chat(tmp)
+            new_scan = _scan_chat(local_tmp)
             prev_content = None if prev_scan is None else prev_scan["total"]
             new_content = None if new_scan is None else new_scan["total"]
             # TWO MEASURES OF THE WHOLE TABLE, because on this pod the row
@@ -1839,7 +2161,32 @@ def sync_once(force: bool = False) -> dict:
                     "REFUSING to publish: " + " || AND, SEPARATELY: ".join(reasons)
                 )
 
-        os.replace(tmp, SNAPSHOT_DB)
+        # STAGE 2 (F3): local_tmp is now VERIFIED (every guard above passed).
+        # Copy it to /data with NO sqlite3 connection open anywhere - LOCAL_DB
+        # was only ever touched in stage 1, above, and is not reopened here.
+        # A stalling /data now costs time, never a lock OpenWebUI is waiting
+        # behind.
+        SNAPSHOT_DB.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local_tmp, data_tmp)
+        _fsync_file_and_dir(data_tmp)
+        # Verify the copy landed intact: a hash compare of the two (already
+        # local, already-read-once-for-guards) files is cheap - SNAPSHOT_DB
+        # is not yet touched, and every guard above already read local_tmp in
+        # full at least once, so the hash's own read is the only new full
+        # pass this costs. Cheaper and more exact than re-running
+        # quick_check, which only proves data_tmp is SOME well-formed SQLite
+        # file - not that it is byte-identical to what the guards approved.
+        local_hash = _sha256_file(local_tmp)
+        data_hash = _sha256_file(data_tmp)
+        if local_hash != data_hash:
+            raise RuntimeError(
+                f"REFUSING to publish: the copy to {data_tmp} does not match "
+                f"the verified local file (sha256 {local_hash[:12]} != "
+                f"{data_hash[:12]}) - /data may be corrupting writes. Nothing "
+                f"has been published; the live database is unaffected."
+            )
+
+        os.replace(data_tmp, SNAPSHOT_DB)
         # Stamp the snapshot with the LOCAL mtime this image was taken from,
         # so "has anything changed since the last publish?" is a meaningful
         # question next cycle. Without this the snapshot carries the temp
@@ -1867,18 +2214,31 @@ def sync_once(force: bool = False) -> dict:
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
         # Expected whenever the volume is stalling — which is the condition
-        # this module exists for. The LIVE database is local and unaffected;
-        # only the durability window widens. Loud, but never fatal.
+        # this module exists for. THE LIVE DATABASE IS LOCAL AND UNAFFECTED
+        # is now actually true whatever fails here (v3.1.9, F3): stage 1
+        # already released LOCAL_DB's lock before this point, so nothing
+        # past it - including everything a slow /data can do - reaches back
+        # to the file OpenWebUI has open. Only the durability window widens.
+        # Loud, but never fatal.
         logger.warning(
             f"snapshot publish failed ({out['error']}). The live database is "
             f"local and unaffected; retrying in {SYNC_INTERVAL_S:.0f}s. Chat "
             f"history is exposed to pod loss until this succeeds."
         )
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
+    finally:
+        # Always clean up BOTH temp files on the way out, success or failure
+        # (F4): leaving one behind for "the next exception handler" is
+        # exactly the old pid-keyed bug's shape, just moved - a SIGKILL here
+        # skips this too, which is why _sweep_stale_sync_temps() at the top
+        # of the NEXT cycle is the real fix; this is the fast path that
+        # usually means there is nothing for that sweep to find.
+        for _p in (local_tmp, data_tmp):
+            try:
+                if _p.exists():
+                    _p.unlink()
+            except Exception:
+                pass
+        _release_sync_lock(lock)
     return out
 
 

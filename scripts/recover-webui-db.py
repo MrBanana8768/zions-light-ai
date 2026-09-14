@@ -41,6 +41,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 DB = Path(os.environ.get("WEBUI_DB", "/data/openwebui/webui.db"))
@@ -49,6 +51,16 @@ FORENSICS = Path(os.environ.get("WEBUI_DB_FORENSICS", "/data/forensics"))
 # Journals SQLite may leave beside the database. -journal is the rollback
 # journal (the one seen in production); -wal/-shm appear in WAL mode.
 SIDECARS = ("-journal", "-wal", "-shm")
+# The SAME check RUNBOOK_DB_JOURNAL.md route 2B tells an operator to run by
+# hand after starting OpenWebUI alone ("Wait until this prints 200 ... a
+# large database can take a few minutes"). r318-b F5: this script's own
+# route (2A) started OpenWebUI and stopped there - never waiting for it to
+# actually answer, and never saying a word about compactor/backup (see
+# `main`'s own comment at [5/5] for why THIS script cannot restart those
+# two itself).
+OPENWEBUI_CONFIG_URL = os.environ.get(
+    "OPENWEBUI_CONFIG_URL", "http://127.0.0.1:3000/api/config"
+)
 
 
 def say(msg: str) -> None:
@@ -66,6 +78,25 @@ def supervisor(action: str, program: str = "openwebui") -> bool:
     except Exception as e:
         say(f"    supervisorctl {action} failed: {type(e).__name__}: {e}")
         return False
+
+
+def wait_for_openwebui(timeout_s: float = 180, poll_s: float = 5) -> bool:
+    """Poll OpenWebUI's own health endpoint until it answers 200, or give
+    up after `timeout_s`. The SAME check the runbook's route 2B tells an
+    operator to re-run by hand every 30 seconds - bounded here so this
+    script cannot hang forever if OpenWebUI never comes up (a large
+    database can take a few minutes to open; a script that never returns
+    on a genuinely stuck boot is its own incident)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(OPENWEBUI_CONFIG_URL, timeout=10) as r:
+                if r.status == 200:
+                    return True
+        except (urllib.error.URLError, OSError, ValueError):
+            pass  # not answering yet, or answering something other than 200
+        time.sleep(poll_s)
+    return False
 
 
 def inspect(path: Path) -> dict:
@@ -222,11 +253,46 @@ def main() -> int:
     time.sleep(8)
     supervisor("status")
 
+    # r318-b F5. This used to stop here - RECOVERED printed, exit 0, and
+    # the script's own job was done. But this script starts ONLY openwebui
+    # (see `supervisor`'s default `program="openwebui"` above, and [1/5]'s
+    # stop, same default) - it never stopped compactor or backup, so it
+    # cannot know whether they were running before this recovery started
+    # (a runbook route that stops them by hand - 2A does exactly that -
+    # leaves no record here for the script to read back). OpenWebUI's own
+    # model endpoint IS the compactor, so until an operator runs the line
+    # below, "RECOVERED" is true of the database and false of her ability
+    # to chat.
+    #
+    # Bounded wait for a REAL answer, not a fixed sleep, before saying so -
+    # the same check RUNBOOK_DB_JOURNAL.md route 2B has an operator poll by
+    # hand ("re-run it every 30 seconds"). Verifying OpenWebUI is actually
+    # serving BEFORE telling the operator to add compactor/backup's own
+    # load back onto the freshly-recovered database mirrors 2B's own
+    # ordering ("Start OpenWebUI alone first ... Then start the rest").
+    say("")
+    say("      waiting for OpenWebUI to answer "
+        f"({OPENWEBUI_CONFIG_URL}) before finishing...")
+    if wait_for_openwebui():
+        say("      OpenWebUI answered 200")
+    else:
+        say("      WARNING: OpenWebUI did not answer within the wait - "
+            "check it by hand (supervisorctl status; tail /data/logs/"
+            "openwebui.log) before running the line below")
+
     say("")
     say("=" * 62)
     say(f"RECOVERED — {info['chats']} chats, {info['users']} users, integrity ok")
     say(f"verified copy kept at {RESCUE / DB.name}")
     say("=" * 62)
+    say("")
+    say("This script only ever starts/stops openwebui. If compactor and/or")
+    say("backup were stopped for this recovery (RUNBOOK_DB_JOURNAL.md route")
+    say("2A: `supervisorctl stop openwebui compactor backup`), start them")
+    say("now - until you do, no chat reaches vLLM:")
+    say("")
+    say("    supervisorctl start compactor backup")
+    say("")
     return 0
 
 

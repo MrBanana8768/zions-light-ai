@@ -143,13 +143,21 @@ Continue only if it ends with `the database is recoverable`.
 
 **The real run.** It renames the originals aside and never deletes them; it
 refuses to swap unless the integrity check says ok; and it starts OpenWebUI at
-the end.
+the end, then waits for it to actually answer.
 ```bash
 /opt/compactor-venv/bin/python /data/scripts/recover-webui-db.py --yes
 ```
 Success ends with `RECOVERED — N chats, N users, integrity ok`. The broken
 originals are moved to `/data/forensics/webui.db*.broken-<stamp>`, and a
 verified copy stays in `/tmp/rescue` until the pod restarts.
+
+**Then start the rest.** The script only ever starts/stops `openwebui` — it
+never stopped `compactor` or `backup` (you did, above, by hand), so it
+cannot know whether to restart them, and it says so at the end. Until you
+run this, no chat reaches vLLM:
+```bash
+supervisorctl start compactor backup
+```
 
 Then go to section 3.
 
@@ -226,7 +234,9 @@ volume that just stalled):
 ```bash
 /opt/compactor-venv/bin/python /opt/compactor/backup.py --once; echo "EXIT=$?"
 ```
-Success is `EXIT=0`, `"ok": true` and an archive name. On v3.1.6.1–v3.1.8,
+Success is `EXIT=0` and a line starting `[OK] zions-backup-` (without
+`--json`, `backup.py` prints `[OK] <archive> db=ok, ...`, never
+`"ok": true` — that key only appears with `--json`). On v3.1.6.1–v3.1.8,
 "NOT pruning — memory shrank" in that output is a known false alarm.
 
 **3.5 Verify that archive** (use the name the backup printed):
