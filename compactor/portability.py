@@ -394,10 +394,46 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
         # — but it is recorded, because a snapshot with an unverified layer is
         # not the same object as a snapshot with a verified one.
         unverified.append("episodic (vector store unavailable)")
+    # v3.1.9 (hostile pass 5, C5-4). F1's torn-bytes rule (above) covered the
+    # facts file only. A torn `summaries/<conv>.json` — the identical shape,
+    # one layer over: a sync-lock/journal incident cuts the file mid-write,
+    # leaving facts and episodic fully readable — used to just be recorded
+    # unverified HERE with nothing kept aside. The overwrite that followed
+    # (admin_import_conversation, or cleanup_test_conversations' wipe) then
+    # called summarizer.save_state and replaced the file wholesale: the torn
+    # bytes — the only surviving evidence of what the L1/L2/L3 hierarchy had
+    # been — were gone, and the published snapshot said "summaries
+    # (unreadable)" with nothing behind that sentence to restore from.
+    # Reproduced (SP\p5-c\admin_probe.py case A): status 200, quarantine
+    # published, `torn facts_path: None`, "UNIQUE-TORN-SUMMARY-MARKER"
+    # nowhere in the quarantine dir. Same fix as F1, one layer over: capture
+    # the torn file's raw bytes here, verify/publish them alongside the JSON
+    # snapshot below, and refuse the whole quarantine (QuarantineError) if
+    # even the raw bytes cannot be copied aside — never proceed on a "the
+    # store is unreadable, nothing to lose" guess.
+    _torn_summary_raw: bytes | None = None
     try:
         summarizer.load_state(conv_id)
-    except memory.StoreUnreadable:
+    except memory.StoreUnreadable as e:
         unverified.append("summaries (unreadable)")
+        logger.warning(
+            f"conv={conv_id}: quarantine could not read the summary state "
+            f"file ({e}); the OTHER layers are still measured and "
+            f"snapshotted, and the torn file's raw bytes are copied aside "
+            f"rather than letting an overwrite replace them with nothing "
+            f"kept (hostile pass 5, C5-4 — the same rule F1 gave the facts "
+            f"file)"
+        )
+        try:
+            _torn_summary_raw = e.path.read_bytes()
+        except OSError as read_err:
+            raise QuarantineError(
+                f"conv={conv_id}: the summary state file is unreadable "
+                f"({e}) AND its raw bytes could not be copied aside either "
+                f"({type(read_err).__name__}: {read_err}) — refusing to "
+                f"publish a snapshot that would lose the one copy of "
+                f"evidence for what the summary hierarchy was"
+            ) from read_err
     except Exception:  # pragma: no cover - load_state's own best-effort paths
         unverified.append("summaries (unreadable)")
 
@@ -419,6 +455,9 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
         # (computed after `published`, a few lines down) — None when the
         # facts layer was readable, a string path once it is.
         "torn_facts_path": None,
+        # C5-4 (hostile pass 5): the same field, one layer over, for a torn
+        # summary state file. Also filled in below.
+        "torn_summary_path": None,
         "restore_hint": (
             "per-row: facts.restore_from_archive(conv_id) — preferred. "
             "whole-conversation: import_conversation(this file, "
@@ -476,26 +515,39 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
     quarantine_dir().mkdir(parents=True, exist_ok=True)
     published = _quarantine_path(conv_id)
     partial = published.with_name(published.name + ".partial")
-    # F1: the torn facts file's own raw bytes, staged and published beside
-    # the JSON snapshot under the same rename-into-place discipline — a
-    # `.torn` file that only ever appears once BOTH it and the JSON snapshot
-    # have been proven written. None when the facts layer was readable (the
-    # common case; nothing to carry).
-    torn_published = (
-        published.with_name(f"{published.stem}.facts.torn")
-        if _torn_facts_raw is not None else None
-    )
-    torn_partial = (
-        torn_published.with_name(torn_published.name + ".partial")
-        if torn_published is not None else None
-    )
-    # Filled in now that the path is known (the dict was built before
+    # F1 / C5-4 (hostile pass 5): every layer whose own file was unreadable
+    # gets its raw bytes staged and published beside the JSON snapshot under
+    # the same rename-into-place discipline — a `.torn` file that only ever
+    # appears once BOTH it and the JSON snapshot have been proven written.
+    # One list keyed by layer name instead of one pair of variables per
+    # layer, so a THIRD layer (a future caller that starts clearing persona
+    # or the archive sidecar — see the C5-4 fix note above) is one more
+    # entry here, not a third copy of the stage/verify/publish/cleanup block
+    # below: exactly the "a rule applied at one call site and missed at its
+    # sibling" shape this project keeps paying for. Empty when every layer
+    # was readable (the common case; nothing to carry).
+    _torn_layers: list[tuple[str, bytes]] = []
+    if _torn_facts_raw is not None:
+        _torn_layers.append(("facts", _torn_facts_raw))
+    if _torn_summary_raw is not None:
+        _torn_layers.append(("summary", _torn_summary_raw))
+    torn_published: dict[str, Path] = {
+        layer: published.with_name(f"{published.stem}.{layer}.torn")
+        for layer, _ in _torn_layers
+    }
+    torn_partial: dict[str, Path] = {
+        layer: path.with_name(path.name + ".partial")
+        for layer, path in torn_published.items()
+    }
+    # Filled in now that the paths are known (the dict was built before
     # `published` existed) — written into the METADATA BLOCK, not just this
     # function's return value, so a caller reading the snapshot back off
     # disk (an operator, or a test that does not keep the live process
     # around) can still find the torn bytes.
-    if torn_published is not None:
-        bundle["quarantine"]["torn_facts_path"] = str(torn_published)
+    if "facts" in torn_published:
+        bundle["quarantine"]["torn_facts_path"] = str(torn_published["facts"])
+    if "summary" in torn_published:
+        bundle["quarantine"]["torn_summary_path"] = str(torn_published["summary"])
 
     try:
         # Stage. atomic_write_json gives tmp+fsync+replace, so the `.partial`
@@ -560,32 +612,34 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
                 f"persona this conversation has stored"
             )
 
-        # F1: stage and verify the torn facts file's raw bytes exactly like
-        # the JSON bundle above — write, read back, compare — BEFORE either
-        # file is published under its real name. A copy that silently wrote
-        # short (a full disk, a torn write of THIS write) is worse than no
-        # copy, because the caller reads its presence as "preserved".
-        if torn_partial is not None:
-            torn_partial.write_bytes(_torn_facts_raw)
-            if torn_partial.read_bytes() != _torn_facts_raw:
+        # F1 / C5-4: stage and verify every torn layer's raw bytes exactly
+        # like the JSON bundle above — write, read back, compare — BEFORE
+        # any file is published under its real name. A copy that silently
+        # wrote short (a full disk, a torn write of THIS write) is worse
+        # than no copy, because the caller reads its presence as
+        # "preserved".
+        for _layer, _raw in _torn_layers:
+            _tp = torn_partial[_layer]
+            _tp.write_bytes(_raw)
+            if _tp.read_bytes() != _raw:
                 raise QuarantineError(
-                    f"conv={conv_id}: the torn facts file's raw-byte copy "
-                    f"did not read back identical to what was written"
+                    f"conv={conv_id}: the torn {_layer} file's raw-byte "
+                    f"copy did not read back identical to what was written"
                 )
 
         # Publish. Same rename-into-place backup.py uses: the file appears
         # under its real name only once it has been proven readable.
         os.replace(partial, published)
-        if torn_partial is not None:
-            os.replace(torn_partial, torn_published)
+        for _layer in torn_partial:
+            os.replace(torn_partial[_layer], torn_published[_layer])
     except Exception:
         try:
             partial.unlink()
         except OSError:
             pass
-        if torn_partial is not None:
+        for _tp in torn_partial.values():
             try:
-                torn_partial.unlink()
+                _tp.unlink()
             except OSError:
                 pass
         raise
@@ -599,7 +653,10 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
         f"summary={'yes' if _has_summary_content(back.get('summary_state')) else 'no'}, "
         f"persona={'yes' if back_q.get('persona') else 'no'}"
         + (f", unverified: {'; '.join(unverified)}" if unverified else "")
-        + (f", torn facts bytes: {torn_published}" if torn_published is not None else "")
+        + (
+            f", torn bytes kept for: {', '.join(sorted(torn_published))}"
+            if torn_published else ""
+        )
     )
 
     return {
@@ -614,7 +671,10 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
         # bytes of the torn file, copied aside next to this snapshot. None
         # (not absent) when there was nothing to carry, so a caller can tell
         # "facts were readable" from "this response predates the field".
-        "torn_facts_path": torn_published,
+        "torn_facts_path": torn_published.get("facts"),
+        # C5-4 (hostile pass 5): the same field, one layer over, for a torn
+        # summary state file.
+        "torn_summary_path": torn_published.get("summary"),
     }
 
 
