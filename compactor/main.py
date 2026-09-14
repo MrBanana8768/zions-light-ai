@@ -3851,6 +3851,33 @@ _OPENWEBUI_TASK_SUFFIXES = (
 )
 
 
+# hostile pass #5 (reviewer A F1). Ubuntu 24.04 split tzdata's `backward`
+# file — the aliases below — into a separate `tzdata-legacy` package the
+# shipped image does not install, so ZoneInfo(raw) fails for every one of
+# these even though the zone they NAME exists under its current name. Fixing
+# that for real is a Dockerfile change (add tzdata-legacy, or pip install
+# tzdata into the compactor venv) and belongs to whoever owns the image, not
+# this file. What belongs here: when a legacy name fails, and this table
+# happens to know its replacement, say so — an operator who typed the name
+# she has always used should see the name that will actually resolve on this
+# image, not just "not a usable IANA time zone name" and a guess. This map
+# does NOT change what resolves; it only makes the error actionable, and only
+# for names on it. Small and hand-picked (the ones the shipped image was
+# actually probed against, SP\p5-a\tzprobe.out) rather than exhaustive,
+# because a wrong canonical name would suggest a fix that PRODUCES the wrong
+# offset for a zone with a genuinely different history (e.g. Asia/Calcutta
+# and Asia/Kolkata are the same zone; not every backward link is this clean).
+_LEGACY_ZONE_ALIASES = {
+    "us/arizona": "America/Phoenix",
+    "asia/calcutta": "Asia/Kolkata",
+    "europe/kiev": "Europe/Kyiv",
+    "asia/katmandu": "Asia/Kathmandu",
+    "america/buenos_aires": "America/Argentina/Buenos_Aires",
+    "asia/saigon": "Asia/Ho_Chi_Minh",
+    "america/godthab": "America/Nuuk",
+}
+
+
 def _resolve_time_zone(environ) -> tuple[tzinfo, str, str, str | None]:
     """(zone, name, source, error) from COMPACTOR_TIMEZONE, else UTC. Also
     validates the browser-supplied name (_browser_time_zone passes it in under
@@ -3877,9 +3904,17 @@ def _resolve_time_zone(environ) -> tuple[tzinfo, str, str, str | None]:
     try:
         return ZoneInfo(raw), raw, source, None
     except Exception as e:  # ZoneInfoNotFoundError, ValueError (a path), OSError
+        suggestion = ""
+        canonical = _LEGACY_ZONE_ALIASES.get(raw.lower())
+        if canonical:
+            try:
+                ZoneInfo(canonical)  # does THIS image actually have it?
+                suggestion = f" — did you mean {canonical!r}? That name resolves here."
+            except Exception:
+                pass  # the alias doesn't help on this image either; say nothing extra
         return timezone.utc, "UTC", source, (
             f"{source}={raw!r} is not a usable IANA time zone name "
-            f"({type(e).__name__}: {e})"
+            f"({type(e).__name__}: {e}){suggestion}"
         )
 
 
@@ -4039,6 +4074,60 @@ def _is_openwebui_task_conv_id(conv_id: str | None) -> bool:
     return bool(conv_id) and str(conv_id).endswith(_OPENWEBUI_TASK_SUFFIXES)
 
 
+# The literal opening of every OpenWebUI task-generation prompt (open_webui's
+# get_task_model_id / task.py templates render "### Task:\n<instructions>\n
+# ### Chat History:\n..." for title, tags, follow-ups, query generation and
+# the rest of TASKS.*). See TASK_REQ in test_time_injection.py, which is this
+# exact shape. Used only by _looks_like_openwebui_task_prompt, for the dating
+# decision — never for the memory classifier, which has its own reasons
+# (_is_repeat_task_traffic) that this string is not part of.
+_OPENWEBUI_TASK_PROMPT_HEAD = "### Task:"
+
+
+def _looks_like_openwebui_task_prompt(messages: list[dict]) -> bool:
+    """Does the newest user turn look like OpenWebUI's own task template,
+    rather than something she typed?
+
+    hostile pass #5 (reviewer A F2). Under hash identity (production today —
+    RUNBOOK_MEMORY_IDENTITY.md) there is no header to tell a title/tag/
+    follow-up call apart from a first turn or a regenerate; only
+    _is_repeat_task_traffic's history-POSITION heuristic does, and a
+    conv_id built purely from content hash can put a genuine new (or
+    regenerated) opener at the SAME position as an older, already-deep
+    conversation that happens to hash-collide with it (same system prompt,
+    same first 512 characters). That collision is real text from her, not a
+    task call — dating it matters at least as much as dating a task template
+    does, since an ordinary opening line is exactly where the model not
+    knowing the time would show. Confirmed with a synthetic fixture, not
+    production data (test_time_injection.py [6b]): an opener with no
+    task-shaped content, seeded to collide by hash with an older,
+    already-deep conversation, was sent undated before this fix and is
+    dated after it.
+
+    So this narrows what "_is_repeat_task_traffic says yes" is allowed to
+    mean for the DATING decision only: not dated only when the request is
+    ALSO shaped like the thing that classifier exists to recognise. Checked
+    as an ADDITIONAL condition, never a replacement — a real first turn that
+    happens to open with a markdown heading is not task traffic just because
+    it looks like one; the position bar is what actually gates that, and
+    still must pass first. The memory tail's classification (whether this
+    gets memorized) is untouched: it has no template-text check and this
+    function is not called from it. That half is a known identity
+    limitation, not something a text heuristic can safely close — a real
+    conversation COULD legitimately open with a message that starts
+    "### Task:" (a user pasting one), and skipping the tail on it would be
+    exactly the silent-memory-loss bug _is_repeat_task_traffic's docstring
+    already warns about. Reported, not fixed here.
+    """
+    newest = next(
+        (m for m in reversed(messages) if isinstance(m, dict) and m.get("role") == "user"),
+        None,
+    )
+    if newest is None:
+        return False
+    return _message_text(newest).lstrip().startswith(_OPENWEBUI_TASK_PROMPT_HEAD)
+
+
 def _time_line_for_request(conv_id: str | None, messages: list[dict]) -> str | None:
     """The line to date this request with, or None. Decided on the ORIGINAL
     request, before anything is forwarded, so the guard can reserve its size.
@@ -4054,7 +4143,12 @@ def _time_line_for_request(conv_id: str | None, messages: list[dict]) -> str | N
         return None
     if _is_openwebui_task_conv_id(conv_id):
         return None
-    if conv_id and _is_repeat_task_traffic(conv_id, messages):
+    # hostile pass #5 F2: _is_repeat_task_traffic alone over-fires on a
+    # hash-identity collision (see _looks_like_openwebui_task_prompt) — add
+    # the shape check so only genuine task calls skip dating here. The
+    # memory classifier below this function is untouched.
+    if conv_id and _is_repeat_task_traffic(conv_id, messages) \
+            and _looks_like_openwebui_task_prompt(messages):
         return None
     global _last_time_zone_obj
     zone, name, source, browser_error = _request_time_zone(messages)
@@ -4426,6 +4520,7 @@ def _enforce_hard_budget(
     limit: int | None = None,
     protect_system: int = 1,
     report: dict | None = None,
+    reserve: int = 0,
 ) -> list[dict]:
     """Last line of defense: never forward a request that vLLM must reject.
 
@@ -4462,6 +4557,20 @@ def _enforce_hard_budget(
     and gets messages back, and a signature that breaks its callers to carry
     diagnostics is how the same fix gets applied at one site and missed at its
     sibling.
+
+    `reserve`, when passed, is the number of tokens `limit` was already
+    shrunk by for something this guard never sees (v3.1.9: the current-time
+    line, shaved off `effective_limit` before this call so the line has room
+    to be added AFTER the guard, merges and tail repair). It changes nothing
+    about what is shed — the guard still tries to fit `limit`, the reduced
+    number, because that is what makes room for the line at all — it only
+    changes what a FAILURE to fit `limit` is allowed to mean (hostile pass
+    #5, reviewer A F3). A payload that clears `limit + reserve` but not
+    `limit` is not the failure this guard exists to prevent: vLLM will
+    accept it, undated, exactly as sent. Logging that at ERROR ("vLLM will
+    most likely reject this") was false on its face and the soak counted it
+    as one. Default 0 — every other caller's `limit` already means the real
+    limit, and a payload over it by any amount is a real failure.
     """
     if limit is None:
         limit = HARD_INPUT_LIMIT
@@ -4659,27 +4768,81 @@ def _enforce_hard_budget(
             _is_compaction_standin(msgs[i])
             for i in _droppable_system_indices(msgs, protect_system)
         ):
-            # Memory's total is computed once: this loop removes turns only.
-            # And the oldest turn is found from the front, where the system
-            # blocks are: in this state the array can hold thousands of
-            # turns, and rebuilding an index list per dropped turn was
-            # quadratic on the request path.
-            _memory = sum(
-                per[i] for i in _droppable_system_indices(msgs, protect_system)
-                if not _is_compaction_standin(msgs[i])
-            )
-            _n_turns = sum(1 for m in msgs if m.get("role") != "system")
-            while running > limit:
-                if running - _memory <= limit:
-                    break
-                if _n_turns <= max(1, KEEP_RECENT_TURNS):
-                    break
-                i0 = next(i for i, m in enumerate(msgs) if m.get("role") != "system")
-                running -= per[i0]
-                del msgs[i0]
-                del per[i0]
-                dropped += 1
-                _n_turns -= 1
+            # hostile pass #5 (reviewer A F4): the pass-4 F5 loop this replaces
+            # stopped the moment cutting ALL injected memory could cover the
+            # rest ("running - _memory <= limit"), on the reasoning that
+            # anything beyond that point is memory's to pay. But "memory
+            # COULD pay it" is not "an old exchange isn't owed first" — the
+            # oldest turns in this state are the ones no summary covers
+            # (comment above), so they are worth at least as much as facts
+            # and retrieval, not less. Stopping at the fractional point meant
+            # this loop always left LESS THAN ONE old exchange undropped and
+            # let memory absorb that remainder — every time, by construction.
+            # Measured at her numbers (facts 400 + retrieval 1,500 tokens, old
+            # exchanges 1,800 tokens each): memory was cut or gone on 16 of 40
+            # payload sizes and whole on 0, while shedding one more old
+            # exchange instead of touching memory would have fit the same
+            # limit on 38 of those 16.
+            #
+            # So now: shed every FULL old exchange this state can spare — down
+            # to the protected recent window, and NEVER a lone message — before
+            # memory is touched at all; memory is spent only once that floor is
+            # reached and the array still does not fit. "Never a lone message"
+            # is not cosmetic: the old per-message version could stop having
+            # dropped an old USER turn but not yet its reply — exactly the pair
+            # the role-alternation repair below would go on to delete anyway,
+            # AFTER memory had already been halved and dropped to cover the
+            # tokens that orphaned reply cost. Traced at the shipped limit:
+            # 1,798 tokens (9% of the window) sat unused because the space the
+            # repair freed arrived after the memory spend it would have made
+            # unnecessary. Shedding whole exchanges up front leaves the repair
+            # nothing to do in this branch.
+            # Linear, not once-per-drop (hostile pass #5 review follow-up).
+            # A first cut of this loop rebuilt `idxs` (a full scan of `msgs`)
+            # AND called `del msgs[i]` / `del per[i]` on every single
+            # iteration — and `del` near the front of a list is itself O(n),
+            # since everything after the deleted index shifts down. In this
+            # state the array can hold thousands of turns with hundreds
+            # needing to go (her live chat: ~480 turns today, ~1,900 in the
+            # archive, ~470 shed per request in this regime), so that was
+            # O(n) work repeated once per dropped exchange — quadratic on
+            # the request path, which runs holding the GIL (reviewer pass-3
+            # F6 measured 0.46s of GIL-bound CPU in the reuse gate on far
+            # less data than this). The fix: scan `msgs` for its non-system
+            # turns exactly ONCE, walk a plain integer pointer over that list
+            # to decide how much to cut (no list rebuilding, no per-step
+            # deletion), and — only once, after the decision is made — build
+            # the shortened `msgs`/`per` in a single pass. See
+            # test_p5_guard.py's timing section for the measured bound.
+            _turn_idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+            _floor = max(1, KEEP_RECENT_TURNS)
+            _n_turns = len(_turn_idxs)
+            _cut = 0        # how many of the OLDEST entries of _turn_idxs go
+            _freed = 0      # tokens that shedding them frees
+            while running - _freed > limit and _n_turns - _cut > _floor:
+                i0 = _turn_idxs[_cut]
+                # A whole exchange: the oldest surviving turn, plus its reply
+                # if (and only if) that reply immediately follows it in the
+                # non-system sequence. Anything else — the reply already
+                # gone, or this being an assistant turn already orphaned by
+                # an earlier round — is shed alone, since there is no
+                # partner left to split it from.
+                pair_len = (
+                    2
+                    if _cut + 1 < _n_turns and msgs[i0].get("role") == "user"
+                    and msgs[_turn_idxs[_cut + 1]].get("role") == "assistant"
+                    else 1
+                )
+                if _n_turns - (_cut + pair_len) < _floor:
+                    break  # the recent window starts here; stop, don't split it
+                _freed += sum(per[_turn_idxs[_cut + k]] for k in range(pair_len))
+                _cut += pair_len
+            if _cut:
+                _drop = set(_turn_idxs[:_cut])
+                msgs = [m for i, m in enumerate(msgs) if i not in _drop]
+                per = [p for i, p in enumerate(per) if i not in _drop]
+                running -= _freed
+                dropped += _cut
             while running > limit and trimmed < 32:
                 big = [
                     i
@@ -4901,45 +5064,68 @@ def _enforce_hard_budget(
             }
         )
     if running > limit:
-        # v3.1: this used to log at WARNING and read like a success — "hard
-        # budget enforced" while forwarding a payload the guard itself has just
-        # measured as too large. It is a failure of the thing whose entire job
-        # is to make vLLM's 400 impossible, and the 400 is now the expected
-        # outcome. Say so, at ERROR, with the shortfall, so it is findable
-        # before the user reports it rather than after.
-        #
-        # v3.1 D3: and say WHAT is left, because the two residuals need
-        # different people to act. On 2026-08-28 the line read "dropped 0 old
-        # turn(s), trimmed 6 injected block(s), dropped 1 injected block(s)
-        # entirely - still 16417 over"; 16,384 + 16,417 = 32,801, which is
-        # exactly the number vLLM went on to report, so every one of those
-        # 32,801 tokens was the caller's own system prompt and the single turn
-        # the user had typed. Nothing the compactor is allowed to touch was
-        # still in that payload — and the line said "a conversation with
-        # nothing left to shed is the usual cause" without saying which case it
-        # was looking at, so it read as a compactor problem for four hours.
-        if not _droppable_system_indices(msgs, protect_system):
-            residual = (
-                "Nothing injected remains: what is left is the caller's own "
-                "system prompt and the newest turn, and neither is this "
-                "guard's to spend. The request as SENT does not fit the "
-                "window — that is a client-side size problem, not a memory one"
-            )
+        if reserve and running <= limit + reserve:
+            # hostile pass #5 (reviewer A F3). `limit` here can already be
+            # narrower than the real window: the request path shrinks it by
+            # `reserve` tokens to leave room for the current-time line, which
+            # is added to the payload AFTER this guard returns (see
+            # _time_line_for_request / _inject_time_line). A payload that
+            # clears the REAL window (limit + reserve) but not this narrowed
+            # one is not the failure this guard exists to prevent — vLLM
+            # will accept it exactly as sent, just undated. Before this fix,
+            # this branch could not tell the two apart: every payload over
+            # `limit` (reserve band or genuinely oversized) logged "hard
+            # budget FAILED to fit ... vLLM will most likely reject this" at
+            # ERROR, and the soak (and any operator) read that as a real
+            # failure for a request that was one line short of full and
+            # about to be accepted. Silent here on purpose: the caller (it
+            # alone knows this is a reserve, not a real limit, and knows the
+            # conversation) is the one place that can say it once per
+            # conversation instead of once per process — see
+            # _time_line_for_request's call site in chat_completions.
+            pass
         else:
-            # Unreachable: the pass above drops every droppable block before
-            # this line can be reached. Kept as a marker, because a guard that
-            # gives up holding memory it was allowed to spend is the exact
-            # defect v3.1 D3 closed and it should be loud if it returns.
-            residual = (
-                "BUG: injected block(s) survived the last-resort drop — the "
-                "guard is holding memory it was allowed to spend"
+            # v3.1: this used to log at WARNING and read like a success — "hard
+            # budget enforced" while forwarding a payload the guard itself has
+            # just measured as too large. It is a failure of the thing whose
+            # entire job is to make vLLM's 400 impossible, and the 400 is now
+            # the expected outcome. Say so, at ERROR, with the shortfall, so it
+            # is findable before the user reports it rather than after.
+            #
+            # v3.1 D3: and say WHAT is left, because the two residuals need
+            # different people to act. On 2026-08-28 the line read "dropped 0
+            # old turn(s), trimmed 6 injected block(s), dropped 1 injected
+            # block(s) entirely - still 16417 over"; 16,384 + 16,417 = 32,801,
+            # which is exactly the number vLLM went on to report, so every one
+            # of those 32,801 tokens was the caller's own system prompt and the
+            # single turn the user had typed. Nothing the compactor is allowed
+            # to touch was still in that payload — and the line said "a
+            # conversation with nothing left to shed is the usual cause"
+            # without saying which case it was looking at, so it read as a
+            # compactor problem for four hours.
+            if not _droppable_system_indices(msgs, protect_system):
+                residual = (
+                    "Nothing injected remains: what is left is the caller's own "
+                    "system prompt and the newest turn, and neither is this "
+                    "guard's to spend. The request as SENT does not fit the "
+                    "window — that is a client-side size problem, not a memory one"
+                )
+            else:
+                # Unreachable: the pass above drops every droppable block
+                # before this line can be reached. Kept as a marker, because a
+                # guard that gives up holding memory it was allowed to spend is
+                # the exact defect v3.1 D3 closed and it should be loud if it
+                # returns.
+                residual = (
+                    "BUG: injected block(s) survived the last-resort drop — the "
+                    "guard is holding memory it was allowed to spend"
+                )
+            logger.error(
+                f"hard budget FAILED to fit: {detail} — still "
+                f"{running - limit} token(s) over. Forwarding anyway (the newest "
+                f"turn is never dropped); vLLM will most likely reject this. "
+                f"{residual}."
             )
-        logger.error(
-            f"hard budget FAILED to fit: {detail} — still "
-            f"{running - limit} token(s) over. Forwarding anyway (the newest "
-            f"turn is never dropped); vLLM will most likely reject this. "
-            f"{residual}."
-        )
     else:
         logger.warning(f"hard budget enforced: {detail}")
     return msgs
@@ -7200,8 +7386,56 @@ async def chat_completions(request: Request) -> Any:
         effective_limit - _time_reserve,
         caller_system,
         guard_report,
+        _time_reserve,
     )
+    # The limit the FORWARDED payload is held to, REGARDLESS of the line: the
+    # guard above shed against `effective_limit - _time_reserve` only to leave
+    # the line room, and a rejection this request goes on to take is measured
+    # against the real window, not that narrowed one. Computed once, here,
+    # rather than recomputed later: _note_backend_rejection moves
+    # _BUDGET_MARGIN, so a value read after the response comes back could name
+    # a budget that was no longer in force by the time the rejection was
+    # logged. Mirrors the clamp inside _enforce_hard_budget.
+    enforced_limit = max(256, effective_limit - _BUDGET_MARGIN)
+    # True when the guard could not fit the (possibly reserve-narrowed) limit
+    # it was handed. Drives ONE decision below: whether there is room left to
+    # add the current-time line at all — and there, "narrowed by the reserve"
+    # is exactly the question, so this stays as-is (unrenamed) for that use.
     guard_measured_overflow = guard_report.get("fits") is False
+    # hostile pass #5 (reviewer A F3). A SEPARATE question, despite starting
+    # from the same report: whether a vLLM rejection on THIS payload would be
+    # evidence our counting is wrong (_note_backend_rejection's calibration).
+    # The guard above was handed the REDUCED limit (less `_time_reserve`), so
+    # "fits is False" there can mean either "does not fit the real window" or
+    # merely "does not fit with room left for the line" — and only the first
+    # is evidence of anything. A payload that clears `enforced_limit` (the
+    # real one) is going to be ACCEPTED by vLLM, undated, exactly as
+    # measured; telling the calibration otherwise would have it distrust a
+    # measurement that was never wrong. It would also, before this fix, have
+    # the guard itself log "hard budget FAILED to fit ... vLLM will most
+    # likely reject this" at ERROR for a request about to succeed — which the
+    # soak then counted as a real failure (reserve=0 on every OTHER caller of
+    # _enforce_hard_budget keeps that ERROR exactly as before; see its
+    # docstring).
+    _reserve_band = (
+        guard_measured_overflow
+        and _time_reserve > 0
+        and guard_report.get("measured") is not None
+        and guard_report["measured"] <= enforced_limit
+    )
+    calibration_overflow = guard_measured_overflow and not _reserve_band
+    if _reserve_band and logsetup.log_once(f"time_injection.reserve_band.{conv_id or '?'}"):
+        # Once per conversation, not once per process (logsetup.log_once's
+        # usual grain): a process serves many conversations, and "no room for
+        # the line" is a fact about THIS one's shape, not the process's. Said
+        # here, where conv_id is available — the guard itself has none.
+        logger.info(
+            f"conv={conv_id or '?'}: payload fits the {enforced_limit}-token "
+            f"window ({guard_report['measured']} tokens) but not with room "
+            f"left for the current-time line ({_time_reserve}-token "
+            f"reserve); sending it undated rather than shedding memory or "
+            f"turns to make room for a line alone."
+        )
     body["messages"] = _merge_adjacent_system_messages(body["messages"])
     # ...and non-system turns that ended up sharing a role (compaction hoists
     # image turns out of chronological order, which lands user next to user).
@@ -7235,18 +7469,9 @@ async def chat_completions(request: Request) -> Any:
         else:
             body["messages"], _ = _inject_time_line(body["messages"], _time_line)
 
-    # The limit the FORWARDED payload was held to. v3.1.9: that is the guard's
-    # limit plus the current-time line's reserve - the guard shed the array
-    # against `effective_limit - _time_reserve` and the line then used at most
-    # that reserve - so it is still `effective_limit` less the margin. The
-    # guard's own narrower limit would inflate every learned overshoot by the
-    # reserve, for tokens that were accounted for. Captured here rather than
-    # recomputed if this request is rejected: _note_backend_rejection moves
-    # _BUDGET_MARGIN, so by the time a rejection is logged the margin is no
-    # longer the one this payload was measured against, and the log line would
-    # name a budget that was never in force. Mirrors the clamp inside
-    # _enforce_hard_budget.
-    enforced_limit = max(256, effective_limit - _BUDGET_MARGIN)
+    # enforced_limit (the limit the FORWARDED payload was held to, margin
+    # already subtracted) was computed right after the guard call above, not
+    # here — see that comment for why the timing matters.
 
     stream = bool(body.get("stream", False))
     # read=None keeps long generations from being cut off, but connect/write/
@@ -7311,7 +7536,7 @@ async def chat_completions(request: Request) -> Any:
                             # and still be told to retry.
                             tightened = _note_backend_rejection(
                                 err_body, enforced_limit,
-                                guard_measured_overflow=guard_measured_overflow,
+                                guard_measured_overflow=calibration_overflow,
                             )
                             if r.status_code < 500:
                                 # A 4xx means the backend is HEALTHY and refused
@@ -7489,7 +7714,7 @@ async def chat_completions(request: Request) -> Any:
             # advice-to-the-user half is absent here.
             _note_backend_rejection(
                 str(response_json)[:2000], enforced_limit,
-                guard_measured_overflow=guard_measured_overflow,
+                guard_measured_overflow=calibration_overflow,
             )
             return JSONResponse(content=response_json, status_code=r.status_code)
 
