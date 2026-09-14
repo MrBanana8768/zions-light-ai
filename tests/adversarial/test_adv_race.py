@@ -1525,7 +1525,9 @@ def test_command_storm_on_one_conversation(client):
     ops.append(lambda: cs[9].get(f"/admin/conversations/{conv}/facts"))
     ops.append(lambda: cs[10].get(f"/admin/conversations/{conv}/export"))
     ops.append(lambda: cs[11].post(f"/admin/conversations/{conv}/archive"))
-    ops.append(lambda: cs[12].post(f"/admin/conversations/{conv}/restore", json={}))
+    # restore_all explicitly: since v3.1.9 (hostile pass 4, F3) an empty body
+    # is a 400, which would take the restore out of the race it is here for.
+    ops.append(lambda: cs[12].post(f"/admin/conversations/{conv}/restore", json={"restore_all": True}))
     ops.append(lambda: cs[13].post(f"/admin/conversations/{conv}/dedup"))
     try:
         res = barrier_parallel(ops)

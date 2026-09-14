@@ -519,13 +519,18 @@ def admin_get_archive(conv_id: str) -> list[dict]:
 
 
 def admin_restore_from_archive(
-    conv_id: str, text_substring: str | None = None
+    conv_id: str, text_substring: str | None = None, restore_all: bool = False
 ) -> dict:
-    """POST /admin/conversations/<id>/restore → {restored, filter, ...}."""
+    """POST /admin/conversations/<id>/restore → {restored, filter, ...}.
+
+    v3.1.9 (hostile pass 4, F3): an empty body is a 400, not "restore
+    everything"; restoring every archived fact takes restore_all=True."""
     assert ADMIN_URL, "admin_restore_from_archive requires ZIONS_TEST_ADMIN_URL"
     body: dict = {}
     if text_substring is not None:
         body["text_substring"] = text_substring
+    if restore_all:
+        body["restore_all"] = True
     with _client(ADMIN_URL) as c:
         r = c.post(f"/admin/conversations/{conv_id}/restore", json=body)
         r.raise_for_status()

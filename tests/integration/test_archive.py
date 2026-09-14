@@ -3,7 +3,7 @@ Tier-3 validation of stale-fact archival endpoints (V2.1 Phase 7 Step 2).
 
 GET  /admin/conversations/<id>/archive
 POST /admin/conversations/<id>/archive?older_than_days=N
-POST /admin/conversations/<id>/restore  body: {text_substring?}
+POST /admin/conversations/<id>/restore  body: {text_substring} | {restore_all: true}
 
 We seed state via /admin/import (rather than driving real chats and
 waiting for last_used to age) so tests are deterministic and don't
@@ -95,7 +95,15 @@ def test_restore_all_brings_archived_back():
         assert len(H.admin_get_facts(target)) == 0, "prep: active empty"
         assert len(H.admin_get_archive(target)) == 2, "prep: archive full"
 
-        result = H.admin_restore_from_archive(target)  # no filter = all
+        # v3.1.9 (hostile pass 4, F3): an empty body used to mean "restore
+        # everything". It is now refused, and moves nothing.
+        with H._client(H.ADMIN_URL) as c:
+            r = c.post(f"/admin/conversations/{target}/restore", json={})
+        assert r.status_code == 400, f"empty body must be refused: {r.status_code} {r.text[:200]}"
+        assert len(H.admin_get_facts(target)) == 0, "a refused restore moved nothing"
+        assert len(H.admin_get_archive(target)) == 2, "a refused restore moved nothing"
+
+        result = H.admin_restore_from_archive(target, restore_all=True)
         assert result["restored"] == 2, f"expected 2 restored: {result!r}"
         assert result["filter"] is None
         assert len(H.admin_get_facts(target)) == 2
