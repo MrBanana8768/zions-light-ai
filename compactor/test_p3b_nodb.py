@@ -101,19 +101,46 @@ def test_missing_webui_db_refuses_the_cycle_and_holds_the_prune():
 
 
 def test_control_the_escape_hatch_still_publishes_when_set():
-    print("\n[test] F12 CONTROL: COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB=1 still allows a memory-only archive")
+    print("\n[test] F12 CONTROL: COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB=1 still allows a memory-only archive on a pod's FIRST cycle")
+    # p4-b G6: the hatch now expires once list_backups(d) is non-empty (see
+    # that finding) — this CONTROL uses a FRESH backup dir with NO prior
+    # archive, the one shape the hatch is meant for, rather than baselining
+    # through run_once first (which this test used to do, and which would
+    # now make the hatch a no-op — see the new test right after this one).
+    fresh_bk = _ROOT / "bk-hatch-fresh"
     _build()
-    time.sleep(1.1)
-    backup.run_once(_BK)
     (_DATA / "webui.db").rename(_ROOT / "db-elsewhere-2")
     os.environ["COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB"] = "1"
     try:
         time.sleep(1.1)
-        r = backup.run_once(_BK)
-        assert_true(r["ok"], f"CONTROL: the escape hatch publishes anyway (got {r})")
-        newest = backup.read_manifest(Path(backup.list_backups(_BK)[0]["path"]))
+        r = backup.run_once(fresh_bk)
+        assert_true(r["ok"], f"CONTROL: the escape hatch publishes anyway on a fresh pod's first cycle (got {r})")
+        newest = backup.read_manifest(Path(backup.list_backups(fresh_bk)[0]["path"]))
         assert_eq(newest["sources"]["webui.db"]["present"], False,
                   f"CONTROL: and the manifest honestly says webui.db is absent (got {newest['sources']['webui.db']})")
+    finally:
+        os.environ.pop("COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB", None)
+
+
+def test_g6_the_hatch_expires_once_one_archive_exists():
+    print("\n[test] p4-b G6: the escape hatch no longer applies once the pod has ANY archive")
+    _build()
+    time.sleep(1.1)
+    baseline = backup.run_once(_BK)
+    assert_true(baseline["ok"], f"PRECONDITION: baseline cycle with the db present is ok (got {baseline})")
+    before_count = len(backup.list_backups(_BK))
+
+    (_DATA / "webui.db").rename(_ROOT / "db-elsewhere-3")
+    os.environ["COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB"] = "1"
+    try:
+        time.sleep(1.1)
+        r = backup.run_once(_BK)
+        assert_eq(r["ok"], False,
+                  f"G6 fix: the hatch is INERT once an archive already exists — the cycle still refuses (got {r})")
+        assert_true("ALREADY published" in (r.get("detail") or "") and "webui.db" in (r.get("detail") or ""),
+                    f"and the detail explains why (got {r.get('detail')!r})")
+        assert_eq(len(backup.list_backups(_BK)), before_count,
+                  "G6 fix: nothing was pruned or published behind the refused cycle")
     finally:
         os.environ.pop("COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB", None)
 
@@ -138,6 +165,7 @@ if __name__ == "__main__":
     tests = [
         test_missing_webui_db_refuses_the_cycle_and_holds_the_prune,
         test_control_the_escape_hatch_still_publishes_when_set,
+        test_g6_the_hatch_expires_once_one_archive_exists,
         test_control_a_healthy_cycle_with_the_db_present_still_prunes,
     ]
     for t in tests:

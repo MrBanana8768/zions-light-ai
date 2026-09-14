@@ -847,6 +847,39 @@ def test_f5_quality_gate_skips_are_intended_to_degrade_status():
           "is outside this lane's file list (see 'Found, not fixed').")
 
 
+def test_g3_restore_marker_reason_fires_and_clears():
+    """p4-b G3: the third of the three places this finding asks the
+    in-flight/stale restore marker be checked — /health/full. Writes a
+    marker with the SAME function backup.py::restore_backup uses
+    (webuidb.write_restore_marker), never a hand-built file, per the
+    brief's "real writer" doctrine."""
+    print("\n[G3] an in-flight/stale restore marker reaches status_reasons, and clearing it clears the reason")
+    _reset_all()
+    r0 = full()
+    check(not _has(r0, "restore marker"), "G3 fixture: no marker, no reason, before this test writes one")
+
+    stamp = "20260913-999999-000"
+    webuidb.write_restore_marker(stamp, {
+        "archive": "zions-backup-20260913-000000.tar.gz",
+        "target_db": str(LOCAL_DB), "staged_db_tmp": None,
+        "sroot": None, "staged_store_incoming": None,
+        "quarantine_dir": str(webuidb.QUARANTINE),
+    })
+    try:
+        r = full()
+        print(f"      reasons={r['status_reasons']}")
+        check(r["status"] == "degraded" and _has(r, "restore marker"),
+              "G3 FIRES: a present marker degrades the pod and names itself in status_reasons")
+        check(_has(r, "restore-") and _has(r, ".inprogress"),
+              "and the reason names the actual marker FILE, not just that one exists")
+    finally:
+        webuidb.remove_restore_marker(stamp)
+
+    r_after = full()
+    check(not _has(r_after, "restore marker"),
+          "G3 CONTROL: removing the marker (the documented recovery) clears the reason on the next poll")
+
+
 TESTS = [
     test_f1_zero_backups_is_ok_during_the_grace_window,
     test_f1_zero_backups_after_the_grace_window_degrades,
@@ -873,6 +906,7 @@ TESTS = [
     test_f4_falls_back_safely_when_local_db_is_unreadable,
     test_f4_three_intervals_boundary_is_pinned,
     test_f5_quality_gate_skips_are_intended_to_degrade_status,
+    test_g3_restore_marker_reason_fires_and_clears,
 ]
 
 

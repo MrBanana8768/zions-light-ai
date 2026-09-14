@@ -897,9 +897,29 @@ def _gather_blocking() -> dict:
         snapshot = {"watched": None, "stale": False,
                     "error": f"{type(e).__name__}: {e}"}
 
+    # p4-b G3. An in-flight/stale backup.py::restore_backup() marker,
+    # checked the SAME placement-independent way entrypoint.sh's own boot
+    # gate does (webuidb.py --check-restore-marker) and restore_backup's own
+    # refusal to start a second restore over an earlier one's marker: this
+    # is the third of the three places G3 asks the marker be read, so a
+    # marker left by a kill is visible here even on a pod that has already
+    # booted past entrypoint.sh's own refusal (an older image, or the
+    # marker appearing from an out-of-band `--restore` run AFTER boot).
+    # find_interrupted_restore() only globs a small forensics directory and
+    # reads one small JSON file — it never opens webui.db, so this costs
+    # nothing on the same volume the sqlite_journal probe above already
+    # worries about the read reliability of.
+    try:
+        import webuidb
+        _marker = webuidb.find_interrupted_restore()
+        restore_marker = {"present": _marker is not None, "marker": _marker}
+    except Exception as e:
+        restore_marker = {"present": None, "marker": None,
+                           "error": f"{type(e).__name__}: {e}"}
+
     return {"storage": storage, "stats": stats, "writes": writes,
             "backups": backups, "sqlite_journal": sqlite_journal,
-            "snapshot": snapshot}
+            "snapshot": snapshot, "restore_marker": restore_marker}
 
 
 # ---------------------------------------------------------------------------
@@ -1463,6 +1483,35 @@ async def gather_health_full(
             # answered "clean". Unknown is not fine, same doctrine as bg,
             # mt, backups and writes below.
             reasons.append(f"sqlite journal probe unobservable ({_sj['error']})")
+        # p4-b G3: the third of the three places this finding asks the
+        # in-flight/stale restore marker be checked (the other two:
+        # entrypoint.sh before OpenWebUI starts, and restore_backup itself
+        # before starting a new restore over an earlier one's marker). A
+        # marker here means backup.py::restore_backup was interrupted, or
+        # finished (successfully or via a full rollback) without reaching
+        # its own removal call — either way the live webui.db and/or
+        # compactor store may be missing or at a mixed generation, and
+        # nothing else on this endpoint would say so: the census/payload
+        # checks above compare archives to each other, not to what is
+        # actually live right now.
+        _rm = blocking.get("restore_marker") or {}
+        if _rm.get("present"):
+            _rm_marker = _rm.get("marker") or {}
+            reasons.append(
+                f"an in-flight/stale restore marker is present at "
+                f"{_rm_marker.get('marker_path')}: backup.py::restore_backup "
+                f"was interrupted, or finished without removing its own "
+                f"marker. The live webui.db and/or compactor store MAY be "
+                f"missing or at a mixed generation. A boot refuses on this "
+                f"same marker (entrypoint.sh, before OpenWebUI starts); if "
+                f"the pod is already up, the marker is stale from before "
+                f"this boot or was left by a restore run after it. See "
+                f"OPERATIONS.md's restore section for what the marker's "
+                f"plan means and how to confirm the live state and clear it "
+                f"safely."
+            )
+        elif _rm.get("error"):
+            reasons.append(f"restore-marker probe unobservable ({_rm['error']})")
         # THE ROLLUP IS OTHERWISE UNOBSERVABLE. v3.1.8's skip-path rollup has
         # six ways to do nothing and five are silent: raw_chars == 0, no
         # conversational history, task traffic, the summarizer disabled, an

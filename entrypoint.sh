@@ -285,6 +285,69 @@ export WEBUI_SNAPSHOT_DB="${WEBUI_SNAPSHOT_DB:-${DATA_DIR:-/data/openwebui}/webu
 # read what that costs.
 export WEBUI_DB_ALLOW_EMPTY_START="${WEBUI_DB_ALLOW_EMPTY_START:-false}"
 
+# p4-b G3. PLACEMENT-INDEPENDENT, on purpose: this runs BEFORE the
+# WEBUI_DB_LOCAL split below, so it also covers WEBUI_DB_LOCAL=false (the
+# shipped production default). That placement's own branch, a few lines
+# down, never calls webuidb.py --restore / restore_on_boot() at all - so
+# before this, a SIGKILL or an EIO partway through backup.py::restore_backup
+# (a RunPod redeploy, an OOM kill, a closed terminal) left a marker on
+# /data that NOTHING on that placement's boot ever looked at: the pod came
+# up normally onto whatever half-finished state the kill left, silently.
+# (p3-b F4/F9 built the marker; p4-b G3 is "and read it where production
+# actually boots".)
+#
+# Cheap and safe to run on EVERY boot: it only globs a small directory and
+# reads a small JSON file if one is there - it does NOT open webui.db, and
+# on the normal boot (no marker) this is a no-op before anything else on
+# this page has touched a single conversation byte.
+echo "[2a/3] Checking for an interrupted restore..."
+_restore_marker_rc=0
+_restore_marker_out="$(/opt/compactor-venv/bin/python /opt/compactor/webuidb.py --check-restore-marker 2>&1)" \
+    || _restore_marker_rc=$?
+if [ "${_restore_marker_rc}" -ne 0 ]; then
+    echo ""
+    echo "      ============================================================"
+    echo "      AN INTERRUPTED RESTORE WAS LEFT IN PROGRESS - REFUSING TO START."
+    echo ""
+    echo "${_restore_marker_out}"
+    echo ""
+    echo "      What this means: backup.py --restore (or a restore triggered"
+    echo "      by hand) was killed, or crashed, partway through moving files"
+    echo "      into place. The marker printed above is a"
+    echo "      /data/forensics/restore-*.inprogress file, and it can mean"
+    echo "      any of three things - the marker's own \"plan\" block above"
+    echo "      names the exact paths for whichever one this is:"
+    echo "        1. genuinely mid-restore: webui.db and/or the compactor"
+    echo "           store may be MISSING or at a MIXED generation right now."
+    echo "        2. the restore finished and rolled itself back, but this"
+    echo "           process died before it could remove its own marker -"
+    echo "           the live paths are back to their PRE-restore state."
+    echo "        3. the restore finished and SUCCEEDED, but this process"
+    echo "           died before it could remove its own marker - the live"
+    echo "           paths are the archive's, and nothing is wrong with them."
+    echo ""
+    echo "      This is NOT auto-recovered: telling (1) apart from (2)/(3)"
+    echo "      needs a human to look, because doing it here would mean"
+    echo "      opening webui.db at every boot with a marker present - on"
+    echo "      the same network volume that has twice this week taken"
+    echo "      several minutes to roll back a hot SQLite journal on her"
+    echo "      138 MB database, adding a second opener there is not a risk"
+    echo "      worth taking automatically."
+    echo ""
+    echo "      With someone watching:"
+    echo "        /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --status"
+    echo "      Check the target path(s) named in the marker's \"plan\" above by"
+    echo "      hand (do they exist? does each webui.db pass quick_check via"
+    echo "      --status?). Once you are sure the live state is either fully"
+    echo "      restored or fully back to its pre-restore state, delete the"
+    echo "      marker file named above and redeploy - the next boot will not"
+    echo "      refuse once it is gone."
+    echo "      ============================================================"
+    echo ""
+    exit 1
+fi
+echo "      no interrupted restore found"
+
 if [ "${WEBUI_DB_LOCAL}" = "true" ]; then
     export DATABASE_URL="${DATABASE_URL:-sqlite:///${WEBUI_LOCAL_DB}}"
     export WEBUIDB_SYNC_ENABLED=true

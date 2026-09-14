@@ -37,6 +37,14 @@ from pathlib import Path
 SUPERVISOR_CONF = Path(
     os.environ.get("SUPERVISOR_CONF", "/etc/supervisor/conf.d/supervisord.conf")
 )
+# p4-b G7. Where entrypoint.sh lives inside the built image (Dockerfile:
+# `COPY entrypoint.sh /entrypoint.sh`). See main()'s precondition check —
+# its presence, with the WEBUI_DB_LOCAL NORMALIZATION block in it, is how
+# this script tells a v3.1.6+ image (where the built-in, normalized
+# WEBUI_DB_LOCAL flag is the supported way to make this switch, and
+# webuidb.sync_once() REFUSES outright unless it is "true") apart from an
+# older one this hot-patch form was actually written for.
+ENTRYPOINT_SH = Path(os.environ.get("ENTRYPOINT_SH", "/entrypoint.sh"))
 LOCAL_DB = Path(os.environ.get("WEBUI_LOCAL_DB", "/var/lib/openwebui/webui.db"))
 SNAPSHOT_DB = Path(os.environ.get("WEBUI_SNAPSHOT_DB", "/data/openwebui/webui.db"))
 COMPACTOR_DIR = Path(os.environ.get("COMPACTOR_DIR", "/opt/compactor"))
@@ -152,6 +160,48 @@ def main() -> int:
     say("=" * 66)
 
     # --- preconditions ----------------------------------------------------
+    # p4-b G7. On a v3.1.6+ image, WEBUI_DB_LOCAL is entrypoint.sh's OWN,
+    # supported way to place webui.db on local disk — and this script never
+    # sets it. Before this check, running the hot-patch on such an image
+    # left OpenWebUI pointed at local disk (this script's own patch, above)
+    # while supervisord's [program:webuidb-sync] inherited the environment's
+    # WEBUI_DB_LOCAL=false (unset by this script, unlike entrypoint.sh's own
+    # true-placement branch) — so webuidb.sync_once() refused every cycle,
+    # including after a manual `supervisorctl start webuidb-sync`, per F8's
+    # placement gate ("webuidb-sync should not be running on this pod at
+    # all"). The backup daemon kept reading DATABASE_URL from its own
+    # environment (the stale /data file), never the local one this script
+    # just switched OpenWebUI onto. Chat history written after the switch
+    # lived ONLY on the container's overlay, and this script printed
+    # "SWITCHED ... /data now receives snapshots" regardless (SP\p4-b\
+    # misc4.py part 6: the patched [program:webuidb-sync] section has
+    # autostart=%(ENV_WEBUIDB_SYNC_ENABLED)s and no environment= line at
+    # all). Refuse outright rather than leave that half-switched: the
+    # correct fix on this image is the flag entrypoint.sh already reads.
+    if ENTRYPOINT_SH.is_file():
+        try:
+            _ep_text = ENTRYPOINT_SH.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            _ep_text = ""
+            say(f"WARNING: could not read {ENTRYPOINT_SH} ({e}) — cannot "
+                f"tell whether this image normalizes WEBUI_DB_LOCAL; "
+                f"proceeding with the hot-patch form")
+        if "BEGIN WEBUI_DB_LOCAL NORMALIZATION" in _ep_text:
+            say("FAIL: this image's entrypoint.sh already normalizes "
+                "WEBUI_DB_LOCAL (v3.1.6+) — it is the supported way to put")
+            say("      webui.db on local disk, and this hot-patch script "
+                "does not set it, so a pod patched this way ends up with")
+            say("      OpenWebUI on local disk and webuidb-sync REFUSING "
+                "every cycle (it inherits WEBUI_DB_LOCAL=false and F8's")
+            say("      placement gate will not let it run), even after a "
+                "manual `supervisorctl start webuidb-sync`. Chat history")
+            say("      written after a switch like that would live only "
+                "on this container's overlay.")
+            say("")
+            say("      set WEBUI_DB_LOCAL=true in the template and "
+                "redeploy.")
+            return 2
+
     module = COMPACTOR_DIR / "webuidb.py"
     if not module.exists():
         say(f"FAIL: {module} is missing. Install it first:")

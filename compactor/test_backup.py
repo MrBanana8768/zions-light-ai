@@ -544,18 +544,23 @@ def test_payload_collapse_is_refused_and_does_not_prune():
     assert_true(first["ok"], "fat baseline backup ok")
 
     # The store shrinks to almost nothing — the shape a half-mounted volume
-    # produces, and the shape a legitimate edit does not. with_db=False
-    # here is about the STORE collapsing, not the db — p3-b F12 added its
-    # own refusal for a missing db and would otherwise preempt the
-    # payload-collapse check this test is actually about, so the escape
-    # hatch is set for this one cycle.
-    _seed_sources(n_facts=1, pad=0, with_db=False)
-    os.environ["COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB"] = "1"
-    try:
-        with _CapturedAlerts() as alerts:
-            rep = backup.run_once()
-    finally:
-        os.environ.pop("COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB", None)
+    # produces, and the shape a legitimate edit does not. This test's
+    # subject is the STORE collapsing, not the db, so webui.db is left
+    # PRESENT (with_db defaults to True, same tiny one-row db as the
+    # baseline) — p3-b F12 added its own refusal for a MISSING db, and
+    # p4-b G6 made the escape hatch that used to work around F12 here
+    # INERT once any archive exists (as one already does, from the "fat
+    # baseline" a few lines up) — so this fixture no longer touches the
+    # hatch at all, and only ever exercises the payload-collapse check it
+    # is actually about. (A previous version of this test used
+    # with_db=False plus COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB=1 to dodge
+    # F12's refusal; G6's expiry made that combination refuse for a
+    # DIFFERENT reason — "hatch no longer applies" — instead of ever
+    # reaching the payload-collapse check, a wrong-reason failure caught by
+    # this lane's own whole-suite run.)
+    _seed_sources(n_facts=1, pad=0)
+    with _CapturedAlerts() as alerts:
+        rep = backup.run_once()
 
     assert_eq(rep["ok"], False, "collapsed payload → cycle fails")
     assert_true("PAYLOAD COLLAPSED" in rep["detail"], "detail flags the collapse")

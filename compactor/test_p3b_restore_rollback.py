@@ -265,11 +265,152 @@ def test_control_ordinary_rollback_with_no_obstacle_still_works():
               "CONTROL: the OLD store is back at the live path")
 
 
+_G2_CHILD = r'''
+import json, os, signal, sqlite3, subprocess, sys, tarfile, time
+from pathlib import Path
+sys.path.insert(0, os.getcwd())
+import backup
+
+CID = "0123456789abcdef0123456789abcdef"
+TMP = Path(os.environ["G2_TMP"])
+DATA = Path(os.environ["DATA_DIR"])
+STORE = Path(os.environ["COMPACTOR_STORAGE_ROOT"])
+DB = DATA / "webui.db"
+
+
+def mkstore(root, gen):
+    (root / "personas").mkdir(parents=True, exist_ok=True)
+    (root / "facts").mkdir(parents=True, exist_ok=True)
+    (root / "personas" / f"{CID}.json").write_bytes(json.dumps({"persona_text": gen}).encode())
+    (root / "facts" / f"{CID}.json").write_bytes(
+        json.dumps({"conv_id": CID, "facts": [{"text": gen}]}).encode())
+
+
+def build_archive():
+    a = TMP / "arch"
+    a.mkdir()
+    c = sqlite3.connect(str(a / "webui.db"))
+    c.execute("create table chat (id text primary key, chat text)")
+    c.execute("insert into chat values ('c','NEW')")
+    c.commit(); c.close()
+    mkstore(a / "compactor", "NEW")
+    man = {"schema": "v2", "sources": {"webui.db": {"present": True},
+           "compactor": {"present": True, "json_files": 2, "chroma_sqlite": False,
+                          "conversations": backup._census(a / "compactor")}}, "payload_bytes": 1}
+    (a / "manifest.json").write_bytes(json.dumps(man).encode())
+    arch = TMP / "zions-backup-20260101-000000.tar.gz"
+    with tarfile.open(arch, "w:gz") as t:
+        t.add(a, arcname=".")
+    return arch
+
+
+DATA.mkdir(parents=True, exist_ok=True)
+c = sqlite3.connect(str(DB))
+c.execute("create table chat (id text primary key, chat text)")
+c.executemany("insert into chat values (?,?)", [(f"c{i}", "x" * 900) for i in range(4000)])
+c.commit(); c.close()
+code = ("import sqlite3,os\n"
+        f"c=sqlite3.connect({str(DB)!r},isolation_level=None)\n"
+        "c.execute('BEGIN')\n"
+        "c.execute(\"UPDATE chat SET chat=replace(chat,'x','w')\")\n"
+        "os._exit(9)\n")
+subprocess.run([sys.executable, "-c", code])
+j = Path(str(DB) + "-journal")
+assert j.exists(), "fixture: killed writer must leave a journal"
+
+mkstore(STORE, "OLD")
+arch = build_archive()
+
+real_aside = backup._quarantine_aside
+def aside_then_recreate(path, stamp):
+    dest = real_aside(path, stamp)
+    if Path(path) == STORE:
+        (STORE / "facts").mkdir(parents=True)
+        (STORE / "facts" / "x.json").write_bytes(b'{"facts": []}')
+    return dest
+backup._quarantine_aside = aside_then_recreate
+
+real_mb = backup._move_back_no_nest
+def mb(src, dst, *, stamp, label):
+    # p4-b G2's kill point: right when the FIRST sidecar move-back is about
+    # to run. Under the FIXED order this only happens AFTER the db's own
+    # move-back (label == "webui.db") already completed — so this SIGKILL
+    # proves the state right in between: db back, its journal still in
+    # quarantine, nothing foreign beside the live db.
+    if "(database sidecar)" in label:
+        os.kill(os.getpid(), signal.SIGKILL)
+    return real_mb(src, dst, stamp=stamp, label=label)
+backup._move_back_no_nest = mb
+
+backup.restore_backup(arch, webui_db=DB, confirm=True)
+print("UNEXPECTED: restore_backup returned without being killed")
+'''
+
+
+def test_g2_kill_between_db_and_sidecar_restore_leaves_a_recoverable_not_corrupt_state():
+    print("\n[test] p4-b G2: SIGKILL between the db and sidecar move-back in the "
+          "store-failure rollback — db lands WITHOUT a foreign journal beside it")
+    shutil.rmtree(_TMP, ignore_errors=True)
+    _TMP.mkdir(parents=True)
+    env = dict(
+        os.environ, G2_TMP=str(_TMP), DATA_DIR=str(_DATA),
+        COMPACTOR_STORAGE_ROOT=str(_STORE), WEBUI_DB_QUARANTINE=str(_Q),
+        COMPACTOR_BACKUP_MIN_FREE_MB="1",
+    )
+    r = subprocess.run([sys.executable, "-c", _G2_CHILD], env=env,
+                        cwd=os.getcwd(), capture_output=True, text=True, timeout=60)
+    assert_true(r.returncode != 0, f"fixture: the child was SIGKILLed (got rc={r.returncode}, "
+                f"stdout={r.stdout!r}, stderr={r.stderr[-500:]!r})")
+    assert_true("UNEXPECTED" not in r.stdout, "fixture: killed before restore_backup returned")
+
+    j = Path(str(DB) + "-journal")
+    # THE CORE G2 PROPERTY: the live db is the OLD one, and there is NO
+    # journal beside it right now (the state a kill in this exact window
+    # leaves) — never a MISMATCHED pair (a journal beside a db it does not
+    # belong to), which is what the pre-fix order could produce here.
+    assert_true(DB.exists(), "the live db path is populated after the kill")
+    assert_true(not j.exists(),
+                "G2 fix: no journal sits beside the live db yet (it is still in "
+                "quarantine) — never a FOREIGN journal beside a mismatched db")
+
+    c = sqlite3.connect(str(DB))
+    try:
+        row_val = c.execute("select chat from chat limit 1").fetchone()[0]
+    finally:
+        c.close()
+    assert_true(row_val in ("x" * 900, "w" * 900),
+                f"G2 fix: the live db is genuinely the OLD generation's bytes, not "
+                f"the NEW archive's db and not corrupted garbage (got {row_val[:20]!r}...)")
+
+    # The OLD journal is exactly where the rollback left it: still in
+    # quarantine, recoverable by hand (move it back beside webui.db and
+    # SQLite rolls it back correctly) — never silently lost.
+    quarantined_journals = list(_Q.glob("webui.db-journal.pre-restore-*"))
+    assert_true(len(quarantined_journals) == 1,
+                f"G2 fix: the OLD journal is preserved in quarantine, recoverable by "
+                f"hand (got {quarantined_journals})")
+
+    # Reuniting the OLD db with its OWN journal by hand (the documented
+    # recovery) must roll back cleanly to the fully-committed state — proof
+    # that the kill window left something RECOVERABLE, not corrupted.
+    shutil.copy2(quarantined_journals[0], j)
+    c = sqlite3.connect(str(DB))
+    try:
+        integrity = c.execute("PRAGMA integrity_check").fetchone()[0]
+        committed = c.execute("select count(*) from chat where chat like 'x%'").fetchone()[0]
+    finally:
+        c.close()
+    assert_eq(integrity, "ok", "G2 fix: reuniting the OLD db with ITS OWN journal by "
+              "hand rolls back cleanly (no page-level corruption occurred)")
+    assert_eq(committed, 4000, "G2 fix: and every originally-committed row is intact")
+
+
 if __name__ == "__main__":
     tests = [
         test_store_swap_failure_restores_db_AND_its_journal_no_nested_store,
         test_control_ordinary_rollback_with_no_obstacle_still_works,
+        test_g2_kill_between_db_and_sidecar_restore_leaves_a_recoverable_not_corrupt_state,
     ]
     for t in tests:
         t()
-    print("\nAll p3-b restore-rollback (F5) tests passed.")
+    print("\nAll p3-b restore-rollback (F5) + p4-b G2 tests passed.")
