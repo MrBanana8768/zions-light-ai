@@ -129,8 +129,17 @@ services:
     # (uvicorn is not reloading), which is why every documented command
     # above recreates it explicitly with `up -d --force-recreate` before
     # running the suite (`docker compose run` has no such flag).
+    # A SMALL REAL webui.db first. This stack runs no OpenWebUI, and since
+    # v3.1.9 a backup cycle that cannot find the database fails instead of
+    # publishing an archive with no chat history (pass-3 F12). The opt-out for
+    # that expires once a pod has published an archive (pass-4 G6), which is
+    # right on a pod, so the stack gets a database of the shape backup.py and
+    # webuidb read (a `chat` table with id, chat, updated_at) rather than an
+    # escape hatch. The backup tests then exercise the real path.
     command:
       - >
+        mkdir -p /var/lib/openwebui &&
+        /opt/compactor-venv/bin/python -c "import sqlite3,time; c=sqlite3.connect('/var/lib/openwebui/webui.db'); c.execute('create table if not exists chat (id text primary key, user_id text, title text, chat text, created_at integer, updated_at integer)'); c.execute('insert or ignore into chat values (?,?,?,?,?,?)', ('itest-chat','itest-user','integration fixture','{\"messages\": []}', int(time.time()), int(time.time()))); c.commit(); c.close()" &&
         cd /src/compactor &&
         exec /opt/compactor-venv/bin/uvicorn main:app
         --host 0.0.0.0 --port 8080 --log-level info
@@ -151,13 +160,6 @@ services:
       COMPACTOR_RAG_ENABLED: "true"
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
-      # This stack runs no OpenWebUI, so there is no webui.db. Since v3.1.9
-      # (pass-3 F12) a backup cycle that cannot find the database fails
-      # instead of publishing an archive with no chat history, which is right
-      # on a pod and wrong here, where test_backup.py is about the memory
-      # store. This is that fix's explicit escape hatch; production never sets
-      # it.
-      COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB: "1"
     ports:
       - "8081:8080"   # 8080 on the host is often the developer's own tunnel
     healthcheck:
@@ -237,8 +239,17 @@ services:
     # (uvicorn is not reloading), which is why every documented command
     # above recreates it explicitly with `up -d --force-recreate` before
     # running the suite (`docker compose run` has no such flag).
+    # A SMALL REAL webui.db first. This stack runs no OpenWebUI, and since
+    # v3.1.9 a backup cycle that cannot find the database fails instead of
+    # publishing an archive with no chat history (pass-3 F12). The opt-out for
+    # that expires once a pod has published an archive (pass-4 G6), which is
+    # right on a pod, so the stack gets a database of the shape backup.py and
+    # webuidb read (a `chat` table with id, chat, updated_at) rather than an
+    # escape hatch. The backup tests then exercise the real path.
     command:
       - >
+        mkdir -p /var/lib/openwebui &&
+        /opt/compactor-venv/bin/python -c "import sqlite3,time; c=sqlite3.connect('/var/lib/openwebui/webui.db'); c.execute('create table if not exists chat (id text primary key, user_id text, title text, chat text, created_at integer, updated_at integer)'); c.execute('insert or ignore into chat values (?,?,?,?,?,?)', ('itest-chat','itest-user','integration fixture','{\"messages\": []}', int(time.time()), int(time.time()))); c.commit(); c.close()" &&
         cd /src/compactor &&
         exec /opt/compactor-venv/bin/uvicorn main:app
         --host 0.0.0.0 --port 8080 --log-level info
