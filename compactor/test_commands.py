@@ -15,6 +15,7 @@ import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 _TMP_ROOT = tempfile.mkdtemp(prefix="zions_commands_test_")
@@ -1146,21 +1147,37 @@ def test_quarantine_refuses_to_publish_a_snapshot_short_of_the_store():
 
 
 def test_quarantine_propagates_an_unreadable_facts_file():
-    print("\n[test] quarantine_conversation raises on an unreadable facts file")
-    # It must not fall back to "0 facts expected" and then congratulate itself
-    # for capturing 0 — the operation that follows is about to rewrite that
-    # very file.
+    print("\n[test] a torn facts file is never silently treated as empty -- "
+          "and, since v3.1.9 hostile pass 4 (F1), no longer blocks the "
+          "snapshot of the layers that ARE readable either")
+    # This test used to assert that quarantine_conversation RAISED
+    # StoreUnreadable and published NOTHING for a torn facts file -- which
+    # was exactly the bug hostile pass 4's F1 finding reported: the facts
+    # read failing before anything else ran made the caller
+    # (admin_import_conversation's overwrite path) read "the store is
+    # unreadable" and skip the ENTIRE snapshot, including the summary
+    # hierarchy and episodic index a torn FACTS file does not even touch.
+    # quarantine_conversation now absorbs the torn read instead of
+    # propagating it: the facts layer is marked unverified (never silently
+    # treated as empty -- the property this test has always been about,
+    # and still is), its raw bytes are copied aside as evidence, and every
+    # OTHER readable layer still publishes.
     _wipe()
     cid = "tidy-quarantine-corrupt"
     memory.facts_path(cid).parent.mkdir(parents=True, exist_ok=True)
-    memory.facts_path(cid).write_text("{not json", encoding="utf-8")
-    raised = False
-    try:
-        portability.quarantine_conversation(cid, reason="test")
-    except memory.StoreUnreadable:
-        raised = True
-    assert_true(raised, "StoreUnreadable propagates to the caller")
-    assert_eq(portability.list_quarantine(cid), [], "nothing published")
+    _torn_bytes = b"{not json"
+    memory.facts_path(cid).write_bytes(_torn_bytes)
+    result = portability.quarantine_conversation(cid, reason="test")
+    assert_true("facts (unreadable)" in result["unverified_layers"],
+                "the facts layer is recorded unverified, not silently "
+                "treated as empty")
+    assert_eq(len(portability.list_quarantine(cid)), 1,
+              "the snapshot of the OTHER (readable) layers still publishes")
+    assert_true(result["torn_facts_path"] is not None
+                and Path(result["torn_facts_path"]).is_file(),
+                "the torn file's own raw bytes are copied aside")
+    assert_eq(Path(result["torn_facts_path"]).read_bytes(), _torn_bytes,
+              "the copied bytes are exactly the torn file's original bytes")
 
 
 def test_tidy_finishes_an_interrupted_apply():

@@ -11,9 +11,11 @@ expected (fixed) outcome, from that log.
     python test_p3c_admin_fuzz.py
 """
 import hashlib
+import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 _TMP_ROOT = tempfile.mkdtemp(prefix="p3c-adminfuzz-")
 os.environ["COMPACTOR_STORAGE_ROOT"] = _TMP_ROOT
@@ -229,8 +231,7 @@ check(r.status_code == 200 and j.get("rollup_calls") == 0 and len(LLM_CALLS) == 
 # F1b: an overwrite whose safety snapshot cannot be written is REFUSED
 # ---------------------------------------------------------------------------
 print()
-print("[F1b] a failed pre-overwrite snapshot refuses the overwrite; an already-"
-      "unreadable store still imports as a recovery")
+print("[F1b] a failed pre-overwrite snapshot refuses the overwrite")
 import portability  # noqa: E402
 
 _real_quarantine = portability.quarantine_conversation
@@ -248,22 +249,95 @@ try:
     check(r.status_code == 409 and len(facts.load_facts(victim)) == 40,
           f"a snapshot failure refuses the overwrite (409) and her 40 facts stay "
           f"(got {r.status_code}, {len(facts.load_facts(victim))} facts)")
-
-    def _q_unreadable(conv_id, *, reason):
-        raise memory.StoreUnreadable(memory.storage_root() / "facts" / f"{conv_id}.json",
-                                     ValueError("simulated torn write"))
-
-    portability.quarantine_conversation = _q_unreadable
-    victim = "f1b-store-unreadable"
-    facts.save_facts(victim, [{"text": "LIVE fact", "added_turn": 1, "last_used": 1, "pin": False}])
-    STORE[victim] = exchanges(2)
-    r = admin.post("/admin/conversations/import",
-                   json={"bundle": bundle, "target_conv_id": victim, "overwrite": True})
-    check(r.status_code == 200,
-          f"CONTROL: an already-unreadable store still imports as a recovery "
-          f"(got {r.status_code}: {r.text[:120]})")
 finally:
     portability.quarantine_conversation = _real_quarantine
+
+
+# ---------------------------------------------------------------------------
+# F1 (hostile pass 4, reviewer C): a TORN FACTS FILE must not skip the
+# snapshot of the layers that ARE readable, and the torn file's own bytes
+# must be copied aside.
+#
+# The pass-3 CONTROL this replaces reached the "already unreadable, nothing
+# to lose" exemption by monkeypatching quarantine_conversation itself to
+# raise StoreUnreadable directly — a route production never takes (nothing
+# calls quarantine_conversation and expects it to just blow up; the real
+# trigger is ONE layer's file being torn on disk). It also asserted only
+# the HTTP status code, never what the overwrite destroyed. This reproduces
+# the real on-disk shape (a truncated facts.json, the MooseFS-stall class
+# this project has already had) through the real endpoint, against the real
+# quarantine_conversation, and checks what survived.
+# ---------------------------------------------------------------------------
+print()
+print("[F1 pass-4] a torn facts file must not skip the snapshot of the "
+      "readable summary/episodic layers, and the torn bytes must be copied "
+      "aside")
+
+victim = "f1p4-torn-facts"
+# Readable summary + episodic state — exactly what a torn FACTS file (only)
+# leaves behind; the other two layers never touched the disk that tore.
+summarizer.save_state(victim, {
+    "l1": [{"text": "old l1 chunk", "first_turn": 1, "last_turn": 2}],
+    "l2": [], "l3": None, "last_summarized_turn": 2,
+})
+STORE[victim] = exchanges(3)
+_torn_bytes = b'{"conv_id": "f1p4-torn-facts", "facts": [{"text": "truncated mid ob'
+_facts_path = memory.facts_path(victim)
+_facts_path.parent.mkdir(parents=True, exist_ok=True)
+_facts_path.write_bytes(_torn_bytes)
+try:
+    facts.load_facts(victim)
+    _fixture_torn_ok = False
+except memory.StoreUnreadable:
+    _fixture_torn_ok = True
+check(_fixture_torn_ok,
+      "fixture check: the truncated facts file actually raises StoreUnreadable "
+      "(otherwise this isn't testing what it claims to)")
+
+# THE PRODUCTION ROUTE: the real endpoint, the real quarantine_conversation,
+# no monkeypatching.
+r = admin.post("/admin/conversations/import",
+               json={"bundle": bundle, "target_conv_id": victim, "overwrite": True})
+check(r.status_code == 200,
+      f"an overwrite still succeeds when only the facts layer is torn "
+      f"(got {r.status_code}: {r.text[:200]})")
+
+snaps = portability.list_quarantine(victim)
+check(len(snaps) == 1, f"exactly one quarantine snapshot was published (got {len(snaps)})")
+if snaps:
+    snap = json.loads(snaps[-1].read_text(encoding="utf-8"))
+    q = snap.get("quarantine", {})
+    check("facts (unreadable)" in (q.get("unverified_layers") or []),
+          f"the facts layer is recorded unverified (got {q.get('unverified_layers')})")
+    # THE BUG this finding reports: before the fix, StoreUnreadable from the
+    # facts read propagated out of quarantine_conversation before ANY other
+    # layer was even measured, so the exemption in main.py skipped this
+    # entire snapshot — these two checks are what that skip destroyed.
+    check(bool((snap.get("summary_state") or {}).get("l1")),
+          "the READABLE summary hierarchy survived into the snapshot")
+    check(len(snap.get("episodic") or []) >= 3,
+          f"the READABLE episodic rows survived into the snapshot (got "
+          f"{len(snap.get('episodic') or [])})")
+    torn_path = q.get("torn_facts_path")
+    check(bool(torn_path) and Path(torn_path).is_file(),
+          f"the torn facts file's raw bytes were copied aside (path={torn_path!r})")
+    if torn_path:
+        check(Path(torn_path).read_bytes() == _torn_bytes,
+              "the copied bytes are byte-identical to the original torn file")
+# And the recovery itself: the import replaces the torn file with the
+# bundle's (now-readable) facts — the exemption's original point, still true.
+# (Guarded: if the endpoint refused above, the torn file is still on disk
+# and load_facts would raise StoreUnreadable again — a separate, already-
+# reported failure, not a second crash on top of it.)
+try:
+    _post_facts = facts.load_facts(victim)
+    check(len(_post_facts) == len(bundle.get("facts") or []),
+          "the import replaced the torn facts file with the bundle's, now readable")
+except memory.StoreUnreadable:
+    check(r.status_code == 200,
+          "the import replaced the torn facts file with the bundle's, now "
+          "readable (skipped: the facts file is still torn, consistent "
+          "with the endpoint above having refused the overwrite)")
 
 
 if FAILED:
