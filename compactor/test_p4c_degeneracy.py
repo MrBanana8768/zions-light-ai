@@ -8,33 +8,55 @@ reviewer's own reproduction (SP\\p4-c\\p4c_fragment.py) — same word lists,
 same shape builders, rebuilt here as assertion-based tests per the fix-lane
 brief.
 
-Two independent problems, two independent (partial) fixes:
+STATUS AS OF HOSTILE PASS 5 (C5-6, SP\\p5-c-findings.md): this file's own
+pass-4 fix (join-everything, proportional floor) was found to have reopened
+3 MORE runaway holes (a low-space non-prose block joined in beside a real
+second runaway diluted it below its own floor) while newly flagging normal
+dialogue-heavy and two-beat-paragraph replies pass-4 never touched. Pass 5
+replaced the exemption again — see the block comment above it in main.py,
+and the consolidated compactor/test_p5_degen_matrix.py, which is now the
+authoritative record of every shape from every pass and the reasoning
+behind each label. This file is kept as a real regression test (it is not
+redundant with the matrix file: it pins the exact pass-4 shapes against
+their own history) with the specific checks pass 5 changed updated in
+place, named below.
+
+Two independent problems from pass 4, both revisited at pass 5:
 
   HOLES (a runaway that should be caught, was not): a second runaway cut
   short (500/540 chars, 90/96 spaces) never cleared the OLD exemption's
   fixed 100-space-per-line floor; trailing content spread over many short
   lines (terminated bullets, several short fragment lines) had no single
-  line long enough to trip the old per-line check. FIXED: the exemption now
-  judges the trailing content AS A WHOLE (joined), with a spaces floor
-  PROPORTIONAL to its own length instead of a fixed 100.
+  line long enough to trip the old per-line check. Pass 4 "fixed" all of
+  these by judging the trailing content AS A WHOLE (joined), with a spaces
+  floor PROPORTIONAL to its own length — which pass 5 found reopened 3
+  DIFFERENT holes (HOLE-a/b/c in test_p5_degen_matrix.py) the same way.
+  Pass 5's replacement closes R1/R2 (list-majority / multi-line-join, see
+  main.py) with no new cost, but found R3/R3b measured statistically
+  identical to a normal two-beat-paragraph reply (FP-c) and, per this
+  lane's stated priority, left them open rather than risk that false
+  refusal — see where they are now asserted (moved to `info`, below).
 
   REGRESSION (a normal reply wrongly redacted): a "beat" paragraph (short
   scene-setting sentences, e.g. "She smiles. The fire crackles.") has a low
   apparent mean-fragment-length by the SAME arithmetic that flags a real
   collapse, purely from being short-sentenced, not degenerate. When it was
   the single longest trailing line, the old rule flagged it directly.
-  PARTIALLY FIXED: judging the trailing content as a whole (above) also
-  fixes the case where a second such paragraph is followed by ordinary
-  prose (N2) — the aggregate mean is no longer dominated by one short-
-  sentence line. NOT fixed: a runaway followed by only a SHORT beat-style
-  remark (the finding's N1, an 18-character closing question) is still a
-  false positive — a targeted fix for exactly that case was written, shown
-  to fix N1, and then REVERTED after it reopened
-  `test_degenerate_reply.py` [9c] case B (a short, terminated SIGN-OFF
-  after a REAL collapse, which that pass-3 fixture requires to stay caught
-  and which is the identical shape to N1 with the opposite correct answer)
-  — see the reverted block comment in main.py (search "TRIED AND REVERTED")
-  and SP\\fix-p4c.md F4 for the full account.
+  Pass 4 fixed N2 (a second such paragraph followed by ordinary prose) by
+  the same join; N1 (a runaway followed by only a SHORT beat-style remark,
+  an 18-character closing question) was tried, shown to fix N1, and
+  REVERTED after it reopened `test_degenerate_reply.py` [9c] case B (a
+  short, terminated SIGN-OFF after a REAL collapse, which that pass-3
+  fixture required to stay caught and which is the identical shape to N1
+  with the opposite correct answer) — see SP\\fix-p4c.md F4 for the full
+  account of that attempt. Pass 5 measured the "identical shape" claim
+  directly (SP\\p5-degen\\measure.py) instead of taking it on faith,
+  confirmed [9c] case E is the same shape too, found no signal that
+  separates any of them, and — per this lane's stated priority, a normal
+  reply lost from memory is worse than a runaway kept — resolved the tie
+  toward KEEPING: N1/N4 are now fixed, and [9c] cases B and E are
+  RELABELLED (both here and in test_degenerate_reply.py) rather than left
+  as an unresolved conflict.
 
     python test_p4c_degeneracy.py
 """
@@ -121,13 +143,15 @@ check(runaway + "\n" + "\n".join(collapse_line(60, start=40 + 3 * k) for k in ra
       "R2: runaway + 6 short lines of fragments (newlines return) — same "
       "shape, spread over several lines instead of one")
 
-check(runaway + "\n" + collapse_line(500, start=200), True,
-      "R3: runaway + 2nd runaway cut at 500 chars (90 spaces) — used to "
-      "read as 'too sparse to judge' under the OLD fixed 100-space floor")
-
-check(runaway + "\n" + collapse_line(540, start=200), True,
-      "R3b: runaway + 2nd runaway cut at 540 chars (96 spaces) — same "
-      "shape, still under the old fixed floor")
+# R3/R3b: v3.1.9 (hostile pass 5, C5-6) MOVED these from asserted-True to
+# `info` below (with R4) — see that section for why: measured
+# (SP\\p5-degen\\measure.py), a 500/540-char second runaway is
+# statistically indistinguishable from FP-c (test_p5_degen_matrix.py), an
+# ordinary two-beat-paragraph reply of the same length, on every feature
+# this rule can see. Per this lane's priority (a normal reply lost from
+# memory is worse than a runaway kept), resolved toward keeping FP-c, which
+# leaves R3/R3b open — unchanged from their pass-4 disposition, just no
+# longer asserted as if pass 4 had closed them.
 
 check(runaway + "\n" + collapse_line(600, start=200), True,
       "R3c CONTROL: runaway + 2nd runaway cut at 600 chars (109 spaces) — "
@@ -135,9 +159,14 @@ check(runaway + "\n" + collapse_line(600, start=200), True,
 
 check(runaway + "\n" + "\n".join(f"- {WORDS[i % 20]}" for i in range(16)),
       True,
-      "R6 CONTROL: runaway + 16 UNTERMINATED short bullets — already "
-      "caught before this fix (the runaway line itself, not the trailing "
-      "exemption) and must stay caught")
+      "R6 CONTROL: runaway + 16 UNTERMINATED short bullets — stays caught. "
+      "CORRECTED (hostile pass 5, mutation testing): the trailing content "
+      "here is under DEGENERATE_MIN_CHARS (~234 chars), so this DOES go "
+      "through the exemption's SHORT-trailer path — it stays caught "
+      "because unterminated bullets fail _trailing_ends_in_real_sentence, "
+      "not because it bypasses the exemption. (The original pass-4 comment "
+      "claimed the opposite; a mutation on the short-trailer check turned "
+      "this case red, which is how the mistake was found.)")
 
 
 # ---------------------------------------------------------------------------
@@ -161,28 +190,52 @@ check(head + "\n\n" + beats_para(1700) + "\n\n" + beats_para(800, start=5) + "\n
 
 
 # ---------------------------------------------------------------------------
-# Known, documented, NOT fixed (deferred) — recorded here as an honest
-# "still broken" pin, not silently dropped. If either of these ever starts
-# passing on its own, that is progress worth noting, not a reason to relax
-# this test — but they are not expected to with the current, reverted
-# design (see main.py's "TRIED AND REVERTED" comment).
+# v3.1.9 (hostile pass 5, C5-6): N1/N4 FIXED (moved from `info` to asserted
+# checks below — they were false positives at pass 4, and are not any
+# more). R3/R4 remain genuinely open, still `info` only — see the block
+# comment above the trailing-content exemption in main.py, and
+# test_p5_degen_matrix.py, for the measured reasoning behind each.
 # ---------------------------------------------------------------------------
 print()
-print("[F4 deferred] known-open false positives/negatives (documented "
-      "trade-off, not silently dropped — see SP\\fix-p4c.md F4)")
+print("[F4 regression, continued] N1/N4 are FIXED this pass (hostile pass "
+      "5, C5-6) — see main.py's block comment for the short-trailer "
+      "termination check that fixed them")
 
-_n1 = head + "\n\n" + beats_para(1700) + "\n\n*What do you do?*"
-_n1_result = main.reply_is_degenerate(_n1)
-print(f"  info N1 (beat paragraph + 18-char closing question): "
-      f"reply_is_degenerate -> {_n1_result!r} (still a false positive; "
-      f"deferred, see main.py 'TRIED AND REVERTED')")
+check(head + "\n\n" + beats_para(1700) + "\n\n*What do you do?*", False,
+      "N1: beat paragraph + an 18-char closing question — FIXED (hostile "
+      "pass 5): a short, properly TERMINATED remark is now exempt the same "
+      "way [9c] B/E are (test_degenerate_reply.py, relabelled)")
 
-_n4 = head + "\n\n" + beats_para(1700) + "\n\n" + prose_close[:250].rsplit(" ", 1)[0] + "."
-_n4_result = main.reply_is_degenerate(_n4)
-print(f"  info N4 (beat paragraph + 250-char prose close): "
-      f"reply_is_degenerate -> {_n4_result!r} (still a false positive; "
-      f"falls in the 150-300 char gap between the short-trailer path that "
-      f"was reverted and the substantial/DEGENERATE_MIN_CHARS floor)")
+check(head + "\n\n" + beats_para(1700) + "\n\n"
+      + prose_close[:250].rsplit(" ", 1)[0] + ".", False,
+      "N4: beat paragraph + a 250-char prose close — FIXED (hostile pass "
+      "5): terminated, same mechanism as N1")
+
+
+# ---------------------------------------------------------------------------
+# Known, documented, still NOT fixed (deferred) — recorded here as an
+# honest "still open" pin, not silently dropped. R3/R3b joined this section
+# in hostile pass 5 (see the comment where they used to be asserted,
+# above): measured statistically identical to FP-c
+# (test_p5_degen_matrix.py), a normal two-beat-paragraph reply, on every
+# feature this rule can see — resolved toward keeping FP-c, which leaves
+# R3/R3b open. R4 was already here at pass 4 and is unchanged.
+# ---------------------------------------------------------------------------
+print()
+print("[F4/C5-6 deferred] known-open holes (documented trade-off, not "
+      "silently dropped — see SP\\fix-p5-degen.md)")
+
+_r3 = runaway + "\n" + collapse_line(500, start=200)
+_r3_result = main.reply_is_degenerate(_r3)
+print(f"  info R3 (runaway + 2nd runaway cut at 500 chars, 90 spaces): "
+      f"reply_is_degenerate -> {_r3_result!r} (still a miss; measured "
+      f"statistically identical to FP-c — see SP\\p5-degen\\measure.py)")
+
+_r3b = runaway + "\n" + collapse_line(540, start=200)
+_r3b_result = main.reply_is_degenerate(_r3b)
+print(f"  info R3b (runaway + 2nd runaway cut at 540 chars, 96 spaces): "
+      f"reply_is_degenerate -> {_r3b_result!r} (still a miss; same reason "
+      f"as R3)")
 
 _r4 = runaway + "\n\n" + prose_close
 _r4_result = main.reply_is_degenerate(_r4)
@@ -196,18 +249,24 @@ print(f"  info R4 (runaway + 330-char ordinary paragraph): "
 # Sibling sweep: the pass-3 [9c] fixtures this fix must not disturb (also
 # re-run directly via test_degenerate_reply.py; restated briefly here so
 # this file's own pass/fail is a complete signal on its own).
+#
+# v3.1.9 (hostile pass 5, C5-6) RELABELS B from must-catch to must-keep —
+# see test_degenerate_reply.py's [9c] section for the full justification
+# (measured identical in shape to N1; resolved toward keeping per this
+# lane's stated priority). F is unaffected: no sentence terminator at all.
 # ---------------------------------------------------------------------------
 print()
-print("[sibling] pass-3 [9c] short-trailer-after-a-real-collapse cases "
-      "must still be caught (these are what the reverted short-trailer "
-      "exemption would have broken)")
+print("[sibling] pass-3 [9c] short-trailer-after-a-real-collapse cases: B "
+      "is RELABELLED (hostile pass 5, same reasoning as "
+      "test_degenerate_reply.py), F stays caught")
 
 
-check(runaway + "\n\nAlways yours.", True,
-      "B: runaway + a short, terminated sign-off ('Always yours.') is "
-      "still caught")
+check(runaway + "\n\nAlways yours.", False,
+      "B (RELABELLED, hostile pass 5 C5-6): runaway + a short, TERMINATED "
+      "sign-off ('Always yours.') is now kept, not caught — identical "
+      "shape to N1")
 check(runaway + "\n\n---", True,
-      "F: runaway + a bare '---' is still caught")
+      "F: runaway + a bare '---' is still caught — no sentence terminator")
 
 
 if FAILED:

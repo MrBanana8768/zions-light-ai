@@ -2507,29 +2507,73 @@ def _line_is_fragment_shaped(
     return len(line) / (breaks + 1) <= DEGENERATE_LINE_SENTENCE_CHARS
 
 
-# v3.1.9 (hostile pass 4, F4) TRIED AND REVERTED: a separate exemption for
-# trailing content too SHORT for the fragment-mean math to mean anything
-# (a short, complete remark has a low apparent "mean fragment length" for
-# the same reason a runaway does — not enough text to contain more than one
-# or two sentence breaks; N1 in the finding, an 18-character closing
-# question, scores a mean of 17 and reads as "fragment-shaped" by the same
-# arithmetic that catches a real collapse, purely from being short). A
-# version of this judged short trailing content by whether it was a
-# TERMINATED remark instead of by shape. It fixed the finding's N1, but
-# directly reopened `test_degenerate_reply.py` [9c] case B — a runaway
-# followed only by "Always yours." (14 characters, a genuine sentence
-# terminator) — which that pass-3 fixture pins as a case that MUST stay
-# caught, on the reasoning that a short, innocuous-looking, well-terminated
-# sign-off after a real collapse is exactly the shape a model produces when
-# it trails off, and is indistinguishable, using only the trailing text
-# itself, from N1's "*What do you do?*" after a genuine beat paragraph. The
-# two fixtures are the same shape with opposite correct answers — telling
-# them apart needs a signal this lane does not have (real trailing-tail
-# data), and `test_degenerate_reply.py` is not in this lane's editable-
-# test-file list to re-derive that fixture around. Reverted rather than
-# ship a fix that reopens a hole a previous pass closed. N1 (and the
-# similarly-shaped 150-300 character band) stays an open false positive —
-# see SP\\fix-p4c.md F4 for the full trade-off.
+# v3.1.9 (hostile pass 4, F4) TRIED AND REVERTED, v3.1.9 (hostile pass 5,
+# C5-6) RESOLVED: a separate exemption for trailing content too SHORT for
+# the fragment-mean math to mean anything (a short, complete remark has a
+# low apparent "mean fragment length" for the same reason a runaway does —
+# not enough text to contain more than one or two sentence breaks; N1 in
+# the pass-4 finding, an 18-character closing question, scores a mean of 17
+# and reads as "fragment-shaped" by the same arithmetic that catches a real
+# collapse, purely from being short). A version of this judged short
+# trailing content by whether it was a TERMINATED remark instead of by
+# shape. It fixed N1, but directly reopened `test_degenerate_reply.py`
+# [9c] case B — a runaway followed only by "Always yours." (14 characters,
+# a genuine sentence terminator) — which that pass-3 fixture pinned as a
+# case that MUST stay caught, on the reasoning that a short,
+# innocuous-looking, well-terminated sign-off after a real collapse is
+# exactly the shape a model produces when it trails off, and is
+# indistinguishable, using only the trailing text itself, from N1's "*What
+# do you do?*" after a genuine beat paragraph. Pass 4 called the two
+# fixtures "the same shape with opposite correct answers" and reverted
+# rather than ship a fix that reopens a hole a previous pass closed.
+#
+# Pass 5 measured this claim directly (SP\\p5-degen\\measure.py) instead of
+# reasoning about it: [9c] case E ("Thanks for asking.") is the identical
+# shape too, and there is no THIRD feature anywhere in this rule's reach
+# (not length, not space density, not what line came before it) that tells
+# a genuine sign-off after a collapse apart from an ordinary one after a
+# beat paragraph — the codebase's own doctrine that "a normal reply lost
+# from her memory is worse than a runaway kept" (see this lane's report,
+# SP\\fix-p5-degen.md) then settles the tie: keep, not redact. `_is_real_
+# sentence_end`/`_trailing_ends_in_real_sentence` below is that same
+# TERMINATED-remark check, shipped this time — [9c] cases B and E are
+# relabelled in test_degenerate_reply.py to match (see that file's [9c] for
+# the reasoning restated at the point of the change), and case C (a bare
+# emoji) and case F ("---") — which have no terminator at all — are
+# unaffected and stay caught, proving this is a narrower fix than "give up
+# on short trailing content," not a wider one.
+
+
+_TRAILING_LIST_MAJORITY_MIN = 8
+_TRAILING_PROSE_SPACE_RATIO = 8
+
+
+def _trailing_line_is_prose_dense(line: str, *, ratio: int = _TRAILING_PROSE_SPACE_RATIO) -> bool:
+    """True if `line` has at least one space per `ratio` characters -- the
+    density a real sentence clears easily and a URL, a markdown table row,
+    or a dotted identifier never does (see the trailing-content exemption's
+    SUBSTANTIAL branch below, and C5-6's HOLE-a/b/c in
+    SP\\p5-c-findings.md)."""
+    return line.count(" ") * ratio >= len(line)
+
+
+_TRAILING_SENTENCE_END_RE = re.compile(
+    r"""[.!?]["'”’)\]»*_~`]*\Z"""
+    r"""|[。！？][”’」』)）]*\Z"""
+)
+
+
+def _trailing_ends_in_real_sentence(text: str) -> bool:
+    """True if `text` ends on a genuine sentence terminator, per
+    _is_real_sentence_end (shared with trim_to_last_sentence and the
+    fragment-line rule -- one definition of "sentence end" for the whole
+    file). Used only by the trailing-content exemption's SHORT branch
+    below, for trailing content too short for the fragment-mean math to
+    mean anything at all."""
+    m = _TRAILING_SENTENCE_END_RE.search(text)
+    if not m:
+        return False
+    return _is_real_sentence_end(text, m.start())
 
 
 def reply_is_degenerate(text: str) -> str | None:
@@ -2712,31 +2756,37 @@ def reply_is_degenerate(text: str) -> str | None:
     #     picked as the single longest trailing line and judged fragment-
     #     shaped on its own, even though the paragraph AFTER it made the
     #     trailing content as a whole read as ordinary prose.
-    # Fixed by joining ALL trailing non-blank content into one string and
-    # judging THAT as a whole, with a spaces floor PROPORTIONAL to its own
-    # length (len // 8, replacing the fixed 100) — proportional is what
-    # "too sparse to judge" should have meant from the start. Verified
-    # against every shape in the finding plus this codebase's own two real
-    # corpus false positives (25,209 and 15,141 characters, real prose
-    # following, still exempt) and the pass-3 case D control (600-character
-    # second runaway, still caught) — see test_p4c_degeneracy.py.
+    # Fixed (v3.1.9, hostile pass 4, F4) by joining ALL trailing non-blank
+    # content into one string and judging THAT as a whole, with a spaces
+    # floor PROPORTIONAL to its own length (len // 8, replacing the fixed
+    # 100) — proportional is what "too sparse to judge" should have meant
+    # from the start. This closed the finding's holes, but hostile pass 5
+    # (C5-6) found the join itself reopened three of them a different way —
+    # a low-space NON-PROSE block (a markdown table, a URL list, a fenced
+    # code block) joined in beside a real second runaway pulled the WHOLE
+    # blob's space density under its own proportional floor, exempting the
+    # runaway it was joined next to — and newly flagged ordinary
+    # dialogue-heavy and two-beat-paragraph replies the same way N2 needed
+    # fixing for. See the full account, the measurements, and what replaced
+    # it (list-majority / multi-line-join / single-longest-prose-line, in
+    # that order) at the trailing-content exemption itself, a few dozen
+    # lines below — this comment only carries the F4 history forward;
+    # SP\\fix-p5-degen.md has the confusion tables.
     #
-    # NOT fixed here, deferred (see SP\\fix-p4c.md F4): trailing content
-    # under DEGENERATE_MIN_CHARS never reaches this exemption at all
-    # (unchanged from before this fix) — a runaway followed by a SHORT
-    # normal remark (the finding's N1: an 18-character closing question) is
-    # still a false positive, and a TRIED fix for exactly that case was
-    # reverted after it reopened `test_degenerate_reply.py` [9c] case B (a
-    # short, terminated SIGN-OFF after a real collapse, which that pass-3
-    # fixture requires to stay caught, and which is the same shape as N1
-    # with the opposite correct answer) — see the reverted block comment a
-    # few dozen lines up for the full account. A runaway followed by ONE
-    # ordinary paragraph right around DEGENERATE_MIN_CHARS (the finding's
-    # R4, ~330 characters) is separately undecided: indistinguishable, by
-    # this arithmetic, from the two real corpus false positives at 15-25x
-    # that length — "how long a real trailing paragraph needs to be" is a
-    # calibration question this lane's synthetic-only fixtures cannot
-    # answer (real data was not granted here either).
+    # Still deferred, unresolved by pass 5 either (see SP\\fix-p5-degen.md):
+    # a genuine second runaway cut at 500 or 540 characters (R3/R3b) is
+    # measured statistically indistinguishable from an ordinary ~400-600
+    # char "beat" paragraph (FP-c) — mean fragment length within one point,
+    # same order of magnitude in space density — so closing R3/R3b with any
+    # threshold on this arithmetic also flags FP-c; resolved toward keeping
+    # per this lane's priority, so R3/R3b stay open holes. A runaway
+    # followed by ONE ordinary paragraph right around DEGENERATE_MIN_CHARS
+    # (R4, ~330 characters) is separately undecided for the same reason:
+    # indistinguishable, by this arithmetic, from the two real corpus false
+    # positives at 15-25x that length — "how long a real trailing paragraph
+    # needs to be" is a calibration question synthetic fixtures cannot
+    # answer (real data was not granted to this lane either; see the report
+    # for exactly what a corpus measurement would need to show).
     lines = text.splitlines()
     last_nonblank_idx = -1
     for _i, _raw in enumerate(lines):
@@ -2766,18 +2816,165 @@ def reply_is_degenerate(text: str) -> str | None:
             if ln / (breaks + 1) <= DEGENERATE_LINE_SENTENCE_CHARS:
                 exempt = False
                 if line_idx != last_nonblank_idx:
-                    trailing_nonblank = [
-                        t.strip() for t in lines[line_idx + 1:] if t.strip()
-                    ]
-                    trailing_chars = sum(len(t) for t in trailing_nonblank)
-                    if trailing_chars >= DEGENERATE_MIN_CHARS:
-                        # F4: the WHOLE trailing content, not just its
-                        # longest single line — see the block comment above.
-                        joined_trailing = " ".join(trailing_nonblank)
-                        exempt = not _line_is_fragment_shaped(
-                            joined_trailing,
-                            min_spaces=max(1, len(joined_trailing) // 8),
-                        )
+                    # v3.1.9 (hostile pass 5, C5-6) REPLACES the F4
+                    # join-everything/proportional-floor check. See the
+                    # block comment above for the full history; this
+                    # rewrites the "not itself fragment-shaped" half again.
+                    #
+                    # Fenced code after the candidate line is skipped
+                    # entirely (the primary per-line loop already does this
+                    # for the candidate itself; the exemption never did).
+                    trailing_nonblank: list[str] = []
+                    _tc_in_fence = False
+                    for _tc_raw in lines[line_idx + 1:]:
+                        _tc_line = _tc_raw.strip()
+                        if not _tc_line:
+                            continue
+                        if _tc_line.startswith("```"):
+                            _tc_in_fence = not _tc_in_fence
+                            continue
+                        if _tc_in_fence:
+                            continue
+                        trailing_nonblank.append(_tc_line)
+                    if trailing_nonblank:
+                        trailing_chars = sum(len(t) for t in trailing_nonblank)
+                        if trailing_chars < DEGENERATE_MIN_CHARS:
+                            # SHORT trailing content (C5-6's FP-a and the
+                            # finding's own N1/N4): too little text for the
+                            # fragment-mean math to mean anything -- a short
+                            # remark and a short collapse have the same low
+                            # apparent mean fragment length purely from being
+                            # short (N1's "*What do you do?*" scores the same
+                            # as a real trail-off). The only feature left
+                            # that distinguishes them is whether the remark
+                            # reads as a COMPLETE thought: ends on a genuine
+                            # sentence terminator (_is_real_sentence_end),
+                            # not an abbreviation, not nothing at all. A bare
+                            # emoji or "---" has no terminator and stays
+                            # caught (test_degenerate_reply.py [9c] C/F); a
+                            # short, properly punctuated sign-off is exempt.
+                            #
+                            # v3.1.9 (hostile pass 3, F5) pinned [9c] case B
+                            # ("Always yours.") and case E ("Thanks for
+                            # asking.") as MUST-STAY-CAUGHT on the reasoning
+                            # that a short, innocuous, well-terminated
+                            # remark after a real collapse is exactly the
+                            # shape a model produces trailing off. Measured
+                            # (SP\p5-degen\measure.py-style check, hostile
+                            # pass 5): B and E are the IDENTICAL shape to N1
+                            # in every feature this rule can see (short,
+                            # terminated, nothing else). There is no signal
+                            # here about whether the line BEFORE the
+                            # candidate was a genuine collapse or an
+                            # ordinary beat paragraph -- that would need
+                            # real trailing-tail corpus data (see
+                            # SP\fix-p4c.md F4's own TRIED AND REVERTED
+                            # account of this exact conflict). Per this
+                            # lane's priority (a normal reply lost from her
+                            # memory is worse than a runaway kept), resolved
+                            # toward KEEPING: [9c] B and E are relabelled in
+                            # test_degenerate_reply.py (see
+                            # SP\fix-p5-degen.md for the write-up) and this
+                            # now exempts all four equally by the one
+                            # feature that is actually here -- termination,
+                            # not authorship.
+                            exempt = _trailing_ends_in_real_sentence(
+                                " ".join(trailing_nonblank)
+                            )
+                        else:
+                            # SUBSTANTIAL trailing content (>= 300 chars).
+                            #
+                            # Measured (SP\p5-degen\measure.py): a genuine
+                            # second runaway cut at 500/540/600 chars and an
+                            # ordinary ~400-800 char "beat" paragraph
+                            # (test_p4c_degeneracy.py's beats_para) score
+                            # WITHIN ONE POINT of each other on mean fragment
+                            # length (24.8-29.7, all under the 40-char
+                            # limit) and are the same order of magnitude in
+                            # space density -- there is no arithmetic
+                            # threshold on a SINGLE blob of trailing prose
+                            # that catches one and keeps the other; every
+                            # value tried also flags C5-6's FP-c (two beat
+                            # paragraphs, nothing else). So a single
+                            # substantial blob is judged the way pass-3
+                            # judged it before F4: by the single longest
+                            # trailing PROSE line, against the FIXED
+                            # _LINE_MIN_SPACES floor (100) -- not the F4
+                            # proportional one. This keeps R3c caught (600
+                            # chars clears 100 spaces) and leaves R3/R3b
+                            # open, exactly like FP-c (500/540 chars, 90-96
+                            # spaces, never clears 100) -- documented, not
+                            # silently dropped, in SP\fix-p5-degen.md.
+                            #
+                            # "Longest PROSE line": lines that are
+                            # majority-list-shaped (C5-6's R1: 32 terminated
+                            # bullets -- the list phase returning, not prose
+                            # at all) are judged separately, by COUNT, not
+                            # by the mean-length math the list-run backstop
+                            # already owns (DEGENERATE_LIST_RUN=50; 32 is
+                            # short of that independent threshold but is
+                            # still "more of the collapse" for THIS
+                            # exemption's purposes). And a line with too few
+                            # spaces to be prose at all (a markdown table
+                            # row, a URL, a dotted identifier -- none of
+                            # which has 1 space per 8 characters) is
+                            # excluded before anything is joined or
+                            # measured: C5-6's HOLE-a/b/c is exactly a real
+                            # 600-char second runaway diluted below its own
+                            # proportional floor by 30 table rows or 12 URLs
+                            # joined in beside it. Filtering them out first
+                            # (rather than joining and hoping the floor
+                            # scales) leaves the real runaway line to be
+                            # judged on its own, the way it always was.
+                            #
+                            # Content spread over SEVERAL long prose lines
+                            # (C5-6's R2: 6 lines of genuine fragment-shaped
+                            # collapse, none alone clearing the old
+                            # single-line check) is still joined and judged
+                            # as a whole with the F4 proportional floor --
+                            # that half of F4 was correct and is kept. The
+                            # line-count floor (>=2) is what keeps this from
+                            # reopening FP-a/b (dialogue: no individual line
+                            # reaches DEGENERATE_LINE_SENTENCE_CHARS, so
+                            # there is nothing to join) or FP-c (ONE long
+                            # beat paragraph, correctly routed to the
+                            # single-blob path above instead).
+                            list_lines = [
+                                t for t in trailing_nonblank
+                                if _LIST_ITEM_RE.match(t)
+                            ]
+                            if (
+                                len(list_lines) >= _TRAILING_LIST_MAJORITY_MIN
+                                and len(list_lines) >= len(trailing_nonblank) / 2
+                            ):
+                                exempt = False
+                            else:
+                                prose_candidates = [
+                                    t for t in trailing_nonblank
+                                    if t not in list_lines
+                                    and _trailing_line_is_prose_dense(t)
+                                ]
+                                long_lines = [
+                                    t for t in prose_candidates
+                                    if len(t) >= DEGENERATE_LINE_SENTENCE_CHARS
+                                ]
+                                if len(long_lines) >= 2:
+                                    joined_trailing = " ".join(long_lines)
+                                    exempt = not _line_is_fragment_shaped(
+                                        joined_trailing,
+                                        min_spaces=max(1, len(joined_trailing) // 8),
+                                    )
+                                elif prose_candidates:
+                                    exempt = not _line_is_fragment_shaped(
+                                        max(prose_candidates, key=len)
+                                    )
+                                else:
+                                    # nothing prose-shaped followed at all
+                                    # (pure table/URL/code) -- "too sparse
+                                    # to judge" reads as not-fragment
+                                    # everywhere else in this file, so it
+                                    # does here too: exempt.
+                                    exempt = True
                 if not exempt:
                     return (
                         f"an unbroken line of {ln} characters made of "
