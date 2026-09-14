@@ -378,6 +378,10 @@ ENV VLLM_URL="http://localhost:8000"
 ENV COMPACTOR_FACTS_EXTRACTION="true"
 ENV COMPACTOR_MAX_FACTS_TOKENS="1500"
 ENV COMPACTOR_ADMIN_BIND="127.0.0.1"
+# v3.1.9: the model is told the current date and time, in her browser's zone.
+# COMPACTOR_TIMEZONE (the fallback) is deliberately NOT baked; see
+# RUNPOD_DEPLOY.md "The current date and time".
+ENV COMPACTOR_TIME_INJECTION="true"
 
 # V2.0 Phase 3 — episodic memory (RAG). Embedding model baked into the
 # image at /opt/embeddings; FASTEMBED_CACHE_PATH points there so no

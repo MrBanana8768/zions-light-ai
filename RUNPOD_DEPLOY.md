@@ -260,6 +260,66 @@ As of **rc8** the image's built-in defaults are the production A40 config
 On images older than rc8 the built-in default was the 22B (unbootable on an
 A40): always override per [runpod.env.template](runpod.env.template).
 
+### The current date and time
+
+From v3.1.9 the model is told the real date and time on every message, in
+**her browser's time zone**.
+
+**1. Prerequisite: her chat must already log `source=header`.** Adding a line
+to the system prompt changes the system prompt. A conversation whose id is
+still derived by hash (`source=hash`) gets a NEW id when the system prompt
+changes, and its memory is left behind under the old one. Check first:
+`grep -aE "conv_id=[^ ]+ source=[^ ]+ msgs=" /data/logs/compactor.log | grep -v __selftest | tail -3`.
+(The boot selftest always logs `source=header`; ignore it, which is what the
+`grep -v` does.) If her chat says `source=hash`, either do
+[RUNBOOK_MEMORY_IDENTITY.md](RUNBOOK_MEMORY_IDENTITY.md) first, or skip step 2
+entirely and use step 3 on its own: the model is still told the right time, in
+the zone you set, without touching the system prompt.
+
+**2. Add one line to her model's system prompt.** OpenWebUI → Admin Panel →
+Settings → Models → her model → System Prompt. Add this line on its own, at
+the start of a line, exactly as written:
+
+```
+User timezone: {{CURRENT_TIMEZONE}}
+```
+
+OpenWebUI replaces `{{CURRENT_TIMEZONE}}` with the time zone her browser
+reports (for example `America/Phoenix`) on every message. It stays the same
+unless her device's time zone changes, so it does not slow the model down.
+Do **not** add `{{CURRENT_DATETIME}}` there: it changes every minute and would
+make the model reprocess her whole conversation on every message. A model's
+system prompt is shared by every user of that model; that is fine here,
+because there is one user.
+
+**3. Optional fallback.** For requests that do not come from her browser (a
+direct API call, a client that does not fill in `{{CURRENT_TIMEZONE}}`), set
+`COMPACTOR_TIMEZONE=America/Phoenix` in the RunPod template. The order is: her
+browser's zone, then `COMPACTOR_TIMEZONE`, then UTC. `TZ` is not used for this.
+
+**What the model sees.** One line at the start of her newest message, in the
+request sent to the model only:
+
+```
+[Current date and time: Monday, September 14, 2026, 9:41 AM MST (UTC-07:00)]
+```
+
+She never sees it, OpenWebUI never stores it, and it never enters memory
+(facts, summaries or the episodic index). Title, tag and follow-up generation
+are not given it, and `/remember`-style commands are unaffected. The
+`User timezone:` line itself stays in the system prompt the model reads.
+
+**Check it took.** After her next message, `curl -s localhost:8080/health/full`
+→ `config.time_injection`: `last_source` must be `browser`, `last_timezone`
+her zone, and `current_line` the line the model is being shown. `utc` or `env`
+with a `last_browser_error` means the system-prompt line was not filled in or
+names no real zone (the compactor log says so once). `fallback_error` names a
+misspelled `COMPACTOR_TIMEZONE`; the pod still boots, on UTC, with one
+`TIME ZONE NOT APPLIED` ERROR in `compactor.log`.
+
+**Turn it off.** `COMPACTOR_TIME_INJECTION=false` (also `0`, `no`, `off`) and
+redeploy.
+
 ### Vision (V3.1) — enabling image understanding
 
 Set `MODEL_REPO` to a vision-language model (see presets in `.env.example`)

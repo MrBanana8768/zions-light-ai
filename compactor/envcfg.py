@@ -118,6 +118,39 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
+_BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
+_BOOL_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def env_bool(name: str, default: bool) -> bool:
+    """Read an on/off env var. Unset, blank, or unrecognised -> default.
+
+    v3.1.9 (COMPACTOR_TIME_INJECTION). The spellings are supervisord's own
+    boolean() set — {1,true,yes,on} / {0,false,no,off}, case-insensitive —
+    because entrypoint.sh already normalises the supervisord-gated flags to
+    exactly that vocabulary and an operator should not have to learn a second
+    one for the compactor's flags. Unlike supervisord, surrounding whitespace
+    is stripped: `false ` with a trailing space is what a copy-paste into a
+    RunPod template field leaves behind, and it plainly means false.
+
+    An unrecognised value (`flase`, `disabled`) is the DEFAULT, never a raise,
+    for this module's one non-negotiable reason. The older bare readers
+    (`.lower() != "false"` in facts.py and retrieval.py) are deliberately left
+    alone: they read ANY non-"false" value as on, which differs from this for
+    `0`/`no`/`off`, and changing what an existing deployment's flag means is
+    not something a shared helper gets to do quietly.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    v = str(raw).strip().lower()
+    if v in _BOOL_TRUE:
+        return True
+    if v in _BOOL_FALSE:
+        return False
+    return default
+
+
 def env_window_s(name: str, default: float) -> float:
     """Read a degrade-window seconds value from the environment, safely.
 

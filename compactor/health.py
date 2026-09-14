@@ -1702,8 +1702,26 @@ async def gather_health_full(
             # COMPACTOR_HIERARCHICAL_SUMMARY=false survives every redeploy;
             # before this it had no observable anywhere.
             "hierarchical_summary": summarizer.enabled(),
+            # v3.1.9: whether the model is told the time, in which zone, and
+            # the exact line it is shown - an unusable COMPACTOR_TIMEZONE
+            # resolves to UTC and `timezone_error` says so here for as long as
+            # the process lives. Read from sys.modules for _tokenizer_state's
+            # reason (main imports health); None outside the app.
+            "time_injection": _time_injection_config(),
         },
     }
+
+
+def _time_injection_config() -> dict | None:
+    """config.time_injection: main.time_injection_state(), or None/an error."""
+    main_mod = sys.modules.get("main")
+    fn = getattr(main_mod, "time_injection_state", None) if main_mod else None
+    if not callable(fn):
+        return None
+    try:
+        return fn()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def status_to_http_code(status: str) -> int:

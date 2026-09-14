@@ -26,7 +26,9 @@ import threading
 import time
 import unicodedata
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -48,7 +50,7 @@ import retrieval
 import selftest as selftest_module
 import summarizer
 import tailhealth
-from envcfg import env_float
+from envcfg import env_bool, env_float
 from memory import (
     StoreUnreadable,
     UnsafeConvId,
@@ -3441,6 +3443,361 @@ def _is_repeat_task_traffic(conv_id: str, messages: list[dict]) -> bool:
     return position >= TASK_TRAFFIC_MIN_POSITION
 
 
+# ---------------------------------------------------------------------------
+# v3.1.9: THE CURRENT DATE AND TIME (V4_ROADMAP.md section 1.1, item 1)
+# ---------------------------------------------------------------------------
+#
+# The user reported "it doesn't keep track of the actual time", and the cause
+# was total: not one layer of the prompt carried wall-clock time. Asked the
+# time, the model invented one, and the inventions ("4:01 AM", "9:19 AM
+# Friday") reached the fact store as facts. So the forwarded request now
+# carries ONE line, at the head of the newest user message:
+#
+#     [Current date and time: Monday, September 14, 2026, 9:41 AM MST (UTC-07:00)]
+#
+# WHERE IT GOES, and the two places it must not:
+#
+#   * NOT in the leading system block. vLLM's prefix cache keys on the leading
+#     prompt; a value that changes every minute near the front would recompute
+#     her whole ~100k-token context on every message.
+#   * NOT as a separate system message near the end. Mistral-family templates
+#     (Cydonia-24B is Mistral Small) accept one leading system message and then
+#     strict user/assistant alternation, and 400 anything else - see "at most
+#     one system message" at the memory injection in chat_completions.
+#   * So it is a PREFIX of the newest user message, added to the FORWARDED
+#     payload only, after the guard, the merges and the tail repair have
+#     settled which message that is. OpenWebUI never sees it and never re-sends
+#     it, so the model only ever sees one line (the current one), and every
+#     earlier turn reaches the prefix cache exactly as it did before. What it
+#     does cost: the previous request's newest user turn was sent WITH a line
+#     and is re-sent without one, so the cached prefix now ends at the start
+#     of that turn instead of after it - one user turn and one reply
+#     re-prefilled per message, not the conversation.
+#
+# WHAT THE LINE IS NOT ALLOWED TO REACH. Every memory writer - fact extraction,
+# the episodic index, the rollup, the covered-turn record, backfill - reads the
+# REQUEST (`messages`, `last_user_text`), never `body["messages"]`, and
+# _inject_time_line copies the one message it changes instead of mutating it:
+# the compacted array shares message dicts with `messages`, so an in-place edit
+# would put the line into the request the tail reads. A fingerprint of a user
+# turn carrying a line no later request contains would read as an EDIT to the
+# reuse gate and switch compaction reuse off (test_time_memory.py).
+#
+# THE WORDING. Square brackets and a label, no verb and no addressee: it reads
+# as metadata attached to her message, the way a client stamps a message, not
+# as something she typed and not as an instruction the model should act on or
+# acknowledge. Nothing in it asks for a reply ("note", "remember", "the user's
+# time is" would all invite one). The assistant turns the model conditions on
+# never contain it, so there is no earlier reply of its own to imitate. Weekday
+# and month are spelled out because models are unreliable at deriving a
+# weekday from a date; minutes and no seconds, because a seconds value is
+# stale before the reply is read. The zone is given as its abbreviation AND
+# its UTC offset, because abbreviations collide (CST, IST) and the offset is
+# what makes "is it morning where she is" unambiguous.
+#
+# WHICH ZONE: HER BROWSER'S, then the operator's, then UTC. OpenWebUI 0.11.0
+# renders `{{CURRENT_TIMEZONE}}` in a model's system prompt with the browser's
+# Intl.DateTimeFormat().resolvedOptions().timeZone (frontend
+# $lib/utils getUserTimezone -> the chat request's `variables`;
+# utils/payload.py resolve_system_prompt -> prompt_variables_template, a plain
+# string replace; the rendered prompt becomes messages[0]). The request
+# metadata itself never reaches the compactor (routers/openai.py pops it), so
+# the rendered system prompt is the only carrier. The operator adds ONE line,
+# `User timezone: {{CURRENT_TIMEZONE}}`, to her model's system prompt; it is
+# constant for her, so the leading prompt stays cache-friendly, and it follows
+# her device if she travels. The compactor reads that label from the LEADING
+# system message only - never from a user or assistant turn, where anyone
+# could type it - validates it with zoneinfo, and forwards the system prompt
+# unchanged (the model can read the line too). A client that does not render
+# variables (a direct API call) sends the literal placeholder, which falls back
+# to COMPACTOR_TIMEZONE and then UTC, and says so once.
+
+TIME_INJECTION_ENABLED = env_bool("COMPACTOR_TIME_INJECTION", True)
+TIME_LINE_PREFIX = "[Current date and time: "
+_TIME_LINE_SEPARATOR = "\n\n"
+# Tokens beyond the line's own bytes that joining it to her message may cost:
+# the separator's merge with her first word, and the template's separator
+# between content parts on a list-content turn. Generous on purpose - at 16
+# out of a 32k window it costs nothing, and it is the one number standing
+# between an unmeasured addition and a context-length 400.
+_TIME_LINE_JOIN_SLACK = 16
+_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+             "Saturday", "Sunday")
+_MONTHS = ("January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December")
+# Names that mean UTC and must work WITHOUT a timezone database: a slim image
+# or a Windows interpreter has no tzdata, and ZoneInfo("UTC") raises there.
+_UTC_ZONE_NAMES = frozenset({"UTC", "ETC/UTC"})
+# OpenWebUI's background task names (open_webui.constants.TASKS). With the
+# connection header this project documents, {"X-Conversation-Id":
+# "{{CHAT_ID}}{{TASK}}"} (RUNBOOK_MEMORY_IDENTITY.md), a task call arrives on
+# "<chat uuid><task name>", so the suffix identifies it on its FIRST call -
+# before _is_repeat_task_traffic has any history to judge by. Used only to
+# decide whether to date a request; it changes no memory decision.
+_OPENWEBUI_TASK_SUFFIXES = (
+    "title_generation", "tags_generation", "follow_up_generation",
+    "emoji_generation", "query_generation", "image_prompt_generation",
+    "autocomplete_generation", "function_calling", "moa_response_generation",
+)
+
+
+def _resolve_time_zone(environ) -> tuple[tzinfo, str, str, str | None]:
+    """(zone, name, source, error) from COMPACTOR_TIMEZONE, else UTC. Also
+    validates the browser-supplied name (_browser_time_zone passes it in under
+    the same key).
+
+    NEVER RAISES, for envcfg's reason: this runs at import, and a typo in a
+    RunPod template field must not stop the container booting. An unusable
+    name resolves to UTC and returns the error, which _announce_time_zone logs
+    at ERROR once and /health/full's config block shows for as long as the
+    process lives.
+
+    TZ IS NOT READ. runpod.env.template sets TZ for the container, and it is
+    tempting to use it as a second fallback; it is not one, because the
+    owner's precedence is browser -> COMPACTOR_TIMEZONE -> UTC, and a second
+    environment variable quietly feeding the clock is a source nobody would
+    think to check when the time is wrong.
+    """
+    raw = str(environ.get("COMPACTOR_TIMEZONE") or "").strip()
+    source = "COMPACTOR_TIMEZONE"
+    if not raw:
+        return timezone.utc, "UTC", "default", None
+    if raw.upper() in _UTC_ZONE_NAMES:
+        return timezone.utc, "UTC", source, None
+    try:
+        return ZoneInfo(raw), raw, source, None
+    except Exception as e:  # ZoneInfoNotFoundError, ValueError (a path), OSError
+        return timezone.utc, "UTC", source, (
+            f"{source}={raw!r} is not a usable IANA time zone name "
+            f"({type(e).__name__}: {e})"
+        )
+
+
+_TIME_ZONE, TIME_ZONE_NAME, _TIME_ZONE_SOURCE, _TIME_ZONE_ERROR = _resolve_time_zone(
+    os.environ
+)
+
+# The exact, documented label (RUNPOD_DEPLOY.md). At the start of a line of the
+# LEADING system message; the value is the rest of that line. Case-sensitive on
+# purpose: a documented string is matched as documented, not approximately.
+TIME_ZONE_PROMPT_LABEL = "User timezone:"
+_TIME_ZONE_LABEL_RE = re.compile(
+    r"^[ \t]*" + re.escape(TIME_ZONE_PROMPT_LABEL) + r"[ \t]*(.*?)[ \t]*$",
+    re.MULTILINE,
+)
+# What the last dated request used, for /health/full. Process-local, written on
+# the request path, read by the probe; a torn read between two requests can
+# only mix two valid states, and nothing decides anything on it.
+_LAST_TIME_ZONE: dict = {"source": None, "timezone": None, "browser_error": None}
+_last_time_zone_obj: tzinfo | None = None
+
+
+def _browser_time_zone(messages: list[dict]) -> tuple[tzinfo | None, str | None, str | None]:
+    """(zone, name, error) from the label in the LEADING system message.
+
+    (None, None, None) when there is no leading system message or no label -
+    an ordinary request, nothing to report. (None, None, error) when the label
+    is there and unusable: an unrendered `{{CURRENT_TIMEZONE}}` (a client that
+    does not render OpenWebUI's variables) or a name zoneinfo refuses. Only
+    messages[0] is read, and only when it is a system message: a label in a
+    user or assistant turn is text someone typed and must never move the clock.
+    """
+    if not messages or not isinstance(messages[0], dict) \
+            or messages[0].get("role") != "system":
+        return None, None, None
+    found = _TIME_ZONE_LABEL_RE.search(_message_text(messages[0]))
+    if found is None:
+        return None, None, None
+    raw = found.group(1).strip()   # .strip(): a CRLF prompt leaves a '\r'
+    if not raw or "{{" in raw or "}}" in raw:
+        return None, None, (
+            f"the system prompt's {TIME_ZONE_PROMPT_LABEL!r} line is "
+            f"{raw[:80]!r}, not a rendered time zone (a client that does not "
+            f"substitute {{{{CURRENT_TIMEZONE}}}})"
+        )
+    zone, name, _source, err = _resolve_time_zone({"COMPACTOR_TIMEZONE": raw})
+    if err:
+        return None, None, (
+            f"the system prompt's {TIME_ZONE_PROMPT_LABEL!r} line names "
+            f"{raw[:80]!r}, which is not a usable IANA time zone"
+        )
+    return zone, name, None
+
+
+def _request_time_zone(messages: list[dict]) -> tuple[tzinfo, str, str, str | None]:
+    """(zone, name, source, browser_error) for one request. source is
+    "browser", "env" (a valid COMPACTOR_TIMEZONE) or "utc"."""
+    zone, name, browser_error = _browser_time_zone(messages)
+    if zone is not None:
+        return zone, name, "browser", None
+    if browser_error and logsetup.log_once("time_injection.browser_zone_unusable"):
+        logger.warning(
+            f"{browser_error}; dating her messages in the fallback zone "
+            f"{TIME_ZONE_NAME} instead. Said once per process; /health/full "
+            f"config.time_injection shows the source in use."
+        )
+    if _TIME_ZONE_SOURCE == "COMPACTOR_TIMEZONE" and not _TIME_ZONE_ERROR:
+        return _TIME_ZONE, TIME_ZONE_NAME, "env", browser_error
+    return timezone.utc, "UTC", "utc", browser_error
+
+
+def _now_utc() -> datetime:
+    """The wall clock. A seam so tests can pin the minute."""
+    return datetime.now(timezone.utc)
+
+
+def _format_time_line(now: datetime, zone: tzinfo) -> str:
+    """The line, for instant `now` in `zone`. Pure; English names come from
+    fixed tables, not strftime, because %A and %B follow the process locale."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    local = now.astimezone(zone)
+    offset = local.utcoffset() or timedelta(0)
+    abbr = local.tzname() or ""
+    if offset == timedelta(0) and abbr in ("UTC", ""):
+        label = "UTC"
+    else:
+        minutes = int(offset.total_seconds()) // 60
+        hh, mm = divmod(abs(minutes), 60)
+        numeric = f"UTC{'+' if minutes >= 0 else '-'}{hh:02d}:{mm:02d}"
+        # A zone with no letter abbreviation reports its offset AS its name
+        # ("-03" for America/Sao_Paulo); printing both would say it twice.
+        label = f"{abbr} ({numeric})" if abbr[:1].isalpha() else numeric
+    hour12 = local.hour % 12 or 12
+    return (
+        f"{TIME_LINE_PREFIX}{_WEEKDAYS[local.weekday()]}, "
+        f"{_MONTHS[local.month - 1]} {local.day}, {local.year}, "
+        f"{hour12}:{local.minute:02d} {'AM' if local.hour < 12 else 'PM'} {label}]"
+    )
+
+
+def current_time_line(now: datetime | None = None) -> str:
+    """The line in the FALLBACK zone (COMPACTOR_TIMEZONE, else UTC) - what a
+    request without a usable browser zone is shown."""
+    return _format_time_line(now if now is not None else _now_utc(), _TIME_ZONE)
+
+
+def time_injection_state() -> dict:
+    """For /health/full's config block (health.py cannot import main).
+
+    `last_source` / `last_timezone`: what the most recent dated request used
+    ("browser", "env", "utc"; None before the first). `current_line`: the line
+    a request would get right now in that zone (the fallback zone before the
+    first request). `fallback_*`: the operator's zone and why it is not in
+    force if it is not."""
+    zone = _last_time_zone_obj if _last_time_zone_obj is not None else _TIME_ZONE
+    return {
+        "enabled": TIME_INJECTION_ENABLED,
+        "last_source": _LAST_TIME_ZONE["source"],
+        "last_timezone": _LAST_TIME_ZONE["timezone"],
+        "last_browser_error": _LAST_TIME_ZONE["browser_error"],
+        "fallback_timezone": TIME_ZONE_NAME,
+        "fallback_source": _TIME_ZONE_SOURCE,
+        "fallback_error": _TIME_ZONE_ERROR,
+        "prompt_label": TIME_ZONE_PROMPT_LABEL,
+        "current_line": _format_time_line(_now_utc(), zone),
+    }
+
+
+def _announce_time_zone() -> None:
+    """Say once per process what the model is told, and LOUDLY if the zone the
+    operator set did not take. Called at startup and on the request path (a
+    set lookup after the first call), so a process that never ran the
+    lifespan still says it before its first dated reply."""
+    if not logsetup.log_once("time_injection.announce"):
+        return
+    if _TIME_ZONE_ERROR:
+        logger.error(
+            f"TIME ZONE NOT APPLIED: {_TIME_ZONE_ERROR}. Requests without a "
+            f"browser zone (the system prompt's {TIME_ZONE_PROMPT_LABEL!r} "
+            f"line) are being told UTC instead, which is wrong by hours if she "
+            f"is anywhere else. Fix COMPACTOR_TIMEZONE (a name such as "
+            f"America/Phoenix, see RUNPOD_DEPLOY.md) and redeploy; /health/full "
+            f"config.time_injection shows what is in force."
+        )
+    logger.info(
+        f"current-time line "
+        f"{'ON' if TIME_INJECTION_ENABLED else 'OFF (COMPACTOR_TIME_INJECTION)'}: "
+        f"zone from the system prompt's {TIME_ZONE_PROMPT_LABEL!r} line, else "
+        f"{TIME_ZONE_NAME} (from {_TIME_ZONE_SOURCE}); without a browser zone "
+        f"the model sees {current_time_line()!r} at the head of her newest "
+        f"message"
+    )
+
+
+def _is_openwebui_task_conv_id(conv_id: str | None) -> bool:
+    return bool(conv_id) and str(conv_id).endswith(_OPENWEBUI_TASK_SUFFIXES)
+
+
+def _time_line_for_request(conv_id: str | None, messages: list[dict]) -> str | None:
+    """The line to date this request with, or None. Decided on the ORIGINAL
+    request, before anything is forwarded, so the guard can reserve its size.
+
+    Task traffic is not dated: a title or a tag that absorbs "Monday, 9:41 AM"
+    is worse than one that does not, and a follow-up suggestion is not a turn
+    she is waiting on. Both classifiers are READ here, never changed - the
+    memory tail makes its own decision later, on the same `messages`.
+    """
+    if not TIME_INJECTION_ENABLED:
+        return None
+    if not any(isinstance(m, dict) and m.get("role") == "user" for m in messages):
+        return None
+    if _is_openwebui_task_conv_id(conv_id):
+        return None
+    if conv_id and _is_repeat_task_traffic(conv_id, messages):
+        return None
+    global _last_time_zone_obj
+    zone, name, source, browser_error = _request_time_zone(messages)
+    _LAST_TIME_ZONE.update(source=source, timezone=name, browser_error=browser_error)
+    _last_time_zone_obj = zone
+    return _format_time_line(_now_utc(), zone)
+
+
+def _time_line_token_reserve(line: str) -> int:
+    """An upper bound on what adding `line` can cost, in tokens.
+
+    UTF-8 bytes, not an estimate: every tokenizer this project runs (Mistral's
+    tekken, the byte-level BPE fixtures) spends at least one byte per token, so
+    a line cannot cost more tokens than it has bytes. Plus the separator and a
+    fixed slack for the join (see _TIME_LINE_JOIN_SLACK). ~20 real tokens,
+    reserved as ~100: the difference is noise in a 32k window, and the bound
+    needs no /tokenize round trip on the request path.
+    """
+    return (len(line.encode("utf-8")) + len(_TIME_LINE_SEPARATOR.encode("utf-8"))
+            + _TIME_LINE_JOIN_SLACK)
+
+
+def _inject_time_line(messages: list[dict], line: str) -> tuple[list[dict], bool]:
+    """Prefix the NEWEST user message of `messages` with `line`. Returns
+    (messages, injected). Never mutates: a new list, and a new dict for the one
+    message changed (see the section comment for why that is load-bearing).
+
+    A string turn becomes line + blank line + her text. A content-LIST turn (an
+    image, or a client that sends parts) gets a leading text part rather than
+    having one of its parts rewritten, so the parts she sent reach the backend
+    untouched. Any other content shape, or no user message at all, is left
+    alone.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            new_content: Any = (
+                f"{line}{_TIME_LINE_SEPARATOR}{content}" if content else line
+            )
+        elif isinstance(content, list):
+            new_content = [{"type": "text", "text": line + _TIME_LINE_SEPARATOR},
+                           *content]
+        else:
+            return messages, False
+        out = list(messages)
+        out[i] = {**m, "content": new_content}
+        return out, True
+    return messages, False
+
+
 def _bound_injected_blocks(
     blocks: list[tuple[int, str, str]], budget: int
 ) -> tuple[list[str], list[str], int]:
@@ -5408,6 +5765,9 @@ async def lifespan(app: FastAPI):
         logger.info("storage layout ready")
     except Exception as e:
         logger.warning(f"could not initialize storage layout: {e}")
+    # v3.1.9: an unusable COMPACTOR_TIMEZONE is an ERROR at boot, not a
+    # surprise in her first reply. Never raises (see _resolve_time_zone).
+    _announce_time_zone()
     # v3.1.3: warm the exact local tokenizer HERE, off the loop, for the
     # same reason as the modality probe below - lazily it loaded inside the
     # async request handler, so the FIRST request after every boot that had
@@ -6391,6 +6751,34 @@ async def chat_completions(request: Request) -> Any:
     # only case that reaches (one user turn larger than the whole budget) doing
     # so does not even achieve the fit.
     caller_system = sum(1 for m in messages if m.get("role") == "system")
+    # v3.1.9: the current-time line (see _inject_time_line). DECIDED here, on
+    # the original request, so the guard can be handed a limit that already
+    # makes room for it; ADDED after the guard, the merges and the tail
+    # repair, because each of those can change which message is her newest.
+    # A line the guard never counted would be the one thing in the payload
+    # nobody measured, so its reserve (an upper bound, not an estimate) comes
+    # out of the guard's limit. Deciding can read the store (repeat task
+    # traffic) and must never cost her the reply, so a failure here sends the
+    # request undated and says so once.
+    _time_line: str | None = None
+    _time_reserve = 0
+    try:
+        _announce_time_zone()
+        _time_line = _time_line_for_request(conv_id, messages)
+    except Exception as e:
+        _time_line = None
+        if logsetup.log_once("time_injection.decide"):
+            logger.exception(
+                f"conv={conv_id or '?'}: could not decide whether to add the "
+                f"current-time line ({type(e).__name__}: {e}); sending this and "
+                f"any later failing request without it"
+            )
+    if _time_line is not None:
+        _time_reserve = _time_line_token_reserve(_time_line)
+        # The guard floors its limit at 256; below that floor a reserve could
+        # not be honoured, so a window that small is simply not dated.
+        if effective_limit - _BUDGET_MARGIN - _time_reserve < 256:
+            _time_line, _time_reserve = None, 0
     # v3.1 D4: what the guard decided, carried to the rejection path. Without
     # it a 400 the guard PREDICTED (and logged at ERROR before sending) is
     # indistinguishable from one that surprised it, and the calibration learns
@@ -6399,7 +6787,7 @@ async def chat_completions(request: Request) -> Any:
     body["messages"] = await run_in_threadpool(
         _enforce_hard_budget,
         body["messages"],
-        effective_limit,
+        effective_limit - _time_reserve,
         caller_system,
         guard_report,
     )
@@ -6424,8 +6812,25 @@ async def chat_completions(request: Request) -> Any:
         # and warning about it would train the operator to ignore the line
         # that does matter.
         logger.info(f"conv={conv_id or '?'}: {_tail_note}")
+    # v3.1.9: date her newest message - the very last change to the payload.
+    # Not when the guard measured the payload as NOT fitting: that request is
+    # already over the window with nothing left the guard may spend, and a
+    # line could only make the rejection vLLM is about to send more certain.
+    if _time_line is not None:
+        if guard_measured_overflow:
+            logger.info(
+                f"conv={conv_id or '?'}: not adding the current-time line - the "
+                f"payload already does not fit the window"
+            )
+        else:
+            body["messages"], _ = _inject_time_line(body["messages"], _time_line)
 
-    # The limit the guard ACTUALLY shed against, captured here rather than
+    # The limit the FORWARDED payload was held to. v3.1.9: that is the guard's
+    # limit plus the current-time line's reserve - the guard shed the array
+    # against `effective_limit - _time_reserve` and the line then used at most
+    # that reserve - so it is still `effective_limit` less the margin. The
+    # guard's own narrower limit would inflate every learned overshoot by the
+    # reserve, for tokens that were accounted for. Captured here rather than
     # recomputed if this request is rejected: _note_backend_rejection moves
     # _BUDGET_MARGIN, so by the time a rejection is logged the margin is no
     # longer the one this payload was measured against, and the log line would

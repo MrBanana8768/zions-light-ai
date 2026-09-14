@@ -118,6 +118,7 @@ os.environ["COMPACTOR_L2_CHUNK_SIZE"] = os.environ.get("SOAK_L2_CHUNK_SIZE", "2"
 os.environ["COMPACTOR_L3_CHUNK_SIZE"] = os.environ.get("SOAK_L3_CHUNK_SIZE", "2")
 
 import asyncio  # noqa: E402
+import json  # noqa: E402
 import logging  # noqa: E402
 import re  # noqa: E402
 import time  # noqa: E402
@@ -518,6 +519,98 @@ def _turn_signals(log: str, counters_before: dict, counters_after: dict) -> dict
     }
 
 
+# ---- v3.1.9: the current-time line ------------------------------------------
+# main._inject_time_line dates the NEWEST user message of the forwarded chat
+# payload with one line. Three things must hold on a growing conversation and
+# only a soak drives all of them at once: every chat call carries exactly one
+# line where it belongs and no request-path summarization call carries any;
+# nothing a memory writer reads, and nothing on disk, contains one; and the
+# line never moves where two prompts diverge in front of the newest user turn.
+_TIME_NEEDLE = "[Current date and time: "
+_TIME_LINE_RE = re.compile(r"^\[Current date and time: [^\]\n]*\]\n\n")
+
+
+def _time_line_problems(bodies: list[dict]) -> list[str]:
+    """What is wrong with the time line in ONE request's backend calls. Pure.
+
+    `bodies` are the /v1/chat/completions bodies the request path sent, in
+    order; the last is the chat call, any before it are summarization."""
+    if not bodies:
+        return ["no chat call reached the backend"]
+    probs = []
+    chat = bodies[-1].get("messages") or []
+    total = json.dumps(chat).count(_TIME_NEEDLE)
+    if total != 1:
+        probs.append(f"the chat payload carries {total} time line(s), not 1")
+    newest = next((m for m in reversed(chat) if m.get("role") == "user"), None)
+    c = (newest or {}).get("content")
+    head = c if isinstance(c, str) else (
+        c[0].get("text", "") if isinstance(c, list) and c and isinstance(c[0], dict)
+        else "")
+    if not str(head).startswith(_TIME_NEEDLE):
+        probs.append("the newest user message does not start with the time line")
+    for k, b in enumerate(bodies[:-1], start=1):
+        if _TIME_NEEDLE in json.dumps(b):
+            probs.append(f"request-path summarization call {k} carries a time line")
+    return probs
+
+
+def _time_leak_problems(read_texts: list[str], stored: dict[str, bytes],
+                        control: str) -> list[str]:
+    """Whether the line reached memory: what the writers READ, and what is on
+    disk. Pure. `control` must appear in what they read, or a leak could not
+    have been seen and the check proves nothing."""
+    probs = []
+    if not any(control in t for t in read_texts):
+        probs.append(f"fixture: no text a memory writer read contains {control!r}, "
+                     f"so a leaked line could not have been seen")
+    leaked = [t[:60] for t in read_texts if _TIME_NEEDLE in t]
+    if leaked:
+        probs.append(f"{len(leaked)} text(s) a memory writer read carry the line: {leaked[:2]}")
+    on_disk = sorted(k for k, v in stored.items() if _TIME_NEEDLE.encode() in v)
+    if on_disk:
+        probs.append(f"stored file(s) carry the line: {on_disk[:3]}")
+    return probs
+
+
+def _undated(msgs: list[dict]) -> list[dict]:
+    """`msgs` with the time line taken back out of the newest user turn."""
+    out = [dict(m) for m in msgs]
+    for m in reversed(out):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            m["content"] = _TIME_LINE_RE.sub("", c, count=1)
+        elif isinstance(c, list) and c and isinstance(c[0], dict) \
+                and str(c[0].get("text", "")).startswith(_TIME_NEEDLE):
+            m["content"] = c[1:]
+        break
+    return out
+
+
+def _prefix_problems(rows: list[dict]) -> list[str]:
+    """The line may only change tokens AT OR AFTER the newest user message.
+    Pure. Each row: `dated_vs_undated` (common token prefix of the forwarded
+    prompt and the same prompt undated), `user_offset` (tokens before the
+    newest user message), and for a consecutive pair whose history in front of
+    the earlier prompt's newest user turn is unchanged, `pair_common` (common
+    prefix of the two DATED prompts)."""
+    probs = []
+    for r in rows:
+        if r["dated_vs_undated"] < r["user_offset"]:
+            probs.append(f"turn {r['turn']}: the dated prompt diverges from the undated "
+                         f"one at token {r['dated_vs_undated']}, before the newest user "
+                         f"message at {r['user_offset']}")
+        if r.get("pair_common") is not None and r["pair_common"] < r["user_offset"]:
+            probs.append(f"turn {r['turn']}->{r['turn'] + 1}: unchanged history, yet the "
+                         f"prompts diverge at token {r['pair_common']}, before "
+                         f"{r['user_offset']}")
+    if not rows:
+        probs.append("no prompt was measured")
+    return probs
+
+
 def _oracle_selftest() -> tuple[list[str], int]:
     """Each oracle against the defect shape it exists for (must go RED) and a
     healthy control (must stay GREEN). Returns the cases that came out wrong.
@@ -774,6 +867,56 @@ def _oracle_selftest() -> tuple[list[str], int]:
     expect("REUSE CONTROL: cap refusal BEFORE any chunk is not this check's",
            lambda: _reuse_problems([ru(1, 0, compacted=False, reused=0, cap=True)]
                                    + reuse_good[1:]), False)
+
+    # ---- v3.1.9: the current-time line ------------------------------------
+    TL = "[Current date and time: Monday, September 14, 2026, 4:41 PM UTC]"
+    sysm = {"role": "system", "content": "persona"}
+    u_old = {"role": "user", "content": "Turn 1."}
+    a_old = {"role": "assistant", "content": "Reply."}
+    dated = {"model": "m", "messages": [sysm, u_old, a_old,
+                                        {"role": "user", "content": TL + "\n\nTurn 2."}]}
+    summ = {"model": "m", "messages": [{"role": "user", "content": "summarize these"}]}
+    expect("TIME CONTROL: one line, at the head of the newest user message",
+           lambda: _time_line_problems([summ, dated]), False)
+    expect("TIME CONTROL: a content-list turn dated by a leading text part",
+           lambda: _time_line_problems([{"messages": [sysm, {"role": "user", "content": [
+               {"type": "text", "text": TL + "\n\n"},
+               {"type": "image_url", "image_url": {"url": "x"}}]}]}]), False)
+    expect("TIME undated chat payload",
+           lambda: _time_line_problems([{"messages": [sysm, u_old]}]), True)
+    expect("TIME line in the leading system block instead",
+           lambda: _time_line_problems([{"messages": [
+               {"role": "system", "content": TL + " persona"}, u_old]}]), True)
+    expect("TIME line twice (an older turn still carries one)",
+           lambda: _time_line_problems([{"messages": [
+               sysm, {"role": "user", "content": TL + "\n\nTurn 1."}, a_old,
+               dated["messages"][-1]]}]), True)
+    expect("TIME a summarization call carries the line",
+           lambda: _time_line_problems([{"messages": [dated["messages"][-1]]}, dated]),
+           True)
+    expect("TIME LEAK CONTROL: writers read her text, nothing carries the line",
+           lambda: _time_leak_problems(["Turn 2. Tell me about item 2"],
+                                       {"f.json": b"{}"}, "Tell me about item"), False)
+    expect("TIME LEAK a fact extraction read the dated text",
+           lambda: _time_leak_problems([TL + "\n\nTell me about item 2"], {},
+                                       "Tell me about item"), True)
+    expect("TIME LEAK a stored summary carries the line",
+           lambda: _time_leak_problems(["Tell me about item 2"],
+                                       {"s.json": TL.encode()}, "Tell me about item"), True)
+    expect("TIME LEAK a leak check that could not have seen one",
+           lambda: _time_leak_problems(["placeholder"], {}, "Tell me about item"), True)
+    expect("TIME UNDATE: the line comes back out exactly",
+           lambda: [] if _undated(dated["messages"])[-1]["content"] == "Turn 2."
+           and dated["messages"][-1]["content"].startswith(TL) else ["not undated"], False)
+    expect("TIME PREFIX CONTROL: divergence at the newest user message",
+           lambda: _prefix_problems([{"turn": 1, "dated_vs_undated": 120,
+                                      "user_offset": 118, "pair_common": 119}]), False)
+    expect("TIME PREFIX the line diverges the prompt inside the system block",
+           lambda: _prefix_problems([{"turn": 1, "dated_vs_undated": 3,
+                                      "user_offset": 118, "pair_common": None}]), True)
+    expect("TIME PREFIX unchanged history, consecutive prompts diverge early",
+           lambda: _prefix_problems([{"turn": 1, "dated_vs_undated": 118,
+                                      "user_offset": 118, "pair_common": 40}]), True)
     return failures, cases[0]
 
 
@@ -983,6 +1126,11 @@ def _turn(n: int, history: list[dict], looping: bool, rewrite=None
     # that, then blamed the code for it.
     request_calls = _fixture_stats().get("chat_completions", 0) - _calls_at_start
     _drain_tails()
+    # v3.1.9: on EVERY request, the main run and the traffic phase alike.
+    _tp = _time_line_problems(forwarded)
+    if _tp:
+        fail(f"request {n}: the current-time line is wrong in what reached the backend",
+             "; ".join(_tp))
     sent = forwarded[-1].get("messages", []) if forwarded else []
     reply = ""
     try:
@@ -1044,7 +1192,13 @@ _tail_new_facts = [0]
 _real_facts_tail = main._facts_tail
 
 
+# v3.1.9: every user text a memory writer is handed, for _time_leak_problems.
+_memory_read_texts: list[str] = []
+
+
 async def _facts_tail_spy(conv_id, *args, **kwargs):
+    _memory_read_texts.append(str(args[1] if len(args) > 1
+                                  else kwargs.get("last_user_text", "")))
     before = {f.get("text") for f in facts_mod.load_facts(conv_id)}
     try:
         return await _real_facts_tail(conv_id, *args, **kwargs)
@@ -1054,6 +1208,16 @@ async def _facts_tail_spy(conv_id, *args, **kwargs):
 
 
 main._facts_tail = _facts_tail_spy
+
+_real_index_exchange = main.retrieval.index_exchange
+
+
+def _index_exchange_spy(conv_id, turn_index, user_text, assistant_text, *a, **k):
+    _memory_read_texts.append(str(user_text))
+    return _real_index_exchange(conv_id, turn_index, user_text, assistant_text, *a, **k)
+
+
+main.retrieval.index_exchange = _index_exchange_spy
 
 # _summarize_pieces: how many of each L1 chunk's input pieces were redaction
 # placeholders. A chunk of placeholders is non-empty, so the coverage oracle
@@ -1129,6 +1293,7 @@ print(f"[soak] fixture: {FIXTURE_URL}")
 _reset_fixture()
 
 history: list[dict] = []
+_sent_by_turn: list[tuple[int, list[dict]]] = []
 rows: list[dict] = []
 calls_seen: list[tuple] = []
 compaction_fired = False
@@ -1144,6 +1309,7 @@ for n in range(1, TURNS + 1):
     _t0 = time.monotonic()
     status, log, sent, reply, _calls = _turn(n, history,
                                               looping=(phase == "refuse"))
+    _sent_by_turn.append((n, sent))
     _cc1 = main.compaction_counters()
     _elapsed = time.monotonic() - _t0
     _th1 = tailhealth.snapshot()
@@ -1343,6 +1509,66 @@ print(f"  ok   compaction reused the hierarchy on {len(_reusing)} turn(s) "
       f"(first at turn {_reusing[0]['turn'] if _reusing else None}, most "
       f"{max((r['reused'] for r in _reusing), default=0)} turns off the shelf) "
       f"and was never refused over the per-request cap once a chunk existed")
+
+# v3.1.9: THE CURRENT-TIME LINE, measured against the fixture's own tokenizer.
+
+
+def _tok(msgs: list[dict], agp: bool) -> list[int]:
+    r = httpx.post(f"{FIXTURE_URL}/tokenize", json={
+        "model": "fixture-model", "messages": msgs, "add_generation_prompt": agp},
+        timeout=30.0)
+    r.raise_for_status()
+    return list(r.json()["tokens"])
+
+
+def _common(a: list[int], b: list[int]) -> int:
+    n = min(len(a), len(b))
+    return next((i for i in range(n) if a[i] != b[i]), n)
+
+
+_prefix_rows: list[dict] = []
+_line_costs: list[int] = []
+_extra_uncached: list[int] = []
+_prev = None
+for _n, _p in _sent_by_turn:
+    _idx = max(i for i, m in enumerate(_p) if m.get("role") == "user")
+    _t_dated, _t_undated = _tok(_p, True), _tok(_undated(_p), True)
+    _row = {"turn": _n, "user_offset": len(_tok(_p[:_idx], False)) if _idx else 0,
+            "dated_vs_undated": _common(_t_dated, _t_undated), "pair_common": None}
+    _line_costs.append(len(_t_dated) - len(_t_undated))
+    if _prev is not None:
+        _pn, _pp, _pidx, _pt_dated, _pt_undated, _prow = _prev
+        _pair = _common(_pt_dated, _t_dated)
+        _extra_uncached.append(_common(_pt_undated, _t_undated) - _pair)
+        if _p[:_pidx] == _pp[:_pidx]:
+            _prow["pair_common"] = _pair
+    _prefix_rows.append(_row)
+    _prev = (_n, _p, _idx, _t_dated, _t_undated, _row)
+_prefix_p = _prefix_problems(_prefix_rows)
+if _prefix_p:
+    fail("the current-time line moved where prompts diverge", "; ".join(_prefix_p[:5]))
+_stable_pairs = [r for r in _prefix_rows if r["pair_common"] is not None]
+_sorted_extra = sorted(_extra_uncached) or [0]
+print(f"  ok   the current-time line changed no token before the newest user message on "
+      f"all {len(_prefix_rows)} turns (it costs {min(_line_costs)}-{max(_line_costs)} "
+      f"fixture tokens); {len(_stable_pairs)} consecutive pair(s) kept their history, and "
+      f"every one shared its whole prefix up to the earlier newest user turn")
+print(f"  note prefix-cache cost of the line between consecutive prompts, in fixture "
+      f"tokens that become uncached vs the same prompts undated: median "
+      f"{_sorted_extra[len(_sorted_extra) // 2]}, max {_sorted_extra[-1]} "
+      f"(0 where memory injection or compaction already changed the prompt in front "
+      f"of it)")
+
+_stored_blobs = {str(q): q.read_bytes() for q in __import__("pathlib").Path(_STORE).rglob("*")
+                 if q.is_file()}
+_leak_p = _time_leak_problems(
+    _memory_read_texts + [piece for _, ps in _l1_pieces_log for piece in ps],
+    _stored_blobs, "Tell me about item")
+if _leak_p:
+    fail("the current-time line reached memory", "; ".join(_leak_p))
+print(f"  ok   no time line in the {len(_memory_read_texts)} user text(s) the fact and "
+      f"episodic writers read, the {sum(len(ps) for _, ps in _l1_pieces_log)} piece(s) "
+      f"the L1 summaries read, or the {len(_stored_blobs)} file(s) on disk")
 
 # BOTH SIDES OF THE MEMORY TAIL (A3). The shipped soak's only memory
 # assertion was a non-empty fact store, which the backfill filled on a run
@@ -1697,6 +1923,16 @@ print(f"  ok   {len(_traffic_rows)} traffic turn(s) (regenerate, delete last, de
       f"old, edit 40 back): all answered, reuse on {len(_t_reusing)} compacting "
       f"turn(s), never refused over the cap, never compacted without reusing")
 print(f"  ok   request-path LLM calls per message (label:calls): {' '.join(_traffic_log)}")
+
+_stored_blobs = {str(q): q.read_bytes() for q in __import__("pathlib").Path(_STORE).rglob("*")
+                 if q.is_file()}
+_leak_p = _time_leak_problems(
+    _memory_read_texts + [piece for _, ps in _l1_pieces_log for piece in ps],
+    _stored_blobs, "Tell me about item")
+if _leak_p:
+    fail("traffic phase: the current-time line reached memory", "; ".join(_leak_p))
+print(f"  ok   after the traffic phase too, nothing memory read or stored carries a "
+      f"time line ({len(_stored_blobs)} file(s))")
 
 print()
 print(f"All soak checks passed over {TURNS} turns and {_tn[0] - TURNS} traffic turns.")
