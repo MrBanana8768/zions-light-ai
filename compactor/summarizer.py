@@ -63,6 +63,8 @@ the summarizer hit a problem.
 
 import asyncio
 import bisect
+import contextlib
+import contextvars
 import hashlib
 import logging
 import os
@@ -2227,6 +2229,78 @@ async def _llm_summarize(
     return ((choices[0].get("message") or {}).get("content") or "").strip()
 
 
+# ---------------------------------------------------------------------------
+# v3.1.9 (hostile pass 4, F5). A budget on REAL vLLM summarization calls
+# (_llm_summarize invocations), independent of how many rollup PASSES the
+# caller makes (maybe_rollup, called once per pass) and independent of how
+# many tiers or map-reduce batches one pass touches internally. Before this,
+# `max_calls` on /compact counted calls to maybe_rollup itself, and ONE
+# maybe_rollup call drains every L1 and L2 tier that is due in its own
+# internal `while` loops — `{"max_calls": 1}` on a deep backlog still ran
+# however many vLLM calls the whole backlog needed, not one.
+#
+# A CONTEXTVAR, not a parameter threaded through every intermediate function
+# (_do_l1_rollup, _do_l2_rollup, _do_l3_rollup, _summarize_pieces,
+# _summarize_pieces_raw): every one of those five is monkeypatched with a
+# fixed-signature stub somewhere in this test suite (nine files, at last
+# count — test_compaction_reuse.py, test_l3_coverage.py,
+# test_p3a_reuse_endpoint.py, test_p3a_reuse_traffic.py,
+# test_p4a_reuse_order.py, test_review_fixes.py, test_soak_conversation.py,
+# test_time_memory.py, and main.admin_compact's own caller stubs
+# maybe_rollup wholesale in test_admin_compact.py [5c]). Adding a keyword
+# argument to any of their signatures breaks every stub that does not also
+# grow that keyword — which is every one of them, since none takes
+# `**kwargs`. A contextvar needs no call-site change anywhere in that chain:
+# it is read only at the one real HTTP-call site (`_call`, inside
+# `_summarize_pieces_raw`), and a stub that replaces anything ABOVE that
+# point in the chain never reaches the read at all — exactly correct,
+# because a stub that does not make real vLLM calls has nothing to bound.
+#
+# maybe_rollup's own `vllm_call_budget` PARAMETER (see its docstring) sets
+# this for the duration of its call, for a caller that CAN pass a keyword.
+# `vllm_call_budget_ctx` is the lower-level context-manager form for a
+# caller that must keep calling maybe_rollup with today's exact signature
+# (main.admin_compact, for the stub-compatibility reason above) — both set
+# the same underlying mechanism, and either can be read back afterward for
+# how many calls were actually spent and whether the budget ran out.
+_vllm_call_budget: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar(
+    "summarizer_vllm_call_budget", default=None
+)
+
+
+@contextlib.contextmanager
+def vllm_call_budget_ctx(max_calls: int):
+    """Bound the number of REAL vLLM summarization calls made by anything
+    that runs inside this block — a maybe_rollup call, or a direct call
+    into _do_l1_rollup/_do_l2_rollup/_do_l3_rollup — to at most `max_calls`.
+
+    Yields the mutable dict `{"remaining": int, "exhausted": bool}`; read it
+    after the block to see how many calls are left (0 if the budget bound)
+    and whether anything was still due when it ran out. `remaining` is
+    decremented once per REAL call to `_llm_summarize`, wherever in the
+    L1/L2/L3 drain (including a map-reduce split within any one tier) it
+    happens — never once per rollup pass or per tier, both of which can
+    spend zero-or-more real calls.
+
+    A state mutation for a chunk/chapter/refresh is only ever written AFTER
+    its summarize call returns non-empty text (see _do_l1_rollup,
+    _do_l2_rollup, _do_l3_rollup) — that ordering already exists for
+    unrelated reasons (an LLM failure must not record a chunk it did not
+    produce) and is exactly what this budget needs too: the call this
+    exhausts on returns "" without an HTTP call, its tier reads that as "no
+    progress" and stops, and nothing records covering turns it did not
+    summarize. A resumed call (the next /compact request, or the next
+    chat-path tail) re-reads state from disk and continues from the real
+    watermark, same as any other partial-progress rollup already does.
+    """
+    budget = {"remaining": max_calls, "exhausted": False}
+    token = _vllm_call_budget.set(budget)
+    try:
+        yield budget
+    finally:
+        _vllm_call_budget.reset(token)
+
+
 async def _summarize_pieces(
     conv_id: str,
     client: httpx.AsyncClient,
@@ -2290,6 +2364,18 @@ async def _summarize_pieces_raw(
     )
 
     async def _call(prompt: str, batch: list[str]) -> str:
+        # F5: the ONE real HTTP-call site every tier's every batch goes
+        # through — see the block comment above _vllm_call_budget for why
+        # the check lives here and nowhere else in the chain. No `await`
+        # between the check and the decrement, so concurrent map-phase
+        # callers (asyncio.gather below) cannot race past each other onto
+        # the same unit of budget — asyncio only yields at an `await`.
+        _vllm_budget = _vllm_call_budget.get()
+        if _vllm_budget is not None:
+            if _vllm_budget["remaining"] <= 0:
+                _vllm_budget["exhausted"] = True
+                return ""
+            _vllm_budget["remaining"] -= 1
         return await _llm_summarize(
             client, vllm_url, model, prompt, "\n\n".join(batch), max_tokens
         )
@@ -2811,6 +2897,7 @@ async def maybe_rollup(
     reply_as_streamed: str | None = None,
     skip_if_position_past: int | None = None,
     skipped_at: list | None = None,
+    vllm_call_budget: dict | None = None,
 ) -> dict:
     """Public entry point. Loads state, runs whichever tier(s) need work,
     saves atomically. Held under conv_lock so concurrent rollups can't tear
@@ -2841,6 +2928,56 @@ async def maybe_rollup(
     (the backfill): the comparison has to be made here, under conv_lock after
     the load, because one made before taking the lock let a live tail queued
     on it run in between (hostile pass #3, reviewer E F3).
+
+    `vllm_call_budget`: optional mutable {"remaining": int, "exhausted":
+    bool} (v3.1.9, hostile pass 4, F5). Bounds REAL vLLM summarization
+    calls made during THIS call, across L1/L2/L3 and any internal
+    map-reduce split — not rollup passes (a caller making several
+    maybe_rollup calls decides its own pass count) and not tiers (one tier
+    can spend zero calls, if nothing is due, or several, if its input maps
+    to more than one batch). "remaining" is decremented once per real
+    call; "exhausted" is set True if the budget ran out before every tier
+    that needed a rollup got one. None (the default) is unlimited: today's
+    behaviour, byte-for-byte — a caller that does not pass this sees no
+    change at all. See `vllm_call_budget_ctx` (above _summarize_pieces)
+    for the equivalent context-manager form, for a caller that cannot add
+    a keyword to ITS OWN call to this function (main.admin_compact uses
+    that form, because something upstream of it stubs this function
+    wholesale in a test with a fixed 4-positional-argument signature).
+    """
+    _budget_token = None
+    if vllm_call_budget is not None:
+        _budget_token = _vllm_call_budget.set(vllm_call_budget)
+    try:
+        return await _maybe_rollup_body(
+            conv_id, messages, vllm_url, model,
+            raw_messages=raw_messages,
+            reply_as_streamed=reply_as_streamed,
+            skip_if_position_past=skip_if_position_past,
+            skipped_at=skipped_at,
+        )
+    finally:
+        if _budget_token is not None:
+            _vllm_call_budget.reset(_budget_token)
+
+
+async def _maybe_rollup_body(
+    conv_id: str,
+    messages: list[dict],
+    vllm_url: str,
+    model: str,
+    *,
+    raw_messages: list[dict] | None = None,
+    reply_as_streamed: str | None = None,
+    skip_if_position_past: int | None = None,
+    skipped_at: list | None = None,
+) -> dict:
+    """The actual rollup logic, unchanged by F5's split — maybe_rollup
+    (above) is now a thin wrapper that sets/resets the vLLM call budget's
+    contextvar around this call and otherwise passes every argument
+    through untouched. Split out rather than wrapping the body inline so
+    the diff for F5 is "one function extracted, one small wrapper added",
+    not a full reindent of ~170 lines under a new try/finally.
     """
     async with conv_lock(conv_id):
         # OFF THE EVENT LOOP (v3.1.9.2). Benchmarked on the v3.1.9 harness:

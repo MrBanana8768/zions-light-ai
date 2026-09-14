@@ -159,21 +159,45 @@ def test_legacy_records_without_pin_field_load_as_unpinned():
 
 
 def test_pin_round_trips_through_archive_and_restore():
-    print("\n[test] pin survives archive_stale_facts -> restore_from_archive")
+    print("\n[test] pin survives eviction into the archive sidecar -> "
+          "restore_from_archive")
+    # v3.1.9 (hostile pass 4, F8d). archive_stale_facts (the TIME-based
+    # sweep) now exempts pinned facts outright -- a pin means "do not
+    # remove this by age/pressure alone", the rule _lru_split's own sort
+    # already states for the BUDGET-based evictor (prune_facts): pins sort
+    # LAST, i.e. they are evicted only once every non-pinned fact is
+    # already gone and the budget is STILL too tight. This test used to
+    # get its pinned fixture into the archive via archive_stale_facts,
+    # which is exactly the route F8d closes -- rewritten to use the real
+    # route a pin can still legitimately end up in the archive by: budget
+    # eviction so tight that not even the LRU-favoured pinned fact fits
+    # (the field note directly above _lru_split's own sort documents this
+    # exact shape from production: "a pinned fact with a stale last_used,
+    # against 200 fresh facts, was archived").
     _wipe_storage()
     cid = "pin-archive"
     now = int(time.time())
     stale = now - 1_000_000
-    facts.save_facts(cid, [
-        _f("pinned but stale", 0, stale, pin=True),
-        _f("unpinned and stale", 1, stale, pin=False),
-    ])
-    kept, archived = facts.archive_stale_facts(cid, older_than_days=1)
-    assert_eq(kept, 0, "both facts were stale enough to archive")
-    assert_eq(archived, 2, "both moved to the sidecar")
+    pinned = _f("pinned but stale", 0, stale, pin=True)
+    unpinned = _f("unpinned and stale", 1, stale, pin=False)
+    # body_budget = max_tokens - _FACTS_BLOCK_HEADER_TOKENS = 0: no fact's
+    # rendered bullet (always > 0 tokens) can fit, pinned or not. Equal
+    # to, not less than, the header floor -- so this is NOT the degenerate
+    # "budget too small even for the header" branch (that returns early
+    # sorted by added_turn only, bypassing the pin-aware sort/walk this
+    # test means to exercise); it is the ordinary path finding it can
+    # afford zero facts.
+    kept, dropped = facts.prune_facts(
+        [pinned, unpinned], max_tokens=facts._FACTS_BLOCK_HEADER_TOKENS,
+        conv_id=cid,
+    )
+    assert_eq(kept, [], "a budget of exactly the header floor fits no fact")
+    assert_eq(dropped, 2, "both facts evicted, pinned included")
 
     sidecar = facts.load_archive(cid)
     by_text = {f["text"]: f for f in sidecar}
+    assert_true("pinned but stale" in by_text,
+                "the pinned fact reached the sidecar via real budget eviction")
     assert_eq(by_text["pinned but stale"]["pin"], True, "pin preserved in the archive sidecar")
     assert_eq(by_text["unpinned and stale"]["pin"], False, "non-pin preserved too")
 
@@ -182,6 +206,48 @@ def test_pin_round_trips_through_archive_and_restore():
     active = {f["text"]: f for f in facts.load_facts(cid)}
     assert_eq(active["pinned but stale"]["pin"], True,
               "the restored fact is STILL pinned after the round trip")
+
+
+def test_archive_stale_facts_exempts_pinned_facts_at_older_than_days_0():
+    print("\n[test] archive_stale_facts(older_than_days=0) keeps a pinned "
+          "fact active; an unpinned one just as stale is still archived "
+          "(F8d, hostile pass 4)")
+    _wipe_storage()
+    cid = "pin-sweep-exempt"
+    now = int(time.time())
+    stale = now - 1_000_000
+    facts.save_facts(cid, [
+        _f("pinned and stale", 0, stale, pin=True),
+        _f("unpinned and stale", 1, stale, pin=False),
+    ])
+    kept, archived = facts.archive_stale_facts(cid, older_than_days=0)
+    assert_eq(kept, 1, "the pinned fact stays active — the sweep never touches it")
+    assert_eq(archived, 1, "CONTROL: the equally-stale UNPINNED fact is still archived")
+
+    active = {f["text"]: f for f in facts.load_facts(cid)}
+    assert_true("pinned and stale" in active,
+                "the pinned fact is still in the active set")
+    assert_true("unpinned and stale" not in active,
+                "the unpinned fact left the active set")
+
+    sidecar = {f["text"]: f for f in facts.load_archive(cid)}
+    assert_true("pinned and stale" not in sidecar,
+                "the pinned fact never reached the sidecar")
+    assert_true("unpinned and stale" in sidecar,
+                "CONTROL: the unpinned fact did")
+
+    # And it holds at the (unusually generous) 90-day default too, not just
+    # at the literal older_than_days=0 the finding's own proof used.
+    _wipe_storage()
+    cid2 = "pin-sweep-exempt-default"
+    ancient = now - (200 * 86400)
+    facts.save_facts(cid2, [
+        _f("pinned and ancient", 0, ancient, pin=True),
+        _f("unpinned and ancient", 1, ancient, pin=False),
+    ])
+    kept2, archived2 = facts.archive_stale_facts(cid2)  # default 90 days
+    assert_eq(kept2, 1, "CONTROL: the pinned fact is exempt at the default cutoff too")
+    assert_eq(archived2, 1, "the unpinned fact is still archived at the default cutoff")
 
 
 def test_set_pinned_sets_and_clears_by_substring():
@@ -649,6 +715,7 @@ if __name__ == "__main__":
         test_pin_round_trips_through_save_and_load()
         test_legacy_records_without_pin_field_load_as_unpinned()
         test_pin_round_trips_through_archive_and_restore()
+        test_archive_stale_facts_exempts_pinned_facts_at_older_than_days_0()
         test_set_pinned_sets_and_clears_by_substring()
 
         test_no_query_no_pins_matches_the_pre_f1_lru_split_exactly()

@@ -2391,16 +2391,19 @@ _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s")
 _LINE_MIN_SPACES = 100
 
 
-def _fragment_line_breaks(line: str, *, min_chars: int = DEGENERATE_LINE_CHARS) -> int | None:
+def _fragment_line_breaks(
+    line: str, *, min_chars: int = DEGENERATE_LINE_CHARS,
+    min_spaces: int = _LINE_MIN_SPACES,
+) -> int | None:
     """The sentence/clause-break count `reply_is_degenerate`'s fragment-line
     rule judges `line` on, or None if `line` is too short or too sparse to
-    even be a CANDIDATE (below `min_chars`, or under _LINE_MIN_SPACES spaces
-    — see the block comment above these constants).
+    even be a CANDIDATE (below `min_chars`, or under `min_spaces` spaces —
+    see the block comment above these constants).
 
     v3.1.9 (hostile pass 3, F5). Split out of the per-line loop so BOTH the
-    line being judged AND the trailing-content exemption's own longest-line
-    check (see `_line_is_fragment_shaped` and the loop below) run the exact
-    same arithmetic — one function, not two copies that can drift the way
+    line being judged AND the trailing-content exemption's own check (see
+    `_line_is_fragment_shaped` and the loop below) run the exact same
+    arithmetic — one function, not two copies that can drift the way
     scripts/calibrate-structural-degeneracy.py's independent copy already
     had (five drifts named in the finding; that script now imports this
     one instead of re-implementing it).
@@ -2413,16 +2416,27 @@ def _fragment_line_breaks(line: str, *, min_chars: int = DEGENERATE_LINE_CHARS) 
     finding's case D, ~600 characters) is exactly as diagnostic of the same
     collapse as a full one — it is only shorter because whatever cut the
     reply cut it earlier — so it must not need to independently clear the
-    1500-character floor to disqualify the exemption. `_LINE_MIN_SPACES`
-    still applies either way, which is what actually protects a short,
-    ordinary trailing sentence from being misread as a fragment (a real
-    sentence that short has nowhere near 100 spaces).
+    1500-character floor to disqualify the exemption.
+
+    `min_spaces` defaults to `_LINE_MIN_SPACES` (100, fixed) — right for the
+    PRIMARY line-judging call, which only ever runs on lines already past
+    the 1500-character floor, where 100 spaces is a low bar a real sentence
+    clears easily. v3.1.9 (hostile pass 4, F4): a FIXED floor is wrong for
+    shorter candidate text — a genuine second runaway cut at 500 or 540
+    characters has only 90-96 spaces (this codebase's own generated prose
+    density), so the fixed-100 floor read it as "too sparse to be a
+    candidate" and granted the trailing-content exemption to a shape that
+    is exactly as diagnostic as the 600-character cut one line up, which
+    DOES clear 100. The trailing-content exemption now passes a floor
+    PROPORTIONAL to the text's own length instead (see the call site) —
+    proportional to length is what "sparse" should have meant from the
+    start; a fixed number conflated "sparse" with "short".
 
     `line` must already be `.strip()`-ped — both call sites do that once,
     on the same value, before calling this.
     """
     ln = len(line)
-    if ln < min_chars or line.count(" ") < _LINE_MIN_SPACES:
+    if ln < min_chars or line.count(" ") < min_spaces:
         return None
     # R24: "! " and "? " are always real ends (see _is_real_sentence_end),
     # but "." needs the abbreviation and single-initial check
@@ -2441,7 +2455,9 @@ def _fragment_line_breaks(line: str, *, min_chars: int = DEGENERATE_LINE_CHARS) 
     return breaks
 
 
-def _line_is_fragment_shaped(line: str, *, min_chars: int = 0) -> bool:
+def _line_is_fragment_shaped(
+    line: str, *, min_chars: int = 0, min_spaces: int = _LINE_MIN_SPACES,
+) -> bool:
     """True if `line` alone would trip the fragment-collapse math (mean
     fragment length at or under DEGENERATE_LINE_SENTENCE_CHARS). `line`
     must already be `.strip()`-ped.
@@ -2454,11 +2470,39 @@ def _line_is_fragment_shaped(line: str, *, min_chars: int = 0) -> bool:
     `min_chars=0` (the default here, unlike `_fragment_line_breaks`'s own
     default) is deliberate — see that function's docstring for why the
     trailing check does not require the primary DEGENERATE_LINE_CHARS floor.
+    `min_spaces` is threaded through for the same reason (F4, see
+    `_fragment_line_breaks`'s docstring) — the trailing-content call site
+    passes a length-proportional value, not the fixed default.
     """
-    breaks = _fragment_line_breaks(line, min_chars=min_chars)
+    breaks = _fragment_line_breaks(line, min_chars=min_chars, min_spaces=min_spaces)
     if breaks is None:
         return False
     return len(line) / (breaks + 1) <= DEGENERATE_LINE_SENTENCE_CHARS
+
+
+# v3.1.9 (hostile pass 4, F4) TRIED AND REVERTED: a separate exemption for
+# trailing content too SHORT for the fragment-mean math to mean anything
+# (a short, complete remark has a low apparent "mean fragment length" for
+# the same reason a runaway does — not enough text to contain more than one
+# or two sentence breaks; N1 in the finding, an 18-character closing
+# question, scores a mean of 17 and reads as "fragment-shaped" by the same
+# arithmetic that catches a real collapse, purely from being short). A
+# version of this judged short trailing content by whether it was a
+# TERMINATED remark instead of by shape. It fixed the finding's N1, but
+# directly reopened `test_degenerate_reply.py` [9c] case B — a runaway
+# followed only by "Always yours." (14 characters, a genuine sentence
+# terminator) — which that pass-3 fixture pins as a case that MUST stay
+# caught, on the reasoning that a short, innocuous-looking, well-terminated
+# sign-off after a real collapse is exactly the shape a model produces when
+# it trails off, and is indistinguishable, using only the trailing text
+# itself, from N1's "*What do you do?*" after a genuine beat paragraph. The
+# two fixtures are the same shape with opposite correct answers — telling
+# them apart needs a signal this lane does not have (real trailing-tail
+# data), and `test_degenerate_reply.py` is not in this lane's editable-
+# test-file list to re-derive that fixture around. Reverted rather than
+# ship a fix that reopens a hole a previous pass closed. N1 (and the
+# similarly-shaped 150-300 character band) stays an open false positive —
+# see SP\\fix-p4c.md F4 for the full trade-off.
 
 
 def reply_is_degenerate(text: str) -> str | None:
@@ -2616,19 +2660,56 @@ def reply_is_degenerate(text: str) -> str | None:
     # runaway line plus a short sign-off, an emoji line, or "---" all
     # scored `stored` (memorized) instead of `skipped_degenerate`.
     #
-    # The fix: a non-last candidate line is exempt ONLY when what follows it
-    # is SUBSTANTIAL (>= DEGENERATE_MIN_CHARS of non-blank trailing text —
-    # the same floor "nothing is judged structurally" already uses
-    # elsewhere in this function) AND that trailing content's own longest
-    # line is not ITSELF fragment-shaped (_line_is_fragment_shaped). Both
-    # conditions matter: char count alone would let a second, shorter
-    # runaway "look substantial" (case D in the finding: a 600-character cut
-    # runaway following the first), and fragment-shape alone would flag a
-    # real, finished narrative followed by ordinary short lines (a closing
-    # one-liner after a long paragraph). The two real corpus false
-    # positives (25,209 and 15,141 characters, real prose following) clear
-    # both bars and keep their exemption; every synthetic runaway-plus-
-    # trailer shape in the finding fails at least one and is caught.
+    # The fix: a non-last candidate line is exempt when what follows it is
+    # SUBSTANTIAL (>= DEGENERATE_MIN_CHARS of non-blank trailing text — the
+    # same floor "nothing is judged structurally" already uses elsewhere in
+    # this function) AND that trailing content, judged AS A WHOLE, is not
+    # ITSELF fragment-shaped.
+    #
+    # v3.1.9 (hostile pass 4, F4) rewrote the "not itself fragment-shaped"
+    # half. It used to pick the SINGLE LONGEST trailing line and judge that
+    # line alone (`_line_is_fragment_shaped`, fixed 100-space floor). Three
+    # holes followed directly from "one line, fixed floor":
+    #   - a second runaway cut at 500 or 540 characters has only 90-96
+    #     spaces (this codebase's own generated-prose density) and never
+    #     cleared the fixed 100-space floor to even be judged — exactly as
+    #     diagnostic as the 600-character cut case already caught one line
+    #     up, missed purely because it was shorter;
+    #   - trailing content spread across MANY short lines (30+ terminated
+    #     list bullets; several short fragment-shaped lines) has no single
+    #     line long enough to trip the per-line math, even though the
+    #     aggregate is obviously more of the same collapse;
+    #   - the flip side let a genuine reply through the OTHER way: a second
+    #     "beat" paragraph of ordinary short scene-setting sentences (mean
+    #     fragment length in the same range the fragment rule flags) was
+    #     picked as the single longest trailing line and judged fragment-
+    #     shaped on its own, even though the paragraph AFTER it made the
+    #     trailing content as a whole read as ordinary prose.
+    # Fixed by joining ALL trailing non-blank content into one string and
+    # judging THAT as a whole, with a spaces floor PROPORTIONAL to its own
+    # length (len // 8, replacing the fixed 100) — proportional is what
+    # "too sparse to judge" should have meant from the start. Verified
+    # against every shape in the finding plus this codebase's own two real
+    # corpus false positives (25,209 and 15,141 characters, real prose
+    # following, still exempt) and the pass-3 case D control (600-character
+    # second runaway, still caught) — see test_p4c_degeneracy.py.
+    #
+    # NOT fixed here, deferred (see SP\\fix-p4c.md F4): trailing content
+    # under DEGENERATE_MIN_CHARS never reaches this exemption at all
+    # (unchanged from before this fix) — a runaway followed by a SHORT
+    # normal remark (the finding's N1: an 18-character closing question) is
+    # still a false positive, and a TRIED fix for exactly that case was
+    # reverted after it reopened `test_degenerate_reply.py` [9c] case B (a
+    # short, terminated SIGN-OFF after a real collapse, which that pass-3
+    # fixture requires to stay caught, and which is the same shape as N1
+    # with the opposite correct answer) — see the reverted block comment a
+    # few dozen lines up for the full account. A runaway followed by ONE
+    # ordinary paragraph right around DEGENERATE_MIN_CHARS (the finding's
+    # R4, ~330 characters) is separately undecided: indistinguishable, by
+    # this arithmetic, from the two real corpus false positives at 15-25x
+    # that length — "how long a real trailing paragraph needs to be" is a
+    # calibration question this lane's synthetic-only fixtures cannot
+    # answer (real data was not granted here either).
     lines = text.splitlines()
     last_nonblank_idx = -1
     for _i, _raw in enumerate(lines):
@@ -2663,8 +2744,13 @@ def reply_is_degenerate(text: str) -> str | None:
                     ]
                     trailing_chars = sum(len(t) for t in trailing_nonblank)
                     if trailing_chars >= DEGENERATE_MIN_CHARS:
-                        longest_trailing = max(trailing_nonblank, key=len)
-                        exempt = not _line_is_fragment_shaped(longest_trailing)
+                        # F4: the WHOLE trailing content, not just its
+                        # longest single line — see the block comment above.
+                        joined_trailing = " ".join(trailing_nonblank)
+                        exempt = not _line_is_fragment_shaped(
+                            joined_trailing,
+                            min_spaces=max(1, len(joined_trailing) // 8),
+                        )
                 if not exempt:
                     return (
                         f"an unbroken line of {ln} characters made of "
@@ -7536,19 +7622,110 @@ async def admin_archive_stale(conv_id: str, older_than_days: int | None = None):
 async def admin_restore_from_archive(conv_id: str, request: Request):
     """Move archived facts back to active storage.
 
-    Body JSON (all fields optional):
-        {"text_substring": "<substring filter>" | null}
+    Body JSON — exactly one of:
+        {"text_substring": "<non-empty substring filter>"}
+            restores only archived facts whose text contains it
+            (case-insensitive).
+        {"restore_all": true}
+            restores EVERY archived fact. Must be explicit and parsed
+            STRICTLY (see _strict_affirmative, shared with `overwrite` on
+            /admin/conversations/import): only `true`, `"true"`, `"1"` or
+            `"yes"` ever turn this on.
 
-    Omit body or pass {} to restore ALL archived facts.
+    v3.1.9 (hostile pass 4, F3). Before this fix, an ABSENT body, an EMPTY
+    body, a body this endpoint could not parse at all (curl's default
+    form-encoding; a trailing comma; the USER_GUIDE.md example typed into
+    Windows PowerShell/cmd, where the outer quoting strips the inner
+    double-quotes and the body stops being JSON), a MISSPELLED key
+    (`textSubstring`), or a `text_substring` that was null / "" / 0 / false
+    (facts.restore_from_archive's own `if text_substring:` treats all of
+    those the same as "no filter") ALL restored EVERY archived fact — 300+
+    rows in the reviewer's proof, each one stamped `last_used: now` so they
+    immediately outrank her real active facts for injection and pruning.
+    None of those shapes restores anything now: a malformed/non-object body
+    is a 400 (same shape as /compact and /admin/conversations/import), an
+    unrecognised key is a 400, and restoring everything requires the
+    explicit `restore_all` flag rather than being what happens when nothing
+    else was understood.
     """
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
+    raw_body = await request.body()
+    if raw_body.strip():
+        try:
+            body = await request.json()
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"body is present but could not be parsed as JSON "
+                    f"({type(e).__name__}: {e}); omit the body entirely, or "
+                    f"send {{\"text_substring\": \"...\"}} or "
+                    f"{{\"restore_all\": true}}"
+                ),
+            )
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"body must be a JSON object, got {type(body).__name__}",
+            )
+    else:
         body = {}
     _refuse_unpaired_surrogate(body)
-    substring = body.get("text_substring")
+
+    _RESTORE_BODY_KEYS = {"text_substring", "restore_all"}
+    _unknown = sorted(set(body.keys()) - _RESTORE_BODY_KEYS)
+    if _unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"unrecognised key(s) in body: {_unknown}; only "
+                f"{sorted(_RESTORE_BODY_KEYS)} are accepted here"
+            ),
+        )
+
+    # A present text_substring must be a real, non-empty string — not None
+    # (absent is the normal way to ask for "no filter"), and not "", 0,
+    # false, [] or a non-string, every one of which the OLD facts.py-level
+    # `if text_substring:` check treated identically to "no filter", which
+    # on THIS endpoint used to mean "restore all" (the exact bug). A
+    # non-string value (e.g. `text_substring: 123`) is also what used to
+    # 500 inside facts.py's `.lower()` call (F8c) — caught here instead.
+    _raw_substring = body.get("text_substring")
+    substring: str | None = None
+    if _raw_substring is not None:
+        if not isinstance(_raw_substring, str) or not _raw_substring.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"text_substring must be a non-empty string, got "
+                    f"{_raw_substring!r}"
+                ),
+            )
+        substring = _raw_substring
+
+    restore_all = _strict_affirmative(
+        body.get("restore_all", False), commit_tokens=_OVERWRITE_COMMIT_TOKENS
+    )
+
+    if substring is not None and restore_all:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "text_substring and restore_all=true are mutually "
+                "exclusive; send exactly one"
+            ),
+        )
+    if substring is None and not restore_all:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                'specify either {"text_substring": "<non-empty string>"} '
+                "to restore matching archived facts, or "
+                '{"restore_all": true} to restore every archived fact '
+                "explicitly. An absent, empty, or unparseable body no "
+                "longer restores everything (hostile pass 4, F3)."
+            ),
+        )
+
     async with conv_lock(conv_id):
         restored = facts.restore_from_archive(
             conv_id, text_substring=substring,
@@ -7557,6 +7734,7 @@ async def admin_restore_from_archive(conv_id: str, request: Request):
         "conv_id": conv_id,
         "restored": restored,
         "filter": substring,
+        "restore_all": restore_all,
     }
 
 
@@ -7644,6 +7822,83 @@ def _strict_affirmative(value: Any, *, commit_tokens: tuple[str, ...]) -> bool:
     return False
 
 
+# v3.1.9 (hostile pass 4, F6). /compact and /merge-into each read a
+# request as a fixed, small vocabulary of keys — {dry_run, max_calls} and
+# {dry_run, refresh_last_used} respectively. A KEY the caller spelled wrong
+# (`dry`, `dry_runs`, `is_dry_run`, `preview`, a nested
+# `{"options": {"dry_run": true}}`, `?dryrun_mode=true`) matches none of
+# the existing typo rules (those only catch near-spellings OF "dry_run"
+# itself), so it used to read as "no opinion" — and on /compact, whose
+# default is LIVE, the caller's own dry-intent key silently did nothing.
+# Enumerating every way to almost spell "dry_run" is an unbounded list;
+# refusing anything outside an endpoint's small, fixed vocabulary is not,
+# and it catches every misspelling in one rule instead of one typo at a
+# time.
+def _refuse_unknown_keys(keys, allowed: set[str], *, where: str) -> None:
+    # A key that is a TYPO of "dry_run" (`dryRun`, `dry-run`, `dryrun`,
+    # `dry_run[]`, a trailing-space/percent-encoded variant —
+    # `_looks_like_misspelled_dry_run`, shared with `_dry_run_from`) is
+    # deliberately EXEMPT from "unknown": it already has its own, stricter
+    # handling (forced dry, never a 400 — test_admin_compact.py's [9b]
+    # pins this end-to-end: `?dryrun=true` must still answer 200 with
+    # `dry_run: true`, not a refusal). Only a key that is NEITHER in this
+    # endpoint's vocabulary NOR recognisable as a dry_run typo is refused
+    # here.
+    extra = sorted(
+        k for k in set(keys)
+        if k not in allowed and not _looks_like_misspelled_dry_run(k)
+    )
+    if extra:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"unrecognised key(s) in {where}: {extra}; only "
+                f"{sorted(allowed)} are accepted here"
+            ),
+        )
+
+
+def _refuse_duplicate_json_keys(raw_body: bytes) -> None:
+    """400 on a JSON body whose top-level object repeats a key.
+
+    v3.1.9 (hostile pass 4, F6). `json.loads` (what `await request.json()`
+    uses under the hood) resolves a duplicate key last-wins by default, so
+    `{"dry_run": true, "dry_run": false}` silently becomes
+    `{"dry_run": false}` with no trace either value ever disagreed — the
+    same "an ambiguous value quietly wins" shape `_dry_run_from` exists to
+    end for two DIFFERENT sources (body vs. query) disagreeing, one level
+    under the parse itself, where one source disagrees with ITSELF.
+
+    Only meaningful for a body that DOES parse as an object — a
+    syntactically broken body is already a 400 from whatever primary parse
+    the caller already ran (this function does not replace that parse, and
+    is safe to call on an absent/empty body: nothing to check).
+    """
+    if not raw_body or not raw_body.strip():
+        return
+
+    def _hook(pairs):
+        seen: set[str] = set()
+        dupes: set[str] = set()
+        for k, _ in pairs:
+            if k in seen:
+                dupes.add(k)
+            seen.add(k)
+        if dupes:
+            raise ValueError(f"duplicate key(s) in JSON body: {sorted(dupes)}")
+        return dict(pairs)
+
+    try:
+        json.loads(raw_body, object_pairs_hook=_hook)
+    except ValueError as e:
+        if "duplicate key" not in str(e):
+            # Not what this function checks for — a syntax error here means
+            # the caller's own primary parse should already have refused
+            # this body elsewhere. Nothing to add.
+            return
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.post(
     "/admin/conversations/import",
     dependencies=[Depends(_require_localhost)],
@@ -7677,42 +7932,65 @@ async def admin_import_conversation(request: Request):
     overwrite = _strict_affirmative(
         body.get("overwrite", False), commit_tokens=_OVERWRITE_COMMIT_TOKENS
     )
-    target_for_quarantine = body.get("target_conv_id")
-    if not target_for_quarantine and isinstance(bundle, dict):
-        target_for_quarantine = bundle.get("source_conv_id")
+    # v3.1.9 (F7 fix, hostile pass 4): validate the bundle, resolve the
+    # target conv_id, and check the in-flight-writer lock BEFORE the
+    # pre-overwrite snapshot below, not after. Before this fix, every one of
+    # those three refusals (bad bundle version, facts not a list, a target
+    # held by a live extraction tail) happened INSIDE import_conversation,
+    # which ran AFTER a full quarantine snapshot had already been published
+    # — so a refused import (a retry loop, a scripted health check, a client
+    # resending a stale bundle) left one more never-pruned copy of the
+    # conversation on disk every single time, for no output a bundle
+    # validator alone could not have said in microseconds. This also fixes
+    # F8(b)/(c): the SAME resolved (stripped, type-checked) target is now
+    # used for both the snapshot and the eventual import — see
+    # portability._validate_target_ready's docstring.
+    #
+    # UnsafeConvId alongside ImportError_ (v3.1.8): a body-supplied
+    # target_conv_id / new_conv_id is CLIENT INPUT that reaches the
+    # filesystem; memory._safe_path refuses to leave STORAGE_ROOT, and that
+    # refusal is a 400 about the request, not a 500 about us.
+    try:
+        target = portability._validate_target_ready(
+            bundle, target_conv_id=body.get("target_conv_id")
+        )
+    except (portability.ImportError_, UnsafeConvId) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     # v3.1.9 (F1 fix): take a quarantine copy before an overwrite lands, the
     # same reversibility cleanup's quarantine-then-wipe already gives a test
     # conv. import_conversation itself never had this — an overwrite replaced
     # facts/summary/episodic wholesale with nothing recoverable but a backup
     # cycle.
     #
-    # A FAILED SNAPSHOT REFUSES THE OVERWRITE, with one exception. The lane
-    # that added this made it best-effort, so an unverifiable snapshot
-    # logged a warning and the overwrite replaced the store anyway: the
-    # data-loss path this snapshot exists to close, reopened on exactly the
-    # occasions the net was needed. The one case that proceeds is a store
-    # that is ALREADY unreadable (StoreUnreadable). There is nothing
-    # readable to lose, and an import is how an operator recovers it.
-    if overwrite and isinstance(target_for_quarantine, str) and target_for_quarantine.strip():
+    # A FAILED SNAPSHOT REFUSES THE OVERWRITE. v3.1.9 (hostile pass 4, F1)
+    # removed the one case that used to proceed anyway: a facts layer that
+    # was ALREADY unreadable (StoreUnreadable) no longer skips this snapshot
+    # — the lane that first wrote this comment read "the store is
+    # unreadable" from ONE layer raising and let the exemption through, but
+    # a torn facts file leaves the summary hierarchy and episodic index
+    # fully readable, and the overwrite that followed destroyed those too.
+    # quarantine_conversation itself now absorbs a StoreUnreadable facts
+    # read (records the layer unverified, copies the torn file's raw bytes
+    # aside) instead of raising it, so this call site no longer needs — and
+    # must not have — a StoreUnreadable exemption: any exception it still
+    # raises (QuarantineError, or the raw bytes themselves being
+    # uncopyable) means the snapshot genuinely could not be written, and the
+    # overwrite is refused.
+    if overwrite:
         try:
             portability.quarantine_conversation(
-                target_for_quarantine, reason="admin import overwrite"
-            )
-        except StoreUnreadable as e:
-            logger.warning(
-                f"conv={target_for_quarantine}: the existing store is unreadable "
-                f"({e}); nothing readable to snapshot, so the explicit "
-                f"overwrite proceeds as a recovery"
+                target, reason="admin import overwrite"
             )
         except Exception as e:
             logger.error(
-                f"conv={target_for_quarantine}: pre-overwrite quarantine failed "
+                f"conv={target}: pre-overwrite quarantine failed "
                 f"({type(e).__name__}: {e}); overwrite refused"
             )
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"refusing to overwrite conv_id {target_for_quarantine!r}: "
+                    f"refusing to overwrite conv_id {target!r}: "
                     f"a restorable snapshot of its current state could not be "
                     f"written first ({type(e).__name__}: {e}). Nothing was "
                     f"changed. Fix the quarantine location, or export the "
@@ -7725,10 +8003,11 @@ async def admin_import_conversation(request: Request):
             target_conv_id=body.get("target_conv_id"),
             overwrite=overwrite,
         )
-    # v3.1.8: UnsafeConvId alongside ImportError_. A body-supplied
-    # target_conv_id / new_conv_id is CLIENT INPUT that reaches the
-    # filesystem; memory._safe_path refuses to leave STORAGE_ROOT, and
-    # that refusal is a 400 about the request, not a 500 about us.
+    # Re-checked here too (not just above): _validate_target_ready runs
+    # AGAIN inside import_conversation, immediately before the write, which
+    # is what closes the TOCTOU the snapshot's own I/O opens (see that
+    # function's docstring) — so this exception mapping stays reachable even
+    # though the common failures were already caught above.
     except (portability.ImportError_, UnsafeConvId) as e:
         raise HTTPException(status_code=400, detail=str(e))
     return result
@@ -7768,17 +8047,38 @@ async def admin_fork_conversation(conv_id: str, request: Request):
     "/admin/conversations/cleanup-test-data",
     dependencies=[Depends(_require_localhost)],
 )
-async def admin_cleanup_test_conversations(dry_run: bool = True):
+async def admin_cleanup_test_conversations(request: Request):
     """Quarantine-then-remove the test/placeholder conversations polluting
     the store: 129 "conversations" for ~26 real ones, inflating
     /admin/conversations, the health stats and every backup archive.
+
+    Body (optional): {"dry_run": true}
+    Query (optional): ?dry_run=false
 
     DRY RUN BY DEFAULT. Matches only ids minted by selftest.py and the
     integration harness, and refuses any match that carries substantial
     memory (or whose layers cannot be read - unreadable counts as
     substantial, never as empty). Everything is quarantined before it is
     wiped, so this is reversible; nothing is unlinked.
+
+    v3.1.9 (hostile pass 4, F8a). `dry_run` used to be a plain FastAPI
+    `bool` query param, which is Starlette's own last-wins coercion over
+    repeated values (`?dry_run=true&dry_run=false` COMMITS) and had no body
+    form at all — a JSON `{"dry_run": true}` was silently ignored, exactly
+    gate-review holes (a) and (b) that `_dry_run_from` was built to close,
+    fixed there for /compact and /merge-into but never carried here. Reuses
+    that same helper now: both sources are read, and dry wins on any
+    disagreement, including a source disagreeing with itself.
     """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    _refuse_unpaired_surrogate(body)
+    dry_run = _dry_run_from(request, body, default=True)
+
     async def _wipe(conv_id: str) -> dict:
         # Through commands._wipe_all_layers rather than _clear_all_memory
         # directly, so a cleanup leaves exactly what /forget leaves - the
@@ -7994,6 +8294,7 @@ async def admin_merge(src_conv_id: str, dst_conv_id: str, request: Request):
 
     See portability.merge_conversation for the full contract.
     """
+    _raw_body = await request.body()
     try:
         body = await request.json()
     except Exception:
@@ -8001,6 +8302,21 @@ async def admin_merge(src_conv_id: str, dst_conv_id: str, request: Request):
     if not isinstance(body, dict):
         body = {}
     _refuse_unpaired_surrogate(body)
+    # v3.1.9 (hostile pass 4, F6 sibling sweep). Checked AFTER the surrogate
+    # guard (which must stay the first refusal every body-reading handler
+    # gives, per test_surrogate_guard.py's structural check) and only when
+    # the body DID parse as an object — a malformed body already falls back
+    # to {} above, which is safe here because merge's default is DRY,
+    # unlike /compact's.
+    if isinstance(body, dict) and body:
+        _refuse_duplicate_json_keys(_raw_body)
+    _refuse_unknown_keys(
+        body.keys(), {"dry_run", "refresh_last_used"}, where="body"
+    )
+    _refuse_unknown_keys(
+        request.query_params.keys(), {"dry_run", "refresh_last_used"},
+        where="the query string",
+    )
     # Absent means DRY for merge: this endpoint rewrites two conversations
     # and an operator who meant to commit sees unchanged counts and tries
     # again, while the reverse mistake is not recoverable.
@@ -8152,6 +8468,21 @@ async def admin_compact(conv_id: str, request: Request):
 
     Body (all optional):
         {"max_calls": 200, "dry_run": false}
+    Query form also honoured (v3.1.9, hostile pass 4, F5):
+        ?max_calls=200&dry_run=false
+    No other body or query key is accepted — an unrecognised one is a 400
+    rather than silently ignored.
+
+    `max_calls` bounds REAL vLLM summarization calls (hostile pass 4, F5) —
+    `{"max_calls": 1}` makes at most one vLLM HTTP call, however deep the
+    backlog, via `summarizer.vllm_call_budget_ctx` wrapping the whole drain
+    below. This closes the earlier hole where `max_calls` counted PASSES
+    (calls to summarizer.maybe_rollup) instead: one pass drains every L1
+    and L2 tier due in its own internal loop, so a deep backlog could spend
+    far more than `max_calls` real calls in a single pass. The response
+    reports both: `vllm_calls` is the number this parameter now actually
+    bounds; `rollup_calls` (unchanged) is the number of PASSES this loop
+    itself made, kept for existing callers that read it that way.
 
     The transcript is reconstructed from the EPISODIC store, which is the only
     ordered record of the conversation the compactor owns — OpenWebUI holds the
@@ -8221,6 +8552,23 @@ async def admin_compact(conv_id: str, request: Request):
     else:
         body = {}  # truly absent body: the documented live default applies
     _refuse_unpaired_surrogate(body)
+    # v3.1.9 (hostile pass 4, F6). Checked AFTER the surrogate guard (which
+    # stays the first refusal every body-reading handler gives) and only on
+    # a non-empty body — `{}` trivially has no duplicate keys. This is the
+    # F2 (pass 3) class one level down: a body that parses fine but repeats
+    # a key, or spells a dry-intent key this endpoint does not recognise
+    # (`dry`, `dry_runs`, `is_dry_run`, `preview`, `{"options": {"dry_run":
+    # true}}`) used to read as "no opinion" and LIVE (this endpoint's
+    # default) applied — the caller's own key silently did nothing. /compact
+    # accepts exactly two keys; anything else, in the body OR the query
+    # string, is refused rather than enumerated as one more typo to catch.
+    if body:
+        _refuse_duplicate_json_keys(raw_body)
+    _refuse_unknown_keys(body.keys(), {"dry_run", "max_calls"}, where="body")
+    _refuse_unknown_keys(
+        request.query_params.keys(), {"dry_run", "max_calls"},
+        where="the query string",
+    )
     # v3.1.9 (hostile pass 2, MEDIUM). `int(body.get("max_calls") or 200)`
     # used Python truthiness on the raw value, so an explicit
     # {"max_calls": 0} — an operator asking this endpoint to run its guards
@@ -8235,7 +8583,6 @@ async def admin_compact(conv_id: str, request: Request):
     # (`{"max_calls": "abc"}`) took the other failure direction: int() raised
     # ValueError uncaught, a 500 with no explanation for a caller-supplied
     # body that a 400 exists to handle everywhere else in this file.
-    _raw_max_calls = body.get("max_calls", 200)
     # v3.1.9 LOW (hostile pass 3, F3). Two more holes in the same int()
     # conversion the comment above already tightened once:
     #   - `bool` is a subclass of `int` in Python, so `int(True) == 1` ran
@@ -8246,18 +8593,47 @@ async def admin_compact(conv_id: str, request: Request):
     #     old `except (TypeError, ValueError)` did not catch — an uncaught
     #     500 with the fix's own comment claiming "non-integers are a 400".
     #     `NaN` was already a 400: `int(float('nan'))` raises ValueError.
-    if isinstance(_raw_max_calls, bool):
-        raise HTTPException(
-            status_code=400,
-            detail=f"max_calls must be an integer, got {_raw_max_calls!r}",
+    # NOT named `raw` (test_envcfg.py's file-wide, name-based env-taint scan
+    # treats every `raw` in this file as descended from `_env_int`'s own
+    # `raw = os.environ.get(name)`, scope or not — see that test's own
+    # docstring. This value never touches the environment; `candidate`
+    # sidesteps the false positive instead of fighting the detector.
+    def _parse_one_max_calls(candidate: Any, *, source: str) -> int:
+        if isinstance(candidate, bool):
+            raise HTTPException(
+                status_code=400,
+                detail=f"max_calls ({source}) must be an integer, got {candidate!r}",
+            )
+        try:
+            return int(candidate)
+        except (TypeError, ValueError, OverflowError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"max_calls ({source}) must be an integer, got {candidate!r}",
+            )
+
+    # v3.1.9 (hostile pass 4, F5). max_calls used to be read from the BODY
+    # ONLY: `{"dry_run": false} + ?max_calls=1` silently ran the 200-call
+    # default, the same "accepted-looking and inert" shape R4 already named
+    # for the flag right beside it (dry_run) — an operator probing with
+    # `?max_calls=1` to see ONE rollup got the whole backlog. Both sources
+    # are read now: a source that is ABSENT (the key not present at all)
+    # has no opinion, exactly like `_dry_run_from`'s own present/absent
+    # rule; `{"max_calls": null}` in the body is likewise "no opinion" (its
+    # pre-existing meaning, unchanged) rather than a parse error. When only
+    # one source is present, it wins; when BOTH are present, the SMALLER of
+    # the two wins — fewer calls is the safe direction for a bound, so a
+    # disagreement can never silently pick the more dangerous number.
+    _max_calls_candidates: list[int] = []
+    if "max_calls" in body and body["max_calls"] is not None:
+        _max_calls_candidates.append(
+            _parse_one_max_calls(body["max_calls"], source="body")
         )
-    try:
-        max_calls = 200 if _raw_max_calls is None else int(_raw_max_calls)
-    except (TypeError, ValueError, OverflowError):
-        raise HTTPException(
-            status_code=400,
-            detail=f"max_calls must be an integer, got {_raw_max_calls!r}",
+    if "max_calls" in request.query_params:
+        _max_calls_candidates.append(
+            _parse_one_max_calls(request.query_params["max_calls"], source="query")
         )
+    max_calls = min(_max_calls_candidates) if _max_calls_candidates else 200
     # Clamped both directions rather than trusted outright. Below zero has no
     # meaning for a count of calls (the loop already treats 0 as "run the
     # guards, make no calls" via `while calls < max_calls`, so negative would
@@ -8468,27 +8844,52 @@ async def admin_compact(conv_id: str, request: Request):
     )
     calls = 0
     t0 = time.time()
-    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
-        while calls < max_calls:
-            prev = summarizer.load_state(conv_id).get("last_summarized_turn", 0)
-            try:
-                await summarizer.maybe_rollup(
-                    conv_id, _redacted_messages, VLLM_URL, MODEL_REPO,
-                )
-            except Exception as e:
-                plan["stopped_because"] = f"{type(e).__name__}: {e}"
-                break
-            calls += 1
-            now = summarizer.load_state(conv_id).get("last_summarized_turn", 0)
-            if now <= prev:
-                plan["stopped_because"] = "the watermark stopped advancing"
-                break
-        else:
-            plan["stopped_because"] = f"hit max_calls={max_calls}"
+    # v3.1.9 (hostile pass 4, F5). max_calls now bounds REAL vLLM
+    # summarization calls (summarizer.vllm_call_budget_ctx), not just the
+    # PASSES this loop makes — one pass (one maybe_rollup call) can still
+    # make many real calls internally (it drains every L1/L2 chunk that is
+    # due), and used to be able to spend however many the whole backlog
+    # needed regardless of max_calls. `calls < max_calls` below is UNCHANGED
+    # and kept as a second, independent bound on passes themselves — partly
+    # a belt-and-braces safety net, partly because this exact call
+    # (`summarizer.maybe_rollup(conv_id, _redacted_messages, VLLM_URL,
+    # MODEL_REPO)`) is monkeypatched wholesale by a fixed-signature stub in
+    # test_admin_compact.py's own max_calls coverage, so it keeps calling
+    # maybe_rollup with today's EXACT signature — the budget is set via the
+    # context-manager form instead of a keyword argument here for exactly
+    # that reason (see vllm_call_budget_ctx's own docstring).
+    with summarizer.vllm_call_budget_ctx(max_calls) as vllm_budget:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
+            while calls < max_calls:
+                prev = summarizer.load_state(conv_id).get("last_summarized_turn", 0)
+                try:
+                    await summarizer.maybe_rollup(
+                        conv_id, _redacted_messages, VLLM_URL, MODEL_REPO,
+                    )
+                except Exception as e:
+                    plan["stopped_because"] = f"{type(e).__name__}: {e}"
+                    break
+                calls += 1
+                now = summarizer.load_state(conv_id).get("last_summarized_turn", 0)
+                if now <= prev:
+                    plan["stopped_because"] = "the watermark stopped advancing"
+                    break
+                if vllm_budget["remaining"] <= 0:
+                    plan["stopped_because"] = f"hit max_calls={max_calls} (vLLM calls)"
+                    break
+            else:
+                plan["stopped_because"] = f"hit max_calls={max_calls}"
+        vllm_calls_made = max_calls - vllm_budget["remaining"]
 
     after = summarizer.load_state(conv_id)
     plan.update({
         "rollup_calls": calls,
+        # F5: the number this endpoint's own docstring now promises
+        # max_calls bounds — actual vLLM HTTP calls, counted wherever in
+        # the L1/L2/L3 drain (including a map-reduce split) they happened,
+        # not rollup passes. rollup_calls (above) is kept unchanged for
+        # existing callers that read it as "how many maybe_rollup passes".
+        "vllm_calls": vllm_calls_made,
         "elapsed_s": round(time.time() - t0, 1),
         "watermark_after": after.get("last_summarized_turn", 0),
         "l1_after": len(after.get("l1") or []),

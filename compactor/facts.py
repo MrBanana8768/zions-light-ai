@@ -523,6 +523,17 @@ def archive_stale_facts(
     Callers should serialize via conv_lock — concurrent extraction tail
     could otherwise see torn state mid-move. Idempotent: running twice with
     the same cutoff archives the same set on first call, zero on second.
+
+    PINNED facts are exempt (v3.1.9, hostile pass 4, F8d) and are never
+    archived by this sweep regardless of how old `last_used` is —
+    `_lru_split` already exempts pins from ITS eviction on the stated
+    rationale that a pin means "do not remove this by age/pressure alone";
+    this sweep had no such exemption, so `?older_than_days=0` (or the
+    90-day default, given enough time and no injection to refresh
+    last_used) archived a pinned fact exactly like any other. Archived is
+    not deleted (`restore_from_archive` gets it back), but a pinned fact
+    silently leaving the active set the pin exists to protect it from is
+    the same class of surprise either way.
     """
     if older_than_days < 0:
         return len(load_facts(conv_id)), 0
@@ -530,10 +541,10 @@ def archive_stale_facts(
     active = load_facts(conv_id)
     if not active:
         return 0, 0
-    stale = [f for f in active if f.get("last_used", 0) < cutoff]
+    stale = [f for f in active if not f.get("pin") and f.get("last_used", 0) < cutoff]
     if not stale:
         return len(active), 0
-    fresh = [f for f in active if f.get("last_used", 0) >= cutoff]
+    fresh = [f for f in active if f.get("pin") or f.get("last_used", 0) >= cutoff]
     # Sidecar first, active set second — see archive_facts on the ordering.
     archive_facts(conv_id, stale)
     save_facts(conv_id, fresh)
@@ -557,7 +568,19 @@ def restore_from_archive(
     Caller serializes via conv_lock. Restored facts get their `last_used`
     bumped to now so they don't immediately re-archive on the next pass.
     The `archived_at` field is dropped (the fact is hot again).
+
+    Raises TypeError if `text_substring` is present and not a string (F8c,
+    hostile pass 4): `.lower()` a few lines down would otherwise raise
+    AttributeError on e.g. an int, a 500 with no explanation. The admin
+    endpoint (main.admin_restore_from_archive) already refuses this shape
+    with a 400 before calling here; this is the same check one layer down,
+    for any other caller of this function.
     """
+    if text_substring is not None and not isinstance(text_substring, str):
+        raise TypeError(
+            f"text_substring must be a string or None, got "
+            f"{type(text_substring).__name__}"
+        )
     archived = load_archive(conv_id)
     if not archived:
         return 0

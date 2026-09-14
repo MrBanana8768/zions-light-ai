@@ -287,9 +287,10 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
     "episodic", "summary", "persona", "unverified_layers"}.
 
     Raises QuarantineError if the snapshot cannot be proven to hold at least
-    what the store held a moment ago. Raises memory.StoreUnreadable if the
-    facts file is there and cannot be read — an operation that is about to
-    rewrite that file must not proceed on a guess (F1).
+    what the store held a moment ago, OR if the facts file is unreadable and
+    its raw bytes cannot be copied aside either (see F1 below) — a snapshot
+    that cannot be written must abort the caller's removal/overwrite rather
+    than proceed on a guess.
 
     The produced file is a plain export bundle plus a `quarantine` metadata
     block, so `import_conversation(json.load(open(path)),
@@ -306,13 +307,67 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
     explicit operator action, they are small (text only, no embeddings), and
     this module is not going to invent an automatic delete for the one
     directory whose entire job is to survive one.
-    """
-    # Measured BEFORE the export, and strictly: this is the expectation the
-    # verify step tries to contradict, so it cannot come from the same
-    # best-effort reads it is checking. StoreUnreadable propagates on purpose.
-    expected_facts = len(facts.load_facts(conv_id))
 
+    v3.1.9 (hostile pass 4, F1). This function USED TO let StoreUnreadable
+    from the very first line (measuring expected_facts) propagate straight
+    past everything below — the archive, the persona, the episodic count,
+    the summary state, the export, the publish. A torn FACTS file made the
+    caller (admin_import_conversation's overwrite path) read "the store is
+    unreadable" and skip the ENTIRE snapshot, including the summary
+    hierarchy and episodic index the torn facts file does not touch and
+    which were otherwise perfectly readable. The overwrite that followed
+    then destroyed all of it, plus the torn file's own bytes — the one
+    surviving copy of what the facts had been, gone with nothing kept
+    aside. Caught here instead: an unreadable facts file marks that ONE
+    layer unverified and copies its raw bytes into the quarantine (a
+    sibling `<snapshot>.facts.torn` file, path returned as
+    `torn_facts_path`, verified by read-back like everything else this
+    function publishes) rather than aborting before anything else is even
+    measured.
+    """
     unverified: list[str] = []
+
+    # v3.1.9 (F1). Measured BEFORE the export, and strictly: this is the
+    # expectation the verify step tries to contradict, so it cannot come
+    # from the same best-effort reads it is checking. A facts file that IS
+    # unreadable no longer propagates out of this function — see the
+    # docstring. `expected_facts` becomes 0 (nothing readable to count),
+    # the layer is marked unverified, and the torn file's own raw bytes are
+    # captured here for the staging/publish block below (search
+    # "torn_partial") to carry into the quarantine. export_conversation()
+    # further down independently hits the same StoreUnreadable on the same
+    # file and, in its own best-effort
+    # (non-strict) mode, degrades to `facts: []` — consistent with
+    # expected_facts=0, so Contradiction #1 does not fire on a mismatch this
+    # function itself created.
+    expected_facts = 0
+    _torn_facts_raw: bytes | None = None
+    try:
+        expected_facts = len(facts.load_facts(conv_id))
+    except memory.StoreUnreadable as e:
+        unverified.append("facts (unreadable)")
+        logger.warning(
+            f"conv={conv_id}: quarantine could not read the facts file "
+            f"({e}); the OTHER layers are still measured and snapshotted, "
+            f"and the torn file's raw bytes are copied aside rather than "
+            f"treating the whole store as unreadable"
+        )
+        try:
+            _torn_facts_raw = e.path.read_bytes()
+        except OSError as read_err:
+            # Nothing to fall back to: the one thing this branch exists to
+            # preserve (the torn file's own bytes, the best evidence of
+            # what the facts were) could not even be copied. Abort rather
+            # than publish a snapshot that silently drops it — same
+            # "refuse rather than guess" rule as every other QuarantineError
+            # below.
+            raise QuarantineError(
+                f"conv={conv_id}: the facts file is unreadable ({e}) AND its "
+                f"raw bytes could not be copied aside either "
+                f"({type(read_err).__name__}: {read_err}) — refusing to "
+                f"publish a snapshot that would lose the one copy of "
+                f"evidence for what the facts were"
+            ) from read_err
 
     # The two layers export_conversation does not carry — see the block
     # comment above. Read as best-effort and RECORDED when they fail, never
@@ -360,6 +415,10 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
         "archive": list(archived_rows),
         "persona": persona_record,
         "unverified_layers": list(unverified),
+        # F1: filled in below once the torn-facts sibling path is known
+        # (computed after `published`, a few lines down) — None when the
+        # facts layer was readable, a string path once it is.
+        "torn_facts_path": None,
         "restore_hint": (
             "per-row: facts.restore_from_archive(conv_id) — preferred. "
             "whole-conversation: import_conversation(this file, "
@@ -384,9 +443,59 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
             f"that does not contain what it is supposed to protect"
         )
 
+    # Contradiction #1b (F2, hostile pass 4). The facts check above has no
+    # sibling on episodic, and `retrieval.export_indexed_exchanges` is
+    # contractually "[] on ANY failure, never raises" (its own docstring) —
+    # the exact "unknown read as empty" shape the facts check exists to
+    # catch, one layer over. This was sized for quarantine's first caller (a
+    # facts cleanup, which never touches episodic, so an unverified episodic
+    # count was recorded rather than fatal). v3.1.9 reused this function as
+    # the safety net for /admin/conversations/import's overwrite, which DOES
+    # empty the episodic index (import_conversation -> forget_conversation)
+    # — so a snapshot that is short of what conversation_doc_count just
+    # measured must refuse exactly like a short facts snapshot does: a
+    # transient export failure at the moment of the snapshot would otherwise
+    # publish a 0-row bundle that verifies clean against itself (0 == 0) and
+    # the overwrite would then empty an index this snapshot claimed to have
+    # preserved. Skipped when expected_episodic is None — that means the
+    # count itself could not be measured (already recorded in
+    # unverified_layers above), which is a different, non-fatal claim than
+    # "we measured N and got fewer back".
+    if (
+        expected_episodic is not None
+        and len(bundle.get("episodic") or []) < expected_episodic
+    ):
+        raise QuarantineError(
+            f"conv={conv_id}: snapshot holds "
+            f"{len(bundle.get('episodic') or [])} episodic entr(ies) but the "
+            f"store held {expected_episodic} a moment ago — refusing to "
+            f"publish a snapshot that does not contain what it is supposed "
+            f"to protect"
+        )
+
     quarantine_dir().mkdir(parents=True, exist_ok=True)
     published = _quarantine_path(conv_id)
     partial = published.with_name(published.name + ".partial")
+    # F1: the torn facts file's own raw bytes, staged and published beside
+    # the JSON snapshot under the same rename-into-place discipline — a
+    # `.torn` file that only ever appears once BOTH it and the JSON snapshot
+    # have been proven written. None when the facts layer was readable (the
+    # common case; nothing to carry).
+    torn_published = (
+        published.with_name(f"{published.stem}.facts.torn")
+        if _torn_facts_raw is not None else None
+    )
+    torn_partial = (
+        torn_published.with_name(torn_published.name + ".partial")
+        if torn_published is not None else None
+    )
+    # Filled in now that the path is known (the dict was built before
+    # `published` existed) — written into the METADATA BLOCK, not just this
+    # function's return value, so a caller reading the snapshot back off
+    # disk (an operator, or a test that does not keep the live process
+    # around) can still find the torn bytes.
+    if torn_published is not None:
+        bundle["quarantine"]["torn_facts_path"] = str(torn_published)
 
     try:
         # Stage. atomic_write_json gives tmp+fsync+replace, so the `.partial`
@@ -451,14 +560,34 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
                 f"persona this conversation has stored"
             )
 
+        # F1: stage and verify the torn facts file's raw bytes exactly like
+        # the JSON bundle above — write, read back, compare — BEFORE either
+        # file is published under its real name. A copy that silently wrote
+        # short (a full disk, a torn write of THIS write) is worse than no
+        # copy, because the caller reads its presence as "preserved".
+        if torn_partial is not None:
+            torn_partial.write_bytes(_torn_facts_raw)
+            if torn_partial.read_bytes() != _torn_facts_raw:
+                raise QuarantineError(
+                    f"conv={conv_id}: the torn facts file's raw-byte copy "
+                    f"did not read back identical to what was written"
+                )
+
         # Publish. Same rename-into-place backup.py uses: the file appears
         # under its real name only once it has been proven readable.
         os.replace(partial, published)
+        if torn_partial is not None:
+            os.replace(torn_partial, torn_published)
     except Exception:
         try:
             partial.unlink()
         except OSError:
             pass
+        if torn_partial is not None:
+            try:
+                torn_partial.unlink()
+            except OSError:
+                pass
         raise
 
     # Counts only. Never fact text, never conversation content — this log goes
@@ -470,6 +599,7 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
         f"summary={'yes' if _has_summary_content(back.get('summary_state')) else 'no'}, "
         f"persona={'yes' if back_q.get('persona') else 'no'}"
         + (f", unverified: {'; '.join(unverified)}" if unverified else "")
+        + (f", torn facts bytes: {torn_published}" if torn_published is not None else "")
     )
 
     return {
@@ -480,6 +610,11 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
         "summary": _has_summary_content(back.get("summary_state")),
         "persona": bool(back_q.get("persona")),
         "unverified_layers": unverified,
+        # F1: present only when the facts layer was unreadable — the raw
+        # bytes of the torn file, copied aside next to this snapshot. None
+        # (not absent) when there was nothing to carry, so a caller can tell
+        # "facts were readable" from "this response predates the field".
+        "torn_facts_path": torn_published,
     }
 
 
@@ -826,27 +961,83 @@ def _validate_bundle(bundle: dict) -> None:
         )
 
 
-def import_conversation(
-    bundle: dict, *, target_conv_id: str | None = None, overwrite: bool = False
-) -> dict:
-    """Restore a conversation from a bundle.
+def _validate_target_ready(bundle: dict, *, target_conv_id: str | None = None) -> str:
+    """The cheap, side-effect-free part of `import_conversation`: bundle
+    shape, target-id resolution, and the in-flight-writer lock check.
+    Raises ImportError_ (or memory.UnsafeConvId, from an unsafe conv_id
+    reaching `memory.conv_lock`) on exactly the failures import_conversation
+    itself would raise for the same inputs. Returns the resolved target
+    conv_id.
 
-    `target_conv_id`: where to land the data. Default is the bundle's
-    own source_conv_id (so re-importing into the same pod restores
-    in place). Override to clone into a fresh conv_id without touching
-    the original.
+    v3.1.9 (hostile pass 4, F7). Split out so a caller that is about to take
+    a pre-overwrite quarantine snapshot (main.admin_import_conversation) can
+    run these checks FIRST and skip the snapshot entirely when the import
+    was always going to be refused. Before this split, a bad bundle version,
+    `bundle.facts` not a list, or a target held by an in-flight writer all
+    failed INSIDE import_conversation, AFTER the caller had already
+    published a full quarantine snapshot — so every refused attempt (a
+    retry loop, a scripted health check, a client resending a stale bundle)
+    left one more never-pruned copy of the conversation on disk, for no
+    output that a bundle validator alone could not have said in
+    microseconds.
 
-    `overwrite`: if False (default), refuses to import when target conv
-    already has any state — prevents accidental wipe of an active conv.
-    If True, replaces existing state wholesale.
+    import_conversation calls this AGAIN, immediately before it writes —
+    not a redundant check but the fix for the TOCTOU the snapshot's own I/O
+    opens: the lock could be taken between this function returning here (in
+    the caller, before the snapshot) and import_conversation's write, so
+    the write must re-verify it is still clear right before it happens, not
+    trust a lock state that is now stale by however long the snapshot took.
 
-    Returns a counters dict for the response body.
+    Also fixes two F8 LOWs (hostile pass 4) that used to surface only deep
+    inside quarantine_conversation or import_conversation's own writes:
+      (b) a whitespace-padded target_conv_id used to reach
+          quarantine_conversation UNSTRIPPED (main.py quarantined the raw
+          body value, only import_conversation stripped it), so the
+          snapshot step read a conv_id the import step would not — a
+          harmless-looking mismatch that surfaced as a misleading 409
+          ("could not write a snapshot") for what import would have handled
+          as an ordinary existing-state 400. Both steps now resolve the SAME
+          stripped `target` from this one function.
+      (c) a non-string target_conv_id / bundle.source_conv_id (an int, a
+          list) used to reach `.strip()` a few lines below and raise an
+          uncaught AttributeError — a 500 for caller input every other
+          malformed-body case in this file answers with 400. Checked
+          explicitly, ahead of the `.strip()` call.
     """
     _validate_bundle(bundle)
 
-    target = (target_conv_id or bundle.get("source_conv_id") or "").strip()
+    # F8(c): reject a non-string id explicitly rather than let `.strip()`
+    # raise AttributeError on it a few lines down. `target_conv_id or
+    # bundle.get(...)` picks whichever of the two candidates is present
+    # (falsy values — None, "", 0 — fall through to the next one, matching
+    # the original truthiness-based fallback exactly); only the TYPE of
+    # whatever wins that fallback is checked here.
+    _candidate = target_conv_id if target_conv_id else bundle.get("source_conv_id")
+    if _candidate is not None and not isinstance(_candidate, str):
+        raise ImportError_(
+            f"conv_id must be a string, got {type(_candidate).__name__}: "
+            f"{_candidate!r}"
+        )
+    # F8(b): stripped HERE, once, so every caller (the pre-snapshot check in
+    # main.py and import_conversation's own write below) resolves the
+    # identical target — no more "quarantine saw the raw id, import saw the
+    # stripped one".
+    target = (_candidate or "").strip()
     if not target:
         raise ImportError_("no target_conv_id provided and bundle has no source_conv_id")
+
+    # F8(b), continued: the same class of refusal memory._safe_path raises
+    # for a conv_id that would resolve outside STORAGE_ROOT (a traversal
+    # attempt, or one that is merely unusable as a path component) used to
+    # surface only once real I/O started — inside quarantine_conversation's
+    # first read, deep enough that main.py's generic `except Exception`
+    # around the snapshot read it as "the snapshot could not be written" and
+    # answered 409, not as the 400-about-the-request it actually is.
+    # memory.facts_path resolves a Path and does no I/O, so calling it here
+    # is as cheap as everything else in this function and raises the same
+    # memory.UnsafeConvId the rest of this codebase already maps to 400
+    # (main.py's `except (portability.ImportError_, UnsafeConvId)`).
+    memory.facts_path(target)
 
     # v3.1 D18: archive, restore and dedup all serialize on conv_lock; import
     # — the one operation that clears three layers and rewrites them wholesale
@@ -872,6 +1063,26 @@ def import_conversation(
             f"underneath it — that writer would overwrite the bundle on its "
             f"next save. Retry in a moment."
         )
+    return target
+
+
+def import_conversation(
+    bundle: dict, *, target_conv_id: str | None = None, overwrite: bool = False
+) -> dict:
+    """Restore a conversation from a bundle.
+
+    `target_conv_id`: where to land the data. Default is the bundle's
+    own source_conv_id (so re-importing into the same pod restores
+    in place). Override to clone into a fresh conv_id without touching
+    the original.
+
+    `overwrite`: if False (default), refuses to import when target conv
+    already has any state — prevents accidental wipe of an active conv.
+    If True, replaces existing state wholesale.
+
+    Returns a counters dict for the response body.
+    """
+    target = _validate_target_ready(bundle, target_conv_id=target_conv_id)
 
     # Pre-flight: detect existing state to honor overwrite=False.
     #
