@@ -487,6 +487,34 @@ check(_ctf([_memo_a]) == _ctf([dict(_memo_a)]) and _ctf([_memo_a]) != _ctf([_mem
       "the fingerprint memo (F6) returns the same answer for equal text and a "
       "different one for a same-length edit, in either order")
 
+print("[11b] the out-of-position record (hostile pass #4 F6): validated, ordered, "
+      "and only as good as the chunk that read it")
+_x1, _x2 = "1" * 16, "2" * 16
+_st_x = {"l1": [{"text": "A", "first_turn": 1, "last_turn": 20},
+                {"text": "B", "first_turn": 21, "last_turn": 40}],
+         "covered_fps": "".join(_ctf(_h24[:40]))}
+_st_x["covered_extra"] = [[5, 40, _x1], [0, 20, _x2], ["5", 40, _x1], [5, 40, "zz"],
+                          [5, True, _x1], [3, 40, _U]]
+check(summarizer._covered_extra(_st_x) == [(5, 40, _x1), (0, 20, _x2)],
+      "CONTROL: valid rows read back; a string position, a bad fingerprint, a bool owner "
+      "and the UNKNOWN marker are each dropped alone")
+_seq_x, _pos_x = summarizer._record_sequence(_st_x)
+check(_seq_x[0] == _x2 and _seq_x[6] == _x1 and _pos_x[6] == 5 and len(_seq_x) == 42,
+      "an extra row sorts after the covered position it names")
+_st_x["l1"] = _st_x["l1"][:1]                    # chunk 21-40 parked / cut off
+_seq_y, _ = summarizer._record_sequence(_st_x)
+check(_x1 not in _seq_y and _x2 in _seq_y and len(_seq_y) == 21,
+      "*** an extra row read by a chunk the chain no longer reaches does not count")
+check(summarizer._record_patch_fps(_st_x, 20, [(0, _x2), (7, _x1)]) is True
+      and len(_st_x["covered_extra"]) == 3,
+      "the writer adds a new row and not a duplicate of one it holds")
+_x3 = "3" * 16
+check(summarizer._record_patch_fps(_st_x, 20, [(9, _x3), (9, _x3)]) is True
+      and sum(1 for r in _st_x["covered_extra"] if r[2] == _x3) == 2
+      and summarizer._record_patch_fps(_st_x, 20, [(9, _x3), (9, _x3)]) is False,
+      "but two identical turns read together get two rows (one entry pairs with one "
+      "turn), and reading them again adds none")
+
 print("[12] a TRUNCATED HEAD is reused for the turns it carries, and loses none")
 # The third cut refused this on length alone ("the array is shorter than the
 # conversation is known to be"). Its turns ARE turns 1..20, and the chunk read
@@ -754,7 +782,11 @@ check(_out_raised == [],
 _real_pieces = summarizer._summarize_pieces
 
 
+PIECES: list[list[str]] = []   # every rollup call's input, in order
+
+
 async def _stub_pieces(conv_id, client, vllm_url, model, prompt, pieces, max_tokens):
+    PIECES.append(list(pieces))
     return f"ROLLED-CHUNK over {len(pieces)} piece(s)"
 
 
@@ -814,15 +846,32 @@ try:
           and CALLS and not any("# Status" in t or "question 0" in t for t in CALLS[0]),
           "and reuse FIRES: no covered turn, degenerate or not, was re-summarized")
 
-    print("[19] a STOPPED reply that closes a chunk is recorded AS STREAMED, at once")
-    # F1. The chunk summarizes the trimmed reply; OpenWebUI keeps and re-sends
-    # what streamed. The record is written with the chunk, from the streamed
-    # text — never from the next request, which is what blessed a turn that
-    # replaced it.
+    print("[19] a STOPPED reply that closes a chunk: the chunk READS the tail the record blesses")
+    # hostile pass #3 F1: the record is written with the chunk, from the
+    # streamed text — never from the next request. hostile pass #4 (reviewer
+    # A F1): and the chunk must read that same text. This case used to roll
+    # up the memory-trimmed reply and assert the full re-sent one "matches
+    # it": everything after the last sentence boundary (a trailing list) was
+    # then in no summary and replaced on every later request. The tail below
+    # carries a marker AFTER the last boundary, so only a chunk that read the
+    # streamed text can hold it.
+    _prose = ("We went over the plan for the week. The clinic opens at nine and "
+              "the pharmacy closes early on Fridays. Bring the blue folder with "
+              "the insurance letter, the list of questions we wrote together, and "
+              "the notebook with last month's readings. Ask about the new dose "
+              "before you leave, and write the answer down. ")
     CONV_TR = "reuse_trimmed"
     REQ_TR = _request(29)                       # 59 turns; the reply is turn 60
-    _full_reply = "answer 29 " + "word " * 60
-    asyncio.run(main._rollup_hierarchy(CONV_TR, REQ_TR, "answer 29 word word",
+    _full_reply = ("answer 29. " + _prose
+                   + "\n\nThe steps:\n- TAIL-MARKER-29 call the clinic about the"
+                   " appointment\n- bring the folder")
+    _cut = main.decide_memory_tail(_full_reply, finished=False, truncated=False, holed=False)
+    check(_cut.outcome == "stored_trimmed" and "TAIL-MARKER-29" not in _cut.text
+          and not main.reply_is_degenerate(_full_reply),
+          f"fixture: memory keeps the trimmed head ({_cut.outcome}, {len(_cut.text)} of "
+          f"{len(_full_reply)} chars), the marker is in the cut tail, and the reply is no loop")
+    PIECES.clear()
+    asyncio.run(main._rollup_hierarchy(CONV_TR, REQ_TR, _cut.text,
                                        reply_as_streamed=_full_reply))
     _st_t1 = summarizer.load_state(CONV_TR)
     check(summarizer._covered_prefix(_st_t1) == 60
@@ -830,22 +879,75 @@ try:
           f"the chunk closed on turn 60 and recorded the STREAMED reply in the "
           f"same call (prefix {summarizer._covered_prefix(_st_t1)}, record "
           f"{len(summarizer._covered_fps(_st_t1))})")
+    check(bool(PIECES) and any("TAIL-MARKER-29" in p for p in PIECES[-1]),
+          f"*** F1: and the chunk that closed on it READ the tail after the last "
+          f"sentence boundary (last chunk input: "
+          f"{[p[-40:] for p in PIECES[-1][-1:]] if PIECES else None})")
     REQ_TR2 = list(REQ_TR) + [{"role": "assistant", "content": _full_reply},
                               {"role": "user", "content": "question 30 " + "word " * 60}]
     REQ_TR3 = list(REQ_TR2) + [{"role": "assistant", "content": "answer 30 " + "word " * 60},
                                {"role": "user", "content": "question 31 " + "word " * 60}]
     check(_plan(CONV_TR, REQ_TR3) == (60, set()),
-          f"and the full reply OpenWebUI re-sends matches it (got {_plan(CONV_TR, REQ_TR3)})")
+          f"and the full reply OpenWebUI re-sends pairs with it (got {_plan(CONV_TR, REQ_TR3)})")
     CONV_TR_NO = "reuse_trimmed_unstreamed"
-    asyncio.run(main._rollup_hierarchy(CONV_TR_NO, REQ_TR, "answer 29 word word"))
+    asyncio.run(main._rollup_hierarchy(CONV_TR_NO, REQ_TR, _cut.text))
     check(_plan(CONV_TR_NO, REQ_TR3) == (59, set()),
-          f"CONTROL: recorded from the trimmed text instead, the re-sent reply "
-          f"pairs with nothing, so the reuse span stops before it (got "
-          f"{_plan(CONV_TR_NO, REQ_TR3)})")
+          f"CONTROL: a caller with no streamed text records the trimmed reply, "
+          f"the re-sent reply pairs with nothing, so the reuse span stops before "
+          f"it (got {_plan(CONV_TR_NO, REQ_TR3)})")
     out = _run(REQ_TR3, CONV_TR_NO)
-    check(len(CALLS) == 1 and any(t.startswith("answer 29 word word word") for t in CALLS_FULL[0])
+    check(len(CALLS) == 1 and any("TAIL-MARKER-29" in t for t in CALLS_FULL[0])
           and _lost_turns(CONV_TR_NO, REQ_TR3, out) == [],
           "and it is summarized fresh on every request instead of reused: never lost")
+
+    print("[19b] F7: a cut reply with a clean head and a runaway tail keeps its head in the chunk")
+    # hostile pass #4 (reviewer A F7). Memory keeps the clean head of such a
+    # reply; the rollup redacted the WHOLE reply to the placeholder, the
+    # record blessed the full text, and the head was removed from every later
+    # request. Both places the chunk can read it: as the reply that closes a
+    # chunk, and as a history turn inside one.
+    _loop_reply = "answer 39. " + _prose + _prose.replace("week", "month") + "\n" + ("═" * 600)
+    _cut2 = main.decide_memory_tail(_loop_reply, finished=False, truncated=True, holed=False)
+    check(bool(main.reply_is_degenerate(_loop_reply)) and _cut2.outcome == "stored_trimmed"
+          and not main.reply_is_degenerate(_cut2.text),
+          f"fixture: the full reply is a loop, memory kept its clean {len(_cut2.text)}-char head")
+    _red = main._redact_degenerate_turns([{"role": "assistant", "content": _loop_reply},
+                                          {"role": "assistant", "content": RULE * 400}])
+    check(_red[0]["content"] == _cut2.text and "═" not in _red[0]["content"],
+          "*** F7: history redaction keeps exactly memory's clean head, not the placeholder")
+    check(_red[1]["content"] == main._DEGENERATE_HISTORY_PLACEHOLDER,
+          "CONTROL: a loop with no clean head still becomes the placeholder")
+    CONV_F7 = "reuse_f7_closing"
+    # Varied text: this file's "word " * 60 turns are themselves loops to the
+    # detector, and their placeholders would hide the one being asserted.
+    import random as _random
+    _WORDS = ["river", "lantern", "quiet", "morning", "garden", "letter", "stone",
+              "window", "silver", "harbor", "meadow", "candle", "thread", "bridge"]
+
+    def _varied(k: int, role: str) -> dict:
+        rr = _random.Random(f"{role}{k}")
+        return {"role": role, "content": f"{role} {k} "
+                + " ".join(rr.choice(_WORDS) for _ in range(50)) + "."}
+
+    REQ_F7 = [{"role": "system", "content": "you are a companion"}] + [
+        _varied(t, "user" if t % 2 else "assistant") for t in range(1, 80)]
+    check(not any(main.reply_is_degenerate(m["content"]) for m in REQ_F7[1:]),
+          "fixture: no other turn of this history is a loop")
+    REQ_F7[40] = {"role": "assistant", "content": _loop_reply}   # turn 40, mid-history
+    PIECES.clear()
+    asyncio.run(main._rollup_hierarchy(CONV_F7, REQ_F7, _cut2.text,
+                                       reply_as_streamed=_loop_reply))
+    _joined = "\n".join(p for call in PIECES for p in call)
+    check(summarizer._covered_prefix(summarizer.load_state(CONV_F7)) == 80
+          and _joined.count("answer 39. We went over the plan") == 2
+          and "═" * 20 not in _joined and main._DEGENERATE_HISTORY_PLACEHOLDER not in _joined,
+          f"the chunks read the head twice (turn 40 in history, turn 80 closing) and "
+          f"no loop and no placeholder (heads {_joined.count('answer 39. We went over the plan')})")
+    _rec_f7 = summarizer._covered_fps(summarizer.load_state(CONV_F7))
+    _full_fp = _ctf([{"role": "assistant", "content": _loop_reply}])[0]
+    check(_rec_f7[39] == _full_fp and _rec_f7[79] == _full_fp,
+          "and both positions are recorded as the FULL reply the client re-sends, so it "
+          "pairs (the documented trade: only the post-boundary loop is left out)")
 
     print("[20] a conversation past its first L3 refresh still reuses")
     CONV_L3 = "reuse_after_l3"
@@ -896,8 +998,11 @@ try:
     summarizer.save_state(CONV_LEG, _st_leg)
     _REQ_LEG = _LEG + [{"role": "user", "content": "question 24 " + "word " * 60}]
     asyncio.run(main._rollup_hierarchy(CONV_LEG, _REQ_LEG, "answer 24 " + "word " * 60))
-    check(summarizer._covered_fps(summarizer.load_state(CONV_LEG)) == _ctf(_ns(_LEG)[:40]),
-          "the first live rollup adopted positions 1-40 from the request")
+    _rec_leg = summarizer._covered_fps(summarizer.load_state(CONV_LEG))
+    check(_rec_leg == _ctf(_ns(_LEG)[:38]) + [_U, _U],
+          "the first live rollup adopted positions 1-38 from the request, and NOT "
+          "the chunk's closing exchange 39-40 (hostile pass #4 F2: a regenerate of "
+          "a closing reply leaves no other trace)")
     out = _run(_REQ_LEG, CONV_LEG)
     check(any("LEGACY-CHUNK" in str(m.get("content", "")) for m in out),
           "and reuse fires on the adopted hierarchy")
@@ -906,15 +1011,125 @@ try:
     _seed(CONV_LEG2, _LEG2, [{"text": "LEGACY-CHUNK-2", "first_turn": 1, "last_turn": 40}],
           record=False)
     _REGEN = _LEG2[:-1]                     # regenerate: re-send up to turn 39
-    asyncio.run(main._rollup_hierarchy(CONV_LEG2, _REGEN, "answer 19 REGENERATED " + "word " * 60))
+    _REGEN_REPLY = {"role": "assistant", "content": "answer 19 REGENERATED " + "word " * 60}
+    asyncio.run(main._rollup_hierarchy(CONV_LEG2, _REGEN, _REGEN_REPLY["content"]))
     _rec_leg2 = summarizer._covered_fps(summarizer.load_state(CONV_LEG2))
-    check(len(_rec_leg2) == 39,
-          f"*** the appended reply is never adopted: 39 positions, not 40 (got {len(_rec_leg2)})")
-    _AFTER = _REGEN + [{"role": "assistant", "content": "answer 19 REGENERATED " + "word " * 60}] + _ns(history(24))[40:46]
+    check(len(_rec_leg2) == 40 and _rec_leg2[39] == _U
+          and _ctf([_REGEN_REPLY])[0] not in _rec_leg2
+          and _rec_leg2[:38] == _ctf(_ns(_LEG2)[:38]),
+          f"*** the appended reply is never adopted: position 40 is UNKNOWN and the "
+          f"regenerated reply is nowhere in the record (got {len(_rec_leg2)} entries, "
+          f"last {_rec_leg2[-1:]})")
+    _AFTER = _REGEN + [_REGEN_REPLY] + _ns(history(24))[40:46]
     _AFTER = [_LEG2[0]] + _ns(_AFTER)
     asyncio.run(main._rollup_hierarchy(CONV_LEG2, _AFTER, "answer 23 " + "word " * 60))
-    check(len(summarizer._covered_fps(summarizer.load_state(CONV_LEG2))) == 39,
+    check(summarizer._covered_fps(summarizer.load_state(CONV_LEG2)) == _rec_leg2,
           "and a later call does not adopt it either (one-shot)")
+
+    # The shapes below are the state files v3.1.6.1 — the build on her pod —
+    # leaves, as reviewer A measured them by running that tree's own
+    # maybe_rollup (SP/p4-a/out/upg_p1.log, upg2_p1.log): every chunk label
+    # kept, `last_summarized_turn` pulled down to the array length by its
+    # _reconcile_watermark after a delete or edit-and-resend, no turns_seen,
+    # no anchor, no record.
+    def _tagged(n: int, tag: str) -> dict:
+        role = "user" if n % 2 else "assistant"
+        return {"role": role, "content": f"{tag}-{role}-{n} " + " ".join(
+            _WORDS[(n * 7 + k * 3) % len(_WORDS)] for k in range(40)) + "."}
+
+    print("[16d] F3: upgraded INSIDE the offset window (array shorter than the highest "
+          "label) — adoption still runs, and never blesses the edited branch")
+    # v3.1.6.1: 30 exchanges (chunks 1-20, 21-40, 41-60), edit-and-resend at
+    # turn 45 (array 46; watermark pulled to 46), three more exchanges. The
+    # first v3.1.9 request carries 53 turns against labels to 60: the window
+    # offset is 8 on this call and never returns to 0.
+    CONV_F3 = "reuse_legacy_offset_window"
+    _F3_HIST = [_tagged(t, "orig") for t in range(1, 45)] + [_tagged(t, "edit") for t in range(45, 54)]
+    _st_f3 = summarizer.load_state(CONV_F3)
+    _st_f3["l1"] = [{"text": f"V3161-CHUNK-{k}", "first_turn": 20 * k + 1, "last_turn": 20 * (k + 1)}
+                    for k in range(3)]
+    _st_f3["last_summarized_turn"] = 46
+    summarizer.save_state(CONV_F3, _st_f3)
+    _F3_REQ = [{"role": "system", "content": "you are a companion"}] + _F3_HIST
+    asyncio.run(main._rollup_hierarchy(CONV_F3, _F3_REQ, _tagged(54, "edit")["content"]))
+    _st_f3 = summarizer.load_state(CONV_F3)
+    _rec_f3 = summarizer._covered_fps(_st_f3)
+    _off_f3 = summarizer._recorded_position(_st_f3) - 54
+    _adopted_f3 = [e for e in _rec_f3 if e != _U]
+    check(_off_f3 > 0 and len(_rec_f3) == 60 and _st_f3.get("legacy_adopted") is True,
+          f"*** F3: adoption ran on the first request at window offset {_off_f3} "
+          f"(record {len(_rec_f3)}, flag {_st_f3.get('legacy_adopted')})")
+    check(len(_adopted_f3) >= 25 and set(_adopted_f3) <= set(_ctf(_F3_HIST[:44])),
+          f"and it adopted {len(_adopted_f3)} positions, every one from the part of the "
+          f"array v3.1.6.1's chunks read (turns 1-44)")
+    check(not set(_rec_f3) & set(_ctf(_F3_HIST[44:])),
+          "*** F2(c): no turn of the edited branch (45 on, written after the watermark "
+          "was pulled down to 46) is in the record")
+    out = _run(_F3_REQ, CONV_F3)
+    check(any("V3161-CHUNK" in str(m.get("content", "")) for m in out)
+          and _lost_turns(CONV_F3, _F3_REQ, out) == [],
+          "and reuse fires on the next request with no turn lost")
+
+    print("[16e] F2: an edit-and-resend under a LATER chunk, and a regenerated closing "
+          "reply, are refused by the traces they leave")
+    # v3.1.6.1 (SP/p4-a/out/upg_p1.log): chunks 1-20, 21-40 (closing reply
+    # A40 then regenerated), 41-60, then an edit-and-resend at turn 45
+    # (watermark to 46) and enough exchanges for chunk 47-66, which starts
+    # inside 41-60. The array is the new branch from 45 on.
+    CONV_F2 = "reuse_legacy_traces"
+    _F2_HIST = ([_tagged(t, "orig") for t in range(1, 40)] + [_tagged(40, "regen")]
+                + [_tagged(t, "orig") for t in range(41, 45)] + [_tagged(t, "edit") for t in range(45, 76)])
+    _st_f2 = summarizer.load_state(CONV_F2)
+    _st_f2["l1"] = [{"text": f"V3161-TRACE-{a}", "first_turn": a, "last_turn": b}
+                    for a, b in ((1, 20), (21, 40), (41, 60), (47, 66))]
+    _st_f2["last_summarized_turn"] = 66
+    summarizer.save_state(CONV_F2, _st_f2)
+    _F2_REQ = [{"role": "system", "content": "you are a companion"}] + _F2_HIST
+    asyncio.run(main._rollup_hierarchy(CONV_F2, _F2_REQ, _tagged(76, "edit")["content"]))
+    _rec_f2 = summarizer._covered_fps(summarizer.load_state(CONV_F2))
+    check(len(_rec_f2) == 66 and _rec_f2[44] == _U and _rec_f2[45] == _U,
+          f"*** F2(c): positions 45-46, the resent exchange no chunk read, are UNKNOWN "
+          f"(got {_rec_f2[44:46]})")
+    check(_rec_f2[39] == _U and _ctf([_F2_HIST[39]])[0] not in _rec_f2,
+          "*** F2(b): the regenerated reply at the closing position 40 is not adopted")
+    check(_rec_f2[43] == _ctf([_F2_HIST[43]])[0] and _rec_f2[47] == _ctf([_F2_HIST[47]])[0]
+          and _rec_f2[0] == _ctf([_F2_HIST[0]])[0],
+          "CONTROL: turns 1, 44 and 48, which chunks did read, are adopted")
+
+    print("[16f] F8: a CAPPED client at window offset 20 adopts only window turns the "
+          "chunks cover, and adoption is one-shot even with UNKNOWN at position 1")
+    # A pre-v3.1.9 state from the v3.1.7/v3.1.8 line (turns_seen and the
+    # anchor exist, the record does not): chunks 1-20 and 21-40, position 60,
+    # and a client whose window is the last 40 turns. The anchor makes the
+    # offset exact: window turn 1 is conversation turn 21.
+    CONV_F8 = "reuse_legacy_capped"
+    _F8_ALL = [_tagged(t, "cap") for t in range(1, 63)]
+    _st_f8 = summarizer.load_state(CONV_F8)
+    _st_f8["l1"] = [{"text": f"CAPPED-CHUNK-{k}", "first_turn": 20 * k + 1, "last_turn": 20 * (k + 1)}
+                    for k in range(2)]
+    _st_f8["last_summarized_turn"] = 40
+    _st_f8["turns_seen"] = 60
+    _st_f8["tail_fp"] = summarizer._turn_fingerprints(_F8_ALL[56:60])
+    _st_f8["head_fp"] = summarizer._turn_fingerprints(_F8_ALL[19:20])[0]
+    _st_f8["window_turns"] = 40
+    summarizer.save_state(CONV_F8, _st_f8)
+    _F8_REQ = [{"role": "system", "content": "you are a companion"}] + _F8_ALL[20:61]
+    asyncio.run(main._rollup_hierarchy(CONV_F8, _F8_REQ, _F8_ALL[61]["content"]))
+    _st_f8b = summarizer.load_state(CONV_F8)
+    _rec_f8 = summarizer._covered_fps(_st_f8b)
+    check(summarizer._recorded_position(_st_f8b) == 62,
+          f"fixture: the anchor measured position 62, offset 20 "
+          f"(got {summarizer._recorded_position(_st_f8b)})")
+    check(_rec_f8[:20] == [_U] * 20 and _rec_f8[20:38] == _ctf(_F8_ALL[20:38]),
+          "positions 1-20 (before the window) are UNKNOWN and 21-38 hold window turns 1-18, "
+          "which ARE conversation turns 21-38")
+    check(not set(_rec_f8[:40]) & set(_ctf(_F8_ALL[40:62])),
+          "*** F8: no window turn past the chunks (conversation turns 41-62) is recorded "
+          "under a covered position — adopting as if the window started at turn 1 would")
+    _F8_REQ2 = [{"role": "system", "content": "you are a companion"}] + _F8_ALL[:61]
+    asyncio.run(main._rollup_hierarchy(CONV_F8, _F8_REQ2, _F8_ALL[61]["content"]))
+    check(summarizer._covered_fps(summarizer.load_state(CONV_F8))[:40] == _rec_f8[:40],
+          "and a later full-history request does not re-adopt the leading UNKNOWN run")
 
     print("[22] the backfill: the live tail owns the rollup in production order, "
           "and the backfill records from the UNREDACTED snapshot when it runs")

@@ -67,7 +67,9 @@ def check(cond, label):
         FAILED.append(label)
 
 
-TAG = re.compile(r"\b[UAT]\d+v\d+\b")
+# B tags mark text AFTER the last sentence boundary of a cut reply (hostile
+# pass #4, reviewer A F1): the part memory trims away and the client keeps.
+TAG = re.compile(r"\b[UATB]\d+v\d+\b")
 FRESH_INPUTS: list[list[dict]] = []
 
 
@@ -137,14 +139,18 @@ class Convo:
             visible.update(TAG.findall(summarizer._message_text(m)))
         missing, stale = [], []
         for m in req_turns:
-            t = tag_of(m)
-            if t in visible:
-                continue
-            base = re.match(r"([UAT]\d+)v", t).group(1)
-            if any(v.startswith(base + "v") for v in visible):
-                stale.append(t)
-            else:
-                missing.append(t)
+            # EVERY tag of the turn, not only its first (hostile pass #4, F1):
+            # a stopped reply's B tag sits in the tail memory trims, and an
+            # oracle that looked at the leading tag alone could not see that
+            # tail vanish.
+            for t in TAG.findall(summarizer._message_text(m)):
+                if t in visible:
+                    continue
+                base = re.match(r"([UATB]\d+)v", t).group(1)
+                if any(v.startswith(base + "v") for v in visible):
+                    stale.append(t)
+                else:
+                    missing.append(t)
         if missing or stale:
             self.problems.append(f"{label}: missing={missing} stale={stale}")
         self.rows.append({
@@ -312,15 +318,27 @@ async def scenarios():
     assert_healthy(c, "capped window", _STEADY, after=mark)
 
     print("[11] every reply STOPPED: memory keeps a trimmed prefix, the client re-sends all of it")
+    # hostile pass #4 (reviewer A F1). This used to trim with full[:40], which
+    # kept the turn's tag, so the tag oracle could not see a lost tail. Now
+    # each reply is cut by the REAL decide_memory_tail after a B-tagged,
+    # unterminated list, and the oracle checks every tag: the B tag is exactly
+    # the text a chunk closing on the reply must have read.
     c = Convo("tr_stopped")
+    closing_stops = 0
     for _ in range(40):
         u = turn("user", c.next_num())
-        a = turn("assistant", c.next_num())
-        full = summarizer._message_text(a)
+        num = c.next_num()
+        full = (summarizer._message_text(turn("assistant", num))
+                + f"\n\nNext steps:\n- B{num}v1 call about the {_W[num % 16]} form\n- bring the list")
+        a = {"role": "assistant", "content": full}
+        cut = main.decide_memory_tail(full, finished=False, truncated=False, holed=False)
+        assert cut.store and f"B{num}v1" not in cut.text, cut
+        closing_stops += 1 if (len(c.hist) + 2) % _CHUNK == 0 else 0
         c.streamed = full
-        await c.request(c.hist + [u], {"role": "assistant", "content": full[:40]},
+        await c.request(c.hist + [u], {"role": "assistant", "content": cut.text},
                         f"stopped {tag_of(u)}")
         c.hist += [u, a]
+    check(closing_stops >= 3, f"fixture: {closing_stops} of the stopped replies closed an L1 chunk")
     assert_healthy(c, "stopped replies", _STEADY)
 
 

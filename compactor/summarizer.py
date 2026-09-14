@@ -62,6 +62,7 @@ the summarizer hit a problem.
 """
 
 import asyncio
+import bisect
 import hashlib
 import logging
 import os
@@ -184,6 +185,20 @@ def _empty_state(conv_id: str) -> dict:
         # _adopt_legacy_record), which costs a summarization call and cannot
         # cost a turn. See _record_chunk_fps.
         "covered_fps": "",
+        # hostile pass #4 (reviewer A F6). Turns a chunk read OUT OF POSITION:
+        # request turns that paired with nothing although they sit inside
+        # the covered span (the text after a delete or regenerate of a
+        # chunk-closing exchange, an edit, a legacy position no evidence
+        # backs), re-read by the next L1 chunk as extra pieces. One
+        # [after_position, owner_last_turn, fingerprint] per turn: it sorts
+        # after record entry `after_position`, and it counts only while the
+        # chunk that read it (ending at owner_last_turn) is inside the
+        # covered prefix. See _record_sequence and _patch_candidates.
+        "covered_extra": [],
+        # hostile pass #4 (reviewer A F2/F3). Set once the one-shot adoption
+        # of pre-v3.1.9 chunks has run, so it cannot run again whatever the
+        # leading entries of the record hold. See _adopt_legacy_record.
+        "legacy_adopted": False,
     }
 
 
@@ -258,6 +273,12 @@ def load_state(conv_id: str) -> dict:
     # match a request.
     if _covered_fps(data):
         state["covered_fps"] = data["covered_fps"]
+    # hostile pass #4. Invalid rows are dropped one by one rather than voiding
+    # the list: an extra entry is only ever a reason to REPLACE a turn, so a
+    # row that is not read costs a refresh, never a turn.
+    state["covered_extra"] = _covered_extra(data)
+    if isinstance(data.get("legacy_adopted"), bool):
+        state["legacy_adopted"] = data["legacy_adopted"]
     if parked["l1"] or parked["l2"] or parked["l3"] is not None:
         state[_UNRECOGNIZED] = parked
     return state
@@ -1066,8 +1087,158 @@ def _record_chunk_fps(
     return after != before
 
 
+def _covered_extra(state: dict) -> list[tuple[int, int, str]]:
+    """The out-of-position record (`covered_extra`), validated row by row.
+
+    Each row is [after_position, owner_last_turn, fingerprint]: a turn some
+    L1 chunk read as an extra piece (_patch_candidates), which sorts after
+    covered position `after_position` and was read by the chunk ending at
+    `owner_last_turn`. A malformed row is skipped, not the list: a row is
+    only ever a reason to replace a turn, so an unread row costs a refresh.
+    """
+    raw = state.get("covered_extra")
+    if not isinstance(raw, list):
+        return []
+    out: list[tuple[int, int, str]] = []
+    for row in raw:
+        if not (isinstance(row, (list, tuple)) and len(row) == 3):
+            continue
+        after, owner, fp = row
+        if (
+            type(after) is int and type(owner) is int and isinstance(fp, str)
+            and after >= 0 and owner >= 1 and len(fp) == _FP_WIDTH
+            and not fp.strip("0123456789abcdef")
+        ):
+            out.append((after, owner, fp))
+    return out
+
+
+def _record_sequence(state: dict) -> tuple[list[str], list[int]]:
+    """The record as the pairing reads it: (fingerprints, positions), in
+    conversation order.
+
+    The chunk-written entries for positions 1..eff (eff: what the unbroken
+    chunk chain from turn 1 backs, _covered_prefix), with every
+    out-of-position row (_covered_extra) inserted after the position it sorts
+    after. `positions[i]` is the covered position of sequence element i, or
+    for an extra row the position it sorts after. An extra row counts only
+    while the chunk that read it is inside that chain: a chunk parked by
+    load_state or cut off by a hole takes its extras with it.
+    """
+    entries = _covered_fps(state)
+    eff = min(_covered_prefix(state), len(entries))
+    if eff <= 0:
+        return [], []
+    extras: dict[int, list[str]] = {}
+    for after, owner, fp in _covered_extra(state):
+        if owner <= eff and after <= eff:
+            extras.setdefault(after, []).append(fp)
+    seq: list[str] = list(extras.get(0, ()))
+    pos: list[int] = [0] * len(seq)
+    for k in range(1, eff + 1):
+        seq.append(entries[k - 1])
+        pos.append(k)
+        for fp in extras.get(k, ()):
+            seq.append(fp)
+            pos.append(k)
+    return seq, pos
+
+
+def _record_patch_fps(
+    state: dict, owner_last_turn: int, rows: list[tuple[int, str]]
+) -> bool:
+    """Append out-of-position rows (after_position, fingerprint) read by the
+    chunk ending at `owner_last_turn`. True if anything was added.
+
+    Counted, not de-duplicated: a row already held for the same
+    (after_position, fingerprint) is not written again, but two identical
+    turns read together ("ok", "ok") need two rows, because one entry pairs
+    with one turn (_pairing) and the second would stay unpaired — refreshed
+    on every request and re-read by every chunk, for good."""
+    existing = _covered_extra(state)
+    held: dict[tuple[int, str], int] = {}
+    for a, _o, f in existing:
+        held[(a, f)] = held.get((a, f), 0) + 1
+    out = [list(r) for r in existing]
+    added = False
+    seen: dict[tuple[int, str], int] = {}
+    for after, fp in rows:
+        if fp == _FP_UNKNOWN:
+            continue
+        key = (int(after), fp)
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] <= held.get(key, 0):
+            continue
+        out.append([int(after), int(owner_last_turn), fp])
+        added = True
+    state["covered_extra"] = out
+    return added
+
+
+def _legacy_unread_positions(state: dict, legacy_watermark: int | None) -> set[int]:
+    """Covered positions a pre-v3.1.9 state file PROVES no chunk read.
+
+    hostile pass #4 (reviewer A F2). A v3.1.6.1 file records no text, but its
+    shape keeps three traces of the traffic that put unread turns under
+    chunk labels:
+
+      * a watermark BELOW the highest label (read before
+        _repair_watermark_below_chunks raises it). v3.1.6.1's
+        _reconcile_watermark set it to the array length on the tail after a
+        delete or an edit-and-resend, so the exchange of that tail (w-1, w)
+        and everything after it is text no chunk read — unless a chunk has
+        closed at w since, in which case only what is after w is unread and
+        the chunk's own start is the second trace;
+      * a span that starts INSIDE a span written before it (41-60, then
+        47-66): the pull-down again, and s-2, s-1 are that tail's exchange;
+      * the closing exchange of every chunk still in l1, and of the furthest
+        span: a regenerate of the reply that closed a chunk, or a delete of
+        that exchange and a new message, moves no watermark on v3.1.6.1
+        (39 + 1 = 40 is not below 40), so nothing else can tell it from the
+        exchange the chunk read.
+
+    What no trace can show, stated so nobody reads this as complete: an
+    in-place edit (OpenWebUI's edit-and-Save without a new branch), and a
+    regenerate of a closing reply whose chunk has since been consumed into
+    an L2 chapter. See _adopt_legacy_record for why those are adopted.
+    """
+    unread: set[int] = set()
+    l1 = [c for c in (state.get("l1") or []) if isinstance(c, dict)]
+    l2 = [c for c in (state.get("l2") or []) if isinstance(c, dict)]
+    l3 = state.get("l3") if isinstance(state.get("l3"), dict) else None
+    ordered = ([l3] if l3 else []) + l2 + l1
+    spans = [
+        (c.get("first_turn"), c.get("last_turn")) for c in ordered
+        if isinstance(c.get("first_turn"), int) and isinstance(c.get("last_turn"), int)
+    ]
+    highest = _highest_chunk_turn(state)
+    if isinstance(legacy_watermark, int) and 0 < legacy_watermark < highest:
+        w = legacy_watermark
+        closed_at_w = bool(spans) and spans[-1][1] == w
+        unread.update(range(max(1, w + 1 if closed_at_w else w - 1), highest + 1))
+    reach = 0
+    for ft, lt in spans:
+        if reach and ft <= reach:
+            unread.update(p for p in (ft - 2, ft - 1) if p >= 1)
+        reach = max(reach, lt)
+    # The closing exchange of the furthest span too, whatever its tier. This
+    # also absorbs the one error the position can carry into adoption: with
+    # no anchor in the file, _observed_position HOLDS where the truth may be
+    # one exchange on, so the offset can read up to _ASSUMED_NEW_TURNS low
+    # and window turn i land up to two positions below its own. Only the
+    # last two covered positions can then receive a turn past the chain,
+    # and they are never adopted.
+    for lt in [c.get("last_turn") for c in l1] + [highest]:
+        if isinstance(lt, int):
+            unread.update(p for p in range(lt - _ASSUMED_NEW_TURNS + 1, lt + 1) if p >= 1)
+    return unread
+
+
 def _adopt_legacy_record(
-    state: dict, request_turns: list[dict], window_offset: int
+    state: dict,
+    request_turns: list[dict],
+    window_offset: int,
+    legacy_watermark: int | None = None,
 ) -> bool:
     """One-shot adoption of chunks written before v3.1.9, which recorded
     nothing. True if the record changed.
@@ -1076,20 +1247,63 @@ def _adopt_legacy_record(
     conversation is ~1,900 turns of such chunks: never adopting them means the
     reuse path refreshes her whole history on every request, which is the
     4-call cap refusal this feature exists to end. So the array in hand is
-    believed ONCE — the documented upgrade trade, and what the pre-v3.1.9
-    gate substituted on with no evidence at all — narrowed so that it cannot
-    become F1 or F9 again:
+    believed ONCE, narrowed so that it cannot become F1 or F9 again:
 
-      * only the LEADING unrecorded run (an empty record, or the _FP_UNKNOWN
-        padding a raw-less admin rebuild wrote below its own chunks). Once
-        position 1 holds a fingerprint this never runs again.
+      * ONCE, by the `legacy_adopted` flag, and only over the LEADING
+        unrecorded run (an empty record, or the _FP_UNKNOWN padding a
+        raw-less admin rebuild wrote below its own chunks).
       * only positions chunks covered BEFORE this call (maybe_rollup calls it
         ahead of its own rollups, whose chunks record themselves).
       * only the request's own turns, never the reply appended after them:
         a chunk that closed on a reply is exactly what a regenerate replaces.
-      * only at window offset 0, where position N is request_turns[N-1].
+      * AT ANY WINDOW OFFSET o (hostile pass #4, reviewer A F3/F8): position
+        p takes request_turns[p - o - 1], and positions 1..o stay UNKNOWN. It
+        used to require o == 0, and o is never 0 again once the position has
+        run ahead of the array — v3.1.9 seeds the position from the highest
+        chunk label, and v3.1.6.1 kept every label while pulling its
+        watermark down after a delete or edit-and-resend. Upgrade inside that
+        window and adoption never ran: the whole legacy span was refreshed
+        on every request, for good. For a CAPPED client this reads exactly
+        the part of the window the chunks cover (position o+1 is window turn
+        1). For a full-history client whose array shrank it under-adopts by
+        o turns, never over: those are re-read by the next L1 chunks
+        (_patch_candidates).
+      * never a position _legacy_unread_positions proves no chunk read,
+        under either reading of the array (window turn i as position o+1+i,
+        or as position i+1).
+
+    WHAT IT STILL BELIEVES (reviewer A F2), and why that is the least bad
+    option. An in-place edit made on v3.1.6.1, and a regenerate of a
+    closing reply whose chunk was since folded into an L2 chapter, leave no
+    trace, and are adopted as if their chunk had read them. Two alternatives
+    were assessed:
+
+      * the episodic store as evidence (adopt a position only when its text
+        matches an indexed exchange). It cannot see the regenerate or the
+        edit-and-resend: the store is append-only across branches, so the
+        regenerated reply and the resent turn are indexed too. It does see
+        an in-place edit — and it also rejects every exchange memory never
+        stored, trimmed or was damaged on: before v3.1.4 a cut reply was
+        not stored at all (51 Stops and 12 ceilings in one 2026-09-01 log
+        window, more than half of that window's exchanges), pre-D1 rows
+        were overwritten in place, and a trimmed reply matches the re-sent
+        one only as a prefix, which is no evidence about the tail. Every
+        rejected position is refreshed on every request until re-read, and
+        at that rate the refreshed span is the cap refusal again;
+      * a rebuild of the whole covered span from the current array, the
+        complete fix, which is ~95 L1-sized summarization calls at her
+        length and is the admin endpoint's job, not a request tail's.
+
+    And relative to what she runs: v3.1.6.1 does not deliver an old
+    correction either. At ~1,700 messages its compaction needs far more than
+    MAX_SUMMARY_CALLS_PER_REQUEST batches, refuses, and the guard sheds the
+    older turns; the model receives the injected hierarchy, whose chunks
+    are these same summaries of the text before the correction. An adopted
+    position changes what reaches the model only for a turn the guard would
+    have kept verbatim — the newest few — and the closing exchanges of the
+    chunks still in l1 are exactly the ones this refuses.
     """
-    if window_offset != 0 or len(request_turns) < 1:
+    if state.get("legacy_adopted") or len(request_turns) < 1:
         return False
     entries = _covered_fps(state)
     lead = 0
@@ -1097,45 +1311,181 @@ def _adopt_legacy_record(
         lead += 1
     if entries and lead == 0:
         return False
-    upto = min(_covered_prefix(state), len(request_turns))
+    upto = _covered_prefix(state)
     if lead < len(entries):
         upto = min(upto, lead)
     if upto <= 0:
         return False
-    adopted = _covered_turn_fingerprints(request_turns[:upto])
-    if len(adopted) != upto:
-        return False
+    o = max(0, int(window_offset))
+    unread = _legacy_unread_positions(state, legacy_watermark)
+    adopted: list[str] = []
+    for p in range(1, upto + 1):
+        i = p - o - 1
+        if 0 <= i < len(request_turns) and p not in unread and (i + 1) not in unread:
+            adopted.append(_covered_turn_fingerprint(request_turns[i]))
+        else:
+            adopted.append(_FP_UNKNOWN)
     state["covered_fps"] = "".join(adopted + entries[upto:])
+    state["legacy_adopted"] = True
     return True
 
 
-def _paired_turns(record: list[str], now: list[str]) -> set[int]:
-    """Indices into `now` whose fingerprint EQUALS some entry of `record`.
+def _increasing_anchors(cand: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """The longest subsequence of `cand` (request index ascending) whose
+    record indices strictly increase. Patience sorting, O(n log n)."""
+    tails_k: list[int] = []
+    tails_i: list[int] = []
+    prev = [-1] * len(cand)
+    for i, (_j, k) in enumerate(cand):
+        p = bisect.bisect_left(tails_k, k)
+        if p > 0:
+            prev[i] = tails_i[p - 1]
+        if p == len(tails_k):
+            tails_k.append(k)
+            tails_i.append(i)
+        else:
+            tails_k[p] = k
+            tails_i[p] = i
+    out: list[tuple[int, int]] = []
+    i = tails_i[-1] if tails_i else -1
+    while i >= 0:
+        out.append(cand[i])
+        i = prev[i]
+    out.reverse()
+    return out
 
-    hostile pass #3 (reviewer A F2/F3/F7). The third shape compared turn N of
-    the request with record entry N. Positions shift: delete one message and
-    every later turn read as changed, so the refreshed span started at the
-    deletion and grew by two turns per exchange until the cap refused it; and
-    the length gate beside it declined outright after a delete of two or
-    more, an edit-and-resend, every regenerate, or two tool messages.
-    Pairing by content makes a delete cost nothing and an edit cost the
-    edited turn.
 
-    MEMBERSHIP, NOT AN ORDER-PRESERVING ALIGNMENT, and that is deliberate.
-    Safety never depended on which entry a turn pairs with: an entry is a
-    fingerprint a chunk wrote from the text it read, so a turn whose
-    fingerprint is in the record has its content in the stored summary
-    wherever it sits. An alignment only decides how MUCH is reused, and the
-    first cut of this used the standard library's SequenceMatcher, which
-    junks any fingerprint repeated in more than 1% of the request ("ok",
-    "continue", identical redaction placeholders) — those turns then read as
-    changed and were refreshed on every request — and measured 679 ms on
-    1,990 turns half of which were one repeated placeholder. A set lookup is
-    linear and has no such case.
+def _pairing(record: list[str], now: list[str]) -> dict[int, int]:
+    """{index into `now`: index into `record`}: which request turn each
+    record entry vouches for, IN ORDER, each entry used at most once.
+
+    hostile pass #4 (reviewer A F4). The previous shape was set membership:
+    any turn whose fingerprint was ANYWHERE in the record was replaced. A
+    repeated "yes" to a new question, or a paste sent twice, was then
+    replaced by the summary of its earlier twin in another context — for
+    good when it sat where no chunk would ever read it (after a delete of the
+    exchange that closed a chunk).
+
+    ORDER-PRESERVING, AND NOT SequenceMatcher. The first cut of the content
+    gate used difflib, which junks any element repeated in over 1% of a long
+    sequence ("continue", "ok", identical redaction placeholders — refreshed
+    on every request after any delete) and measured 679 ms at 1,990 turns.
+    This is patience alignment:
+
+      1. ANCHORS: turns whose fingerprint occurs exactly once in `now` and
+         exactly once in `record`; of those, the longest run whose record
+         indices increase. Her replies are long and unique, so anchors are
+         dense — roughly every other turn.
+      2. GAPS: between two consecutive anchors, each remaining turn pairs with
+         the FIRST unused entry holding its fingerprint inside the same gap of
+         the record, in order (sorted index lists + bisect). A "continue"
+         between two unique replies sits in a one-turn gap and pairs; a
+         "yes" whose only twin is outside its gap pairs with nothing.
+
+    A turn is still replaced only when its own content is an entry a chunk
+    wrote (safety is unchanged); the order only removes pairings. A delete
+    costs nothing and an edit costs the edited turn, as before. Inside one
+    very long gap with no unique turns at all, the greedy step can pair a
+    turn with a later twin and leave the turns between unpaired: that costs
+    refreshes, which the next L1 chunk re-reads, never a turn.
     """
-    have = set(record)
-    have.discard(_FP_UNKNOWN)
-    return {j for j, fp in enumerate(now) if fp in have}
+    rec_idx: dict[str, list[int]] = {}
+    for k, fp in enumerate(record):
+        if fp != _FP_UNKNOWN:
+            rec_idx.setdefault(fp, []).append(k)
+    if not rec_idx:
+        return {}
+    now_count: dict[str, int] = {}
+    for fp in now:
+        now_count[fp] = now_count.get(fp, 0) + 1
+    cand = [
+        (j, rec_idx[fp][0]) for j, fp in enumerate(now)
+        if now_count[fp] == 1 and len(rec_idx.get(fp, ())) == 1
+    ]
+    anchors = _increasing_anchors(cand)
+    pairs: dict[int, int] = {}
+    bounds = [(-1, -1)] + anchors + [(len(now), len(record))]
+    for (j0, k0), (j1, k1) in zip(bounds, bounds[1:]):
+        last_k = k0
+        for j in range(j0 + 1, j1):
+            lst = rec_idx.get(now[j])
+            if not lst:
+                continue
+            p = bisect.bisect_right(lst, last_k)
+            if p < len(lst) and lst[p] < k1:
+                pairs[j] = lst[p]
+                last_k = lst[p]
+        if j1 < len(now):
+            pairs[j1] = k1
+    return pairs
+
+
+def _paired_turns(record: list[str], now: list[str]) -> set[int]:
+    """Indices into `now` that _pairing pairs with an entry of `record`.
+
+    hostile pass #3 (reviewer A F2/F3/F7) made this content-based: the third
+    shape compared turn N of the request with record entry N, so one delete
+    shifted every later turn and the refreshed span grew until the cap
+    refused it. hostile pass #4 (F4) made it ordered; see _pairing.
+    """
+    return set(_pairing(record, now))
+
+
+def _has_image_parts(m: dict) -> bool:
+    content = m.get("content")
+    return isinstance(content, list) and any(
+        isinstance(c, dict)
+        and (c.get("type") in ("image_url", "image", "input_image") or "image_url" in c)
+        for c in content
+    )
+
+
+def _patch_candidates(
+    state: dict, raw_turns: list[dict], first_read: int
+) -> list[tuple[int, int]]:
+    """[(index into raw_turns, after_position)]: the turns the next L1 chunk
+    re-reads as extra pieces, oldest first, at most L1_CHUNK_SIZE.
+
+    hostile pass #4 (reviewer A F6). A turn inside the covered span that
+    pairs with nothing is summarized fresh by compact_if_needed on every
+    request, and nothing ever re-read it: the turns written after a delete of
+    a chunk-closing exchange (+2 per delete), a regenerated closing reply
+    (+1), an edited turn, an admin rebuild's placeholder positions, a legacy
+    position no evidence backs. Measured growth +2/+1 per event with no decay
+    across an L2 rollup; projected at her edit rate, most messages paying 3
+    summarization calls in about two months and the 4-call refusal in four
+    to six.
+
+    Computed the way the gate computes it (_pairing over _record_sequence):
+    every unpaired text turn BEFORE `first_read`, the first raw index this
+    call's chunk reads in position order. That is the gate's refreshed set
+    (unpaired turns before the last paired one) plus the unpaired turns
+    between the last paired one and where the chunk starts — the turns
+    written after a delete of the closing exchange sit exactly there, and
+    no later chunk would ever read them. Bounding by the last paired turn
+    instead left them for a second L1 cycle (measured). Nothing at or after
+    `first_read` is a candidate, so one chunk never reads a turn twice. The
+    chunk records each in `covered_extra` after the covered position of the
+    paired turn before it, so the next request pairs them. Image turns are
+    skipped (compaction never removes one).
+    """
+    seq, seq_pos = _record_sequence(state)
+    if not seq or not raw_turns:
+        return []
+    pairs = _pairing(seq, _covered_turn_fingerprints(raw_turns))
+    out: list[tuple[int, int]] = []
+    after = 0
+    for j in range(min(len(raw_turns), max(0, first_read))):
+        if j in pairs:
+            after = seq_pos[pairs[j]]
+            continue
+        m = raw_turns[j]
+        if _has_image_parts(m) or not _message_text(m).strip():
+            continue
+        out.append((j, after))
+        if len(out) >= L1_CHUNK_SIZE:
+            break
+    return out
 
 
 def _coverage_plan(state: dict, to_summarize: list[dict]) -> tuple[int, set[int]]:
@@ -1143,29 +1493,30 @@ def _coverage_plan(state: dict, to_summarize: list[dict]) -> tuple[int, set[int]
     turns the reuse path may take, and the 0-based indices inside it that it
     must summarize fresh instead of replacing.
 
-    A turn is replaced only when its fingerprint is paired with an equal
-    record entry (_paired_turns) among the entries the unbroken chunk chain
-    from turn 1 backs (_covered_prefix). Every entry was written from the
-    text a chunk read (_record_chunk_fps), so a replaced turn's content is in
-    the stored summary. `covered` ends after the last replaced turn; every
-    other turn before it is `changed`. That holds for a capped window, a
-    truncated head, a delete, a regenerate, an edit and a shorter branch
-    alike, which is why no length comparison guards this any more (F2/F3/F7):
-    a window whose turns the record does not hold simply reads as changed.
+    A turn is replaced only when it is PAIRED (_pairing, order-preserving)
+    with an equal entry of the record sequence (_record_sequence: the
+    entries the unbroken chunk chain from turn 1 backs, plus the turns a
+    chunk re-read out of position). Every entry was written from the text a
+    chunk read (_record_chunk_fps, _record_patch_fps), so a replaced turn's
+    content is in the stored summary. `covered` ends after the last replaced
+    turn; every other turn before it is `changed`. That holds for a capped
+    window, a truncated head, a delete, a regenerate, an edit and a shorter
+    branch alike, which is why no length comparison guards this any more
+    (F2/F3/F7): a window whose turns the record does not hold simply reads
+    as changed.
 
     (0, set()) when there is no record (no evidence) or nothing pairs.
     Pure; hashing is memoized (F6), and the gate still runs it in the
     threadpool.
     """
-    have = _covered_fps(state)
-    eff = min(_covered_prefix(state), len(have))
-    if eff <= 0:
+    seq, _pos = _record_sequence(state)
+    if not seq:
         return 0, set()
     non_system = [m for m in to_summarize if m.get("role") != "system"]
     if not non_system:
         return 0, set()
     now = _covered_turn_fingerprints(non_system)
-    matched = _paired_turns(have[:eff], now)
+    matched = _paired_turns(seq, now)
     if not matched:
         return 0, set()
     covered = max(matched) + 1
@@ -2028,6 +2379,7 @@ async def _do_l1_rollup(
     messages: list[dict],
     window_offset: int = 0,
     raw_turns: list[dict] | None = None,
+    patch: list[tuple[int, int]] | None = None,
 ) -> bool:
     """Roll the next L1_CHUNK_SIZE turns after last_summarized_turn into a
     new L1 chunk. Returns True if the watermark advanced.
@@ -2036,6 +2388,12 @@ async def _do_l1_rollup(
     client sees them, index for index (maybe_rollup builds and checks it).
     This chunk's covered-turn record is written from it, or from `messages`
     itself when it is None — see _record_chunk_fps.
+
+    `patch`, if given (with raw_turns), is [(non-system index, after
+    position)] from _patch_candidates: older turns inside the covered span
+    that pair with nothing. The chunk reads them as extra pieces ahead of its
+    own turns and records them out of position (_record_patch_fps) in the
+    same mutation. Its label, and so the tiling, L2 and L3, are unchanged.
 
     `window_offset` is (position - len(window)): how many turns of this
     conversation sit BEFORE the first turn the client sent. It is 0 for a
@@ -2114,6 +2472,24 @@ async def _do_l1_rollup(
             f"GET /admin/conversations/{conv_id}"
         )
         return True
+    # hostile pass #4 (reviewer A F6): the older unpaired turns this chunk
+    # re-reads, AHEAD of its own turns because they are older. Read from
+    # `messages` (the rollup view: a loop redacted exactly as it would be at
+    # its own position), recorded from `raw_turns` below, the same split as
+    # the chunk's own turns. Only with raw_turns: without the client's text
+    # (the admin rebuild) there is nothing to pair a re-read against.
+    _ns_msgs = [m for m in messages if m.get("role") != "system"]
+    _patch = [
+        (j, after) for j, after in (patch or [])
+        if raw_turns is not None and 0 <= j < min(len(_ns_msgs), len(raw_turns))
+        and j < pos_first - 1
+    ]
+    if _patch:
+        pieces = [
+            f"[{_ns_msgs[j].get('role', 'unknown')}] (an earlier turn, as it "
+            f"reads now): {_message_text(_ns_msgs[j])}"
+            for j, _a in _patch
+        ] + pieces
     text = await _summarize_pieces(
         conv_id, client, vllm_url, model, _PROMPT_L1, pieces, L1_MAX_TOKENS
     )
@@ -2144,12 +2520,15 @@ async def _do_l1_rollup(
     # position an admin rebuild summarized from placeholders (F9).
     #
     # From `raw_turns` when the caller has the client's own text, because
-    # `messages` is the rollup input — degenerate replies redacted, a stopped
-    # reply trimmed to its last sentence — which no request carries, and
-    # recording that switched reuse off on ordinary traffic (the 2026-09-12
-    # soak). The raw text carries two documented trades: a redacted loop, and
-    # a stopped reply's unterminated last fragment, are replaced by a summary
-    # that omitted them.
+    # `messages` is the rollup input — degenerate replies redacted — which no
+    # request carries, and recording that switched reuse off on ordinary
+    # traffic (the 2026-09-12 soak). The raw text carries ONE documented
+    # trade: a reply reply_is_degenerate calls a loop is read as its clean
+    # sentence head (or the placeholder when it has none), so what follows
+    # its last sentence boundary is replaced by a summary that omitted it
+    # (main._redact_degenerate_turns). A STOPPED reply is no longer a second
+    # trade (hostile pass #4, reviewer A F1): the tail appends it as it
+    # streamed, so the chunk that closes on it reads the tail it records.
     _src = (
         raw_turns if raw_turns is not None
         else [m for m in messages if m.get("role") != "system"]
@@ -2157,6 +2536,17 @@ async def _do_l1_rollup(
     _record_chunk_fps(
         state, covered_first, last_turn, _src[pos_first - 1:pos_last]
     )
+    if _patch:
+        _record_patch_fps(
+            state, last_turn,
+            [(after, _covered_turn_fingerprint(raw_turns[j])) for j, after in _patch],
+        )
+        logger.info(
+            f"conv={conv_id}: the L1 chunk for turns {covered_first}-"
+            f"{last_turn} also re-read {len(_patch)} earlier turn(s) that no "
+            f"stored summary held as they read now; they are reused from "
+            f"the next request on instead of summarized fresh on every one"
+        )
     # A rollup had no success line of its own, so the only evidence the
     # hierarchy was advancing was the injection counter — which is why S-5
     # froze it for the life of the deployment without anyone noticing.
@@ -2483,7 +2873,10 @@ async def maybe_rollup(
 
         # Before anything reads the watermark: a file written by the old
         # _reconcile_watermark can have it BELOW the chunks it wrote, and
-        # every number below is derived from it (v3.1.7, R12).
+        # every number below is derived from it (v3.1.7, R12). The value it
+        # had is kept first: it is one of the traces the one-shot legacy
+        # adoption reads (hostile pass #4, _legacy_unread_positions).
+        _legacy_watermark = state.get("last_summarized_turn")
         changed = _repair_watermark_below_chunks(conv_id, state)
 
         before_position = state.get("turns_seen")
@@ -2545,20 +2938,35 @@ async def maybe_rollup(
                     f"rather than reused"
                 )
             if request_turns and await run_in_threadpool(
-                _adopt_legacy_record, state, request_turns, window_offset
+                _adopt_legacy_record, state, request_turns, window_offset,
+                _legacy_watermark if isinstance(_legacy_watermark, int) else None,
             ):
                 changed = True
 
         if needs_rollup(state, current_turns):
             try:
+                # hostile pass #4 (reviewer A F6): the refreshed turns the
+                # FIRST chunk of this drain re-reads. Computed once, against
+                # the record as it stands before this call's chunks, and
+                # handed to one chunk only, so no turn is read twice.
+                _patch: list[tuple[int, int]] = []
+                if raw_turns is not None and _needs_l1_rollup(state, current_turns):
+                    _first_read = (
+                        int(state.get("last_summarized_turn", 0)) + 1
+                        - window_offset - 1
+                    )
+                    _patch = await run_in_threadpool(
+                        _patch_candidates, state, raw_turns, _first_read
+                    )
                 async with httpx.AsyncClient() as client:
                     # Drain L1 rollups until either caught up or no more material.
                     while _needs_l1_rollup(state, current_turns):
                         if not await _do_l1_rollup(
                             conv_id, client, vllm_url, model, state, messages,
-                            window_offset, raw_turns,
+                            window_offset, raw_turns, _patch,
                         ):
                             break
+                        _patch = []
                         changed = True
 
                     # Drain L2 rollups while threshold met.

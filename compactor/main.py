@@ -1946,14 +1946,19 @@ async def compact_if_needed(
             elif _changed:
                 # Every request, not once: a refreshed span that is growing is
                 # the early warning of the cap refusal, and this is the only
-                # line that shows it.
+                # line that shows it. No cause is guessed (hostile pass #4,
+                # reviewer A F4): a turn is unpaired when no chunk read its
+                # text at its place in the order, whatever changed. The next
+                # L1 rollup re-reads these (summarizer._patch_candidates), so
+                # the count should fall back to 0 within one L1 cycle; one
+                # that keeps climbing across cycles is the fault to chase.
                 logger.info(
                     f"conv={conv_id}: {len(_changed)} of the first {_covered} "
                     f"turn(s) this request would compact are not in the "
-                    f"stored summaries' covered-turn record (edited, "
-                    f"regenerated, written after a delete, or on another "
-                    f"branch); summarizing those fresh rather than replacing "
-                    f"them"
+                    f"stored summaries' covered-turn record (not paired, in "
+                    f"order, with text a chunk read); summarizing those fresh "
+                    f"rather than replacing them until an L1 rollup re-reads "
+                    f"them (up to {summarizer.L1_CHUNK_SIZE} per rollup)"
                 )
 
             # OPEN_ISSUES2 LOW, re-checked against this gate: `_covered > 0`
@@ -2731,16 +2736,43 @@ def _redact_degenerate_turns(messages: list[dict]) -> list[dict]:
     chunk — but neither should look, to a chunk-existence check, like there
     was nothing there. Saying plainly that something was omitted is the
     difference between a gap and a silent one.
+
+    A CLEAN HEAD IS KEPT (hostile pass #4, reviewer A F7). A reply whose
+    whole text the detector calls a loop, but whose prefix up to the last
+    sentence boundary is clean, is replaced by that prefix — the exact rule
+    decide_memory_tail applies to a cut reply (trim to the last sentence,
+    the MIN_MEMORABLE_TRIMMED_CHARS floor, judged on the kept text), not the
+    placeholder. Before this, a ceiling-cut reply with a clean prose head and
+    a runaway tail was stored trimmed by memory, and then its chunk read the
+    placeholder while the covered-turn record held the full text the client
+    re-sends: from that chunk on the reply was removed WHOLE from every
+    request, head included, although memory had deliberately kept the head.
+    The head is not a loop by memory's own rule. What a redacted turn now
+    loses is only what follows its last sentence boundary, which is where
+    the loop is. A turn with no clean head still gets the placeholder.
+
+    The history carries no "finished" flag, so the rule is the cut rule for
+    every turn: a FINISHED reply memory refused whole also keeps its clean
+    head here. That is the same judgement (the object is the text being
+    summarized), and the hierarchy is a summary, not the fact store.
     """
     out = []
     redacted = 0
+    kept_heads = 0
     for m in messages:
         if (
             isinstance(m, dict)
             and m.get("role") == "assistant"
             and reply_is_degenerate(_message_text(m))
         ):
-            m = {**m, "content": _DEGENERATE_HISTORY_PLACEHOLDER}
+            head = decide_memory_tail(
+                _message_text(m), finished=False, truncated=True, holed=False
+            )
+            if head.store and head.text.strip():
+                m = {**m, "content": head.text}
+                kept_heads += 1
+            else:
+                m = {**m, "content": _DEGENERATE_HISTORY_PLACEHOLDER}
             redacted += 1
         out.append(m)
     if redacted:
@@ -2752,7 +2784,8 @@ def _redact_degenerate_turns(messages: list[dict]) -> list[dict]:
         # kill.
         logger.info(
             f"redacted {redacted} degenerate historical turn(s) from "
-            f"rollup input ({len(messages)} total)"
+            f"rollup input ({len(messages)} total); {kept_heads} of them "
+            f"kept their clean sentence head"
         )
     return out
 
@@ -3939,10 +3972,47 @@ def _enforce_hard_budget(
         # removed). So when the stand-in is present, the injected blocks
         # around it are trimmed and then dropped FIRST, the stand-in itself
         # untouched; turns, and then the stand-in, only after that.
+        #
+        # EXCEPT THE TURNS THAT GO ANYWAY (hostile pass #4, reviewer A F5).
+        # In the cap-refusal state — a stand-in in the array AND summarize()
+        # refusing the fresh span over the per-request call cap, which hands
+        # every refreshed or uncovered turn back verbatim — the turns left
+        # are not "her last message and the reply she is answering" but tens
+        # to thousands of old deferred turns, far more than all injected
+        # memory together. Spending memory first then bought nothing:
+        # measured at the shipped limit, the guard halved and dropped persona,
+        # pinned facts and retrieval, and then dropped 100 old turns anyway
+        # (the pre-F5 order dropped 104 and kept persona and facts). So the
+        # old turns that would have to be shed EVEN WITH EVERY SPENDABLE BLOCK
+        # DROPPED are shed first, oldest first, never into the last
+        # KEEP_RECENT_TURNS; memory is spent only on what is left over. In
+        # steady reuse (nothing deferred) that set is empty and the order
+        # above is unchanged.
         if any(
             _is_compaction_standin(msgs[i])
             for i in _droppable_system_indices(msgs, protect_system)
         ):
+            # Memory's total is computed once: this loop removes turns only.
+            # And the oldest turn is found from the front, where the system
+            # blocks are: in this state the array can hold thousands of
+            # turns, and rebuilding an index list per dropped turn was
+            # quadratic on the request path.
+            _memory = sum(
+                per[i] for i in _droppable_system_indices(msgs, protect_system)
+                if not _is_compaction_standin(msgs[i])
+            )
+            _n_turns = sum(1 for m in msgs if m.get("role") != "system")
+            while running > limit:
+                if running - _memory <= limit:
+                    break
+                if _n_turns <= max(1, KEEP_RECENT_TURNS):
+                    break
+                i0 = next(i for i, m in enumerate(msgs) if m.get("role") != "system")
+                running -= per[i0]
+                del msgs[i0]
+                del per[i0]
+                dropped += 1
+                _n_turns -= 1
             while running > limit and trimmed < 32:
                 big = [
                     i
@@ -4786,9 +4856,10 @@ async def _async_tail(
 
     `reply_as_streamed` is the reply as the CLIENT received it, passed only
     when it differs from `assistant_text` (a stopped or ceiling-cut reply,
-    which decide_memory_tail trims to its last sentence). Memory stores the
-    trimmed text; the covered-turn record must describe what OpenWebUI keeps
-    and re-sends, which is what streamed (hostile pass #3, F1). See
+    which decide_memory_tail trims to its last sentence). Facts and the
+    episodic index store the trimmed text; the hierarchy reads, and the
+    covered-turn record describes, what OpenWebUI keeps and re-sends, which
+    is what streamed (hostile pass #3 F1; hostile pass #4 reviewer A F1). See
     _rollup_hierarchy.
     """
     # V2.3 Theme 2: under disk pressure, stop GROWING memory but keep
@@ -4886,10 +4957,22 @@ async def _rollup_hierarchy(
     roll up the history alone — which is what the skipped-tail path passes.
 
     `reply_as_streamed` is that reply as the client received it, when it
-    differs (a stopped reply trimmed for memory). The chunk summarizes
-    `assistant_text`; the covered-turn record it writes describes the
-    streamed text, because that is what every later request carries
-    (hostile pass #3, F1 — see summarizer._record_chunk_fps).
+    differs (a stopped reply trimmed for memory). The covered-turn record
+    describes the streamed text, because that is what every later request
+    carries (hostile pass #3, F1 — see summarizer._record_chunk_fps), and
+    since hostile pass #4 (reviewer A F1) the chunk READS it too: the reply
+    is appended as streamed, through the same redaction every history turn
+    gets. Before, the chunk summarized `assistant_text` — the memory-trimmed
+    prefix — while the record blessed the full reply, so a Stopped or
+    ceiling-cut reply that CLOSED an L1 chunk lost everything after its last
+    sentence boundary (a trailing list, notes after a code block) from every
+    later request, in no layer at all. A cut reply that does not close a
+    chunk was already read in full by a later chunk, from the next request;
+    this makes the closing position read what the other nineteen do. The
+    trim exists for the fact store and the episodic index, which still get
+    `assistant_text`; a runaway loop still never reaches a summary, because
+    the redaction judges the streamed text (its clean head, or the
+    placeholder).
 
     WHY None IS A CASE AT ALL (v3.1.8). A reply that trips
     reply_is_degenerate must not enter memory: the fact extractor would
@@ -4958,11 +5041,30 @@ async def _rollup_hierarchy(
         # 20 turns 4.6ms, 40 turns 9.5ms, 85 turns 65ms, 170 turns 446ms -
         # and it runs on every single turn. The detector blocking this same
         # loop is a defect this branch has already shipped once.
-        _redacted = await run_in_threadpool(
-            _redact_degenerate_turns, list(messages)
+        #
+        # hostile pass #4 (reviewer A F1): a reply that was cut is appended
+        # AS STREAMED, redacted in the same pass as the history — the text
+        # the record will describe, so a chunk closing on it reads its tail.
+        # See this function's docstring. Should the redaction leave nothing
+        # but the placeholder, the reply memory itself kept (`assistant_text`,
+        # already judged clean) is what the chunk reads instead.
+        _streamed_differs = (
+            assistant_text is not None
+            and reply_as_streamed is not None
+            and reply_as_streamed != assistant_text
         )
+        _to_redact = list(messages) + (
+            [{"role": "assistant", "content": reply_as_streamed}]
+            if _streamed_differs else []
+        )
+        _redacted = await run_in_threadpool(_redact_degenerate_turns, _to_redact)
+        _reply_text = assistant_text
+        if _streamed_differs:
+            _reply_text = _message_text(_redacted.pop())
+            if _reply_text == _DEGENERATE_HISTORY_PLACEHOLDER:
+                _reply_text = assistant_text
         full_messages = _redacted + (
-            [{"role": "assistant", "content": assistant_text}]
+            [{"role": "assistant", "content": _reply_text}]
             if assistant_text is not None
             else []
         )
@@ -4978,11 +5080,7 @@ async def _rollup_hierarchy(
         # (or test double) of maybe_rollup that predates the kwarg is
         # unaffected on every reply that was not cut.
         _rollup_kwargs: dict = {"raw_messages": list(messages)}
-        if (
-            assistant_text is not None
-            and reply_as_streamed is not None
-            and reply_as_streamed != assistant_text
-        ):
+        if _streamed_differs:
             _rollup_kwargs["reply_as_streamed"] = reply_as_streamed
         state = await summarizer.maybe_rollup(
             conv_id, full_messages, VLLM_URL, MODEL_REPO or "",
@@ -5251,6 +5349,8 @@ def _run_memory_tail(
     # hostile pass #3 (F1): the covered-turn record must describe the reply
     # as the client RECEIVED it — `text`, the accumulator's whole stream or
     # the non-stream body — not `decision.text`, which is trimmed for memory.
+    # hostile pass #4 (reviewer A F1): and the hierarchy reads that same
+    # text, so a chunk that closes on a cut reply summarizes its tail.
     # Passed only when the two differ (a trimmed store), so test doubles of
     # _async_tail that predate the kwarg keep working on every other reply.
     _tail_kwargs: dict = {"injected_facts": injected_facts}

@@ -934,13 +934,19 @@ def _set_reply(seq: int, looping: bool) -> None:
              repr(m))
 
 
-def _turn(n: int, history: list[dict], looping: bool
+def _turn(n: int, history: list[dict], looping: bool, rewrite=None
           ) -> tuple[int, str, list[dict], str, int]:
     """One real POST through the compactor to the fixture.
 
     Returns (status, log text, forwarded payload, reply text, LLM calls made
     ON THE REQUEST PATH) — the last one measured before the memory tail runs,
-    because the tail does not block the user."""
+    because the tail does not block the user.
+
+    `rewrite(body, response)`, if given, may return a replacement
+    httpx.Response for a /v1/chat/completions call — the traffic phase uses
+    it to make the backend answer one chat turn with finish_reason=length,
+    which the fixture cannot emit (hostile pass #4)."""
+    _request_no[0] += 1
     _set_reply(n, looping)
     _calls_at_start = _fixture_stats().get("chat_completions", 0)
     cap = _Capture()
@@ -953,7 +959,10 @@ def _turn(n: int, history: list[dict], looping: bool
     async def _spy(self, url, **kw):
         if url.endswith("/v1/chat/completions"):
             forwarded.append(kw.get("json") or {})
-        return await _real_post(self, url, **kw)
+        resp = await _real_post(self, url, **kw)
+        if rewrite is not None and url.endswith("/v1/chat/completions"):
+            resp = rewrite(kw.get("json") or {}, resp) or resp
+        return resp
 
     try:
         with patch.object(main, "_fire_and_forget", _defer_tail), \
@@ -1051,6 +1060,10 @@ main._facts_tail = _facts_tail_spy
 # accepts it — and in the shipped run 21 of 22 assistant turns were
 # placeholders by the time the rollup saw them.
 _l1_inputs: list[tuple[int, int]] = []
+# hostile pass #4 (reviewer A F1/F4): WHAT each L1 chunk read, keyed by the
+# request (_turn call) whose tail wrote it, for the traffic phase's checks.
+_l1_pieces_log: list[tuple[int, list[str]]] = []
+_request_no = [0]
 _real_summarize_pieces = summarizer._summarize_pieces
 
 
@@ -1061,6 +1074,7 @@ async def _summarize_pieces_spy(conv_id, client_, vllm_url, model, system_prompt
             sum(1 for p in pieces if main._DEGENERATE_HISTORY_PLACEHOLDER in p),
             len(pieces),
         ))
+        _l1_pieces_log.append((_request_no[0], list(pieces)))
     return await _real_summarize_pieces(conv_id, client_, vllm_url, model,
                                         system_prompt, pieces, max_tokens)
 
@@ -1449,13 +1463,13 @@ _traffic_log: list[str] = []
 _tn = [TURNS]
 
 
-def _traffic_turn(label: str, req: list[dict]) -> str:
+def _traffic_turn(label: str, req: list[dict], rewrite=None) -> str:
     """One request of the traffic phase. Returns the reply text; `req` is
     the array sent (ending on a user turn)."""
     global _prev_watermark
     _tn[0] += 1
     _cc0 = main.compaction_counters()
-    status, log, sent, reply, calls = _turn(_tn[0], req, looping=False)
+    status, log, sent, reply, calls = _turn(_tn[0], req, looping=False, rewrite=rewrite)
     _cc1 = main.compaction_counters()
     if status != 200:
         fail(f"traffic {label}: HTTP {status}")
@@ -1503,6 +1517,176 @@ history[:] = history[:_edit_at] + [{"role": "user", "content":
 history.append({"role": "assistant", "content": _traffic_turn("edit-resend", history)})
 for _ in range(8):
     _traffic_exchange("after-edit")
+
+# ---- hostile pass #4 (reviewer A F1, F4, F6) --------------------------------
+# 5. A CUT REPLY THAT CLOSES AN L1 CHUNK (F1). The fixture always finishes
+# "stop", so the backend's answer to this one chat turn is rewritten at the
+# httpx boundary into what vLLM returns for a reply cut at the generation
+# ceiling: prose, then an unterminated list, finish_reason=length. The
+# compactor's non-stream path then does exactly what it does in production:
+# memory keeps the prose, the client keeps all of it. The chunk that closes on
+# it must READ the list (the marker), and record the reply as sent.
+_STOP_TAIL = "SOAK-STOP-TAIL"
+_STOP_TEXT = (
+    "We went back over the week together. The office opens at nine, and the "
+    "form has to be signed before the end of the month. You asked whether the "
+    "second letter mattered, and it does, because it names the date the "
+    "change began. Keep both letters in the blue folder with the receipts. If "
+    "anyone asks for the reference number, it is on the back of the first "
+    "page, under the stamp. We also talked about the garden and the bench "
+    "that needs painting before the rain.\n\nThe steps we agreed:\n"
+    f"- {_STOP_TAIL} call the office about the form\n- bring the folder and"
+)
+_stop_cut = main.decide_memory_tail(_STOP_TEXT, finished=True, truncated=True, holed=False)
+if _stop_cut.outcome != tailhealth.STORED_TRIMMED or _STOP_TAIL in _stop_cut.text:
+    fail("traffic stop: the cut reply fixture is not a trimmed store with its marker in "
+         "the cut tail", f"{_stop_cut.outcome}: {_stop_cut.reason}")
+
+
+def _length_cut_rewrite(marker: str):
+    def _rw(body: dict, resp):
+        msgs = body.get("messages") or []
+        if not msgs or msgs[-1].get("role") != "user" or marker not in str(msgs[-1].get("content")):
+            return None      # a summarization call, not the chat turn
+        j = resp.json()
+        j["choices"][0]["message"]["content"] = _STOP_TEXT
+        j["choices"][0]["finish_reason"] = "length"
+        return httpx.Response(resp.status_code, json=j, request=resp.request)
+    return _rw
+
+
+def _closes_chunk_next() -> bool:
+    _s = summarizer.load_state(CONV)
+    return (summarizer._recorded_position(_s) + 2
+            - int(_s.get("last_summarized_turn", 0))) >= summarizer.L1_CHUNK_SIZE
+
+
+_stop_done = False
+for _attempt in range(3 * summarizer.L1_CHUNK_SIZE):
+    if not _closes_chunk_next():
+        _traffic_exchange("before-stop")
+        continue
+    _wm0 = summarizer.load_state(CONV).get("last_summarized_turn", 0)
+    _req_at = _request_no[0] + 1
+    _marker = f"Turn {_tn[0] + 1}. STOP-HERE"
+    history.append({"role": "user", "content": f"{_marker} Walk me through the paperwork again."})
+    history.append({"role": "assistant", "content": _traffic_turn(
+        "stop-closing", history, rewrite=_length_cut_rewrite(_marker))})
+    if history[-1]["content"] != _STOP_TEXT:
+        fail("traffic stop: the client did not receive the cut reply", history[-1]["content"][:80])
+    _s1 = summarizer.load_state(CONV)
+    if _s1.get("last_summarized_turn", 0) == _wm0:
+        continue
+    _stop_done = True
+    _read = [p for rq, ps in _l1_pieces_log if rq == _req_at for p in ps]
+    if not any(_STOP_TAIL in p for p in _read):
+        fail("*** F1: the chunk that closed on a cut reply did not read its tail",
+             f"{len(_read)} piece(s) read on that turn")
+    _last = int(_s1["last_summarized_turn"])
+    _fp_sent = summarizer._covered_turn_fingerprint({"role": "assistant", "content": _STOP_TEXT})
+    if summarizer._covered_fps(_s1)[_last - 1] != _fp_sent:
+        fail("traffic stop: the closing position is not recorded as the reply the client holds")
+    break
+if not _stop_done:
+    fail("traffic stop: no cut reply closed an L1 chunk in "
+         f"{3 * summarizer.L1_CHUNK_SIZE} attempts")
+for _ in range(3):
+    _traffic_exchange("after-stop")
+print(f"  ok   a length-cut reply closed an L1 chunk: memory kept {len(_stop_cut.text)} of "
+      f"{len(_STOP_TEXT)} chars, the chunk read the tail after the last sentence "
+      f"boundary, and recorded the reply as the client holds it")
+
+
+# 6. A DUPLICATE SHORT MESSAGE (F4): "yes" once early, then again right after
+# deleting the exchange that closed a chunk, where no chunk will read it at
+# its position. On every later request it must not be paired with the record
+# until a chunk written after it appeared has read it.
+def _probe_paired(probe: dict) -> bool:
+    _, _ts, _ = main.split_messages(list(history))
+    idx = next((i for i, m in enumerate(t for t in _ts if t.get("role") != "system")
+                if m is probe), None)
+    if idx is None:
+        return False
+    cov, chg = summarizer._coverage_plan(summarizer.load_state(CONV), _ts)
+    return idx < cov and idx not in chg
+
+
+history.append({"role": "user", "content": "yes"})
+history.append({"role": "assistant", "content": _traffic_turn("yes-early", history)})
+# The early "yes" must already be READ by a chunk (in the record) before its
+# twin is sent, or pairing by membership would not pair the twin either and
+# this check could not fail.
+_early_yes_pos = summarizer._recorded_position(summarizer.load_state(CONV)) - 1
+for _attempt in range(4 * summarizer.L1_CHUNK_SIZE):
+    _wm0 = summarizer.load_state(CONV).get("last_summarized_turn", 0)
+    _traffic_exchange("before-duplicate")
+    _wm1 = summarizer.load_state(CONV).get("last_summarized_turn", 0)
+    if _wm1 != _wm0 and _wm1 >= _early_yes_pos:
+        break
+else:
+    fail("traffic duplicate: no chunk closed past the early 'yes'")
+if summarizer._covered_turn_fingerprint({"role": "user", "content": "yes"}) not in \
+        summarizer._record_sequence(summarizer.load_state(CONV))[0]:
+    fail("traffic duplicate: fixture — the early 'yes' is not in the record, so the twin "
+         "check below could not fail")
+del history[-2:]
+_yes = {"role": "user", "content": "yes"}
+_yes_since = _request_no[0] + 1
+history.append(_yes)
+history.append({"role": "assistant", "content": _traffic_turn("yes-after-delete", history)})
+_yes_legit = 0
+for _ in range(summarizer.L1_CHUNK_SIZE // 2 + 4):
+    history.append({"role": "user", "content": f"Turn {_tn[0] + 1}. Tell me about item {_tn[0] + 1} in detail."})
+    if _probe_paired(_yes):
+        if not any(rq >= _yes_since and any(p.split(": ", 1)[-1] == "yes" for p in ps)
+                   for rq, ps in _l1_pieces_log):
+            fail("*** F4: the repeated 'yes' was paired with its earlier twin before any "
+                 "chunk read it")
+        _yes_legit += 1
+    history.append({"role": "assistant", "content": _traffic_turn("after-duplicate", history)})
+print(f"  ok   a repeated 'yes' after a delete was never paired with its twin; a chunk "
+      f"re-read it and it came off the shelf on {_yes_legit} request(s)")
+if not _yes_legit:
+    fail("F4/F6 liveness: the repeated 'yes' was never re-read by a chunk")
+
+
+# 7. A LONG RUN OF DELETES AND REGENERATES (F6): one right after every L1
+# chunk closes. The turns each leaves unpaired inside the covered span must be
+# re-read by the next chunk, not refreshed on every request for good.
+_refreshed: list[int] = []
+_events = 0
+_kinds = ("delete-last", "regenerate-closing", "delete-reply")
+_run_start = len(_traffic_rows)
+while _events < 4:
+    _wm0 = summarizer.load_state(CONV).get("last_summarized_turn", 0)
+    history.append({"role": "user", "content": f"Turn {_tn[0] + 1}. Tell me about item {_tn[0] + 1} in detail."})
+    _, _ts, _ = main.split_messages(list(history))
+    _refreshed.append(len(summarizer._coverage_plan(summarizer.load_state(CONV), _ts)[1]))
+    history.append({"role": "assistant", "content": _traffic_turn("delete-regen-run", history)})
+    if summarizer.load_state(CONV).get("last_summarized_turn", 0) == _wm0:
+        if len(_traffic_rows) - _run_start > 12 * summarizer.L1_CHUNK_SIZE:
+            fail("traffic run: no L1 chunk closed in the delete/regenerate run")
+        continue
+    _kind = _kinds[_events % len(_kinds)]
+    _events += 1
+    if _kind == "delete-last":
+        del history[-2:]
+    elif _kind == "regenerate-closing":
+        history[-1] = {"role": "assistant",
+                       "content": _traffic_turn("regenerate-closing", history[:-1])}
+    else:
+        del history[-1:]    # only the reply; her next message follows her last
+for _ in range(summarizer.L1_CHUNK_SIZE // 2 + 2):
+    history.append({"role": "user", "content": f"Turn {_tn[0] + 1}. Tell me about item {_tn[0] + 1} in detail."})
+    _, _ts, _ = main.split_messages(list(history))
+    _refreshed.append(len(summarizer._coverage_plan(summarizer.load_state(CONV), _ts)[1]))
+    history.append({"role": "assistant", "content": _traffic_turn("after-run", history)})
+_third = max(1, len(_refreshed) // 3)
+if max(_refreshed[-_third:]) > max(4, max(_refreshed[:_third]) + 2):
+    fail("*** F6: the refreshed span grew across a run of deletes and regenerates",
+         f"refreshed per request: {_refreshed}")
+print(f"  ok   {_events} deletes/regenerates right after chunk closes: refreshed turns "
+      f"per request {_refreshed} (bounded, re-read by the next chunk)")
 
 _traffic_p = _reuse_problems(_traffic_rows)
 if _traffic_p:
