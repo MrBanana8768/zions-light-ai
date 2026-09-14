@@ -972,6 +972,82 @@ def _reset_hierarchy_progress_for_tests() -> None:
     _progress["eligible"] = 0
 
 
+# v3.1.9 (tail catch-up, hostile follow-up). How "recently" a watermark had
+# to advance to call a catch-up CONVERGING, in wall-clock seconds.
+#
+# THIS REPLACED A POLL-TO-POLL COMPARISON, and the replacement is the whole
+# point of this follow-up, so the reasoning is worth keeping here in full.
+# The first cut called a catch-up "converging" when hierarchy_lag_recent was
+# smaller than the PREVIOUS /health/full POLL saw. The Dockerfile
+# HEALTHCHECK polls every 30 s; the one thing that ever advances a rollup is
+# her sending a message, which happens every few minutes at MOST. So on a
+# real pod, consecutive polls almost always see the SAME lag — not because
+# the catch-up stalled, but because nothing happened between the two polls
+# at all — and the wording flapped back to the actionable "/compact" advice
+# for dozens of polls between her turns, on a catch-up that was genuinely
+# healthy the whole time. The project's own first test for this polled once
+# per turn, which is exactly the one cadence that could not see the bug.
+#
+# The fix reads evidence the TAIL recorded (summarizer.record_catchup_pass /
+# catchup_progress_for) instead of anything this endpoint measures itself,
+# so the verdict cannot depend on how often /health/full happens to be
+# asked — only on how often SHE actually chats, which is what a catch-up's
+# rate is actually made of.
+#
+# WHY 15 MINUTES. Her cadence during an active session is minutes between
+# turns (the 24 h window elsewhere in this module,
+# _WORST_LAG_RECENCY_S, is for "is this conversation live AT ALL", not
+# this). 15 minutes comfortably spans a real gap for typing, reading a long
+# reply, or stepping away mid-thought without reading as "converging" from
+# a single stale advance hours ago — and is short enough that a catch-up
+# that truly stopped making progress falls back to the actionable wording
+# within one plausible gap between her turns, not after an entire session.
+_CATCHUP_RECENT_S = 15 * 60.0
+
+
+def _catchup_verdict(conv_id: str | None) -> str:
+    """"converging", "stuck", or "unknown" for `conv_id`'s catch-up, from
+    the TAIL's own process-local record (summarizer.catchup_progress_for) —
+    never from anything this function measures itself. See _CATCHUP_RECENT_S
+    above for why a poll-to-poll comparison was wrong.
+
+    "converging": the watermark advanced within the last _CATCHUP_RECENT_S
+    seconds — real, recent, cadence-of-HER-chatting evidence of progress.
+
+    "stuck": HIERARCHY_STALL_DECISIONS or more PASSES have happened for this
+    conversation with work due and no advance in any of them. Reusing that
+    constant rather than a second tuned number: it is already this module's
+    answer to "how many rollup-eligible events with no progress count as
+    stalled", just applied here per-conversation (a pass only ever happens
+    on her turn) instead of store-wide (H-1's decisions, any conversation).
+
+    "unknown": no evidence either way — every conv_id starts here, and a
+    conv_id NOT in the record (no budgeted pass has run for it in THIS
+    process) is "unknown" too, most commonly right after a restart. See the
+    call site for what "unknown" means for the reason: the SAME actionable
+    wording "stuck" gets, not "converging" — the safe direction, because a
+    restart losing this process-local evidence must not let an operator
+    believe a genuinely stuck backlog is self-healing just because nothing
+    has been observed about it yet in the new process. The tail's very next
+    budgeted pass on this conversation (her next message) starts building
+    real evidence again; there is no other way to recover it, and none is
+    needed — this is a live-process diagnostic, not a durable record.
+    """
+    if conv_id is None:
+        return "unknown"
+    evidence = summarizer.catchup_progress_for(conv_id)
+    if evidence is None:
+        return "unknown"
+    last_advance = evidence.get("last_advance_monotonic")
+    if isinstance(last_advance, (int, float)):
+        if time.monotonic() - last_advance <= _CATCHUP_RECENT_S:
+            return "converging"
+    passes = evidence.get("passes_since_advance")
+    if isinstance(passes, int) and passes >= HIERARCHY_STALL_DECISIONS:
+        return "stuck"
+    return "unknown"
+
+
 def _hierarchy_progress(fingerprint: Any, mt: dict) -> dict:
     """checks.hierarchy: is the switch on, and how many rollup-eligible
     decisions have passed since the summary state last changed.
@@ -1548,16 +1624,44 @@ async def gather_health_full(
         _lag_limit = 2 * summarizer.L1_CHUNK_SIZE
         if _lag_limit <= 0:
             _lag_limit = 2 * 20
+        # v3.1.9 (tail catch-up, hostile follow-up). `hierarchy["catching_up"]`
+        # is set whenever the worst-recent conversation is over the lag
+        # limit, REGARDLESS of verdict — a diagnostic, always visible in the
+        # payload, never gated on whether it degrades `status`. What DOES
+        # gate `status` is the verdict alone: "converging" means the bounded
+        # per-turn tail (or backfill) is provably shrinking this backlog on
+        # its own, right now, by the tail's OWN evidence — nothing left for
+        # an operator to do, and `status` staying "ok" for that is not a
+        # blind spot, it is what "ok" is FOR (see this function's own
+        # docstring: "degraded — ... something the operator needs to see").
+        # Paging someone for hours over a catch-up that needs no action is
+        # the alarm-fatigue failure mode this follow-up exists to close, on
+        # top of the flapping one. "stuck" and "unknown" both degrade status
+        # with the SAME actionable reason as before v3.1.9's catch-up
+        # feature ever shipped — "unknown" (no evidence, most commonly a
+        # recent restart) chooses the ACTIONABLE reading on purpose: losing
+        # this process-local evidence must never let a genuinely stuck
+        # backlog read as self-healing just because nothing has been
+        # observed about it yet. See _catchup_verdict's own docstring.
+        _lag_conv = stats.get("hierarchy_lag_recent_conv")
         if isinstance(_lag, int) and _lag > _lag_limit:
-            reasons.append(
-                f"the summary hierarchy is {_lag} turns behind on "
-                f"conv={stats.get('hierarchy_lag_recent_conv')} "
-                f"(limit {_lag_limit}). Turns past the watermark are carried "
-                f"by the raw window alone, so the oldest of them fall out of "
-                f"the request as it grows. "
-                f"POST /admin/conversations/<id>/compact drains the "
-                f"backlog off the request path."
-            )
+            _verdict = _catchup_verdict(_lag_conv)
+            hierarchy["catching_up"] = {
+                "conv": _lag_conv, "lag": _lag, "limit": _lag_limit,
+                "verdict": _verdict,
+            }
+            if _verdict != "converging":
+                reasons.append(
+                    f"the summary hierarchy is {_lag} turns behind on "
+                    f"conv={_lag_conv} "
+                    f"(limit {_lag_limit}). Turns past the watermark are carried "
+                    f"by the raw window alone, so the oldest of them fall out of "
+                    f"the request as it grows. "
+                    f"POST /admin/conversations/<id>/compact drains the "
+                    f"backlog off the request path."
+                )
+        else:
+            hierarchy["catching_up"] = None
         # v3.1.9 (H-1). The half hierarchy_lag cannot see: the rollup is not
         # running, or its writes are not landing, so both of the numbers the
         # lag is made of are frozen. See HIERARCHY_STALL_DECISIONS.

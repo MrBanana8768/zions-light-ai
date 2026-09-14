@@ -1934,6 +1934,255 @@ if _leak_p:
 print(f"  ok   after the traffic phase too, nothing memory read or stored carries a "
       f"time line ({len(_stored_blobs)} file(s))")
 
+# ===========================================================================
+# CATCH-UP PHASE (v3.1.9): the hierarchy pushed far behind (rollups failing
+# for a stretch), then recovered, against the REAL tokenizer-contract
+# fixture. Deliberately NOT woven into the shared `history`/`rows` run
+# above: every oracle above (_phase_problems, _tier_plan, _lag_guard_
+# unreachable, ...) is tuned to TURNS/STORE_TURNS/REFUSE_TURNS arithmetic,
+# and a mid-run backlog would shift every one of those counts for no
+# benefit this phase needs. This drives summarizer.maybe_rollup DIRECTLY,
+# the same real function the tail and backfill call, against a SEPARATE
+# conv_id and a static local message array — proving the bounded-progress
+# and no-livelock properties from test_tail_catchup.py's stubbed unit
+# tests hold against the real /tokenize and real map-reduce batch-sizing
+# math too, which is exactly what changes between a synthetic fixture and
+# her actual ~1,650-token replies.
+# ===========================================================================
+print()
+print("[soak catch-up] hierarchy pushed far behind (rollups failing), then recovered")
+
+
+def _catchup_progress_problems(
+    watermarks: list[int], target_turn: int, max_passes: int,
+) -> list[str]:
+    """`watermarks` is last_summarized_turn read after each successive
+    bounded catch-up pass, oldest first (the failing stretch's passes are
+    NOT included — see the call site). Flags what would mean the bounded
+    catch-up is broken, not just slow:
+
+      - the watermark moving BACKWARD (impossible from a correct rollup;
+        a fixture/harness bug here would make every assertion below
+        meaningless without this check saying so first);
+      - never reaching `target_turn` at all within the passes given — the
+        LIVELOCK this whole feature exists to rule out;
+      - taking more than `max_passes` to get there, the same "bounded, not
+        merely eventual" property main.TAIL_ROLLUP_MAX_CALLS' own comment
+        documents for one turn, checked here across the whole catch-up.
+    """
+    problems = []
+    for i in range(1, len(watermarks)):
+        if watermarks[i] < watermarks[i - 1]:
+            problems.append(
+                f"watermark went BACKWARD at pass {i}: "
+                f"{watermarks[i - 1]} -> {watermarks[i]}"
+            )
+    if not watermarks or watermarks[-1] < target_turn:
+        problems.append(
+            f"never reached turn {target_turn} within {len(watermarks)} "
+            f"pass(es) (last={watermarks[-1] if watermarks else None}) "
+            f"-- LIVELOCK"
+        )
+    elif len(watermarks) > max_passes:
+        problems.append(
+            f"took {len(watermarks)} passes to catch up, over the "
+            f"{max_passes}-pass ceiling this backlog should need"
+        )
+    return problems
+
+
+# ---- oracle self-test: prove the checker above can say both yes and no
+# BEFORE trusting its verdict on the real run, the same discipline
+# _oracle_selftest() above applies to every other checker in this file.
+_co_ok = _catchup_progress_problems([0, 20, 40, 60], 60, 10)
+if _co_ok:
+    fail("*** catch-up oracle: a clean monotonic run flagged as a problem",
+         "; ".join(_co_ok))
+_co_backward = _catchup_progress_problems([0, 20, 10, 60], 60, 10)
+if not any("BACKWARD" in p for p in _co_backward):
+    fail("*** catch-up oracle: a watermark regression was not caught",
+         repr(_co_backward))
+_co_livelock = _catchup_progress_problems([0, 0, 0, 0], 60, 10)
+if not any("LIVELOCK" in p for p in _co_livelock):
+    fail("*** catch-up oracle: a watermark stuck at 0 was not caught",
+         repr(_co_livelock))
+_co_slow = _catchup_progress_problems(list(range(0, 620, 20)), 600, 5)
+if not any("ceiling" in p for p in _co_slow):
+    fail("*** catch-up oracle: taking far more passes than the backlog "
+         "needs was not caught", repr(_co_slow))
+print("  ok   catch-up oracle: catches a backward watermark, a livelock, "
+      "and an over-slow catch-up, and clears a clean run")
+
+_reset_fixture()
+_set_reply(seq=90001, looping=False)
+
+_CATCHUP_L1 = summarizer.L1_CHUNK_SIZE
+# 8 L1 chunks' worth: deep enough that ONE bounded pass cannot possibly
+# clear it (proving the "successive passes" behaviour, not the "small
+# backlog clears in one turn" behaviour test_tail_catchup.py's CONTROL
+# already covers), shallow enough to stay well under this soak's own
+# per-suite time budget against a real HTTP fixture.
+_CATCHUP_TURNS = 8 * _CATCHUP_L1
+
+
+def _catchup_history(n_turns: int) -> list[dict]:
+    msgs = [{"role": "system", "content": "You are a patient assistant."}]
+    for i in range(1, n_turns + 1):
+        msgs.append({
+            "role": "user",
+            "content": f"Catch-up item {i}. " + ("Detail sentence. " * 30),
+        })
+        msgs.append({
+            "role": "assistant",
+            "content": f"Catch-up reply {i}. " + ("Detail sentence. " * 30),
+        })
+    return msgs
+
+
+_catchup_msgs = _catchup_history(_CATCHUP_TURNS)
+_CATCHUP_CONV = f"{CONV}_catchup"
+_CATCHUP_UNBOUNDED_CONV = f"{CONV}_catchup_unbounded"
+summarizer.save_state(_CATCHUP_CONV,
+                       {"l1": [], "l2": [], "l3": None, "last_summarized_turn": 0})
+summarizer.save_state(_CATCHUP_UNBOUNDED_CONV,
+                       {"l1": [], "l2": [], "l3": None, "last_summarized_turn": 0})
+
+
+async def _catchup_pass(conv_id: str, budget_calls: int | None) -> dict:
+    kw: dict = {}
+    if budget_calls is not None:
+        kw["vllm_call_budget"] = {"remaining": budget_calls, "exhausted": False}
+    return await summarizer.maybe_rollup(
+        conv_id, _catchup_msgs, main.VLLM_URL, main.MODEL_REPO, **kw
+    )
+
+
+# ---- push it behind: rollups fail for a stretch --------------------------
+# The fixture's own `status` mode field only gates /tokenize's http_error
+# path (fixture_server.py's /tokenize handler) — /v1/chat/completions has no
+# such switch, so it cannot simulate a failing REAL summarization call on
+# its own. What DOES fail a real vLLM call the identical way a real outage
+# or pod restart would: pointing at a vLLM that genuinely is not there.
+# `main.VLLM_URL` is read fresh by `_catchup_pass` on every call (not cached
+# at import), so retargeting it here to a closed local port makes every real
+# HTTP attempt during this stretch raise a genuine httpx.ConnectError — both
+# /tokenize (so _count_tokens falls back to the pessimistic per-char
+# estimate, exactly as documented) and /v1/chat/completions (so
+# _llm_summarize's own `raise_for_status`-adjacent POST raises). maybe_rollup's
+# own top-level try/except (see _maybe_rollup_body) swallows it: nothing
+# here should raise OUT of _catchup_pass.
+_real_vllm_url = main.VLLM_URL
+main.VLLM_URL = "http://127.0.0.1:1"  # nothing listens on port 1
+_failing_watermarks = []
+try:
+    for _ in range(4):
+        try:
+            _st = asyncio.run(_catchup_pass(_CATCHUP_CONV, summarizer.L1_CHUNK_SIZE))
+        except Exception as e:
+            fail("catch-up: a failing rollup pass raised OUT of maybe_rollup "
+                 "instead of being logged and swallowed",
+                 f"{type(e).__name__}: {e}")
+        _failing_watermarks.append(_st.get("last_summarized_turn", 0))
+finally:
+    main.VLLM_URL = _real_vllm_url
+if any(_failing_watermarks):
+    fail("catch-up: the watermark advanced while every real vLLM call was "
+         "failing", repr(_failing_watermarks))
+if summarizer.load_state(_CATCHUP_CONV).get("l1"):
+    fail("catch-up: an L1 chunk was recorded from a pass whose real call "
+         "failed", repr(summarizer.load_state(_CATCHUP_CONV)))
+print(f"  ok   {len(_failing_watermarks)} failing pass(es) against an "
+      f"unreachable vLLM: watermark stayed at 0, nothing partial recorded")
+
+# ---- recover: bounded passes catch up, one turn at a time ----------------
+# main.VLLM_URL is already restored (the `finally` above); the fixture's own
+# mode was never touched by the outage simulation, so nothing to reset there.
+_watermarks: list[int] = []
+_calls_per_pass: list[int] = []
+_MAX_PASSES = _CATCHUP_TURNS // _CATCHUP_L1 + 6  # generous: chunks + headroom
+for _p in range(_MAX_PASSES):
+    _budget = {"remaining": _CATCHUP_L1, "exhausted": False}
+    _st = asyncio.run(summarizer.maybe_rollup(
+        _CATCHUP_CONV, _catchup_msgs, main.VLLM_URL, main.MODEL_REPO,
+        vllm_call_budget=_budget,
+    ))
+    _wm = _st.get("last_summarized_turn", 0)
+    _watermarks.append(_wm)
+    _calls_per_pass.append(_CATCHUP_L1 - _budget["remaining"])
+    if not summarizer.needs_rollup(_st, _st.get("turns_seen", 0)):
+        break
+
+_cu_p = _catchup_progress_problems(_watermarks, _CATCHUP_TURNS, _MAX_PASSES)
+if _cu_p:
+    fail("catch-up: bounded recovery did not converge as required",
+         "; ".join(_cu_p))
+# Bounded, not merely eventual: no single pass may spend more than one
+# UNIT's overshoot beyond the per-pass budget. Since this fixture's chunks
+# are real prose (REPLY_CHARS-sized), a chunk can cost more than one
+# real call (map-reduce) -- so calls_per_pass can exceed _CATCHUP_L1, but
+# not by an unbounded amount. A generous multiple (4x) catches "the budget
+# was silently ignored" (the overshoot-unbounded mutation) without pinning
+# this soak to this fixture's exact batch-sizing arithmetic.
+_over = [c for c in _calls_per_pass if c > 4 * _CATCHUP_L1]
+if _over:
+    fail("catch-up: at least one pass spent far more than its budget plus "
+         "one unit's documented overshoot",
+         f"calls per pass: {_calls_per_pass}")
+print(f"  ok   {len(_watermarks)} recovery pass(es) reached turn "
+      f"{_watermarks[-1]} of {_CATCHUP_TURNS}: watermark strictly advanced, "
+      f"calls per pass {_calls_per_pass}, never over budget's overshoot bound")
+
+# ---- CONTROL: the same backlog, drained in one unbounded pass -----------
+_unbounded_state = asyncio.run(
+    _catchup_pass(_CATCHUP_UNBOUNDED_CONV, None)
+)
+while summarizer.needs_rollup(
+    _unbounded_state, _unbounded_state.get("turns_seen", 0)
+):
+    _unbounded_state = asyncio.run(_catchup_pass(_CATCHUP_UNBOUNDED_CONV, None))
+
+_final_state = summarizer.load_state(_CATCHUP_CONV)
+if _final_state.get("last_summarized_turn") != _unbounded_state.get("last_summarized_turn"):
+    fail("catch-up: the split (bounded) run's final watermark differs from "
+         "one unbounded drain over the identical backlog",
+         f"bounded={_final_state.get('last_summarized_turn')} "
+         f"unbounded={_unbounded_state.get('last_summarized_turn')}")
+_bounded_spans = [(c.get("first_turn"), c.get("last_turn"))
+                  for c in (_final_state.get("l1") or [])]
+_unbounded_spans = [(c.get("first_turn"), c.get("last_turn"))
+                    for c in (_unbounded_state.get("l1") or [])]
+if _bounded_spans != _unbounded_spans:
+    fail("catch-up: the split run's remaining L1 chunk boundaries differ "
+         "from the unbounded CONTROL's",
+         f"bounded={_bounded_spans} unbounded={_unbounded_spans}")
+if (_final_state.get("l2") or []) != (_unbounded_state.get("l2") or []) and (
+    [c.get("text") for c in (_final_state.get("l2") or [])]
+    != [c.get("text") for c in (_unbounded_state.get("l2") or [])]
+):
+    fail("catch-up: the split run's L2 chapters differ from the unbounded "
+         "CONTROL's")
+print(f"  ok   CONTROL: split-across-passes reaches the SAME final "
+      f"watermark, L1 span(s) and L2 chapter(s) as one unbounded drain "
+      f"(watermark={_final_state.get('last_summarized_turn')})")
+
+# ---- reuse returns: fully caught up, a further pass spends nothing ------
+_settled_budget = {"remaining": _CATCHUP_L1, "exhausted": False}
+asyncio.run(summarizer.maybe_rollup(
+    _CATCHUP_CONV, _catchup_msgs, main.VLLM_URL, main.MODEL_REPO,
+    vllm_call_budget=_settled_budget,
+))
+_settled_calls = _CATCHUP_L1 - _settled_budget["remaining"]
+if _settled_calls != 0:
+    fail("catch-up: a pass over an already-caught-up conversation still "
+         "made real vLLM calls -- nothing was due, so nothing should have "
+         "been spent",
+         f"calls made: {_settled_calls}")
+print("  ok   once caught up, a further pass makes ZERO real vLLM calls "
+      "(nothing left due — the same reuse the request path's compaction "
+      "gets once a chunk exists)")
+
+_reset_fixture()
+
 print()
 print(f"All soak checks passed over {TURNS} turns and {_tn[0] - TURNS} traffic turns.")
 print("REMINDER: the fixture's tokenizer is not Cydonia's. This proves the "

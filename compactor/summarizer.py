@@ -69,6 +69,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 import unicodedata
 from datetime import datetime, timezone
 from typing import Any
@@ -2247,14 +2248,28 @@ async def _llm_summarize(
 # test_p3a_reuse_endpoint.py, test_p3a_reuse_traffic.py,
 # test_p4a_reuse_order.py, test_review_fixes.py, test_soak_conversation.py,
 # test_time_memory.py, and main.admin_compact's own caller stubs
-# maybe_rollup wholesale in test_admin_compact.py [5c]). Adding a keyword
+# maybe_rollup wholesale in test_admin_compact.py [5c]). PLUS `maybe_rollup`
+# ITSELF, stubbed wholesale (not just one of the five below it) by at least
+# two more callers with their own fixed signature: test_admin_compact.py
+# again, and — found the hard way, by the v3.1.9 tail-catch-up feature
+# passing `vllm_call_budget=` as a keyword on the TAIL's own call to
+# maybe_rollup and breaking it — test_degenerate_skip.py's
+# `spy_maybe_rollup(cid, messages, vllm_url, model, *, raw_messages=None)`.
+# main._rollup_hierarchy uses the context-manager form for exactly the
+# reason main.admin_compact already did (see that function's own comment on
+# the point): a keyword added to the maybe_rollup CALL breaks any stub of
+# maybe_rollup ITSELF, not just of what it calls internally. Adding a keyword
 # argument to any of their signatures breaks every stub that does not also
 # grow that keyword — which is every one of them, since none takes
 # `**kwargs`. A contextvar needs no call-site change anywhere in that chain:
-# it is read only at the one real HTTP-call site (`_call`, inside
-# `_summarize_pieces_raw`), and a stub that replaces anything ABOVE that
-# point in the chain never reaches the read at all — exactly correct,
-# because a stub that does not make real vLLM calls has nothing to bound.
+# it is read at the one real HTTP-call site (`_call`, inside
+# `_summarize_pieces_raw`, for accounting) and at the L1/L2/L3 drain in
+# `_maybe_rollup_body` (via `_budget_allows_unit`, for the unit-boundary
+# gate itself — v3.1.9, tail catch-up), and a stub that replaces anything
+# ABOVE `_call` in the chain never reaches ITS read at all — exactly
+# correct, because a stub that does not make real vLLM calls has nothing to
+# bound. `_maybe_rollup_body` is not one of the nine stubbed functions
+# above, so the gate's own call site needed no signature change either.
 #
 # maybe_rollup's own `vllm_call_budget` PARAMETER (see its docstring) sets
 # this for the duration of its call, for a caller that CAN pass a keyword.
@@ -2299,6 +2314,52 @@ def vllm_call_budget_ctx(max_calls: int):
         yield budget
     finally:
         _vllm_call_budget.reset(token)
+
+
+def _budget_allows_unit() -> bool:
+    """True if the current vLLM call budget (if any) has room to START a new
+    rollup UNIT — one L1 chunk, one L2 fold, or the L3 refresh.
+
+    v3.1.9 (tail catch-up). Checked ONCE per unit, immediately BEFORE that
+    unit's first real vLLM call, by the L1/L2/L3 drain in
+    `_maybe_rollup_body` — never per real call within a unit. Per-call was
+    F5's original shape (see the check this replaced in
+    `_summarize_pieces_raw`'s `_call`, and the comment left there): it
+    could return "" to any ONE map batch inside a unit that had already
+    spent calls, and `_summarize_pieces_raw`'s map-reduce already treats
+    ANY empty map batch as a whole-unit failure — correct, elsewhere, for a
+    real LLM failure, but here it meant a budget smaller than one unit's
+    own call cost NEVER advanced: a 20-turn L1 chunk needing 2 map batches
+    + 1 reduce = 3 calls is ordinary at L1_MAX_TOKENS=500 (more under the
+    pessimistic /tokenize-down scale), so a budget of 1 or 2 hit the same
+    exhausted-mid-chunk failure, recorded nothing (by design — see
+    _summarize_pieces_raw), and represented the IDENTICAL too-expensive
+    chunk again next turn. Not slow progress: LIVELOCK, forever, on any
+    backlog whose chunks cost more than the configured budget.
+
+    Gating at the unit boundary instead means every unit that is ALLOWED to
+    start is GUARANTEED to finish — `remaining` is spent, possibly past
+    zero, but a started unit is never refused mid-flight. The documented
+    cost is an overshoot of AT MOST one unit's own calls: once `remaining`
+    has reached zero or below, the very NEXT check (on the next unit, not
+    this one) sees `remaining <= 0` and refuses, so only one unit per call
+    can ever run past the budget, never an unbounded number of them.
+
+    `remaining <= 0` refuses cleanly when the caller opened the budget at
+    ZERO on purpose — admin /compact's documented `{"max_calls": 0}` ("run
+    the guards, make no real calls", hostile pass 2 MEDIUM) — because 0 is
+    never `> 0`, so the first unit is never allowed to start either. The
+    tail's own default (COMPACTOR_TAIL_ROLLUP_MAX_CALLS=4, main.py) is
+    never 0 unless an operator sets it that way on purpose, in which case
+    it means the same thing admin /compact's 0 already does.
+    """
+    budget = _vllm_call_budget.get()
+    if budget is None:
+        return True
+    if budget["remaining"] > 0:
+        return True
+    budget["exhausted"] = True
+    return False
 
 
 async def _summarize_pieces(
@@ -2366,15 +2427,28 @@ async def _summarize_pieces_raw(
     async def _call(prompt: str, batch: list[str]) -> str:
         # F5: the ONE real HTTP-call site every tier's every batch goes
         # through — see the block comment above _vllm_call_budget for why
-        # the check lives here and nowhere else in the chain. No `await`
-        # between the check and the decrement, so concurrent map-phase
-        # callers (asyncio.gather below) cannot race past each other onto
-        # the same unit of budget — asyncio only yields at an `await`.
+        # the accounting lives here and nowhere else in the chain.
+        #
+        # v3.1.9 (tail catch-up): the REFUSAL that used to live here —
+        # return "" once `remaining <= 0` — moved to the UNIT boundary
+        # (`_budget_allows_unit`, checked by the L1/L2/L3 drain in
+        # `_maybe_rollup_body` before a unit starts, not here). See that
+        # function's docstring for why: refusing mid-unit is exactly the
+        # shape that livelocked a budget smaller than one unit's call cost,
+        # because this map-reduce already treats any empty map batch as a
+        # whole-unit failure. A unit that was allowed to start now always
+        # finishes; `remaining` still decrements for every real call this
+        # unit makes, including past zero (the documented overshoot), so
+        # the accounting `vllm_call_budget_ctx` promises ("remaining
+        # decremented once per real call") holds unchanged — only the
+        # refusal moved.
+        #
+        # No `await` between the read and the decrement, so concurrent
+        # map-phase callers (asyncio.gather below) cannot race past each
+        # other onto the same unit of budget — asyncio only yields at an
+        # `await`.
         _vllm_budget = _vllm_call_budget.get()
         if _vllm_budget is not None:
-            if _vllm_budget["remaining"] <= 0:
-                _vllm_budget["exhausted"] = True
-                return ""
             _vllm_budget["remaining"] -= 1
         return await _llm_summarize(
             client, vllm_url, model, prompt, "\n\n".join(batch), max_tokens
@@ -2941,9 +3015,31 @@ async def maybe_rollup(
     behaviour, byte-for-byte — a caller that does not pass this sees no
     change at all. See `vllm_call_budget_ctx` (above _summarize_pieces)
     for the equivalent context-manager form, for a caller that cannot add
-    a keyword to ITS OWN call to this function (main.admin_compact uses
-    that form, because something upstream of it stubs this function
-    wholesale in a test with a fixed 4-positional-argument signature).
+    a keyword to ITS OWN call to this function because something upstream
+    of it stubs this function WHOLESALE in a test with a fixed-argument
+    signature: main.admin_compact (test_admin_compact.py's own stub) and
+    main._rollup_hierarchy (v3.1.9, tail catch-up — test_degenerate_skip.py's
+    `spy_maybe_rollup`) both use the context-manager form for exactly this
+    reason. backfill.py's one call (v3.1.9, tail catch-up) passes this
+    keyword directly instead: nothing in its own test coverage stubs
+    maybe_rollup wholesale, so it has no fixed signature to preserve.
+
+    v3.1.9 (tail catch-up): the budget is checked at the UNIT boundary —
+    before each L1 chunk, L2 fold, or the L3 refresh starts — not before
+    each real call within one. See `_budget_allows_unit`'s docstring for
+    why: a per-call check livelocks whenever a unit's own call cost (a
+    20-turn L1 chunk needing map-reduce is ordinarily 2-3 calls) exceeds
+    the budget, because this module's map-reduce already fails the WHOLE
+    unit on any single empty batch, and an exhausted-mid-unit refusal is
+    indistinguishable from a real LLM failure to that check. So a unit
+    that is allowed to START always FINISHES — "remaining" can go
+    negative, documenting an overshoot of at most one unit's own calls,
+    never more, because the NEXT unit's boundary check sees the negative
+    balance and refuses. This is what turns "process a bounded number of
+    calls per turn" into a guarantee that a tail with work due always
+    completes at least one whole L1 chunk (or one L2 fold, or the L3
+    refresh, when no L1 chunk is due) — the property a caller bounding
+    per-turn work over a persistent backlog actually needs.
     """
     _budget_token = None
     if vllm_call_budget is not None:
@@ -3096,28 +3192,118 @@ async def _maybe_rollup_body(
                         _patch_candidates, state, raw_turns, _first_read
                     )
                 async with httpx.AsyncClient() as client:
-                    # Drain L1 rollups until either caught up or no more material.
-                    while _needs_l1_rollup(state, current_turns):
-                        if not await _do_l1_rollup(
-                            conv_id, client, vllm_url, model, state, messages,
-                            window_offset, raw_turns, _patch,
-                        ):
-                            break
-                        _patch = []
-                        changed = True
-
-                    # Drain L2 rollups while threshold met.
-                    while _needs_l2_rollup(state):
-                        if not await _do_l2_rollup(
-                            conv_id, client, vllm_url, model, state
-                        ):
-                            break
-                        changed = True
-
-                    # L3 is at most one rollup per call (refresh, not stack).
-                    if _needs_l3_rollup(state):
-                        if await _do_l3_rollup(conv_id, client, vllm_url, model, state):
+                    # v3.1.9 (tail catch-up). ONE loop, priority order
+                    # L3 > L2 > L1 — not the old L1-then-L2-then-L3 shape,
+                    # and not three separate while loops any more.
+                    #
+                    # WHY THE ORDER FLIPPED. Under an unlimited budget
+                    # (before this feature) it never mattered: L1 fully
+                    # drained, then L2 fully drained whatever that produced,
+                    # then L3 ran once — every tier was fully caught up by
+                    # the time the call returned regardless of which order
+                    # got there. Under a PER-TURN budget, a backlog deep
+                    # enough to outlast the budget never reaches "L1 fully
+                    # drained" in one call — so draining L1 first would
+                    # spend the WHOLE per-turn budget on L1, every turn, for
+                    # as long as the L1 backlog outlasts L2's threshold.
+                    # `state["l1"]` is injected into every request
+                    # (format_summary_block, one line per chunk) — L1's own
+                    # bound on that injection is L2_CHUNK_SIZE, enforced by
+                    # L2 folding chunks out of it, and NEVER while L2 is
+                    # starved for budget. Checking the UPPER tier first,
+                    # every iteration of this loop, means l1 is folded into
+                    # l2 (and l2 into l3) the moment either crosses
+                    # threshold, whether or not L1 itself is still behind —
+                    # so injection stays bounded for the FULL length of a
+                    # catch-up that can span many turns, not just at the end
+                    # of it.
+                    #
+                    # `_l3_done` caps L3 at one refresh per call, the same
+                    # contract the old `if` (not `while`) already gave it.
+                    #
+                    # v3.1.9 (hostile follow-up): stated precisely, because
+                    # the first cut of this comment argued it wrong. A
+                    # SECOND refresh later in the same call would NOT be
+                    # re-folding what the first one already covered —
+                    # `_do_l3_rollup` clears l2 on success, so a second
+                    # trigger means genuinely NEW chapters arrived since —
+                    # it would fold them SEPARATELY from the first refresh's
+                    # batch, in a different map-reduce grouping, producing a
+                    # DIFFERENT L3 text than one consolidated refresh over
+                    # everything the call produced would have. That is the
+                    # real reason this caps at one per call rather than
+                    # looping: not "wasted work", but "a second refresh
+                    # inside one call is not equivalent to the single
+                    # consolidated one the OLD L1-then-L2-then-L3 order
+                    # always produced" — so capping and deferring the
+                    # remainder to the NEXT call is the closer match, and is
+                    # exactly what the old order already did whenever ONE
+                    # call's L1/L2 work produced more L2 growth than a
+                    # single refresh needed to consume (old code's own
+                    # trailing `if` also ran only once, catching whatever
+                    # existed in l2 AT THAT POINT — the same one-shot shape,
+                    # just checked after L1/L2 instead of interleaved with
+                    # them).
+                    #
+                    # DOES THIS REACH GENUINE STEADY STATE (not behind)?
+                    # Confirmed no, by construction, not by luck — and
+                    # proven directly in test_tail_catchup.py [3b], not just
+                    # argued here. For `_l3_done` to defer anything, L3 must
+                    # already be due (len(l2) >= L3_CHUNK_SIZE) EITHER at
+                    # this call's start OR a second time after this call's
+                    # own L1/L2 work. Under ample (non-exhausted) budget —
+                    # true for any conversation that is not behind — this
+                    # very loop's only "nothing left to do" exit already
+                    # resolves L3 (to len(l2)==0) before any call returns,
+                    # so nothing is ever left over FOR a later call to find
+                    # already due. And a single ordinary turn (one exchange)
+                    # advances the observed position by one exchange, so one
+                    # ordinary call can produce AT MOST one new L1 chunk and
+                    # therefore at most one new L2 fold — never two
+                    # independent threshold crossings for `_l3_done` to
+                    # ration between. The "lag one call behind" shape this
+                    # cap can produce is real, but only for a call that
+                    # itself processes many chunks at once — a deep catch-up
+                    # under a tight budget, or an admin/backfill rebuild
+                    # from the episodic store — never steady, one-exchange-
+                    # at-a-time chat, which is what "not behind" means.
+                    _l3_done = False
+                    while True:
+                        if not _l3_done and _needs_l3_rollup(state):
+                            if not _budget_allows_unit():
+                                break
+                            _l3_done = True
+                            if not await _do_l3_rollup(
+                                conv_id, client, vllm_url, model, state
+                            ):
+                                break
                             changed = True
+                        elif _needs_l2_rollup(state):
+                            if not _budget_allows_unit():
+                                break
+                            if not await _do_l2_rollup(
+                                conv_id, client, vllm_url, model, state
+                            ):
+                                break
+                            changed = True
+                        elif _needs_l1_rollup(state, current_turns):
+                            if not _budget_allows_unit():
+                                break
+                            if not await _do_l1_rollup(
+                                conv_id, client, vllm_url, model, state, messages,
+                                window_offset, raw_turns, _patch,
+                            ):
+                                break
+                            _patch = []
+                            changed = True
+                        else:
+                            # Nothing due at all — caught up (or every due
+                            # tier already ran this call). The ONLY exit
+                            # that means "no work is outstanding"; every
+                            # other `break` above means "work remains but
+                            # the budget said stop" or "a unit's own LLM
+                            # call returned empty and recorded nothing".
+                            break
             except Exception as e:
                 logger.exception(f"conv={conv_id}: rollup failed mid-flight: {e}")
 
@@ -3149,6 +3335,109 @@ async def _maybe_rollup_body(
                 logger.exception(f"conv={conv_id}: rollup state write failed: {e}")
 
         return state
+
+
+# ---------------------------------------------------------------------------
+# Tail catch-up progress — process-local, per conversation (v3.1.9, hostile
+# follow-up on the tail-catch-up feature)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. health.py's hierarchy_lag reason first tried to tell a
+# CONVERGING catch-up (self-healing, no operator action needed) from a
+# STUCK one (needs `/compact`) by comparing hierarchy_lag_recent poll to
+# poll. That is WRONG, and wrong in a way that only showed up against a
+# real pod: the Dockerfile HEALTHCHECK polls /health/full every 30 s, and
+# she sends a message — the only thing that ever advances a rollup — every
+# few minutes at most. So on a real pod, almost every pair of CONSECUTIVE
+# polls sees the exact same lag: not because the catch-up stalled, but
+# because nothing has happened between the two polls at all. The
+# "converging" wording appeared on exactly the one poll right after a tail
+# happened to run, then flipped back to the actionable "/compact" wording
+# for the next several dozen polls until her next message — poll-cadence
+# dependent, flapping, and printing the "run /compact" advice on nearly
+# every poll during a real, healthy, self-healing catch-up. The project's
+# own test for it polled once per turn, which is exactly the one cadence
+# that hid the bug.
+#
+# THE FIX: evidence the TAIL itself records, independent of how often
+# anything polls /health/full. Every BUDGETED pass (main._rollup_hierarchy,
+# and backfill.py's one-shot rollup) reports here whether the watermark it
+# just tried to advance for `conv_id` actually moved. health.py reads it
+# back and asks two cadence-independent questions: "did the watermark
+# advance RECENTLY, in wall-clock time?" (converging) and "have PASSES
+# happened, with work still due, without an advance?" (stuck) — both
+# keyed to how often SHE chats (a tail pass only ever happens on her
+# turn), never to how often the HEALTHCHECK polls.
+#
+# WHY summarizer.py AND NOT A NEW MODULE. health.py cannot import main
+# (main imports health) — the same constraint tailhealth.py's own
+# docstring names for the identical reason. This module is not that
+# precedent's twin by accident: both `main._rollup_hierarchy` (the writer)
+# and `health.py` (the reader) already import `summarizer` for unrelated
+# reasons, so no new import edge is needed anywhere. Keyed by conv_id,
+# which is not a new privacy surface here — gather_memory_stats already
+# puts a bare conv_id in this same endpoint's payload
+# (hierarchy_lag_conv/hierarchy_lag_recent_conv).
+#
+# PROCESS RESTARTS LOSE THIS. There is no disk-backed version, on purpose:
+# it exists to answer "is the CURRENT process's tail actively making
+# progress", and a value surviving a restart would describe a process that
+# no longer exists. A conv_id with no entry means "no budgeted pass has
+# run for it in this process yet" — see catchup_progress_for's own
+# docstring for what health.py does with that (the answer is: treat it the
+# same as "not converging", the safe default — see that function's own
+# comment for why).
+_catchup_progress: dict[str, dict[str, Any]] = {}
+
+
+def record_catchup_pass(
+    conv_id: str, before_watermark: int, after_watermark: int, work_due_after: bool,
+) -> None:
+    """Called after every BUDGETED maybe_rollup pass (main._rollup_hierarchy,
+    backfill.py) — never after an unbounded one (admin /compact's default
+    max_calls=200 already drains everything in a few passes; there is
+    nothing for a catch-up-rate signal to describe there).
+
+    `before_watermark`/`after_watermark` are last_summarized_turn before and
+    after this pass. `work_due_after` is whether the hierarchy still needs a
+    rollup once this pass finished (summarizer.needs_rollup on the returned
+    state) — a pass that advanced the watermark AND still has more due is
+    still "progress", tracked the same as any other advance.
+    """
+    now = time.monotonic()
+    entry = _catchup_progress.setdefault(conv_id, {
+        "last_advance_monotonic": None,
+        "passes_since_advance": 0,
+    })
+    if after_watermark > before_watermark:
+        entry["last_advance_monotonic"] = now
+        entry["passes_since_advance"] = 0
+    elif work_due_after:
+        # Only a pass that HAD work due and made none counts against the
+        # stall counter — a pass with nothing due (an ordinary, caught-up
+        # turn) is not evidence of anything stalling.
+        entry["passes_since_advance"] += 1
+    entry["watermark"] = after_watermark
+    entry["work_due"] = work_due_after
+    entry["last_pass_monotonic"] = now
+
+
+def catchup_progress_for(conv_id: str) -> dict[str, Any] | None:
+    """This process's evidence for `conv_id`, or None if no budgeted pass has
+    run for it since this process started (a fresh boot, or a conv_id that
+    has simply never been behind). health.py's own comment at the call site
+    is where "None" gets turned into a behaviour — this function only
+    reports what is known, never guesses at what a restart erased.
+
+    A shallow copy: callers get a snapshot, not a handle into the live dict
+    a later pass could mutate under them mid-read.
+    """
+    entry = _catchup_progress.get(conv_id)
+    return dict(entry) if entry is not None else None
+
+
+def _reset_catchup_progress_for_tests() -> None:
+    _catchup_progress.clear()
 
 
 # ---------------------------------------------------------------------------
