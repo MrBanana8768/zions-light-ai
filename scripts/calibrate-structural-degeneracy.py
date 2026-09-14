@@ -70,10 +70,14 @@ def say(m=""):
 # independent reimplementation and not a thin wrapper around the import, so
 # resist the temptation to just call main.reply_is_degenerate here.
 #
-# v3.1.9 (hostile pass 3, F5) fixes FIVE drifts this finding named, so the
-# CROSS-CHECK's own report of mismatches means something again (before this,
+# v3.1.9 (hostile pass 3, F5) fixed FIVE drifts this finding named, so the
+# CROSS-CHECK's own report of mismatches means something again (before that,
 # it was comparing two rules that could legitimately disagree even when
-# neither had a bug):
+# neither had a bug). v3.1.9 (hostile pass 5, C5-6) rewrote the
+# trailing-content exemption itself (both the shipped rule and this copy,
+# together, in the same change) — see compactor/main.py's block comment
+# above reply_is_degenerate's exemption for the full reasoning; ported
+# here unchanged so the sweep below still means what it says:
 #
 #   1. ANY-LINE, not last-line-or-substantial-exempt. reply_is_degenerate
 #      only judges the reply's own last non-blank line UNCONDITIONALLY, and
@@ -110,6 +114,7 @@ def structural_collapse(
     item_chars: int = LIST_ITEM_CHARS,
     min_chars: int = 300,
     period_break_counter=None,
+    sentence_end_checker=None,
 ) -> str | None:
     def _breaks(line: str) -> int:
         if period_break_counter is not None:
@@ -123,11 +128,23 @@ def structural_collapse(
             b = line.count(", ")
         return b
 
-    def _is_fragment(line: str, *, floor: int) -> bool:
+    def _is_fragment(line: str, *, floor: int, min_spaces: int = LINE_MIN_SPACES) -> bool:
         n = len(line)
-        if n < floor or line.count(" ") < LINE_MIN_SPACES:
+        if n < floor or line.count(" ") < min_spaces:
             return False
         return n / (_breaks(line) + 1) <= sentence_chars
+
+    def _prose_dense(line: str, ratio: int = 8) -> bool:
+        return line.count(" ") * ratio >= len(line)
+
+    def _ends_in_real_sentence(joined: str) -> bool:
+        if sentence_end_checker is not None:
+            return sentence_end_checker(joined)
+        # Fallback ONLY when main.py could not be imported at all: no
+        # abbreviation/single-initial check, same accuracy trade as the
+        # naive ". " count above.
+        s = joined.rstrip()
+        return bool(s) and s[-1] in ".!?\u2026"
 
     lines = text.splitlines()
     last_nonblank_idx = -1
@@ -155,15 +172,61 @@ def structural_collapse(
         if _is_fragment(line, floor=line_chars):
             exempt = False
             if line_idx != last_nonblank_idx:  # drift #1
-                trailing = [t.strip() for t in lines[line_idx + 1:] if t.strip()]
-                trailing_chars = sum(len(t) for t in trailing)
-                if trailing_chars >= min_chars:
-                    longest = max(trailing, key=len)
-                    # No length floor here (floor=0), matching main.py's
-                    # _line_is_fragment_shaped default: a SECOND runaway cut
-                    # short is exactly as diagnostic as a full one — see F5's
-                    # case D and main.py's own comment on this exact point.
-                    exempt = not _is_fragment(longest, floor=0)
+                # v3.1.9 (hostile pass 5, C5-6): mirrors main.py's rewritten
+                # trailing-content exemption exactly (see the block comment
+                # above reply_is_degenerate's exemption in compactor/main.py
+                # for the full reasoning) — fenced code skipped, SHORT
+                # trailing content judged by termination, SUBSTANTIAL
+                # trailing content judged by list-majority / multi-line
+                # join / single-longest-prose-line, in that order.
+                trailing_nonblank: list[str] = []
+                tc_in_fence = False
+                for t in lines[line_idx + 1:]:
+                    s = t.strip()
+                    if not s:
+                        continue
+                    if s.startswith("```"):
+                        tc_in_fence = not tc_in_fence
+                        continue
+                    if tc_in_fence:
+                        continue
+                    trailing_nonblank.append(s)
+                if trailing_nonblank:
+                    trailing_chars = sum(len(t) for t in trailing_nonblank)
+                    if trailing_chars < min_chars:
+                        exempt = _ends_in_real_sentence(
+                            " ".join(trailing_nonblank)
+                        )
+                    else:
+                        list_lines = [
+                            t for t in trailing_nonblank if BULLET.match(t)
+                        ]
+                        if (
+                            len(list_lines) >= 8
+                            and len(list_lines) >= len(trailing_nonblank) / 2
+                        ):
+                            exempt = False
+                        else:
+                            prose_candidates = [
+                                t for t in trailing_nonblank
+                                if t not in list_lines and _prose_dense(t)
+                            ]
+                            long_lines = [
+                                t for t in prose_candidates
+                                if len(t) >= sentence_chars
+                            ]
+                            if len(long_lines) >= 2:
+                                joined = " ".join(long_lines)
+                                exempt = not _is_fragment(
+                                    joined, floor=0,
+                                    min_spaces=max(1, len(joined) // 8),
+                                )
+                            elif prose_candidates:
+                                exempt = not _is_fragment(
+                                    max(prose_candidates, key=len), floor=0,
+                                )
+                            else:
+                                exempt = True
             if not exempt:
                 return "fragment-line"
     if len(text) >= min_chars and run >= list_run:  # drift #4
@@ -233,9 +296,11 @@ def rate(k: int, n: int) -> str:
 def try_import_main():
     """The real detector, if this checkout (or the pod) can import it. Also
     returns the real period-break counter (main._count_real_period_breaks)
-    when available — see structural_collapse's docstring for why THAT one
-    piece is imported rather than approximated even in the local copy,
-    unlike the threshold-swept constants below."""
+    and the real short-trailer termination check
+    (main._trailing_ends_in_real_sentence) when available — see
+    structural_collapse's docstring for why these pieces are imported
+    rather than approximated even in the local copy, unlike the
+    threshold-swept constants below."""
     os.environ.setdefault("MODEL_REPO", "")
     for cand in (HERE.parent / "compactor", Path("/app"), Path.cwd()):
         if (cand / "main.py").exists() and str(cand) not in sys.path:
@@ -243,12 +308,16 @@ def try_import_main():
     try:
         import main  # type: ignore
 
-        return main.reply_is_degenerate, main._count_real_period_breaks
+        return (
+            main.reply_is_degenerate,
+            main._count_real_period_breaks,
+            main._trailing_ends_in_real_sentence,
+        )
     except Exception:
-        return None, None
+        return None, None, None
 
 
-def report(db: Path, cut_line: int, real_detector, period_break_counter=None) -> None:
+def report(db: Path, cut_line: int, real_detector, period_break_counter=None, sentence_end_checker=None) -> None:
     replies = load_replies(db)
     rows = []
     for m in replies:
@@ -256,7 +325,10 @@ def report(db: Path, cut_line: int, real_detector, period_break_counter=None) ->
         f = features(text)
         f["day"] = _mrh.day_of(m["timestamp"])
         f["cut"] = f["last_line"] > cut_line
-        f["rule"] = structural_collapse(text, period_break_counter=period_break_counter)
+        f["rule"] = structural_collapse(
+            text, period_break_counter=period_break_counter,
+            sentence_end_checker=sentence_end_checker,
+        )
         f["existing"] = None
         if real_detector is not None:
             f["real"] = real_detector(text)
@@ -322,9 +394,11 @@ def report(db: Path, cut_line: int, real_detector, period_break_counter=None) ->
 
     def sweep(label, **kw):
         fp_n = sum(1 for t in texts_done
-                   if structural_collapse(t, period_break_counter=period_break_counter, **kw))
+                   if structural_collapse(t, period_break_counter=period_break_counter,
+                                           sentence_end_checker=sentence_end_checker, **kw))
         tp_n = sum(1 for t in texts_cut
-                   if structural_collapse(t, period_break_counter=period_break_counter, **kw))
+                   if structural_collapse(t, period_break_counter=period_break_counter,
+                                           sentence_end_checker=sentence_end_checker, **kw))
         say(f"  {label:<34} FP {rate(fp_n, len(texts_done))}   TP {rate(tp_n, len(texts_cut))}")
 
     for v in (1000, 1200, 1500, 2000, 2500):
@@ -403,7 +477,7 @@ def main() -> int:
     args = ap.parse_args()
     LINE_CHARS, LINE_SENTENCE_CHARS = args.line_chars, args.sentence_chars
     LIST_RUN, LIST_ITEM_CHARS = args.list_run, args.item_chars
-    real, period_break_counter = try_import_main()
+    real, period_break_counter, sentence_end_checker = try_import_main()
     # v3.1.9 (hostile pass 3, F5): DEGENERATE_MIN_CHARS drift #4's fix reads
     # the real constant when main.py is importable, the local stdlib default
     # otherwise — same doctrine as period_break_counter above.
@@ -422,10 +496,11 @@ def main() -> int:
     # not just the four CLI-swept ones.
     structural_collapse.__defaults__ = (
         LINE_CHARS, LINE_SENTENCE_CHARS, LIST_RUN, LIST_ITEM_CHARS,
-        min_chars, period_break_counter,
+        min_chars, period_break_counter, sentence_end_checker,
     )
     for t in args.targets:
-        report(find_db(Path(t)), args.cut_line, real, period_break_counter)
+        report(find_db(Path(t)), args.cut_line, real, period_break_counter,
+               sentence_end_checker)
     return 0
 
 

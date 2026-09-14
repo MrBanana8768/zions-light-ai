@@ -444,20 +444,52 @@ check(fragments(110, 15), True,
 
 print()
 print("[9c] hostile pass 3, F5 — a runaway followed by only a SHORT trailing "
-      "line (well under DEGENERATE_MIN_CHARS) must still be caught, not "
-      "exempted just because it is technically not the last line")
-# Proof (SP\\p3-c\\p3c_fragment.py, frag1.log): before this fix, all of B-F
-# below scored 'stored' (memorized) instead of 'skipped_degenerate'.
-check(fragments(110, 15) + "\n\nAlways yours.", True,
-      "B: runaway line + a short sign-off line is still caught")
+      "line (well under DEGENERATE_MIN_CHARS) is judged by whether that "
+      "line is a genuinely TERMINATED remark, not exempted just for being "
+      "short or just for being technically not the last line")
+# Proof (SP\\p3-c\\p3c_fragment.py, frag1.log): before the pass-3 fix, all
+# of B-F below scored 'stored' (memorized) instead of 'skipped_degenerate'.
+#
+# v3.1.9 (hostile pass 5, C5-6) RELABELS B and E from must-catch to
+# must-keep. Pass 3 pinned B ("Always yours.") and E ("Thanks for asking.")
+# as must-stay-caught on the reasoning that a short, well-terminated
+# remark after a real collapse is exactly the shape a model produces
+# trailing off. Pass 4 (SP\\fix-p4c.md F4) found a normal reply with the
+# IDENTICAL shape — a beat paragraph followed by a short, terminated
+# remark ("*What do you do?*", the finding's N1) — being wrongly redacted,
+# tried a fix, and reverted it specifically because it reopened B: "the two
+# fixtures are the same shape with opposite correct answers." Pass 5
+# measured that claim directly (SP\\p5-degen\\measure.py) instead of taking
+# it on faith, confirmed E is the same shape too, and found no third
+# feature (not length, not space density, not the line before it) that
+# separates a genuine sign-off after a collapse from an ordinary one after
+# a beat paragraph — this rule cannot see the difference. Per this lane's
+# stated priority (a normal reply lost from her memory permanently is
+# worse than a runaway kept, folded into a summary a human can still
+# review), a genuine tie is resolved toward KEEPING: B and E now read
+# `False` too, alongside N1, matching main.py's
+# `_trailing_ends_in_real_sentence` — see that function and the block
+# comment above the trailing-content exemption for the full account. C and
+# F are UNCHANGED and stay caught: a bare emoji or "---" has no sentence
+# terminator at all, so this is a narrower rule (termination, not "short"),
+# not a wider one that gives up on short trailing content altogether. See
+# also compactor/test_p5_degen_matrix.py, which restates B-F alongside
+# every other case this rule now has to get right at once.
+check(fragments(110, 15) + "\n\nAlways yours.", False,
+      "B (RELABELLED, hostile pass 5 C5-6): runaway line + a short, "
+      "TERMINATED sign-off is the same shape as N1 (test_p4c_degeneracy.py) "
+      "and is now kept, not caught — see the comment above")
 check(fragments(110, 15) + "\n\n\U0001F60A", True,
-      "C: runaway line + a lone emoji line is still caught")
+      "C: runaway line + a lone emoji line is still caught — no sentence "
+      "terminator at all")
 check(fragments(110, 15) + "\n\n---", True,
-      "F: runaway line + a bare '---' is still caught")
+      "F: runaway line + a bare '---' is still caught — no sentence "
+      "terminator at all")
 # D: the trailing content is not SHORT (about 600 chars, over
 # DEGENERATE_MIN_CHARS) but IS itself fragment-shaped - a second, shorter
 # cut runaway. Char count alone must not be enough to exempt: the longest
-# trailing line must also fail _line_is_fragment_shaped.
+# trailing PROSE line must also fail _line_is_fragment_shaped (the fixed,
+# not proportional, floor — see main.py's SUBSTANTIAL branch).
 _second_runaway = fragments(40, 15)  # ~600 chars, same collapse shape
 assert len(_second_runaway) >= main.DEGENERATE_MIN_CHARS
 assert main._line_is_fragment_shaped(_second_runaway)
@@ -465,9 +497,12 @@ check(fragments(110, 15) + "\n\n" + _second_runaway, True,
       "D: runaway line + a SECOND runaway (600+ chars, but itself "
       "fragment-shaped) is still caught - trailing char count alone is not "
       "an exemption")
-# E: the comma-separated collapse shape gets the identical treatment.
-check(comma_long + "\n\nThanks for asking.", True,
-      "E: comma collapse + a short trailing line is still caught")
+# E: the comma-separated collapse shape gets the identical (relabelled)
+# treatment as B — same short, terminated remark, same conflict with N1,
+# same resolution.
+check(comma_long + "\n\nThanks for asking.", False,
+      "E (RELABELLED, hostile pass 5 C5-6): comma collapse + a short, "
+      "TERMINATED trailing line — same shape as B, now kept, not caught")
 
 print()
 print("[R-TAIL] a PHRASE repeating to the end of the reply (v3.1.8)")
