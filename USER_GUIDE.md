@@ -175,8 +175,11 @@ curl -X POST http://localhost:8080/admin/conversations/<id>/dedup
 curl -X POST "http://localhost:8080/admin/conversations/<id>/archive?older_than_days=30"
 
 # Restore archived facts (all, or matching a substring)
+# An empty body is refused (400) -- restoring everything needs the
+# explicit restore_all flag below, so a typo or an empty -d can never
+# silently restore every archived fact.
 curl -X POST http://localhost:8080/admin/conversations/<id>/restore \
-  -H 'Content-Type: application/json' -d '{}'                       # all
+  -H 'Content-Type: application/json' -d '{"restore_all": true}'    # all
 curl -X POST http://localhost:8080/admin/conversations/<id>/restore \
   -H 'Content-Type: application/json' -d '{"text_substring": "Lyra"}'
 ```

@@ -7509,13 +7509,20 @@ async def admin_get_facts(conv_id: str):
     "/admin/conversations/{conv_id}/facts",
     dependencies=[Depends(_require_localhost)],
 )
-async def admin_forget_facts(conv_id: str):
+async def admin_forget_facts(conv_id: str, request: Request):
     """Forget ALL memory for a conversation (V2.0 granularity: all-or-
     nothing). Clears persistent facts (Phase 2), episodic embeddings
     (Phase 3), AND the hierarchical summary state (Phase 4) — a full
     three-layer memory reset for when the model is stuck on something
     wrong. Targeted forgetting (single fact by substring) is V2.1.
+
+    Takes no body and no query key (hostile pass 5, C5-5): either is a
+    400, not a silently-ignored stray.
     """
+    raw_body, body = await _parse_admin_json_body(request)
+    _refuse_bad_admin_request(
+        request, raw_body, body, body_keys=set(), query_keys=set(),
+    )
     # DRAIN FIRST, exactly as the chat /forget does (RACE-01, adversarial
     # concurrency sweep, reproduced 10/10 and 5/5 in the forced case).
     #
@@ -7653,8 +7660,10 @@ async def admin_get_persona(conv_id: str):
 async def admin_set_persona(conv_id: str, request: Request):
     """Set or replace the persona for a conv.
 
-    Body: {"text": "<persona text>"}
+    Body: {"text": "<persona text>"}. No query key is accepted, and no
+    other body key (hostile pass 5, C5-5) — either is a 400.
     """
+    raw_body = await request.body()
     try:
         body = await request.json()
     except Exception:
@@ -7662,6 +7671,9 @@ async def admin_set_persona(conv_id: str, request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
     _refuse_unpaired_surrogate(body)
+    _refuse_bad_admin_request(
+        request, raw_body, body, body_keys={"text"}, query_keys=set(),
+    )
     text = body.get("text")
     if not isinstance(text, str) or not text.strip():
         raise HTTPException(status_code=400, detail="missing required field: 'text' (non-empty string)")
@@ -7675,9 +7687,17 @@ async def admin_set_persona(conv_id: str, request: Request):
     "/admin/conversations/{conv_id}/persona",
     dependencies=[Depends(_require_localhost)],
 )
-async def admin_delete_persona(conv_id: str):
+async def admin_delete_persona(conv_id: str, request: Request):
     """Clear the persona for a conv. Idempotent — returns deleted=False
-    if no persona was stored."""
+    if no persona was stored.
+
+    Takes no body and no query key (hostile pass 5, C5-5): either is a
+    400, not a silently-ignored stray.
+    """
+    raw_body, body = await _parse_admin_json_body(request)
+    _refuse_bad_admin_request(
+        request, raw_body, body, body_keys=set(), query_keys=set(),
+    )
     deleted = persona.clear_persona(conv_id)
     return {"conv_id": conv_id, "deleted": deleted}
 
@@ -7691,8 +7711,11 @@ async def admin_inherit_persona(conv_id: str, request: Request):
     into this one. Useful for spinning up new conversations that should
     start with the same role/voice context as an existing one.
 
-    Body: {"source_conv_id": "<conv_id to copy from>"}
+    Body: {"source_conv_id": "<conv_id to copy from>"}. No query key is
+    accepted, and no other body key (hostile pass 5, C5-5) — either is a
+    400.
     """
+    raw_body = await request.body()
     try:
         body = await request.json()
     except Exception:
@@ -7700,6 +7723,9 @@ async def admin_inherit_persona(conv_id: str, request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
     _refuse_unpaired_surrogate(body)
+    _refuse_bad_admin_request(
+        request, raw_body, body, body_keys={"source_conv_id"}, query_keys=set(),
+    )
     src = body.get("source_conv_id")
     if not isinstance(src, str) or not src.strip():
         raise HTTPException(status_code=400, detail="missing required field: 'source_conv_id'")
@@ -7725,13 +7751,38 @@ async def admin_get_archive(conv_id: str):
     "/admin/conversations/{conv_id}/archive",
     dependencies=[Depends(_require_localhost)],
 )
-async def admin_archive_stale(conv_id: str, older_than_days: int | None = None):
+async def admin_archive_stale(conv_id: str, request: Request):
     """Trigger a stale-fact archival pass for one conv. Moves facts whose
     last_used is older than the cutoff to the archive sidecar.
 
-    Query: ?older_than_days=N (default 90, env-overridable).
+    Query: ?older_than_days=N (default 90, env-overridable). No body is
+    accepted.
+
+    v3.1.9 (hostile pass 5, C5-5). Used to be a plain FastAPI-typed query
+    param, which silently ignores anything it was not told to bind: a
+    misspelled `?older_than_day=365` (missing the trailing "s") fell back
+    to the 90-day default with no error, and this endpoint has NO dry-run
+    mode at all, so `?dry_run=true&older_than_days=0` archived every stale
+    fact live — the query string's dry intent was simply never read. Both
+    are now a 400: `older_than_days` is the only accepted query key
+    (typo'd or not, anything else — dry_run included — is unrecognised),
+    and this endpoint takes no body key at all.
     """
-    days = older_than_days if older_than_days is not None else facts.ARCHIVE_DEFAULT_DAYS
+    raw_body, body = await _parse_admin_json_body(request)
+    _refuse_bad_admin_request(
+        request, raw_body, body, body_keys=set(), query_keys={"older_than_days"},
+    )
+    _raw_days = request.query_params.get("older_than_days")
+    if _raw_days is None:
+        days = facts.ARCHIVE_DEFAULT_DAYS
+    else:
+        try:
+            days = int(_raw_days)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"older_than_days must be an integer, got {_raw_days!r}",
+            )
     async with conv_lock(conv_id):
         kept, archived = facts.archive_stale_facts(conv_id, older_than_days=days)
     return {
@@ -7798,16 +7849,19 @@ async def admin_restore_from_archive(conv_id: str, request: Request):
         body = {}
     _refuse_unpaired_surrogate(body)
 
-    _RESTORE_BODY_KEYS = {"text_substring", "restore_all"}
-    _unknown = sorted(set(body.keys()) - _RESTORE_BODY_KEYS)
-    if _unknown:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"unrecognised key(s) in body: {_unknown}; only "
-                f"{sorted(_RESTORE_BODY_KEYS)} are accepted here"
-            ),
-        )
+    # v3.1.9 (hostile pass 5, C5-5). This used to be an ad hoc unknown-body-
+    # key check with no duplicate-key check and no query-string check at
+    # all — `/restore?dry_run=true` with `{"restore_all": true}` in the
+    # body restored 300 archived facts, because the query-string dry intent
+    # was never even read, and a duplicated `{"restore_all": false,
+    # "restore_all": true}` resolved last-wins the same way. /restore has
+    # NO dry-run mode at all, so query_keys is the empty set: a `dry_run`
+    # key here, correctly spelled or not, is exactly as unrecognised as any
+    # other stray key (dry_run_typo_exempt defaults False).
+    _refuse_bad_admin_request(
+        request, raw_body, body,
+        body_keys={"text_substring", "restore_all"}, query_keys=set(),
+    )
 
     # A present text_substring must be a real, non-empty string — not None
     # (absent is the normal way to ask for "no filter"), and not "", 0,
@@ -7870,7 +7924,7 @@ async def admin_restore_from_archive(conv_id: str, request: Request):
     "/admin/conversations/{conv_id}/dedup",
     dependencies=[Depends(_require_localhost)],
 )
-async def admin_dedup(conv_id: str):
+async def admin_dedup(conv_id: str, request: Request):
     """Run a full hybrid (embedding + LLM) dedup pass on the conv's facts.
 
     Returns counters for the response body:
@@ -7879,8 +7933,13 @@ async def admin_dedup(conv_id: str):
     Inline dedup runs automatically after every fact extraction (cheap
     when no candidate clusters); this endpoint is for manual cleanup
     of conversations that pre-date Phase 7 or accumulated dupes via
-    backfill/import.
+    backfill/import. Takes no body and no query key (hostile pass 5,
+    C5-5): either is a 400, not a silently-ignored stray.
     """
+    raw_body, body = await _parse_admin_json_body(request)
+    _refuse_bad_admin_request(
+        request, raw_body, body, body_keys=set(), query_keys=set(),
+    )
     async with conv_lock(conv_id):
         before = facts.load_facts(conv_id)
         if len(before) < 2:
@@ -7961,19 +8020,37 @@ def _strict_affirmative(value: Any, *, commit_tokens: tuple[str, ...]) -> bool:
 # refusing anything outside an endpoint's small, fixed vocabulary is not,
 # and it catches every misspelling in one rule instead of one typo at a
 # time.
-def _refuse_unknown_keys(keys, allowed: set[str], *, where: str) -> None:
+#
+# v3.1.9 (hostile pass 5, C5-5). This rule landed on /compact and
+# /merge-into only — /restore, /import, /cleanup-test-data and /archive
+# kept the old, permissive behaviour: `/restore?dry_run=true` with
+# `restore_all` restored 300 facts (restore has no dry run and just
+# ignored the key); `/archive?dry_run=true` archived live for the same
+# reason. `dry_run_typo_exempt` is what makes the exemption above
+# CONDITIONAL rather than global: True only for an endpoint that itself
+# implements dry_run (checked via `_dry_run_from`) and therefore already
+# gives a near-misspelling of "dry_run" its own, stricter, forced-dry
+# handling — /compact, /merge-into, /cleanup-test-data. False (the
+# default) is for every endpoint with NO dry_run concept at all: there a
+# dry_run key, correctly spelled or not, is exactly as unrecognised as any
+# other stray key and must be refused, never silently ignored the way it
+# used to be.
+def _refuse_unknown_keys(
+    keys, allowed: set[str], *, where: str, dry_run_typo_exempt: bool = False,
+) -> None:
     # A key that is a TYPO of "dry_run" (`dryRun`, `dry-run`, `dryrun`,
     # `dry_run[]`, a trailing-space/percent-encoded variant —
     # `_looks_like_misspelled_dry_run`, shared with `_dry_run_from`) is
-    # deliberately EXEMPT from "unknown": it already has its own, stricter
-    # handling (forced dry, never a 400 — test_admin_compact.py's [9b]
-    # pins this end-to-end: `?dryrun=true` must still answer 200 with
-    # `dry_run: true`, not a refusal). Only a key that is NEITHER in this
-    # endpoint's vocabulary NOR recognisable as a dry_run typo is refused
-    # here.
+    # exempt from "unknown" ONLY when `dry_run_typo_exempt` is True: it
+    # already has its own, stricter handling (forced dry, never a 400 —
+    # test_admin_compact.py's [9b] pins this end-to-end: `?dryrun=true`
+    # must still answer 200 with `dry_run: true`, not a refusal). On an
+    # endpoint that never calls `dry_run_typo_exempt=True`, this exemption
+    # never applies, and a dry_run typo is just one more unrecognised key.
     extra = sorted(
         k for k in set(keys)
-        if k not in allowed and not _looks_like_misspelled_dry_run(k)
+        if k not in allowed
+        and not (dry_run_typo_exempt and _looks_like_misspelled_dry_run(k))
     )
     if extra:
         raise HTTPException(
@@ -7983,6 +8060,82 @@ def _refuse_unknown_keys(keys, allowed: set[str], *, where: str) -> None:
                 f"{sorted(allowed)} are accepted here"
             ),
         )
+
+
+# v3.1.9 (hostile pass 5, C5-5). The duplicate-key + unknown-key pair above
+# was called from admin_compact and admin_merge only, each re-deriving its
+# own raw-body-parse-and-refuse boilerplate around them. Every OTHER
+# body- or query-reading admin write endpoint now goes through this ONE
+# function instead — restore, import, fork, cleanup-test-data, dedup,
+# forget, the persona endpoints, and the manual backup trigger — so the
+# rule cannot be applied at one call site and missed at its sibling again,
+# which is exactly how it was missed the first time (F6 fixed two of what
+# was, even then, already more than two admin write endpoints).
+#
+# Deliberately does NOT also call `_refuse_unpaired_surrogate`: that guard
+# must stay a call `test_surrogate_guard.py`'s structural check can find
+# textually INSIDE each handler's own function body (it walks each
+# function's own AST, not functions it calls), so every handler keeps that
+# one line inline even after adopting this helper for everything else.
+def _refuse_bad_admin_request(
+    request: Request,
+    raw_body: bytes,
+    body: dict,
+    *,
+    body_keys: set[str],
+    query_keys: set[str],
+    dry_run_typo_exempt: bool = False,
+) -> None:
+    _refuse_duplicate_json_keys(raw_body)
+    _refuse_unknown_keys(
+        body.keys(), body_keys, where="body",
+        dry_run_typo_exempt=dry_run_typo_exempt,
+    )
+    _refuse_unknown_keys(
+        request.query_params.keys(), query_keys, where="the query string",
+        dry_run_typo_exempt=dry_run_typo_exempt,
+    )
+
+
+# v3.1.9 (hostile pass 5, C5-5). For an admin write endpoint that never used
+# to read its body or query string AT ALL (forget, dedup, delete-persona,
+# the manual backup trigger) — so a stray key there was not "ignored", it
+# was never looked at. This gives every one of them the SAME strict parse
+# /restore, /import and /compact already have (hostile pass 3/4, F2/F3):
+# an empty/whitespace body is the common "no body was sent" case and
+# becomes `{}`; anything else that fails to parse, or parses to something
+# other than a JSON object, is a 400 rather than silently treated as no
+# body. Unlike `_refuse_bad_admin_request`, this DOES call
+# `_refuse_unpaired_surrogate` itself — it is the only place these
+# endpoints call `request.json()`, so it has to be, for
+# test_surrogate_guard.py's structural check (every function that reads a
+# JSON body also guards it) to find both calls together. The handlers this
+# lane already found calling `request.json()` inline (persona, restore,
+# import, fork, cleanup-test-data, merge-into, compact) keep doing that
+# themselves rather than switching to this helper — no functional change
+# for them, and no risk to that check's own bookkeeping.
+async def _parse_admin_json_body(request: Request) -> tuple[bytes, dict]:
+    raw_body = await request.body()
+    if not raw_body.strip():
+        body: dict = {}
+    else:
+        try:
+            body = await request.json()
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"body is present but could not be parsed as JSON "
+                    f"({type(e).__name__}: {e})"
+                ),
+            )
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"body must be a JSON object, got {type(body).__name__}",
+            )
+    _refuse_unpaired_surrogate(body)
+    return raw_body, body
 
 
 def _refuse_duplicate_json_keys(raw_body: bytes) -> None:
@@ -8045,7 +8198,16 @@ async def admin_import_conversation(request: Request):
     parsed STRICTLY (see _strict_affirmative): only `true`, `"true"`, `"1"`
     or `"yes"` ever overwrite. Every other spelling, including `"false"`,
     `"no"`, `"0"` and `"off"`, is read as no-overwrite — the safe side.
+
+    No query key is accepted, and no body key outside {bundle,
+    target_conv_id, overwrite} (hostile pass 5, C5-5): this endpoint has
+    NO dry-run mode, so a {"dry_run": true} alongside overwrite: true used
+    to be silently ignored and the overwrite ran anyway — it is now a 400,
+    like any other unrecognised key. A duplicated top-level key
+    ({"overwrite": false, ..., "overwrite": true}) is a 400 too, rather
+    than resolving last-wins toward the destructive value.
     """
+    raw_body = await request.body()
     try:
         body = await request.json()
     except Exception:
@@ -8053,6 +8215,10 @@ async def admin_import_conversation(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
     _refuse_unpaired_surrogate(body)
+    _refuse_bad_admin_request(
+        request, raw_body, body,
+        body_keys={"bundle", "target_conv_id", "overwrite"}, query_keys=set(),
+    )
     bundle = body.get("bundle")
     if bundle is None:
         raise HTTPException(status_code=400, detail="missing required field: 'bundle'")
@@ -8149,8 +8315,12 @@ async def admin_fork_conversation(conv_id: str, request: Request):
     untouched. Body is optional:
         {"new_conv_id": "<str>" | null}
     If omitted, the fork's id is `<src>__fork_<6hex>`.
+
+    No query key is accepted, and no body key outside new_conv_id
+    (hostile pass 5, C5-5) — either is a 400.
     """
     # Body is optional — accept empty or missing.
+    raw_body = await request.body()
     try:
         body = await request.json()
     except Exception:
@@ -8158,6 +8328,9 @@ async def admin_fork_conversation(conv_id: str, request: Request):
     if not isinstance(body, dict):
         body = {}
     _refuse_unpaired_surrogate(body)
+    _refuse_bad_admin_request(
+        request, raw_body, body, body_keys={"new_conv_id"}, query_keys=set(),
+    )
     try:
         return portability.fork_conversation(
             conv_id, new_conv_id=body.get("new_conv_id")
@@ -8196,7 +8369,19 @@ async def admin_cleanup_test_conversations(request: Request):
     fixed there for /compact and /merge-into but never carried here. Reuses
     that same helper now: both sources are read, and dry wins on any
     disagreement, including a source disagreeing with itself.
+
+    v3.1.9 (hostile pass 5, C5-5). No duplicate-key check existed either —
+    a body of {"dry_run": true, "dry_run": false} resolved last-wins
+    (False, commit) and wiped a matched conversation, directly
+    contradicting this endpoint's own docstring above ("dry wins on any
+    disagreement, including a source disagreeing with itself"). dry_run is
+    the only accepted key, in either the body or the query string;
+    dry_run_typo_exempt=True because this endpoint DOES have a dry_run
+    (via _dry_run_from immediately below), so a near-misspelling of it
+    already gets forced onto the safe side there instead of being an
+    unrecognised key.
     """
+    raw_body = await request.body()
     try:
         body = await request.json()
     except Exception:
@@ -8204,6 +8389,10 @@ async def admin_cleanup_test_conversations(request: Request):
     if not isinstance(body, dict):
         body = {}
     _refuse_unpaired_surrogate(body)
+    _refuse_bad_admin_request(
+        request, raw_body, body, body_keys={"dry_run"}, query_keys={"dry_run"},
+        dry_run_typo_exempt=True,
+    )
     dry_run = _dry_run_from(request, body, default=True)
 
     async def _wipe(conv_id: str) -> dict:
@@ -8437,12 +8626,17 @@ async def admin_merge(src_conv_id: str, dst_conv_id: str, request: Request):
     # unlike /compact's.
     if isinstance(body, dict) and body:
         _refuse_duplicate_json_keys(_raw_body)
+    # dry_run_typo_exempt=True: merge-into DOES implement dry_run (below,
+    # via _dry_run_from), so a near-misspelling of it already gets forced
+    # onto the safe (dry) side there rather than being an unrecognised key
+    # (hostile pass 5, C5-5 — see _refuse_unknown_keys' own docstring).
     _refuse_unknown_keys(
-        body.keys(), {"dry_run", "refresh_last_used"}, where="body"
+        body.keys(), {"dry_run", "refresh_last_used"}, where="body",
+        dry_run_typo_exempt=True,
     )
     _refuse_unknown_keys(
         request.query_params.keys(), {"dry_run", "refresh_last_used"},
-        where="the query string",
+        where="the query string", dry_run_typo_exempt=True,
     )
     # Absent means DRY for merge: this endpoint rewrites two conversations
     # and an operator who meant to commit sees unchanged counts and tries
@@ -8705,10 +8899,17 @@ async def admin_compact(conv_id: str, request: Request):
     # string, is refused rather than enumerated as one more typo to catch.
     if body:
         _refuse_duplicate_json_keys(raw_body)
-    _refuse_unknown_keys(body.keys(), {"dry_run", "max_calls"}, where="body")
+    # dry_run_typo_exempt=True: /compact DOES implement dry_run (via
+    # _dry_run_from below), so a near-misspelling of it already gets forced
+    # onto the safe (dry) side there rather than being an unrecognised key
+    # (hostile pass 5, C5-5 — see _refuse_unknown_keys' own docstring).
+    _refuse_unknown_keys(
+        body.keys(), {"dry_run", "max_calls"}, where="body",
+        dry_run_typo_exempt=True,
+    )
     _refuse_unknown_keys(
         request.query_params.keys(), {"dry_run", "max_calls"},
-        where="the query string",
+        where="the query string", dry_run_typo_exempt=True,
     )
     # v3.1.9 (hostile pass 2, MEDIUM). `int(body.get("max_calls") or 200)`
     # used Python truthiness on the raw value, so an explicit
@@ -9074,11 +9275,19 @@ async def admin_list_backups():
 
 
 @app.post("/admin/backups", dependencies=[Depends(_require_localhost)])
-async def admin_run_backup(response: Response):
+async def admin_run_backup(request: Request, response: Response):
     """Trigger one backup cycle now (create → verify → publish → prune).
     Returns the report. HTTP 200 if the backup was created AND verified;
     503 if it failed (so this is a usable monitoring signal). Runs in a
-    thread — the cycle is blocking I/O (sqlite snapshot, tar, verify)."""
+    thread — the cycle is blocking I/O (sqlite snapshot, tar, verify).
+
+    Takes no body and no query key (hostile pass 5, C5-5): either is a
+    400, not a silently-ignored stray.
+    """
+    raw_body, body = await _parse_admin_json_body(request)
+    _refuse_bad_admin_request(
+        request, raw_body, body, body_keys=set(), query_keys=set(),
+    )
     report = await asyncio.to_thread(backup_module.run_once)
     response.status_code = 200 if report.get("ok") else 503
     return report
