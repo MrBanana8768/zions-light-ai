@@ -212,12 +212,81 @@ backup.restore_backup(P(os.environ["ARCH"]), webui_db=P(os.environ["TARGET"]), c
                 f"nothing live was ever about to move")
 
 
+def test_g3_restore_backup_refuses_to_start_over_an_earlier_marker():
+    print("\n[test] p4-b G3: restore_backup refuses to START a new restore while an earlier marker is still on disk")
+    arch = _reset_live()
+    # A marker from an unrelated, earlier run this process did not start
+    # (an interrupted CLI --restore, or a concurrent one) — written with
+    # the SAME function restore_backup itself uses.
+    webuidb.write_restore_marker("20260101-000000-000", {
+        "archive": "some-earlier-archive.tar.gz", "target_db": str(_DB),
+        "staged_db_tmp": None, "sroot": None, "staged_store_incoming": None,
+        "quarantine_dir": str(_Q),
+    })
+    try:
+        try:
+            backup.restore_backup(arch, webui_db=_DB, confirm=True)
+            assert_true(False, "fixture: restore_backup must refuse while an earlier marker exists")
+        except RuntimeError as e:
+            assert_true("earlier restore" in str(e) or "marker" in str(e),
+                        f"G3 fix: the refusal names the marker (got {e})")
+    finally:
+        webuidb.remove_restore_marker("20260101-000000-000")
+    # Nothing was touched — the live db from _reset_live() is still there,
+    # untouched, and the earlier marker's cleanup above is unaffected by
+    # this restore attempt (which never got past its precondition check).
+    assert_true(_DB.exists(), "G3 fix: the refusal happened before touching anything live")
+
+
+def test_g4_a_fully_rolled_back_store_failure_clears_its_own_marker():
+    print("\n[test] p4-b G4: a store-swap failure that fully rolls back clears its own marker (no stale marker survives a handled failure)")
+    arch = _reset_live()
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky_store_replace(src, dst):
+        if str(dst) == str(_STORE) and calls["n"] == 0:
+            calls["n"] += 1
+            raise OSError("simulated store-swap failure")
+        return real_replace(src, dst)
+
+    os.replace = flaky_store_replace
+    try:
+        try:
+            backup.restore_backup(arch, webui_db=_DB, confirm=True)
+            assert_true(False, "fixture: the injected failure must raise")
+        except OSError as e:
+            assert_true("simulated" in str(e), f"fixture: got the injected failure (got {e})")
+    finally:
+        os.replace = real_replace
+
+    marker = webuidb.find_interrupted_restore()
+    assert_true(marker is None,
+                f"G4 fix: a FULLY rolled-back failure clears its own marker — no stale marker "
+                f"survives a handled failure (got {marker})")
+    boot = webuidb.restore_on_boot()
+    assert_true(boot["action"] != "restore_interrupted",
+                f"G4 fix: and the next boot is NOT refused over a failure that fully recovered (got {boot['action']})")
+
+
+def test_g4_a_successful_restore_removes_its_own_marker_even_though_it_could_not_clear_an_unrelated_one():
+    print("\n[test] p4-b G4 boundary: restore_backup's own marker-removal is scoped to ITS OWN stamp")
+    arch = _reset_live()
+    rep = backup.restore_backup(arch, webui_db=_DB, confirm=True)
+    assert_true(rep["ok"], f"fixture: the restore itself succeeded (got {rep})")
+    marker = webuidb.find_interrupted_restore()
+    assert_true(marker is None, f"CONTROL: a clean, successful restore leaves no marker at all (got {marker})")
+
+
 if __name__ == "__main__":
     tests = [
         test_marker_present_after_a_kill_between_the_two_swaps,
         test_no_marker_and_no_debris_after_a_clean_restore,
         test_no_marker_for_a_kill_during_staging_before_any_live_move,
+        test_g3_restore_backup_refuses_to_start_over_an_earlier_marker,
+        test_g4_a_fully_rolled_back_store_failure_clears_its_own_marker,
+        test_g4_a_successful_restore_removes_its_own_marker_even_though_it_could_not_clear_an_unrelated_one,
     ]
     for t in tests:
         t()
-    print("\nAll p3-b restore-marker (F4/F9) tests passed.")
+    print("\nAll p3-b restore-marker (F4/F9) + p4-b G3/G4 tests passed.")

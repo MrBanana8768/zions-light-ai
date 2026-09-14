@@ -518,6 +518,7 @@ def _census(store: Path) -> dict:
                 "summary_active_bytes": 0,
                 "archived_chapter_bytes": 0,
                 "persona": False,
+                "persona_bytes": 0,
             },
         )
 
@@ -590,6 +591,13 @@ def _census(store: Path) -> dict:
             data = _read_json(f)
             if isinstance(data, dict):
                 text = data.get("persona_text")
+                if isinstance(text, str):
+                    # p4-b G5. Recorded even when text is "" (or whitespace,
+                    # which the presence flag below treats as absent) — the
+                    # hwm floor on this field needs the RAW byte count, the
+                    # same way facts_bytes reads the text a count-preserving
+                    # rewrite can gut without moving.
+                    slot(f.stem)["persona_bytes"] = len(text)
                 if isinstance(text, str) and text.strip():
                     slot(f.stem)["persona"] = True
 
@@ -788,6 +796,225 @@ def _census_regressions(expected: dict, actual: dict) -> list[str]:
     return out
 
 
+def _census_hwm_update(prev_hwm: dict, census: dict) -> tuple[dict, list[str]]:
+    """(new_hwm, losses) — the per-conversation HIGH-WATER MARK check p4-b
+    G5 adds alongside _census_regressions's immediate-previous-cycle floor.
+
+    THE GAP THIS CLOSES. _census_regressions only ever compares THIS
+    cycle's numbers to the ONE cycle before it, so a loss spread thin
+    enough that every single step stays above the 0.5 floor never trips
+    it — each night's (already-diminished) archive quietly becomes the
+    next baseline. Proof (SP\\p4-b\\census4.py): a conversation's facts
+    truncated 140 -> 71 -> 36 -> 19 -> 10 -> 5 over five cycles reads
+    `census_regressions: []` on every single one (the worst single-cycle
+    ratio is 71/140 = 0.507, just above the floor). A persona overwritten
+    with "x" and 4 of 5 L1 summary chunks dropped, each in ONE cycle
+    against a field the existing rules do not track byte-for-byte at all
+    (persona) or only check for a TOTAL wipe (summary_active_bytes),
+    passed the same way.
+
+    THE FIX. A high-water mark per conversation per field, carried forward
+    in each archive's own manifest (census_hwm, written by create_backup)
+    — so the comparison is against the BEST state seen recently, not just
+    the last one. `census` is THIS cycle's freshly computed _census()
+    output; `prev_hwm` is the previous archive's own `census_hwm` (or {}
+    with nothing yet to compare against).
+
+    ALARM ONCE, so the SAME already-reported loss does not nag every
+    night forever (the hostile317-c F1 failure mode, on a new field): a
+    field that fires THIS cycle resets its own high-water mark to this
+    cycle's (lower) value, so tomorrow's comparison is against today's
+    reality, not the pre-loss peak. A field that does NOT fire keeps
+    climbing: new_hwm = max(prev_hwm, this cycle). First-ever sighting of a
+    conversation (no prior hwm entry, or a hwm of 0 — a real high-water
+    mark can never be zero for a field that has anything in it) seeds the
+    mark from THIS cycle with no alarm: there is nothing yet to have
+    fallen from.
+
+    FOUR FIELDS, deliberately not every field _census produces:
+      * facts_union (facts + archived_facts) — the same union
+        _census_regressions's own first rule already uses, so eviction
+        moving mass between the two fields still does not fire this one.
+      * facts_bytes — text gutted with the count preserved.
+      * persona_bytes — len(persona_text). Not covered by ANY existing
+        rule byte-for-byte: the existing `persona` field is a bare
+        present/absent bool, so a persona overwritten with a one-character
+        stub stays "present" forever (SP\\p4-b\\census4.py's own proof).
+      * summary_active_bytes — the SAME field _census_regressions's total-
+        wipe rule already reads, now ALSO checked as a gradual bleed
+        rather than only an all-or-nothing wipe against the watermark.
+
+    A CONVERSATION MISSING FROM `census` ENTIRELY (deleted, retired, or a
+    genuine /forget — main._clear_all_memory removes its files outright)
+    is walked too, via the union of both dicts' conv_ids below, exactly
+    the way _census_regressions's own iteration (over `expected`, the
+    OLDER side) already catches a conversation disappearing between two
+    cycles — every field reads 0 this cycle, alarms once (a deliberate
+    forget/retire SHOULD alarm once, same doctrine as the existing persona
+    rule), and its hwm entry is then dropped rather than carried forward
+    forever once every field is back at 0.
+    """
+    losses: list[str] = []
+    new_hwm: dict = {}
+    fields = (
+        "facts_union", "facts_bytes", "persona_bytes", "summary_active_bytes",
+    )
+    for conv_id in sorted(set(prev_hwm) | set(census)):
+        want = prev_hwm.get(conv_id) or {}
+        if not isinstance(want, dict):
+            want = {}
+        have = census.get(conv_id) or {}
+        current = {
+            "facts_union": int(have.get("facts") or 0) + int(have.get("archived_facts") or 0),
+            "facts_bytes": int(have.get("facts_bytes") or 0),
+            "persona_bytes": int(have.get("persona_bytes") or 0),
+            "summary_active_bytes": int(have.get("summary_active_bytes") or 0),
+        }
+        conv_hwm: dict = {}
+        for field in fields:
+            old_h = want.get(field)
+            value = current[field]
+            if not isinstance(old_h, (int, float)) or old_h <= 0:
+                # No baseline yet (or the mark was already reset to 0 by a
+                # full removal, below) — seed it, nothing to have fallen
+                # from.
+                conv_hwm[field] = value
+                continue
+            if value < old_h * _CENSUS_LOSS_FLOOR:
+                losses.append(
+                    f"{conv_id}.{field} {old_h}->{value} (more than half "
+                    f"below its high-water mark)"
+                )
+                conv_hwm[field] = value  # reset: alarm once, not every night
+            else:
+                conv_hwm[field] = max(old_h, value)
+        # A conv_id visited only because it lingered in prev_hwm, now fully
+        # gone (every field back at 0), is not worth carrying forward —
+        # the loss above already fired once; keeping a {0,0,0,0} entry
+        # would only cost space for a conversation that no longer exists.
+        if any(conv_hwm.values()):
+            new_hwm[conv_id] = conv_hwm
+    return new_hwm, losses
+
+
+def _webui_db_scan_for_manifest(db_path: Path) -> dict | None:
+    """Chat-content summary for the manifest, so a prune can be held on
+    webui.db losing HER HISTORY, not just on the compactor store shrinking
+    (p4-b G1).
+
+    Reuses webuidb._scan_chat — the SAME function webuidb.py's own
+    publish-time guards (chat-count ratio, the cast-as-blob content-byte
+    ratio, MAX_ROW_LOSS_BYTES per surviving conversation) already measure
+    with — rather than writing a third copy of "how much of her chat
+    history is actually in this file". Those guards run on the LOCAL ->
+    SNAPSHOT sync path, which is OFF in production (WEBUI_DB_LOCAL=false):
+    a nightly backup cycle over the SNAPSHOT itself had no equivalent at
+    all. Two production-reachable shapes read `ok` and pruned behind them
+    before this fix (SP\\p4-b\\emptydb.py): the database replaced by a
+    fresh, empty OpenWebUI-shaped schema after a kill mid-restore leaves
+    the db MISSING (G3's window) and OpenWebUI then builds one; and her one
+    big conversation row gutted to `{"messages": []}` in place, with no
+    VACUUM, so the FILE SIZE does not move and Connection.backup() copies
+    the same free pages either way — payload_ratio read 1.0.
+
+    Called on the STAGED SNAPSHOT COPY (db_dest, right after
+    _snapshot_sqlite succeeds) — the exact bytes going into this archive,
+    same doctrine as _census being computed from the staged store rather
+    than the live one.
+
+    None when webui.db has no `chat` table or could not be read at all (a
+    foreign schema, or the snapshot copy itself failing a beat after
+    _snapshot_sqlite succeeded) — never confused with "zero chats", which
+    is a real, comparable result. See _scan_chat's own docstring for the
+    None-vs-zero distinction and why it costs a full table scan.
+    """
+    import webuidb
+    scan = webuidb._scan_chat(db_path)
+    if scan is None:
+        return None
+    rows = scan["rows"]
+    return {
+        "chats": len(rows) if rows is not None else None,
+        "content_bytes": scan["total"],
+        "newest_updated_at": scan["newest"],
+        # Per-conversation bytes (keyed by chat id), so a LATER cycle can
+        # catch ONE conversation gutted in place even while the total and
+        # the count barely move — many small chats can hide one large one
+        # emptied (the exact "gutted in place" proof above: 51 chats,
+        # payload_ratio 1.0). None when _scan_chat itself could not key the
+        # rows (no id column, or a duplicate id) — see its own
+        # "why_no_rows"; the caller must not read that as "zero rows".
+        "row_bytes": (
+            {str(k): v[0] for k, v in rows.items()} if rows is not None else None
+        ),
+    }
+
+
+def _webui_db_regressions(prev_src: dict, new_src: dict) -> list[str]:
+    """Like _census_regressions, but for webui.db's own chat CONTENT rather
+    than the compactor store (p4-b G1). `prev_src`/`new_src` are each
+    manifest's `sources["webui.db"]` block.
+
+    Cross-version / pre-fix compatibility, same doctrine as p3-b F3: an
+    OLD manifest (this project's own code before this fix, or an archive a
+    v3.1.6.1/v3.1.8 image wrote) never has a "chats" key at all — that is
+    "no baseline to compare against", not "a baseline of zero chats", so a
+    missing key here is silence, never an alarm. (Mirrors read_manifest's
+    own docstring: an unreadable OLD archive is a missing baseline, never a
+    baseline of zero.)
+
+    A database that WAS present and readable and now reads absent or
+    unreadable is not silence, though — it is exactly the G1 "replaced by
+    an empty schema" shape, and the escape hatch that lets a cycle publish
+    with no webui.db at all (COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB — see G6)
+    must not make THIS check go quiet the moment it is used: a chats/
+    content_bytes value that cannot be read this cycle reads as 0 for the
+    floor below, exactly like a genuine drop to zero would.
+    """
+    out: list[str] = []
+    if not isinstance(prev_src, dict) or not isinstance(new_src, dict):
+        return out
+    if "chats" not in prev_src:
+        return out
+
+    prev_chats = prev_src.get("chats")
+    if isinstance(prev_chats, int) and prev_chats > 0:
+        new_chats = new_src.get("chats")
+        effective = new_chats if isinstance(new_chats, int) else 0
+        if effective < prev_chats * _CENSUS_LOSS_FLOOR:
+            out.append(f"webui.db.chats {prev_chats}->{effective}")
+
+    prev_bytes = prev_src.get("content_bytes")
+    if isinstance(prev_bytes, int) and prev_bytes > 0:
+        new_bytes = new_src.get("content_bytes")
+        effective_bytes = new_bytes if isinstance(new_bytes, int) else 0
+        if effective_bytes < prev_bytes * _CENSUS_LOSS_FLOOR:
+            out.append(f"webui.db.content_bytes {prev_bytes}->{effective_bytes}")
+
+    # Per-conversation loss on a SURVIVING id — the shape neither floor
+    # above can see when the gutted conversation is a small fraction of a
+    # large db (the proof above: one 3 MB row emptied among 51 chats moves
+    # the total by well under half). Reuses webuidb.MAX_ROW_LOSS_BYTES —
+    # the SAME threshold the sync-publish guard applies to this exact
+    # question, read fresh per call so an operator's env override applies
+    # here too, not frozen at whatever it was at import.
+    prev_rows = prev_src.get("row_bytes")
+    new_rows = new_src.get("row_bytes")
+    if isinstance(prev_rows, dict) and isinstance(new_rows, dict):
+        import webuidb
+        threshold = webuidb.MAX_ROW_LOSS_BYTES
+        for cid, prev_n in prev_rows.items():
+            if cid not in new_rows:
+                continue  # a deletion, not a row gutted in place — not this check's question
+            new_n = new_rows[cid]
+            if (
+                isinstance(prev_n, int) and isinstance(new_n, int)
+                and prev_n - new_n > threshold
+            ):
+                out.append(f"webui.db.row[{cid[:12]}] {prev_n}->{new_n} bytes")
+    return out
+
+
 def read_manifest(archive_path: Path) -> dict | None:
     """Pull manifest.json out of a published archive without unpacking the
     rest. Returns None when it is absent or unreadable — callers must treat
@@ -839,7 +1066,9 @@ def list_backups(backup_dir: Path | None = None) -> list[dict]:
 # Create
 # ---------------------------------------------------------------------------
 
-def create_backup(backup_dir: Path | None = None) -> Path:
+def create_backup(
+    backup_dir: Path | None = None, *, prev_manifest: dict | None = None
+) -> Path:
     """Build a verified-elsewhere archive of webui.db + the compactor store.
 
     Writes to a `.partial` temp file; the caller (run_once) verifies it and
@@ -847,6 +1076,19 @@ def create_backup(backup_dir: Path | None = None) -> Path:
 
     Raises RuntimeError if the min-free guard trips, or if the compactor
     store is missing (v3.1 F2 — see the guard at step 2).
+
+    `prev_manifest` (p4-b G5) is the PREVIOUS archive's manifest, when the
+    caller has one — read_manifest(list_backups(d)[0]) in run_once's own
+    terms. It is used for exactly one thing: carrying the per-conversation
+    high-water mark (census_hwm) forward so a slow bleed across many
+    cycles — each individual drop under the 0.5 floor _census_regressions
+    already checks against the immediate previous cycle — still trips a
+    floor eventually, against the BEST state seen recently rather than
+    only the state one cycle ago. None (the default, and what every
+    existing caller before this fix passes implicitly) means "no
+    baseline": the archive gets THIS cycle's own values as its starting
+    high-water mark, and nothing is flagged — there is nothing yet to have
+    fallen from.
     """
     d = backup_dir or BACKUP_DIR
     d.mkdir(parents=True, exist_ok=True)
@@ -878,6 +1120,13 @@ def create_backup(backup_dir: Path | None = None) -> Path:
             manifest["sources"]["webui.db"] = {
                 "present": True, "bytes": db_dest.stat().st_size,
             }
+            # p4-b G1. New keys, added to the EXISTING "webui.db" block an
+            # old reader already only reads "present"/"bytes" out of by
+            # name (p3-b F3's doctrine) — see _webui_db_scan_for_manifest's
+            # own docstring for what they hold and why.
+            chat_scan = _webui_db_scan_for_manifest(db_dest)
+            if chat_scan is not None:
+                manifest["sources"]["webui.db"].update(chat_scan)
         else:
             manifest["sources"]["webui.db"] = {"present": False}
             # p3-b F12. This branch used to log a WARNING and carry on — the
@@ -896,24 +1145,62 @@ def create_backup(backup_dir: Path | None = None) -> Path:
             # ALLOW_PUBLISH_OVER_UNREADABLE gives webuidb.py, for the one
             # legitimate case: a brand-new pod where the backup daemon's
             # first cycle races OpenWebUI's own first write.
-            if os.environ.get(
+            #
+            # p4-b G6. THE HATCH NOW EXPIRES: it is honoured only while
+            # list_backups(d) is EMPTY — a pod that has never published a
+            # single archive yet, which is the only shape the "genuinely
+            # fresh deployment" case in the message below actually
+            # describes. Once one archive exists, the hatch is a no-op and
+            # this refuses regardless of the env var. Why: the daemon's own
+            # 15-minute retry already clears the fresh-pod race unaided
+            # (misc4.py's own run_daemon simulation — the first cycle fires
+            # before OpenWebUI's first write lands and simply retries), so
+            # the hatch was never NEEDED for the case its own message
+            # names — it was advice for a race that resolves itself. An
+            # operator who followed that advice anyway left it set in the
+            # RunPod template, where it survives every later redeploy, and
+            # from then on ANY cycle where live_webui_db() resolves to a
+            # missing file (misresolution, an unmounted volume, a moved db)
+            # published a memory-only archive and pruned real ones behind
+            # it — this is exactly p3-b F12 again, with no signal at all
+            # once set (SP\p4-b\emptydb.py case 3: `ok: true, pruned:
+            # [3 older archives]`, the escape hatch its only cause). Expiry
+            # closes that: the hatch can no longer disable F12's refusal
+            # on a pod that has ever successfully backed up before.
+            _hatch_set = os.environ.get(
                 "COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB", ""
-            ).strip().lower() not in ("1", "true", "yes"):
+            ).strip().lower() in ("1", "true", "yes")
+            if _hatch_set and not list_backups(d):
+                logger.warning(
+                    f"webui.db not found at {live_db} — backing up memory "
+                    f"only (COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB=1 is set and "
+                    f"this pod has never published an archive yet)"
+                )
+            else:
                 raise RuntimeError(
                     f"refusing to back up: webui.db not found at {live_db} "
                     f"— the live database is missing, unmounted, or "
                     f"live_webui_db() is resolving to the wrong path. Not "
                     f"writing an archive with no chat history behind the "
-                    f"good ones it would age out through retention. If this "
-                    f"is a genuinely fresh deployment racing OpenWebUI's own "
-                    f"first write, set "
-                    f"COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB=1 to publish "
-                    f"memory-only archives until it appears."
+                    f"good ones it would age out through retention."
+                    + (
+                        f" COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB=1 is set, but "
+                        f"this pod has ALREADY published at least one "
+                        f"archive, so the hatch no longer applies — it is "
+                        f"for a pod's very first cycle only, and its own "
+                        f"15-minute retry already clears that race without "
+                        f"it. If webui.db is genuinely gone or moved, fix "
+                        f"that; do not re-widen this hatch to work around "
+                        f"it."
+                        if _hatch_set
+                        # p4-b G6: the advice to set the hatch for "a
+                        # genuinely fresh deployment racing OpenWebUI's own
+                        # first write" is deliberately REMOVED here (it used
+                        # to be printed in this exact message) — the race
+                        # needs no hatch at all; see the comment above.
+                        else ""
+                    )
                 )
-            logger.warning(
-                f"webui.db not found at {live_db} — backing up memory only "
-                f"(COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB=1 is set)"
-            )
 
         # 2. compactor/ store (atomic-written files are individually consistent)
         if not STORAGE_ROOT.is_dir():
@@ -956,6 +1243,17 @@ def create_backup(backup_dir: Path | None = None) -> Path:
             )
         n_files = sum(1 for f in store_dest.rglob("*") if f.is_file())
         n_json = sum(1 for _ in store_dest.rglob("*.json"))
+        conversations_census = _census(store_dest)
+        # p4-b G5: the high-water mark, carried forward from the PREVIOUS
+        # archive's own manifest (never the live store — see this
+        # function's own docstring for why None means "no baseline yet").
+        # See _census_hwm_update's docstring for the reset-on-fire rule
+        # that gives this alarm-once semantics.
+        prev_hwm = (
+            ((prev_manifest or {}).get("sources", {}).get("compactor", {}) or {})
+            .get("census_hwm") or {}
+        )
+        new_hwm, _ = _census_hwm_update(prev_hwm, conversations_census)
         manifest["sources"]["compactor"] = {
             "present": True,
             "files": n_files,
@@ -965,7 +1263,8 @@ def create_backup(backup_dir: Path | None = None) -> Path:
             # archive that has an episodic store.
             "json_files": n_json,
             "chroma_sqlite": chroma_present,
-            "conversations": _census(store_dest),
+            "conversations": conversations_census,
+            "census_hwm": new_hwm,
         }
         manifest["payload_bytes"] = _tree_bytes(staging)
 
@@ -1349,10 +1648,39 @@ def run_once(backup_dir: Path | None = None) -> dict:
     # its own baseline and every comparison below is vacuous — the same
     # mistake verify_backup made with the manifest.
     existing = list_backups(d)
+    # p4-b G6: loud, EVERY cycle, whenever the hatch is armed — not only on
+    # the cycle it actually gets used. Before this fix the only trace of
+    # COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB=1 being set was a single WARNING
+    # on a cycle that happened to hit a missing webui.db; on every other
+    # cycle (the overwhelming majority, once set and forgotten in a RunPod
+    # template) it was completely silent — an operator watching only
+    # normal "backup ok" lines had no way to notice the safety net was off
+    # long before the day it mattered. Once list_backups(d) is non-empty
+    # the hatch no longer even does anything (see create_backup's own
+    # comment on the refusal it used to silently bypass), so this doubles
+    # as a nag to go unset it.
+    if os.environ.get(
+        "COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB", ""
+    ).strip().lower() in ("1", "true", "yes"):
+        logger.warning(
+            "COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB=1 is set"
+            + (
+                " and this pod has already published archives, so it no "
+                "longer has any effect — unset it."
+                if existing
+                else " — a missing webui.db will publish a memory-only "
+                "archive instead of refusing. This is meant for a pod's "
+                "very first cycle only; unset it once the first archive "
+                "exists."
+            )
+        )
     prev_entry = existing[0] if existing else None
     prev_manifest = read_manifest(Path(prev_entry["path"])) if prev_entry else None
     try:
-        partial = create_backup(d)
+        # p4-b G5: prev_manifest passed through so create_backup can carry
+        # the per-conversation census high-water mark forward — see its
+        # own docstring and _census_hwm_update.
+        partial = create_backup(d, prev_manifest=prev_manifest)
         ok, detail = verify_backup(partial)
         report["detail"] = detail
         if not ok:
@@ -1412,6 +1740,36 @@ def run_once(backup_dir: Path | None = None) -> dict:
             # numbers; _census_shortfalls's strict "any decrease" rule is
             # for verify_backup's within-one-archive integrity check only.
             losses = _census_regressions(prev_census, new_census)
+        # p4-b G1: the census above watches the compactor STORE only — it
+        # has no idea webui.db, her whole chat history, exists at all. The
+        # store is the SMALLER half of the real payload (this pod's own
+        # manifests: ~138 MB db vs ~436 MB total), so a webui.db replaced
+        # by an empty schema or gutted in place holds payload_ratio well
+        # above MIN_PAYLOAD_RATIO and census_regressions empty, and prunes
+        # the good archives behind it (SP\p4-b\emptydb.py). Same doctrine
+        # as the census check just above: hold the prune, publish anyway,
+        # tell someone — never silently lose the older archives that would
+        # still have her history.
+        losses += _webui_db_regressions(
+            (prev_manifest or {}).get("sources", {}).get("webui.db") or {},
+            (new_manifest or {}).get("sources", {}).get("webui.db") or {},
+        )
+        # p4-b G5: the slow-bleed check, against the high-water mark
+        # create_backup already computed and baked into new_manifest (it
+        # needed prev_manifest's own hwm to do that, at creation time — see
+        # create_backup's docstring). Recomputed here rather than threaded
+        # back out of create_backup's return value: the inputs
+        # (prev_manifest's hwm, and new_census — the SAME dict
+        # create_backup just wrote into the archive it built from) are
+        # already both in hand, and _census_hwm_update is a pure function
+        # of them, so this reproduces the identical loss list create_backup
+        # itself would have seen, without changing create_backup's return
+        # type for every OTHER caller (the CLI, the suites).
+        if isinstance(new_census, dict):
+            prev_hwm = (
+                (prev_manifest or {}).get("sources", {}).get("compactor", {}) or {}
+            ).get("census_hwm") or {}
+            losses += _census_hwm_update(prev_hwm, new_census)[1]
         report["census_regressions"] = losses
         report["ok"] = True
         report["elapsed_s"] = round(time.monotonic() - t0, 1)
@@ -1522,6 +1880,31 @@ def restore_backup(
         target = webui_db or live_webui_db()
         _require_no_active_writer(target)
         stamp = _restore_stamp()
+
+        # p4-b G3: refuse to START a new restore while an EARLIER one's
+        # marker is still on disk. This run has not written ITS OWN marker
+        # yet (that happens a bit further down, once staging succeeds) —
+        # so any marker found here belongs to a run this process did not
+        # start: one genuinely still in flight (a concurrent --restore), or
+        # one left behind by an earlier kill that was never cleaned up
+        # (G4). Stacking a second restore on top of live paths that might
+        # already be missing or at a mixed generation compounds exactly the
+        # failure the marker exists to flag, the same way
+        # _require_no_active_writer above refuses to restore under an open
+        # writer rather than trying to reason about what it might do.
+        import webuidb
+        _earlier_marker = webuidb.find_interrupted_restore()
+        if _earlier_marker is not None:
+            raise RuntimeError(
+                f"refusing to restore: an earlier restore's marker is "
+                f"still on disk at {_earlier_marker.get('marker_path')} — "
+                f"either a restore is genuinely still in flight, or an "
+                f"earlier one was interrupted and never cleaned up. "
+                f"Resolve that first (see OPERATIONS.md's restore section "
+                f"for what the marker's plan means and how to clear it "
+                f"safely) before starting a new one: "
+                f"{json.dumps(_earlier_marker, indent=1)}"
+            )
 
         # ------------------------------------------------------------------
         # STAGE EVERYTHING FIRST, TOUCH NOTHING LIVE UNTIL IT IS STAGED.
@@ -1675,12 +2058,22 @@ def restore_backup(
             try:
                 os.replace(db_tmp, target)
             except BaseException:
+                _db_swap_rollback_ok = True
                 if db_aside is not None:
-                    shutil.move(str(db_aside), str(target))
+                    try:
+                        shutil.move(str(db_aside), str(target))
+                    except OSError as e:
+                        _db_swap_rollback_ok = False
+                        logger.error(
+                            f"could not move {db_aside} back to {target} "
+                            f"after a failed restore ({e}); move it back by "
+                            f"hand BEFORE anything opens {target.name}"
+                        )
                 for side, aside in reversed(moved):
                     try:
                         shutil.move(str(aside), str(side))
                     except OSError as e:
+                        _db_swap_rollback_ok = False
                         logger.error(
                             f"could not put {aside} back as {side.name} "
                             f"after a failed restore ({e}); move it back by "
@@ -1691,6 +2084,21 @@ def restore_backup(
                 # copy is only debris; leaving it would be a multi-gigabyte
                 # `.incoming` nobody is told about.
                 shutil.rmtree(store_incoming, ignore_errors=True)
+                # p4-b G4: this handler's rollback puts the live state back
+                # to EXACTLY its pre-restore condition (db + sidecars both
+                # accounted for above) — the marker written a few lines above
+                # `if have_db:` exists to protect against an UNKNOWN mixed
+                # live state, and there is not one here when every move above
+                # actually landed. Leaving the marker anyway would refuse
+                # every later boot for a restore that is, on the live paths,
+                # as if it never ran. Only clear it when EVERY move above is
+                # confirmed back — a partial rollback is exactly the unknown
+                # state the marker exists to flag, and clearing it there
+                # would silently erase the one piece of evidence an operator
+                # has that something is still wrong.
+                if _db_swap_rollback_ok:
+                    import webuidb
+                    webuidb.remove_restore_marker(stamp)
                 raise
             _fsync_dir(target.parent)
 
@@ -1804,32 +2212,37 @@ def restore_backup(
                 # -wal, quarantined a few lines above have_db) were never
                 # part of this rollback before. Putting the old db back
                 # WITHOUT the hot journal it had is exactly the corruption
-                # A3-2 exists to prevent, rebuilt inside this handler: SQLite
-                # opens the restored file believing there is nothing to
-                # replay and a live connection reads uncommitted pages as
-                # committed (SP\p3-b\rollback.py: integrity ok, but 2,276
-                # rows that were never committed). Sidecars go back FIRST,
-                # same as the db-swap handler above restores them after its
-                # own db_aside — order does not matter for correctness here
-                # (nothing reopens the db until this function returns), it
-                # only matters that both happen.
+                # A3-2 exists to prevent, rebuilt inside this handler.
+                #
+                # p4-b G2: THE DATABASE GOES BACK FIRST, THEN ITS SIDECARS —
+                # the reverse of what shipped, and the comment that used to
+                # sit here ("order does not matter for correctness ...
+                # nothing reopens the db until this function returns") was
+                # wrong. Moving the sidecars back first lands the OLD
+                # -journal beside `target` WHILE `target` STILL HOLDS THE
+                # NEW DATABASE (db_aside has not moved yet) — a SIGKILL in
+                # that window (a RunPod redeploy, an OOM kill) leaves a NEW
+                # db + OLD journal pair that LOOKS matched. The next process
+                # to open it (OpenWebUI on WEBUI_DB_LOCAL=false, where
+                # nothing checks a marker before that open — G3) applies the
+                # OLD journal's pages to the NEW file: proof, SP\p4-b\
+                # rbkill.py — after that open `database disk image is
+                # malformed`, and the pre-restore OLD database sitting in
+                # forensics WITHOUT its journal (moved away out from under
+                # it) reads 1,480 committed-looking rows from a transaction
+                # that never committed (integrity_check still says "ok").
+                # An EIO on the db move-back (no kill needed) reaches the
+                # same state: the log used to tell the operator to move the
+                # db back by hand without warning that a foreign journal
+                # now sits beside the live file. Moving the db back FIRST
+                # means the only db ever beside a foreign-looking journal
+                # is the one about to receive ITS OWN journal a moment
+                # later, and a kill between the two leaves OLD db + OLD
+                # journal not yet reunited — recoverable by hand, not
+                # silently corrupted. This is the same order the db-swap
+                # handler above (the one a few lines up, for a failure
+                # DURING the database's own swap) already used.
                 if have_db and db_aside is not None:
-                    for side, aside in reversed(moved):
-                        try:
-                            _move_back_no_nest(
-                                aside, side, stamp=stamp,
-                                label=f"{side.name} (database sidecar)",
-                            )
-                        except OSError as e:
-                            rollback_errors.append(
-                                f"could not put {aside} back as {side.name} "
-                                f"({e})"
-                            )
-                            logger.error(
-                                f"restore rollback: {rollback_errors[-1]} — "
-                                f"move it back by hand BEFORE anything opens "
-                                f"{target.name}"
-                            )
                     try:
                         _move_back_no_nest(
                             db_aside, target, stamp=stamp, label="webui.db",
@@ -1844,6 +2257,30 @@ def restore_backup(
                             f"the pre-restore database is still at "
                             f"{db_aside}, move it back by hand"
                         )
+                    else:
+                        # Only once the OLD db is actually back at `target`
+                        # do its sidecars get restored beside it — never
+                        # beside whatever was there before (the NEW db, or
+                        # nothing). If the db move-back above failed, the
+                        # sidecars stay in quarantine too: reuniting a hot
+                        # journal with the WRONG database is worse than
+                        # leaving both quarantined for a human to sort out.
+                        for side, aside in reversed(moved):
+                            try:
+                                _move_back_no_nest(
+                                    aside, side, stamp=stamp,
+                                    label=f"{side.name} (database sidecar)",
+                                )
+                            except OSError as e:
+                                rollback_errors.append(
+                                    f"could not put {aside} back as "
+                                    f"{side.name} ({e})"
+                                )
+                                logger.error(
+                                    f"restore rollback: {rollback_errors[-1]} "
+                                    f"— move it back by hand BEFORE anything "
+                                    f"opens {target.name}"
+                                )
                     if rollback_errors:
                         logger.error(
                             f"the store swap failed after the database swap "
@@ -1861,6 +2298,20 @@ def restore_backup(
                             f"included ({target}), so nothing is left at a "
                             f"mixed generation"
                         )
+                # p4-b G4: same reasoning as the db-swap handler above — a
+                # FULLY successful rollback (rollback_errors == [], covering
+                # both the store-only and the store+db cases: this list is
+                # shared across both branches above) puts the live paths
+                # back to exactly their pre-restore state, so the marker has
+                # nothing left to protect against. Cleared here, once, after
+                # both possible rollback branches (store-only; store+db)
+                # have had their chance to append to rollback_errors —
+                # never inside either branch individually, or a store-only
+                # rollback with have_db False would clear the marker before
+                # the (skipped) db branch even ran.
+                if not rollback_errors:
+                    import webuidb
+                    webuidb.remove_restore_marker(stamp)
                 raise
             _fsync_dir(sroot.parent)
             if store_aside is not None:

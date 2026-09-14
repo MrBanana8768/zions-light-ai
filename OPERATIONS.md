@@ -569,6 +569,29 @@ tail -20 /data/logs/backup.log
 and verified; `[FAIL] …` and exit 1 when not (see "Backups stopped or failing"
 above). `--verify` prints `[OK] db=ok, …` for a good archive.
 
+### `COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB`: a one-time bootstrap setting
+
+The backup daemon refuses a cycle outright (holds the prune) when it cannot
+find `webui.db` at all — a missing database is treated the same as a missing
+memory store, never silently backed up without her chat history. On a
+genuinely brand-new pod the daemon's very first cycle can race OpenWebUI's
+own first write and hit this refusal once; **the daemon's own 15-minute retry
+already clears that race on its own**, so you should not normally need to
+touch this setting at all.
+
+If you do set `COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB=1` (RunPod template
+variable), it only has any effect while `/data/backups/` holds **zero**
+archives — the very first cycle. Once one archive has published, the setting
+is inert and the refusal applies regardless: a hatch that stayed effective
+forever would silently turn a later missing/unmounted/misresolved `webui.db`
+into a memory-only archive that prunes real history behind it, which is the
+exact failure this refusal exists to catch. **Unset it once the first backup
+exists** — leaving it in the template past that point does nothing useful and
+invites confusion later. The backup log names it loudly, every cycle, for as
+long as it is set (`backup.py --once`'s own log line, or `tail -f
+/data/logs/backup.log`), specifically so it cannot sit forgotten and silent
+in a template.
+
 ### 🔥 Restore from a backup (recover lost/corrupted memory)
 
 **Use the manual procedure below on every release.** It never deletes
@@ -585,20 +608,60 @@ cannot be left half done.
 > v3.1.8 carries the same code).
 >
 > **From v3.1.9, `backup.py --restore` is rewritten, available, and not yet
-> reviewed.** It now copies everything it will restore next to its destination
-> first, moves
-> the old database's journal and the old memory store into `/data/forensics`
-> instead of deleting them, checks free space first, refuses to start if a
-> writer is holding the database mid-write, and can list what it set aside
+> fully reviewed.** It copies everything it will restore next to its
+> destination first, moves the old database's journal and the old memory
+> store into `/data/forensics` instead of deleting them (together, in the
+> order that keeps a hot journal beside the database it belongs to at every
+> step — a hostile-review finding on the ROLLBACK path specifically, fixed
+> before this review cycle closed), checks free space first, refuses to
+> start if a writer is holding the database mid-write, refuses to start a
+> second restore while an earlier one's marker is still on disk (below),
+> integrity-checks the database it just landed before touching the memory
+> store, and prints a restart line naming only the services that placement
+> actually uses. It can list what it set aside, staged copies included
 > (`backup.py --list-pre-restore`). It is still not the documented path, for
 > reasons in the code as well as the calendar: the final hostile review of
 > v3.1.9 has not cleared it; it cannot see a writer when a journal already
-> exists (exactly the incident state), so stopping the writers is still on you;
-> if its last step fails it can leave the restored database with the old
-> memory store; its free-space check reads MooseFS's cluster-wide number; and
-> it does not integrity-check the result or tell you what to start. The manual
-> procedure does all of those explicitly. Until that review clears it, use the
-> manual procedure on v3.1.9 too.
+> exists (exactly the incident state), so stopping the writers is still on
+> you; and its free-space check reads MooseFS's cluster-wide number. The
+> manual procedure does all of those explicitly. Until that review clears
+> it, use the manual procedure on v3.1.9 too.
+>
+> **An interrupted restore leaves a marker — `/data/forensics/restore-
+> *.inprogress`.** Any `backup.py --restore` run (including the CLI's) writes
+> this the moment it finishes staging, before touching anything live, and
+> removes it only once the restore fully landed or a failure was fully
+> rolled back. If the process is killed in between (a redeploy, an OOM
+> kill), or a rollback could not fully complete, the marker survives. While
+> it exists: the pod refuses to boot (entrypoint.sh checks for it before
+> OpenWebUI starts, on every placement, and prints its own banner naming the
+> file), `backup.py --restore` refuses to start a second restore, and
+> `/health/full`'s `status_reasons` names it. It means one of three things —
+> read the marker itself (`cat` it; it is JSON naming every path the restore
+> planned to touch) to tell them apart:
+>   1. genuinely mid-restore — webui.db and/or the compactor store may be
+>      missing or at a mixed generation right now;
+>   2. the restore finished and rolled itself back, but the process died
+>      before it could remove its own marker — the live paths are back to
+>      their pre-restore state;
+>   3. the restore finished and succeeded, but the process died before it
+>      could remove its own marker — the live paths are the archive's, and
+>      nothing is wrong with them.
+> This is deliberately not auto-recovered at boot: telling (1) apart from
+> (2)/(3) needs opening webui.db, and doing that automatically at every boot
+> with a marker present is not worth the risk on a volume that has already
+> taken minutes to roll back a hot journal on a database this size. With
+> someone watching, run `backup.py --status`, check whether the path(s)
+> named in the marker's `plan` exist and pass `quick_check`, and once you are
+> sure the live state is either fully restored or fully back to its
+> pre-restore state, `rm` the marker file named in the banner (or by
+> `find_interrupted_restore`) and redeploy or restart. A restore clears
+> ITS OWN marker automatically on a full success or a fully-completed
+> rollback — most of the time you will never see one. `backup.py --restore`
+> also REFUSES TO START while an EARLIER run's marker is still on disk (it
+> will not run a new restore over unresolved state), so clear a stale one
+> by hand, as above, before trying again — a later restore never sweeps up
+> a marker it did not itself write.
 
 **This procedure is for the production placement, `WEBUI_DB_LOCAL=false`**,
 where the live chat database IS `/data/openwebui/webui.db`. Every line runs in

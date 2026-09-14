@@ -1975,7 +1975,44 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
     )
-    if "--restore" in sys.argv:
+    if "--check-restore-marker" in sys.argv:
+        # p4-b G3. PLACEMENT-INDEPENDENT: entrypoint.sh runs this BEFORE the
+        # `if [ "${WEBUI_DB_LOCAL}" = "true" ]` split, so it also covers
+        # WEBUI_DB_LOCAL=false (production, the shipped default) — the
+        # placement whose boot never calls --restore / restore_on_boot at
+        # all, so restore_on_boot's OWN marker check (a few lines below)
+        # never runs there either. Before this, a kill mid-restore_backup()
+        # on that placement booted silently onto whatever half-finished
+        # state it left (G1's db-replaced-by-empty-schema shape is one
+        # consequence; see that finding).
+        #
+        # DELIBERATELY DOES NOT OPEN webui.db, and never will:
+        # find_interrupted_restore() only globs QUARANTINE (a small
+        # forensics directory) and reads one small JSON file — no
+        # PRAGMA quick_check, no row scan, nothing that competes for the
+        # SAME file lock a hot rollback journal replay needs. This runs on
+        # EVERY boot, including the overwhelming majority with no marker at
+        # all, on the same MooseFS volume that took several minutes to roll
+        # back a hot journal on a 138 MB webui.db twice in one afternoon
+        # (2026-09-13 production incident, WEBUI_DB_LOCAL=false) — a
+        # second opener here would not speed that rollback up, and could
+        # only add contention to it, on the one boot where every second
+        # already counts. Whether a marker that IS present can be cleared
+        # automatically needs exactly that kind of open (a quick_check
+        # against the target database) to answer safely — deliberately not
+        # attempted here; see the banner below and restore_backup's own
+        # self-clearing (this finding's other half, at the marker's write
+        # site) for what closes the common case before boot ever sees it:
+        # a FULLY rolled-back or fully re-verified restore removes its own
+        # marker, so by the time this runs the only markers left describe a
+        # restore this process cannot itself prove finished.
+        interrupted = find_interrupted_restore()
+        if interrupted is None:
+            print("no in-flight restore marker")
+            sys.exit(0)
+        print(json.dumps(interrupted, indent=1))
+        sys.exit(1)
+    elif "--restore" in sys.argv:
         r = restore_on_boot()
         print(r)
         # THE EXIT CODE IS THE ONLY THING THE BOOT SCRIPT CAN SEE, and this
