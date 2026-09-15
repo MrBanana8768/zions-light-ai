@@ -47,6 +47,19 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 #   - read-aloud returned HTTP 200 with a JSON "No such file or directory:
 #     'ffprobe'" body instead of audio, on every reply;
 #   - any recording over 20 MB failed in ~4 s.
+# - tzdata-legacy (v3.1.9): Ubuntu 24.04 split the IANA "backward" links
+#   (pre-merge zone names still in everyday use — US/Arizona, Asia/Calcutta,
+#   Europe/Kiev, Asia/Katmandu, America/Buenos_Aires, Asia/Saigon,
+#   America/Godthab, ...) out of the base `tzdata` package. Without it,
+#   COMPACTOR_TIMEZONE or a browser label naming one of those resolves to
+#   UTC — the exact failure the current-time feature exists to prevent —
+#   logging one ERROR/WARNING but never degrading `/health/full` (hostile
+#   pass #5, reviewer A, F1). Confirmed present for this base image/release
+#   (`apt-cache policy tzdata-legacy` on nvidia/cuda:13.0.0-runtime-ubuntu24.04:
+#   candidate 2026c-0ubuntu0.24.04.1, noble-updates). If a future base image
+#   does not carry this package, use the zone's CURRENT canonical name
+#   instead (e.g. `America/Phoenix`, not `US/Arizona`) — every zone this
+#   project documents already has one.
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
@@ -61,7 +74,8 @@ RUN apt-get update && \
         supervisor \
         binutils \
         build-essential \
-        ffmpeg && \
+        ffmpeg \
+        tzdata-legacy && \
     apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
@@ -372,11 +386,43 @@ ENV COMPACTOR_BACKUP_ENABLED="true"
 ENV COMPACTOR_TARGET_TOKENS=""
 ENV COMPACTOR_KEEP_RECENT_TURNS="4"
 ENV COMPACTOR_SUMMARY_MAX_TOKENS="1024"
+# v3.1.9: raised from the code default (main.py, 0.5) alongside the four
+# other memory-budget rows in this file (owner's live pod change, v3.1.8,
+# applied by hand via supervisord environment= — lost on every restart).
+# Why the fraction had to move WITH the summary block cap, not alone:
+# inject_budget = effective_limit * INJECTION_BUDGET_FRACTION is shared by
+# persona + summary + facts + retrieval. At the raised facts/retrieval caps
+# (3500/3500) but the OLD fraction (0.5, ~10,384 tokens on her 20,768-token
+# window), retrieval — priority 3, dropped WHOLE when it does not fit
+# (_bound_injected_blocks) — would have been silently cut from every
+# request. At 0.6 (~12,460 tokens) retrieval has room, with the summary
+# block pinned below at what it already measured (6,230). Raise together;
+# do not raise one without the other.
+ENV COMPACTOR_INJECTION_BUDGET_FRACTION="0.6"
+# v3.1.9: same pod change; pinned at the summary block's own measured size
+# (code default, summarizer.py, is 12000 — this is LOWER, not raised,
+# because at the new fraction the summary block only needed this much to
+# stay whole; see the comment above).
+ENV COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS="6230"
 ENV VLLM_URL="http://localhost:8000"
 
 # V2.0 Phase 2 — facts memory
 ENV COMPACTOR_FACTS_EXTRACTION="true"
-ENV COMPACTOR_MAX_FACTS_TOKENS="1500"
+# v3.1.9: raised from the code default (facts.py, 1500) to what the owner
+# ran live on the pod since v3.1.8 via a supervisord environment= edit (lost
+# on every container restart) — this bakes that edit into the image so it
+# survives a restart/redeploy instead of needing to be reapplied by hand.
+# See the four related budget rows elsewhere in this file (INJECT_FACTS,
+# just below; MAX_RETRIEVAL_TOKENS in the RAG block; INJECTION_BUDGET_FRACTION
+# and SUMMARY_BLOCK_MAX_TOKENS above, in the context-compactor settings
+# block) — they were raised together, and INJECTION_BUDGET_FRACTION's own
+# comment explains why the fraction had to move with them. Does NOT change
+# compactor/facts.py's own coded default (1500); this is an environment
+# override only.
+ENV COMPACTOR_MAX_FACTS_TOKENS="3500"
+# v3.1.9: same pod change as above, injection-side twin of MAX_FACTS_TOKENS
+# (code default 400, facts.py).
+ENV COMPACTOR_INJECT_FACTS_TOKENS="600"
 ENV COMPACTOR_ADMIN_BIND="127.0.0.1"
 # v3.1.9: the model is told the current date and time, in her browser's zone.
 # COMPACTOR_TIMEZONE (the fallback) is deliberately NOT baked; see
@@ -387,6 +433,11 @@ ENV COMPACTOR_TIME_INJECTION="true"
 # image at /opt/embeddings; FASTEMBED_CACHE_PATH points there so no
 # runtime download. RAG can be disabled with COMPACTOR_RAG_ENABLED=false.
 ENV COMPACTOR_RAG_ENABLED="true"
+# v3.1.9: raised from the code default (retrieval.py, 1500) alongside the
+# other memory-budget rows above — see COMPACTOR_INJECTION_BUDGET_FRACTION's
+# comment for why the fraction bump matters here specifically (this is the
+# block that gets dropped whole if it does not fit).
+ENV COMPACTOR_MAX_RETRIEVAL_TOKENS="3500"
 ENV COMPACTOR_RAG_TOP_K="5"
 ENV COMPACTOR_EMBEDDING_MODEL="BAAI/bge-small-en-v1.5"
 ENV FASTEMBED_CACHE_PATH="/opt/embeddings"

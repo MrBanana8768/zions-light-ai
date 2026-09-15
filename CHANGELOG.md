@@ -32,7 +32,7 @@ git tag messages. Every item links to the runbook that carries the commands.
   old image has not pruned since 2026-08-30 (its "memory shrank" check is
   noise); v3.1.9 resumes pruning by itself, but only on its first nightly
   cycle. The previewed manual prune is in
-  [OPERATIONS.md → Nightly "memory shrank" alert](OPERATIONS.md#nightly-memory-shrank-alert--noise-on-v3161-to-v318-a-real-signal-from-v319).
+  [OPERATIONS.md → Nightly "memory shrank" alert](OPERATIONS.md#nightly-memory-shrank-alert--noise-on-v3161-to-v318-a-real-signal-from-v319-except-one-item).
 
 ### Verifying the deploy
 
@@ -63,6 +63,25 @@ git tag messages. Every item links to the runbook that carries the commands.
   [OPERATIONS.md → What "memory tail skipping" means](OPERATIONS.md#what-memory-tail-skipping-means).
   This reason is new to the pod (v3.1.6.1 has no memory-tail tracking) and is
   unchanged in v3.1.9 by design.
+- **What to expect in the logs on her first two messages after the upgrade**
+  (measured against a copy of her real v3.1.7-written state): her **first**
+  message under v3.1.9 may still log `compaction skipped: … turns need N
+  summarization calls` / `hard budget enforced …` — it adopts the v3.1.7-era
+  summary record once (a one-time legacy-adoption cost) and is not itself a
+  fault. From her **second** message onward, requests reuse the stored
+  summary hierarchy: no more refusals, no more shedding, a normal-sized
+  forwarded payload. If refusals continue past the second message, something
+  is wrong; if only the very first one refused, that is the expected shape.
+- **A `hierarchy is N turns behind` reason with `verdict: unknown` right
+  after the deploy (or any restart) is expected, not a fault.** The
+  catch-up verdict is process-local evidence the tail records as it runs;
+  a freshly started process has none yet, so any conversation already
+  behind reads `unknown` until her next message on it — this is not
+  itself evidence of a stall, and it typically starts advancing on her
+  very next message. The reason itself offers `/compact` as an option "if
+  it should not wait for that", not as a required action; prefer waiting
+  for her next message right after a deploy. See "Summary hierarchy
+  catch-up" below.
 
 ### The current date and time
 
@@ -75,9 +94,34 @@ git tag messages. Every item links to the runbook that carries the commands.
   `COMPACTOR_TIMEZONE=<her IANA zone>` (for example `America/Phoenix`) in the
   RunPod template instead:** the model is told the right time, it just does
   not follow her device if she travels. With neither, UTC.
-- **Check:** after her next message, `/health/full` →
-  `config.time_injection.last_source` is `browser` and `current_line` shows
-  her local time.
+- **Use the zone's current canonical name, not an old-style one.** The image
+  now includes `tzdata-legacy`, so pre-merge spellings like `US/Arizona` or
+  `Asia/Calcutta` resolve too — but do not rely on that for a zone not
+  listed on this pod; prefer the canonical name (`America/Phoenix`,
+  `Asia/Kolkata`, ...). A name that does not resolve at all falls back to
+  UTC with one ERROR line at boot and no `/health/full` status change (see
+  the Check below).
+- **Check (route-dependent — the two setups above check differently):** on
+  `source=header` with the system-prompt line, after her next message
+  `/health/full` → `config.time_injection.last_source` is `browser` and
+  `current_line` shows her local time. On `source=hash` with
+  `COMPACTOR_TIMEZONE` set (today's setup), `last_source` is `env`, never
+  `browser` — that is correct, not a fault; confirm the zone itself in
+  `config.time_injection.last_timezone` instead. Either way, if
+  `config.time_injection.fallback_error`
+  is non-empty, the configured zone name did not resolve and every message is
+  dated in UTC with `/health/full` `status` still `ok` — this is a silent
+  failure with no `status_reasons` entry, so check `fallback_error`
+  explicitly rather than trusting `status`.
+- Title, tag, follow-up and query-generation calls (OpenWebUI "task
+  traffic") are never dated under header identity. Under today's hash
+  identity, the same calls are recognized (and left undated) only once a
+  conversation has genuinely reached `COMPACTOR_TASK_TRAFFIC_MIN_POSITION`
+  (default 4) turns — the first one or two task calls on a brand-new
+  template may be dated, harmlessly. A real first message from her that
+  happens to hash-collide with an older, already-deep conversation's opener
+  is still dated correctly, but is not memorized (a known hash-identity
+  limitation; header identity removes it — see RUNBOOK_MEMORY_IDENTITY.md).
 - To switch it off: `COMPACTOR_TIME_INJECTION=false`. Details:
   [RUNPOD_DEPLOY.md → The current date and time](RUNPOD_DEPLOY.md#the-current-date-and-time).
 
@@ -117,12 +161,79 @@ git tag messages. Every item links to the runbook that carries the commands.
   (and the one-shot backfill rollup for a newly-discovered V1 conversation)
   drained every L1/L2/L3 rollup a backlog needed in ONE pass — however many
   vLLM calls that took, on the same single GPU she is chatting on. Both now
-  spend at most `COMPACTOR_TAIL_ROLLUP_MAX_CALLS` (default 4) real vLLM
-  calls per turn and resume on the next one — the watermark is persisted, so
-  this always converges, logging one INFO line per turn while it is still
-  behind — and `/health/full`'s "summary hierarchy is N turns behind" reason
-  stays visible the whole time but is worded as CONVERGING (dropping the
-  "run `/compact`" advice) once it can see the lag shrinking poll to poll.
+  spend `COMPACTOR_TAIL_ROLLUP_MAX_CALLS` (default 4) real vLLM calls as a
+  **per-turn budget that bounds where a rollup unit is allowed to START, not
+  a hard ceiling on the turn**: a unit that starts always finishes, so one
+  turn can spend up to `(budget − 1)` plus that one unit's own cost — normally
+  a few calls, but measured at 6-16 calls for a single unit when `/tokenize`
+  is down. The watermark is persisted, so this always converges over
+  successive turns even when a turn overshoots.
+- **`/health/full`'s `checks.hierarchy` now carries real evidence, not a
+  poll-to-poll guess.** Each conversation whose recent hierarchy lag is over
+  the limit gets a `verdict`: `converging` (the watermark advanced within the
+  last 15 minutes — no action needed, `status` stays `ok`), `stuck` (20
+  budgeted passes in a row with work due and no advance), or `unknown` (no
+  evidence yet for this process — almost always a recent restart; treat as
+  "wait for her next message", not as a confirmed stall). Only `stuck` and
+  `unknown` add a `status_reasons` line and degrade `status`; `converging`
+  never does. `checks.hierarchy.catching_up` is the single worst conversation
+  (unchanged shape); the new `catching_up_all` lists every one currently over
+  the limit, so a converging conversation with a large lag can no longer mask
+  a genuinely stuck one with a smaller lag.
+- **A summary tier (L2 fold or L3 refresh) that fails on every attempt no
+  longer freezes the whole hierarchy behind it.** Before this fix, the drain
+  checks tiers in priority order (L3, then L2, then L1) every call, and a
+  persistently failing upper tier aborted the ENTIRE pass — so L1 (which is
+  injected into every request) stopped advancing too, forever, from the turn
+  the failure started. Now a failing tier is skipped for that call only, and
+  the tiers below it keep advancing. Look for `conv=<id>: L3 refresh failed
+  and will be retried next turn without blocking L1/L2 — ...` (or the L2
+  equivalent) in the compactor log — that ERROR, once per conversation per
+  tier, is what to grep for if `catching_up_all` or the `/health/full` reason
+  names a failing tier. When it does, running `/compact` will NOT clear the
+  backlog (it runs the identical drain and hits the same failure); fix the
+  underlying cause first (commonly an unreadable archive sidecar,
+  `summaries/<conv>.archive.json`).
+- **The catch-up INFO log line now names what is actually pending**, instead
+  of always describing the L1 watermark (which used to print "0 turn(s)
+  still uncovered … ~0 more turn(s)" — misleadingly — when only an L2 fold
+  or the L3 refresh was still due). It now says `L1 N turn(s) still
+  uncovered`, `an L2 fold pending`, `an L3 refresh pending`, or a
+  comma-joined combination, with a turn-count ETA only when L1 itself is the
+  pending tier.
+
+### Memory budgets
+
+- **The memory-injection budgets the owner raised by hand on the running pod
+  (a supervisord `environment=` edit, applied 2026-09-15, lost on every
+  container restart) are now the SHIPPED DEFAULTS.** The v3.1.9 deploy
+  bakes them into the image and the RunPod template, so the live edit is no
+  longer needed and will not silently revert on the next restart or
+  redeploy:
+
+  | Variable | Code default | v3.1.9 shipped default |
+  |---|---|---|
+  | `COMPACTOR_MAX_FACTS_TOKENS` | 1500 | **3500** |
+  | `COMPACTOR_INJECT_FACTS_TOKENS` | 400 | **600** |
+  | `COMPACTOR_MAX_RETRIEVAL_TOKENS` | 1500 | **3500** |
+  | `COMPACTOR_INJECTION_BUDGET_FRACTION` | 0.5 | **0.6** |
+  | `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | 12000 | **6230** |
+
+  The fraction and the two raised caps move together, not independently:
+  `inject_budget = effective_limit × INJECTION_BUDGET_FRACTION` is shared by
+  persona + summary + facts + retrieval, and retrieval (priority 3) is
+  dropped WHOLE by `_bound_injected_blocks` when it does not fit. At the
+  raised facts/retrieval caps under the OLD 0.5 fraction, retrieval would
+  have been silently dropped from every request; 0.6 gives it room, with the
+  summary block pinned at what it measured itself needing (6,230, below its
+  own 12,000 code default). Do not change one of these five without the
+  others. **This changes only the environment defaults baked into the image
+  and template — none of the Python code defaults (`facts.py`,
+  `retrieval.py`, `main.py`, `summarizer.py`) were changed**; an operator
+  who has already overridden any of these five in their own template keeps
+  their own value.
+- Details and the pod measurement behind these numbers:
+  [RUNPOD_DEPLOY.md → Memory budgets](RUNPOD_DEPLOY.md#memory-budgets--raised-defaults-in-v319).
 
 ### Rolling back to an older image
 
@@ -135,16 +246,22 @@ git tag messages. Every item links to the runbook that carries the commands.
 
 ### Backups — what changes with v3.1.9
 
-- **The "memory shrank … NOT pruning" alert now means something.** On
-  v3.1.6.1–v3.1.8 it fired every night on normal fact eviction and summary
-  rollups, so nothing pruned after 2026-08-30. v3.1.9 compares what cannot come
-  back (active + archived facts together, the highest summarized turn, archived
-  chapters, indexed exchanges), so on v3.1.9 **treat every `NOT pruning —
-  memory shrank` as a real loss** and ask for help before pruning anything.
+- **The "memory shrank … NOT pruning" alert now means something — with one
+  known false-alarm shape, not yet fixed in code.** On v3.1.6.1–v3.1.8 it
+  fired every night on normal fact eviction and summary rollups, so nothing
+  pruned after 2026-08-30. v3.1.9 compares what cannot come back (active +
+  archived facts together, the highest summarized turn, archived chapters,
+  indexed exchanges), so **most `NOT pruning — memory shrank` alerts on
+  v3.1.9 are real** and should be treated that way — **except** the item
+  named `summary_active_bytes`: an ordinary L1→L2 (or L2→L3) fold routinely
+  drops it by more than half (one chapter is shorter than the chunks it
+  replaces) and trips the false-alarm shape on a night that lost nothing.
+  Before treating a `summary_active_bytes` alert as real loss, check whether
+  it is this shape — see
+  [OPERATIONS.md → Nightly "memory shrank" alert](OPERATIONS.md#nightly-memory-shrank-alert--noise-on-v3161-to-v318-a-real-signal-from-v319-except-one-item).
   **After the deploy, look for the first nightly cycle** (within about a day):
   `grep -aE "NOT pruning|pruned [0-9]+" /data/logs/backup.log | tail -3` should
-  show `backup ok: … pruned N; …` (N may be 0). Details:
-  [OPERATIONS.md → Nightly "memory shrank" alert](OPERATIONS.md#nightly-memory-shrank-alert--noise-on-v3161-to-v318-a-real-signal-from-v319).
+  show `backup ok: … pruned N; …` (N may be 0).
 - **A failed backup is retried after 15 minutes**, not 24 hours (log:
   `backup cycle failed: …; retrying in 15 min`), and `/health/full` degrades
   on a stale or missing backup. A hot rollback journal no longer has to fail

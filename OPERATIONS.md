@@ -81,6 +81,57 @@ print('newest backup:', b.get('latest'), '| age (hours):', round((time.time()-m)
   happens; from v3.1.9 it degrades past 36 hours. Either way, go to "Backups
   stopped or failing" below.
 
+#### `checks.hierarchy` — the summary catch-up reason (v3.1.9)
+
+```bash
+curl -s localhost:8080/health/full | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+print('reasons:', d['status_reasons'])
+print('catching_up:', d['checks']['hierarchy'].get('catching_up'))
+print('catching_up_all:', d['checks']['hierarchy'].get('catching_up_all'))"
+```
+
+Each conversation whose recent hierarchy lag is over the limit gets a
+`verdict`: **`converging`** (the watermark advanced within the last 15
+minutes — no action, and this never adds a `status_reasons` line or
+degrades `status`), **`stuck`** (20 budgeted tail passes in a row with work
+due and no advance — the actionable case), or **`unknown`** (no catch-up
+evidence for THIS process yet — almost always a recent restart; treat it as
+"wait for her next message," not as a confirmed stall — `unknown` DOES add
+a `status_reasons` line and degrade `status`, deliberately, so a lost
+restart-evidence window is never read as self-healing — but its wording
+says plainly that nothing has been observed yet and is not itself evidence
+of a stall, distinct from `stuck`'s wording, which names the actual
+failure). `catching_up`
+is the single worst conversation; `catching_up_all` lists every conversation
+currently over the limit, so a converging one with a large lag cannot hide a
+genuinely stuck one with a smaller lag. **Do not run `/compact` on a `stuck`
+verdict without checking the log first**: `grep -a "failed and will be
+retried next turn" /data/logs/compactor.log | tail -5` — if a tier is named
+there, `/compact` runs the identical drain and will NOT clear the backlog;
+fix the named cause first (commonly an unreadable
+`summaries/<conv>.archive.json`).
+
+#### `config.time_injection` — the current-time feature (v3.1.9)
+
+```bash
+curl -s localhost:8080/health/full | python3 -c "
+import json,sys; d=json.load(sys.stdin); t=d['config'].get('time_injection') or {}
+print('last_source:', t.get('last_source'), '| last_timezone:', t.get('last_timezone'))
+print('fallback_error:', t.get('fallback_error'))
+print('current_line:', t.get('current_line'))"
+```
+
+`last_source` reads `browser` (header identity, system-prompt line present),
+`env` (hash identity with `COMPACTOR_TIMEZONE` set — correct for that route,
+not a fault), or `utc` (neither is in force). **`fallback_error` is the one
+to actually check** for a misconfigured `COMPACTOR_TIMEZONE`: a name that
+does not resolve falls back to UTC silently as far as `status` is concerned
+— it does NOT add a `status_reasons` line or degrade `status`, only this
+one field and a single `TIME ZONE NOT APPLIED` ERROR in `compactor.log` at
+boot. See RUNPOD_DEPLOY.md "The current date and time" for what each route
+should show.
+
 #### What "memory tail skipping" means
 
 v3.1.7 added a reason that reads `memory tail skipping: N reply(ies) not
@@ -214,7 +265,7 @@ misleading number and can never fire here.
   ones with `/opt/clean-models.sh` (see
   [Cleaning up old model weights](#cleaning-up-old-model-weights-on-the-volume)).
 
-### Nightly "memory shrank" alert — noise on v3.1.6.1 to v3.1.8, a real signal from v3.1.9
+### Nightly "memory shrank" alert — noise on v3.1.6.1 to v3.1.8, a real signal from v3.1.9 (except one item)
 
 **What you see:** `backup.log` says
 
@@ -263,10 +314,35 @@ lowers it), and the archived-chapter file. So the items it can name are:
 | `<id>.summary_turn N->M` | that conversation's summaries now cover fewer turns than yesterday |
 | `<id>.archived_chapters N->M` | archived chapter summaries were lost |
 | `<id>.episodic N->M` | indexed exchanges were lost (a `/forget` or a memory reset can also do this) |
+| `<id>.summary_active_bytes N->M (hierarchy emptied, watermark at K)` | the ENTIRE active summary hierarchy went to 0 bytes while the watermark still claims K turns covered — real loss |
+| `<id>.summary_active_bytes N->M (more than half below its high-water mark)` | **known false-alarm shape, see below — do not treat as real on its own** |
 
-**On v3.1.9, treat every `NOT pruning — memory shrank` as real.** Do not prune
-by hand; leave the archives alone and ask for help, unless you know the named
-conversation was deliberately reset.
+**On v3.1.9, treat every `NOT pruning — memory shrank` item as real, EXCEPT
+`summary_active_bytes … (more than half below its high-water mark)`.** That
+one specific wording is a known false alarm, not yet fixed in code (the fix
+is tracked for a later patch release): an ORDINARY L1→L2 or L2→L3 summary
+fold routinely drops active summary bytes by more than half in one step —
+ten L1 chunks of a few thousand characters each collapse into one shorter L2
+chapter, the same shape an L2→L3 refresh repeats — and the high-water-mark
+check (`backup.py`, `_census_hwm_update`) compares against the BEST size it
+has ever seen for that conversation, which a routine fold will almost always
+undercut. Nothing was lost; the fold is the summary hierarchy working as
+designed, and the mark resets itself the next cycle (so this fires at most
+once per fold, not every night after).
+
+**How to tell this false alarm apart from a real `summary_active_bytes`
+loss**, before asking for help: pull that conversation's summary state
+(`curl -s localhost:8080/admin/conversations/<id> | python3 -m json.tool`,
+`.summary`) and compare its L1/L2/L3 shape against yesterday's backup (or
+just check whether an L2 chapter count or L3 presence went UP by one since
+the last cycle). **If the chapter count went up by one (or L3 newly
+appeared) in the SAME backup where `summary_active_bytes` fell** — that is
+this false-alarm shape: an ordinary fold, not a loss; the backup is fine,
+do not restore anything. **If the chapter/L3 count did NOT go up** (bytes
+fell with no corresponding fold), or you see the OTHER `summary_active_bytes
+… (hierarchy emptied, watermark at K)` wording, or any of the other items in
+the table above — treat it as real: do not prune by hand, leave the
+archives alone, and ask for help.
 
 **What to look for after the v3.1.9 deploy:** the first nightly cycle (within
 about 24 hours of the boot — the daemon skips the boot-time run if a backup
