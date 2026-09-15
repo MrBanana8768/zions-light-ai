@@ -243,19 +243,44 @@ further. Re-open the connection dialog and check the Headers text is exactly as
 in step 3, saved. Nothing is lost: her message went to the old id, which is
 intact.
 
-The first message under the new id rebuilds its whole summary hierarchy in the
-background (about 20-25 summarization calls). Replies stay normal; wait until
-the log shows the rebuild finished:
+**The rebuild is NOT a one-message background job — it spans many of her
+messages.** Earlier releases drained the whole new hierarchy on her first
+message under the new id. From v3.1.9, the tail spends at most
+`COMPACTOR_TAIL_ROLLUP_MAX_CALLS` real vLLM calls per turn (default 4 — see
+CHANGELOG.md "Summary hierarchy catch-up"), so a brand-new id with no
+summary state yet catches up roughly `L1_CHUNK_SIZE` (default 20) messages'
+worth of hierarchy per turn, i.e. very roughly `M / 80` of her turns for a
+conversation of `M` messages (4 chunks' worth per turn at the default
+budget). Measured on a rehearsal copy: a 960-message conversation took about
+14 of her turns to fully catch up; a 1,900-message conversation took about
+27. Treat those as orders of magnitude, not a promise — the exact count
+depends on how long her chunks are and whether `/tokenize` is up.
+
+Replies stay normal the whole time (this runs in the background, off the
+request path). Watch for the per-turn catch-up line instead of waiting for
+one "finished" line:
 
 ```bash
-grep -a "conv=<new-uuid>: rollup" /data/logs/compactor.log | tail -3
+grep -a "conv=<new-uuid>" /data/logs/compactor.log | grep "hierarchy catch-up in progress" | tail -5
 ```
 
-**Success:** a line ending `last_turn=<number>`, where the number is at or a
-little below her message count (it moves in steps of 20). It can take 10-30
-minutes. **If after 30 minutes nothing prints:** run
-`grep -a "conv=<new-uuid>" /data/logs/compactor.log | grep -E "ERROR|WARNING" | tail -10`
-and ask for help with what it shows.
+**Success is this line disappearing.** While it is still behind, each of her
+messages logs one line naming what is still pending — `L1 N turn(s) still
+uncovered`, `an L2 fold pending`, `an L3 refresh pending`, or a
+comma-joined combination — with a turn-count ETA only when L1 itself is the
+pending tier. Once a message produces NO such line, the hierarchy is caught
+up for that conversation. **Do not judge "done" by a `rollup → …
+last_turn=<number>` line falling near her message count on the FIRST
+message** — under the bounded catch-up that is expected to be far below her
+message count on every early turn; that is normal progress, not a stall.
+**If the catch-up line is still printing after roughly `M / 80` of her
+turns with no `hierarchy is N turns behind` reason turning `stuck` in
+`/health/full`:** it is still converging, just slowly (a long conversation
+genuinely takes many turns) — keep watching. **If `/health/full`'s hierarchy
+reason shows `verdict: stuck` for this conversation, or you see `L3 refresh
+failed and will be retried next turn` / `L2 ... failed` for it in the log:**
+stop and ask for help — a tier is failing on every attempt and needs a fix,
+not more waiting; running `/compact` on it will hit the identical failure.
 
 Then:
 
@@ -335,7 +360,20 @@ Safe once step 4 passed, and not before: until her requests say
 OpenWebUI → **Models** → `coder3101/Cydonia-24B-v4.3-vision-heretic` → system
 prompt.
 
+**If you are also turning on the current-time feature (v3.1.9), its line is
+already the FIRST line of the grey block below.** This is the only safe
+place in this runbook to add it: it depends on the chat already being on
+`source=header` (true here, since you are past step 4), and RUNPOD_DEPLOY.md
+"The current date and time" warns that adding it to a chat still on
+`source=hash` forks its memory the same way any other system-prompt edit
+does. If you do NOT want the time feature yet, delete that first line before
+saving — the rest of the prompt is unaffected either way. Check it took:
+`/health/full` → `config.time_injection.last_source` is `browser` after her
+next message.
+
 ```
+User timezone: {{CURRENT_TIMEZONE}}
+
 Write in flowing prose — ordinary paragraphs and sentences, the way a person actually talks.
 
 No emoji, no emoticons, no decorative symbols. Warmth belongs in the words: if something is tender, funny or playful, say it in the sentence rather than marking it with a glyph.
