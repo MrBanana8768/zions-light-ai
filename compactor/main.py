@@ -1851,9 +1851,30 @@ def split_messages(messages: list[dict]) -> tuple[list[dict], list[dict], list[d
 COMPACTION_SUMMARY_HEADER = "[Summary of earlier conversation]"
 
 
+def _standin_injected_share(inject_budget: int) -> int:
+    """How many tokens a reused-hierarchy stand-in may claim from the
+    injection budget, computed IDENTICALLY to the separately-injected
+    summary block's own cap (search `format_summary_block` in
+    chat_completions) — same formula, one function, so the two call sites
+    cannot drift apart the way the stand-in budget and this cap used to
+    (v3.1.9.1; see `compact_if_needed`'s stand-in budget for why they must
+    agree).
+
+    60% of the injection budget, capped at SUMMARY_BLOCK_MAX_TOKENS. Not a
+    guess: on a REUSING turn the injection site skips its own copy of the
+    summary entirely (`sum(in-array)`), so this share is genuinely free —
+    nothing else in the request spends it.
+    """
+    return min(
+        summarizer.SUMMARY_BLOCK_MAX_TOKENS,
+        int(inject_budget * 0.6),
+    )
+
+
 async def compact_if_needed(
     messages: list[dict], conv_id: str | None = None,
     *, stored_turns_out: list | None = None,
+    inject_budget: int | None = None,
 ) -> list[dict]:
     """
     `stored_turns_out`, if given, receives one `int` — how many older turns
@@ -1875,6 +1896,16 @@ async def compact_if_needed(
     caller learns to skip its own copy without re-deriving the decision (or
     changing this function's return type, which test_compaction_reuse.py
     and its mutation suite pin as `list[dict]`).
+
+    `inject_budget`, if given, is the caller's already-computed injection
+    budget (v3.1.9.1) — the SAME figure the caller's own summary injection
+    is capped against (60% of it, via `_standin_injected_share`). On a
+    reusing turn that injection is skipped (see hostile2-reuse M1 above),
+    which frees its share, so the stand-in here may claim up to that share
+    when it is larger than what TARGET_TOKENS alone would leave. Omitted (as
+    every call before 3.1.9.1 omits it), the stand-in gets exactly the old
+    TARGET-only figure — this keeps existing callers and their pinned
+    arithmetic unchanged.
     """
     current = count_tokens(messages)
     if current <= TARGET_TOKENS:
@@ -2048,13 +2079,42 @@ async def compact_if_needed(
                     # summarize() and the injected block, where the guard
                     # sheds the OLDEST verbatim turns first, never the recent
                     # ones this budget exists to keep.
+                    #
+                    # v3.1.9.1: THE ABOVE WAS THE WHOLE BUG (production,
+                    # 2026-09-16 11:06Z — see CHANGELOG). On a reusing turn
+                    # the injection site below skips its own copy of the
+                    # summary (`sum(in-array)`), which frees that block's
+                    # share of the injection budget — but this TARGET-only
+                    # figure never counted that share, so the stand-in was
+                    # squeezed as if the summary were STILL going to be
+                    # injected separately too. With long recent turns
+                    # (`_others` ~12.7k against TARGET 15,576) that leaves
+                    # only ~1,846 tokens for a hierarchy that needs ~5.1k,
+                    # so all_or_nothing declined reuse on EVERY request and
+                    # the 4-call cap fired 37/37 times — the exact failure
+                    # v3.1.9 shipped to remove. Fixed: the stand-in may use
+                    # up to what the summary injection would have spent,
+                    # via `_standin_injected_share` (same formula as the
+                    # injection site, one function, so the two cannot drift
+                    # apart again) — whichever of the two figures is
+                    # larger. Only proceeds when `inject_budget` was passed
+                    # (chat_completions always passes it now); a caller that
+                    # does not — an old or a direct test call — gets exactly
+                    # the pre-3.1.9.1 TARGET-only figure, so no existing
+                    # test's arithmetic changes under it.
                     _others = await run_in_threadpool(
                         count_tokens, system_msgs + preserved_images + keep_recent
                     )
-                    _standin_budget = min(
+                    _target_based_budget = min(
                         summarizer.SUMMARY_BLOCK_MAX_TOKENS,
                         TARGET_TOKENS - _others - SUMMARY_MAX_TOKENS,
                     )
+                    _standin_budget = _target_based_budget
+                    if inject_budget is not None:
+                        _standin_budget = max(
+                            _target_based_budget,
+                            _standin_injected_share(inject_budget),
+                        )
                     if _standin_budget > 0:
                         # all_or_nothing: a squeezed block drops the OLDEST
                         # scenes, which are the same turns removed below. See
@@ -2067,12 +2127,23 @@ async def compact_if_needed(
                             all_or_nothing=True,
                         ) or ""
                     if not stored_text:
+                        # v3.1.9.1: the budget named here is no longer always
+                        # the TARGET-derived figure — it is whichever of that
+                        # and the injected share (see `_standin_injected_
+                        # share`) was larger, so the message names the real
+                        # source rather than always blaming TARGET.
+                        _budget_source = (
+                            "the injection budget's summary share"
+                            if inject_budget is not None
+                            and _standin_budget > _target_based_budget
+                            else f"TARGET ({TARGET_TOKENS})"
+                        )
                         logger.info(
                             f"conv={conv_id}: the stored summaries cover "
                             f"{stored_turns - len(_changed)} of the turns this "
                             f"request would compact, but they do not fit whole "
-                            f"in the {max(0, _standin_budget)} token(s) TARGET "
-                            f"({TARGET_TOKENS}) leaves beside the system prompt, "
+                            f"in the {max(0, _standin_budget)} token(s) "
+                            f"{_budget_source} leaves beside the system prompt, "
                             f"images and recent turns ({_others}) and one fresh "
                             f"summary ({SUMMARY_MAX_TOKENS}); summarizing from "
                             f"scratch rather than letting the stand-in push the "
@@ -7235,24 +7306,6 @@ async def chat_completions(request: Request) -> Any:
             status_code=200,
         )
 
-    # V1 compaction
-    # hostile2-reuse M1: `_compaction_stored_turns` is how the summary
-    # injection below (search `format_summary_block`) learns whether THIS
-    # call already put a stand-in for the hierarchy in the array, so it can
-    # skip injecting its own, separately-trimmed copy of the same summaries
-    # — see compact_if_needed's docstring for why this is an out-param
-    # rather than a return-type change.
-    _compaction_stored_turns: list[int] = []
-    try:
-        body["messages"] = await compact_if_needed(
-            messages, conv_id, stored_turns_out=_compaction_stored_turns
-        )
-    except Exception as e:
-        logger.exception(
-            f"compaction failed; falling through with the original messages — "
-            f"the hard-budget guard will shed content if they don't fit: {e}"
-        )
-
     # The window this request will finally be measured against, computed HERE
     # rather than at the pre-flight below because the memory injection that
     # follows has to be bounded by it. vLLM enforces prompt + max_tokens <=
@@ -7260,6 +7313,10 @@ async def chat_completions(request: Request) -> Any:
     # completion still 400able; and a memory budget expressed as a token
     # constant cannot see any of that. Nothing between here and the guard
     # depends on the value, and it depends on nothing but `body`.
+    #
+    # v3.1.9.1: moved ahead of V1 compaction (was after it) so that
+    # `inject_budget`, below, exists before `compact_if_needed` runs — see
+    # that move's reason on `inject_budget` itself.
     try:
         req_max_tokens = int(body.get("max_tokens") or 0)
     except (TypeError, ValueError):
@@ -7273,6 +7330,41 @@ async def chat_completions(request: Request) -> Any:
         MAX_MODEL_LEN,
         max(256, MAX_MODEL_LEN - max(GENERATION_RESERVE, req_max_tokens)),
     )
+
+    # v3.1.9.1: also moved ahead of V1 compaction, for the same reason —
+    # `has_history` only reads `messages` (unchanged, still the client's
+    # original array; compaction hasn't run yet) and `inject_budget` only
+    # reads `effective_limit`, computed just above, so nothing here depends
+    # on compaction having happened.
+    has_history = _has_conversational_history(messages)
+    inject_budget = int(
+        effective_limit
+        * (
+            INJECTION_BUDGET_FRACTION
+            if has_history
+            else INJECTION_NO_HISTORY_FRACTION
+        )
+    )
+
+    # V1 compaction
+    # hostile2-reuse M1: `_compaction_stored_turns` is how the summary
+    # injection below (search `format_summary_block`) learns whether THIS
+    # call already put a stand-in for the hierarchy in the array, so it can
+    # skip injecting its own, separately-trimmed copy of the same summaries
+    # — see compact_if_needed's docstring for why this is an out-param
+    # rather than a return-type change.
+    _compaction_stored_turns: list[int] = []
+    try:
+        body["messages"] = await compact_if_needed(
+            messages, conv_id,
+            stored_turns_out=_compaction_stored_turns,
+            inject_budget=inject_budget,
+        )
+    except Exception as e:
+        logger.exception(
+            f"compaction failed; falling through with the original messages — "
+            f"the hard-budget guard will shed content if they don't fit: {e}"
+        )
 
     # V2.0 memory injection. ALL three layers (facts, RAG, summary) are
     # collected into a SINGLE combined system message and injected in one
@@ -7414,21 +7506,11 @@ async def chat_completions(request: Request) -> Any:
         except Exception as e:
             logger.warning(f"conv={conv_id}: retrieval load failed (non-fatal): {e}")
 
-        # Injection budget, computed HERE rather than at the inject point
-        # below, because the summary block needs its share of it first: the
-        # block's own 12,000-token cap exceeds this whole budget at
-        # production config, and capping only inside summarizer meant
-        # _bound_injected_blocks dropped whole layers (facts gone from ~50%
-        # tier fill, everything but persona at ~70%).
-        has_history = _has_conversational_history(messages)
-        inject_budget = int(
-            effective_limit
-            * (
-                INJECTION_BUDGET_FRACTION
-                if has_history
-                else INJECTION_NO_HISTORY_FRACTION
-            )
-        )
+        # has_history / inject_budget: computed ABOVE, before V1 compaction
+        # (search "also moved ahead of V1 compaction") — compact_if_needed
+        # now needs inject_budget too, for the reused-hierarchy stand-in's
+        # budget, so both moved up together rather than being computed twice
+        # with two chances to drift apart.
 
         # --- Hierarchical summary stack (Phase 4) ---
         # State only grows via the async tail (rollups post-response), so
@@ -7464,17 +7546,17 @@ async def chat_completions(request: Request) -> Any:
                 sblock = None
                 log_parts.append("sum(in-array)")
             else:
-                # 60% of the injection budget: at production config that is
-                # ~4,900 tokens, which reproduces the old working behaviour
-                # (summary trimmed newest-kept, facts and persona still fit)
-                # and leaves 40% for the other three layers.
+                # 60% of the injection budget, capped at SUMMARY_BLOCK_MAX_
+                # TOKENS: at production config that is ~4,900 tokens, which
+                # reproduces the old working behaviour (summary trimmed
+                # newest-kept, facts and persona still fit) and leaves 40%
+                # for the other three layers. v3.1.9.1: this exact formula
+                # is also what a REUSING turn's stand-in may claim, via
+                # `_standin_injected_share` — see that helper's docstring.
                 sblock = await run_in_threadpool(
                     summarizer.format_summary_block,
                     sstate,
-                    min(
-                        summarizer.SUMMARY_BLOCK_MAX_TOKENS,
-                        int(inject_budget * 0.6),
-                    ),
+                    _standin_injected_share(inject_budget),
                 )
                 if sblock:
                     injected_blocks.append(
