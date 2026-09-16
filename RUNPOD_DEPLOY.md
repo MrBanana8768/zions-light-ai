@@ -390,6 +390,62 @@ name regardless.
 **Turn it off.** `COMPACTOR_TIME_INJECTION=false` (also `0`, `no`, `off`) and
 redeploy.
 
+### Sampling parameters
+
+OpenWebUI's **Advanced Params** (per-model or per-chat) only map a fixed set
+of names onto the OpenAI-shaped request it sends: `temperature`, `top_p`,
+`min_p`, `max_tokens`, `frequency_penalty`, `presence_penalty`,
+`reasoning_effort`, `seed`, `stop`, `logit_bias`, `response_format`. Anything
+else — including any name from an Ollama-style setup — has to go under
+**Custom Parameters** instead, where OpenWebUI passes it through to the
+request body verbatim, under whatever key you typed.
+
+vLLM's name for what Ollama calls `repeat_penalty` is **`repetition_penalty`**.
+Before v3.1.9.2, setting `repeat_penalty` as a Custom Parameter did nothing —
+vLLM does not recognise the key, silently ignores it, and
+`repetition_penalty` stayed at its default of 1.0. **From v3.1.9.2 on**, the
+compactor translates `repeat_penalty` to `repetition_penalty` before
+forwarding (and drops `repeat_last_n`, which has no vLLM equivalent at all).
+It is still better to set `repetition_penalty` directly under Custom
+Parameters, by its real name, so nothing depends on the translation.
+
+**Recommended starting values for this model** (Cydonia-24B):
+
+| Setting | Where in OpenWebUI | Value |
+|---|---|---|
+| `repetition_penalty` | Custom Parameters (name typed exactly) | `1.15` |
+| Frequency Penalty | Advanced Params | `0.2` |
+| Max Tokens | Advanced Params | `7000` |
+
+Leaving Max Tokens unset means the request carries no ceiling at all: a
+runaway reply continues until it fills the context window or someone presses
+Stop. 7000 tokens is roughly 28,000 characters, above this model's normal
+long replies. The compactor reserves the larger of
+`COMPACTOR_GENERATION_RESERVE` (12000) and Max Tokens for the reply, so any
+value up to 12000 leaves its memory budgets unchanged.
+
+**Confirming from the log that loops are being caught.** A repetition-loop
+reply produces a WARNING when it is detected. The wording differs slightly
+between streamed replies (`... look like a repetition loop (...)`) and
+non-streamed ones (`reply looks like a repetition loop (...)`); one grep
+catches both:
+
+```bash
+grep -a 'like a repetition loop' /data/logs/compactor.log | tail
+```
+
+and, once that reply is later replayed back as history, an INFO line at the
+point it is kept out of what is forwarded:
+
+```
+conv=<id>: replaced <N> degenerate assistant turn(s) in the forwarded window with a placeholder
+```
+
+Neither line names the reply's own text. If `repeat_penalty` was translated
+because `repetition_penalty` was absent, that is a separate INFO line at
+request time: `conv=<id>: translated Ollama repeat_penalty=... to vLLM
+repetition_penalty=...` (logged once per conversation, not on every turn).
+
 ### Vision (V3.1) — enabling image understanding
 
 Set `MODEL_REPO` to a vision-language model (see presets in `.env.example`)

@@ -244,6 +244,36 @@ itself unreachable (so "curl refused on :8080" == compactor down).
 - Check `/health/full`. If `degraded`, vLLM is the problem (above). The
   compactor itself rarely 500s — memory failures degrade to no-ops.
 
+### Sampling parameters
+
+OpenWebUI's **Advanced Params** map only a fixed set of names onto the
+request it sends: `temperature`, `top_p`, `min_p`, `max_tokens`,
+`frequency_penalty`, `presence_penalty`, `reasoning_effort`, `seed`, `stop`,
+`logit_bias`, `response_format`. Anything else — including any Ollama-style
+name — has to be set under **Custom Parameters** instead, where OpenWebUI
+passes it through to the request body exactly as typed.
+
+vLLM's name is `repetition_penalty`; Ollama's name for the same idea is
+`repeat_penalty`. **From v3.1.9.2 on**, the compactor translates
+`repeat_penalty` to `repetition_penalty` before forwarding (a bad value is
+dropped with a WARNING, never forwarded) and drops `repeat_last_n`, which has
+no vLLM equivalent. Before v3.1.9.2, a Custom Parameter named
+`repeat_penalty` reached vLLM unrecognised and did nothing — no error, no
+log line, `repetition_penalty` just stayed at its default of 1.0.
+
+Recommended starting values for this model (Cydonia-24B):
+`repetition_penalty` 1.15 (Custom Parameter), Frequency Penalty 0.2 and Max
+Tokens 7000 (both Advanced Params). Full detail:
+[RUNPOD_DEPLOY.md → Sampling parameters](RUNPOD_DEPLOY.md#sampling-parameters).
+
+**Confirming loops are being caught.** A repetition-loop reply logs a
+WARNING at detection time (`grep -a 'like a repetition loop'` matches both
+the streamed and non-streamed wording) and, once OpenWebUI replays it back
+as history, an
+INFO line each time it is kept out of what is forwarded to vLLM:
+`conv=<id>: replaced <N> degenerate assistant turn(s) in the forwarded
+window with a placeholder`. Neither line names the reply's own text.
+
 ### Disk is filling up
 ```bash
 du -sh /data/* 2>/dev/null | sort -h

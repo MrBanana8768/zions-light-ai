@@ -3037,6 +3037,28 @@ _DEGENERATE_HISTORY_PLACEHOLDER = (
 )
 
 
+# Shared by _redact_degenerate_turns (the rollup-input redaction) and
+# _redact_forwarded_loop_replies (v3.1.9.2, the forwarded-window redaction,
+# below chat_completions): BOTH need the same "keep the clean sentence head,
+# else fall back to the placeholder" decision on a turn reply_is_degenerate
+# has flagged, and a rule this load-bearing must not exist twice — two copies
+# is how the two sites would eventually disagree about what "clean" means.
+def _degenerate_replacement_content(text: str, placeholder: str) -> tuple[str, bool]:
+    """-> (replacement content, whether a clean head was kept).
+
+    `text` must already be known-degenerate (caller has checked
+    `reply_is_degenerate`). Applies the same cut rule `decide_memory_tail`
+    applies to a cut reply: keep the longest prefix ending on a sentence
+    boundary if that prefix clears MIN_MEMORABLE_TRIMMED_CHARS, else use
+    `placeholder` whole. See _redact_degenerate_turns's docstring (hostile
+    pass #4, reviewer A F7) for why keeping the head matters.
+    """
+    head = decide_memory_tail(text, finished=False, truncated=True, holed=False)
+    if head.store and head.text.strip():
+        return head.text, True
+    return placeholder, False
+
+
 def _redact_degenerate_turns(messages: list[dict]) -> list[dict]:
     """Copy of `messages` with any assistant turn that is itself a
     repetition loop replaced by a neutral placeholder, so it cannot be
@@ -3086,14 +3108,12 @@ def _redact_degenerate_turns(messages: list[dict]) -> list[dict]:
             and m.get("role") == "assistant"
             and reply_is_degenerate(_message_text(m))
         ):
-            head = decide_memory_tail(
-                _message_text(m), finished=False, truncated=True, holed=False
+            content, kept_head = _degenerate_replacement_content(
+                _message_text(m), _DEGENERATE_HISTORY_PLACEHOLDER
             )
-            if head.store and head.text.strip():
-                m = {**m, "content": head.text}
+            m = {**m, "content": content}
+            if kept_head:
                 kept_heads += 1
-            else:
-                m = {**m, "content": _DEGENERATE_HISTORY_PLACEHOLDER}
             redacted += 1
         out.append(m)
     if redacted:
@@ -6792,6 +6812,187 @@ def _refuse_unpaired_surrogate(body: Any) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# v3.1.9.2: keep detected loop replies out of what is FORWARDED to vLLM, not
+# only out of what is memorized.
+#
+# reply_is_degenerate + _redact_degenerate_turns already keep a repetition
+# loop out of the rollup/fact-extraction input. They do NOT touch what
+# chat_completions sends back to vLLM: OpenWebUI keeps the loop reply in chat
+# history and re-sends it on every later request, and the hard-budget guard
+# leaves only ~5 turns in the forwarded window, so right after a loop the
+# loop reply can be a large fraction of everything the model sees — which is
+# exactly the conditioning that makes the NEXT reply degenerate too (observed
+# in production: the reply after a loop came back empty).
+#
+# The placeholder is deliberately generic and inert: it must read as
+# ordinary history (the chat template refuses empty assistant content, so it
+# cannot be blank) and must not use the words "loop" or "repetition" the
+# model could itself latch onto and echo — the failure this exists to stop
+# is exactly the model fixating on a short phrase.
+_DEGENERATE_FORWARD_PLACEHOLDER = "[a short reply was given here]"
+
+
+def _redact_forwarded_loop_replies(messages: list[dict]) -> tuple[list[dict], int]:
+    """-> (copy of `messages` with degenerate ASSISTANT turns replaced, count
+    replaced).
+
+    Mirrors _redact_degenerate_turns (same detector, same clean-head rule,
+    via the shared `_degenerate_replacement_content` helper) but is a
+    SEPARATE call, on the FORWARDED window, because the two redactions run at
+    different times for different reasons and must not be collapsed into
+    one: this one runs on every request (see the call site in
+    chat_completions for why it must run AFTER compaction/injection and
+    BEFORE _enforce_hard_budget), the other runs once per rollup.
+
+    Only assistant turns are touched — never a user turn, a system message,
+    the compaction stand-in, or (by construction, since only PRIOR turns are
+    degenerate-checkable — the newest message is always the one this request
+    is asking a reply TO) the newest message.
+    """
+    out = []
+    replaced = 0
+    last_index = len(messages) - 1
+    for i, m in enumerate(messages):
+        if (
+            i != last_index  # never the newest message (continue_final_message
+            # can make it an assistant turn; it is what THIS request is about,
+            # not history to sanitize)
+            and isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and reply_is_degenerate(_message_text(m))
+        ):
+            content, _kept_head = _degenerate_replacement_content(
+                _message_text(m), _DEGENERATE_FORWARD_PLACEHOLDER
+            )
+            m = {**m, "content": content}
+            replaced += 1
+        out.append(m)
+    return out, replaced
+
+
+# ---------------------------------------------------------------------------
+# v3.1.9.2: Ollama sampling-name translation.
+#
+# The owner's OpenWebUI model had `repeat_penalty` set (Ollama's name for
+# vLLM's `repetition_penalty`). OpenWebUI's `apply_model_params_to_body_openai`
+# passes UNKNOWN keys through verbatim rather than dropping them, so
+# `repeat_penalty` rode all the way to vLLM 0.19, which does not recognise it
+# — it lands in pydantic's `model_extra` and `SamplingParams.repetition_penalty`
+# stayed at its default of 1.0. Nothing rejected the request and nothing
+# logged: the knob just did nothing, silently, for as long as it was set that
+# way. `repeat_last_n` has no vLLM equivalent at all (vLLM's repetition
+# penalty has no window) and gets the same silent-drop treatment upstream, so
+# it is named here too.
+#
+# Bounded per-conversation-id "already logged" set, not logsetup.log_once:
+# log_once's set is keyed by call site and is meant to hold a handful of
+# entries for the process's lifetime; keying it by conv_id here would grow it
+# by one entry per DISTINCT conversation forever. This set is capped and
+# evicts the oldest entry, because the goal is "don't repeat the line on every
+# turn of the SAME conversation", not "remember every conversation ever seen".
+_SAMPLING_TRANSLATION_LOGGED: dict[str, None] = {}
+_SAMPLING_TRANSLATION_LOGGED_CAP = 2000
+
+
+def _log_sampling_translation_once(key: str) -> bool:
+    """True the first time `key` is seen; False after. Bounded (see above)."""
+    if key in _SAMPLING_TRANSLATION_LOGGED:
+        return False
+    if len(_SAMPLING_TRANSLATION_LOGGED) >= _SAMPLING_TRANSLATION_LOGGED_CAP:
+        # dicts preserve insertion order; drop the oldest entry to make room
+        # rather than let this grow without bound across a long-lived process.
+        _SAMPLING_TRANSLATION_LOGGED.pop(next(iter(_SAMPLING_TRANSLATION_LOGGED)))
+    _SAMPLING_TRANSLATION_LOGGED[key] = None
+    return True
+
+
+def _translate_ollama_sampling_params(body: dict, conv_id: str | None) -> None:
+    """Mutate `body` in place: translate Ollama-named sampling keys vLLM does
+    not understand into the vLLM name, or drop them, before forwarding.
+
+    - `repeat_penalty` -> `repetition_penalty` when the latter is absent.
+      When BOTH are present, `repetition_penalty` (the name the client meant
+      for vLLM) wins and `repeat_penalty` is simply removed — a client
+      sending both is not asking for two penalties, and picking the vLLM
+      name is the one reading that cannot silently double-apply anything.
+    - `repeat_penalty` is coerced to float; a value that is not a positive
+      number (non-numeric, zero, or negative — vLLM requires > 0) is dropped
+      with a WARNING rather than forwarded, since a bad value forwarded as
+      `repetition_penalty` would 400 the request AFTER compaction and
+      injection have already spent the turn.
+    - `repetition_penalty` itself, if the client sent it as a numeric
+      string (OpenWebUI json-decodes Custom Parameters, so this is normally
+      a number, but a hand-built client can send "1.1"), is coerced to
+      float in place so vLLM's schema does not reject it.
+    - `repeat_last_n` has no vLLM equivalent and is removed either way, with
+      an INFO note that it was dropped (not silently, the whole point here).
+
+    No other sampling key is touched.
+    """
+    conv_key = conv_id or "?"
+
+    def _coerce_positive_float(value):
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not (f > 0):
+            return None
+        return f
+
+    had_repeat_penalty = "repeat_penalty" in body
+    had_repetition_penalty = "repetition_penalty" in body
+
+    if had_repeat_penalty:
+        raw = body.pop("repeat_penalty")
+        if had_repetition_penalty:
+            # repetition_penalty wins; repeat_penalty is just discarded.
+            if _log_sampling_translation_once(f"repeat_penalty.both.{conv_key}"):
+                logger.info(
+                    f"conv={conv_key}: request set both repeat_penalty and "
+                    f"repetition_penalty; keeping repetition_penalty="
+                    f"{body['repetition_penalty']!r} and dropping repeat_penalty"
+                )
+        else:
+            coerced = _coerce_positive_float(raw)
+            if coerced is None:
+                logger.warning(
+                    f"conv={conv_key}: dropping repeat_penalty={raw!r} (not a "
+                    f"positive number) — not forwarded as repetition_penalty"
+                )
+            else:
+                body["repetition_penalty"] = coerced
+                if _log_sampling_translation_once(f"repeat_penalty.{conv_key}"):
+                    logger.info(
+                        f"conv={conv_key}: translated Ollama repeat_penalty="
+                        f"{raw!r} to vLLM repetition_penalty={coerced!r} "
+                        f"(vLLM 0.19 does not recognise repeat_penalty and "
+                        f"ignores it silently otherwise)"
+                    )
+
+    # A numeric-string repetition_penalty (however it arrived) must still be
+    # a float by the time it reaches vLLM's schema.
+    if "repetition_penalty" in body and isinstance(body["repetition_penalty"], str):
+        coerced = _coerce_positive_float(body["repetition_penalty"])
+        if coerced is None:
+            logger.warning(
+                f"conv={conv_key}: dropping non-numeric repetition_penalty="
+                f"{body['repetition_penalty']!r}"
+            )
+            del body["repetition_penalty"]
+        else:
+            body["repetition_penalty"] = coerced
+
+    if "repeat_last_n" in body:
+        dropped = body.pop("repeat_last_n")
+        if _log_sampling_translation_once(f"repeat_last_n.{conv_key}"):
+            logger.info(
+                f"conv={conv_key}: dropping repeat_last_n={dropped!r} — vLLM's "
+                f"repetition penalty has no windowed equivalent"
+            )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Any:
     # PARSE DEFENSIVELY. The careful empty/invalid-messages 400 below is
@@ -6924,6 +7125,15 @@ async def chat_completions(request: Request) -> Any:
         _warn_if_conversation_forked(conv_id, source, messages)
     except Exception as e:
         logger.warning(f"conv_id resolution failed: {e}")
+
+    # v3.1.9.2: translate/drop Ollama-named sampling keys BEFORE anything
+    # else touches `body`, so every later stage (including the eventual
+    # forward to vLLM) sees the vLLM-shaped body. See
+    # _translate_ollama_sampling_params's docstring for why this exists.
+    try:
+        _translate_ollama_sampling_params(body, conv_id)
+    except Exception as e:
+        logger.warning(f"conv={conv_id or '?'}: sampling param translation failed (non-fatal): {e}")
 
     # The latest user message — used both as the RAG retrieval query and,
     # later, as the exchange's user half for the async indexing/facts tail.
@@ -7430,6 +7640,26 @@ async def chat_completions(request: Request) -> Any:
     # indistinguishable from one that surprised it, and the calibration learns
     # a process-global margin from the first kind.
     guard_report: dict = {}
+    # v3.1.9.2: redact detected loop replies out of the FORWARDED window here
+    # — after compaction and memory injection, before _enforce_hard_budget —
+    # so the guard measures what is actually sent (it must see the shorter
+    # placeholder text, not the runaway original) and NOT before compaction:
+    # compaction pairs recent turns against the stored covered-turn record by
+    # CONTENT, and redacting first would make a degenerate turn unpaired,
+    # so it would be treated as new and re-summarized on every request
+    # instead of being recognised as already covered.
+    body["messages"], _loop_replaced = await run_in_threadpool(
+        _redact_forwarded_loop_replies, body["messages"]
+    )
+    if _loop_replaced:
+        # Count only — no text. The rollup-input redaction already logs a
+        # near-identical line for the same underlying detector; this one is
+        # the forwarded-window twin and can fire on requests that never
+        # trigger a rollup at all.
+        logger.info(
+            f"conv={conv_id or '?'}: replaced {_loop_replaced} degenerate "
+            f"assistant turn(s) in the forwarded window with a placeholder"
+        )
     body["messages"] = await run_in_threadpool(
         _enforce_hard_budget,
         body["messages"],

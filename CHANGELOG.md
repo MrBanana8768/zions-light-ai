@@ -9,6 +9,47 @@ on Docker Hub.
 
 ---
 
+## [3.1.9.2] — repetition-loop hardening
+
+**The bug (production logs):** the model (Cydonia-24B, vLLM 0.19.0) sometimes
+degenerates into one token or phrase repeated, or an unbroken line of short
+fragments. `reply_is_degenerate` already kept such a reply out of what gets
+memorized, but OpenWebUI still re-sends it as ordinary chat history on every
+later request, and the hard-budget guard's ~5-turn window makes a recent loop
+reply a large fraction of everything the model is shown right after it loops
+— plausibly why the reply after a loop has come back empty. Separately, the
+owner's `repeat_penalty` (Ollama's name) rode through OpenWebUI's
+pass-through-unknown-keys behavior to vLLM, which does not recognise it —
+`repetition_penalty` silently stayed at its default, and nothing said so.
+
+### Fixed
+- **Ollama sampling-name translation.** `repeat_penalty` is translated to
+  `repetition_penalty` before forwarding (coerced to a positive float; a bad
+  value is dropped with a WARNING, never forwarded). If both are present,
+  `repetition_penalty` wins. `repeat_last_n` has no vLLM equivalent and is
+  dropped with a note. A numeric-string `repetition_penalty` is coerced to
+  float. Logged at INFO, at most once per conversation-id per process
+  (bounded set — see `_translate_ollama_sampling_params` in `main.py`).
+- **Detected loop replies are now kept out of what is FORWARDED to vLLM**,
+  not only out of what is memorized. After compaction and memory injection,
+  before the hard-budget guard, every non-newest degenerate ASSISTANT turn is
+  replaced with a short neutral placeholder (`_redact_forwarded_loop_replies`
+  in `main.py`) — the same clean-sentence-head rule the rollup-input
+  redaction already applied, now shared via one helper so the two sites
+  cannot drift apart. User turns, system messages and the newest message are
+  never touched. Logged at INFO as a count only (no text).
+
+Operator note: see [RUNPOD_DEPLOY.md → Sampling parameters](RUNPOD_DEPLOY.md#sampling-parameters)
+for the mapping between OpenWebUI's Advanced/Custom Parameters and vLLM's
+names, and recommended starting values for this model.
+
+Does NOT fix: the model degenerating in the first place (that is a sampling/
+model-behavior problem, mitigated by the `repetition_penalty` translation
+above, not eliminated by it); the injected-memory-hierarchy's own placeholder
+wording (unchanged, memory-only).
+
+---
+
 ## [3.1.9] — operator notes (the last V3 release)
 
 Operator-facing notes only: what to check on the pod, what not to run, and
