@@ -66,6 +66,33 @@ def _forwarded_prompt_tokens(resp) -> int | None:
         return None
 
 
+def _forwarded_match(chats: list[dict], marker: str) -> dict | None:
+    """The record for the FORWARDED chat request carrying `marker`.
+
+    The compactor makes its own /v1/chat/completions calls to the same
+    fixture (summarization, fact extraction, persona) from the async tail,
+    and those carry the turn text — marker included — as INPUT. They land
+    AFTER the forwarded request, so `matches[-1]` picked a summarizer call:
+    it reported `sampling={'temperature': 0.0}` and no repetition_penalty,
+    which looked exactly like the translation failing to reach vLLM. The
+    forwarded array is the one whose LAST message is the newest user turn
+    (the one the marker is on); a summarizer payload ends with its own
+    instruction. Fall back to the earliest match, since the forward always
+    precedes the tail it triggers.
+    """
+    tail_marked = [
+        c for c in chats
+        if c.get("messages") and marker in (c["messages"][-1].get("markers") or [])
+    ]
+    if tail_marked:
+        return tail_marked[0]
+    any_marked = [
+        c for c in chats
+        if any(marker in (m.get("markers") or []) for m in c.get("messages", []))
+    ]
+    return any_marked[0] if any_marked else None
+
+
 def _last_chats(fixture_client) -> list[dict]:
     r = fixture_client.get("/_fixture/last_chats")
     r.raise_for_status()
@@ -127,15 +154,12 @@ def test_repeat_penalty_translation_reaches_the_wire(
     assert r.status_code == 200, f"HTTP {r.status_code}: {r.text[:300]}"
 
     chats = _last_chats(fixture_client)
-    matches = [
-        c for c in chats
-        if any(marker in m.get("markers", []) for m in c.get("messages", []))
-    ]
-    assert matches, (
+    forwarded = _forwarded_match(chats, marker)
+    assert forwarded is not None, (
         f"no /_fixture/last_chats entry carries marker {marker!r} — the "
         f"fixture never saw this request forwarded at all"
     )
-    wire = matches[-1]["sampling"]
+    wire = forwarded["sampling"]
     record(
         "advcov-repeat-penalty",
         f"[{label}] sent={body_extra} wire_sampling={wire}",
@@ -243,12 +267,8 @@ def test_degenerate_reply_in_history_is_redacted_on_the_wire(client, fixture_cli
     assert r.status_code == 200, f"HTTP {r.status_code}: {r.text[:300]}"
 
     chats = _last_chats(fixture_client)
-    matches = [
-        c for c in chats
-        if any(head_marker in m.get("markers", []) for m in c.get("messages", []))
-    ]
-    assert matches, "no /_fixture/last_chats entry carries the clean-head marker"
-    wire = matches[-1]
+    wire = _forwarded_match(chats, head_marker)
+    assert wire is not None, "no /_fixture/last_chats entry carries the clean-head marker"
     assistant_wire = [m for m in wire["messages"] if m["role"] == "assistant"]
     record(
         "advcov-degenerate-reply-wire",
