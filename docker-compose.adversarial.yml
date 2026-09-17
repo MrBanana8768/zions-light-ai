@@ -56,8 +56,20 @@ services:
     # From the read-only mount, never a copy — see the long note in
     # docker-compose.integration.yml about a stack that served code 49
     # minutes older than the commit it was verifying.
+    #
+    # A SMALL REAL webui.db first, same shape and same reason as
+    # docker-compose.integration.yml (pass-3 F12: since v3.1.9 a backup cycle
+    # that cannot find the database refuses instead of publishing an archive
+    # with no chat history). Without this, test_adv_race.py's
+    # test_backup_while_the_store_is_being_written got a 503 from every
+    # /admin/backups call and never reached the race it is named for. This
+    # copy lives in the container's own filesystem (not a mounted volume), so
+    # it is as isolated per `-p <project>` run as the rest of the adversarial
+    # stack and is gone on `down -v`.
     command:
       - >
+        mkdir -p /var/lib/openwebui &&
+        /opt/compactor-venv/bin/python -c "import sqlite3,time; c=sqlite3.connect('/var/lib/openwebui/webui.db'); c.execute('create table if not exists chat (id text primary key, user_id text, title text, chat text, created_at integer, updated_at integer)'); c.execute('insert or ignore into chat values (?,?,?,?,?,?)', ('adv-chat','adv-user','adversarial fixture','{\"messages\": []}', int(time.time()), int(time.time()))); c.commit(); c.close()" &&
         cd /src/compactor &&
         exec /opt/compactor-venv/bin/uvicorn main:app
         --host 0.0.0.0 --port 8080 --log-level info

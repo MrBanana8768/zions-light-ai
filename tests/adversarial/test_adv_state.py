@@ -126,20 +126,27 @@ def test_finding_import_malformed_fact_bricks_facts_reads(client, name):
 
 @pytest.mark.parametrize("name", list(POISON_FACTS))
 def test_finding_unreadable_facts_do_not_affect_health_status(client, name):
-    """CONFIRMED F-S6 / health gap (state-04, state-01).
+    """ADVFIX REWRITE (P8 gate) — F-S6's health gap is FIXED; this now pins
+    the correct behaviour. Was: CONFIRMED F-S6 / health gap (state-04,
+    state-01) — `gather_health_full` built `status`/`status_reasons` from
+    storage, vLLM, disk-pressure, background shedding, memory-tail skipping
+    and /tokenize, but never from `stats.unreadable`, so a corrupt/unreadable
+    memory file registered in the body (`stats.unreadable.facts` moved) but
+    contributed NOTHING to the top-line status or the Docker HEALTHCHECK.
 
-    `gather_health_full` builds its `status`/`status_reasons` from storage,
-    vLLM, disk-pressure, background shedding, memory-tail skipping and
-    /tokenize — but NEVER from `stats.unreadable`. So a corrupt/unreadable
-    memory file registers in the body (`stats.unreadable.facts` moves) yet
-    contributes NOTHING to the top-line status or the Docker HEALTHCHECK.
+    Proven fixed live for all three POISON_FACTS shapes
+    (`findings/state-F-S6-import-poison.md`): `status_reasons` now carries
+    "unreadable memory on disk: N facts. Those conversations are not being
+    read and must not be written over; see stats.unreadable." and
+    `health.status` is "degraded". This test does NOT assert the top-line
+    value stays "degraded" specifically (unrelated tail-skip noise from other
+    traffic in this shared-process stack can independently move `status`); it
+    asserts the precise fix: the unreadable count rises AND a status_reason
+    now references it.
 
-    This test does NOT assert the top-line value (that is influenced by
-    unrelated tail-skip noise from other traffic). It asserts the precise
-    defect: the unreadable count rises, and no status_reason references it.
-
-    A fix (feed a nonzero stats.unreadable into `reasons`) would add such a
-    reason and flip the second assertion.
+    FAILS IF: stats.unreadable.facts stops rising on this poison, or
+    status_reasons stops mentioning "unreadable" for a nonzero
+    stats.unreadable.facts.
     """
     conv = _cid("fs6h-" + name)
     r = _import(client, _bundle(facts=[POISON_FACTS[name]]), conv)
@@ -163,9 +170,11 @@ def test_finding_unreadable_facts_do_not_affect_health_status(client, name):
         "the poison did not register in stats.unreadable.facts — the body "
         "signal is gone too; re-baseline."
     )
-    assert not mentions_unreadable, (
-        "status_reasons now references the unreadable layer — the health gap "
-        "appears fixed. Update this test to assert the new reason."
+    # The FIX: the unreadable layer now has a voice in status_reasons.
+    assert mentions_unreadable, (
+        "GOOD NEWS did not fully land: stats.unreadable.facts rose but no "
+        "status_reason mentions 'unreadable'/'corrupt'/the conv id — the "
+        "health gap F-S6 named is back. reasons=%r" % (reasons,)
     )
 
     _forget(client, conv)
