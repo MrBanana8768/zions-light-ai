@@ -957,6 +957,123 @@ check(_EXPECTED_SITE_BUDGET in _site_budgets,
       f"{_site_budgets})")
 
 
+# ---------------------------------------------------------------------------
+# [F1] p7 hostile pass #7: the compacted-branch floor (main.py:_enforce_hard_
+# budget, `_floor`) used to be the raw KEEP_RECENT_TURNS MESSAGE count (4).
+# split_messages ALIGNS its own kept-recent window to start on a USER turn
+# (leading non-user turns move into the summarized portion — a template
+# requirement), so the window it actually protects can hold FEWER than
+# KEEP_RECENT_TURNS messages. With an old, unpaired assistant turn (an image,
+# most often — but the bug is about POSITION, not content, so a plain heavy
+# assistant turn reproduces it just as well) sitting where the 4th-from-end
+# slot falls, the old floor counted it as "recent" and protected it from the
+# pre-shed loop — spending injected memory (halving, then dropping facts) to
+# keep a turn that was never actually inside the aligned recent window. This
+# tests main._enforce_hard_budget directly (like test_p5_guard.py, which
+# owns this same function's other branches), with its own deterministic
+# byte-counting stand-in for count_tokens so the numbers here do not depend
+# on a live tokenizer.
+# ---------------------------------------------------------------------------
+print("\n[F1] guard floor is ALIGNED like split_messages, not a raw message count")
+
+
+def _f1_tokens(msgs) -> int:
+    return sum(len(main._message_text(m).encode("utf-8")) + 4 for m in msgs)
+
+
+def _f1_build(old_exchanges=30):
+    """A compaction stand-in, injected memory, `old_exchanges` ordinary old
+    pairs, then one UNPAIRED old assistant turn (the image stand-in) right
+    before the previous exchange and the newest turn — exactly the slot
+    `split_messages` would push out of its aligned keep_recent window
+    (KEEP_RECENT_TURNS=4 non-system messages ending in
+    [image, prev-u, prev-a, newest-u] starts on ASSISTANT, so alignment
+    drops the image, leaving keep_recent=[prev-u, prev-a, newest-u], 3
+    messages, not 4)."""
+    facts = "[Facts]\n" + "".join(
+        f"- FACT{i:02d} she likes item {i} very much indeed.\n" for i in range(9)
+    )
+    facts = facts + "f" * (400 - len(facts))
+    msgs = [
+        {"role": "system", "content": "P" * 1200},
+        {"role": "system", "content": main.COMPACTION_SUMMARY_HEADER + "\n" + "s" * 6000},
+        {"role": "system", "content": facts},
+    ]
+    for i in range(old_exchanges):
+        msgs.append({"role": "user", "content": f"old-u{i} " + "u" * 150})
+        msgs.append({"role": "assistant", "content": f"old-a{i} " + "a" * 1650})
+    # The unpaired old turn: no user turn immediately precedes it in this
+    # position (the pair above it already closed), so it is exactly the
+    # shape split_messages would push into the summarized portion when the
+    # 4-message tail starts on it.
+    msgs.append({"role": "assistant", "content": "old-image-stub " + "i" * 30000})
+    msgs.append({"role": "user", "content": "prev-u " + "u" * 150})
+    msgs.append({"role": "assistant", "content": "prev-a " + "a" * 1650})
+    msgs.append({"role": "user", "content": "newest " + "n" * 200})
+    return msgs
+
+
+_F1_LIMIT = 20768 - 90  # the shipped v3.1.9 effective limit, less a time-line reserve
+
+_f1_saved_count_tokens = main.count_tokens
+_f1_saved_count_tokens_exact = main.count_tokens_exact
+_f1_saved_margin = main._BUDGET_MARGIN
+main.count_tokens = _f1_tokens
+main.count_tokens_exact = lambda ms, *a, **k: _f1_tokens(ms)
+main._BUDGET_MARGIN = 0
+try:
+    _f1_msgs = _f1_build()
+    _f1_rep: dict = {}
+    _f1_out = main._enforce_hard_budget(_f1_msgs, _F1_LIMIT, 1, _f1_rep)
+finally:
+    main.count_tokens = _f1_saved_count_tokens
+    main.count_tokens_exact = _f1_saved_count_tokens_exact
+    main._BUDGET_MARGIN = _f1_saved_margin
+
+_f1_mem_out = [
+    x for x in _f1_out
+    if x.get("role") == "system" and "[Facts]" in (x.get("content") or "")
+]
+_f1_facts_whole = bool(_f1_mem_out) and all(
+    f"FACT{i:02d}" in _f1_mem_out[0]["content"] for i in range(9)
+)
+_f1_image_survived = any(
+    m.get("role") == "assistant" and "old-image-stub" in (m.get("content") or "")
+    for m in _f1_out
+)
+check(_f1_rep.get("fits"), f"fixture: the guard fit the payload ({_f1_rep})")
+check(
+    _f1_facts_whole,
+    "*** F1: facts survive whole — the unpaired old turn is shed by the "
+    "pre-shed loop instead of being counted as 'recent' and protected at "
+    "memory's expense",
+)
+check(
+    not _f1_image_survived,
+    "*** F1: the unpaired old turn does NOT survive alongside whole facts "
+    "— if it did, this fixture is not exercising the floor bug at all",
+)
+
+# CONTROL: the actual protected window (prev-u, prev-a, newest) always
+# survives regardless of the floor fix — this proves the fix does not
+# over-shed into turns split_messages really would protect.
+_f1_recent_survived = all(
+    any(
+        m.get("role") == exp_role and m.get("content", "").startswith(exp_prefix)
+        for m in _f1_out
+    )
+    for exp_role, exp_prefix in (
+        ("user", "prev-u"), ("assistant", "prev-a"), ("user", "newest"),
+    )
+)
+check(
+    _f1_recent_survived,
+    "CONTROL: the truly-recent window (prev-u, prev-a, newest) still "
+    "survives — the fix narrows the floor, it does not remove protection "
+    "for what split_messages actually keeps",
+)
+
+
 if FAILED:
     print(f"\n{len(FAILED)} check(s) FAILED:")
     for f in FAILED:

@@ -262,17 +262,30 @@ no vLLM equivalent. Before v3.1.9.2, a Custom Parameter named
 log line, `repetition_penalty` just stayed at its default of 1.0.
 
 Recommended starting values for this model (Cydonia-24B):
-`repetition_penalty` 1.15 (Custom Parameter), Frequency Penalty 0.2 and Max
-Tokens 7000 (both Advanced Params). Full detail:
+`repetition_penalty` 1.05 (Custom Parameter), Frequency Penalty 0.3 and Max
+Tokens 12000 (both Advanced Params) — **not** the 4 chars/token rule of thumb
+Max Tokens 7000 used to be picked by: this model's own measured pairs run
+2.0-2.4 chars/token on assistant replies, so 7000 tokens is only ~14-17k
+characters, below her normal p90 reply length, and would cut ordinary long
+replies mid-sentence. vLLM 0.19 also applies `repetition_penalty` to PROMPT
+tokens, not only output, so a high value discourages words already sitting
+in her ~20k-token conversation/memory context, not just words the model has
+already said in this reply — raise Frequency Penalty (output-only) before
+raising `repetition_penalty` further if loops return. Full detail:
 [RUNPOD_DEPLOY.md → Sampling parameters](RUNPOD_DEPLOY.md#sampling-parameters).
 
 **Confirming loops are being caught.** A repetition-loop reply logs a
 WARNING at detection time (`grep -a 'like a repetition loop'` matches both
-the streamed and non-streamed wording) and, once OpenWebUI replays it back
-as history, an
-INFO line each time it is kept out of what is forwarded to vLLM:
-`conv=<id>: replaced <N> degenerate assistant turn(s) in the forwarded
-window with a placeholder`. Neither line names the reply's own text.
+wordings — the split is FINISHED vs CUT, not streamed vs non-streamed) and,
+once OpenWebUI replays it back as history, an INFO line each time it is kept
+out of what is forwarded to vLLM: `conv=<id>: replaced <N> degenerate
+assistant turn(s) in the forwarded window with a placeholder`. **These two
+counts can differ**: a CUT reply whose trimmed head reads clean is stored
+TRIMMED with no loop WARNING at all (memory only judges the kept head), but
+the full original text is still flagged and still replaced in the forwarded
+window on every later request — a `replaced` count with no matching WARNING
+for that turn is expected, not a sign the detector missed it. Neither line
+names the reply's own text.
 
 ### Disk is filling up
 ```bash

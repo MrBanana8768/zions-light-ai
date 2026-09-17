@@ -243,6 +243,97 @@ assert_eq(sent.get("temperature"), 1.1, "[1f] CONTROL: unrelated sampling key un
 assert_true("repetition_penalty" not in sent, "[1f] CONTROL: no key materialized from nothing")
 assert_true("repeat_penalty" not in sent, "[1f] CONTROL: no key materialized from nothing")
 
+# [1g] p7 hostile pass #7, F4: "inf" / "Infinity" / "1e999" (strings OpenWebUI
+# would otherwise json-decode to a real float, but "inf" itself is not valid
+# JSON, so a typed value like this reaches us as a string) used to satisfy
+# `f > 0` and get forwarded as a real `inf`, which httpx 0.28.1's
+# `allow_nan=False` encoder then REFUSES to serialize (ValueError, raised
+# from inside the proxy, after compaction/injection already spent the turn —
+# see _translate_ollama_sampling_params's docstring). Each must be dropped
+# with a WARNING instead, exactly like any other invalid value.
+for _bad_val, _label in (
+    ("inf", "the string 'inf'"),
+    ("Infinity", "the string 'Infinity'"),
+    ("1e999", "the string '1e999' (parses to inf)"),
+):
+    r, sent, records = _post_chat(msgs, f"loop-r1-nonfinite-{_label[:6]}", {"repeat_penalty": _bad_val})
+    assert_true(
+        "repetition_penalty" not in sent,
+        f"[1g] *** {_label} as repeat_penalty is dropped, not forwarded as inf",
+    )
+    assert_true(
+        _find(records, "dropping repeat_penalty"),
+        f"[1g] {_label}: WARNING logged for the dropped non-finite value",
+    )
+
+# [1g2] the same for repetition_penalty sent directly (numeric OR string —
+# a numeric 1e999 parses to inf at json.loads time too, closing that half of
+# F4's pre-existing hole as well).
+r, sent, records = _post_chat(msgs, "loop-r1-nonfinite-direct-str", {"repetition_penalty": "inf"})
+assert_true("repetition_penalty" not in sent, "[1g2] string repetition_penalty='inf' dropped")
+# Build the JSON body TEXT by hand: `1e999` must appear as the literal
+# digits of a JSON NUMBER (not the bare `Infinity` CONSTANT chat_completions
+# already rejects at parse time via `parse_constant`). Python's own float()
+# happily turns the digit string "1e999" into inf during json.loads's number
+# parsing, which `parse_constant` never sees — that path is what F4 says was
+# already a hole before this lane (a pre-existing one; the string-to-inf
+# coercion this lane closes is a SEPARATE, new-in-.2 hole). json.dumps(1e999)
+# cannot be used to build this fixture: Python's own `1e999` LITERAL already
+# evaluates to inf before json.dumps ever sees it, so it would round-trip as
+# the `Infinity` constant, not as digits.
+_body_1e999 = (
+    '{"model": "stub-model", "messages": ' + json.dumps(msgs) +
+    ', "stream": false, "repetition_penalty": 1e999}'
+)
+assert_true("1e999" in _body_1e999, "[1g2] fixture sanity: the raw body text carries the digits 1e999")
+_StubVLLM.sent.clear()
+_h = _CaptureLogs()
+_lg = logging.getLogger("compactor")
+_lg.addHandler(_h)
+try:
+    with patch.object(main.httpx, "AsyncClient", _StubVLLM), \
+         patch.object(main, "_fire_and_forget", _swallow_tail):
+        _r_direct = client.post(
+            "/v1/chat/completions",
+            content=_body_1e999,
+            headers={"X-Conversation-Id": "loop-r1-nonfinite-numeric", "Content-Type": "application/json"},
+        )
+finally:
+    _lg.removeHandler(_h)
+_sent_direct = _StubVLLM.sent[-1] if _StubVLLM.sent else None
+assert_true(
+    _sent_direct is not None and "repetition_penalty" not in _sent_direct,
+    "[1g2] *** a numeric 1e999 repetition_penalty (parses to inf at JSON-decode "
+    "time, a pre-existing hole distinct from the string-'inf' one) is dropped "
+    "too, not just the string form",
+)
+
+# [1h] CONTROL: an ordinary finite repeat_penalty still translates normally —
+# the non-finite check does not accidentally reject real values.
+r, sent, records = _post_chat(msgs, "loop-r1-finite-control", {"repeat_penalty": 1.15})
+assert_eq(sent.get("repetition_penalty"), 1.15, "[1h] CONTROL: an ordinary finite value still translates")
+
+# [1i] p7 hostile pass #7, F4: when repetition_penalty ITSELF is invalid but
+# repeat_penalty is valid, the valid one is used instead of losing both.
+r, sent, records = _post_chat(
+    msgs, "loop-r1-fallback",
+    {"repeat_penalty": 1.1, "repetition_penalty": "abc"},
+)
+assert_eq(
+    sent.get("repetition_penalty"), 1.1,
+    "[1i] *** repetition_penalty invalid + repeat_penalty valid -> the valid "
+    "repeat_penalty value is forwarded, not neither",
+)
+
+# [1j] CONTROL: when repetition_penalty IS valid, it still wins over
+# repeat_penalty exactly as [1b] already covers — repeated here so a mutant
+# that always prefers repeat_penalty cannot hide behind [1i] alone.
+r, sent, records = _post_chat(
+    msgs, "loop-r1-both-still-wins",
+    {"repeat_penalty": 1.9, "repetition_penalty": 1.05},
+)
+assert_eq(sent.get("repetition_penalty"), 1.05, "[1j] CONTROL: a VALID repetition_penalty still wins")
+
 print()
 print("=" * 70)
 print("[2] R2 — degenerate assistant turns redacted from the FORWARDED window")
@@ -345,6 +436,96 @@ sent_asst = next(m["content"] for m in sent["messages"] if m.get("role") == "ass
 assert_eq(sent_asst, _cut.text, "[2f] forwarded content is exactly memory's clean head, not the placeholder")
 assert_true(RULE not in sent_asst, "[2f] the runaway tail did not reach vLLM")
 
+# [2g] p7 hostile pass #7, F2: a PHRASE loop ("X. X. X. ...") ends on
+# sentence boundaries, so the OLD rule (trim_to_last_sentence on the WHOLE
+# text, then re-judge) could not cut it at all -- the "clean head" it found
+# was still the whole degenerate reply, so it fell back to the placeholder
+# and threw away a real, long, clean answer. The fix cuts at the position
+# the detector itself located (start of the phrase-loop span), which cannot
+# be inside the loop, so the head it re-judges is guaranteed clean.
+_phrase_unit = "Absolutely. With Desperation. With Humility. "
+_phrase_loop_reply = "answer here. " + _PROSE + _PROSE.replace("week", "month") + "\n" + (_phrase_unit * 30)
+assert_true(
+    bool(main.reply_is_degenerate(_phrase_loop_reply)),
+    "[2g] fixture: the phrase loop trips the detector",
+)
+assert_true(
+    main.decide_memory_tail(_phrase_loop_reply, finished=False, truncated=True, holed=False).outcome
+    != "stored_trimmed",
+    "[2g] fixture sanity: the OLD whole-text trim rule cannot cut this clean "
+    "(it lands back inside the loop's own sentence boundaries, so memory's "
+    "rule — unchanged by this lane — does not call it a clean trim either)",
+)
+r, sent, records = _post_chat(
+    [user("what should I remember"), asst(_phrase_loop_reply), user("got it, anything else")],
+    "loop-r2-phrase",
+)
+_g_sent_asst = next(m["content"] for m in sent["messages"] if m.get("role") == "assistant")
+assert_true(
+    _g_sent_asst != main._DEGENERATE_FORWARD_PLACEHOLDER,
+    "[2g] *** the clean prose head survived — NOT replaced whole by the "
+    "placeholder just because the loop itself ends on sentence boundaries",
+)
+assert_true("clinic opens at nine" in _g_sent_asst, "[2g] the real prose head reached vLLM")
+# Not necessarily ZERO copies of the phrase: _tail_loop_span (unmodified by
+# this lane) measures its span in whole repeated UNITS from the end of the
+# text, and can leave up to about one unit's worth of the loop's own start
+# uncollapsed when that leftover fragment happens to end on a sentence
+# boundary itself (as this phrase does, being itself period-terminated) —
+# trim_to_last_sentence then legitimately keeps it as "the last sentence".
+# The fix is judged the way F2's own real-data proof judges it: the loop is
+# overwhelmingly cut, not that a detector span imprecision inherited from
+# unmodified code is papered over here.
+_g_phrase_copies = _g_sent_asst.count(_phrase_unit.strip())
+assert_true(
+    _g_phrase_copies <= 2,
+    f"[2g] the looping phrase reached vLLM at most a couple of times, not "
+    f"all 30 repeats (got {_g_phrase_copies})",
+)
+
+# [2h] p7 hostile pass #7, F3: a healthy reply with ONE mid-reply elongation
+# (a scream) is not thrown away whole -- only the flagged span is collapsed,
+# and both the clean text BEFORE and AFTER it reach the model.
+_scream = "A" * 130
+_mid_span_reply = (
+    _PROSE + "Then she screamed: " + _scream + ". After that, everyone sat "
+    "back down and the meeting continued as planned, calmly and clearly, "
+    "for several more minutes without incident."
+)
+assert_true(bool(main.reply_is_degenerate(_mid_span_reply)), "[2h] fixture: the scream trips the detector")
+r, sent, records = _post_chat(
+    [user("what happened"), asst(_mid_span_reply), user("go on")],
+    "loop-r2-midspan",
+)
+_h_sent_asst = next(m["content"] for m in sent["messages"] if m.get("role") == "assistant")
+assert_true(
+    _h_sent_asst != main._DEGENERATE_FORWARD_PLACEHOLDER,
+    "[2h] *** not replaced whole — a mid-reply span costs at most itself",
+)
+assert_true("clinic opens at nine" in _h_sent_asst, "[2h] clean text BEFORE the scream reached vLLM")
+assert_true("meeting continued as planned" in _h_sent_asst, "[2h] clean text AFTER the scream reached vLLM")
+assert_true(_scream not in _h_sent_asst, "[2h] the scream itself did not reach vLLM")
+
+# [2i] p7 hostile pass #7, F3: a repeated-value array inside a fenced code
+# block is not flagged by the token rule at all (fenced code is now skipped
+# there, same as the fragment-line rule already skips it) -- CONTROL for the
+# fence-skip half of F3, independent of [2h]'s span-cut half.
+_codeblock_reply = (
+    _PROSE + "Here is the matrix:\n```\n" + ("[0.00, 0.00, 0.00, 0.00] " * 20) +
+    "\n```\nLet me know if that helps, and I can explain any row you like."
+)
+assert_true(
+    main.reply_is_degenerate(_codeblock_reply) is None,
+    "[2i] CONTROL: a repeated-value array INSIDE a fenced code block is not "
+    "flagged — fenced code is excluded from the token rule",
+)
+r, sent, records = _post_chat(
+    [user("show me"), asst(_codeblock_reply), user("thanks")],
+    "loop-r2-codeblock",
+)
+_i_sent_asst = next(m["content"] for m in sent["messages"] if m.get("role") == "assistant")
+assert_eq(_i_sent_asst, _codeblock_reply, "[2i] CONTROL: the code block reached vLLM untouched, verbatim")
+
 print()
 print("[3] pairing: fingerprinting happens on ORIGINAL text, before this redaction runs")
 print("-" * 70)
@@ -416,24 +597,179 @@ assert_true(
 )
 
 print()
+print("[3c] pairing END-TO-END via chat_completions itself (p7 hostile pass #7, "
+      "F5): [3b] above never calls chat_completions — it feeds _coverage_plan "
+      "a list IT redacted itself, so it cannot see where the real call site "
+      "is. This drives the actual endpoint with a conversation large enough "
+      "to reuse for real and confirms reuse still fires with the redaction "
+      "in its real position.")
+print("-" * 70)
+_E2E_CONV = "loop-r2-e2e-reuse"
+
+
+def _e2e_turn(i):
+    # Padded well past TARGET_TOKENS in aggregate (main.py's char/4 local
+    # estimator is what's live here — /tokenize is stubbed to fail fast, same
+    # as every other section in this file) so compact_if_needed actually
+    # takes the compaction path instead of its early under-TARGET return.
+    if i % 2 == 1:
+        return user(f"question {i} " + ("word " * 60))
+    if i == 10:
+        return asst(DEGENERATE_TEXT)
+    return asst(f"answer {i}, a plain reply with a clean sentence. " + ("word " * 60))
+
+
+_e2e_msgs = [_e2e_turn(i) for i in range(1, 201)]  # turns 1..200
+_e2e_state = summarizer.load_state(_E2E_CONV)
+_e2e_state["l1"] = [{"text": "STORED-CHUNK", "first_turn": 1, "last_turn": 200}]
+_e2e_state["last_summarized_turn"] = 200
+summarizer._record_chunk_fps(_e2e_state, 1, 200, _e2e_msgs)
+summarizer.save_state(_E2E_CONV, _e2e_state)
+
+_e2e_summarize_calls = []
+_real_summarize = main.summarize
+
+
+async def _spy_summarize(client, to_summarize):
+    _e2e_summarize_calls.append(list(to_summarize))
+    return await _real_summarize(client, to_summarize)
+
+
+with patch.object(main, "summarize", _spy_summarize):
+    _e2e_r, _e2e_sent, _e2e_records = _post_chat(
+        _e2e_msgs + [user("201st, keeps turn 10 well out of the newest slot")],
+        _E2E_CONV,
+    )
+
+assert_eq(_e2e_r.status_code, 200, "[3c] request accepted")
+assert_true(
+    not _e2e_summarize_calls,
+    "[3c] *** reuse actually fired through the real endpoint: summarize() "
+    "was never called, so the seeded hierarchy covered everything — this is "
+    "the check that would go red if the redaction's real call-site position "
+    "(after compaction, before the guard) regressed back to running before "
+    "compaction",
+)
+_e2e_sent_texts = [m.get("content") for m in _e2e_sent.get("messages", [])]
+assert_true(
+    DEGENERATE_TEXT not in _e2e_sent_texts,
+    "[3c] the degenerate turn's raw text did not reach vLLM even on the "
+    "reuse path",
+)
+
+print()
 print("[4] performance: detector cost on a large forwarded window stays bounded")
 print("-" * 70)
-# The detector now runs on EVERY request (it did not before). Build a large
-# but realistic recent window (the hard-budget guard already caps what
-# reaches this point to a handful of turns in production, but this measures
-# the redaction function in isolation against a much larger window than it
-# will ever actually see, as a safety margin) and time it.
+# p7 hostile pass #7, F5: the old fixture here (400 messages, ~100 chars
+# each) measured nothing realistic and its own docstring's claim was false —
+# this redaction runs BEFORE _enforce_hard_budget (main.py's chat_completions
+# call order), not after, so on the DECLINED path it sees the client's WHOLE
+# array, not "a handful of turns". Real-data measurement (p7's real_fp.out,
+# her main chat's current branch: 811 messages, 4.66M chars) cost 0.78-0.83s
+# of GIL-bound CPU PER REQUEST that declines reuse. This fixture is sized to
+# the same order of magnitude (800 turns, several KB each) instead of a
+# fixture too small to show the cost at all.
+#
+# _reply_degenerate_verdict is now cached per content digest (see its
+# comment): a real conversation resends the SAME turn text on every later
+# request, so only genuinely NEW turns pay full detection cost — this run
+# below is a cold-cache worst case (every turn here is unique), which is
+# also why it is timed as a single pass rather than "first call vs repeat".
 _big_window = []
-for i in range(200):
-    _big_window.append(user(f"question number {i} about something ordinary"))
-    _big_window.append(asst(f"answer number {i}, a perfectly normal reply with several sentences. "
-                             f"It has more than one clause. It ends cleanly."))
+for i in range(800):
+    # Varied per-sentence (the counter `j` changes every repeat) so this is
+    # genuinely non-repeating prose, not an accidental phrase loop the
+    # detector is SUPPOSED to catch — an earlier draft of this fixture
+    # repeated the identical sentence 40x per message and tripped [4]'s own
+    # "no false positives" assertion, which was the tail-loop rule correctly
+    # firing on a fixture bug, not a detector bug.
+    body = " ".join(
+        f"Sentence {j} of turn {i} says something ordinary and specific."
+        for j in range(40)
+    )  # ~2.9KB per message, comparable order of magnitude to her real data
+    _big_window.append(user(f"question {i}: " + body))
+    _big_window.append(asst(f"answer {i}: " + body))
 _t0 = time.monotonic()
 _out, _replaced = main._redact_forwarded_loop_replies(_big_window)
 _elapsed_ms = (time.monotonic() - _t0) * 1000
-print(f"  {len(_big_window)} messages, {_elapsed_ms:.1f} ms, {_replaced} replaced (expect 0)")
+_total_chars = sum(len(main._message_text(m)) for m in _big_window)
+print(f"  {len(_big_window)} messages, {_total_chars} chars, {_elapsed_ms:.1f} ms, "
+      f"{_replaced} replaced (expect 0)")
 assert_eq(_replaced, 0, "[4] no false positives on ordinary prose")
-assert_true(_elapsed_ms < 2000, f"[4] stayed under 2000ms for a 400-message window (got {_elapsed_ms:.1f}ms)")
+assert_true(
+    _elapsed_ms < 5000,
+    f"[4] stayed under a generous 5000ms bound for a {len(_big_window)}-message, "
+    f"{_total_chars}-char window (got {_elapsed_ms:.1f}ms) — this is a safety "
+    f"ceiling, not the production expectation; see the real-data number quoted "
+    f"above for what she actually pays per request",
+)
+
+print()
+print("[4b] the cache bound: a resent (unchanged) window is cheap, and still "
+      "catches every turn it caught cold")
+print("-" * 70)
+# OpenWebUI resends the SAME turn text on every later request. This is
+# exactly the shape the digest cache on _reply_degenerate_verdict exists for (see
+# its comment): the second call over the IDENTICAL window should cost a
+# small fraction of the first, and — the correctness half, not just the
+# speed half — replace exactly the same turns, proving the cache cannot
+# skip a turn that reached vLLM uncached.
+_t1 = time.monotonic()
+_out2, _replaced2 = main._redact_forwarded_loop_replies(_big_window)
+_elapsed2_ms = (time.monotonic() - _t1) * 1000
+print(f"  repeat pass: {_elapsed2_ms:.1f} ms, {_replaced2} replaced")
+assert_eq(_replaced2, _replaced, "[4b] identical replacement count on the resent window")
+assert_true(
+    _elapsed2_ms < _elapsed_ms / 2,
+    f"[4b] *** the cache bound actually bounds something: repeat pass "
+    f"({_elapsed2_ms:.1f}ms) is well under half the cold pass "
+    f"({_elapsed_ms:.1f}ms)",
+)
+# And with one NEW degenerate turn appended (never seen by the cache before),
+# it is still caught — the cache narrows to "already-judged text", it never
+# widens to "any text that looks similar".
+_fresh_window = _big_window + [user("one more"), asst(DEGENERATE_TEXT), user("still there?")]
+_out3, _replaced3 = main._redact_forwarded_loop_replies(_fresh_window)
+assert_eq(_replaced3, _replaced + 1,
+          "[4b] CONTROL: a brand-new degenerate turn appended after the cached "
+          "window is still caught — the cache does not paper over a real turn "
+          "that reaches vLLM")
+
+print()
+print("[5] a phrase loop longer than the tail-loop window is cut until clean "
+      "(coordinator review)")
+print("-" * 70)
+# The tail-loop rule measures at most _TAIL_LOOP_WINDOW characters, so one
+# cut removes at most that much of a long phrase loop and the kept head is
+# still a loop. Real data had 10 of 67 flagged replies in that state after a
+# single cut. The redaction must keep cutting until the text is clean, and
+# still keep the clean head.
+_head5 = " ".join(
+    f"Sentence {j} is ordinary and specific about the garden." for j in range(40)
+)
+for _reps5 in (300, 600, 1500):
+    _loop5 = _head5 + " " + ("And I will stay right here with you. " * _reps5)
+    assert_true(
+        len(_loop5) - len(_head5) > 2 * main._TAIL_LOOP_WINDOW,
+        f"[5] fixture: the loop ({len(_loop5) - len(_head5)} chars) is longer "
+        f"than two tail-loop windows",
+    )
+    _r5, _sent5, _ = _post_chat(
+        [user("tell me about the garden"), asst(_loop5), user("and then?")],
+        f"loopguard-long-{_reps5}",
+    )
+    assert_eq(_r5.status_code, 200, f"[5] request with a {_reps5}x loop succeeded")
+    _fwd5 = [m for m in _sent5["messages"] if m.get("role") == "assistant"][0]["content"]
+    assert_true(
+        main.reply_is_degenerate(_fwd5) is None,
+        f"[5] *** {_reps5}x: what reached vLLM is no longer flagged as a loop "
+        f"({len(_fwd5)} chars forwarded)",
+    )
+    assert_true(
+        _head5[:200] in _fwd5 and len(_fwd5) >= len(_head5) - 80,
+        f"[5] *** {_reps5}x: the clean head survived "
+        f"({len(_fwd5)} of {len(_head5)} head chars)",
+    )
 
 print()
 print("ALL TESTS PASSED")

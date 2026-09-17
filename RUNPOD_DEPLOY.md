@@ -413,22 +413,50 @@ Parameters, by its real name, so nothing depends on the translation.
 
 | Setting | Where in OpenWebUI | Value |
 |---|---|---|
-| `repetition_penalty` | Custom Parameters (name typed exactly) | `1.15` |
-| Frequency Penalty | Advanced Params | `0.2` |
-| Max Tokens | Advanced Params | `7000` |
+| `repetition_penalty` | Custom Parameters (name typed exactly) | `1.05` |
+| Frequency Penalty | Advanced Params | `0.3` |
+| Max Tokens | Advanced Params | `12000` |
 
 Leaving Max Tokens unset means the request carries no ceiling at all: a
 runaway reply continues until it fills the context window or someone presses
-Stop. 7000 tokens is roughly 28,000 characters, above this model's normal
-long replies. The compactor reserves the larger of
-`COMPACTOR_GENERATION_RESERVE` (12000) and Max Tokens for the reply, so any
-value up to 12000 leaves its memory budgets unchanged.
+Stop. **7000 tokens is NOT "roughly 28,000 characters" on this model** — that
+assumes 4 characters/token, and this model's own measured pairs (see
+`count_tokens_exact`'s docstring in `compactor/main.py`, production data,
+2026-08-28) run 2.0-2.4 characters/token on assistant replies, because this
+model's heavy use of box-drawing and other decoration characters prices high.
+At that rate 7000 tokens is roughly 14,000-17,000 characters — below her
+normal p90 reply length (measured ~17,000 characters on her main chat,
+hostile pass #7), so a real, non-runaway reply would routinely hit the
+ceiling and come back cut mid-sentence, and get stored to memory trimmed the
+same way (`stream truncated at the generation ceiling`). **12000 tokens**
+(roughly 24,000-29,000 characters at the same measured rate) covers ordinary
+long replies with headroom and does not change memory's budgets: the
+compactor already reserves the larger of `COMPACTOR_GENERATION_RESERVE`
+(12000) and Max Tokens, so 12000 is the value it already plans around. To
+check the real rate on your own pod rather than trust this range, POST a
+sample of her actual replies to vLLM's `/tokenize` endpoint and compare the
+returned token count against the character count directly, rather than
+estimating.
+
+vLLM 0.19 applies `repetition_penalty` to **prompt tokens as well as output**
+(verified by reading `model_executor/layers/utils.py::apply_penalties` and
+the V2 GPU sampler kernel in the served image) — it is not output-only the
+way Ollama's `repeat_penalty` behaves. Against a prompt that can run to
+~20,000 tokens of her own conversation and injected memory, a HIGH
+`repetition_penalty` discourages the model from using words that are already
+sitting in that history, not only words it has already said in this reply —
+which can flatten normal vocabulary, not just break loops. The values above
+lean on Frequency Penalty (output-only) to do most of the anti-loop work and
+keep `repetition_penalty` closer to its default; if loops return, raise
+Frequency Penalty before raising `repetition_penalty` further.
 
 **Confirming from the log that loops are being caught.** A repetition-loop
-reply produces a WARNING when it is detected. The wording differs slightly
-between streamed replies (`... look like a repetition loop (...)`) and
-non-streamed ones (`reply looks like a repetition loop (...)`); one grep
-catches both:
+reply produces a WARNING when it is detected. The wording split is **FINISHED
+vs CUT (Stop or the generation ceiling), not streamed vs non-streamed** —
+both paths run through the same `decide_memory_tail`, and either shape can
+happen on a streamed or non-streamed request: `reply looks like a repetition
+loop (...)` for a reply the model finished on its own, `... look like a
+repetition loop (...)` for one that was cut. One grep catches both:
 
 ```bash
 grep -a 'like a repetition loop' /data/logs/compactor.log | tail
@@ -441,9 +469,17 @@ point it is kept out of what is forwarded:
 conv=<id>: replaced <N> degenerate assistant turn(s) in the forwarded window with a placeholder
 ```
 
-Neither line names the reply's own text. If `repeat_penalty` was translated
-because `repetition_penalty` was absent, that is a separate INFO line at
-request time: `conv=<id>: translated Ollama repeat_penalty=... to vLLM
+**These two counts do not have to match, and a mismatch is not a bug.** A
+CUT loop reply whose trimmed sentence head reads clean is stored TRIMMED in
+memory (`stored_trimmed`, no loop WARNING at all — memory's own judgement
+only sees the kept head) even though the detector flagged the FULL text, and
+that full text still gets replaced in the forwarded window on every later
+request (counted in the `replaced <N>` INFO line). So it is normal to see a
+`replaced` count with no matching `like a repetition loop` WARNING for the
+same turn; do not read that as the detector missing something. Neither line
+names the reply's own text. If `repeat_penalty` was translated because
+`repetition_penalty` was absent, that is a separate INFO line at request
+time: `conv=<id>: translated Ollama repeat_penalty=... to vLLM
 repetition_penalty=...` (logged once per conversation, not on every turn).
 
 ### Vision (V3.1) — enabling image understanding

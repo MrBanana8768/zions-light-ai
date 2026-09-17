@@ -16,9 +16,12 @@ V2.0 additions:
 import asyncio
 import bisect
 import codecs
+import collections
 import dataclasses
+import hashlib
 import json
 import logging
+import math
 import warnings
 import os
 import re
@@ -2656,26 +2659,89 @@ def _trailing_ends_in_real_sentence(text: str) -> bool:
     return _is_real_sentence_end(text, m.start())
 
 
-def reply_is_degenerate(text: str) -> str | None:
-    """Why this reply looks like a repetition loop, or None if it looks fine.
+# v3.1.9.2 (p7 hostile pass #7, F2/F3): the forwarded-window redaction needs
+# to know WHERE the degenerate span is, not just THAT the reply is
+# degenerate, so it can keep clean text around a loop instead of throwing the
+# whole reply away (see _degenerate_replacement_content). Rather than
+# maintaining a second copy of this detection logic — which is exactly the
+# kind of "two copies eventually disagree" risk the shared-helper comment
+# above _degenerate_replacement_content already warns about for the
+# clean-head rule — `reply_is_degenerate` is now a thin wrapper around this
+# function, which returns the same reason string PLUS the span (character
+# offsets into `text`) the firing rule can point to. Existing callers of
+# `reply_is_degenerate` see no change: same input, same string-or-None
+# return.
+#
+# Not every rule has a localized span. The character-run, phrase/tail-loop,
+# token-run and fragment-line rules each flag a specific run of text and
+# report (start, end). The decoration-fraction rule, the script-drift rule
+# and the list-run backstop are measured over the WHOLE reply (a fraction,
+# a script mix, a count of short list lines scattered through it) and have
+# no single span to cut around, so they report (None, None) — callers that
+# want a span fall back to the old whole-reply clean-head rule for those.
+#
+# Cached: _redact_forwarded_loop_replies (below, main.py:6907) runs this over
+# EVERY historical assistant turn on EVERY request that declines reuse — on
+# her real main chat that is ~800 turns, and the token/tail-loop/fragment-line
+# scans in this function cost real CPU per call (see _TAIL_LOOP_WINDOW's and
+# _TOKEN_RUN_RE's comments for measured per-call costs). A turn's text is
+# fixed once written; OpenWebUI resends the same turns unchanged on every
+# later request, so the verdict for a given exact text never changes.
+# The cache is keyed on a 128-bit BLAKE2b digest of the text, NOT the text
+# itself (coordinator review): an lru_cache keyed on the string keeps every
+# cached reply alive — 4,096 of her replies at ~10k characters each is tens
+# of MB, over 100 MB for non-ASCII text, held for the life of the process.
+# The digest costs one pass over the bytes (~10 ms for an 800-turn array)
+# and a 128-bit collision is not a practical risk, so this still only skips
+# RECOMPUTING a verdict for text already judged; it cannot skip a turn that
+# reaches vLLM. A lock guards the dict: callers run in the threadpool.
+_DEGENERATE_VERDICT_CACHE_SIZE = _env_int(
+    "COMPACTOR_DEGENERATE_VERDICT_CACHE_SIZE", 4096
+)
 
-    On 2026-08-29 the model entered a loop emitting U+2501 and produced three
-    consecutive replies that were 50-79% box-drawing, each ending mid-rule after
-    a single unbroken run of 386, 425 and 569 characters. Decoration fraction
-    climbed 6.7% -> 50% -> 67% -> 79% across four turns, because each reply
-    entered the history and the guard — shedding to the most recent handful of
-    messages — made that pattern most of what the model could still see.
 
-    This does NOT stop the reply reaching the user; by the time we can measure
-    it, she has already read it, and silently rewriting model output is not
-    something this system does. It stops the reply being MEMORISED, so a loop
-    cannot write itself into facts, episodic and summaries and be injected back
-    as though it were something worth remembering. Same doctrine as the
-    finish_reason=="length" gate: a reply that is not a real answer is not a
-    memory.
+_DEGENERATE_VERDICT_CACHE: "collections.OrderedDict[bytes, tuple]" = collections.OrderedDict()
+_DEGENERATE_VERDICT_LOCK = threading.Lock()
+
+
+def _reply_degenerate_verdict(text: str) -> tuple[str | None, int | None, int | None]:
+    """Cached front of `_reply_degenerate_verdict_uncached` (see the block
+    comment above for why the key is a digest)."""
+    if not text:
+        return None, None, None
+    key = hashlib.blake2b(
+        text.encode("utf-8", "surrogatepass"), digest_size=16
+    ).digest()
+    with _DEGENERATE_VERDICT_LOCK:
+        hit = _DEGENERATE_VERDICT_CACHE.get(key)
+        if hit is not None:
+            _DEGENERATE_VERDICT_CACHE.move_to_end(key)
+            return hit
+    verdict = _reply_degenerate_verdict_uncached(text)
+    if _DEGENERATE_VERDICT_CACHE_SIZE > 0:
+        with _DEGENERATE_VERDICT_LOCK:
+            _DEGENERATE_VERDICT_CACHE[key] = verdict
+            _DEGENERATE_VERDICT_CACHE.move_to_end(key)
+            while len(_DEGENERATE_VERDICT_CACHE) > _DEGENERATE_VERDICT_CACHE_SIZE:
+                _DEGENERATE_VERDICT_CACHE.popitem(last=False)
+    return verdict
+
+
+def _reply_degenerate_verdict_uncached(text: str) -> tuple[str | None, int | None, int | None]:
+    """(reason, span_start, span_end) — see the block comment above.
+
+    `reason` is None (and start/end are None) when the reply looks fine.
+
+    Detection itself is unchanged from the original reply_is_degenerate
+    (see the 2026-08-29/09-01/09-07/09-08 history in the per-rule comments
+    below for why each rule and threshold exists). On 2026-08-29 the model
+    entered a loop emitting U+2501 and produced three consecutive replies
+    that were 50-79% box-drawing; this stops the reply being MEMORISED, so a
+    loop cannot write itself into facts, episodic and summaries and be
+    injected back as though it were something worth remembering.
     """
     if not text:
-        return None
+        return None, None, None
     n = len(text)
     # LONGEST match, not the first. re.search returns the earliest match, so a
     # reply with a brief repetition early and a runaway later was judged on the
@@ -2690,10 +2756,28 @@ def reply_is_degenerate(text: str) -> str | None:
     # the stricter one would win, making the measured character threshold a
     # lie. Requiring an alphanumeric in the repeated unit keeps them disjoint:
     # decoration to the character rule, identifiers to this one.
+    #
+    # F3 (p7 hostile pass #7): fenced code was not excluded here, so a
+    # legitimate repeated-value array inside a ```fence``` (a
+    # `[0.00, 0.00, ...]` matrix; a repeated placeholder token) was flagged
+    # the same as a real identifier loop. The fragment-line rule below
+    # already skips fenced code; this brings the token rule in line with
+    # it. Same toggle-list-plus-bisect shape trim_to_last_sentence uses, so
+    # a candidate's fence membership costs one bisect, not a rescan.
+    _fence_toggles: list[int] = []
+    _fpos = 0
+    for _fline in text.splitlines(keepends=True):
+        if _fline.strip().startswith("```"):
+            _fence_toggles.append(_fpos)
+        _fpos += len(_fline)
+
+    def _tm_in_fence(i: int) -> bool:
+        return bool(_fence_toggles) and bisect.bisect_right(_fence_toggles, i) % 2 == 1
+
     tm = max(
         (
             x for x in _TOKEN_RUN_RE.finditer(text)
-            if any(c.isalnum() for c in x.group(1))
+            if any(c.isalnum() for c in x.group(1)) and not _tm_in_fence(x.start())
         ),
         key=lambda x: len(x.group(0)),
         default=None,
@@ -2703,20 +2787,24 @@ def reply_is_degenerate(text: str) -> str | None:
             f"the token {tm.group(1)[:24]!r} repeated for "
             f"{len(tm.group(0))} characters (limit "
             f"{DEGENERATE_TOKEN_RUN_CHARS})"
-        )
+        ), tm.start(), tm.end()
     # The repeated PHRASE, which the token rule above cannot represent.
     _loop = _tail_loop_span(text)
     if _loop >= DEGENERATE_TAIL_LOOP_CHARS:
+        # Anchored at the end by construction (_tail_loop_span only ever
+        # looks at text.rstrip()'s tail), so the span always runs to the
+        # (stripped) end of the reply — there is no "after" to keep here.
+        _stripped_len = len(text.rstrip())
         return (
             f"a phrase repeating to the end of the reply for {_loop} "
             f"characters (limit {DEGENERATE_TAIL_LOOP_CHARS})"
-        )
+        ), _stripped_len - _loop, _stripped_len
     m = max(_RUN_RE.finditer(text), key=lambda x: len(x.group(0)), default=None)
     if m and len(m.group(0)) >= DEGENERATE_RUN_CHARS:
         return (
             f"a single character repeated {len(m.group(0))} times "
             f"(limit {DEGENERATE_RUN_CHARS})"
-        )
+        ), m.start(), m.end()
     # Script drift. Counted over LETTERS, not characters, so punctuation,
     # markdown and code do not dilute it.
     # NFKC first: MATHEMATICAL BOLD / DOUBLE-STRUCK / FULLWIDTH letters are
@@ -2760,19 +2848,25 @@ def reply_is_degenerate(text: str) -> str | None:
         if (frac >= DEGENERATE_NONLATIN_FRACTION and len(scripts) >= 5) or (
             frac >= 0.20 and len(scripts) >= 3
         ):
+            # No localized span: this is a property of the WHOLE reply (a
+            # letter-count fraction and a script count), not one run of
+            # text. Callers that want a span (F2/F3) fall back to the old
+            # whole-reply clean-head rule for this verdict.
             return (
                 f"{100 * frac:.0f}% of letters are non-Latin over "
                 f"{lat + non} letters across {len(scripts)} script(s) "
                 f"(limit {100 * DEGENERATE_NONLATIN_FRACTION:.0f}% over "
                 f"5+ scripts, or 20% over 3+)"
-            )
+            ), None, None
     if n >= DEGENERATE_MIN_CHARS:
         decor = sum(1 for c in text if c in _DECOR_CHARS)
         if decor / n >= DEGENERATE_DECOR_FRACTION:
+            # Same as script drift: a fraction over the whole reply, no
+            # single span. No end paren here either — completed below.
             return (
                 f"{100 * decor / n:.0f}% decoration characters over {n} chars "
                 f"(limit {100 * DEGENERATE_DECOR_FRACTION:.0f}%)"
-            )
+            ), None, None
     # Structural collapse (see the block comment above the DEGENERATE_LINE_*
     # constants). One pass over lines.
     #
@@ -2872,6 +2966,16 @@ def reply_is_degenerate(text: str) -> str | None:
     for _i, _raw in enumerate(lines):
         if _raw.strip():
             last_nonblank_idx = _i
+    # F2/F3: character offset of each line's start, so the fragment-line
+    # rule below can report a span (start, end) instead of only a reason.
+    # splitlines(keepends=True) segments text identically to splitlines()
+    # (same line boundaries; only the trailing separator differs), so the
+    # two lists stay index-aligned.
+    _line_offsets: list[int] = []
+    _pos = 0
+    for _kept in text.splitlines(keepends=True):
+        _line_offsets.append(_pos)
+        _pos += len(_kept)
 
     run = 0
     in_fence = False
@@ -3056,24 +3160,42 @@ def reply_is_degenerate(text: str) -> str | None:
                                     # does here too: exempt.
                                     exempt = True
                 if not exempt:
+                    _fl_start = _line_offsets[line_idx]
                     return (
                         f"an unbroken line of {ln} characters made of "
                         f"{breaks + 1} fragments averaging "
                         f"{ln / (breaks + 1):.0f} characters (limit "
                         f"{DEGENERATE_LINE_SENTENCE_CHARS} over "
                         f"{DEGENERATE_LINE_CHARS}+ characters)"
-                    )
+                    ), _fl_start, _fl_start + len(raw)
     # R19: gated on DEGENERATE_MIN_CHARS like the decoration-fraction rule
     # above — this file's own doctrine (see MIN_MEMORABLE_TRIMMED_CHARS)
     # calls that the floor below which nothing is judged structurally, and
     # this branch was the one exception.
     if n >= DEGENERATE_MIN_CHARS and run >= DEGENERATE_LIST_RUN:
+        # No localized span reported (deferred): the run is a COUNT of short
+        # list lines, not necessarily contiguous text free of other content
+        # in between (blank lines interleave without resetting it), so
+        # "first line of the run" is not as clean a boundary as the other
+        # rules' regex matches. Callers needing a span fall back to the old
+        # whole-reply clean-head rule for this verdict too.
         return (
             f"a run of {run} consecutive list items of "
             f"{DEGENERATE_LIST_ITEM_CHARS} characters or fewer (limit "
             f"{DEGENERATE_LIST_RUN})"
-        )
-    return None
+        ), None, None
+    return None, None, None
+
+
+def reply_is_degenerate(text: str) -> str | None:
+    """Why this reply looks like a repetition loop, or None if it looks fine.
+
+    Thin wrapper around `_reply_degenerate_verdict` (defined just above)
+    that keeps the original signature every existing caller relies on. See
+    that function for the detection rules themselves and for why the span
+    it also computes lives there instead of in a second copy of this logic.
+    """
+    return _reply_degenerate_verdict(text)[0]
 
 
 # v3.1.3: the skip does not do what its docstring promises without this.
@@ -3114,19 +3236,131 @@ _DEGENERATE_HISTORY_PLACEHOLDER = (
 # else fall back to the placeholder" decision on a turn reply_is_degenerate
 # has flagged, and a rule this load-bearing must not exist twice — two copies
 # is how the two sites would eventually disagree about what "clean" means.
-def _degenerate_replacement_content(text: str, placeholder: str) -> tuple[str, bool]:
-    """-> (replacement content, whether a clean head was kept).
+_DEGENERATE_SPAN_MARKER = "[a repeated section was left out here]"
+
+
+def _degenerate_replacement_content(
+    text: str, placeholder: str, *, keep_middle: bool = False
+) -> tuple[str, bool]:
+    """-> (replacement content, whether any clean text was kept).
 
     `text` must already be known-degenerate (caller has checked
-    `reply_is_degenerate`). Applies the same cut rule `decide_memory_tail`
-    applies to a cut reply: keep the longest prefix ending on a sentence
-    boundary if that prefix clears MIN_MEMORABLE_TRIMMED_CHARS, else use
-    `placeholder` whole. See _redact_degenerate_turns's docstring (hostile
-    pass #4, reviewer A F7) for why keeping the head matters.
+    `reply_is_degenerate`).
+
+    `keep_middle=False` (the default; used by `_redact_degenerate_turns`,
+    the ROLLUP-input redaction, which this lane leaves alone — see the
+    module note above `_redact_degenerate_turns` for why): applies the
+    original cut rule `decide_memory_tail` applies to a cut reply — keep the
+    longest prefix of the WHOLE text ending on a sentence boundary if that
+    prefix clears MIN_MEMORABLE_TRIMMED_CHARS, else use `placeholder` whole.
+
+    `keep_middle=True` (used by `_redact_forwarded_loop_replies`, v3.1.9.2):
+    v3.1.9.2 (p7 hostile pass #7, F2/F3). The `keep_middle=False` rule
+    trims to the last sentence boundary of the WHOLE reply and re-judges
+    that prefix with `reply_is_degenerate` — which does not help when the
+    degenerate span itself ends on sentence boundaries (a phrase loop:
+    "Absolutely. With Desperation. With Humility. ..." is fine prose by
+    that measure) or sits in the MIDDLE of an otherwise clean reply (a
+    120+-character scream or a zeros array in a code fence). Real corpus
+    measurement (SP\\p7\\real_head.py, hostile pass #7): 33 of 68 flagged
+    replies had a clean head of 416-21,569 characters the old rule threw
+    away whole. Here, instead, the SAME position `_reply_degenerate_verdict`
+    already located for the rule that fired is used to cut around just the
+    flagged span:
+      - span reaches the (stripped) end of the reply (the tail-loop rule is
+        always this shape; the other three can be): keep
+        `trim_to_last_sentence(text[:start])` if it clears
+        MIN_MEMORABLE_TRIMMED_CHARS, else `placeholder` whole — same floor
+        as before, but the sentence search is now confined to the text
+        BEFORE the loop, so it can no longer land on a sentence boundary
+        INSIDE the loop the way searching the whole text did.
+      - span sits in the middle: keep `trim_to_last_sentence(text[:start])`
+        before it AND `text[end:]` after it, with only the flagged span
+        itself collapsed to `_DEGENERATE_SPAN_MARKER` — the reader (the
+        model, on the next request) sees everything except the loop/scream/
+        array itself, not a placeholder standing in for the whole answer.
+      - no span (decoration fraction, script drift, the list-run backstop —
+        see `_reply_degenerate_verdict`'s comment on which rules have one):
+        falls back to the `keep_middle=False` rule above; there is nothing
+        to cut AROUND.
+    Only a single span is handled (the one `_reply_degenerate_verdict`'s
+    "longest match wins" logic already picked as worst); a reply with two
+    independently-flagged spans is not split apart further, same limit the
+    detector itself already has (see its own docstring on LONGEST match).
     """
-    head = decide_memory_tail(text, finished=False, truncated=True, holed=False)
-    if head.store and head.text.strip():
-        return head.text, True
+    if not keep_middle:
+        head = decide_memory_tail(text, finished=False, truncated=True, holed=False)
+        if head.store and head.text.strip():
+            return head.text, True
+        return placeholder, False
+
+    # REPEATED UNTIL CLEAN (coordinator review, real data). One cut is not
+    # always enough: the span the detector reports can start after the loop
+    # really began (a phrase loop measured from its tail window; a fragment
+    # line inside a longer degenerate stretch), so the kept head can itself
+    # still be flagged. On the 2026-09-16 backup, 10 of 67 flagged replies
+    # were still flagged after one cut. The tail-loop rule looks at most
+    # _TAIL_LOOP_WINDOW characters, so each pass removes at most that much of
+    # a phrase loop: a 22k-character loop needs ~6 passes. Re-judge and cut
+    # again while the text keeps shrinking, up to _DEGENERATE_CUT_MAX_PASSES
+    # (her longest reply, 51k characters, needs ~13); whatever is still
+    # flagged after that goes out as the placeholder, never as loop text.
+    # Memoized per (digest, placeholder): OpenWebUI resends the same flagged
+    # turn on every later request, and this is several detector passes.
+    key = (
+        hashlib.blake2b(text.encode("utf-8", "surrogatepass"), digest_size=16).digest(),
+        placeholder,
+    )
+    with _DEGENERATE_VERDICT_LOCK:
+        hit = _DEGENERATE_CUT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    content, kept = _cut_degenerate_span_once(text, placeholder)
+    for _ in range(_DEGENERATE_CUT_MAX_PASSES):
+        if not kept or not reply_is_degenerate(content):
+            break
+        nxt, nkept = _cut_degenerate_span_once(content, placeholder)
+        if nkept and len(nxt) >= len(content):
+            content, kept = placeholder, False
+            break
+        content, kept = nxt, nkept
+    else:
+        if kept and reply_is_degenerate(content):
+            content, kept = placeholder, False
+    result = (content, kept)
+    with _DEGENERATE_VERDICT_LOCK:
+        _DEGENERATE_CUT_CACHE[key] = result
+        while len(_DEGENERATE_CUT_CACHE) > 1024:
+            _DEGENERATE_CUT_CACHE.popitem(last=False)
+    return result
+
+
+_DEGENERATE_CUT_MAX_PASSES = 64
+_DEGENERATE_CUT_CACHE: "collections.OrderedDict[tuple, tuple[str, bool]]" = collections.OrderedDict()
+
+
+def _cut_degenerate_span_once(text: str, placeholder: str) -> tuple[str, bool]:
+    """One cut around the span `_reply_degenerate_verdict` reports (see
+    `_degenerate_replacement_content(keep_middle=True)` for the rules)."""
+    _reason, start, end = _reply_degenerate_verdict(text)
+    if _reason is None:
+        return text, True
+    if start is None or end is None:
+        head = decide_memory_tail(text, finished=False, truncated=True, holed=False)
+        if head.store and head.text.strip():
+            return head.text, True
+        return placeholder, False
+
+    pre = trim_to_last_sentence(text[:start]).strip()
+    post = text[end:].strip()
+    if end >= len(text.rstrip()):
+        # Runs to the end: nothing after it worth keeping.
+        if len(pre) >= MIN_MEMORABLE_TRIMMED_CHARS:
+            return pre, True
+        return placeholder, False
+    if pre or post:
+        combined = "\n\n".join(p for p in (pre, _DEGENERATE_SPAN_MARKER, post) if p)
+        return combined, True
     return placeholder, False
 
 
@@ -4916,6 +5150,29 @@ def _enforce_hard_budget(
             # test_p5_guard.py's timing section for the measured bound.
             _turn_idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
             _floor = max(1, KEEP_RECENT_TURNS)
+            # F1 (p7 hostile pass #7): split_messages ALIGNS its kept-recent
+            # window to start on a USER turn (leading non-user turns move
+            # into the summarized portion — required so the template stays
+            # valid; see split_messages's docstring). At KEEP_RECENT_TURNS=4
+            # a real request keeps 3 messages, not 4. This floor used to be
+            # the raw KEEP_RECENT_TURNS message count, so with any preserved
+            # OLD turn (an image, most often) sitting where the 4th-from-end
+            # slot would be, this guard counted it as "recent" and protected
+            # it from the shed loop above — spending injected memory (halving,
+            # then dropping facts/retrieval) to keep a turn split_messages had
+            # already decided was old enough to summarize away. If the array
+            # still didn't fit, the plain shed loop a few lines down dropped
+            # that same turn anyway, so the memory was spent for nothing.
+            # Fix: align the floor the same way split_messages aligns its
+            # window, so "recent" means the same thing in both places.
+            if len(_turn_idxs) >= _floor:
+                _aligned_tail = _turn_idxs[-_floor:]
+                while (
+                    len(_aligned_tail) > 1
+                    and msgs[_aligned_tail[0]].get("role") != "user"
+                ):
+                    _aligned_tail = _aligned_tail[1:]
+                _floor = max(1, len(_aligned_tail))
             _n_turns = len(_turn_idxs)
             _cut = 0        # how many of the OLDEST entries of _turn_idxs go
             _freed = 0      # tokens that shedding them frees
@@ -6934,7 +7191,7 @@ def _redact_forwarded_loop_replies(messages: list[dict]) -> tuple[list[dict], in
             and reply_is_degenerate(_message_text(m))
         ):
             content, _kept_head = _degenerate_replacement_content(
-                _message_text(m), _DEGENERATE_FORWARD_PLACEHOLDER
+                _message_text(m), _DEGENERATE_FORWARD_PLACEHOLDER, keep_middle=True
             )
             m = {**m, "content": content}
             replaced += 1
@@ -7004,11 +7261,25 @@ def _translate_ollama_sampling_params(body: dict, conv_id: str | None) -> None:
     conv_key = conv_id or "?"
 
     def _coerce_positive_float(value):
+        # F4 (p7 hostile pass #7): a string "inf" / "Infinity" / "1e999" (or
+        # a numeric 1e999, which `json.loads`'s default float() already
+        # parses to inf) satisfied `f > 0` and was forwarded as-is. httpx
+        # 0.28.1 encodes the outgoing JSON with `allow_nan=False`, so the
+        # forward raised `ValueError: Out of range float values are not
+        # JSON compliant: inf` from inside the proxy, AFTER compaction and
+        # injection had already spent the turn on a request that was never
+        # going to reach vLLM (see the docstring above this function). Also
+        # reject bool: `isinstance(True, float)` is False but `float(True)
+        # == 1.0` silently accepts it as if it were a real penalty someone
+        # chose, when it is almost certainly a client typo (a flag value
+        # leaking into a numeric field).
+        if isinstance(value, bool):
+            return None
         try:
             f = float(value)
         except (TypeError, ValueError):
             return None
-        if not (f > 0):
+        if not (f > 0) or not math.isfinite(f):
             return None
         return f
 
@@ -7017,38 +7288,69 @@ def _translate_ollama_sampling_params(body: dict, conv_id: str | None) -> None:
 
     if had_repeat_penalty:
         raw = body.pop("repeat_penalty")
+        coerced_repeat = _coerce_positive_float(raw)
         if had_repetition_penalty:
-            # repetition_penalty wins; repeat_penalty is just discarded.
-            if _log_sampling_translation_once(f"repeat_penalty.both.{conv_key}"):
-                logger.info(
-                    f"conv={conv_key}: request set both repeat_penalty and "
-                    f"repetition_penalty; keeping repetition_penalty="
-                    f"{body['repetition_penalty']!r} and dropping repeat_penalty"
+            # F4: repetition_penalty used to win unconditionally, even when
+            # ITS OWN value was invalid — so
+            # {"repeat_penalty": 1.1, "repetition_penalty": "abc"} forwarded
+            # NEITHER penalty: the invalid repetition_penalty was dropped
+            # below and the client's one valid value (repeat_penalty) had
+            # already been discarded here. repetition_penalty still wins
+            # when it is itself valid; otherwise fall back to the coerced
+            # repeat_penalty rather than losing both.
+            existing_valid = _coerce_positive_float(body.get("repetition_penalty"))
+            if existing_valid is not None:
+                if _log_sampling_translation_once(f"repeat_penalty.both.{conv_key}"):
+                    logger.info(
+                        f"conv={conv_key}: request set both repeat_penalty and "
+                        f"repetition_penalty; keeping repetition_penalty="
+                        f"{body['repetition_penalty']!r} and dropping repeat_penalty"
+                    )
+            elif coerced_repeat is not None:
+                _invalid = body.get("repetition_penalty")
+                body["repetition_penalty"] = coerced_repeat
+                logger.warning(
+                    f"conv={conv_key}: repetition_penalty="
+                    f"{_invalid!r} was invalid; using "
+                    f"repeat_penalty={raw!r} ({coerced_repeat!r}) instead of "
+                    f"dropping both"
                 )
+            # else: both invalid — the general repetition_penalty validation
+            # below drops whatever invalid value is still sitting in body.
         else:
-            coerced = _coerce_positive_float(raw)
-            if coerced is None:
+            if coerced_repeat is None:
                 logger.warning(
                     f"conv={conv_key}: dropping repeat_penalty={raw!r} (not a "
-                    f"positive number) — not forwarded as repetition_penalty"
+                    f"positive finite number) — not forwarded as "
+                    f"repetition_penalty"
                 )
             else:
-                body["repetition_penalty"] = coerced
+                body["repetition_penalty"] = coerced_repeat
                 if _log_sampling_translation_once(f"repeat_penalty.{conv_key}"):
                     logger.info(
                         f"conv={conv_key}: translated Ollama repeat_penalty="
-                        f"{raw!r} to vLLM repetition_penalty={coerced!r} "
+                        f"{raw!r} to vLLM repetition_penalty={coerced_repeat!r} "
                         f"(vLLM 0.19 does not recognise repeat_penalty and "
                         f"ignores it silently otherwise)"
                     )
 
-    # A numeric-string repetition_penalty (however it arrived) must still be
-    # a float by the time it reaches vLLM's schema.
-    if "repetition_penalty" in body and isinstance(body["repetition_penalty"], str):
+    # Any repetition_penalty (numeric or string, however it arrived) must be
+    # a positive FINITE float by the time it reaches vLLM's schema — not only
+    # a string one. A numeric 1e999 (parsed to inf at JSON-decode time) or a
+    # string "inf"/"Infinity" both used to pass the old `isinstance(..., str)`
+    # gate straight through (the numeric case) or be coerced to `inf` itself
+    # (the string case), and either one 500s the forward the same way F4
+    # documents for repeat_penalty.
+    if "repetition_penalty" in body and not (
+        isinstance(body["repetition_penalty"], (int, float))
+        and not isinstance(body["repetition_penalty"], bool)
+        and math.isfinite(body["repetition_penalty"])
+        and body["repetition_penalty"] > 0
+    ):
         coerced = _coerce_positive_float(body["repetition_penalty"])
         if coerced is None:
             logger.warning(
-                f"conv={conv_key}: dropping non-numeric repetition_penalty="
+                f"conv={conv_key}: dropping invalid repetition_penalty="
                 f"{body['repetition_penalty']!r}"
             )
             del body["repetition_penalty"]

@@ -26,27 +26,84 @@ pass-through-unknown-keys behavior to vLLM, which does not recognise it —
 - **Ollama sampling-name translation.** `repeat_penalty` is translated to
   `repetition_penalty` before forwarding (coerced to a positive float; a bad
   value is dropped with a WARNING, never forwarded). If both are present,
-  `repetition_penalty` wins. `repeat_last_n` has no vLLM equivalent and is
-  dropped with a note. A numeric-string `repetition_penalty` is coerced to
-  float. Logged at INFO, at most once per conversation-id per process
+  `repetition_penalty` wins **when it is itself valid**; otherwise the
+  coerced `repeat_penalty` is used instead of losing both values.
+  `repeat_last_n` has no vLLM equivalent and is dropped with a note. A
+  numeric-string `repetition_penalty` is coerced to float. **Non-finite
+  values are rejected** (a string `"inf"`/`"Infinity"`/`"1e999"`, or a
+  numeric `1e999`, used to be coerced to a real `inf` and forwarded, which
+  httpx's encoder then refused to serialize — a 500 from inside the proxy,
+  after compaction and memory injection had already spent the turn; hostile
+  pass #7, F4). Logged at INFO, at most once per conversation-id per process
   (bounded set — see `_translate_ollama_sampling_params` in `main.py`).
 - **Detected loop replies are now kept out of what is FORWARDED to vLLM**,
   not only out of what is memorized. After compaction and memory injection,
   before the hard-budget guard, every non-newest degenerate ASSISTANT turn is
-  replaced with a short neutral placeholder (`_redact_forwarded_loop_replies`
-  in `main.py`) — the same clean-sentence-head rule the rollup-input
-  redaction already applied, now shared via one helper so the two sites
-  cannot drift apart. User turns, system messages and the newest message are
-  never touched. Logged at INFO as a count only (no text).
+  replaced (`_redact_forwarded_loop_replies` in `main.py`) — but **only the
+  flagged SPAN is collapsed, not the whole reply**, when the detector can
+  locate one (a token run, a phrase repeating to the end, a single-character
+  run, or an unbroken fragment line): the clean text before it, and after it
+  when the span sits mid-reply, both reach the model. Real-data measurement
+  (hostile pass #7, F2) showed the earlier whole-reply-replacement rule threw
+  away a real, clean answer of up to 21.6k characters on 33 of 68 flagged
+  replies, because a PHRASE loop ends on sentence boundaries and the old
+  "trim to the last sentence, re-judge" rule could not cut it at all. The
+  cut repeats until what is left is no longer flagged (the phrase rule looks
+  at a 4,000-character window, so one cut can leave part of a long loop in
+  place; on the 2026-09-16 backup that was 10 of 67 flagged replies before
+  this, 0 after). A reply with no span to cut around (decoration fraction,
+  script drift, the short-list-run backstop) falls back to its clean
+  sentence head; only a reply with no clean text worth keeping gets the
+  whole-reply placeholder (10 of 67 on that backup, down from 51 of 68). Fenced
+  code is now excluded from the token-run rule (a repeated-value array in a
+  ```code``` block is no longer flagged, matching the fragment-line rule's
+  existing fence handling; hostile pass #7, F3). User turns, system
+  messages and the newest message are never touched. Logged at INFO as a
+  count only (no text). Apart from the fenced-code exemption above, the
+  detection rules and thresholds are unchanged; note that the exemption
+  applies wherever `reply_is_degenerate` is used, including the memory skip.
+  A new internal helper (`_reply_degenerate_verdict`) exposes the flagged
+  span alongside the same reason string, cached per 128-bit content digest
+  (not the text itself, so the cache holds no reply text) so a
+  conversation OpenWebUI resends unchanged on every later request only pays
+  the detection cost once per turn, not once per request (measured
+  0.78-0.83s CPU per request on an 811-message real conversation before
+  caching; hostile pass #7, F5). The ROLLUP-input redaction
+  (`_redact_degenerate_turns`, memory-side, pre-existing) is UNCHANGED —
+  this release does not have the real-data basis to prove the same
+  span-cutting rule is safe there.
+- **The hard-budget guard's recent-turn floor is now aligned the same way
+  `split_messages` aligns its own kept-recent window** (starts on a user
+  turn; an odd turn count means the real window can hold one fewer message
+  than `KEEP_RECENT_TURNS`). The floor used to be the raw message count, so
+  an old, unpaired turn (most often a retained image) sitting in the
+  misaligned slot was protected from the pre-shed loop and could cost
+  injected memory (facts/retrieval halved or dropped) to keep a turn that
+  was not actually inside the real recent window — and could still be
+  dropped anyway by a later shedding stage, spending the memory for nothing
+  (hostile pass #7, F1).
 
 Operator note: see [RUNPOD_DEPLOY.md → Sampling parameters](RUNPOD_DEPLOY.md#sampling-parameters)
 for the mapping between OpenWebUI's Advanced/Custom Parameters and vLLM's
-names, and recommended starting values for this model.
+names, and recommended starting values for this model — **Max Tokens 12000,
+not 7000**: this model measures 2.0-2.4 characters/token on assistant
+replies (not the 4 chars/token a naive estimate assumes), so 7000 tokens is
+only ~14-17k characters and would cut some of her ordinary long replies
+mid-sentence (hostile pass #7, F6). `repetition_penalty` is now recommended
+at 1.05 with Frequency Penalty 0.3, because vLLM 0.19 applies
+`repetition_penalty` to prompt tokens as well as output — a high value
+discourages words already in the conversation/memory context, not only
+words already said in this reply.
 
 Does NOT fix: the model degenerating in the first place (that is a sampling/
 model-behavior problem, mitigated by the `repetition_penalty` translation
-above, not eliminated by it); the injected-memory-hierarchy's own placeholder
-wording (unchanged, memory-only).
+above, not eliminated by it); the injected-memory-hierarchy's own
+(`_redact_degenerate_turns`) whole-reply placeholder wording, left
+unchanged; the decoration-fraction/script-drift/short-list-run verdicts,
+which still fall back to whole-reply replacement in the forwarded window
+because they have no single span to cut around; the pre-existing
+TARGET-based stand-in budget gap above roughly 16k max_tokens (not
+triggered at the recommended 12000; tracked, deferred).
 
 ---
 
