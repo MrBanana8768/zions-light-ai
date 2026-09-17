@@ -2376,6 +2376,45 @@ _TAIL_LOOP_MAX_UNIT = 400
 _TOKEN_RUN_RE = re.compile(r"(\S{3,40})(?:[ _\n\t]*\1){3,}")
 
 
+# Shared by trim_to_last_sentence, _reply_degenerate_verdict_uncached's
+# token-run fence exemption, and _trim_forwarded_prefix: each independently
+# scanned `text.splitlines(keepends=True)` for lines starting with ``` and
+# built the same list of toggle offsets, before this existed (P8-2, hostile
+# pass #8 review follow-up — "a rule applied at one call site and missed at
+# its identical sibling"). One function now, so a future change to what
+# counts as a fence delimiter cannot update two of the three copies and miss
+# the third.
+def _fence_toggle_offsets(text: str) -> list[int]:
+    """Character offsets of every ``` fence-delimiter LINE in `text`, in
+    order of appearance. `bisect.bisect_right(offsets, i) % 2 == 1` means
+    position `i` sits after an ODD number of toggles — i.e. inside a fence
+    that has opened but not (yet, by position `i`) closed again."""
+    toggles: list[int] = []
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        if line.strip().startswith("```"):
+            toggles.append(pos)
+        pos += len(line)
+    return toggles
+
+
+def _in_open_fence(toggles: list[int], i: int) -> bool:
+    """True when `i` sits inside a fence, whether or not that fence ever
+    closes again later in the text. This is trim_to_last_sentence's rule: a
+    cut boundary must never land inside an unterminated ``` opener, closed
+    or not — the store never sees an unbalanced fence either way."""
+    return bool(toggles) and bisect.bisect_right(toggles, i) % 2 == 1
+
+
+def _in_closed_fence(toggles: list[int], i: int) -> bool:
+    """True only when `i` is inside a fence that goes on to CLOSE (a later
+    toggle exists past it). An opener with nothing left to close it does
+    NOT count, even though bisect alone cannot tell the two apart from `i`'s
+    side — see the P8-2 comment at this function's one caller."""
+    idx = bisect.bisect_right(toggles, i)
+    return idx % 2 == 1 and idx < len(toggles)
+
+
 def _tail_loop_span(text: str) -> int:
     """Characters occupied by a unit that repeats at the very END of `text`.
 
@@ -2764,20 +2803,40 @@ def _reply_degenerate_verdict_uncached(text: str) -> tuple[str | None, int | Non
     # already skips fenced code; this brings the token rule in line with
     # it. Same toggle-list-plus-bisect shape trim_to_last_sentence uses, so
     # a candidate's fence membership costs one bisect, not a rescan.
-    _fence_toggles: list[int] = []
-    _fpos = 0
-    for _fline in text.splitlines(keepends=True):
-        if _fline.strip().startswith("```"):
-            _fence_toggles.append(_fpos)
-        _fpos += len(_fline)
+    #
+    # P8-2 (hostile pass #8): that first version used _in_open_fence's rule
+    # (in ANY fence, closed or not) — fine for trim_to_last_sentence, which
+    # only ever needs to avoid landing a CUT inside an unterminated opener,
+    # but wrong here. An unmatched ``` opener then fenced everything after
+    # it FOREVER (an odd toggle count has no later toggle to end it, so
+    # every position past it still bisects "odd"). This model uses bare
+    # ``` lines as decorative boxes — 128 of 1,709 unique real replies in
+    # the 2026-09-16 backup have an ODD count — so a real identifier loop
+    # starting after the last (unmatched) opener and running to the end of
+    # the reply was exempted and stored to memory verbatim; v3.1.9 flagged
+    # it, this exemption silently un-flagged it (three verdicts changed
+    # across the whole backup, one of them this shape). Fixed two ways,
+    # both required, per the finding:
+    #   1. A run only counts as "in a fence" when the fence actually CLOSES
+    #      again later (`_in_closed_fence`, not `_in_open_fence`) — an
+    #      opener with nothing left to close it protects nothing.
+    #   2. Even inside a fence that does close, a run is NEVER exempted if
+    #      it reaches the (stripped) end of the reply — that is exactly the
+    #      tail-loop shape this rule exists to catch, and "the box around
+    #      it happens to be closed" is not evidence the run itself is code.
+    # p7's F3 case (a repeated-value array inside a fence that closes,
+    # mid-reply, nowhere near the end) is unaffected by either change.
+    _fence_toggles = _fence_toggle_offsets(text)
+    _stripped_len = len(text.rstrip())
 
-    def _tm_in_fence(i: int) -> bool:
-        return bool(_fence_toggles) and bisect.bisect_right(_fence_toggles, i) % 2 == 1
+    def _tm_in_fence(i: int, j: int) -> bool:
+        return _in_closed_fence(_fence_toggles, i) and j < _stripped_len
 
     tm = max(
         (
             x for x in _TOKEN_RUN_RE.finditer(text)
-            if any(c.isalnum() for c in x.group(1)) and not _tm_in_fence(x.start())
+            if any(c.isalnum() for c in x.group(1))
+            and not _tm_in_fence(x.start(), x.end())
         ),
         key=lambda x: len(x.group(0)),
         default=None,
@@ -3302,41 +3361,134 @@ def _degenerate_replacement_content(
     # were still flagged after one cut. The tail-loop rule looks at most
     # _TAIL_LOOP_WINDOW characters, so each pass removes at most that much of
     # a phrase loop: a 22k-character loop needs ~6 passes. Re-judge and cut
-    # again while the text keeps shrinking, up to _DEGENERATE_CUT_MAX_PASSES
-    # (her longest reply, 51k characters, needs ~13); whatever is still
-    # flagged after that goes out as the placeholder, never as loop text.
+    # again while the text keeps shrinking, up to a budget-derived pass count
+    # (her longest reply, 51k characters, needs ~13, well inside it); whatever
+    # is still flagged after that goes out as the placeholder, never as loop
+    # text, and it is LOGGED (P8-5/P8-8, hostile pass #8 — the old version
+    # fell back silently, so an operator could not tell "a real loop this
+    # large happened" from any other placeholder cause).
+    #
+    # P8-5: a fixed PASS COUNT bounds passes, not CPU — each pass costs
+    # roughly len(content) of regex scanning, so _DEGENERATE_CUT_MAX_PASSES
+    # (64) over a 300k-character pathological loop measured 2.2s of
+    # GIL-bound CPU on first sight; no real reply has come anywhere near
+    # that (her longest is 51k). Bound total CHARACTERS scanned across all
+    # passes instead of a flat pass count: for anything up to several times
+    # her real maximum this is still the full 64 passes (unchanged
+    # behaviour); a pathological input far beyond that gets fewer, cheaper
+    # passes before giving up, instead of grinding through 64 of them.
     # Memoized per (digest, placeholder): OpenWebUI resends the same flagged
     # turn on every later request, and this is several detector passes.
     key = (
         hashlib.blake2b(text.encode("utf-8", "surrogatepass"), digest_size=16).digest(),
         placeholder,
     )
-    with _DEGENERATE_VERDICT_LOCK:
-        hit = _DEGENERATE_CUT_CACHE.get(key)
-    if hit is not None:
-        return hit
+    # P8-8 (hostile pass #8): COMPACTOR_DEGENERATE_VERDICT_CACHE_SIZE=0 used
+    # to disable only _reply_degenerate_verdict's cache — this cache, whose
+    # VALUES are the kept replacement TEXT (not just a verdict tuple), kept
+    # caching regardless, at a hard-coded 1,024 entries. An operator who set
+    # that env var to 0 specifically to stop caching reply content in this
+    # process (the CHANGELOG's own "the cache holds no reply text" claim was
+    # false for exactly this cache, see P8-8) got no effect here at all.
+    # Same env var, both caches.
+    if _DEGENERATE_VERDICT_CACHE_SIZE > 0:
+        with _DEGENERATE_VERDICT_LOCK:
+            hit = _DEGENERATE_CUT_CACHE.get(key)
+        if hit is not None:
+            return hit
+    _max_passes = max(
+        1, min(_DEGENERATE_CUT_MAX_PASSES, _DEGENERATE_CUT_BUDGET_CHARS // max(1, len(text)))
+    )
     content, kept = _cut_degenerate_span_once(text, placeholder)
-    for _ in range(_DEGENERATE_CUT_MAX_PASSES):
+    for _ in range(_max_passes):
         if not kept or not reply_is_degenerate(content):
             break
         nxt, nkept = _cut_degenerate_span_once(content, placeholder)
         if nkept and len(nxt) >= len(content):
+            logger.warning(
+                f"degenerate-cut: a cut pass on a {len(text)}-char reply "
+                f"stopped shrinking at {len(content)} chars while still "
+                f"flagged degenerate; falling back to the whole-reply "
+                f"placeholder"
+            )
             content, kept = placeholder, False
             break
         content, kept = nxt, nkept
     else:
         if kept and reply_is_degenerate(content):
+            logger.warning(
+                f"degenerate-cut: a {len(text)}-char reply was still "
+                f"flagged after {_max_passes} cut pass(es); falling back "
+                f"to the whole-reply placeholder instead of forwarding or "
+                f"storing loop text"
+            )
             content, kept = placeholder, False
     result = (content, kept)
-    with _DEGENERATE_VERDICT_LOCK:
-        _DEGENERATE_CUT_CACHE[key] = result
-        while len(_DEGENERATE_CUT_CACHE) > 1024:
-            _DEGENERATE_CUT_CACHE.popitem(last=False)
+    if _DEGENERATE_VERDICT_CACHE_SIZE > 0:
+        with _DEGENERATE_VERDICT_LOCK:
+            _DEGENERATE_CUT_CACHE[key] = result
+            while len(_DEGENERATE_CUT_CACHE) > 1024:
+                _DEGENERATE_CUT_CACHE.popitem(last=False)
     return result
 
 
 _DEGENERATE_CUT_MAX_PASSES = 64
+# P8-5: total characters a reply may have scanned across every cut pass
+# combined (see the comment at this constant's one use, above). 60,000 is
+# comfortably above her longest real reply (51k), so nothing observed in
+# production loses even one pass to this; it only shortens the pathological
+# tail (a loop far beyond anything her real replies reach).
+_DEGENERATE_CUT_BUDGET_CHARS = _DEGENERATE_CUT_MAX_PASSES * 60_000
 _DEGENERATE_CUT_CACHE: "collections.OrderedDict[tuple, tuple[str, bool]]" = collections.OrderedDict()
+
+
+def _trim_forwarded_prefix(text: str) -> str:
+    """The longest prefix of `text` to keep before a degenerate span, for
+    the FORWARDED window only (`_cut_degenerate_span_once`'s `pre`).
+
+    P8-3 (hostile pass #8): `trim_to_last_sentence` refuses any boundary
+    inside a ``` fence — the right rule for the MEMORY-side redaction
+    (`_redact_degenerate_turns`, keep_middle=False): an unterminated opener
+    must never reach facts.py's line filter, and a `.` inside code is not a
+    sentence end anyway. It is the wrong rule here: this text is shown to
+    the model as ordinary conversation HISTORY, nothing is extracted from
+    it, so a boundary INSIDE a fence costs nothing. Real-data measurement
+    (P8-3): this model writes long replies as prose broken up by
+    decorative ``` boxes, and the fence exclusion can throw away
+    everything back to the last sentence end OUTSIDE a box — the WHOLE
+    reply in one real case (the last sentence sat inside a box 4 characters
+    before the loop), about 11,080 characters of boxes-and-prose in
+    another.
+
+    Longest prefix ending at a real sentence boundary (fence or no fence)
+    OR a line break, whichever reaches further: a code box rarely ends in
+    terminal punctuation, so the line-break fallback is what actually saves
+    most of a box's own content when the true sentence boundary sits well
+    before it or inside it.
+
+    Self-balancing (P8-4): if the kept prefix has an ODD number of ```
+    lines (opened, never closed within it — the cut can now legally land
+    there, unlike trim_to_last_sentence), a closing ``` line is appended so
+    this prefix ALONE stays a well-formed fence pair. Otherwise everything
+    the model reads after it — the marker, and any `post` text
+    `_cut_degenerate_span_once` appends after that — would open as code.
+    """
+    if not text:
+        return ""
+    end = 0
+    for m in _SENTENCE_END_RE.finditer(text):
+        i = m.start()
+        if not _is_real_sentence_end(text, i):
+            continue
+        end = m.end()
+    cut_end = max(end, text.rfind("\n") + 1)
+    if cut_end <= 0:
+        return ""
+    cut = text[:cut_end]
+    _fences = sum(1 for line in cut.splitlines() if line.strip().startswith("```"))
+    if _fences % 2 == 1:
+        cut = cut.rstrip("\n") + "\n```"
+    return cut
 
 
 def _cut_degenerate_span_once(text: str, placeholder: str) -> tuple[str, bool]:
@@ -3351,7 +3503,10 @@ def _cut_degenerate_span_once(text: str, placeholder: str) -> tuple[str, bool]:
             return head.text, True
         return placeholder, False
 
-    pre = trim_to_last_sentence(text[:start]).strip()
+    # P8-3: use the forwarded-only prefix rule (fence boundaries allowed,
+    # self-balanced) instead of the memory-side trim_to_last_sentence — see
+    # _trim_forwarded_prefix's docstring.
+    pre = _trim_forwarded_prefix(text[:start]).strip()
     post = text[end:].strip()
     if end >= len(text.rstrip()):
         # Runs to the end: nothing after it worth keeping.
@@ -3359,7 +3514,28 @@ def _cut_degenerate_span_once(text: str, placeholder: str) -> tuple[str, bool]:
             return pre, True
         return placeholder, False
     if pre or post:
+        # P8-4 (hostile pass #8): a MID-reply span inside a CLOSED fence
+        # splits one box across `pre` (keeps the opener, now self-balanced
+        # by _trim_forwarded_prefix above) and `post` (keeps the box's own
+        # closer). Joined as `pre + marker + post`, the marker sits right
+        # after pre's own synthetic close, so post's leading text — which
+        # was INSIDE the box in the original — would read as plain prose
+        # until its own closer, then everything AFTER that stray closer
+        # opens as code with nothing left to end it. If the span started
+        # inside a fence in the ORIGINAL text, post is picking back up
+        # inside that same fence; prefix it with a fresh opener so its own
+        # leading text (up to its own real closer) renders exactly as it
+        # did originally.
+        if post and _in_open_fence(_fence_toggle_offsets(text), start):
+            post = "```\n" + post
         combined = "\n\n".join(p for p in (pre, _DEGENERATE_SPAN_MARKER, post) if p)
+        # Belt-and-braces: regardless of what the two pieces above did
+        # individually, the text actually forwarded must never itself
+        # carry an odd ``` count — an unbalanced fence here is exactly what
+        # leaves the REST of the conversation misread as code from this
+        # point on (P8-4's failure mode).
+        if sum(1 for ln in combined.splitlines() if ln.strip().startswith("```")) % 2 == 1:
+            combined = combined.rstrip() + "\n```"
         return combined, True
     return placeholder, False
 
@@ -3636,19 +3812,18 @@ def trim_to_last_sentence(text: str) -> str:
     if not text:
         return ""
     # Fence toggles as text offsets, so each candidate costs one bisect
-    # rather than a re-scan of everything before it. Same "line starts with
-    # ```" test reply_is_degenerate uses, so the two agree on what a fence is.
-    toggles: list[int] = []
-    pos = 0
-    for line in text.splitlines(keepends=True):
-        if line.strip().startswith("```"):
-            toggles.append(pos)
-        pos += len(line)
+    # rather than a re-scan of everything before it. Shared with
+    # reply_is_degenerate (_fence_toggle_offsets/_in_open_fence) so the two
+    # agree on what a fence is — this function wants ANY open fence,
+    # closed or not (a cut must never land inside an unterminated opener),
+    # unlike the token-run rule's `_in_closed_fence` (see P8-2's comment
+    # there for why the two rules need different fence definitions).
+    toggles = _fence_toggle_offsets(text)
     end = 0
     n = len(text)
     for m in _SENTENCE_END_RE.finditer(text):
         i = m.start()
-        if toggles and bisect.bisect_right(toggles, i) % 2 == 1:
+        if _in_open_fence(toggles, i):
             continue  # inside an open fence
         if not _is_real_sentence_end(text, i):
             continue
@@ -5170,6 +5345,34 @@ def _enforce_hard_budget(
                 while (
                     len(_aligned_tail) > 1
                     and msgs[_aligned_tail[0]].get("role") != "user"
+                ):
+                    _aligned_tail = _aligned_tail[1:]
+                # P8-1 (hostile pass #8): the role check above only strips a
+                # WRONG role. OpenWebUI sends an uploaded image as a USER
+                # turn (RUNPOD_DEPLOY.md: "OpenAI's standard multimodal
+                # format" puts an image part on the user message, never the
+                # assistant's), and compact_if_needed inserts its preserved
+                # OLD images (`preserved_images`) directly in front of the
+                # true keep_recent window — `system + summary_blocks +
+                # deferred + preserved_images + keep_recent`. So on a real
+                # request the window this floor looks at is
+                # [old_image(user), prev-u(user), prev-a(assistant),
+                # newest(user)]: it already "starts on a user turn" whether
+                # that first entry is the old image or the real first
+                # recent turn, so the check above strips nothing and the
+                # floor stayed at the raw KEEP_RECENT_TURNS count —
+                # protecting the old image from the shed loop below at the
+                # cost of injected memory (halved, then dropped) it never
+                # needed to spend. split_messages's own keep_recent window
+                # always ALTERNATES roles (a real exchange is never two
+                # consecutive user turns); an old image sitting in front of
+                # it breaks that alternation, so strip the front entry
+                # whenever it shares a role with the entry right after it —
+                # exactly the case the role-only check above cannot see.
+                while (
+                    len(_aligned_tail) > 1
+                    and msgs[_aligned_tail[0]].get("role")
+                    == msgs[_aligned_tail[1]].get("role")
                 ):
                     _aligned_tail = _aligned_tail[1:]
                 _floor = max(1, len(_aligned_tail))
@@ -7097,6 +7300,36 @@ def _reject_json_constant(name: str):
     """
     raise ValueError(f"{name} is not valid JSON for a request body")
 
+
+def _finite_json_float(s: str) -> float:
+    """`parse_float` for `json.loads`: like the default `float(s)`, but
+    raises for a numeral that parses to a NON-FINITE value.
+
+    P8-6 (hostile pass #8): `_reject_json_constant` above only intercepts
+    the bare `NaN` / `Infinity` / `-Infinity` CONSTANT names — an ordinary-
+    looking JSON NUMBER that merely overflows float range, like
+    `1e999`, never calls it at all; Python's json module hands it to
+    `parse_float` (or plain `float()`) which silently returns `inf`. That
+    body then parsed cleanly and looked ordinary: `{"max_tokens": 1e999}`
+    reached `int(body.get("max_tokens") or 0)` below, and `int(inf)` raises
+    `OverflowError`, which the surrounding `except (TypeError, ValueError)`
+    did not catch — a 500 from a client-supplied number the parser itself
+    could reject far more cheaply, before compaction or memory injection
+    ever touch the request. Any OTHER numeric sampling key (temperature,
+    presence/frequency penalty, ...) sending the same digits would reach
+    httpx's `allow_nan=False` encoder and 500 the same way F4 already
+    documented for repeat_penalty/repetition_penalty. Rejecting at PARSE
+    time, like `_reject_json_constant`, covers every numeric field at once
+    — the same reasoning that function's own docstring gives for NaN and
+    the bare Infinity constant applies just as well to an ordinary numeral
+    that merely evaluates to one.
+    """
+    f = float(s)
+    if not math.isfinite(f):
+        raise ValueError(f"{s} is not a finite JSON number")
+    return f
+
+
 def _unpaired_surrogate(obj: Any) -> str | None:
     """The UnicodeEncodeError text if `obj` cannot be written as UTF-8 JSON.
 
@@ -7161,9 +7394,9 @@ def _refuse_unpaired_surrogate(body: Any) -> None:
 _DEGENERATE_FORWARD_PLACEHOLDER = "[a short reply was given here]"
 
 
-def _redact_forwarded_loop_replies(messages: list[dict]) -> tuple[list[dict], int]:
-    """-> (copy of `messages` with degenerate ASSISTANT turns replaced, count
-    replaced).
+def _redact_forwarded_loop_replies(messages: list[dict]) -> tuple[list[dict], int, int]:
+    """-> (copy of `messages` with degenerate ASSISTANT turns touched, count
+    touched, count of those replaced WHOLE by the placeholder).
 
     Mirrors _redact_degenerate_turns (same detector, same clean-head rule,
     via the shared `_degenerate_replacement_content` helper) but is a
@@ -7177,9 +7410,19 @@ def _redact_forwarded_loop_replies(messages: list[dict]) -> tuple[list[dict], in
     the compaction stand-in, or (by construction, since only PRIOR turns are
     degenerate-checkable — the newest message is always the one this request
     is asking a reply TO) the newest message.
+
+    P8-8 (hostile pass #8): `touched` used to be the only count returned,
+    and the call site logged it as "replaced N ... with a placeholder" —
+    true in v3.1.9.2's first cut, false since P8-3/P8-4's span-cut fix: on
+    the 2026-09-16 backup only 10 of 66 flagged replies were replaced
+    WHOLE, the other 56 kept a clean head/tail and lost only the flagged
+    span. An operator could not tell "a whole answer vanished" from "one
+    short span was cut out of an otherwise-intact reply" from the log
+    alone. The third return value is exactly that split.
     """
     out = []
-    replaced = 0
+    touched = 0
+    whole = 0
     last_index = len(messages) - 1
     for i, m in enumerate(messages):
         if (
@@ -7190,13 +7433,15 @@ def _redact_forwarded_loop_replies(messages: list[dict]) -> tuple[list[dict], in
             and m.get("role") == "assistant"
             and reply_is_degenerate(_message_text(m))
         ):
-            content, _kept_head = _degenerate_replacement_content(
+            content, kept_head = _degenerate_replacement_content(
                 _message_text(m), _DEGENERATE_FORWARD_PLACEHOLDER, keep_middle=True
             )
             m = {**m, "content": content}
-            replaced += 1
+            touched += 1
+            if not kept_head:
+                whole += 1
         out.append(m)
-    return out, replaced
+    return out, touched, whole
 
 
 # ---------------------------------------------------------------------------
@@ -7382,7 +7627,9 @@ async def chat_completions(request: Request) -> Any:
     # and a client that sent nonsense deserves to be told which nonsense.
     _raw = await request.body()
     try:
-        body = json.loads(_raw, parse_constant=_reject_json_constant)
+        body = json.loads(
+            _raw, parse_constant=_reject_json_constant, parse_float=_finite_json_float
+        )
     except Exception as e:
         logger.warning(
             f"rejected chat request with an unparseable body "
@@ -7621,7 +7868,30 @@ async def chat_completions(request: Request) -> Any:
     # that move's reason on `inject_budget` itself.
     try:
         req_max_tokens = int(body.get("max_tokens") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # P8-6 (hostile pass #8): `int(inf)` raises OverflowError, not
+        # TypeError/ValueError — not caught here before this fix, so a
+        # non-finite max_tokens 500'd the proxy instead of falling into
+        # this branch. `_finite_json_float` (chat_completions's
+        # `json.loads`) now rejects a non-finite NUMERAL at parse time for
+        # every numeric field, closing that off before this line ever
+        # runs; this except is the second line of defence for any other
+        # unparseable shape (a string, a list, ...). Either way, the
+        # CLIENT'S OWN bad value must not silently ride along in `body` —
+        # this branch decided the budget math would treat it as absent (0)
+        # while leaving whatever the client actually sent untouched, so a
+        # value this guard could not parse could still reach vLLM as-is
+        # and fail there instead. Drop it and log, the same way
+        # _translate_ollama_sampling_params drops an invalid penalty
+        # rather than forwarding it unexamined — never silently REWRITE a
+        # value the client chose, only ever drop an invalid one.
+        if "max_tokens" in body:
+            logger.warning(
+                f"conv={conv_id or '?'}: dropping invalid max_tokens="
+                f"{body['max_tokens']!r} (not a finite integer) — not "
+                f"forwarded"
+            )
+            del body["max_tokens"]
         req_max_tokens = 0
     if req_max_tokens > MAX_MODEL_LEN // 2:
         # Pair with the reserve cap in effective_limit so prompt+completion
@@ -8032,17 +8302,27 @@ async def chat_completions(request: Request) -> Any:
     # CONTENT, and redacting first would make a degenerate turn unpaired,
     # so it would be treated as new and re-summarized on every request
     # instead of being recognised as already covered.
-    body["messages"], _loop_replaced = await run_in_threadpool(
+    body["messages"], _loop_touched, _loop_whole = await run_in_threadpool(
         _redact_forwarded_loop_replies, body["messages"]
     )
-    if _loop_replaced:
+    if _loop_touched:
         # Count only — no text. The rollup-input redaction already logs a
         # near-identical line for the same underlying detector; this one is
         # the forwarded-window twin and can fire on requests that never
         # trigger a rollup at all.
+        #
+        # P8-8 (hostile pass #8): this used to say "replaced N ... with a
+        # placeholder" unconditionally, which stopped being true once
+        # P8-3/P8-4 made cutting-around-the-span the common case (10 of 66
+        # flagged replies replaced whole on the 2026-09-16 backup, not all
+        # 66) — an operator could not tell a vanished answer from a
+        # trimmed one. whole=<k> names how many actually got the
+        # placeholder; the rest (touched - whole) kept a clean head/tail
+        # around the collapsed span.
         logger.info(
-            f"conv={conv_id or '?'}: replaced {_loop_replaced} degenerate "
-            f"assistant turn(s) in the forwarded window with a placeholder"
+            f"conv={conv_id or '?'}: touched {_loop_touched} degenerate "
+            f"assistant turn(s) in the forwarded window (whole={_loop_whole} "
+            f"cut={_loop_touched - _loop_whole})"
         )
     body["messages"] = await run_in_threadpool(
         _enforce_hard_budget,

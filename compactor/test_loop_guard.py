@@ -275,12 +275,12 @@ assert_true("repetition_penalty" not in sent, "[1g2] string repetition_penalty='
 # digits of a JSON NUMBER (not the bare `Infinity` CONSTANT chat_completions
 # already rejects at parse time via `parse_constant`). Python's own float()
 # happily turns the digit string "1e999" into inf during json.loads's number
-# parsing, which `parse_constant` never sees — that path is what F4 says was
-# already a hole before this lane (a pre-existing one; the string-to-inf
-# coercion this lane closes is a SEPARATE, new-in-.2 hole). json.dumps(1e999)
-# cannot be used to build this fixture: Python's own `1e999` LITERAL already
-# evaluates to inf before json.dumps ever sees it, so it would round-trip as
-# the `Infinity` constant, not as digits.
+# parsing, which `parse_constant` never saw before P8-6 (hostile pass #8) —
+# that path was a hole distinct from the string-to-inf coercion this lane
+# closed first (F4). json.dumps(1e999) cannot be used to build this fixture:
+# Python's own `1e999` LITERAL already evaluates to inf before json.dumps
+# ever sees it, so it would round-trip as the `Infinity` constant, not as
+# digits.
 _body_1e999 = (
     '{"model": "stub-model", "messages": ' + json.dumps(msgs) +
     ', "stream": false, "repetition_penalty": 1e999}'
@@ -301,12 +301,19 @@ try:
 finally:
     _lg.removeHandler(_h)
 _sent_direct = _StubVLLM.sent[-1] if _StubVLLM.sent else None
-assert_true(
-    _sent_direct is not None and "repetition_penalty" not in _sent_direct,
-    "[1g2] *** a numeric 1e999 repetition_penalty (parses to inf at JSON-decode "
-    "time, a pre-existing hole distinct from the string-'inf' one) is dropped "
-    "too, not just the string form",
+# P8-6 (hostile pass #8): this numeral used to reach
+# _translate_ollama_sampling_params, get coerced, and be dropped there
+# (the assertion this replaces). Now chat_completions's json.loads itself
+# (parse_float=_finite_json_float) rejects ANY numeral that overflows to
+# inf, for every numeric field at once — this request never reaches
+# translation, compaction or vLLM at all; it 400s at the door instead.
+assert_eq(
+    _r_direct.status_code, 400,
+    "[1g2] *** a numeric 1e999 repetition_penalty (any numeral that "
+    "overflows to inf, in ANY numeric field) is now rejected at JSON-parse "
+    "time with a 400, not coerced and forwarded",
 )
+assert_true(_sent_direct is None, "[1g2] the request never reached vLLM")
 
 # [1h] CONTROL: an ordinary finite repeat_penalty still translates normally —
 # the non-finite check does not accidentally reject real values.
@@ -334,6 +341,60 @@ r, sent, records = _post_chat(
 )
 assert_eq(sent.get("repetition_penalty"), 1.05, "[1j] CONTROL: a VALID repetition_penalty still wins")
 
+# [1k] P8-6 (hostile pass #8): a numeric max_tokens that overflows to inf
+# ("1e999", as literal JSON digits — see [1g2]'s comment on why this must
+# be built by hand, not via json.dumps) used to reach
+# int(body.get("max_tokens") or 0) and raise OverflowError, which the
+# surrounding `except (TypeError, ValueError)` did NOT catch — a 500 from
+# inside the proxy. It is now rejected at JSON-PARSE time with a 400, for
+# ANY numeral that overflows, not only this one field (chat_completions's
+# json.loads now takes parse_float=_finite_json_float).
+_body_max_tokens_1e999 = (
+    '{"model": "stub-model", "messages": ' + json.dumps(msgs) +
+    ', "stream": false, "max_tokens": 1e999}'
+)
+_StubVLLM.sent.clear()
+_h6 = _CaptureLogs()
+_lg6 = logging.getLogger("compactor")
+_lg6.addHandler(_h6)
+try:
+    with patch.object(main.httpx, "AsyncClient", _StubVLLM), \
+         patch.object(main, "_fire_and_forget", _swallow_tail):
+        _r6 = client.post(
+            "/v1/chat/completions",
+            content=_body_max_tokens_1e999,
+            headers={"X-Conversation-Id": "loop-r1-maxtokens-inf", "Content-Type": "application/json"},
+        )
+finally:
+    _lg6.removeHandler(_h6)
+assert_eq(
+    _r6.status_code, 400,
+    "[1k] *** P8-6: a max_tokens numeral that overflows to inf is REJECTED "
+    "with a 400, not a 500",
+)
+assert_true(not _StubVLLM.sent, "[1k] the request never reached vLLM")
+
+# [1l] CONTROL: an ordinary, finite max_tokens is untouched — the new
+# parse-time check does not reject real values, and a valid value is never
+# rewritten (only ever dropped when invalid, per P8-6).
+r, sent, records = _post_chat(msgs, "loop-r1-maxtokens-control", {"max_tokens": 500})
+assert_eq(r.status_code, 200, "[1l] CONTROL: an ordinary max_tokens request is accepted")
+assert_eq(sent.get("max_tokens"), 500, "[1l] CONTROL: a valid max_tokens is forwarded UNCHANGED, never rewritten")
+
+# [1m] P8-6: an UNPARSEABLE (but JSON-valid) max_tokens — a string — is
+# dropped from the forwarded body with a WARNING instead of riding along
+# unexamined. Before this fix, int(body.get("max_tokens") or 0) decided
+# the LOCAL budget math would treat it as absent (0), but left the
+# client's own bad value sitting untouched in `body`, still headed for
+# vLLM as-is.
+r, sent, records = _post_chat(msgs, "loop-r1-maxtokens-bad", {"max_tokens": "not-a-number"})
+assert_eq(r.status_code, 200, "[1m] a bad max_tokens does not fail the whole request")
+assert_true("max_tokens" not in sent, "[1m] *** P8-6: the invalid max_tokens is dropped, not forwarded as-is")
+assert_true(
+    _find(records, "dropping invalid max_tokens"),
+    "[1m] WARNING logged for the dropped bad value",
+)
+
 print()
 print("=" * 70)
 print("[2] R2 — degenerate assistant turns redacted from the FORWARDED window")
@@ -356,7 +417,8 @@ degenerate_forwarded = [m for m in sent_msgs if m.get("content") == DEGENERATE_T
 assert_true(not degenerate_forwarded, "[2a] raw degenerate text did not reach vLLM")
 placeholder_forwarded = [m for m in sent_msgs if m.get("content") == main._DEGENERATE_FORWARD_PLACEHOLDER]
 assert_true(bool(placeholder_forwarded), "[2a] placeholder present in forwarded body")
-assert_true(_find(records, "replaced 1 degenerate assistant turn"), "[2a] INFO count-only line logged")
+assert_true(_find(records, "touched 1 degenerate assistant turn"), "[2a] INFO count-only line logged")
+assert_true(_find(records, "whole=1 cut=0"), "[2a] *** P8-8: whole/cut split logged (DEGENERATE_TEXT has no clean head, so it is a WHOLE replacement)")
 
 # [2b] CONTROL: a healthy turn that is NOT the newest message is
 # byte-identical to what the client sent. (The newest user message gets the
@@ -379,7 +441,7 @@ r, sent, records = _post_chat(clean, "loop-r2-clean")
 non_newest_clean = {m["content"] for m in clean[:-1]}
 sent_contents = {m["content"] for m in sent["messages"] if m["role"] != "system"}
 assert_true(non_newest_clean.issubset(sent_contents), "[2c] CONTROL: clean earlier turns forwarded verbatim")
-assert_true(not _find(records, "replaced"), "[2c] CONTROL: no replacement logged for a clean conversation")
+assert_true(not _find(records, "touched"), "[2c] CONTROL: no replacement logged for a clean conversation")
 
 # [2d] the newest message is never touched even if the client asked to
 # continue a degenerate final assistant turn (continue_final_message=True).
@@ -506,18 +568,42 @@ assert_true("clinic opens at nine" in _h_sent_asst, "[2h] clean text BEFORE the 
 assert_true("meeting continued as planned" in _h_sent_asst, "[2h] clean text AFTER the scream reached vLLM")
 assert_true(_scream not in _h_sent_asst, "[2h] the scream itself did not reach vLLM")
 
-# [2i] p7 hostile pass #7, F3: a repeated-value array inside a fenced code
-# block is not flagged by the token rule at all (fenced code is now skipped
-# there, same as the fragment-line rule already skips it) -- CONTROL for the
-# fence-skip half of F3, independent of [2h]'s span-cut half.
+# [2i] p7 hostile pass #7, F3 + P8-2 (hostile pass #8): a repeated
+# IDENTIFIER-shaped token trips the token rule outside a fence, is exempt
+# inside a fence that CLOSES, and is flagged AGAIN after an UNCLOSED fence
+# opener. P8-7 (hostile pass #8): the OLD [2i] fixture here
+# ("[0.00, 0.00, 0.00, 0.00] " * 20) never matched _TOKEN_RUN_RE at all —
+# the brackets and commas break each row into four DIFFERENT space-
+# separated tokens ("[0.00,", "0.00,", "0.00,", "0.00]"), none of which
+# repeats three times in a row the way the regex requires — so the CONTROL
+# below passed whether or not fenced code was exempt from the token rule,
+# and the half of F3 that actually changed memory behaviour (P8-2: an
+# unclosed fence exempting a real loop) had NO test at all, in either
+# direction. Two mutants (nofence/closed, SP\p8\fencemut.py) left every
+# suite including this one at rc=0.
+_ID_UNIT = "identifier_run_9f3k2"  # 20 chars, alnum — a real _TOKEN_RUN_RE unit
+_ID_LOOP = (_ID_UNIT + " ") * 10   # well past DEGENERATE_TOKEN_RUN_CHARS (120)
+assert_true(
+    len(_ID_LOOP) >= main.DEGENERATE_TOKEN_RUN_CHARS,
+    "[2i] fixture sanity: the identifier run clears the token-run threshold",
+)
+assert_true(
+    main.reply_is_degenerate(_PROSE + _ID_LOOP) is not None,
+    "[2i] *** CONTROL: the identifier run trips the token rule when it is "
+    "NOT fenced at all — this fixture actually exercises _TOKEN_RUN_RE, "
+    "unlike the old '[0.00, ...]' array, which matched no rule at all",
+)
+
+# Inside a fence that CLOSES (p7's F3 shape): still exempt — unaffected by
+# P8-2's fix (see _reply_degenerate_verdict_uncached's comment).
 _codeblock_reply = (
-    _PROSE + "Here is the matrix:\n```\n" + ("[0.00, 0.00, 0.00, 0.00] " * 20) +
+    _PROSE + "Here is the matrix:\n```\n" + _ID_LOOP +
     "\n```\nLet me know if that helps, and I can explain any row you like."
 )
 assert_true(
     main.reply_is_degenerate(_codeblock_reply) is None,
-    "[2i] CONTROL: a repeated-value array INSIDE a fenced code block is not "
-    "flagged — fenced code is excluded from the token rule",
+    "[2i] CONTROL: the SAME identifier run inside a fence that CLOSES is "
+    "not flagged — fenced code is excluded from the token rule",
 )
 r, sent, records = _post_chat(
     [user("show me"), asst(_codeblock_reply), user("thanks")],
@@ -525,6 +611,153 @@ r, sent, records = _post_chat(
 )
 _i_sent_asst = next(m["content"] for m in sent["messages"] if m.get("role") == "assistant")
 assert_eq(_i_sent_asst, _codeblock_reply, "[2i] CONTROL: the code block reached vLLM untouched, verbatim")
+
+# [2i2] P8-2 (hostile pass #8): the SAME identifier run after an UNCLOSED
+# ``` line (a lone opener — this model's own decorative-box style; 128 of
+# 1,709 unique real replies in the 2026-09-16 backup have an odd ``` count)
+# is flagged AGAIN, not exempted forever, and is kept out of the forwarded
+# window — this is the check the finding says did not exist before this
+# lane, in either direction.
+_unclosed_fence_reply = _PROSE + "Here is a note:\n```\n" + _ID_LOOP
+assert_true(
+    main.reply_is_degenerate(_unclosed_fence_reply) is not None,
+    "[2i2] *** P8-2: the identifier run after an UNCLOSED ``` opener is "
+    "flagged — an unmatched opener must not exempt everything after it "
+    "forever",
+)
+r, sent, records = _post_chat(
+    [user("note this"), asst(_unclosed_fence_reply), user("thanks")],
+    "loop-r2-unclosed-fence",
+)
+_i2_sent_asst = next(m["content"] for m in sent["messages"] if m.get("role") == "assistant")
+assert_true(
+    _ID_UNIT * 3 not in _i2_sent_asst,
+    "[2i2] *** P8-2: the identifier loop after the unclosed fence did not "
+    "reach vLLM verbatim in the forwarded window",
+)
+assert_true(
+    "clinic opens at nine" in _i2_sent_asst,
+    "[2i2] the clean prose BEFORE the unclosed fence still reached vLLM",
+)
+
+# [2i3] P8-2: isolates the "must actually CLOSE" half of the fix from the
+# "never if it reaches the end" half — a MID-reply identifier run inside a
+# fence that NEVER closes anywhere in the whole reply (more prose follows
+# the run, so the run itself does NOT reach the stripped end) is still
+# flagged. A version of the fix that only checked "reaches the end" (and
+# exempted anything merely inside SOME open region, closed or not) would
+# wrongly exempt this — it never reaches the end, so that check alone
+# would not catch it.
+_mid_unclosed = (
+    _PROSE + "\n```\n" + _ID_LOOP +
+    "\nmore prose after the loop, and the fence never closes anywhere in "
+    "this whole reply, so by toggle count it stays open all the way to "
+    "the end even though the run itself is nowhere near that end."
+)
+assert_true(
+    main.reply_is_degenerate(_mid_unclosed) is not None,
+    "[2i3] *** P8-2: a MID-reply identifier run inside a fence that NEVER "
+    "closes is still flagged — exemption requires the fence to actually "
+    "CLOSE, not merely to still read as 'open' by toggle parity",
+)
+
+# [2j] P8-3 (hostile pass #8): the last real sentence of the reply sits
+# INSIDE a ``` box that never closes again (this model's own "box, then
+# runs to the end" shape — see P8-2's comment on how common the unclosed
+# form is), and a tail loop runs from right after it to the end. The OLD
+# memory-side rule (trim_to_last_sentence: no boundary inside ANY fence,
+# closed or not) would find NOTHING before this loop — the one real
+# sentence is excluded for being fenced, and nothing else in the prefix
+# ends in punctuation at all — so the whole reply would have gone out as
+# the placeholder. The forwarded path must do better: nothing is
+# extracted from this text, so a boundary inside the box is fine, and the
+# kept prefix must come back self-balanced (P8-4) even though the box it
+# was cut from never closes in the original.
+_p3_prefix_no_period = (
+    "Preliminary remark with no terminal punctuation anywhere in it at all "
+    "and it keeps going for a while without a single period question mark "
+    "or exclamation point anywhere in this whole stretch of ordinary words "
+    "so that the kept prefix clears the memorable-trim floor on its own "
+    "even before the box and its one real sentence are added after it here"
+)
+_p3_boxed_reply = (
+    _p3_prefix_no_period + "\n```\n"
+    "Final thought inside an unclosed box ends here.\n" + (RULE * 600)
+)
+assert_true(bool(main.reply_is_degenerate(_p3_boxed_reply)), "[2j] fixture: the tail run trips the detector")
+assert_eq(
+    main.decide_memory_tail(_p3_boxed_reply, finished=False, truncated=True, holed=False).outcome,
+    main.tailhealth.SKIPPED_NO_BOUNDARY,
+    "[2j] fixture sanity: the OLD memory-side rule (fence-restricted) finds "
+    "NO sentence boundary at all before the loop — the one real sentence "
+    "is excluded for sitting inside the (never-closing) box — so memory's "
+    "own rule (unchanged by this lane) falls back to nothing kept",
+)
+r, sent, records = _post_chat(
+    [user("note this down"), asst(_p3_boxed_reply), user("thanks, go on")],
+    "loop-r2-boxed-tail",
+)
+_j_sent_asst = next(m["content"] for m in sent["messages"] if m.get("role") == "assistant")
+assert_true(
+    _j_sent_asst != main._DEGENERATE_FORWARD_PLACEHOLDER,
+    "[2j] *** P8-3: NOT replaced whole — the sentence inside the unclosed "
+    "box is kept even though the memory-side rule cannot use it",
+)
+assert_true(
+    "Final thought inside" in _j_sent_asst,
+    "[2j] *** P8-3: the sentence that sat INSIDE the box reached vLLM",
+)
+assert_true(RULE not in _j_sent_asst, "[2j] the tail loop itself did not reach vLLM")
+assert_true(
+    sum(1 for _ln in _j_sent_asst.splitlines() if _ln.strip().startswith("```")) % 2 == 0,
+    "[2j] *** P8-4: the forwarded text has a BALANCED ``` count, even "
+    "though it was cut from a box that never closes in the original",
+)
+assert_true(
+    main.reply_is_degenerate(_j_sent_asst) is None,
+    "[2j] the forwarded text is not itself re-flagged as degenerate",
+)
+
+# [2k] P8-4 (hostile pass #8): a MID-reply span sitting INSIDE a fence that
+# DOES close (prose, box with a status line and the flagged run, more
+# prose after). The kept prefix and suffix are cut from two different
+# HALVES of the same original box; joined naively, that leaves ONE stray
+# ``` marker and everything after it misreads as code. Both the prose
+# BEFORE and the prose AFTER the box, plus the box's own non-degenerate
+# status line, must all still reach vLLM, and the result must stay
+# balanced.
+_p4_reply = (
+    _PROSE + "Here is a diagnostic dump:\n```\n" + (RULE * 300) +
+    "\nstatus: nominal\n```\n"
+    "Everything looks fine now, thanks for checking. And we can continue "
+    "with the next part of the plan."
+)
+assert_true(bool(main.reply_is_degenerate(_p4_reply)), "[2k] fixture: the boxed run trips the detector")
+r, sent, records = _post_chat(
+    [user("run the check"), asst(_p4_reply), user("and then?")],
+    "loop-r2-boxed-midspan",
+)
+_k_sent_asst = next(m["content"] for m in sent["messages"] if m.get("role") == "assistant")
+assert_true(
+    _k_sent_asst != main._DEGENERATE_FORWARD_PLACEHOLDER,
+    "[2k] *** P8-4: NOT replaced whole — a boxed mid-reply span costs at "
+    "most itself",
+)
+assert_true("clinic opens at nine" in _k_sent_asst, "[2k] clean prose BEFORE the box reached vLLM")
+assert_true(
+    "Everything looks fine now" in _k_sent_asst and "next part of the plan" in _k_sent_asst,
+    "[2k] clean prose AFTER the box reached vLLM",
+)
+assert_true(RULE not in _k_sent_asst, "[2k] the run itself did not reach vLLM")
+assert_true(
+    sum(1 for _ln in _k_sent_asst.splitlines() if _ln.strip().startswith("```")) % 2 == 0,
+    "[2k] *** P8-4: the forwarded text has a BALANCED ``` count — the box "
+    "split across the kept prefix and suffix did not leave a stray marker",
+)
+assert_true(
+    main.reply_is_degenerate(_k_sent_asst) is None,
+    "[2k] the forwarded text is not itself re-flagged as degenerate",
+)
 
 print()
 print("[3] pairing: fingerprinting happens on ORIGINAL text, before this redaction runs")
@@ -539,7 +772,7 @@ print("-" * 70)
 # BEFORE compaction) would visibly break pairing rather than silently no-op.
 _fp = summarizer._covered_turn_fingerprint
 _orig_fp = _fp(asst(DEGENERATE_TEXT))
-_redacted_msgs, _n = main._redact_forwarded_loop_replies(
+_redacted_msgs, _n, _n_whole = main._redact_forwarded_loop_replies(
     [user("x"), asst(DEGENERATE_TEXT), user("y")]
 )
 _redacted_fp = _fp(_redacted_msgs[1])
@@ -584,7 +817,7 @@ _covered_orig, _changed_orig = summarizer._coverage_plan(_pair_state, _pair_msgs
 assert_eq(_covered_orig, 20, "[3b] ORIGINAL messages: the whole seeded span reuses (compaction's real input)")
 assert_true(9 not in _changed_orig, "[3b] ORIGINAL: turn 10 (0-based index 9, the degenerate one) is NOT flagged changed")
 
-_pair_msgs_redacted, _pair_n = main._redact_forwarded_loop_replies(_pair_msgs + [user("21st, keeps turn 10 non-newest")])
+_pair_msgs_redacted, _pair_n, _pair_n_whole = main._redact_forwarded_loop_replies(_pair_msgs + [user("21st, keeps turn 10 non-newest")])
 _pair_msgs_redacted = _pair_msgs_redacted[:20]  # drop the trailing probe turn again
 assert_eq(_pair_n, 1, "[3b] fixture: exactly the one degenerate turn was redacted")
 _covered_bad, _changed_bad = summarizer._coverage_plan(_pair_state, _pair_msgs_redacted)
@@ -690,7 +923,7 @@ for i in range(800):
     _big_window.append(user(f"question {i}: " + body))
     _big_window.append(asst(f"answer {i}: " + body))
 _t0 = time.monotonic()
-_out, _replaced = main._redact_forwarded_loop_replies(_big_window)
+_out, _replaced, _replaced_whole = main._redact_forwarded_loop_replies(_big_window)
 _elapsed_ms = (time.monotonic() - _t0) * 1000
 _total_chars = sum(len(main._message_text(m)) for m in _big_window)
 print(f"  {len(_big_window)} messages, {_total_chars} chars, {_elapsed_ms:.1f} ms, "
@@ -715,7 +948,7 @@ print("-" * 70)
 # speed half — replace exactly the same turns, proving the cache cannot
 # skip a turn that reached vLLM uncached.
 _t1 = time.monotonic()
-_out2, _replaced2 = main._redact_forwarded_loop_replies(_big_window)
+_out2, _replaced2, _replaced2_whole = main._redact_forwarded_loop_replies(_big_window)
 _elapsed2_ms = (time.monotonic() - _t1) * 1000
 print(f"  repeat pass: {_elapsed2_ms:.1f} ms, {_replaced2} replaced")
 assert_eq(_replaced2, _replaced, "[4b] identical replacement count on the resent window")
@@ -729,7 +962,7 @@ assert_true(
 # it is still caught — the cache narrows to "already-judged text", it never
 # widens to "any text that looks similar".
 _fresh_window = _big_window + [user("one more"), asst(DEGENERATE_TEXT), user("still there?")]
-_out3, _replaced3 = main._redact_forwarded_loop_replies(_fresh_window)
+_out3, _replaced3, _replaced3_whole = main._redact_forwarded_loop_replies(_fresh_window)
 assert_eq(_replaced3, _replaced + 1,
           "[4b] CONTROL: a brand-new degenerate turn appended after the cached "
           "window is still caught — the cache does not paper over a real turn "
@@ -770,6 +1003,49 @@ for _reps5 in (300, 600, 1500):
         f"[5] *** {_reps5}x: the clean head survived "
         f"({len(_fwd5)} of {len(_head5)} head chars)",
     )
+
+print()
+print("[6] P8-5 (hostile pass #8): the cut-pass budget is bounded by "
+      "CHARACTERS scanned, not a flat pass count, and giving up to the "
+      "placeholder because that budget ran out is LOGGED, not silent")
+print("-" * 70)
+# [5] above is the CONTROL that a long loop converges to a clean kept head
+# under the real (large) budget. This section proves the budget itself is
+# real: starved down to where a loop this size cannot possibly converge,
+# the redaction still ends in a well-defined placeholder (never half-cut
+# loop text) and says so in the log — the old version fell back to the
+# placeholder silently whenever the fixed 64-pass cap was exhausted.
+_head6 = " ".join(
+    f"Note {j} is ordinary and specific about the weather." for j in range(40)
+)
+_loop6 = _head6 + " " + ("Stay with me a little longer, please. " * 4000)
+assert_true(
+    main.reply_is_degenerate(_loop6) is not None,
+    "[6] fixture: the loop trips the detector",
+)
+_saved_budget = main._DEGENERATE_CUT_BUDGET_CHARS
+main._DEGENERATE_CUT_BUDGET_CHARS = len(_loop6)  # ~1 pass allowed, nowhere near enough
+_h6b = _CaptureLogs()
+_lg6b = logging.getLogger("compactor")
+_lg6b.addHandler(_h6b)
+try:
+    _content6, _kept6 = main._degenerate_replacement_content(
+        _loop6, main._DEGENERATE_FORWARD_PLACEHOLDER, keep_middle=True
+    )
+finally:
+    _lg6b.removeHandler(_h6b)
+    main._DEGENERATE_CUT_BUDGET_CHARS = _saved_budget
+assert_true(
+    not _kept6 and _content6 == main._DEGENERATE_FORWARD_PLACEHOLDER,
+    "[6] *** P8-5: with the pass budget starved to ~1 pass, a loop that "
+    "needs many falls back cleanly to the placeholder rather than leaving "
+    "a half-cut loop fragment",
+)
+assert_true(
+    _find(_h6b.records, "cut pass"),
+    "[6] *** P8-5: giving up to the placeholder because of the pass "
+    "budget is LOGGED (used to be silent)",
+)
 
 print()
 print("ALL TESTS PASSED")

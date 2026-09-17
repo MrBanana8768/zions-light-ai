@@ -277,15 +277,25 @@ raising `repetition_penalty` further if loops return. Full detail:
 **Confirming loops are being caught.** A repetition-loop reply logs a
 WARNING at detection time (`grep -a 'like a repetition loop'` matches both
 wordings — the split is FINISHED vs CUT, not streamed vs non-streamed) and,
-once OpenWebUI replays it back as history, an INFO line each time it is kept
-out of what is forwarded to vLLM: `conv=<id>: replaced <N> degenerate
-assistant turn(s) in the forwarded window with a placeholder`. **These two
-counts can differ**: a CUT reply whose trimmed head reads clean is stored
-TRIMMED with no loop WARNING at all (memory only judges the kept head), but
-the full original text is still flagged and still replaced in the forwarded
-window on every later request — a `replaced` count with no matching WARNING
-for that turn is expected, not a sign the detector missed it. Neither line
-names the reply's own text.
+once OpenWebUI replays it back as history, an INFO line each time it is
+touched in what is forwarded to vLLM: `conv=<id>: touched <N> degenerate
+assistant turn(s) in the forwarded window (whole=<K> cut=<N-K>)`. **These
+two counts can differ**: a CUT reply whose trimmed head reads clean is
+stored TRIMMED with no loop WARNING at all (memory only judges the kept
+head), but the full original text is still flagged and still touched in
+the forwarded window on every later request — a `touched` count with no
+matching WARNING for that turn is expected, not a sign the detector missed
+it. Neither line names the reply's own text. **`whole` vs `cut`** (v3.1.9.2
+hostile pass #8, P8-8): `whole` is how many of those `touched` turns lost
+the ENTIRE reply to the placeholder; the rest (`cut`) kept a clean
+head/tail around only the flagged span — on the 2026-09-16 backup that was
+10 whole out of 66 touched, so `cut` is usually the larger number, not
+`whole`.
+
+**A non-finite numeral in the request body (v3.1.9.2 hostile pass #8,
+P8-6)** — `"max_tokens": 1e999` or the same in any other numeric field —
+now gets a 400 at parse time instead of a 500 from inside the proxy after
+compaction and memory injection had already run.
 
 ### Disk is filling up
 ```bash

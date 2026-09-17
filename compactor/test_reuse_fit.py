@@ -963,16 +963,36 @@ check(_EXPECTED_SITE_BUDGET in _site_budgets,
 # split_messages ALIGNS its own kept-recent window to start on a USER turn
 # (leading non-user turns move into the summarized portion — a template
 # requirement), so the window it actually protects can hold FEWER than
-# KEEP_RECENT_TURNS messages. With an old, unpaired assistant turn (an image,
-# most often — but the bug is about POSITION, not content, so a plain heavy
-# assistant turn reproduces it just as well) sitting where the 4th-from-end
-# slot falls, the old floor counted it as "recent" and protected it from the
-# pre-shed loop — spending injected memory (halving, then dropping facts) to
-# keep a turn that was never actually inside the aligned recent window. This
-# tests main._enforce_hard_budget directly (like test_p5_guard.py, which
-# owns this same function's other branches), with its own deterministic
-# byte-counting stand-in for count_tokens so the numbers here do not depend
-# on a live tokenizer.
+# KEEP_RECENT_TURNS messages. With an old, unpaired turn sitting where the
+# 4th-from-end slot falls, the old floor counted it as "recent" and
+# protected it from the pre-shed loop — spending injected memory (halving,
+# then dropping facts) to keep a turn that was never actually inside the
+# aligned recent window.
+#
+# P8-1 (hostile pass #8): the fix that landed for p7's F1 only stripped a
+# leading turn of the WRONG ROLE from the aligned window — which happened
+# to fully cover the ASSISTANT-role stub this section used to test with
+# (an assistant turn at the front is never "user", so the existing
+# `!= "user"` check already stripped it), but not what production actually
+# sends. OpenWebUI puts an uploaded image on a USER turn (RUNPOD_DEPLOY.md:
+# OpenAI's own multimodal format), never an assistant one, and
+# compact_if_needed inserts its preserved old images directly in front of
+# the true keep_recent window. So the real tail is
+# [old_image(USER), prev-u(USER), prev-a(assistant), newest(USER)]: it
+# ALREADY "starts on a user turn" whichever of the two front entries it is,
+# so the role-only check stripped nothing and the floor stayed unaligned
+# for this shape — the exact production regression the fixture below now
+# exercises as the PRIMARY case. The floor now also strips a leading entry
+# that shares its role with the entry right after it (a real recent window
+# always alternates roles), which handles this. Both role shapes are
+# tested below: "user" is production's own shape; "assistant" is kept as a
+# CONTROL, the shape the pre-P8-1 fix already handled correctly (so it
+# must keep passing unchanged).
+#
+# This tests main._enforce_hard_budget directly (like test_p5_guard.py,
+# which owns this same function's other branches), with its own
+# deterministic byte-counting stand-in for count_tokens so the numbers
+# here do not depend on a live tokenizer.
 # ---------------------------------------------------------------------------
 print("\n[F1] guard floor is ALIGNED like split_messages, not a raw message count")
 
@@ -981,15 +1001,33 @@ def _f1_tokens(msgs) -> int:
     return sum(len(main._message_text(m).encode("utf-8")) + 4 for m in msgs)
 
 
-def _f1_build(old_exchanges=30):
+def _f1_image_turn(tag):
+    """A USER turn carrying an uploaded image — OpenWebUI's real shape.
+    Padded the same as the pre-P8-1 assistant stub so an incorrectly-kept
+    turn still forces a real choice against memory (this test only needs
+    "expensive enough to matter", not vLLM's own image-token accounting)."""
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": tag + " " + "i" * 30000},
+            {"type": "image_url",
+             "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+        ],
+    }
+
+
+def _f1_build(old_exchanges=30, image_role="user"):
     """A compaction stand-in, injected memory, `old_exchanges` ordinary old
-    pairs, then one UNPAIRED old assistant turn (the image stand-in) right
-    before the previous exchange and the newest turn — exactly the slot
-    `split_messages` would push out of its aligned keep_recent window
-    (KEEP_RECENT_TURNS=4 non-system messages ending in
-    [image, prev-u, prev-a, newest-u] starts on ASSISTANT, so alignment
-    drops the image, leaving keep_recent=[prev-u, prev-a, newest-u], 3
-    messages, not 4)."""
+    pairs, then one UNPAIRED old turn (the image stand-in, role
+    `image_role`) right before the previous exchange and the newest turn —
+    exactly the slot `split_messages` would push out of its aligned
+    keep_recent window (KEEP_RECENT_TURNS=4 non-system messages ending in
+    [image, prev-u, prev-a, newest-u]: with image_role="assistant" the
+    4-message tail starts on ASSISTANT, so the role check alone already
+    strips it; with image_role="user" (production's own shape, P8-1) the
+    tail starts on USER either way, so only the role-ALTERNATION check
+    added for P8-1 catches it — leaving keep_recent=[prev-u, prev-a,
+    newest-u], 3 messages, not 4, in both cases)."""
     facts = "[Facts]\n" + "".join(
         f"- FACT{i:02d} she likes item {i} very much indeed.\n" for i in range(9)
     )
@@ -1006,7 +1044,10 @@ def _f1_build(old_exchanges=30):
     # position (the pair above it already closed), so it is exactly the
     # shape split_messages would push into the summarized portion when the
     # 4-message tail starts on it.
-    msgs.append({"role": "assistant", "content": "old-image-stub " + "i" * 30000})
+    if image_role == "user":
+        msgs.append(_f1_image_turn("old-image-stub"))
+    else:
+        msgs.append({"role": "assistant", "content": "old-image-stub " + "i" * 30000})
     msgs.append({"role": "user", "content": "prev-u " + "u" * 150})
     msgs.append({"role": "assistant", "content": "prev-a " + "a" * 1650})
     msgs.append({"role": "user", "content": "newest " + "n" * 200})
@@ -1015,63 +1056,65 @@ def _f1_build(old_exchanges=30):
 
 _F1_LIMIT = 20768 - 90  # the shipped v3.1.9 effective limit, less a time-line reserve
 
-_f1_saved_count_tokens = main.count_tokens
-_f1_saved_count_tokens_exact = main.count_tokens_exact
-_f1_saved_margin = main._BUDGET_MARGIN
-main.count_tokens = _f1_tokens
-main.count_tokens_exact = lambda ms, *a, **k: _f1_tokens(ms)
-main._BUDGET_MARGIN = 0
-try:
-    _f1_msgs = _f1_build()
-    _f1_rep: dict = {}
-    _f1_out = main._enforce_hard_budget(_f1_msgs, _F1_LIMIT, 1, _f1_rep)
-finally:
-    main.count_tokens = _f1_saved_count_tokens
-    main.count_tokens_exact = _f1_saved_count_tokens_exact
-    main._BUDGET_MARGIN = _f1_saved_margin
+for _f1_image_role in ("user", "assistant"):
+    _f1_saved_count_tokens = main.count_tokens
+    _f1_saved_count_tokens_exact = main.count_tokens_exact
+    _f1_saved_margin = main._BUDGET_MARGIN
+    main.count_tokens = _f1_tokens
+    main.count_tokens_exact = lambda ms, *a, **k: _f1_tokens(ms)
+    main._BUDGET_MARGIN = 0
+    try:
+        _f1_msgs = _f1_build(image_role=_f1_image_role)
+        _f1_rep: dict = {}
+        _f1_out = main._enforce_hard_budget(_f1_msgs, _F1_LIMIT, 1, _f1_rep)
+    finally:
+        main.count_tokens = _f1_saved_count_tokens
+        main.count_tokens_exact = _f1_saved_count_tokens_exact
+        main._BUDGET_MARGIN = _f1_saved_margin
 
-_f1_mem_out = [
-    x for x in _f1_out
-    if x.get("role") == "system" and "[Facts]" in (x.get("content") or "")
-]
-_f1_facts_whole = bool(_f1_mem_out) and all(
-    f"FACT{i:02d}" in _f1_mem_out[0]["content"] for i in range(9)
-)
-_f1_image_survived = any(
-    m.get("role") == "assistant" and "old-image-stub" in (m.get("content") or "")
-    for m in _f1_out
-)
-check(_f1_rep.get("fits"), f"fixture: the guard fit the payload ({_f1_rep})")
-check(
-    _f1_facts_whole,
-    "*** F1: facts survive whole — the unpaired old turn is shed by the "
-    "pre-shed loop instead of being counted as 'recent' and protected at "
-    "memory's expense",
-)
-check(
-    not _f1_image_survived,
-    "*** F1: the unpaired old turn does NOT survive alongside whole facts "
-    "— if it did, this fixture is not exercising the floor bug at all",
-)
+    _f1_mem_out = [
+        x for x in _f1_out
+        if x.get("role") == "system" and "[Facts]" in (x.get("content") or "")
+    ]
+    _f1_facts_whole = bool(_f1_mem_out) and all(
+        f"FACT{i:02d}" in _f1_mem_out[0]["content"] for i in range(9)
+    )
+    _f1_image_survived = any(
+        "old-image-stub" in main._message_text(m) for m in _f1_out
+    )
+    check(_f1_rep.get("fits"), f"[{_f1_image_role}] fixture: the guard fit the payload ({_f1_rep})")
+    check(
+        _f1_facts_whole,
+        f"*** F1 [{_f1_image_role}]: facts survive whole — the unpaired old "
+        f"turn is shed by the pre-shed loop instead of being counted as "
+        f"'recent' and protected at memory's expense",
+    )
+    check(
+        not _f1_image_survived,
+        f"*** F1 [{_f1_image_role}]: the unpaired old turn does NOT survive "
+        f"alongside whole facts — if it did, this fixture is not exercising "
+        f"the floor bug at all",
+    )
 
-# CONTROL: the actual protected window (prev-u, prev-a, newest) always
-# survives regardless of the floor fix — this proves the fix does not
-# over-shed into turns split_messages really would protect.
-_f1_recent_survived = all(
-    any(
-        m.get("role") == exp_role and m.get("content", "").startswith(exp_prefix)
-        for m in _f1_out
+    # CONTROL: the actual protected window (prev-u, prev-a, newest) always
+    # survives regardless of the floor fix — this proves the fix does not
+    # over-shed into turns split_messages really would protect.
+    _f1_recent_survived = all(
+        any(
+            m.get("role") == exp_role and main._message_text(m).startswith(exp_prefix)
+            for m in _f1_out
+        )
+        for exp_role, exp_prefix in (
+            ("user", "prev-u"), ("assistant", "prev-a"), ("user", "newest"),
+        )
     )
-    for exp_role, exp_prefix in (
-        ("user", "prev-u"), ("assistant", "prev-a"), ("user", "newest"),
+    check(
+        _f1_recent_survived,
+        f"CONTROL [{_f1_image_role}]: the truly-recent window (prev-u, "
+        f"prev-a, newest) still survives — the fix narrows the floor, it "
+        f"does not remove protection for what split_messages actually "
+        f"keeps",
     )
-)
-check(
-    _f1_recent_survived,
-    "CONTROL: the truly-recent window (prev-u, prev-a, newest) still "
-    "survives — the fix narrows the floor, it does not remove protection "
-    "for what split_messages actually keeps",
-)
 
 
 if FAILED:

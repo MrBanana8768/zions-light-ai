@@ -466,21 +466,52 @@ and, once that reply is later replayed back as history, an INFO line at the
 point it is kept out of what is forwarded:
 
 ```
-conv=<id>: replaced <N> degenerate assistant turn(s) in the forwarded window with a placeholder
+conv=<id>: touched <N> degenerate assistant turn(s) in the forwarded window (whole=<K> cut=<N-K>)
 ```
 
-**These two counts do not have to match, and a mismatch is not a bug.** A
-CUT loop reply whose trimmed sentence head reads clean is stored TRIMMED in
-memory (`stored_trimmed`, no loop WARNING at all — memory's own judgement
-only sees the kept head) even though the detector flagged the FULL text, and
-that full text still gets replaced in the forwarded window on every later
-request (counted in the `replaced <N>` INFO line). So it is normal to see a
-`replaced` count with no matching `like a repetition loop` WARNING for the
-same turn; do not read that as the detector missing something. Neither line
-names the reply's own text. If `repeat_penalty` was translated because
-`repetition_penalty` was absent, that is a separate INFO line at request
-time: `conv=<id>: translated Ollama repeat_penalty=... to vLLM
-repetition_penalty=...` (logged once per conversation, not on every turn).
+**`whole` vs `cut` (from v3.1.9.2 hostile pass #8, P8-8):** this line used to
+read `replaced <N> ... with a placeholder` unconditionally. That is only true
+for the `whole` count — most flagged replies keep a clean head (and, for a
+mid-reply span, a clean tail too) and only lose the flagged span itself; on
+the 2026-09-16 backup that was 10 of 66 touched replies replaced whole, not
+all of them. Read `whole` as "the model lost the whole answer for that turn"
+and `cut` as "one span was removed from an otherwise-intact reply".
+
+**These counts do not have to match the WARNING count above, and a mismatch
+is not a bug.** A CUT loop reply whose trimmed sentence head reads clean is
+stored TRIMMED in memory (`stored_trimmed`, no loop WARNING at all —
+memory's own judgement only sees the kept head) even though the detector
+flagged the FULL text, and that full text is still touched in the forwarded
+window on every later request (counted in the `touched <N>` INFO line). So it
+is normal to see a `touched` count with no matching `like a repetition loop`
+WARNING for the same turn; do not read that as the detector missing
+something. Neither line names the reply's own text. If `repeat_penalty` was
+translated because `repetition_penalty` was absent, that is a separate INFO
+line at request time: `conv=<id>: translated Ollama repeat_penalty=... to
+vLLM repetition_penalty=...` (logged once per conversation, not on every
+turn).
+
+**`max_tokens` and other numeric sampling fields (v3.1.9.2, hostile pass
+#8, P8-6).** A request body whose JSON carries a numeral that overflows to
+`inf` (for example `"max_tokens": 1e999`, in any numeric field, not only
+the sampling penalties) is now rejected at parse time with an HTTP 400,
+the same way a bare `NaN`/`Infinity` constant already was — it used to 500
+from inside the proxy instead, after compaction and memory injection had
+already run. An unparseable `max_tokens` (a string, a list, ...) is
+dropped from the forwarded body with a WARNING rather than left in place
+unexamined; a VALID `max_tokens` is never rewritten, only capped against
+the model's context window as before.
+
+**Preserved images and the recent-turn floor (v3.1.9.1 hostile pass #7 F1,
+corrected in v3.1.9.2 hostile pass #8 P8-1).** An uploaded image always
+arrives as a part of a USER turn (see "Vision" below) — never an assistant
+one. The hard-budget guard's recent-turn floor accounts for that: an old,
+preserved image sitting in front of the real recent window no longer
+counts as part of "recent" merely because both it and the turn after it
+are user turns; it is recognised by the role-alternation break instead, so
+it is available to be shed ahead of injected memory (facts/retrieval) the
+same as any other old turn, whether it happens to be a USER-role image or
+(the pre-P8-1 test shape) an orphaned ASSISTANT turn.
 
 ### Vision (V3.1) — enabling image understanding
 

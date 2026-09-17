@@ -59,19 +59,30 @@ pass-through-unknown-keys behavior to vLLM, which does not recognise it —
   ```code``` block is no longer flagged, matching the fragment-line rule's
   existing fence handling; hostile pass #7, F3). User turns, system
   messages and the newest message are never touched. Logged at INFO as a
-  count only (no text). Apart from the fenced-code exemption above, the
-  detection rules and thresholds are unchanged; note that the exemption
+  count only (no text) — `touched=<n> whole=<k> cut=<n-k>` (hostile pass #8,
+  P8-8: the line used to say "replaced N ... with a placeholder"
+  unconditionally, which stopped being true once span-cutting made a
+  placeholder the MINORITY outcome — 10 of 66 flagged replies on the
+  2026-09-16 backup, not all of them). Apart from the fenced-code exemption
+  above and the P8-2 fix described below, the detection rules and
+  thresholds are unchanged; note that the exemption
   applies wherever `reply_is_degenerate` is used, including the memory skip.
   A new internal helper (`_reply_degenerate_verdict`) exposes the flagged
   span alongside the same reason string, cached per 128-bit content digest
-  (not the text itself, so the cache holds no reply text) so a
+  (not the text itself, so the VERDICT cache holds no reply text) so a
   conversation OpenWebUI resends unchanged on every later request only pays
   the detection cost once per turn, not once per request (measured
   0.78-0.83s CPU per request on an 811-message real conversation before
-  caching; hostile pass #7, F5). The ROLLUP-input redaction
-  (`_redact_degenerate_turns`, memory-side, pre-existing) is UNCHANGED —
-  this release does not have the real-data basis to prove the same
-  span-cutting rule is safe there.
+  caching; hostile pass #7, F5). A SEPARATE cache
+  (`_DEGENERATE_CUT_CACHE`) memoizes the cut-and-re-judge loop's own
+  result, keyed the same way — its VALUES **are** the kept replacement
+  text (a correction to this entry's earlier wording, which claimed
+  neither cache held reply text; hostile pass #8, P8-8), capped at 1,024
+  entries and now honouring `COMPACTOR_DEGENERATE_VERDICT_CACHE_SIZE=0`
+  the same way the verdict cache does (it used to keep caching regardless
+  of that setting). The ROLLUP-input redaction (`_redact_degenerate_turns`,
+  memory-side, pre-existing) is UNCHANGED — this release does not have the
+  real-data basis to prove the same span-cutting rule is safe there.
 - **The hard-budget guard's recent-turn floor is now aligned the same way
   `split_messages` aligns its own kept-recent window** (starts on a user
   turn; an odd turn count means the real window can hold one fewer message
@@ -81,7 +92,62 @@ pass-through-unknown-keys behavior to vLLM, which does not recognise it —
   injected memory (facts/retrieval halved or dropped) to keep a turn that
   was not actually inside the real recent window — and could still be
   dropped anyway by a later shedding stage, spending the memory for nothing
-  (hostile pass #7, F1).
+  (hostile pass #7, F1). **Correction (hostile pass #8, P8-1):** the first
+  version of this fix only stripped a leading turn of the WRONG role from
+  the aligned window, which happened to fully cover a stale ASSISTANT-role
+  test fixture but not what production actually sends — OpenWebUI puts an
+  uploaded image on a USER turn, so a preserved old image sat in front of
+  another USER turn and the role check alone found nothing to strip,
+  leaving the floor unaligned exactly as before for that shape. The floor
+  now also strips a leading turn that shares its role with the turn right
+  after it (a real recent window always alternates roles; two consecutive
+  user turns at the front means the first one is not actually recent).
+- **Fence exemption fixes (hostile pass #8):**
+  - **P8-2 (regression, was flagged correctly by v3.1.9):** the token-run
+    fence exemption above treated an UNCLOSED ` ``` ` opener as fencing
+    everything after it forever — this model uses bare ` ``` ` lines as
+    decorative boxes (128 of 1,709 unique real replies in the 2026-09-16
+    backup have an odd count), so a real identifier loop starting after
+    the last unmatched opener and running to the end of the reply was
+    silently exempted and stored to memory/forwarded verbatim. Fixed: a
+    run only counts as fenced when the fence actually CLOSES again later,
+    and never when the run reaches the end of the reply either way. The
+    p7 F3 case (a repeated-value array inside a fence that closes,
+    mid-reply) is unaffected.
+  - **P8-3:** the forwarded-window cut's clean-prefix rule reused
+    `trim_to_last_sentence`, which refuses any boundary inside a fence —
+    correct for the memory-side redaction (an unterminated opener must
+    never reach fact extraction), wrong for the forwarded view, where
+    nothing is extracted. This model's boxed reply style put the last
+    real sentence end inside a box often enough to discard up to the
+    WHOLE reply before a loop in one real case, and roughly 11k
+    characters of boxes-and-prose in another. A new
+    `_trim_forwarded_prefix` (forwarded path only; the memory-side rule is
+    unchanged) allows a boundary inside a fence and falls back to the
+    last line break when no sentence end is available, self-balancing any
+    fence it leaves open.
+  - **P8-4:** a mid-reply cut that splits one CLOSED fence across the kept
+    prefix and suffix used to leave a stray, unbalanced ` ``` ` marker,
+    misreading the rest of the reply as code. The cut now balances the
+    fence count of what it actually emits.
+  - **P8-5:** the cut-and-re-judge loop's pass budget is now bounded by
+    total CHARACTERS scanned across all passes, not a flat pass count — a
+    300k-character pathological loop (far beyond her longest real reply,
+    51k) now costs a fraction of the 2.2s of GIL-bound CPU it measured
+    before, with no change for anything her real conversations produce.
+    Falling back to the whole-reply placeholder because the pass budget
+    was exhausted is now logged at WARNING (it used to be silent).
+- **`max_tokens: 1e999` (and any other numeral that overflows to `inf`, in
+  any numeric request field) is now rejected at JSON-parse time with a 400**
+  (hostile pass #8, P8-6), the same way the existing `NaN`/`Infinity`
+  constant guard works. It used to reach `int(body.get("max_tokens") or 0)`
+  and raise `OverflowError`, which the surrounding `except
+  (TypeError, ValueError)` did not catch — a 500 from inside the proxy for
+  a client-supplied number, now caught before compaction or memory
+  injection ever run. `OverflowError` was also added to that except clause
+  as a second line of defence, which now drops (and logs) an unparseable
+  `max_tokens` instead of leaving the client's own bad value sitting
+  untouched in the forwarded body.
 
 Operator note: see [RUNPOD_DEPLOY.md → Sampling parameters](RUNPOD_DEPLOY.md#sampling-parameters)
 for the mapping between OpenWebUI's Advanced/Custom Parameters and vLLM's
@@ -103,7 +169,13 @@ unchanged; the decoration-fraction/script-drift/short-list-run verdicts,
 which still fall back to whole-reply replacement in the forwarded window
 because they have no single span to cut around; the pre-existing
 TARGET-based stand-in budget gap above roughly 16k max_tokens (not
-triggered at the recommended 12000; tracked, deferred).
+triggered at the recommended 12000; tracked, deferred); the
+cut-and-re-judge loop's algorithm itself (hostile pass #8, P8-5) — passes
+are now budgeted by total characters scanned rather than redesigned to
+extend a tail cut backwards in one pass, which would need its own
+mutation-tested coverage beyond this lane's scope; a merge of two
+concurrent conversations losing acknowledged facts (hostile pass #8's
+gate note; pre-existing, untouched by this diff, needs its own ticket).
 
 ---
 
