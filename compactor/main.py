@@ -1499,7 +1499,78 @@ def count_tokens(messages: list[dict]) -> int:
     if tok is not None:
         try:
             text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            return len(tok.encode(text)) + image_tokens
+            # v3.1.9.3: do NOT add the flat estimate for an image the template
+            # already priced, AND do not trust len(tok.encode(text)) to have
+            # priced it correctly either — two separate bugs this tier's
+            # image handling carried, both dormant until opencv made tier 1
+            # reachable for an image-bearing message at all (before, cv2's
+            # ImportError sent every such request straight to the except
+            # below, so nothing here ever ran against a real image).
+            #
+            # Bug 1 (double count): `text` already contains the template's
+            # own real per-image markers (Pixtral-style [IMG]/[IMG_BREAK]/
+            # [IMG_END]), so `len(tok.encode(text))` prices the image once,
+            # and the unconditional `+ image_tokens` used to price it AGAIN.
+            #
+            # Bug 2 (the encode() round-trip mis-prices the markers it DOES
+            # find): [IMG]/[IMG_BREAK]/[IMG_END] are each a single real
+            # vocabulary id in this model (verified: tok.get_vocab() has
+            # them at ids 10/12/13) — but transformers' own docs warn that
+            # apply_chat_template(tokenize=False) + a separate encode() is
+            # unsafe for exactly this reason, and it is: plain encode() does
+            # not recognise the bracket TEXT as the special token it rendered
+            # from, and re-tokenizes it as ordinary BPE instead — measured on
+            # this model, that costs 4/7/5 raw tokens per [IMG]/[IMG_BREAK]/
+            # [IMG_END] occurrence instead of 1. Fixing bug 1 alone (skip the
+            # flat add, keep len(tok.encode(text)) as the image's price)
+            # still leaves this: a 2048px image priced at ~6,300 tokens
+            # against a real cost of 3,080 (~2x over) — worse than the
+            # pre-opencv flat 4,096 this whole path was meant to improve on,
+            # and the shape hostile pass #11 (P11-4) blamed for the guard's
+            # residual overshoot. So: strip the marker text back out, encode
+            # what remains (ordinary text, priced exactly as it always was),
+            # and add back ONE token per marker occurrence — what it actually
+            # costs in the vocabulary. Verified end to end against vLLM's own
+            # usage.prompt_tokens (scripts/probe-vision.py): this lands within
+            # a handful of tokens of 110/380/1406/3080 at 256/512/1024/2048px
+            # (SP\fix-3193-opencv.md), not 2-2.3x over it. The only residual
+            # imprecision is at the text/marker BOUNDARY — stripping a marker
+            # can change how BPE merges the characters immediately next to
+            # it, on the order of a token or two per image, not per hundred.
+            #
+            # [IMG_END] is the one-per-image close marker (verified: exactly
+            # one occurrence per image at every size tested, regardless of how
+            # many [IMG]/[IMG_BREAK] tiles that image expands to), so counting
+            # it against how many images this payload actually carries tells
+            # us how many the template priced. If they match, every image was
+            # priced. If the template priced FEWER than the payload carries —
+            # a future model or template that drops an image instead of
+            # raising, which the ImportError path does not rule out — charge
+            # the flat estimate for the ones it did not price, same as before
+            # this fix for those. `max(0, ...)` because a message could
+            # legitimately contain the literal text "[IMG_END]" with zero
+            # real images (n_images=0); that must never go negative and
+            # subtract from the real text cost. Gated on `n_images` too, not
+            # just `n_priced`: a TEXT-ONLY conversation that happens to
+            # mention the literal string "[IMG_END]" (someone discussing this
+            # very code, say) must not have that mention treated as a real
+            # marker and stripped out of its own token cost -- n_images == 0
+            # means there is no image in this payload at all, so the
+            # strip-and-reprice branch below never applies regardless of what
+            # text.count() finds.
+            n_images = sum(_message_image_count(m) for m in messages)
+            n_priced = text.count("[IMG_END]") if n_images else 0
+            unpriced_image_tokens = max(0, n_images - n_priced) * IMAGE_TOKEN_ESTIMATE
+            if n_priced:
+                n_markers = 0
+                stripped = text
+                for marker in ("[IMG]", "[IMG_BREAK]", "[IMG_END]"):
+                    n_markers += stripped.count(marker)
+                    stripped = stripped.replace(marker, "")
+                rendered_tokens = len(tok.encode(stripped)) + n_markers
+            else:
+                rendered_tokens = len(tok.encode(text))
+            return rendered_tokens + unpriced_image_tokens
         except Exception as e:
             # Tier 2, and until v3.1 it was the tier that always ran while
             # saying nothing: jinja2 was missing from the venv and the served
