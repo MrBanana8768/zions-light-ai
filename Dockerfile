@@ -192,6 +192,21 @@ RUN set -e; \
         exit 1; \
     fi
 
+# Fail the build if opencv is missing -- the same doctrine as the two guards
+# above, for the failure mode found in production logs (v3.1.9.3). mistral_common
+# needs cv2 to tokenize an IMAGE chunk (image.py's transform_image ->
+# assert_opencv_installed); without it, transformers' MistralCommonBackend
+# raises ImportError the moment a message carries an image_url part, and
+# main.py's count_tokens() falls back to its encode()+4 tier for that call
+# only -- text-only requests are unaffected (jinja2 alone is sufficient for
+# those; measured 2026-09-18 against the real served model's tokenizer files).
+# COMPACTOR_MAX_RETAINED_IMAGES defaults to 1, so an image-bearing request is
+# the normal case, not a rare one -- this is not dormant. See
+# compactor/requirements.txt's opencv-python-headless comment for the full
+# measurement and the sizing/version audit.
+RUN /opt/compactor-venv/bin/python -c \
+    "import cv2; print('opencv available for mistral_common image tokenization:', cv2.__version__)"
+
 # Pre-download the bge-small ONNX embedding model into the image so the
 # first request pays no download. Static weights belong in the image, not
 # on the /data volume. FASTEMBED_CACHE_PATH (ENV section below) points here.
