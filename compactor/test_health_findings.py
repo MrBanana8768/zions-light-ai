@@ -945,6 +945,78 @@ def test_p9_reuse_decline_signal_reaches_health_full():
           "visibility-only: a reuse decline does not itself take the pod down")
 
 
+def test_p12_2_window_decline_has_its_own_reason_and_numbers():
+    """P12-2 (hostile pass #12): the P11-6 structural check (a stand-in
+    that fits `declined_budget`'s own ceiling whole, but would still
+    squeeze the system prompt and the recent turns out of the request's
+    real window) used to record itself as a PLAIN "budget" decline, with
+    `_standin_budget`/`_others` — the TARGET-/injection-based ceiling this
+    check never even consults. An operator reading `checks.reuse` after
+    one of these saw `last_declined_ceiling` sitting at the CONFIGURED
+    `SUMMARY_BLOCK_MAX_TOKENS` (or the injection-based figure) for a
+    decline that number had nothing to do with, and OPERATIONS.md's own
+    runbook reads that as "raise the setting" — which moves nothing here.
+    Same style as `test_p9_reuse_decline_signal_reaches_health_full`
+    above: calls the real recorder functions directly (the arithmetic
+    that DECIDES a window squeeze is test_reuse_fit.py's `[14]`'s job;
+    this test is about the health WIRING for a window decline that
+    already happened).
+    """
+    print("\n[P12-2] a window-squeeze decline gets its own reason, "
+          "counter and numbers — not folded into 'budget'")
+    import main  # local: this module does not import main at module scope
+
+    before = health._reuse_state()
+    declined_window_before = before["declined_window"]
+    declined_budget_before = before["declined_budget"]
+
+    # A real budget decline first, with its OWN numbers — establishes a
+    # baseline the window decline right after it must not clobber or be
+    # confused with.
+    main._record_reuse_attempt()
+    main._record_reuse_outcome("budget", 6230, 11459)
+    mid = health._reuse_state()
+    check(mid["declined_budget"] == declined_budget_before + 1,
+          "*** declined_budget increments on the plain budget decline")
+    check(mid["last_reason"] == "budget", "*** last_reason names it 'budget'")
+    check(mid["last_declined_ceiling"] == 6230 and mid["last_declined_others"] == 11459,
+          "*** the budget decline's own two numbers are recorded")
+
+    # Now a window-squeeze decline, with a DIFFERENT pair of numbers.
+    main._record_reuse_attempt()
+    main._record_reuse_outcome("window", 12372, 8396)
+    after = health._reuse_state()
+    check(after["declined_window"] == declined_window_before + 1,
+          "*** declined_window increments — a SEPARATE counter from declined_budget")
+    check(after["declined_budget"] == declined_budget_before + 1,
+          "*** declined_budget does NOT also increment for a window decline "
+          "— the two counters are additive, not aliased")
+    check(after["last_reason"] == "window",
+          "*** last_reason names the window decline specifically, not 'budget'")
+    check(
+        after["last_declined_ceiling"] == 12372 and after["last_declined_others"] == 8396,
+        f"*** the window decline's OWN two numbers overwrite the prior "
+        f"budget decline's (got ceiling={after['last_declined_ceiling']}, "
+        f"others={after['last_declined_others']}) — reading them together "
+        f"with last_reason='window' is what makes them meaningful, per "
+        f"_record_reuse_outcome's own docstring",
+    )
+    check(after["declined_recently"] is True,
+          "*** a window decline counts as 'recently declined' too — it is "
+          "as real a capacity squeeze as a budget decline (P12-2 widened "
+          "this from 'budget' specifically, matching OPERATIONS.md's "
+          "updated runbook text)")
+
+    r = full()
+    check(
+        r["checks"].get("reuse", {}).get("declined_window") == after["declined_window"],
+        "*** gather_health_full's checks.reuse carries declined_window too, "
+        "the same live state _reuse_state() reads directly",
+    )
+    check(r["status"] != "down",
+          "visibility-only: a window decline does not itself take the pod down")
+
+
 def _p10_3_history(n_exchanges: int, words: int = 200) -> list:
     """Plain old turns, no system prefix — same shape as test_reuse_fit.py's
     `history()` minus its leading system message (not needed here; this
@@ -1345,6 +1417,7 @@ TESTS = [
     test_p10_3_reuse_error_state_is_not_a_silent_success,
     test_p11_1_reuse_success_is_not_recorded_before_the_fresh_span_summarize,
     test_p11_3_declined_recently_follows_only_a_real_budget_decline,
+    test_p12_2_window_decline_has_its_own_reason_and_numbers,
 ]
 
 

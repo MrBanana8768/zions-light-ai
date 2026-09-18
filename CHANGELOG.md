@@ -20,17 +20,98 @@ its only real-tokenizer suite for three releases, and an adversarial test
 that could no longer tell a genuine reuse success from a decline.
 
 ### Fixed
-- **P11-6: reuse no longer squeezes her recent conversation.** The
-  v3.1.9.2 reuse ceiling ignored the recent window, so at the hierarchy
-  size its 15000 cap was raised for (~13k tokens, hers is ~8.4k today) reuse
-  lost her previous exchange where declining would have kept it.
-  `compact_if_needed` now also bounds the stand-in by what the window
-  leaves beside the system prompt and the retained images (priced at the
+- **P11-6/P12-1: reuse no longer squeezes her recent conversation, at any
+  image price.** The v3.1.9.2 reuse ceiling ignored the recent window, so
+  at the hierarchy size its 15000 cap was raised for (~13k tokens, hers is
+  ~8.4k today) reuse lost her previous exchange where declining would have
+  kept it. This entry originally said `compact_if_needed` bounded the
+  stand-in by the system prompt and the retained images, "priced at the
   `IMAGE_TOKEN_ESTIMATE` constant, deliberately independent of
-  `count_tokens`). Known residual, not a regression: with
-  `COMPACTOR_IMAGE_TOKENS` lowered to about 3,080, one combination (a ~13.6k
-  hierarchy beside an 8,000-token previous reply) reuses and loses that
-  exchange; v3.1.9.2 loses it the same way.
+  `count_tokens`" — **that was not what the code did, and hostile pass #12
+  (P12-1) found the gap it left**: the reserve called `count_tokens`
+  itself, so it was priced by whichever tier of that function happened to
+  run — the flat 4,096-token estimate before the opencv fix below, or that
+  fix's own real per-resolution cost (measured ~3,080 square, ~2,352 for a
+  4:3 photo) after it. Landing opencv in the SAME release made the lower,
+  real price the default on the pod with no setting changed — the reserve
+  shrank, and reuse started firing again at the exact hierarchy sizes this
+  entry exists to protect (measured on a real branch: her previous
+  exchange lost at up to 47 of 474 positions, depending on state, where
+  declining or v3.1.9 kept it). The reserve now bounds the stand-in by the
+  system prompt and the ACTUAL recent turns (`keep_recent` — what the
+  guard, see P12-5 below, never spends before the previous exchange) plus
+  a fresh summary's worst case when a fresh span is pending (see P12-6
+  below for what "worst case" actually means), instead of a per-image
+  estimate — so the decision no longer prices images at all, and does not
+  move when `count_tokens`'s image pricing does. Verified at all three
+  prices above.
+- **P12-5: a DECLINED reuse request no longer sheds her previous exchange
+  before injected memory.** P11-6/P12-1's structural check above (and the
+  plain over-budget path) routes a growing share of requests through the
+  declined path — summarize the older span from scratch, forward it
+  verbatim where it will not fit a call cap, inject facts and retrieval as
+  usual. The hard-budget guard's "spend memory before the turns no summary
+  covers" ordering (pass-3 F5) only ran when the array carried
+  compaction's OWN stand-in; a declined array carries injected memory with
+  no stand-in, so it fell through to the floor-less generic shed loop,
+  which sheds the OLDEST non-system turn with no idea memory sits right
+  next to it — and once old turns ran out, that oldest turn was her
+  previous exchange. Measured on a real branch: every such loss (20-23 of
+  474 positions per hierarchy state) had 2,500-8,500 tokens of injected
+  memory left unspent that would have covered it. The same ordering now
+  applies to any array carrying injected memory, stand-in or not.
+- **P12-2 (MEDIUM): a window-squeeze decline (P11-6/P12-1, above) no
+  longer reports itself as an ordinary budget decline.** It used to record
+  `last_reason=budget` with the TARGET-/injection-based ceiling and total
+  — numbers this check never consults — so `checks.reuse` showed
+  `last_declined_ceiling` sitting at the configured
+  `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`, and OPERATIONS.md's runbook reads
+  that as "raise the setting," which moves nothing here (reproduced:
+  raising it from 15000 to 20000 left the same requests declining). Now
+  its own reason (`"window"`), its own counter (`declined_window`), and
+  its own two numbers; OPERATIONS.md explains what actually helps instead
+  (fewer/cheaper retained images, a smaller reply, an earlier L3 rollup).
+- **P12-3 (LOW, test only): a merge whose commit fails now has a test
+  proving `conv_lock(dst)` is released.** The shipped code was already
+  correct (the release runs in a `finally`) — no fix, only a mutation-
+  tested regression check, since none of the existing merge-concurrency
+  cases drove a commit failure and a regression here would wedge every
+  later writer to the conversation (the extraction tail, `/remember`,
+  `/forget`, archive/restore/dedup, the next merge) until the process
+  restarts.
+- **P12-6: the fresh-summary reserve (P12-1, above) now prices what
+  `summarize()` can actually produce, not a guess at one call.** A
+  real-data replay of P12-1 found one state still open: with a fresh
+  summary attached to the stand-in (routine — 3 `summarize()` calls per
+  reusing request between L1 rollups, per hostile pass #11 — not an edge
+  case), reuse still lost her previous exchange at 26 of 474 positions
+  where declining kept it. Cause: the reserve's fresh-summary allowance
+  assumed exactly one `SUMMARY_MAX_TOKENS` batch. `summarize()` map-
+  reduces the fresh span over budget-sized batches, and when the reduce
+  phase cannot fold them (the per-request call budget exhausted by the
+  map phase, or two dense partials together still missing the reduce
+  call's own input budget), the returned summary is the RAW CONCATENATION
+  of every un-folded batch, each up to `SUMMARY_MAX_TOKENS` — measured at
+  1,000-2,000 tokens (one or two un-folded batches), not the one this
+  reserve priced for. The reserve now previews the SAME batching
+  `summarize()` itself will do, on the same fresh span, and reserves
+  `n_batches * SUMMARY_MAX_TOKENS`. **A second real-data replay (the
+  coordinator's corrected "unpair" methodology, after their first "fresh"
+  harness turned out to be a spy artifact that could not test this reserve
+  at all) found the cap-refusal case was itself backwards**: reserving
+  NOTHING once the pessimistic batch estimate exceeded the per-request
+  call cap assumed `summarize()` would refuse to run — but that estimate
+  is deliberately inflated (2.0x) to size the reserve safely when
+  `summarize()` DOES proceed, not to predict whether it will; on content
+  whose REAL (undoubled) batch count is still under the cap, `summarize()`
+  proceeds anyway and can still leave every batch un-folded. Measured at
+  the live end of her branch (positions 948/952, her last real message is
+  a 39,569-character reply): reuse fired with a stand-in beside a 3-4
+  batch fresh span and a zero-token reserve for it, and lost her previous
+  exchange with 3.9-4.7k tokens to spare. Fixed: the reserve now caps at
+  the call cap's OWN worst case (`min(n_batches, MAX_SUMMARY_CALLS_PER_
+  REQUEST) * SUMMARY_MAX_TOKENS`) instead of collapsing to zero — correct
+  whichever way the real, non-pessimistic `summarize()` call decides.
 - **P11-4: the guard no longer spends injected memory on arithmetic the
   exact counter contradicts.** A residual of v3.1.9.2's P10-1 fix: round one
   could cut memory on a local estimate that overpriced images, then shed

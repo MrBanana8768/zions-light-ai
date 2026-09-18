@@ -551,6 +551,110 @@ def test_long_hold_times_out_with_the_original_refusal():
     assert_eq(landed, [], "NOTHING from the refused merge was written to dst")
 
 
+def test_merge_failure_releases_the_dst_lock():
+    print("\n[test] P12-3 (hostile pass #12): a merge whose COMMIT raises "
+          "(save_facts failing partway through — disk full, an unreadable "
+          "store) must still release conv_lock(dst). The normal dispatch "
+          "path (merge_conversation's `else` branch, portal-acquired) runs "
+          "`try: _merge_commit() finally: anyio.from_thread.run_sync("
+          "_release_dst_lock)` — the release is IN a `finally`, so this is "
+          "a test-gap fix, not a code fix: every one of the six cases "
+          "above only ever drives a merge that succeeds, is refused before "
+          "acquiring, or times out waiting to acquire — none of them makes "
+          "_merge_commit() itself raise AFTER the lock is held, so a "
+          "regression here (the release falling out of the `finally`, or "
+          "acquiring on a code path that forgets to release) would ship "
+          "green. If it ever did regress: every later writer to dst — the "
+          "extraction tail, /remember, /forget, archive/restore/dedup, and "
+          "the next merge — takes this SAME lock with an unbounded "
+          "`async with` (see the module comment on _acquire_dst_lock_"
+          "bounded/_release_dst_lock), so a stranded lock wedges every one "
+          "of them until the process restarts.")
+    memory.ensure_storage_layout()
+    dst, src = "mergefail-dst", "mergefail-src"
+    reset_state(dst)
+    reset_state(src)
+    seed_facts(dst, ["the mergefail destination's own pre-existing fact"])
+    merge_texts = distinct_facts(5, "mergefail")
+    seed_facts(src, merge_texts)
+
+    orig_save = facts.save_facts
+
+    def _boom(conv_id, facts_list):
+        if conv_id == dst:
+            # Synthetic failure standing in for a real one (disk full, a
+            # corrupt store) — not a network or lock-layer error, so it
+            # exercises exactly the "the commit itself raised" shape this
+            # test is named for, not a refusal before the lock was ever
+            # held.
+            raise OSError(28, "No space left on device (injected, P12-3 test)")
+        return orig_save(conv_id, facts_list)
+
+    async def _raise_then_check():
+        facts.save_facts = _boom
+        try:
+            await anyio.to_thread.run_sync(
+                functools.partial(portability.merge_conversation, src, dst, dry_run=False)
+            )
+            return "no_raise", None
+        except OSError as e:
+            return "raised", e
+        finally:
+            facts.save_facts = orig_save
+
+    outcome, err = asyncio.run(_raise_then_check())
+    assert_eq(
+        outcome, "raised",
+        f"the injected failure actually raised through the bridge (got {err})",
+    )
+    assert_true(
+        not memory.conv_lock(dst).locked(),
+        "*** P12-3: conv_lock(dst) is FREE after the failed commit — the "
+        "`finally` around _merge_commit() released it even though the "
+        "commit itself raised",
+    )
+
+    async def _retry():
+        return await anyio.to_thread.run_sync(
+            functools.partial(portability.merge_conversation, src, dst, dry_run=False)
+        )
+
+    t0 = time.monotonic()
+    asyncio.run(_retry())
+    elapsed = time.monotonic() - t0
+    assert_true(
+        elapsed < portability._MERGE_DST_LOCK_TIMEOUT_S * 0.5,
+        f"*** P12-3: the retry merge committed promptly ({elapsed:.2f}s), "
+        f"not after waiting out the {portability._MERGE_DST_LOCK_TIMEOUT_S}s "
+        f"acquire bound — a stranded lock would force every later writer "
+        f"to wait the FULL bound and then be refused, forever",
+    )
+    got = fact_texts(dst)
+    landed = [t for t in merge_texts if t in got]
+    assert_eq(
+        sorted(landed), sorted(merge_texts),
+        "every fact from the retried merge landed on dst",
+    )
+
+    async def _async_writer_can_acquire():
+        try:
+            await asyncio.wait_for(memory.conv_lock(dst).acquire(), timeout=2.0)
+            memory.conv_lock(dst).release()
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    acquired = asyncio.run(_async_writer_can_acquire())
+    assert_true(
+        acquired,
+        "*** P12-3: a tail-shaped async writer (holding conv_lock the same "
+        "way _facts_tail/_async_tail/`/remember`/`/forget`/archive/"
+        "restore/dedup do, via a plain `async with`) can still acquire "
+        "conv_lock(dst) after the failed merge — the lock was never "
+        "stranded",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -563,6 +667,7 @@ def _all_tests():
         test_merge_does_not_block_the_event_loop_while_writing,
         test_short_hold_serializes_and_both_merges_land,
         test_long_hold_times_out_with_the_original_refusal,
+        test_merge_failure_releases_the_dst_lock,
     ]
 
 

@@ -1256,11 +1256,11 @@ def _reuse_state() -> dict:
 
     CONTRACT: main.reuse_decline_state() -> {"attempted": int,
     "succeeded": int, "declined_no_state": int, "declined_no_coverage":
-    int, "declined_budget": int, "errored": int, "declined_recently":
-    bool, "last_reason": str | None, "last_attempt_age_s": float | None,
-    "last_declined_ceiling": int | None, "last_declined_others": int |
-    None}, read-only and cheap. Numbers only — no conversation text, no
-    conv_id, no hierarchy content.
+    int, "declined_budget": int, "declined_window": int, "errored": int,
+    "declined_recently": bool, "last_reason": str | None,
+    "last_attempt_age_s": float | None, "last_declined_ceiling": int |
+    None, "last_declined_others": int | None}, read-only and cheap.
+    Numbers only — no conversation text, no conv_id, no hierarchy content.
 
     P10-3 (hostile pass #10): `attempted`/`declined_budget` alone could not
     tell a fresh process apart from "reuse has never been possible here"
@@ -1272,6 +1272,15 @@ def _reuse_state() -> dict:
     `last_reason` names what the MOST RECENT attempt resolved to, and
     `last_attempt_age_s` is `None` only when no candidate request has
     reached `compact_if_needed`'s reuse check in this process at all.
+
+    P12-2 (hostile pass #12): `declined_window` is a second, ADDITIVE
+    decline reason — the stand-in fit `declined_budget`'s ceiling whole but
+    would still have squeezed the request's real window against the system
+    prompt and the recent turns (main.py's P11-6 structural check). It has
+    its own counter because it is a different decline with different
+    numbers: `last_declined_ceiling`/`last_declined_others` mean one thing
+    when `last_reason == "budget"` and another when `last_reason ==
+    "window"` — read them together with `last_reason`, never on their own.
     """
     main_mod = sys.modules.get("main")
     if main_mod is None:

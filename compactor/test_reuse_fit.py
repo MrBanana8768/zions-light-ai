@@ -1147,11 +1147,15 @@ _G11_RETR = "[Retrieved]\n" + "RETRIEVAL " + "r" * (1500 - 22)
 _G11_MEM = _G11_FACTS + "\n\n" + _G11_RETR
 
 
-def _g11_build_and_guard(aprev_chars: int):
+def _g11_build_and_guard(aprev_chars: int, *, expect_reuse: bool = True):
     """Reuse the CONV_CAPACITY hierarchy against a fresh recent window whose
     A_prev is `aprev_chars` long: real compact_if_needed at the shipped
-    numbers builds the stand-in, then persona + injected memory are added
-    the way chat_completions adds them, then the real guard runs."""
+    numbers builds the stand-in (or declines, see `expect_reuse` — P12-1
+    made the recent window's own size, A_prev included, part of the reuse
+    decision itself, so a large enough `aprev_chars` no longer reaches the
+    guard with a stand-in beside it at all), then persona + injected memory
+    are added the way chat_completions adds them, then the real guard runs.
+    """
     recent = [
         {"role": "user", "content": "prev-u " + "u" * 300},
         {"role": "assistant", "content": "prev-a " + "a" * aprev_chars},
@@ -1166,25 +1170,36 @@ def _g11_build_and_guard(aprev_chars: int):
                     inject_budget=_G_PLANNED_INJECT)
     finally:
         summarizer.SUMMARY_BLOCK_MAX_TOKENS = saved_sbmax
-    check(
-        stored_out == [_G_LAST_COVERED],
-        f"fixture (aprev={aprev_chars}): reuse fires on the at-capacity "
-        f"hierarchy (stored_turns_out={stored_out})",
-    )
+    if expect_reuse:
+        check(
+            stored_out == [_G_LAST_COVERED],
+            f"fixture (aprev={aprev_chars}): reuse fires on the at-capacity "
+            f"hierarchy (stored_turns_out={stored_out})",
+        )
+    else:
+        check(
+            stored_out == [0],
+            f"*** P12-1 fixture (aprev={aprev_chars}): reuse DECLINES — "
+            f"A_prev alone is now part of the P11-6 structural reserve "
+            f"(`system_msgs + keep_recent`), so a reply this large no "
+            f"longer reaches the guard with the stand-in still standing "
+            f"beside it (stored_turns_out={stored_out})",
+        )
     # `out` is compact_if_needed's real return: `history()`'s own leading
-    # "you are a companion" caller system message, the real stand-in, then
+    # "you are a companion" caller system message, the real stand-in (when
+    # one rendered — `None` on a decline whose fresh-span summarize() also
+    # produced nothing, which this stubbed `summarize()` does not), then
     # the 3 real recent turns — find the stand-in by CONTENT (as the guard
     # itself does via `_is_compaction_standin`), not by position, and drop
     # the caller system message here (redundant with the persona line
     # added below; keeping both would leave an extra unprotected system
     # message that only muddies what this section is measuring).
-    standin = next(m for m in out if main._is_compaction_standin(m))
+    standin = next((m for m in out if main._is_compaction_standin(m)), None)
     recent = [m for m in out if m.get("role") != "system"]
-    full = [
-        {"role": "system", "content": "P" * 2500},
-        standin,
-        {"role": "system", "content": _G11_MEM},
-    ] + recent
+    full = [{"role": "system", "content": "P" * 2500}]
+    if standin is not None:
+        full.append(standin)
+    full += [{"role": "system", "content": _G11_MEM}] + recent
     # No /tokenize in this offline process, so this runs on main's own real
     # fallback (char/4-ish local estimate, UNCORRECTED) — the exact counter
     # state p10's own reproduction used as its second confirmation
@@ -1221,27 +1236,67 @@ def _g11_build_and_guard(aprev_chars: int):
 # own size directly, and what that is in tokens at the current measured
 # rate, so this comment cannot drift from the code again the same way).
 # 64,000 characters is above her single largest recorded reply (51,290
-# characters) — outweighs persona + facts + retrieval combined, so memory
-# alone can never cover the gap.
-_g11_rep_h, _g11_facts_h, _g11_prev_h, _g11_ns_h = _g11_build_and_guard(64000)
+# characters).
+#
+# P12-1 (hostile pass #12) CHANGES WHAT THIS CASE EXERCISES. Before, this
+# reply outweighed persona + facts + retrieval combined but reuse still
+# FIRED (the old P11-6 reserve never looked at the recent window at all),
+# so the guard had to notice memory could not cover the gap and shed the
+# exchange instead — P10-1/P11-4's own scenario. Now `keep_recent` — this
+# very reply — is part of the reuse decision itself: a reply this large no
+# longer fits beside the stand-in AT ALL, so reuse correctly declines
+# before the guard ever runs, and the declined path (with nothing large
+# left to forward in this offline harness, where `summarize()` is stubbed
+# rather than genuinely deferring a backlog — see `main.summarize =
+# _spy_summarize` above) needs to shed nothing. [11a-mid] below keeps the
+# ORIGINAL scenario alive at a size P11-6 still allows through.
+_g11_rep_h, _g11_facts_h, _g11_prev_h, _g11_ns_h = _g11_build_and_guard(
+    64000, expect_reuse=False
+)
 check(_g11_rep_h.get("fits") is True, f"[11a] the guard fits the payload ({_g11_rep_h})")
 check(
-    _g11_rep_h.get("trimmed_blocks") == 0 and _g11_rep_h.get("dropped_blocks") == 0,
-    f"*** P10-1 [11a]: injected memory is NOT touched — spending it here "
-    f"could never have covered a 64,000-character (~17k-token) A_prev's "
-    f"gap, so the fix does not waste it before shedding the exchange that "
-    f"actually pays for the request ({_g11_rep_h})",
+    (_g11_rep_h.get("dropped_turns") or 0) == 0,
+    f"*** P12-5 [11a]: with reuse declined by P12-1 before the guard ever "
+    f"ran, the guard has nothing left it needs to shed — U_prev/A_prev are "
+    f"never at risk here in the first place ({_g11_rep_h})",
 )
-check(_g11_facts_h, "*** P10-1 [11a]: facts survive WHOLE (not halved, not dropped)")
-check(
-    (_g11_rep_h.get("dropped_turns") or 0) == 2,
-    f"[11a]: the previous exchange (U_prev+A_prev, one whole pair) is what "
-    f"pays for the request ({_g11_rep_h.get('dropped_turns')} dropped)",
-)
-check(not _g11_prev_h, "[11a]: U_prev/A_prev do NOT survive — they are what the fix sheds")
+check(_g11_prev_h, "*** P12-1/P12-5 [11a]: U_prev/A_prev survive — reuse declined rather than firing and losing them")
 check(
     any("newest" in main._message_text(m) for m in _g11_ns_h),
     "[11a]: the newest turn always survives",
+)
+
+# [11a-mid] P10-1/P11-4's ORIGINAL scenario, preserved: a reply too big for
+# injected memory to cover, but still small enough that P12-1's structural
+# reserve (`system + keep_recent`) fits beside the stand-in, so reuse still
+# fires and the GUARD — not the reuse decision — is what has to choose
+# between spending memory and shedding the exchange. 46,000 characters
+# (~12.2k tokens local) clears the P11-6/P12-1 ceiling at this fixture's
+# numbers (the stand-in renders ~11.5k, `effective_limit_est` here is
+# ~25,960 — see the fraction note in [14] for why this file's own
+# `INJECTION_BUDGET_FRACTION` differs from `_G_PLANNED_INJECT`'s) while
+# still overflowing the guard's real `EFFECTIVE_LIMIT` (20,768) by more
+# than persona+facts+retrieval combined (~1.1k tokens) can free — the same
+# "memory cannot possibly cover the gap" shape [11a] used to test.
+_g11_rep_m, _g11_facts_m, _g11_prev_m, _g11_ns_m = _g11_build_and_guard(46000)
+check(_g11_rep_m.get("fits") is True, f"[11a-mid] the guard fits the payload ({_g11_rep_m})")
+check(
+    _g11_rep_m.get("trimmed_blocks") == 0 and _g11_rep_m.get("dropped_blocks") == 0,
+    f"*** P10-1 [11a-mid]: injected memory is NOT touched — spending it "
+    f"here could never have covered this A_prev's gap, so the fix does not "
+    f"waste it before shedding the exchange that actually pays for the "
+    f"request ({_g11_rep_m})",
+)
+check(_g11_facts_m, "*** P10-1 [11a-mid]: facts survive WHOLE (not halved, not dropped)")
+check(
+    (_g11_rep_m.get("dropped_turns") or 0) == 2,
+    f"[11a-mid]: the previous exchange (U_prev+A_prev, one whole pair) is "
+    f"what pays for the request ({_g11_rep_m.get('dropped_turns')} dropped)",
+)
+check(not _g11_prev_m, "[11a-mid]: U_prev/A_prev do NOT survive — they are what the fix sheds")
+check(
+    any("newest" in main._message_text(m) for m in _g11_ns_m),
+    "[11a-mid]: the newest turn always survives",
 )
 
 # [11b] CONTROL, the other side of the same arithmetic: a smaller gap that
@@ -1888,6 +1943,24 @@ check(
     "squeeze), not silently folded into the old 'does not fit whole in "
     "the ... token(s) TARGET/injection budget leaves' wording",
 )
+# P12-2 (hostile pass #12): the log line changing wording is not proof the
+# RECORDED reason changed too — `checks.reuse`/`reuse_decline_state()` is
+# what an operator (and the health endpoint) actually reads, and it is a
+# SEPARATE code path from the log line. Read it here, right after the
+# real `compact_if_needed` call above that produced this decline, not via
+# a direct `_record_reuse_outcome()` call (test_health_findings.py's
+# `test_p12_2_...` already covers the RECORDER in isolation; this checks
+# that `compact_if_needed` actually calls it with "window", end to end).
+_g14_pB_decline_state = main.reuse_decline_state()
+check(
+    _g14_pB_decline_state.get("last_reason") == "window",
+    f"*** P12-2 [14] 'peakB': main.reuse_decline_state() records "
+    f"last_reason='window' for THIS decline, not 'budget' (got "
+    f"{_g14_pB_decline_state.get('last_reason')!r}) — end-to-end proof "
+    f"that compact_if_needed's window-squeeze branch actually calls "
+    f"_record_reuse_outcome with the new reason, not just a differently-"
+    f"worded log line",
+)
 
 
 def _g14_guard(out, last, tag):
@@ -1928,35 +2001,51 @@ check(
 )
 check(_g14_pB_newest, "[14] 'peakB': the newest turn always survives")
 
-# Cross-pricing note (coordinator, lane opencv): this ceiling prices the
-# preserved images with the SAME `count_tokens()` the guard's own
-# per-message array uses, not a separate hard-coded constant — so it moves
-# automatically with whatever lane opencv's chat-template fix makes that
-# function charge for an image (today: a flat `IMAGE_TOKEN_ESTIMATE` per
-# image, tier 2/3 fallback; after opencv: the template's own real
-# per-resolution cost, measured up to 3,080 on her images). Pinned here at
-# a SECOND, lower per-image price to prove the ceiling actually reacts —
-# NOT a claim that the recent window's own TEXT is protected at either
-# price (it structurally is not; see the comment beside this check in
-# main.py and the P11-6 entry in SP\fix-3193-reuse.md for the measured
-# residual case: the SAME 'peakB' hierarchy beside an 8k-token reply still
-# loses the exchange at the lower image price, no worse than the shipped
-# code, but not improved by this fix either).
-_g14_saved_image_tokens = main.IMAGE_TOKEN_ESTIMATE
-main.IMAGE_TOKEN_ESTIMATE = 3080  # lane opencv's measured real per-image cost
-_g14_pB2_stored, _g14_pB2_out, _g14_pB2_last, _g14_pB2_render, _ = (
-    _g14_run(9, 4000, 8000)
-)
-main.IMAGE_TOKEN_ESTIMATE = _g14_saved_image_tokens
-check(
-    _g14_pB2_stored == [_g14_pB2_last],
-    f"[14] cross-pricing: at a LOWER per-image cost (3,080) the SAME "
-    f"'peakB' hierarchy now REUSES (stored_turns_out={_g14_pB2_stored}) — "
-    f"expected: the ceiling reserves count_tokens(system + preserved "
-    f"images), not a hard-coded 4,096, so cheaper images free more room "
-    f"for the stand-in. This is a documented, not a hidden, consequence — "
-    f"see the P11-6 entry in SP\\fix-3193-reuse.md",
-)
+# Cross-pricing (P12-1, hostile pass #12): this is exactly the residual the
+# shipped (90e3698) check left open, and this fix's whole point. The OLD
+# check reserved `count_tokens(system + preserved_images)` — priced BY
+# `count_tokens`, so it rose and fell with whichever tier of that function
+# happened to run (a flat `IMAGE_TOKEN_ESTIMATE` before opencv, the
+# template's own real per-resolution cost after it — measured ~3,080
+# square, ~2,352 for a 4:3 photo). At the real, lower price the OLD
+# reserve shrank, 'peakB' reused again, and the guard lost the exchange —
+# proven on a real branch (SP\p12-findings.md, P12-1: 13-47 of 474
+# positions depending on state). The fix reserves `system + keep_recent`
+# instead: NOT an image price at all, so it does not move when
+# `count_tokens`'s image pricing does. Pinned at all three prices the
+# brief requires the decision to hold under: the shipped flat default
+# (4,096, checked above at 'today'/'peakA'/'peakB'), and here the two real
+# per-resolution costs p12 measured (3,080 square, 2,352 for a 4:3 photo)
+# — 'peakB' must decline at EVERY one of them, and 'peakA' (a smaller
+# hierarchy, well inside the reserve either way) must still reuse at every
+# one, so this is not "decline whenever an image is cheap" any more than
+# [14]'s original CONTROL was "decline whenever the hierarchy is large".
+for _g14_price, _g14_label in ((3080, "3,080 (opencv, square)"), (2352, "2,352 (opencv, 4:3 photo)")):
+    _g14_saved_image_tokens = main.IMAGE_TOKEN_ESTIMATE
+    main.IMAGE_TOKEN_ESTIMATE = _g14_price
+    try:
+        _g14_pB2_stored, _g14_pB2_out, _g14_pB2_last, _g14_pB2_render, _ = (
+            _g14_run(9, 4000, 8000)
+        )
+        _g14_pA2_stored, _g14_pA2_out, _g14_pA2_last, _g14_pA2_render, _ = (
+            _g14_run(9, 1869, 8000)
+        )
+    finally:
+        main.IMAGE_TOKEN_ESTIMATE = _g14_saved_image_tokens
+    check(
+        _g14_pB2_stored == [0],
+        f"*** P12-1 [14] cross-pricing at {_g14_label}: 'peakB' still "
+        f"DECLINES (stored_turns_out={_g14_pB2_stored}) — the reserve is "
+        f"`system + keep_recent`, not an image price, so it does not "
+        f"reopen the gap the shipped check left when images price below "
+        f"the flat 4,096 estimate",
+    )
+    check(
+        _g14_pA2_stored == [_g14_pA2_last],
+        f"[14] cross-pricing at {_g14_label}: 'peakA' still REUSES "
+        f"(stored_turns_out={_g14_pA2_stored}) — a cheaper image does not "
+        f"make this fix decline a hierarchy it was already happy with",
+    )
 
 main.INJECTION_BUDGET_FRACTION = _G14_SAVED_FRACTION
 
@@ -2102,6 +2191,578 @@ check(
 check(
     any("newest-u" in main._message_text(m) for m in _g15_ns),
     "[15]: the newest turn always survives",
+)
+
+
+# ---------------------------------------------------------------------------
+# [16] P12-5 (hostile pass #12): the compacted-branch ordering ("shed old
+# turns above the floor, THEN spend memory, THEN the floor") used to run
+# only `if any(_is_compaction_standin(...) for i in _droppable_system_
+# indices(...))` — i.e. only when the array carries compaction's OWN
+# summary block. [F1]/[F1-lean] above both exercise that branch, but both
+# of their fixtures ALWAYS include a stand-in system message
+# (`main.COMPACTION_SUMMARY_HEADER`), so neither one can tell the OLD
+# condition apart from the NEW, wider one (`_droppable_system_indices(...)`
+# alone) — both trigger identically whenever a stand-in happens to be
+# present. This section is deliberately the ONE place in this file that
+# builds a guard input with injected memory (facts) and PLENTY of old
+# verbatim turns to shed, but NO stand-in anywhere in the array — the
+# declined-path shape P12-5 is actually about (reuse declined, or never
+# attempted, so summarize() never produced a stand-in; facts/retrieval are
+# still injected the way they are on every request). Before this fix, an
+# array shaped like this fell through to the FLOOR-LESS generic "shed
+# oldest non-system turn" loop, which has no idea a facts block sits right
+# next to it and would shed the previous exchange once shedding old turns
+# alone was not enough — exactly the loss measured on a real branch
+# (SP\p12-findings.md, P12-5: 20-23 of 474 positions per hierarchy state,
+# every one of them with 2.5-8.5k tokens of headroom left had memory been
+# spent instead).
+#
+# Same deterministic byte-counting stand-in for count_tokens/
+# count_tokens_exact as [F1]/[F1-lean] above (this tests
+# main._enforce_hard_budget directly, not through compact_if_needed).
+# ---------------------------------------------------------------------------
+print("\n[16] P12-5: memory is spent before the previous exchange on ANY "
+      "array carrying injected memory, not only a compacted one")
+
+
+def _p125_build(old_exchanges: int, aprev_chars: int = 1650) -> list[dict]:
+    """Persona + injected facts (NO compaction stand-in anywhere in this
+    array — the declined-path shape), `old_exchanges` ordinary old pairs
+    (standing in for the deferred verbatim backlog a declined request
+    forwards), then the previous exchange and the newest turn. Mirrors
+    `_f1_build` above minus the `COMPACTION_SUMMARY_HEADER` system
+    message."""
+    facts_block = "[Facts]\n" + "".join(
+        f"- FACT{i:02d} she likes item {i} very much indeed.\n" for i in range(9)
+    )
+    facts_block = facts_block + "f" * (400 - len(facts_block))
+    msgs = [
+        {"role": "system", "content": "P" * 1200},
+        {"role": "system", "content": facts_block},
+    ]
+    for i in range(old_exchanges):
+        msgs.append({"role": "user", "content": f"old-u{i} " + "u" * 150})
+        msgs.append({"role": "assistant", "content": f"old-a{i} " + "a" * 1650})
+    msgs.append({"role": "user", "content": "prev-u " + "u" * 150})
+    msgs.append({"role": "assistant", "content": "prev-a " + "a" * aprev_chars})
+    msgs.append({"role": "user", "content": "newest " + "n" * 200})
+    return msgs
+
+
+def _p125_run(old_exchanges: int, aprev_chars: int = 1650):
+    _saved_ct = main.count_tokens
+    _saved_cte = main.count_tokens_exact
+    _saved_margin = main._BUDGET_MARGIN
+    main.count_tokens = _f1_tokens
+    main.count_tokens_exact = lambda ms, *a, **k: _f1_tokens(ms)
+    main._BUDGET_MARGIN = 0
+    try:
+        _msgs = _p125_build(old_exchanges, aprev_chars)
+        check(
+            not any(main._is_compaction_standin(m) for m in _msgs),
+            "[16] fixture: no compaction stand-in anywhere in this array — "
+            "the shape this section exists to cover",
+        )
+        _rep: dict = {}
+        _out = main._enforce_hard_budget(_msgs, _F1_LIMIT, 1, _rep)
+    finally:
+        main.count_tokens = _saved_ct
+        main.count_tokens_exact = _saved_cte
+        main._BUDGET_MARGIN = _saved_margin
+    _mem_out = [
+        x for x in _out
+        if x.get("role") == "system" and "[Facts]" in (x.get("content") or "")
+    ]
+    _facts_whole = bool(_mem_out) and all(
+        f"FACT{i:02d}" in _mem_out[0]["content"] for i in range(9)
+    )
+    _ns = [m for m in _out if m.get("role") != "system"]
+    _prev_survived = (
+        any(main._message_text(m).startswith("prev-u") for m in _ns)
+        and any(main._message_text(m).startswith("prev-a") for m in _ns)
+    )
+    return _rep, _facts_whole, _prev_survived, _ns
+
+
+# [16a] A FEW old turns to shed (5 pairs — standing in for a modest
+# deferred backlog) plus a previous exchange sized so that shedding EVERY
+# old pair still leaves the array just over the limit, by less than what
+# facts alone would free: the guard must choose between spending facts
+# and shedding the previous exchange. P12-5: it must spend (or drop)
+# facts, not the exchange — the SAME choice the compacted branch already
+# made correctly when a stand-in was present ([F1] above). (18,900
+# characters for A_prev is deliberately tuned so this is a CLOSE call at
+# the floor boundary, not a case either ordering would resolve the same
+# way — see the mutation note below.)
+_p125a_rep, _p125a_facts, _p125a_prev, _p125a_ns = _p125_run(
+    old_exchanges=5, aprev_chars=18900
+)
+check(_p125a_rep.get("fits") is True, f"[16a] the guard fits the payload ({_p125a_rep})")
+check(
+    _p125a_prev,
+    f"*** P12-5 [16a]: the previous exchange (U_prev/A_prev) SURVIVES on a "
+    f"NON-compacted array carrying injected memory — before this fix, the "
+    f"floor-less generic shed loop (gated only on a stand-in being "
+    f"present) would have reached U_prev/A_prev exactly like any other "
+    f"'old' turn ({_p125a_rep})",
+)
+check(
+    any(main._message_text(m).startswith("newest") for m in _p125a_ns),
+    "[16a]: the newest turn always survives",
+)
+
+# [16b] CONTROL: with no old turns to shed at all and a previous exchange
+# too large for facts alone to cover, the exchange still must pay — this
+# is not "always protect the previous exchange no matter what", only
+# "spend memory first". Mirrors [11a-mid]'s shape without going through
+# compact_if_needed.
+_p125b_rep, _p125b_facts, _p125b_prev, _p125b_ns = _p125_run(
+    old_exchanges=0, aprev_chars=25000
+)
+check(_p125b_rep.get("fits") is True, f"[16b] CONTROL the guard fits the payload ({_p125b_rep})")
+check(
+    not _p125b_prev,
+    f"*** P12-5 [16b] CONTROL: with nothing else left to shed and a reply "
+    f"far bigger than facts alone can cover, the previous exchange is "
+    f"what pays — the fix is an ordering choice (memory before the "
+    f"turns above the floor), not a blanket 'never touch U_prev/A_prev' "
+    f"rule ({_p125b_rep})",
+)
+check(
+    any(main._message_text(m).startswith("newest") for m in _p125b_ns),
+    "[16b] CONTROL: the newest turn always survives",
+)
+
+
+# ---------------------------------------------------------------------------
+# [17] P12-6 (coordinator follow-up to P12-1, real-data replay, hostile
+# pass #12): the P11-6/P12-1 reserve's fresh-summary allowance assumed ONE
+# SUMMARY_MAX_TOKENS batch. The coordinator's real-data replay (her branch,
+# 474 positions) found the "fresh+peakB" state — an uncovered tail past her
+# last L1 rollup, ROUTINE per p11 (3 summarize() calls per reusing request
+# between rollups), not an edge case — where the fresh summary actually
+# costs 1,000-2,000 tokens (one or two UN-FOLDED map-reduce batches, not the
+# single batch this reserve priced for): reuse still fired and lost her
+# previous exchange at 26 of 474 positions where declining kept it.
+#
+# [17a] reproduces that shape synthetically: her peakB hierarchy (~12,951
+# measured tokens — [14]'s own peakA/peakB render 11,529/13,660 at
+# l3_tokens 1,869/4,000, ~1:1 with l3_tokens since the L3 filler dominates
+# the difference, so 3,291 interpolates to ~12,951) plus a genuinely large
+# UNCOVERED TAIL (2 exchanges past the last L1/L2 chunk boundary, 4,000
+# tokens each — P12-1's own comment names "an uncovered tail past
+# stored_turns" as one of the two `_fresh_span_preview` triggers — sized so
+# `_chunk_to_budget`'s pessimistic-scale estimate needs 2 batches, not 1:
+# 16,000 raw tokens > the ~14,848-token threshold for a second 29,696-token
+# batch), stubbed through a summarize() double that returns what an
+# un-folded 2-batch reduce failure actually looks like: two concatenated
+# near-cap chunks, ~1,800 tokens together — her measured magnitude, not
+# derived from this fixture's own token count, so the stub cannot
+# accidentally match whatever the fix under test predicts.
+#
+# [17b] confirms the OTHER half of the coordinator's ask (item 2): when a
+# SMALLER fresh span (one batch, correctly reserved at flat SUMMARY_MAX_
+# TOKENS either way) lets reuse fire with a fresh-summary-bearing stand-in,
+# the guard's P12-5 ordering still spends injected memory before the
+# previous exchange — proving the combined (stored + fresh) system message
+# is still recognised as ONE stand-in by `_is_compaction_standin`, and nothing
+# about attaching a fresh summary confuses the guard's own floor/memory
+# choice downstream.
+# ---------------------------------------------------------------------------
+print("\n[17] P12-6: the fresh-summary reserve prices what summarize() can "
+      "actually produce (possibly several un-folded batches), not a flat "
+      "single one")
+
+
+async def _g17_multibatch_summarize(client, to_summarize):
+    """Simulates summarize()'s real worst case for a fresh span needing
+    multiple map-reduce batches where the reduce phase never folds them —
+    the reduce budget exhausted by the map phase, or two dense partials
+    together still missing the reduce call's own input budget (see
+    summarize()'s own "stopping the reduce" / reduce-failure branches).
+    Returns TWO concatenated near-SUMMARY_MAX_TOKENS chunks (~1,800 tokens
+    together) regardless of the exact input — her measured real growth
+    (coordinator's real-data replay, "fresh+peakB": 12,951 -> 13,955-
+    14,953), not derived from this fixture's own token count."""
+    CALLS.append(list(to_summarize))
+    chunk = "MULTIBATCH-SUMMARY-PART " + _g_filler(900)
+    return chunk + "\n\n" + chunk, []
+
+
+async def _g17_singlebatch_summarize(client, to_summarize):
+    """A single-batch fresh summary, capped exactly at what one real
+    _summarize_once call can return — the case the flat SUMMARY_MAX_TOKENS
+    allowance was always correct for."""
+    CALLS.append(list(to_summarize))
+    return "SINGLEBATCH-SUMMARY " + _g_filler(main.SUMMARY_MAX_TOKENS - 8), []
+
+
+_G17_HIER_CONV = "reuse_fit_p12_6_hierarchy"
+
+
+def _g17_hierarchy(n_l1: int = 9, l3_tokens: int | None = 3291):
+    """Self-contained copy of `_g14_hierarchy`'s body (not a call to it) —
+    [17a]/[17b] deliberately seed DIFFERENT hierarchy sizes (peakB-ish,
+    then "today") on the same conv id in sequence; `_g14_hierarchy`
+    reuses `_G14_CONV` and only SETS `st["l3"]` when `l3_tokens` is
+    truthy, never clearing a PRIOR seed's l3 when this one has none — the
+    exact shape [14] itself never hits (its own today/peakA/peakB calls
+    only ever ADD an l3, never remove one, in that order). Reproduced here
+    once, from first principles, so [17] cannot leak state into or out of
+    [14]/[15]'s own conv id either."""
+    older = history(n_l1 * 5 + 20, words=200)
+    l1 = [
+        {"tier": "l1", "text": "L1scene " + _g_filler(_G12_L1_MEAN),
+         "first_turn": i * 10 + 1, "last_turn": i * 10 + 10}
+        for i in range(n_l1)
+    ]
+    l2 = [
+        {"tier": "l2", "text": "L2chapter " + _g_filler(_G12_L2_MEAN),
+         "first_turn": n_l1 * 10 + i * 10 + 1, "last_turn": n_l1 * 10 + i * 10 + 10}
+        for i in range(4)
+    ]
+    last = l2[-1]["last_turn"]
+    st = _seed_hierarchy(_G17_HIER_CONV, older, l1 + l2)
+    st.pop("l3", None)  # never leak a previous call's L3 on this conv id
+    if l3_tokens:
+        st["l3"] = {
+            "text": "L3theme " + _g_filler(l3_tokens),
+            "first_turn": 1, "last_turn": last,
+        }
+    summarizer.save_state(_G17_HIER_CONV, st)
+    st = summarizer.load_state(_G17_HIER_CONV)
+    saved = summarizer.SUMMARY_BLOCK_MAX_TOKENS
+    summarizer.SUMMARY_BLOCK_MAX_TOKENS = 10**9
+    render = summarizer._estimate_block_tokens(
+        summarizer.format_summary_block(st, 10**9) or ""
+    )
+    summarizer.SUMMARY_BLOCK_MAX_TOKENS = saved
+    return older, last, render
+
+
+def _g17_build(
+    n_fresh_pairs: int, fresh_pair_tokens: int, aprev_tokens: int = 8000,
+    n_l1: int = 9, l3_tokens: int | None = 3291,
+):
+    """Her peakB-ish hierarchy by default (n_l1=9, l3_tokens=3291 -> her
+    measured ~12,951), THEN an uncovered tail of `n_fresh_pairs` fat
+    exchanges past the last L1/L2 chunk boundary, THEN her measured
+    755-char system prompt and the same realistic recent exchange [14]/
+    [16] use. [17b] passes a smaller ("today") hierarchy — even ONE
+    correctly-reserved fresh batch (1,024 tokens) does not fit beside a
+    12,951-token hierarchy and an 8,000-token reply at all (12,951 + 1,024
+    + 128 = 14,103 > the ~12,372-token ceiling this recent window leaves —
+    the SAME reason plain peakB already declines with zero fresh content),
+    so proving the guard still protects a fresh-summary-bearing stand-in
+    needs a hierarchy small enough for reuse to actually fire with one."""
+    older, last, render = _g17_hierarchy(n_l1, l3_tokens)
+    older = list(older)
+    older[0] = {"role": "system", "content": "S" * 755}
+    for i in range(n_fresh_pairs):
+        older.append(fat_turn("user", fresh_pair_tokens, f"fresh-u{i}"))
+        older.append(fat_turn("assistant", fresh_pair_tokens, f"fresh-a{i}"))
+    recent = [
+        fat_turn("user", 100, "prev-u"),
+        fat_turn("assistant", aprev_tokens, "prev-a"),
+        fat_turn("user", 100, "newest-u"),
+    ]
+    return older + recent, last, render
+
+
+_G17_CONV = _G17_HIER_CONV  # the SAME conv id `_g17_hierarchy` seeds — a
+# different one would make compact_if_needed look up an empty state
+
+
+def _g17_run(
+    summarize_stub, n_fresh_pairs, fresh_pair_tokens,
+    n_l1=9, l3_tokens=3291, aprev_tokens=6000,
+):
+    # [14]'s own fraction note applies here unchanged: `_G_PLANNED_INJECT`
+    # is a LITERAL 0.75-based figure, but this file's module-level env sets
+    # `COMPACTOR_INJECTION_BUDGET_FRACTION="0.6"` (the sections before [14]
+    # use it, and [14] itself restores it when done) — recovering
+    # `effective_limit` as `inject_budget / INJECTION_BUDGET_FRACTION`
+    # without matching the two is exactly the mismatch [14]'s own comment
+    # warns about: an inflated `_effective_limit_est` (25,960 instead of
+    # 20,768) that never declines at all, silently under-testing this
+    # section's whole point. Same save/restore [14] uses.
+    saved_fraction = main.INJECTION_BUDGET_FRACTION
+    main.INJECTION_BUDGET_FRACTION = 0.75
+    main.summarize = summarize_stub
+    try:
+        msgs, last, render = _g17_build(
+            n_fresh_pairs, fresh_pair_tokens, aprev_tokens=aprev_tokens,
+            n_l1=n_l1, l3_tokens=l3_tokens,
+        )
+        saved_sbmax = summarizer.SUMMARY_BLOCK_MAX_TOKENS
+        summarizer.SUMMARY_BLOCK_MAX_TOKENS = _G12_SHIPPED_SBMAX
+        stored_out: list = []
+        with capture() as records:
+            try:
+                out = _run(
+                    msgs, _G17_CONV, stored_turns_out=stored_out,
+                    inject_budget=_G_PLANNED_INJECT,
+                )
+            finally:
+                summarizer.SUMMARY_BLOCK_MAX_TOKENS = saved_sbmax
+    finally:
+        main.summarize = _spy_summarize
+        main.INJECTION_BUDGET_FRACTION = saved_fraction
+    return stored_out, out, last, render, records.records
+
+
+# [17a] the reproduction: a fresh span big enough to need 2 un-folded
+# batches (~1,800 measured tokens), at her peakB-ish hierarchy size.
+_g17a_stored, _g17a_out, _g17a_last, _g17a_render, _g17a_log = _g17_run(
+    _g17_multibatch_summarize, n_fresh_pairs=2, fresh_pair_tokens=4000
+)
+check(
+    12700 <= _g17a_render <= 13200,
+    f"fixture: [17a] hierarchy renders near the coordinator's measured "
+    f"12,951 (got {_g17a_render})",
+)
+_g17a_rep, _g17a_prev, _g17a_newest = _g14_guard(_g17a_out, _g17a_last, "17a")
+check(
+    _g17a_rep.get("fits") is True,
+    f"[17a] the guard fits the payload ({_g17a_rep})",
+)
+check(
+    _g17a_prev,
+    f"*** P12-6 [17a]: her previous exchange (U_prev/A_prev) survives "
+    f"END TO END — whatever compact_if_needed decided (stored_turns_out="
+    f"{_g17a_stored}), the real guard afterward does not lose it to a "
+    f"fresh summary this reserve failed to price for ({_g17a_rep})",
+)
+check(
+    _g17a_newest,
+    "[17a]: the newest turn always survives",
+)
+
+# [17b] item 2: a SMALLER hierarchy ("today", ~9,075 — plain peakB already
+# declines regardless of fresh content, see `_g17_build`'s own docstring)
+# plus a SMALLER fresh span (one batch, correctly reserved either way)
+# lets reuse fire with a fresh-summary-bearing stand-in — the guard's
+# P12-5 ordering must still spend memory before the previous exchange.
+_g17b_stored, _g17b_out, _g17b_last, _g17b_render, _ = _g17_run(
+    _g17_singlebatch_summarize, n_fresh_pairs=1, fresh_pair_tokens=2000,
+    n_l1=8, l3_tokens=None,
+)
+check(
+    _g17b_stored == [_g17b_last],
+    f"*** P12-6 [17b] fixture: reuse fires with a SMALLER fresh span "
+    f"(stored_turns_out={_g17b_stored}) — the state this CONTROL needs: a "
+    f"fresh-summary-bearing stand-in actually reaching the guard",
+)
+_g17b_standin = next(
+    (m for m in _g17b_out if main._is_compaction_standin(m)), None
+)
+check(
+    _g17b_standin is not None and "SINGLEBATCH-SUMMARY" in _g17b_standin["content"],
+    "[17b] fixture: the stand-in the guard will see actually carries the "
+    "fresh summary text, combined with the stored hierarchy in ONE system "
+    "message (not two) — the shape `_is_compaction_standin` must still "
+    "recognise",
+)
+_g17b_rep, _g17b_prev, _g17b_newest = _g14_guard(_g17b_out, _g17b_last, "17b")
+check(
+    _g17b_rep.get("fits") is True,
+    f"[17b] the guard fits the payload ({_g17b_rep})",
+)
+check(
+    _g17b_prev,
+    f"*** P12-6 [17b]: her previous exchange still survives the guard "
+    f"when the stand-in it protects is a COMBINED stored+fresh message, "
+    f"not just the bare hierarchy — P12-5's ordering does not get confused "
+    f"by what the stand-in is made of ({_g17b_rep})",
+)
+check(
+    _g17b_newest,
+    "[17b]: the newest turn always survives",
+)
+
+
+# ---------------------------------------------------------------------------
+# [18] P12-6 coordinator follow-up #2 (hostile pass #12, real-data "unpair"
+# replay — the SECOND, corrected replay after the coordinator found their
+# first "fresh" harness was a spy artifact that could not test this reserve
+# at all: it appended ~1,000 tokens to the stand-in AFTER compact_if_needed
+# returned, where no decision inside it could ever see them). The "unpair"
+# variant is real: every third assistant turn among the last 60 COVERED
+# turns gets its content changed, so `_coverage_plan` genuinely stops
+# pairing them and `compact_if_needed` itself summarizes them fresh
+# (verified on her branch: 1 summarize() call at most positions, 3-4 at
+# some). At the LIVE END of her branch — her last real message is a
+# 39,569-character (~10.5k-token) reply, and the replies just before it are
+# also long — reuse fired with an 11.8k-token stand-in beside a 3-4 batch
+# fresh span and lost her previous exchange, where declining kept it.
+#
+# ROOT CAUSE, found by direct reproduction (not guessed): the fresh-span
+# reserve's ESCAPE HATCH — "more than MAX_SUMMARY_CALLS_PER_REQUEST
+# PESSIMISTIC-estimated batches means summarize() will cap-refuse, so
+# reserve nothing" — is backwards. The pessimistic (2.0x) scale this
+# preview uses to size the reserve SAFELY is not what `summarize()` itself
+# uses to decide whether to proceed at all; on content whose REAL
+# (undoubled) batch count is under the cap, `summarize()` proceeds and can
+# still leave every batch un-folded — exactly the costly case this reserve
+# exists to price for — while the PESSIMISTIC preview's own inflated count
+# can land just OVER the cap on that SAME content, collapsing the reserve
+# to zero at precisely the wrong moment. [18a] reproduces this directly:
+# a fresh span sized so the pessimistic preview predicts battle count OVER
+# the cap while a REALISTIC (capped-at-4-batches) fresh summary is what
+# actually lands beside the stand-in — the previous exchange must not be
+# what pays for a reserve that collapsed to zero. [18b] is the CONTROL:
+# the same shape, but with a small (1-batch) fresh span, where the OLD
+# formula was already correct and must stay correct.
+# ---------------------------------------------------------------------------
+print("\n[18] P12-6 coordinator follow-up #2: the fresh-span reserve's "
+      "cap-refusal escape hatch must not collapse to zero on its own "
+      "pessimism")
+
+
+async def _g18_multibatch_summarize(client, to_summarize):
+    """Her real magnitude: several un-folded near-cap batches concatenated
+    (matching the coordinator's real SUMC=3-4, capped at MAX_SUMMARY_CALLS_
+    PER_REQUEST=4 either way — summarize() itself never returns more than
+    that many un-folded parts, by construction), not a single small
+    summary and not an unbounded one."""
+    CALLS.append(list(to_summarize))
+    parts = ["UNPAIR-SUMMARY-PART " + _g_filler(900) for _ in range(4)]
+    return "\n\n".join(parts), []
+
+
+async def _g18_singlebatch_summarize(client, to_summarize):
+    CALLS.append(list(to_summarize))
+    return "UNPAIR-SUMMARY-SMALL " + _g_filler(500), []
+
+
+def _g18_build(unpaired_tokens: int, n_unpaired: int, aprev_tokens: int):
+    """Her peakA-ish hierarchy ([14]'s own construction, ~11.5k — the
+    coordinator's real branch measured ~11.8k for this state; close
+    enough that the arithmetic below is representative, not recalibrated
+    to a different decimal), THEN `n_unpaired` of her last 60 COVERED
+    turns (every 3rd assistant turn, matching the coordinator's own real
+    methodology) get their CONTENT changed post-seed — the fingerprint
+    record still holds the ORIGINAL text, so `_coverage_plan` genuinely
+    stops pairing them, exactly as it would for a real edited/regenerated
+    reply. THEN her measured 755-char system prompt and a tunable recent
+    exchange."""
+    older, last, render = _g17_hierarchy(n_l1=9, l3_tokens=1869)
+    older = list(older)
+    older[0] = {"role": "system", "content": "S" * 755}
+    modified = 0
+    for turn_no in range(last - 59, last + 1):
+        if modified >= n_unpaired:
+            break
+        if turn_no % 6 == 0:  # assistant turns are even; every 3rd = every 6th turn number
+            older[turn_no] = fat_turn(
+                "assistant", unpaired_tokens, f"unpaired-{turn_no}"
+            )
+            modified += 1
+    recent = [
+        fat_turn("user", 100, "prev-u"),
+        fat_turn("assistant", aprev_tokens, "prev-a"),
+        fat_turn("user", 100, "newest-u"),
+    ]
+    return older + recent, last, render, modified
+
+
+def _g18_run(summarize_stub, unpaired_tokens, n_unpaired, aprev_tokens):
+    # Same fraction note as [17]/_g17_run: _G_PLANNED_INJECT is a literal
+    # 0.75-based figure; this file's module env sets 0.6.
+    saved_fraction = main.INJECTION_BUDGET_FRACTION
+    main.INJECTION_BUDGET_FRACTION = 0.75
+    main.summarize = summarize_stub
+    try:
+        msgs, last, render, modified = _g18_build(
+            unpaired_tokens, n_unpaired, aprev_tokens
+        )
+        saved_sbmax = summarizer.SUMMARY_BLOCK_MAX_TOKENS
+        summarizer.SUMMARY_BLOCK_MAX_TOKENS = _G12_SHIPPED_SBMAX
+        stored_out: list = []
+        with capture() as records:
+            try:
+                out = _run(
+                    msgs, _G17_HIER_CONV, stored_turns_out=stored_out,
+                    inject_budget=_G_PLANNED_INJECT,
+                )
+            finally:
+                summarizer.SUMMARY_BLOCK_MAX_TOKENS = saved_sbmax
+    finally:
+        main.summarize = _spy_summarize
+        main.INJECTION_BUDGET_FRACTION = saved_fraction
+    return stored_out, out, last, render, modified, records.records
+
+
+# [18a] the reproduction: 10 unpaired assistant turns at 5,900 tokens each
+# (59,000 raw — pushes the PESSIMISTIC-scale batch estimate to 5, one OVER
+# MAX_SUMMARY_CALLS_PER_REQUEST=4) beside a 7,000-token A_prev (tuned so
+# the base hierarchy alone fits the structural ceiling — the OLD formula's
+# collapse to a ZERO fresh reserve is what must be caught here; a bigger
+# A_prev would decline correctly even at zero reserve, the same way plain
+# peakB already does regardless of the bug, and would not discriminate the
+# needle at all — found this exact trap while building [17a] the first
+# time).
+_g18a_stored, _g18a_out, _g18a_last, _g18a_render, _g18a_modified, _g18a_log = (
+    _g18_run(_g18_multibatch_summarize, unpaired_tokens=5900, n_unpaired=10,
+             aprev_tokens=7000)
+)
+check(
+    11300 <= _g18a_render <= 11700,
+    f"fixture: [18a] hierarchy renders near peakA (got {_g18a_render})",
+)
+check(
+    _g18a_modified == 10,
+    f"fixture: [18a] modified exactly 10 covered assistant turns (got "
+    f"{_g18a_modified})",
+)
+_g18a_rep, _g18a_prev, _g18a_newest = _g14_guard(_g18a_out, _g18a_last, "18a")
+check(
+    _g18a_rep.get("fits") is True,
+    f"[18a] the guard fits the payload ({_g18a_rep})",
+)
+check(
+    _g18a_prev,
+    f"*** P12-6 [18a]: her previous exchange (U_prev/A_prev) survives END "
+    f"TO END — whatever compact_if_needed decided (stored_turns_out="
+    f"{_g18a_stored}), the real guard afterward does not lose it to a "
+    f"fresh-span reserve that collapsed to zero because its own pessimism "
+    f"crossed the call cap ({_g18a_rep})",
+)
+check(
+    _g18a_newest,
+    "[18a]: the newest turn always survives",
+)
+
+# [18b] CONTROL: a SMALL (1-batch, well under the cap either way) unpaired
+# span at the SAME hierarchy and recent-window sizes — the OLD formula was
+# already correct here (n_batches <= cap), and the fix must not change
+# that: reuse still fires, the fresh-summary-bearing stand-in still
+# reaches the guard, and the exchange still survives.
+_g18b_stored, _g18b_out, _g18b_last, _g18b_render, _g18b_modified, _ = (
+    _g18_run(_g18_singlebatch_summarize, unpaired_tokens=1200, n_unpaired=2,
+             aprev_tokens=7000)
+)
+check(
+    _g18b_stored == [_g18b_last],
+    f"*** P12-6 [18b] CONTROL: reuse fires with a SMALL (1-batch) unpaired "
+    f"span (stored_turns_out={_g18b_stored}) — the fix must not make this "
+    f"section decline MORE than the old formula did on content already "
+    f"under the cap",
+)
+_g18b_rep, _g18b_prev, _g18b_newest = _g14_guard(_g18b_out, _g18b_last, "18b")
+check(
+    _g18b_rep.get("fits") is True,
+    f"[18b] CONTROL the guard fits the payload ({_g18b_rep})",
+)
+check(
+    _g18b_prev,
+    f"[18b] CONTROL: her previous exchange survives — unaffected by this "
+    f"fix, the same as before it ({_g18b_rep})",
+)
+check(
+    _g18b_newest,
+    "[18b] CONTROL: the newest turn always survives",
 )
 
 

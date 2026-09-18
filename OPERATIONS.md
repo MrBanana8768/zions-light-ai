@@ -121,6 +121,7 @@ print('attempted:', r.get('attempted'), '| succeeded:', r.get('succeeded'))
 print('declined_no_state:', r.get('declined_no_state'),
       '| declined_no_coverage:', r.get('declined_no_coverage'),
       '| declined_budget:', r.get('declined_budget'),
+      '| declined_window:', r.get('declined_window'),
       '| errored:', r.get('errored'))
 print('last_reason:', r.get('last_reason'), '| last_attempt_age_s:', r.get('last_attempt_age_s'))
 print('declined_recently:', r.get('declined_recently'))
@@ -147,47 +148,85 @@ what the MOST RECENT attempt resolved to — `"success"`, `"no_state"`
 (nothing stored yet, normal for a new conversation), `"no_coverage"` (a
 hierarchy exists but does not cover this array — a different branch, a
 delete-and-regenerate, or a store rebuild), `"budget"` (exists, covers
-this array, still does not fit the stand-in's budget whole) or
-`"error"` (an exception — check `/data/logs/compactor.log` for "could not
-reuse stored summaries" around `last_attempt_age_s` seconds ago). **A
-nonzero `errored` count is the one that needs a log, not a shrug**: this
-counter exists specifically because "the request still succeeded" (the
-`except` clause's whole job) used to also mean "nothing tells you this
-happened."
+this array, but the rendered stand-in does not fit the stand-in's OWN
+budget whole), `"window"` (hostile pass #12, P12-2 — exists, covers this
+array, the stand-in fits ITS OWN budget, but alongside the system prompt
+and the recent turns it would leave no room in the request's real window
+— a DIFFERENT decline from `"budget"`, see below) or `"error"` (an
+exception — check `/data/logs/compactor.log` for "could not reuse stored
+summaries" around `last_attempt_age_s` seconds ago). **A nonzero
+`errored` count is the one that needs a log, not a shrug**: this counter
+exists specifically because "the request still succeeded" (the `except`
+clause's whole job) used to also mean "nothing tells you this happened."
 
 `attempted`/`succeeded`/`declined_no_state`/`declined_no_coverage`/
-`declined_budget`/`errored` are all cumulative since the process started
-— **a restart resets every one of them to zero, not a rolling window**
-(unlike `declined_recently`, below) — so a freshly restarted pod reading
-`attempted: 0` says nothing about whether reuse was healthy or broken
-before the restart; use `last_attempt_age_s` (`None` only when no
-candidate request has reached the reuse check yet THIS process) rather
-than assuming a low `attempted` means a quiet feature. `declined_budget
-== 0` with `attempted > 0` means every stand-in attempt that reached the
-budget check fit; that is the healthy state to expect in normal
-operation. **`declined_recently`** is `true` for `COMPACTOR_REUSE_DECLINE_
-DEGRADE_WINDOW_S` (default 300s) after the most recent BUDGET decline
-specifically — check this first if you suspect the feature just stopped
-working, rather than the cumulative counter, which stays nonzero forever
-after even one decline early in a long-lived process. `last_declined_ceiling` and
-`last_declined_others` are the two numbers from that decline's own log
-line (`the stored summaries cover N of the turns ... but they do not fit
-whole in the <ceiling> token(s) ... leaves beside the system prompt,
-images and recent turns (<others>) and one fresh summary`) — if
-`declined_recently` is true, the summary hierarchy has grown past what
-`COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`/`COMPACTOR_STANDIN_BUDGET_FRACTION`
-can hold right now (see RUNPOD_DEPLOY.md's [Memory budgets](RUNPOD_DEPLOY.md#memory-budgets--raised-defaults-in-v319)
-for the exact arithmetic and what to raise). **Do not use 11,300 as the
-threshold to watch for** (hostile pass #10, P10-2 corrected this doc: that
-figure is in a different unit from what `last_declined_ceiling` is checked
-against, and her own hierarchy's measured steady-state peak with a real L3
-is already 11,728 — above it — while still reusing at the shipped
-default). Compare `last_declined_ceiling` against
-`COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` itself (15,000 shipped) instead: a
-decline with `last_declined_ceiling` at or near that configured value
-means the hierarchy has genuinely outgrown the current setting and it is
-time to raise it (together with `COMPACTOR_INJECTION_BUDGET_FRACTION`,
-which the ceiling can also never exceed).
+`declined_budget`/`declined_window`/`errored` are all cumulative since the
+process started — **a restart resets every one of them to zero, not a
+rolling window** (unlike `declined_recently`, below) — so a freshly
+restarted pod reading `attempted: 0` says nothing about whether reuse was
+healthy or broken before the restart; use `last_attempt_age_s` (`None`
+only when no candidate request has reached the reuse check yet THIS
+process) rather than assuming a low `attempted` means a quiet feature.
+`declined_budget == 0 and declined_window == 0` with `attempted > 0` means
+every stand-in attempt that reached either check fit; that is the healthy
+state to expect in normal operation. **`declined_recently`** is `true` for
+`COMPACTOR_REUSE_DECLINE_DEGRADE_WINDOW_S` (default 300s) after the most
+recent CAPACITY decline — `"budget"` OR `"window"` (P12-2 widened this
+from "budget" specifically: `no_state`/`no_coverage`/`error` still do not
+set it, but a window-squeeze decline is exactly as real a capacity squeeze
+as a budget one, and hiding it here just meant an operator staring at
+`declined_recently: false` minutes after a run of window declines) —
+check this first if you suspect the feature just stopped working, rather
+than the cumulative counters, which stay nonzero forever after even one
+decline early in a long-lived process. **Read `last_declined_ceiling`/
+`last_declined_others` together with `last_reason` — they mean a
+DIFFERENT pair of numbers depending on which reason produced them:**
+
+- **`last_reason == "budget"`**: the two numbers from that decline's own
+  log line (`the stored summaries cover N of the turns ... but they do
+  not fit whole in the <ceiling> token(s) ... leaves beside the system
+  prompt, images and recent turns (<others>) and one fresh summary`) — if
+  `declined_recently` is true for this reason, the summary hierarchy has
+  grown past what `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`/
+  `COMPACTOR_STANDIN_BUDGET_FRACTION` can hold right now (see
+  RUNPOD_DEPLOY.md's [Memory budgets](RUNPOD_DEPLOY.md#memory-budgets--raised-defaults-in-v319)
+  for the exact arithmetic and what to raise). **Do not use 11,300 as the
+  threshold to watch for** (hostile pass #10, P10-2 corrected this doc:
+  that figure is in a different unit from what `last_declined_ceiling` is
+  checked against, and her own hierarchy's measured steady-state peak with
+  a real L3 is already 11,728 — above it — while still reusing at the
+  shipped default). Compare `last_declined_ceiling` against
+  `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` itself (15,000 shipped) instead: a
+  decline with `last_declined_ceiling` at or near that configured value
+  means the hierarchy has genuinely outgrown the current setting and it is
+  time to raise it (together with `COMPACTOR_INJECTION_BUDGET_FRACTION`,
+  which the ceiling can also never exceed).
+- **`last_reason == "window"`** (hostile pass #12, P12-2): a DIFFERENT
+  check, with its own log line (`the stored summaries cover N of the
+  turns ... and the <rendered>-token stand-in fits the <budget>-token
+  ceiling, but alongside this conversation's system prompt and recent
+  turns it would leave the ~<ceiling>-token window no room for the turns
+  it exists to keep`). Here `last_declined_ceiling` is
+  `effective_limit_est - (system prompt + the recent turns)` — the room
+  actually available for the stand-in — and `last_declined_others` is what
+  the system prompt and the recent turns themselves cost. **`last_declined_
+  ceiling` sitting at or near `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` (or
+  anywhere else) means nothing for THIS reason — it is not that number.**
+  Neither `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` nor
+  `COMPACTOR_INJECTION_BUDGET_FRACTION` can move it: raising either only
+  changes how big a stand-in is ALLOWED to render before this check runs,
+  never what this check compares it against (P12-2's own reproduction:
+  raising `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` from 15,000 to 20,000 left
+  the SAME requests declining, `last_declined_ceiling` merely following the
+  new inject-budget cap). What DOES move it: fewer or cheaper retained
+  images (`COMPACTOR_MAX_RETAINED_IMAGES`, `COMPACTOR_IMAGE_TOKENS`), a
+  smaller recent reply (nothing to configure — this is about what the user
+  actually sent), or a smaller stored hierarchy (trigger an L3 rollup
+  early, `/admin/...` — see the hierarchy section above). A window decline
+  is not a bug and not data loss: the declined path (v3.1.9.3, hostile
+  pass #12 P12-5) protects the SAME recent turns this check exists to
+  protect, by spending injected memory (facts, retrieval) before them —
+  it is slower and forwards more raw text, not silently worse.
 
 #### `config.time_injection` — the current-time feature (v3.1.9)
 

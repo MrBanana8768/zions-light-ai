@@ -2061,6 +2061,9 @@ def _standin_reuse_ceiling(inject_budget: int) -> int:
 # (`compact_if_needed`'s `finally`, one call per request that reached the
 # top of its `if conv_id:` block) instead of scattered across `if`s an
 # earlier return could skip.
+# P12-2 (hostile pass #12): "window" is its own outcome, not a shade of
+# "budget" — see the module comment above `declined_window`'s counter for
+# why the two must not share numbers.
 _REUSE_STATS_LOCK = threading.Lock()
 _reuse_stats: dict = {
     "attempted": 0,
@@ -2068,6 +2071,7 @@ _reuse_stats: dict = {
     "declined_no_state": 0,
     "declined_no_coverage": 0,
     "declined_budget": 0,
+    "declined_window": 0,
     "errored": 0,
     "last_attempt_monotonic": None,
     "last_reason": None,
@@ -2082,6 +2086,17 @@ _REUSE_OUTCOME_COUNTER_KEYS = {
     "no_state": "declined_no_state",
     "no_coverage": "declined_no_coverage",
     "budget": "declined_budget",
+    # P12-2 (hostile pass #12): the P11-6 structural check (`_window_squeeze`
+    # in compact_if_needed) used to record itself as "budget" too — a
+    # hierarchy that fits `_standin_budget` whole but would still squeeze the
+    # recent window out is a DIFFERENT decline than one whose rendered stand-in
+    # does not fit `_standin_budget` at all, with different numbers explaining
+    # it (see `_reuse_ceiling`/`_reuse_others` at that call site). Folding it
+    # into "budget" meant `last_declined_ceiling` could read the CONFIGURED
+    # `SUMMARY_BLOCK_MAX_TOKENS`/injection figure for a decline that number
+    # had nothing to do with — the exact state OPERATIONS.md's "raise the
+    # setting" advice cannot fix, because neither setting moves this ceiling.
+    "window": "declined_window",
     "error": "errored",
 }
 
@@ -2100,10 +2115,24 @@ def _record_reuse_outcome(
     reason: str, ceiling: int | None = None, others: int | None = None
 ) -> None:
     """The ONE outcome a reuse attempt resolved to. `reason` is one of
-    "success", "no_state", "no_coverage", "budget" or "error" — see the
-    module comment above `_reuse_stats` for what each means. `ceiling`/
-    `others` are only meaningful (and only ever passed) for "budget": the
-    two numbers the decline's own log line names."""
+    "success", "no_state", "no_coverage", "budget", "window" or "error" —
+    see the module comment above `_reuse_stats` for what each means.
+    `ceiling`/`others` are only meaningful (and only ever passed) for
+    "budget" and "window": the two numbers EACH one's own log line names —
+    `_standin_budget`/`_others` for "budget", `_standin_structural_ceiling`/
+    `_sys_recent_floor` for "window" (P12-2, hostile pass #12) — never mixed
+    between the two, because they answer different questions and a reader
+    would otherwise not know which formula produced the number in front of
+    them.
+
+    OPERATIONS.md, on a "window" decline: no setting raises this ceiling.
+    It is `inject_budget / INJECTION_BUDGET_FRACTION` (the request's real
+    window) minus the system prompt and the recent turns — `SUMMARY_BLOCK_
+    MAX_TOKENS` and `INJECTION_BUDGET_FRACTION` change how big a stand-in
+    is ALLOWED to render, not what this check compares it against. What
+    actually moves it: fewer or cheaper retained images (`COMPACTOR_MAX_
+    RETAINED_IMAGES`, `COMPACTOR_IMAGE_TOKENS`), a smaller recent reply, or
+    a smaller stored hierarchy (an operator-triggered L3 rollup)."""
     with _REUSE_STATS_LOCK:
         _reuse_stats["last_reason"] = reason
         if reason == "success":
@@ -2118,18 +2147,22 @@ def _record_reuse_outcome(
             key = "declined_budget"
         _reuse_stats[key] += 1
         # P11-3 (hostile pass #11, LOW): OPERATIONS.md documents
-        # `declined_recently` as following "the most recent BUDGET decline
-        # specifically" — and `last_declined_ceiling`/`last_declined_others`
-        # as that SAME decline's own two explanatory numbers. Before this,
-        # the stamp fired for every non-success reason, so a brand-new
-        # conversation's very first request (`no_state` — nothing stored
-        # yet, not a budget squeeze) set `declined_recently` exactly like a
-        # real squeeze would, and a `no_state`/`no_coverage`/`error`
-        # outcome overwrote `last_declined_ceiling`/`last_declined_others`
-        # with `None` — erasing a genuine budget decline's own numbers at
-        # the very next unrelated one. Scoped to the one reason the
-        # runbook and the fields' own names describe.
-        if reason == "budget":
+        # `declined_recently` as following "the most recent capacity decline
+        # (budget or window) specifically" — and `last_declined_ceiling`/
+        # `last_declined_others` as that SAME decline's own two explanatory
+        # numbers (read together with `last_reason`, which says which
+        # formula produced them). Before P11-3, the stamp fired for every
+        # non-success reason, so a brand-new conversation's very first
+        # request (`no_state` — nothing stored yet, not a squeeze) set
+        # `declined_recently` exactly like a real one would, and a
+        # `no_state`/`no_coverage`/`error` outcome overwrote
+        # `last_declined_ceiling`/`last_declined_others` with `None` —
+        # erasing a genuine decline's own numbers at the very next unrelated
+        # one. Scoped to the two reasons that are actually a capacity
+        # squeeze; "window" joined "budget" here in P12-2 for the same
+        # reason P11-3 scoped it to "budget" in the first place — it is one
+        # more genuine squeeze, not a mechanical failure.
+        if reason in ("budget", "window"):
             _reuse_stats["last_declined_monotonic"] = time.monotonic()
             _reuse_stats["last_declined_ceiling"] = ceiling
             _reuse_stats["last_declined_others"] = others
@@ -2141,20 +2174,21 @@ def reuse_decline_state() -> dict:
     cannot import main at module scope, see that function's docstring).
 
     Returns {"attempted": int, "succeeded": int, "declined_no_state": int,
-    "declined_no_coverage": int, "declined_budget": int, "errored": int,
-    "declined_recently": bool, "last_reason": str | None,
-    "last_attempt_age_s": float | None, "last_declined_ceiling": int |
+    "declined_no_coverage": int, "declined_budget": int, "declined_window":
+    int, "errored": int, "declined_recently": bool, "last_reason": str |
+    None, "last_attempt_age_s": float | None, "last_declined_ceiling": int |
     None, "last_declined_others": int | None}. Read-only, cheap (one lock,
     no I/O), never raises.
 
     P10-3: `declined_budget` keeps its P9 name and meaning (a budget-
-    specific decline) for callers/dashboards already reading it; the three
-    new counters are additive, not a rename — nothing that read this dict
-    before P10-3 sees a field disappear or change meaning.
-    `last_attempt_age_s` (new) is what makes `attempted: 0` unambiguous:
-    `None` means no candidate request has occurred in this process yet;
-    a real number, however large, means at least one has, however long
-    ago — restart resets both, see OPERATIONS.md.
+    specific decline) for callers/dashboards already reading it; the new
+    counters (P10-3's three, and P12-2's `declined_window`) are additive,
+    not a rename — nothing that read this dict before sees a field
+    disappear or change meaning. `last_attempt_age_s` is what makes
+    `attempted: 0` unambiguous: `None` means no candidate request has
+    occurred in this process yet; a real number, however large, means at
+    least one has, however long ago — restart resets both, see
+    OPERATIONS.md.
     """
     with _REUSE_STATS_LOCK:
         last_at = _reuse_stats["last_declined_monotonic"]
@@ -2173,6 +2207,7 @@ def reuse_decline_state() -> dict:
             "declined_no_state": _reuse_stats["declined_no_state"],
             "declined_no_coverage": _reuse_stats["declined_no_coverage"],
             "declined_budget": _reuse_stats["declined_budget"],
+            "declined_window": _reuse_stats["declined_window"],
             "errored": _reuse_stats["errored"],
             "declined_recently": declined_recently,
             "last_reason": _reuse_stats["last_reason"],
@@ -2548,55 +2583,160 @@ async def compact_if_needed(
                     # hierarchy passes ~11-13k real tokens, and cuts memory
                     # on 27-62% of requests it did not need to.
                     #
-                    # This does NOT try to reproduce the guard's exact
-                    # arithmetic here (P11-4 owns that, downstream, with a
-                    # real tokenizer count) — it is a STRUCTURAL check using
-                    # only the parts of `_others` that do not depend on the
-                    # SIZE of this request's recent conversation: the system
-                    # prompt and the images actually preserved ahead of the
-                    # recent window (the request's own recent TEXT is
-                    # deliberately left out — a single reply bigger than
-                    # the whole window is a real state the guard must
-                    # already handle whether reuse fires or not, P11-4's
-                    # finding, not this one; folding it in here would
-                    # decline reuse in cases where declining cannot help
-                    # either, and it would make this decision swing on the
-                    # newest turn's length, which has nothing to do with
-                    # how much of the HIERARCHY fits). Priced with the SAME
-                    # `count_tokens` the guard's own per-message array uses
-                    # (not a separate `IMAGE_TOKEN_ESTIMATE`-based guess),
-                    # so this reserve moves automatically with however that
-                    # function prices an image today — flat
-                    # `IMAGE_TOKEN_ESTIMATE` while the chat template cannot
-                    # be applied to an image-bearing list, or the template's
-                    # own real per-resolution cost once it can (see the
-                    # opencv work landing alongside this fix): whichever it
-                    # is, this check reserves what the guard will actually
-                    # charge for these images, not a guess that can drift
-                    # from it. `_effective_limit_est` recovers the window
-                    # this request was actually sized against from the two
-                    # numbers this function has (`inject_budget` IS
+                    # P12-1 (hostile pass #12): the first shape of this check
+                    # (v3.1.9.3 as merged, 90e3698) reserved `system_msgs +
+                    # preserved_images`, priced through this same
+                    # `count_tokens`. That was wrong on two counts, not one.
+                    # First, `preserved_images` is exactly what the compacted
+                    # branch sheds FIRST, before it ever touches memory
+                    # (P8-1's ordering, still true after P12-5 below) — so
+                    # reserving room for them protected turns the branch was
+                    # never going to fight to keep, while leaving `keep_recent`
+                    # itself — the turns the branch protects LAST, and never
+                    # sheds while anything else can be spent — with no reserve
+                    # at all. Second, and what actually opened this back up:
+                    # `count_tokens` prices an image by WHICHEVER tier of
+                    # itself happens to run — a flat `IMAGE_TOKEN_ESTIMATE`
+                    # (4,096) while the chat template cannot be applied to an
+                    # image-bearing list, or the template's own real
+                    # per-resolution cost (measured ~3,080 square, 2,352 for a
+                    # 4:3 photo) once opencv makes that path reachable. A
+                    # reserve built ONLY from that price rises and falls with
+                    # which tier fired, on hardware this process does not
+                    # control — and once real pricing is available it prices
+                    # LOWER, the reserve shrinks, and reuse starts firing
+                    # again at exactly the peak hierarchy sizes this check
+                    # exists to decline at. Measured on a real branch at the
+                    # real per-image price: reuse still loses the previous
+                    # exchange at 13-47 of 474 positions where declining or
+                    # v3.1.9 kept it, depending on state and whether a fresh
+                    # summary is also pending — the crossover this check was
+                    # supposed to draw, drawn in the wrong place because it
+                    # was never reserving the thing that actually needs
+                    # protecting.
+                    #
+                    # THE FIX RESERVES `system_msgs + keep_recent` instead —
+                    # what the compacted branch can NEVER shed ahead of the
+                    # previous exchange, whatever it costs and whatever it
+                    # contains (images included, at whatever price
+                    # `count_tokens` gives them; this check no longer prices
+                    # images AS images at all). This is deliberately the same
+                    # quantity `_enforce_hard_budget`'s aligned floor protects
+                    # (P10-1/P11-4's `_floor`/`_aligned_tail`), so the
+                    # decision here and the guard's own floor downstream agree
+                    # about what "the turns that must stay" costs, under
+                    # WHATEVER `count_tokens` charges for whatever they
+                    # contain — the decision no longer depends on which tier
+                    # of `count_tokens` happened to price an image, because it
+                    # is not asking a question about images any more. This
+                    # requires P12-5's fix alongside it (see
+                    # `_enforce_hard_budget` below): the guard only actually
+                    # protects `keep_recent` ahead of memory on EVERY array
+                    # that carries memory once that fix lands; without it, a
+                    # DECLINED request (this check firing) could still lose
+                    # `keep_recent` to the floor-less generic shed loop, and
+                    # this reserve would be protecting a promise the guard was
+                    # not yet keeping.
+                    #
+                    # A fresh-span summary, when one is pending, is appended
+                    # to the SAME returned array as the stand-in (see
+                    # `summary_blocks` below) — reserve its worst case too,
+                    # or a request with an unpaired tail could clear this
+                    # check and still not fit once that second block lands
+                    # beside it. A small fixed margin (128 tokens) absorbs
+                    # the gap between `_estimate_block_tokens`'s render
+                    # estimate and `count_tokens`'s own count, taken a few
+                    # lines apart and never atomically with the request this
+                    # decision is actually about — not tuned to one fixture,
+                    # just large enough to cover that drift without
+                    # declining a stand-in that clears by a wide margin.
+                    #
+                    # THE WORST CASE IS NOT ONE SUMMARY_MAX_TOKENS BATCH
+                    # (coordinator follow-up to P12-1, real-data replay,
+                    # hostile pass #12). `summarize()` map-reduces the fresh
+                    # span over budget-sized batches; the reduce phase only
+                    # ever SHRINKS what the map phase produced (folding
+                    # partials down), and when it cannot fold — the
+                    # per-request call budget exhausted by the map phase
+                    # itself, or two dense partials together still missing
+                    # the reduce call's own input budget — `summary` is the
+                    # RAW CONCATENATION of every un-folded batch, each up to
+                    # `SUMMARY_MAX_TOKENS` (see `summarize()`'s own "stopping
+                    # the reduce" and reduce-failure branches). A flat
+                    # `SUMMARY_MAX_TOKENS` here silently assumed the fresh
+                    # span always costs exactly one call. Measured on her
+                    # real branch: the stand-in grew 12,951 -> 13,955-14,953
+                    # (1,000-2,000 tokens) in the routine state where some
+                    # covered turns are unpaired and a fresh summary joins
+                    # the stand-in — one or two un-folded batches, not the
+                    # single one this reserve assumed, so reuse fired
+                    # believing it had more headroom than it actually would,
+                    # and lost her previous exchange at 26 of 474 positions
+                    # where declining kept it. p11 measured this as
+                    # ROUTINE, not an edge case: 3 summarize() calls on
+                    # every reusing request between L1 rollups.
+                    #
+                    # Fixed by pricing the ACTUAL worst case instead of
+                    # guessing one call: preview the SAME batching
+                    # `summarize()` itself will do, on the SAME fresh span
+                    # this decision is about. That span's composition
+                    # (`refreshed` + the uncovered tail) is already fixed by
+                    # `_covered`/`_changed`/`stored_turns` at this point,
+                    # independent of whether THIS check keeps or blanks
+                    # `stored_text` — mirrors `refreshed`'s own assignment a
+                    # few dozen lines down, computed early here because that
+                    # assignment runs too late for this decision to see it.
+                    # Priced by the local estimator at `_PESSIMISTIC_
+                    # SUMMARY_SCALE` (2.0), not a second exact /tokenize
+                    # call: this decision already spends one exact-adjacent
+                    # count above (`_sys_recent_floor`), and biasing toward
+                    # MORE predicted batches (a BIGGER reserve, not smaller)
+                    # is the safe direction — the same reasoning
+                    # `summarize()`'s own /tokenize-down fallback already
+                    # uses for this exact constant. A batch count OVER
+                    # `MAX_SUMMARY_CALLS_PER_REQUEST` does NOT mean reserve
+                    # nothing — a second real-data replay (hostile pass #12,
+                    # the coordinator's "unpair" variant) found that read
+                    # backwards: this preview's own pessimism can push an
+                    # ESTIMATE over the cap on content whose REAL (undoubled)
+                    # batch count is still under it, in which case
+                    # `summarize()` does not cap-refuse at all — it proceeds,
+                    # at its own real scale, and can still leave every batch
+                    # un-folded. So the reserve is capped at the CAP's own
+                    # worst case (`min(batches, MAX_SUMMARY_CALLS_PER_
+                    # REQUEST) * SUMMARY_MAX_TOKENS`), never zero: correct
+                    # whichever way the real, non-pessimistic call decides
+                    # (a real cap-refusal just makes this reserve larger than
+                    # strictly needed, the same safe direction every other
+                    # margin in this check already errs in; a real batch
+                    # count under the cap is covered exactly, since it is by
+                    # definition <= the cap this reserves for). Computed only
+                    # inside the guard below (`stored_text` rendered,
+                    # `inject_budget` known) — the one place this number is
+                    # used.
+                    #
+                    # This still does NOT try to reproduce the guard's exact
+                    # arithmetic (P11-4 owns that, downstream, with a real
+                    # tokenizer count when one is available) — it is a
+                    # STRUCTURAL check using the local estimator only, the
+                    # same one `_standin_rendered` and the rest of this
+                    # function already use. `_effective_limit_est` recovers
+                    # the window this request was actually sized against from
+                    # the two numbers this function has (`inject_budget` IS
                     # `effective_limit * INJECTION_BUDGET_FRACTION` at every
                     # real call site — chat_completions always passes both
                     # from the same request) rather than TARGET_TOKENS (only
                     # 75% of it, already the reason `_target_based_budget`
                     # alone under-reuses — see P9-1/P9-2 above). Calibrated
-                    # against a synthetic fixture built at her measured
-                    # shape (755-char system prompt, two images, hierarchy
-                    # renders of ~9.1k/11.5k/13.6k estimator tokens —
+                    # against a synthetic fixture built at her measured shape
+                    # (755-char system prompt, two images, hierarchy renders
+                    # of ~9.1k/11.5k/13.6k estimator tokens —
                     # test_reuse_fit.py [14]): this places the crossover
-                    # between the second and third state, matching the
-                    # ~11-13k real-token range p11 measured on her actual
-                    # branch. Residual, not claimed fixed: this reserve is
-                    # silent about the recent window's own TEXT size, so a
-                    # sizeable-but-not-outlier reply beside a hierarchy this
-                    # check still allows can still cost the guard the
-                    # exchange (P11-4's territory) — smaller once images
-                    # price lower (more of the window opens up for the
-                    # stand-in, not for the reply), never larger. See
-                    # SP\fix-3193-reuse.md's P11-6 entry for the measured
-                    # case and why a wider reserve was not adopted (overfit
-                    # to one fixture, not a principled bound).
+                    # between the second and third state under BOTH the flat
+                    # and the real per-image price, matching the ~11-13k
+                    # real-token range p11/p12 measured on her actual branch.
+                    # See SP\p12-findings.md's P12-1/P12-6 entries for the
+                    # measured case this closes.
                     _window_squeeze = False
                     if (
                         stored_text
@@ -2606,29 +2746,97 @@ async def compact_if_needed(
                         _standin_rendered = summarizer._estimate_block_tokens(
                             stored_text
                         )
-                        _sys_img_floor = await run_in_threadpool(
-                            count_tokens, system_msgs + preserved_images
+                        _sys_recent_floor = await run_in_threadpool(
+                            count_tokens, system_msgs + keep_recent
                         )
                         _effective_limit_est = int(
                             round(inject_budget / INJECTION_BUDGET_FRACTION)
                         )
-                        _standin_structural_ceiling = (
-                            _effective_limit_est - _sys_img_floor
+                        # The fresh span: exactly `fresh_input`'s own
+                        # composition a few dozen lines down (a changed
+                        # covered TEXT turn — `refreshed` there filters
+                        # `_changed` down to non-image turns the same way,
+                        # since an image is preserved verbatim whatever its
+                        # fingerprint says and never re-summarized as text —
+                        # plus an uncovered tail past `stored_turns`).
+                        # Recomputed here rather than sharing `refreshed`
+                        # directly, because that assignment runs too late
+                        # for this decision to see it (`stored_turns` is not
+                        # final until this branch decides whether to keep
+                        # `stored_text` at all). Counting a changed IMAGE
+                        # turn here would count a summarize() call that
+                        # `fresh_input` was never going to make — caught by
+                        # test_reuse_fit.py [14]'s own 'peakA' CONTROL,
+                        # whose two preserved images are unpaired by
+                        # construction (new content no chunk has summarized)
+                        # and falsely tripped an earlier draft of this
+                        # reserve before the image filter was added.
+                        _fresh_span_preview = [
+                            m for i, m in enumerate(to_summarize[:_covered])
+                            if i in _changed and not _message_has_image(m)
+                        ] + text_only[stored_turns:]
+                        if _fresh_span_preview:
+                            _fresh_batches = len(await run_in_threadpool(
+                                _chunk_to_budget,
+                                _fresh_span_preview,
+                                min(
+                                    MAX_MODEL_LEN,
+                                    max(
+                                        256,
+                                        MAX_MODEL_LEN - SUMMARY_MAX_TOKENS
+                                        - SUMMARY_INPUT_RESERVE,
+                                    ),
+                                ),
+                                _PESSIMISTIC_SUMMARY_SCALE,
+                            ))
+                            _fresh_reserve = (
+                                min(_fresh_batches, MAX_SUMMARY_CALLS_PER_REQUEST)
+                                * SUMMARY_MAX_TOKENS
+                            )
+                        else:
+                            _fresh_reserve = 0
+                        _standin_reserve = (
+                            _standin_rendered
+                            + _fresh_reserve
+                            + 128
                         )
-                        if _standin_rendered > _standin_structural_ceiling:
+                        _standin_structural_ceiling = (
+                            _effective_limit_est - _sys_recent_floor
+                        )
+                        if _standin_reserve > _standin_structural_ceiling:
                             _window_squeeze = True
                             stored_text = ""
                     if not stored_text:
-                        # P9-1/P9-2 (hostile pass #9), reason recorded once
-                        # at the bottom of the block (P10-3): a budget
-                        # decline, specifically — the hierarchy exists,
-                        # covers this array, and still does not fit the
-                        # stand-in's budget whole.
-                        _reuse_reason = "budget"
-                        _reuse_ceiling, _reuse_others = _standin_budget, _others
                         if _window_squeeze:
-                            # P11-6: the block itself fit the flat ceiling —
-                            # this is the NEW check, not the old one below.
+                            # P12-2 (hostile pass #12): this used to fall
+                            # through to the SAME "budget" reason below, with
+                            # `_reuse_ceiling, _reuse_others = _standin_budget,
+                            # _others` — the TARGET-/injection-based ceiling
+                            # and the system+images+recent total THIS check
+                            # never even consults. `checks.reuse` then showed
+                            # `last_declined_ceiling` sitting at the
+                            # CONFIGURED `SUMMARY_BLOCK_MAX_TOKENS` (or the
+                            # injection-based figure) for a decline that
+                            # `_standin_budget` had nothing to do with —
+                            # OPERATIONS.md's runbook reads that as "the
+                            # hierarchy has genuinely outgrown the current
+                            # setting, raise it", and raising either named
+                            # setting moves nothing here: this decline fires
+                            # because the STAND-IN plus the system prompt and
+                            # the recent window would leave no room in the
+                            # request's real window, a question `_standin_
+                            # budget` never asks and `SUMMARY_BLOCK_MAX_TOKENS`/
+                            # `INJECTION_BUDGET_FRACTION` cannot move (raising
+                            # either only changes how big a stand-in is
+                            # ALLOWED to render before this check runs, not
+                            # what this check compares it against). Own
+                            # reason, own counter (`declined_window`), and the
+                            # numbers that actually decided it — see
+                            # `_record_reuse_outcome`'s docstring for what an
+                            # operator can do about it instead.
+                            _reuse_reason = "window"
+                            _reuse_ceiling = _standin_structural_ceiling
+                            _reuse_others = _sys_recent_floor
                             logger.info(
                                 f"conv={conv_id}: the stored summaries cover "
                                 f"{stored_turns - len(_changed)} of the turns "
@@ -2636,19 +2844,29 @@ async def compact_if_needed(
                                 f"{_standin_rendered}-token stand-in fits the "
                                 f"{max(0, _standin_budget)}-token ceiling, but "
                                 f"alongside this conversation's system prompt "
-                                f"and images it would leave the "
+                                f"and recent turns it would leave the "
                                 f"~{_effective_limit_est}-token window no room "
-                                f"for the turns it exists to keep; "
+                                f"for the turns it exists to keep "
+                                f"(reserve {_standin_reserve} > "
+                                f"{_standin_structural_ceiling} available); "
                                 f"summarizing from scratch rather than letting "
                                 f"the stand-in push the recent turns out"
                             )
                         else:
+                            # P9-1/P9-2 (hostile pass #9), reason recorded
+                            # once at the bottom of the block (P10-3): a
+                            # budget decline, specifically — the hierarchy
+                            # exists, covers this array, and still does not
+                            # fit the stand-in's budget whole.
+                            #
                             # v3.1.9.1: the budget named here is no longer
                             # always the TARGET-derived figure — it is
                             # whichever of that and the injected share (see
                             # `_standin_injected_share`) was larger, so the
                             # message names the real source rather than
                             # always blaming TARGET.
+                            _reuse_reason = "budget"
+                            _reuse_ceiling, _reuse_others = _standin_budget, _others
                             _budget_source = (
                                 "the injection budget's summary share"
                                 if inject_budget is not None
@@ -5720,15 +5938,21 @@ def _enforce_hard_budget(
 
     Shedding order is by value: oldest turns first (already summarized, and the
     memory layers exist precisely to carry that content forward), then the
-    injected memory blocks, trimmed largest-first — EXCEPT on an array
-    compaction already reduced (its summary block is present): there the
-    turns left are the ones no summary covers, so injected memory goes first
-    and compaction's own block last (hostile pass #3, F5). The newest turn is never
-    dropped — losing the message the user just typed is worse than any
-    truncation. After shedding, role alternation is REPAIRED (first non-system
-    message must be a user turn) — the first cut of this guard could stop
-    mid-pair and hand the Mistral template an assistant-first conversation,
-    manufacturing the very 400 it exists to prevent (rc6 review).
+    injected memory blocks, trimmed largest-first — EXCEPT on an array that
+    carries INJECTED MEMORY at all (facts, retrieval, or compaction's own
+    summary block — P12-5, hostile pass #12; used to be gated on the summary
+    block specifically, see that fix's comment at this branch's condition
+    below for why that was too narrow): there the turns above the aligned
+    recent window are the ones no summary covers, so those are shed first,
+    injected memory goes next, and the recent window (and compaction's
+    stand-in, if present) go last, only once nothing else is left to spend
+    (hostile pass #3, F5; hostile pass #4, F5's "except the turns that go
+    anyway"). The newest turn is never dropped — losing the message the user
+    just typed is worse than any truncation. After shedding, role alternation
+    is REPAIRED (first non-system message must be a user turn) — the first
+    cut of this guard could stop mid-pair and hand the Mistral template an
+    assistant-first conversation, manufacturing the very 400 it exists to
+    prevent (rc6 review).
 
     Cost discipline (rc6 review): the first cut re-ran the full chat-template
     tokenization of the ENTIRE list once per dropped message — O(N²) blocking
@@ -5926,7 +6150,8 @@ def _enforce_hard_budget(
         # `_skip_generic`'s assignment for why the floor-less generic
         # stages below must not ALSO run in the same round.
         _skip_generic = False
-        # --- a COMPACTED array: spend injected memory before any turn ---
+        # --- an array carrying INJECTED MEMORY: spend memory before any turn
+        #     above the protected recent window ---
         #
         # hostile pass #3 (reviewer A F5; pass #2's H5). "Oldest turns first"
         # rests on the oldest turns being already summarized. That is true of
@@ -5942,25 +6167,55 @@ def _enforce_hard_budget(
         # around it are trimmed and then dropped FIRST, the stand-in itself
         # untouched; turns, and then the stand-in, only after that.
         #
+        # P12-5 (hostile pass #12): THE SAME REASONING APPLIES WHETHER OR NOT
+        # THE STAND-IN ITSELF IS PRESENT. The original condition here asked
+        # `_is_compaction_standin` specifically, so a DECLINED request —
+        # reuse turned itself off (P11-6/P12-1's check, or the plain
+        # over-budget path), no stand-in in the array, but facts and
+        # retrieval still injected the way they are on every request — fell
+        # straight through to the floor-less generic shed loop a few dozen
+        # lines down, which has no floor and sheds the OLDEST non-system
+        # turn regardless of what it is. On a declined request that turn is
+        # not always an old, already-summarized one: once the fresh span
+        # itself is deferred (the 4-call cap, or simply a long backlog),
+        # `text_only[stored_turns:]` verbatim turns sit ahead of `U_prev`,
+        # `A_prev` and `U_new` in the SAME array injected memory sits beside
+        # — and the generic loop reaches U_prev/A_prev exactly like it would
+        # any other "old" turn, before ever trying the memory it is sitting
+        # right next to. Measured on a real branch: every loss this caused
+        # (20-23 of 474 positions per hierarchy state) had 2.5-8.5k tokens of
+        # headroom left over — dropping memory instead would have kept the
+        # exchange every single time. The owner's call, relayed by the
+        # coordinator: her own previous exchange — the reply she is
+        # answering — is kept over injected memory, on every array that
+        # carries memory, not only a compacted one. So the trigger here is
+        # simply "is there any injected system content to spend at all" —
+        # `_droppable_system_indices` already answers exactly that (system
+        # messages beyond what the caller sent), whether or not one of them
+        # happens to be compaction's own stand-in. The branch body below was
+        # already written generally enough for this: `_spend` (a few dozen
+        # lines down) filters OUT the stand-in when computing what memory
+        # can cover, so with no stand-in present `_spend` is simply "every
+        # injected block", and the branch behaves exactly like the pre-P12-5
+        # code did whenever a stand-in incidentally happened to be one of
+        # those blocks.
+        #
         # EXCEPT THE TURNS THAT GO ANYWAY (hostile pass #4, reviewer A F5).
-        # In the cap-refusal state — a stand-in in the array AND summarize()
-        # refusing the fresh span over the per-request call cap, which hands
-        # every refreshed or uncovered turn back verbatim — the turns left
-        # are not "her last message and the reply she is answering" but tens
-        # to thousands of old deferred turns, far more than all injected
-        # memory together. Spending memory first then bought nothing:
-        # measured at the shipped limit, the guard halved and dropped persona,
-        # pinned facts and retrieval, and then dropped 100 old turns anyway
-        # (the pre-F5 order dropped 104 and kept persona and facts). So the
-        # old turns that would have to be shed EVEN WITH EVERY SPENDABLE BLOCK
-        # DROPPED are shed first, oldest first, never into the last
-        # KEEP_RECENT_TURNS; memory is spent only on what is left over. In
-        # steady reuse (nothing deferred) that set is empty and the order
-        # above is unchanged.
-        if any(
-            _is_compaction_standin(msgs[i])
-            for i in _droppable_system_indices(msgs, protect_system)
-        ):
+        # In the cap-refusal state — summarize() refusing the fresh span over
+        # the per-request call cap, which hands every refreshed or uncovered
+        # turn back verbatim, with or without a stand-in for the OLDER span
+        # beside it — the turns left are not "her last message and the reply
+        # she is answering" but tens to thousands of old deferred turns, far
+        # more than all injected memory together. Spending memory first then
+        # bought nothing: measured at the shipped limit, the guard halved and
+        # dropped persona, pinned facts and retrieval, and then dropped 100
+        # old turns anyway (the pre-F5 order dropped 104 and kept persona and
+        # facts). So the old turns that would have to be shed EVEN WITH EVERY
+        # SPENDABLE BLOCK DROPPED are shed first, oldest first, never into
+        # the last KEEP_RECENT_TURNS; memory is spent only on what is left
+        # over. In steady reuse (nothing deferred) that set is empty and the
+        # order above is unchanged.
+        if _droppable_system_indices(msgs, protect_system):
             # hostile pass #5 (reviewer A F4): the pass-4 F5 loop this replaces
             # stopped the moment cutting ALL injected memory could cover the
             # rest ("running - _memory <= limit"), on the reasoning that
