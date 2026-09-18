@@ -281,6 +281,38 @@ def _env_float(name: str, default: float) -> float:
 # the window belongs to the conversation.
 INJECTION_BUDGET_FRACTION = _env_float("COMPACTOR_INJECTION_BUDGET_FRACTION", 0.5)
 
+# P9-1/P9-2 (hostile pass #9): a SEPARATE fraction for the reuse stand-in's
+# ceiling (see `_standin_reuse_ceiling` below), deliberately NOT the same
+# 0.6 constant `_standin_injected_share` uses for the separately-injected
+# summary block. The two situations only look alike. The injected block
+# competes for room in `inject_budget` alongside persona, facts and
+# retrieval (all four bounded together by `_bound_injected_blocks`), so it
+# only gets a slice. The stand-in is different: on a REUSING turn the
+# summary injection site skips its own copy entirely (`sum(in-array)`,
+# search `_compaction_stored_turns` in chat_completions) — nothing else in
+# `inject_budget` spends this share, so there is no reason to multiply it
+# down by 0.6 as though it still had to leave room for a sibling that this
+# turn never renders. v3.1.9.1 and v3.1.9.2 used the SAME function for
+# both (deliberately, "so the two call sites cannot drift apart") and that
+# is exactly what starved the stand-in: at the shipped 0.6/6230 defaults
+# the ceiling was 6,230 against her ~9,050-token hierarchy (P9-1); even at
+# the planned 0.75/10000 it was 9,345 — 300 tokens above her hierarchy and
+# 1,955 BELOW the bounded hierarchy's own construction capacity
+# (9*L1_MAX + 4*L2_MAX + L3_MAX = 11,300 at shipped chunk sizes), so growth
+# alone would turn reuse off again within one L1 chunk. Default 1.0: the
+# stand-in may claim the WHOLE freed share, capped only by
+# SUMMARY_BLOCK_MAX_TOKENS (see that constant's own comment for why its
+# default moved to 12,000). Measured against a hierarchy built to
+# documented capacity (9 L1 / 4 L2 / 1 L3, `format_summary_block`'s own
+# corpus-free filler): the true render cost (tier content plus the block
+# header and one header line per item) is between 11,400 and 11,500
+# tokens, so 12,000 clears it with room to spare. The guard downstream
+# (`_enforce_hard_budget`) is still free to shed OTHER injected memory if
+# the whole request runs over effective_limit — this fraction only decides
+# whether the stand-in is ALLOWED to render whole, not whether the request
+# fits.
+STANDIN_BUDGET_FRACTION = _env_float("COMPACTOR_STANDIN_BUDGET_FRACTION", 1.0)
+
 # ...and a much tighter one for a request with no conversational history.
 #
 # Live, 2026-08-28: a request with msgs=2, source=hash, lastturn=0 and no prior
@@ -1855,23 +1887,107 @@ COMPACTION_SUMMARY_HEADER = "[Summary of earlier conversation]"
 
 
 def _standin_injected_share(inject_budget: int) -> int:
-    """How many tokens a reused-hierarchy stand-in may claim from the
-    injection budget, computed IDENTICALLY to the separately-injected
-    summary block's own cap (search `format_summary_block` in
-    chat_completions) — same formula, one function, so the two call sites
-    cannot drift apart the way the stand-in budget and this cap used to
-    (v3.1.9.1; see `compact_if_needed`'s stand-in budget for why they must
-    agree).
+    """How many tokens the SEPARATELY-INJECTED summary block (search
+    `format_summary_block` in chat_completions, the non-reuse call site)
+    may claim from the injection budget.
 
-    60% of the injection budget, capped at SUMMARY_BLOCK_MAX_TOKENS. Not a
-    guess: on a REUSING turn the injection site skips its own copy of the
-    summary entirely (`sum(in-array)`), so this share is genuinely free —
-    nothing else in the request spends it.
+    60% of the injection budget, capped at SUMMARY_BLOCK_MAX_TOKENS. This
+    block competes for `inject_budget` alongside persona, facts and
+    retrieval (`_bound_injected_blocks` bounds all four together), so it
+    only gets a share, not the whole thing.
+
+    NOT used for the reuse stand-in any more (P9-1/P9-2, hostile pass #9)
+    — see `_standin_reuse_ceiling` below and `STANDIN_BUDGET_FRACTION`'s
+    comment for why the two needed to stop sharing one formula. Kept as
+    its own function because this call site's constraint (room must be
+    left for three siblings) is real and unrelated to the stand-in's.
     """
     return min(
         summarizer.SUMMARY_BLOCK_MAX_TOKENS,
         int(inject_budget * 0.6),
     )
+
+
+def _standin_reuse_ceiling(inject_budget: int) -> int:
+    """How many tokens a REUSED-hierarchy stand-in (the array-embedded
+    substitute `compact_if_needed` returns in place of the turns it
+    removed) may render at, when reuse is being attempted.
+
+    `STANDIN_BUDGET_FRACTION` (default 1.0) of the injection budget,
+    capped at SUMMARY_BLOCK_MAX_TOKENS — see that env var's own comment
+    for the arithmetic (why 0.6, `_standin_injected_share`'s fraction, is
+    wrong here, and why the default clears the hierarchy's documented
+    9*L1_MAX + 4*L2_MAX + L3_MAX construction capacity instead of falling
+    short of it by design).
+    """
+    return min(
+        summarizer.SUMMARY_BLOCK_MAX_TOKENS,
+        int(inject_budget * STANDIN_BUDGET_FRACTION),
+    )
+
+
+# P9-1/P9-2 (hostile pass #9): reuse decline accounting, for /health/full's
+# `checks.reuse`. Before this, the ONLY evidence a decline ever happened was
+# the INFO log line inside compact_if_needed (see the "the stored summaries
+# cover ... but they do not fit whole" message below) plus the WARNING that
+# follows it when the 4-call summarize() cap then fires — this is the exact
+# failure mode P9-1 says shipped invisibly (green health, CHANGELOG claiming
+# the feature worked). Cheap and in-process, same shape as tailhealth.py's
+# counters (module-level dict + lock, numbers only): NO conversation text,
+# NO conv_id, NO hierarchy content — only counts and the two numbers
+# (ceiling, other-consumers total) that explain a decline. Windowed the
+# same way tailhealth/bgwork are (`declined_recently`) so a burst of
+# declines is visible while it is happening and for one window after, not
+# pinned forever by one squeeze early in a long-lived process.
+_REUSE_STATS_LOCK = threading.Lock()
+_reuse_stats: dict = {
+    "attempted": 0,
+    "declined_budget": 0,
+    "last_declined_monotonic": None,
+    "last_declined_ceiling": None,
+    "last_declined_others": None,
+}
+REUSE_DECLINE_DEGRADE_WINDOW_S = _env_float(
+    "COMPACTOR_REUSE_DECLINE_DEGRADE_WINDOW_S", 300.0
+)
+
+
+def _record_reuse_attempt() -> None:
+    with _REUSE_STATS_LOCK:
+        _reuse_stats["attempted"] += 1
+
+
+def _record_reuse_decline(ceiling: int, others: int) -> None:
+    with _REUSE_STATS_LOCK:
+        _reuse_stats["declined_budget"] += 1
+        _reuse_stats["last_declined_monotonic"] = time.monotonic()
+        _reuse_stats["last_declined_ceiling"] = ceiling
+        _reuse_stats["last_declined_others"] = others
+
+
+def reuse_decline_state() -> dict:
+    """CONTRACT for health.py's `_reuse_state()` (the same call-time,
+    sys.modules-based read `_tokenizer_state()` already uses — health.py
+    cannot import main at module scope, see that function's docstring).
+
+    Returns {"attempted": int, "declined_budget": int,
+    "declined_recently": bool, "last_declined_ceiling": int | None,
+    "last_declined_others": int | None}. Read-only, cheap (one lock, no
+    I/O), never raises.
+    """
+    with _REUSE_STATS_LOCK:
+        last_at = _reuse_stats["last_declined_monotonic"]
+        declined_recently = (
+            last_at is not None
+            and (time.monotonic() - last_at) <= REUSE_DECLINE_DEGRADE_WINDOW_S
+        )
+        return {
+            "attempted": _reuse_stats["attempted"],
+            "declined_budget": _reuse_stats["declined_budget"],
+            "declined_recently": declined_recently,
+            "last_declined_ceiling": _reuse_stats["last_declined_ceiling"],
+            "last_declined_others": _reuse_stats["last_declined_others"],
+        }
 
 
 async def compact_if_needed(
@@ -1901,14 +2017,17 @@ async def compact_if_needed(
     and its mutation suite pin as `list[dict]`).
 
     `inject_budget`, if given, is the caller's already-computed injection
-    budget (v3.1.9.1) — the SAME figure the caller's own summary injection
-    is capped against (60% of it, via `_standin_injected_share`). On a
-    reusing turn that injection is skipped (see hostile2-reuse M1 above),
-    which frees its share, so the stand-in here may claim up to that share
-    when it is larger than what TARGET_TOKENS alone would leave. Omitted (as
-    every call before 3.1.9.1 omits it), the stand-in gets exactly the old
-    TARGET-only figure — this keeps existing callers and their pinned
-    arithmetic unchanged.
+    budget (v3.1.9.1) — the figure the caller's own summary injection is
+    capped against on a NON-reusing turn (60% of it, via
+    `_standin_injected_share`). On a reusing turn that injection is
+    skipped (see hostile2-reuse M1 above), which frees the WHOLE share for
+    the stand-in here (P9-1/P9-2, hostile pass #9: `_standin_reuse_ceiling`,
+    a separate and larger fraction of the same `inject_budget` — see
+    STANDIN_BUDGET_FRACTION's comment for why 60% was wrong for this call
+    site), used whenever it is larger than what TARGET_TOKENS alone would
+    leave. Omitted (as every call before 3.1.9.1 omits it), the stand-in
+    gets exactly the old TARGET-only figure — this keeps existing callers
+    and their pinned arithmetic unchanged.
     """
     current = count_tokens(messages)
     if current <= TARGET_TOKENS:
@@ -2095,16 +2214,34 @@ async def compact_if_needed(
                     # only ~1,846 tokens for a hierarchy that needs ~5.1k,
                     # so all_or_nothing declined reuse on EVERY request and
                     # the 4-call cap fired 37/37 times — the exact failure
-                    # v3.1.9 shipped to remove. Fixed: the stand-in may use
-                    # up to what the summary injection would have spent,
-                    # via `_standin_injected_share` (same formula as the
-                    # injection site, one function, so the two cannot drift
-                    # apart again) — whichever of the two figures is
-                    # larger. Only proceeds when `inject_budget` was passed
-                    # (chat_completions always passes it now); a caller that
-                    # does not — an old or a direct test call — gets exactly
-                    # the pre-3.1.9.1 TARGET-only figure, so no existing
-                    # test's arithmetic changes under it.
+                    # v3.1.9 shipped to remove. Fixed in v3.1.9.1: the
+                    # stand-in may use up to what the summary injection
+                    # would have spent, via `_standin_injected_share`.
+                    #
+                    # P9-1/P9-2 (hostile pass #9): that first fix reused
+                    # `_standin_injected_share`'s 0.6-of-inject_budget
+                    # formula verbatim — the SAME cap the separately
+                    # injected block uses to leave room for facts and
+                    # retrieval — which this call site does not need to
+                    # leave room for anything: the summary injection this
+                    # freed share came from is SKIPPED on a reusing turn,
+                    # not shrunk. At the shipped 0.6/6230 defaults that
+                    # pinned the ceiling at 6,230 (below her ~9,050-token
+                    # hierarchy — reuse never fired); at the planned
+                    # 0.75/10000 it was still only 9,345 (below the
+                    # hierarchy's own 11,300-token construction capacity —
+                    # reuse would turn itself off again within one L1
+                    # chunk). Now uses `_standin_reuse_ceiling`, its own
+                    # formula at `STANDIN_BUDGET_FRACTION` (default 1.0 —
+                    # see that constant's comment for the arithmetic) —
+                    # whichever of the two figures (TARGET-based or
+                    # injection-based) is larger. Only proceeds when
+                    # `inject_budget` was passed (chat_completions always
+                    # passes it now); a caller that does not — an old or a
+                    # direct test call — gets exactly the pre-3.1.9.1
+                    # TARGET-only figure, so no existing test's arithmetic
+                    # changes under it.
+                    _record_reuse_attempt()
                     _others = await run_in_threadpool(
                         count_tokens, system_msgs + preserved_images + keep_recent
                     )
@@ -2114,9 +2251,18 @@ async def compact_if_needed(
                     )
                     _standin_budget = _target_based_budget
                     if inject_budget is not None:
+                        # P9-1/P9-2 (hostile pass #9): was
+                        # `_standin_injected_share(inject_budget)` (the
+                        # SEPARATELY-injected block's 0.6-of-inject_budget
+                        # formula) — starved the stand-in to 6,230 tokens
+                        # at the shipped defaults and 9,345 at the planned
+                        # ones, both under the hierarchy's own 11,300-token
+                        # construction capacity. `_standin_reuse_ceiling`
+                        # is the stand-in's OWN formula now; see
+                        # STANDIN_BUDGET_FRACTION's comment.
                         _standin_budget = max(
                             _target_based_budget,
-                            _standin_injected_share(inject_budget),
+                            _standin_reuse_ceiling(inject_budget),
                         )
                     if _standin_budget > 0:
                         # all_or_nothing: a squeezed block drops the OLDEST
@@ -2130,6 +2276,11 @@ async def compact_if_needed(
                             all_or_nothing=True,
                         ) or ""
                     if not stored_text:
+                        # P9-1/P9-2 (hostile pass #9): record the decline
+                        # BEFORE the log line below (same ordering doctrine
+                        # as _hierarchy_progress: counted no earlier than
+                        # the fact it describes). Numbers only.
+                        _record_reuse_decline(_standin_budget, _others)
                         # v3.1.9.1: the budget named here is no longer always
                         # the TARGET-derived figure — it is whichever of that
                         # and the injected share (see `_standin_injected_
@@ -2376,23 +2527,59 @@ _TAIL_LOOP_MAX_UNIT = 400
 _TOKEN_RUN_RE = re.compile(r"(\S{3,40})(?:[ _\n\t]*\1){3,}")
 
 
-# Shared by trim_to_last_sentence, _reply_degenerate_verdict_uncached's
-# token-run fence exemption, and _trim_forwarded_prefix: each independently
-# scanned `text.splitlines(keepends=True)` for lines starting with ``` and
-# built the same list of toggle offsets, before this existed (P8-2, hostile
-# pass #8 review follow-up — "a rule applied at one call site and missed at
-# its identical sibling"). One function now, so a future change to what
-# counts as a fence delimiter cannot update two of the three copies and miss
-# the third.
+# Shared by trim_to_last_sentence and _trim_forwarded_prefix: each
+# independently scanned `text.splitlines(keepends=True)` for lines starting
+# with ``` and built the same list of toggle offsets, before this existed
+# (P8-2, hostile pass #8 review follow-up — "a rule applied at one call site
+# and missed at its identical sibling"). One function now, so a future
+# change to what counts as a fence delimiter cannot update one copy and
+# miss the other.
+#
+# `_reply_degenerate_verdict_uncached`'s token-run rule used to be a third
+# caller (a fence exemption, via a now-deleted `_in_closed_fence`), removed
+# entirely at P9-3 (hostile pass #9) — see that function's comment. It does
+# not use fence offsets at all any more.
 def _fence_toggle_offsets(text: str) -> list[int]:
     """Character offsets of every ``` fence-delimiter LINE in `text`, in
     order of appearance. `bisect.bisect_right(offsets, i) % 2 == 1` means
     position `i` sits after an ODD number of toggles — i.e. inside a fence
-    that has opened but not (yet, by position `i`) closed again."""
+    that has opened but not (yet, by position `i`) closed again.
+
+    P9-6 (hostile pass #9), 4-SPACE INDENT: a line indented 4+ spaces is an
+    indented CODE BLOCK under CommonMark, not a fence delimiter, even if it
+    starts with ``` after the indent — that text is literal code content,
+    not markup. `.strip()` used to remove indentation before the check, so
+    such a line was wrongly counted as a toggle. Checked on the RAW line
+    now: only whitespace narrow enough that a renderer still reads the
+    ``` as markup counts. (Tabs are not special-cased into CommonMark's
+    4-space tab-stop rule here — this is the same "close enough, matches
+    every real case this model produces" simplification the rest of this
+    detector already makes; her replies use bare, unindented ``` lines.)
+
+    NOT FIXED (documented, not silent): `~~~` fences are invisible here —
+    only ``` is recognised. CommonMark treats ``` and ~~~ as independent
+    fence-marker families (a ``` opener is closed only by another ```
+    line, never by ~~~, and vice versa); this function's toggle list is a
+    single flat, character-agnostic parity count, so adding ~~~ blindly
+    would let a ``` block and a ~~~ block CROSS-CLOSE each other under a
+    mixed-marker reply — trading one false negative (a ~~~ box read as
+    plain text) for a false positive of a different, worse shape (a block
+    boundary computed wrong instead of just not computed). A correct fix
+    needs per-marker-type pairing, not a one-line change, and this
+    function has already been the site of three hostile-pass regressions
+    from smaller "just add the missing case" patches (F3, P8-2, P9-3) —
+    not worth the risk on the last V3 release for a LOW-severity gap. The
+    two remaining callers (`trim_to_last_sentence`, `_trim_forwarded_
+    prefix`) both fail toward keeping MORE text out of a cut boundary when
+    they misjudge a fence, so the failure mode of missing ~~~ is losing a
+    boundary that would have been fine to use, not corrupting one that
+    exists — see each caller's own fence-direction comment.
+    """
     toggles: list[int] = []
     pos = 0
     for line in text.splitlines(keepends=True):
-        if line.strip().startswith("```"):
+        _stripped = line.lstrip(" ")
+        if len(line) - len(_stripped) < 4 and _stripped.startswith("```"):
             toggles.append(pos)
         pos += len(line)
     return toggles
@@ -2404,15 +2591,6 @@ def _in_open_fence(toggles: list[int], i: int) -> bool:
     cut boundary must never land inside an unterminated ``` opener, closed
     or not — the store never sees an unbalanced fence either way."""
     return bool(toggles) and bisect.bisect_right(toggles, i) % 2 == 1
-
-
-def _in_closed_fence(toggles: list[int], i: int) -> bool:
-    """True only when `i` is inside a fence that goes on to CLOSE (a later
-    toggle exists past it). An opener with nothing left to close it does
-    NOT count, even though bisect alone cannot tell the two apart from `i`'s
-    side — see the P8-2 comment at this function's one caller."""
-    idx = bisect.bisect_right(toggles, i)
-    return idx % 2 == 1 and idx < len(toggles)
 
 
 def _tail_loop_span(text: str) -> int:
@@ -2796,47 +2974,45 @@ def _reply_degenerate_verdict_uncached(text: str) -> tuple[str | None, int | Non
     # lie. Requiring an alphanumeric in the repeated unit keeps them disjoint:
     # decoration to the character rule, identifiers to this one.
     #
-    # F3 (p7 hostile pass #7): fenced code was not excluded here, so a
-    # legitimate repeated-value array inside a ```fence``` (a
-    # `[0.00, 0.00, ...]` matrix; a repeated placeholder token) was flagged
-    # the same as a real identifier loop. The fragment-line rule below
-    # already skips fenced code; this brings the token rule in line with
-    # it. Same toggle-list-plus-bisect shape trim_to_last_sentence uses, so
-    # a candidate's fence membership costs one bisect, not a rescan.
+    # F3 (p7 hostile pass #7) added a fence exemption here so a legitimate
+    # repeated-value array inside a ```fence``` (a `[0.00, 0.00, ...]`
+    # matrix; a repeated placeholder token) would not be flagged the same as
+    # a real identifier loop. P8-2 (hostile pass #8) narrowed it after that
+    # first shape let an identifier loop after an UNMATCHED ``` opener run
+    # to the end of the reply, unflagged, because an odd toggle count has no
+    # later toggle to end it and bisect reads every position past it as
+    # still "in fence".
     #
-    # P8-2 (hostile pass #8): that first version used _in_open_fence's rule
-    # (in ANY fence, closed or not) — fine for trim_to_last_sentence, which
-    # only ever needs to avoid landing a CUT inside an unterminated opener,
-    # but wrong here. An unmatched ``` opener then fenced everything after
-    # it FOREVER (an odd toggle count has no later toggle to end it, so
-    # every position past it still bisects "odd"). This model uses bare
-    # ``` lines as decorative boxes — 128 of 1,709 unique real replies in
-    # the 2026-09-16 backup have an ODD count — so a real identifier loop
-    # starting after the last (unmatched) opener and running to the end of
-    # the reply was exempted and stored to memory verbatim; v3.1.9 flagged
-    # it, this exemption silently un-flagged it (three verdicts changed
-    # across the whole backup, one of them this shape). Fixed two ways,
-    # both required, per the finding:
-    #   1. A run only counts as "in a fence" when the fence actually CLOSES
-    #      again later (`_in_closed_fence`, not `_in_open_fence`) — an
-    #      opener with nothing left to close it protects nothing.
-    #   2. Even inside a fence that does close, a run is NEVER exempted if
-    #      it reaches the (stripped) end of the reply — that is exactly the
-    #      tail-loop shape this rule exists to catch, and "the box around
-    #      it happens to be closed" is not evidence the run itself is code.
-    # p7's F3 case (a repeated-value array inside a fence that closes,
-    # mid-reply, nowhere near the end) is unaffected by either change.
-    _fence_toggles = _fence_toggle_offsets(text)
-    _stripped_len = len(text.rstrip())
-
-    def _tm_in_fence(i: int, j: int) -> bool:
-        return _in_closed_fence(_fence_toggles, i) and j < _stripped_len
-
+    # P9-3 (hostile pass #9): P8-2's narrowed guard — exempt only inside a
+    # fence that goes on to CLOSE, and only if the run does not reach the
+    # (stripped) end of the reply — is UNSATISFIABLE in the one shape that
+    # matters. For `_in_closed_fence(i)` to be true a later toggle (the
+    # closing ``` line) must exist, and that toggle sits AFTER the run, so
+    # `j < _stripped_len` is true every time the fence-closed test is true:
+    # the two conditions are mutually exclusive, and the "reaches the end"
+    # half can never fire. A loop that sits inside a fence that closes —
+    # the ordinary shape, since this model writes decorative boxes
+    # constantly and finishes most of them — was exempted regardless of
+    # whether it ran to the end of the reply. v3.1.9 flagged it; the
+    # exemption silently un-flagged it. Mutation-measured: deleting the
+    # "reaches the end" clause changed 0 of 20,000 synthetic verdicts — it
+    # was dead code from the day it shipped.
+    #
+    # Two hostile reviews caught two different shapes of the same mistake:
+    # a fence-awareness carve-out in a rule whose whole job is to catch text
+    # that never terminates. REMOVED, not narrowed. This rule now judges
+    # text exactly as v3.1.9 did, with no fence awareness at all. F3's
+    # complaint is answered elsewhere: `decide_memory_tail` /
+    # `_trim_forwarded_prefix` already cut the flagged span out (with a
+    # marker) and keep the rest of the reply, so a legitimate repeated-value
+    # array only costs its own span, not the reply. The remaining cost of
+    # losing the exemption is that such a reply is skipped from MEMORY —
+    # exactly what v3.1.9 already did. No regression; simply not the
+    # improvement F3/P8-2 tried to make.
     tm = max(
         (
             x for x in _TOKEN_RUN_RE.finditer(text)
             if any(c.isalnum() for c in x.group(1))
-            and not _tm_in_fence(x.start(), x.end())
         ),
         key=lambda x: len(x.group(0)),
         default=None,
@@ -3812,12 +3988,13 @@ def trim_to_last_sentence(text: str) -> str:
     if not text:
         return ""
     # Fence toggles as text offsets, so each candidate costs one bisect
-    # rather than a re-scan of everything before it. Shared with
-    # reply_is_degenerate (_fence_toggle_offsets/_in_open_fence) so the two
-    # agree on what a fence is — this function wants ANY open fence,
-    # closed or not (a cut must never land inside an unterminated opener),
-    # unlike the token-run rule's `_in_closed_fence` (see P8-2's comment
-    # there for why the two rules need different fence definitions).
+    # rather than a re-scan of everything before it. Shares
+    # `_fence_toggle_offsets`/`_in_open_fence` with `_trim_forwarded_prefix`
+    # so the two agree on what a fence is — this function wants ANY open
+    # fence, closed or not (a cut must never land inside an unterminated
+    # opener). `reply_is_degenerate`'s token-run rule no longer has a fence
+    # reading of its own at all (P9-3, hostile pass #9 — the exemption it
+    # used to share this offset list with was removed, not narrowed).
     toggles = _fence_toggle_offsets(text)
     end = 0
     n = len(text)
@@ -8119,12 +8296,14 @@ async def chat_completions(request: Request) -> Any:
                 log_parts.append("sum(in-array)")
             else:
                 # 60% of the injection budget, capped at SUMMARY_BLOCK_MAX_
-                # TOKENS: at production config that is ~4,900 tokens, which
-                # reproduces the old working behaviour (summary trimmed
-                # newest-kept, facts and persona still fit) and leaves 40%
-                # for the other three layers. v3.1.9.1: this exact formula
-                # is also what a REUSING turn's stand-in may claim, via
-                # `_standin_injected_share` — see that helper's docstring.
+                # TOKENS: leaves the other 40% (persona, facts, retrieval)
+                # room in `inject_budget`, all four bounded together by
+                # `_bound_injected_blocks`. P9-1/P9-2 (hostile pass #9):
+                # this is NOT what a REUSING turn's stand-in claims any
+                # more — that call site (compact_if_needed) has its own
+                # formula, `_standin_reuse_ceiling`, because it does not
+                # share this constraint (nothing else spends its share on
+                # a reusing turn — see STANDIN_BUDGET_FRACTION's comment).
                 sblock = await run_in_threadpool(
                     summarizer.format_summary_block,
                     sstate,

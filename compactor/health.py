@@ -1242,6 +1242,43 @@ def _tokenizer_state() -> dict:
     return {"available": True, **st}
 
 
+def _reuse_state() -> dict:
+    """checks.reuse: main.reuse_decline_state(), or why it cannot be read.
+
+    P9-1/P9-2 (hostile pass #9): before this, a reuse decline (the stored
+    hierarchy not fitting the stand-in's budget, so the request falls back
+    to summarizing from scratch) had NO signal anywhere but an INFO log
+    line inside compact_if_needed — this is the exact failure mode P9-1
+    describes: the feature silently not firing while /health/full and the
+    CHANGELOG both said it worked. Same call-time, sys.modules-based read
+    as `_tokenizer_state` above (module-scope `import main` here would be
+    circular — see that function's docstring for the full reasoning).
+
+    CONTRACT: main.reuse_decline_state() -> {"attempted": int,
+    "declined_budget": int, "declined_recently": bool,
+    "last_declined_ceiling": int | None, "last_declined_others": int |
+    None}, read-only and cheap. Numbers only — no conversation text, no
+    conv_id, no hierarchy content.
+    """
+    main_mod = sys.modules.get("main")
+    if main_mod is None:
+        return {"available": False,
+                "reason": "main is not loaded in this process"}
+    fn = getattr(main_mod, "reuse_decline_state", None)
+    if not callable(fn):
+        return {"available": False,
+                "reason": "main.reuse_decline_state() is not present in this build"}
+    try:
+        st = fn()
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        return {"available": False, "reason": err, "error": err}
+    if not isinstance(st, dict):
+        err = f"main.reuse_decline_state() returned {type(st).__name__}, not a dict"
+        return {"available": False, "reason": err, "error": err}
+    return {"available": True, **st}
+
+
 async def gather_health_full(
     vllm_url: str, target_tokens: int, tokenize: dict | None = None
 ) -> dict:
@@ -1306,6 +1343,8 @@ async def gather_health_full(
     hierarchy = _hierarchy_progress(stats.pop("_hierarchy_fingerprint", None), mt)
     # Pure in-memory read of main's own state; see _tokenizer_state.
     tokenizer = _tokenizer_state()
+    # P9-1/P9-2 (hostile pass #9): same pattern, for reuse declines.
+    reuse = _reuse_state()
 
     # Why a reason list and not a bare string: `bg` used to be computed here,
     # placed in the payload, and never read. Sustained shedding — the pool
@@ -1933,6 +1972,10 @@ async def gather_health_full(
             "hierarchy": hierarchy,
             # v3.1.9: main.tokenizer_state(), or {"available": false, ...}.
             "tokenizer": tokenizer,
+            # v3.1.9.2 (P9-1/P9-2): main.reuse_decline_state(), or
+            # {"available": false, ...}. Visibility only — does not affect
+            # `status`, the same as `tokenizer` above.
+            "reuse": reuse,
         },
         "stats": stats,
         "backups": backup_info,

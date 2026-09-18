@@ -54,19 +54,19 @@ pass-through-unknown-keys behavior to vLLM, which does not recognise it —
   this, 0 after). A reply with no span to cut around (decoration fraction,
   script drift, the short-list-run backstop) falls back to its clean
   sentence head; only a reply with no clean text worth keeping gets the
-  whole-reply placeholder (10 of 67 on that backup, down from 51 of 68). Fenced
-  code is now excluded from the token-run rule (a repeated-value array in a
-  ```code``` block is no longer flagged, matching the fragment-line rule's
-  existing fence handling; hostile pass #7, F3). User turns, system
-  messages and the newest message are never touched. Logged at INFO as a
-  count only (no text) — `touched=<n> whole=<k> cut=<n-k>` (hostile pass #8,
-  P8-8: the line used to say "replaced N ... with a placeholder"
+  whole-reply placeholder (10 of 67 on that backup, down from 51 of 68).
+  **Fenced code was excluded from the token-run rule for one release
+  (hostile pass #7, F3) and is NOT any more — see the "REMOVED, not
+  narrowed" entry under hostile pass #9 below; that history is kept here
+  for context, not as a description of current behaviour.** User turns,
+  system messages and the newest message are never touched. Logged at INFO
+  as a count only (no text) — `touched=<n> whole=<k> cut=<n-k>` (hostile
+  pass #8, P8-8: the line used to say "replaced N ... with a placeholder"
   unconditionally, which stopped being true once span-cutting made a
   placeholder the MINORITY outcome — 10 of 66 flagged replies on the
-  2026-09-16 backup, not all of them). Apart from the fenced-code exemption
-  above and the P8-2 fix described below, the detection rules and
-  thresholds are unchanged; note that the exemption
-  applies wherever `reply_is_degenerate` is used, including the memory skip.
+  2026-09-16 backup, not all of them). Apart from the fence-exemption
+  history described below, the detection rules and thresholds are
+  unchanged.
   A new internal helper (`_reply_degenerate_verdict`) exposes the flagged
   span alongside the same reason string, cached per 128-bit content digest
   (not the text itself, so the VERDICT cache holds no reply text) so a
@@ -102,18 +102,37 @@ pass-through-unknown-keys behavior to vLLM, which does not recognise it —
   now also strips a leading turn that shares its role with the turn right
   after it (a real recent window always alternates roles; two consecutive
   user turns at the front means the first one is not actually recent).
-- **Fence exemption fixes (hostile pass #8):**
+- **Fence exemption fixes (hostile pass #8), and REMOVAL (hostile pass #9):**
   - **P8-2 (regression, was flagged correctly by v3.1.9):** the token-run
     fence exemption above treated an UNCLOSED ` ``` ` opener as fencing
     everything after it forever — this model uses bare ` ``` ` lines as
     decorative boxes (128 of 1,709 unique real replies in the 2026-09-16
     backup have an odd count), so a real identifier loop starting after
     the last unmatched opener and running to the end of the reply was
-    silently exempted and stored to memory/forwarded verbatim. Fixed: a
-    run only counts as fenced when the fence actually CLOSES again later,
-    and never when the run reaches the end of the reply either way. The
-    p7 F3 case (a repeated-value array inside a fence that closes,
-    mid-reply) is unaffected.
+    silently exempted and stored to memory/forwarded verbatim. "Fixed" at
+    the time: a run only counts as fenced when the fence actually CLOSES
+    again later, and never when the run reaches the end of the reply
+    either way.
+  - **P9-3 (hostile pass #9): P8-2's own fix does not work, and the
+    exemption is now REMOVED entirely rather than narrowed a third time.**
+    The "never when the run reaches the end of the reply" half is
+    logically unsatisfiable together with "only inside a fence that
+    CLOSES": for a fence to be judged closed, a LATER `` ``` `` toggle
+    must exist past the run, which makes "reaches the end" false by
+    construction every time "closed" is true. The clause never fired —
+    mutation-measured, 0 of 20,000 synthetic verdicts depended on it — so
+    a loop sitting inside an ordinary CLOSED decorative box (the common
+    case for this model, not the exotic one) was exempted regardless of
+    position: stored to facts/episodic/rollups and forwarded on the wire
+    unredacted. v3.1.9 flagged this shape; v3.1.9.2 (through this release,
+    until now) silently did not. The token-run rule now judges text
+    exactly as v3.1.9 did, with **no fence awareness of any kind**. The p7
+    F3 complaint this exemption was originally written for (a legitimate
+    repeated-value array losing the whole reply) is already answered by
+    the span-cut described above, which keeps the rest of the reply and
+    drops only the flagged span — so the cost of losing the exemption is
+    that such a reply is skipped from MEMORY only, exactly as v3.1.9 did;
+    not a regression, simply not the improvement F3/P8-2 attempted.
   - **P8-3:** the forwarded-window cut's clean-prefix rule reused
     `trim_to_last_sentence`, which refuses any boundary inside a fence —
     correct for the memory-side redaction (an unterminated opener must
@@ -148,6 +167,15 @@ pass-through-unknown-keys behavior to vLLM, which does not recognise it —
   as a second line of defence, which now drops (and logs) an unparseable
   `max_tokens` instead of leaving the client's own bad value sitting
   untouched in the forwarded body.
+- **A 4-space-indented ` ``` ` line is no longer misread as a fence
+  delimiter** (hostile pass #9, P9-6): CommonMark treats text indented 4+
+  spaces as an indented code block, so a ``` at that indentation is
+  literal content, not markup — `_fence_toggle_offsets` used to strip all
+  leading whitespace before checking, so such a line was counted as a
+  toggle and could mis-pair a real fence's open/close state one line
+  later than it should. Affects `trim_to_last_sentence` and
+  `_trim_forwarded_prefix`'s cut-boundary decisions only; the token-run
+  rule has no fence reading of its own to affect (see P9-3 above).
 
 Operator note: see [RUNPOD_DEPLOY.md → Sampling parameters](RUNPOD_DEPLOY.md#sampling-parameters)
 for the mapping between OpenWebUI's Advanced/Custom Parameters and vLLM's
@@ -175,7 +203,15 @@ are now budgeted by total characters scanned rather than redesigned to
 extend a tail cut backwards in one pass, which would need its own
 mutation-tested coverage beyond this lane's scope; a merge of two
 concurrent conversations losing acknowledged facts (hostile pass #8's
-gate note; pre-existing, untouched by this diff, needs its own ticket).
+gate note; pre-existing, untouched by this diff, needs its own ticket);
+`~~~`-delimited fences, still invisible to `_fence_toggle_offsets`
+(hostile pass #9, P9-6) — CommonMark treats ``` and ~~~ as independent
+fence-marker families that do not cross-close each other, and this
+detector's toggle list is a single flat, character-agnostic parity count,
+so adding ~~~ without also tracking marker type would let a ``` block and
+a ~~~ block mis-pair under a mixed-marker reply; a real fix needs
+per-marker pairing, judged not worth the redesign risk for a LOW-severity
+gap on the last V3 release.
 
 ---
 
@@ -225,6 +261,39 @@ as L1 rollups catch up. On a copy of the production data: 792 turns replaced,
 larger, injected-share budget still declines exactly as before (same log
 line, now naming the real budget source) — no partial/squeezed stand-in was
 added, to avoid removing turns the log could not honestly say were covered.
+
+**Correction (hostile pass #9, P9-1/P9-2): the fix above stopped working on
+her own conversation within days, and the "her hierarchy (~5.1k tokens) fits
+... and reuse fires" claim two paragraphs up was already stale by the time
+this release reached hostile review.** Both terms of the stand-in's budget
+are capped by `SUMMARY_BLOCK_MAX_TOKENS`, and the fix's own 60%-of-
+inject_budget share is a hard-coded `0.6` multiplier that
+`SUMMARY_BLOCK_MAX_TOKENS` can only ever LOWER, never raise past. At the
+values this release actually shipped (`COMPACTOR_INJECTION_BUDGET_
+FRACTION=0.6`, `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=6230`) the ceiling is a
+flat 6,230 tokens — below her hierarchy one day later (~9,050 tokens, up
+from ~5.1k) — so reuse silently declined on every request again, the exact
+2026-09-16 failure this entry describes fixing. Raising `SUMMARY_BLOCK_MAX_
+TOKENS` alone does not help: even at `0.75`/`20000` the ceiling is pinned at
+~9,345 by the `0.6` multiplier, still 1,955 tokens short of the hierarchy's
+own documented construction capacity (9 L1 scenes + 4 L2 chapters + 1 L3 at
+their max sizes = 11,300 tokens), so reuse would turn itself off again
+within one L1 rollup chunk regardless of how the fraction is tuned. **Fixed
+in v3.1.9.2** (hostile pass #9): the reuse stand-in now has its OWN budget
+formula (`_standin_reuse_ceiling`, `COMPACTOR_STANDIN_BUDGET_FRACTION`,
+default 1.0 of the injection budget) instead of sharing the separately-
+injected summary block's 60% formula — the two situations only looked
+alike; nothing else spends the stand-in's share on a reusing turn, because
+the separate injection is SKIPPED, not shrunk. Shipped defaults moved to
+`COMPACTOR_INJECTION_BUDGET_FRACTION=0.75` and `COMPACTOR_SUMMARY_BLOCK_
+MAX_TOKENS=12000`, which together clear the 11,300-token capacity with
+margin (empirically measured against a hierarchy built to exactly that
+capacity: true render cost 11,400-11,500 tokens). `/health/full` now
+reports `checks.reuse` (`attempted`, `declined_budget`,
+`declined_recently`, and the two numbers — ceiling and other-consumers
+total — behind the most recent decline; no conversation text, ever), so
+the next time her data outgrows the arithmetic again the operator sees it
+without reading request logs.
 
 ---
 

@@ -880,6 +880,56 @@ def test_g3_restore_marker_reason_fires_and_clears():
           "G3 CONTROL: removing the marker (the documented recovery) clears the reason on the next poll")
 
 
+def test_p9_reuse_decline_signal_reaches_health_full():
+    """P9-1/P9-2 (hostile pass #9): checks.reuse. Before this, a reuse
+    decline (the stored hierarchy not fitting the stand-in's budget) had
+    NO signal anywhere but an INFO log line inside compact_if_needed —
+    exactly how the feature shipped silently off (P9-1: green health,
+    CHANGELOG claiming it worked). `health._reuse_state()` reads
+    `main.reuse_decline_state()` via sys.modules, the same call-time
+    pattern `_tokenizer_state()` already uses for `checks.tokenizer` (see
+    that function's docstring for why a module-scope `import main` here
+    would be circular) — this test imports `main` itself (this file does
+    not, at module scope, unlike test_reuse_fit.py) so the "available"
+    path is actually exercised, not just the "main is not loaded" one.
+    """
+    print("\n[P9-1/P9-2] checks.reuse reads main.reuse_decline_state()")
+    import main  # local: this module does not import main at module scope
+
+    # Numbers only, and cheap: call the real recorder functions directly
+    # rather than driving a whole compact_if_needed request (that path is
+    # test_reuse_fit.py's [10] section's job — this test is about the
+    # health WIRING, not the reuse arithmetic).
+    before = health._reuse_state()
+    check(before.get("available") is True,
+          f"main is loaded in this process, so checks.reuse must read it "
+          f"(got {before})")
+    attempted_before = before["attempted"]
+    declined_before = before["declined_budget"]
+
+    main._record_reuse_attempt()
+    main._record_reuse_decline(9345, 12706)
+    after = health._reuse_state()
+    check(after["attempted"] == attempted_before + 1,
+          "*** attempted increments")
+    check(after["declined_budget"] == declined_before + 1,
+          "*** declined_budget increments")
+    check(after["declined_recently"] is True,
+          "*** a decline just now reads as recent")
+    check(after["last_declined_ceiling"] == 9345 and after["last_declined_others"] == 12706,
+          "*** the two numbers that explain the decline are carried through, "
+          "unchanged — no conversation text, no conv_id, anywhere in this "
+          "payload")
+
+    r = full()
+    check("reuse" in r["checks"], "*** gather_health_full's checks dict carries 'reuse'")
+    check(r["checks"].get("reuse", {}).get("declined_budget") == after["declined_budget"],
+          "and it is the SAME live state _reuse_state() reads directly, not "
+          "a stale or re-derived copy")
+    check(r["status"] != "down",
+          "visibility-only: a reuse decline does not itself take the pod down")
+
+
 TESTS = [
     test_f1_zero_backups_is_ok_during_the_grace_window,
     test_f1_zero_backups_after_the_grace_window_degrades,
@@ -907,6 +957,7 @@ TESTS = [
     test_f4_three_intervals_boundary_is_pinned,
     test_f5_quality_gate_skips_are_intended_to_degrade_status,
     test_g3_restore_marker_reason_fires_and_clears,
+    test_p9_reuse_decline_signal_reaches_health_full,
 ]
 
 

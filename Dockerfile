@@ -395,15 +395,50 @@ ENV COMPACTOR_SUMMARY_MAX_TOKENS="1024"
 # (3500/3500) but the OLD fraction (0.5, ~10,384 tokens on her 20,768-token
 # window), retrieval — priority 3, dropped WHOLE when it does not fit
 # (_bound_injected_blocks) — would have been silently cut from every
-# request. At 0.6 (~12,460 tokens) retrieval has room, with the summary
-# block pinned below at what it already measured (6,230). Raise together;
-# do not raise one without the other.
-ENV COMPACTOR_INJECTION_BUDGET_FRACTION="0.6"
-# v3.1.9: same pod change; pinned at the summary block's own measured size
-# (code default, summarizer.py, is 12000 — this is LOWER, not raised,
-# because at the new fraction the summary block only needed this much to
-# stay whole; see the comment above).
-ENV COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS="6230"
+# request.
+#
+# v3.1.9.2, P9-1/P9-2 (hostile pass #9): raised again, 0.6 -> 0.75. At 0.6
+# (inject_budget ~12,460) the REUSE stand-in's ceiling (a separate figure —
+# see main.py's STANDIN_BUDGET_FRACTION comment for why it is no longer
+# the same 0.6-of-this-fraction formula the injected summary block below
+# uses) was 6,230 tokens against her ~9,050-token hierarchy: reuse never
+# fired at the values this release actually shipped, though the CHANGELOG
+# said it did. At 0.75 (inject_budget ~15,576) the stand-in's own ceiling
+# (STANDIN_BUDGET_FRACTION=1.0, capped by SUMMARY_BLOCK_MAX_TOKENS below)
+# clears the hierarchy's documented 11,300-token construction capacity —
+# see that env var's comment for the margin measured against a
+# full-capacity state. The INJECTED block below still only takes 60% of
+# this (unchanged formula, `_standin_injected_share`): ~9,345 tokens,
+# leaving facts (600) and retrieval (3500) their room with ~2,100 to
+# spare. Raise together with SUMMARY_BLOCK_MAX_TOKENS; do not raise one
+# without the other.
+ENV COMPACTOR_INJECTION_BUDGET_FRACTION="0.75"
+# v3.1.9: pod change, pinned at the summary block's own measured size for
+# the fraction of that time (6,230).
+#
+# v3.1.9.2, P9-1/P9-2 (hostile pass #9): raised to 12,000 — the code
+# default (summarizer.py) this had been overriding downward. At 6,230 (and
+# even at a "planned" 10,000 this release almost shipped) the reuse
+# stand-in's ceiling was capped here directly and stayed BELOW the
+# hierarchy's 11,300-token construction capacity no matter how the
+# fraction above was raised — measured: 0.90 * this same formula still
+# landed at 11,214, 86 tokens short. 12,000 clears the capacity; probed
+# against a hierarchy built to exactly 9 L1 / 4 L2 / 1 L3 at their max
+# sizes, the true render cost (tier content plus the block header and one
+# header line per item) lands between 11,400 and 11,500, so 12,000 carries
+# real margin, not just enough to clear the raw arithmetic. This value is
+# an outer backstop for BOTH the stand-in and the separately-injected
+# block; the 60%/100% split between them lives in the fraction, not here.
+ENV COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS="12000"
+# v3.1.9.2, P9-1/P9-2 (hostile pass #9): new. Governs ONLY the reuse
+# stand-in's ceiling (main.py `_standin_reuse_ceiling`), not the
+# separately-injected summary block (`_standin_injected_share`, still
+# hard-coded at 0.6 — see COMPACTOR_INJECTION_BUDGET_FRACTION's comment
+# for why the two needed to stop sharing one formula). 1.0: on a reusing
+# turn the injection site skips its own copy of the summary entirely, so
+# nothing else in the injection budget spends this share — there is no
+# sibling to leave room for.
+ENV COMPACTOR_STANDIN_BUDGET_FRACTION="1.0"
 ENV VLLM_URL="http://localhost:8000"
 
 # V2.0 Phase 2 — facts memory

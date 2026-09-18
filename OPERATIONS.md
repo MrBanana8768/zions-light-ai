@@ -112,6 +112,44 @@ there, `/compact` runs the identical drain and will NOT clear the backlog;
 fix the named cause first (commonly an unreadable
 `summaries/<conv>.archive.json`).
 
+#### `checks.reuse` — is the reuse stand-in actually firing? (v3.1.9.2)
+
+```bash
+curl -s localhost:8080/health/full | python3 -c "
+import json,sys; d=json.load(sys.stdin); r=d['checks'].get('reuse') or {}
+print('attempted:', r.get('attempted'), '| declined_budget:', r.get('declined_budget'))
+print('declined_recently:', r.get('declined_recently'))
+print('last_declined_ceiling:', r.get('last_declined_ceiling'),
+      '| last_declined_others:', r.get('last_declined_others'))"
+```
+
+Added after hostile pass #9 (P9-1/P9-2) found the reuse feature v3.1.9.1
+introduced silently declining on every request again, at the numbers
+v3.1.9.2 nearly shipped, with no signal anywhere but an INFO log line. This
+is visibility-only — it never appears in `status_reasons` and never
+degrades `status`, the same as `checks.tokenizer` — because a decline
+still falls back to summarizing from scratch and answers the turn; it is
+slower and remembers less precisely, not broken.
+
+`attempted` and `declined_budget` are cumulative since the process started
+(a restart resets both, not a rolling window — unlike `declined_recently`,
+below). `declined_budget == 0` with `attempted > 0` means every stand-in
+attempt fit; that is the healthy state to expect in normal operation.
+**`declined_recently`** is `true` for `COMPACTOR_REUSE_DECLINE_DEGRADE_
+WINDOW_S` (default 300s) after the MOST RECENT decline — check this first
+if you suspect the feature just stopped working, rather than the
+cumulative counter, which stays nonzero forever after even one decline
+early in a long-lived process. `last_declined_ceiling` and
+`last_declined_others` are the two numbers from that decline's own log
+line (`the stored summaries cover N of the turns ... but they do not fit
+whole in the <ceiling> token(s) ... leaves beside the system prompt,
+images and recent turns (<others>) and one fresh summary`) — if
+`declined_recently` is true and `last_declined_ceiling` is close to (or
+below) 11,300, the summary hierarchy has grown past what
+`COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`/`COMPACTOR_STANDIN_BUDGET_FRACTION`
+can hold (see RUNPOD_DEPLOY.md's [Memory budgets](RUNPOD_DEPLOY.md#memory-budgets--raised-defaults-in-v319)
+for the exact arithmetic and what to raise).
+
 #### `config.time_injection` — the current-time feature (v3.1.9)
 
 ```bash

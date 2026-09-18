@@ -568,18 +568,28 @@ assert_true("clinic opens at nine" in _h_sent_asst, "[2h] clean text BEFORE the 
 assert_true("meeting continued as planned" in _h_sent_asst, "[2h] clean text AFTER the scream reached vLLM")
 assert_true(_scream not in _h_sent_asst, "[2h] the scream itself did not reach vLLM")
 
-# [2i] p7 hostile pass #7, F3 + P8-2 (hostile pass #8): a repeated
-# IDENTIFIER-shaped token trips the token rule outside a fence, is exempt
-# inside a fence that CLOSES, and is flagged AGAIN after an UNCLOSED fence
-# opener. P8-7 (hostile pass #8): the OLD [2i] fixture here
+# [2i] p7 hostile pass #7, F3 + P8-2 (hostile pass #8) + P9-3 (hostile pass
+# #9): a repeated IDENTIFIER-shaped token trips the token rule outside a
+# fence, and — as of P9-3 — trips it EVERY TIME, fence or no fence. F3
+# added an exemption for text inside a CLOSED fence; P8-2 narrowed it after
+# an UNCLOSED opener was found to exempt everything after it forever; P9-3
+# found that P8-2's own narrowing ("closed AND does not reach the end of
+# the reply") is unsatisfiable — a fence can only be judged "closed" by
+# finding a LATER toggle, and that later toggle is necessarily after the
+# run, so "reaches the end" and "is inside a closed fence" can never both
+# be true, and the "reaches the end" clause never fired (0 of 20,000
+# mutation-tested verdicts depended on it). A loop inside an ordinary
+# closed decorative box — the common case, not the exotic one — was
+# silently exempted regardless of position. REMOVED ENTIRELY, not narrowed
+# again: this rule now judges text exactly as v3.1.9 did, with no fence
+# reading at all. See [2i4] below for the five-row table that pins this
+# down case by case. P8-7 (hostile pass #8): the OLD [2i] fixture here
 # ("[0.00, 0.00, 0.00, 0.00] " * 20) never matched _TOKEN_RUN_RE at all —
 # the brackets and commas break each row into four DIFFERENT space-
 # separated tokens ("[0.00,", "0.00,", "0.00,", "0.00]"), none of which
-# repeats three times in a row the way the regex requires — so the CONTROL
-# below passed whether or not fenced code was exempt from the token rule,
-# and the half of F3 that actually changed memory behaviour (P8-2: an
-# unclosed fence exempting a real loop) had NO test at all, in either
-# direction. Two mutants (nofence/closed, SP\p8\fencemut.py) left every
+# repeats three times in a row the way the regex requires — so a CONTROL
+# built on it would pass whether or not fenced code was exempt from the
+# token rule. Two mutants (nofence/closed, SP\p8\fencemut.py) left every
 # suite including this one at rc=0.
 _ID_UNIT = "identifier_run_9f3k2"  # 20 chars, alnum — a real _TOKEN_RUN_RE unit
 _ID_LOOP = (_ID_UNIT + " ") * 10   # well past DEGENERATE_TOKEN_RUN_CHARS (120)
@@ -594,30 +604,45 @@ assert_true(
     "unlike the old '[0.00, ...]' array, which matched no rule at all",
 )
 
-# Inside a fence that CLOSES (p7's F3 shape): still exempt — unaffected by
-# P8-2's fix (see _reply_degenerate_verdict_uncached's comment).
+# Inside a fence that CLOSES (p7's F3 shape): P9-3 removed the exemption,
+# so this is now flagged too, exactly as v3.1.9 judged it. The loop itself
+# is still cut from what reaches vLLM like any other mid-reply span (full
+# pre/post/balance assertions on this exact "prose, boxed run, more prose"
+# shape live at [2k] below); the cost of losing the exemption is that a
+# genuinely decorative closed box is skipped from MEMORY, not that
+# anything leaks forward.
 _codeblock_reply = (
     _PROSE + "Here is the matrix:\n```\n" + _ID_LOOP +
     "\n```\nLet me know if that helps, and I can explain any row you like."
 )
 assert_true(
-    main.reply_is_degenerate(_codeblock_reply) is None,
-    "[2i] CONTROL: the SAME identifier run inside a fence that CLOSES is "
-    "not flagged — fenced code is excluded from the token rule",
+    main.reply_is_degenerate(_codeblock_reply) is not None,
+    "[2i] *** P9-3: the SAME identifier run inside a fence that CLOSES is "
+    "now flagged — the fence exemption is gone, not narrowed",
 )
 r, sent, records = _post_chat(
     [user("show me"), asst(_codeblock_reply), user("thanks")],
     "loop-r2-codeblock",
 )
 _i_sent_asst = next(m["content"] for m in sent["messages"] if m.get("role") == "assistant")
-assert_eq(_i_sent_asst, _codeblock_reply, "[2i] CONTROL: the code block reached vLLM untouched, verbatim")
+assert_true(
+    _ID_UNIT * 3 not in _i_sent_asst,
+    "[2i] *** P9-3: the identifier loop inside the closed box did not "
+    "reach vLLM verbatim in the forwarded window",
+)
+assert_true(
+    "Let me know if that helps" in _i_sent_asst,
+    "[2i] the clean prose AFTER the closed box still reached vLLM",
+)
 
-# [2i2] P8-2 (hostile pass #8): the SAME identifier run after an UNCLOSED
-# ``` line (a lone opener — this model's own decorative-box style; 128 of
-# 1,709 unique real replies in the 2026-09-16 backup have an odd ``` count)
-# is flagged AGAIN, not exempted forever, and is kept out of the forwarded
-# window — this is the check the finding says did not exist before this
-# lane, in either direction.
+# [2i2] P8-2 (hostile pass #8), still true after P9-3 removed the fence
+# exemption entirely: the SAME identifier run after an UNCLOSED ``` line (a
+# lone opener — this model's own decorative-box style; 128 of 1,709 unique
+# real replies in the 2026-09-16 backup have an odd ``` count) is flagged,
+# and is kept out of the forwarded window. Kept as a regression check: with
+# no fence reading left in the token rule at all, this passes for a
+# simpler reason now (there is nothing to exempt it), but the case must
+# stay caught.
 _unclosed_fence_reply = _PROSE + "Here is a note:\n```\n" + _ID_LOOP
 assert_true(
     main.reply_is_degenerate(_unclosed_fence_reply) is not None,
@@ -640,14 +665,11 @@ assert_true(
     "[2i2] the clean prose BEFORE the unclosed fence still reached vLLM",
 )
 
-# [2i3] P8-2: isolates the "must actually CLOSE" half of the fix from the
-# "never if it reaches the end" half — a MID-reply identifier run inside a
-# fence that NEVER closes anywhere in the whole reply (more prose follows
-# the run, so the run itself does NOT reach the stripped end) is still
-# flagged. A version of the fix that only checked "reaches the end" (and
-# exempted anything merely inside SOME open region, closed or not) would
-# wrongly exempt this — it never reaches the end, so that check alone
-# would not catch it.
+# [2i3] Originally P8-2's isolation of the "must actually CLOSE" half from
+# the "never if it reaches the end" half (that second half was P9-3's dead
+# clause — see [2i]'s comment). Kept as a regression check now that there
+# is no fence reading at all: a MID-reply identifier run inside a fence
+# that NEVER closes anywhere in the whole reply must stay flagged.
 _mid_unclosed = (
     _PROSE + "\n```\n" + _ID_LOOP +
     "\nmore prose after the loop, and the fence never closes anywhere in "
@@ -660,6 +682,66 @@ assert_true(
     "closes is still flagged — exemption requires the fence to actually "
     "CLOSE, not merely to still read as 'open' by toggle parity",
 )
+
+# [2i4] P9-3 (hostile pass #9) regression table — the exact five rows the
+# lane brief verified against the v3.1.9 tag before assigning this fix:
+#
+#   case                                    v3.1.9   de3c376 (unfixed)
+#   loop, no fence                          flagged  flagged
+#   loop after an UNCLOSED fence            flagged  flagged
+#   loop inside a fence that CLOSES         flagged  NOT flagged  <- hole
+#   closed fence, then trailing text        flagged  NOT flagged  <- hole
+#   repeated-value array in a closed fence  flagged  NOT flagged  <- hole
+#
+# Every row must now read as flagged, matching the v3.1.9 column: the
+# token rule has no fence exemption of any kind any more, so a fence
+# closing or not closing, or being followed by more text or not, cannot
+# change the verdict.
+_i4_cases = {
+    "no fence at all": _PROSE + _ID_LOOP,
+    "after an unclosed fence opener": _PROSE + "```\n" + _ID_LOOP,
+    "inside a fence that closes, mid-reply": (
+        _PROSE + "```\n" + _ID_LOOP + "\n```\nmore prose follows the box."
+    ),
+    "inside a fence that closes, ending the reply": (
+        _PROSE + "```\n" + _ID_LOOP + "\n```"
+    ),
+    "inside a fence that closes, ending the reply, trailing newline": (
+        _PROSE + "```\n" + _ID_LOOP + "\n```\n"
+    ),
+    "repeated-value array shape, closed fence, ending the reply": (
+        _PROSE + "```\n" + ((_ID_UNIT + "_row ") * 10) + "\n```"
+    ),
+}
+for _i4_name, _i4_text in _i4_cases.items():
+    assert_true(
+        main.reply_is_degenerate(_i4_text) is not None,
+        f"[2i4] *** P9-3: '{_i4_name}' is flagged — matches v3.1.9, no "
+        "fence exemption of any shape survives",
+    )
+
+# [2i5] P9-6 (hostile pass #9): a 4-space-indented ``` line is CommonMark
+# indented CODE CONTENT, not a fence delimiter — `_fence_toggle_offsets`
+# used to strip all leading whitespace before checking, so such a line was
+# wrongly counted as a toggle. A real opener (unindented) followed by a
+# 4-space-indented ``` line (literal content, not a closer) must still
+# read as an OPEN fence at a position after the indented line — if the
+# indented line were wrongly treated as a toggle, that position would
+# wrongly read as CLOSED.
+_indent_toggles = main._fence_toggle_offsets(
+    "prose\n```\ncode line one\n    ```\nmore code\n```\nprose after"
+)
+assert_eq(
+    len(_indent_toggles), 2,
+    "[2i5] *** P9-6: only the two UNINDENTED ``` lines are toggles — the "
+    "4-space-indented one in the middle is literal content",
+)
+assert_true(
+    main._in_open_fence(_indent_toggles, len("prose\n```\ncode line one\n    ```\nmore c")),
+    "[2i5] *** P9-6: a position after the (correctly ignored) indented "
+    "``` line still reads as inside the still-open real fence",
+)
+
 
 # [2j] P8-3 (hostile pass #8): the last real sentence of the reply sits
 # INSIDE a ``` box that never closes again (this model's own "box, then

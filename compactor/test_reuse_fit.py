@@ -958,6 +958,151 @@ check(_EXPECTED_SITE_BUDGET in _site_budgets,
 
 
 # ---------------------------------------------------------------------------
+# [10] P9-1/P9-2 (hostile pass #9): the SHIPPED v3.1.9.2 numbers
+# (COMPACTOR_INJECTION_BUDGET_FRACTION=0.75, COMPACTOR_SUMMARY_BLOCK_MAX_
+# TOKENS=12000, COMPACTOR_STANDIN_BUDGET_FRACTION=1.0 — Dockerfile /
+# runpod.env.template), not the 0.6/6230 incident numbers this file pins
+# everywhere else. A hierarchy built to DOCUMENTED CAPACITY (9 L1 scenes at
+# L1_MAX_TOKENS, 4 L2 chapters at L2_MAX_TOKENS, 1 L3 at L3_MAX_TOKENS — the
+# same "9*L1_MAX + 4*L2_MAX + L3_MAX = 11,300" arithmetic summarizer.py's
+# own format_summary_block docstring names) must REUSE at the shipped
+# numbers. At the OLD 0.6/6230 pair it must still DECLINE — proving the
+# fixture actually sits at the boundary the finding describes, not merely
+# "large enough that any fix would pass it" — and even under the interim
+# 0.75/6230 pairing (P9-1's "planned" values this release almost shipped)
+# it must ALSO decline, matching P9-2's own measurement that raising
+# SUMMARY_BLOCK_MAX_TOKENS alone (without also fixing the 0.6-of-
+# inject_budget formula) buys nothing: the old `_standin_injected_share`
+# formula pins the ceiling at 9,345 regardless of SBMAX, 1,955 short of
+# capacity.
+# ---------------------------------------------------------------------------
+print("[10] P9-1/P9-2: a hierarchy at documented CAPACITY reuses at the "
+      "shipped numbers, declines at the old ones")
+main.summarize = _spy_summarize
+
+
+def _g_filler(n_tokens: int) -> str:
+    """ASCII text whose _estimate_block_tokens (chars//4, no tokenizer
+    available in this offline test) prices at very close to n_tokens —
+    same construction P9's own cliff2.py/fence2.py probes used."""
+    return ("word " * n_tokens).strip()[: n_tokens * 4]
+
+
+CONV_CAPACITY = "reuse_fit_capacity"
+# 65 exchanges (130 non-system turns) — exactly enough turn POSITIONS for
+# the 9 L1 + 4 L2 chunks below to cover with no gap, same chunk-boundary
+# convention _seed_hierarchy's other callers use (positions in the full
+# non-system turn sequence).
+G_OLDER = history(65, words=200)
+_G_L1_CHUNKS = [
+    {"tier": "l1", "text": "L1scene " + _g_filler(summarizer.L1_MAX_TOKENS),
+     "first_turn": i * 10 + 1, "last_turn": i * 10 + 10}
+    for i in range(9)
+]
+_G_L2_CHUNKS = [
+    {"tier": "l2", "text": "L2chapter " + _g_filler(summarizer.L2_MAX_TOKENS),
+     "first_turn": 90 + i * 10 + 1, "last_turn": 90 + i * 10 + 10}
+    for i in range(4)
+]
+_G_LAST_COVERED = _G_L2_CHUNKS[-1]["last_turn"]
+check(_G_LAST_COVERED == len(_ns(G_OLDER)),
+      f"fixture: the 13 chunks cover every turn position in G_OLDER with no "
+      f"gap (last_turn={_G_LAST_COVERED}, non-system turns="
+      f"{len(_ns(G_OLDER))})")
+_G_ST = _seed_hierarchy(CONV_CAPACITY, G_OLDER, _G_L1_CHUNKS + _G_L2_CHUNKS)
+# _seed_hierarchy only understands "l1"/"l2" tiers (see its own docstring);
+# L3 is set directly the same way test_summary_block_budget.py's fixtures
+# do (a plain {"text", "first_turn", "last_turn"} dict) — there is no
+# separate "real writer" for L3 to call here without a live LLM, and this
+# module-level dict assignment is exactly what maybe_rollup itself does
+# after an L3 refresh call returns.
+_G_ST["l3"] = {
+    "text": "L3theme " + _g_filler(summarizer.L3_MAX_TOKENS),
+    "first_turn": 1, "last_turn": _G_LAST_COVERED,
+}
+summarizer.save_state(CONV_CAPACITY, _G_ST)
+_G_ST = summarizer.load_state(CONV_CAPACITY)
+
+# Recent turns sized like the production fixture above (OTHERS ~12-14k);
+# doesn't matter much here since G_OLDER alone (65 * ~200-word turns) is
+# already far over TARGET_TOKENS.
+G_RECENT = [
+    {"role": "user", "content": "Q1 " + "u" * 1500},
+    {"role": "assistant", "content": "A1 " + "a" * 10000},
+    {"role": "user", "content": "Q2 " + "u" * 1500},
+    {"role": "assistant", "content": "A2 " + "a" * 7600},
+]
+G_MSGS = G_OLDER + G_RECENT
+check(main.count_tokens(G_MSGS) > main.TARGET_TOKENS,
+      "fixture: G_MSGS is over TARGET, so compaction triggers")
+
+# Measure the hierarchy's own true render cost uncapped (SUMMARY_BLOCK_MAX_
+# TOKENS raised far out of the way just for this measurement) — must sit at
+# or above the documented 11,300-token construction capacity, otherwise
+# this fixture is not actually AT capacity and proves nothing.
+_g_saved_sbmax_measure = summarizer.SUMMARY_BLOCK_MAX_TOKENS
+summarizer.SUMMARY_BLOCK_MAX_TOKENS = 10**9
+_G_HIER_TOKENS = summarizer._estimate_block_tokens(
+    summarizer.format_summary_block(_G_ST, 10**9) or ""
+)
+summarizer.SUMMARY_BLOCK_MAX_TOKENS = _g_saved_sbmax_measure
+_G_CAPACITY = (
+    9 * summarizer.L1_MAX_TOKENS + 4 * summarizer.L2_MAX_TOKENS
+    + summarizer.L3_MAX_TOKENS
+)
+check(_G_CAPACITY == 11300, f"fixture: documented capacity (got {_G_CAPACITY})")
+check(_G_HIER_TOKENS >= _G_CAPACITY,
+      f"fixture: the hierarchy's true render cost ({_G_HIER_TOKENS}) is at "
+      f"or above documented capacity ({_G_CAPACITY}) — this fixture is "
+      f"actually AT the boundary, not merely large")
+
+
+def _g_run(sbmax: int, inject_budget: int):
+    saved = summarizer.SUMMARY_BLOCK_MAX_TOKENS
+    summarizer.SUMMARY_BLOCK_MAX_TOKENS = sbmax
+    try:
+        stored_out: list = []
+        out = _run(G_MSGS, CONV_CAPACITY, stored_turns_out=stored_out,
+                    inject_budget=inject_budget)
+    finally:
+        summarizer.SUMMARY_BLOCK_MAX_TOKENS = saved
+    return stored_out, out
+
+
+_G_OLD_INJECT = int(EFFECTIVE_LIMIT * 0.6)
+_G_PLANNED_INJECT = int(EFFECTIVE_LIMIT * 0.75)  # same as the shipped fraction
+
+_g_decline_before = main.reuse_decline_state()["declined_budget"]
+_g_stored_old, _g_out_old = _g_run(6230, _G_OLD_INJECT)
+check(_g_stored_old == [0],
+      f"*** at the OLD 0.6/6230 numbers, a hierarchy at documented capacity "
+      f"DECLINES (stored_turns_out={_g_stored_old}) — P9-1's reproduction")
+check(main.reuse_decline_state()["declined_budget"] == _g_decline_before + 1,
+      "*** and the decline is counted in main.reuse_decline_state() — the "
+      "health signal this fix adds actually increments on this exact "
+      "failure")
+
+_g_stored_interim, _g_out_interim = _g_run(6230, _G_PLANNED_INJECT)
+check(_g_stored_interim == [0],
+      f"*** at 0.75 injection fraction but the OLD SUMMARY_BLOCK_MAX_TOKENS "
+      f"(6230), it STILL declines (stored_turns_out={_g_stored_interim}) — "
+      f"P9-2: raising the fraction alone buys nothing while "
+      f"_standin_injected_share's hard-coded 0.6 keeps the ceiling pinned "
+      f"under 9,345")
+
+_g_stored_new, _g_out_new = _g_run(12000, _G_PLANNED_INJECT)
+check(_g_stored_new and _g_stored_new[0] == _G_LAST_COVERED,
+      f"*** at the SHIPPED 0.75/12000/1.0 numbers, the SAME full-capacity "
+      f"hierarchy REUSES completely (stored_turns_out={_g_stored_new}, "
+      f"expected [{_G_LAST_COVERED}]) — the fix")
+check(any("L1scene " in str(m.get("content", "")) for m in _g_out_new)
+      and any("L2chapter " in str(m.get("content", "")) for m in _g_out_new)
+      and any("L3theme " in str(m.get("content", "")) for m in _g_out_new),
+      "and every tier — L1, L2 and L3 — actually travelled into the array, "
+      "not just the newest scenes a partial fit would have kept")
+
+
+# ---------------------------------------------------------------------------
 # [F1] p7 hostile pass #7: the compacted-branch floor (main.py:_enforce_hard_
 # budget, `_floor`) used to be the raw KEEP_RECENT_TURNS MESSAGE count (4).
 # split_messages ALIGNS its own kept-recent window to start on a USER turn

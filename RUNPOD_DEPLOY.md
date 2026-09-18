@@ -198,35 +198,77 @@ disk on this boot.
 
 ### Memory budgets — raised defaults in v3.1.9
 
-Five environment variables control how much of her own facts/retrieval/
-summary memory is stored and injected per turn. The owner raised all five
-by hand on the running pod (2026-09-15, a `supervisorctl` `environment=`
-edit on the `compactor` program — lost on every container restart, so it
-had to be reapplied after any redeploy). **v3.1.9 bakes the same five
-values into the image and this template, so that live edit is no longer
-needed:**
+*(Two of these six rows were raised again, and a sixth added, in v3.1.9.2
+— see below; the anchor name is kept as-is so existing links into this
+section do not break.)*
 
-| Variable | Code default | v3.1.9 shipped default |
-|---|---|---|
-| `COMPACTOR_MAX_FACTS_TOKENS` | 1500 | 3500 |
-| `COMPACTOR_INJECT_FACTS_TOKENS` | 400 | 600 |
-| `COMPACTOR_MAX_RETRIEVAL_TOKENS` | 1500 | 3500 |
-| `COMPACTOR_INJECTION_BUDGET_FRACTION` | 0.5 | 0.6 |
-| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | 12000 | 6230 |
+Six environment variables control how much of her own facts/retrieval/
+summary memory is stored and injected per turn. The owner raised the first
+five by hand on the running pod (2026-09-15, a `supervisorctl` `environment=`
+edit on the `compactor` program — lost on every container restart, so it
+had to be reapplied after any redeploy). **v3.1.9 baked the same five
+values into the image and this template, so that live edit is no longer
+needed; v3.1.9.2 (hostile pass #9, P9-1/P9-2) raised the fraction and
+summary-block cap again and added the sixth row, for a DIFFERENT reason —
+see below:**
+
+| Variable | Code default | v3.1.9 shipped default | v3.1.9.2 shipped default |
+|---|---|---|---|
+| `COMPACTOR_MAX_FACTS_TOKENS` | 1500 | 3500 | 3500 (unchanged) |
+| `COMPACTOR_INJECT_FACTS_TOKENS` | 400 | 600 | 600 (unchanged) |
+| `COMPACTOR_MAX_RETRIEVAL_TOKENS` | 1500 | 3500 | 3500 (unchanged) |
+| `COMPACTOR_INJECTION_BUDGET_FRACTION` | 0.5 | 0.6 | **0.75** |
+| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | 12000 | 6230 | **12000** |
+| `COMPACTOR_STANDIN_BUDGET_FRACTION` | 1.0 (no v3.1.9 equivalent) | — | **1.0** |
 
 **Why the fraction and summary-block rows moved together with the two
-raised caps, not independently:** `inject_budget = effective_limit ×
-COMPACTOR_INJECTION_BUDGET_FRACTION` is shared by persona + summary + facts
-+ retrieval. Retrieval is the lowest-priority block and is dropped WHOLE
-(not trimmed) by `_bound_injected_blocks` when it does not fit. At the
+raised caps in v3.1.9, not independently:** `inject_budget = effective_limit
+× COMPACTOR_INJECTION_BUDGET_FRACTION` is shared by persona + summary +
+facts + retrieval. Retrieval is the lowest-priority block and is dropped
+WHOLE (not trimmed) by `_bound_injected_blocks` when it does not fit. At the
 raised facts/retrieval caps (3500/3500) under the OLD fraction (0.5, about
 10,384 tokens of her 20,768-token window), retrieval would have been
 silently dropped from every request. At 0.6 (about 12,460 tokens) retrieval
-has room, with the summary block pinned at what it measured itself needing
-(6,230 — lower than its own 12,000 code default, not a further raise). **Do
-not change one of these five without the others.**
+had room, with the summary block pinned at what it measured itself needing
+at the time (6,230). **Do not change one of the first five without the
+others.**
 
-Evidence behind these numbers (2026-09-15 pod measurement, before the
+**Why the fraction and summary-block cap moved AGAIN in v3.1.9.2, and why a
+sixth variable was added:** these two rows do double duty. Besides the
+facts/retrieval room above, they also set the ceiling for the REUSE
+STAND-IN — the array-embedded substitute `compact_if_needed` returns in
+place of older turns a stored summary hierarchy already covers, main.py
+`_standin_reuse_ceiling`. At the v3.1.9 pair (0.6/6230) that ceiling was a
+flat 6,230 tokens, below her hierarchy within a day of the fix that
+introduced it (~9,050 tokens, up from ~5.1k when v3.1.9.1 shipped) — reuse
+silently declined on every request again, exactly the 2026-09-16 failure
+v3.1.9.1 was written to remove, with `/health/full` and the CHANGELOG both
+saying it worked. Raising `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` alone does
+not fix this: the stand-in's OLD formula multiplied the injection budget by
+a hard-coded 0.6 before ever reaching the SUMMARY_BLOCK_MAX_TOKENS cap, so
+even `0.75`/`20000` only reached a ~9,345-token ceiling — 1,955 tokens
+short of the hierarchy's own documented construction capacity (9 L1 scenes
++ 4 L2 chapters + 1 L3 at their max sizes = 11,300 tokens). `COMPACTOR_
+STANDIN_BUDGET_FRACTION` (new) is the stand-in's OWN fraction of the
+injection budget, separate from the 0.6 the separately-injected summary
+block still uses (that block, unlike the stand-in, has to leave room for
+facts/retrieval in the SAME inject_budget — the stand-in does not, because
+on a reusing turn that separate injection is skipped entirely). At 1.0, the
+ceiling is `min(SUMMARY_BLOCK_MAX_TOKENS, inject_budget)` = `min(12000,
+15576)` = 12,000, which clears the 11,300-token capacity with measured
+margin (a hierarchy built to exactly that capacity renders 11,400-11,500
+tokens in practice, header and per-item overhead included). **The
+separately-injected block's own share is unaffected by this row**: it still
+computes `min(SUMMARY_BLOCK_MAX_TOKENS, int(inject_budget × 0.6))` ≈ 9,345
+tokens at the new fraction, comfortably under `inject_budget` (15,576) with
+facts (600) and retrieval (3,500) still fitting. `/health/full`'s
+`checks.reuse` now reports `attempted`/`declined_budget`/
+`declined_recently` and the two numbers behind the most recent decline —
+watch that field after any future change to these three rows; a growing
+hierarchy can outgrow even 12,000 within one L1 rollup chunk, and this is
+how the operator would see it happen instead of reading request logs.
+
+Evidence behind the v3.1.9 numbers (2026-09-15 pod measurement, before that
 raise): roughly 16 new facts extracted per exchange with roughly 16 evicted
 (the 1500-token store churning), only 6-12 of about 160 stored facts
 actually reaching injection, retrieval keeping only 1 of 5 candidate hits,
@@ -668,8 +710,9 @@ Override these in your Runpod template if needed:
 | `COMPACTOR_MAX_RETRIEVAL_TOKENS` | code default `1500`, **image/template default `3500`** (v3.1.9) | Token budget for the whole retrieved-exchange block. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
 | `COMPACTOR_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (prebaked ONNX in the image) |
 | `COMPACTOR_HIERARCHICAL_SUMMARY` | `true` | L1→L2→L3 rolling summaries. Set `false` to disable. |
-| `COMPACTOR_INJECTION_BUDGET_FRACTION` | code default `0.5`, **image/template default `0.6`** (v3.1.9) | Fraction of the effective input limit shared by persona + summary + facts + retrieval. Must move together with the facts/retrieval caps above — see [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
-| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | code default `12000`, **image/template default `6230`** (v3.1.9) | Cap on the rendered summary block. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
+| `COMPACTOR_INJECTION_BUDGET_FRACTION` | code default `0.5`, **image/template default `0.75`** (v3.1.9.2; was `0.6` in v3.1.9) | Fraction of the effective input limit shared by persona + summary + facts + retrieval, AND the input to the reuse stand-in's own ceiling. Must move together with the facts/retrieval caps and the summary-block cap above — see [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
+| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | code default `12000`, **image/template default `12000`** (v3.1.9.2; was lowered to `6230` in v3.1.9) | Outer cap on the rendered summary block AND the reuse stand-in. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
+| `COMPACTOR_STANDIN_BUDGET_FRACTION` | code default `1.0` | **New in v3.1.9.2.** Fraction of the injection budget the reuse stand-in's own ceiling may claim — separate from the 60% the separately-injected summary block still uses. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
 | `COMPACTOR_TAIL_ROLLUP_MAX_CALLS` | `4` | Per-turn budget for the background tail (and the one-shot backfill rollup) catching up a summary hierarchy that has fallen far behind (a vLLM outage, days of rollup failures). Bounds where a rollup unit is allowed to **start**, not a hard per-turn ceiling: a unit that starts always finishes, so one turn can spend up to `(budget − 1)` plus that unit's own real cost — normally a few calls, but measured at 6-16 calls for one unit when `/tokenize` is down. Converges over successive turns either way; see CHANGELOG.md "Summary hierarchy catch-up" (v3.1.9). |
 | `COMPACTOR_DEDUP_SIMILARITY` | `0.75` | Cosine threshold for fact-dedup candidate clustering |
 | `COMPACTOR_DEDUP_MAX_LLM_CALLS` | `10` | Cap on LLM merge calls per dedup pass |
@@ -796,16 +839,21 @@ then `supervisorctl start compactor backup`.
   model is told the real date/time; do NOT edit her model's system prompt to
   add the `User timezone:` line yet — that forks a hash-identity chat's
   memory. See [The current date and time](#the-current-date-and-time).
-- **The five memory-budget rows** — `COMPACTOR_MAX_FACTS_TOKENS=3500`,
+- **The six memory-budget rows** — `COMPACTOR_MAX_FACTS_TOKENS=3500`,
   `COMPACTOR_INJECT_FACTS_TOKENS=600`, `COMPACTOR_MAX_RETRIEVAL_TOKENS=3500`,
-  `COMPACTOR_INJECTION_BUDGET_FRACTION=0.6`,
-  `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=6230`. These are now the image's own
-  defaults (see [Memory budgets](#memory-budgets--raised-defaults-in-v319)),
-  so adding the rows is optional and self-documenting, not required — but if
-  your v3.1.8 template already has a hand-added `COMPACTOR_MAX_FACTS_TOKENS`
-  or similar row at a DIFFERENT value (the pre-v3.1.9 live-pod workaround),
-  either remove it or update it to match, or it will silently override the
-  new image default.
+  `COMPACTOR_INJECTION_BUDGET_FRACTION=0.75`,
+  `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=12000`,
+  `COMPACTOR_STANDIN_BUDGET_FRACTION=1.0` (the last three raised/added in
+  v3.1.9.2 — see [Memory budgets](#memory-budgets--raised-defaults-in-v319)
+  for why). These are now the image's own defaults, so adding the rows is
+  optional and self-documenting, not required — but if your template
+  already has a hand-added `COMPACTOR_MAX_FACTS_TOKENS` or similar row at a
+  DIFFERENT value (the pre-v3.1.9 live-pod workaround, or the v3.1.9
+  `0.6`/`6230` pair), either remove it or update it to match, or it will
+  silently override the new image default — **this specific shape (a
+  leftover `0.6`/`6230` override) is exactly what put the reuse feature
+  back to declining silently in hostile pass #9**, so check for it if
+  upgrading a pod that has ever had these rows added by hand.
 
 ### 4. Deploy
 

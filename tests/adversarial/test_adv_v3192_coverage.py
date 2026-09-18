@@ -70,27 +70,49 @@ def _forwarded_match(chats: list[dict], marker: str) -> dict | None:
     """The record for the FORWARDED chat request carrying `marker`.
 
     The compactor makes its own /v1/chat/completions calls to the same
-    fixture (summarization, fact extraction, persona) from the async tail,
-    and those carry the turn text — marker included — as INPUT. They land
+    fixture (summarization, fact extraction) from the async tail, and
+    those carry the turn text — marker included — as INPUT. They land
     AFTER the forwarded request, so `matches[-1]` picked a summarizer call:
     it reported `sampling={'temperature': 0.0}` and no repetition_penalty,
-    which looked exactly like the translation failing to reach vLLM. The
-    forwarded array is the one whose LAST message is the newest user turn
-    (the one the marker is on); a summarizer payload ends with its own
-    instruction. Fall back to the earliest match, since the forward always
-    precedes the tail it triggers.
+    which looked exactly like the translation failing to reach vLLM.
+
+    P9-6 (hostile pass #9): the original fix for that used a PRIMARY rule
+    (marker on the LAST message — the forwarded array's last message is
+    always the newest user turn) with a FALLBACK to "the earliest match"
+    for tests whose marker sits elsewhere (e.g. inside an assistant turn
+    mid-history). The fallback is an ORDERING assumption, not a
+    discriminator — it happens to hold today because compaction makes no
+    backend call for a sub-TARGET conversation, but if that ever stops
+    being true the fallback would silently pick a summarizer/facts payload
+    again, the exact bug this function exists to avoid, with no test able
+    to tell.
+
+    Fixed: identify the forward POSITIVELY instead. Both known internal
+    callers set an explicit `temperature` on every request —
+    `_summarize_once` (main.py) sends 0.2, facts extraction
+    (facts.py::extract_facts) sends 0.0 — because both want deterministic-
+    ish structured output, not creative sampling. The forwarded request is
+    the CLIENT'S own body verbatim (main.py's two real forwarding call
+    sites post `body` unmodified) with whatever sampling keys the client
+    sent, which in this suite's `_chat()` helper never includes
+    `temperature` unless a test explicitly asks for it. So: the forward is
+    the marked record whose `sampling` has NO `temperature` key at all —
+    true regardless of where in the array the marker sits. Asserts exactly
+    one such record matches, rather than trusting index 0 of however many
+    there are (a genuine ambiguity — two candidates — is now a test
+    failure, not a silent pick).
     """
-    tail_marked = [
-        c for c in chats
-        if c.get("messages") and marker in (c["messages"][-1].get("markers") or [])
-    ]
-    if tail_marked:
-        return tail_marked[0]
-    any_marked = [
+    marked = [
         c for c in chats
         if any(marker in (m.get("markers") or []) for m in c.get("messages", []))
     ]
-    return any_marked[0] if any_marked else None
+    forwarded = [c for c in marked if "temperature" not in (c.get("sampling") or {})]
+    assert len(forwarded) <= 1, (
+        f"P9-6: {len(forwarded)} records carrying marker {marker!r} all lack "
+        f"an explicit temperature — cannot tell which is the real forward "
+        f"(records: {forwarded})"
+    )
+    return forwarded[0] if forwarded else None
 
 
 def _last_chats(fixture_client) -> list[dict]:
@@ -338,14 +360,34 @@ def test_reuse_with_a_stored_hierarchy_no_cap_refusal_stand_in_on_wire(
     smaller than its true (uncompacted) token count — the older span did not
     go out verbatim.
 
-    NOT PROVEN (documented, not asserted): that the reuse CODE PATH
-    specifically fired rather than a second fresh summarize — the fixture
-    has no way to distinguish those from outside (both produce a small
-    forwarded prompt and a real 200). The chat_completions call-count
-    comparison below is the closest available black-box signal and is
-    reported, not hard-asserted, because fact extraction and episodic
-    indexing in the async tail also call the same endpoint and add noise
-    unrelated to reuse.
+    P9-4 (hostile pass #9): the assertion below used to be `fwd2 <
+    n2_true * 0.5` alone — satisfied by a factor of 20 with NO stored
+    hierarchy at all (`stored_turns_out=[0]`), because a full decline
+    still summarizes the older span from scratch and returns a short
+    array; a small forwarded prompt and a real 200 are what the DECLINED
+    path produces too, not evidence reuse specifically fired. Fixed:
+    `/health/full`'s `checks.reuse` (main.py `reuse_decline_state()`,
+    hostile pass #9's P9-1/P9-2 fix, same compactor process this test
+    already drives via `client`) is the compactor's OWN bookkeeping of
+    whether a stand-in was attempted and whether it was declined for
+    budget — evidence the declined path cannot fake, unlike anything
+    inferable from the wire alone. Request 2 must show `attempted`
+    increment by exactly one (an attempt was made) and `declined_budget`
+    NOT increment (it was not declined) — i.e., the stand-in fit and was
+    used. `reuse_decline_state()`'s own contract (numbers only: attempted/
+    declined_budget/declined_recently/last_declined_ceiling/
+    last_declined_others, no conversation text) is exercised directly, end
+    to end through `compact_if_needed`, by `compactor/test_reuse_fit.py`
+    section `[10]` and its mutation table (this lane's report,
+    SP\\fix-loops4.md) — including the exact "declines, then reuses" shape
+    this assertion depends on. This file's own suite runs inside a real
+    docker-compose adversarial stack (`-p loops4`) rather than as a
+    unit-level `pytest`, which I did not stand up for this specific change
+    (heavy — the lane brief's own warning about three concurrent stacks
+    crashing the shared VM applies); the logic is the same p9-findings.md
+    itself used to prove this exact finding ("proven at the
+    compact_if_needed level instead, which is the layer the assertion
+    actually depends on").
     """
     conv = f"advcov-reuse-{uuid.uuid4().hex[:8]}"
 
@@ -370,12 +412,27 @@ def test_reuse_with_a_stored_hierarchy_no_cap_refusal_stand_in_on_wire(
     ]
     n2_true = _true_count(fixture_client, msgs2)
 
+    # P9-4: the compactor's OWN reuse bookkeeping, before/after request 2.
+    # `checks.reuse` may be `{"available": False, ...}` on a build without
+    # main.reuse_decline_state() (main.py cannot be assumed to be exactly
+    # HEAD in every environment this runs against) — treat that as a hard
+    # failure for THIS assertion rather than silently skipping it, since a
+    # missing signal is exactly the P9-1 failure mode (invisible, not
+    # absent).
+    reuse_before = client.get("/health/full").json()["checks"].get("reuse") or {}
+    assert reuse_before.get("available"), (
+        f"P9-4 precondition: /health/full's checks.reuse is not available "
+        f"({reuse_before}) — main.reuse_decline_state() is missing or the "
+        f"wiring broke; this test cannot tell reuse from decline without it"
+    )
+
     stats_before_2 = fixture_client.get("/_fixture/stats").json()
     r2 = _chat(client, msgs2, conv)
     calls_2_immediate = (
         fixture_client.get("/_fixture/stats").json().get("chat_completions", 0)
         - stats_before_2.get("chat_completions", 0)
     )
+    reuse_after = client.get("/health/full").json()["checks"].get("reuse") or {}
 
     assert r2.status_code == 200, (
         f"NO CAP REFUSAL: request 2 (a growing conversation on the same "
@@ -385,13 +442,41 @@ def test_reuse_with_a_stored_hierarchy_no_cap_refusal_stand_in_on_wire(
     reply2 = (r2.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
     assert reply2, "request 2 answered 200 with no content — a refusal in disguise"
 
+    # P9-4 (hostile pass #9): the hard proof. `fwd2 < n2_true * 0.5` below
+    # is satisfied by the DECLINED path too (a full re-summarize also
+    # shrinks the forwarded prompt) — it stays as supporting evidence, not
+    # the discriminator. `attempted` incrementing by exactly one and
+    # `declined_budget` NOT moving is evidence only a SUCCESSFUL stand-in
+    # produces: a decline increments `declined_budget` in the very same
+    # code path (main.py's `_record_reuse_decline`, called before the "do
+    # not fit whole" log line), and nothing outside compact_if_needed's
+    # reuse block touches either counter.
+    assert reuse_after.get("attempted") == reuse_before.get("attempted", 0) + 1, (
+        f"request 2 did not register a reuse attempt at all "
+        f"(before={reuse_before}, after={reuse_after}) — either no stored "
+        f"hierarchy covers anything yet (settle after request 1 did not "
+        f"land, or the hierarchy genuinely does not cover these turns), or "
+        f"main.compact_if_needed's reuse block was not reached"
+    )
+    assert reuse_after.get("declined_budget") == reuse_before.get("declined_budget", 0), (
+        f"THE REUSE CODE PATH DID NOT FIRE: request 2's stand-in was "
+        f"DECLINED for budget (before={reuse_before}, after={reuse_after}) "
+        f"— the small forwarded prompt below comes from a fresh "
+        f"re-summarize of the whole older span, not from reusing the "
+        f"stored hierarchy; this is exactly the P9-1/P9-2 failure mode "
+        f"(the feature silently not firing) and NOT what this test's name "
+        f"claims to cover"
+    )
+
     fwd2 = _forwarded_prompt_tokens(r2)
     record(
         "advcov-reuse",
         f"n1_true={n1_true} calls_for_request_1(incl. its own forward)={calls_1} "
         f"n2_true={n2_true} fwd2={fwd2} "
         f"calls_for_request_2_before_its_tail_settles(incl. its own forward)="
-        f"{calls_2_immediate} (NOT hard-asserted — see docstring)",
+        f"{calls_2_immediate} (NOT hard-asserted — see docstring) "
+        f"reuse_before={reuse_before} reuse_after={reuse_after} (P9-4: the "
+        f"hard-asserted evidence that the reuse code path specifically fired)",
     )
     assert fwd2 is not None and fwd2 < n2_true * 0.5, (
         f"STAND-IN NOT ON THE WIRE: request 2 forwarded {fwd2} of {n2_true} "
