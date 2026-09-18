@@ -2884,6 +2884,50 @@ check(
     f"(got {main.reuse_decline_state().get('last_reason')!r})",
 )
 
+# [19b] P14-4 (hostile pass #14): [19] only asserts her previous exchange
+# survives, and a check that declines MORE always satisfies that — the
+# margin subtracted twice passed every suite. This pins the other side:
+# under a margin the stand-in still has room for, reuse still fires.
+# Self-calibrating, so it does not depend on this fixture's exact sizes: a
+# window decline forced at 8,192 records the recent floor and the reserve;
+# with the window this fixture passes (its inject budget over the 0.75
+# fraction `_g19_run` sets) they give the slack S at margin 0 without
+# trusting the check's own margin arithmetic. A margin of ceil(2S/3) leaves
+# room once and not twice.
+_g19b_aprev = 7000
+_g19_run(8192, aprev_tokens=_g19b_aprev)
+_g19b_st = main.reuse_decline_state()
+check(
+    _g19b_st.get("last_reason") == "window",
+    f"fixture: [19b] margin 8192 forces a window decline "
+    f"({_g19b_st.get('last_reason')!r})",
+)
+_g19b_slack = (
+    int(round(_G_PLANNED_INJECT / 0.75))
+    - (_g19b_st.get("last_declined_others") or 0)
+    - (_g19b_st.get("last_declined_reserve") or 0)
+)
+check(_g19b_slack > 600, f"fixture: [19b] {_g19b_slack} tokens of slack at margin 0")
+_g19b_margin = -(-2 * _g19b_slack // 3)
+_g19b_stored, _g19b_out, _g19b_last, _, _ = _g19_run(
+    _g19b_margin, aprev_tokens=_g19b_aprev
+)
+check(
+    _g19b_stored == [_g19b_last],
+    f"*** P14-4 [19b] margin={_g19b_margin} (slack {_g19b_slack}): reuse "
+    f"still fires when the stand-in fits beside the margin "
+    f"(stored_turns_out={_g19b_stored}) — a margin subtracted more than "
+    f"once declines here",
+)
+main._BUDGET_MARGIN = _g19b_margin
+_g19b_rep, _g19b_prev, _g19b_newest = _g14_guard(_g19b_out, _g19b_last, "19b")
+main._BUDGET_MARGIN = 0
+check(
+    _g19b_rep.get("fits") is True and _g19b_prev and _g19b_newest,
+    f"[19b] and the guard, at the same margin, fits it with her previous "
+    f"exchange and the newest turn ({_g19b_rep})",
+)
+
 
 # ---------------------------------------------------------------------------
 # [20] P13-2 (hostile pass #13, MEDIUM): the fresh-span preview always priced
@@ -2895,9 +2939,10 @@ check(
 # against the window — declining reuse on her routine between-L1-rollup
 # uncovered tail even when the real (or worst-case un-folded) summarize()
 # call would have fit. SP\p13-findings.md P13-2: 11-82 extra window declines
-# per 474 positions, each one dropping the uncovered tail from the model's
-# view entirely (P12-5's order forwards it verbatim, then sheds it ahead of
-# memory, in the cap-refusal state a decline lands in).
+# per 474 positions, most of them losing the uncovered tail from the model's
+# view (a decline hands summarize() the whole older span, that is refused
+# over the call cap, and P12-5's order sheds the verbatim turns ahead of
+# memory).
 #
 # Fixture: [17]'s own hierarchy/fresh-tail builder (`_g17_run`), her peakA
 # shape (l3_tokens=1869) with a 2-pair, 3,750-token-per-message fresh tail
@@ -2925,8 +2970,25 @@ def _g20_stub_exact(ratio):
     return lambda ms, *a, **k: int(main.count_tokens(ms) * ratio)
 
 
-def _g20_run(exact_ratio):
-    main.count_tokens_exact = _g20_stub_exact(exact_ratio)
+def _g20_stub_exact_by_content(fresh_ratio, other_ratio):
+    """P14-4 (hostile pass #14): a ratio that depends on WHAT is measured —
+    `fresh_ratio` for a list made only of the fresh span's turns,
+    `other_ratio` for anything else. With one ratio for every list, the
+    preview's scale measured on `system + keep_recent` instead of the fresh
+    span passed every suite; this way only the right list gives the passing
+    answer."""
+    def _exact(ms, *a, **k):
+        fresh = bool(ms) and all(
+            isinstance(m.get("content"), str)
+            and m["content"].startswith("fresh-")
+            for m in ms
+        )
+        return int(main.count_tokens(ms) * (fresh_ratio if fresh else other_ratio))
+    return _exact
+
+
+def _g20_run(exact_ratio, stub=None):
+    main.count_tokens_exact = stub or _g20_stub_exact(exact_ratio)
     try:
         return _g17_run(_spy_summarize, 2, 3750, n_l1=9, l3_tokens=1869, aprev_tokens=7500)
     finally:
@@ -2960,8 +3022,12 @@ check(
 # [20c] *** THE FIX: /tokenize answers near her measured real range (~1.0x,
 # SP\p13-findings.md's "summarize() POSTs ... token scale ~1.0x" note) —
 # the SAME fresh span that declines at the pessimistic scale above now
-# needs only one batch, fits, and reuses.
-_g20c_stored, _g20c_out, _g20c_last, _g20c_render, _g20c_log = _g20_run(1.05)
+# needs only one batch, fits, and reuses. The stub answers 1.05 only for the
+# fresh span itself and 2.0 for any other list (P14-4), so the scale must be
+# measured on the list summarize() will receive.
+_g20c_stored, _g20c_out, _g20c_last, _g20c_render, _g20c_log = _g20_run(
+    None, stub=_g20_stub_exact_by_content(1.05, 2.0)
+)
 check(
     _g20c_stored == [_g20c_last],
     f"*** P13-2 [20c]: the SAME fresh span that declines at the pessimistic "

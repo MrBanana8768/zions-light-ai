@@ -20,7 +20,8 @@ its only real-tokenizer suite for three releases, and an adversarial test
 that could no longer tell a genuine reuse success from a decline. Hostile
 pass #13's own real-data replay then found one more HIGH in the reuse
 window check itself (P13-1, below) plus a MEDIUM and two LOWs, closed in
-this same release before it shipped.
+this same release before it shipped. Hostile pass #14 cleared the result to
+ship; its four LOWs are either fixed below or listed as known residuals.
 
 ### Fixed
 - **P13-1 (HIGH): the reuse window check now reads the learned budget
@@ -40,7 +41,12 @@ this same release before it shipped.
   positions lost the exchange at margins 513/4,096/8,192; at peakA, up to
   453. Never worse than v3.1.9.2 in the same state. Fixed by subtracting
   `_BUDGET_MARGIN` from the check's own `_effective_limit_est`, the same
-  global the guard reads, at the same point in the same request. The
+  global the guard reads. The two reads are not atomic (hostile pass #14,
+  P14-1, known residual): a margin latched by another request's rejection
+  while this one is mid-compaction applies to this request's guard but
+  not its reuse decision, and can cost her previous exchange on that one
+  request. The guard keeps reading the live value on purpose; forwarding
+  at the pre-rejection limit risks losing the whole reply instead. The
   learned margin is also now visible at `/health/full`'s
   `checks.budget_margin` (`main.budget_margin_state()`) — before this it
   had no field anywhere in that endpoint (the adversarial suite's own F-02
@@ -55,12 +61,23 @@ this same release before it shipped.
   uncovered tail past the last L1 chunk, present on every request) this
   inflated the predicted batch count and declined reuse on 11-82 of 474
   positions per state that would have fit even the real call's un-folded
-  worst case — each decline drops the uncovered tail from the model's
-  view entirely (the declined path's cap-refusal case forwards it
-  verbatim, then sheds it ahead of memory). Fixed: one more
-  `count_tokens_exact` call measures the real scale on the same span
-  `summarize()` will use, falling back to the pessimistic 2.0x only when
-  `/tokenize` genuinely does not answer.
+  worst case. Most declines lose the uncovered tail (147 of 165 at tail 20
+  peakB): a window decline hands `summarize()` the whole older span, that
+  is refused over the call cap, and the verbatim turns are shed ahead of
+  memory. Fixed: one more `count_tokens_exact` call measures the real
+  scale on the same span `summarize()` will use, falling back to the
+  pessimistic 2.0x only when `/tokenize` genuinely does not answer.
+  The trade, measured by hostile pass #13 on her real branch at tail 20
+  peakB: the tail is lost at 69 positions instead of 147 (25 instead of 45
+  at peakA), and because reuse fires more often at peak sizes, facts or
+  retrieval are cut on more requests (4/243 instead of 0/166 with folded
+  fresh summaries; 51/307 instead of 4/225 in the un-folded worst case).
+  Her previous exchange is never lost either way. Known residual (hostile
+  pass #14, P14-2): the preview and `summarize()` ask `/tokenize`
+  separately, so if it fails in the milliseconds between them,
+  `summarize()` can make more batches than were reserved, up to 2,048
+  tokens more on a span at exactly the call cap. That costs the one
+  request.
 - **P13-3 (LOW, documentation): three passages describing a
   replay-harness artifact as a measurement corrected** (see P12-6's own
   correction below); the runbook's window-decline guidance now names the
@@ -68,6 +85,11 @@ this same release before it shipped.
   `last_declined_ceiling`/`last_declined_others` in `checks.reuse`
   (`last_declined_reserve`); "not silently worse" replaced with what a
   window decline actually drops in the cap-refusal state P13-2 measured.
+  Hostile pass #14 (P14-3) corrected six details of those corrections:
+  the settings that do move the reserve and the ceiling, the images
+  sentence, the declined path's cause, which number measures what, the
+  log lines that used to be the only sign of a margin, and the trade in
+  P13-2 above.
 - **P13-4 (LOW): the hard-budget guard's memory-before-previous-exchange
   order (P12-5, below) now holds on a conversation with no system
   prompt.** `_droppable_system_indices` used to clamp with `sys_idxs[max(1,

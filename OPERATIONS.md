@@ -231,17 +231,28 @@ DIFFERENT pair of numbers depending on which reason produced them:**
   nothing on this pod): a smaller learned budget margin (see
   `checks.budget_margin`, below — a margin in force shrinks
   `last_declined_ceiling` directly and is the single biggest lever while
-  it lasts), a smaller `last_declined_reserve` (a smaller uncovered tail
-  or fewer un-folded fresh-summary batches — nothing to configure, this
-  tracks what the conversation actually did between L1 rollups), fewer
-  retained images IF AND ONLY IF the recent window itself carries more
-  images than `COMPACTOR_MAX_RETAINED_IMAGES` allows (`COMPACTOR_
-  IMAGE_TOKENS` moves nothing on a pod with opencv installed — the image
-  ships it from v3.1.9.3, so this pod prices a rendered image by its real
+  it lasts), a smaller `last_declined_reserve` (mostly what the
+  conversation did between L1 rollups: a smaller uncovered tail, fewer
+  un-folded fresh-summary batches), fewer retained images IF AND ONLY IF
+  the recent window itself carries more images than
+  `COMPACTOR_MAX_RETAINED_IMAGES` allows (`COMPACTOR_IMAGE_TOKENS` moves
+  nothing on a pod with opencv installed — the image ships it from
+  v3.1.9.3, so this pod prices a rendered image by its real
   per-resolution cost, not the flat estimate `COMPACTOR_IMAGE_TOKENS`
-  names), a smaller recent reply (nothing to configure), or a smaller
-  stored hierarchy (trigger an L3 rollup early, `/admin/...` — see the
-  hierarchy section above).
+  names), a smaller recent reply, or a smaller stored hierarchy (trigger
+  an L3 rollup early, `/admin/...` — see the hierarchy section above).
+
+  Settings that move it, each with a cost (corrected, hostile pass #14,
+  P14-3 — this used to say the reserve was "nothing to configure"):
+  `COMPACTOR_SUMMARY_MAX_TOKENS` and `COMPACTOR_MAX_SUMMARY_CALLS` scale
+  the fresh-summary part of the reserve (`min(batches, calls) x
+  max tokens`; lowering either makes fresh summaries shorter or defers
+  more of the span); `COMPACTOR_GENERATION_RESERVE` and the client's
+  `max_tokens` set the window itself (lowering them leaves less room for
+  her reply); `COMPACTOR_KEEP_RECENT_TURNS` sets the recent floor (lowering
+  it forwards fewer turns verbatim). None of these is a fix for an
+  occasional decline; they are for a conversation that declines on most
+  requests.
 
   **A window decline is not a bug and is not data loss, but it is not
   free either** (corrected, hostile pass #13, P13-3 — this used to say
@@ -249,15 +260,17 @@ DIFFERENT pair of numbers depending on which reason produced them:**
   the hierarchy but not for what sits above it). The declined path
   (v3.1.9.3, hostile pass #12 P12-5) protects the SAME recent turns this
   check exists to protect, by spending injected memory (facts, retrieval)
-  before them, and the request is always answered. But in her routine
-  between-L1-rollup state the declined path is usually the cap-refusal
-  case (the uncovered tail, plus whatever changed, exceeds
-  `MAX_SUMMARY_CALLS_PER_REQUEST`): those turns go out VERBATIM rather
-  than summarized, and P12-5's order sheds verbatim turns above the
-  protected floor before it ever touches memory — so the uncovered tail
-  that triggered the decline can reach the model NEITHER summarized NOR
-  verbatim (hostile pass #13, P13-2: measured on 11-82 of 474 positions
-  per state, real data). If `declined_recently` is true for `"window"`
+  before them, and the request is always answered. But a window decline
+  resets the reuse to nothing, so `summarize()` is handed the WHOLE older
+  span, and at her size that exceeds `COMPACTOR_MAX_SUMMARY_CALLS` and is
+  refused (corrected, hostile pass #14, P14-3 — this used to blame the
+  uncovered tail alone): those turns go out VERBATIM rather than
+  summarized, and P12-5's order sheds verbatim turns above the protected
+  floor before it ever touches memory — so the uncovered tail can reach
+  the model NEITHER summarized NOR verbatim. Real-data replay (hostile
+  passes #13 and #14): after this release's fixes that still happens at
+  25-69 of 474 positions with a 20-turn uncovered tail (peakA / peakB),
+  down from 45-147 before them. If `declined_recently` is true for `"window"`
   and the conversation's replies seem to have forgotten something recent,
   this is the mechanism to suspect before assuming the hierarchy itself
   lost it.
@@ -277,11 +290,14 @@ already predict (a `/tokenize` outage, or a mispriced image) latches it to
 `overshoot + 512`, up to `MAX_MODEL_LEN // 4` (`ceiling` above), in ONE
 step, and it applies PROCESS-WIDE (one uvicorn worker, one margin, every
 conversation) until `release_after` (`COMPACTOR_BUDGET_MARGIN_RELEASE_
-AFTER`, default 50) consecutive ACCEPTED requests halve it — `ok_streak`
-is how far into that count this process already is. Before this release
-the ONLY way to learn a margin was in force was the one-time "context
-calibration" log line at boot, or the "margin N" suffix on a hard-budget
-shed line if one happened to fire while it was up; the adversarial suite's
+AFTER`, default 50) consecutive ACCEPTED requests halve it (or clear it,
+once it is 512 or below) — `ok_streak` is how far into that count this
+process already is. Before this release the only way to learn a margin
+was in force was the log: the WARNING when it latches ("Tightening the
+hard limit by N for EVERY conversation"), the INFO when it is released,
+or the "margin N" suffix on a hard-budget shed line if one happened to
+fire while it was up (the boot-time "context calibration" line always
+shows a fresh process's 0); the adversarial suite's
 own F-02 finding (`tests/adversarial/test_adv_faults.py`) names the gap
 explicitly ("/health/full has no margin field"). This is visibility-only —
 it never appears in `status_reasons` and never degrades `status`: the
@@ -296,6 +312,14 @@ ago. If reuse looks like it "just stopped working" and `checks.budget_
 margin.margin` is nonzero, that is very likely why, and the fix is time
 (`ok_streak` accepted requests) rather than a config change — the margin
 already IS the config change reacting to a real overshoot it measured.
+
+One request can fall between the two reads (hostile pass #14, P14-1): if
+a margin latches while a request is already past its reuse decision, that
+request's guard applies the new margin and can shed her previous exchange
+to fit. Every request after it reads the new margin in both places. The
+guard keeps the live value on purpose, because the margin was learned
+from a rejection and forwarding at the old limit risks losing the whole
+reply instead.
 
 #### `config.time_injection` — the current-time feature (v3.1.9)
 

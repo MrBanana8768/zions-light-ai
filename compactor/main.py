@@ -2138,17 +2138,21 @@ def _record_reuse_outcome(
     existed nowhere but that line. `None` for every other reason, "budget"
     included — a budget decline never computes it.
 
-    OPERATIONS.md, on a "window" decline: no setting raises this ceiling.
-    It is `inject_budget / INJECTION_BUDGET_FRACTION` (the request's real
-    window, LESS the learned budget margin as of P13-1) minus the system
-    prompt and the recent turns — `SUMMARY_BLOCK_MAX_TOKENS` and
-    `INJECTION_BUDGET_FRACTION` change how big a stand-in is ALLOWED to
-    render, not what this check compares it against. What actually moves
-    it: a smaller learned margin (see `checks.budget_margin`), fewer or
-    cheaper retained images ON A BACKEND WITHOUT opencv's real per-image
-    render (`COMPACTOR_MAX_RETAINED_IMAGES`; `COMPACTOR_IMAGE_TOKENS` prices
-    nothing once opencv renders images for real — P13-3), a smaller recent
-    reply, or a smaller stored hierarchy (an operator-triggered L3 rollup)."""
+    OPERATIONS.md, on a "window" decline: the ceiling is `inject_budget /
+    INJECTION_BUDGET_FRACTION` (the request's real window, LESS the learned
+    budget margin as of P13-1) minus the system prompt and the recent turns
+    — `SUMMARY_BLOCK_MAX_TOKENS` and `INJECTION_BUDGET_FRACTION` change how
+    big a stand-in is ALLOWED to render, not what this check compares it
+    against. What moves the ceiling: a smaller learned margin (see
+    `checks.budget_margin`), a smaller generation reserve or client
+    `max_tokens` (a bigger window, less room to reply),
+    `COMPACTOR_KEEP_RECENT_TURNS` (a smaller recent floor, fewer verbatim
+    turns), fewer images in the recent window itself (older retained images
+    are not in the reserve since P12-1, on any backend), a smaller recent
+    reply, or a smaller stored hierarchy (an operator-triggered L3 rollup).
+    What moves the reserve: `COMPACTOR_SUMMARY_MAX_TOKENS` and
+    `COMPACTOR_MAX_SUMMARY_CALLS`, which scale the fresh-summary part
+    (hostile pass #14, P14-3)."""
     with _REUSE_STATS_LOCK:
         _reuse_stats["last_reason"] = reason
         if reason == "success":
@@ -2241,10 +2245,13 @@ def budget_margin_state() -> dict:
     sys.modules-based read `_tokenizer_state()`/`reuse_decline_state()`
     already use — health.py cannot import main at module scope).
 
-    P13-1/P13-3 (hostile pass #13): before this, the ONLY way to learn
-    `_BUDGET_MARGIN` was in force was the one-time "context calibration"
-    line logged at boot, or the "margin N" suffix on a hard-budget shed
-    line IF one happened to fire while it was up — the adversarial suite's
+    P13-1/P13-3 (hostile pass #13): before this, the only way to learn
+    `_BUDGET_MARGIN` was in force was the log: the WARNING when a rejection
+    latches it ("Tightening the hard limit by N for EVERY conversation"),
+    the INFO when it is released, or the "margin N" suffix on a hard-budget
+    shed line IF one happened to fire while it was up (the boot-time
+    "context calibration" line always shows a fresh process's 0; hostile
+    pass #14, P14-3) — the adversarial suite's
     own F-02 (test_adv_faults.py) names this gap explicitly: "/health/full
     has no margin field". A margin latched by one vLLM 400 the guard did
     not predict (a `/tokenize` outage, a mispriced image) silently narrows
@@ -2879,19 +2886,28 @@ async def compact_if_needed(
                         # budget_margin` (below, and see
                         # `budget_margin_state()`) makes the state itself
                         # visible for the first time; before it, an operator
-                        # had only the one-time "context calibration" log
-                        # line at boot and whatever margin value happened to
-                        # appear in a shed line's "margin N" suffix.
+                        # had only the latch WARNING, the release INFO, and
+                        # whatever margin value happened to appear in a shed
+                        # line's "margin N" suffix.
                         #
-                        # Fixed by reading `_BUDGET_MARGIN` here exactly the
-                        # way the guard reads it: the same global, at the
-                        # same point in the same request (nothing between
-                        # this check and the guard's own read, a few
-                        # thousand lines down in the SAME request, ever
-                        # changes it — `_note_backend_accepted`/
-                        # `_note_backend_rejection` only run once THIS
-                        # response has gone out), so the two never disagree
-                        # about what margin is in force. This does not also
+                        # Fixed by reading `_BUDGET_MARGIN` here the way the
+                        # guard reads it: the same global. The two reads are
+                        # NOT atomic (hostile pass #14, P14-1): this request
+                        # awaits summarize() and several thread hops before
+                        # the guard runs, and another request's rejection
+                        # can latch a margin in between
+                        # (`_note_backend_rejection` runs whenever ANY
+                        # response comes back). That request's guard then
+                        # sheds against a limit this check never saw, and
+                        # can lose her previous exchange, for that one
+                        # request only; every later request reads the new
+                        # margin in both places. The guard deliberately keeps
+                        # reading the live value rather than a snapshot: a
+                        # margin learned mid-request means vLLM just
+                        # rejected a payload the guard believed would fit,
+                        # and forwarding at the stale limit risks the same
+                        # rejection, which loses the whole reply rather than
+                        # one exchange of context. This does not also
                         # subtract `_time_reserve` (the current-time line's
                         # reserve, ~97-105 tokens): that reserve is decided
                         # later in `chat_completions`, after this function
@@ -2950,14 +2966,18 @@ async def compact_if_needed(
                             # her routine between-L1-rollup uncovered tail):
                             # 11-82 window declines per 474 positions that
                             # would have fit even the un-folded WORST case a
-                            # real call can build. Every one of those
-                            # declines drops the uncovered tail from the
-                            # model's view entirely (P12-5's order sheds it,
-                            # verbatim-forwarded, ahead of memory in the
-                            # cap-refusal state the decline lands in) —
-                            # trading a summarized-but-present tail for one
-                            # that reaches the model neither way, on a false
-                            # premise.
+                            # real call can build. Most declines lose the
+                            # uncovered tail from the model's view (147 of
+                            # 165 at tail 20 peakB): a window decline resets
+                            # stored_turns to 0, summarize() is handed the
+                            # whole older span, that refuses over the call
+                            # cap, and P12-5's order sheds the verbatim turns
+                            # ahead of memory — a summarized-but-present tail
+                            # traded for one that reaches the model neither
+                            # way, on a false premise. With this fix the tail
+                            # is still lost at 25-69 of 474 (tail 20 peakA /
+                            # peakB), and reuse cuts facts or retrieval more
+                            # often at peak sizes (see CHANGELOG P13-2).
                             #
                             # Fixed by measuring the SAME scale `summarize()`
                             # will use, on the SAME list, the same way: one
@@ -2978,6 +2998,16 @@ async def compact_if_needed(
                             # batches is the safe direction" should not
                             # still believe declining is free — see
                             # OPERATIONS.md's P13-3 correction.
+                            #
+                            # Known residual (hostile pass #14, P14-2): this
+                            # call and summarize()'s are separate POSTs. If
+                            # this one answers and summarize()'s fails,
+                            # summarize() packs at 2.0 and can make more
+                            # batches than reserved here: a span at exactly
+                            # the call cap under 2.0 comes back up to 2,048
+                            # tokens over. Needs a /tokenize failure in the
+                            # milliseconds between the two calls; costs that
+                            # one request.
                             _fresh_local = await run_in_threadpool(
                                 count_tokens, _fresh_span_preview
                             )
