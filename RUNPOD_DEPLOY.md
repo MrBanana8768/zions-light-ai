@@ -218,7 +218,7 @@ see below:**
 | `COMPACTOR_INJECT_FACTS_TOKENS` | 400 | 600 | 600 (unchanged) |
 | `COMPACTOR_MAX_RETRIEVAL_TOKENS` | 1500 | 3500 | 3500 (unchanged) |
 | `COMPACTOR_INJECTION_BUDGET_FRACTION` | 0.5 | 0.6 | **0.75** |
-| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | 12000 | 6230 | **12000** |
+| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | 12000 | 6230 | **15000** (was 12000; raised again, hostile pass #10, P10-2 — see below) |
 | `COMPACTOR_STANDIN_BUDGET_FRACTION` | 1.0 (no v3.1.9 equivalent) | — | **1.0** |
 
 **Why the fraction and summary-block rows moved together with the two
@@ -246,27 +246,48 @@ v3.1.9.1 was written to remove, with `/health/full` and the CHANGELOG both
 saying it worked. Raising `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` alone does
 not fix this: the stand-in's OLD formula multiplied the injection budget by
 a hard-coded 0.6 before ever reaching the SUMMARY_BLOCK_MAX_TOKENS cap, so
-even `0.75`/`20000` only reached a ~9,345-token ceiling — 1,955 tokens
-short of the hierarchy's own documented construction capacity (9 L1 scenes
-+ 4 L2 chapters + 1 L3 at their max sizes = 11,300 tokens). `COMPACTOR_
+even `0.75`/`20000` only reached a ~9,345-token ceiling. `COMPACTOR_
 STANDIN_BUDGET_FRACTION` (new) is the stand-in's OWN fraction of the
 injection budget, separate from the 0.6 the separately-injected summary
 block still uses (that block, unlike the stand-in, has to leave room for
 facts/retrieval in the SAME inject_budget — the stand-in does not, because
-on a reusing turn that separate injection is skipped entirely). At 1.0, the
-ceiling is `min(SUMMARY_BLOCK_MAX_TOKENS, inject_budget)` = `min(12000,
-15576)` = 12,000, which clears the 11,300-token capacity with measured
-margin (a hierarchy built to exactly that capacity renders 11,400-11,500
-tokens in practice, header and per-item overhead included). **The
+on a reusing turn that separate injection is skipped entirely). **The
 separately-injected block's own share is unaffected by this row**: it still
 computes `min(SUMMARY_BLOCK_MAX_TOKENS, int(inject_budget × 0.6))` ≈ 9,345
-tokens at the new fraction, comfortably under `inject_budget` (15,576) with
-facts (600) and retrieval (3,500) still fitting. `/health/full`'s
+tokens at the 0.75 fraction, comfortably under `inject_budget` (15,576)
+with facts (600) and retrieval (3,500) still fitting. `/health/full`'s
 `checks.reuse` now reports `attempted`/`declined_budget`/
 `declined_recently` and the two numbers behind the most recent decline —
-watch that field after any future change to these three rows; a growing
-hierarchy can outgrow even 12,000 within one L1 rollup chunk, and this is
-how the operator would see it happen instead of reading request logs.
+watch that field after any future change to these three rows; the ceiling
+can be outgrown as the hierarchy grows, and this is how the operator would
+see it happen instead of reading request logs.
+
+**Correction (hostile pass #10, P10-2): at 1.0/12000 the ceiling was
+`min(SUMMARY_BLOCK_MAX_TOKENS, inject_budget)` = `min(12000, 15576)` =
+12,000, and this section used to say that "clears the 11,300-token
+capacity with measured margin." That comparison was wrong on its own
+terms: 11,300 (`9*L1_MAX_TOKENS + 4*L2_MAX_TOKENS + L3_MAX_TOKENS`) is in
+OUTPUT tokens, but the ceiling is checked against `_estimate_block_tokens`,
+which prices non-ASCII at one token per UTF-8 BYTE — never the same unit.
+Separately, her real L1/L2 chunks already exceed the per-tier maxima that
+figure assumes (measured: 8 L1 chunks mean 561, max 792 against
+`L1_MAX_TOKENS=500`; 4 L2 chapters mean 1,102, max 1,271 against
+`L2_MAX_TOKENS=1200`), and a stalled `/tokenize` (a live state on this pod)
+routinely makes the L3 rollup give up and concatenate 2-3 parts instead of
+summarizing them — that concatenation is what gets stored, and it carries
+into every later refresh. Measured against her real chunks plus a real L3:
+steady-state peak 11,728 (272 tokens of headroom against 12,000, not a
+comfortable margin); with a 2x-part give-up concatenation, 13,860 — OVER
+12,000, so reuse would have declined again as her hierarchy grew past
+today's state. **`COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` is now `15000`**
+(table above), sized off that measured give-up-L3 peak (13,860) with
+~1,140 tokens of real margin rather than the wrong-unit nominal figure. It
+is still capped by `inject_budget` (15,576 at 0.75) regardless of this
+value, and it does not claim to be un-outgrowable — a 3x-part give-up
+concatenation (~15,860) still declines, safely, back to summarizing from
+scratch. `test_reuse_fit.py` pins a fixture built from these measured tier
+sizes (not the nominal maxima) so a future default that stops clearing
+this peak fails the suite instead of the pod.
 
 Evidence behind the v3.1.9 numbers (2026-09-15 pod measurement, before that
 raise): roughly 16 new facts extracted per exchange with roughly 16 evicted
@@ -479,6 +500,32 @@ check the real rate on your own pod rather than trust this range, POST a
 sample of her actual replies to vLLM's `/tokenize` endpoint and compare the
 returned token count against the character count directly, rather than
 estimating.
+
+**P10-5 (hostile pass #10): raising Max Tokens above `COMPACTOR_
+GENERATION_RESERVE` (12000) lets the reuse stand-in claim up to 75% of
+the whole window, not just its documented 72%.** `_standin_reuse_ceiling`
+is `min(COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS, inject_budget *
+COMPACTOR_STANDIN_BUDGET_FRACTION)`, and `inject_budget = effective_limit
+× COMPACTOR_INJECTION_BUDGET_FRACTION`, where `effective_limit =
+MAX_MODEL_LEN - max(COMPACTOR_GENERATION_RESERVE, Max Tokens)`. At Max
+Tokens 12000 (recommended, above) or anywhere at or below the reserve,
+`effective_limit` stays at its floor (20,768) and the ceiling is capped
+by `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` itself — 15,000 of 20,768, 72%.
+Raise Max Tokens PAST the reserve and `effective_limit` shrinks with it;
+past roughly 15,000, `inject_budget` itself drops below
+`COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` and becomes the binding constraint,
+which is a flat `COMPACTOR_INJECTION_BUDGET_FRACTION` (75%) of whatever
+window is left — the stand-in alone can then occupy three-quarters of the
+context, leaving that much less room for the recent turns actually being
+answered. **Not triggered at the recommended Max Tokens 12000** (the
+reserve's own floor keeps `effective_limit` from shrinking at or below
+it), so this is informational, not an operational alarm — but the 72%
+figure itself is already higher than it was before hostile pass #10
+raised `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` from 12,000 to 15,000 (was
+58%; see [Memory budgets](#memory-budgets--raised-defaults-in-v319)), a
+side effect of that fix worth knowing about if you tune Max Tokens
+upward. `test_reuse_fit.py`'s `[13]` section pins this table so a future
+change to any of the three budget variables is measured, not guessed.
 
 vLLM 0.19 applies `repetition_penalty` to **prompt tokens as well as output**
 (verified by reading `model_executor/layers/utils.py::apply_penalties` and
@@ -711,7 +758,7 @@ Override these in your Runpod template if needed:
 | `COMPACTOR_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (prebaked ONNX in the image) |
 | `COMPACTOR_HIERARCHICAL_SUMMARY` | `true` | L1→L2→L3 rolling summaries. Set `false` to disable. |
 | `COMPACTOR_INJECTION_BUDGET_FRACTION` | code default `0.5`, **image/template default `0.75`** (v3.1.9.2; was `0.6` in v3.1.9) | Fraction of the effective input limit shared by persona + summary + facts + retrieval, AND the input to the reuse stand-in's own ceiling. Must move together with the facts/retrieval caps and the summary-block cap above — see [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
-| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | code default `12000`, **image/template default `12000`** (v3.1.9.2; was lowered to `6230` in v3.1.9) | Outer cap on the rendered summary block AND the reuse stand-in. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
+| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | code default `12000`, **image/template default `15000`** (v3.1.9.2; was lowered to `6230` in v3.1.9, then `12000`, then `15000` — hostile pass #10, P10-2) | Outer cap on the rendered summary block AND the reuse stand-in. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
 | `COMPACTOR_STANDIN_BUDGET_FRACTION` | code default `1.0` | **New in v3.1.9.2.** Fraction of the injection budget the reuse stand-in's own ceiling may claim — separate from the 60% the separately-injected summary block still uses. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
 | `COMPACTOR_TAIL_ROLLUP_MAX_CALLS` | `4` | Per-turn budget for the background tail (and the one-shot backfill rollup) catching up a summary hierarchy that has fallen far behind (a vLLM outage, days of rollup failures). Bounds where a rollup unit is allowed to **start**, not a hard per-turn ceiling: a unit that starts always finishes, so one turn can spend up to `(budget − 1)` plus that unit's own real cost — normally a few calls, but measured at 6-16 calls for one unit when `/tokenize` is down. Converges over successive turns either way; see CHANGELOG.md "Summary hierarchy catch-up" (v3.1.9). |
 | `COMPACTOR_DEDUP_SIMILARITY` | `0.75` | Cosine threshold for fact-dedup candidate clustering |
@@ -842,7 +889,7 @@ then `supervisorctl start compactor backup`.
 - **The six memory-budget rows** — `COMPACTOR_MAX_FACTS_TOKENS=3500`,
   `COMPACTOR_INJECT_FACTS_TOKENS=600`, `COMPACTOR_MAX_RETRIEVAL_TOKENS=3500`,
   `COMPACTOR_INJECTION_BUDGET_FRACTION=0.75`,
-  `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=12000`,
+  `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=15000`,
   `COMPACTOR_STANDIN_BUDGET_FRACTION=1.0` (the last three raised/added in
   v3.1.9.2 — see [Memory budgets](#memory-budgets--raised-defaults-in-v319)
   for why). These are now the image's own defaults, so adding the rows is

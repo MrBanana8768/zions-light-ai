@@ -177,6 +177,55 @@ pass-through-unknown-keys behavior to vLLM, which does not recognise it —
   `_trim_forwarded_prefix`'s cut-boundary decisions only; the token-run
   rule has no fence reading of its own to affect (see P9-3 above).
 
+### Fixed (hostile pass #10)
+
+- **P10-1 (HIGH): the hard-budget guard spent injected memory it never
+  needed to spend, then shed the previous exchange anyway.** On a reusing
+  request the array is usually exactly at the recent-window floor
+  (`[U_prev, A_prev, U_new]`); the guard's floor alignment used to run
+  only when the array held MORE turns than the floor, so it stayed
+  unaligned on that exact shape, persona/facts/retrieval were halved and
+  dropped for nothing, and the previous exchange was shed anyway by the
+  plain fallback loop right after — finishing 6,187-9,213 tokens under the
+  limit with memory gone AND the exchange gone. Measured on her real
+  branch: 24 of 472 positions (5.1%). Fixed: the compacted branch now
+  decides once, by arithmetic, whether spending every spendable injected
+  block could ever cover the gap before it crosses into the protected
+  recent window — memory pays when it can, the exchange pays only when
+  memory provably cannot (`compactor/main.py`, `_enforce_hard_budget`).
+- **P10-2 (HIGH): the reuse ceiling's "11,300-token capacity" was in the
+  wrong unit, and 12,000 did not clear what her hierarchy actually
+  renders at.** `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` raised 12000 ->
+  15000, sized off a measured render (her real per-tier chunk sizes plus
+  a give-up L3 concatenation — routine whenever `/tokenize` is down) with
+  real margin, not the nominal per-tier maxima. Every comment and doc
+  citing the old, wrong-unit figure corrected. See [Memory
+  budgets](RUNPOD_DEPLOY.md#memory-budgets--raised-defaults-in-v319).
+- **P10-3 (MEDIUM): `checks.reuse` could read as a healthy reuse while
+  the attempt had actually crashed.** The attempt counter lived at a call
+  site three `if`s deep that four of five failure shapes never reached;
+  the decline counter lived in one further-nested `if`, so an exception
+  left `attempted` incremented with nothing to show it had failed. Both
+  now record once, at the top and bottom of the same block, with a
+  `reason` (`success`/`no_state`/`no_coverage`/`budget`/`error`) — see
+  OPERATIONS.md's `checks.reuse` section.
+- **P10-4 (MEDIUM): the P9-6 indent fix (4-space-indented ``` lines) was
+  applied to `_fence_toggle_offsets` alone; two siblings still counted
+  fences the old, indent-blind way and could disagree by one, inserting
+  an unmatched real fence opener into a reply that had none.**
+  `_trim_forwarded_prefix` and `_cut_degenerate_span_once`'s
+  belt-and-braces check now both use `_fence_toggle_offsets`. The
+  fragment-line rule's two inline fence walks (P9-5) are still not
+  migrated — reasoned in a code comment (main.py, above the fragment-line
+  loop) and in the fix lane's own report, not silently left as-is.
+- **P10-5 (LOW, informational): raising Max Tokens past
+  `COMPACTOR_GENERATION_RESERVE` lets the reuse stand-in claim up to 75%
+  of the window** (72% at or below the recommended Max Tokens, up from
+  58% before P10-2 raised the ceiling default — a side effect worth
+  knowing if you tune Max Tokens upward). Not triggered at the documented
+  Max Tokens (12000). See [RUNPOD_DEPLOY.md → Max
+  Tokens](RUNPOD_DEPLOY.md#sampling-parameters).
+
 Operator note: see [RUNPOD_DEPLOY.md → Sampling parameters](RUNPOD_DEPLOY.md#sampling-parameters)
 for the mapping between OpenWebUI's Advanced/Custom Parameters and vLLM's
 names, and recommended starting values for this model — **Max Tokens 12000,
@@ -294,6 +343,33 @@ reports `checks.reuse` (`attempted`, `declined_budget`,
 total — behind the most recent decline; no conversation text, ever), so
 the next time her data outgrows the arithmetic again the operator sees it
 without reading request logs.
+
+**Correction (hostile pass #10, P10-2): "clears the 11,300-token capacity
+with margin" was also wrong, in a way the "empirically measured" render
+above happened to paper over.** The 11,300 figure (`9*L1_MAX_TOKENS +
+4*L2_MAX_TOKENS + L3_MAX_TOKENS`) is in OUTPUT tokens; the ceiling above is
+checked against `_estimate_block_tokens`, which prices non-ASCII at one
+token per UTF-8 BYTE — up to 4.27x over for CJK, 2.34x for Greek — so the
+two numbers were never in the same unit, and this user quotes scripture.
+Separately, her real L1/L2 chunks already exceed the PER-TIER maxima that
+figure assumes (measured: 8 L1 chunks mean 561, max 792 against
+`L1_MAX_TOKENS=500`; 4 L2 chapters mean 1,102, max 1,271 against
+`L2_MAX_TOKENS=1200`), and L3 is not bounded by `L3_MAX_TOKENS` in
+practice — a stalled `/tokenize` (a live state on this pod) routinely
+makes the L3 rollup give up and CONCATENATE 2-3 parts instead of
+summarizing them, and that concatenation is what gets stored and carried
+into every later refresh. Measured against her real chunks plus a real L3:
+steady-state peak 11,728 (272 tokens of the claimed margin, not "1,955
+short" nor comfortably clear); with a 2x-part give-up concatenation,
+13,860 — over 12,000, and reuse declines again exactly as it did before
+this entry's own fix. **Fixed in v3.1.9.2** (hostile pass #10):
+`COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` raised to `15000`, sized off the
+measured give-up-L3 peak (13,860) with ~1,140 tokens of real margin rather
+than off the wrong-unit nominal figure — see that variable's own comment
+in `Dockerfile`/`runpod.env.template` for the full arithmetic. This does
+not claim the ceiling "cannot be outgrown"; a 3x-part give-up
+concatenation (~15,860) still declines, safely, back to summarizing from
+scratch.
 
 ---
 

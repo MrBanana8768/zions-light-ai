@@ -405,13 +405,15 @@ ENV COMPACTOR_SUMMARY_MAX_TOKENS="1024"
 # fired at the values this release actually shipped, though the CHANGELOG
 # said it did. At 0.75 (inject_budget ~15,576) the stand-in's own ceiling
 # (STANDIN_BUDGET_FRACTION=1.0, capped by SUMMARY_BLOCK_MAX_TOKENS below)
-# clears the hierarchy's documented 11,300-token construction capacity —
-# see that env var's comment for the margin measured against a
-# full-capacity state. The INJECTED block below still only takes 60% of
-# this (unchanged formula, `_standin_injected_share`): ~9,345 tokens,
-# leaving facts (600) and retrieval (3500) their room with ~2,100 to
-# spare. Raise together with SUMMARY_BLOCK_MAX_TOKENS; do not raise one
-# without the other.
+# clears her measured hierarchy sizes — see that env var's comment for the
+# actual numbers (P10-2, hostile pass #10, corrected the "11,300-token
+# construction capacity" this comment used to cite: that figure is in the
+# wrong UNIT and her real tiers already exceed the per-tier maxima it
+# assumes). The INJECTED block below still only takes 60% of this
+# (unchanged formula, `_standin_injected_share`): ~9,345 tokens, leaving
+# facts (600) and retrieval (3500) their room with ~2,100 to spare. Raise
+# together with SUMMARY_BLOCK_MAX_TOKENS; do not raise one without the
+# other.
 ENV COMPACTOR_INJECTION_BUDGET_FRACTION="0.75"
 # v3.1.9: pod change, pinned at the summary block's own measured size for
 # the fraction of that time (6,230).
@@ -419,17 +421,50 @@ ENV COMPACTOR_INJECTION_BUDGET_FRACTION="0.75"
 # v3.1.9.2, P9-1/P9-2 (hostile pass #9): raised to 12,000 — the code
 # default (summarizer.py) this had been overriding downward. At 6,230 (and
 # even at a "planned" 10,000 this release almost shipped) the reuse
-# stand-in's ceiling was capped here directly and stayed BELOW the
-# hierarchy's 11,300-token construction capacity no matter how the
-# fraction above was raised — measured: 0.90 * this same formula still
-# landed at 11,214, 86 tokens short. 12,000 clears the capacity; probed
-# against a hierarchy built to exactly 9 L1 / 4 L2 / 1 L3 at their max
-# sizes, the true render cost (tier content plus the block header and one
-# header line per item) lands between 11,400 and 11,500, so 12,000 carries
-# real margin, not just enough to clear the raw arithmetic. This value is
-# an outer backstop for BOTH the stand-in and the separately-injected
-# block; the 60%/100% split between them lives in the fraction, not here.
-ENV COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS="12000"
+# stand-in's ceiling was capped here directly and stayed BELOW what her
+# hierarchy actually renders at.
+#
+# v3.1.9.2, P10-2 (hostile pass #10): 12,000 was ALSO wrong, in three
+# compounding ways, and raised again to 15,000.
+#   1. "9*L1_MAX_TOKENS + 4*L2_MAX_TOKENS + L3_MAX_TOKENS = 11,300" (the
+#      figure the previous comment here cited as "capacity") is in OUTPUT
+#      tokens. The ceiling below is enforced in `_estimate_block_tokens`
+#      units, which price non-ASCII at one token per UTF-8 BYTE — up to
+#      4.27x over for CJK text, 2.34x for Greek (summarizer.py's own
+#      measured figures) — and this user quotes scripture. 11,300 was never
+#      a bound on what the ceiling actually checks; it was a bound on a
+#      different number that happens to share some of the same inputs.
+#   2. Her real L1/L2 chunks already exceed the PER-TIER maxima "capacity"
+#      assumes: measured 2026-09-17, her 8 L1 chunks price at mean 561, max
+#      792 estimator tokens against L1_MAX_TOKENS=500; her 4 L2 chapters at
+#      mean 1,102, max 1,271 against L2_MAX_TOKENS=1200. A state "at
+#      documented capacity" renders ABOVE 11,300 before any non-ASCII is
+#      involved at all.
+#   3. L3 is not bounded by L3_MAX_TOKENS in practice: summarizer.py's own
+#      `_do_l3_rollup` comment records that `_summarize_pieces_raw` "gives
+#      up and CONCATENATES its parts" — routine whenever /tokenize is down
+#      (a live state on this pod) and the chapter count is not tiny — and
+#      that give-up concatenation is exactly what gets STORED as
+#      `state['l3']['text']`, carried forward into every later refresh.
+#      Measured (her real L1/L2 chunks, a real L3 taken from another of her
+#      conversations, uncapped render): her steady-state peak with that
+#      real L3 is 11,728; with L3 at exactly L3_MAX_TOKENS, 11,860; with a
+#      2x-L3_MAX give-up concatenation (summarizer.py's own comment calls
+#      2-3 parts "measured"), 13,860.
+# 15,000 clears the measured steady-state give-up-L3 peak (13,860) by
+# ~1,140 tokens — real margin against what this actually renders at, not
+# against the wrong-unit nominal figure. It does NOT claim to clear every
+# theoretical case (a 3x-part give-up concatenation, ~15,860, still
+# declines — safely: reuse falls back to summarizing from scratch, the
+# same non-data-losing decline this whole ceiling exists to trigger when
+# it must) and it cannot exceed COMPACTOR_INJECTION_BUDGET_FRACTION's
+# inject_budget (15,576 at 0.75) regardless of this value — see
+# `_standin_reuse_ceiling` in main.py, which takes the min of the two. This
+# value is an outer backstop for BOTH the stand-in and the
+# separately-injected block; the 60%/100% split between them lives in the
+# fraction, not here. See test_reuse_fit.py's measured-tier-size section
+# for the fixture that fails if a future default stops clearing this.
+ENV COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS="15000"
 # v3.1.9.2, P9-1/P9-2 (hostile pass #9): new. Governs ONLY the reuse
 # stand-in's ceiling (main.py `_standin_reuse_ceiling`), not the
 # separately-injected summary block (`_standin_injected_share`, still

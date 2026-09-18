@@ -64,8 +64,10 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import sys
 import tempfile
+from pathlib import Path
 
 os.environ.setdefault("MODEL_REPO", "test-model")
 os.environ.setdefault("VLLM_URL", "http://stub:8000")
@@ -958,10 +960,12 @@ check(_EXPECTED_SITE_BUDGET in _site_budgets,
 
 
 # ---------------------------------------------------------------------------
-# [10] P9-1/P9-2 (hostile pass #9): the SHIPPED v3.1.9.2 numbers
+# [10] P9-1/P9-2 (hostile pass #9): the round-4 numbers
 # (COMPACTOR_INJECTION_BUDGET_FRACTION=0.75, COMPACTOR_SUMMARY_BLOCK_MAX_
-# TOKENS=12000, COMPACTOR_STANDIN_BUDGET_FRACTION=1.0 — Dockerfile /
-# runpod.env.template), not the 0.6/6230 incident numbers this file pins
+# TOKENS=12000, COMPACTOR_STANDIN_BUDGET_FRACTION=1.0). The SHIPPED
+# SUMMARY_BLOCK_MAX_TOKENS is now higher (P10-2) and [12] reads it from the
+# Dockerfile and runpod.env.template; a hierarchy that reuses at 12000
+# reuses at any larger value. Not the 0.6/6230 incident numbers this file pins
 # everywhere else. A hierarchy built to DOCUMENTED CAPACITY (9 L1 scenes at
 # L1_MAX_TOKENS, 4 L2 chapters at L2_MAX_TOKENS, 1 L3 at L3_MAX_TOKENS — the
 # same "9*L1_MAX + 4*L2_MAX + L3_MAX = 11,300" arithmetic summarizer.py's
@@ -1092,7 +1096,7 @@ check(_g_stored_interim == [0],
 
 _g_stored_new, _g_out_new = _g_run(12000, _G_PLANNED_INJECT)
 check(_g_stored_new and _g_stored_new[0] == _G_LAST_COVERED,
-      f"*** at the SHIPPED 0.75/12000/1.0 numbers, the SAME full-capacity "
+      f"*** at the round-4 0.75/12000/1.0 numbers, the SAME full-capacity "
       f"hierarchy REUSES completely (stored_turns_out={_g_stored_new}, "
       f"expected [{_G_LAST_COVERED}]) — the fix")
 check(any("L1scene " in str(m.get("content", "")) for m in _g_out_new)
@@ -1100,6 +1104,295 @@ check(any("L1scene " in str(m.get("content", "")) for m in _g_out_new)
       and any("L3theme " in str(m.get("content", "")) for m in _g_out_new),
       "and every tier — L1, L2 and L3 — actually travelled into the array, "
       "not just the newest scenes a partial fit would have kept")
+
+
+# ---------------------------------------------------------------------------
+# [11] P10-1 (hostile pass #10): [10] above stops at compact_if_needed — it
+# proves reuse FIRES at the shipped numbers, but never calls the guard that
+# runs right after it on every real request. On her real branch, 24 of 472
+# positions (5.1%) reused successfully and then had the guard destroy
+# persona, facts and retrieval AND shed the previous exchange anyway,
+# finishing 6,187-9,213 tokens under the limit — because the compacted
+# branch's turn-shed floor (main.py's `_floor`) used to gate its own
+# alignment on `len(_turn_idxs) >= _floor`, which is false on exactly the
+# shape a reusing request produces (`[U_prev, A_prev, U_new]`, 3 turns for
+# KEEP_RECENT_TURNS=4). `_floor` stayed unaligned, the pre-shed loop never
+# started, every spendable block was halved and dropped for nothing, and
+# the plain shed loop after this branch dropped U_prev/A_prev anyway.
+#
+# The fix restructures the compacted branch to decide ONCE, by arithmetic:
+# shed the next old exchange (even below the aligned floor) only when
+# spending every spendable injected block down to nothing still could not
+# cover the gap; otherwise let memory pay and leave the recent window
+# whole. [11a] is her actual shape (a single reply bigger than all injected
+# memory combined — memory cannot possibly cover the gap alone, so the
+# exchange must go, and it goes WHOLE with memory untouched). [11b] is the
+# CONTROL this fix must not break: a smaller gap that injected memory alone
+# already covers, where U_prev/A_prev and the facts block all survive and
+# no turn is shed at all — proving this is still an arithmetic choice, not
+# "always shed a turn when a stand-in is present" (a fifth special case,
+# which LOOPS5_BRIEF explicitly rules out).
+#
+# Builds on the SAME at-capacity hierarchy [10] just proved reuses
+# completely at 0.75/12000/1.0, so the stand-in below is REAL
+# compact_if_needed output, not a hand-built stub — [10]'s own discipline.
+# ---------------------------------------------------------------------------
+print("\n[11] P10-1: the guard no longer spends memory it does not need to")
+
+_G11_FACTS = "[Facts]\n" + "".join(
+    f"- FACT{i:02d} she likes item {i} very much indeed.\n" for i in range(9)
+)
+_G11_FACTS = _G11_FACTS + "f" * (400 - len(_G11_FACTS))
+_G11_RETR = "[Retrieved]\n" + "RETRIEVAL " + "r" * (1500 - 22)
+_G11_MEM = _G11_FACTS + "\n\n" + _G11_RETR
+
+
+def _g11_build_and_guard(aprev_chars: int):
+    """Reuse the CONV_CAPACITY hierarchy against a fresh recent window whose
+    A_prev is `aprev_chars` long: real compact_if_needed at the shipped
+    numbers builds the stand-in, then persona + injected memory are added
+    the way chat_completions adds them, then the real guard runs."""
+    recent = [
+        {"role": "user", "content": "prev-u " + "u" * 300},
+        {"role": "assistant", "content": "prev-a " + "a" * aprev_chars},
+        {"role": "user", "content": "newest " + "n" * 400},
+    ]
+    msgs = G_OLDER + recent
+    saved_sbmax = summarizer.SUMMARY_BLOCK_MAX_TOKENS
+    summarizer.SUMMARY_BLOCK_MAX_TOKENS = 12000
+    stored_out: list = []
+    try:
+        out = _run(msgs, CONV_CAPACITY, stored_turns_out=stored_out,
+                    inject_budget=_G_PLANNED_INJECT)
+    finally:
+        summarizer.SUMMARY_BLOCK_MAX_TOKENS = saved_sbmax
+    check(
+        stored_out == [_G_LAST_COVERED],
+        f"fixture (aprev={aprev_chars}): reuse fires on the at-capacity "
+        f"hierarchy (stored_turns_out={stored_out})",
+    )
+    # `out` is compact_if_needed's real return: `history()`'s own leading
+    # "you are a companion" caller system message, the real stand-in, then
+    # the 3 real recent turns — find the stand-in by CONTENT (as the guard
+    # itself does via `_is_compaction_standin`), not by position, and drop
+    # the caller system message here (redundant with the persona line
+    # added below; keeping both would leave an extra unprotected system
+    # message that only muddies what this section is measuring).
+    standin = next(m for m in out if main._is_compaction_standin(m))
+    recent = [m for m in out if m.get("role") != "system"]
+    full = [
+        {"role": "system", "content": "P" * 2500},
+        standin,
+        {"role": "system", "content": _G11_MEM},
+    ] + recent
+    # No /tokenize in this offline process, so this runs on main's own real
+    # fallback (char/4-ish local estimate, UNCORRECTED) — the exact counter
+    # state p10's own reproduction used as its second confirmation
+    # ("Same result with /tokenize unavailable"). Deliberately NOT the
+    # deterministic byte-count stand-in test_p5_guard.py/[F1] use: those
+    # size their fixtures directly in that counter's own units, but this
+    # section's fixture is sized in the REAL estimator's units (chars/4,
+    # matching [10]'s own hierarchy-capacity arithmetic above), so swapping
+    # in a byte-exact counter here would silently re-price every message
+    # ~4x and stop measuring the scenario this section is named for.
+    rep: dict = {}
+    result = main._enforce_hard_budget(full, EFFECTIVE_LIMIT, 1, rep)
+    mem_out = [
+        m for m in result
+        if m.get("role") == "system" and "[Facts]" in (m.get("content") or "")
+    ]
+    facts_whole = bool(mem_out) and all(
+        f"FACT{i:02d}" in mem_out[0]["content"] for i in range(9)
+    )
+    ns = [m for m in result if m.get("role") != "system"]
+    prev_survived = (
+        any("prev-u" in main._message_text(m) for m in ns)
+        and any("prev-a" in main._message_text(m) for m in ns)
+    )
+    return rep, facts_whole, prev_survived, ns
+
+
+# [11a] her real shape: a single 16k-token reply (measured 26,484-39,569
+# chars on her live branch tail) outweighs persona + facts + retrieval
+# combined, so memory alone can never cover the gap.
+_g11_rep_h, _g11_facts_h, _g11_prev_h, _g11_ns_h = _g11_build_and_guard(64000)
+check(_g11_rep_h.get("fits") is True, f"[11a] the guard fits the payload ({_g11_rep_h})")
+check(
+    _g11_rep_h.get("trimmed_blocks") == 0 and _g11_rep_h.get("dropped_blocks") == 0,
+    f"*** P10-1 [11a]: injected memory is NOT touched — spending it here "
+    f"could never have covered a 16k-token A_prev's gap, so the fix does "
+    f"not waste it before shedding the exchange that actually pays for the "
+    f"request ({_g11_rep_h})",
+)
+check(_g11_facts_h, "*** P10-1 [11a]: facts survive WHOLE (not halved, not dropped)")
+check(
+    (_g11_rep_h.get("dropped_turns") or 0) == 2,
+    f"[11a]: the previous exchange (U_prev+A_prev, one whole pair) is what "
+    f"pays for the request ({_g11_rep_h.get('dropped_turns')} dropped)",
+)
+check(not _g11_prev_h, "[11a]: U_prev/A_prev do NOT survive — they are what the fix sheds")
+check(
+    any("newest" in main._message_text(m) for m in _g11_ns_h),
+    "[11a]: the newest turn always survives",
+)
+
+# [11b] CONTROL, the other side of the same arithmetic: a smaller gap that
+# injected memory alone already covers. The fix must NOT reach for the
+# previous exchange here — U_prev/A_prev AND the facts block all survive.
+# Proves the fix is an arithmetic choice, not "always shed a turn when a
+# stand-in is present" (a fifth special case of the same defect).
+_g11_rep_l, _g11_facts_l, _g11_prev_l, _g11_ns_l = _g11_build_and_guard(32000)
+check(_g11_rep_l.get("fits") is True, f"[11b] the guard fits the payload ({_g11_rep_l})")
+check(
+    (_g11_rep_l.get("dropped_turns") or 0) == 0,
+    f"*** P10-1 [11b] CONTROL: no turn is dropped — memory alone covers "
+    f"this smaller gap ({_g11_rep_l})",
+)
+check(_g11_prev_l, "*** P10-1 [11b] CONTROL: U_prev AND A_prev both survive")
+check(
+    _g11_facts_l,
+    "*** P10-1 [11b] CONTROL: the facts block survives WHOLE too (retrieval, "
+    "listed after facts in the same injected block, is what a partial trim "
+    "here cuts first)",
+)
+
+
+# ---------------------------------------------------------------------------
+# [12] P10-2 (hostile pass #10): "12000 clears the hierarchy's documented
+# 11,300-token construction capacity with margin" was measured against a
+# fixture built at the NOMINAL per-tier maxima (9 L1 at exactly
+# L1_MAX_TOKENS, 4 L2 at exactly L2_MAX_TOKENS, 1 L3 at exactly
+# L3_MAX_TOKENS — [10]'s own `_G_HIER_TOKENS` fixture above). Her REAL
+# tiers already exceed those maxima (measured 2026-09-17: 8 L1 chunks mean
+# 561, max 792 against L1_MAX_TOKENS=500; 4 L2 chapters mean 1,102, max
+# 1,271 against L2_MAX_TOKENS=1200), and `_do_l3_rollup`'s own comment
+# documents that a stalled /tokenize routinely makes the L3 rollup give up
+# and CONCATENATE 2-3 parts instead of summarizing them — storing that
+# concatenation, which then carries into every later render. A hierarchy
+# built from these MEASURED sizes plus a 2x-L3_MAX give-up concatenation
+# renders close to p10's own reported 13,860 (this fixture: ~13,891 —
+# small construction differences from a slightly different filler are
+# expected; both exceed 12,000) — DECLINING at the old 12,000 default and
+# REUSING at the new 15,000 one. This is the regression test LOOPS5_BRIEF
+# asks for: it fails if a future default stops clearing this measured
+# peak, the way 12,000 already did.
+# ---------------------------------------------------------------------------
+print("\n[12] P10-2: the ceiling clears a hierarchy sized from MEASURED tiers, "
+      "not nominal maxima")
+
+_G12_L1_MEAN, _G12_L1_MAX = 561, 792
+_G12_L2_MEAN, _G12_L2_MAX = 1102, 1271
+
+_g12_l1 = [
+    {"tier": "l1", "text": "L1scene " + _g_filler(_G12_L1_MEAN),
+     "first_turn": i * 10 + 1, "last_turn": i * 10 + 10}
+    for i in range(8)
+]
+_g12_l1.append({
+    "tier": "l1", "text": "L1scene " + _g_filler(_G12_L1_MAX),
+    "first_turn": 81, "last_turn": 90,
+})
+_g12_l2 = [
+    {"tier": "l2", "text": "L2chapter " + _g_filler(_G12_L2_MEAN),
+     "first_turn": 90 + i * 10 + 1, "last_turn": 90 + i * 10 + 10}
+    for i in range(4)
+]
+_G12_LAST = _g12_l2[-1]["last_turn"]
+check(
+    _G12_LAST == 130,
+    f"fixture: [12]'s hierarchy covers the same 130 turn positions as "
+    f"[10]'s (got {_G12_LAST})",
+)
+
+
+def _g12_shipped_sbmax_from(path: Path, pattern: str) -> int:
+    """Read the SHIPPED COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS straight out of
+    the deploy config, not a literal pinned in this file — so a future
+    revert of the shipped value (Dockerfile or runpod.env.template) fails
+    THIS test instead of leaving a stale number here to agree with it."""
+    text = path.read_text(encoding="utf-8")
+    m = re.search(pattern, text)
+    check(bool(m), f"fixture: found {pattern!r} in {path.name}")
+    return int(m.group(1)) if m else -1
+
+
+_G12_ROOT = Path(__file__).resolve().parent.parent
+_G12_SHIPPED_DOCKERFILE = _g12_shipped_sbmax_from(
+    _G12_ROOT / "Dockerfile",
+    r'ENV COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS="(\d+)"',
+)
+_G12_SHIPPED_RUNPOD = _g12_shipped_sbmax_from(
+    _G12_ROOT / "runpod.env.template",
+    r"COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=(\d+)",
+)
+check(
+    _G12_SHIPPED_DOCKERFILE == _G12_SHIPPED_RUNPOD,
+    f"*** P10-2: Dockerfile ({_G12_SHIPPED_DOCKERFILE}) and "
+    f"runpod.env.template ({_G12_SHIPPED_RUNPOD}) ship the SAME "
+    f"COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS default — the two are hand-kept "
+    f"in sync (see each file's own comment) and this is what would catch "
+    f"them drifting apart",
+)
+_G12_SHIPPED_SBMAX = _G12_SHIPPED_DOCKERFILE
+
+# The give-up L3: `_do_l3_rollup`'s own comment measures 2-3 concatenated
+# parts, each near L3_MAX_TOKENS, so 2x is the routine case, not a
+# hand-picked worst case.
+_g12_l3_giveup = {
+    "text": "L3theme " + _g_filler(2 * summarizer.L3_MAX_TOKENS),
+    "first_turn": 1, "last_turn": _G12_LAST,
+}
+_g12_state = {"l1": _g12_l1, "l2": _g12_l2, "l3": _g12_l3_giveup}
+
+_g12_saved_sbmax = summarizer.SUMMARY_BLOCK_MAX_TOKENS
+summarizer.SUMMARY_BLOCK_MAX_TOKENS = 10**9
+_G12_RENDER = summarizer._estimate_block_tokens(
+    summarizer.format_summary_block(_g12_state, 10**9) or ""
+)
+summarizer.SUMMARY_BLOCK_MAX_TOKENS = _g12_saved_sbmax
+_G12_OLD_SBMAX = 12000  # the retired default (P9-1/P9-2) — a fixed
+# historical reference point, not something that should track the deploy
+# config the way the SHIPPED value below does.
+check(
+    _G12_RENDER > _G12_OLD_SBMAX,
+    f"fixture: the measured-tier-plus-give-up-L3 hierarchy renders above "
+    f"the OLD {_G12_OLD_SBMAX} default ({_G12_RENDER}) — otherwise this "
+    f"fixture does not reproduce the regression at all",
+)
+check(
+    _G12_RENDER < _G12_SHIPPED_SBMAX,
+    f"fixture: ... and below the shipped default ({_G12_RENDER} < "
+    f"{_G12_SHIPPED_SBMAX}) — otherwise this fixture cannot show the "
+    f"shipped default clearing it either",
+)
+
+for _g12_budget, _g12_expect_reuse in (
+    (_G12_OLD_SBMAX, False), (_G12_SHIPPED_SBMAX, True),
+):
+    summarizer.SUMMARY_BLOCK_MAX_TOKENS = _g12_budget
+    try:
+        _g12_out = summarizer.format_summary_block(
+            _g12_state, _g12_budget, all_or_nothing=True
+        )
+    finally:
+        summarizer.SUMMARY_BLOCK_MAX_TOKENS = _g12_saved_sbmax
+    _g12_reused = bool(_g12_out)
+    check(
+        _g12_reused == _g12_expect_reuse,
+        f"*** P10-2: at SUMMARY_BLOCK_MAX_TOKENS={_g12_budget}, a hierarchy "
+        f"built from her MEASURED tier sizes plus a routine give-up L3 "
+        f"{'REUSES' if _g12_expect_reuse else 'DECLINES'} as expected "
+        f"(render={_G12_RENDER}, got {'REUSES' if _g12_reused else 'DECLINES'})",
+    )
+    if _g12_expect_reuse:
+        check(
+            all(f"L1scene " in _g12_out for _ in [0])
+            and "L2chapter " in _g12_out
+            and "L3theme " in _g12_out,
+            "*** P10-2: at the shipped default every tier travels into the "
+            "stand-in whole — not just the newest scenes a partial fit "
+            "would keep",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1146,22 +1439,28 @@ def _f1_tokens(msgs) -> int:
     return sum(len(main._message_text(m).encode("utf-8")) + 4 for m in msgs)
 
 
-def _f1_image_turn(tag):
+def _f1_image_turn(tag, n_chars=30000):
     """A USER turn carrying an uploaded image — OpenWebUI's real shape.
     Padded the same as the pre-P8-1 assistant stub so an incorrectly-kept
     turn still forces a real choice against memory (this test only needs
-    "expensive enough to matter", not vLLM's own image-token accounting)."""
+    "expensive enough to matter", not vLLM's own image-token accounting).
+    `n_chars` is a parameter (P10-1, hostile pass #10) so a caller can tune
+    how EXPENSIVE the misjudged turn is — see `_f1_build`'s own comment on
+    `old_exchanges=0, n_chars=11000` for why the default (30000, paired
+    with `old_exchanges=30`) alone stopped being enough to catch a floor
+    miscalculation once the guard could pay a small overshoot with memory
+    instead of shedding a turn."""
     return {
         "role": "user",
         "content": [
-            {"type": "text", "text": tag + " " + "i" * 30000},
+            {"type": "text", "text": tag + " " + "i" * n_chars},
             {"type": "image_url",
              "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
         ],
     }
 
 
-def _f1_build(old_exchanges=30, image_role="user"):
+def _f1_build(old_exchanges=30, image_role="user", image_chars=30000):
     """A compaction stand-in, injected memory, `old_exchanges` ordinary old
     pairs, then one UNPAIRED old turn (the image stand-in, role
     `image_role`) right before the previous exchange and the newest turn —
@@ -1190,9 +1489,9 @@ def _f1_build(old_exchanges=30, image_role="user"):
     # shape split_messages would push into the summarized portion when the
     # 4-message tail starts on it.
     if image_role == "user":
-        msgs.append(_f1_image_turn("old-image-stub"))
+        msgs.append(_f1_image_turn("old-image-stub", n_chars=image_chars))
     else:
-        msgs.append({"role": "assistant", "content": "old-image-stub " + "i" * 30000})
+        msgs.append({"role": "assistant", "content": "old-image-stub " + "i" * image_chars})
     msgs.append({"role": "user", "content": "prev-u " + "u" * 150})
     msgs.append({"role": "assistant", "content": "prev-a " + "a" * 1650})
     msgs.append({"role": "user", "content": "newest " + "n" * 200})
@@ -1260,6 +1559,140 @@ for _f1_image_role in ("user", "assistant"):
         f"does not remove protection for what split_messages actually "
         f"keeps",
     )
+
+
+# ---------------------------------------------------------------------------
+# [F1-lean] P10-1 (hostile pass #10) made the section above stop catching a
+# MISCOMPUTED floor. `_f1_build`'s default `old_exchanges=30` puts 30
+# deferred exchanges above whatever the floor is — the unconditional
+# "shed everything above the floor" pass sheds the image (and plenty more)
+# regardless of whether the floor is 3 (correct) or 4 (P8-1's bug: the
+# unpaired image miscounted as "recent"), so the ABOVE loop's own
+# assertions stayed green even with `main.py`'s same-role alignment check
+# disabled outright (checked directly against this file, needle
+# `samerole` in SP\lpmut\mut.py — see this lane's report for the numbers).
+# The new below-floor arithmetic (P10-1) only consults the floor's exact
+# value in ONE place: whether spending every spendable injected block
+# could cover the gap on its own. With no deferred history and a LARGE
+# image (the section above), the gap is far bigger than the facts block
+# alone could ever cover, so the image gets shed either way and a wrong
+# floor is invisible. A SMALL gap — one memory alone COULD cover, if the
+# floor's miscalculation let the guard reach for it — is what still
+# distinguishes correct from broken: at the exact image size below,
+# `_floor` correct (3) sheds the image unconditionally BEFORE memory is
+# ever considered; `_floor` wrong (4, matching the pre-P8-1 bug exactly)
+# lets the guard reach for memory instead, since the gap and the facts
+# block happen to be comparable sizes.
+# ---------------------------------------------------------------------------
+print("\n[F1-lean] P10-1: a SMALL gap keeps the floor's exact value load-bearing")
+
+_f1_saved_count_tokens = main.count_tokens
+_f1_saved_count_tokens_exact = main.count_tokens_exact
+_f1_saved_margin = main._BUDGET_MARGIN
+main.count_tokens = _f1_tokens
+main.count_tokens_exact = lambda ms, *a, **k: _f1_tokens(ms)
+main._BUDGET_MARGIN = 0
+try:
+    _f1l_msgs = _f1_build(old_exchanges=0, image_role="user", image_chars=11000)
+    _f1l_rep: dict = {}
+    _f1l_out = main._enforce_hard_budget(_f1l_msgs, _F1_LIMIT, 1, _f1l_rep)
+finally:
+    main.count_tokens = _f1_saved_count_tokens
+    main.count_tokens_exact = _f1_saved_count_tokens_exact
+    main._BUDGET_MARGIN = _f1_saved_margin
+
+_f1l_mem_out = [
+    x for x in _f1l_out
+    if x.get("role") == "system" and "[Facts]" in (x.get("content") or "")
+]
+_f1l_facts_whole = bool(_f1l_mem_out) and all(
+    f"FACT{i:02d}" in _f1l_mem_out[0]["content"] for i in range(9)
+)
+_f1l_image_survived = any(
+    "old-image-stub" in main._message_text(m) for m in _f1l_out
+)
+check(_f1l_rep.get("fits"), f"[F1-lean] fixture: the guard fit the payload ({_f1l_rep})")
+check(
+    not _f1l_image_survived,
+    f"*** F1-lean: the unpaired old image does NOT survive, even though "
+    f"memory alone could have covered this small a gap — the floor is "
+    f"computed correctly (3, not 4), so the unconditional above-floor "
+    f"shed removes it before memory is ever consulted ({_f1l_rep})",
+)
+check(
+    _f1l_facts_whole,
+    "*** F1-lean: facts survive whole — memory was never touched because "
+    "the image alone already covered the gap",
+)
+
+
+# ---------------------------------------------------------------------------
+# [13] P10-5 (hostile pass #10, LOW): the stand-in's ceiling, as a FRACTION
+# of the window, grows as `max_tokens` grows past the generation reserve —
+# `_standin_reuse_ceiling` is `min(SUMMARY_BLOCK_MAX_TOKENS, inject_budget)`
+# with nothing bounding it relative to `effective_limit` itself, so once
+# `inject_budget` (which shrinks with `effective_limit`) drops below
+# SUMMARY_BLOCK_MAX_TOKENS, the ceiling becomes a flat
+# INJECTION_BUDGET_FRACTION (75% shipped) of whatever window is left. Not
+# reachable at RUNPOD_DEPLOY.md's recommended Max Tokens (12000, equal to
+# the generation reserve, so effective_limit never shrinks there); reachable
+# if Max Tokens is raised past the reserve. Documented in RUNPOD_DEPLOY.md's
+# "Max Tokens" section and `_standin_reuse_ceiling`'s own docstring; pinned
+# here so a future change to SUMMARY_BLOCK_MAX_TOKENS, GENERATION_RESERVE or
+# INJECTION_BUDGET_FRACTION is measured, not silently different. No test
+# varied max_tokens on the reuse path before this (p7's own F7 note, true
+# until now).
+# ---------------------------------------------------------------------------
+print("\n[13] P10-5: the stand-in ceiling's share of the window across max_tokens")
+
+_G13_SHIPPED_FRACTION = 0.75  # COMPACTOR_INJECTION_BUDGET_FRACTION, shipped
+
+
+def _g13_ceiling_share(max_tokens: int):
+    """(effective_limit, inject_budget, ceiling, ceiling/effective_limit)
+    at the SHIPPED SUMMARY_BLOCK_MAX_TOKENS (read from Dockerfile/
+    runpod.env.template above, `_G12_SHIPPED_SBMAX` — the same value [12]
+    already proved the two files agree on) and the shipped injection
+    fraction, for one `max_tokens` value."""
+    eff_limit = min(
+        main.MAX_MODEL_LEN,
+        max(256, main.MAX_MODEL_LEN - max(main.GENERATION_RESERVE, max_tokens)),
+    )
+    inject_budget = int(eff_limit * _G13_SHIPPED_FRACTION)
+    saved_sbmax = summarizer.SUMMARY_BLOCK_MAX_TOKENS
+    summarizer.SUMMARY_BLOCK_MAX_TOKENS = _G12_SHIPPED_SBMAX
+    try:
+        ceiling = main._standin_reuse_ceiling(inject_budget)
+    finally:
+        summarizer.SUMMARY_BLOCK_MAX_TOKENS = saved_sbmax
+    return eff_limit, inject_budget, ceiling, ceiling / eff_limit
+
+
+_G13_AT_RECOMMENDED = _g13_ceiling_share(12000)  # RUNPOD_DEPLOY.md's recommendation
+_G13_ABOVE_RESERVE = _g13_ceiling_share(20000)   # well past the reserve
+
+check(
+    _G13_AT_RECOMMENDED[3] < _G13_SHIPPED_FRACTION - 1e-9,
+    f"*** P10-5: at the RECOMMENDED Max Tokens (12000, == the generation "
+    f"reserve), the stand-in ceiling stays BELOW the flat "
+    f"INJECTION_BUDGET_FRACTION share {_G13_AT_RECOMMENDED} — P10-5 is "
+    f"not triggered at documented settings",
+)
+check(
+    abs(_G13_ABOVE_RESERVE[3] - _G13_SHIPPED_FRACTION) < 0.005,
+    f"*** P10-5: well past the reserve, inject_budget becomes the binding "
+    f"term and the ceiling converges on the flat "
+    f"INJECTION_BUDGET_FRACTION share {_G13_ABOVE_RESERVE} — the "
+    f"documented worst case",
+)
+check(
+    _G13_ABOVE_RESERVE[3] > _G13_AT_RECOMMENDED[3],
+    f"*** P10-5: the ceiling's share of the window is MONOTONE with "
+    f"max_tokens past the reserve — raising Max Tokens only ever grows "
+    f"the stand-in's share, never shrinks it (at-recommended share="
+    f"{_G13_AT_RECOMMENDED[3]:.3f}, above-reserve share="
+    f"{_G13_ABOVE_RESERVE[3]:.3f})",
+)
 
 
 if FAILED:

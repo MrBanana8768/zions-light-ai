@@ -1130,4 +1130,109 @@ assert_true(
 )
 
 print()
+print("[7] P10-4 (hostile pass #10): a 4-space-indented ``` line before a "
+      "mid-reply loop no longer makes the forwarded cut insert an "
+      "unmatched real fence opener")
+print("-" * 70)
+# P9-6 (hostile pass #9) taught _fence_toggle_offsets that a ``` line
+# indented 4+ spaces is CommonMark literal content, not a fence delimiter
+# — but that fix landed at _fence_toggle_offsets alone. _trim_forwarded_
+# prefix's self-balancing count and _cut_degenerate_span_once's
+# belt-and-braces parity check both still counted fence lines with the
+# OLD, indent-blind `line.strip().startswith("```")` test, so the two
+# readers disagreed by exactly one on any reply carrying such a line.
+# _trim_forwarded_prefix counted 1 (odd, "unbalanced") and appended a
+# REAL, unindented ``` line to "close" it — the only genuine fence
+# delimiter anywhere in the kept prefix, so it OPENED a fence that never
+# closes; the belt-and-braces check then counted 2 (the indented line
+# plus the appended one) and called it even, missing its own job.
+#
+# This fixture: ordinary prose, one 4-space-indented decorative ```
+# line (literal content, matching this model's real boxed-reply style —
+# see P8-3's own measurement), more prose, a mid-reply token-run loop,
+# and a clean tail. The indented line sits in the KEPT PREFIX ahead of
+# the loop, which is exactly where the two readers used to disagree.
+_p10_4_prose_before = (
+    "This is ordinary prose before the box, with real content. " * 3
+)
+_p10_4_indented_line = (
+    "    ``` a decorative box marker, indented 4 spaces (literal code "
+    "content, not a fence delimiter)\n"
+)
+_p10_4_prose_after_indent = (
+    "More ordinary prose after the box, still not a loop yet, plenty of "
+    "words here to keep this a real sentence. "
+)
+_p10_4_loop = "loopword " * 20  # a token run: '\S{3,40}' repeated 4+ times
+_p10_4_prose_tail = (
+    "And finally some ordinary closing prose after the loop wraps up "
+    "nicely here, the end."
+)
+_p10_4_text = (
+    _p10_4_prose_before + "\n\n" + _p10_4_indented_line + "\n"
+    + _p10_4_prose_after_indent + "\n\n" + _p10_4_loop + "\n\n"
+    + _p10_4_prose_tail
+)
+
+_p10_4_verdict, _p10_4_start, _p10_4_end = main._reply_degenerate_verdict(_p10_4_text)
+assert_true(
+    _p10_4_verdict is not None and _p10_4_start is not None,
+    f"[7] fixture: the mid-reply loop trips the detector (verdict="
+    f"{_p10_4_verdict!r})",
+)
+assert_true(
+    _p10_4_start is not None and _p10_4_start > _p10_4_text.find(_p10_4_indented_line.strip()),
+    "[7] fixture: the indented decorative line sits BEFORE the loop, in "
+    "what becomes the kept prefix — otherwise this fixture does not "
+    "exercise the disagreement at all",
+)
+
+_p10_4_content, _p10_4_kept = main._degenerate_replacement_content(
+    _p10_4_text, main._DEGENERATE_FORWARD_PLACEHOLDER, keep_middle=True
+)
+assert_true(
+    _p10_4_kept,
+    "[7] fixture: the clean prose before and after the loop is kept "
+    "(not the whole-reply placeholder) — this is the cut path P10-4 "
+    "affects, not the give-up path",
+)
+
+_p10_4_kept_prefix_old_count = sum(
+    1 for ln in _p10_4_text[:_p10_4_start].splitlines()
+    if ln.strip().startswith("```")
+)
+assert_true(
+    _p10_4_kept_prefix_old_count % 2 == 1,
+    f"[7] fixture: on the ORIGINAL text's kept-prefix region (input only, "
+    f"independent of which code ran), the OLD indent-blind counter reads "
+    f"{_p10_4_kept_prefix_old_count} (odd, 'unbalanced') while the real "
+    f"fence structure has zero real delimiters — this is the exact "
+    f"disagreement P10-4 describes; a fixture where the two already "
+    f"agreed would prove nothing",
+)
+_p10_4_new_toggles = main._fence_toggle_offsets(_p10_4_content)
+assert_true(
+    len(_p10_4_new_toggles) % 2 == 0,
+    f"*** P10-4 [7]: the indent-aware reader (`_fence_toggle_offsets`, "
+    f"the one every fence decision in this module now trusts) sees EVEN "
+    f"parity — no real, unmatched fence in what is forwarded "
+    f"(toggles={_p10_4_new_toggles})",
+)
+assert_true(
+    not any(ln == "```" for ln in _p10_4_content.splitlines()),
+    "*** P10-4 [7]: no line in the forwarded content is a BARE, "
+    "unindented ``` marker — the old bug's signature was exactly this: "
+    "_trim_forwarded_prefix appending one to 'close' a fence that was "
+    "never open, which then opened a real one with nothing to end it",
+)
+assert_true(
+    _p10_4_prose_before[:30] in _p10_4_content
+    and _p10_4_prose_tail in _p10_4_content
+    and main._DEGENERATE_SPAN_MARKER in _p10_4_content,
+    "[7] the clean prose before and after the loop, and the cut marker "
+    "in between, all survive — this fix is about fence WELL-FORMEDNESS, "
+    "not about what gets cut",
+)
+
+print()
 print("ALL TESTS PASSED")

@@ -1255,10 +1255,23 @@ def _reuse_state() -> dict:
     circular — see that function's docstring for the full reasoning).
 
     CONTRACT: main.reuse_decline_state() -> {"attempted": int,
-    "declined_budget": int, "declined_recently": bool,
+    "succeeded": int, "declined_no_state": int, "declined_no_coverage":
+    int, "declined_budget": int, "errored": int, "declined_recently":
+    bool, "last_reason": str | None, "last_attempt_age_s": float | None,
     "last_declined_ceiling": int | None, "last_declined_others": int |
     None}, read-only and cheap. Numbers only — no conversation text, no
     conv_id, no hierarchy content.
+
+    P10-3 (hostile pass #10): `attempted`/`declined_budget` alone could not
+    tell a fresh process apart from "reuse has never been possible here"
+    apart from "every attempt this process made actually crashed" — all
+    three read as `attempted=0` or as `attempted>0, declined_budget=0`.
+    `succeeded`/`declined_no_state`/`declined_no_coverage`/`errored` are
+    ADDITIVE new counters (not a rename — `attempted` and `declined_budget`
+    keep their P9 meaning for any existing reader of this dict);
+    `last_reason` names what the MOST RECENT attempt resolved to, and
+    `last_attempt_age_s` is `None` only when no candidate request has
+    reached `compact_if_needed`'s reuse check in this process at all.
     """
     main_mod = sys.modules.get("main")
     if main_mod is None:
