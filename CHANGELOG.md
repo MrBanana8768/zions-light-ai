@@ -20,9 +20,53 @@ its only real-tokenizer suite for three releases, and an adversarial test
 that could no longer tell a genuine reuse success from a decline.
 
 ### Fixed
-<!-- lane reuse: paragraph(s) for P11-6/P11-4/P11-1/P11-3 go here -->
-<!-- lane merge: paragraph(s) for the concurrent-merge fact loss go here -->
-<!-- lane opencv: paragraph(s) for the missing opencv extra go here -->
+- **P11-6: reuse no longer squeezes her recent conversation.** The
+  v3.1.9.2 reuse ceiling ignored the recent window, so at the hierarchy
+  size its 15000 cap was raised for (~13k tokens, hers is ~8.4k today) reuse
+  lost her previous exchange where declining would have kept it.
+  `compact_if_needed` now also bounds the stand-in by what the window
+  leaves beside the system prompt and the retained images (priced at the
+  `IMAGE_TOKEN_ESTIMATE` constant, deliberately independent of
+  `count_tokens`). Known residual, not a regression: with
+  `COMPACTOR_IMAGE_TOKENS` lowered to about 3,080, one combination (a ~13.6k
+  hierarchy beside an 8,000-token previous reply) reuses and loses that
+  exchange; v3.1.9.2 loses it the same way.
+- **P11-4: the guard no longer spends injected memory on arithmetic the
+  exact counter contradicts.** A residual of v3.1.9.2's P10-1 fix: round one
+  could cut memory on a local estimate that overpriced images, then shed
+  the exchange anyway. It now re-checks against the exact count before
+  spending memory.
+- **P11-1: `checks.reuse` records the outcome after the work that can
+  fail.** It used to record `success` before the fresh-span summarize ran;
+  a failure there forwarded her whole original array (cut to ~3 turns by
+  the guard) while `/health/full` still said `success`. Now that case is
+  `error`.
+- **P11-3 (LOW): `declined_recently` means what the runbook says** —
+  budget declines only; a cancelled request is not counted as one.
+- **Concurrent merges into one conversation no longer lose facts.**
+  `merge_conversation` runs on a threadpool worker and only PROBED
+  `conv_lock(dst)`, an asyncio lock it never held, so two merges into the
+  same destination both passed and both did an unsynchronised
+  load-modify-write: the adversarial race lost 20 of 40 acknowledged facts
+  on 60 of 60 attempts, with HTTP 200 on both sides. The lock is now
+  actually held for the read-modify-write — acquired on the event loop
+  with a 10-second bound (on timeout, the original "retry in a moment"
+  refusal), the file work kept on the worker thread so the server does not
+  stall, and released in a `finally`. The reverse-merge (source) guard is
+  unchanged.
+- **The compactor's chat template now loads for images, and prices each
+  image once.** Every boot logged `could not apply the chat template ...
+  opencv is not installed`. Measured: only messages carrying an image ever
+  hit it — text-only counting was already correct, so facts, retrieval and
+  the summary and persona blocks do not move. `opencv-python-headless`
+  (pinned) is added to the compactor venv (+152 MB unpacked, no other
+  package version changed). Installing it alone would have made images
+  WORSE: `count_tokens` added its flat 4,096-token estimate on top of the
+  template's own image tokens, and re-encoded the image markers as literal
+  text (2-2.3x each). It now prices a rendered image by its markers and
+  keeps the flat estimate only for images the template did not render.
+  Measured against vLLM's own per-image cost at 256/512/1024/2048 px
+  (110/380/1406/3080 tokens): within 3 tokens.
 - **P11-2 (hostile pass #11, re-opening P9-4): the adversarial reuse test's
   discriminator passed when reuse did not fire at all.** P10-3 (v3.1.9.2)
   gave a stored-hierarchy miss (`no_state`, a brand-new conversation),
