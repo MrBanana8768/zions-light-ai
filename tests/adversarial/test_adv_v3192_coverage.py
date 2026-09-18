@@ -388,6 +388,47 @@ def test_reuse_with_a_stored_hierarchy_no_cap_refusal_stand_in_on_wire(
     itself used to prove this exact finding ("proven at the
     compact_if_needed level instead, which is the layer the assertion
     actually depends on").
+
+    P11-2 (hostile pass #11) RE-OPENED the discriminator above, in the
+    commit that says it made reuse failures visible (v3.1.9.1 -> v3.1.9.2,
+    P10-3): `attempted` moved to count every request that reaches the top
+    of `compact_if_needed`'s `if conv_id:` block (a live QUESTION, not yet
+    an answer), and only a BUDGET decline moves `declined_budget` any more
+    — a brand-new conversation with no stored hierarchy at all ("no_state"),
+    a hierarchy that covers none of this array ("no_coverage"), and the
+    reuse block's own `except` firing ("error") each now produce
+    `attempted +1, declined_budget +0` too, which the OLD assertion pair
+    reads as "the stand-in fit and was used" for all three. Proven at the
+    `compact_if_needed` + `reuse_decline_state()` layer (same layer, same
+    method as P9-4's own proof above — this repo's established way to
+    check a `checks.reuse` claim no black-box HTTP fixture fault-injection
+    hook can drive; SP\\gatecov\\p112_repro.py, synthetic only, no real
+    data): the OLD pair (`attempted == before+1` AND `declined_budget ==
+    before`) PASSES on all three, and ALSO on a fourth shape this test
+    cannot construct at all through real HTTP — reuse recorded "success"
+    (`checks.reuse.succeeded` incremented) and THEN the fresh-span
+    `summarize()` call 503s, `compact_if_needed` raises, and
+    `chat_completions` forwards the original array (P11-1, a SEPARATE
+    finding: `_reuse_reason` is fixed as "success" before that call runs,
+    at main.py's `finally` block around line 2507, so a fresh-span failure
+    after it changes nothing this test can read — that recording-order
+    defect belongs to lane reuse's `compact_if_needed`, not to this file).
+
+    FIXED: the discriminator now requires `succeeded == before + 1` AND
+    `last_reason == "success"` — no_state/no_coverage/error each leave
+    `succeeded` unchanged and set a different `last_reason`, so all three
+    now correctly fail this assertion (proven red, synthetic, in
+    p112_repro.py's phases A/B/C). The fourth shape (success recorded,
+    then the fresh-span summarize fails) is NOT closed by this file alone
+    — it needs P11-1 landing in `compact_if_needed` so a post-recording
+    failure is reported as "error" rather than "success"; once that lands,
+    THIS SAME assertion (unchanged) closes it too. Two dedicated tests
+    below (`test_reuse_discriminator_reports_no_state_not_success` and
+    `..._no_coverage_not_success`) drive the no_state and no_coverage
+    shapes through REAL `/v1/chat/completions` calls (no fault-injection
+    hook needed — a brand-new conv_id and an unrelated-content conv_id are
+    both ordinary client behaviour), so those two are covered end to end
+    by this pytest suite, not only by the standalone script.
     """
     conv = f"advcov-reuse-{uuid.uuid4().hex[:8]}"
 
@@ -445,12 +486,17 @@ def test_reuse_with_a_stored_hierarchy_no_cap_refusal_stand_in_on_wire(
     # P9-4 (hostile pass #9): the hard proof. `fwd2 < n2_true * 0.5` below
     # is satisfied by the DECLINED path too (a full re-summarize also
     # shrinks the forwarded prompt) — it stays as supporting evidence, not
-    # the discriminator. `attempted` incrementing by exactly one and
-    # `declined_budget` NOT moving is evidence only a SUCCESSFUL stand-in
-    # produces: a decline increments `declined_budget` in the very same
-    # code path (main.py's `_record_reuse_decline`, called before the "do
-    # not fit whole" log line), and nothing outside compact_if_needed's
-    # reuse block touches either counter.
+    # the discriminator.
+    #
+    # P11-2 (hostile pass #11) RE-OPENED this: `attempted` incrementing by
+    # exactly one and `declined_budget` NOT moving stopped being evidence
+    # only a successful stand-in produces the moment P10-3 gave no_state,
+    # no_coverage and error their OWN counters instead of folding them into
+    # `declined_budget` — all three now also produce `attempted +1,
+    # declined_budget +0` (see this test's own docstring for the proof).
+    # Kept below as a WEAKER, supporting check (still true of a genuine
+    # success, still useful in a failure's error message), but no longer
+    # the discriminator.
     assert reuse_after.get("attempted") == reuse_before.get("attempted", 0) + 1, (
         f"request 2 did not register a reuse attempt at all "
         f"(before={reuse_before}, after={reuse_after}) — either no stored "
@@ -458,14 +504,34 @@ def test_reuse_with_a_stored_hierarchy_no_cap_refusal_stand_in_on_wire(
         f"land, or the hierarchy genuinely does not cover these turns), or "
         f"main.compact_if_needed's reuse block was not reached"
     )
-    assert reuse_after.get("declined_budget") == reuse_before.get("declined_budget", 0), (
-        f"THE REUSE CODE PATH DID NOT FIRE: request 2's stand-in was "
-        f"DECLINED for budget (before={reuse_before}, after={reuse_after}) "
-        f"— the small forwarded prompt below comes from a fresh "
-        f"re-summarize of the whole older span, not from reusing the "
-        f"stored hierarchy; this is exactly the P9-1/P9-2 failure mode "
-        f"(the feature silently not firing) and NOT what this test's name "
-        f"claims to cover"
+    # THE DISCRIMINATOR (P11-2's fix): `succeeded` is the ONE counter that
+    # moves on exactly one `_reuse_reason` value ("success" — see
+    # main.py's `_record_reuse_outcome`), and `last_reason` names it
+    # directly rather than requiring the reader to rule out every OTHER
+    # reason by checking a counter that reason does not touch. no_state,
+    # no_coverage, error and a BUDGET decline all leave `succeeded`
+    # unchanged and set `last_reason` to their own name — none of them can
+    # produce this pair.
+    assert reuse_after.get("succeeded") == reuse_before.get("succeeded", 0) + 1, (
+        f"THE REUSE CODE PATH DID NOT SUCCEED: request 2's `succeeded` "
+        f"counter did not move (before={reuse_before}, after={reuse_after}) "
+        f"— whatever produced the small forwarded prompt below, it was not "
+        f"a stand-in that rendered; this is exactly the P9-1/P9-2/P11-2 "
+        f"failure mode (the feature silently not firing, or firing and "
+        f"then not being distinguishable from a decline) and NOT what this "
+        f"test's name claims to cover"
+    )
+    assert reuse_after.get("last_reason") == "success", (
+        f"request 2's last recorded reuse outcome was "
+        f"{reuse_after.get('last_reason')!r}, not 'success' "
+        f"(before={reuse_before}, after={reuse_after}) — declined_budget, "
+        f"no_state, no_coverage and error are all DECLINES/faults, not the "
+        f"successful stand-in this test's name claims to prove. NOTE "
+        f"(P11-1, not fixed by this file): if lane reuse's fix for P11-1 "
+        f"has not landed yet, `last_reason` can still read 'success' here "
+        f"even when the fresh-span summarize() call AFTER this point 5xxs "
+        f"and the original array was forwarded instead — see this test's "
+        f"docstring for why that specific shape needs main.py's fix too"
     )
 
     fwd2 = _forwarded_prompt_tokens(r2)
@@ -482,5 +548,140 @@ def test_reuse_with_a_stored_hierarchy_no_cap_refusal_stand_in_on_wire(
         f"STAND-IN NOT ON THE WIRE: request 2 forwarded {fwd2} of {n2_true} "
         f"true tokens — the older span was not meaningfully compacted/"
         f"substituted"
+    )
+    assert _settle(client), "background tail work never drained after request 2"
+
+
+# ---------------------------------------------------------------------------
+# 3b. P11-2: the discriminator must NOT read a decline as a success
+# ---------------------------------------------------------------------------
+#
+# Two of P11-2's four false-positive shapes (no_state, no_coverage) are
+# ordinary client behaviour — no fault-injection hook needed — so they are
+# driven here through the real endpoint, same as the test above. The other
+# two (the reuse block's own `except` firing; reuse recorded "success" and
+# THEN the fresh-span summarize() call fails) need a fault this fixture has
+# no hook for on /v1/chat/completions (only /tokenize has one — see
+# testfixtures/tokenizer-contract/fixture_server.py's `/_fixture/mode`), so
+# they are proven at the `compact_if_needed` + `reuse_decline_state()` layer
+# instead (SP\\gatecov\\p112_repro.py, synthetic only) — the same layer, and
+# the same reason, as the test above's own docstring already documents for
+# P9-4's original proof.
+
+
+def test_reuse_discriminator_reports_no_state_not_success(client, fixture_client):
+    """P11-2. A brand-new conv_id's FIRST request, already over TARGET_TOKENS,
+    reaches `compact_if_needed`'s reuse block (an attempt is a live question
+    the instant there is a conv_id, older text turns, and the request is over
+    budget — see `_record_reuse_attempt`'s own comment) and finds no stored
+    hierarchy at all: `_covered == 0` and nothing in the covered-turn record,
+    so `_reuse_reason = "no_state"` (main.py ~2272-2277). No settle, no
+    second request, no fault injection — this is what any brand-new
+    conversation's first oversized request does.
+
+    FAILS IF: `succeeded` moves, or `last_reason` reads "success" — the
+    OLD discriminator (`attempted +1, declined_budget +0`) PASSES on this
+    shape too (proof in the test above's docstring), which is exactly what
+    P11-2 is about: a request that never had anything to reuse must not
+    read as a successful reuse.
+    """
+    conv = f"advcov-reuse-nostate-{uuid.uuid4().hex[:8]}"
+    msgs = _pairs_of(50) + [{"role": "user", "content": "one more thing?"}]
+    n_true = _true_count(fixture_client, msgs)
+    assert n_true > TARGET_TOKENS, (
+        f"fixture too small ({n_true} true tokens) to force compaction on "
+        f"a first request — widen _pairs_of's count"
+    )
+
+    reuse_before = client.get("/health/full").json()["checks"].get("reuse") or {}
+    assert reuse_before.get("available"), (
+        f"precondition: /health/full's checks.reuse is not available "
+        f"({reuse_before}) — main.reuse_decline_state() is missing or the "
+        f"wiring broke"
+    )
+    r = _chat(client, msgs, conv)
+    assert r.status_code == 200, f"HTTP {r.status_code}: {r.text[:300]}"
+    reuse_after = client.get("/health/full").json()["checks"].get("reuse") or {}
+
+    record(
+        "advcov-reuse-discriminator",
+        f"[no_state] n_true={n_true} reuse_before={reuse_before} "
+        f"reuse_after={reuse_after}",
+    )
+    assert reuse_after.get("last_reason") == "no_state", (
+        f"setup did not reach the shape this test needs — expected "
+        f"last_reason='no_state' on a brand-new conv_id's first oversized "
+        f"request, got {reuse_after.get('last_reason')!r} "
+        f"(before={reuse_before}, after={reuse_after})"
+    )
+    assert reuse_after.get("succeeded") == reuse_before.get("succeeded", 0), (
+        f"P11-2: a conv_id with NOTHING stored yet must not increment "
+        f"`succeeded` (before={reuse_before}, after={reuse_after})"
+    )
+    assert _settle(client), "background tail work never drained"
+
+
+def test_reuse_discriminator_reports_no_coverage_not_success(client, fixture_client):
+    """P11-2. Request 1 builds a real stored hierarchy for a conv_id (settled,
+    same as the happy-path test above). Request 2, on the SAME conv_id,
+    replaces the ENTIRE history with unrelated content sharing no text with
+    request 1 — the "different branch / delete-and-regenerate" shape
+    `_coverage_plan` is written to detect (main.py ~2257-2264): a hierarchy
+    EXISTS (`summarizer._covered_fps` is non-empty) but covers none of THIS
+    array, so `_reuse_reason = "no_coverage"`.
+
+    FAILS IF: `succeeded` moves, or `last_reason` reads "success" — same
+    P11-2 shape as the no_state test above, on the other counter P10-3
+    split out.
+    """
+    conv = f"advcov-reuse-nocoverage-{uuid.uuid4().hex[:8]}"
+    msgs1 = _pairs_of(50) + [{"role": "user", "content": "and so what should I do next?"}]
+    n1_true = _true_count(fixture_client, msgs1)
+    assert n1_true > TARGET_TOKENS, (
+        f"fixture too small ({n1_true} true tokens) to force first-time "
+        f"summarization — widen _pairs_of's count"
+    )
+    r1 = _chat(client, msgs1, conv)
+    assert r1.status_code == 200, f"request 1: HTTP {r1.status_code}: {r1.text[:300]}"
+    assert _settle(client), "background tail work never drained after request 1"
+
+    # Unrelated content on the SAME conv_id — a different word bank and a
+    # disjoint turn-number range, so no turn's fingerprint can pair with the
+    # covered-turn record request 1's tail wrote.
+    unrelated_word = "papaya quokka xylophone zeppelin umbrella vortex "
+    msgs2 = [
+        {"role": "user" if i % 2 == 0 else "assistant",
+         "content": f"unrelated turn {i}. " + unrelated_word * 30}
+        for i in range(100)
+    ] + [{"role": "user", "content": "one more thing?"}]
+    n2_true = _true_count(fixture_client, msgs2)
+    assert n2_true > TARGET_TOKENS, (
+        f"fixture too small ({n2_true} true tokens) — widen the unrelated "
+        f"turn count"
+    )
+
+    reuse_before = client.get("/health/full").json()["checks"].get("reuse") or {}
+    r2 = _chat(client, msgs2, conv)
+    assert r2.status_code == 200, f"request 2: HTTP {r2.status_code}: {r2.text[:300]}"
+    reuse_after = client.get("/health/full").json()["checks"].get("reuse") or {}
+
+    record(
+        "advcov-reuse-discriminator",
+        f"[no_coverage] n1_true={n1_true} n2_true={n2_true} "
+        f"reuse_before={reuse_before} reuse_after={reuse_after}",
+    )
+    assert reuse_after.get("last_reason") == "no_coverage", (
+        f"setup did not reach the shape this test needs — expected "
+        f"last_reason='no_coverage' when request 2 replaces the whole "
+        f"history with unrelated content, got "
+        f"{reuse_after.get('last_reason')!r} (before={reuse_before}, "
+        f"after={reuse_after}) — if this reads 'no_state', request 1's "
+        f"hierarchy never got built/settled; if it reads something else, "
+        f"the unrelated content accidentally paired with the covered-turn "
+        f"record"
+    )
+    assert reuse_after.get("succeeded") == reuse_before.get("succeeded", 0), (
+        f"P11-2: a hierarchy that covers NONE of this array must not "
+        f"increment `succeeded` (before={reuse_before}, after={reuse_after})"
     )
     assert _settle(client), "background tail work never drained after request 2"

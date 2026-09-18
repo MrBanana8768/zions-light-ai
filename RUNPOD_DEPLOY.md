@@ -483,23 +483,34 @@ Parameters, by its real name, so nothing depends on the translation.
 Leaving Max Tokens unset means the request carries no ceiling at all: a
 runaway reply continues until it fills the context window or someone presses
 Stop. **7000 tokens is NOT "roughly 28,000 characters" on this model** — that
-assumes 4 characters/token, and this model's own measured pairs (see
-`count_tokens_exact`'s docstring in `compactor/main.py`, production data,
-2026-08-28) run 2.0-2.4 characters/token on assistant replies, because this
-model's heavy use of box-drawing and other decoration characters prices high.
-At that rate 7000 tokens is roughly 14,000-17,000 characters — below her
-normal p90 reply length (measured ~17,000 characters on her main chat,
-hostile pass #7), so a real, non-runaway reply would routinely hit the
-ceiling and come back cut mid-sentence, and get stored to memory trimmed the
-same way (`stream truncated at the generation ceiling`). **12000 tokens**
-(roughly 24,000-29,000 characters at the same measured rate) covers ordinary
-long replies with headroom and does not change memory's budgets: the
-compactor already reserves the larger of `COMPACTOR_GENERATION_RESERVE`
-(12000) and Max Tokens, so 12000 is the value it already plans around. To
-check the real rate on your own pod rather than trust this range, POST a
-sample of her actual replies to vLLM's `/tokenize` endpoint and compare the
-returned token count against the character count directly, rather than
-estimating.
+assumes 4 characters/token. **Correction (P11-5, hostile pass #11, superseding
+the 2.0-2.4 chars/token figure this section used to cite from hostile pass
+#7/2026-08-28 production data):** that earlier figure was measured on
+2026-08-28 replies carrying unusually heavy box-drawing decoration (one reply
+alone had 2,151 box-drawing characters in 17,930 characters). Measured fresh
+on her CURRENT branch (476 replies, 2026-09-17, Tekken tokenizer —
+`SP\p11\tekcal.py`), box-drawing is down to 0.11% of characters and the rate
+is **3.77 characters/token** (p50 3.85, p90 4.58). Caveat: this used
+mistral_common's bundled `tekken_240911` vocabulary (131k tokens, the
+Pixtral/Nemo family default), not the served Cydonia-24B's own `tekken.json`,
+and did not call the pod's own `/tokenize` — treat 3.77 as a good estimate,
+not a pod-verified number, until someone does. At 3.77 chars/token, 7000
+tokens is roughly **26,000 characters**, not 14,000-17,000 — her p90 reply
+(~17,000 characters) is about 4,500 tokens and would NOT routinely hit a
+7000-token ceiling; only her largest recorded reply (51,290 characters, about
+13,600 tokens) would hit it hard. **The 12000 recommendation below is
+UNCHANGED and still safe** — if anything more comfortably so than the old
+figure implied: **12000 tokens is roughly 45,000 characters** at the measured
+rate, so it now cuts only replies over about 45k characters (her single
+largest recorded reply, 51,290 characters, is the only one that would still
+be affected) rather than the "ordinary long replies" framing the old
+14-17k-character figure suggested. It covers ordinary long replies with
+headroom and does not change memory's budgets: the compactor already reserves
+the larger of `COMPACTOR_GENERATION_RESERVE` (12000) and Max Tokens, so 12000
+is the value it already plans around. To check the real rate on your own pod
+rather than trust this range, POST a sample of her actual replies to vLLM's
+`/tokenize` endpoint and compare the returned token count against the
+character count directly, rather than estimating.
 
 **P10-5 (hostile pass #10): raising Max Tokens above `COMPACTOR_
 GENERATION_RESERVE` (12000) lets the reuse stand-in claim up to 75% of
