@@ -341,10 +341,17 @@ log line, `repetition_penalty` just stayed at its default of 1.0.
 Recommended starting values for this model (Cydonia-24B):
 `repetition_penalty` 1.05 (Custom Parameter), Frequency Penalty 0.3 and Max
 Tokens 12000 (both Advanced Params) — **not** the 4 chars/token rule of thumb
-Max Tokens 7000 used to be picked by: this model's own measured pairs run
-2.0-2.4 chars/token on assistant replies, so 7000 tokens is only ~14-17k
-characters, below her normal p90 reply length, and would cut ordinary long
-replies mid-sentence. vLLM 0.19 also applies `repetition_penalty` to PROMPT
+Max Tokens 7000 used to be picked by. **Correction (P11-5, hostile pass #11):**
+this used to say "2.0-2.4 chars/token" from 2026-08-28 production data, which
+was measured on unusually box-drawing-heavy replies; her current branch (476
+replies, 2026-09-17, Tekken) measures **3.77 chars/token** instead (full
+detail and the vocabulary caveat: [RUNPOD_DEPLOY.md → Sampling
+parameters](RUNPOD_DEPLOY.md#sampling-parameters)). At that rate 7000 tokens
+is ~26k characters, comfortably above her normal p90 reply length, so it is
+no longer accurate to say it "would cut ordinary long replies mid-sentence"
+— it still cuts her rare very-long replies, which is why 12000 remains the
+recommendation, not a reason to raise it further. vLLM 0.19 also applies
+`repetition_penalty` to PROMPT
 tokens, not only output, so a high value discourages words already sitting
 in her ~20k-token conversation/memory context, not just words the model has
 already said in this reply — raise Frequency Penalty (output-only) before

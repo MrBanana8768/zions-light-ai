@@ -9,6 +9,71 @@ on Docker Hub.
 
 ---
 
+## [3.1.9.3] — the gate tells the truth
+
+Four findings from hostile pass #11 (v3.1.9.2 at `1069da1`), closed across
+four parallel lanes: the reuse ceiling accounting for the recent window
+(lane reuse), a concurrent-merge fact-loss race (lane merge), the missing
+`opencv` extra that keeps the real chat template from loading (lane opencv),
+and — this lane's own items — a release gate that had been silently skipping
+its only real-tokenizer suite for three releases, and an adversarial test
+that could no longer tell a genuine reuse success from a decline.
+
+### Fixed
+<!-- lane reuse: paragraph(s) for P11-6/P11-4/P11-1/P11-3 go here -->
+<!-- lane merge: paragraph(s) for the concurrent-merge fact loss go here -->
+<!-- lane opencv: paragraph(s) for the missing opencv extra go here -->
+- **P11-2 (hostile pass #11, re-opening P9-4): the adversarial reuse test's
+  discriminator passed when reuse did not fire at all.** P10-3 (v3.1.9.2)
+  gave a stored-hierarchy miss (`no_state`, a brand-new conversation),
+  a coverage miss (`no_coverage`, a hierarchy that exists but covers none
+  of this request) and the reuse block's own exception (`error`) their own
+  counters instead of folding them into `declined_budget` — so
+  `tests/adversarial/test_adv_v3192_coverage.py`'s discriminator
+  (`attempted == before+1 AND declined_budget == before`) started passing
+  on all three, exactly the "reuse silently did not fire" failure mode the
+  test exists to catch. Fixed: the discriminator now requires `succeeded ==
+  before+1 AND last_reason == "success"` — no other outcome can produce
+  that pair. Two new tests (`test_reuse_discriminator_reports_no_state_
+  not_success`, `..._no_coverage_not_success`) drive the `no_state` and
+  `no_coverage` shapes through ordinary real HTTP requests (a brand-new
+  conversation's first oversized request; a second request that replaces
+  the whole history on the same conversation id). A fourth shape — reuse
+  recorded "success" and then the fresh-span re-summarize call itself fails
+  — is a separate finding (P11-1) in `compact_if_needed`'s recording order,
+  not in this test; this same assertion will also catch it once that lands.
+- **The tokenizer-contract suite (`compactor/test_tokenizer_contract.py`)
+  had been SKIPPED in every release gate since v3.1.7 (P9-6), including
+  this one's own predecessor — and it is the only suite that exercises a
+  real `/tokenize` contract, the one that would have caught the
+  fixture-handler change v3.1.9.2 itself shipped.** Not a code defect: the
+  suite has always correctly reported SKIP (exit 3) with a loud reason when
+  no fixture is reachable. The gap was procedural — every gate assembled
+  for a release ran `docker-compose.tokenizer-contract.yml`'s `soak-tests`
+  service (a scale/lag check, its own separate fixture) and never its
+  `contract-tests` service (the real-tokenizer contract check), two
+  different suites in the same compose file, easy to conflate by name. Ran
+  directly at this release's HEAD: **rc=0, 98 checks, 0 failures, "All
+  tokenizer-contract tests passed."** `scripts/run-tests.py`'s module
+  docstring — the project's one canonical description of how to run
+  everything — now names `contract-tests` explicitly and says plainly that
+  no fixed set of compose invocations is "the gate" until that one's exit
+  code has been read too.
+- **P11-5 (LOW): the "2.0-2.4 characters/token" figure in `RUNPOD_DEPLOY.md`
+  and `OPERATIONS.md`'s Max Tokens guidance was measured on an unusually
+  decorated month.** That figure came from 2026-08-28 production replies
+  carrying heavy box-drawing decoration; her current branch (476 replies,
+  measured 2026-09-17 with the Tekken tokenizer) is 0.11% box-drawing and
+  runs **3.77 characters/token** instead — nearly double, which made the
+  old "7000 tokens routinely hits her p90 reply" claim wrong in the
+  alarming direction (it does not, at the corrected rate) and understated
+  how much headroom 12000 tokens actually carries (~45k characters, not
+  ~24-29k). Both docs corrected with the new figure, its date, method and
+  a vocabulary caveat (measured against `mistral_common`'s bundled
+  `tekken_240911`, not the served model's own `tekken.json`; no pod
+  `/tokenize` call was made). **The 12000 Max Tokens recommendation is
+  unchanged** — it was already safe, and remains so at the corrected rate.
+
 ## [3.1.9.2] — repetition-loop hardening
 
 **The bug (production logs):** the model (Cydonia-24B, vLLM 0.19.0) sometimes
