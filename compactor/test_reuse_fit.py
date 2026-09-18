@@ -2343,8 +2343,19 @@ check(
 # last L1 rollup, ROUTINE per p11 (3 summarize() calls per reusing request
 # between rollups), not an edge case — where the fresh summary actually
 # costs 1,000-2,000 tokens (one or two UN-FOLDED map-reduce batches, not the
-# single batch this reserve priced for): reuse still fired and lost her
-# previous exchange at 26 of 474 positions where declining kept it.
+# single batch this reserve priced for).
+#
+# CORRECTION (hostile pass #13, P13-3): the coordinator's own "lost her
+# previous exchange at 26 of 474 positions" number for this state was later
+# found to be a replay-harness artifact, not a real measurement — the
+# replay's spy appended its own ~1,000-token "fresh" text to a stand-in
+# that already carried a real fresh summary for the same span, a shape no
+# production request can reach (SP\p13-findings.md verified this in full:
+# `_fresh_span_preview` previews exactly `fresh_input`'s own composition,
+# and nothing joins the stand-in after this decision runs). The reserve
+# gap this section tests for (one call priced, two or more actually
+# needed) is real and still the point of [17]/[17a]/[17b] below; only the
+# "26 of 474" citation was the artifact.
 #
 # [17a] reproduces that shape synthetically: her peakB hierarchy (~12,951
 # measured tokens — [14]'s own peakA/peakB render 11,529/13,660 at
@@ -2382,9 +2393,12 @@ async def _g17_multibatch_summarize(client, to_summarize):
     together still missing the reduce call's own input budget (see
     summarize()'s own "stopping the reduce" / reduce-failure branches).
     Returns TWO concatenated near-SUMMARY_MAX_TOKENS chunks (~1,800 tokens
-    together) regardless of the exact input — her measured real growth
-    (coordinator's real-data replay, "fresh+peakB": 12,951 -> 13,955-
-    14,953), not derived from this fixture's own token count."""
+    together) regardless of the exact input — a size chosen to be
+    plausible for two un-folded SUMMARY_MAX_TOKENS-capped batches, not
+    derived from this fixture's own token count (P13-3, hostile pass #13:
+    the "12,951 -> 13,955-14,953" figure once cited here as a real-branch
+    measurement was a replay-harness artifact, not a measurement — see
+    [17]'s own correction above)."""
     CALLS.append(list(to_summarize))
     chunk = "MULTIBATCH-SUMMARY-PART " + _g_filler(900)
     return chunk + "\n\n" + chunk, []
@@ -2763,6 +2777,234 @@ check(
 check(
     _g18b_newest,
     "[18b] CONTROL: the newest turn always survives",
+)
+
+
+# ---------------------------------------------------------------------------
+# [19] P13-1 (hostile pass #13, HIGH): the window check ignores the guard's
+# learned `_BUDGET_MARGIN`. After a vLLM context-length 400 the guard did NOT
+# predict (a `/tokenize` outage or a mispriced image — `_note_backend_
+# rejection`'s own docstring), `_BUDGET_MARGIN` latches to `overshoot + 512`,
+# up to the MAX_MODEL_LEN//4 ceiling, in ONE step, process-wide, released
+# only after BUDGET_MARGIN_RELEASE_AFTER (default 50) consecutive accepted
+# requests. `_enforce_hard_budget` (the guard) subtracts it from its own
+# limit before shedding a single token (main.py: `if _BUDGET_MARGIN: limit =
+# max(256, limit - _BUDGET_MARGIN)`). The window check recovered the SAME
+# `effective_limit` but never subtracted the SAME margin — so while one was
+# in force, this check could approve a stand-in the guard, needing that many
+# more tokens of room than the check thought existed, could not actually fit
+# beside the previous exchange. Reuse "succeeded" and the guard then shed
+# U_prev/A_prev to find the room — exactly the loss P12-5 (above) fixed on
+# the DECLINED path, given back on the REUSING one.
+#
+# The reviewer found no existing test can tell this apart: `[F1]`/`[F1-lean]`
+# pin `main._BUDGET_MARGIN = 0` (this file's own [F1] sections above), and
+# every other section here runs at the module default of 0 — a margin was
+# simply never exercised through the window check before.
+#
+# Fixture: [14]'s own 'peakA' hierarchy (n_l1=9, l3_tokens=1869, the SAME
+# CONTROL state [14] uses to prove this is not "decline once the hierarchy
+# is merely large"), with `aprev_tokens=8500` — 500 tokens larger than [14]'s
+# own 8,000, tuned so this state sits close enough to the window ceiling
+# that margin 513 (the SMALLEST value `overshoot + 512` can latch to) is
+# already enough to tip it, the same as the reviewer's real-data measurement
+# (P13-1: 3 of 474 peakA positions already lose the exchange at margin 513).
+# Calibrated empirically against HEAD (SP\fix-3193-r3.md's [19] proof; not
+# derived from this fixture's own token count, so the fix cannot accidentally
+# match what the fixture assumes): at margin 0 the previous exchange
+# survives; at margin 513 AND margin 8192 (the F-02 ceiling) it does not,
+# before this fix.
+# ---------------------------------------------------------------------------
+print("\n[19] P13-1: the window check reads _BUDGET_MARGIN the same way the "
+      "guard does, at the same moment in the same request")
+
+
+def _g19_run(margin, aprev_tokens=8500):
+    """[14]'s own peakA construction, wrapped with the SAME local
+    save/restore [17]/[18] use for `INJECTION_BUDGET_FRACTION` and
+    `summarize` (by the time this section runs, [14]'s own module-level
+    override has long since been restored — see [14]'s `_G14_SAVED_
+    FRACTION`), plus `_BUDGET_MARGIN` for the one thing this section is
+    actually about."""
+    saved_fraction = main.INJECTION_BUDGET_FRACTION
+    saved_summarize = main.summarize
+    saved_margin = main._BUDGET_MARGIN
+    main.INJECTION_BUDGET_FRACTION = 0.75
+    main.summarize = _spy_summarize
+    main._BUDGET_MARGIN = margin
+    try:
+        return _g14_run(9, 1869, aprev_tokens)
+    finally:
+        main.INJECTION_BUDGET_FRACTION = saved_fraction
+        main.summarize = saved_summarize
+        main._BUDGET_MARGIN = saved_margin
+
+
+# [19a] CONTROL: healthy state (margin 0) — reuse fires and her previous
+# exchange survives the real guard, same shape as [14]'s own 'peakA' check
+# above, just at the slightly larger aprev_tokens this section needs.
+_g19a_stored, _g19a_out, _g19a_last, _g19a_render, _ = _g19_run(0)
+check(
+    _g19a_stored == [_g19a_last],
+    f"[19a] CONTROL (margin 0): reuse fires (stored_turns_out={_g19a_stored})",
+)
+main._BUDGET_MARGIN = 0
+_g19a_rep, _g19a_prev, _g19a_newest = _g14_guard(_g19a_out, _g19a_last, "19a")
+check(_g19a_rep.get("fits") is True, f"[19a] the guard fits the payload ({_g19a_rep})")
+check(
+    _g19a_prev,
+    f"[19a] CONTROL: her previous exchange survives at margin 0 ({_g19a_rep})",
+)
+
+for _g19_margin in (513, 8192):
+    _g19_stored, _g19_out, _g19_last, _g19_render, _ = _g19_run(_g19_margin)
+    main._BUDGET_MARGIN = _g19_margin
+    _g19_rep, _g19_prev, _g19_newest = _g14_guard(_g19_out, _g19_last, f"19-{_g19_margin}")
+    main._BUDGET_MARGIN = 0
+    check(
+        _g19_prev,
+        f"*** P13-1 [19] margin={_g19_margin}: her previous exchange "
+        f"survives end to end — either reuse correctly declined (window "
+        f"squeeze, so the declined path's P12-5 protection runs) or reuse "
+        f"fired and the guard still fit the stand-in whole beside it "
+        f"(stored_turns_out={_g19_stored}, guard={_g19_rep}) — before this "
+        f"fix, reuse fired here (the window check never read the margin) "
+        f"and the guard then shed the exchange to find the room the margin "
+        f"cost it",
+    )
+    check(
+        _g19_newest,
+        f"[19] margin={_g19_margin}: the newest turn always survives",
+    )
+
+check(
+    main.reuse_decline_state().get("last_reason") in ("window", "success"),
+    f"[19]: reuse_decline_state() recorded a real outcome for the last "
+    f"margin=8192 attempt above, not a stale value from an earlier section "
+    f"(got {main.reuse_decline_state().get('last_reason')!r})",
+)
+
+
+# ---------------------------------------------------------------------------
+# [20] P13-2 (hostile pass #13, MEDIUM): the fresh-span preview always priced
+# `_fresh_span_preview` at `_PESSIMISTIC_SUMMARY_SCALE` (2.0x), even when
+# `/tokenize` answers and `summarize()` itself packs the SAME list at the
+# MEASURED scale (exact/local — summarize()'s own `_scale = _exact /
+# _local`). Pricing the preview 2x what the real call will use inflates the
+# predicted batch count and, with it, the reserve this check compares
+# against the window — declining reuse on her routine between-L1-rollup
+# uncovered tail even when the real (or worst-case un-folded) summarize()
+# call would have fit. SP\p13-findings.md P13-2: 11-82 extra window declines
+# per 474 positions, each one dropping the uncovered tail from the model's
+# view entirely (P12-5's order forwards it verbatim, then sheds it ahead of
+# memory, in the cap-refusal state a decline lands in).
+#
+# Fixture: [17]'s own hierarchy/fresh-tail builder (`_g17_run`), her peakA
+# shape (l3_tokens=1869) with a 2-pair, 3,750-token-per-message fresh tail
+# and `aprev_tokens=7500` — sized (empirically, against HEAD; not derived
+# from this fixture's own count) so the SAME span needs TWO map-reduce
+# batches at the pessimistic 2.0x scale (reserve 13,705 > the 12,872-token
+# ceiling — declines) but only ONE at her measured ~1.0x range (reserve
+# 12,681 <= 12,872 — fits), because next-fit packs each message
+# independently and four ~3,750-token messages clear one ~29,696-token
+# batch at 1.05x but not at 2.0x.
+# ---------------------------------------------------------------------------
+print("\n[20] P13-2: the fresh-span preview measures the same scale "
+      "summarize() will use, instead of always pricing pessimistically")
+
+_g20_saved_cte = main.count_tokens_exact
+
+
+def _g20_stub_exact(ratio):
+    """None simulates `/tokenize` not answering (summarize()'s own
+    fallback path); a float simulates it answering with that exact/local
+    ratio — same shape as this file's `_g15_exact_counter`/`_f1_tokens`
+    stubs elsewhere, but parameterised on the ratio this section varies."""
+    if ratio is None:
+        return lambda ms, *a, **k: None
+    return lambda ms, *a, **k: int(main.count_tokens(ms) * ratio)
+
+
+def _g20_run(exact_ratio):
+    main.count_tokens_exact = _g20_stub_exact(exact_ratio)
+    try:
+        return _g17_run(_spy_summarize, 2, 3750, n_l1=9, l3_tokens=1869, aprev_tokens=7500)
+    finally:
+        main.count_tokens_exact = _g20_saved_cte
+
+
+# [20a] CONTROL: /tokenize down — falls back to the pessimistic 2.0x scale,
+# unchanged from the shipped behaviour, and still declines. This is the one
+# case the OLD comment's reasoning ("bias toward more predicted batches is
+# the safe direction, the same reasoning summarize()'s own /tokenize-down
+# fallback uses") was actually correct for.
+_g20a_stored, _g20a_out, _g20a_last, _g20a_render, _g20a_log = _g20_run(None)
+check(
+    _g20a_stored == [0],
+    f"[20a] CONTROL (/tokenize down): the preview still falls back to the "
+    f"pessimistic scale and declines, same as before this fix "
+    f"(stored_turns_out={_g20a_stored})",
+)
+
+# [20b] CONTROL: /tokenize answers, and the real measured scale genuinely IS
+# 2.0x (a degraded local counter) — must still decline. The fix reads the
+# real measurement; it does not turn the decline off unconditionally.
+_g20b_stored, _g20b_out, _g20b_last, _g20b_render, _g20b_log = _g20_run(2.0)
+check(
+    _g20b_stored == [0],
+    f"[20b] CONTROL: measured scale 2.0x still declines — the fix is not "
+    f"'always approve', it is 'approve at the real scale' "
+    f"(stored_turns_out={_g20b_stored})",
+)
+
+# [20c] *** THE FIX: /tokenize answers near her measured real range (~1.0x,
+# SP\p13-findings.md's "summarize() POSTs ... token scale ~1.0x" note) —
+# the SAME fresh span that declines at the pessimistic scale above now
+# needs only one batch, fits, and reuses.
+_g20c_stored, _g20c_out, _g20c_last, _g20c_render, _g20c_log = _g20_run(1.05)
+check(
+    _g20c_stored == [_g20c_last],
+    f"*** P13-2 [20c]: the SAME fresh span that declines at the pessimistic "
+    f"scale reuses once the preview measures the real scale "
+    f"(stored_turns_out={_g20c_stored}) — before this fix the preview never "
+    f"asked and always priced this span at 2.0x, one batch more than the "
+    f"measured scale needs",
+)
+_g20c_rep, _g20c_prev, _g20c_newest = _g14_guard(_g20c_out, _g20c_last, "20c")
+check(_g20c_rep.get("fits") is True, f"[20c] the guard fits the payload ({_g20c_rep})")
+check(_g20c_prev, f"[20c]: her previous exchange survives end to end ({_g20c_rep})")
+check(_g20c_newest, "[20c]: the newest turn always survives")
+
+# [20d] invariant (the brief's own requirement): the preview must never
+# count FEWER batches than a larger scale would — next-fit bin-packing is
+# monotone in the per-message price, so raising the scale can only add
+# batches, never remove one. This is what makes "fall back to the
+# pessimistic scale when /tokenize is down" a SAFE direction rather than a
+# guess: whatever the real (measured) scale turns out to be, 2.0x reserves
+# at least as much. Checked directly on `_chunk_to_budget`, independent of
+# compact_if_needed, at the two scales [20a]-[20c] exercise plus the
+# pessimistic constant itself.
+_g20d_span = [
+    fat_turn("user", 3750, "u1"), fat_turn("assistant", 3750, "a1"),
+    fat_turn("user", 3750, "u2"), fat_turn("assistant", 3750, "a2"),
+]
+_g20d_budget = min(
+    main.MAX_MODEL_LEN,
+    max(256, main.MAX_MODEL_LEN - main.SUMMARY_MAX_TOKENS - main.SUMMARY_INPUT_RESERVE),
+)
+_g20d_batches_low = len(main._chunk_to_budget(_g20d_span, _g20d_budget, 1.0))
+_g20d_batches_measured = len(main._chunk_to_budget(_g20d_span, _g20d_budget, 1.05))
+_g20d_batches_pess = len(
+    main._chunk_to_budget(_g20d_span, _g20d_budget, main._PESSIMISTIC_SUMMARY_SCALE)
+)
+check(
+    _g20d_batches_low <= _g20d_batches_measured <= _g20d_batches_pess,
+    f"[20d] invariant: batch count never DECREASES as the packing scale "
+    f"rises (1.0x={_g20d_batches_low}, 1.05x={_g20d_batches_measured}, "
+    f"{main._PESSIMISTIC_SUMMARY_SCALE}x={_g20d_batches_pess}) — the "
+    f"pessimistic fallback used whenever /tokenize does not answer can only "
+    f"ever reserve AS MANY OR MORE batches than the measured scale this fix "
+    f"now prefers when /tokenize does answer, never fewer",
 )
 
 

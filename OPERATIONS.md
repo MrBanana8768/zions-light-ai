@@ -126,7 +126,8 @@ print('declined_no_state:', r.get('declined_no_state'),
 print('last_reason:', r.get('last_reason'), '| last_attempt_age_s:', r.get('last_attempt_age_s'))
 print('declined_recently:', r.get('declined_recently'))
 print('last_declined_ceiling:', r.get('last_declined_ceiling'),
-      '| last_declined_others:', r.get('last_declined_others'))"
+      '| last_declined_others:', r.get('last_declined_others'),
+      '| last_declined_reserve:', r.get('last_declined_reserve'))"
 ```
 
 Added after hostile pass #9 (P9-1/P9-2) found the reuse feature v3.1.9.1
@@ -206,27 +207,95 @@ DIFFERENT pair of numbers depending on which reason produced them:**
   turns ... and the <rendered>-token stand-in fits the <budget>-token
   ceiling, but alongside this conversation's system prompt and recent
   turns it would leave the ~<ceiling>-token window no room for the turns
-  it exists to keep`). Here `last_declined_ceiling` is
-  `effective_limit_est - (system prompt + the recent turns)` — the room
-  actually available for the stand-in — and `last_declined_others` is what
-  the system prompt and the recent turns themselves cost. **`last_declined_
-  ceiling` sitting at or near `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` (or
-  anywhere else) means nothing for THIS reason — it is not that number.**
-  Neither `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` nor
+  it exists to keep (reserve <last_declined_reserve> > <last_declined_
+  ceiling> available)`). `last_declined_ceiling` is `effective_limit_est
+  - (system prompt + the recent turns)` — the room actually available for
+  the stand-in — `last_declined_others` is what the system prompt and the
+  recent turns themselves cost, and `last_declined_reserve` (v3.1.9.3,
+  P13-3 — before this release the number was findable only in the log
+  line) is what was actually COMPARED against the ceiling: the rendered
+  stand-in, plus the fresh-summary reserve when a fresh span is pending
+  (P12-6/P13-2, below), plus a fixed 128-token drift allowance. **`last_
+  declined_ceiling` sitting at or near `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`
+  (or anywhere else) means nothing for THIS reason — it is not that
+  number.** Neither `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` nor
   `COMPACTOR_INJECTION_BUDGET_FRACTION` can move it: raising either only
   changes how big a stand-in is ALLOWED to render before this check runs,
   never what this check compares it against (P12-2's own reproduction:
   raising `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` from 15,000 to 20,000 left
   the SAME requests declining, `last_declined_ceiling` merely following the
-  new inject-budget cap). What DOES move it: fewer or cheaper retained
-  images (`COMPACTOR_MAX_RETAINED_IMAGES`, `COMPACTOR_IMAGE_TOKENS`), a
-  smaller recent reply (nothing to configure — this is about what the user
-  actually sent), or a smaller stored hierarchy (trigger an L3 rollup
-  early, `/admin/...` — see the hierarchy section above). A window decline
-  is not a bug and not data loss: the declined path (v3.1.9.3, hostile
-  pass #12 P12-5) protects the SAME recent turns this check exists to
-  protect, by spending injected memory (facts, retrieval) before them —
-  it is slower and forwards more raw text, not silently worse.
+  new inject-budget cap).
+
+  **What actually moves it** (corrected, hostile pass #13, P13-3 — the
+  list below used to also name `COMPACTOR_IMAGE_TOKENS`, which prices
+  nothing on this pod): a smaller learned budget margin (see
+  `checks.budget_margin`, below — a margin in force shrinks
+  `last_declined_ceiling` directly and is the single biggest lever while
+  it lasts), a smaller `last_declined_reserve` (a smaller uncovered tail
+  or fewer un-folded fresh-summary batches — nothing to configure, this
+  tracks what the conversation actually did between L1 rollups), fewer
+  retained images IF AND ONLY IF the recent window itself carries more
+  images than `COMPACTOR_MAX_RETAINED_IMAGES` allows (`COMPACTOR_
+  IMAGE_TOKENS` moves nothing on a pod with opencv installed — the image
+  ships it from v3.1.9.3, so this pod prices a rendered image by its real
+  per-resolution cost, not the flat estimate `COMPACTOR_IMAGE_TOKENS`
+  names), a smaller recent reply (nothing to configure), or a smaller
+  stored hierarchy (trigger an L3 rollup early, `/admin/...` — see the
+  hierarchy section above).
+
+  **A window decline is not a bug and is not data loss, but it is not
+  free either** (corrected, hostile pass #13, P13-3 — this used to say
+  "slower and forwards more raw text, not silently worse", which held for
+  the hierarchy but not for what sits above it). The declined path
+  (v3.1.9.3, hostile pass #12 P12-5) protects the SAME recent turns this
+  check exists to protect, by spending injected memory (facts, retrieval)
+  before them, and the request is always answered. But in her routine
+  between-L1-rollup state the declined path is usually the cap-refusal
+  case (the uncovered tail, plus whatever changed, exceeds
+  `MAX_SUMMARY_CALLS_PER_REQUEST`): those turns go out VERBATIM rather
+  than summarized, and P12-5's order sheds verbatim turns above the
+  protected floor before it ever touches memory — so the uncovered tail
+  that triggered the decline can reach the model NEITHER summarized NOR
+  verbatim (hostile pass #13, P13-2: measured on 11-82 of 474 positions
+  per state, real data). If `declined_recently` is true for `"window"`
+  and the conversation's replies seem to have forgotten something recent,
+  this is the mechanism to suspect before assuming the hierarchy itself
+  lost it.
+
+#### `checks.budget_margin` — is a learned budget correction narrowing the window right now? (v3.1.9.3, P13-1/P13-3)
+
+```bash
+curl -s localhost:8080/health/full | python3 -c "
+import json,sys; d=json.load(sys.stdin); m=d['checks'].get('budget_margin') or {}
+print('margin:', m.get('margin'), '/ ceiling:', m.get('ceiling'))
+print('release_after:', m.get('release_after'), '| ok_streak:', m.get('ok_streak'))"
+```
+
+`main._BUDGET_MARGIN` is the degraded-mode backstop for when the local
+token count has been WRONG — a vLLM context-length 400 the guard did not
+already predict (a `/tokenize` outage, or a mispriced image) latches it to
+`overshoot + 512`, up to `MAX_MODEL_LEN // 4` (`ceiling` above), in ONE
+step, and it applies PROCESS-WIDE (one uvicorn worker, one margin, every
+conversation) until `release_after` (`COMPACTOR_BUDGET_MARGIN_RELEASE_
+AFTER`, default 50) consecutive ACCEPTED requests halve it — `ok_streak`
+is how far into that count this process already is. Before this release
+the ONLY way to learn a margin was in force was the one-time "context
+calibration" log line at boot, or the "margin N" suffix on a hard-budget
+shed line if one happened to fire while it was up; the adversarial suite's
+own F-02 finding (`tests/adversarial/test_adv_faults.py`) names the gap
+explicitly ("/health/full has no margin field"). This is visibility-only —
+it never appears in `status_reasons` and never degrades `status`: the
+process is already correcting itself, and a 400 without it would be worse.
+
+**While `margin` is nonzero, both `_enforce_hard_budget` (the hard-budget
+guard) and the P11-6/P12-1/P13-1 reuse window check subtract it from their
+own limit before deciding anything** — so a nonzero margin is the single
+biggest thing that can move `checks.reuse`'s `last_declined_ceiling` for
+`"window"` (see above) on a conversation that was reusing fine a moment
+ago. If reuse looks like it "just stopped working" and `checks.budget_
+margin.margin` is nonzero, that is very likely why, and the fix is time
+(`ok_streak` accepted requests) rather than a config change — the margin
+already IS the config change reacting to a real overshoot it measured.
 
 #### `config.time_injection` — the current-time feature (v3.1.9)
 

@@ -17,9 +17,75 @@ four parallel lanes: the reuse ceiling accounting for the recent window
 `opencv` extra that keeps the real chat template from loading (lane opencv),
 and — this lane's own items — a release gate that had been silently skipping
 its only real-tokenizer suite for three releases, and an adversarial test
-that could no longer tell a genuine reuse success from a decline.
+that could no longer tell a genuine reuse success from a decline. Hostile
+pass #13's own real-data replay then found one more HIGH in the reuse
+window check itself (P13-1, below) plus a MEDIUM and two LOWs, closed in
+this same release before it shipped.
 
 ### Fixed
+- **P13-1 (HIGH): the reuse window check now reads the learned budget
+  margin the guard already reads.** After a vLLM context-length 400 the
+  guard did not predict (a `/tokenize` outage, a mispriced image),
+  `_BUDGET_MARGIN` latches to `overshoot + 512` (up to the
+  `MAX_MODEL_LEN // 4` ceiling) in one step, process-wide, and
+  `_enforce_hard_budget` shrinks its own limit by it before shedding a
+  token — but the P11-6/P12-1 window check above recovered the same
+  `effective_limit` and never subtracted the same margin. While a margin
+  was in force, this check could approve a stand-in the guard, needing
+  that many more tokens of room than the check thought existed, could not
+  actually fit beside the previous exchange — reuse "succeeded" and the
+  guard then shed U_prev/A_prev to find the room, giving back exactly what
+  P12-5 (below) fixed on the declined path. Real-data replay (hostile pass
+  #13, `SP\p13-findings.md`): at her current hierarchy, 1/30/313 of 474
+  positions lost the exchange at margins 513/4,096/8,192; at peakA, up to
+  453. Never worse than v3.1.9.2 in the same state. Fixed by subtracting
+  `_BUDGET_MARGIN` from the check's own `_effective_limit_est`, the same
+  global the guard reads, at the same point in the same request. The
+  learned margin is also now visible at `/health/full`'s
+  `checks.budget_margin` (`main.budget_margin_state()`) — before this it
+  had no field anywhere in that endpoint (the adversarial suite's own F-02
+  names the gap by name).
+- **P13-2 (MEDIUM): the fresh-summary reserve now prices the batch count at
+  the scale `summarize()` will actually use.** The P12-6 reserve (below)
+  priced its batch-count preview at the flat pessimistic scale (2.0x)
+  unconditionally, reasoning that it mirrored `summarize()`'s own
+  `/tokenize`-down fallback — but `summarize()` only falls back to 2.0x
+  when `/tokenize` does not answer; otherwise it packs the same list at
+  the measured, ~1.0x scale. In her routine between-L1-rollup state (an
+  uncovered tail past the last L1 chunk, present on every request) this
+  inflated the predicted batch count and declined reuse on 11-82 of 474
+  positions per state that would have fit even the real call's un-folded
+  worst case — each decline drops the uncovered tail from the model's
+  view entirely (the declined path's cap-refusal case forwards it
+  verbatim, then sheds it ahead of memory). Fixed: one more
+  `count_tokens_exact` call measures the real scale on the same span
+  `summarize()` will use, falling back to the pessimistic 2.0x only when
+  `/tokenize` genuinely does not answer.
+- **P13-3 (LOW, documentation): three passages describing a
+  replay-harness artifact as a measurement corrected** (see P12-6's own
+  correction below); the runbook's window-decline guidance now names the
+  knobs that actually move it and the fresh-summary reserve alongside
+  `last_declined_ceiling`/`last_declined_others` in `checks.reuse`
+  (`last_declined_reserve`); "not silently worse" replaced with what a
+  window decline actually drops in the cap-refusal state P13-2 measured.
+- **P13-4 (LOW): the hard-budget guard's memory-before-previous-exchange
+  order (P12-5, below) now holds on a conversation with no system
+  prompt.** `_droppable_system_indices` used to clamp with `sys_idxs[max(1,
+  protect_system):]` — protecting at least the first system message even
+  when the caller sent none — so on a request with no system prompt
+  (`caller_system == 0`), whatever `inject_system_block` put at index 0
+  (facts, if no persona precedes it) read as "the caller's own", the
+  P12-5 branch never triggered, and the floor-less generic shed loop it
+  exists to preempt reached her previous exchange first, with injected
+  memory sitting right beside it, unspent. Fixed by trusting the
+  function's own documented contract (`sys_idxs[protect_system:]`, no
+  floor). The compaction stand-in keeps its protection by content
+  (`_is_compaction_standin`) in the memory-first branch, and is spent
+  only as the very last resort, the same with or without a caller prompt
+  in front of it. The clamp used to shield it from that last resort only
+  when it happened to sit at index 0. `test_budget_guard.py`'s system-less
+  test pinned that position rule with a fixture that was never a real
+  stand-in; it now pins the content rule and the parity instead.
 - **P11-6/P12-1: reuse no longer squeezes her recent conversation, at any
   image price.** The v3.1.9.2 reuse ceiling ignored the recent window, so
   at the hierarchy size its 15000 cap was raised for (~13k tokens, hers is
@@ -84,9 +150,8 @@ that could no longer tell a genuine reuse success from a decline.
   real-data replay of P12-1 found one state still open: with a fresh
   summary attached to the stand-in (routine — 3 `summarize()` calls per
   reusing request between L1 rollups, per hostile pass #11 — not an edge
-  case), reuse still lost her previous exchange at 26 of 474 positions
-  where declining kept it. Cause: the reserve's fresh-summary allowance
-  assumed exactly one `SUMMARY_MAX_TOKENS` batch. `summarize()` map-
+  case), the reserve's fresh-summary allowance assumed exactly one
+  `SUMMARY_MAX_TOKENS` batch. `summarize()` map-
   reduces the fresh span over budget-sized batches, and when the reduce
   phase cannot fold them (the per-request call budget exhausted by the
   map phase, or two dense partials together still missing the reduce

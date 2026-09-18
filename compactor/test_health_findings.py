@@ -1244,6 +1244,71 @@ def test_p11_1_reuse_success_is_not_recorded_before_the_fresh_span_summarize():
           "as both a success and an error")
 
 
+def test_p13_1_budget_margin_signal_reaches_health_full():
+    """P13-1/P13-3 (hostile pass #13): checks.budget_margin. Before this,
+    the learned budget margin (main._BUDGET_MARGIN — the degraded-mode
+    backstop `_enforce_hard_budget` and, since P13-1, the P11-6/P12-1
+    window check both subtract from their own limit while it is in force)
+    had NO field anywhere in /health/full. The repo's own adversarial suite
+    names the gap by name (F-02, test_adv_faults.py: "/health/full has no
+    margin field") — a margin latched by one lying `/tokenize` response
+    lasts up to COMPACTOR_BUDGET_MARGIN_RELEASE_AFTER accepted requests and
+    was, until this fix, invisible to an operator reading this endpoint.
+
+    Same call-time, sys.modules-based wiring as `checks.reuse`/
+    `checks.tokenizer` above (`health._budget_margin_state()` reads
+    `main.budget_margin_state()`) — this test drives the real global
+    directly (cheap, no request needed) and confirms the SAME number
+    reaches `gather_health_full`'s payload, restoring it afterward so this
+    test cannot leak a margin into any test that runs after it.
+    """
+    print("\n[P13-1/P13-3] checks.budget_margin reads main.budget_margin_state()")
+    import main  # local: this module does not import main at module scope
+
+    saved_margin = main._BUDGET_MARGIN
+    saved_streak = main._budget_ok_streak
+    try:
+        main._BUDGET_MARGIN = 0
+        healthy = health._budget_margin_state()
+        check(healthy.get("available") is True,
+              f"main is loaded in this process, so checks.budget_margin must "
+              f"read it (got {healthy})")
+        check(healthy.get("margin") == 0,
+              f"*** a healthy process (no margin learned) reads margin=0 "
+              f"(got {healthy})")
+
+        main._BUDGET_MARGIN = 4096
+        main._budget_ok_streak = 7
+        degraded = health._budget_margin_state()
+        check(degraded.get("margin") == 4096,
+              f"*** a learned margin reaches checks.budget_margin unchanged "
+              f"(got {degraded})")
+        check(degraded.get("release_after") == main.BUDGET_MARGIN_RELEASE_AFTER,
+              f"*** release_after names the real "
+              f"COMPACTOR_BUDGET_MARGIN_RELEASE_AFTER, not a copy that can "
+              f"drift from it (got {degraded})")
+        check(degraded.get("ok_streak") == 7,
+              f"*** ok_streak is the live count toward release, not a stale "
+              f"0 (got {degraded})")
+        check(degraded.get("ceiling") == main.MAX_MODEL_LEN // 4,
+              f"*** ceiling names the real MAX_MODEL_LEN//4 cap "
+              f"_note_backend_rejection latches to, not a hand-copied "
+              f"number that can drift from it (got {degraded})")
+
+        r = full()
+        check("budget_margin" in r["checks"],
+              "*** gather_health_full's checks dict carries 'budget_margin'")
+        check(r["checks"].get("budget_margin", {}).get("margin") == 4096,
+              "and it is the SAME live state _budget_margin_state() reads "
+              "directly, not a stale or re-derived copy")
+        check(r["status"] != "down",
+              "visibility-only: a learned margin does not itself take the "
+              "pod down — it is a self-healing degraded mode, not a fault")
+    finally:
+        main._BUDGET_MARGIN = saved_margin
+        main._budget_ok_streak = saved_streak
+
+
 def test_p11_3_declined_recently_follows_only_a_real_budget_decline():
     """P11-3 (hostile pass #11, LOW): OPERATIONS.md documents
     `declined_recently` as following "the most recent BUDGET decline
@@ -1418,6 +1483,7 @@ TESTS = [
     test_p11_1_reuse_success_is_not_recorded_before_the_fresh_span_summarize,
     test_p11_3_declined_recently_follows_only_a_real_budget_decline,
     test_p12_2_window_decline_has_its_own_reason_and_numbers,
+    test_p13_1_budget_margin_signal_reaches_health_full,
 ]
 
 

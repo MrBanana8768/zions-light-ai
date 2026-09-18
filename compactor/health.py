@@ -1301,6 +1301,43 @@ def _reuse_state() -> dict:
     return {"available": True, **st}
 
 
+def _budget_margin_state() -> dict:
+    """checks.budget_margin: main.budget_margin_state(), or why it cannot be
+    read. Same call-time, sys.modules-based pattern as _tokenizer_state and
+    _reuse_state above.
+
+    P13-1/P13-3 (hostile pass #13): the learned budget margin
+    (main._BUDGET_MARGIN) had no field anywhere in this endpoint — the
+    adversarial suite's own F-02 says so by name. It is reachable from a
+    single vLLM context-length 400 the guard did not predict (a `/tokenize`
+    outage, a mispriced image), it can silently cost reuse her previous
+    exchange while it is in force (see main.py's P13-1 fix in
+    compact_if_needed), and it takes up to
+    COMPACTOR_BUDGET_MARGIN_RELEASE_AFTER (default 50) consecutive accepted
+    requests to fully release. Visibility only, like `tokenizer`/`reuse`
+    above — a nonzero margin does not move `status`: it is a self-healing
+    degraded mode the process is already correcting, not a fault to alarm
+    an operator awake for.
+    """
+    main_mod = sys.modules.get("main")
+    if main_mod is None:
+        return {"available": False,
+                "reason": "main is not loaded in this process"}
+    fn = getattr(main_mod, "budget_margin_state", None)
+    if not callable(fn):
+        return {"available": False,
+                "reason": "main.budget_margin_state() is not present in this build"}
+    try:
+        st = fn()
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        return {"available": False, "reason": err, "error": err}
+    if not isinstance(st, dict):
+        err = f"main.budget_margin_state() returned {type(st).__name__}, not a dict"
+        return {"available": False, "reason": err, "error": err}
+    return {"available": True, **st}
+
+
 async def gather_health_full(
     vllm_url: str, target_tokens: int, tokenize: dict | None = None
 ) -> dict:
@@ -1367,6 +1404,9 @@ async def gather_health_full(
     tokenizer = _tokenizer_state()
     # P9-1/P9-2 (hostile pass #9): same pattern, for reuse declines.
     reuse = _reuse_state()
+    # P13-1/P13-3 (hostile pass #13): same pattern again, for the learned
+    # budget margin reuse's own window check now reads (main.py P13-1).
+    budget_margin = _budget_margin_state()
 
     # Why a reason list and not a bare string: `bg` used to be computed here,
     # placed in the payload, and never read. Sustained shedding — the pool
@@ -1998,6 +2038,10 @@ async def gather_health_full(
             # {"available": false, ...}. Visibility only — does not affect
             # `status`, the same as `tokenizer` above.
             "reuse": reuse,
+            # v3.1.9.3 (P13-1/P13-3): main.budget_margin_state(), or
+            # {"available": false, ...}. Visibility only — does not affect
+            # `status`, the same doctrine as `tokenizer`/`reuse` above.
+            "budget_margin": budget_margin,
         },
         "stats": stats,
         "backups": backup_info,

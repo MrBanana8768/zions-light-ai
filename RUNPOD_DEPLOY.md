@@ -623,9 +623,18 @@ the compactor handles them correctly:
 - **Image turns survive compaction** — they're kept verbatim rather than
   summarized to text (which would lose the image), so the model can still see
   an image many turns later.
-- **Image tokens are budgeted** — `COMPACTOR_IMAGE_TOKENS` (default 768) is
-  added per image so long, image-heavy threads don't overflow the context
-  window. Raise it if the model errors on big image threads.
+- **Image tokens are budgeted** — with `opencv-python-headless` installed
+  (shipped in the image since v3.1.9.3, so the real chat template can render an
+  image at all), `count_tokens` prices a RENDERED image by its actual
+  markers in the template output (measured within ~3 tokens of vLLM's own
+  per-resolution cost at 256/512/1024/2048px). `COMPACTOR_IMAGE_TOKENS`
+  (default 4096) is a flat per-image fallback used ONLY for an image the
+  template did NOT render (no chat template applicable, or opencv
+  unavailable) — corrected, hostile pass #13 (P13-3): this used to say it
+  is "added per image" unconditionally, which stopped being the common
+  case once opencv shipped. On a pod running the shipped default, raising
+  `COMPACTOR_IMAGE_TOKENS` moves nothing for a rendered image; it only
+  helps the un-rendered fallback path.
 
 Most VLMs want `--limit-mm-per-prompt image=N` in `VLLM_EXTRA_ARGS`; some
 (Pixtral) want `--tokenizer-mode mistral`. The creative-writing models and the
