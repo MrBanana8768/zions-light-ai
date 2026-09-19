@@ -184,6 +184,23 @@ def _tight_cluster_vecs(n: int) -> list[list[float]]:
     return [[1.0, i * 0.001] for i in range(n)]
 
 
+def _vec_for_related_fact(text: str) -> list[float]:
+    """Text-driven twin of `_tight_cluster_vecs`, for the SAME formula:
+    "related-fact-{i}" always gets [1.0, i*0.001], read from its own
+    suffix rather than from the size of whatever batch happens to be
+    asked for. v3.1.9.4 B1 made dedup's embedding call go through
+    retrieval._embed_cached, which — correctly — asks the mocked
+    `retrieval._embed` for only the facts it has not already cached, not
+    the whole growing blob every pass; a mock keyed by list POSITION
+    (`_tight_cluster_vecs(len(facts_so_far))`) breaks the moment the
+    request it receives is a subset. Keying by the text itself instead
+    gives the identical vector a full-batch call always gave, for any
+    subset in any order — see _run_growing_blob.
+    """
+    i = int(text.rsplit("-", 1)[1])
+    return [1.0, i * 0.001]
+
+
 async def _run_growing_blob(conv_id: str, start: int, end: int):
     """Simulate `end - start` passes of a transitive blob that gains one
     member per pass, all-KEEP (the 97.3%-of-clusters case). Returns the
@@ -196,7 +213,7 @@ async def _run_growing_blob(conv_id: str, start: int, end: int):
         client = MagicMock()
         client.post = AsyncMock(return_value=_mock_chat_response("KEEP"))
         with patch.object(retrieval, "_embed",
-                           lambda texts, _n=len(facts_so_far): _tight_cluster_vecs(_n)), \
+                           lambda texts: [_vec_for_related_fact(t) for t in texts]), \
              patch.object(dedup, "MAX_LLM_CALLS_PER_PASS", 1000):
             result, removed = await dedup.dedup_facts(
                 client, "http://x", "m", facts_so_far, conv_id=conv_id
@@ -277,6 +294,20 @@ def test_deferred_backlog_shrinks_under_a_saturated_call_budget():
         v[-1] = (member_id % 1000) * 0.0005
         return v
 
+    def _vec_for_text(text, dims):
+        # "blob{b}-fact{m}" -> vec_for(b, m, dims). Text-driven, not
+        # position-driven: v3.1.9.4 B1 routed dedup's embedding call
+        # through retrieval._embed_cached, which asks the mocked
+        # `retrieval._embed` for only the facts NOT already cached from an
+        # earlier pass in this same run — a mock that returns a
+        # pre-built, whole-pass `vecs` list regardless of which (possibly
+        # partial) `texts` it was actually asked for breaks as soon as
+        # that request is a subset. This one derives each vector from its
+        # own text, so it is correct for any subset in any order,
+        # including the one-new-member-per-pass case this test relies on.
+        blob_part, fact_part = text.split("-")
+        return vec_for(int(blob_part[len("blob"):]), int(fact_part[len("fact"):]), dims)
+
     async def run(splitfn):
         dims = n_blobs + 1
         with patch.object(dedup, "_split_cluster", splitfn):
@@ -287,16 +318,16 @@ def test_deferred_backlog_shrinks_under_a_saturated_call_budget():
                 for _ in range(growth_per_pass):
                     blobs[turn % n_blobs] += 1
                     turn += 1
-                facts, vecs = [], []
+                facts = []
                 for b in range(n_blobs):
                     for m in range(blobs[b]):
                         facts.append(_fact(f"blob{b}-fact{m}", added_turn=turn))
-                        vecs.append(vec_for(b, m, dims))
                 client = MagicMock()
                 client.post = AsyncMock(return_value=_mock_chat_response("KEEP"))
                 stats = {"facts": len(facts), "clusters": 0, "memo_skips": 0,
                           "calls": 0, "merges": 0, "removed": 0, "deferred": 0}
-                with patch.object(retrieval, "_embed", lambda texts, v=vecs: v), \
+                with patch.object(retrieval, "_embed",
+                                   lambda texts, d=dims: [_vec_for_text(t, d) for t in texts]), \
                      patch.object(dedup, "MAX_LLM_CALLS_PER_PASS", cap):
                     await dedup._dedup_pass(
                         client, "http://x", "m", facts, "c-deferred-sim", stats
@@ -407,6 +438,9 @@ if __name__ == "__main__":
     try:
         for t in _all_tests():
             dedup.reset_refusal_memo()
+            # v3.1.9.4 B1: dedup's embedding call is now cached by text
+            # (retrieval._embed_cached), process-scoped like the memo above.
+            retrieval.reset_vector_cache()
             t()
         print("\nAll dedup churn-gate tests passed.")
     finally:

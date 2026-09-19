@@ -725,6 +725,13 @@ if __name__ == "__main__":
         test_ranking_falls_back_to_lru_when_embedder_returns_none()
         test_ranking_falls_back_to_lru_when_embedder_raises()
         test_ranking_falls_back_when_vector_count_mismatches()
+        # v3.1.9.4 B1: the default (no embedder=) path now goes through
+        # retrieval._embed_cached, a process-scoped cache. This is the
+        # only test in this file that exercises that path directly
+        # (patch.object(retrieval, "_embed", ...) rather than passing
+        # embedder=) — reset first so it never depends on what an earlier
+        # test happened to leave cached.
+        retrieval.reset_vector_cache()
         test_default_embedder_wiring_reaches_retrieval_module()
 
         test_pinned_fact_survives_a_query_it_has_nothing_to_do_with()

@@ -7186,6 +7186,9 @@ class SseAccumulator:
       partial events until \\n\\n delimiter)
     - Non-content events (role-only deltas, finish_reason, [DONE])
     - Malformed JSON in a single event (just drops that one event)
+    - vLLM's own in-band mid-stream failure (v3.1.9.4 B4 / P15-1): a
+      `{"error": ...}` event, or a choice with `finish_reason: "error"`,
+      followed by [DONE] as if nothing happened — see errored()/complete()
 
     Failures NEVER raise — fact extraction is best-effort downstream.
     """
@@ -7220,6 +7223,12 @@ class SseAccumulator:
         # nothing. See feed() and finalize() for where it is actually set
         # now.
         self._holed: bool = False
+        # v3.1.9.4 B4 (P15-1). Set when this accumulator has seen vLLM's
+        # own in-band failure event mid-stream. Sticky, same reasoning as
+        # _holed: a [DONE] that follows an error is not a finish, and
+        # nothing later in the stream can undo that — see complete()'s
+        # docstring and feed()'s handling of the "error" shapes.
+        self._errored: bool = False
 
     def feed(self, chunk: bytes) -> None:
         try:
@@ -7255,9 +7264,51 @@ class SseAccumulator:
                     continue
                 try:
                     obj = json.loads(payload)
+                    # v3.1.9.4 B4 (P15-1). vLLM 0.19's own request-level
+                    # internal-failure shape: after streaming some
+                    # content, ONE `{"error": {"message": ..., "type":
+                    # ..., "code": 500}}` event, then [DONE] — no
+                    # "choices" key at all. `obj.get("choices", [{}])[0]`
+                    # below would default to `{}` for this shape (no
+                    # KeyError, no crash), so `fr`/`content` both come
+                    # back empty and the event was silently ignored: the
+                    # only trace left was [DONE] a moment later, which
+                    # set _complete exactly as it would for a reply that
+                    # genuinely finished. Checked BEFORE the choices walk,
+                    # and sticky (see __init__): a [DONE] later in the
+                    # SAME buffer, or in a later feed() call, must not
+                    # undo it — complete() checks _errored first.
+                    if isinstance(obj, dict) and "error" in obj:
+                        self._errored = True
+                        if logsetup.log_once("accumulator.feed.error_event"):
+                            err = obj.get("error")
+                            msg = (
+                                err.get("message")
+                                if isinstance(err, dict) else err
+                            )
+                            logger.warning(
+                                f"vLLM stream carried an in-band error "
+                                f"event ({msg!r}); treating the reply as "
+                                f"CUT, not finished, even though [DONE] "
+                                f"may still follow"
+                            )
+                        continue
                     choice = obj.get("choices", [{}])[0]
                     fr = choice.get("finish_reason")
-                    if fr:
+                    if fr == "error":
+                        # The OTHER shape the finding names: a choice
+                        # naming its own finish_reason "error" rather than
+                        # a top-level object. Same treatment; deliberately
+                        # NOT folded into the `if fr:` branch below, which
+                        # sets _complete — an errored finish is exactly
+                        # the case that must NOT read as finished.
+                        self._errored = True
+                        if logsetup.log_once("accumulator.feed.error_finish_reason"):
+                            logger.warning(
+                                "vLLM stream's finish_reason was 'error'; "
+                                "treating the reply as CUT, not finished"
+                            )
+                    elif fr:
                         self._complete = True
                         # "length" means vLLM hit the token ceiling, not that
                         # the model finished. The text is a cut-off sentence.
@@ -7314,8 +7365,16 @@ class SseAccumulator:
         actually FINISHED the reply. A client disconnect mid-stream leaves
         this False, and the async tail must not memorize the half-reply as if
         the model said it (rc6 review: truncated text was being fact-extracted
-        and rolled into summaries as a completed assistant turn)."""
-        return self._complete
+        and rolled into summaries as a completed assistant turn).
+
+        v3.1.9.4 B4 (P15-1): also False once an in-band error event has
+        been seen (see feed()'s handling of vLLM 0.19's `{"error": ...}`
+        shape), REGARDLESS of _complete — [DONE] still arrives after
+        vLLM's own mid-stream failure, and it does not mean the model
+        finished. Same sticky-flag shape as holed() overriding a clean
+        finish: an accumulator that knows something is wrong must say so
+        even when the OTHER signal looks fine."""
+        return self._complete and not self._errored
 
     def truncated(self) -> bool:
         """True when the stream ended with finish_reason "length" — vLLM hit
@@ -7353,6 +7412,19 @@ class SseAccumulator:
         path, where a hole was memorized silently until v3.1.4."""
         return self._holed
 
+    def errored(self) -> bool:
+        """True when vLLM sent an in-band failure event mid-stream (v3.1.9.4
+        B4 / P15-1) — a top-level `{"error": ...}` event (vLLM 0.19's
+        request-level internal-failure shape), or a choice whose
+        `finish_reason` is itself `"error"`. Sticky, same as holed(): once
+        set it stays set for the life of this accumulator, because a
+        [DONE] that follows an in-band error is not a finish. complete()
+        already folds this in (False whenever errored() is True); this
+        getter exists so a caller can log or count the distinction rather
+        than only see "did not finish" with no reason — the same
+        motivation truncated() has next to complete()."""
+        return self._errored
+
     def usable(self) -> bool:
         """Describes the STREAM: the model finished, and it finished because
         it was done rather than because it ran out of room.
@@ -7365,8 +7437,12 @@ class SseAccumulator:
         in decide_memory_tail, which trims a cut reply to its last complete
         sentence and judges what is left. Gating the tail on this method
         again would reintroduce that loss; it is kept because "did the stream
-        finish cleanly" is still a true thing to be able to ask."""
-        return self._complete and not self._truncated
+        finish cleanly" is still a true thing to be able to ask.
+
+        v3.1.9.4 B4: also False on an in-band error (complete() already
+        folds this in, so `not self._truncated` alone would not — a reply
+        that errored was never truncated, but it is not usable either)."""
+        return self._complete and not self._truncated and not self._errored
 
 
 def _fire_and_forget(coro, label: str | None = None) -> bool:

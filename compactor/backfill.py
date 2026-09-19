@@ -13,8 +13,16 @@ Design choices (per V2.0 plan):
   next request, typically within ~30s-2min depending on conversation
   length on Magnum 12B.
 - **State tracked on disk** in `backfill_state.json` per conv so a pod
-  restart mid-backfill knows to resume rather than re-extract everything
-  (or worse, mark facts file as incomplete forever).
+  restart mid-backfill is visible and can be retried rather than the
+  record sitting `in_progress` forever with nothing reading it. v3.1.9.4
+  B2 (P15-2): this is a RETRY (restart from the top over the current
+  message history, `_merge_backfilled` deduping against whatever is on
+  disk), not an incremental resume from `exchanges_done` — a prior
+  design note here claimed resume-from-progress behaviour that the code
+  never actually had; `needs_backfill` is what decides a retry is due,
+  and it reads the RECORD, not "does a facts file exist" (a live tail's
+  own writes during an abandoned run used to look, permanently, like V2
+  had already taken over).
 - **Stale-detection** so a crashed backfill (process killed, OOM, etc.)
   gets retried on next encounter rather than blocking memory creation
   for that conv forever.
@@ -207,28 +215,62 @@ _MIN_MESSAGES_FOR_BACKFILL = 4
 
 def needs_backfill(conv_id: str, messages: list[dict]) -> bool:
     """Return True iff this conv has enough history to be worth backfilling
-    AND has no facts file yet AND no in-progress (non-stale) backfill.
+    AND (no facts file yet, OR an earlier backfill of THIS conversation was
+    abandoned or failed) AND no in-progress (non-stale) backfill is already
+    running.
+
+    v3.1.9.4 B2 (P15-2). Until this fix, `facts_path(conv_id).is_file()`
+    was checked FIRST and unconditionally returned False the moment any
+    facts file existed — including one the KICKOFF REQUEST'S OWN live tail
+    wrote within seconds of the reply, while a lazy backfill of the same
+    conversation's full history was still minutes into running in the
+    background. A redeploy, OOM or crash any time after that first live
+    tail write (P15-2's real-data run lengths: up to 2h43m for 195
+    exchanges) left the backfill record permanently `in_progress` with no
+    reader, and every later request for that conversation saw a facts file
+    and never tried again — the history before that first live exchange
+    was gone for good, silently.
+
+    The retry condition is now the RECORD, not "does a facts file exist":
+    a facts file only means "V2 has taken over from V1" when there is no
+    unfinished backfill record for this exact conversation still open. See
+    _run_backfill's own up-front refusal, which this decision has to agree
+    with — a resumed run's `existing` facts (the live tail's writes made
+    during the abandoned attempt) must NOT cause it to refuse itself as
+    "not a V1 store"; `_merge_backfilled`'s additive merge is what makes
+    running a resumed pass over a non-empty store safe.
     """
     if len(messages) < _MIN_MESSAGES_FOR_BACKFILL:
         return False  # too short to bother
-    if facts_path(conv_id).is_file():
-        # Facts already exist — V2 took over from new. Advisory only: this
-        # runs at kickoff and the task starts later, so _run_backfill repeats
-        # the check with load_facts under the lock before it does any work
-        # (v3.1 F3). Kept as is_file() here because it is the cheaper answer
-        # and because an existing-but-empty facts file is still a store this
-        # module has no business reconstructing.
+    if not facts_module.extraction_enabled():
+        # v3.1.9.4 B2 (P15-8). Backfill's whole job is spending vLLM calls
+        # to extract facts; with extraction off there is nothing for it to
+        # do; _facts_tail already honours this switch (main.py:7381) and a
+        # sibling that runs the identical kind of call must too.
         return False
     state = read_state(conv_id)
-    if state is None:
-        return True  # never attempted
-    s = state.get("state")
-    if s == "complete":
-        return False  # already done
-    if s == "in_progress" and not is_stale(state):
-        return False  # someone else is on it
-    # "failed" or stale "in_progress" → retry
-    return True
+    if state is not None:
+        s = state.get("state")
+        if s == "complete":
+            return False  # already done
+        if s == "in_progress":
+            return is_stale(state)  # someone else is on it, unless they died
+        if s == "failed":
+            return True  # retry a clean failure same as a crashed one
+        # Any other/unknown value on disk: fall through to the facts-file
+        # check below rather than guess — same as "no record" (state=None).
+    if facts_path(conv_id).is_file():
+        # No backfill record for this conversation at all (state is None,
+        # or an unrecognised value handled just above) — the ORIGINAL v2.0
+        # gate: facts already exist, so this is not a fresh V1 conversation
+        # and there is nothing to reconstruct. Advisory only: this runs at
+        # kickoff and the task starts later, so _run_backfill repeats the
+        # check with load_facts under the lock before it does any work
+        # (v3.1 F3). Kept as is_file() here because it is the cheaper
+        # answer and because an existing-but-empty facts file is still a
+        # store this module has no business reconstructing.
+        return False
+    return True  # never attempted, and no facts file either
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +334,18 @@ async def _run_backfill(
         # main.py:1509 hands us the CLIENT's message array — under the
         # 2026-08-24 7-of-241 condition a triggered backfill extracts from 7
         # messages and saves that as the entire store (v3.1 F3).
+        # v3.1.9.4 B2 (P15-2). Read BEFORE this run's own _write_state below
+        # overwrites it: a resumed pass (a stale in_progress or a failed
+        # record for THIS conversation) is expected to find non-empty
+        # `existing` facts — the live tail wrote them seconds after the
+        # kickoff reply, minutes before the earlier attempt died — and
+        # those are not evidence this is no longer a V1 store, just the
+        # window between "backfill decided to run" and "backfill finished".
+        prior_state = read_state(conv_id)
+        resuming = prior_state is not None and (
+            prior_state.get("state") == "failed"
+            or (prior_state.get("state") == "in_progress" and is_stale(prior_state))
+        )
         async with conv_lock(conv_id):
             try:
                 existing = facts_module.load_facts(conv_id)
@@ -305,12 +359,22 @@ async def _run_backfill(
                     f"reconstruction"
                 )
                 return
-        if existing:
+        if existing and not resuming:
             logger.info(
                 f"conv={conv_id}: backfill refused — {len(existing)} fact(s) "
                 f"already on disk; this is not a V1 store"
             )
             return
+        if existing and resuming:
+            logger.info(
+                f"conv={conv_id}: resuming a backfill whose earlier attempt "
+                f"left state={prior_state.get('state')!r} "
+                f"({prior_state.get('exchanges_done', 0)}/"
+                f"{prior_state.get('exchanges_total', 0)} exchanges done) — "
+                f"{len(existing)} fact(s) already on disk (from the live "
+                f"tail or a prior partial pass) will be merged with, not "
+                f"replaced by, this pass's extraction"
+            )
 
         pairs = extract_user_assistant_pairs(messages)
         if not pairs:
@@ -330,7 +394,13 @@ async def _run_backfill(
             for i, (user_text, asst_text) in enumerate(pairs, start=1):
                 try:
                     new_strs = await facts_module.extract_facts_from_exchange(
-                        client, vllm_url, model, user_text, asst_text, accumulated
+                        client, vllm_url, model, user_text, asst_text, accumulated,
+                        # v3.1.9.4 B2 (P15-8 fix, incidental): without this
+                        # every backfill extraction call logged
+                        # "conv=? (caller passed none)", so a backfill's
+                        # load on vLLM could not be attributed to the
+                        # conversation causing it.
+                        conv_id=conv_id,
                     )
                     for s in new_strs:
                         accumulated.append({

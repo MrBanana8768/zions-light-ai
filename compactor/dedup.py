@@ -10,7 +10,7 @@ wastes context-window budget on the same idea three ways.
 
 Hybrid two-stage design:
 
-  Stage 1 — embedding clustering (cheap):
+  Stage 1 — embedding clustering:
     Re-use the bge-small ONNX model from retrieval. Compute pairwise
     cosine similarity. Cluster fact indices via union-find above a
     configurable threshold (default 0.75). Singletons are dropped — only
@@ -24,8 +24,16 @@ Hybrid two-stage design:
     Temperature 0.0 + a KEEP-on-doubt prompt to keep the LLM conservative.
 
 Cost shape:
-  - Stage 1: O(N²) cosine comparisons on 384-dim vectors. 50 facts ≈ 1275
-    compares ≈ <1ms.
+  - Stage 1's cosine comparisons ARE cheap: O(N²) on 384-dim vectors, 50
+    facts ~= 1275 compares ~= <1ms. Getting the VECTORS is not: _embed_facts
+    used to hand the WHOLE fact list to the embedding model, unbatched
+    against nothing already known, on every call this module was ever
+    entered from — v3.1.9.4 B1 (P15-4) measured that against her real
+    ~190-fact store at ~12.9s, inline under conv_lock, on every memory
+    tail that ran dedup. _embed_facts now goes through
+    retrieval._embed_cached, keyed on (model, exact text), so a tail whose
+    store did not change since the last one it ran on re-embeds nothing;
+    see _embed_facts and retrieval._embed_cached's docstrings.
   - Stage 2: one LLM call per candidate cluster, minus the clusters the
     model has already refused this process (see the refusal memo below).
     MAX_LLM_CALLS_PER_PASS caps total at 10 so even pathological
@@ -91,6 +99,7 @@ import re
 from collections import OrderedDict
 
 import httpx
+from starlette.concurrency import run_in_threadpool
 
 import facts as facts_module
 import retrieval as retrieval_module
@@ -292,6 +301,13 @@ def _embed_facts(facts: list[dict]) -> list[list[float]] | None:
     """Embed each fact's text via retrieval module's shared bge-small.
     Returns None if embedding subsystem isn't available — caller treats
     that as "no dedup possible" and returns input unchanged.
+
+    v3.1.9.4 B1 (P15-4): goes through retrieval._embed_cached rather than
+    _embed directly, so a call over a store this process has already
+    embedded (the common case — dedup runs on nearly every tail, and the
+    store changes by a few facts a turn) only pays for the new or edited
+    text. See retrieval._embed_cached's docstring for the cache's
+    correctness argument (keyed on exact text + model identity, bounded).
     """
     if not facts:
         return []
@@ -300,7 +316,7 @@ def _embed_facts(facts: list[dict]) -> list[list[float]] | None:
         # Empty/missing text entries — skip dedup rather than embed ""
         # which would cluster everything together.
         return None
-    vecs = retrieval_module._embed(texts)
+    vecs = retrieval_module._embed_cached(texts)
     if not vecs or len(vecs) != len(facts):
         return None
     return vecs
@@ -707,7 +723,19 @@ async def _dedup_pass(
         return list(facts), 0
 
     try:
-        clusters = find_candidate_clusters(facts)
+        # v3.1.9.4 B1 (P15-4): find_candidate_clusters is sync and, on a
+        # cache miss, calls into fastembed's ONNX inference — CPU work
+        # that used to run straight on the event loop, inline under
+        # conv_lock, on every memory tail (measured ~12.9s against her
+        # real store before the retrieval._embed_cached fix). Off-loaded
+        # to the threadpool exactly like every other CPU-bound helper this
+        # codebase already moves off the loop (see main.py's own
+        # run_in_threadpool call sites) — a warm cache hit is fast enough
+        # that the thread handoff costs more than the call itself, but a
+        # cold one (a redeploy, a conversation dedup has not touched
+        # before) still must not block anything else this process is
+        # doing.
+        clusters = await run_in_threadpool(find_candidate_clusters, facts)
     except Exception as e:
         logger.warning(f"dedup: clustering failed (no-op): {e}")
         return list(facts), 0
