@@ -1903,25 +1903,38 @@ async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
          ALSO gated on `_pending_others_ctx` — see that contextvar's own
          docstring below — so this retry can never spend a call a map (or
          reduce) batch that has not started yet still needs for its OWN
-         guaranteed first call.
-      4. v3.1.9.4 (R5 / P16-7 fix). A retry that finishes cleanly does NOT
-         automatically win any more: `_summary_retry_suffix` asks for
-         roughly HALF the ordinary word target, so a clean retry can be
-         much SHORTER than a first attempt that was cut but still trims to
-         a complete sentence boundary well past the retry's whole length.
-         Trim the first attempt and compare: the retry wins only if it is
-         AT LEAST AS LONG as that trimmed first attempt — the same rule
-         step 5 already applies to the "both cut" case, now applied
-         uniformly instead of skipped whenever the retry itself happens to
-         finish clean. Every retry actually made (clean or cut) is counted
+         guaranteed first call. v3.1.9.4 (R6 / P17-1 fix, part a): ALSO
+         skipped when the first attempt trimmed with
+         `_trim_best_effort_summary` already reaches at least the retry's
+         own word target AND is not a repetition loop
+         (`reply_is_degenerate`) — step 4 below means an obedient retry
+         could not win that comparison anyway, so spending the call would
+         only pay for a result already thrown away. A looping trim is the
+         one exception: it must not block the retry that would replace it,
+         so a looping first attempt always gets the retry regardless of
+         its trimmed length.
+      4. v3.1.9.4 (R5 / P16-7 fix; R6 / P17-1 fix, part b). A retry that
+         finishes cleanly does NOT automatically win any more:
+         `_summary_retry_suffix` asks for roughly HALF the ordinary word
+         target, so a clean retry can be much SHORTER than a first attempt
+         that was cut but still trims to a complete sentence boundary well
+         past the retry's whole length. Trim the first attempt and
+         compare: the retry wins if it is AT LEAST AS LONG as that trimmed
+         first attempt — the same rule step 5 already applies to the "both
+         cut" case, now applied uniformly instead of skipped whenever the
+         retry itself happens to finish clean — OR if the first attempt
+         trimmed to a REPETITION LOOP and the retry did not: a loop must
+         not win this comparison on raw length over a clean candidate.
+         Every retry actually made (clean or cut) is counted
          (retried_compaction_summary_count) regardless of which candidate
          wins, so an operator can see how often the second call runs at
          all, not only how often it still loses.
-      5. Still cut (or no budget left for a retry, or the retry lost the
-         length comparison in step 4): trim EVERY candidate actually in
-         hand with _trim_best_effort_summary and keep whichever TRIMS
-         LONGER. Log a WARNING naming the conversation (from
-         _summary_log_ctx) and count it (truncated_compaction_summary_count).
+      5. Still cut (or no budget left for a retry, skipped for step 3's
+         length check, or the retry lost the length comparison in step 4):
+         trim EVERY candidate actually in hand with _trim_best_effort_summary
+         and keep whichever TRIMS LONGER. Log a WARNING naming the
+         conversation (from _summary_log_ctx) and count it
+         (truncated_compaction_summary_count).
       6. "" only when EVERY candidate is itself empty/whitespace — every
          existing caller of this function already treats "" as "nothing
          usable" and degrades (see summarize()'s own empty-content
@@ -1980,34 +1993,58 @@ async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
     if finish_reason != "length":
         return text
 
-    # Cut. Retry ONCE at the same max_tokens, gated on the shared
-    # per-request call budget actually having room for a second real call
-    # AND (P16-4) on that spend not dipping into what batches still to
-    # come are owed.
+    # Cut. v3.1.9.4 (R6 / P17-1 fix, part a). Trim what is already in hand
+    # BEFORE deciding whether a retry can even win the "longer candidate"
+    # rule below — see summarizer._llm_summarize's own block comment (the
+    # identical fix, applied there too) for the full reasoning: a retry
+    # that obeys `_summary_retry_suffix`'s roughly-half word target is
+    # shorter by construction than a first attempt whose trim already
+    # reaches that many words, so spending the call then is pure cost. The
+    # exception (part b) is a first attempt that trimmed to a REPETITION
+    # LOOP — `reply_is_degenerate` (this module's own load-bearing
+    # detector, no import-cycle concern here since this IS main.py) flags
+    # exactly that shape, and it must not block the retry that would
+    # replace the loop, nor win the length comparison below just by
+    # looping longer.
+    trimmed_first = _trim_best_effort_summary(text)
+    retry_words = max(20, _target_words(SUMMARY_MAX_TOKENS) // 2)
+    first_is_looping = reply_is_degenerate(trimmed_first) is not None
+    skip_retry_for_length = (
+        not first_is_looping and len(trimmed_first.split()) >= retry_words
+    )
+
+    # Retry ONCE at the same max_tokens, gated on the shared per-request
+    # call budget actually having room for a second real call, on that
+    # spend not dipping into what batches still to come are owed (P16-4),
+    # AND (P17-1 fix, part a) on the trim above not already having made
+    # the retry unwinnable.
     retry_text: str | None = None
     retry_finish: str | None = None
     retried = False
-    _budget = _summary_call_budget.get()
-    _pending_others = _pending_others_ctx.get()
-    _reserve = _pending_others() if _pending_others is not None else 0
-    if _budget is None or _budget[0] > _reserve:
-        if _budget is not None:
-            _budget[0] -= 1
-        retried = True
-        retry_words = max(20, _target_words(SUMMARY_MAX_TOKENS) // 2)
-        retry_text, retry_finish = await _one_call(_summary_retry_suffix(retry_words))
+    if not skip_retry_for_length:
+        _budget = _summary_call_budget.get()
+        _pending_others = _pending_others_ctx.get()
+        _reserve = _pending_others() if _pending_others is not None else 0
+        if _budget is None or _budget[0] > _reserve:
+            if _budget is not None:
+                _budget[0] -= 1
+            retried = True
+            retry_text, retry_finish = await _one_call(_summary_retry_suffix(retry_words))
 
     if retried:
         global _retried_compaction_summary_calls
         _retried_compaction_summary_calls += 1
 
-    trimmed_first = _trim_best_effort_summary(text)
     if retry_text is not None and retry_finish != "length":
-        # v3.1.9.4 (R5 / P16-7 fix). Clean retry — but it only wins if it
-        # is at least as long as the first attempt trimmed to a sentence
-        # boundary; a short-but-complete retry must not discard a longer,
-        # cleanly-trimmable first attempt.
-        if len(retry_text) >= len(trimmed_first):
+        # v3.1.9.4 (R5 / P16-7 fix; R6 / P17-1 fix, part b). Clean retry —
+        # it wins if it is at least as long as the first attempt trimmed to
+        # a sentence boundary (a short-but-complete retry must not discard
+        # a longer, cleanly-trimmable first attempt), OR if the first
+        # attempt trimmed to a repetition loop and the retry did not: a
+        # loop must not win on raw length over a clean candidate.
+        if len(retry_text) >= len(trimmed_first) or (
+            first_is_looping and reply_is_degenerate(retry_text) is None
+        ):
             return retry_text
         # Falls through to the trim-and-compare block below, which will
         # correctly pick trimmed_first over a (untrimmed, already-clean)
@@ -2024,7 +2061,15 @@ async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
         [retry_text if retry_finish != "length" else _trim_best_effort_summary(retry_text)]
         if retry_text is not None else []
     )
-    best_idx = max(range(len(candidates_trimmed)), key=lambda i: len(candidates_trimmed[i]))
+    # v3.1.9.4 (R6 / P17-1 part b, both-cut path too): a candidate that
+    # trims to a repetition loop never wins on length over a clean one.
+    best_idx = max(
+        range(len(candidates_trimmed)),
+        key=lambda i: (
+            reply_is_degenerate(candidates_trimmed[i]) is None,
+            len(candidates_trimmed[i]),
+        ),
+    )
     best = candidates_trimmed[best_idx]
     if not best:
         # Every candidate was itself empty or whitespace-only.
@@ -2036,6 +2081,8 @@ async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
     _retry_note = (
         "retried at the same cap with a tighter word target, still cut or too short"
         if retry_text is not None
+        else "no retry: the trimmed first attempt already met the retry's word target"
+        if skip_retry_for_length
         else "no vLLM-call budget left for a retry"
     )
     logger.warning(
@@ -7308,18 +7355,63 @@ def _shed_last_resort(
         _g3a_skip_step34 = False
         _g3a_trial_running: int | None = None
         _g3a_trial_counter: str | None = None
+        # v3.1.9.4 (R6 / P17-2 fix). Snapshot of what steps 1+2 took, so the
+        # SECOND checkpoint (after step 3, below) can tell whether step 3
+        # itself actually spent anything this round — the same "did the
+        # step before me change anything" test `_g3a_after_step1` already
+        # applies to this one.
+        _g3a_after_step2 = set(_g3a_gone)
+        # v3.1.9.4 (R6 / P17-2 fix). Which msgs a trial measurement below
+        # actually covered, so the end-of-round reuse (past step 4) can
+        # tell whether ITS trial is still valid for `msgs` as they stand
+        # now, no matter which of the two checkpoints produced it or
+        # whether step 3/4 ran after it — see that reuse's own comment.
+        _g3a_trial_snapshot: frozenset[int] | None = None
+        # v3.1.9.4 (R6 / P17-3 fix). `not _g3a_last_round` on both
+        # checkpoints below: the last round already falls back to spending
+        # everything eligible unconditionally (steps 2/4's own
+        # `_g3a_last_round` bypass, above), so a checkpoint there decides
+        # nothing — and firing it anyway is exactly how this pass reached
+        # `_G3A_MEASURE_CAP + 1` measurements: gated only on
+        # `_g3a_measures < _G3A_MEASURE_CAP` (true right up to the cap),
+        # its own `measure` call could push `_g3a_measures` to the cap and
+        # the unconditional end-of-round measure then pushed it one past —
+        # contradicting this function's own docstring ("still inside
+        # _G3A_MEASURE_CAP"). test_v3194_guard_g3a.py's pinned-count probe:
+        # 7 calls at head, 6 with this gate.
         if (
-            _g3a_gone != _g3a_after_step1
+            not _g3a_last_round
+            and _g3a_gone != _g3a_after_step1
             and _g3a_freed < _g3a_target
             and _g3a_measures < _G3A_MEASURE_CAP
         ):
             _g3a_trial_msgs = [m for i, m in enumerate(msgs) if i not in _g3a_gone]
             _g3a_trial_running, _g3a_trial_counter = measure(_g3a_trial_msgs)
             _g3a_measures += 1
+            _g3a_trial_snapshot = frozenset(_g3a_gone)
             if _g3a_trial_running <= limit:
                 # Steps 1+2 alone were enough for real — stop here, never
                 # letting step 3/4 touch anything this round.
                 _g3a_skip_step34 = True
+            else:
+                # v3.1.9.4 (R6 / P17-2 fix). Steps 1+2 alone were NOT
+                # enough for real either — re-base what step 3 (and, one
+                # step later, step 4) still needs on the MEASURED gap
+                # instead of the round's `per`-estimated `_g3a_target`/
+                # `_g3a_freed`, which a PRIOR round's rescale can have
+                # skewed per class (see this function's own P16-3 comment
+                # above for why: it over-prices one class and under-prices
+                # another under a single blanket ratio). Left un-rebased,
+                # step 3 could drop U_prev/A_prev on the stale estimate and
+                # STILL look short of the stale target, sending step 4
+                # after the protected stand-in even though the real gap
+                # after steps 1+2 needs less than step 3 alone would free —
+                # never demonstrated in isolation before P17-2's probe,
+                # because the OTHER checkpoint (after step 3, below) always
+                # caught the equivalent case one step later in every
+                # fixture tried until then.
+                _g3a_target = _g3a_trial_running - limit
+                _g3a_freed = 0
 
         # --- step 3: the recent window's own turns, except the
         #     newest, oldest-of-the-window first ---
@@ -7342,6 +7434,37 @@ def _shed_last_resort(
                     _g3a_gone.add(j)
                     _g3a_freed += per[j]
                 _q += pair_len
+
+        # v3.1.9.4 (R6 / P17-2 fix). The sibling of the step-2 checkpoint
+        # above, one step later: step 3 can ALSO have spent something this
+        # round (U_prev/A_prev), and step 4 is about to decide whether to
+        # touch the PROTECTED stand-in from the same `per`-estimated
+        # `_g3a_freed`/`_g3a_target` the checkpoint above already showed
+        # can be wrong. Gated identically (only when step 3 actually
+        # changed something, the estimate still looks short, this is not
+        # the last round, and there is cap room for one more `measure`)
+        # and behaves the same way: real convergence stops step 4 outright;
+        # real non-convergence re-bases the target on what steps 1-3
+        # ACTUALLY left over, so step 4 only spends the protected stand-in
+        # when the real gap still needs it — the P17-2 probe's own case
+        # (final 200 where dropping U_prev/A_prev alone already reaches
+        # 700, comfortably under an 800 limit).
+        if (
+            not _g3a_skip_step34
+            and not _g3a_last_round
+            and _g3a_gone != _g3a_after_step2
+            and _g3a_freed < _g3a_target
+            and _g3a_measures < _G3A_MEASURE_CAP
+        ):
+            _g3a_trial_msgs = [m for i, m in enumerate(msgs) if i not in _g3a_gone]
+            _g3a_trial_running, _g3a_trial_counter = measure(_g3a_trial_msgs)
+            _g3a_measures += 1
+            _g3a_trial_snapshot = frozenset(_g3a_gone)
+            if _g3a_trial_running <= limit:
+                _g3a_skip_step34 = True
+            else:
+                _g3a_target = _g3a_trial_running - limit
+                _g3a_freed = 0
 
         # --- step 4: the protected stand-in, truly last. v3.1.9.4
         #     (v3194-r3, R6): TARGET-LIMITED, matching step 2's fix above
@@ -7377,13 +7500,16 @@ def _shed_last_resort(
         per = [p for i, p in enumerate(per) if i not in _g3a_gone]
 
         _g3a_before_measure = running
-        # v3.1.9.4 (R5 / P16-3 fix). When the checkpoint above already
-        # measured this exact `msgs` (steps 3/4 skipped, so `_g3a_gone`
-        # has not changed since the trial), reuse that result instead of
-        # measuring the identical payload again — the trial already spent
-        # one of this round's measurements; a second one here would count
-        # twice for no new information.
-        if _g3a_skip_step34 and _g3a_trial_running is not None:
+        # v3.1.9.4 (R5 / P16-3 fix; R6 / P17-2 fix widened this to either
+        # checkpoint). When a checkpoint above already measured this exact
+        # `msgs` — its snapshot (`_g3a_trial_snapshot`) still equals
+        # `_g3a_gone` now, i.e. nothing after that trial (whichever of the
+        # two checkpoints it was) added anything else — reuse that result
+        # instead of measuring the identical payload again. A trial that
+        # was NOT the last thing to touch `_g3a_gone` (say, checkpoint 1
+        # ran, rebased, and then step 3 or step 4 went on to drop more) is
+        # stale for this purpose and falls through to a real re-measure.
+        if _g3a_trial_running is not None and _g3a_gone == _g3a_trial_snapshot:
             running, counter = _g3a_trial_running, _g3a_trial_counter
         else:
             running, counter = measure(msgs)
@@ -11847,8 +11973,23 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
         try:
             existing = facts.load_facts(conv_id)
             n_facts = len(existing)
-            if n_facts > 0:
-                facts.save_facts(conv_id, [])
+            # v3.1.9.4 (R6 / P17-4 follow-up). Used to write the empty-facts
+            # tombstone only `if n_facts > 0` — so a wipe on a conversation
+            # that already had no facts (or whose facts a prior pass already
+            # cleared) left NO facts file at all. commands._wipe_all_layers
+            # (the chat /forget path) writes this tombstone unconditionally,
+            # for exactly the reason `backfill._facts_tombstoned`'s own
+            # docstring gives: it is what `needs_backfill` treats as a
+            # confirmed wipe, defense-in-depth alongside (not instead of)
+            # `backfill.mark_wiped` above — a second signal that survives
+            # even if a future wipe path forgets to call mark_wiped, or (the
+            # exact shape P17-4 closes) a race turns the backfill record's
+            # own "wiped" state back into something retryable. This endpoint
+            # is the one wipe path that did NOT already give her that
+            # backup: writing it unconditionally here, matching
+            # _wipe_all_layers, closes that gap rather than leaving the
+            # admin DELETE path weaker than chat /forget for no reason.
+            facts.save_facts(conv_id, [])
         except StoreUnreadable as e:
             n_facts = 0
             unreadable.append("facts")

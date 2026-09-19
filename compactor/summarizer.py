@@ -71,6 +71,7 @@ import os
 import re
 import time
 import unicodedata
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -2403,6 +2404,40 @@ def _tier_of(system_prompt: str) -> str:
     }.get(system_prompt, "?")
 
 
+# v3.1.9.4 (R6 / P17-1 fix, part b). A minimal, LOCAL repetition check for
+# `_llm_summarize`'s retry-vs-first-attempt comparison below — needed
+# because a first attempt cut mid-loop (a model stuck repeating one line
+# until max_tokens) trims to a long but WORTHLESS candidate that must not
+# win the "longer candidate" rule just by out-wording a short, clean retry.
+# summarizer.py cannot import main.reply_is_degenerate: main.py imports
+# this module (see `import summarizer` there), not the other way, and
+# `_trim_to_last_sentence`'s own docstring already states the identical
+# constraint for the same reason. This module has never carried a
+# repetition/degeneracy detector of its own to reuse instead — grepping it
+# for one turned up only comments referencing main.py's (see
+# `_redact_degenerate_turns`, mentioned above at `maybe_rollup`'s own
+# comments, never called from here). So this reuses the one piece of
+# machinery this module DOES already have for the job: `_SENTENCE_END_RE`,
+# the same regex `_trim_to_last_sentence` uses to find sentence boundaries.
+# Splitting on it and checking whether one normalized sentence accounts for
+# most of the result is intentionally narrower than
+# main.reply_is_degenerate (which also catches fragment-run and list-run
+# loops, and is the load-bearing detector for stored replies generally) —
+# this exists only to keep a looping trimmed candidate from winning the
+# length comparison below, nothing more.
+def _is_repetition_loop(text: str) -> bool:
+    """True when `text` looks like one sentence repeated until it filled
+    the space (the P17-1 probe's case B: "She said she would think about
+    it." x60) rather than genuinely varied content. Requires at least 4
+    sentences before judging anything a loop, so an ordinary short summary
+    is never flagged."""
+    sentences = [s.strip().lower() for s in _SENTENCE_END_RE.split(text) if s.strip()]
+    if len(sentences) < 4:
+        return False
+    _, top_count = Counter(sentences).most_common(1)[0]
+    return top_count / len(sentences) >= 0.5
+
+
 async def _llm_summarize(
     client: httpx.AsyncClient,
     vllm_url: str,
@@ -2449,20 +2484,35 @@ async def _llm_summarize(
          would silently let a caller's `{"max_calls": N}` spend N+1 real
          calls. No `await` between the check and the decrement, matching
          `_call`'s own reasoning for why that is race-safe under concurrent
-         map-phase callers.
-      4. v3.1.9.4 (R5 / P16-7 fix). If the retry ALSO finished normally, it
-         no longer wins automatically. `_retry_suffix` asks for roughly
-         HALF the tier's ordinary word target, so a clean retry can be much
-         SHORTER than a first attempt that was cut but still trims (step 5)
-         to a complete sentence boundary well past the retry's whole
-         length — before this fix that shorter, complete retry silently
-         replaced a longer, perfectly usable trimmed first attempt, and
-         nothing counted that it had even happened. It now wins only if it
-         is AT LEAST AS LONG as the first attempt trimmed with
-         `_trim_best_effort` — the same comparison step 5 already made for
-         the "both cut" case, applied here too instead of skipped.
-      5. Otherwise (the retry was cut too, was skipped for budget, or lost
-         the length comparison in step 4): this is where the finding's
+         map-phase callers. v3.1.9.4 (R6 / P17-1 fix, part a): ALSO skipped
+         when the first attempt trimmed with `_trim_best_effort` already
+         reaches at least the retry's own word target AND is not a
+         repetition loop (`_is_repetition_loop`) — step 4 below means an
+         obedient retry could not win that comparison anyway, so spending
+         the call would only pay for a result already thrown away. A
+         looping trim is the one exception: it must not block the retry
+         that would replace it, so a looping first attempt always gets the
+         retry regardless of its trimmed length.
+      4. v3.1.9.4 (R5 / P16-7 fix; R6 / P17-1 fix, part b). If the retry
+         ALSO finished normally, it no longer wins automatically.
+         `_retry_suffix` asks for roughly HALF the tier's ordinary word
+         target, so a clean retry can be much SHORTER than a first attempt
+         that was cut but still trims (step 5) to a complete sentence
+         boundary well past the retry's whole length — before the R5 fix
+         that shorter, complete retry silently replaced a longer,
+         perfectly usable trimmed first attempt, and nothing counted that
+         it had even happened. It now wins if it is AT LEAST AS LONG as
+         the first attempt trimmed with `_trim_best_effort` — the same
+         comparison step 5 already made for the "both cut" case, applied
+         here too instead of skipped — OR if the first attempt trimmed to
+         a REPETITION LOOP and the retry did not: a loop must not win this
+         comparison on raw length over a clean candidate (the P17-1
+         probe's case B — a first attempt cut mid-loop trims to hundreds of
+         repeated words and would otherwise beat a short, clean retry every
+         time).
+      5. Otherwise (the retry was cut too, was skipped for budget or for
+         step 3's length check, or lost the length comparison in step 4):
+         this is where the finding's
          original defect used to land silently. Trim EVERY candidate
          actually in hand (`text`, and `retry_text` if a retry ran, unless
          it already finished clean and lost step 4 — nothing to trim there)
@@ -2521,37 +2571,61 @@ async def _llm_summarize(
     if finish_reason != "length":
         return text
 
-    # Cut. Retry ONCE at the same max_tokens (see the docstring above for
-    # why lowering it would not help), gated on the shared vLLM-call budget
-    # actually having room for a second real call.
+    # Cut. v3.1.9.4 (R6 / P17-1 fix, part a). Trim what is already in hand
+    # BEFORE deciding whether a retry can even win: `_retry_suffix` asks
+    # for roughly HALF the tier's ordinary word target, at the SAME cap, so
+    # a retry that OBEYS that instruction and finishes cleanly is shorter
+    # by construction than a first attempt whose trim already reaches that
+    # many words — the "longer candidate" rule a few lines down means such
+    # a retry cannot win, so spending the call for it is pure cost with no
+    # chance of a different outcome. Skip it in that case. The exception
+    # (part b) is a first attempt that trimmed to a REPETITION LOOP: a
+    # model stuck repeating one line can out-word a clean retry by sheer
+    # repeats, and that must not block the retry that would replace the
+    # loop with something usable, nor win the length comparison below just
+    # by looping longer — see `_is_repetition_loop`.
+    trimmed_first = _trim_best_effort(text)
+    retry_words = max(20, _target_words(max_tokens) // 2)
+    first_is_looping = _is_repetition_loop(trimmed_first)
+    skip_retry_for_length = (
+        not first_is_looping and len(trimmed_first.split()) >= retry_words
+    )
+
+    # Retry ONCE at the same max_tokens (see the docstring above for why
+    # lowering it would not help), gated on the shared vLLM-call budget
+    # actually having room for a second real call, AND (P17-1 fix, part a)
+    # on the trim above not already having made the retry unwinnable.
     retry_text: str | None = None
     retry_finish: str | None = None
     retried = False
-    _budget = _vllm_call_budget.get()
-    if _budget is None or _budget["remaining"] > 0:
-        if _budget is not None:
-            _budget["remaining"] -= 1
-        retried = True
-        retry_words = max(20, _target_words(max_tokens) // 2)
-        retry_text, retry_finish = await _one_call(_retry_suffix(retry_words))
+    if not skip_retry_for_length:
+        _budget = _vllm_call_budget.get()
+        if _budget is None or _budget["remaining"] > 0:
+            if _budget is not None:
+                _budget["remaining"] -= 1
+            retried = True
+            retry_text, retry_finish = await _one_call(_retry_suffix(retry_words))
 
     if retried:
         global _retried_summary_calls
         _retried_summary_calls += 1
 
-    # v3.1.9.4 (R5 / P16-7 fix). A clean retry (finish_reason != "length")
-    # used to win unconditionally the instant it happened. `_retry_suffix`
-    # asks for roughly HALF the tier's ordinary word target, at the SAME
-    # cap — so a retry that finishes cleanly can be much SHORTER than a
-    # first attempt that was cut but still trims to a complete sentence
-    # boundary well past the retry's whole length. It now wins only if it
-    # is AT LEAST AS LONG as the first attempt trimmed — the same rule the
-    # "both cut" branch below already applies, now applied uniformly
-    # rather than skipped whenever the retry itself happens to finish
-    # clean.
-    trimmed_first = _trim_best_effort(text)
+    # v3.1.9.4 (R5 / P16-7 fix; R6 / P17-1 fix, part b). A clean retry
+    # (finish_reason != "length") used to win unconditionally the instant
+    # it happened. `_retry_suffix` asks for roughly HALF the tier's
+    # ordinary word target, at the SAME cap — so a retry that finishes
+    # cleanly can be much SHORTER than a first attempt that was cut but
+    # still trims to a complete sentence boundary well past the retry's
+    # whole length. It now wins if it is AT LEAST AS LONG as the first
+    # attempt trimmed — the same rule the "both cut" branch below already
+    # applies, now applied uniformly rather than skipped whenever the
+    # retry itself happens to finish clean — OR if the first attempt
+    # trimmed to a repetition loop and the retry did not: a loop must not
+    # win this comparison on raw length over a clean candidate.
     if retry_text is not None and retry_finish != "length":
-        if len(retry_text) >= len(trimmed_first):
+        if len(retry_text) >= len(trimmed_first) or (
+            first_is_looping and not _is_repetition_loop(retry_text)
+        ):
             return retry_text
         # Falls through: trimmed_first wins the comparison below (a clean
         # retry_text needs no further trimming of its own — see
@@ -2565,7 +2639,12 @@ async def _llm_summarize(
         [retry_text if retry_finish != "length" else _trim_best_effort(retry_text)]
         if retry_text is not None else []
     )
-    best_idx = max(range(len(candidates)), key=lambda i: len(candidates[i]))
+    # v3.1.9.4 (R6 / P17-1 part b, both-cut path too): a candidate that
+    # trims to a repetition loop never wins on length over a clean one.
+    best_idx = max(
+        range(len(candidates)),
+        key=lambda i: (not _is_repetition_loop(candidates[i]), len(candidates[i])),
+    )
     best = candidates[best_idx]
     if not best:
         # Every candidate was itself empty or whitespace-only — nothing
@@ -2578,6 +2657,8 @@ async def _llm_summarize(
     _retry_note = (
         "retried at the same cap with a tighter word target, still cut or too short"
         if retry_text is not None
+        else "no retry: the trimmed first attempt already met the retry's word target"
+        if skip_retry_for_length
         else "no vLLM-call budget left for a retry"
     )
     logger.warning(

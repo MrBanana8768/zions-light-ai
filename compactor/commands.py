@@ -723,22 +723,37 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
     if parts:
         lines.append("Forgot: " + ", ".join(parts) + ".")
 
-    # v3.1.9.4 (R5 / P16-6, documented — not a new defect). The facts
-    # tombstone above genuinely stops the lazy backfill from reconstructing
-    # facts from history. The summary hierarchy has no equivalent: if this
-    # chat keeps going, OpenWebUI resends the whole prior transcript with
-    # the next message (the client's choice, not this service's), and the
-    # very next ordinary turn rebuilds the L1/L2/L3 summary from it — so
-    # say that here rather than let "Forgot: summary state." read as a
-    # permanent guarantee it is not. Only surfaced when a summary or
-    # chapter archive was actually part of what got cleared.
-    if totals["forgotten_summary"] or totals["forgotten_chapters"]:
+    # v3.1.9.4 (R5 / P16-6, documented — not a new defect; R6 / P17-5 fix).
+    # The facts tombstone above genuinely stops the lazy backfill from
+    # reconstructing facts from history. The summary hierarchy has no
+    # equivalent: if this chat keeps going, OpenWebUI resends the whole
+    # prior transcript with the next message (the client's choice, not
+    # this service's), and the hierarchy starts rebuilding the L1/L2/L3
+    # summary from it — catch-up is bounded per turn
+    # (COMPACTOR_TAIL_ROLLUP_MAX_CALLS), so a long pre-/forget history
+    # takes several turns to fully re-summarize, not one — so say that here
+    # rather than let "Forgot: summary state." read as a permanent
+    # guarantee it is not.
+    #
+    # P17-5: this used to be gated on `forgotten_summary or
+    # forgotten_chapters` — a /forget on a conversation that had facts but
+    # no summary YET (a short chat, or the hierarchy only just enabled) got
+    # no note at all, even though the exact same rebuild happens: nothing
+    # about "the client resends the transcript and the hierarchy re-folds
+    # it" depends on whether a summary already existed to clear. The
+    # honest condition is "this /forget cleared something from a
+    # conversation whose history can still come back" — i.e. `parts` is
+    # non-empty — not "the summary specifically was one of the things
+    # cleared". Not shown on a no-op /forget (`parts` empty, "Nothing to
+    # forget"): there is nothing that could rebuild from a conversation
+    # this had no memory of in the first place.
+    if parts:
         lines.append(
             "Note: if you keep chatting in this conversation, the summary "
-            "will rebuild itself from the history your client resends — "
-            "/forget clears it only until the next message here. Start a "
-            "new conversation to keep old context from being summarized "
-            "again."
+            "will start rebuilding itself from the history your client "
+            "resends — /forget clears it only until the next message "
+            "here. Start a new conversation to keep old context from "
+            "being summarized again."
         )
 
     # v3.1: main.py's _clear_all_memory states the contract in its return value

@@ -237,6 +237,54 @@ def _write_state(conv_id: str, state: dict) -> None:
     atomic_write_json(_backfill_state_path(conv_id), state)
 
 
+def _write_state_unless_wiped(conv_id: str, state: dict) -> bool:
+    """Same as `_write_state`, for every ORDINARY progress/failure/complete
+    write `_run_backfill` makes — except it refuses to overwrite a record
+    that already reads `"wiped"` on disk. v3.1.9.4 (R6 / P17-4 fix).
+
+    `_run_backfill`'s own per-iteration generation check (right before the
+    extraction call) and the two LOCKED checks (kickoff and final save)
+    cover most of a wipe landing mid-run, but there is a gap none of them
+    closes: a wipe that lands WHILE an extraction call is in flight is
+    invisible to the checks around it — the top-of-loop check already
+    passed, and on the LAST exchange there is no next iteration to run the
+    next top-of-loop check at all, so `mark_wiped`'s own `"wiped"` write
+    (inside the wipe's own lock) is the last thing on disk only until this
+    loop's unconditional post-extraction progress write lands right behind
+    it, turning `"wiped"` back into `"in_progress"`. A crash between that
+    write and the final locked check (plausible: that check waits on
+    `conv_lock`, and a live tail can hold it for as long as an extraction
+    plus a rollup) leaves exactly that clobbered `"in_progress"` on disk —
+    which later goes stale and becomes retryable, silently undoing the
+    wipe on her next message.
+
+    Re-checking the generation once more right before each of these writes
+    (see the call sites) closes the common case, but the check and the
+    write are still two separate statements with an `await`-free gap
+    between them in an async function — not proof against every interleave
+    a future change could introduce. This is the second, structural half
+    of the fix: whatever gap remains, the write itself refuses to turn a
+    `"wiped"` record into anything else, so the two together mean a wipe
+    that has already landed on disk can never be undone by a write that
+    started before it. `_write_wiped` and `mark_wiped` do not call this —
+    their entire job is to WRITE `"wiped"`, including over a record that
+    is not already wiped, and writing `"wiped"` over `"wiped"` is a
+    harmless no-op either way.
+
+    Returns True if the write went through, False if it was refused
+    (refused only when a wipe has already landed).
+    """
+    current = read_state(conv_id)
+    if current is not None and current.get("state") == "wiped":
+        logger.info(
+            f"conv={conv_id}: backfill progress write skipped — the record "
+            f"already reads 'wiped'; not resurrecting it as {state.get('state')!r}"
+        )
+        return False
+    _write_state(conv_id, state)
+    return True
+
+
 def _write_failed_or_abandoned(
     conv_id: str,
     attempts: int,
@@ -270,7 +318,10 @@ def _write_failed_or_abandoned(
         state_value = "abandoned"
     else:
         state_value = "failed"
-    _write_state(conv_id, {
+    # v3.1.9.4 (R6 / P17-4 fix). Wipe-safe: a wipe that landed while this
+    # run was failing must not have its "wiped" record turned back into
+    # "failed"/"abandoned" — see _write_state_unless_wiped's own docstring.
+    _write_state_unless_wiped(conv_id, {
         "state": state_value,
         "started_at": started_at,
         "exchanges_done": exchanges_done,
@@ -353,12 +404,14 @@ def mark_wiped(conv_id: str) -> None:
     retry from it again.
 
     This alone is not the whole fix — a backfill still ACTIVELY running
-    keeps making its own per-exchange progress writes (`_write_state` inside
-    `_run_backfill`'s loop) with no generation check of its own, and one of
-    those can land after this call and overwrite `"wiped"` back to
-    `"in_progress"`. See the generation check inside that loop (P16-2's own
-    fix), which is what keeps a `"wiped"` record wiped once a wipe lands
-    mid-run rather than mid-gap.
+    keeps making its own progress writes (`_write_state_unless_wiped`
+    inside `_run_backfill`'s loop and around it) which, without more, could
+    land after this call and overwrite `"wiped"` back to `"in_progress"`.
+    See the generation checks inside and around that loop (P16-2's fix,
+    and P17-4's follow-up covering the gap during the LAST exchange's
+    extraction call) for what catches a wipe landing mid-run rather than
+    mid-gap, and `_write_state_unless_wiped`'s own docstring for the
+    belt-and-suspenders write-side refusal that backs those checks up.
     """
     state = read_state(conv_id)
     if state is None:
@@ -374,10 +427,12 @@ def mark_wiped(conv_id: str) -> None:
 
 
 def _facts_tombstoned(conv_id: str) -> bool:
-    """True iff a facts file exists for this conv and is EMPTY — the exact
-    signature a wipe's tombstone write leaves (`main._clear_all_memory` /
-    `commands._wipe_all_layers`' own "leave an EMPTY facts store behind
-    rather than no facts store" comment). v3.1.9.4 (R5 / P16-1).
+    """True iff a facts file exists for this conv, is EMPTY, and the
+    archive sidecar is ALSO empty — the signature a genuine wipe's
+    tombstone leaves (`main._clear_all_memory` / `commands._wipe_all_
+    layers`' own "leave an EMPTY facts store behind rather than no facts
+    store" comment; `_wipe_all_layers` clears the archive sidecar too).
+    v3.1.9.4 (R5 / P16-1; R6 / P17-5 correction, see below).
 
     Defense in depth, checked from `needs_backfill`'s retry branches
     (`failed`, stale `in_progress`) regardless of what the record itself
@@ -385,25 +440,60 @@ def _facts_tombstoned(conv_id: str) -> bool:
     own lock, so it cannot be raced), but a wipe path that some future
     change adds without also calling `mark_wiped` — the "fixed at one site,
     missed the identical sibling" defect this codebase keeps paying for —
-    must not silently reopen this exact hole. Nothing in this codebase ever
-    writes an empty facts file except a wipe's tombstone: extraction only
+    must not silently reopen this exact hole.
+
+    v3.1.9.4 (R6 / P17-5 correction). This docstring used to claim "nothing
+    in this codebase ever writes an empty facts file except a wipe's
+    tombstone." Not literally true, and a hostile pass's own review of the
+    PREMISE, not just the code, is what caught it: a selective
+    `/forget <substring>` that happens to match every stored fact
+    (`commands._handle_forget`'s arg branch), `/tidy apply` removing every
+    remaining row, the admin archive-stale sweep
+    (`facts.archive_stale_facts`), and an empty-bundle import can all leave
+    `[]` too, none of them a wipe (no `bump_wipe_generation`, no
+    `mark_wiped`).
+      - Selective /forget-all and an empty-bundle import are still
+        deliberate, total deletions by her or the operator — refusing a
+        failed/stale retry afterwards is the same defensible call a real
+        wipe gets, so these two are left as-is.
+      - `/tidy` and archive-stale are categorically different: they ARCHIVE
+        rather than delete (`facts.archive_facts`/`archive_stale_facts`
+        move rows to the sidecar `restore_from_archive` can bring back),
+        so the facts are NOT gone — treating that as a wipe's tombstone
+        would refuse a legitimate retry over memory that still exists, one
+        call away from being restored. The archive-sidecar check below is
+        the fix: a genuine wipe (via `_wipe_all_layers`, the chat /forget
+        path) clears the archive too, so requiring it ALSO empty excludes
+        exactly the `/tidy`/archive-stale case while still recognizing a
+        real wipe. (The admin DELETE endpoint does not yet clear the
+        archive sidecar at all — a separate, already-acknowledged gap,
+        see `commands._wipe_all_layers`' own comment — so this check is
+        weaker defense-in-depth for that one path when the conv also has
+        older archived facts predating the wipe; `mark_wiped` remains the
+        primary defence there regardless.)
+
+    Nothing in this codebase writes an empty facts file with an EMPTY
+    archive sidecar behind it except a wipe's tombstone: extraction only
     APPENDS (`_merge_backfilled`, the live tail's own merge), and a
     conversation that has never had a fact extracted has no file at all
     (G2's own reasoning — an empty merge is nothing to save). So an
-    existing-but-empty file is never ambiguous the way a non-empty one
-    legitimately is (that case IS the live tail's writes during a resumable
-    run — see `_run_backfill`'s own `existing and resuming` branch, which
-    this function does not touch).
+    existing-but-empty file with nothing in the archive either is never
+    ambiguous the way a non-empty one legitimately is (that case IS the
+    live tail's writes during a resumable run — see `_run_backfill`'s own
+    `existing and resuming` branch, which this function does not touch).
 
-    Unreadable is treated as "not confirmed a tombstone" (returns False)
-    rather than guessed at — the same "never rewrite the unknown from a
-    guess" rule `_run_backfill` itself follows for `StoreUnreadable`; the
-    record-based checks this backs up are still there as the primary path.
+    Unreadable (either file) is treated as "not confirmed a tombstone"
+    (returns False) rather than guessed at — the same "never rewrite the
+    unknown from a guess" rule `_run_backfill` itself follows for
+    `StoreUnreadable`; the record-based checks this backs up are still
+    there as the primary path.
     """
     if not facts_path(conv_id).is_file():
         return False
     try:
-        return facts_module.load_facts(conv_id) == []
+        if facts_module.load_facts(conv_id) != []:
+            return False
+        return facts_module.load_archive(conv_id) == []
     except StoreUnreadable:
         return False
 
@@ -790,7 +880,12 @@ async def _run_backfill(
             logger.info(f"conv={conv_id}: backfill skipped — no user/assistant pairs found")
             return
 
-        _write_state(conv_id, {
+        # v3.1.9.4 (R6 / P17-4 fix): wipe-safe (see
+        # _write_state_unless_wiped) — the locked check just above already
+        # covers a wipe that landed before this point, but a wipe racing
+        # in right after that check and before this write is the same
+        # class of gap the loop's own checks below close for later writes.
+        _write_state_unless_wiped(conv_id, {
             "state": "in_progress",
             "started_at": started_at,
             "exchanges_done": 0,
@@ -853,8 +948,36 @@ async def _run_backfill(
                         f"conv={conv_id}: backfill extraction failed on "
                         f"exchange {i}/{len(pairs)}: {e}"
                     )
-                # Progress update every exchange (cheap atomic write)
-                _write_state(conv_id, {
+                # v3.1.9.4 (R6 / P17-4 fix). Re-check AFTER the extraction
+                # call, before the progress write below — the top-of-loop
+                # check above only proves no wipe had landed BEFORE this
+                # exchange's (possibly slow) extraction call started. A
+                # wipe landing WHILE that call was in flight is invisible
+                # to it, and on the LAST exchange there is no next
+                # iteration to catch it at the next top-of-loop check
+                # either: the progress write below would be the last thing
+                # on disk, turning mark_wiped's "wiped" back into
+                # "in_progress" — exactly the gap the reviewer's P17-4
+                # probe demonstrated (a /forget landing during the final
+                # extraction call, then a kill before the final locked
+                # check, left a retryable "in_progress" record that
+                # re-extracted the whole forgotten history). Same
+                # terminal write and same early return as the top-of-loop
+                # check uses.
+                if wipe_generation is not None and wipe_generation != current_wipe_generation(conv_id):
+                    _write_wiped(
+                        conv_id, this_attempt,
+                        started_at=started_at,
+                        exchanges_done=i - 1, exchanges_total=len(pairs),
+                    )
+                    return
+                # Progress update every exchange (cheap atomic write).
+                # v3.1.9.4 (R6 / P17-4 fix): wipe-safe (see
+                # _write_state_unless_wiped) — belt-and-suspenders for the
+                # re-check just above, which closes the common case but is
+                # still a separate statement from this write, not an
+                # atomic check-and-write.
+                _write_state_unless_wiped(conv_id, {
                     "state": "in_progress",
                     "started_at": started_at,
                     "exchanges_done": i,
@@ -1029,7 +1152,13 @@ async def _run_backfill(
         except Exception as e:
             logger.warning(f"conv={conv_id}: backfill summary rollup failed (non-fatal): {e}")
 
-        _write_state(conv_id, {
+        # v3.1.9.4 (R6 / P17-4 fix): wipe-safe (see
+        # _write_state_unless_wiped) — this write happens AFTER the final
+        # locked generation check (above, before the facts save) and
+        # OUTSIDE conv_lock, across the summary rollup's own calls; a wipe
+        # landing in that window must not have "complete" overwrite the
+        # "wiped" it just wrote.
+        _write_state_unless_wiped(conv_id, {
             "state": "complete",
             "started_at": started_at,
             "exchanges_done": len(pairs),

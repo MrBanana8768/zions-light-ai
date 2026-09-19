@@ -227,12 +227,20 @@ def test_backfill_discarded_before_starting_when_wipe_ran_before_first_turn():
 
 
 def test_wiped_record_is_a_permanent_refusal_on_its_own_terms():
-    print("\n[test] W2: needs_backfill refuses a 'wiped' record because it "
-          "IS 'wiped' — not as a side effect of the wipe also leaving an "
-          "empty facts.json tombstone behind (main._clear_all_memory only "
-          "writes one when facts existed to clear; this conv_id never had "
-          "any, so no facts file exists at all — the backfill record's own "
-          "state is the only thing that can be refusing the retry)")
+    print("\n[test] W2 (+ v3.1.9.4 R6 / P17-4 follow-up): needs_backfill "
+          "refuses a 'wiped' record because it IS 'wiped' — not merely as "
+          "a side effect of the empty facts.json tombstone `_clear_all_"
+          "memory` also leaves behind. Before P17-4's follow-up,"
+          "`_clear_all_memory` wrote that tombstone only when facts existed"
+          " to clear, so a conv_id that never had any facts left no facts"
+          " file at all and this isolation was incidental. It now writes"
+          " the tombstone UNCONDITIONALLY (matching commands._wipe_all_"
+          "layers, the chat /forget path, for the same defense-in-depth"
+          " reason _facts_tombstoned's own docstring gives), so this test"
+          " deletes that tombstone straight back out after the wipe to"
+          " isolate the record's own state as the thing actually being"
+          " checked — needs_backfill's own docstring confirms the RECORD"
+          " is checked before any facts-file signal (B2's reordering).")
     _wipe_storage()
     cid = "w2-wiped-terminal-in-isolation"
     check(memory.current_wipe_generation(cid) == 0, "starts at generation 0")
@@ -241,11 +249,17 @@ def test_wiped_record_is_a_permanent_refusal_on_its_own_terms():
     # A wipe with nothing to clear (no facts, no summary, no episodic) still
     # bumps the generation — main._clear_all_memory does this unconditionally
     # (see its own comment: "FIRST statement inside the lock"). Called
-    # directly here for the same reason, with no facts file created as a
-    # side effect either way.
+    # directly here for the same reason.
     asyncio.run(main._clear_all_memory(cid, source="test"))
     check(memory.current_wipe_generation(cid) == 1, "the wipe bumped the generation")
-    check(not facts.facts_path(cid).is_file(), "no facts file exists — nothing was ever written for this conv_id")
+    # v3.1.9.4 (R6 / P17-4 follow-up): the tombstone now exists even though
+    # this conv_id never had a fact — see the docstring above.
+    check(facts.facts_path(cid).is_file() and facts.load_facts(cid) == [],
+          "the empty-facts tombstone now exists unconditionally")
+    # Remove it: isolates the record's own "wiped" state as the ONLY signal
+    # left for needs_backfill to refuse on.
+    facts.facts_path(cid).unlink()
+    check(not facts.facts_path(cid).is_file(), "tombstone removed for isolation")
 
     stub = _NewFactExtraction("resurrected fact")
     orig = facts.extract_facts_from_exchange
@@ -264,7 +278,8 @@ def test_wiped_record_is_a_permanent_refusal_on_its_own_terms():
         backfill.needs_backfill(cid, _msgs(3)) is False,
         "needs_backfill refuses — and it cannot be falling through to the "
         "'no facts file' branch (that branch would say True), so this is "
-        "the 'wiped' state itself being checked",
+        "the 'wiped' state itself being checked, with the tombstone "
+        "removed out from under it",
     )
 
 
