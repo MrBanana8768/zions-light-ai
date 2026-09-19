@@ -1117,15 +1117,22 @@ def test_call_site_passes_the_callers_system_count():
 
     seen = {}
 
-    def recorder(messages, limit=None, protect_system=None, report=None, reserve=0):
-        # reserve (hostile pass #5 F3): a real parameter of the guard now,
-        # not asserted here — this test is about protect_system (M9), and a
-        # recorder that cannot accept every argument the request path
-        # actually passes would TypeError instead of testing anything.
+    def recorder(
+        messages, limit=None, protect_system=None, report=None, reserve=0,
+        standin_protected=True,
+    ):
+        # reserve (hostile pass #5 F3) and standin_protected (P14-1, hostile
+        # pass #14, lane v3194-guard): both real parameters of the guard
+        # now, not asserted here in depth — this test is about
+        # protect_system (M9), and a recorder that cannot accept every
+        # argument the request path actually passes would TypeError instead
+        # of testing anything (exactly what happened when this parameter was
+        # added and this recorder was not updated for it).
         seen["messages"] = list(messages)
         seen["limit"] = limit
         seen["protect_system"] = protect_system
         seen["report"] = report
+        seen["standin_protected"] = standin_protected
         return messages
 
     # v3.1.9: the clock is pinned, because the guard is now handed the
@@ -1168,6 +1175,18 @@ def test_call_site_passes_the_callers_system_count():
         isinstance(seen["report"], dict),
         f"the call site passes a report dict for the guard's verdict: "
         f"{seen['report']!r}",
+    )
+    # P14-1 (hostile pass #14, lane v3194-guard): this fixture never
+    # attempts reuse at all (a short two-system-message conversation, no
+    # stored hierarchy for `cid`), so compact_if_needed never reports a
+    # margin the window check used, and the call site's own comparison
+    # (`_compaction_stored_turns and ... and _BUDGET_MARGIN > ...`) is
+    # False by construction — standin_protected must stay at its default,
+    # not get flipped by an unrelated code path.
+    assert_true(
+        seen.get("standin_protected") is True,
+        f"a request with nothing to reuse leaves standin_protected at its "
+        f"default (got {seen.get('standin_protected')!r})",
     )
 
 

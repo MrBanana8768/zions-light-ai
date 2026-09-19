@@ -17,6 +17,7 @@ import asyncio
 import bisect
 import codecs
 import collections
+import contextvars
 import dataclasses
 import hashlib
 import json
@@ -30,7 +31,7 @@ import time
 import unicodedata
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone, tzinfo
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -1313,6 +1314,95 @@ def _space_fill_empty_assistant(messages: list[dict]) -> tuple[list[dict], int]:
     return out, filled
 
 
+# P14-2 (hostile pass #14, LOW): compact_if_needed's fresh-span preview and
+# summarize() each called count_tokens_exact SEPARATELY on the SAME list a
+# few dozen lines apart in the same request (the preview mirrors summarize()'s
+# own measurement on purpose — see the preview's comment in compact_if_needed).
+# Two independent POSTs means two independent chances to fail: if the
+# preview's call answered and summarize()'s failed a moment later, the
+# preview priced the reserve at the measured (~1.0x) scale while summarize()
+# fell back to the pessimistic 2.0x scale on the SAME turns, packed into up
+# to twice as many map-reduce batches, and could return a summary up to
+# 2,048 tokens (one SUMMARY_MAX_TOKENS batch) larger than the reserve the
+# window check priced it at — the stand-in then carries tokens nobody
+# reserved room for, and the guard sheds to find them (P12-5's order: memory
+# first, her previous exchange only once that is gone). Proven end to end
+# with the real summarize() and a scripted flap (SP\p14\flap.py): 4 of 24
+# spans over the reserve, all on the "preview answers, summarize() fails"
+# schedule; the reverse flap over-reserves (safe) and both-answer /
+# both-fail agree exactly, by construction.
+#
+# Fixed here, at the one function both callers share, rather than by
+# plumbing a scale into summarize() (P13's other candidate) — that would
+# change `summarize(client, fresh_input)`'s call shape, which 34+ test
+# stubs across this suite replace with a fixed two-argument signature
+# (`grep -rn "main.summarize =" compactor tests`); breaking that shape here
+# breaks every one of them for a fix that belongs one level down. A small
+# content-keyed memo of SUCCESSFUL counts means the preview's own call
+# (compact_if_needed's `_fresh_span_preview`, byte-identical to summarize()'s
+# `to_summarize` — the reviewer's own Q2 note: "same list, same order")
+# answers summarize()'s later call for free, from the SAME vLLM response,
+# instead of risking a second POST that can fail on its own. A FAILURE is
+# never cached (a transient /tokenize outage must stay visible to every
+# caller, not get remembered as "we already know this list is unmeasurable"
+# — see the failure-cache HIGH this file already fixed once for
+# _TOKENIZER_TRIED, a few hundred lines up); only a real vLLM answer goes
+# in.
+#
+# REQUEST-scoped, not process-wide — a `contextvars.ContextVar`, set fresh
+# by `compact_if_needed` (the only caller whose SAME-request double-call
+# this exists for) and otherwise absent. A first draft made this a bare
+# process-wide dict, bounded but living for the life of the process; it
+# broke two EXISTING suites this lane does not own
+# (test_tokenize_flags.py's `[6]`, test_tokenize_repair.py's `test_every_
+# empty_shape_a_client_can_send_is_repaired`), both of which call `main.
+# count_tokens_exact` DIRECTLY, outside any request, and assert on the
+# /tokenize call a stub captured — a memo hit on content an EARLIER,
+# unrelated section already measured meant no call was made at all, and
+# the stub's capture stayed empty. A process-wide cache cannot tell "the
+# same request, a few lines apart" from "two unrelated callers, minutes or
+# tests apart" — but a contextvar can, for free: `count_tokens_exact`
+# consults it only when SET, so a caller outside `compact_if_needed` (a
+# direct unit-test call, `_enforce_hard_budget`'s own calls, `_sent_token_
+# size`) sees exactly the un-memoized behaviour it always had, and the
+# memo only ever activates for the one call chain — the preview, then
+# summarize() — this fix is about. No lock needed: everywhere this
+# context is set, the calls that consult it happen sequentially (each
+# `await run_in_threadpool(...)` blocks until it returns before the next
+# one starts), and a fresh dict per `compact_if_needed` call means no
+# bound is needed either — it holds at most a handful of entries before
+# the function returns and the context reverts.
+_COUNT_TOKENS_EXACT_MEMO_CTX: "contextvars.ContextVar[dict[str, int] | None]" = (
+    contextvars.ContextVar("count_tokens_exact_memo", default=None)
+)
+
+
+def _count_tokens_exact_memo_key(
+    messages: list[dict], add_generation_prompt: bool | None
+) -> str:
+    """A key that changes if and only if count_tokens_exact's POST body
+    would change. Must cover everything that body depends on: every
+    message's role and content (in order — two lists with the same
+    messages in a different order are a different prompt), and the
+    explicit `add_generation_prompt` argument, which alone determines both
+    request flags (`_agp` and its strict complement `continue_final_message`
+    — see this function's own comment on the two-flag pairing). `repr`, not
+    `str`, so a role/content that happens to BE the separator bytes cannot
+    collide with them, and so a non-string content (a multimodal parts
+    list — never passed by this function's two P14-2 callers, both
+    text-only spans, but reachable from the guard's own calls) hashes
+    without raising."""
+    h = hashlib.sha256()
+    h.update(repr(add_generation_prompt).encode("utf-8", "surrogatepass"))
+    for m in messages:
+        is_dict = isinstance(m, dict)
+        h.update(b"\x00")
+        h.update(repr(m.get("role") if is_dict else None).encode("utf-8", "surrogatepass"))
+        h.update(b"\x01")
+        h.update(repr(m.get("content") if is_dict else m).encode("utf-8", "surrogatepass"))
+    return h.hexdigest()
+
+
 def count_tokens_exact(
     messages: list[dict], add_generation_prompt: bool | None = None
 ) -> int | None:
@@ -1352,6 +1442,23 @@ def count_tokens_exact(
     """
     if not messages:
         return 0
+    # P14-2: answer from the memo before spending a second POST on a list
+    # THIS REQUEST has already measured successfully — only when
+    # `compact_if_needed` has actually turned the memo on for this call
+    # chain (`_COUNT_TOKENS_EXACT_MEMO_CTX`, see its own comment for why
+    # this is request-scoped and not a process-wide cache). Keyed on the
+    # INPUT messages (not the space-filled copy below) — space-filling is
+    # a pure function of the input, so two calls with the same input
+    # always space-fill the same way, and hashing the smaller original
+    # list is cheaper. See _count_tokens_exact_memo_key for what the key
+    # covers.
+    _memo = _COUNT_TOKENS_EXACT_MEMO_CTX.get()
+    _memo_key = (
+        _count_tokens_exact_memo_key(messages, add_generation_prompt)
+        if _memo is not None else None
+    )
+    if _memo is not None and _memo_key in _memo:
+        return _memo[_memo_key]
     # An assistant-final list is a CONTINUATION, not a prompt awaiting a
     # reply. Both flags derive from that one fact and are strict complements:
     # vLLM refuses if add_generation_prompt is True on an assistant-final
@@ -1455,7 +1562,15 @@ def count_tokens_exact(
             )
             return None
         _note_tokenize_success()
-        return int(n)
+        _n = int(n)
+        # P14-2: only a REAL answer goes in the memo — never a failure (see
+        # this function's own comment on _TOKENIZER_TRIED for why caching a
+        # miss turns a transient outage into a permanent one) — and only
+        # when the caller turned the memo on at all (`_memo is not None`;
+        # see _COUNT_TOKENS_EXACT_MEMO_CTX's own comment).
+        if _memo is not None:
+            _memo[_memo_key] = _n
+        return _n
     except Exception as e:
         _note_tokenize_failure(
             f"error.{type(e).__name__}", f"unreachable ({type(e).__name__}: {e})"
@@ -2280,8 +2395,28 @@ async def compact_if_needed(
     messages: list[dict], conv_id: str | None = None,
     *, stored_turns_out: list | None = None,
     inject_budget: int | None = None,
+    reuse_margin_out: list | None = None,
 ) -> list[dict]:
     """
+    `reuse_margin_out`, if given, receives one `int` — the `_BUDGET_MARGIN`
+    this function's reuse WINDOW CHECK read at decision time (`_BUDGET_
+    MARGIN or 0`, the same value `_effective_limit_est` subtracts a few
+    lines below) — written once, at that read, whether the window check
+    ends up keeping the stand-in or declining it. P14-1 (hostile pass #14):
+    that read and `_enforce_hard_budget`'s own read of the SAME global,
+    later in the same request, are not atomic — this function awaits
+    `summarize()` and several thread hops in between, during which another
+    request's rejection can LATCH a larger margin. The window check's
+    decision was made for the margin it read; if the margin is larger by
+    the time the guard runs, the decision's "the stand-in fits beside her
+    previous exchange" no longer holds, and the guard needs to know the
+    margin it is now enforcing against grew AFTER this decision, not before
+    — see `chat_completions`'s use of this value beside its own call to
+    `_enforce_hard_budget`'s `standin_protected`. Empty (as every caller
+    before this one leaves it) when the window check never ran (no
+    conv_id, no hierarchy, `_standin_budget <= 0`) — the caller then has no
+    reuse decision to compare a later margin against.
+
     `stored_turns_out`, if given, receives one `int` — how many older turns
     the RETURNED array replaced with a stand-in FROM STORED SUMMARIES — and
     only at the final return, beside that array. Every early return (nothing
@@ -2315,8 +2450,68 @@ async def compact_if_needed(
     gets exactly the old TARGET-only figure — this keeps existing callers
     and their pinned arithmetic unchanged.
     """
+    # P14-2: turn the count_tokens_exact memo ON for this call — a fresh
+    # dict every time, so nothing from an earlier call (or another
+    # request that happens to share this thread's context) leaks in. See
+    # _COUNT_TOKENS_EXACT_MEMO_CTX's own comment for why this is scoped
+    # here and not left as a process-wide cache. Not reset back to None
+    # before this function returns: everything after it, in THIS SAME
+    # request, that also calls count_tokens_exact (the guard, later in
+    # chat_completions) is welcome to the same request-scoped benefit,
+    # and mismatched content simply misses the memo rather than
+    # colliding with it — the dict is discarded with this request's own
+    # asyncio Task regardless.
+    #
+    # This dict is also visible to any background task THIS request
+    # spawns after compaction (the memory tail, in chat_completions) —
+    # copy_context() (asyncio.create_task/BackgroundTasks both use it)
+    # copies the ContextVar -> value MAPPING, not the dict object it
+    # points to, so the child task gets the same dict, live, not a
+    # snapshot. Confirmed harmless, not reset for this reason either:
+    # (1) content-keyed — a background task's own call on content this
+    # request already measured gets back that same real count (still
+    # correct, since tokenization of fixed content is deterministic);
+    # content it did NOT already measure simply misses and calls
+    # /tokenize itself, same as if the memo were off. Nothing is ever
+    # served a count for content it didn't ask for. (2) a plain `dict[key]
+    # = value` write is one GIL-protected step in CPython — no thread
+    # (run_in_threadpool workers included) ever observes a torn/partial
+    # write, and two writers racing on the SAME key just do one redundant
+    # /tokenize call each and agree on the value, since it's the same
+    # content either way. No lock needed.
+    _COUNT_TOKENS_EXACT_MEMO_CTX.set({})
     current = count_tokens(messages)
-    if current <= TARGET_TOKENS:
+    # G3d (v3.1.9.4, hostile pass #14's "not demonstrated" list, lane
+    # v3194-guard): TARGET_TOKENS is a fixed fraction of HARD_INPUT_LIMIT
+    # (0.75 by default) — it does not know about `_BUDGET_MARGIN`, the
+    # learned, process-wide correction `_enforce_hard_budget` (the guard,
+    # downstream) subtracts from ITS OWN limit before shedding a single
+    # token. TARGET_TOKENS is built with headroom under HARD_INPUT_LIMIT
+    # on purpose (25% of it, by default), so a small margin still leaves
+    # this trigger below what the guard will actually enforce — but the
+    # margin can latch as high as `MAX_MODEL_LEN // 4` (8,192 at the
+    # shipped defaults), which can exceed that headroom outright. When it
+    # does, an array between `HARD_INPUT_LIMIT - margin` and TARGET_
+    # TOKENS skips compaction entirely — no summary, no stand-in — and
+    # reaches the guard raw, where (with nothing injected to trigger the
+    # floor-aware P12-5 branch) the generic shed loop has no protection
+    # for the recent window beyond "never the very last message".
+    # Reproduced (SP\3194-guard\g3d_repro.py): at margin 513 the trigger
+    # cannot fall below HARD_INPUT_LIMIT's own 25% headroom (513 < 4,096),
+    # so this never fires there — CONTROL, unaffected; at margin 8,192 an
+    # array sized exactly in that gap (a small handful of old turns beside
+    # a realistically large previous reply) skips compaction, and the
+    # guard then sheds BOTH old turns AND her previous exchange
+    # (dropped_turns=10, prev_survived=False) to fit — content compaction
+    # would have summarized instead of losing outright.
+    #
+    # Fixed by shifting the trigger down by the SAME margin the guard
+    # will subtract, floored the same way the guard floors its own limit
+    # (`max(256, ...)`, `_enforce_hard_budget`'s own clamp) — so whenever
+    # the margin grows, compaction becomes eager exactly in step with how
+    # much less room the guard now has, and an array this trigger passes
+    # on is one the guard was never going to need to shed raw.
+    if current <= max(256, TARGET_TOKENS - (_BUDGET_MARGIN or 0)):
         return messages
     system_msgs, to_summarize, keep_recent = split_messages(messages)
     if not to_summarize:
@@ -2842,8 +3037,76 @@ async def compact_if_needed(
                         _standin_rendered = summarizer._estimate_block_tokens(
                             stored_text
                         )
-                        _sys_recent_floor = await run_in_threadpool(
+                        # G3c (v3.1.9.4, hostile pass #14's "not
+                        # demonstrated" list, lane v3194-guard): this used
+                        # to be `count_tokens(system_msgs + keep_recent)`
+                        # alone — the LOCAL estimator, while the guard
+                        # downstream verifies the array it actually sheds
+                        # with vLLM's own exact count. `keep_recent`
+                        # carries `A_prev`, her previous reply, which is
+                        # exactly the content this file documents the
+                        # local tokenizer reading 34-51% low on
+                        # (count_tokens_exact's own docstring: decorative
+                        # box-drawing characters and emoji). A floor read
+                        # too LOW makes `_standin_structural_ceiling`
+                        # (`_effective_limit_est - _sys_recent_floor`, a
+                        # few lines down) read too HIGH, so this check can
+                        # approve a stand-in that, once the guard measures
+                        # honestly, does not fit beside her previous
+                        # exchange — the guard then sheds to find the
+                        # room, exactly the P13-1 shape from a different
+                        # counter being wrong. Reproduced: a synthetic
+                        # 51%-low counter on `A_prev` content flips reuse
+                        # from correctly declining to firing at exactly
+                        # the sizes where the real (exact) floor would not
+                        # have allowed it, and the guard then sheds her
+                        # previous exchange to compensate (2 turns
+                        # dropped, `prev_kept=False`) at 10,000-14,000
+                        # synthetic `A_prev` tokens.
+                        #
+                        # Fixed the same way `_fresh_scale` a few lines
+                        # down already is: measure it exactly when
+                        # `/tokenize` answers. This is the FIRST exact
+                        # call in this check (`_fresh_exact` a few lines
+                        # below is the second, for the same reason).
+                        #
+                        # Falls back to the PLAIN local count, unscaled —
+                        # not a pessimistic multiplier — when `/tokenize`
+                        # does not answer. A first draft of this fix used
+                        # the pessimistic 2.0x scale here (mirroring
+                        # `_fresh_scale`'s own fallback a few lines down),
+                        # reasoning that biasing the floor LARGER when
+                        # unmeasured is the safe direction the rest of
+                        # this file always takes. It is safe, but it is
+                        # not FREE: `_fresh_scale`'s 2.0x fallback only
+                        # ever applies to the FRESH SPAN, which is small
+                        # or absent on most requests; `_sys_recent_floor`
+                        # is the recent window's cost on EVERY request
+                        # that reaches this check, and `/tokenize` being
+                        # unreachable is this suite's own default test
+                        # posture (most fixtures never point `VLLM_URL` at
+                        # a real server at all) — doubling it there
+                        # doubled the floor on states this file's own
+                        # hostile-pass history had already tuned and
+                        # proven should reuse (test_reuse_fit.py's [14]
+                        # 'today'/'peakA', [17b], [18b], [19a], [20c],
+                        # [21c]: 18 checks broke, reuse declining where it
+                        # was measured to correctly fire). The pre-fix
+                        # code ALREADY forwarded the plain local count
+                        # whenever `/tokenize` was down — that is not a
+                        # new risk this fix introduces, only a state it
+                        # leaves exactly as it found it. Improve the
+                        # common case (a live `/tokenize`, most requests)
+                        # without changing the degraded one.
+                        _sys_recent_local = await run_in_threadpool(
                             count_tokens, system_msgs + keep_recent
+                        )
+                        _sys_recent_exact = await run_in_threadpool(
+                            count_tokens_exact, system_msgs + keep_recent
+                        )
+                        _sys_recent_floor = (
+                            _sys_recent_exact if _sys_recent_exact is not None
+                            else _sys_recent_local
                         )
                         # P13-1 (hostile pass #13, HIGH): this recovers
                         # `effective_limit`, but not the limit
@@ -2899,26 +3162,54 @@ async def compact_if_needed(
                         # (`_note_backend_rejection` runs whenever ANY
                         # response comes back). That request's guard then
                         # sheds against a limit this check never saw, and
-                        # can lose her previous exchange, for that one
+                        # could lose her previous exchange, for that one
                         # request only; every later request reads the new
-                        # margin in both places. The guard deliberately keeps
-                        # reading the live value rather than a snapshot: a
-                        # margin learned mid-request means vLLM just
-                        # rejected a payload the guard believed would fit,
-                        # and forwarding at the stale limit risks the same
-                        # rejection, which loses the whole reply rather than
-                        # one exchange of context. This does not also
-                        # subtract `_time_reserve` (the current-time line's
-                        # reserve, ~97-105 tokens): that reserve is decided
-                        # later in `chat_completions`, after this function
-                        # returns, so it is not available here to subtract —
-                        # the fixed `+128` below still has to absorb it, and
-                        # the "Verified sound" measurements in
+                        # margin in both places. This does not also subtract
+                        # `_time_reserve` (the current-time line's reserve,
+                        # ~97-105 tokens): that reserve is decided later in
+                        # `chat_completions`, after this function returns,
+                        # so it is not available here to subtract — the
+                        # fixed `+128` below still has to absorb it, and the
+                        # "Verified sound" measurements in
                         # SP\p13-findings.md show ~15-20 tokens of slack left
                         # over for genuine estimator drift once it does. That
                         # gap is real but small next to the 513-8,192 a
                         # margin can hide, which is why this fix and not that
                         # one closes the HIGH.
+                        #
+                        # v3.1.9.4 (P14-1's own residual, hostile pass #14):
+                        # the guard STILL reads the live global, not a
+                        # snapshot of this value — a margin learned
+                        # mid-request means vLLM just rejected a payload the
+                        # guard believed would fit, and forwarding at a
+                        # stale, smaller limit risks the SAME rejection,
+                        # which loses the whole reply rather than one
+                        # exchange of context. That constraint (owner-facing,
+                        # documented in OPERATIONS.md and the CHANGELOG) is
+                        # why a plain "read the margin once and pass it down"
+                        # fix is wrong: it would fix the race by reopening
+                        # the thing P13-1 closed. So the margin THIS decision
+                        # used is reported instead, in `reuse_margin_out`
+                        # (once, here, whether or not the window check ends
+                        # up keeping the stand-in). If the live margin the
+                        # guard is about to enforce is LARGER than what this
+                        # decision saw, the decision that judged the
+                        # stand-in fit beside her previous exchange no
+                        # longer holds — `chat_completions` compares the two
+                        # right beside its own call to the guard and, when
+                        # the margin grew, tells the guard (`standin_
+                        # protected=False`) to spend the stand-in as
+                        # ordinary injected memory, ahead of the previous
+                        # exchange, instead of at the recent window's own
+                        # protected tier — exactly the order a request that
+                        # had DECLINED under the larger margin to begin with
+                        # would already get (P12-5). A margin that FALLS
+                        # mid-request needs no such correction: the guard's
+                        # live limit is only more generous than this
+                        # decision assumed, so whatever it approved still
+                        # fits.
+                        if reuse_margin_out is not None:
+                            reuse_margin_out.append(_BUDGET_MARGIN or 0)
                         _effective_limit_est = int(
                             round(inject_budget / INJECTION_BUDGET_FRACTION)
                         ) - (_BUDGET_MARGIN or 0)
@@ -2987,10 +3278,11 @@ async def compact_if_needed(
                             # exact/local, falling back to the pessimistic
                             # 2.0 only when `/tokenize` genuinely does not
                             # answer — exactly the case the old comment's
-                            # reasoning was actually correct for. This is a
-                            # SECOND exact-adjacent call in this check (the
-                            # first is `_sys_recent_floor`'s `count_tokens`
-                            # above, which is local-only); accepted for the
+                            # reasoning was actually correct for. This is
+                            # the SECOND exact call in this check (the
+                            # first is `_sys_recent_floor`'s own exact
+                            # count above — G3c, hostile pass #14 —
+                            # local-only before that fix); accepted for the
                             # same reason `summarize()` itself pays it: an
                             # accurate reserve here is what stops the
                             # decline this section measures, and a reader
@@ -2999,15 +3291,30 @@ async def compact_if_needed(
                             # still believe declining is free — see
                             # OPERATIONS.md's P13-3 correction.
                             #
-                            # Known residual (hostile pass #14, P14-2): this
-                            # call and summarize()'s are separate POSTs. If
-                            # this one answers and summarize()'s fails,
-                            # summarize() packs at 2.0 and can make more
-                            # batches than reserved here: a span at exactly
-                            # the call cap under 2.0 comes back up to 2,048
-                            # tokens over. Needs a /tokenize failure in the
-                            # milliseconds between the two calls; costs that
-                            # one request.
+                            # Fixed (hostile pass #14, P14-2; v3.1.9.4): this
+                            # call and summarize()'s used to be separate
+                            # POSTs. If this one answered and summarize()'s
+                            # failed a few lines later, summarize() packed at
+                            # the pessimistic 2.0x fallback and could make
+                            # more batches than reserved here — a span at
+                            # exactly the call cap under 2.0 came back up to
+                            # 2,048 tokens over what this reserve priced,
+                            # and the guard shed memory and then her previous
+                            # exchange to find the room (P12-5's order).
+                            # count_tokens_exact now memoizes a SUCCESSFUL
+                            # answer, keyed by content, and never a failure
+                            # (see its own comment) — `_fresh_exact` below and
+                            # summarize()'s own `count_tokens_exact(to_
+                            # summarize)` a few lines later measure the SAME
+                            # list (Q2's own finding: "same list, same
+                            # order"), so summarize()'s call answers from
+                            # this one's real vLLM response instead of
+                            # risking a second POST that can fail on its own.
+                            # The reverse flap (this call fails, summarize()'s
+                            # answers) was already safe — over-reserving, not
+                            # under — and stays exactly as before: a failure
+                            # is never cached, so summarize() still makes its
+                            # own call and prices whatever it gets.
                             _fresh_local = await run_in_threadpool(
                                 count_tokens, _fresh_span_preview
                             )
@@ -6295,6 +6602,51 @@ def _is_compaction_standin(m: dict) -> bool:
     ) if isinstance(m, dict) else False
 
 
+def _aligned_recent_tail(msgs: list[dict]) -> list[int]:
+    """The protected recent window's indices into `msgs`: the last
+    KEEP_RECENT_TURNS non-system turns, aligned to start on a USER turn
+    and never on two consecutive same-role messages (an old preserved
+    image sitting directly in front of the true recent window, most
+    often — see the two alignment rules below for the production
+    incidents each one closes).
+
+    G3a (v3.1.9.4, lane v3194-guard): extracted from the P12-5 branch's
+    own inline computation (`_enforce_hard_budget`, a few hundred lines
+    down) so the post-round forced-drop pass agrees with it about
+    exactly what "the protected recent window" means, rather than a
+    second copy of the same three rules drifting from the first — this
+    file's own most common defect, by its own account (see this
+    function's callers' comments). Pure: takes `msgs` as given, decides
+    nothing about `per`/`running`/limits, so both callers can use it at
+    whatever point in their own shedding they need to know the floor.
+    """
+    _turn_idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+    _floor = max(1, KEEP_RECENT_TURNS)
+    _aligned_tail = _turn_idxs[-min(_floor, len(_turn_idxs)):]
+    # F1 (p7 hostile pass #7): split_messages aligns its kept-recent window
+    # to start on a USER turn — strip any leading non-user entry, or this
+    # floor protects a turn split_messages already decided was old enough
+    # to summarize away (P10-1's own finding, at the site this was
+    # extracted from).
+    while (
+        len(_aligned_tail) > 1
+        and msgs[_aligned_tail[0]].get("role") != "user"
+    ):
+        _aligned_tail = _aligned_tail[1:]
+    # P8-1 (hostile pass #8): the role check above only strips a WRONG
+    # role — an old preserved image sent as a USER turn (OpenAI's
+    # multimodal format) passes it while still breaking the alternation
+    # a real exchange always has. Strip the front entry whenever it
+    # shares a role with the entry right after it.
+    while (
+        len(_aligned_tail) > 1
+        and msgs[_aligned_tail[0]].get("role")
+        == msgs[_aligned_tail[1]].get("role")
+    ):
+        _aligned_tail = _aligned_tail[1:]
+    return _aligned_tail
+
+
 def _has_sheddable_content(msgs: list[dict], protect_system: int) -> bool:
     """Is there anything left the guard is permitted to remove?
 
@@ -6316,12 +6668,250 @@ def _has_sheddable_content(msgs: list[dict], protect_system: int) -> bool:
     return bool(_droppable_system_indices(msgs, protect_system))
 
 
+# G3a (v3.1.9.4): module-level, not a local inside _shed_last_resort, so
+# test_v3194_guard_g3a.py's measurement-cap check asserts against the SAME
+# value the function actually enforces rather than a hardcoded duplicate
+# that could silently drift from it.
+_G3A_MEASURE_CAP = 6
+
+
+def _shed_last_resort(
+    msgs: list[dict],
+    per: list[int],
+    running: int,
+    limit: int,
+    protect_system: int,
+    standin_protected: bool,
+    counter: str,
+    dropped: int,
+    sys_dropped: int,
+    measure: Callable[[list[dict]], tuple[int, str]],
+) -> tuple[list[dict], list[int], int, str, int, int]:
+    """v3.1 D3 / G3a (v3.1.9.4, hostile pass #14's "not demonstrated" list,
+    lane v3194-guard) — `_enforce_hard_budget`'s LAST resort, called only
+    once its own six rounds of arithmetic-then-verify have already failed
+    to converge. Extracted from that function's body into its own,
+    directly-testable function — test_v3194_guard_g3a.py calls it without
+    the six-round loop above it, so the linear-time bound and the
+    measurement cap are properties of THIS function, not entangled with
+    how many rounds ran before it.
+
+    The round budget above is six, and its shedding arithmetic runs on a
+    single `scale` fixed once at the top of `_enforce_hard_budget`; a
+    compaction stand-in whose LOCAL price reads far under its true cost
+    (this repo's own documented undercount on LLM-generated prose) can
+    skew that scale enough that the round loop's own per-round estimate
+    stops short EVERY round without ever finishing — reproduced: 123 ->
+    85 -> 61 -> 47 -> 37 -> 31 turns over six rounds, round 6 ending 568
+    tokens over limit with 24 old turns still sitting there.
+
+    This function spends whatever the six rounds left behind, in the SAME
+    priority `_enforce_hard_budget`'s own docstring already states —
+    oldest turns first, injected memory next, the recent window and the
+    stand-in last, never the newest — as four explicit steps:
+      1. turns ABOVE the aligned recent window (`_aligned_recent_tail`,
+         the SAME floor the P12-5 branch computes), oldest first, whole
+         exchanges where a pair exists;
+      2. spendable injected memory — facts, retrieval, and the
+         compaction stand-in only when `standin_protected` is False —
+         spent UNCONDITIONALLY once step 1 alone is not enough (the
+         same "spend every remaining scrap" doctrine v3.1 D3 already
+         uses for memory: it is worth less than a successful request,
+         so being surgical about it, the way steps 1/3 are surgical
+         about turns, only risks under-cutting when a measurement does
+         not reflect content — see the step's own comment);
+      3. the recent window's own turns, except the newest, oldest of the
+         window first, whole exchanges where a pair exists;
+      4. the PROTECTED stand-in (when `standin_protected` is True) —
+         truly last, unconditionally, only once nothing else remains.
+
+    A first draft shed every non-newest turn, oldest first, before ever
+    reaching step 2 — so on an array that still carried facts or
+    retrieval when this ran, it dropped her previous exchange (step 3)
+    AHEAD of injected memory (step 2), exactly what P12-5 and the
+    owner's standing rule forbid ("her previous exchange is kept over
+    injected memory; the newest turn is never dropped"). Caught by
+    test_v3194_guard_g3a.py's `[G3a-mem]`, which arms a leftover old
+    turn ABOVE the floor alongside spendable facts and retrieval and
+    asserts memory pays, not the exchange.
+
+    Linear time (hostile pass #5's own "linear, not once-per-drop"
+    finding at the P12-5 branch, repeated here rather than reverting to
+    it): each of up to `_G3A_MEASURE_CAP` rounds builds its index lists
+    ONCE from the current `msgs` (never rebuilt per drop) and cuts by
+    walking pointers over them — bounded rounds times linear work per
+    round is linear overall, the same shape the round loop and the
+    P12-5 branch both already use.
+
+    Bounded exact measurements: at most `_G3A_MEASURE_CAP` (6, matching
+    the round budget above it) calls to `measure` total. After each one
+    that still leaves it over limit, the REMAINING per-item estimates
+    are rescaled by (what this round ACTUALLY freed) / (what its
+    estimate said it would free) — a correction the round loop's own
+    fixed `scale` never applies mid-flight, which is exactly what let
+    this pass's own target keep moving underneath a naive single-shot
+    estimate in the reproduction. At the cap, whatever this pass has
+    managed is forwarded and logged; `report` (built by the caller from
+    the returned counts) still names it — the round loop's own "give up
+    gracefully" doctrine, not a new failure mode.
+
+    `measure`: `_enforce_hard_budget`'s own `_measure` closure, passed
+    in rather than recreated here so this function has no access to
+    anything but its own parameters — the same reason `report` is a
+    dict the caller fills in, not a return-type change (see this
+    module's own `report` docstring at `_enforce_hard_budget`).
+    """
+    _g3a_measures = 0
+    while running > limit and _g3a_measures < _G3A_MEASURE_CAP:
+        _g3a_target = running - limit
+        _g3a_freed = 0
+        _g3a_gone: set[int] = set()
+
+        # Index lists, built ONCE this round from the CURRENT msgs.
+        _g3a_idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+        _g3a_aligned = set(_aligned_recent_tail(msgs))
+        _g3a_above = [i for i in _g3a_idxs if i not in _g3a_aligned]
+        _g3a_recent = [i for i in _g3a_idxs if i in _g3a_aligned]
+
+        # --- step 1: turns above the aligned floor, oldest first ---
+        _p = 0
+        while _p < len(_g3a_above) and _g3a_freed < _g3a_target:
+            i0 = _g3a_above[_p]
+            pair_len = (
+                2
+                if _p + 1 < len(_g3a_above)
+                and msgs[i0].get("role") == "user"
+                and msgs[_g3a_above[_p + 1]].get("role") == "assistant"
+                else 1
+            )
+            for k in range(pair_len):
+                j = _g3a_above[_p + k]
+                _g3a_gone.add(j)
+                _g3a_freed += per[j]
+            _p += pair_len
+
+        # --- step 2: spendable injected memory — facts/retrieval always
+        #     qualify; the stand-in only when standin_protected is
+        #     False. UNCONDITIONAL, not target-limited, once step 1
+        #     alone was not enough: the same "spend every remaining
+        #     scrap" doctrine the pre-G3a forced drop already used for
+        #     all injected memory (memory the model never gets to read
+        #     costs nothing a 400 does not already cost). Target-limiting
+        #     this step the way step 1 limits turns made it converge
+        #     only as fast as the per-round `_g3a_target` — computed
+        #     from `running`, which a measurement that does not reflect
+        #     content (test_budget_guard.py's own adversarial stub: a
+        #     FIXED value regardless of what was cut) never shrinks, so
+        #     a target-limited step 2 spent only one block per round and
+        #     exhausted the six-round cap with memory still held — the
+        #     exact "guard holding memory it was allowed to spend"
+        #     defect v3.1 D3 exists to prevent, reopened by being too
+        #     conservative about assumed-cheap memory.
+        if _g3a_freed < _g3a_target:
+            for i in _droppable_system_indices(msgs, protect_system):
+                if not (standin_protected and _is_compaction_standin(msgs[i])):
+                    _g3a_gone.add(i)
+                    _g3a_freed += per[i]
+
+        # --- step 3: the recent window's own turns, except the
+        #     newest, oldest-of-the-window first ---
+        if _g3a_freed < _g3a_target and len(_g3a_recent) > 1:
+            _recent_limit = len(_g3a_recent) - 1  # never the last (newest)
+            _q = 0
+            while _q < _recent_limit and _g3a_freed < _g3a_target:
+                i0 = _g3a_recent[_q]
+                pair_len = (
+                    2
+                    if _q + 1 < _recent_limit
+                    and msgs[i0].get("role") == "user"
+                    and msgs[_g3a_recent[_q + 1]].get("role") == "assistant"
+                    else 1
+                )
+                if _q + pair_len > _recent_limit:
+                    pair_len = 1  # never reach into the newest turn
+                for k in range(pair_len):
+                    j = _g3a_recent[_q + k]
+                    _g3a_gone.add(j)
+                    _g3a_freed += per[j]
+                _q += pair_len
+
+        # --- step 4: the protected stand-in, truly last. UNCONDITIONAL
+        #     for the same reason step 2 is: only ONE block to spend
+        #     here in the overwhelming majority of cases, and reaching
+        #     this step at all means every cheaper option is already
+        #     gone. ---
+        if _g3a_freed < _g3a_target:
+            for i in _droppable_system_indices(msgs, protect_system):
+                if (
+                    standin_protected and _is_compaction_standin(msgs[i])
+                    and i not in _g3a_gone
+                ):
+                    _g3a_gone.add(i)
+                    _g3a_freed += per[i]
+
+        if not _g3a_gone:
+            break  # nothing left any step could touch; forward best effort
+
+        dropped += sum(1 for i in _g3a_gone if msgs[i].get("role") != "system")
+        sys_dropped += sum(1 for i in _g3a_gone if msgs[i].get("role") == "system")
+        msgs = [m for i, m in enumerate(msgs) if i not in _g3a_gone]
+        per = [p for i, p in enumerate(per) if i not in _g3a_gone]
+
+        _g3a_before_measure = running
+        running, counter = measure(msgs)
+        _g3a_measures += 1
+        if running <= limit:
+            break
+        # Rescale: how much this round's cuts ACTUALLY freed vs. what
+        # their (stale, fixed-`scale`) estimate said — applied to every
+        # remaining per-item estimate so the NEXT round's decisions are
+        # calibrated to reality instead of repeating the same mistake.
+        # `max(1, ...)` keeps every estimate usable as a sort/comparison
+        # key even after a large downward correction.
+        if _g3a_freed > 0:
+            _g3a_ratio = (_g3a_before_measure - running) / _g3a_freed
+            per = [max(1, int(p * _g3a_ratio)) for p in per]
+
+    if running > limit and _g3a_measures >= _G3A_MEASURE_CAP:
+        logger.warning(
+            f"hard budget: the last-resort pass hit its "
+            f"{_G3A_MEASURE_CAP}-measurement cap {running - limit} "
+            f"token(s) still over limit {limit}; forwarding the best it "
+            f"reached (dropped {dropped}, sys_dropped {sys_dropped})"
+        )
+
+    # Repair role alternation — steps 1 and 3 above cut whole exchanges
+    # where a pair exists, but a lone orphan (its partner already gone
+    # from an earlier round, or the array arrived mid-pair) can still
+    # leave the first non-system message assistant-first, which would
+    # hand the chat template the exact shape this guard exists to
+    # prevent. Not counted against `_G3A_MEASURE_CAP` — the round loop's
+    # own repair stage is the same, unconditional, one more `measure`
+    # only if something actually changed.
+    _g3a_repair_idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+    _g3a_repaired = False
+    while (
+        len(_g3a_repair_idxs) > 1
+        and msgs[_g3a_repair_idxs[0]].get("role") != "user"
+    ):
+        del msgs[_g3a_repair_idxs[0]]
+        del per[_g3a_repair_idxs[0]]
+        dropped += 1
+        _g3a_repaired = True
+        _g3a_repair_idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+    if _g3a_repaired:
+        running, counter = measure(msgs)
+
+    return msgs, per, running, counter, dropped, sys_dropped
+
+
 def _enforce_hard_budget(
     messages: list[dict],
     limit: int | None = None,
     protect_system: int = 1,
     report: dict | None = None,
     reserve: int = 0,
+    standin_protected: bool = True,
 ) -> list[dict]:
     """Last line of defense: never forward a request that vLLM must reject.
 
@@ -6378,6 +6968,25 @@ def _enforce_hard_budget(
     most likely reject this") was false on its face and the soak counted it
     as one. Default 0 — every other caller's `limit` already means the real
     limit, and a payload over it by any amount is a real failure.
+
+    `standin_protected` (v3.1.9.4, P14-1's residual, hostile pass #14):
+    True (the default, and what every existing caller gets) is the
+    behaviour above — the P12-5 branch's three loops exclude compaction's
+    own stand-in from what they will spend, so it sits at the SAME
+    protected tier as the recent window and is dropped only as the true
+    last resort elsewhere in this function. Pass False when the caller
+    knows THIS stand-in was approved by a reuse decision made under a
+    SMALLER `_BUDGET_MARGIN` than the one this call is enforcing (the
+    margin grew, mid-request, after that decision — see
+    `compact_if_needed`'s `reuse_margin_out`): the decision that judged the
+    stand-in small enough to fit beside her previous exchange no longer
+    holds, so the stand-in is spent as ordinary injected memory instead —
+    ahead of the previous exchange, exactly the order a request that had
+    DECLINED reuse under that same larger margin would already get. This
+    changes ONLY the P12-5 branch's three spend-filters; the stand-in is
+    still never the FIRST thing spent (turns above the recent window still
+    go first, same as always), and every other caller, and every round
+    after this one, is completely unaffected.
     """
     if limit is None:
         limit = HARD_INPUT_LIMIT
@@ -6495,6 +7104,23 @@ def _enforce_hard_budget(
             f"{local_total} is a floor and not a count, and every number in the "
             f"shed line below inherits it."
         )
+
+    def _standin_spendable(m: dict) -> bool:
+        """Is `m` ordinary spendable memory for the P12-5 branch's three
+        filters below (`_spend`, the trim loop's `big`, the drop loop's
+        `spendable`) — i.e. NOT the protected compaction stand-in?
+
+        True whenever `m` is not the stand-in at all. When it IS the
+        stand-in, the answer depends on `standin_protected` (this
+        function's own parameter, v3.1.9.4, P14-1's residual): True (the
+        default) keeps it out of every one of those filters, same as
+        always — dropped only as the true last resort, elsewhere in this
+        function. False means the caller has already decided this
+        specific stand-in's protection no longer holds (a reuse decision
+        made under a smaller margin than the one this call enforces — see
+        this function's own docstring), so it is exactly as spendable as
+        facts or retrieval here."""
+        return not (standin_protected and _is_compaction_standin(m))
 
     def _measure(ms: list[dict]) -> tuple[int, str]:
         """Ground truth for `ms`, and the name of whoever supplied it.
@@ -6665,78 +7291,19 @@ def _enforce_hard_budget(
             # `_skip_generic`'s assignment at the end of this branch.
             _cb_before = (dropped, trimmed, sys_dropped)
             _turn_idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
-            _floor = max(1, KEEP_RECENT_TURNS)
-            # F1 (p7 hostile pass #7): split_messages ALIGNS its kept-recent
-            # window to start on a USER turn (leading non-user turns move
-            # into the summarized portion — required so the template stays
-            # valid; see split_messages's docstring). At KEEP_RECENT_TURNS=4
-            # a real request keeps 3 messages, not 4. This floor used to be
-            # the raw KEEP_RECENT_TURNS message count, so with any preserved
-            # OLD turn (an image, most often) sitting where the 4th-from-end
-            # slot would be, this guard counted it as "recent" and protected
-            # it from the shed loop above — spending injected memory (halving,
-            # then dropping facts/retrieval) to keep a turn split_messages had
-            # already decided was old enough to summarize away. If the array
-            # still didn't fit, the plain shed loop a few lines down dropped
-            # that same turn anyway, so the memory was spent for nothing.
-            # Fix: align the floor the same way split_messages aligns its
-            # window, so "recent" means the same thing in both places.
-            #
-            # P10-1 (hostile pass #10): this alignment used to run only
-            # `if len(_turn_idxs) >= _floor`, i.e. only when the array held
-            # MORE turns than the floor. On a reusing request the array
-            # compact_if_needed returns is usually exactly AT the floor —
-            # `[U_prev, A_prev, U_new]`, three turns for KEEP_RECENT_TURNS=4
-            # — so the gate was false, `_floor` stayed at the raw
-            # KEEP_RECENT_TURNS count, and the shed loop below never even
-            # started (`_n_turns - _cut > _floor` was false immediately, 3
-            # is not > 4). Every one of those turns then read as
-            # "protected", the branch went straight to spending injected
-            # memory (persona, facts, retrieval — halved six times, then
-            # dropped), and STILL did not fit, because `U_prev`/`A_prev` can
-            # legitimately run to 16k+ tokens on their own. Control then
-            # fell out of this branch into the plain shed loop a few lines
-            # down, which has no floor and no pairing, and it dropped
-            # `U_prev` then `A_prev` anyway — spending memory for nothing
-            # and finishing 6,187-9,213 tokens under the limit with persona,
-            # facts and retrieval all gone (measured on her real branch,
-            # 24/472 positions, 5.1%). Aligning unconditionally fixes what
-            # `_floor` MEANS; the loop below fixes what happens when even
-            # that aligned floor is too large to keep whole.
-            _aligned_tail = _turn_idxs[-min(_floor, len(_turn_idxs)):]
-            while (
-                len(_aligned_tail) > 1
-                and msgs[_aligned_tail[0]].get("role") != "user"
-            ):
-                _aligned_tail = _aligned_tail[1:]
-            # P8-1 (hostile pass #8): the role check above only strips a
-            # WRONG role. OpenWebUI sends an uploaded image as a USER
-            # turn (RUNPOD_DEPLOY.md: "OpenAI's standard multimodal
-            # format" puts an image part on the user message, never the
-            # assistant's), and compact_if_needed inserts its preserved
-            # OLD images (`preserved_images`) directly in front of the
-            # true keep_recent window — `system + summary_blocks +
-            # deferred + preserved_images + keep_recent`. So on a real
-            # request the window this floor looks at is
-            # [old_image(user), prev-u(user), prev-a(assistant),
-            # newest(user)]: it already "starts on a user turn" whether
-            # that first entry is the old image or the real first
-            # recent turn, so the check above strips nothing and the
-            # floor stayed at the raw KEEP_RECENT_TURNS count —
-            # protecting the old image from the shed loop below at the
-            # cost of injected memory (halved, then dropped) it never
-            # needed to spend. split_messages's own keep_recent window
-            # always ALTERNATES roles (a real exchange is never two
-            # consecutive user turns); an old image sitting in front of
-            # it breaks that alternation, so strip the front entry
-            # whenever it shares a role with the entry right after it —
-            # exactly the case the role-only check above cannot see.
-            while (
-                len(_aligned_tail) > 1
-                and msgs[_aligned_tail[0]].get("role")
-                == msgs[_aligned_tail[1]].get("role")
-            ):
-                _aligned_tail = _aligned_tail[1:]
+            # F1/P8-1/P10-1 (hostile passes #7/#8/#10): the floor is
+            # ALIGNED — split_messages's own keep_recent window starts on
+            # a user turn and never repeats a role at its front (an old
+            # preserved image, most often), and this floor has to mean
+            # the same "recent" or memory gets spent protecting a turn
+            # split_messages already decided was old enough to summarize
+            # away, and the unaligned floor-less shed loop then drops it
+            # anyway a few lines down. G3a (v3.1.9.4): extracted into
+            # `_aligned_recent_tail` — see its own docstring for the
+            # full history of why each alignment rule exists — so this
+            # branch and the post-round forced-drop pass a few hundred
+            # lines down agree about exactly what the floor is.
+            _aligned_tail = _aligned_recent_tail(msgs)
             _floor = max(1, len(_aligned_tail))
             _n_turns = len(_turn_idxs)
             _cut = 0        # how many of the OLDEST entries of _turn_idxs go
@@ -6800,7 +7367,7 @@ def _enforce_hard_budget(
                     # uses at the end of every round.
                     _spend = [
                         i for i in _droppable_system_indices(msgs, protect_system)
-                        if not _is_compaction_standin(msgs[i])
+                        if _standin_spendable(msgs[i])
                     ]
                     _mem_ceiling = sum(per[i] for i in _spend)
                     _gone = set(_turn_idxs[:_cut]) | set(_spend)
@@ -6860,7 +7427,7 @@ def _enforce_hard_budget(
                 big = [
                     i
                     for i in _droppable_system_indices(msgs, protect_system)
-                    if not _is_compaction_standin(msgs[i])
+                    if _standin_spendable(msgs[i])
                     and isinstance(msgs[i].get("content"), str)
                     and len(msgs[i]["content"]) > 400
                 ]
@@ -6880,7 +7447,7 @@ def _enforce_hard_budget(
             while running > limit:
                 spendable = [
                     i for i in _droppable_system_indices(msgs, protect_system)
-                    if not _is_compaction_standin(msgs[i])
+                    if _standin_spendable(msgs[i])
                 ]
                 if not spendable:
                     break
@@ -7011,61 +7578,20 @@ def _enforce_hard_budget(
         if not _has_sheddable_content(msgs, protect_system):
             break  # nothing left to shed; forward best effort
 
-    # v3.1 D3 — the last thing that happens before a payload the guard has
-    # MEASURED as too large goes out the door: spend every remaining scrap of
-    # injected memory.
-    #
-    # The rounds above can exit still over the limit with injected blocks in
-    # hand. The round budget is six, and the shedding arithmetic runs on scaled
-    # per-message LOCAL counts, so a round can believe it has fit, the exact
-    # verify can disagree, and the sixth disagreement is simply the last one.
-    # The old code then forwarded anyway, on the reasoning that the newest turn
-    # is never dropped.
-    #
-    # That reasoning is right about TURNS and does not transfer to injected
-    # memory. Dropping memory the model will never get to read costs nothing
-    # that the 400 does not already cost, and the 400 additionally loses the
-    # message the user just typed — no reply, no facts, no episodic write, and
-    # nothing retries it. Memory the model cannot receive is worth less than a
-    # request that succeeds; the drop stage already makes exactly that trade,
-    # and this is the one point where the guard used to decline to make it.
+    # v3.1 D3 / G3a (v3.1.9.4, hostile pass #14's "not demonstrated" list,
+    # lane v3194-guard) — the LAST resort, after six rounds of
+    # arithmetic-then-verify have already failed to converge. Extracted
+    # into `_shed_last_resort` (see its own docstring for the full
+    # mechanism, the reproduction, and the fix P12-5's own priority
+    # order required) so it can be unit-tested directly, isolated from
+    # the round loop above — test_v3194_guard_g3a.py's linear-time bound
+    # and measurement-cap checks call it without running six rounds
+    # first.
     if running > limit:
-        # Drop the MINIMUM that fits — then verify, and keep going if it did not.
-        #
-        # Two properties, and the first version of this had only one each time.
-        # Dropping EVERYTHING is wasteful: measured by review, a payload over by
-        # 550 tokens lost persona, facts and summary when one 1500-token block
-        # covered it — discarding the priority reasoning _bound_injected_blocks
-        # spends twenty lines establishing (persona last, because losing it
-        # makes the reply wrong in KIND rather than merely thinner). But
-        # dropping the minimum by ARITHMETIC alone is worse: `running` here is
-        # scaled per-message estimate, and if the exact count still does not
-        # fit, forwarding while holding memory we were allowed to spend is the
-        # thing this whole path exists to prevent.
-        #
-        # So: cheapest-first by the estimate, then measure, then escalate on
-        # the measurement until it fits or nothing droppable remains. The extra
-        # /tokenize calls are bounded by the number of injected blocks and this
-        # is a last-resort path that should almost never run.
-        forced = _droppable_system_indices(msgs, protect_system)
-        for i in reversed(forced):
-            if running <= limit:
-                break
-            running -= per[i]
-            del msgs[i]
-            del per[i]
-            sys_dropped += 1
-        if sys_dropped:
-            running, counter = _measure(msgs)
-        while running > limit:
-            remaining = _droppable_system_indices(msgs, protect_system)
-            if not remaining:
-                break
-            i = remaining[-1]
-            del msgs[i]
-            del per[i]
-            sys_dropped += 1
-            running, counter = _measure(msgs)
+        msgs, per, running, counter, dropped, sys_dropped = _shed_last_resort(
+            msgs, per, running, limit, protect_system, standin_protected,
+            counter, dropped, sys_dropped, _measure,
+        )
 
     # v3.1 A9/A10: the shed line now names the counter behind its numbers and
     # the margin in force. Every number in this line came from one of two
@@ -9472,11 +9998,20 @@ async def chat_completions(request: Request) -> Any:
     # — see compact_if_needed's docstring for why this is an out-param
     # rather than a return-type change.
     _compaction_stored_turns: list[int] = []
+    # P14-1 (hostile pass #14): the margin compact_if_needed's reuse window
+    # check read at decision time, if that check ran at all — compared
+    # against the LIVE margin right beside the guard call below, so a
+    # margin that grew while this request awaited summarize() demotes the
+    # stand-in's protection instead of costing her previous exchange. See
+    # compact_if_needed's own docstring for `reuse_margin_out` and
+    # _enforce_hard_budget's for `standin_protected`.
+    _reuse_margin_at_decision: list[int] = []
     try:
         body["messages"] = await compact_if_needed(
             messages, conv_id,
             stored_turns_out=_compaction_stored_turns,
             inject_budget=inject_budget,
+            reuse_margin_out=_reuse_margin_at_decision,
         )
     except Exception as e:
         logger.exception(
@@ -9872,6 +10407,42 @@ async def chat_completions(request: Request) -> Any:
             f"assistant turn(s) in the forwarded window (whole={_loop_whole} "
             f"cut={_loop_touched - _loop_whole})"
         )
+    # P14-1 (hostile pass #14): compact_if_needed's reuse window check
+    # (when it ran at all) reserved room for the stand-in against the
+    # margin it read AT DECISION TIME. This request may have spent seconds
+    # in summarize() and several thread hops since — read live, right
+    # beside the guard's own read a moment from now, rather than trust a
+    # value that could be stale by then. If the live margin grew past what
+    # the decision saw, that decision's "the stand-in fits beside her
+    # previous exchange" no longer holds: tell the guard to spend this
+    # specific stand-in as ordinary memory, ahead of the previous
+    # exchange, instead of at the recent window's own protected tier —
+    # the order a request that had DECLINED reuse under this same larger
+    # margin would already get (P12-5). See compact_if_needed's `reuse_
+    # margin_out` and _enforce_hard_budget's `standin_protected` for the
+    # full reasoning, and why a plain snapshot of the margin is the wrong
+    # fix (the guard must never forward at a limit smaller than the LIVE
+    # margin demands — a stale snapshot there risks the whole reply, not
+    # one exchange). A margin that FALLS mid-request needs no correction:
+    # the guard's live limit is only more generous than the decision
+    # assumed, so whatever it approved still fits.
+    _standin_protected = True
+    if (
+        _compaction_stored_turns
+        and _compaction_stored_turns[0] > 0
+        and _reuse_margin_at_decision
+        and _BUDGET_MARGIN > _reuse_margin_at_decision[0]
+    ):
+        _standin_protected = False
+        logger.info(
+            f"conv={conv_id or '?'}: the reuse decision that kept the "
+            f"compaction stand-in read _BUDGET_MARGIN="
+            f"{_reuse_margin_at_decision[0]}; the guard is enforcing "
+            f"{_BUDGET_MARGIN} now (latched by another request while this "
+            f"one awaited summarize()) — spending the stand-in as ordinary "
+            f"memory ahead of the previous exchange rather than risk it to "
+            f"a decision that no longer holds"
+        )
     body["messages"] = await run_in_threadpool(
         _enforce_hard_budget,
         body["messages"],
@@ -9879,6 +10450,7 @@ async def chat_completions(request: Request) -> Any:
         caller_system,
         guard_report,
         _time_reserve,
+        _standin_protected,
     )
     # The limit the FORWARDED payload is held to, REGARDLESS of the line: the
     # guard above shed against `effective_limit - _time_reserve` only to leave

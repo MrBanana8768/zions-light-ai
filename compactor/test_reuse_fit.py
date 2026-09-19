@@ -2987,10 +2987,10 @@ def _g20_stub_exact_by_content(fresh_ratio, other_ratio):
     return _exact
 
 
-def _g20_run(exact_ratio, stub=None):
+def _g20_run(exact_ratio, stub=None, aprev_tokens=7500):
     main.count_tokens_exact = stub or _g20_stub_exact(exact_ratio)
     try:
-        return _g17_run(_spy_summarize, 2, 3750, n_l1=9, l3_tokens=1869, aprev_tokens=7500)
+        return _g17_run(_spy_summarize, 2, 3750, n_l1=9, l3_tokens=1869, aprev_tokens=aprev_tokens)
     finally:
         main.count_tokens_exact = _g20_saved_cte
 
@@ -3025,8 +3025,21 @@ check(
 # needs only one batch, fits, and reuses. The stub answers 1.05 only for the
 # fresh span itself and 2.0 for any other list (P14-4), so the scale must be
 # measured on the list summarize() will receive.
+#
+# aprev_tokens=1000, not [20a]/[20b]'s shared 7500: this stub's
+# "2.0 for any other list" bucket is deliberately punitive so a mutant
+# that measures the WRONG list (P14-4's own finding) cannot hide — and
+# G3c (v3.1.9.4) gave `_sys_recent_floor` its own EXACT call over
+# `system_msgs + keep_recent`, the SAME shape that bucket exists to
+# catch, so this stub (correctly, for P14-4's purpose) now also prices
+# THAT call at 2.0x. At aprev_tokens=7500 that doubled recent-window
+# floor alone exceeds the ~12,872-token ceiling this fixture's numbers
+# above describe, so reuse would decline regardless of the fresh-span
+# scale this section exists to test — recalibrated down so the floor
+# leaves room again; the fresh-tail numbers above (2 pairs, 3,750
+# tokens each, the reserve/ceiling arithmetic) are unchanged.
 _g20c_stored, _g20c_out, _g20c_last, _g20c_render, _g20c_log = _g20_run(
-    None, stub=_g20_stub_exact_by_content(1.05, 2.0)
+    None, stub=_g20_stub_exact_by_content(1.05, 2.0), aprev_tokens=1000
 )
 check(
     _g20c_stored == [_g20c_last],
@@ -3072,6 +3085,455 @@ check(
     f"ever reserve AS MANY OR MORE batches than the measured scale this fix "
     f"now prefers when /tokenize does answer, never fewer",
 )
+
+
+# ---------------------------------------------------------------------------
+# [21] P14-1 (hostile pass #14, lane v3194-guard): the P13-1 fix's own
+# residual. `compact_if_needed`'s reuse window check and `_enforce_hard_
+# budget`'s own read of `_BUDGET_MARGIN` are NOT atomic — this function
+# awaits `summarize()` and several thread hops in between (`[19]`'s own
+# section above proves the two agree WITHIN one request when nothing moves
+# the global in between). If another request's unpredicted rejection
+# latches a LARGER margin while this one is suspended, the window check's
+# decision ("the stand-in fits beside her previous exchange") was made for
+# a margin smaller than the one the guard now enforces, and the guard's
+# P12-5 branch protected the stand-in at the SAME tier as the recent
+# window — so it cut into U_prev/A_prev before ever touching a stand-in
+# that decision no longer justified. p14 proved it end to end
+# (SP\p14\mk_conc.py): (a) margin 0 throughout kept the exchange, (b)
+# margin 8192 throughout kept it (the window check declined, P13-1's own
+# fix), (c) 0 at the check and 8192 by the time the guard ran LOST it.
+#
+# THE FIX: `compact_if_needed` gained `reuse_margin_out` — the margin its
+# window check actually read, reported once, at that read. `chat_
+# completions` compares that to the LIVE `_BUDGET_MARGIN` right beside its
+# own call to the guard; when the margin grew since the decision, it
+# passes `_enforce_hard_budget`'s new `standin_protected=False`, which
+# excludes the stand-in from the P12-5 branch's protected tier for THIS
+# call only — spent as ordinary memory, ahead of the previous exchange,
+# the same order a request that had DECLINED reuse under that larger
+# margin would already get. The guard's own numeric limit is UNCHANGED —
+# it still reads the live global for `limit` itself, never a stale
+# snapshot (the owner-facing constraint already in OPERATIONS.md: the
+# guard must never forward at a limit smaller than the live margin
+# demands). A margin that FALLS mid-request needs no correction: the
+# decision was already conservative, so the (now more generous) live
+# limit only has more room than it assumed.
+#
+# This file's own `_g14_guard` cannot exercise this: it calls
+# `_enforce_hard_budget` with the 4-arg shape every other section here
+# uses (`standin_protected` defaults True), so this section builds the
+# fixture and drives both functions directly, mirroring exactly what
+# `chat_completions` now does between them — the reuse decision, the
+# margin comparison, and the guard call — rather than reusing `_g14_guard`
+# unmodified.
+# ---------------------------------------------------------------------------
+print("\n[21] P14-1: a margin latched by another request mid-request no "
+      "longer costs her previous exchange")
+
+_G21_OVERFLOW = (
+    "This model's maximum context length is 32768 tokens. However, your "
+    "request has 29000 input tokens. Please reduce the length of the input "
+    "messages."
+)
+
+
+async def _g21_bumping_summarize(client, to_summarize):
+    """The race: another request's unpredicted rejection lands while THIS
+    request is suspended awaiting its own fresh-span summarize()."""
+    main._note_backend_rejection(
+        _G21_OVERFLOW, enforced_limit=20768, guard_measured_overflow=False
+    )
+    return await _spy_summarize(client, to_summarize)
+
+
+async def _g21_falling_summarize(client, to_summarize):
+    """The margin-FALLS direction: another request's accepted-streak
+    release lowered the margin while this one awaited summarize(). Moved
+    directly (release only happens via consecutive accepted requests, off
+    this test's critical path) — same pattern [F1]/[19] use elsewhere in
+    this file to pin a margin for one section."""
+    main._BUDGET_MARGIN = 0
+    return await _spy_summarize(client, to_summarize)
+
+
+def _g21_run(stub, margin_at_start):
+    """p14's own peakA fixture ([17]/[19]'s own construction, n_l1=9,
+    l3_tokens=1869 — sized so the SAME span reuses at the measured ~1.05x
+    scale). aprev_tokens=6500, not [19]'s 8500 or the original p14 draft's
+    7500: G3c (v3.1.9.4) gave `_sys_recent_floor` its own exact call, and
+    this section's `_g20_stub_exact(1.05)` answers it too (a flat ratio
+    for ANY list) — a small, deliberate inflation of the recent window's
+    own measured cost that ate the margin 7500 left; recalibrated down,
+    same as [20c]'s own `aprev_tokens` a few sections up, for the same
+    reason. Driven through the fix's own
+    wiring: `reuse_margin_out` from compact_if_needed, compared against
+    the LIVE margin right beside the guard call, deciding `standin_
+    protected` — exactly chat_completions's own sequence between the two
+    functions, copied here in shape (not by calling chat_completions
+    itself, which needs a full request/app context this suite does not
+    build)."""
+    saved = main._BUDGET_MARGIN
+    main._BUDGET_MARGIN = margin_at_start
+    main.count_tokens_exact = _g20_stub_exact(1.05)
+    saved_fraction = main.INJECTION_BUDGET_FRACTION
+    saved_summarize = main.summarize
+    try:
+        main.INJECTION_BUDGET_FRACTION = 0.75
+        main.summarize = stub
+        msgs, last, render = _g17_build(
+            2, 3750, aprev_tokens=6500, n_l1=9, l3_tokens=1869,
+        )
+        saved_sbmax = summarizer.SUMMARY_BLOCK_MAX_TOKENS
+        summarizer.SUMMARY_BLOCK_MAX_TOKENS = _G12_SHIPPED_SBMAX
+        stored_out: list = []
+        margin_at_decision: list = []
+        try:
+            out = _run(
+                msgs, _G17_CONV, stored_turns_out=stored_out,
+                inject_budget=_G_PLANNED_INJECT,
+                reuse_margin_out=margin_at_decision,
+            )
+        finally:
+            summarizer.SUMMARY_BLOCK_MAX_TOKENS = saved_sbmax
+
+        # --- chat_completions's own P14-1 wiring (main.py, beside its call
+        #     to _enforce_hard_budget), copied in shape ---
+        margin_at_guard = main._BUDGET_MARGIN
+        standin_protected = True
+        if (
+            stored_out and stored_out[0] > 0
+            and margin_at_decision
+            and margin_at_guard > margin_at_decision[0]
+        ):
+            standin_protected = False
+
+        # --- the rest of what chat_completions does after compact_if_needed
+        #     (persona + injected memory, then the real guard) — _g14_guard's
+        #     own body, plus the new parameter it does not know about ---
+        standin = next((m for m in out if main._is_compaction_standin(m)), None)
+        rest = [m for m in out if m.get("role") != "system"]
+        full = [out[0], {"role": "system", "content": "P" * 2500}]
+        if standin is not None:
+            full.append(standin)
+        full.append({"role": "system", "content": _G11_MEM})
+        full += rest
+        rep: dict = {}
+        result = main._enforce_hard_budget(
+            full, EFFECTIVE_LIMIT, 1, rep, 0, standin_protected,
+        )
+        ns_result = [m for m in result if m.get("role") != "system"]
+        prev_survived = (
+            any("prev-u" in main._message_text(m) for m in ns_result)
+            and any("prev-a" in main._message_text(m) for m in ns_result)
+        )
+        newest_survived = any(
+            "newest-u" in main._message_text(m) for m in ns_result
+        )
+        return (
+            stored_out, margin_at_decision, margin_at_guard,
+            standin_protected, rep, prev_survived, newest_survived,
+        )
+    finally:
+        main.count_tokens_exact = _g20_saved_cte
+        main._BUDGET_MARGIN = saved
+        main.summarize = saved_summarize
+        main.INJECTION_BUDGET_FRACTION = saved_fraction
+
+
+# [21a] CONTROL: margin 0 throughout — unaffected by this fix.
+_g21a = _g21_run(_spy_summarize, 0)
+check(_g21a[5], f"[21a] CONTROL margin 0 throughout: her previous exchange survives (rep={_g21a[4]})")
+check(_g21a[6], "[21a]: the newest turn always survives")
+
+# [21b] CONTROL: margin 8192 in force from the start — the P13-1 shape;
+# also unaffected (the window check itself declines at this margin, so
+# there is no stand-in to protect or demote).
+_g21b = _g21_run(_spy_summarize, 8192)
+check(_g21b[5], f"[21b] CONTROL margin 8192 throughout: her previous exchange survives (rep={_g21b[4]})")
+check(_g21b[6], "[21b]: the newest turn always survives")
+
+# [21c] *** THE FIX: 0 at the window check, latched to 8192 by the time the
+# guard runs — before this fix: a=kept b=kept c=LOST (SP\p14-findings.md,
+# P14-1). After it, the fix must see the margin grew and demote the
+# stand-in's protection, and her previous exchange must survive.
+_g21c = _g21_run(_g21_bumping_summarize, 0)
+check(
+    _g21c[0] and _g21c[0][0] > 0,
+    f"[21c] fixture: reuse fires at the margin the decision saw "
+    f"(stored_turns_out={_g21c[0]})",
+)
+check(
+    _g21c[3] is False,
+    f"[21c]: the fix demotes the stand-in's protection once the LIVE "
+    f"margin ({_g21c[2]}) exceeds what the decision read "
+    f"({_g21c[1]}) — standin_protected={_g21c[3]}",
+)
+check(
+    _g21c[5],
+    f"*** P14-1 [21c] THE FIX: her previous exchange survives the race "
+    f"that lost it before this fix (a=kept b=kept c=LOST) — rep={_g21c[4]}",
+)
+check(_g21c[6], "[21c]: the newest turn always survives")
+
+# [21d] CONTROL: the margin FALLS mid-request (another request's accepted
+# streak released it) — must not make anything worse. The decision was
+# already made under the LARGER margin, so it was already conservative;
+# the fix must not demote the stand-in here, and the exchange must survive
+# regardless.
+_g21d = _g21_run(_g21_falling_summarize, 8192)
+check(
+    _g21d[3] is True,
+    f"[21d]: a FALLING margin does not demote the stand-in's protection "
+    f"(standin_protected={_g21d[3]}) — the decision it was made under was "
+    f"already conservative",
+)
+check(_g21d[5], f"[21d]: her previous exchange survives when the margin only falls (rep={_g21d[4]})")
+check(_g21d[6], "[21d]: the newest turn always survives")
+
+main._BUDGET_MARGIN = 0
+main._budget_ok_streak = 0
+
+
+# ---------------------------------------------------------------------------
+# [22] P14-1, THE WIRING FOR REAL (same doctrine as [8]/[9] above: "nothing
+# that calls a function can see whether its call site is right"). [21]
+# proves `compact_if_needed`'s `reuse_margin_out` and `_enforce_hard_
+# budget`'s `standin_protected` are correct in themselves, but it drives
+# both directly and copies chat_completions's own margin-comparison logic
+# IN THE TEST — a mutant inside chat_completions's actual wiring (the
+# comparison, which field it reads, whether it is wired in at all) is
+# invisible to [21]. This section drives the REAL endpoint instead
+# (POST /v1/chat/completions via TestClient, [8]'s own infrastructure),
+# with `main.summarize` patched to bump `_BUDGET_MARGIN` mid-request the
+# same way [21c]'s race does, and checks the ACTUAL forwarded payload —
+# not a value this test computed, the bytes chat_completions put on the
+# wire.
+# ---------------------------------------------------------------------------
+print("\n[22] P14-1 driving chat_completions itself: a margin latched mid-"
+      "request must not cost her previous exchange on the real endpoint")
+
+CONV_G22 = _G17_CONV
+
+
+async def _g22_bumping_summarize(client, to_summarize):
+    """Same race as [21c]'s, at the real endpoint: another request's
+    unpredicted rejection lands while THIS request awaits its own
+    fresh-span summarize()."""
+    main._note_backend_rejection(
+        _G21_OVERFLOW, enforced_limit=20768, guard_measured_overflow=False
+    )
+    return await _spy_summarize(client, to_summarize)
+
+
+_g22_msgs, _g22_last, _g22_render = _g17_build(
+    2, 3750, aprev_tokens=6500, n_l1=9, l3_tokens=1869,
+)
+_g22_saved_fraction = main.INJECTION_BUDGET_FRACTION
+_g22_saved_sbmax = summarizer.SUMMARY_BLOCK_MAX_TOKENS
+_g22_saved_margin = main._BUDGET_MARGIN
+main.INJECTION_BUDGET_FRACTION = 0.75  # [17]/[19]/[21]'s own fixture assumes this
+summarizer.SUMMARY_BLOCK_MAX_TOKENS = _G12_SHIPPED_SBMAX
+main.count_tokens_exact = _g20_stub_exact(1.05)
+main.summarize = _g22_bumping_summarize
+main._BUDGET_MARGIN = 0
+def _g22_no_redact(messages):
+    """Passthrough for main._redact_forwarded_loop_replies (the fence
+    lane's loop-detection code, main.py:8758-8975 — not this lane's to
+    edit). Needed only because this fixture's fat_turn() content is a tag
+    plus a long run of ONE repeated character, by design (cheap, exact
+    token control) — which is indistinguishable, to an UNRELATED
+    degeneracy detector, from a model generating a repetitive loop, and it
+    redacts the "prev-a" marker this check looks for. Orthogonal to
+    P14-1/G2: [8]/[9] above use realistic (non-repetitive) content and
+    never trip it; this fixture just cannot use fat_turn's shape and also
+    exercise that subsystem in the same request."""
+    return messages, 0, 0
+
+
+_g22_handler = _CaptureLogs()
+_ep_logger.addHandler(_g22_handler)
+try:
+    _EndpointStubVLLM.sent.clear()
+    with _patch.object(main.httpx, "AsyncClient", _EndpointStubVLLM), \
+         _patch.object(main, "_fire_and_forget", _swallow_tail), \
+         _patch.object(main, "_redact_forwarded_loop_replies", _g22_no_redact):
+        _g22_resp = _client.post(
+            "/v1/chat/completions",
+            json={"model": "stub-model", "messages": _g22_msgs, "stream": False},
+            headers={"X-Conversation-Id": CONV_G22},
+        )
+finally:
+    _ep_logger.removeHandler(_g22_handler)
+    summarizer.SUMMARY_BLOCK_MAX_TOKENS = _g22_saved_sbmax
+    main.INJECTION_BUDGET_FRACTION = _g22_saved_fraction
+    main.count_tokens_exact = _g20_saved_cte
+    main.summarize = _spy_summarize
+    main._BUDGET_MARGIN = _g22_saved_margin
+    main._budget_ok_streak = 0
+
+check(
+    _g22_resp.status_code == 200,
+    f"fixture: the real endpoint request succeeded (got {_g22_resp.status_code}: "
+    f"{_g22_resp.text[:200]})",
+)
+_g22_forwarded = _EndpointStubVLLM.sent[-1] if _EndpointStubVLLM.sent else None
+_g22_fwd_text = (
+    " ".join(str(m.get("content", "")) for m in _g22_forwarded.get("messages", []))
+    if _g22_forwarded else ""
+)
+check(
+    main.COMPACTION_SUMMARY_HEADER in _g22_fwd_text,
+    "fixture: the stand-in reached the wire — reuse fired, so this request "
+    "actually exercises the race (a request that declined has no stand-in "
+    "to demote)",
+)
+check(
+    "prev-u" in _g22_fwd_text and "prev-a" in _g22_fwd_text,
+    f"*** P14-1 [22] THE FIX, END TO END: her previous exchange "
+    f"(U_prev/A_prev) is in the ACTUAL payload chat_completions put on "
+    f"the wire, driven through the real endpoint with a margin latched by "
+    f"another request while this one awaited summarize() — before this "
+    f"fix, this exact race dropped it (SP\\p14-findings.md, P14-1)",
+)
+check(
+    "newest-u" in _g22_fwd_text,
+    "[22]: the newest turn always survives, at the real endpoint too",
+)
+
+
+# ---------------------------------------------------------------------------
+# [23] G3c (hostile pass #14's "not demonstrated" list, lane v3194-guard):
+# `_sys_recent_floor` (system prompt + recent window) used to be counted
+# with the LOCAL count_tokens alone, while the guard downstream verifies
+# the array it actually sheds with vLLM's own exact count. `keep_recent`
+# carries `A_prev`, her previous reply — exactly the content this file
+# documents the local tokenizer reading 34-51% low on (count_tokens_
+# exact's own docstring: decorative box-drawing characters and emoji). A
+# floor read too LOW makes `_standin_structural_ceiling` (`_effective_
+# limit_est - _sys_recent_floor`) read too HIGH, so the window check could
+# approve a stand-in that, once the guard measures honestly, does not
+# actually fit beside her previous exchange — the SAME P13-1 shape, from a
+# different counter being wrong.
+#
+# Reproduced: a synthetic counter that reads `A_prev`-tagged content at
+# 49% of its true price (the documented worst case, matching this file's
+# and count_tokens_exact's own "up to 51% low" language) on p14's own
+# peakA fixture. Before the fix: reuse fired at aprev_tokens 10,000-14,000
+# and the guard then shed her previous exchange (2 turns dropped) to
+# compensate. After it: the window check declines at those same sizes
+# instead (stored_turns_out=[0]) — the guard is never put in that
+# position at all.
+#
+# THE FIX: `_sys_recent_floor` gets its own `count_tokens_exact` call
+# (the SAME pattern `_fresh_scale` a few lines below it already uses),
+# falling back to the PLAIN local count — unscaled, not the pessimistic
+# 2.0x `_fresh_scale` falls back to — when `/tokenize` does not answer.
+# That asymmetry is deliberate: a first draft used the pessimistic
+# fallback here too and broke 18 of this file's OWN checks ([14] 'today'/
+# 'peakA', [17b], [18b], [19a], [20c], [21c] among them) — `/tokenize`
+# being unreachable is this suite's own default test posture (most
+# fixtures never point VLLM_URL at a real server), so doubling the
+# recent-window floor whenever it is down doubled it on states this
+# file's hostile-pass history had already proven should reuse. The
+# pre-fix code already forwarded the plain local count on that path; this
+# fix changes nothing there, only the common case where `/tokenize` DOES
+# answer.
+# ---------------------------------------------------------------------------
+print("\n[23] G3c: _sys_recent_floor is counted exactly when /tokenize "
+      "answers, not just approximately with the local estimator")
+
+
+def _g23_true(txt):
+    return len(txt) // 4 + 4
+
+
+def _g23_local_counter(ms):
+    total = 0
+    for m in ms:
+        txt = main._message_text(m)
+        n = _g23_true(txt)
+        if "prev-a" in txt:
+            n = int(n * 0.49)  # the documented worst case: 51% low
+        total += n
+    return total
+
+
+def _g23_exact_counter(ms, *a, **k):
+    return sum(_g23_true(main._message_text(m)) for m in ms)
+
+
+def _g23_run(aprev_tokens, count_tokens_stub, count_tokens_exact_stub):
+    saved_fraction = main.INJECTION_BUDGET_FRACTION
+    saved_summarize = main.summarize
+    saved_ct = main.count_tokens
+    saved_cte = main.count_tokens_exact
+    main.INJECTION_BUDGET_FRACTION = 0.75
+    main.summarize = _spy_summarize
+    main.count_tokens = count_tokens_stub
+    main.count_tokens_exact = count_tokens_exact_stub
+    try:
+        stored, out, last, render, log = _g17_run(
+            _spy_summarize, 2, 3750, n_l1=9, l3_tokens=1869,
+            aprev_tokens=aprev_tokens,
+        )
+        rep, prev, newest = _g14_guard(out, last, "g23")
+        return stored, out, last, rep, prev, newest
+    finally:
+        main.INJECTION_BUDGET_FRACTION = saved_fraction
+        main.summarize = saved_summarize
+        main.count_tokens = saved_ct
+        main.count_tokens_exact = saved_cte
+
+
+# [23a] *** THE FIX: at aprev_tokens=12000 — inside the window where the
+# unfixed code fired reuse and the guard then shed her previous exchange
+# (reproduced: stored=[130], dropped_turns=2, prev_kept=False) — the
+# window check now declines instead, so the guard never has to choose.
+_g23a_stored, _g23a_out, _g23a_last, _g23a_rep, _g23a_prev, _g23a_newest = _g23_run(
+    12000, _g23_local_counter, _g23_exact_counter
+)
+check(
+    _g23a_stored == [0],
+    f"*** G3c [23a] THE FIX: the window check declines once the recent "
+    f"floor is measured exactly (stored_turns_out={_g23a_stored}) — "
+    f"before this fix it fired here and the guard then shed her previous "
+    f"exchange to compensate",
+)
+check(
+    _g23a_prev and _g23a_newest,
+    f"[23a]: her previous exchange and the newest turn both survive end "
+    f"to end ({_g23a_rep})",
+)
+
+# [23b] CONTROL: /tokenize down for this call specifically — falls back to
+# the PLAIN local count (not a pessimistic multiplier), so behaviour here
+# is UNCHANGED from before this fix: reuse still fires (the local counter
+# under-reads the floor exactly as it always did on this path, and this
+# fix does not touch that).
+_g23b_stored, *_g23b_rest = _g23_run(
+    12000, _g23_local_counter, _g20_stub_exact(None)
+)
+check(
+    _g23b_stored == [130],
+    f"[23b] CONTROL (/tokenize down): unchanged from before this fix — "
+    f"the plain local count is used, same as the pre-fix code always did "
+    f"on this path (stored_turns_out={_g23b_stored})",
+)
+
+# [23c] CONTROL: a SMALL A_prev, where even a 51%-low local reading is
+# nowhere near enough to matter — reuse must still fire normally. The fix
+# must not make this check MORE conservative than it needs to be.
+_g23c_stored, _g23c_out, _g23c_last, _g23c_rep, _g23c_prev, _g23c_newest = _g23_run(
+    4000, _g23_local_counter, _g23_exact_counter
+)
+check(
+    _g23c_stored == [130],
+    f"[23c] CONTROL: a small A_prev still reuses normally "
+    f"(stored_turns_out={_g23c_stored}) — the fix declines only when the "
+    f"REAL floor genuinely does not leave room, not unconditionally",
+)
+check(_g23c_prev and _g23c_newest, f"[23c]: her previous exchange and the newest turn survive ({_g23c_rep})")
 
 
 if FAILED:

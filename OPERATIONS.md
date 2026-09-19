@@ -315,11 +315,19 @@ already IS the config change reacting to a real overshoot it measured.
 
 One request can fall between the two reads (hostile pass #14, P14-1): if
 a margin latches while a request is already past its reuse decision, that
-request's guard applies the new margin and can shed her previous exchange
-to fit. Every request after it reads the new margin in both places. The
-guard keeps the live value on purpose, because the margin was learned
-from a rejection and forwarding at the old limit risks losing the whole
-reply instead.
+request's guard applies the new margin. Fixed in v3.1.9.4: the reuse
+window check now reports the margin it used for its decision, and the
+guard call compares that to the LIVE margin right beside itself; if the
+margin grew in between, the guard spends the compaction stand-in as
+ordinary memory, ahead of her previous exchange, instead of protecting it
+at the recent window's own tier — the same order a request that had
+declined reuse under that larger margin would already get. The guard's
+own numeric limit is still always the live value, never a stale snapshot
+of the earlier one — forwarding at the old, smaller limit would risk
+losing the whole reply to a second rejection on the same mechanism, which
+is strictly worse than losing one exchange of context, so only the
+stand-in's protection is conditional, not the limit itself. Every request
+after the margin changes reads it fresh in both places, as before.
 
 #### `config.time_injection` — the current-time feature (v3.1.9)
 
