@@ -86,6 +86,7 @@ from memory import (
     StoreUnreadable,
     atomic_write_json,
     conv_lock,
+    current_wipe_generation,
     read_json_strict,
     storage_root,
     summary_archive_path,
@@ -2637,6 +2638,51 @@ def vllm_call_budget_ctx(max_calls: int):
         _vllm_call_budget.reset(token)
 
 
+# v3.1.9.4 (R1 / P15-5 follow-up). SAME shape as _vllm_call_budget just
+# above, and for the identical reason: maybe_rollup is monkeypatched
+# WHOLESALE by test doubles this module does not own, so a new keyword on
+# ITS signature would TypeError every one of them. A contextvar set around
+# the call, read by _maybe_rollup_body itself (not by maybe_rollup's thin
+# wrapper — this one has no per-call decrement to own, so there is nothing
+# for a wrapper layer to do), survives that: a stub which replaces
+# maybe_rollup wholesale never reads it, which is correct — a stub making
+# no real writes has nothing to discard.
+_wipe_generation: "contextvars.ContextVar[int | None]" = contextvars.ContextVar(
+    "summarizer_wipe_generation", default=None
+)
+
+
+@contextlib.contextmanager
+def wipe_generation_ctx(generation: int | None):
+    """Set the conversation's wipe generation, as captured by the caller at
+    the moment its background tail was SUBMITTED, for the duration of one
+    `maybe_rollup` call. `_maybe_rollup_body` reads it back (via
+    `_wipe_generation.get()`) immediately after loading state, under
+    conv_lock, and discards the ENTIRE rollup — no tier runs, no chapter
+    archive write, no save_state — if it disagrees with
+    `memory.current_wipe_generation(conv_id)` at that moment: a /forget (or
+    any other wipe) that ran after this tail was submitted must not have
+    its deletion undone by a rollup that reads stale content and writes it
+    back.
+
+    `generation=None` (main.admin_compact and backfill.py's one call, which
+    both call `maybe_rollup` directly with no context manager at all, leave
+    this at its contextvar default of None) disables the check entirely —
+    those are not background tails racing a wipe; they run on a request an
+    operator or the backfill itself is waiting on, not stale work outliving
+    one. A caller inside this SAME `with` block that itself passes
+    `generation=None` (a tail that never captured one — see
+    `main._facts_tail`'s identical `wipe_generation: int | None = None`
+    convention) gets the same opt-out, for the same reason: nothing
+    changes for a direct test call or a caller not participating.
+    """
+    token = _wipe_generation.set(generation)
+    try:
+        yield
+    finally:
+        _wipe_generation.reset(token)
+
+
 def _budget_allows_unit() -> bool:
     """True if the current vLLM call budget (if any) has room to START a new
     rollup UNIT — one L1 chunk, one L2 fold, or the L3 refresh.
@@ -3516,6 +3562,29 @@ async def _maybe_rollup_body(
         # which is the point: the IO moves to a worker, the serialisation
         # that stops concurrent rollups tearing the file does not.
         state = await run_in_threadpool(load_state, conv_id)
+
+        # v3.1.9.4 (R1 / P15-5 follow-up). Checked right after the load, so
+        # `state` below is always something real to return, and before
+        # anything else in this function runs — no tier check, no
+        # watermark repair, no LLM call, no _archive_chapters, no
+        # save_state. See wipe_generation_ctx's own docstring for why a
+        # single check here, this early, is enough: nothing else may hold
+        # conv_lock(conv_id) while this section does, so a wipe's bump (see
+        # memory.bump_wipe_generation) either already happened — and this
+        # call discards, correctly, because the wipe's own deletes are
+        # either already done or queued right behind it on this exact lock
+        # — or has not happened yet, in which case this call is free to
+        # proceed and whatever it writes is exactly what a wipe arriving
+        # afterward is supposed to clear.
+        _wgen = _wipe_generation.get()
+        if _wgen is not None and _wgen != current_wipe_generation(conv_id):
+            logger.warning(
+                f"conv={conv_id}: discarding a summary rollup — a wipe ran "
+                f"after this tail was submitted (generation {_wgen} != "
+                f"current {current_wipe_generation(conv_id)}); the turns it "
+                f"would have summarized were already asked to be forgotten"
+            )
+            return state
 
         if (
             skip_if_position_past is not None

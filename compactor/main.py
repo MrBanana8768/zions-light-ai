@@ -58,7 +58,9 @@ from envcfg import env_bool, env_float
 from memory import (
     StoreUnreadable,
     UnsafeConvId,
+    bump_wipe_generation,
     conv_lock,
+    current_wipe_generation,
     ensure_storage_layout,
     facts_path,
     list_known_conv_ids,
@@ -1711,7 +1713,19 @@ def count_tokens(messages: list[dict]) -> int:
     return sum(len(_message_text(m)) // 4 + 4 for m in messages) + image_tokens
 
 
-SUMMARY_PROMPT = """You are summarizing an earlier portion of a conversation so it can be compressed into context.
+# v3.1.9.4 (R3 / P15-6 follow-up). A length target IN WORDS, matching
+# summarizer._target_words exactly (same 0.6 factor, same reasoning: a
+# steering hint for the FIRST attempt, comfortably under SUMMARY_MAX_TOKENS
+# — not what GUARANTEES a stored summary never ends mid-sentence, which is
+# _summarize_once's retry-then-trim shape below). Kept as its own copy
+# rather than imported from summarizer.py: this module is not summarizer's
+# caller in that direction (summarizer.py never imports main), and the
+# function is three lines.
+def _target_words(max_tokens: int) -> int:
+    return max(40, int(max_tokens * 0.6))
+
+
+SUMMARY_PROMPT = f"""You are summarizing an earlier portion of a conversation so it can be compressed into context.
 
 Produce a concise but comprehensive summary that preserves:
 - Key facts, names, numbers, decisions, and instructions given
@@ -1719,33 +1733,220 @@ Produce a concise but comprehensive summary that preserves:
 - The user's goals, constraints, and stated preferences
 - The state of any in-progress work
 
+Keep it to roughly {_target_words(SUMMARY_MAX_TOKENS)} words or fewer — well under your length limit, so you finish with a complete final sentence rather than being cut off partway through.
 Do not editorialize. Do not greet. Output only the summary."""
 
 
+def _summary_retry_suffix(target_words: int) -> str:
+    """The one line added to the system prompt on the single retry a cut
+    compaction summary gets — same reasoning as
+    summarizer._retry_suffix/_llm_summarize's own block comment: the retry
+    keeps the SAME max_tokens (the cap IS the real budget vLLM will
+    generate against; shrinking it while the prompt's own word target is
+    unchanged just gets the retry cut too, one sentence earlier, for no
+    reason) and changes only the INSTRUCTION, to an achievable target."""
+    return (
+        "\n\nYour previous attempt at this ran past its length limit and "
+        "was cut off mid-sentence. This time, keep it to roughly "
+        f"{target_words} words or fewer — well under the limit — and make "
+        "sure your LAST sentence is complete."
+    )
+
+
+def _trim_best_effort_summary(text: str) -> str:
+    """Never come back empty on a non-empty `text`, even with NO sentence
+    boundary anywhere — a cut summary written as a bullet/numbered list
+    (SUMMARY_PROMPT's own "preserves... the state of any in-progress work"
+    ask invites exactly that shape) can run for a long stretch with no
+    `.`/`!`/`?` at all. Same fallback chain as
+    summarizer._trim_best_effort, and for the identical reason (see that
+    function's own docstring): sentence boundary, then line boundary, then
+    word boundary with " …" appended. `trim_to_last_sentence` (this
+    module's own, fence-aware version) is the first step, per this item's
+    brief. Returns "" only when `text` itself is empty/whitespace-only.
+    """
+    if not text.strip():
+        return ""
+    by_sentence = trim_to_last_sentence(text)
+    if by_sentence:
+        return by_sentence
+    lines = text.split("\n")
+    if len(lines) > 1:
+        by_line = "\n".join(lines[:-1]).rstrip()
+        if by_line:
+            return by_line
+    words = text.split()
+    if len(words) > 1:
+        return " ".join(words[:-1]) + " …"
+    return text.strip() + " …"
+
+
+# v3.1.9.4 (R3 / P15-6 follow-up). Two contextvars, exactly mirroring
+# summarizer.py's own `_vllm_call_budget`/`_rollup_log_ctx` pair and for the
+# IDENTICAL reason: `_summarize_once` is monkeypatched WHOLESALE, with a
+# fixed two-positional-argument signature `(client, turns)`, by at least
+# five test files (test_p3a_soak_signals.py, test_review_fixes.py,
+# test_summarize_invariant.py, test_v3194_guard_g1.py,
+# test_v3194_guard_g3d.py — none takes `**kwargs`), and `summarize()`
+# ITSELF is replaced wholesale, with a fixed `(client, to_summarize)`
+# signature, by 34+ more (see the block comment a few hundred lines above
+# this one, at compact_if_needed's own P13 note: "that would change
+# summarize(client, fresh_input)'s call shape... breaking that shape here
+# breaks every one of them"). A parameter on either signature TypeErrors
+# every one of those stubs the moment the (now-unchanged) call site above
+# them passes it. Set around the call, read where needed, exactly as
+# `_call`/`maybe_rollup` already do for the equivalent problem one module
+# over. A stub that replaces `summarize`/`_summarize_once` wholesale never
+# reads either contextvar, which is correct: a stub making no real vLLM
+# calls has nothing to bound and nothing to log a conversation id for.
+#
+# `_summary_call_budget` holds a mutable `[int]` (this module's own
+# single-element-list idiom, matching `calls_left` a few hundred lines
+# below — summarizer.py uses a dict for its extra `exhausted` bookkeeping,
+# which nothing here needs) — the SAME list `summarize()`'s map/reduce
+# phases already decrement in `_bounded()`, set once at the top of
+# `summarize()` so it also covers the single-batch path, which has no
+# `_bounded()` wrapper of its own. `_summarize_once` decrements it AGAIN,
+# itself, for its own retry — `_bounded()`'s decrement only ever accounted
+# for the ONE guaranteed call, so an uncounted retry would let a request
+# silently spend MAX_SUMMARY_CALLS_PER_REQUEST + 1 real calls. None means
+# unbounded (no caller sets it that way today; kept for the same
+# "a caller that does not pass this sees no change" reason summarizer's
+# version documents).
+_summary_call_budget: "contextvars.ContextVar[list[int] | None]" = contextvars.ContextVar(
+    "main_summary_call_budget", default=None
+)
+
+# `_summary_log_ctx` holds `{"conv_id": ...}` — set by compact_if_needed
+# (the one caller of summarize() with a conv_id in scope; summarize()'s own
+# signature has never carried one, for the same wholesale-monkeypatch
+# reason) around its call to summarize(), so a cut-and-trimmed compaction
+# summary's WARNING can still name the conversation.
+_summary_log_ctx: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar(
+    "main_summary_log_ctx", default=None
+)
+
+# v3.1.9.4 (R3). How many _summarize_once calls (the compaction summary,
+# request-path) were cut at max_tokens and still had nothing better than a
+# fallback-trimmed result after the retry (or after skipping it for lack of
+# budget) — the compaction-path sibling of
+# summarizer.truncated_summary_count(). Process-local, reset on restart;
+# surfaced at /health/full by R4 (another region of this same file).
+_truncated_compaction_summary_calls = 0
+
+
+def truncated_compaction_summary_count() -> int:
+    """How many _summarize_once calls were cut at max_tokens and still had
+    no better than a fallback-trimmed result after the retry. See
+    summarizer.truncated_summary_count for the hierarchical-tier sibling
+    this mirrors; the two are separate counters because they cover
+    separate call sites with separate callers."""
+    return _truncated_compaction_summary_calls
+
+
 async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
-    """One summarization call. Caller guarantees `turns` fits the input budget."""
+    """One summarization call. Caller guarantees `turns` fits the input budget.
+
+    v3.1.9.4 (R3 / P15-6 follow-up). Never hands back text a
+    `finish_reason=length` reply cut mid-sentence — the equivalent fix to
+    summarizer._llm_summarize's own (P15-6), applied to this module's ONE
+    other summarization call site (the compaction summary, on the REQUEST
+    path rather than the background tail). Same shape, same reasoning
+    (see summarizer._llm_summarize's own block comment for the full
+    argument this mirrors):
+
+      1. One real call at SUMMARY_MAX_TOKENS.
+      2. `finish_reason` anything but "length" -> return it untouched.
+      3. Cut -> retry ONCE at the SAME max_tokens (lowering it does not
+         help: SUMMARY_PROMPT's own word target is unchanged, so a smaller
+         cap and the same instruction just contradict each other), with a
+         tighter word-target INSTRUCTION only (_summary_retry_suffix).
+         Gated on, and decremented from, the shared per-request call budget
+         (_summary_call_budget) — this call is on the REQUEST PATH, and
+         MAX_SUMMARY_CALLS_PER_REQUEST already bounds it; an uncounted
+         retry would silently let one request spend one more real vLLM
+         call than its own cap says it may.
+      4. Retry finishes cleanly -> return it.
+      5. Still cut (or no budget left for a retry): trim EVERY candidate
+         actually in hand with _trim_best_effort_summary and keep whichever
+         TRIMS LONGER — not automatically the retry's, since its tighter
+         target can trim to less than the first attempt would have. Log a
+         WARNING naming the conversation (from _summary_log_ctx) and count
+         it (truncated_compaction_summary_count).
+      6. "" only when EVERY candidate is itself empty/whitespace — every
+         existing caller of this function already treats "" as "nothing
+         usable" and degrades (see summarize()'s own empty-content
+         handling); this fix does not touch that contract.
+    """
     transcript = "\n\n".join(
         f"[{m.get('role', 'unknown')}]: {_message_text(m)}" for m in turns
     )
-    payload = {
-        "model": MODEL_REPO,
-        "messages": [
-            {"role": "system", "content": SUMMARY_PROMPT},
-            {"role": "user", "content": f"Conversation to summarize:\n\n{transcript}"},
-        ],
-        "max_tokens": SUMMARY_MAX_TOKENS,
-        "temperature": 0.2,
-        "stream": False,
-    }
-    r = await client.post(f"{VLLM_URL}/v1/chat/completions", json=payload, timeout=300.0)
-    r.raise_for_status()
-    data = r.json()
-    choices = data.get("choices") or []
-    if not choices:
-        # A 200 with no choices (or an error-shaped body) must not become an
-        # opaque IndexError — callers catch ValueError and degrade gracefully.
-        raise ValueError(f"vLLM returned no choices for summarize: {str(data)[:200]}")
-    return (choices[0].get("message") or {}).get("content", "").strip()
+
+    async def _one_call(extra_system: str = "") -> tuple[str, str | None]:
+        payload = {
+            "model": MODEL_REPO,
+            "messages": [
+                {"role": "system", "content": SUMMARY_PROMPT + extra_system},
+                {"role": "user", "content": f"Conversation to summarize:\n\n{transcript}"},
+            ],
+            "max_tokens": SUMMARY_MAX_TOKENS,
+            "temperature": 0.2,
+            "stream": False,
+        }
+        r = await client.post(f"{VLLM_URL}/v1/chat/completions", json=payload, timeout=300.0)
+        r.raise_for_status()
+        data = r.json()
+        choices = data.get("choices") or []
+        if not choices:
+            # A 200 with no choices (or an error-shaped body) must not become an
+            # opaque IndexError — callers catch ValueError and degrade gracefully.
+            raise ValueError(f"vLLM returned no choices for summarize: {str(data)[:200]}")
+        choice = choices[0]
+        text = (choice.get("message") or {}).get("content", "").strip()
+        return text, choice.get("finish_reason")
+
+    text, finish_reason = await _one_call()
+    if finish_reason != "length":
+        return text
+
+    # Cut. Retry ONCE at the same max_tokens, gated on the shared
+    # per-request call budget actually having room for a second real call.
+    retry_text: str | None = None
+    retry_finish: str | None = None
+    _budget = _summary_call_budget.get()
+    if _budget is None or _budget[0] > 0:
+        if _budget is not None:
+            _budget[0] -= 1
+        retry_words = max(20, _target_words(SUMMARY_MAX_TOKENS) // 2)
+        retry_text, retry_finish = await _one_call(_summary_retry_suffix(retry_words))
+        if retry_finish != "length":
+            return retry_text
+
+    # Still cut (or no budget left for a retry at all). Trim every
+    # candidate actually in hand and keep the longer trimmed result.
+    candidates = [text] + ([retry_text] if retry_text is not None else [])
+    trimmed = [_trim_best_effort_summary(c) for c in candidates]
+    best_idx = max(range(len(trimmed)), key=lambda i: len(trimmed[i]))
+    best = trimmed[best_idx]
+    if not best:
+        # Every candidate was itself empty or whitespace-only.
+        return ""
+
+    global _truncated_compaction_summary_calls
+    _truncated_compaction_summary_calls += 1
+    _ctx = _summary_log_ctx.get() or {}
+    _retry_note = (
+        "retried at the same cap with a tighter word target, still cut"
+        if retry_text is not None
+        else "no vLLM-call budget left for a retry"
+    )
+    logger.warning(
+        f"conv={_ctx.get('conv_id', '?')}: compaction summary was cut at "
+        f"max_tokens={SUMMARY_MAX_TOKENS} ({_retry_note}) — kept trimmed to "
+        f"{len(best)} of {len(candidates[best_idx])} chars rather than "
+        f"stored past where the model stopped"
+    )
+    return best
 
 
 def _chunk_to_budget(
@@ -1781,6 +1982,34 @@ def _chunk_to_budget(
 
 
 async def summarize(
+    client: httpx.AsyncClient, to_summarize: list[dict]
+) -> tuple[str, list[dict]]:
+    """Thin wrapper around `_summarize_body` (v3.1.9.4, R3 / P15-6
+    follow-up) — same split as summarizer.maybe_rollup/_maybe_rollup_body's
+    own (F5), for the identical reason: `summarize`'s call signature is
+    frozen (`(client, to_summarize)`, monkeypatched wholesale by 34+ test
+    stubs across this suite — see compact_if_needed's own P13 comment a
+    few hundred lines up), so the per-request vLLM-call budget
+    `_summarize_once`'s retry needs to read cannot travel as a parameter.
+    This wrapper sets it up ONCE, in a contextvar, and resets it exactly
+    once regardless of which of `_summarize_body`'s several return points
+    fires — the same guarantee `vllm_call_budget_ctx`'s try/finally gives
+    its own caller.
+    """
+    # ONE budget across the single-batch path AND map/reduce — see
+    # _summary_call_budget's own block comment above _summarize_once for
+    # why this has to be set here (covering the whole call) rather than
+    # only around the map/reduce section, which used to be the only place
+    # this list existed.
+    calls_left = [max(1, MAX_SUMMARY_CALLS_PER_REQUEST)]
+    _budget_token = _summary_call_budget.set(calls_left)
+    try:
+        return await _summarize_body(client, to_summarize)
+    finally:
+        _summary_call_budget.reset(_budget_token)
+
+
+async def _summarize_body(
     client: httpx.AsyncClient, to_summarize: list[dict]
 ) -> tuple[str, list[dict]]:
     """Summarize older turns, MAP-REDUCE style so the summarization request
@@ -1930,14 +2159,26 @@ async def summarize(
     # semaphore so a huge history can't monopolize the engine. Sequential
     # batches added multi-minute latency on long conversations (rc6 review).
     sem = asyncio.Semaphore(4)
-    # ONE budget across map AND reduce.
+    # ONE budget across map AND reduce — AND, since v3.1.9.4 (R3), the SAME
+    # list `summarize()`'s wrapper already put in `_summary_call_budget`,
+    # not a second independent one. Read back here rather than created
+    # fresh: `_summarize_once`'s own retry decrements `_summary_call_
+    # budget.get()` directly, so if this section built its own separate
+    # list, this loop's accounting and the retry's accounting would be two
+    # different counters agreeing only by coincidence — a retry could
+    # spend a call this section's own `if len(groups) > calls_left[0]:`
+    # check below believes it never had.
     #
     # The first cut of this cap bounded the map phase only, and the soak caught
     # it the same hour: 4 map calls + 1 reduce call + the user's reply = 6
     # against a budget of 5. Capping one phase of a two-phase algorithm is the
     # sibling-site miss again, committed inside the fix for a sibling-site
     # miss. A budget that does not cover every call is not a budget.
-    calls_left = [max(0, MAX_SUMMARY_CALLS_PER_REQUEST)]
+    # `or` fallback: only reachable if something calls _summarize_body
+    # directly, bypassing the summarize() wrapper that normally sets this
+    # (nothing in this codebase does today) — a sane default rather than a
+    # crash on a None subscript.
+    calls_left = _summary_call_budget.get() or [max(1, MAX_SUMMARY_CALLS_PER_REQUEST)]
 
     async def _bounded(batch: list[dict]) -> str:
         # Checked inside the semaphore so concurrent waves cannot each see the
@@ -3537,6 +3778,11 @@ async def compact_if_needed(
     fresh_input = refreshed + text_only[stored_turns:]
     async with httpx.AsyncClient() as client:
         if fresh_input:
+            # v3.1.9.4 (R3 / P15-6 follow-up). Set around ONLY this call —
+            # see _summary_log_ctx's own block comment above _summarize_once
+            # for why this is the one place conv_id can reach that function
+            # at all (summarize()'s own signature is frozen).
+            _summary_log_token = _summary_log_ctx.set({"conv_id": conv_id})
             try:
                 summary, deferred = await summarize(client, fresh_input)
             except Exception:
@@ -3553,6 +3799,8 @@ async def compact_if_needed(
                 if _reuse_pending_success:
                     _record_reuse_outcome("error")
                 raise
+            finally:
+                _summary_log_ctx.reset(_summary_log_token)
         else:
             summary, deferred = "", []
     if _reuse_pending_success:
@@ -6708,22 +6956,26 @@ def _shed_last_resort(
     This function spends whatever the six rounds left behind, in the SAME
     priority `_enforce_hard_budget`'s own docstring already states —
     oldest turns first, injected memory next, the recent window and the
-    stand-in last, never the newest — as four explicit steps:
+    stand-in last, never the newest — as four explicit steps, ALL FOUR
+    target-limited (v3.1.9.4, v3194-r3, R6 — steps 2 and 4 used to drop
+    every eligible block the moment they were reached at all, even when
+    one block already closed the gap; see each step's own comment for why
+    that changed and why the pass's cross-round rescale, described below,
+    is what makes stopping early safe):
       1. turns ABOVE the aligned recent window (`_aligned_recent_tail`,
          the SAME floor the P12-5 branch computes), oldest first, whole
-         exchanges where a pair exists;
+         exchanges where a pair exists, only as many as the round's
+         target needs;
       2. spendable injected memory — facts, retrieval, and the
-         compaction stand-in only when `standin_protected` is False —
-         spent UNCONDITIONALLY once step 1 alone is not enough (the
-         same "spend every remaining scrap" doctrine v3.1 D3 already
-         uses for memory: it is worth less than a successful request,
-         so being surgical about it, the way steps 1/3 are surgical
-         about turns, only risks under-cutting when a measurement does
-         not reflect content — see the step's own comment);
+         compaction stand-in only when `standin_protected` is False — in
+         that same ascending (injection) order, only as many blocks as
+         the round's target needs, once step 1 alone was not enough;
       3. the recent window's own turns, except the newest, oldest of the
-         window first, whole exchanges where a pair exists;
-      4. the PROTECTED stand-in (when `standin_protected` is True) —
-         truly last, unconditionally, only once nothing else remains.
+         window first, whole exchanges where a pair exists, only as many
+         as the round's target needs;
+      4. the PROTECTED stand-in (when `standin_protected` is True) — last,
+         only once nothing else remains, and only if the target still
+         is not met.
 
     A first draft shed every non-newest turn, oldest first, before ever
     reaching step 2 — so on an array that still carried facts or
@@ -6767,6 +7019,32 @@ def _shed_last_resort(
         _g3a_freed = 0
         _g3a_gone: set[int] = set()
 
+        # v3.1.9.4 (v3194-r3, R6). Steps 2 and 4 below are target-limited
+        # (see each step's own comment for the full reasoning) EXCEPT on
+        # the LAST round this pass is allowed to run, where they fall back
+        # to spending everything eligible — the same unconditional shape
+        # they always had before this fix. Reproduced, not theoretical:
+        # test_budget_guard.py's own `test_the_guard_sheds_injection_to_
+        # nothing_before_forwarding_an_oversized_payload` pins a real,
+        # non-contrived shape this closes — count_tokens_exact pinned to
+        # `limit + 1` regardless of content, so `running` (and therefore
+        # `_g3a_target`) never moves no matter what gets dropped. Under
+        # that fixture, plain target-limiting satisfies each round's own
+        # (never-shrinking, tiny) target with exactly ONE block — this
+        # pass's own rescale (below) cannot help, because a ratio of
+        # (before - running)/freed with `before == running` is always 0,
+        # which crushes future per-item estimates toward the floor rather
+        # than escalating them — and with only `_G3A_MEASURE_CAP` rounds
+        # available, target-limiting alone left memory unspent at the cap
+        # exactly like the pre-G3a "first draft" comment warned: "the
+        # guard is holding memory it was allowed to spend." Falling back
+        # to unconditional on the FINAL round only — never earlier —
+        # keeps [G3a-unconditional]'s minimal-drop proof intact (a normal
+        # overshoot converges well before the last round) while
+        # guaranteeing this pass never gives up with spendable memory
+        # still in hand, which is the one invariant v3.1 D3 must not lose.
+        _g3a_last_round = _g3a_measures == _G3A_MEASURE_CAP - 1
+
         # Index lists, built ONCE this round from the CURRENT msgs.
         _g3a_idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
         _g3a_aligned = set(_aligned_recent_tail(msgs))
@@ -6792,23 +7070,29 @@ def _shed_last_resort(
 
         # --- step 2: spendable injected memory — facts/retrieval always
         #     qualify; the stand-in only when standin_protected is
-        #     False. UNCONDITIONAL, not target-limited, once step 1
-        #     alone was not enough: the same "spend every remaining
-        #     scrap" doctrine the pre-G3a forced drop already used for
-        #     all injected memory (memory the model never gets to read
-        #     costs nothing a 400 does not already cost). Target-limiting
-        #     this step the way step 1 limits turns made it converge
-        #     only as fast as the per-round `_g3a_target` — computed
-        #     from `running`, which a measurement that does not reflect
-        #     content (test_budget_guard.py's own adversarial stub: a
-        #     FIXED value regardless of what was cut) never shrinks, so
-        #     a target-limited step 2 spent only one block per round and
-        #     exhausted the six-round cap with memory still held — the
-        #     exact "guard holding memory it was allowed to spend"
-        #     defect v3.1 D3 exists to prevent, reopened by being too
-        #     conservative about assumed-cheap memory.
+        #     False. v3.1.9.4 (v3194-r3, R6): TARGET-LIMITED, like step 1,
+        #     not "drop every eligible block once reached" — that was
+        #     this step's ORIGINAL shape here, and it reintroduced
+        #     exactly what the forced drop this whole function replaced
+        #     was written to avoid, in that forced drop's own words:
+        #     "Dropping EVERYTHING is wasteful: measured by review, a
+        #     payload over by 550 tokens lost persona, facts and summary
+        #     when one 1500-token block covered it." A gap of a few
+        #     hundred tokens does not need facts AND retrieval AND the
+        #     stand-in gone; it needs however many of them, in this same
+        #     ascending (facts, then retrieval — the injection order
+        #     _droppable_system_indices returns) order, actually cover
+        #     the gap. EXCEPT on `_g3a_last_round` (see the block comment
+        #     at the top of this loop): a target that never moves because
+        #     the measurement never reflects real progress can make plain
+        #     target-limiting spend only one block per round forever, so
+        #     the final round always spends everything eligible instead of
+        #     stopping early — the guarantee steps 2/4 always gave, kept
+        #     for the one round where giving it up actually matters.
         if _g3a_freed < _g3a_target:
             for i in _droppable_system_indices(msgs, protect_system):
+                if not _g3a_last_round and _g3a_freed >= _g3a_target:
+                    break
                 if not (standin_protected and _is_compaction_standin(msgs[i])):
                     _g3a_gone.add(i)
                     _g3a_freed += per[i]
@@ -6835,13 +7119,24 @@ def _shed_last_resort(
                     _g3a_freed += per[j]
                 _q += pair_len
 
-        # --- step 4: the protected stand-in, truly last. UNCONDITIONAL
-        #     for the same reason step 2 is: only ONE block to spend
-        #     here in the overwhelming majority of cases, and reaching
-        #     this step at all means every cheaper option is already
-        #     gone. ---
+        # --- step 4: the protected stand-in, truly last. v3.1.9.4
+        #     (v3194-r3, R6): TARGET-LIMITED, matching step 2's fix above
+        #     and for the identical reason — dropping the stand-in when
+        #     it was never needed is the same "550 tokens over, lost a
+        #     1500-token block that covered it" waste step 2 closes, one
+        #     step later. In the overwhelming majority of cases there is
+        #     only ONE block reachable here (the stand-in itself), so the
+        #     `break` below rarely changes anything by itself — this
+        #     step's actual leverage is that it now shares the SAME loop
+        #     shape as step 2, so a future second protected block (none
+        #     exists today) inherits target-limiting for free instead of
+        #     needing this exact fix reapplied at its own sibling site.
+        #     Same `_g3a_last_round` exception as step 2, for the same
+        #     reason.
         if _g3a_freed < _g3a_target:
             for i in _droppable_system_indices(msgs, protect_system):
+                if not _g3a_last_round and _g3a_freed >= _g3a_target:
+                    break
                 if (
                     standin_protected and _is_compaction_standin(msgs[i])
                     and i not in _g3a_gone
@@ -8021,6 +8316,54 @@ def _merge_touched(fresh: list[dict], touched: list[dict]) -> list[dict]:
     return merged
 
 
+# v3.1.9.4 (R1 / P15-5 follow-up). _async_tail is replaced WHOLESALE, with
+# a FIXED signature, by three test doubles that predate this feature
+# (test_truncated_tail.py's _spy_tail, test_saturation.py's _spy_tail; a
+# fourth, test_budget_guard.py's `recorder`, takes *args/**kwargs and would
+# have been fine either way). An explicit `wipe_generation=` keyword on
+# _async_tail's own signature TypeErrors the construction of the coroutine
+# at the call site below — before _fire_and_forget or bgwork.pool ever see
+# it — the moment any of those three doubles is active. Reproduced: adding
+# the keyword directly broke test_truncated_tail.py's [E1] with a bare
+# HTTP 500 (raise_server_exceptions=False there swallows the TypeError into
+# a generic 500 with no traceback in the test output).
+#
+# A contextvar, set around ONLY the call that submits the tail, sidesteps
+# this exactly the way summarizer.wipe_generation_ctx does for
+# maybe_rollup — and it is not merely a workaround for the monkeypatch
+# problem. asyncio.create_task (inside bgwork.pool.submit) snapshots the
+# CURRENT context at the moment it is called, which is submission, not
+# execution, so this is the mechanism that gives "captured at submission,
+# not when the tail happens to start" for free, with no separate bookkeeping
+# needed. A stub that replaces _async_tail wholesale never reads it, which
+# is correct: a stub making no real writes has nothing to discard.
+_tail_wipe_generation: "contextvars.ContextVar[int | None]" = contextvars.ContextVar(
+    "main_tail_wipe_generation", default=None
+)
+
+
+def _wipe_generation_stale(conv_id: str, wipe_generation: int | None) -> bool:
+    """True when a tail captured `wipe_generation` at submission time and
+    the conversation's wipe generation has since moved on — a /forget (or
+    any other path that deletes this conversation's memory; see
+    memory.bump_wipe_generation) ran after this tail was handed to the pool
+    and before it reached this check (v3.1.9.4, R1 / P15-5 follow-up).
+
+    MUST be called under conv_lock(conv_id), and as close as practical to
+    the write it guards — see memory.bump_wipe_generation's own docstring
+    for why a wipe's bump and its deletes share one locked section with no
+    other writer able to observe one without the other.
+
+    `wipe_generation=None` always returns False: the caller is not
+    participating (a direct test call, or a code path this fix does not
+    cover), so nothing changes for it.
+    """
+    return (
+        wipe_generation is not None
+        and wipe_generation != current_wipe_generation(conv_id)
+    )
+
+
 async def _facts_tail(
     conv_id: str,
     touched_facts: list[dict],
@@ -8029,8 +8372,20 @@ async def _facts_tail(
     turn_index: int,
     *,
     injected_facts: list[dict] | None = None,
+    wipe_generation: int | None = None,
 ) -> None:
     """Job 2 of the memory tail: fact extraction, dedup, prune, save.
+
+    `wipe_generation` (v3.1.9.4, R1 / P15-5 follow-up): the conversation's
+    wipe generation as of the moment this tail was SUBMITTED to the pool
+    (see current_wipe_generation's docstring). None (the default) means the
+    caller is not participating in the check — every direct-call test
+    double of this "public-shaped coroutine" (R8's own words, a few lines
+    below) keeps working unchanged. When not None, both write sites below
+    re-read current_wipe_generation(conv_id) under conv_lock, immediately
+    before writing, and discard the write on a mismatch: a /forget (or any
+    other wipe path) that ran after this tail was submitted must not be
+    undone by a write that lands after it.
 
     v3.1.7 (R8). Lifted out of _async_tail UNCHANGED, line for line, for one
     reason: it owns two early `return`s, and inside _async_tail those returns
@@ -8094,6 +8449,19 @@ async def _facts_tail(
         # tracking persists across restarts. Re-read under the lock (see
         # _merge_touched) so we don't clobber a concurrent tail's writes.
         async with conv_lock(conv_id):
+            # v3.1.9.4 (R1 / P15-5 follow-up). See _wipe_generation_stale's
+            # docstring. A wipe that ran after this tail was submitted must
+            # not be undone by the touched-save below — even though it only
+            # carries LRU timestamps forward, the facts it re-persists are
+            # exactly the ones /forget just asked to be gone.
+            if _wipe_generation_stale(conv_id, wipe_generation):
+                logger.info(
+                    f"conv={conv_id}: discarding a facts-tail touched-save — "
+                    f"a wipe ran after this tail was submitted "
+                    f"(generation {wipe_generation} != current "
+                    f"{current_wipe_generation(conv_id)})"
+                )
+                return
             try:
                 merged = _merge_touched(facts.load_facts(conv_id), touched_facts)
                 # Nothing to persist means nothing to write (v3.1 G2) — an
@@ -8145,6 +8513,23 @@ async def _facts_tail(
         return
 
     async with conv_lock(conv_id):
+        # v3.1.9.4 (R1 / P15-5 follow-up). See _wipe_generation_stale's
+        # docstring. Checked BEFORE the extraction call, not just before the
+        # save below: a wipe already means whatever this tail is about to
+        # extract will be discarded, so there is no reason to spend a vLLM
+        # call finding that out. Correctness does not depend on checking
+        # this early — see memory.bump_wipe_generation's own docstring for
+        # why a bump that lands WHILE this section holds the lock cannot
+        # happen at all — but a saved GPU call on a conversation that just
+        # asked to be forgotten is a real benefit, not just tidiness.
+        if _wipe_generation_stale(conv_id, wipe_generation):
+            logger.info(
+                f"conv={conv_id}: discarding a facts-tail extraction — a "
+                f"wipe ran after this tail was submitted (generation "
+                f"{wipe_generation} != current "
+                f"{current_wipe_generation(conv_id)})"
+            )
+            return
         try:
             async with httpx.AsyncClient() as client:
                 # BOUNDED, but by the STORE cap — not by the injection cap.
@@ -8346,7 +8731,28 @@ async def _async_tail(
     covered-turn record describes, what OpenWebUI keeps and re-sends, which
     is what streamed (hostile pass #3 F1; hostile pass #4 reviewer A F1). See
     _rollup_hierarchy.
+
+    v3.1.9.4 (R1 / P15-5 follow-up): this conversation's wipe generation, as
+    of the moment this WHOLE tail was submitted to the pool, is NOT a
+    parameter here — see _tail_wipe_generation's own block comment for why
+    (this function is replaced wholesale, with a fixed signature, by three
+    test doubles that predate this feature). Read from that contextvar
+    below instead, once, and threaded explicitly to jobs 2 and 3
+    (_facts_tail, _rollup_hierarchy — neither is monkeypatched wholesale
+    anywhere, so an explicit keyword is fine for both); job 1 (episodic
+    indexing) checks the local copy directly, under its own conv_lock, for
+    the identical reason the block comment above it already gives for
+    taking that lock at all: this is the second write site that reason
+    applies to.
     """
+    # v3.1.9.4 (R1 / P15-5 follow-up). See _tail_wipe_generation's own block
+    # comment. Read ONCE, here, rather than at each of the three sites below
+    # — asyncio.create_task snapshotted this contextvar's value when
+    # bgwork.pool.submit created the Task this coroutine is running as, so
+    # it is already fixed for the life of this call; re-reading it per site
+    # would just re-derive the same answer three times.
+    wipe_generation = _tail_wipe_generation.get()
+
     # V2.3 Theme 2: under disk pressure, stop GROWING memory but keep
     # serving. The chat response already went out; this tail is pure
     # persistence, so skipping it entirely is the correct degraded
@@ -8391,14 +8797,29 @@ async def _async_tail(
     # whether it is reachable.
     if (assistant_text or "").strip() and _has_pairable_user_text(last_user_text):
         async with conv_lock(conv_id):
-            try:
-                indexed = retrieval.index_exchange(
-                    conv_id, turn_index, last_user_text, assistant_text
+            # v3.1.9.4 (R1 / P15-5 follow-up). See _wipe_generation_stale's
+            # docstring, and the block comment above this `if` for why
+            # episodic indexing already takes its own lock: a wipe holds
+            # this SAME lock while it deletes the episodic index
+            # (retrieval.forget_conversation, inside _clear_all_memory), so
+            # an unlocked check would race it exactly the way an unlocked
+            # index_exchange already used to.
+            if _wipe_generation_stale(conv_id, wipe_generation):
+                logger.info(
+                    f"conv={conv_id}: discarding an episodic index write — "
+                    f"a wipe ran after this tail was submitted (generation "
+                    f"{wipe_generation} != current "
+                    f"{current_wipe_generation(conv_id)})"
                 )
-                if indexed:
-                    logger.info(f"conv={conv_id}: indexed exchange (turn ~{turn_index})")
-            except Exception as e:
-                logger.warning(f"conv={conv_id}: episodic indexing failed: {e}")
+            else:
+                try:
+                    indexed = retrieval.index_exchange(
+                        conv_id, turn_index, last_user_text, assistant_text
+                    )
+                    if indexed:
+                        logger.info(f"conv={conv_id}: indexed exchange (turn ~{turn_index})")
+                except Exception as e:
+                    logger.warning(f"conv={conv_id}: episodic indexing failed: {e}")
 
     # --- 2. Facts extraction ---
     # In its own coroutine since v3.1.7 (R8): its early returns must end
@@ -8410,6 +8831,7 @@ async def _async_tail(
         assistant_text,
         turn_index,
         injected_facts=injected_facts,
+        wipe_generation=wipe_generation,
     )
 
     # --- 3. Hierarchical summary rollup (Phase 4) ---
@@ -8426,6 +8848,7 @@ async def _async_tail(
     await _rollup_hierarchy(
         conv_id, original_messages, assistant_text,
         reply_as_streamed=reply_as_streamed,
+        wipe_generation=wipe_generation,
     )
 
 
@@ -8435,6 +8858,7 @@ async def _rollup_hierarchy(
     assistant_text: str | None,
     *,
     reply_as_streamed: str | None = None,
+    wipe_generation: int | None = None,
 ) -> None:
     """Advance the hierarchical summary. Both tail paths call this.
 
@@ -8593,7 +9017,21 @@ async def _rollup_hierarchy(
         # TAIL_ROLLUP_MAX_CALLS' own comment for what "bounded" means here
         # and why it is safe from the livelock a strict per-call bound would
         # have caused.
-        with summarizer.vllm_call_budget_ctx(TAIL_ROLLUP_MAX_CALLS) as _budget:
+        # v3.1.9.4 (R1 / P15-5 follow-up). SAME reasoning as
+        # vllm_call_budget_ctx immediately above, and the SAME mechanism:
+        # summarizer.wipe_generation_ctx sets a contextvar around the call
+        # rather than passing wipe_generation= as a keyword, because
+        # maybe_rollup is the identical monkeypatched-wholesale function
+        # that comment describes. summarizer._maybe_rollup_body reads it
+        # right after loading state, under its own conv_lock, and discards
+        # the whole rollup (no _do_l1/l2/l3_rollup call, no save_state, no
+        # _archive_chapters) on a mismatch — a stub that replaces
+        # maybe_rollup wholesale never reads the contextvar either, which is
+        # correct: a stub making no real writes has nothing to discard.
+        with (
+            summarizer.vllm_call_budget_ctx(TAIL_ROLLUP_MAX_CALLS) as _budget,
+            summarizer.wipe_generation_ctx(wipe_generation),
+        ):
             state = await summarizer.maybe_rollup(
                 conv_id, full_messages, VLLM_URL, MODEL_REPO or "",
                 **_rollup_kwargs,
@@ -8813,6 +9251,16 @@ def _run_memory_tail(
 
     Returns the decision so a caller (or a test) can see what was done.
     """
+    # v3.1.9.4 (R1 / P15-5 follow-up). Captured HERE, synchronously, on the
+    # request path — before either _fire_and_forget call below hands a tail
+    # to bgwork.pool. See memory.bump_wipe_generation's own docstring for
+    # why "at submission" is the only correct moment: a tail parked on the
+    # pool's concurrency semaphore has run no code of its own yet, so
+    # reading this from INSIDE the coroutine's body would read whatever the
+    # generation happens to be whenever the task finally starts, not what
+    # it was when the request that produced this exchange was in flight —
+    # exactly the gap a wipe arriving in between is supposed to close.
+    wipe_generation = current_wipe_generation(conv_id)
     decision = decide_memory_tail(
         text, finished=finished, truncated=truncated, holed=holed
     )
@@ -8953,7 +9401,9 @@ def _run_memory_tail(
             # unconditionally above, and the store branch still uses it.
             and _has_conversational_history(messages)
             and not _fire_and_forget(
-                _rollup_hierarchy(conv_id, messages, None),
+                _rollup_hierarchy(
+                    conv_id, messages, None, wipe_generation=wipe_generation,
+                ),
                 label=f"rollup conv={conv_id}",
             )
         ):
@@ -8982,18 +9432,28 @@ def _run_memory_tail(
     _tail_kwargs: dict = {"injected_facts": injected_facts}
     if text != decision.text:
         _tail_kwargs["reply_as_streamed"] = text
-    accepted = _fire_and_forget(
-        _async_tail(
-            conv_id,
-            touched_facts,
-            last_user_text,
-            decision.text,
-            turn_index,
-            messages,  # original request messages, for rollup
-            **_tail_kwargs,
-        ),
-        label=f"tail conv={conv_id}",
-    )
+    # v3.1.9.4 (R1 / P15-5 follow-up). wipe_generation is NOT in _tail_kwargs
+    # — see _tail_wipe_generation's own block comment for why a keyword on
+    # _async_tail's signature breaks three test doubles that replace it
+    # wholesale. Set the contextvar around ONLY this submission instead;
+    # reset immediately after, so it does not leak into whatever this
+    # (still-running) request handler does next.
+    _wipe_gen_token = _tail_wipe_generation.set(wipe_generation)
+    try:
+        accepted = _fire_and_forget(
+            _async_tail(
+                conv_id,
+                touched_facts,
+                last_user_text,
+                decision.text,
+                turn_index,
+                messages,  # original request messages, for rollup
+                **_tail_kwargs,
+            ),
+            label=f"tail conv={conv_id}",
+        )
+    finally:
+        _tail_wipe_generation.reset(_wipe_gen_token)
     if not accepted:
         # v3.1.8 (F-07). The pool shed it, so nothing will be written. Say
         # so, under its own label, and correct the store we just counted.
@@ -9075,7 +9535,19 @@ async def lifespan(app: FastAPI):
     yield
     # Graceful: give in-flight background work (fact extraction, indexing,
     # rollup, backfill) a moment to finish via the bounded pool.
-    await bgwork.pool.drain(timeout=10.0)
+    #
+    # v3.1.9.4 (R5 / P15-5 follow-up, bg lane B3). cancel_on_timeout=True —
+    # drain's new default (round 2, B3) is to WAIT rather than cancel on
+    # timeout, correct for commands._settle_background_work's /forget drain
+    # (a running tail must not be killed just because someone typed
+    # /forget elsewhere), but WRONG for shutdown, the one caller that
+    # actually wants the old behaviour: the process is exiting regardless,
+    # so "leave it running" only means a task's own finally/cleanup code
+    # (an httpx client closing, a lock releasing) never gets the chance a
+    # cancellation would give it. Named explicitly in fix-3194-bg.md B3's
+    # own "Exact change needed at main.py:8367" section, not applied there
+    # because main.py was another lane's file at the time.
+    await bgwork.pool.drain(timeout=10.0, cancel_on_timeout=True)
 
 
 app = FastAPI(title="context-compactor", lifespan=lifespan)
@@ -10110,8 +10582,19 @@ async def chat_completions(request: Request) -> Any:
                 # exists to replace - strictly worse than before. Ranked, the
                 # 26 are the ones this turn is about; pinned identity facts
                 # bypass ranking entirely.
-                injected_facts = facts.select_for_injection(
-                    touched_facts, query_text=last_user_text
+                # v3.1.9.4 (R5 / P15-4 follow-up, bg lane B1). select_for_
+                # injection ranks by relevance whenever query_text is given
+                # (it is, here), which embeds via retrieval._embed_cached —
+                # cheap warm (the B1 fix), but a real model call cold or on
+                # a miss, inline on the event loop before this fix. Every
+                # OTHER embedding-costed call B1 found got moved off the
+                # loop (dedup._dedup_pass's clustering call); this was the
+                # one call site left in chat_completions itself, named but
+                # not fixed there because main.py was another lane's file
+                # at the time (see fix-3194-bg.md B1's own "Exact change
+                # needed at main.py:9393" section).
+                injected_facts = await run_in_threadpool(
+                    facts.select_for_injection, touched_facts, query_text=last_user_text
                 )
                 # NOT touched here. last_used is the LRU eviction key, and
                 # _bound_injected_blocks (below) may drop the facts block
@@ -11046,6 +11529,17 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
     """Wipe every memory layer for a conv. Returns counters for the
     response body. `source` is just for log labeling."""
     async with conv_lock(conv_id):
+        # v3.1.9.4 (R1 / P15-5 follow-up). FIRST statement inside the lock,
+        # before any of the deletes below — see memory.bump_wipe_generation's
+        # own docstring for why the ordering matters. This is the single
+        # chokepoint /forget, DELETE /admin/conversations/<id>/facts and the
+        # self-test cleanup all call through, so bumping here covers all
+        # three at once. A background tail that captured this conversation's
+        # generation before this call started (at the moment it was handed
+        # to bgwork.pool, not when it happens to run) now disagrees with
+        # current_wipe_generation() the instant it re-checks, under this
+        # same lock, and discards whatever it was about to write.
+        bump_wipe_generation(conv_id)
         # v3.1: an unreadable facts file must not abort the whole wipe. The
         # user asked for this data to be gone; refusing to clear the three
         # layers we CAN read would leave more behind than clearing them does,

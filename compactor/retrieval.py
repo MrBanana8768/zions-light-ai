@@ -219,14 +219,30 @@ def _embed_cached(texts: list[str]) -> list[list[float]] | None:
     if not texts:
         return []
     model = EMBEDDING_MODEL
+    # v3.1.9.4 (R5). The all-hits fast path used to look every text up
+    # under ONE lock acquisition, decide it had a full house, then
+    # re-acquire the lock for a SEPARATE move_to_end loop. Between the two
+    # acquisitions the lock is not held at all, so a concurrent call — this
+    # function is reached from run_in_threadpool workers (B1), so real
+    # concurrent threads, not just interleaved coroutines — evicting the
+    # SAME key via its own miss path's `popitem(last=False)` left this
+    # loop calling `move_to_end` on a key no longer in the dict:
+    # OrderedDict.move_to_end raises KeyError on a missing key, uncaught,
+    # so the caller's `except Exception` degraded that whole turn to LRU
+    # order (facts._relevance_order) or skipped dedup
+    # (dedup._embed_facts) — not a crash, but a real feature silently
+    # turned off by a timing accident. Fixed by making the lookup AND the
+    # move_to_end ONE critical section: nothing else can run
+    # `popitem`/`move_to_end` while this holds the lock, so a key this
+    # function itself just read as present is still present when it
+    # touches it a few lines later.
     with _vector_cache_lock:
         hits = [_vector_cache.get((model, t)) for t in texts]
-    miss_idx = [i for i, v in enumerate(hits) if v is None]
-    if not miss_idx:
-        with _vector_cache_lock:
+        miss_idx = [i for i, v in enumerate(hits) if v is None]
+        if not miss_idx:
             for t in texts:
                 _vector_cache.move_to_end((model, t))
-        return hits
+            return hits
     fresh = _embed([texts[i] for i in miss_idx])
     if fresh is None or len(fresh) != len(miss_idx):
         # Same failure contract _embed already has: a caller cannot act on
@@ -242,8 +258,25 @@ def _embed_cached(texts: list[str]) -> list[list[float]] | None:
             _vector_cache.move_to_end(key)
         while len(_vector_cache) > _VECTOR_CACHE_MAX:
             _vector_cache.popitem(last=False)
+        # v3.1.9.4 (R5). This loop touches texts that were HITS from the
+        # lookup several lines above, OUTSIDE this lock acquisition — the
+        # same sibling gap as the all-hits path this fix closes above, one
+        # level over: the lock was released between that lookup and here,
+        # so a concurrent eviction of one of those hit keys is exactly as
+        # possible. The all-hits path could be made airtight by merging
+        # two acquisitions into one (above); this one cannot, the same
+        # way it never could — `_embed(...)` a few lines up is a real,
+        # potentially slow model call that must NOT run while this lock is
+        # held, or every other cache reader/writer serializes behind it.
+        # So: tolerate a missing key instead of assuming presence. Losing
+        # this key's LRU-recency update is harmless (worst case, it is
+        # evicted a little earlier than a perfectly accurate LRU would —
+        # cheap to recompute, never wrong content, per this function's own
+        # docstring); raising KeyError and degrading the whole call is not.
         for t in texts:
-            _vector_cache.move_to_end((model, t))
+            key = (model, t)
+            if key in _vector_cache:
+                _vector_cache.move_to_end(key)
     for i, vec in zip(miss_idx, fresh):
         hits[i] = vec
     return hits

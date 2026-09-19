@@ -1301,6 +1301,65 @@ def _reuse_state() -> dict:
     return {"available": True, **st}
 
 
+def _truncated_summary_state() -> dict:
+    """checks.truncated_summaries: how many rollup-tier summaries
+    (summarizer.truncated_summary_count) and compaction summaries
+    (main.truncated_compaction_summary_count) were cut at max_tokens and had
+    nothing better than a fallback-trimmed result after their one retry —
+    v3.1.9.4 (R4), surfacing the counters R3/round-2's M1 (P15-6) added.
+
+    Visibility only, matching the tokenizer/reuse/budget_margin doctrine
+    just above: a nonzero count never moves `status`. A summary trimmed to
+    a sentence/line/word boundary is a degraded-but-served unit, the same
+    class of self-correcting condition `budget_margin` already documents
+    this way — not a fault worth waking an operator for on its own. Zero on
+    a healthy deployment; a number that climbs is the operator-visible
+    signal P15-6's own finding said this defect had NONE of ("no log line,
+    no counter").
+
+    `hierarchy` reads summarizer.truncated_summary_count() directly (a
+    normal module-level import — no cycle; summarizer.py never imports
+    health.py). `compaction` needs the SAME call-time sys.modules lookup
+    `_tokenizer_state`/`_reuse_state`/`_budget_margin_state` already use for
+    main.py: main.py imports health.py, so a module-level `import main`
+    here would be circular.
+    """
+    hierarchy_count = summarizer.truncated_summary_count()
+    main_mod = sys.modules.get("main")
+    if main_mod is None:
+        return {
+            "available": True,
+            "hierarchy": hierarchy_count,
+            "compaction": None,
+            "compaction_reason": "main is not loaded in this process",
+        }
+    fn = getattr(main_mod, "truncated_compaction_summary_count", None)
+    if not callable(fn):
+        return {
+            "available": True,
+            "hierarchy": hierarchy_count,
+            "compaction": None,
+            "compaction_reason": (
+                "main.truncated_compaction_summary_count() is not present "
+                "in this build"
+            ),
+        }
+    try:
+        compaction_count = fn()
+    except Exception as e:
+        return {
+            "available": True,
+            "hierarchy": hierarchy_count,
+            "compaction": None,
+            "compaction_reason": f"{type(e).__name__}: {e}",
+        }
+    return {
+        "available": True,
+        "hierarchy": hierarchy_count,
+        "compaction": compaction_count,
+    }
+
+
 def _budget_margin_state() -> dict:
     """checks.budget_margin: main.budget_margin_state(), or why it cannot be
     read. Same call-time, sys.modules-based pattern as _tokenizer_state and
@@ -1407,6 +1466,9 @@ async def gather_health_full(
     # P13-1/P13-3 (hostile pass #13): same pattern again, for the learned
     # budget margin reuse's own window check now reads (main.py P13-1).
     budget_margin = _budget_margin_state()
+    # v3.1.9.4 (R4): same pattern again, for the truncated-summary counters
+    # R3/round-2's M1 (P15-6) added.
+    truncated_summaries = _truncated_summary_state()
 
     # Why a reason list and not a bare string: `bg` used to be computed here,
     # placed in the payload, and never read. Sustained shedding — the pool
@@ -2042,6 +2104,13 @@ async def gather_health_full(
             # {"available": false, ...}. Visibility only — does not affect
             # `status`, the same doctrine as `tokenizer`/`reuse` above.
             "budget_margin": budget_margin,
+            # v3.1.9.4 (R4): summarizer.truncated_summary_count() (the L1/
+            # L2/L3 hierarchy) and main.truncated_compaction_summary_count()
+            # (the request-path compaction summary), or None with a reason
+            # if either is unreachable. Visibility only — does not affect
+            # `status`, the same doctrine as `tokenizer`/`reuse`/
+            # `budget_margin` above.
+            "truncated_summaries": truncated_summaries,
         },
         "stats": stats,
         "backups": backup_info,

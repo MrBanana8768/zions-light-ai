@@ -495,6 +495,86 @@ def conv_lock(conv_id: str) -> asyncio.Lock:
 
 
 # ---------------------------------------------------------------------------
+# Per-conv wipe generation (v3.1.9.4, R1 / P15-5 follow-up)
+# ---------------------------------------------------------------------------
+#
+# A counter, not a boolean and not a timestamp. Bumped by EVERY path that
+# deletes a conversation's memory (main._clear_all_memory — the single
+# chokepoint /forget, DELETE /admin/conversations/<id>/facts, and the
+# self-test cleanup all call through — and commands._handle_retire's apply
+# step, which empties the source conversation the same way). A background
+# tail (main._async_tail / _facts_tail / _rollup_hierarchy) captures the
+# CURRENT value of this counter at the moment it is SUBMITTED to the pool —
+# not when it starts running, because a tail parked on the pool's
+# concurrency semaphore has executed zero lines of its own body yet — and
+# carries that captured value with it. Every site where the tail is about
+# to WRITE re-reads this counter, under the SAME conv_lock a wipe path also
+# holds while it bumps and deletes, and discards the write if the two
+# disagree.
+#
+# WHY THIS IS THE AIRTIGHT FIX (P15-5 / R1), where draining first (v3.1.9.4
+# B3) is not. bgwork.pool.drain now WAITS for outstanding tails instead of
+# cancelling them on timeout (see bgwork.BackgroundPool.drain) — the right
+# call for every OTHER conversation's tail, which must not be killed just
+# because ONE conversation typed /forget. But it reopened a narrower hole
+# for the SAME conversation: a tail submitted before /forget arrived, still
+# parked on the pool semaphore (or mid an extraction call) when
+# commands._settle_background_work's drain times out, is now left running
+# — and it eventually acquires conv_lock and writes, with nothing left to
+# stop it, AFTER the wipe already ran. No timeout, no retry count, and no
+# amount of draining harder closes that: the tail could resume after the
+# process is otherwise fully idle. The generation check does not depend on
+# timing at all — a write is either from before the wipe (and survives,
+# correctly: that memory existed and the user had not yet asked to forget
+# it) or from at-or-after it (and never reaches disk), no matter how many
+# seconds, minutes, or pool-scheduling quirks sit in between.
+#
+# WHY IN-PROCESS IS ENOUGH (does not need to survive a restart). A restart
+# kills every in-flight tail along with it — bgwork.BackgroundPool holds
+# live asyncio.Task objects and nothing persists a queue of pending
+# background work anywhere in this codebase — so a tail that could still
+# land AFTER a wipe by outliving it can only do so within the same process
+# lifetime the wipe itself ran in. A generation counter that resets to 0 on
+# every restart is exactly as durable as it needs to be: the only tails it
+# must protect against are ones that could not already have died with the
+# process. Persisting it would buy nothing and cost a disk write on every
+# wipe, on the request path of a command a user types expecting an
+# immediate answer.
+_wipe_generations: dict[str, int] = {}
+
+
+def current_wipe_generation(conv_id: str) -> int:
+    """The conversation's current wipe generation. 0 if it has never been
+    wiped in this process's lifetime. A tail captures this value at
+    submission time; a write site compares its captured value against a
+    fresh call to this function, taken under conv_lock, immediately before
+    it would persist anything, and discards the write on a mismatch."""
+    return _wipe_generations.get(conv_id, 0)
+
+
+def bump_wipe_generation(conv_id: str) -> int:
+    """Call once from inside the SAME conv_lock(conv_id) critical section a
+    wipe path uses for its deletes, before any of them run. Returns the new
+    generation (most callers ignore it; returned for logging/tests).
+
+    Must be called under conv_lock, and before the deletes it guards: with
+    the bump inside the same locked section as the deletes, a concurrent
+    tail either fully completes before this section starts (and is then
+    cleaned up by these deletes, because it ran before them — the correct,
+    unsurprising case: memory written before /forget is what /forget just
+    removed) or cannot acquire the lock until after both the bump and the
+    deletes have finished (and then discards its own write on the
+    mismatch). There is no window in which a tail can observe the bump
+    without the deletes that follow it also already being underway or
+    complete, because nothing else may hold conv_lock(conv_id) while this
+    section does.
+    """
+    g = _wipe_generations.get(conv_id, 0) + 1
+    _wipe_generations[conv_id] = g
+    return g
+
+
+# ---------------------------------------------------------------------------
 # Per-conv inventory (used by /admin/conversations/<id>)
 # ---------------------------------------------------------------------------
 

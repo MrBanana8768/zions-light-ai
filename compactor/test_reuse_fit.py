@@ -2946,13 +2946,29 @@ check(
 #
 # Fixture: [17]'s own hierarchy/fresh-tail builder (`_g17_run`), her peakA
 # shape (l3_tokens=1869) with a 2-pair, 3,750-token-per-message fresh tail
-# and `aprev_tokens=7500` — sized (empirically, against HEAD; not derived
-# from this fixture's own count) so the SAME span needs TWO map-reduce
-# batches at the pessimistic 2.0x scale (reserve 13,705 > the 12,872-token
-# ceiling — declines) but only ONE at her measured ~1.0x range (reserve
-# 12,681 <= 12,872 — fits), because next-fit packs each message
-# independently and four ~3,750-token messages clear one ~29,696-token
-# batch at 1.05x but not at 2.0x.
+# and `aprev_tokens=7500` for [20a]/[20b] below (empirically, against
+# HEAD; not derived from this fixture's own count) — the SAME span needs
+# TWO map-reduce batches at the pessimistic 2.0x scale (reserve 13,705 >
+# the 12,872-token ceiling — declines) but only ONE at her measured ~1.0x
+# range (reserve 12,681 <= 12,872 — fits), because next-fit packs each
+# message independently and four ~3,750-token messages clear one
+# ~29,696-token batch at 1.05x but not at 2.0x.
+#
+# v3.1.9.4 (v3194-r3, R7): [20c]/[20e] below use a DIFFERENT, SELF-
+# CALIBRATING `aprev_tokens` instead of a shared hand-picked one. G3c
+# (hostile pass #14) gave `_sys_recent_floor` its own EXACT measurement
+# over `system_msgs + keep_recent` — `aprev_tokens` is part of that list
+# too — so [20a]/[20b]'s shared 7500 is no longer neutral background for
+# every sub-section once a stub also prices THAT call: at 7500 the
+# doubled floor alone can decline regardless of the fresh span's own
+# scale, and at the 1000 [20c] used to compensate there is so much slack
+# that neither scale nor which list gets measured changes the outcome —
+# both extremes make this section stop actually testing what it claims
+# to. [20c]/[20e] each binary-search their own `aprev_tokens` at runtime
+# against the real `compact_if_needed`, the same kind of self-calibration
+# [19b] above does by computing a margin from `reuse_decline_state()` —
+# adapted here to a search because this fixture's decision is a step
+# function of `aprev_tokens`, not a closed-form expression.
 # ---------------------------------------------------------------------------
 print("\n[20] P13-2: the fresh-span preview measures the same scale "
       "summarize() will use, instead of always pricing pessimistically")
@@ -2987,10 +3003,13 @@ def _g20_stub_exact_by_content(fresh_ratio, other_ratio):
     return _exact
 
 
-def _g20_run(exact_ratio, stub=None, aprev_tokens=7500):
+def _g20_run(exact_ratio, stub=None, aprev_tokens=7500, n_fresh_pairs=2, fresh_pair_tokens=3750):
     main.count_tokens_exact = stub or _g20_stub_exact(exact_ratio)
     try:
-        return _g17_run(_spy_summarize, 2, 3750, n_l1=9, l3_tokens=1869, aprev_tokens=aprev_tokens)
+        return _g17_run(
+            _spy_summarize, n_fresh_pairs, fresh_pair_tokens, n_l1=9, l3_tokens=1869,
+            aprev_tokens=aprev_tokens,
+        )
     finally:
         main.count_tokens_exact = _g20_saved_cte
 
@@ -3026,20 +3045,85 @@ check(
 # fresh span itself and 2.0 for any other list (P14-4), so the scale must be
 # measured on the list summarize() will receive.
 #
-# aprev_tokens=1000, not [20a]/[20b]'s shared 7500: this stub's
-# "2.0 for any other list" bucket is deliberately punitive so a mutant
-# that measures the WRONG list (P14-4's own finding) cannot hide — and
-# G3c (v3.1.9.4) gave `_sys_recent_floor` its own EXACT call over
-# `system_msgs + keep_recent`, the SAME shape that bucket exists to
-# catch, so this stub (correctly, for P14-4's purpose) now also prices
-# THAT call at 2.0x. At aprev_tokens=7500 that doubled recent-window
-# floor alone exceeds the ~12,872-token ceiling this fixture's numbers
-# above describe, so reuse would decline regardless of the fresh-span
-# scale this section exists to test — recalibrated down so the floor
-# leaves room again; the fresh-tail numbers above (2 pairs, 3,750
-# tokens each, the reserve/ceiling arithmetic) are unchanged.
+# v3.1.9.4 (v3194-r3, R7 — coordinator follow-up). G3c gave
+# `_sys_recent_floor` its own EXACT call over `system_msgs + keep_recent`
+# — a SECOND, LEGITIMATE consumer of this same stub's "2.0 for any other
+# list" bucket, distinct from the fresh-span preview this section exists
+# to test. `aprev_tokens` (part of `keep_recent`) was cut to 1000 so that
+# doubled floor left room again — but 1000 turned out to leave SO MUCH
+# room that reuse fires at 1.05x, 2.0x, AND a preview that measures the
+# wrong list entirely: [20c] kept passing while no longer able to tell
+# the fix from the defect it exists to catch (confirmed: `underscale`
+# and `wronglist` on `main.py` both survived this check unchanged).
+#
+# SELF-CALIBRATED, not hand-tuned (as [19b] above does, adapted to a
+# binary search since this fixture's decision is a step function of
+# `aprev_tokens`, not a closed-form arithmetic expression [19b] can
+# compute directly from `reuse_decline_state()`): probe the REAL
+# `compact_if_needed` reuse check directly, through the SAME stub and
+# fixture shape [20a]/[20b] already use, to find the largest
+# `aprev_tokens` where the CORRECT scale (1.05x, measured on the fresh
+# span alone) still reuses, and the largest where the WRONG scale (2.0x
+# — what `wronglist` and `freshscale` both collapse to for this fixture:
+# a preview that measures the wrong list lands in the stub's "any other
+# list" bucket, identically to one that packs at `_PESSIMISTIC_SUMMARY_
+# SCALE` unconditionally) already declines. Both searches read only
+# `stored_turns_out` — the same observable [20a]-[20c]'s own checks
+# already use — so this adapts automatically if MAX_MODEL_LEN,
+# SUMMARY_MAX_TOKENS or any other constant this fixture depends on ever
+# moves, the way a hardcoded constant would not.
+def _g20c_reuses(fresh_ratio, aprev_tokens):
+    _stored, *_ = _g20_run(
+        None, stub=_g20_stub_exact_by_content(fresh_ratio, 2.0),
+        aprev_tokens=aprev_tokens,
+    )
+    return _stored != [0]
+
+
+def _g20_search_largest_reusing(fresh_ratio, lo=200, hi=12000):
+    """Binary search: the largest aprev_tokens where reuse still fires at
+    `fresh_ratio`. Assumes (and the two checks below confirm) that
+    reuse-fires is monotonically non-increasing in aprev_tokens — true
+    here because a bigger A_prev only ever ADDS to `_sys_recent_floor`,
+    never removes from it."""
+    assert _g20c_reuses(fresh_ratio, lo), (
+        f"fixture: aprev_tokens={lo} must still reuse at ratio {fresh_ratio} "
+        f"for this search to have a valid starting point"
+    )
+    assert not _g20c_reuses(fresh_ratio, hi), (
+        f"fixture: aprev_tokens={hi} must already decline at ratio "
+        f"{fresh_ratio} for this search to have a valid ending point"
+    )
+    while hi - lo > 20:
+        mid = (lo + hi) // 2
+        if _g20c_reuses(fresh_ratio, mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+_g20c_correct_edge = _g20_search_largest_reusing(1.05)
+_g20c_wrong_edge = _g20_search_largest_reusing(2.0)
+check(
+    _g20c_wrong_edge < _g20c_correct_edge,
+    f"fixture: a real calibration window exists — the wrong scale (2.0x) "
+    f"stops reusing at a SMALLER aprev_tokens ({_g20c_wrong_edge}) than "
+    f"the correct scale (1.05x) does ({_g20c_correct_edge})",
+)
+# Comfortably inside the window, not pinned to either edge (a search that
+# happens to land within a couple of steps of its own boundary would make
+# this section as fragile as the aprev_tokens=1000 it replaces).
+_g20c_aprev = (_g20c_correct_edge + _g20c_wrong_edge) // 2
+check(
+    _g20c_reuses(1.05, _g20c_aprev) and not _g20c_reuses(2.0, _g20c_aprev),
+    f"fixture: aprev_tokens={_g20c_aprev} (midpoint of "
+    f"[{_g20c_wrong_edge}, {_g20c_correct_edge}]) reuses at 1.05x and "
+    f"declines at 2.0x",
+)
+
 _g20c_stored, _g20c_out, _g20c_last, _g20c_render, _g20c_log = _g20_run(
-    None, stub=_g20_stub_exact_by_content(1.05, 2.0), aprev_tokens=1000
+    None, stub=_g20_stub_exact_by_content(1.05, 2.0), aprev_tokens=_g20c_aprev
 )
 check(
     _g20c_stored == [_g20c_last],
@@ -3053,6 +3137,38 @@ _g20c_rep, _g20c_prev, _g20c_newest = _g14_guard(_g20c_out, _g20c_last, "20c")
 check(_g20c_rep.get("fits") is True, f"[20c] the guard fits the payload ({_g20c_rep})")
 check(_g20c_prev, f"[20c]: her previous exchange survives end to end ({_g20c_rep})")
 check(_g20c_newest, "[20c]: the newest turn always survives")
+
+# [20c-freshscale] *** THE FIX, NAMED: at this SAME calibration, a preview
+# that packs at `_PESSIMISTIC_SUMMARY_SCALE` UNCONDITIONALLY (freshscale —
+# main.py's `_fresh_scale = _PESSIMISTIC_SUMMARY_SCALE` regardless of what
+# `/tokenize` answered) is exactly the `fresh_ratio=2.0` probe the search
+# above already used to find `_g20c_wrong_edge` — restated here as its own
+# named, standalone check (not folded into the search) so a reader — or a
+# mutation run — sees this specific regression called out on its own line.
+_g20_freshscale_stored, *_ = _g20_run(
+    None, stub=_g20_stub_exact_by_content(2.0, 2.0), aprev_tokens=_g20c_aprev
+)
+check(
+    _g20_freshscale_stored == [0],
+    f"*** [20c-freshscale] a preview pinned to the pessimistic scale "
+    f"unconditionally DECLINES here, where the real (1.05x) scale reuses "
+    f"(stored_turns_out={_g20_freshscale_stored}) — this is the exact "
+    f"shape main.py's `_fresh_scale = _PESSIMISTIC_SUMMARY_SCALE` "
+    f"(ignoring what /tokenize measured) would produce",
+)
+
+# [20c-wronglist] main.py's `_fresh_local`/`_fresh_exact` measuring
+# `system_msgs + keep_recent` instead of `_fresh_span_preview` — P14-4's
+# own "wronglist" shape — makes BOTH calls land in this stub's "any other
+# list" bucket (2.0x), identically to freshscale immediately above: from
+# the stub's point of view (content in, ratio out) a preview that asks the
+# wrong question is indistinguishable from one that never asks at all. So
+# [20c]'s own "*** P13-2 [20c]" check IS the named check wronglist trips —
+# driven through the real code (a genuine textual mutation of the two call
+# sites, not just this stub-level argument; see this lane's mutation
+# report for the needle and the confirmed KILLED result) rather than
+# invented here as a separate assertion that would just restate the same
+# stub response under a different name.
 
 # [20d] invariant (the brief's own requirement): the preview must never
 # count FEWER batches than a larger scale would — next-fit bin-packing is
@@ -3084,6 +3200,99 @@ check(
     f"pessimistic fallback used whenever /tokenize does not answer can only "
     f"ever reserve AS MANY OR MORE batches than the measured scale this fix "
     f"now prefers when /tokenize does answer, never fewer",
+)
+
+# ---------------------------------------------------------------------------
+# [20e] v3.1.9.4 (v3194-r3, R7 — coordinator follow-up): `underscale` —
+# main.py's `_fresh_scale = (_fresh_exact / _fresh_local)` becoming
+# `(_fresh_exact / _fresh_local) * 0.5` — UNDER-reserves rather than
+# over-reserving, so [20c]'s own calibration (correct fits, wrong
+# declines) cannot catch it: halving an already-small ratio only makes
+# the preview MORE willing to reuse, never less, and [20c]'s window
+# only exercises "does a bigger ratio correctly decline". Needs the
+# OPPOSITE shape: a fresh span where the TRUE (1.05x) scale already
+# needs TWO batches and correctly DECLINES (the request genuinely does
+# not fit beside a real, un-halved summarize() call), while the halved
+# (0.525x) scale wrongly measures only ONE batch's worth and reuses —
+# approving a stand-in reserve smaller than what summarize() will
+# actually need. A BIGGER fresh span than [20c]'s (8,000 not 3,750
+# tokens/message) crosses the 1-vs-2-batch line at the REAL 1.05x scale
+# instead of needing 2.0x to get there; same self-calibrating binary
+# search as [20c], on this span's own numbers.
+# ---------------------------------------------------------------------------
+print("\n[20e] underscale: halving the measured scale must not approve a "
+      "reserve smaller than what summarize() will actually need")
+
+
+def _g20e_reuses(fresh_ratio, aprev_tokens):
+    _stored, *_ = _g20_run(
+        None, stub=_g20_stub_exact_by_content(fresh_ratio, 2.0),
+        aprev_tokens=aprev_tokens, n_fresh_pairs=2, fresh_pair_tokens=8000,
+    )
+    return _stored != [0]
+
+
+def _g20e_search_largest_reusing(fresh_ratio, lo=200, hi=12000):
+    assert _g20e_reuses(fresh_ratio, lo), (
+        f"fixture: aprev_tokens={lo} must still reuse at ratio {fresh_ratio}"
+    )
+    assert not _g20e_reuses(fresh_ratio, hi), (
+        f"fixture: aprev_tokens={hi} must already decline at ratio {fresh_ratio}"
+    )
+    while hi - lo > 20:
+        mid = (lo + hi) // 2
+        if _g20e_reuses(fresh_ratio, mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+# The boundary at the TRUE scale (1.05x, 2 batches once the span is large
+# enough — unlike [20c]'s smaller span, which only needed 2 batches at a
+# punitive 2.0x).
+_g20e_true_edge = _g20e_search_largest_reusing(1.05)
+# The boundary at the HALVED scale (0.525x, still only 1 batch at sizes
+# well past where 1.05x already needed 2).
+_g20e_half_edge = _g20e_search_largest_reusing(1.05 * 0.5)
+check(
+    _g20e_true_edge < _g20e_half_edge,
+    f"fixture: the halved scale keeps reusing at LARGER aprev_tokens than "
+    f"the true scale does (true edge {_g20e_true_edge} < halved edge "
+    f"{_g20e_half_edge}) — a real gap where the true scale has already "
+    f"correctly declined but the halved one has not caught up",
+)
+# Comfortably inside the window: correctly declines at the true scale,
+# reuses at the halved one.
+_g20e_aprev = (_g20e_true_edge + _g20e_half_edge) // 2
+check(
+    (not _g20e_reuses(1.05, _g20e_aprev)) and _g20e_reuses(1.05 * 0.5, _g20e_aprev),
+    f"fixture: aprev_tokens={_g20e_aprev} (midpoint of "
+    f"[{_g20e_true_edge}, {_g20e_half_edge}]) declines at the true scale "
+    f"and reuses at the halved one",
+)
+
+_g20e_stored, _g20e_out, _g20e_last, _g20e_render, _g20e_log = _g20_run(
+    None, stub=_g20_stub_exact_by_content(1.05, 2.0), aprev_tokens=_g20e_aprev,
+    n_fresh_pairs=2, fresh_pair_tokens=8000,
+)
+check(
+    _g20e_stored == [0],
+    f"*** [20e] CONTROL: at the TRUE measured scale (1.05x), this fresh "
+    f"span correctly needs 2 batches and the request declines rather than "
+    f"reusing (stored_turns_out={_g20e_stored})",
+)
+
+_g20e_under_stored, *_ = _g20_run(
+    None, stub=_g20_stub_exact_by_content(1.05 * 0.5, 2.0), aprev_tokens=_g20e_aprev,
+    n_fresh_pairs=2, fresh_pair_tokens=8000,
+)
+check(
+    _g20e_under_stored != [0],
+    f"*** [20e-underscale] the IDENTICAL fresh span, measured at HALF the "
+    f"true scale, WRONGLY reuses — approving a stand-in reserve sized for "
+    f"one map-reduce batch when summarize() (at the real, un-halved scale) "
+    f"will actually need two (stored_turns_out={_g20e_under_stored})",
 )
 
 

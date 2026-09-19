@@ -46,10 +46,22 @@ defect in the first corrected draft: steps 2/4 were ALSO target-limited
 like the turn-shedding steps, so a measurement that never reflects
 content made them spend only one block per round and exhaust the
 six-round cap with memory still held -- the exact "guard holding memory
-it was allowed to spend" bug v3.1 D3 exists to prevent. Fixed by making
-steps 2 and 4 (injected memory) UNCONDITIONAL once reached — the same
-"spend every remaining scrap" doctrine v3.1 D3 always used for memory,
-which this repo's own `_enforce_hard_budget` docstring already states).
+it was allowed to spend" bug v3.1 D3 exists to prevent. The coordinator's
+fix at the time made steps 2 and 4 UNCONDITIONAL once reached instead).
+
+v3.1.9.4, lane v3194-r3 (R6): steps 2 and 4 are TARGET-LIMITED again,
+like steps 1 and 3 — the unconditional shape above reintroduced exactly
+what the forced drop THIS pass replaced was written to avoid, in that
+forced drop's own comment: "Dropping EVERYTHING is wasteful: measured by
+review, a payload over by 550 tokens lost persona, facts and summary
+when one 1500-token block covered it." The round-cap risk [G3a-cap]
+above exists to bound is real under an adversarial measurement, but this
+pass's own cross-round rescale (which corrects every remaining per-item
+estimate by measured-vs-estimated after each round — see [G3a-rescale]
+below) is the same mechanism steps 1 and 3 have relied on for that risk
+since G3a shipped; [G3a-unconditional] below is rewritten to pin the
+MINIMUM instead of the maximum: two spendable blocks, only one needed,
+and only that one is dropped.
 
     python test_v3194_guard_g3a.py
 """
@@ -262,14 +274,21 @@ _newest_u = _msg("user", "NEWESTU", 50, _mem_costs)
 _mem_msgs = [_persona, _old_u, _old_a, _facts, _retrieval, _prev_u, _prev_a, _newest_u]
 _mem_per = [_mem_costs[m["content"]] for m in _mem_msgs]
 _mem_total = sum(_mem_per)
-# Freeing the old pair alone (600) is NOT enough; freeing the old pair
-# PLUS facts+retrieval (600 + 800 = 1400) IS -- so step 3 (the recent
-# window, which holds her previous exchange) must never even be reached.
-_mem_limit = _mem_total - 900
+# v3.1.9.4 (v3194-r3, R6): step 2 is now TARGET-LIMITED, so a gap that
+# freeing the old pair PLUS FACTS ALONE already closes (600 + 400 = 1000)
+# must leave RETRIEVAL untouched — this fixture's job is to need BOTH
+# memory blocks, not just their sum, so the gap has to sit strictly ABOVE
+# what facts alone (combined with the old pair) provides. Freeing the old
+# pair alone (600) is NOT enough; the old pair plus FACTS alone (1000) is
+# STILL not enough; the old pair plus facts+retrieval (600 + 800 = 1400)
+# IS -- so step 3 (the recent window, which holds her previous exchange)
+# must never even be reached, and BOTH memory blocks are required, not
+# just offered.
+_mem_limit = _mem_total - 1200
 check(
-    600 < _mem_total - _mem_limit <= 1400,
+    1000 < _mem_total - _mem_limit <= 1400,
     f"fixture: the gap ({_mem_total - _mem_limit}) needs the old pair AND "
-    f"memory, but not the recent window",
+    f"BOTH memory blocks (facts alone is not enough), but not the recent window",
 )
 _mem_out_msgs, _mem_out_per, _mem_out_running, _mem_counter, _mem_dropped, _mem_sys_dropped = (
     main._shed_last_resort(
@@ -492,7 +511,12 @@ check(
 check(
     not any(t.startswith("BLOCK") for t in _texts(_cap_out_msgs)),
     f"*** [G3a-cap] every spendable block was still dropped despite the "
-    f"broken measurement (unconditional step 2 — out={sorted(_texts(_cap_out_msgs))})",
+    f"broken measurement — the 5000-token target here is far beyond the "
+    f"200 tokens all 20 blocks together are worth, so target-limited step "
+    f"2 (v3.1.9.4, R6) still exhausts them all; it stops early only when "
+    f"the target really is smaller than what remains, which [G3a-"
+    f"unconditional] below is what actually pins "
+    f"(out={sorted(_texts(_cap_out_msgs))})",
 )
 check(
     any(t.startswith("NEWESTU") for t in _texts(_cap_out_msgs))
@@ -502,66 +526,129 @@ check(
 
 
 # ---------------------------------------------------------------------------
-# [G3a-unconditional] step 2 (spendable memory) must be UNCONDITIONAL, not
-# merely "eventually spent" -- a target-limited version (mirroring step 1's
-# own shape) converges only as fast as `running` shrinks, and a measurement
-# that never reflects content (test_budget_guard.py's own adversarial
-# stub) then spends only a few blocks per round -- exactly the SECOND
-# defect a corrected-but-still-wrong draft reintroduced: exhausting the
-# six-round cap with some injected blocks still held. [G3a-cap] above (20
-# blocks, a target ten times its own available content) cannot distinguish
-# target-limited from unconditional, because target-limiting never gets a
-# chance to bind when there is not enough content to reach the target
-# either way -- this fixture deliberately keeps the per-round target
-# SMALLER than the total spendable content so it does.
+# [G3a-unconditional] v3.1.9.4 (v3194-r3, R6) REWORKED: this used to pin
+# step 2 dropping EVERY eligible block once reached, even when one block
+# already closed the gap -- the exact waste the forced drop this pass
+# replaced was written to avoid, in that forced drop's own comment:
+# "Dropping EVERYTHING is wasteful: measured by review, a payload over by
+# 550 tokens lost persona, facts and summary when one 1500-token block
+# covered it." Steps 2 and 4 are now TARGET-LIMITED, like steps 1 and 3
+# always were (main.py, _shed_last_resort, R6's own comment there has the
+# full reasoning, including why the round-cap risk the ORIGINAL
+# unconditional shape was defending against is bounded, not eliminated, by
+# this pass's own cross-round rescale). This test now pins THE MINIMUM:
+# with a working (non-adversarial) measurement and TWO spendable blocks
+# where only the larger one is needed to close the gap, only that one is
+# dropped -- the smaller one survives.
 # ---------------------------------------------------------------------------
-print("\n[G3a-unconditional] step 2 spends ALL spendable memory in one "
-      "round, not just enough to hit that round's target")
+print("\n[G3a-unconditional] step 2 drops only as much spendable memory as "
+      "the gap needs -- one block closes it, the other survives")
 
 _unc_costs: dict = {}
-_unc_persona = _msg("system", "PERSONA", 10, _unc_costs)
-_unc_blocks = [_msg("system", f"BLOCK{i}", 10, _unc_costs) for i in range(100)]
-_unc_newest = _msg("user", "NEWESTU", 10, _unc_costs)
-_unc_msgs = [_unc_persona] + _unc_blocks + [_unc_newest]
+_unc_persona = _msg("system", "PERSONA", 50, _unc_costs)
+_unc_big = _msg("system", "BIGBLOCK", 1000, _unc_costs)
+_unc_small = _msg("system", "SMALLBLOCK", 1000, _unc_costs)
+_unc_newest = _msg("user", "NEWESTU", 50, _unc_costs)
+_unc_msgs = [_unc_persona, _unc_big, _unc_small, _unc_newest]
 _unc_per = [_unc_costs[m["content"]] for m in _unc_msgs]
-_unc_total = sum(_unc_per)  # 10 + 1000 + 10 = 1020
+_unc_total = sum(_unc_per)  # 50 + 1000 + 1000 + 50 = 2100
+
+# The gap (600) sits strictly under BIGBLOCK's own cost (1000) -- BIGBLOCK
+# ALONE clears it (there is no step 1 content here to help: both messages
+# above the recent window are protected persona/newest, so step 2 carries
+# the whole gap). SMALLBLOCK must never be touched.
+_unc_limit = _unc_total - 600
+check(
+    0 < _unc_total - _unc_limit < 1000,
+    f"fixture: the gap ({_unc_total - _unc_limit}) is smaller than either "
+    f"single spendable block (1000), so ONE closes it",
+)
 
 _unc_calls = [0]
+_unc_real_measure = _real_measure(_unc_costs)
 
 
-def _unc_broken_measure(msgs):
-    """Adversarial, like [G3a-cap]'s own stub: always the SAME fixed
-    value, regardless of what got cut -- so a target computed from
-    `running` never shrinks either, and only genuinely unconditional
-    spending can clear all 100 blocks before the cap."""
+def _unc_counting_measure(msgs):
     _unc_calls[0] += 1
-    return _unc_total, "stub"
+    return _unc_real_measure(msgs)
 
 
 _unc_out_msgs, _unc_out_per, _unc_out_running, _unc_counter, _unc_dropped, _unc_sys_dropped = (
     main._shed_last_resort(
-        list(_unc_msgs), list(_unc_per), _unc_total, _unc_total - 150,
+        list(_unc_msgs), list(_unc_per), _unc_total, _unc_limit,
         protect_system=1, standin_protected=True, counter="stub",
-        dropped=0, sys_dropped=0, measure=_unc_broken_measure,
+        dropped=0, sys_dropped=0, measure=_unc_counting_measure,
     )
 )
-_unc_blocks_left = sum(1 for t in _texts(_unc_out_msgs) if t.startswith("BLOCK"))
+_unc_out_texts = _texts(_unc_out_msgs)
+check(_unc_out_running <= _unc_limit, f"fits (running={_unc_out_running}, limit={_unc_limit})")
 check(
-    _unc_blocks_left == 0,
-    f"*** [G3a-unconditional] THE FIX: all 100 spendable blocks are gone "
-    f"after round 1 -- a target-limited step 2 (the reopened defect) "
-    f"would still be holding roughly 10 of them when the "
-    f"{main._G3A_MEASURE_CAP}-round cap hit ({_unc_blocks_left} BLOCK(s) "
-    f"left)",
+    "BIGBLOCK:1" not in _unc_out_texts,
+    f"*** [G3a-unconditional] THE FIX: BIGBLOCK alone closed the gap and "
+    f"was dropped (out={_unc_out_texts})",
 )
+check(
+    "SMALLBLOCK:2" in _unc_out_texts,
+    f"*** [G3a-unconditional] THE FIX: SMALLBLOCK was NEVER TOUCHED -- the "
+    f"pre-fix shape would have dropped it too, the instant step 2 was "
+    f"reached at all, even though BIGBLOCK alone already closed the gap "
+    f"(out={_unc_out_texts})",
+)
+check(_unc_sys_dropped == 1, f"[G3a-unconditional]: exactly ONE memory block was dropped (sys_dropped={_unc_sys_dropped})")
 check(
     _unc_calls[0] <= main._G3A_MEASURE_CAP,
     f"[G3a-unconditional]: still within the measurement cap ({_unc_calls[0]} calls)",
 )
 check(
-    any(t.startswith("NEWESTU") for t in _texts(_unc_out_msgs))
-    and any(t.startswith("PERSONA") for t in _texts(_unc_out_msgs)),
+    any(t.startswith("NEWESTU") for t in _unc_out_texts)
+    and any(t.startswith("PERSONA") for t in _unc_out_texts),
     "[G3a-unconditional]: the persona and the newest turn always survive",
+)
+
+
+# ---------------------------------------------------------------------------
+# [G3a-step4-target] v3.1.9.4 (v3194-r3, R6): step 4's OWN target-limiting,
+# isolated from step 2. Production only ever offers step 4 one candidate
+# (the single real compaction stand-in), so [G3a-order] above cannot
+# distinguish target-limited from unconditional there -- with one item,
+# both shapes drop it or keep it identically. Two synthetic
+# stand-in-shaped blocks (recognised by _is_compaction_standin on CONTENT
+# alone, per that function's own docstring) isolate step 4's loop the same
+# way [G3a-unconditional] isolates step 2's.
+# ---------------------------------------------------------------------------
+print("\n[G3a-step4-target] step 4 drops only as many protected-stand-in-"
+      "shaped blocks as the gap needs")
+
+_s4_costs: dict = {}
+_s4_persona = _msg("system", "PERSONA", 50, _s4_costs)
+_s4_standin_big = {"role": "system", "content": main.COMPACTION_SUMMARY_HEADER + "\nSTANDINBIG"}
+_s4_costs[_s4_standin_big["content"]] = 1000
+_s4_standin_small = {"role": "system", "content": main.COMPACTION_SUMMARY_HEADER + "\nSTANDINSMALL"}
+_s4_costs[_s4_standin_small["content"]] = 1000
+_s4_newest = _msg("user", "NEWESTU", 50, _s4_costs)
+_s4_msgs = [_s4_persona, _s4_standin_big, _s4_standin_small, _s4_newest]
+_s4_per = [_s4_costs[m["content"]] for m in _s4_msgs]
+_s4_total = sum(_s4_per)  # 50 + 1000 + 1000 + 50 = 2100
+_s4_limit = _s4_total - 600  # gap 600 < either single stand-in's 1000
+
+_s4_out_msgs, *_s4_rest, _s4_sys_dropped = main._shed_last_resort(
+    list(_s4_msgs), list(_s4_per), _s4_total, _s4_limit,
+    protect_system=1, standin_protected=True, counter="stub",
+    dropped=0, sys_dropped=0, measure=_real_measure(_s4_costs),
+)
+_s4_out_texts = _texts(_s4_out_msgs)
+_s4_standins_left = sum(1 for m in _s4_out_msgs if main._is_compaction_standin(m))
+check(
+    _s4_standins_left == 1,
+    f"*** [G3a-step4-target] THE FIX: exactly ONE of the two stand-in-shaped "
+    f"blocks survives — the other alone closed the gap "
+    f"(standins_left={_s4_standins_left}, out={_s4_out_texts})",
+)
+check(_s4_sys_dropped == 1, f"[G3a-step4-target]: exactly one block dropped (sys_dropped={_s4_sys_dropped})")
+check(
+    any(t.startswith("NEWESTU") for t in _s4_out_texts)
+    and any(t.startswith("PERSONA") for t in _s4_out_texts),
+    "[G3a-step4-target]: the persona and the newest turn always survive",
 )
 
 

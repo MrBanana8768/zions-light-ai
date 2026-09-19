@@ -275,6 +275,44 @@ DIFFERENT pair of numbers depending on which reason produced them:**
   this is the mechanism to suspect before assuming the hierarchy itself
   lost it.
 
+#### `checks.truncated_summaries` — how many stored summaries were cut and trimmed rather than finished? (v3.1.9.4, R3/R4, P15-6)
+
+```bash
+curl -s localhost:8080/health/full | python3 -c "
+import json,sys; d=json.load(sys.stdin); t=d['checks'].get('truncated_summaries') or {}
+print('hierarchy (L1/L2/L3):', t.get('hierarchy'))
+print('compaction (request-path):', t.get('compaction'), '| reason:', t.get('compaction_reason'))"
+```
+
+Two counters, both process-local and reset to zero on a restart. `hierarchy`
+is `summarizer.truncated_summary_count()` — how many L1/L2/L3 rollup
+summaries were cut at their tier's `max_tokens` (`finish_reason: "length"`)
+and still had nothing better than a fallback-trimmed result after one retry
+at the same cap with a tighter word target (round 2's M1, P15-6). `compaction`
+is the identical counter for `main._summarize_once` — the compaction summary
+`compact_if_needed` builds on the REQUEST path, not the background tail (R3,
+the same fix applied to this call site's own `finish_reason=length` gap);
+`compaction_reason` explains a `null` compaction value (main.py not loaded
+in this process, or the counter function missing in an older build) the same
+way `checks.reuse`'s `"available": false` does.
+
+Before this release, a cut summary was stored (or forwarded, for the
+compaction path) byte-for-byte as if it had finished — indistinguishable
+on disk from a complete one, with no log line and no counter anywhere
+(P15-6's own finding). Now every cut-and-trimmed unit is retried once and,
+if still cut, logged at WARNING (naming the conversation and, for the
+hierarchy path, the tier) AND counted here. **This is visibility-only — it
+never appears in `status_reasons` and never degrades `status`, the same
+doctrine as `checks.reuse`/`checks.budget_margin` above**: a trimmed summary
+is a degraded-but-served unit (it covers slightly less than the model
+tried to say, at a real sentence/line/word boundary — never mid-sentence,
+never silently stalled), not a fault to alarm an operator awake for. Zero
+on a healthy deployment; a count that climbs steadily is worth investigating
+(a conversation whose turns consistently overflow `COMPACTOR_L1_MAX_TOKENS`/
+`COMPACTOR_L2_MAX_TOKENS`/`COMPACTOR_L3_MAX_TOKENS`/`COMPACTOR_SUMMARY_MAX_TOKENS`,
+or a model that is simply verbose against these caps) — raising the
+relevant `*_MAX_TOKENS` env var is the fix, not a code change.
+
 #### `checks.budget_margin` — is a learned budget correction narrowing the window right now? (v3.1.9.3, P13-1/P13-3)
 
 ```bash

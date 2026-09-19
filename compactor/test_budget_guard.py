@@ -205,10 +205,22 @@ def _guard_with_logs(msgs, limit=None, protect=None):
 
 
 def _budget_line(records):
-    """The guard's single verdict record — WARNING when it fit, ERROR when it
-    did not. None if it never spoke (i.e. it had nothing to do)."""
+    """The guard's single VERDICT record — WARNING ("hard budget enforced:")
+    when it fit, ERROR ("hard budget FAILED to fit:") when it did not. None
+    if it never spoke (i.e. it had nothing to do).
+
+    v3.1.9.4 (v3194-r3, R6): matched on the verdict's own two exact
+    prefixes, not a bare "hard budget" substring. _shed_last_resort (main.py)
+    can now log its OWN intermediate line first ("hard budget: the
+    last-resort pass hit its N-measurement cap..." — pre-existing, not new;
+    R6's target-limiting just means this pass reaches that branch on
+    fixtures that used to converge without ever hitting the cap), which
+    also contains the substring "hard budget" and used to be picked up by
+    this function INSTEAD of the real verdict a few lines later — silently
+    reading a WARNING where an ERROR was coming, or vice versa."""
     for r in records:
-        if "hard budget" in r.getMessage():
+        msg = r.getMessage()
+        if msg.startswith("hard budget enforced:") or msg.startswith("hard budget FAILED to fit:"):
             return r
     return None
 

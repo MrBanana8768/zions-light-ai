@@ -84,7 +84,7 @@ import bgwork
 import facts as facts_module
 import portability
 import textclean
-from memory import StoreUnreadable, conv_lock, storage_root
+from memory import StoreUnreadable, bump_wipe_generation, conv_lock, storage_root
 
 logger = logging.getLogger("compactor.commands")
 
@@ -2296,6 +2296,17 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
 
             # 3. Now empty the source. Sidecar, then the active set, then the
             #    layers that are not facts.
+            #
+            # v3.1.9.4 (R1 / P15-5 follow-up). Bumped here, still inside
+            # both conv_locks (first, second — source_id is one of them),
+            # and before any of the deletes below — same placement rule as
+            # main._clear_all_memory's own bump: a tail of source_id that
+            # captured its generation before this /retire apply started now
+            # disagrees with current_wipe_generation(source_id) the moment
+            # it re-checks, under this same lock, and discards whatever it
+            # was about to write into a conversation that is being retired
+            # out from under it.
+            bump_wipe_generation(source_id)
             facts_module.save_archive(source_id, [])
             # An EMPTY facts file, not an unlinked one — /forget's tombstone,
             # for its reason: backfill.needs_backfill gates on

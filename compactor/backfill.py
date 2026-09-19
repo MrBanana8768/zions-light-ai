@@ -38,13 +38,33 @@ Storage:
 Format:
     {
       "conv_id": "...",
-      "state": "in_progress" | "complete" | "failed",
+      "state": "in_progress" | "complete" | "failed" | "abandoned",
       "started_at": "2026-05-28T...",
       "updated_at": "2026-05-28T...",
       "exchanges_done": 5,
       "exchanges_total": 47,
+      "attempts": 1,
       "error": null
     }
+
+v3.1.9.4 (R2 / P15-2 follow-up). B2's retry-by-record fix (above) turned a
+PERMANENTLY abandoned backfill into one that retries — correct for a
+transient failure (a redeploy, an OOM, a momentary vLLM outage), and wrong
+on its own for one that fails DETERMINISTICALLY: with nothing capping it,
+that conversation would spend a fresh multi-hour run of vLLM calls on every
+single eligible request from then on, forever. `attempts` (new field above)
+counts how many times a run has actually been started for this backfill
+record's current retry generation; `needs_backfill` refuses to retry a
+`failed` record until an EXPONENTIAL backoff since its last update has
+elapsed (`_backoff_ready`, keyed off `attempts`), and `_run_backfill`
+itself stops retrying and writes the new terminal state `"abandoned"`
+instead of `"failed"` once `attempts` reaches `_MAX_BACKFILL_ATTEMPTS`,
+logging one WARNING naming the conversation and its last error. A crash
+(SIGKILL, OOM) that leaves a stale `in_progress` record already at the cap
+is refused the same way, logged once via logsetup.log_once — that record
+itself is never rewritten to `"abandoned"`, because refusing a kickoff
+spends no background task to write it, so `in_progress`/stale/at-the-cap is
+its own permanent (and, via the log line, discoverable) terminal shape.
 """
 
 import logging
@@ -58,6 +78,7 @@ from starlette.concurrency import run_in_threadpool
 
 import envcfg
 import facts as facts_module
+import logsetup
 import retrieval
 import summarizer
 from memory import (
@@ -76,6 +97,25 @@ logger = logging.getLogger("compactor.backfill")
 # consider it crashed and retry. 10 minutes covers the longest plausible
 # backfill (~2000 message conversation at 300ms/call), with margin.
 _STALE_SECONDS = 600
+
+# v3.1.9.4 (R2 / P15-2 follow-up). A backfill that fails deterministically
+# (a malformed history, a store this conversation will never satisfy) must
+# not re-spend a multi-hour run of vLLM calls on every future eligible
+# request forever. Three tries — the first plus two retries — is enough to
+# ride out a transient failure (the case B2 exists for) without turning a
+# permanent one into unbounded load. Small and env-overridable rather than
+# hardcoded, matching this module's other retry/budget knobs.
+_MAX_BACKFILL_ATTEMPTS = envcfg.env_int("COMPACTOR_BACKFILL_MAX_ATTEMPTS", 3)
+
+# Base backoff between a failed attempt and the next retry, DOUBLED per
+# attempt already spent (attempt 1 failed -> wait this long; attempt 2
+# failed -> wait 2x this long; attempt 3 failed -> abandoned, no more
+# retries at all). Reuses _STALE_SECONDS' own 10-minute unit as the default
+# — an operator who already knows what that number means does not need a
+# second one.
+_BACKFILL_RETRY_BACKOFF_S = envcfg.env_int(
+    "COMPACTOR_BACKFILL_RETRY_BACKOFF_S", _STALE_SECONDS
+)
 
 # v3.1.9 (tail catch-up). YES, this gets a budget too, and reuses the tail's
 # own knob (main.TAIL_ROLLUP_MAX_CALLS, same env var) rather than a
@@ -152,6 +192,49 @@ def _write_state(conv_id: str, state: dict) -> None:
     atomic_write_json(_backfill_state_path(conv_id), state)
 
 
+def _write_failed_or_abandoned(
+    conv_id: str,
+    attempts: int,
+    *,
+    started_at: str,
+    exchanges_done: int,
+    exchanges_total: int,
+    error: str,
+) -> None:
+    """The one place `_run_backfill` records an attempt that did not
+    succeed (v3.1.9.4, R2 / P15-2 follow-up). `attempts` is THIS run's own
+    attempt number (see `_run_backfill`'s `this_attempt`) — once it reaches
+    `_MAX_BACKFILL_ATTEMPTS`, the record becomes the terminal state
+    `"abandoned"` instead of the retryable `"failed"`, and a WARNING names
+    the conversation, the attempt count and the error, exactly once (this
+    function runs once per failed run, so no log_once is needed here — see
+    `needs_backfill` for the sibling case, a crash rather than a clean
+    failure, which DOES need one).
+
+    Two call sites share this rather than each deciding independently: the
+    fix-one-site-miss-the-sibling defect this codebase keeps paying for is
+    exactly what having only one of the two write "abandoned" would be.
+    """
+    if attempts >= _MAX_BACKFILL_ATTEMPTS:
+        logger.warning(
+            f"conv={conv_id}: backfill abandoned after {attempts} failed "
+            f"attempt(s) — the {_MAX_BACKFILL_ATTEMPTS}-attempt cap is "
+            f"reached, so this conversation's history will NOT be "
+            f"retried again; last error: {error}"
+        )
+        state_value = "abandoned"
+    else:
+        state_value = "failed"
+    _write_state(conv_id, {
+        "state": state_value,
+        "started_at": started_at,
+        "exchanges_done": exchanges_done,
+        "exchanges_total": exchanges_total,
+        "attempts": attempts,
+        "error": error[:500],
+    })
+
+
 def is_stale(state: dict) -> bool:
     """A state is stale if it's marked in_progress but hasn't been touched
     in _STALE_SECONDS. Indicates a crashed backfill that should be retried.
@@ -167,6 +250,39 @@ def is_stale(state: dict) -> bool:
         return True
     age = (datetime.now(timezone.utc) - ts).total_seconds()
     return age > _STALE_SECONDS
+
+
+def _backoff_ready(state: dict) -> bool:
+    """Whether enough time has passed since a `failed` backfill's last
+    update to retry it again (v3.1.9.4, R2 / P15-2 follow-up).
+
+    Round 2 (B2) made `needs_backfill` return True the instant it saw
+    `state == "failed"`, with no minimum wait at all — so a backfill
+    failing for a deterministic reason retried on the very next eligible
+    request, spending a fresh run of vLLM calls every time. The wait
+    DOUBLES per attempt already recorded (`_BACKFILL_RETRY_BACKOFF_S *
+    2 ** (attempts - 1)`), so a backfill that keeps failing spreads its
+    remaining tries out rather than burning through `_MAX_BACKFILL_
+    ATTEMPTS` inside one busy minute — the cap in `needs_backfill`/
+    `_run_backfill` is what stops it forever; this is what slows it down
+    on the way there.
+
+    Same malformed-timestamp handling as `is_stale`: a missing or
+    unparseable `updated_at` does not block a retry on a guess.
+    """
+    updated_at = state.get("updated_at")
+    if not updated_at:
+        return True
+    try:
+        ts = datetime.fromisoformat(updated_at)
+    except (ValueError, TypeError):
+        return True
+    age = (datetime.now(timezone.utc) - ts).total_seconds()
+    # At least 1: a record with no attempts recorded (pre-fix, or a
+    # malformed write) backs off by exactly the base amount, not less.
+    attempts = max(1, int(state.get("attempts") or 1))
+    backoff = _BACKFILL_RETRY_BACKOFF_S * (2 ** (attempts - 1))
+    return age > backoff
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +355,18 @@ def needs_backfill(conv_id: str, messages: list[dict]) -> bool:
     during the abandoned attempt) must NOT cause it to refuse itself as
     "not a V1 store"; `_merge_backfilled`'s additive merge is what makes
     running a resumed pass over a non-empty store safe.
+
+    v3.1.9.4 (R2 / P15-2 follow-up). A `failed` record no longer retries
+    unconditionally: it waits out `_backoff_ready`'s exponential backoff
+    first, and once `attempts` reaches `_MAX_BACKFILL_ATTEMPTS` it does not
+    retry at all — see `_run_backfill`, which writes the terminal state
+    `"abandoned"` (checked here the same as `"complete"`) instead of
+    `"failed"` the moment that happens, so this branch is reached at most
+    `_MAX_BACKFILL_ATTEMPTS - 1` times for any one record. A stale
+    `in_progress` record already AT the cap (a crash on what was already
+    the Nth attempt) is refused the same way, logged once, because nothing
+    will run to rewrite THAT record to `"abandoned"` — refusing a kickoff
+    spends no background task.
     """
     if len(messages) < _MIN_MESSAGES_FOR_BACKFILL:
         return False  # too short to bother
@@ -253,10 +381,40 @@ def needs_backfill(conv_id: str, messages: list[dict]) -> bool:
         s = state.get("state")
         if s == "complete":
             return False  # already done
+        if s == "abandoned":
+            # v3.1.9.4 (R2). Gave up after _MAX_BACKFILL_ATTEMPTS clean
+            # failures — see _run_backfill. Same terminal weight as
+            # "complete": nothing about a future request changes what
+            # already happened this many times.
+            return False
         if s == "in_progress":
-            return is_stale(state)  # someone else is on it, unless they died
+            if not is_stale(state):
+                return False  # someone else is on it
+            if int(state.get("attempts") or 0) >= _MAX_BACKFILL_ATTEMPTS:
+                # Crashed on an attempt that was already at the cap. This
+                # record stays in_progress/stale forever — see this
+                # function's own docstring for why nothing rewrites it —
+                # so say so exactly once rather than silently refusing
+                # every request for this conversation from now on.
+                if logsetup.log_once(f"backfill.cap_on_crash.{conv_id}"):
+                    logger.warning(
+                        f"conv={conv_id}: backfill's last attempt "
+                        f"({state.get('attempts')}) crashed rather than "
+                        f"failing cleanly, and it was already at the "
+                        f"{_MAX_BACKFILL_ATTEMPTS}-attempt cap — not "
+                        f"retrying again for this conversation"
+                    )
+                return False
+            return True  # stale, and under the cap — retry
         if s == "failed":
-            return True  # retry a clean failure same as a crashed one
+            attempts = int(state.get("attempts") or 0)
+            if attempts >= _MAX_BACKFILL_ATTEMPTS:
+                # Reachable only for a record written before this fix
+                # shipped (_run_backfill now writes "abandoned" instead of
+                # letting a record reach this combination) — same decision
+                # either way: defence in depth, not the primary path.
+                return False
+            return _backoff_ready(state)  # retry once the backoff elapses
         # Any other/unknown value on disk: fall through to the facts-file
         # check below rather than guess — same as "no record" (state=None).
     if facts_path(conv_id).is_file():
@@ -325,6 +483,12 @@ async def _run_backfill(
     pairs: list[tuple[str, str]] = []
     accumulated: list[dict] = []
     now_unix = _now_unix()
+    # v3.1.9.4 (R2). Sane fallback for the outer `except` below, in the
+    # (believed unreachable — read_state degrades to None rather than
+    # raising) case that something fails before this is properly computed
+    # a few lines into the try. Treated as attempt 1 rather than crashing
+    # the exception handler itself over what to log.
+    this_attempt = 1
 
     try:
         # Refuse before spending minutes of GPU on it. Backfill exists to give
@@ -346,6 +510,13 @@ async def _run_backfill(
             prior_state.get("state") == "failed"
             or (prior_state.get("state") == "in_progress" and is_stale(prior_state))
         )
+        # v3.1.9.4 (R2 / P15-2 follow-up). This run's own attempt number —
+        # carried through every _write_state call below (including the
+        # per-exchange progress writes, so a crash mid-run leaves a record
+        # that already shows which attempt it was), and what
+        # _write_failed_or_abandoned compares against _MAX_BACKFILL_
+        # ATTEMPTS. A fresh backfill (no prior record) is attempt 1.
+        this_attempt = int((prior_state or {}).get("attempts") or 0) + 1
         async with conv_lock(conv_id):
             try:
                 existing = facts_module.load_facts(conv_id)
@@ -386,9 +557,13 @@ async def _run_backfill(
             "started_at": started_at,
             "exchanges_done": 0,
             "exchanges_total": len(pairs),
+            "attempts": this_attempt,
             "error": None,
         })
-        logger.info(f"conv={conv_id}: backfill starting over {len(pairs)} exchange(s)")
+        logger.info(
+            f"conv={conv_id}: backfill starting over {len(pairs)} "
+            f"exchange(s) (attempt {this_attempt}/{_MAX_BACKFILL_ATTEMPTS})"
+        )
 
         async with httpx.AsyncClient() as client:
             for i, (user_text, asst_text) in enumerate(pairs, start=1):
@@ -421,6 +596,7 @@ async def _run_backfill(
                     "started_at": started_at,
                     "exchanges_done": i,
                     "exchanges_total": len(pairs),
+                    "attempts": this_attempt,
                     "error": None,
                 })
 
@@ -438,13 +614,13 @@ async def _run_backfill(
                     f"backfill write rather than replacing the store with "
                     f"{len(accumulated)} reconstructed fact(s)"
                 )
-                _write_state(conv_id, {
-                    "state": "failed",
-                    "started_at": started_at,
-                    "exchanges_done": len(pairs),
-                    "exchanges_total": len(pairs),
-                    "error": f"facts store unreadable at write time: {e}"[:500],
-                })
+                _write_failed_or_abandoned(
+                    conv_id, this_attempt,
+                    started_at=started_at,
+                    exchanges_done=len(pairs),
+                    exchanges_total=len(pairs),
+                    error=f"facts store unreadable at write time: {e}",
+                )
                 return
             merged = _merge_backfilled(on_disk, accumulated)
             added = len(merged) - len(on_disk)
@@ -569,22 +745,28 @@ async def _run_backfill(
             # wrote underneath it while it ran — the two used to be
             # indistinguishable because the second set was gone (v3.1 F3).
             "facts_added": added,
+            # v3.1.9.4 (R2): informational only once state is "complete" —
+            # needs_backfill's "complete" branch never looks at it — but a
+            # backfill that took two or three tries to finally succeed
+            # should still SAY that, not read identically to one that
+            # finished on its first attempt.
+            "attempts": this_attempt,
             "error": None,
         })
         logger.info(
             f"conv={conv_id}: backfill complete — {added} fact(s) added to "
             f"{len(on_disk)} already on disk, {len(kept)} kept, {dropped} "
-            f"pruned, from {len(pairs)} exchanges"
+            f"pruned, from {len(pairs)} exchanges (attempt {this_attempt})"
         )
     except Exception as e:
         logger.exception(f"conv={conv_id}: backfill aborted: {e}")
-        _write_state(conv_id, {
-            "state": "failed",
-            "started_at": started_at,
-            "exchanges_done": 0,
-            "exchanges_total": len(pairs),
-            "error": str(e)[:500],
-        })
+        _write_failed_or_abandoned(
+            conv_id, this_attempt,
+            started_at=started_at,
+            exchanges_done=0,
+            exchanges_total=len(pairs),
+            error=str(e),
+        )
     finally:
         _in_progress_local.discard(conv_id)
 
