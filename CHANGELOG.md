@@ -9,6 +9,82 @@ on Docker Hub.
 
 ---
 
+## [3.1.9.4] — every defect we could find
+
+The last patch before the database move. It closes hostile pass #14's
+residuals, pass #15's defect hunt and pass #16's findings, plus the loop
+detector's fence readers left open since pass #9. Built in four parallel
+lanes and five fix rounds; each round was reviewed and mutation-tested
+before merging. Real-data replay of her branch (80 runs, margins 0 to
+8,192, tails, /tokenize down, images, pricings): reuse never loses her
+previous exchange where declining keeps it, and it is never worse than
+v3.1.9.3 in any state.
+
+### Fixed
+- **Replies no longer wait ~30 s for fact selection (P15-4, HIGH).** Every
+  request re-embedded all of her ~190 facts in one batch on the event
+  loop; the pod's own log for 2026-09-17/18 shows the step between
+  compaction and retrieval taking a median of 30.3 s (p90 38.8 s), before
+  vLLM was called, with every other request blocked behind it. A bounded
+  vector cache keyed on (embedding model, exact text), shared with dedup,
+  means a request embeds only her new message and a memory tail only new
+  facts; selection results are identical. Fact selection and dedup's
+  clustering run off the event loop. The first request after a restart
+  still pays the cold cost once.
+- **A /forget cannot be undone by memory work already in flight (P15-5
+  and its follow-ups).** A full /forget used to cancel every other
+  conversation's pending memory writes; now it waits without cancelling,
+  and a per-conversation wipe generation makes any write that began
+  before a wipe (the memory tail, its rollups, the history index, a
+  lazy backfill) discard itself instead of landing after it. /forget, the
+  admin forget, /retire and the overwrite import all bump it, and all mark
+  any backfill for that conversation finished for good, so the next
+  message cannot rebuild her facts from history (P16-1); a running
+  backfill stops at its next exchange (P16-2). After /forget the summary
+  hierarchy still rebuilds from the chat history if she keeps chatting in
+  the same chat, because the chat itself still exists; the /forget reply
+  and USER_GUIDE.md now say so.
+- **Summaries cut at their length cap are no longer stored as complete
+  (P15-6).** Most of her stored summaries end without punctuation, and two
+  of her four live chapters sit at the cap, so this was probably routine.
+  Every summary prompt now asks for a length well under its cap; a cut
+  summary is retried once at the same cap with a tighter target (counted
+  against the call budget), and if still cut, the longer attempt is kept,
+  trimmed to a sentence, line or word boundary, logged, and counted at
+  `/health/full`. A clean retry replaces the first attempt only when it is
+  at least as long as that attempt trimmed (P16-7). The hierarchy never
+  stalls on a cut. Compaction's own summary call gets the same handling,
+  and its retry never takes a call a later batch needs (P16-4).
+- **A reply vLLM cuts with a mid-stream error is no longer memorized as
+  finished (P15-1),** streaming or not (P16-5).
+- **Backfill:** a redeploy mid-backfill no longer abandons it for good
+  (P15-2); a failing backfill retries with a back-off and stops after a
+  small cap; `COMPACTOR_FACTS_EXTRACTION=false` now stops it (P15-8).
+- **The chapter archive is part of her memory (P15-3):** /forget, the
+  admin forget, the wipe check, /retire and the overwrite import now
+  cover `summaries/<id>.archive.json`.
+- **Reuse and the budget guard (P14-1, P14-2, and p14's undemonstrated
+  list):** a margin learned mid-request demotes the summary stand-in
+  ahead of her previous exchange instead of costing the exchange; the
+  reuse preview and summarize() share one /tokenize count; the reuse
+  check's recent-window floor is counted exactly; the compaction trigger
+  accounts for the learned margin; the guard's last-resort pass sheds in
+  the guard's own order (older turns, then injected memory, then the
+  recent window except the newest, then the stand-in), only as much as
+  the gap needs, and measures before touching the recent window once
+  memory has been spent (P16-3). The worst-case current-time line (99 tokens) was
+  measured to fit its allowance; no change needed.
+- **Code fences in the loop detector (P9-5, P10-4, `~~~`):** one shared
+  CommonMark reader for every fence decision (backtick and tilde fences,
+  closers that must match their opener), and balancing fences that match
+  the fence left open. On her 1,782 real replies nothing changes.
+
+### Tests
+Two data-loss guards that nothing pinned now have tests (P15-7), and the
+reuse-preview tests that a later change had weakened were recalibrated.
+
+---
+
 ## [3.1.9.3] — the gate tells the truth
 
 Four findings from hostile pass #11 (v3.1.9.2 at `1069da1`), closed across
