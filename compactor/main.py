@@ -3466,58 +3466,126 @@ _TOKEN_RUN_RE = re.compile(r"(\S{3,40})(?:[ _\n\t]*\1){3,}")
 # caller (a fence exemption, via a now-deleted `_in_closed_fence`), removed
 # entirely at P9-3 (hostile pass #9) — see that function's comment. It does
 # not use fence offsets at all any more.
-def _fence_toggle_offsets(text: str) -> list[int]:
-    """Character offsets of every ``` fence-delimiter LINE in `text`, in
-    order of appearance. `bisect.bisect_right(offsets, i) % 2 == 1` means
-    position `i` sits after an ODD number of toggles — i.e. inside a fence
-    that has opened but not (yet, by position `i`) closed again.
+def _fence_markers(text: str) -> list[tuple[int, str, int]]:
+    """(character offset, delimiter CHARACTER, delimiter RUN LENGTH) for
+    every real CommonMark fence-delimiter LINE in `text`, in order of
+    appearance. `_fence_toggle_offsets` below is the offset-only
+    projection of this list that every boolean/parity caller
+    (`trim_to_last_sentence`, `_in_open_fence`, the fragment-line rule)
+    uses; this richer form exists for the two callers that need to know
+    WHICH marker — character and length — a balancing closer or reopener
+    must use (`_open_fence_closer`, used by `_trim_forwarded_prefix` and
+    `_cut_degenerate_span_once`): a bare ``` does not close a ~~~ block,
+    and a closer shorter than its opener does not close it either.
+
+    F2 (v3194-fence lane, following on P9-6/P9-5/P10-4, hostile passes
+    #9/#10): the prior revision of this function recognised only backtick
+    fences with a flat, marker-agnostic parity count, and said so in this
+    docstring as a deliberate gap — a naive "just add ~~~ to the same
+    toggle list" patch would let a ``` block and a ~~~ block CROSS-CLOSE
+    each other in a mixed-marker reply (open ```, an inner ~~~ line would
+    wrongly "close" it). This version tracks the CURRENTLY OPEN marker's
+    character and run length while walking the text — CommonMark's actual
+    per-marker-type pairing rule — so the two families can never pair with
+    each other, and a same-character closer shorter than its opener (a
+    four-backtick fence containing an ordinary three-backtick line) is
+    read as literal content, not a close. A different-character or
+    too-short line encountered while a fence is open is content; a line
+    that itself qualifies as a fence delimiter is never possible again
+    until the open one is properly closed, which is exactly the "single
+    open fence at a time" model CommonMark uses.
 
     P9-6 (hostile pass #9), 4-SPACE INDENT: a line indented 4+ spaces is an
     indented CODE BLOCK under CommonMark, not a fence delimiter, even if it
-    starts with ``` after the indent — that text is literal code content,
-    not markup. `.strip()` used to remove indentation before the check, so
-    such a line was wrongly counted as a toggle. Checked on the RAW line
-    now: only whitespace narrow enough that a renderer still reads the
-    ``` as markup counts. (Tabs are not special-cased into CommonMark's
-    4-space tab-stop rule here — this is the same "close enough, matches
-    every real case this model produces" simplification the rest of this
-    detector already makes; her replies use bare, unindented ``` lines.)
+    starts with ``` or ~~~ after the indent — that text is literal code
+    content, not markup. Checked on the RAW line: only whitespace narrow
+    enough that a renderer still reads the marker as markup counts. (Tabs
+    are not special-cased into CommonMark's 4-space tab-stop rule here —
+    the same "close enough, matches every real case this model produces"
+    simplification the rest of this detector already makes; her replies
+    use bare, unindented fence lines.)
 
-    NOT FIXED (documented, not silent): `~~~` fences are invisible here —
-    only ``` is recognised. CommonMark treats ``` and ~~~ as independent
-    fence-marker families (a ``` opener is closed only by another ```
-    line, never by ~~~, and vice versa); this function's toggle list is a
-    single flat, character-agnostic parity count, so adding ~~~ blindly
-    would let a ``` block and a ~~~ block CROSS-CLOSE each other under a
-    mixed-marker reply — trading one false negative (a ~~~ box read as
-    plain text) for a false positive of a different, worse shape (a block
-    boundary computed wrong instead of just not computed). A correct fix
-    needs per-marker-type pairing, not a one-line change, and this
-    function has already been the site of three hostile-pass regressions
-    from smaller "just add the missing case" patches (F3, P8-2, P9-3) —
-    not worth the risk on the last V3 release for a LOW-severity gap. The
-    two remaining callers (`trim_to_last_sentence`, `_trim_forwarded_
-    prefix`) both fail toward keeping MORE text out of a cut boundary when
-    they misjudge a fence, so the failure mode of missing ~~~ is losing a
-    boundary that would have been fine to use, not corrupting one that
-    exists — see each caller's own fence-direction comment.
+    Simplification kept from the prior revision, written down rather than
+    left silent: a line's role (opener vs. closer) is decided purely by
+    whether a fence is currently open, and the character/length rule
+    above — NOT by CommonMark's stricter rule that a closing line's
+    content must be blank after the delimiter run (an opener may carry an
+    info string, e.g. "```python", but a real closer may not carry
+    anything else). This function does not enforce that: a line with
+    trailing content after a same/longer run still closes, matching the
+    prior revision's treatment of both roles identically. Not worth
+    tightening further: her replies do not put text after a closing fence
+    line, and every existing corpus/fixture check (P10-4's real-data
+    sweep, this lane's F3 measurement) agrees the two readings never
+    diverge on that point.
     """
-    toggles: list[int] = []
+    markers: list[tuple[int, str, int]] = []
     pos = 0
+    open_char: str | None = None
+    open_len = 0
     for line in text.splitlines(keepends=True):
         _stripped = line.lstrip(" ")
-        if len(line) - len(_stripped) < 4 and _stripped.startswith("```"):
-            toggles.append(pos)
+        if len(line) - len(_stripped) < 4:
+            _content = _stripped.rstrip("\r\n")
+            _ch = _content[:1]
+            if _ch in ("`", "~"):
+                _run = len(_content) - len(_content.lstrip(_ch))
+                if _run >= 3:
+                    if open_char is None:
+                        open_char, open_len = _ch, _run
+                        markers.append((pos, _ch, _run))
+                    elif _ch == open_char and _run >= open_len:
+                        markers.append((pos, _ch, _run))
+                        open_char, open_len = None, 0
+                    # else: a different character, or the same character
+                    # with a shorter run, while a fence is already open —
+                    # literal content of that still-open fence, not a
+                    # delimiter. This is the per-marker-type pairing F2
+                    # added; see the docstring above.
         pos += len(line)
-    return toggles
+    return markers
+
+
+def _fence_toggle_offsets(text: str) -> list[int]:
+    """Character offsets of every fence-delimiter LINE in `text` (```
+    backtick or ~~~ tilde, since F2 — see `_fence_markers`), in order of
+    appearance. `bisect.bisect_right(offsets, i) % 2 == 1` means position
+    `i` sits after an ODD number of toggles — i.e. inside a fence that has
+    opened but not (yet, by position `i`) closed again. Offset-only
+    projection of `_fence_markers`, which every caller that just needs a
+    parity/bisect answer (not the marker's character or length) uses.
+    """
+    return [offset for offset, _ch, _len in _fence_markers(text)]
 
 
 def _in_open_fence(toggles: list[int], i: int) -> bool:
     """True when `i` sits inside a fence, whether or not that fence ever
     closes again later in the text. This is trim_to_last_sentence's rule: a
-    cut boundary must never land inside an unterminated ``` opener, closed
-    or not — the store never sees an unbalanced fence either way."""
+    cut boundary must never land inside an unterminated ``` or ~~~ opener,
+    closed or not — the store never sees an unbalanced fence either way."""
     return bool(toggles) and bisect.bisect_right(toggles, i) % 2 == 1
+
+
+def _open_fence_closer(markers: list[tuple[int, str, int]], i: int) -> str | None:
+    """The literal delimiter LINE (e.g. ``` or ~~~~) that would close the
+    fence left open at position `i`, or None when `i` is not inside an
+    open fence. Always the OPENER's own character repeated its OWN length
+    — always a VALID closer (CommonMark only requires "at least as long as
+    the opener"; matching it exactly is the simplest marker that always
+    qualifies) and always the RIGHT character, so a ~~~ block is balanced
+    with ~~~ and a four-backtick fence with four backticks, never a bare
+    three-backtick ```` ``` ```` that would not actually close either one.
+
+    F2: replaces the hard-coded "```" every caller that needed to
+    reopen or close a fence used to append/prepend — see
+    `_trim_forwarded_prefix` and `_cut_degenerate_span_once`.
+    """
+    offsets = [offset for offset, _ch, _len in markers]
+    idx = bisect.bisect_right(offsets, i)
+    if idx % 2 == 0:
+        return None
+    _offset, ch, length = markers[idx - 1]
+    return ch * length
 
 
 def _tail_loop_span(text: str) -> int:
@@ -4139,42 +4207,54 @@ def _reply_degenerate_verdict_uncached(text: str) -> tuple[str | None, int | Non
         _line_offsets.append(_pos)
         _pos += len(_kept)
 
-    # P9-5 / P10-4 (hostile pass #10): this is the FOURTH place in this
-    # module that reads ``` fences, and it is NOT migrated to
-    # `_fence_toggle_offsets` in this pass — deliberately, written down
-    # rather than left silent. `_fence_toggle_offsets` answers "is
-    # character offset i inside an open fence"; this loop needs "is line
-    # N inside an open fence" while walking `lines` (already `.strip()`ped
-    # at each entry, one per iteration) to decide run-length and
-    # fragment-shape, an orthogonal per-LINE question the offset-based
-    # reader was not built to answer directly — bridging the two would
-    # mean computing `_line_offsets[line_idx]` (already available, see
-    # above) and calling `_in_open_fence` at every line, correct in
-    # principle but touching the hottest, most mutation-tested loop in the
-    # degenerate-reply detector (test_degenerate_reply.py's C5-6 fixtures)
-    # for a fence-INDENT edge case neither inline walk below has been
-    # shown to hit on real data: both still use the OLD, indent-blind
-    # `.startswith("```")` test (the same class of gap `_fence_toggle_
-    # offsets` fixed at P9-6), but unlike `_trim_forwarded_prefix` and the
-    # belt-and-braces check above (fixed this pass), a wrong read HERE
-    # fails toward re-including a fragment-shaped line the exemption would
-    # otherwise have excused, or vice versa — a false-positive/negative
-    # RATE question on the exemption, not an unmatched-fence-reaches-the-
-    # model correctness bug like the two fixed sites. Left open rather
-    # than risk this loop's calibration on the last V3 release without a
-    # real-data reproduction to test against (real data was refused to
-    # this lane).
+    # P9-5 / P10-4 (hostile passes #9/#10), MIGRATED this pass (v3194-fence
+    # lane, F1): this WAS the fourth place in this module reading fences by
+    # hand, indent-blind (`.startswith("```")` on an already-`.strip()`ped
+    # line, so even a 10-space-indented line toggled it) and tilde-blind —
+    # the same class of gap `_fence_toggle_offsets` fixed at P9-6 for the
+    # OTHER three sites (P10-4), left open here because a wrong read here
+    # was reasoned to be a false-positive/negative RATE question on this
+    # exemption, not the unmatched-fence-reaches-the-model correctness bug
+    # P10-4 fixed elsewhere — and because no input had been found where it
+    # changed a verdict at all (P9-5: "I could not construct an input").
+    #
+    # This pass tried again, per the brief's instruction to retry with a
+    # list-shaped collapse after an unmatched opener, and found one
+    # (test_v3194_fence_agreement.py, section [3]): an unclosed real ```
+    # opener, followed by a 4-space-indented line that LOOKS like a closer
+    # but is CommonMark literal content (P9-6), followed by 50+ short list
+    # items.
+    # The OLD hand-rolled walk read the indented line as a real toggle and
+    # closed the fence there, so the list items after it were judged as
+    # ordinary text and tripped the list-run backstop below. Under correct
+    # CommonMark reading the fence never closes — a decorative box this
+    # model does not bother to close runs to the end of the reply (P8-2's
+    # own measurement: 128 of 1,709 real replies have an odd ``` count) —
+    # so everything after the opener, list-shaped or not, is fenced
+    # content and exempt, same as any other code block. FIXED, not merely
+    # migrated for its own sake: the old reading flagged a reply that was
+    # entirely decorative content as a structural collapse.
+    #
+    # Bridged via `_line_offsets[line_idx]` (already computed above for
+    # this rule's own span reporting) plus `_fence_toggle_offsets`: a line
+    # is itself a fence delimiter iff its start offset is one of the
+    # toggles (the same offsets that function already computed), and
+    # otherwise "inside an open fence" is exactly `_in_open_fence` at that
+    # offset — matching `_fence_toggle_offsets`'s bisect-parity reading
+    # exactly, including the P9-6 indent rule and F2's tilde/length-aware
+    # marker pairing, both automatically inherited by sharing the reader.
+    _frag_toggles = _fence_toggle_offsets(text)
+    _frag_toggle_set = set(_frag_toggles)
     run = 0
-    in_fence = False
     for line_idx, raw in enumerate(lines):
         line = raw.strip()
         if not line:
             continue  # a blank line between items does not end a list
-        if line.startswith("```"):
-            in_fence = not in_fence
+        _line_start = _line_offsets[line_idx]
+        if _line_start in _frag_toggle_set:
             run = 0
-            continue
-        if in_fence:
+            continue  # this line is itself a fence delimiter
+        if _in_open_fence(_frag_toggles, _line_start):
             run = 0
             continue
         if len(line) <= DEGENERATE_LIST_ITEM_CHARS and _LIST_ITEM_RE.match(line):
@@ -4195,16 +4275,20 @@ def _reply_degenerate_verdict_uncached(text: str) -> tuple[str | None, int | Non
                     # Fenced code after the candidate line is skipped
                     # entirely (the primary per-line loop already does this
                     # for the candidate itself; the exemption never did).
+                    # Migrated alongside the primary walk above (P9-5/F1):
+                    # same offset-membership / `_in_open_fence` bridge to
+                    # `_fence_toggle_offsets`, sharing `_frag_toggles` —
+                    # the fence structure of the whole text does not change
+                    # per candidate line, so it is computed once, above.
                     trailing_nonblank: list[str] = []
-                    _tc_in_fence = False
-                    for _tc_raw in lines[line_idx + 1:]:
-                        _tc_line = _tc_raw.strip()
+                    for _tc_idx in range(line_idx + 1, len(lines)):
+                        _tc_line = lines[_tc_idx].strip()
                         if not _tc_line:
                             continue
-                        if _tc_line.startswith("```"):
-                            _tc_in_fence = not _tc_in_fence
-                            continue
-                        if _tc_in_fence:
+                        _tc_start = _line_offsets[_tc_idx]
+                        if _tc_start in _frag_toggle_set:
+                            continue  # this line is itself a fence delimiter
+                        if _in_open_fence(_frag_toggles, _tc_start):
                             continue
                         trailing_nonblank.append(_tc_line)
                     if trailing_nonblank:
@@ -4594,12 +4678,19 @@ def _trim_forwarded_prefix(text: str) -> str:
     most of a box's own content when the true sentence boundary sits well
     before it or inside it.
 
-    Self-balancing (P8-4): if the kept prefix has an ODD number of ```
+    Self-balancing (P8-4): if the kept prefix has an ODD number of fence
     lines (opened, never closed within it — the cut can now legally land
-    there, unlike trim_to_last_sentence), a closing ``` line is appended so
+    there, unlike trim_to_last_sentence), a closing line is appended so
     this prefix ALONE stays a well-formed fence pair. Otherwise everything
     the model reads after it — the marker, and any `post` text
     `_cut_degenerate_span_once` appends after that — would open as code.
+
+    F2 (v3194-fence lane): the appended closer now MATCHES the opener that
+    was left open — same character, same length (`_open_fence_closer`) —
+    instead of a hard-coded "```". A ~~~ opener balanced with a bare ```
+    would not close it at all (different marker family; see
+    `_fence_markers`), leaving the real problem this self-balancing exists
+    to prevent.
     """
     if not text:
         return ""
@@ -4621,11 +4712,14 @@ def _trim_forwarded_prefix(text: str) -> str:
     # one saw an unbalanced fence and appended a REAL closing ``` line,
     # which then opened an unmatched fence of its own (the only genuine
     # delimiter in what this function emits), reading the rest of the
-    # forwarded reply as code. `len(_fence_toggle_offsets(cut)) % 2` is the
-    # same parity question asked with the same indent-aware reader every
-    # other fence decision in this module now uses.
-    if len(_fence_toggle_offsets(cut)) % 2 == 1:
-        cut = cut.rstrip("\n") + "\n```"
+    # forwarded reply as code. `_fence_markers` is the same indent-aware,
+    # marker-pairing reader every other fence decision in this module now
+    # uses; an odd count means the LAST marker recorded is the one still
+    # open, so its own (character, length) is what closes it (F2).
+    _cut_markers = _fence_markers(cut)
+    if len(_cut_markers) % 2 == 1:
+        _ch, _len = _cut_markers[-1][1], _cut_markers[-1][2]
+        cut = cut.rstrip("\n") + "\n" + (_ch * _len)
     return cut
 
 
@@ -4664,14 +4758,25 @@ def _cut_degenerate_span_once(text: str, placeholder: str) -> tuple[str, bool]:
         # inside that same fence; prefix it with a fresh opener so its own
         # leading text (up to its own real closer) renders exactly as it
         # did originally.
-        if post and _in_open_fence(_fence_toggle_offsets(text), start):
-            post = "```\n" + post
+        #
+        # F2 (v3194-fence lane): the reopener now matches whichever marker
+        # (character and length) was actually left open at `start` in the
+        # ORIGINAL text (`_open_fence_closer`), instead of a hard-coded
+        # "```" — a mid-reply cut out of a ~~~ box used to get NO reopener
+        # at all (`_in_open_fence(_fence_toggle_offsets(text), start)` was
+        # always False for ~~~, which this function could not see), so
+        # `post`'s own leading text silently read as the START of a fresh
+        # code block only from its own real ~~~ closer's point of view,
+        # with nothing marking where that block began.
+        _reopen = _open_fence_closer(_fence_markers(text), start)
+        if post and _reopen is not None:
+            post = _reopen + "\n" + post
         combined = "\n\n".join(p for p in (pre, _DEGENERATE_SPAN_MARKER, post) if p)
         # Belt-and-braces: regardless of what the two pieces above did
         # individually, the text actually forwarded must never itself
-        # carry an odd ``` count — an unbalanced fence here is exactly what
-        # leaves the REST of the conversation misread as code from this
-        # point on (P8-4's failure mode).
+        # carry an odd real-fence count — an unbalanced fence here is
+        # exactly what leaves the REST of the conversation misread as code
+        # from this point on (P8-4's failure mode).
         #
         # P10-4 (hostile pass #10): this belt-and-braces check used to
         # count with `ln.strip().startswith("```")` — the SAME wrong
@@ -4680,10 +4785,14 @@ def _cut_degenerate_span_once(text: str, placeholder: str) -> tuple[str, bool]:
         # it: both readers agreed with each other (both indent-blind) and
         # disagreed with `_fence_toggle_offsets` (indent-aware since
         # P9-6), so an indented ``` line fooled them identically instead
-        # of one catching the other's mistake. `_fence_toggle_offsets` is
-        # the one reader every other fence decision in this module trusts.
-        if len(_fence_toggle_offsets(combined)) % 2 == 1:
-            combined = combined.rstrip() + "\n```"
+        # of one catching the other's mistake. `_fence_markers` is the one
+        # reader every other fence decision in this module trusts; F2
+        # (this lane) closes with the actually-open marker, not a
+        # hard-coded "```".
+        _combined_markers = _fence_markers(combined)
+        if len(_combined_markers) % 2 == 1:
+            _ch, _len = _combined_markers[-1][1], _combined_markers[-1][2]
+            combined = combined.rstrip() + "\n" + (_ch * _len)
         return combined, True
     return placeholder, False
 
