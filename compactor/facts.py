@@ -770,12 +770,34 @@ def _relevance_order(
     None when ranking cannot run (no query, no embedder, embedding failed,
     or a result shaped wrong) — callers degrade to LRU order on None.
 
-    One batched embedding call for the query AND every candidate's text
-    together (`[query_text] + texts`), matching dedup._embed_facts' batching
-    reasoning: fastembed/bge-small is CPU-milliseconds either way, but one
-    call is still cheaper than two, and it means the query and the facts are
-    embedded by the exact same call, not two that could observe the
-    embedder in different states.
+    v3.1.9.4 B1 (P15-4) rewrote how the vectors are obtained; this is NOT
+    CPU-milliseconds. Measured against her real ~190-fact store on the
+    production image and embedding model: one padded `[query_text] +
+    texts` batch cost a MEDIAN of 12.5s (max 13.3s), inline on the event
+    loop, EVERY chat request — nothing else in the process ran for that
+    long (SP\\p15\\rd_embed_timing.py, rd3.log; SP\\p15\\rd_block_e2e.py,
+    rd5.log; see fix-3194-bg.md B1). The batch was mostly re-paying for
+    facts whose text had not changed since the previous request.
+
+    With no caller-supplied `embedder`, this now makes TWO calls instead
+    of one: `retrieval_module._embed([query_text])` alone (the query
+    changes almost every turn, so it is never worth caching — measured at
+    ~10ms), and `retrieval_module._embed_cached(texts)` for the
+    candidates, which only asks the model for text it has not embedded
+    before under the current model identity. The two calls no longer
+    "observe the embedder in the same state" the way one batched call
+    did, but bge-small's embedding is a stateless pure function of its
+    input text, so that guarantee was never load-bearing — only the
+    keyed-by-text cache's correctness is, and that lives in
+    retrieval._embed_cached.
+
+    A caller-supplied `embedder` (tests, or a future non-default embedding
+    source) keeps the ORIGINAL one-call contract exactly: the cache is
+    specific to retrieval_module._embed's own identity, and mixing an
+    arbitrary caller's vectors into that cache under the same (model,
+    text) key would be silently wrong for whichever caller loses the
+    race — so a supplied embedder bypasses the cache entirely rather than
+    share it.
 
     `embedder` lets a caller (or a test) supply its own — see
     select_for_injection's docstring on why this exists ALONGSIDE the direct
@@ -783,27 +805,37 @@ def _relevance_order(
     """
     if not query_text or not candidates:
         return None
-    embed_fn = embedder if embedder is not None else retrieval_module._embed
     texts = [f.get("text", "") or "" for f in candidates]
     if not all(texts):
         # Defensive, same as dedup._embed_facts: an empty text would embed
         # as "" and cluster/score meaninglessly against everything.
         return None
     try:
-        vecs = embed_fn([query_text] + texts)
+        if embedder is not None:
+            vecs = embedder([query_text] + texts)
+            if not vecs or len(vecs) != len(texts) + 1:
+                return None
+            query_vec, fact_vecs = vecs[0], vecs[1:]
+        else:
+            query_vecs = retrieval_module._embed([query_text])
+            fact_vecs = retrieval_module._embed_cached(texts)
+            if (
+                not query_vecs
+                or len(query_vecs) != 1
+                or not fact_vecs
+                or len(fact_vecs) != len(texts)
+            ):
+                # Same contract as the single-call path: retrieval's own
+                # None-on-failure, or a short/mismatched result, is
+                # "ranking unavailable this turn" — never a partial rank.
+                return None
+            query_vec = query_vecs[0]
     except Exception as e:
         logger.warning(
             f"facts relevance ranking: embedder raised ({e}); falling back "
             f"to LRU for this turn — chat is unaffected"
         )
         return None
-    if not vecs or len(vecs) != len(texts) + 1:
-        # retrieval._embed's own contract: None on failure. A short list
-        # would be a caller-supplied embedder that dropped rows silently —
-        # treat it exactly the same as unavailable rather than guess which
-        # rows are missing.
-        return None
-    query_vec, fact_vecs = vecs[0], vecs[1:]
     scored = list(zip(candidates, fact_vecs))
     # Stable sort: candidates already carry the store's added_turn order, so
     # equal-scoring facts (all-zero mock vectors in a test, or a genuine
@@ -918,13 +950,18 @@ def select_for_injection(
          oversized system block. Logged when it happens.
       2. The REST is ranked against `query_text` (typically the current
          user turn) using the SAME bge-small embedding retrieval.py already
-         computes for episodic retrieval — `retrieval._embed`, CPU-only,
-         milliseconds, no GPU, no new dependency — and the top-scoring facts
-         that fit the remaining budget are kept. `embedder` overrides which
-         embedding function is used (tests use this instead of
-         monkeypatching `retrieval._embed`, though `patch.object(retrieval,
-         "_embed", ...)` — this module's own import of retrieval, mirroring
-         dedup.py's — works too).
+         computes for episodic retrieval — `retrieval._embed`, CPU-only, no
+         GPU, no new dependency. NOT milliseconds at her store's size: see
+         _relevance_order's docstring for the measured cost (~12.5s
+         uncached, median, against ~190 facts) and how v3.1.9.4 B1's
+         (model, text)-keyed cache in retrieval._embed_cached brought a
+         warm request back down to embedding the query alone. The
+         top-scoring facts that fit the remaining budget are kept.
+         `embedder` overrides which embedding function is used (tests use
+         this instead of monkeypatching `retrieval._embed`, though
+         `patch.object(retrieval, "_embed", ...)` — this module's own
+         import of retrieval, mirroring dedup.py's — works too; a supplied
+         `embedder` does NOT go through the cache — see _relevance_order).
 
     GRACEFUL DEGRADATION, exactly as this codebase's other embedding
     consumer (retrieval.py's own docstring: "Everything degrades to a safe

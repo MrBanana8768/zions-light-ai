@@ -928,12 +928,20 @@ def test_memo_key_changes_when_the_cluster_does():
     # questions and the second one deserves its own call.
     pair = list(_KEEP_PAIR)
     trio = pair + [_fact("user wants second-person future", added_turn=3)]
+    # Text-driven, not position-driven: the second dedup_facts call below
+    # reuses `pair`'s two texts unchanged, so v3.1.9.4 B1's vector cache
+    # (retrieval._embed_cached) serves them from the FIRST call and asks
+    # this mock for only the third, new text — a mock keyed by
+    # `range(len(texts))` would then score that lone request as index 0,
+    # not 2, same defect _vec_for_related_fact's docstring explains in
+    # test_dedup_churn_gate.py.
+    _grow_order = [f["text"] for f in trio]
 
     async def go():
         client = MagicMock()
         client.post = AsyncMock(return_value=_mock_chat_response("KEEP"))
         with patch.object(retrieval, "_embed",
-                          lambda texts: [[1.0, i * 0.01] for i in range(len(texts))]):
+                          lambda texts: [[1.0, _grow_order.index(t) * 0.01] for t in texts]):
             await dedup.dedup_facts(client, "http://x", "m", pair, conv_id="c-grow")
             first = client.post.call_count
             await dedup.dedup_facts(client, "http://x", "m", trio, conv_id="c-grow")
@@ -1136,6 +1144,12 @@ if __name__ == "__main__":
             # between tests. Clear it or a later test inherits an earlier
             # one's refusals and passes for the wrong reason.
             dedup.reset_refusal_memo()
+            # Same reasoning for the vector cache (v3.1.9.4 B1): many tests
+            # here reuse short texts like "a"/"b"/"c" with DIFFERENT mocked
+            # vectors from one test to the next. Without this, the second
+            # test to touch a given text would silently get the first
+            # test's cached (and wrong-shape) vector back.
+            retrieval.reset_vector_cache()
             t()
         print("\nAll dedup smoke tests passed.")
     finally:
