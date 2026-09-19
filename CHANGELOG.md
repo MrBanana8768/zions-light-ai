@@ -12,9 +12,9 @@ on Docker Hub.
 ## [3.1.9.4] — every defect we could find
 
 The last patch before the database move. It closes hostile pass #14's
-residuals, pass #15's defect hunt and pass #16's findings, plus the loop
-detector's fence readers left open since pass #9. Built in four parallel
-lanes and five fix rounds; each round was reviewed and mutation-tested
+residuals, pass #15's defect hunt and passes #16 and #17's findings, plus
+the loop detector's fence readers left open since pass #9. Built in four
+parallel lanes and six fix rounds; each round was reviewed and mutation-tested
 before merging. Real-data replay of her branch (80 runs, margins 0 to
 8,192, tails, /tokenize down, images, pricings): reuse never loses her
 previous exchange where declining keeps it, and it is never worse than
@@ -40,10 +40,15 @@ v3.1.9.3 in any state.
   admin forget, /retire and the overwrite import all bump it, and all mark
   any backfill for that conversation finished for good, so the next
   message cannot rebuild her facts from history (P16-1); a running
-  backfill stops at its next exchange (P16-2). After /forget the summary
-  hierarchy still rebuilds from the chat history if she keeps chatting in
-  the same chat, because the chat itself still exists; the /forget reply
-  and USER_GUIDE.md now say so.
+  backfill stops at its next exchange (P16-2), including a /forget that
+  lands during its last extraction call, and no backfill write can turn
+  a "wiped" record back into a retryable one (P17-4). The admin forget now
+  leaves the same empty-facts marker as chat /forget even when there were
+  no facts; /tidy and archive-stale, which archive rather than delete, are
+  no longer mistaken for that marker. After /forget the summary hierarchy
+  still rebuilds from the chat history if she keeps chatting in the same
+  chat, because the chat itself still exists; the /forget reply (now
+  whenever anything was forgotten, P17-5) and USER_GUIDE.md say so.
 - **Summaries cut at their length cap are no longer stored as complete
   (P15-6).** Most of her stored summaries end without punctuation, and two
   of her four live chapters sit at the cap, so this was probably routine.
@@ -52,7 +57,10 @@ v3.1.9.3 in any state.
   against the call budget), and if still cut, the longer attempt is kept,
   trimmed to a sentence, line or word boundary, logged, and counted at
   `/health/full`. A clean retry replaces the first attempt only when it is
-  at least as long as that attempt trimmed (P16-7). The hierarchy never
+  at least as long as that attempt trimmed (P16-7); the retry is skipped
+  when the trimmed first attempt is already long enough, and an attempt
+  stuck in a repetition loop never wins on length over a clean one
+  (P17-1). The hierarchy never
   stalls on a cut. Compaction's own summary call gets the same handling,
   and its retry never takes a call a later batch needs (P16-4).
 - **A reply vLLM cuts with a mid-stream error is no longer memorized as
@@ -72,7 +80,9 @@ v3.1.9.3 in any state.
   the guard's own order (older turns, then injected memory, then the
   recent window except the newest, then the stand-in), only as much as
   the gap needs, and measures before touching the recent window once
-  memory has been spent (P16-3). The worst-case current-time line (99 tokens) was
+  memory has been spent (P16-3) and again before touching the stand-in,
+  so it never drops the stand-in when dropping her previous exchange
+  alone fits; the measurement cap of 6 holds (P17-2, P17-3). The worst-case current-time line (99 tokens) was
   measured to fit its allowance; no change needed.
 - **Code fences in the loop detector (P9-5, P10-4, `~~~`):** one shared
   CommonMark reader for every fence decision (backtick and tilde fences,
