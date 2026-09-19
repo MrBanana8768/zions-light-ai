@@ -10326,11 +10326,33 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
             persona_deleted = persona.clear_persona(conv_id)
         except Exception as e:
             logger.warning(f"conv={conv_id}: persona delete failed: {e}")
-        if n_facts or n_episodic or summary_deleted or persona_deleted:
+        # v3.1.9.4 (P15-3). The L2 chapter cold store
+        # (summaries/<id>.archive.json, summarizer._archive_chapters' only
+        # writer since v3.1.3) was never deleted by ANY wipe path — this is
+        # the single chokepoint chat /forget, DELETE /admin/conversations/
+        # {id}/facts and the test-conversation cleanup all call through, so
+        # fixing it here fixes it at all three call sites at once (the
+        # "fixed at one site, missed the sibling" shape this codebase keeps
+        # paying for). Before this, a conversation whose hierarchy had ever
+        # refreshed L3 kept every consumed chapter on disk through a
+        # /forget that reported a complete wipe. commands._memory_residue
+        # now also counts this layer, so a delete failure here still shows
+        # up in the /forget verification pass rather than being silently
+        # reported clean.
+        chapters_deleted = False
+        try:
+            cp = summarizer.summary_archive_path(conv_id)
+            if cp.is_file():
+                cp.unlink()
+                chapters_deleted = True
+        except Exception as e:
+            logger.warning(f"conv={conv_id}: chapter archive delete failed: {e}")
+        if n_facts or n_episodic or summary_deleted or persona_deleted or chapters_deleted:
             logger.info(
                 f"conv={conv_id}: {source} forgot {n_facts} fact(s) "
                 f"+ {n_episodic} indexed exchange(s) "
                 f"+ summary={'cleared' if summary_deleted else 'absent'} "
+                f"+ chapters={'cleared' if chapters_deleted else 'absent'} "
                 f"+ persona={'cleared' if persona_deleted else 'absent'}"
             )
     return {
@@ -10338,6 +10360,7 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
         "forgotten_facts": n_facts,
         "forgotten_episodic": n_episodic,
         "forgotten_summary": summary_deleted,
+        "forgotten_chapters": chapters_deleted,
         "forgotten_persona": persona_deleted,
         # Present only when a layer could not be read. Callers must not
         # report a clean wipe when this is non-empty.

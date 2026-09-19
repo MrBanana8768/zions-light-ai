@@ -65,15 +65,17 @@ def _write_every_layer(conv_id):
 
 
 def test_purge_conv_files_removes_every_layer():
-    print("\n[test] _purge_conv_files removes facts, archive, summary, persona, backfill")
+    print("\n[test] _purge_conv_files removes facts, archive, summary, chapter archive, persona, backfill")
     conv = "__purge_probe__"
     _write_every_layer(conv)
     paths = selftest._conv_artifact_paths(conv)
-    assert_eq(len(paths), 5, "five artifact paths tracked")
-    assert_true(all(p.is_file() for p in paths), "all five written")
+    # v3.1.9.4 (P15-3): six now — the L2 chapter cold store
+    # (memory.summary_archive_path) joined the enumeration.
+    assert_eq(len(paths), 6, "six artifact paths tracked")
+    assert_true(all(p.is_file() for p in paths), "all six written")
     left = selftest._purge_conv_files(conv)
     assert_eq(left, [], "nothing reported as surviving")
-    assert_true(not any(p.exists() for p in paths), "all five gone from disk")
+    assert_true(not any(p.exists() for p in paths), "all six gone from disk")
 
 
 def test_conv_residue_lists_only_what_exists():

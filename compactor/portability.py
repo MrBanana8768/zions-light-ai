@@ -163,14 +163,16 @@ def export_conversation(conv_id: str, *, strict: bool = False) -> dict:
 # nothing reads or a published file that has been proven readable. Never a
 # half-trusted snapshot.
 #
-# v3.1 D8 — TWO LAYERS THE BUNDLE DOES NOT CARRY, and why they are carried
-# here instead.
+# v3.1 D8 — THREE LAYERS THE BUNDLE DOES NOT CARRY, and why they are carried
+# here instead. (v3.1.9.4, P15-3: the chapter archive joined this list —
+# see the note at the end of this comment.)
 #
 # export_conversation writes exactly three payloads: facts, summary_state,
-# episodic. It does not carry the archive sidecar and it does not carry the
-# persona. For an export that is a schema question; for a PRE-REMOVAL SNAPSHOT
-# it is a correctness one, because both of those layers are things a
-# destructive admin operation deletes:
+# episodic. It does not carry the archive sidecar, it does not carry the
+# persona, and it does not carry the L2 chapter cold store. For an export
+# that is a schema question; for a PRE-REMOVAL SNAPSHOT it is a correctness
+# one, because all three of those layers are things a destructive admin
+# operation deletes:
 #
 #   - commands._wipe_all_layers clears the archive sidecar, and its own
 #     comment records that "NOTHING in this codebase has ever deleted one"
@@ -178,10 +180,16 @@ def export_conversation(conv_id: str, *, strict: bool = False) -> dict:
 #   - main._clear_all_memory calls persona.clear_persona. INCIDENT_2026-08-24
 #     D19 states the consequence in one line: "/forget can destroy a persona
 #     that no export can back up and no import can restore."
+#   - main._clear_all_memory also deletes the chapter cold store
+#     (summaries/<id>.archive.json) since v3.1.9.4 (P15-3) — the same D19
+#     consequence, one layer over: it used to survive every wipe silently
+#     (not deleted, so not even the thing this comment is about), and now
+#     that it IS deleted the same "no export can back it up" gap would
+#     apply to it too if it stopped here.
 #
 # A snapshot that is missing the layers the operation removes is not an
-# archive-before-removing; it is a partial one that reads as complete. So both
-# are measured, carried, and verified on read-back like everything else.
+# archive-before-removing; it is a partial one that reads as complete. So all
+# three are measured, carried, and verified on read-back like everything else.
 #
 # They go in the `quarantine` metadata block rather than into the bundle
 # payload. That is deliberate and it is not laziness: adding payload keys means
@@ -190,13 +198,30 @@ def export_conversation(conv_id: str, *, strict: bool = False) -> dict:
 # working the moment it changes — or silently widening a documented schema.
 # Under `quarantine`, _validate_bundle ignores the extra key, so a snapshot
 # stays a valid v2.1 bundle that import_conversation restores with no new code,
-# AND the two extra layers travel with it for an operator (or
+# AND the three extra layers travel with it for an operator (or
 # commands._handle_retire) to put back explicitly. Restoring them is a
-# `facts.save_archive` and a `persona.save_persona`; the restore_hint says so.
+# `facts.save_archive`, a `persona.save_persona`, and a
+# `summarizer._archive_chapters`; the restore_hint says so.
 #
 # This does NOT close D19 for export/import generally — export_conversation is
-# unchanged and a fork still loses the persona. It closes it for the one path
-# whose entire purpose is to make a removal reversible.
+# unchanged and a fork still loses the persona and the chapter archive. It
+# closes it for the one path whose entire purpose is to make a removal
+# reversible.
+#
+# WHY EXPORT ITSELF STILL DOES NOT CARRY THE CHAPTER ARCHIVE (P15-3 asks this
+# question explicitly, so the answer is here rather than left implicit): the
+# same BUNDLE_VERSION argument two paragraphs up applies without change — an
+# ordinary GET /admin/.../export is not a removal, so there is nothing for it
+# to be reversible AGAINST, and the chapter archive is the ONE copy of
+# chapter-level detail an L3 refresh has already paraphrased, which is a
+# reason to protect it on every REMOVAL path (done, above) but not a reason
+# to widen a schema every existing bundle and both HTTP endpoints depend on
+# staying fixed. A caller that wants the chapter archive alongside an export
+# reads it separately: summarizer.load_chapter_archive(conv_id) — there is
+# no dedicated HTTP endpoint for it today (GET /admin/conversations/<id>/
+# summary returns summary_state only, not the cold chapters); that gap is
+# real but is a separate, additive feature request, not something P15-3
+# asked this fix to close.
 
 # THIS COMMENT WAS FALSE, and it was the root of an arbitrary-file-write.
 #
@@ -287,7 +312,7 @@ def list_quarantine(conv_id: str | None = None) -> list[Path]:
 def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
     """Write a verified, restorable snapshot of this conversation before
     something removes part of it. Returns {"path", "facts", "archive",
-    "episodic", "summary", "persona", "unverified_layers"}.
+    "episodic", "summary", "persona", "chapters", "unverified_layers"}.
 
     Raises QuarantineError if the snapshot cannot be proven to hold at least
     what the store held a moment ago, OR if the facts file is unreadable and
@@ -389,6 +414,25 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
     except Exception as e:
         logger.warning(f"conv={conv_id}: quarantine could not read the persona: {e}")
         unverified.append("persona (unreadable)")
+    # v3.1.9.4 (P15-3): a THIRD layer export_conversation does not carry,
+    # same reason as the two above — summaries/<id>.archive.json
+    # (summarizer._archive_chapters' only writer) is the ONLY copy of
+    # chapter-level detail once an L3 refresh has paraphrased it, and until
+    # this fix nothing removing a conversation's state ever preserved it:
+    # /forget left it on disk unreported (fixed separately, see
+    # main._clear_all_memory and commands._memory_residue), an overwrite
+    # import left the TARGET's old chapters beside the new state (fixed
+    # below, in import_conversation), and /retire orphaned it under the
+    # retired id (fixed in commands._retire_clear_other_layers). This
+    # function is the one place all three of those removals already funnel
+    # through for a restorable copy, so it gets the same read-record-carry
+    # treatment as archived_rows/persona_record above.
+    chapter_rows: list[dict] = []
+    try:
+        chapter_rows = summarizer.load_chapter_archive(conv_id)
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: quarantine could not read the chapter archive: {e}")
+        unverified.append("chapter archive (unreadable)")
 
     expected_episodic = retrieval.conversation_doc_count(conv_id)
     if expected_episodic is None:
@@ -448,11 +492,14 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
             "facts": expected_facts,
             "episodic": expected_episodic,
             "archive": len(archived_rows),
+            "chapters": len(chapter_rows),
         },
-        # The two layers the v2.1 bundle payload has no key for. Carried
+        # The three layers the v2.1 bundle payload has no key for. Carried
         # verbatim so a restore is a copy, not a reconstruction.
         "archive": list(archived_rows),
         "persona": persona_record,
+        # v3.1.9.4 (P15-3): the third layer — see the read above.
+        "chapters": list(chapter_rows),
         "unverified_layers": list(unverified),
         # F1: filled in below once the torn-facts sibling path is known
         # (computed after `published`, a few lines down) — None when the
@@ -466,11 +513,13 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
             "whole-conversation: import_conversation(this file, "
             "target_conv_id=<conv>, overwrite=True) — discards anything "
             "learned since this file was written. import_conversation does "
-            "NOT restore the two layers under quarantine.archive and "
-            "quarantine.persona: put those back with "
-            "facts.save_archive(conv_id, bundle['quarantine']['archive']) and "
+            "NOT restore the three layers under quarantine.archive, "
+            "quarantine.persona and quarantine.chapters: put those back with "
+            "facts.save_archive(conv_id, bundle['quarantine']['archive']), "
             "persona.save_persona(conv_id, "
-            "bundle['quarantine']['persona']['persona_text'])."
+            "bundle['quarantine']['persona']['persona_text']), and "
+            "summarizer._archive_chapters(conv_id, "
+            "bundle['quarantine']['chapters'])."
         ),
     }
 
@@ -590,11 +639,11 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
                 f"conv={conv_id}: quarantine snapshot lost episodic entries "
                 f"between write and read-back"
             )
-        # Same contradiction for the two layers carried in the metadata block.
-        # Verified rather than trusted for exactly the reason the payload is:
-        # the caller is about to delete these, and a snapshot that quietly
-        # dropped them on serialization is worse than no snapshot, because the
-        # caller proceeds.
+        # Same contradiction for the three layers carried in the metadata
+        # block. Verified rather than trusted for exactly the reason the
+        # payload is: the caller is about to delete these, and a snapshot
+        # that quietly dropped them on serialization is worse than no
+        # snapshot, because the caller proceeds.
         back_q = back.get("quarantine")
         if not isinstance(back_q, dict):
             raise QuarantineError(
@@ -613,6 +662,13 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
             raise QuarantineError(
                 f"conv={conv_id}: quarantine snapshot read back without the "
                 f"persona this conversation has stored"
+            )
+        # v3.1.9.4 (P15-3): the third layer, same rule.
+        if len(back_q.get("chapters") or []) < len(chapter_rows):
+            raise QuarantineError(
+                f"conv={conv_id}: quarantine snapshot read back with "
+                f"{len(back_q.get('chapters') or [])} chapter(s), expected "
+                f"at least {len(chapter_rows)}"
             )
 
         # F1 / C5-4: stage and verify every torn layer's raw bytes exactly
@@ -654,6 +710,7 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
         f"{n_back} fact(s), {len(back_q.get('archive') or [])} archived, "
         f"{len(back.get('episodic') or [])} episodic, "
         f"summary={'yes' if _has_summary_content(back.get('summary_state')) else 'no'}, "
+        f"chapters={len(back_q.get('chapters') or [])}, "
         f"persona={'yes' if back_q.get('persona') else 'no'}"
         + (f", unverified: {'; '.join(unverified)}" if unverified else "")
         + (
@@ -669,6 +726,8 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
         "episodic": len(back.get("episodic") or []),
         "summary": _has_summary_content(back.get("summary_state")),
         "persona": bool(back_q.get("persona")),
+        # v3.1.9.4 (P15-3): the third carried layer.
+        "chapters": len(back_q.get("chapters") or []),
         "unverified_layers": unverified,
         # F1: present only when the facts layer was unreadable — the raw
         # bytes of the torn file, copied aside next to this snapshot. None
@@ -1230,6 +1289,44 @@ def import_conversation(
 
     if (pre_existing or unverifiable) and overwrite:
         retrieval.forget_conversation(target)
+        # v3.1.9.4 (P15-3). THREE MORE layers the bundle payload does not
+        # carry and this overwrite never touched: the target's OLD facts
+        # archive, L2 chapter cold store and persona survived every import,
+        # mixed in beside the freshly-written conversation — a "forget"
+        # this is not: the SOURCE bundle's own state lands correctly, but
+        # whatever the TARGET id had before (chapters an L3 refresh had
+        # already archived, facts an eviction had archived, a persona)
+        # stayed live under the same id. All three are already preserved —
+        # main.admin_import_conversation takes a quarantine_conversation
+        # snapshot of the target BEFORE calling here whenever overwrite is
+        # set, and that snapshot now carries all three (see the D8 block
+        # comment above quarantine_conversation) — so clearing them here is
+        # the same "write the replacement, clear what it cannot replace"
+        # shape this function already applies to the episodic index one
+        # line up, not a second archive-before-delete of its own.
+        try:
+            facts.save_archive(target, [])
+        except Exception as e:
+            logger.warning(
+                f"conv={target}: could not clear the old facts archive on "
+                f"overwrite: {e}"
+            )
+        try:
+            _chapter_path = memory.summary_archive_path(target)
+            if _chapter_path.is_file():
+                _chapter_path.unlink()
+        except Exception as e:
+            logger.warning(
+                f"conv={target}: could not clear the old chapter archive on "
+                f"overwrite: {e}"
+            )
+        try:
+            persona.clear_persona(target)
+        except Exception as e:
+            logger.warning(
+                f"conv={target}: could not clear the old persona on "
+                f"overwrite: {e}"
+            )
 
     # Re-embed and re-index each exchange.
     episodic_imported = 0
