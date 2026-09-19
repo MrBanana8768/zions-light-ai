@@ -1281,13 +1281,47 @@ def import_conversation(
     # additive, so it is the one thing that must be emptied — and it is now
     # emptied only after both atomic writes above it have landed.
 
+    # v3.1.9.4 (R4 / W1, P15-5 follow-up). An overwrite onto a target that
+    # already had state (pre_existing) or could not be proven empty
+    # (unverifiable) is the SAME class of wipe main._clear_all_memory and
+    # commands._handle_retire's apply step already bump for: it replaces
+    # this conv_id's facts, and — a few lines down — its facts archive,
+    # chapter archive and persona too. Without the bump, a tail submitted
+    # against `target` before this import ran, still parked on the pool's
+    # concurrency semaphore or mid a vLLM extraction call, captures the
+    # generation as it stood before the import, finds it UNCHANGED when it
+    # finally re-checks under conv_lock, and writes its pre-import facts
+    # straight into the freshly-imported store.
+    #
+    # Computed once and reused below (the archive/chapter/persona clear
+    # shares the identical condition) rather than bumping unconditionally:
+    # an overwrite=True import onto a genuinely empty, freshly-created
+    # target is not wiping anything, and a bump that fires for every import
+    # call would make the generation counter noisy for no protective
+    # benefit.
+    #
+    # WHY NO conv_lock HERE, unlike every other bump site. import_conversation
+    # is a plain `def` called from an `async def` endpoint (see
+    # _validate_target_ready's own comment on this a few lines up) and never
+    # awaits, so it runs to completion on the event loop without yielding —
+    # nothing else can observe `target`'s generation or take conv_lock(target)
+    # while this function is running. That makes the WHOLE function one
+    # atomic section from a concurrent tail's point of view, which is why
+    # _validate_target_ready's `locked()` probe was sufficient mutual
+    # exclusion for the write below and is equally sufficient here: the bump
+    # only has to happen somewhere before this function returns, not under an
+    # explicit lock it cannot await for.
+    will_replace_existing = (pre_existing or unverifiable) and overwrite
+    if will_replace_existing:
+        memory.bump_wipe_generation(target)
+
     # Restore facts wholesale (already-pruned by export, no further pruning).
     facts.save_facts(target, list(bundle.get("facts", [])))
 
     # Restore summary state wholesale.
     summarizer.save_state(target, dict(bundle.get("summary_state", {})))
 
-    if (pre_existing or unverifiable) and overwrite:
+    if will_replace_existing:
         retrieval.forget_conversation(target)
         # v3.1.9.4 (P15-3). THREE MORE layers the bundle payload does not
         # carry and this overwrite never touched: the target's OLD facts

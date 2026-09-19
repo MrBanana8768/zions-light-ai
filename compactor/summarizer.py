@@ -2665,12 +2665,13 @@ def wipe_generation_ctx(generation: int | None):
     its deletion undone by a rollup that reads stale content and writes it
     back.
 
-    `generation=None` (main.admin_compact and backfill.py's one call, which
-    both call `maybe_rollup` directly with no context manager at all, leave
-    this at its contextvar default of None) disables the check entirely —
-    those are not background tails racing a wipe; they run on a request an
-    operator or the backfill itself is waiting on, not stale work outliving
-    one. A caller inside this SAME `with` block that itself passes
+    `generation=None` (main.admin_compact, which calls `maybe_rollup`
+    directly with no context manager at all and leaves this at its
+    contextvar default of None) disables the check entirely — an admin
+    compact is not a background tail racing a wipe; an operator is waiting
+    on it. backfill.py's rollup DOES set it (v3.1.9.4 W2): a backfill runs
+    in the background for up to hours and is exactly the stale work a wipe
+    must be able to stop. A caller inside this SAME `with` block that itself passes
     `generation=None` (a tail that never captured one — see
     `main._facts_tail`'s identical `wipe_generation: int | None = None`
     convention) gets the same opt-out, for the same reason: nothing
