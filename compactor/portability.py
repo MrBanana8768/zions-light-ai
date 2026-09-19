@@ -49,6 +49,7 @@ from typing import Any, Awaitable, Callable
 
 import anyio
 
+import backfill
 import facts
 import memory
 import persona
@@ -1314,6 +1315,17 @@ def import_conversation(
     will_replace_existing = (pre_existing or unverifiable) and overwrite
     if will_replace_existing:
         memory.bump_wipe_generation(target)
+        # v3.1.9.4 (R5 / P16-1 sibling fix). Same reasoning as
+        # main._clear_all_memory's own mark_wiped call: `target`'s facts are
+        # about to be replaced wholesale by the bundle below, so any
+        # `failed`/stale `in_progress` backfill record left over from
+        # `target`'s PRE-import history must not survive to retry against
+        # it later — that record's own exchanges_total was counted against
+        # a conversation this import is about to make unrecognisable.
+        # import_conversation never awaits (see this function's own comment
+        # a few lines up), so there is no lock to take here either; nothing
+        # else can observe `target` mid-function.
+        backfill.mark_wiped(target)
 
     # Restore facts wholesale (already-pruned by export, no further pruning).
     facts.save_facts(target, list(bundle.get("facts", [])))

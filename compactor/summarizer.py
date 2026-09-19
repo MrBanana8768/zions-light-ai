@@ -2360,6 +2360,14 @@ def _retry_suffix(target_words: int) -> str:
 # reads it back.
 _truncated_summary_calls = 0
 
+# v3.1.9.4 (R5 / P16-7 fix). How many _llm_summarize calls, across every
+# tier, actually spent a retry call at all — clean or still cut. A clean
+# retry no longer wins automatically (see _llm_summarize's own step 4), so
+# "retried" and "truncated" (above) are genuinely different now: this
+# counts the ATTEMPT, that counts the outcome "ended up trimmed". Same
+# process-local/health.py-surfaced scope as truncated_summary_count.
+_retried_summary_calls = 0
+
 
 def truncated_summary_count() -> int:
     """How many _llm_summarize calls, across every tier, were cut at
@@ -2368,6 +2376,13 @@ def truncated_summary_count() -> int:
     block comment above `_llm_summarize`. A caller in health.py can surface
     this; this module does not read it back itself."""
     return _truncated_summary_calls
+
+
+def retried_summary_count() -> int:
+    """How many _llm_summarize calls, across every tier, actually spent a
+    retry call (clean or still cut) — see truncated_summary_count's own
+    docstring for how this differs (P16-7)."""
+    return _retried_summary_calls
 
 
 _rollup_log_ctx: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar(
@@ -2435,21 +2450,35 @@ async def _llm_summarize(
          calls. No `await` between the check and the decrement, matching
          `_call`'s own reasoning for why that is race-safe under concurrent
          map-phase callers.
-      4. If the retry ALSO finished normally, return it (a shorter but
-         complete summary — better than the fuller-but-cut first attempt).
-      5. Otherwise (the retry was cut too, OR was skipped for budget): this
-         is where the finding's defect used to land silently. Trim EVERY
-         candidate actually in hand (`text`, and `retry_text` if a retry
-         ran) with `_trim_best_effort` — the fallback chain that finds a
-         line or word boundary when there is no sentence boundary at all —
-         and keep whichever TRIMMED result is LONGER, not automatically the
-         retry: the tighter retry target sometimes produces a cut reply
-         that trims to LESS usable content than the first attempt trimmed
-         would have, and always preferring "the newest attempt" would throw
-         that material away for no reason. Log a WARNING naming the
-         conversation and tier (from `_rollup_log_ctx`, set by `_call`) and
-         count it (truncated_summary_count). The unit still advances — it
-         just covers slightly less than the model tried to say.
+      4. v3.1.9.4 (R5 / P16-7 fix). If the retry ALSO finished normally, it
+         no longer wins automatically. `_retry_suffix` asks for roughly
+         HALF the tier's ordinary word target, so a clean retry can be much
+         SHORTER than a first attempt that was cut but still trims (step 5)
+         to a complete sentence boundary well past the retry's whole
+         length — before this fix that shorter, complete retry silently
+         replaced a longer, perfectly usable trimmed first attempt, and
+         nothing counted that it had even happened. It now wins only if it
+         is AT LEAST AS LONG as the first attempt trimmed with
+         `_trim_best_effort` — the same comparison step 5 already made for
+         the "both cut" case, applied here too instead of skipped.
+      5. Otherwise (the retry was cut too, was skipped for budget, or lost
+         the length comparison in step 4): this is where the finding's
+         original defect used to land silently. Trim EVERY candidate
+         actually in hand (`text`, and `retry_text` if a retry ran, unless
+         it already finished clean and lost step 4 — nothing to trim there)
+         with `_trim_best_effort` — the fallback chain that finds a line or
+         word boundary when there is no sentence boundary at all — and keep
+         whichever TRIMMED result is LONGER, not automatically the retry:
+         the tighter retry target sometimes produces a cut reply that trims
+         to LESS usable content than the first attempt trimmed would have,
+         and always preferring "the newest attempt" would throw that
+         material away for no reason. Log a WARNING naming the conversation
+         and tier (from `_rollup_log_ctx`, set by `_call`) and count it
+         (truncated_summary_count). The unit still advances — it just
+         covers slightly less than the model tried to say. Every retry
+         actually made, clean or cut, is counted separately
+         (retried_summary_count), so an operator can see how often the
+         second call runs even on the turns where it wins outright.
       6. The one case this does NOT paper over: EVERY candidate in hand is
          itself empty or whitespace-only (a reply that said nothing at
          all — `_trim_best_effort` returns "" only for that). That is the
@@ -2497,21 +2526,47 @@ async def _llm_summarize(
     # actually having room for a second real call.
     retry_text: str | None = None
     retry_finish: str | None = None
+    retried = False
     _budget = _vllm_call_budget.get()
     if _budget is None or _budget["remaining"] > 0:
         if _budget is not None:
             _budget["remaining"] -= 1
+        retried = True
         retry_words = max(20, _target_words(max_tokens) // 2)
         retry_text, retry_finish = await _one_call(_retry_suffix(retry_words))
-        if retry_finish != "length":
-            return retry_text
 
-    # Still cut (or no budget left for a retry at all). Trim every candidate
-    # actually in hand and keep the longer trimmed result.
-    candidates = [text] + ([retry_text] if retry_text is not None else [])
-    trimmed = [_trim_best_effort(c) for c in candidates]
-    best_idx = max(range(len(trimmed)), key=lambda i: len(trimmed[i]))
-    best = trimmed[best_idx]
+    if retried:
+        global _retried_summary_calls
+        _retried_summary_calls += 1
+
+    # v3.1.9.4 (R5 / P16-7 fix). A clean retry (finish_reason != "length")
+    # used to win unconditionally the instant it happened. `_retry_suffix`
+    # asks for roughly HALF the tier's ordinary word target, at the SAME
+    # cap — so a retry that finishes cleanly can be much SHORTER than a
+    # first attempt that was cut but still trims to a complete sentence
+    # boundary well past the retry's whole length. It now wins only if it
+    # is AT LEAST AS LONG as the first attempt trimmed — the same rule the
+    # "both cut" branch below already applies, now applied uniformly
+    # rather than skipped whenever the retry itself happens to finish
+    # clean.
+    trimmed_first = _trim_best_effort(text)
+    if retry_text is not None and retry_finish != "length":
+        if len(retry_text) >= len(trimmed_first):
+            return retry_text
+        # Falls through: trimmed_first wins the comparison below (a clean
+        # retry_text needs no further trimming of its own — see
+        # `candidates` there).
+
+    # Still cut (or no budget left for a retry at all, or a clean retry
+    # lost the length comparison above). Trim every candidate actually in
+    # hand and keep the longer trimmed result.
+    originals = [text] + ([retry_text] if retry_text is not None else [])
+    candidates = [trimmed_first] + (
+        [retry_text if retry_finish != "length" else _trim_best_effort(retry_text)]
+        if retry_text is not None else []
+    )
+    best_idx = max(range(len(candidates)), key=lambda i: len(candidates[i]))
+    best = candidates[best_idx]
     if not best:
         # Every candidate was itself empty or whitespace-only — nothing
         # usable anywhere, not even a fallback boundary to trim to.
@@ -2521,14 +2576,14 @@ async def _llm_summarize(
     _truncated_summary_calls += 1
     _ctx = _rollup_log_ctx.get() or {}
     _retry_note = (
-        "retried at the same cap with a tighter word target, still cut"
+        "retried at the same cap with a tighter word target, still cut or too short"
         if retry_text is not None
         else "no vLLM-call budget left for a retry"
     )
     logger.warning(
         f"conv={_ctx.get('conv_id', '?')}: {_ctx.get('tier', '?')}-tier rollup "
         f"summary was cut at max_tokens={max_tokens} ({_retry_note}) — kept "
-        f"trimmed to {len(best)} of {len(candidates[best_idx])} chars rather "
+        f"trimmed to {len(best)} of {len(originals[best_idx])} chars rather "
         f"than stored past where the model stopped"
     )
     return best

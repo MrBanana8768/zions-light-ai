@@ -875,6 +875,22 @@ See [USER_GUIDE.md](USER_GUIDE.md). Quick: `/why` in the chat,
 `/list-facts`, `/forget <substring>`, or full reset
 `curl -X DELETE localhost:8080/admin/conversations/<id>/facts`.
 
+**`/forget` (or the DELETE above) only permanently protects the facts
+layer.** It leaves an empty facts store behind specifically so the lazy
+backfill cannot reconstruct facts from that conversation's history again
+(`backfill.needs_backfill`'s tombstone check). The L1/L2/L3 summary
+hierarchy has no equivalent tombstone: if the operator or the user keeps
+that SAME conversation going, OpenWebUI resends its whole prior
+transcript with the next message — it is the client, not this service,
+that decides what history a request carries — and the next ordinary tail
+rolls the summary hierarchy back up from watermark 0 over the full
+history, as if `/forget` had never touched it (v3.1.9.4 P16-6, documented
+— predates that release, not a regression). If a support request is "I
+forgot X and it came back," check whether the conversation kept going
+afterward before assuming the wipe itself failed; `/why` distinguishes
+the two (a rebuilt summary reads as freshly-summarized content, not a
+surviving fact).
+
 ---
 
 ## Cleaning up old model weights on the volume

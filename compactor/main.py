@@ -1817,6 +1817,23 @@ _summary_call_budget: "contextvars.ContextVar[list[int] | None]" = contextvars.C
     "main_summary_call_budget", default=None
 )
 
+# v3.1.9.4 (R5 / P16-4 fix). Same wholesale-monkeypatch reason as the two
+# contextvars above — a keyword argument on `_summarize_once`'s own
+# signature TypeErrors every stub that replaces it (or `summarize`) with a
+# fixed `(client, turns)` callable (test_review_fixes.py,
+# test_summarize_invariant.py, test_v3194_guard_g1.py, and others this
+# file's own docstring names) the moment `_bounded()` below passes it. Set
+# around the call, read where needed. Holds a zero-argument callable
+# reporting how many OTHER map/reduce-phase batches have not yet taken
+# their own guaranteed call — see `_summarize_once`'s own docstring for
+# why its cut-summary retry needs this. None (the default) means "nobody
+# else is sharing this budget", which is correct for the single-batch
+# call site (no `_bounded()` involved) and for every direct-call test
+# double of `_summarize_once` itself.
+_pending_others_ctx: "contextvars.ContextVar[Callable[[], int] | None]" = contextvars.ContextVar(
+    "main_pending_others", default=None
+)
+
 # `_summary_log_ctx` holds `{"conv_id": ...}` — set by compact_if_needed
 # (the one caller of summarize() with a conv_id in scope; summarize()'s own
 # signature has never carried one, for the same wholesale-monkeypatch
@@ -1834,6 +1851,16 @@ _summary_log_ctx: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar
 # surfaced at /health/full by R4 (another region of this same file).
 _truncated_compaction_summary_calls = 0
 
+# v3.1.9.4 (R5 / P16-7 fix). How many times _summarize_once actually made a
+# retry call at all — clean or still cut. `_truncated_compaction_summary_
+# calls` above only counts the outcome "ended up trimmed"; this counts the
+# ATTEMPT, so an operator can see how often the second call runs even on
+# the turns where it wins and the result is NOT trimmed (a retry that
+# finishes cleanly no longer wins automatically — see the "keep the longer
+# trimmed candidate" rule below — so "retried" and "truncated" are
+# genuinely different counters now, not the same thing under two names).
+_retried_compaction_summary_calls = 0
+
 
 def truncated_compaction_summary_count() -> int:
     """How many _summarize_once calls were cut at max_tokens and still had
@@ -1842,6 +1869,13 @@ def truncated_compaction_summary_count() -> int:
     this mirrors; the two are separate counters because they cover
     separate call sites with separate callers."""
     return _truncated_compaction_summary_calls
+
+
+def retried_compaction_summary_count() -> int:
+    """How many _summarize_once calls actually spent a retry call (clean
+    or still cut) — see summarizer.retried_summary_count for the
+    hierarchical-tier sibling this mirrors (P16-7)."""
+    return _retried_compaction_summary_calls
 
 
 async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
@@ -1865,18 +1899,55 @@ async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
          (_summary_call_budget) — this call is on the REQUEST PATH, and
          MAX_SUMMARY_CALLS_PER_REQUEST already bounds it; an uncounted
          retry would silently let one request spend one more real vLLM
-         call than its own cap says it may.
-      4. Retry finishes cleanly -> return it.
-      5. Still cut (or no budget left for a retry): trim EVERY candidate
-         actually in hand with _trim_best_effort_summary and keep whichever
-         TRIMS LONGER — not automatically the retry's, since its tighter
-         target can trim to less than the first attempt would have. Log a
-         WARNING naming the conversation (from _summary_log_ctx) and count
-         it (truncated_compaction_summary_count).
+         call than its own cap says it may. v3.1.9.4 (R5 / P16-4 fix):
+         ALSO gated on `_pending_others_ctx` — see that contextvar's own
+         docstring below — so this retry can never spend a call a map (or
+         reduce) batch that has not started yet still needs for its OWN
+         guaranteed first call.
+      4. v3.1.9.4 (R5 / P16-7 fix). A retry that finishes cleanly does NOT
+         automatically win any more: `_summary_retry_suffix` asks for
+         roughly HALF the ordinary word target, so a clean retry can be
+         much SHORTER than a first attempt that was cut but still trims to
+         a complete sentence boundary well past the retry's whole length.
+         Trim the first attempt and compare: the retry wins only if it is
+         AT LEAST AS LONG as that trimmed first attempt — the same rule
+         step 5 already applies to the "both cut" case, now applied
+         uniformly instead of skipped whenever the retry itself happens to
+         finish clean. Every retry actually made (clean or cut) is counted
+         (retried_compaction_summary_count) regardless of which candidate
+         wins, so an operator can see how often the second call runs at
+         all, not only how often it still loses.
+      5. Still cut (or no budget left for a retry, or the retry lost the
+         length comparison in step 4): trim EVERY candidate actually in
+         hand with _trim_best_effort_summary and keep whichever TRIMS
+         LONGER. Log a WARNING naming the conversation (from
+         _summary_log_ctx) and count it (truncated_compaction_summary_count).
       6. "" only when EVERY candidate is itself empty/whitespace — every
          existing caller of this function already treats "" as "nothing
          usable" and degrades (see summarize()'s own empty-content
          handling); this fix does not touch that contract.
+
+    `_pending_others_ctx` (v3.1.9.4, R5 / P16-4 fix): read here, not taken
+    as a parameter — a keyword argument on this function's own signature
+    TypeErrors every test double that replaces `_summarize_once` (or
+    `summarize`) wholesale with a fixed `(client, turns)` callable, exactly
+    the problem `_summary_call_budget`/`_summary_log_ctx` (this module's
+    own contextvars, a few hundred lines up) already exist to avoid — see
+    their shared block comment. Holds a zero-argument callable reporting
+    how many OTHER map/reduce-phase batches have not yet taken their own
+    guaranteed first call, set by `_bounded()` around its call to this
+    function. The default (unset, i.e. `None`) means "no one else is
+    sharing this budget" — every direct-call test double, and the
+    single-batch call site (no `_bounded()` involved). Without this,
+    `COMPACTOR_MAX_SUMMARY_CALLS` set above the map phase's semaphore of 4
+    let one batch's retry spend a call a LATER, not-yet-started batch
+    needed for its own guaranteed call — that batch then found the shared
+    budget already empty, returned "" for a reason that had nothing to do
+    with the model's output, and "ANY empty map batch fails the whole
+    summarize" forwarded every turn in the compaction verbatim. The retry
+    may spend a call only when doing so still leaves at least that many
+    calls in the shared budget — reserving exactly what the batches that
+    have not run yet are owed.
     """
     transcript = "\n\n".join(
         f"[{m.get('role', 'unknown')}]: {_message_text(m)}" for m in turns
@@ -1910,24 +1981,51 @@ async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
         return text
 
     # Cut. Retry ONCE at the same max_tokens, gated on the shared
-    # per-request call budget actually having room for a second real call.
+    # per-request call budget actually having room for a second real call
+    # AND (P16-4) on that spend not dipping into what batches still to
+    # come are owed.
     retry_text: str | None = None
     retry_finish: str | None = None
+    retried = False
     _budget = _summary_call_budget.get()
-    if _budget is None or _budget[0] > 0:
+    _pending_others = _pending_others_ctx.get()
+    _reserve = _pending_others() if _pending_others is not None else 0
+    if _budget is None or _budget[0] > _reserve:
         if _budget is not None:
             _budget[0] -= 1
+        retried = True
         retry_words = max(20, _target_words(SUMMARY_MAX_TOKENS) // 2)
         retry_text, retry_finish = await _one_call(_summary_retry_suffix(retry_words))
-        if retry_finish != "length":
-            return retry_text
 
-    # Still cut (or no budget left for a retry at all). Trim every
-    # candidate actually in hand and keep the longer trimmed result.
-    candidates = [text] + ([retry_text] if retry_text is not None else [])
-    trimmed = [_trim_best_effort_summary(c) for c in candidates]
-    best_idx = max(range(len(trimmed)), key=lambda i: len(trimmed[i]))
-    best = trimmed[best_idx]
+    if retried:
+        global _retried_compaction_summary_calls
+        _retried_compaction_summary_calls += 1
+
+    trimmed_first = _trim_best_effort_summary(text)
+    if retry_text is not None and retry_finish != "length":
+        # v3.1.9.4 (R5 / P16-7 fix). Clean retry — but it only wins if it
+        # is at least as long as the first attempt trimmed to a sentence
+        # boundary; a short-but-complete retry must not discard a longer,
+        # cleanly-trimmable first attempt.
+        if len(retry_text) >= len(trimmed_first):
+            return retry_text
+        # Falls through to the trim-and-compare block below, which will
+        # correctly pick trimmed_first over a (untrimmed, already-clean)
+        # retry_text — see the candidates list: a clean retry_text needs no
+        # further trimming of its own, so it is used as-is there too.
+
+    # Still cut (or no budget left for a retry, or a clean retry lost the
+    # length comparison above). Trim every candidate actually in hand
+    # (a clean retry_text is not re-trimmed — it has nothing to trim) and
+    # keep whichever is longer. `originals` mirrors `candidates_trimmed`
+    # index-for-index, only for the log line's "of N chars" below.
+    originals = [text] + ([retry_text] if retry_text is not None else [])
+    candidates_trimmed = [trimmed_first] + (
+        [retry_text if retry_finish != "length" else _trim_best_effort_summary(retry_text)]
+        if retry_text is not None else []
+    )
+    best_idx = max(range(len(candidates_trimmed)), key=lambda i: len(candidates_trimmed[i]))
+    best = candidates_trimmed[best_idx]
     if not best:
         # Every candidate was itself empty or whitespace-only.
         return ""
@@ -1936,14 +2034,14 @@ async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
     _truncated_compaction_summary_calls += 1
     _ctx = _summary_log_ctx.get() or {}
     _retry_note = (
-        "retried at the same cap with a tighter word target, still cut"
+        "retried at the same cap with a tighter word target, still cut or too short"
         if retry_text is not None
         else "no vLLM-call budget left for a retry"
     )
     logger.warning(
         f"conv={_ctx.get('conv_id', '?')}: compaction summary was cut at "
         f"max_tokens={SUMMARY_MAX_TOKENS} ({_retry_note}) — kept trimmed to "
-        f"{len(best)} of {len(candidates[best_idx])} chars rather than "
+        f"{len(best)} of {len(originals[best_idx])} chars rather than "
         f"stored past where the model stopped"
     )
     return best
@@ -2180,14 +2278,37 @@ async def _summarize_body(
     # crash on a None subscript.
     calls_left = _summary_call_budget.get() or [max(1, MAX_SUMMARY_CALLS_PER_REQUEST)]
 
+    # v3.1.9.4 (R5 / P16-4 fix). How many batches have NOT YET taken their
+    # own guaranteed first call — decremented, synchronously and inside the
+    # semaphore (so no two batches can race on it), the instant a batch
+    # takes that call below. `_summarize_once`'s own retry reads this
+    # (via `_pending_others_ctx`) before spending a SECOND call on a cut
+    # batch, so it can never dip into what a batch still waiting its turn
+    # is owed. Starts at len(batches): nobody has gone yet. Also reused,
+    # reset to that round's own group count, by the reduce phase below —
+    # see its own comment.
+    _batches_pending = [len(batches)]
+
     async def _bounded(batch: list[dict]) -> str:
         # Checked inside the semaphore so concurrent waves cannot each see the
         # last remaining call and all spend it.
         async with sem:
             if calls_left[0] <= 0:
+                _batches_pending[0] -= 1
                 return ""
             calls_left[0] -= 1
-            return await _summarize_once(client, batch)
+            _batches_pending[0] -= 1
+            # v3.1.9.4 (R5 / P16-4 fix). Set the CONTEXTVAR around this call
+            # rather than passing pending_others= as a keyword — see
+            # _pending_others_ctx's own block comment for why a keyword on
+            # _summarize_once's signature breaks every test double that
+            # replaces it wholesale. Reset immediately after, so it does not
+            # leak into whatever else runs on this task next.
+            _pending_token = _pending_others_ctx.set(lambda: _batches_pending[0])
+            try:
+                return await _summarize_once(client, batch)
+            finally:
+                _pending_others_ctx.reset(_pending_token)
 
     _raw = await asyncio.gather(*(_bounded(b) for b in batches))
     _empty_batches = sum(1 for p in _raw if not (p or "").strip())
@@ -2201,7 +2322,12 @@ async def _summarize_body(
         # correct degraded mode; partial success takes the same road. (In
         # this map phase "" is always genuine empty content, never
         # call-budget exhaustion: the over-cap check above guarantees
-        # len(batches) fits the call budget.)
+        # len(batches) fits the call budget for every batch's OWN
+        # guaranteed call — v3.1.9.4 R5 / P16-4 closed the gap where a
+        # SIBLING batch's retry could spend that guaranteed call out from
+        # under it; `_bounded`'s own `pending_others` reservation above is
+        # what makes that guarantee hold again above MAX_SUMMARY_CALLS_
+        # PER_REQUEST's default of 4.)
         logger.warning(
             f"summarize: {_empty_batches} of {len(batches)} map batch(es) "
             f"returned empty content - forwarding all {len(to_summarize)} "
@@ -2239,6 +2365,20 @@ async def _summarize_body(
                 f"{len(parts)} partial(s) instead"
             )
             break
+        # v3.1.9.4 (R5 / P16-4 sibling fix). `_bounded` is the SAME closure
+        # the map phase above uses, and its own `pending_others` reservation
+        # is exactly as necessary here: this round's groups run concurrently
+        # via the same asyncio.gather, so one group's cut-summary retry
+        # could just as easily spend a call a SIBLING group in this round
+        # needs for its own guaranteed call — the identical starvation shape
+        # P16-4 closed in the map phase, left open here as the "fixed at one
+        # site, missed the identical sibling" defect this codebase keeps
+        # paying for. `_batches_pending` is reset to THIS round's group
+        # count right before the gather — it was left at 0 from the map
+        # phase above (every map batch already took or was refused its
+        # call), which would otherwise make every reduce-round retry think
+        # nothing else was pending and spend freely.
+        _batches_pending[0] = len(groups)
         try:
             _folded = await asyncio.gather(*(_bounded(g) for g in groups))
         except Exception as e:
@@ -7012,6 +7152,21 @@ def _shed_last_resort(
     anything but its own parameters — the same reason `report` is a
     dict the caller fills in, not a return-type change (see this
     module's own `report` docstring at `_enforce_hard_budget`).
+
+    v3.1.9.4 (R5 / P16-3 fix). Steps 2 and 3 used to run back to back in
+    the SAME round with no measurement between them, both decided from the
+    same round's `per` estimates — which a PRIOR round's rescale (below)
+    can have skewed per class rather than uniformly (over-priced old turns
+    in round 1 under-price memory for round 2, since the rescale applies
+    one ratio to every remaining estimate). That let round 2 "spend"
+    memory on paper in step 2, come up short of `_g3a_target` on the same
+    bad estimate, and drop U_prev/A_prev in step 3 of that SAME round when
+    the real (measured) saving from steps 1+2 would have met the target on
+    its own — breaking the owner's standing rule in the one function
+    written to enforce it. Once step 2 has spent anything, this now
+    measures steps 1+2's REAL combined effect before step 3 (or step 4) is
+    allowed to touch anything, at the cost of at most one extra `measure`
+    call per round, still inside `_G3A_MEASURE_CAP`.
     """
     _g3a_measures = 0
     while running > limit and _g3a_measures < _G3A_MEASURE_CAP:
@@ -7068,6 +7223,12 @@ def _shed_last_resort(
                 _g3a_freed += per[j]
             _p += pair_len
 
+        # v3.1.9.4 (R5 / P16-3 fix). Snapshot of what step 1 alone took,
+        # so the checkpoint right after step 2 (below) can tell whether
+        # step 2 itself actually spent anything THIS round — see that
+        # checkpoint's own comment for why that distinction is the fix.
+        _g3a_after_step1 = set(_g3a_gone)
+
         # --- step 2: spendable injected memory — facts/retrieval always
         #     qualify; the stand-in only when standin_protected is
         #     False. v3.1.9.4 (v3194-r3, R6): TARGET-LIMITED, like step 1,
@@ -7097,9 +7258,72 @@ def _shed_last_resort(
                     _g3a_gone.add(i)
                     _g3a_freed += per[i]
 
+        # v3.1.9.4 (R5 / P16-3 fix). Once step 2 has spent anything this
+        # round, MEASURE steps 1+2's real combined effect before letting
+        # step 3 touch U_prev/A_prev — the owner's standing rule ("her own
+        # previous exchange ... is kept over injected memory; the newest
+        # turn is never dropped"). Without this, step 3 decided whether to
+        # run from `_g3a_freed < _g3a_target`, both computed from `per` —
+        # estimates that a PRIOR round's rescale (below) can have skewed
+        # per class: round 1 over-prices old turns relative to their real
+        # cost, the rescale then applies that single ratio to EVERY
+        # remaining estimate uniformly, under-pricing memory (which was
+        # priced correctly to begin with) for round 2. Round 2's step 2
+        # then "spends" memory on paper at its now-too-low estimate, comes
+        # up short of `_g3a_target` on paper, and step 3 drops the
+        # newest-but-one exchange in that SAME round — when the real
+        # (unscaled) saving from steps 1+2 together would have met the
+        # target on its own. Reproduced: a 3-4x per-class over-price on
+        # step 1's turns lost U_prev/A_prev; 1-2x kept them
+        # (test_v3194_r5_p163.py).
+        #
+        # One extra `measure` call, gated on the cap so this can never push
+        # the function past its documented `_G3A_MEASURE_CAP` budget — if
+        # the cap is already spent, this checkpoint is skipped and step 3
+        # runs on the estimate exactly as it always did (a rarer, already-
+        # degraded case: the round loop is about to stop regardless).
+        #
+        # ALSO gated on `_g3a_freed < _g3a_target` still holding after step
+        # 2 — i.e. only when step 3 is actually about to be ENTERED on the
+        # strength of the estimate (the same condition step 3's own `if`
+        # below tests). Checking this before spending the extra measurement
+        # matters for a reason a first cut of this fix missed: a round
+        # where step 2 alone already meets the (possibly tiny) ESTIMATED
+        # target needs no checkpoint at all, because step 3 would not run
+        # either way — but this pass's OWN round-counting invariant
+        # (`_g3a_last_round = _g3a_measures == _G3A_MEASURE_CAP - 1`, one
+        # measurement per round) silently broke the moment a checkpoint
+        # fired in a round that did not need one: a payload the round loop
+        # can never make fit (count_tokens_exact pinned one token above the
+        # limit regardless of content, test_budget_guard.py's own
+        # `test_the_guard_sheds_injection_to_nothing_before_forwarding_an_
+        # oversized_payload`) has a target so small that ONE dropped block
+        # always satisfies it — an unconditional checkpoint fired every
+        # round, doubling this pass's measurement cost per round, and
+        # `_g3a_last_round` (computed from `_g3a_measures` at the TOP of
+        # each round) never reached `_G3A_MEASURE_CAP - 1` on an actual
+        # round boundary, so the final round's "spend everything eligible"
+        # fallback never triggered at all: 3 blocks shed in 3 double-cost
+        # rounds instead of all 10 on the guaranteed-progress last round.
+        _g3a_skip_step34 = False
+        _g3a_trial_running: int | None = None
+        _g3a_trial_counter: str | None = None
+        if (
+            _g3a_gone != _g3a_after_step1
+            and _g3a_freed < _g3a_target
+            and _g3a_measures < _G3A_MEASURE_CAP
+        ):
+            _g3a_trial_msgs = [m for i, m in enumerate(msgs) if i not in _g3a_gone]
+            _g3a_trial_running, _g3a_trial_counter = measure(_g3a_trial_msgs)
+            _g3a_measures += 1
+            if _g3a_trial_running <= limit:
+                # Steps 1+2 alone were enough for real — stop here, never
+                # letting step 3/4 touch anything this round.
+                _g3a_skip_step34 = True
+
         # --- step 3: the recent window's own turns, except the
         #     newest, oldest-of-the-window first ---
-        if _g3a_freed < _g3a_target and len(_g3a_recent) > 1:
+        if not _g3a_skip_step34 and _g3a_freed < _g3a_target and len(_g3a_recent) > 1:
             _recent_limit = len(_g3a_recent) - 1  # never the last (newest)
             _q = 0
             while _q < _recent_limit and _g3a_freed < _g3a_target:
@@ -7133,7 +7357,7 @@ def _shed_last_resort(
         #     needing this exact fix reapplied at its own sibling site.
         #     Same `_g3a_last_round` exception as step 2, for the same
         #     reason.
-        if _g3a_freed < _g3a_target:
+        if not _g3a_skip_step34 and _g3a_freed < _g3a_target:
             for i in _droppable_system_indices(msgs, protect_system):
                 if not _g3a_last_round and _g3a_freed >= _g3a_target:
                     break
@@ -7153,8 +7377,17 @@ def _shed_last_resort(
         per = [p for i, p in enumerate(per) if i not in _g3a_gone]
 
         _g3a_before_measure = running
-        running, counter = measure(msgs)
-        _g3a_measures += 1
+        # v3.1.9.4 (R5 / P16-3 fix). When the checkpoint above already
+        # measured this exact `msgs` (steps 3/4 skipped, so `_g3a_gone`
+        # has not changed since the trial), reuse that result instead of
+        # measuring the identical payload again — the trial already spent
+        # one of this round's measurements; a second one here would count
+        # twice for no new information.
+        if _g3a_skip_step34 and _g3a_trial_running is not None:
+            running, counter = _g3a_trial_running, _g3a_trial_counter
+        else:
+            running, counter = measure(msgs)
+            _g3a_measures += 1
         if running <= limit:
             break
         # Rescale: how much this round's cuts ACTUALLY freed vs. what
@@ -9242,6 +9475,7 @@ def _run_memory_tail(
     turn_index: int,
     messages: list[dict],
     injected_facts: list[dict] | None,
+    wipe_generation: int | None = None,
 ) -> TailDecision:
     """Decide, count, log, and (maybe) fire the memory tail — for BOTH
     /v1/chat/completions call sites, so that no line of tail policy or
@@ -9250,17 +9484,28 @@ def _run_memory_tail(
     flags, the non-streaming one `finished=True` and finish_reason.
 
     Returns the decision so a caller (or a test) can see what was done.
+
+    `wipe_generation` (v3.1.9.4, R5 / P16-8 fix): the conversation's wipe
+    generation as of the moment `chat_completions` captured this request's
+    inputs (`current_wipe_generation(conv_id)`, read right after conv_id
+    resolution, long before either call site here runs) — NOT read fresh
+    inside this function any more. The streaming call site does not invoke
+    this function until the WHOLE reply has finished streaming to the
+    client, which can be a minute or more after the request started; a
+    /forget that lands and completes during that window would otherwise be
+    invisible to the generation check this value feeds into
+    (`_wipe_generation_stale`, via `_tail_wipe_generation`/
+    `_rollup_hierarchy`'s own `wipe_generation=` keyword below) — the
+    baseline itself would already reflect the wipe, so the later comparison
+    finds no mismatch. `None` (the default, kept for the test doubles in
+    this file's own test suite that call this function directly without a
+    real request in front of it) falls back to reading
+    `current_wipe_generation(conv_id)` right now — correct only when the
+    caller genuinely has no earlier, better moment to report, which real
+    request traffic always does.
     """
-    # v3.1.9.4 (R1 / P15-5 follow-up). Captured HERE, synchronously, on the
-    # request path — before either _fire_and_forget call below hands a tail
-    # to bgwork.pool. See memory.bump_wipe_generation's own docstring for
-    # why "at submission" is the only correct moment: a tail parked on the
-    # pool's concurrency semaphore has run no code of its own yet, so
-    # reading this from INSIDE the coroutine's body would read whatever the
-    # generation happens to be whenever the task finally starts, not what
-    # it was when the request that produced this exchange was in flight —
-    # exactly the gap a wipe arriving in between is supposed to close.
-    wipe_generation = current_wipe_generation(conv_id)
+    if wipe_generation is None:
+        wipe_generation = current_wipe_generation(conv_id)
     decision = decide_memory_tail(
         text, finished=finished, truncated=truncated, holed=holed
     )
@@ -10290,6 +10535,29 @@ async def chat_completions(request: Request) -> Any:
     except Exception as e:
         logger.warning(f"conv_id resolution failed: {e}")
 
+    # v3.1.9.4 (R5 / P16-8 fix). Captured HERE — the earliest point conv_id
+    # is known, before anything else touches `body`/`messages`, before
+    # compaction/injection run, and long before the reply is generated —
+    # rather than letting _run_memory_tail read current_wipe_generation at
+    # ITS OWN call time. For the streaming path, _run_memory_tail is not
+    # called until the WHOLE reply has finished streaming to the client
+    # (the generator's `finally:`, which can run for a minute or more on a
+    # long reply); reading the generation there instead reads whatever it
+    # happens to be AFTER a /forget that raced with and completed during
+    # THIS request already landed — so the comparison inside the tail finds
+    # no mismatch at all, because the "baseline" it diffs against already
+    # reflects the wipe. Same trap, same fix shape, as
+    # backfill.start_backfill_if_needed's own P16-8 fix (capture before the
+    # redact await, not after) — passed through explicitly rather than read
+    # again later, so both the streaming and non-streaming call sites use
+    # the SAME value taken at the SAME moment their `messages`/
+    # `touched_facts` snapshot was effectively fixed. None when conv_id
+    # resolution itself failed above — there is no per-conversation
+    # generation to protect without a conv_id.
+    _tail_wipe_generation_snapshot = (
+        current_wipe_generation(conv_id) if conv_id else None
+    )
+
     # v3.1.9.2: translate/drop Ollama-named sampling keys BEFORE anything
     # else touches `body`, so every later stage (including the eventual
     # forward to vLLM) sees the vLLM-shaped body. See
@@ -11196,6 +11464,11 @@ async def chat_completions(request: Request) -> Any:
                         turn_index=turn_index,
                         messages=messages,  # original request messages, for rollup
                         injected_facts=injected_facts,
+                        # v3.1.9.4 (R5 / P16-8 fix): the generation as of
+                        # this REQUEST's inputs, not as of whenever this
+                        # `finally:` finally runs — see _run_memory_tail's
+                        # own docstring for why that gap matters here.
+                        wipe_generation=_tail_wipe_generation_snapshot,
                     )
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -11310,7 +11583,17 @@ async def chat_completions(request: Request) -> Any:
             _run_memory_tail(
                 conv_id,
                 assistant_text,
-                finished=True,
+                # v3.1.9.4 (R5 / P16-5 fix). B4 taught SseAccumulator.feed/
+                # complete() that finish_reason == "error" is an IN-BAND cut,
+                # not a whole reply — a 200 whose choice carries this value
+                # mid-body, not an HTTP error status. This non-streaming
+                # sibling was never updated to match: `finished=True`
+                # unconditionally stored an "error"-terminated reply as
+                # complete, the exact misclassification B4 removed from the
+                # streaming path. Same predicate as the streaming
+                # accumulator's own `_errored` check, applied here directly
+                # since there is no accumulator object on this path.
+                finished=_finish_reason != "error",
                 truncated=_finish_reason == "length",
                 holed=False,
                 touched_facts=touched_facts,
@@ -11318,6 +11601,10 @@ async def chat_completions(request: Request) -> Any:
                 turn_index=turn_index,
                 messages=messages,  # original request messages, for rollup
                 injected_facts=injected_facts,
+                # v3.1.9.4 (R5 / P16-8 fix): same request-input-time
+                # snapshot the streaming call site now passes — see
+                # _run_memory_tail's own docstring.
+                wipe_generation=_tail_wipe_generation_snapshot,
             )
         return JSONResponse(content=response_json, status_code=r.status_code)
     finally:
@@ -11540,6 +11827,17 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
         # current_wipe_generation() the instant it re-checks, under this
         # same lock, and discards whatever it was about to write.
         bump_wipe_generation(conv_id)
+        # v3.1.9.4 (R5 / P16-1). Same locked section, same ordering
+        # guarantee as bump_wipe_generation itself: neutralise any backfill
+        # sidecar record for this conv BEFORE anything else below runs.
+        # Without this, a `failed` (past its backoff) or stale `in_progress`
+        # backfill record outlives the wipe untouched, because B2 reordered
+        # needs_backfill to check the RECORD before the facts-file
+        # tombstone — so her very next message re-extracted the whole
+        # history this wipe just cleared, and /forget had already reported
+        # a clean wipe. backfill.mark_wiped is a no-op when there is no
+        # record (most conversations never had a backfill).
+        backfill.mark_wiped(conv_id)
         # v3.1: an unreadable facts file must not abort the whole wipe. The
         # user asked for this data to be gone; refusing to clear the three
         # layers we CAN read would leave more behind than clearing them does,

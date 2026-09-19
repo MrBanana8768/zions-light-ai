@@ -22,6 +22,22 @@ Commands (case-insensitive command name, args preserved as-is):
                            layer and report what is actually gone rather than
                            what the wipe intended.
 
+                           v3.1.9.4 (R5 / P16-6, documented — not a new
+                           defect, and not something a patch here can close):
+                           this protection is FACTS-specific. The L1/L2/L3
+                           hierarchical summary has no equivalent tombstone —
+                           if the chat keeps going, OpenWebUI resends the
+                           WHOLE prior transcript with every new message (it
+                           is the client, not this service, that decides what
+                           history a request carries), and the very next
+                           ordinary turn rolls the summary hierarchy back up
+                           from watermark 0 over that full history, exactly
+                           as if she had never run /forget. /forget only
+                           clears the summaries UNTIL the next message in a
+                           chat that continues; starting a NEW conversation
+                           (a fresh conv_id) is what actually keeps old
+                           context from ever being summarized again.
+
                            What it does NOT clear, deliberately: the periodic
                            data-durability snapshots in /data/backups. Those
                            exist so that "a corrupted file, an accidental
@@ -80,6 +96,7 @@ import re
 import time
 from typing import Any, Callable, Awaitable
 
+import backfill
 import bgwork
 import facts as facts_module
 import portability
@@ -705,6 +722,24 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
     lines: list[str] = []
     if parts:
         lines.append("Forgot: " + ", ".join(parts) + ".")
+
+    # v3.1.9.4 (R5 / P16-6, documented — not a new defect). The facts
+    # tombstone above genuinely stops the lazy backfill from reconstructing
+    # facts from history. The summary hierarchy has no equivalent: if this
+    # chat keeps going, OpenWebUI resends the whole prior transcript with
+    # the next message (the client's choice, not this service's), and the
+    # very next ordinary turn rebuilds the L1/L2/L3 summary from it — so
+    # say that here rather than let "Forgot: summary state." read as a
+    # permanent guarantee it is not. Only surfaced when a summary or
+    # chapter archive was actually part of what got cleared.
+    if totals["forgotten_summary"] or totals["forgotten_chapters"]:
+        lines.append(
+            "Note: if you keep chatting in this conversation, the summary "
+            "will rebuild itself from the history your client resends — "
+            "/forget clears it only until the next message here. Start a "
+            "new conversation to keep old context from being summarized "
+            "again."
+        )
 
     # v3.1: main.py's _clear_all_memory states the contract in its return value
     # — "callers must not report a clean wipe when `unreadable` is non-empty".
@@ -2307,6 +2342,15 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
             # was about to write into a conversation that is being retired
             # out from under it.
             bump_wipe_generation(source_id)
+            # v3.1.9.4 (R5 / P16-1 sibling fix). Same reasoning as
+            # main._clear_all_memory's own mark_wiped call, and needed here
+            # for the identical reason: /retire is a wipe of source_id (its
+            # facts are about to be emptied a few lines down), so a
+            # `failed`/stale `in_progress` backfill record left over from
+            # source_id must not survive to retry against a conversation
+            # /retire just emptied. Still inside the same lock the bump
+            # above is inside.
+            backfill.mark_wiped(source_id)
             facts_module.save_archive(source_id, [])
             # An EMPTY facts file, not an unlinked one — /forget's tombstone,
             # for its reason: backfill.needs_backfill gates on

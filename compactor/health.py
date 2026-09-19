@@ -1317,28 +1317,44 @@ def _truncated_summary_state() -> dict:
     signal P15-6's own finding said this defect had NONE of ("no log line,
     no counter").
 
-    `hierarchy` reads summarizer.truncated_summary_count() directly (a
-    normal module-level import — no cycle; summarizer.py never imports
-    health.py). `compaction` needs the SAME call-time sys.modules lookup
+    `hierarchy`/`hierarchy_retried` read summarizer.truncated_summary_count()
+    / .retried_summary_count() directly (a normal module-level import — no
+    cycle; summarizer.py never imports health.py). `compaction`/
+    `compaction_retried` need the SAME call-time sys.modules lookup
     `_tokenizer_state`/`_reuse_state`/`_budget_margin_state` already use for
     main.py: main.py imports health.py, so a module-level `import main`
     here would be circular.
+
+    v3.1.9.4 (R5 / P16-7 fix). `*_retried` are new: a retry that finishes
+    cleanly no longer automatically becomes the stored text (it now wins
+    only if it is at least as long as the first attempt trimmed — see
+    summarizer._llm_summarize / main._summarize_once's own docstrings), so
+    `truncated` alone no longer says how often the second call runs at all
+    — a clean win leaves `truncated` unchanged. `*_retried` counts the
+    ATTEMPT regardless of outcome, next to `*` which counts the outcome
+    "ended up trimmed".
     """
     hierarchy_count = summarizer.truncated_summary_count()
+    hierarchy_retried = summarizer.retried_summary_count()
     main_mod = sys.modules.get("main")
     if main_mod is None:
         return {
             "available": True,
             "hierarchy": hierarchy_count,
+            "hierarchy_retried": hierarchy_retried,
             "compaction": None,
+            "compaction_retried": None,
             "compaction_reason": "main is not loaded in this process",
         }
     fn = getattr(main_mod, "truncated_compaction_summary_count", None)
+    retried_fn = getattr(main_mod, "retried_compaction_summary_count", None)
     if not callable(fn):
         return {
             "available": True,
             "hierarchy": hierarchy_count,
+            "hierarchy_retried": hierarchy_retried,
             "compaction": None,
+            "compaction_retried": None,
             "compaction_reason": (
                 "main.truncated_compaction_summary_count() is not present "
                 "in this build"
@@ -1346,17 +1362,22 @@ def _truncated_summary_state() -> dict:
         }
     try:
         compaction_count = fn()
+        compaction_retried = retried_fn() if callable(retried_fn) else None
     except Exception as e:
         return {
             "available": True,
             "hierarchy": hierarchy_count,
+            "hierarchy_retried": hierarchy_retried,
             "compaction": None,
+            "compaction_retried": None,
             "compaction_reason": f"{type(e).__name__}: {e}",
         }
     return {
         "available": True,
         "hierarchy": hierarchy_count,
+        "hierarchy_retried": hierarchy_retried,
         "compaction": compaction_count,
+        "compaction_retried": compaction_retried,
     }
 
 

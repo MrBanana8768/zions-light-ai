@@ -182,6 +182,18 @@ CUT = (
     "would run at six. Then the user asked about the"
 )
 FINISHED = "Scene summary: the garden plan settled on basil and tomatoes, irrigation at six."
+# v3.1.9.4 (R5 / P16-7 fix). A clean retry only wins the length comparison
+# against the first attempt trimmed to a sentence boundary if it is AT
+# LEAST AS LONG (see summarizer._llm_summarize's own step 4). `FINISHED`
+# alone (80 chars) is shorter than `_trim_best_effort(CUT)` (154 chars,
+# checked by hand against this file's own CUT/_trim_best_effort — if
+# either changes, re-check this margin), so
+# test_cut_reply_whose_retry_finishes_is_stored_untrimmed needs a retry
+# text that is genuinely at least that long to keep testing its own
+# documented claim ("the retry's own complete text IS stored") rather than
+# accidentally exercising the shorter-retry-loses case, which
+# test_v3194_r5_p167.py covers directly.
+FINISHED_LONG = FINISHED + " The bed layout and watering schedule were both confirmed before the chat moved on to the next topic entirely."
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +258,10 @@ def test_cut_reply_whose_retry_finishes_is_stored_untrimmed():
     print("\n[test] a cut first attempt whose retry finishes cleanly stores the retry's full text, uncounted")
     _wipe()
     before = summarizer.truncated_summary_count()
-    queue = [(CUT, "length"), (FINISHED, "stop")]
+    # v3.1.9.4 (R5 / P16-7 fix): FINISHED_LONG, not FINISHED — the retry
+    # only wins if it is at least as long as CUT trimmed to a sentence
+    # boundary (see FINISHED_LONG's own comment above).
+    queue = [(CUT, "length"), (FINISHED_LONG, "stop")]
 
     def handler(body):
         return queue.pop(0)
@@ -257,7 +272,7 @@ def test_cut_reply_whose_retry_finishes_is_stored_untrimmed():
             st = asyncio.run(summarizer.maybe_rollup("cut-retry-ok", _msgs(2), "http://stub:8000", "m"))
     finally:
         _restore(orig)
-    assert_eq(st["l1"][0]["text"], FINISHED, "the retry's own (complete) text is stored, not a trim of the first attempt")
+    assert_eq(st["l1"][0]["text"], FINISHED_LONG, "the retry's own (complete) text is stored, not a trim of the first attempt")
     assert_eq(summarizer.truncated_summary_count(), before, "a reply that finished on retry is not counted as truncated")
     assert_true(find(log.records, "rollup summary was cut at max_tokens") is None, "no truncation WARNING when the retry finished cleanly")
     assert_eq(len(calls), 2, "first attempt + one retry")

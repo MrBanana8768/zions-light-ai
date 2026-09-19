@@ -87,12 +87,25 @@ def test_control_finished_reply_returned_verbatim():
 
 def test_cut_reply_retried_and_finishes_cleanly():
     print("\n[test] a cut first attempt, retried once, finishes cleanly -> retry text returned")
+    # v3.1.9.4 (R5 / P16-7 fix). A clean retry no longer wins automatically
+    # — it wins only when it is at least as long as the first attempt
+    # trimmed to a sentence boundary (see main._summarize_once's own
+    # docstring, and test_v3194_r5_p167.py for the dedicated coverage of
+    # the "clean but SHORTER" case this fix closes). The retry text here
+    # is long enough to win that comparison on its own merits, so this
+    # test still covers its own original, narrower claim: a clean retry
+    # CAN win and is returned verbatim, two calls total.
     client = _FakeClient([
         ("the first attempt ran past its cap and got c", "length"),
-        ("a properly finished retry.", "stop"),
+        ("a properly finished retry that is long enough to beat the "
+         "trimmed first attempt in the length comparison outright.", "stop"),
     ])
     out = asyncio.run(main._summarize_once(client, TURNS))
-    check(out == "a properly finished retry.", "retry's text returned")
+    check(
+        out == "a properly finished retry that is long enough to beat the "
+               "trimmed first attempt in the length comparison outright.",
+        "retry's text returned",
+    )
     check(len(client.calls) == 2, "exactly two HTTP calls (guaranteed + one retry)")
 
 

@@ -275,9 +275,14 @@ def test_wiped_record_is_a_permanent_refusal_on_its_own_terms():
 # ---------------------------------------------------------------------------
 
 def test_backfill_discarded_at_final_write_when_wipe_ran_during_the_loop():
-    print("\n[test] W2: a wipe that lands DURING the extraction loop (after "
-          "the early check already passed) still stops the final write — "
-          "the real 'a backfill can run for hours' shape")
+    print("\n[test] W2 (+ v3.1.9.4 R5 / P16-2): a wipe that lands DURING "
+          "the extraction loop (after the early check already passed) "
+          "now stops the loop itself at the top of the NEXT iteration, "
+          "rather than running to completion and only being caught by "
+          "the final-write check — the real 'a backfill can run for "
+          "hours' shape, and P16-2's own finding: before this fix, every "
+          "remaining exchange still spent a real vLLM call before the "
+          "final check discarded the whole result anyway")
     _wipe_storage()
     cid = "w2-mid-run-discard"
     # No pre-existing facts seeded here (unlike the early-discard test
@@ -318,10 +323,58 @@ def test_backfill_discarded_at_final_write_when_wipe_ran_during_the_loop():
     finally:
         facts.extract_facts_from_exchange = orig
 
-    check(calls["n"] == 4, f"the loop kept running to completion (extraction failures don't abort it): {calls['n']}")
+    # v3.1.9.4 (R5 / P16-2 fix). The loop used to keep running to
+    # completion (all 4 exchanges) regardless of the wipe, and only the
+    # LOCKED final-write check discarded the result — burning 2 wasted
+    # vLLM calls here (exchanges 3 and 4), and up to the rest of a
+    # multi-hour run in production. The per-iteration check now catches
+    # the mismatch at the top of the NEXT iteration after the wipe lands
+    # (iteration 3, right after exchange 2's call did the wipe) and stops
+    # immediately — no iteration 3 or 4 call is ever made.
+    check(calls["n"] == 2, f"the loop stopped at the wipe rather than running to completion: {calls['n']}")
     check(memory.current_wipe_generation(cid) == 1, "the mid-loop wipe bumped the generation")
     check(facts.load_facts(cid) == [],
           f"the accumulated facts (built from pre-wipe history) never reached disk: {facts.load_facts(cid)!r}")
+    state = backfill.read_state(cid)
+    check(state is not None and state.get("state") == "wiped",
+          f"the record reads 'wiped', written by the per-iteration check itself: {state!r}")
+
+
+def test_backfill_discarded_at_final_write_when_wipe_ran_after_the_last_extraction_call():
+    print("\n[test] W2, still covered directly: a wipe landing AFTER the "
+          "LAST extraction call (so there is no 'next iteration' for "
+          "P16-2's per-iteration check to catch it on) is still caught by "
+          "the original, LOCKED final-write check — defense in depth for "
+          "the one window the per-iteration check cannot see into")
+    _wipe_storage()
+    cid = "w2-mid-run-discard-last"
+    wipe_generation = memory.current_wipe_generation(cid)
+
+    calls = {"n": 0}
+
+    async def _wipe_after_last(client, vllm_url, model, user_msg, assistant_msg, existing_facts, **kw):
+        calls["n"] += 1
+        if calls["n"] == 4:  # the LAST exchange for _msgs(4)
+            async with memory.conv_lock(cid):
+                memory.bump_wipe_generation(cid)
+                facts.save_facts(cid, [])
+        return [f"fact from exchange {calls['n']}"]
+
+    orig = facts.extract_facts_from_exchange
+    facts.extract_facts_from_exchange = _wipe_after_last
+    try:
+        asyncio.run(backfill._run_backfill(
+            cid, _msgs(4), "http://stub", "m", wipe_generation=wipe_generation,
+        ))
+    finally:
+        facts.extract_facts_from_exchange = orig
+
+    check(calls["n"] == 4, f"all 4 exchanges were attempted (the wipe lands on the last one): {calls['n']}")
+    check(memory.current_wipe_generation(cid) == 1, "the wipe bumped the generation")
+    check(facts.load_facts(cid) == [],
+          f"the accumulated facts never reached disk — the final-write check caught it: {facts.load_facts(cid)!r}")
+    state = backfill.read_state(cid)
+    check(state is not None and state.get("state") == "wiped", f"the record reads 'wiped': {state!r}")
     state = backfill.read_state(cid)
     check(state is not None and state.get("state") == "wiped",
           f"the record reads 'wiped': {state!r}")
@@ -484,6 +537,7 @@ def _all_tests():
         test_backfill_discarded_before_starting_when_wipe_ran_before_first_turn,
         test_wiped_record_is_a_permanent_refusal_on_its_own_terms,
         test_backfill_discarded_at_final_write_when_wipe_ran_during_the_loop,
+        test_backfill_discarded_at_final_write_when_wipe_ran_after_the_last_extraction_call,
         test_backfill_summary_rollup_discarded_after_a_wipe_ran_since_submission,
         test_control_backfill_summary_rollup_builds_normally_with_no_wipe,
         test_rollup_wiring_alone_discards_a_wipe_that_arrives_after_the_facts_write,
