@@ -65,15 +65,100 @@ _ASCII_RUN_RE = re.compile(
              for ch in sorted(_ASCII_RULE_CHARS))
 )
 
+# v3.1.9.5 D2 (p18a F2): the 2026-09-04 corpus that calibrated _RULE_CHARS
+# above is not the corpus that matters now. Measured on 5,895 replies from
+# 2026-09-20: a symbol wall built from SEVEN distinct code points, six of
+# them outside every set this module knows (only U+2501 — already in
+# _RULE_CHARS — was covered). Widening the list is not the fix: the operator
+# named the three characters in the OLD wall in the system prompt and the
+# model moved to seven new ones. A hand-listed set only ever covers symbols
+# already seen.
+#
+# So this is code-point agnostic: ANY character that is neither alphanumeric
+# nor whitespace, in a run long enough to be a wall rather than ordinary
+# repeated punctuation, is decoration — whatever its code point. Calibration
+# (share of the 5,895 replies containing a run of at least this length):
+#
+#     run >=  6   33.0%
+#     run >= 10   32.0%
+#     run >= 20   28.9%
+#     run >= 40   20.6%
+#
+# A third of her ordinary replies already contain a run of 6+ — for example
+# an em-dash-built divider, or "??" doubled into "????" for emphasis — which
+# is exactly why this COLLAPSES rather than rejects: reducing a run to 3
+# keeps a genuine rule or emphasis run readable (an em-dash divider is still
+# a divider; "????" reads the same as "???") and costs nothing when the run
+# turns out to be decoration, while a run under the floor is never touched at
+# all. 6 is chosen over a higher floor (10/20/40) because those leave short,
+# real dividers ("──────", six characters) unstripped, which is the exact
+# defect this rule exists to close; 6 also matches the run floor the module's
+# proposed fix (v3.1.9.5 review, Q4) was calibrated against.
+#
+# Deliberately NOT applied to characters _RULE_CHARS or _ASCII_RULE_CHARS
+# already recognise: those are removed outright by the passes below
+# regardless of run length (a lone box character mid-sentence is still
+# decoration), and collapsing them first would only add a redundant step.
+# This reaches exactly the characters neither existing pass would have
+# touched — the new, unlisted ones.
+_GENERIC_RUN_MIN = 6
+_GENERIC_COLLAPSE_TO = 3
+
 
 def is_rule_char(ch: str) -> bool:
     return ch in _RULE_CHARS
 
 
+def _is_unlisted_decor_char(ch: str) -> bool:
+    """Neither alphanumeric nor whitespace, and not already covered by
+    _RULE_CHARS or the ASCII rule set — i.e. exactly the kind of character a
+    hand-listed set cannot anticipate. Numeric runs ("000000") are
+    alphanumeric and excluded; whitespace is excluded so indentation inside a
+    fenced code block is never touched."""
+    return (
+        ch not in _RULE_CHARS
+        and ch not in _ASCII_RULE_CHARS
+        and not ch.isalnum()
+        and not ch.isspace()
+    )
+
+
+def _collapse_generic_runs(text: str) -> str:
+    """Collapse a run of >= _GENERIC_RUN_MIN identical characters flagged by
+    `_is_unlisted_decor_char` down to _GENERIC_COLLAPSE_TO copies. See the
+    calibration comment above _GENERIC_RUN_MIN for why 6/3 and why collapse
+    rather than remove."""
+    if not text:
+        return text
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if _is_unlisted_decor_char(ch):
+            j = i + 1
+            while j < n and text[j] == ch:
+                j += 1
+            run_len = j - i
+            out.append(
+                ch * (_GENERIC_COLLAPSE_TO if run_len >= _GENERIC_RUN_MIN else run_len)
+            )
+            i = j
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def rule_char_count(text: str) -> int:
     """Unicode rule characters, plus ASCII characters that appear in a run of
-    at least three. The run requirement is what keeps ordinary hyphenation and
-    emphasis out of the count."""
+    at least three, plus any other non-alphanumeric non-whitespace character
+    that appears in a run of at least `_GENERIC_RUN_MIN` (v3.1.9.5 D2). The
+    run requirements are what keep ordinary hyphenation and emphasis out of
+    the count. The third pass counts the FULL run — this function measures
+    how decorated the text is, not how much of it `strip_rule_decoration`
+    leaves behind; the two are allowed to differ, since the strip
+    deliberately keeps a 3-character remainder for readability (see
+    `_collapse_generic_runs`)."""
     if not text:
         return 0
     n = sum(1 for ch in text if ch in _RULE_CHARS)
@@ -85,6 +170,14 @@ def rule_char_count(text: str) -> int:
         if run_len >= _MIN_ASCII_RUN:
             n += run_len
         run_ch, run_len = (ch, 1) if ch in _ASCII_RULE_CHARS else ("", 0)
+    run_ch, run_len = "", 0
+    for ch in text + "\0":
+        if _is_unlisted_decor_char(ch) and ch == run_ch:
+            run_len += 1
+            continue
+        if run_len >= _GENERIC_RUN_MIN:
+            n += run_len
+        run_ch, run_len = (ch, 1) if _is_unlisted_decor_char(ch) else ("", 0)
     return n
 
 
@@ -112,6 +205,11 @@ def strip_rule_decoration(text: str) -> str:
         return text
     out: list[str] = []
     for line in text.split("\n"):
+        # v3.1.9.5 D2: collapse runs of unlisted decoration FIRST, so a wall
+        # built from code points this module has never seen is already down
+        # to 3 characters by the time the curated passes below decide what
+        # to do with it — see _collapse_generic_runs.
+        line = _collapse_generic_runs(line)
         # ASCII runs first, and as a substitution rather than an edge trim:
         # "--- Status ---" needs both ends gone, and "### Heading" needs a
         # prefix gone, and both are the same rule.

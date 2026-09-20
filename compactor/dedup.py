@@ -103,6 +103,7 @@ from starlette.concurrency import run_in_threadpool
 
 import facts as facts_module
 import retrieval as retrieval_module
+import textclean
 from envcfg import env_float, env_int
 
 logger = logging.getLogger("compactor.dedup")
@@ -571,6 +572,27 @@ async def llm_merge_candidate(
     # Minimal sanity: too short isn't a real fact.
     if len(cleaned) < 6:
         return None, "short"
+    # v3.1.9.5 F3: strip rule/box decoration BEFORE judging or storing this
+    # text — the same order commands._handle_remember (v3.1.8) and
+    # facts._parse_extraction_output already use for their own write paths.
+    # facts.is_storable_fact's own docstring names all three as paths that
+    # "should share one definition rather than grow three"; this one was the
+    # miss, and the worst one to miss — a merge REPLACES every fact in the
+    # cluster with this text, where extraction storing a decorated line only
+    # adds one junk row. The `or cleaned` fallback matches the siblings: a
+    # line that is PURE decoration collapses to "", and falling back to the
+    # undecorated original means is_storable_fact still sees it and still
+    # rejects it on "no alphanumeric content", rather than a stripped-to-
+    # empty string silently changing that verdict.
+    #
+    # Placed before BOTH checks below, not just is_storable_fact: stripping
+    # shortens `cleaned`, and the MIN_MERGE_LENGTH_RATIO check just below has
+    # to compare the length that will actually be stored. A merge that only
+    # cleared that ratio because of its decoration now correctly reads as
+    # "collapsed" and preserves the cluster instead of replacing it with a
+    # thin, now-honest, line — the safe direction, since nothing already
+    # stored is lost by preserving the cluster.
+    cleaned = textclean.strip_rule_decoration(cleaned) or cleaned
     # v3.1.1: the SAME predicate the extraction path uses. is_storable_fact's
     # own docstring names this call site — the store has more than one write
     # path and they must share one definition rather than grow three.
