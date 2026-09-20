@@ -9,6 +9,51 @@ on Docker Hub.
 
 ---
 
+## [3.1.9.5] — she stops teaching herself to make walls
+
+On 2026-09-20 her replies filled with walls of symbols and with cascades of
+synonyms that never repeat a word. The cause was in the sampling settings, not
+in this service, and the operator fixed that by configuration. What this patch
+fixes is everything the compactor got wrong ABOUT it: it could not see either
+shape, it memorized both, and one write path had been storing decoration into
+her facts since v3.1.8.
+
+### Fixed
+- **A merged fact is cleaned like every other written fact.** When duplicate
+  facts are merged, the merged text now gets the same decoration strip that
+  extraction and /remember already applied. This one was the worst place to
+  miss it: a merge REPLACES every fact in the cluster, so decoration there
+  destroyed real memory rather than adding a junk row. Live since v3.1.8. The
+  strip runs before the length-ratio check too, so a merge that only passed
+  that check because of its decoration now keeps the original facts instead.
+- **The decoration cleaner no longer needs to know the character.** Any run of
+  six or more identical characters that are neither letters, digits nor spaces
+  collapses to three, whatever it is. The old hand-listed set passed 102 of the
+  120 characters of a measured wall; it now passes 18. It collapses rather than
+  rejects, because a third of her ordinary replies contain a run that long and
+  three characters still read as a divider.
+- **The degeneracy detector can see both new shapes, and redacts only the
+  offending span.** A symbol wall is flagged when a 200-character window is over
+  half symbols and the reply carries 30 or more distinct ones: 1.2% of her real
+  replies overall, and none at all before the regression. A synonym cascade is
+  flagged on a 60-word window that is 98% new words with under 5% function
+  words: zero of the 2,195 replies from 09-07 to 09-14, then a sharp onset from
+  09-15/16 — earlier than the walls, so the two are separate signals. Both
+  thresholds were calibrated against 5,895 of her real replies, and both rules
+  return a span so the rest of the exchange still reaches her memory.
+- **Token counts stopped silently degrading on every one of her turns.** The
+  local counter asked the model's template for a generation prompt
+  unconditionally, which that template refuses whenever the list ends with one
+  of her replies — so her turns were priced by a crude estimate while user and
+  system turns were priced properly, and every budget decision inherited the
+  error. It now chooses the flags the way the exact counter already did. The
+  failure was reported once per process; it is now a rate-limited warning with
+  a streak and a degraded-since, visible at `/health/full`.
+- **`/health/full` reports degeneracy.** Per-rule counters, so a regime like
+  this shows up in health rather than in the operator reading the chat.
+
+---
+
 ## [3.1.9.4] — every defect we could find
 
 The last patch before the database move. It closes hostile pass #14's
