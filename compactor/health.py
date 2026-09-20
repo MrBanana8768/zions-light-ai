@@ -1418,6 +1418,55 @@ def _budget_margin_state() -> dict:
     return {"available": True, **st}
 
 
+def _degeneracy_rule_state() -> dict:
+    """checks.degeneracy_rules: main.degeneracy_rule_counters(), or why it
+    cannot be read. Same call-time, sys.modules-based pattern as
+    _tokenizer_state/_reuse_state/_budget_margin_state above (main.py
+    imports health.py, so a module-level `import main` here would be
+    circular).
+
+    v3195-main M2. Before this, the whole decoration/degeneracy defence had
+    zero production callers of its own measurement functions and zero log
+    lines that fired more than once per process — see SP\\p18a-findings.md
+    F6: "three of textclean's four public functions have zero production
+    callers... the module that measures decoration measures nothing in
+    production." The tail SKIP counter (memory_tail.skipped/
+    skipped_recently, already surfaced below) is the only degeneracy signal
+    that existed before this, and it is necessarily zero whenever the
+    detector itself is blind — which is exactly the state F1 found (every
+    threshold calibrated before the 2026-09-20 shapes existed). This adds
+    a second, independent signal: how many times EACH new rule actually
+    fired, so a regime like 09-17..09-20 (F1's own measured day-by-day
+    table: 0 flagged before, dozens after) is visible here even if nothing
+    downstream ever turns it into a status reason.
+
+    Visibility only, same doctrine as tokenizer/reuse/budget_margin/
+    truncated_summaries above: a nonzero count never moves `status`. These
+    are new rules whose operating points were argued from a real corpus
+    (see main.py's own comment above DEGENERATE_SYMBOL_WINDOW_CHARS) but
+    were never watched in production before now — an operator should be
+    able to see them fire before deciding whether the rate looks right, not
+    have that decision made silently by omission.
+    """
+    main_mod = sys.modules.get("main")
+    if main_mod is None:
+        return {"available": False,
+                "reason": "main is not loaded in this process"}
+    fn = getattr(main_mod, "degeneracy_rule_counters", None)
+    if not callable(fn):
+        return {"available": False,
+                "reason": "main.degeneracy_rule_counters() is not present in this build"}
+    try:
+        st = fn()
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        return {"available": False, "reason": err, "error": err}
+    if not isinstance(st, dict):
+        err = f"main.degeneracy_rule_counters() returned {type(st).__name__}, not a dict"
+        return {"available": False, "reason": err, "error": err}
+    return {"available": True, **st}
+
+
 async def gather_health_full(
     vllm_url: str, target_tokens: int, tokenize: dict | None = None
 ) -> dict:
@@ -1490,6 +1539,9 @@ async def gather_health_full(
     # v3.1.9.4 (R4): same pattern again, for the truncated-summary counters
     # R3/round-2's M1 (P15-6) added.
     truncated_summaries = _truncated_summary_state()
+    # v3195-main M2: same pattern again, for the new degeneracy rules' fire
+    # counts.
+    degeneracy_rules = _degeneracy_rule_state()
 
     # Why a reason list and not a bare string: `bg` used to be computed here,
     # placed in the payload, and never read. Sustained shedding — the pool
@@ -2132,6 +2184,11 @@ async def gather_health_full(
             # `status`, the same doctrine as `tokenizer`/`reuse`/
             # `budget_margin` above.
             "truncated_summaries": truncated_summaries,
+            # v3195-main M2: main.degeneracy_rule_counters(), or
+            # {"available": false, ...}. Visibility only — does not affect
+            # `status`, the same doctrine as `tokenizer`/`reuse`/
+            # `budget_margin`/`truncated_summaries` above.
+            "degeneracy_rules": degeneracy_rules,
         },
         "stats": stats,
         "backups": backup_info,

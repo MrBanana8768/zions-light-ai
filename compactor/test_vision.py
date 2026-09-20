@@ -174,7 +174,12 @@ class VisionTemplateTokenizer:
     # to one occurrence of each marker, instead of the 1 it really is.
     RAW_MARKER_COST = {"[IMG]": 4, "[IMG_BREAK]": 7, "[IMG_END]": 5}
 
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True,
+                             continue_final_message=False):
+        # v3195-main M3: count_tokens now always passes
+        # continue_final_message (previously it never did at all). Accepted
+        # and otherwise ignored here: this double's rendering never
+        # depended on it.
         parts = []
         for m in messages:
             content = m.get("content")

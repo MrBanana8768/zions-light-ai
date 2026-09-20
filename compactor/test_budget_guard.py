@@ -503,7 +503,12 @@ class FramingTokenizer:
 
     FRAMING = "F" * 160  # 40 tokens of framing per call
 
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True,
+                             continue_final_message=False):
+        # v3195-main M3: count_tokens now always passes continue_final_message
+        # (previously it never did, at all -- see that fix's own comment).
+        # Accepted and otherwise ignored here: this double's own behaviour
+        # never depended on it.
         return self.FRAMING + "".join(main._message_text(m) for m in messages)
 
     def encode(self, text):
@@ -1208,7 +1213,11 @@ class NoChatTemplate:
     carries no chat_template.jinja, so apply_chat_template raises before jinja2
     is even reached. encode() keeps this file's 4-chars-per-token convention."""
 
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True,
+                             continue_final_message=False):
+        # v3195-main M3: accept the flag count_tokens now always passes, so
+        # this still raises for the reason the fixture NAMES (no chat
+        # template) rather than a TypeError over an unexpected keyword.
         raise ValueError("tokenizer.chat_template is not set")
 
     def encode(self, text):
