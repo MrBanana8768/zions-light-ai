@@ -729,8 +729,21 @@ def test_tok_real_contract_end_to_end():
         check(main.get_tokenizer() is None and len(calls) == 1,
               "MERGE fixture: one real failed load happened")
         st = main.tokenizer_state()
-        check(sorted(st) == ["failed_at", "last_error", "loaded", "next_retry_at"],
-              f"MERGE: the contract carries exactly the four agreed keys (got {sorted(st)})")
+        # v3195-main M3: tokenizer_state() gained three ADDITIVE keys
+        # (chat_template_fallback_streak/_total/_degraded_since) -- see that
+        # function's own docstring, which now states explicitly that new
+        # keys are safe here because health._tokenizer_state() spreads the
+        # whole dict with **st rather than reading named keys off it one at
+        # a time. This check's job was always "the four ORIGINAL keys are
+        # still here, still named right, still flowing end to end without
+        # mocking" (see this test's own docstring) -- a superset check
+        # preserves exactly that guarantee without also forbidding a
+        # documented, additive extension.
+        check(
+            {"failed_at", "last_error", "loaded", "next_retry_at"} <= set(st),
+            f"MERGE: the contract still carries the four originally-agreed "
+            f"keys (got {sorted(st)})",
+        )
         r = full()
     finally:
         for k, v in saved.items():

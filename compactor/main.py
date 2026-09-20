@@ -506,8 +506,13 @@ def tokenizer_state() -> dict:
     tokenizer-load failure) was also the one with no field anywhere in
     /health/full — `tokenize` is vLLM's /tokenize HTTP endpoint and
     `tokens.is_available()` is the separate mistral_common tekken tokenizer;
-    neither says anything about this cache. The health lane reads exactly
-    these four keys — do not rename or add to them without updating it.
+    neither says anything about this cache. The health lane read exactly
+    these four keys through v3.1.9.4 — do not RENAME or REMOVE any of them
+    without updating health.py's _tokenizer_state(). v3195-main M3 added
+    three more (chat_template_fallback_streak/_total/_degraded_since):
+    purely ADDITIVE is safe with no health.py change, because
+    health._tokenizer_state() spreads this whole dict with `**st` rather
+    than reading named keys off it one at a time.
 
     WALL-CLOCK TIMES OUT, MONOTONIC INSIDE. The backoff gate is kept on
     time.monotonic() so a clock step cannot shorten or stretch it, but a
@@ -531,6 +536,18 @@ def tokenizer_state() -> dict:
         "last_error": _TOKENIZER_LAST_ERROR,
         "failed_at": _wall(_TOKENIZER_FAILED_AT),
         "next_retry_at": _wall(_TOKENIZER_NEXT_RETRY_AT),
+        # v3195-main M3 (ADDITIVE — see this function's own docstring on
+        # why new keys are safe here: health.py spreads this whole dict
+        # with **st, so no health.py change is required for these to
+        # surface at /health/full). count_tokens' own tier-2 fallback
+        # (see _note_chat_template_fallback), kept separate from
+        # last_error/failed_at above, which are about the tokenizer LOAD,
+        # not about a per-call template failure. Wall-clock already —
+        # _chat_template_degraded_since is set from time.time(), not
+        # time.monotonic(), so it does NOT go through _wall().
+        "chat_template_fallback_streak": _chat_template_fallback_streak,
+        "chat_template_fallback_total": _chat_template_fallback_total,
+        "chat_template_degraded_since": _chat_template_degraded_since,
     }
 
 
@@ -1608,6 +1625,75 @@ warnings.filterwarnings(
 )
 
 
+# v3195-main M3. count_tokens's own tier-2 fallback streak, separate from
+# _tokenize_fail_streak above on purpose: that counter is /tokenize, the
+# HTTP endpoint vLLM answers; this one is the in-process tokenizer's own
+# apply_chat_template call, which never leaves the machine and fails for a
+# structurally different reason. tokenize_health() already keeps chat/text/
+# summarizer forms apart for exactly this reason ("a shared streak let one
+# form's success declare the endpoint healthy while another was still
+# failing") — folding a third, unrelated failure class in here would
+# reintroduce that same blur one layer up. Read via tokenizer_state()
+# (below); written only by count_tokens.
+_chat_template_fallback_streak = 0
+_chat_template_fallback_total = 0
+_chat_template_degraded_since: float | None = None
+_chat_template_last_warn_at: float | None = None
+
+
+def _note_chat_template_fallback(detail: str) -> None:
+    """Record one count_tokens tier-2 fallback and warn at most once per
+    TOKENIZE_WARN_INTERVAL_S. Before this it was `logsetup.log_once`, which
+    reports a condition ONCE for the life of the process — the wrong shape
+    for something that (pre-M3-fix) fired on nearly every request; kept
+    rate-limited rather than switched to logging every occurrence for the
+    same reason _note_tokenize_failure is rate-limited, not silenced."""
+    global _chat_template_fallback_streak, _chat_template_fallback_total
+    global _chat_template_degraded_since, _chat_template_last_warn_at
+    now = time.time()
+    _chat_template_fallback_streak += 1
+    _chat_template_fallback_total += 1
+    if _chat_template_degraded_since is None:
+        _chat_template_degraded_since = now
+    if (
+        _chat_template_last_warn_at is not None
+        and (now - _chat_template_last_warn_at) < TOKENIZE_WARN_INTERVAL_S
+    ):
+        return
+    _chat_template_last_warn_at = now
+    suppressed = (
+        "" if _chat_template_fallback_streak == 1
+        else f" (further lines suppressed for {TOKENIZE_WARN_INTERVAL_S:.0f}s)"
+    )
+    logger.warning(
+        f"could not apply the chat template for {MODEL_REPO} ({detail}); "
+        f"using per-message encode()+4 — every token count from this call "
+        f"UNDERCOUNTS by the template's per-message framing, and every "
+        f"budget decision downstream inherits that error. "
+        f"{_chat_template_fallback_streak} consecutive fallback(s), "
+        f"degraded for {now - _chat_template_degraded_since:.0f}s{suppressed}"
+    )
+
+
+def _note_chat_template_success() -> None:
+    """Clear the streak and say so once, the same shape
+    _note_tokenize_success uses for the HTTP counter."""
+    global _chat_template_fallback_streak, _chat_template_degraded_since
+    global _chat_template_last_warn_at
+    if _chat_template_fallback_streak == 0:
+        return
+    streak = _chat_template_fallback_streak
+    since = _chat_template_degraded_since
+    _chat_template_fallback_streak = 0
+    _chat_template_degraded_since = None
+    _chat_template_last_warn_at = None
+    logger.warning(
+        f"count_tokens' chat template is applying again after {streak} "
+        f"consecutive fallback(s)"
+        + (f" over {time.time() - since:.0f}s" if since is not None else "")
+    )
+
+
 def count_tokens(messages: list[dict]) -> int:
     # V3.1: images cost tokens the text estimate can't see — add a flat
     # per-image estimate so VLM requests don't quietly overflow the budget.
@@ -1615,7 +1701,28 @@ def count_tokens(messages: list[dict]) -> int:
     tok = get_tokenizer()
     if tok is not None:
         try:
-            text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            # v3195-main M3: BOTH flags, same rule count_tokens_exact and
+            # tokens.py already apply (see count_tokens_exact's own comment
+            # on this a few hundred lines above for the full incident
+            # history) — this call was the THIRD site of the same rule and
+            # had neither: add_generation_prompt was unconditionally True
+            # and continue_final_message was never passed at all, so the
+            # deployed MistralCommonTokenizer raised for ANY assistant-final
+            # list ("Consider using continue_final_message instead"). The
+            # guard's own per-message cost table
+            # (per = [count_tokens([m]) for m in msgs]) calls this with a
+            # ONE-message list per turn, so every assistant turn in that
+            # table hit this exact shape on every call, fell to the tier-2
+            # fallback below, and was priced by a different instrument than
+            # every user/system turn in the same table (SP\p18c-findings.md,
+            # the count_tokens finding).
+            _asst_final = bool(messages) and messages[-1].get("role") == "assistant"
+            text = tok.apply_chat_template(
+                messages, tokenize=False,
+                add_generation_prompt=not _asst_final,
+                continue_final_message=_asst_final,
+            )
+            _note_chat_template_success()
             # v3.1.9.3: do NOT add the flat estimate for an image the template
             # already priced, AND do not trust len(tok.encode(text)) to have
             # priced it correctly either — two separate bugs this tier's
@@ -1689,23 +1796,26 @@ def count_tokens(messages: list[dict]) -> int:
                 rendered_tokens = len(tok.encode(text))
             return rendered_tokens + unpriced_image_tokens
         except Exception as e:
-            # Tier 2, and until v3.1 it was the tier that always ran while
-            # saying nothing: jinja2 was missing from the venv and the served
-            # vision model carries no chat template, so tier 1 has never
-            # executed in production. The framing this drops is ~22 tokens per
-            # message on Mistral — an error that scales with MESSAGE COUNT, not
-            # content length, which is why a long conversation of short turns
-            # overflows and a short one of long turns does not. It cost ~5,250
-            # tokens against a 32,768 window on 2026-08-27. Once per process:
-            # this runs several times per request. (v3.1 P0-0 / F60.)
-            if logsetup.log_once("count_tokens.chat_template"):
-                logger.warning(
-                    f"could not apply the chat template for {MODEL_REPO} "
-                    f"({type(e).__name__}: {e}); using per-message encode()+4 — "
-                    f"every token count from this process UNDERCOUNTS by the "
-                    f"template's per-message framing, and every budget decision "
-                    f"downstream inherits that error"
-                )
+            # Tier 2. UNTIL v3195-main M3, the comment here blamed jinja2
+            # being missing from the venv — measured false: the shipped
+            # compactor venv has jinja2 3.1.6 (SP\p18c-findings.md). Before
+            # M3's fix just above, this tier ran for every assistant-final
+            # list unconditionally, which the guard's per-message cost
+            # table produces on every single assistant turn of every
+            # request — not the rare, once-ever event `logsetup.log_once`
+            # implies. It is now a genuine failure path (a real tokenizer
+            # fault, an unexpected message shape neither flag combination
+            # covers), which is exactly why it gets a real counter instead
+            # of firing silently forever after its first occurrence: a
+            # condition that fires on nearly every request and a condition
+            # that fires once in the process's life both used to look
+            # identical in the log, and only one of them is fine. The
+            # framing this drops is ~22 tokens per message on Mistral — an
+            # error that scales with MESSAGE COUNT, not content length,
+            # which is why a long conversation of short turns overflows and
+            # a short one of long turns does not. It cost ~5,250 tokens
+            # against a 32,768 window on 2026-08-27. (v3.1 P0-0 / F60.)
+            _note_chat_template_fallback(f"{type(e).__name__}: {e}")
             total = 0
             for m in messages:
                 total += len(tok.encode(_message_text(m))) + 4
@@ -4196,6 +4306,265 @@ _TAIL_LOOP_MAX_UNIT = 400
 _TOKEN_RUN_RE = re.compile(r"(\S{3,40})(?:[ _\n\t]*\1){3,}")
 
 
+# v3195-main M1 — two 2026-09-20 shapes neither rule above sees (see
+# SP\p18a-findings.md F1 and SP\V3195_MAIN_BRIEF.md M1 for the full
+# measurement). Both are "many DIFFERENT symbols, none individually a long
+# run" and "many DIFFERENT words, none individually repeated" — the exact
+# inverse of what every rule above this comment looks for (one character
+# repeated, one token repeated, one script drifted into). Neither is a
+# fraction-over-the-whole-reply question either: _DECOR_CHARS /
+# DEGENERATE_DECOR_FRACTION already tried that shape for decoration and (a)
+# missed 5 of 7 of the new wall's symbols outright and (b) even counting all
+# of them, one wall in an 8k reply is 1-2% of the reply, nowhere near a 45%
+# floor. A wall is short and DENSE; the fix is to look at density in a
+# bounded WINDOW, not a fraction of the whole text.
+#
+# SHAPE A, "the symbol wall": a short run of many DISTINCT Unicode symbols
+# (categories So/Sm/Sk/Sc — math operators, arrows, currency, modifier
+# marks, dingbats — everything _DECOR_CHARS' box-drawing-plus-ASCII-rule
+# list does not cover, deliberately code-point-agnostic so the next symbol
+# the model picks needs no code change here, same reasoning textclean.py's
+# own docstring gives for choosing ranges over an enumeration). Calibrated
+# on 5,895 real replies (measured by the brief's author, not me — I did not
+# open the corpus). Percentiles of "symbols in the worst 200-char window":
+# p50=7, p90=87, p99=173, p99.9=200, max=200. Percentiles of distinct symbol
+# characters per reply: p50=5, p90=18, p99=46, p99.9=100, max=211. Neither
+# signal alone is precise enough to flag on (window>=100 alone flags 8.18%
+# of all real replies; distinct>=30 alone flags 4.09%) but the PAIR is:
+# window>=100 AND distinct>=30 flags 0.53% of real replies overall, and by
+# day: 0 of 2,550 on 09-07..09-16 (before the regression), 6/207, 15/306,
+# 7/152, 4/71 on 09-17..09-20 (across it) — zero before, non-zero exactly
+# across the regression, which is the same signature the brief's own
+# decisive-cut section argues from. The false-positive cost of this pair is
+# a reply kept out of her memory entirely (see decide_memory_tail); 0.53%
+# of ordinary replies is the price being argued for here, not hidden.
+#
+# Window size (200) is part of the calibration above and is NOT an operator
+# knob for the same reason _TAIL_LOOP_WINDOW isn't: changing it invalidates
+# every percentile in this comment. The two CUTS (how many symbols the
+# window must hold, how many distinct symbols the reply must hold) are
+# environment-configurable like every other threshold in this file.
+DEGENERATE_SYMBOL_WINDOW_CHARS = _env_int("COMPACTOR_DEGENERATE_SYMBOL_WINDOW_CHARS", 100)
+DEGENERATE_SYMBOL_DISTINCT = _env_int("COMPACTOR_DEGENERATE_SYMBOL_DISTINCT", 30)
+_SYMBOL_WALL_WINDOW = 200
+_SYMBOL_CATEGORIES = ("So", "Sm", "Sk", "Sc")
+
+# SHAPE B, "the synonym cascade": normal prose repeats constantly (the,
+# and, a pronoun, a name); a reply that runs into a stretch of wide
+# vocabulary with almost no repetition trips none of the rules above
+# either, because nothing repeats for them to catch. This needs its own
+# signal: word novelty (distinct case-folded word tokens / total word
+# tokens) over a bounded WINDOW, not the whole reply — see the calibration
+# note below for why the whole-reply form of this rule, shipped inert in
+# an earlier revision of this lane, was measured WRONG and never activated.
+#
+# CALIBRATED (v3195-main, second pass) over 5,895 real replies, by the
+# brief's author — I did not open the corpus. Two things were tried and
+# rejected before this one, and the reasons matter because they are not
+# obvious from the rule alone:
+#
+# 1. WHOLE-REPLY novelty (this lane's first attempt) does not separate at
+#    any threshold. Percentiles of distinct/total words at reply length
+#    floor W=60: p50=0.323, p90=0.582, p99=0.748, p99.9=0.874, max=0.881.
+#    The max across the ENTIRE 5,895-reply corpus is 0.881 — below 0.90,
+#    the number this lane's first attempt used as its worked example. That
+#    example was a human-pasted EXCERPT of a cascade, not a whole reply: in
+#    situ the cascade is a SECTION of a normal-length reply, and the
+#    surrounding ordinary prose (which repeats constantly) dilutes the
+#    ratio below any usable cut. A whole-reply rule cannot catch this shape
+#    at any threshold that is also safe — confirmed empirically, not
+#    reasoned from first principles.
+# 2. A TRAILING window (last N words) is worse, not better: at W>=60,
+#    novelty>=0.90 over the trailing 200 words flags 1.45% of ALL real
+#    replies — hundreds of ordinary ones. Whatever the cascade's position
+#    in a reply, "the end" is not it often enough to be a usable proxy.
+# 3. Novelty alone, in ANY window, is still not enough: her replies contain
+#    lists, invocations and liturgical text that are legitimately
+#    function-word-free, so a bare high-novelty window fires on ordinary
+#    content too (a minimum stopword fraction over any 100-word window in
+#    the corpus is below 0.05 in 24.4% of replies).
+#
+# THE CONJUNCTION separates cleanly. Over a 60-word sliding window (stride
+# 10), taking the window that maximises (novelty - stopword_fraction) per
+# reply: novelty >= 0.98 AND stopword_fraction < 0.05 in that window flags
+# ZERO of 2,195 replies from 09-07 through 09-14, then a sharp onset —
+# 3 of 204 on 09-15, 51 of 321 on 09-16, climbing to 117 of 306 on 09-18.
+# Overall this pair flags 5.33% of all real replies; a stricter pair
+# (1.00 / 0.02) flags 2.71%, also zero before 09-15. **The onset here is
+# 09-15/09-16 — one to two days BEFORE shape A's 09-19 sampling-parameter
+# change** (see the block comment above DEGENERATE_SYMBOL_WINDOW_CHARS).
+# The two shapes have different onsets, so this rule is a genuinely
+# separate signal, not a redundant re-detection of shape A's regression.
+#
+# Window size (60 words) and stride (10 words) are part of this
+# calibration, the same way the symbol-wall's 200-CHARACTER window is —
+# changing either invalidates every number above. They are still read from
+# the environment (unlike the symbol wall's fixed window) because a future
+# operator retuning this needs to be able to re-measure and re-set them
+# together without a code change; there is no structural reason (unlike
+# _TAIL_LOOP_WINDOW's quadratic-scan concern) to pin them harder than that.
+DEGENERATE_SYNONYM_WINDOW_WORDS = _env_int("COMPACTOR_DEGENERATE_SYNONYM_WINDOW_WORDS", 60)
+DEGENERATE_SYNONYM_WINDOW_STRIDE = _env_int("COMPACTOR_DEGENERATE_SYNONYM_WINDOW_STRIDE", 10)
+DEGENERATE_SYNONYM_NOVELTY_FRACTION = _env_float(
+    "COMPACTOR_DEGENERATE_SYNONYM_NOVELTY_FRACTION", 0.98
+)
+DEGENERATE_SYNONYM_STOPWORD_FRACTION = _env_float(
+    "COMPACTOR_DEGENERATE_SYNONYM_STOPWORD_FRACTION", 0.05
+)
+# Same reasoning as DEGENERATE_MIN_LETTERS for script drift: a reply
+# shorter than this never has even one full window, so it is not judged by
+# this rule at all. Defaults to the window size — deliberately NOT
+# independent of it structurally (see _synonym_cascade_span's own guard):
+# a reply with fewer words than one window can never contain a qualifying
+# window regardless of what this is set to, so setting it below the window
+# size would only be a silent no-op, not a looser floor.
+DEGENERATE_SYNONYM_MIN_WORDS = _env_int("COMPACTOR_DEGENERATE_SYNONYM_MIN_WORDS", 60)
+# Letters only (no digits, no underscore), internal apostrophes kept as
+# part of the word ("don't" is one token, not two) so a contraction-heavy
+# reply is not scored as more novel than it is purely from splitting on the
+# apostrophe.
+_WORD_RE = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?")
+
+# English-only stopword list, because her conversation is English — this
+# is a function-word DENSITY signal, not a language-agnostic one, and a
+# multilingual list would dilute what "low density" means for the language
+# actually being judged. Overridable by environment (a comma-separated
+# list REPLACES this one wholesale, the same "operator knows better" shape
+# COMPACTOR_DEGENERATE_TAIL_LOOP_CHARS and friends already give every other
+# threshold in this file) for a deployment that serves a different
+# language. Standard English function words (articles, pronouns,
+# prepositions, conjunctions, auxiliary/modal verbs, and their common
+# contractions, since _WORD_RE keeps "don't"/"isn't"/"it's" etc. as single
+# tokens) — this is a well-known, closed set of grammatical words, not a
+# creative or proprietary list.
+_DEFAULT_STOPWORDS = frozenset("""
+    a about above after again against all am an and any are aren't as at
+    be because been before being below between both but by can can't
+    cannot could couldn't did didn't do does doesn't doing don't down
+    during each few for from further had hadn't has hasn't have haven't
+    having he he'd he'll he's her here here's hers herself him himself his
+    how how's i i'd i'll i'm i've if in into is isn't it it's its itself
+    let's me more most mustn't my myself no nor not of off on once only or
+    other ought our ours ourselves out over own same shan't she she'd
+    she'll she's should shouldn't so some such than that that's the their
+    theirs them themselves then there there's these they they'd they'll
+    they're they've this those through to too under until up very was
+    wasn't we we'd we'll we're we've were weren't what what's when when's
+    where where's which while who who's whom why why's will with won't
+    would wouldn't you you'd you'll you're you've your yours yourself
+    yourselves
+""".split())
+_STOPWORDS = frozenset(
+    w.strip().lower()
+    for w in os.environ.get("COMPACTOR_DEGENERATE_STOPWORDS", "").split(",")
+    if w.strip()
+) or _DEFAULT_STOPWORDS
+
+
+def _symbol_wall_span(text: str) -> tuple[int, int, int]:
+    """(distinct symbol chars in the whole text, symbol chars in the worst
+    _SYMBOL_WALL_WINDOW-char window, that window's start offset).
+
+    O(n): one pass to classify each character, one running-sum slide across
+    the window. Bounded the same way every other per-reply scan in this
+    function is bounded — this runs on every reply and on every historical
+    turn during redaction (see _TAIL_LOOP_WINDOW's own comment on why an
+    unbounded scan here would be the O(N^2)-on-the-request-path shape this
+    file carries scars from); this scan is linear regardless of window size,
+    so it carries no such risk.
+    """
+    n = len(text)
+    if n == 0:
+        return 0, 0, 0
+    is_sym = [unicodedata.category(c) in _SYMBOL_CATEGORIES for c in text]
+    distinct = len({c for c, s in zip(text, is_sym) if s})
+    w = min(_SYMBOL_WALL_WINDOW, n)
+    cur = sum(is_sym[:w])
+    best, best_start = cur, 0
+    for i in range(w, n):
+        cur += is_sym[i] - is_sym[i - w]
+        if cur > best:
+            best, best_start = cur, i - w + 1
+    return distinct, best, best_start
+
+
+def _synonym_cascade_span(
+    text: str,
+) -> tuple[int, int, float, float] | None:
+    """The DEGENERATE_SYNONYM_WINDOW_WORDS-word window, among all windows at
+    stride DEGENERATE_SYNONYM_WINDOW_STRIDE, that maximises
+    (novelty - stopword_fraction) — the exact selection the calibration in
+    the block comment above DEGENERATE_SYNONYM_WINDOW_WORDS was measured
+    with (SP\\fix-3195-main.md). Returns
+    (char_start, char_end, novelty, stopword_fraction) for that window, or
+    None if the reply has fewer words than one window (nothing to judge —
+    see DEGENERATE_SYNONYM_MIN_WORDS' own comment on why a shorter floor
+    would be a silent no-op regardless).
+
+    Complexity: O(n_words * window / stride) — not the O(n^2) shape
+    _TAIL_LOOP_WINDOW's comment warns against (there is no backtracking or
+    re-scanning of the same word range from multiple starting offsets in an
+    unbounded way; each window's novelty/stopword pass is a fixed W-word
+    slice). At the shipped defaults (60/10) that is 6x the word count, and
+    even a pathologically small stride still only multiplies by the window
+    size, not by itself — no catastrophic case comparable to unbounded regex
+    backtracking exists here.
+    """
+    matches = list(_WORD_RE.finditer(text))
+    n_words = len(matches)
+    w = DEGENERATE_SYNONYM_WINDOW_WORDS
+    # max(), not w alone: DEGENERATE_SYNONYM_MIN_WORDS is a SEPARATE,
+    # independently-configurable floor (see its own comment), but a reply
+    # shorter than one window can never contain a full window regardless of
+    # what that floor is set to — the max() is what keeps a misconfigured
+    # (too-low) MIN_WORDS from being a silent promise this function cannot
+    # keep.
+    if w <= 0 or n_words < max(w, DEGENERATE_SYNONYM_MIN_WORDS):
+        return None
+    words = [m.group(0).lower() for m in matches]
+    stride = max(1, DEGENERATE_SYNONYM_WINDOW_STRIDE)
+    best_score = None
+    best_start_idx = 0
+    best_novelty = 0.0
+    best_stopword_frac = 0.0
+    start_idx = 0
+    while start_idx + w <= n_words:
+        window_words = words[start_idx:start_idx + w]
+        novelty = len(set(window_words)) / w
+        stopword_frac = sum(1 for ww in window_words if ww in _STOPWORDS) / w
+        score = novelty - stopword_frac
+        if best_score is None or score > best_score:
+            best_score = score
+            best_start_idx = start_idx
+            best_novelty = novelty
+            best_stopword_frac = stopword_frac
+        start_idx += stride
+    char_start = matches[best_start_idx].start()
+    char_end = matches[best_start_idx + w - 1].end()
+    return char_start, char_end, best_novelty, best_stopword_frac
+
+
+# v3195-main M2. How often each new rule above actually fires, since v3.1.8's
+# own textclean.py comment already names the pattern this closes: a defence
+# with no counter is a defence nobody can see working or failing (see
+# SP\p18a-findings.md F6 — three of textclean's four public functions had
+# zero production callers, and the only degeneracy signal health had was the
+# tail SKIP counter, which is zero exactly when the detector is blind). Read
+# with degeneracy_rule_counters(); written only by
+# _reply_degenerate_verdict_uncached, at each rule's own return. Lifetime
+# counts, no window, no reset short of a process restart — same contract as
+# _COMPACTION_COUNTERS just above, which this mirrors deliberately.
+_DEGENERACY_RULE_COUNTERS = {
+    "symbol_wall": 0,
+    "word_novelty": 0,
+}
+
+
+def degeneracy_rule_counters() -> dict:
+    """A copy of the new-rule fire counts (see above), for /health/full."""
+    return dict(_DEGENERACY_RULE_COUNTERS)
+
+
 # Shared by trim_to_last_sentence and _trim_forwarded_prefix: each
 # independently scanned `text.splitlines(keepends=True)` for lines starting
 # with ``` and built the same list of toggle offsets, before this existed
@@ -4777,6 +5146,56 @@ def _reply_degenerate_verdict_uncached(text: str) -> tuple[str | None, int | Non
             f"a single character repeated {len(m.group(0))} times "
             f"(limit {DEGENERATE_RUN_CHARS})"
         ), m.start(), m.end()
+    # v3195-main M1, shape A ("the symbol wall"): many DIFFERENT symbol
+    # characters packed densely in one place, which the run rule above (one
+    # REPEATED character) and the decoration-fraction rule below (a
+    # fraction over the WHOLE reply) both miss by construction. See the
+    # block comment above DEGENERATE_SYMBOL_WINDOW_CHARS for the
+    # calibration. Reports a SPAN (the worst window itself), which is what
+    # the brief asks for and what F4's displacement finding argues for: a
+    # rule that redacts the junk region costs the rest of the reply
+    # nothing, where a whole-reply skip costs all of it.
+    _sym_distinct, _sym_window, _sym_start = _symbol_wall_span(text)
+    if (
+        _sym_window >= DEGENERATE_SYMBOL_WINDOW_CHARS
+        and _sym_distinct >= DEGENERATE_SYMBOL_DISTINCT
+    ):
+        _DEGENERACY_RULE_COUNTERS["symbol_wall"] += 1
+        _sym_w = min(_SYMBOL_WALL_WINDOW, n)
+        return (
+            f"{_sym_window} symbol characters ({_sym_distinct} distinct) in "
+            f"a {_sym_w}-char window (limit {DEGENERATE_SYMBOL_WINDOW_CHARS} "
+            f"in-window / {DEGENERATE_SYMBOL_DISTINCT} distinct)"
+        ), _sym_start, _sym_start + _sym_w
+    # v3195-main M1, shape B ("the synonym cascade"): a WINDOW of almost
+    # every word used exactly once, low on function words, which nothing
+    # above this line can see because nothing repeats for a repetition rule
+    # to catch. CALIBRATED (second pass — see the block comment above
+    # DEGENERATE_SYNONYM_WINDOW_WORDS for the full measurement and why a
+    # whole-reply form of this rule, this lane's first attempt, never
+    # separated on the real corpus and shipped inert). Reports the
+    # qualifying window's own SPAN, same reasoning as the symbol-wall rule
+    # above: the redaction machinery can cut the cascade out and keep the
+    # rest of the reply, which matters here more than for shape A — this
+    # fires on up to a third of replies on the worst measured day, and
+    # losing that many whole exchanges from memory would cost more than the
+    # cascades themselves.
+    _cascade = _synonym_cascade_span(text)
+    if _cascade is not None:
+        _casc_start, _casc_end, _casc_novelty, _casc_stopword_frac = _cascade
+        if (
+            _casc_novelty >= DEGENERATE_SYNONYM_NOVELTY_FRACTION
+            and _casc_stopword_frac < DEGENERATE_SYNONYM_STOPWORD_FRACTION
+        ):
+            _DEGENERACY_RULE_COUNTERS["word_novelty"] += 1
+            return (
+                f"a {DEGENERATE_SYNONYM_WINDOW_WORDS}-word window with "
+                f"{100 * _casc_novelty:.0f}% novel words and "
+                f"{100 * _casc_stopword_frac:.0f}% function words (limit "
+                f">={100 * DEGENERATE_SYNONYM_NOVELTY_FRACTION:.0f}% novel, "
+                f"<{100 * DEGENERATE_SYNONYM_STOPWORD_FRACTION:.0f}% function "
+                f"words)"
+            ), _casc_start, _casc_end
     # Script drift. Counted over LETTERS, not characters, so punctuation,
     # markdown and code do not dilute it.
     # NFKC first: MATHEMATICAL BOLD / DOUBLE-STRUCK / FULLWIDTH letters are
