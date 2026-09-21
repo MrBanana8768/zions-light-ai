@@ -1028,21 +1028,26 @@ def _swallow_tail(coro, label=None):
         pass
 
 
-def _post_chat(messages, conv_id):
+def _post_chat(messages, conv_id, extra=None):
     """One real POST /v1/chat/completions with vLLM stubbed.
 
     -> (response, forwarded_body, log_records). forwarded_body is None if the
-    handler never reached the upstream call."""
+    handler never reached the upstream call. `extra`, if given, is merged
+    into the request JSON (e.g. `{"max_tokens": 300}` — v3.1.9.6, lane
+    v3196-overflow, M9's own max_tokens-clamp check)."""
     _StubVLLM.sent.clear()
     handler = _CaptureLogs()
     lg = logging.getLogger("compactor")
     lg.addHandler(handler)
+    body = {"model": "stub-model", "messages": messages, "stream": False}
+    if extra:
+        body.update(extra)
     try:
         with patch.object(main.httpx, "AsyncClient", _StubVLLM), \
              patch.object(main, "_fire_and_forget", _swallow_tail):
             r = client.post(
                 "/v1/chat/completions",
-                json={"model": "stub-model", "messages": messages, "stream": False},
+                json=body,
                 headers={"X-Conversation-Id": conv_id},
             )
     finally:
@@ -1063,25 +1068,69 @@ def _system_text(msgs):
     )
 
 
+_MEASURED_RE = re.compile(r"-> (\d+) tokens")
+
+
+def _final_measured(record):
+    """The guard's own post-shed token count from its verdict line
+    ("N -> M tokens (limit ...)") — v3.1.9.6, lane v3196-overflow. M9's
+    rework needs the EXACT number the guard measured (not a hand-derived
+    estimate) to compute what a max_tokens clamp should land on."""
+    m = _MEASURED_RE.search(record.getMessage()) if record is not None else None
+    return int(m.group(1)) if m else None
+
+
 def test_endpoint_forwards_both_caller_system_messages():
     print("\n[test] POST /v1/chat/completions — the caller's system messages reach vLLM (M9)")
     # The property, end to end: the guard may spend the memory WE injected and
     # may not spend what the CLIENT sent. Two caller system messages, one
-    # injected facts block, and a final user turn larger than the entire
-    # budget — so the guard runs every stage to exhaustion and cannot reach the
-    # fit whatever it sheds. That last part is what makes this test decisive:
-    # if the payload could be made to fit by dropping the injected block alone,
-    # a broken call site would stop there too and the mutation would live.
+    # injected facts block, and a final user turn sized so the guard cannot
+    # reach the POLICY target (800 = HARD_INPUT_LIMIT) even after dropping
+    # every injected block — but the payload still fits the REAL window
+    # (MAX_MODEL_LEN=1000) with room to spare.
+    #
+    # v3.1.9.6 (lane v3196-overflow): the ORIGINAL fixture here used
+    # big("user", 2000) — a user turn alone bigger than MAX_MODEL_LEN itself,
+    # which the reworked request path now correctly REFUSES before ever
+    # reaching vLLM (see test_endpoint_refuses_the_over_ceiling_payload,
+    # below, which keeps exactly that fixture and its own assertion). That
+    # was never a good test of "the guard shouldn't refuse a servable
+    # payload" — it constructed a payload too big for the whole model, and
+    # the 200 this test used to assert only came from a stub that accepts
+    # any size; a real vLLM would have rejected it too. M9's actual property
+    # (the caller's system messages are never spent; the injected block is
+    # spent instead; the call site passes the real protect count) needs a
+    # payload that is oversized RELATIVE TO POLICY but genuinely servable —
+    # exactly the shape 2026-09-18/19/21 production evidence showed vLLM
+    # accepting. `MIN_GENERATION_FLOOR` is lowered for this test only (and
+    # restored in `finally`) so the real serve limit sits above the 800
+    # policy limit, the same way a generous MAX_MODEL_LEN/GENERATION_RESERVE
+    # ratio does in production (32768/12000, not 1000/200) — see
+    # MIN_GENERATION_FLOOR's own comment in main.py for why 1000/200 alone
+    # would otherwise INVERT the two limits (a separate fix,
+    # `main._serve_floor`, closes that; this test does not depend on it,
+    # since lowering the floor here keeps it well under GENERATION_RESERVE
+    # either way).
     cid = "m9-endpoint"
     facts.save_facts(cid, [{"text": FACT_TEXT, "added_turn": 1, "last_used": 100}])
+    # persona (~50 tok) + CALLER2 (~250 tok) + a 550-token user turn ~= 850
+    # once facts are shed -- over the 800-token POLICY limit, comfortably
+    # under the ~950-token serve limit this test's floor override opens up.
     msgs = [
         {"role": "system", "content": PERSONA},
         {"role": "system", "content": CALLER2},
-        big("user", 2000),
+        big("user", 550),
     ]
     assert_eq(len(_systems(msgs)), 2, "fixture: the CLIENT sent two system messages")
 
-    r, forwarded, records = _post_chat(msgs, cid)
+    saved_floor = main.MIN_GENERATION_FLOOR
+    main.MIN_GENERATION_FLOOR = 50
+    try:
+        r, forwarded, records = _post_chat(
+            msgs, cid, extra={"max_tokens": 300},
+        )
+    finally:
+        main.MIN_GENERATION_FLOOR = saved_floor
     assert_eq(r.status_code, 200, f"the request completed (body: {r.text[:200]!r})")
     assert_true(forwarded is not None, "the request reached the vLLM stub")
 
@@ -1094,6 +1143,12 @@ def test_endpoint_forwards_both_caller_system_messages():
     assert_true(
         _sys_dropped(line) >= 1,
         f"injected memory was there to spend, and was spent: {line.getMessage()}",
+    )
+    assert_true(
+        line.getMessage().startswith("hard budget FAILED to fit:"),
+        f"fixture: still misses the POLICY target even with everything "
+        f"droppable gone — the shape M9 needs, not a payload that "
+        f"trivially fit: {line.getMessage()}",
     )
 
     sys_text = _system_text(forwarded["messages"])
@@ -1114,6 +1169,56 @@ def test_endpoint_forwards_both_caller_system_messages():
         forwarded["messages"][-1]["content"],
         msgs[-1]["content"],
         "the user's own turn was forwarded intact",
+    )
+
+    # v3.1.9.6 (lane v3196-overflow, item 1 REWORK): the max_tokens clamp.
+    # 300 requested + ~850 measured > MAX_MODEL_LEN (1000), so the request
+    # path must have reduced it rather than sending it unclamped for vLLM
+    # to reject.
+    measured = _final_measured(line)
+    assert_true(measured is not None, "fixture: the verdict line carried a number")
+    expected_room = main.MAX_MODEL_LEN - measured
+    assert_true(
+        expected_room < 300,
+        f"fixture: 300 requested must actually exceed the room left "
+        f"({expected_room}), or the clamp below is not exercised",
+    )
+    assert_eq(
+        forwarded.get("max_tokens"), expected_room,
+        f"max_tokens 300 -> {forwarded.get('max_tokens')} (expected "
+        f"{expected_room} = MAX_MODEL_LEN - {measured}), clamped rather "
+        f"than sent unclamped for a guaranteed vLLM 400",
+    )
+
+
+def test_endpoint_refuses_the_over_ceiling_payload():
+    print("\n[test] POST /v1/chat/completions — a payload over MAX_MODEL_LEN "
+          "itself is refused before the call, never reaching the stub (M9's "
+          "original fixture)")
+    # The companion CONTROL to the rework above: M9's ORIGINAL fixture (a
+    # user turn alone bigger than the whole 1000-token MAX_MODEL_LEN) is
+    # genuinely unservable — even vLLM's own auto-clamped generation
+    # (get_max_tokens, see MIN_GENERATION_FLOOR's comment in main.py) needs
+    # SOME room, and there is none left once the newest turn alone already
+    # exceeds the ceiling. The request path must refuse this BEFORE calling
+    # vLLM, not rely on a stub that happens to accept any size.
+    cid = "m9-over-ceiling"
+    msgs = [
+        {"role": "system", "content": PERSONA},
+        {"role": "system", "content": CALLER2},
+        big("user", 2000),
+    ]
+    r, forwarded, records = _post_chat(msgs, cid)
+    assert_eq(r.status_code, 400, f"refused, not relayed to the stub (body: {r.text[:200]!r})")
+    assert_true(forwarded is None, "the stub was never reached")
+    line = _budget_line(records)
+    assert_true(
+        line is not None and line.getMessage().startswith("hard budget FAILED to fit:"),
+        "the guard's own verdict still fired before the refusal",
+    )
+    assert_true(
+        any("refusing to forward to vLLM" in r.getMessage() for r in records),
+        "and the pre-flight refusal is itself logged",
     )
 
 
@@ -1375,6 +1480,58 @@ class _StubVLLMRefusing(_StubVLLM):
         return _StubRejectedResponse(self.status, self.body)
 
 
+class _StubVLLMSequenced(_StubVLLM):
+    """_StubVLLM whose response is SCRIPTED per call, by index (0 = the
+    first attempt, 1 = the one automatic retry v3.1.9.6/item 2 added,
+    clamped to the last entry for any call beyond the script's length).
+    `bodies` is a class attribute (list of (status, body) tuples) set
+    before posting -- same shape as `_StubVLLMRefusing`'s `status`/`body`,
+    generalised to more than one call."""
+
+    bodies: list = [(400, "")]
+
+    def _next(self):
+        i = len(_StubVLLM.sent)
+        idx = min(i, len(self.bodies) - 1)
+        return self.bodies[idx]
+
+    def stream(self, method, url, json=None, **kwargs):
+        _StubVLLM.sent.append(json)
+        status, body = self._next()
+        return _StubStreamCM(_StubStreamResponse(status, body))
+
+    async def post(self, url, json=None, **kwargs):
+        _StubVLLM.sent.append(json)
+        status, body = self._next()
+        return _StubRejectedResponse(status, body)
+
+
+def _post_sequenced(messages, conv_id, bodies, *, stream=True):
+    """POST one chat completion whose upstream response is scripted call by
+    call (v3.1.9.6, lane v3196-overflow, item 2's automatic retry: the
+    fixed-body `_post_rejected` below cannot distinguish "the retry helped"
+    from "the retry didn't help", which is exactly what a stub needs to do
+    to test that mechanism). -> (response, log records, sent bodies)."""
+    _StubVLLM.sent.clear()
+    handler = _CaptureLogs()
+    lg = logging.getLogger("compactor")
+    lg.addHandler(handler)
+    margin_before = main._BUDGET_MARGIN
+    stub = type("_SS", (_StubVLLMSequenced,), {"bodies": bodies})
+    try:
+        with patch.object(main.httpx, "AsyncClient", stub), \
+             patch.object(main, "_fire_and_forget", _swallow_tail):
+            r = client.post(
+                "/v1/chat/completions",
+                json={"model": "stub-model", "messages": messages, "stream": stream},
+                headers={"X-Conversation-Id": conv_id},
+            )
+    finally:
+        lg.removeHandler(handler)
+        main._BUDGET_MARGIN = margin_before
+    return r, handler.records, list(_StubVLLM.sent)
+
+
 def _post_rejected(messages, conv_id, *, status=400, body=None, stream=True,
                    exact_tokens=None):
     """POST one chat completion that vLLM refuses.
@@ -1539,21 +1696,59 @@ def test_retry_is_promised_only_when_the_rejection_taught_us_something():
     # Observed 2026-08-27: three consecutive failures moved the margin +127
     # each while it needed ~5250, and the same "send it again" advice produced
     # the same failure. Advice that cannot work is a lie with a friendly face.
+    #
+    # v3.1.9.6 (lane v3196-overflow, item 2): a rejection that TEACHES the
+    # calibration something is no longer just described in a message -- it
+    # triggers ONE automatic, transparent retry (re-shed against the
+    # just-widened margin and resend) before the user ever sees anything.
+    # `_rejection_user_message` (CONTEXT_OVERFLOW_RETRY/NO_RETRY) is reached
+    # only once the retry budget is SPENT: on attempt 0, a rejection that
+    # is context-overflow, status<500 AND `tightened` always triggers the
+    # retry instead (never reaches the message); on attempt 1 (the retry
+    # itself), it always falls through to the message regardless of
+    # `tightened`. So the two SHAPES actually reachable here are (B) a
+    # retry that fires but whose own rejection teaches nothing further --
+    # NO_RETRY -- and (C) no retry attempted at all because the FIRST
+    # rejection already taught nothing -- also NO_RETRY, immediately.
+    #
+    # A retry whose OWN rejection tightens the margin FURTHER (reaching
+    # CONTEXT_OVERFLOW_RETRY as the final message) is real but not
+    # reachable in THIS file's 1000-token window: `_note_backend_rejection`
+    # floors every widening at `overshoot + 512`, so at this window's
+    # MAX_MODEL_LEN // 4 cap (250) any successful widening at all jumps
+    # STRAIGHT to the cap -- there is no smaller step to widen again from
+    # on a second rejection. That shape needs a window where 512 is small
+    # relative to the cap; it is proven directly, at production scale, in
+    # test_v3196_overflow.py's MUTATION 2 probe (MAX_MODEL_LEN=2,000,000).
     margin_before = main._BUDGET_MARGIN
     try:
+        # Case B: the retry fires (the FIRST rejection taught something --
+        # margin 0 -> the cap) but its own rejection teaches nothing
+        # further (identical reported size; the cap is already reached).
         main._BUDGET_MARGIN = 0
-        r, _records, _t = _post_rejected([user("hi")], "rej-retry")
-        first = _assistant_text(_sse_chunks(r))
-        assert_true(main.CONTEXT_OVERFLOW_RETRY.strip() in first,
-                    "a rejection that tightened the budget invites a resend")
-
-        # Now pin the margin at the cap so the same rejection can teach nothing.
-        main._BUDGET_MARGIN = main.MAX_MODEL_LEN // 4
-        r, _records, _t = _post_rejected([user("hi")], "rej-no-retry")
+        r, _records, sent = _post_sequenced(
+            [user("hi")], "rej-retry-then-nothing",
+            bodies=[(400, ctx_400(1234)), (400, ctx_400(1234))],
+        )
+        assert_eq(len(sent), 2, "fixture: the automatic retry actually fired")
         second = _assistant_text(_sse_chunks(r))
         assert_true(main.CONTEXT_OVERFLOW_NO_RETRY.strip() in second,
-                    "a rejection that taught nothing says so instead")
+                    "a rejection whose own retry taught nothing further "
+                    "says so instead")
         assert_true(main.CONTEXT_OVERFLOW_RETRY.strip() not in second,
+                    "and does not invite a resend that would fail identically")
+
+        # Case C: the margin is ALREADY at its cap before the first attempt
+        # -- nothing to teach, so no retry is even ATTEMPTED (a single call,
+        # not two), and the message is NO_RETRY immediately.
+        main._BUDGET_MARGIN = main.MAX_MODEL_LEN // 4
+        r, _records, _t = _post_rejected([user("hi")], "rej-no-retry")
+        assert_eq(len(_StubVLLM.sent), 1,
+                  "fixture: already-capped teaches nothing, so no retry is attempted")
+        third = _assistant_text(_sse_chunks(r))
+        assert_true(main.CONTEXT_OVERFLOW_NO_RETRY.strip() in third,
+                    "a rejection that taught nothing from the start says so")
+        assert_true(main.CONTEXT_OVERFLOW_RETRY.strip() not in third,
                     "and does not invite a resend that would fail identically")
     finally:
         main._BUDGET_MARGIN = margin_before
@@ -2498,24 +2693,45 @@ def test_one_unfittable_conversation_does_not_narrow_the_window_for_the_others()
     # change nothing if the endpoint never tells it what the guard decided —
     # and the guard's verdict is computed ~200 lines from the rejection path,
     # which is exactly the distance A8's defect survived at.
+    #
+    # v3.1.9.6 (lane v3196-overflow, item 1 REWORK): this fixture (a single
+    # user turn of 2,000 local tokens ALONE inside a 1,000-token
+    # MAX_MODEL_LEN test window) is genuinely unservable under the reworked
+    # request path too -- not merely over its POLICY target -- so it is now
+    # refused BEFORE vLLM is ever called (see test_endpoint_refuses_the_
+    # over_ceiling_payload, which pins that response shape directly). D4's
+    # property is if anything STRONGER for this exact case now: the ORIGINAL
+    # form of this test observed the rejection PATH declining to learn from
+    # a predicted 400; the reworked path removes the predicted 400 (and the
+    # vLLM call that would have produced it) entirely, so there is no
+    # rejection at all for _note_backend_rejection to decline learning
+    # from, and _BUDGET_MARGIN provably cannot move -- verified directly
+    # below, rather than by grepping for a log line from a code path this
+    # fixture no longer reaches.
     saved = (main._BUDGET_MARGIN, main._budget_ok_streak)
     try:
         main._BUDGET_MARGIN = 0
         msgs = [{"role": "system", "content": PERSONA}, big("user", 2000)]
-        _r, records, _tails = _post_rejected(
-            msgs, "d4-unfittable", body=ctx_400(2500)
-        )
+        r, forwarded, records = _post_chat(msgs, "d4-unfittable")
+        assert_eq(r.status_code, 400, "refused before the call, not forwarded")
+        assert_true(forwarded is None, "the stub was never reached")
         assert_true(
-            any("hard budget FAILED to fit" in r.getMessage() for r in records),
+            any("hard budget FAILED to fit" in rec.getMessage() for rec in records),
             "precondition: the guard knew this payload did not fit",
         )
-        assert_true(
-            any("NOT widening the budget margin" in r.getMessage() for r in records),
-            "so the rejection that followed was not treated as new information",
+        assert_eq(
+            main._BUDGET_MARGIN, 0,
+            "the process-wide margin did not move -- there was no rejection "
+            "for _note_backend_rejection to even see",
         )
         assert_true(
-            not any("Tightening the hard limit" in r.getMessage() for r in records),
-            "and the process-wide margin was left alone for everyone else",
+            not any(
+                "Tightening the hard limit" in rec.getMessage()
+                or "NOT widening the budget margin" in rec.getMessage()
+                for rec in records
+            ),
+            "and neither calibration branch fired at all -- this turn never "
+            "reached _note_backend_rejection",
         )
     finally:
         (main._BUDGET_MARGIN, main._budget_ok_streak) = saved
@@ -2544,6 +2760,7 @@ def _all_tests():
         test_protected_unfittable_payload_still_forwards_at_error,
         test_alternation_repair_survives_protected_shedding,
         test_endpoint_forwards_both_caller_system_messages,
+        test_endpoint_refuses_the_over_ceiling_payload,
         test_call_site_passes_the_callers_system_count,
         test_tier2_fallback_is_not_silent,
         test_chunk_to_budget,

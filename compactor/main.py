@@ -58,13 +58,16 @@ from envcfg import env_bool, env_float
 from memory import (
     StoreUnreadable,
     UnsafeConvId,
+    atomic_write_json,
     bump_wipe_generation,
     conv_lock,
     current_wipe_generation,
     ensure_storage_layout,
     facts_path,
     list_known_conv_ids,
+    read_json,
     resolve_conv_id,
+    storage_root,
     storage_summary,
     summary_path,
 )
@@ -139,6 +142,51 @@ HARD_INPUT_LIMIT = min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - GENERATION_RESERV
 # hard limit leaves headroom for that discrepancy rather than pretending it is
 # zero. See count_tokens_exact and REMEDIATION P0-0c.
 TARGET_TOKENS = _env_int("COMPACTOR_TARGET_TOKENS", int(HARD_INPUT_LIMIT * 0.75))
+# v3.1.9.6 (lane v3196-overflow, item 1 REWORK). GENERATION_RESERVE (above) is
+# a POLICY choice — how much room we would LIKE to leave for a reply — not
+# vLLM's own hard requirement. Read straight from the pinned vLLM 0.19.0
+# source shipped in this stack's own image
+# (angreg/zions-light-ai:v3.1.9.4-cu12,
+# vllm/entrypoints/openai/engine/serving.py `_validate_input`,
+# vllm/entrypoints/utils.py `get_max_tokens`):
+#
+#   * vLLM rejects ONLY when `token_num >= max_model_len` (the input alone,
+#     regardless of any reply), OR when the REQUEST carries an explicit
+#     `max_tokens`/`max_completion_tokens` AND `token_num + max_tokens >
+#     max_model_len`.
+#   * When the request carries NO explicit max_tokens, there is no second
+#     check at all — `get_max_tokens` computes the actual generation budget
+#     as `min(max_model_len - token_num, ...)`, i.e. vLLM AUTO-CLAMPS the
+#     reply to whatever room is left. It never 400s for this reason.
+#
+# So a payload that exceeds GENERATION_RESERVE's policy target but still sits
+# under MAX_MODEL_LEN is NOT a guaranteed 400 — it is a request vLLM will
+# serve, just with less room for the reply than the policy would like. The
+# first cut of this lane's item 1 treated "exceeds the policy limit after
+# full shedding" as "cannot be served" and refused before ever calling vLLM
+# — which the pod's own log disproved: three 2026-09-18/19/21 events shed to
+# ~23,200 tokens against an enforced ~20,674-token POLICY limit (MAX_MODEL_LEN
+# 32768, GENERATION_RESERVE 12000), logged "hard budget FAILED to fit", and
+# vLLM's own log shows ZERO context-length rejections for that window — every
+# one was forwarded, accepted and answered, comfortably under the REAL
+# 32,768-token ceiling. Refusing those would have turned three answered
+# turns into three lost ones, the opposite of this lane's whole purpose.
+#
+# MIN_GENERATION_FLOOR is the ONLY thing item 1 now refuses on: the smallest
+# reply worth generating at all. Below it, a request is technically
+# servable (vLLM will auto-clamp and generate SOMETHING) but the something is
+# not worth the round trip — a handful of tokens cannot complete a sentence,
+# let alone answer. 256 is chosen to sit in the same order of magnitude this
+# codebase already treats as a legitimate complete unit (a quarter of
+# SUMMARY_MAX_TOKENS, above, which is sized for a WHOLE compaction summary,
+# not a full reply) — enough for a short but complete paragraph — while
+# staying comfortably below GENERATION_RESERVE's own default (16384), so this
+# floor is reached only when the window is genuinely exhausted, never as a
+# routine substitute for the policy reserve. An operator serving very short,
+# terse replies by design can lower it; one whose replies run long should
+# raise it, since a reply auto-clamped to exactly this floor will read as cut
+# off mid-thought.
+MIN_GENERATION_FLOOR = _env_int("COMPACTOR_MIN_GENERATION_FLOOR", 256)
 # The scale assumed when /tokenize cannot be reached and the summarizer must
 # size batches anyway. See the fallback in summarize() for why this is 2.0 and
 # not 1.0 — a counter you cannot check must be assumed wrong in the direction
@@ -623,7 +671,84 @@ def backend_is_multimodal() -> bool:
 # MAX_MODEL_LEN//4 ceiling on its first rejection and every other conversation
 # in the process paid. It now only learns from a rejection the guard did not
 # already predict — see _note_backend_rejection's `guard_measured_overflow`.
-_BUDGET_MARGIN = 0
+#
+# v3.1.9.6 (lane v3196-overflow, item 3): persisted. Until this release the
+# global above reset to 0 on every restart — supervisord.conf:87 runs one
+# uvicorn process, so a redeploy is a full-process restart — and the backstop
+# this comment describes then re-learned itself the same way it was first
+# learned: by failing on her, once, right after every deploy. That is exactly
+# the shape this lane exists to close, one layer up from the request path.
+#
+# Persisted the way every other piece of degraded-mode state in this codebase
+# is (tokenize_health, the backend-multimodal flag, facts, personas):
+# best-effort, atomic (memory.atomic_write_json — temp file + fsync +
+# os.replace, so a crash mid-write cannot leave a value the next read chokes
+# on), and a missing OR corrupt file means "start clean" — margin 0, learned
+# fresh from the next rejection — never a raised exception on the request
+# path. `_load_budget_margin` also re-clamps to the SAME MAX_MODEL_LEN // 4
+# bound `_note_backend_rejection` enforces on every learning step, so a stale
+# file from a process that ran under a larger MAX_MODEL_LEN cannot hand this
+# one a margin that would crush its own window.
+#
+# Read ONCE, here, at import — not re-read per request. The whole point of
+# `_BUDGET_MARGIN` being a plain module global (v3.1 A10, above) is that one
+# in-process read/write is uncontended; polling disk on every request would
+# both cost an I/O per request and reopen a read-during-write race the atomic
+# write exists to prevent. `_save_budget_margin` is called only at the two
+# places this value actually changes — `_note_backend_rejection` (widens) and
+# `_note_backend_accepted` (decays) — never on a request that left it alone.
+#
+# Whether a PER-PROCESS value is even the right thing to persist is a
+# separate question from whether to persist it at all, and this lane
+# deliberately does not answer it: see fix-3196-overflow.md's report for why
+# (the 2026-08-28 case this module's own D4 comment already documents — one
+# conversation's residual costing every OTHER conversation 8,192 tokens of
+# window — gets WORSE, not better, once that cost also survives a restart,
+# and the honest fix is scoping the margin per-conversation or per-shape, not
+# persisting the process-wide number more durably). Flagged for the owner,
+# not redesigned here.
+_BUDGET_MARGIN_STATE_PATH = storage_root() / "budget_margin.json"
+
+
+def _load_budget_margin() -> int:
+    """The margin a previous process learned and persisted, clamped to this
+    process's own MAX_MODEL_LEN // 4 bound, or 0.
+
+    `read_json` already treats an absent or corrupt file as "no value" — the
+    same "unreadable means start clean" contract facts.py, persona.py and
+    summarizer.py all use for their own on-disk state. A value that parses
+    but is not a plausible margin (wrong type, `bool` — a `bool` is an `int`
+    subclass in Python and would otherwise silently pass the isinstance
+    check — negative, or simply absent) is ALSO start-clean: this number is
+    a backstop for a `/tokenize` outage, not memory, and a stale or
+    tampered one silently taxing the window forever is worse than re-earning
+    it from one real rejection."""
+    raw = read_json(_BUDGET_MARGIN_STATE_PATH, default=None)
+    if not isinstance(raw, dict):
+        return 0
+    v = raw.get("margin")
+    if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+        return 0
+    return min(v, MAX_MODEL_LEN // 4)
+
+
+def _save_budget_margin(value: int) -> None:
+    """Best-effort persistence, called only when `_BUDGET_MARGIN` actually
+    changes. A write failure (read-only volume, disk pressure) must not fail
+    the request whose rejection triggered the learning — it only means the
+    NEXT process starts from whatever was last durably saved rather than
+    this exact value."""
+    try:
+        atomic_write_json(_BUDGET_MARGIN_STATE_PATH, {"margin": value})
+    except Exception as e:
+        logger.warning(
+            f"context calibration: could not persist budget margin {value} "
+            f"({type(e).__name__}: {e}); it will re-learn from the next "
+            f"rejection rather than surviving this process if it restarts"
+        )
+
+
+_BUDGET_MARGIN = _load_budget_margin()
 
 # Every wording vLLM has used to state the prompt size in a context-length 400,
 # read out of the pinned engines rather than guessed. A regex that silently
@@ -748,6 +873,12 @@ def _note_backend_accepted() -> None:
     _budget_ok_streak = 0
     before = _BUDGET_MARGIN
     _BUDGET_MARGIN = 0 if before <= 512 else before // 2
+    # v3.1.9.6 (lane v3196-overflow, item 3): persist every actual change,
+    # release included — not just the widenings below. A process that
+    # decayed its margin to 0 in memory but never told disk would hand the
+    # NEXT restart the pre-decay value right back, silently undoing the
+    # release this log line just announced.
+    _save_budget_margin(_BUDGET_MARGIN)
     logger.info(
         f"context calibration: {BUDGET_MARGIN_RELEASE_AFTER} consecutive "
         f"accepted requests — releasing budget margin {before} -> "
@@ -886,6 +1017,11 @@ def _note_backend_rejection(
                     # process state this rejection just disproved.
                     _budget_ok_streak = 0
                     tightened = True
+                    # v3.1.9.6 (lane v3196-overflow, item 3): persist the
+                    # widening so a restart right after this rejection does
+                    # not throw the correction away and re-learn it by
+                    # failing on her again.
+                    _save_budget_margin(_BUDGET_MARGIN)
                     logger.warning(
                         f"context calibration: vLLM counted {actual} tokens where "
                         f"we budgeted <= {measured_against} ({limit_src}) — our "
@@ -2927,6 +3063,185 @@ def budget_margin_state() -> dict:
         "release_after": BUDGET_MARGIN_RELEASE_AFTER,
         "ok_streak": _budget_ok_streak,
     }
+
+
+# v3.1.9.6 (lane v3196-overflow, item 1 REWORK). A shortened reply budget is
+# a real cost to her — a request that would otherwise have had
+# GENERATION_RESERVE tokens of room now has only whatever MAX_MODEL_LEN left
+# after the prompt — and "count it at /health/full" (the coordinator's own
+# instruction) is what makes that visible instead of a WARNING nobody is
+# watching. Counted the same way `_reuse_stats`/`_budget_ok_streak` are: a
+# plain module global, no lock — uvicorn runs this single-process with a
+# cooperative event loop (supervisord.conf has no --workers), the same
+# reasoning `_note_backend_accepted`'s own docstring already gives for its
+# read-modify-write.
+_max_tokens_clamp_stats = {
+    "clamped": 0,
+    "last_clamped_monotonic": None,
+    "last_original_max_tokens": None,
+    "last_clamped_to": None,
+}
+
+
+def _note_max_tokens_clamped(original: int, clamped_to: int) -> None:
+    """One outgoing request had its `max_tokens` reduced so the prompt+reply
+    would fit MAX_MODEL_LEN instead of taking a guaranteed 400 from vLLM's
+    own `token_num + max_tokens > max_model_len` check. Called from both the
+    original send and the one automatic retry (see `_fit_request_for_vllm`,
+    this function's only caller)."""
+    _max_tokens_clamp_stats["clamped"] += 1
+    _max_tokens_clamp_stats["last_clamped_monotonic"] = time.monotonic()
+    _max_tokens_clamp_stats["last_original_max_tokens"] = original
+    _max_tokens_clamp_stats["last_clamped_to"] = clamped_to
+
+
+def max_tokens_clamp_state() -> dict:
+    """CONTRACT for a future health.py `_max_tokens_clamp_state()`, mirroring
+    `budget_margin_state()`/`reuse_decline_state()` immediately above —
+    health.py cannot import main at module scope, so every one of these is
+    read the same call-time, sys.modules-based way (see `_tokenizer_state()`
+    in health.py for the established pattern). NOTE (v3196-overflow): this
+    lane's brief is scoped to `compactor/main.py` only, so the health.py
+    side that would call this and add a `checks.max_tokens_clamp` key to
+    `/health/full` (the same shape `checks.budget_margin` already has) is
+    NOT wired yet — see fix-3196-overflow.md's report for the exact,
+    smallest addition health.py still needs; this function is what it should
+    call once added.
+
+    Returns {"clamped": int, "last_clamped_age_s": float | None,
+    "last_original_max_tokens": int | None, "last_clamped_to": int | None}.
+    `clamped` is a lifetime count for this process (0 = it has never had to
+    shorten a reply for this reason). Read-only, cheap, never raises."""
+    last_at = _max_tokens_clamp_stats["last_clamped_monotonic"]
+    return {
+        "clamped": _max_tokens_clamp_stats["clamped"],
+        "last_clamped_age_s": (
+            (time.monotonic() - last_at) if last_at is not None else None
+        ),
+        "last_original_max_tokens": _max_tokens_clamp_stats["last_original_max_tokens"],
+        "last_clamped_to": _max_tokens_clamp_stats["last_clamped_to"],
+    }
+
+
+def _serve_floor(effective_limit: int) -> int:
+    """How many tokens of reply `_fit_request_for_vllm` insists on leaving
+    room for, given THIS request's own policy reserve.
+
+    v3.1.9.6 (lane v3196-overflow, item 1 REWORK — the coordinator's second
+    correction). `MIN_GENERATION_FLOOR` alone can INVERT the two limits the
+    request path compares: `effective_limit` (what `_enforce_hard_budget`
+    sheds toward — MAX_MODEL_LEN minus `max(GENERATION_RESERVE,
+    req_max_tokens)`, an OPERATOR POLICY choice) versus the serve limit
+    (MAX_MODEL_LEN minus the floor). An operator who sets
+    `COMPACTOR_GENERATION_RESERVE` below the shipped floor default (256) —
+    200, say, meaning they have explicitly accepted 200-token replies as
+    good enough — ends up with a POLICY limit (800, at MAX_MODEL_LEN=1000)
+    HIGHER than the SERVE limit (744) the flat floor would enforce. The
+    guard then certifies a payload as fitting its own target while this
+    function would still refuse it — two "the window is this big" answers
+    that disagree, from two computations that are supposed to describe the
+    same request.
+
+    The floor here can never be responsible for that: it is capped at
+    `max(GENERATION_RESERVE, req_max_tokens)` — recovered as `MAX_MODEL_LEN
+    - effective_limit`, the exact room the POLICY already reserves — so an
+    operator who has already accepted a smaller reply budget has that
+    acceptance HONOURED, not overruled by a flat default sized for nobody's
+    actual configuration. `min(MIN_GENERATION_FLOOR, that room)`:
+
+      * When the policy reserve is generous (the common case — the shipped
+        GENERATION_RESERVE default is 16384), this returns
+        MIN_GENERATION_FLOOR unchanged: the floor is the binding constraint,
+        exactly the REWORK's original behaviour.
+      * When the policy reserve is smaller than MIN_GENERATION_FLOOR, this
+        returns the policy reserve instead: the serve limit becomes AT MOST
+        MAX_MODEL_LEN - reserve == effective_limit, so `_fit_request_for_
+        vllm` can never refuse (or need to clamp) a payload the guard has
+        already certified as fitting its own, smaller target. Inversion
+        made impossible by construction, not by a test that happens to
+        catch it: `serve_limit = MAX_MODEL_LEN - _serve_floor(...)  >=
+        MAX_MODEL_LEN - min(MIN_GENERATION_FLOOR, MAX_MODEL_LEN -
+        effective_limit)  >=  effective_limit` always, for any
+        effective_limit `_enforce_hard_budget` was ever handed.
+
+    `effective_limit` is clamped to `[256, MAX_MODEL_LEN]` by its own
+    formula (`chat_completions`), so `MAX_MODEL_LEN - effective_limit` is
+    always in `[0, MAX_MODEL_LEN - 256]` — never negative, needing no
+    defensive `max(0, ...)` here.
+    """
+    return min(MIN_GENERATION_FLOOR, MAX_MODEL_LEN - effective_limit)
+
+
+def _fit_request_for_vllm(
+    body: dict, measured: int | None, conv_id: str | None, effective_limit: int,
+) -> tuple[dict, bool, int | None]:
+    """The ONE decision that replaces the old "forward best effort" /
+    blanket pre-flight refusal (v3.1.9.6, lane v3196-overflow, item 1
+    REWORK — see MIN_GENERATION_FLOOR's own comment for the vLLM-source
+    evidence this is built on).
+
+    `measured` is the guard's own token count for `body["messages"]`
+    (`guard_report["measured"]`) — None only from the cheap prescreen path,
+    which is itself proof the payload is nowhere near any of the limits
+    below. `effective_limit` is the SAME policy limit `_enforce_hard_budget`
+    was handed for this request (`effective_limit - _time_reserve` at the
+    guard's own call site — passing the narrower, reserve-inclusive value
+    here only makes `_serve_floor` MORE conservative, never less, so the
+    small mismatch is harmless) — see `_serve_floor` for why this function
+    needs it at all: a flat floor can certify a request as fitting its
+    policy target while still refusing to serve it, when the operator's own
+    GENERATION_RESERVE is smaller than MIN_GENERATION_FLOOR.
+
+    Returns `(body, refuse, needed_floor)`:
+      - `refuse` is True only when even `measured` tokens of input PLUS
+        `_serve_floor(effective_limit)` PLUS the current `_BUDGET_MARGIN` (a
+        safety cushion for exactly the undercount this margin already exists
+        to correct — see its own module-level comment) would exceed
+        MAX_MODEL_LEN. This is the ONLY case nothing can be done about:
+        vLLM's own `token_num >= max_model_len` check would refuse the
+        input alone, floor or no floor. `needed_floor` is `measured +
+        _serve_floor(effective_limit) + _BUDGET_MARGIN - MAX_MODEL_LEN` (how
+        far over, for the honest message) when `refuse` is True, else None.
+      - Otherwise `refuse` is False and `body` is returned with `max_tokens`
+        CLAMPED DOWN when — and only when — the request already carries an
+        explicit one (the client's own, or an earlier request-path clamp)
+        that would combine with `measured` to exceed MAX_MODEL_LEN. A
+        request with NO explicit `max_tokens` is returned untouched:
+        vLLM's own `get_max_tokens` already auto-bounds generation to
+        `max_model_len - token_num` in that case (see MIN_GENERATION_FLOOR's
+        comment), so inventing one here would only add a NEW failure mode
+        (a clamp computed from OUR possibly-undercounted `measured`) where
+        none existed.
+
+    `measured` is pre-time-line — the current-time line (added later, at
+    most `_time_line_token_reserve` tokens) is not folded in here. That is
+    the conservative direction for `refuse` (very slightly more likely to
+    forward, never less) and irrelevant for the clamp (undercounting the
+    prompt by <100 tokens against a floor sized in the hundreds does not
+    change which branch a real request lands in).
+    """
+    if measured is None:
+        return body, False, None
+    floor = _serve_floor(effective_limit)
+    if measured + floor + _BUDGET_MARGIN > MAX_MODEL_LEN:
+        return body, True, measured + floor + _BUDGET_MARGIN - MAX_MODEL_LEN
+    requested = body.get("max_tokens")
+    if isinstance(requested, int) and not isinstance(requested, bool):
+        room = MAX_MODEL_LEN - measured - _BUDGET_MARGIN
+        if requested > room:
+            # room >= floor is guaranteed by the refuse check just above (it
+            # would have returned already otherwise).
+            logger.warning(
+                f"conv={conv_id or '?'}: clamping max_tokens {requested} -> "
+                f"{room} so this request fits MAX_MODEL_LEN ({MAX_MODEL_LEN}) "
+                f"— the prompt measured {measured} tokens (+{_BUDGET_MARGIN} "
+                f"margin), leaving less room to reply than requested rather "
+                f"than a guaranteed 400 from vLLM's own "
+                f"token_num + max_tokens > max_model_len check"
+            )
+            _note_max_tokens_clamped(requested, room)
+            body = {**body, "max_tokens": room}
+    return body, False, None
 
 
 async def compact_if_needed(
@@ -10523,6 +10838,61 @@ def _rejection_user_message(err_body: str, tightened: bool) -> tuple[str, str]:
     return REQUEST_REJECTED_MESSAGE, "backend_rejected"
 
 
+def _guard_predicted_overflow_reply(
+    guard_report: dict, measured: int, over_by: int, irreducible: bool
+) -> str:
+    """The honest reply for the case vLLM never even sees (v3.1.9.6, lane
+    v3196-overflow, item 1 REWORK): even after shedding everything the
+    guard is permitted to shed, `measured` tokens of input plus
+    MIN_GENERATION_FLOOR plus the current `_BUDGET_MARGIN` still exceed
+    MAX_MODEL_LEN — see `_fit_request_for_vllm`, the only caller. This is
+    now a NARROW case: exceeding the POLICY reserve (GENERATION_RESERVE)
+    after full shedding is NOT this case any more — see MIN_GENERATION_
+    FLOOR's own module-level comment for the pod evidence (three
+    2026-09-18/19/21 events shed past the policy limit and were forwarded,
+    accepted and answered by vLLM with zero rejections) that the FIRST cut
+    of this lane's item 1 got wrong by refusing on the policy signal
+    instead of the real one.
+
+    This message is returned WITHOUT ever calling vLLM, so it carries no
+    promise a retry might work (there is nothing new for a retry to
+    measure) and it names the real numbers, because CONTEXT_OVERFLOW_MESSAGE
+    alone was the exact complaint that shipped against production — "too
+    large" with nothing a reader could act on.
+
+    `irreducible` distinguishes the one cause this guard can state with
+    confidence — the caller's own system prompt plus the newest turn
+    (neither of which `_enforce_hard_budget` may ever shed) is alone over
+    the window, so shedding could not have helped no matter how much of it
+    ran — from the rarer case where `_shed_last_resort` hit its own
+    measurement cap with content nominally still spendable (already a
+    separate WARNING; see that function's own docstring). The second case
+    is a compactor limitation, not evidence the user's message itself is
+    too big, and the reply says so rather than guessing.
+    """
+    numbers = (
+        f" The compactor measured this request at {measured:,} tokens; even "
+        f"with everything it is permitted to shed already gone "
+        f"({guard_report.get('dropped_turns', 0)} old turn(s) dropped, "
+        f"{guard_report.get('dropped_blocks', 0)} memory block(s) dropped, "
+        f"{guard_report.get('trimmed_blocks', 0)} trimmed), that plus the "
+        f"smallest reply worth generating ({MIN_GENERATION_FLOOR:,} tokens) "
+        f"is {over_by:,} token(s) more than this model's "
+        f"{MAX_MODEL_LEN:,}-token context window."
+    )
+    cause = (
+        "Your most recent message, together with the conversation's system "
+        "prompt, is larger than the model's context window all by itself — "
+        "there is nothing left this compactor is permitted to remove, so "
+        "sending it again will fail the same way."
+        if irreducible else
+        "The compactor's own shedding pass gave up before finishing — a "
+        "compactor limitation, not a sign this particular message is too "
+        "large. The operator should check the compactor log."
+    )
+    return f"{_REJECTED_PREAMBLE} {cause}{numbers} {_REJECTED_MEMORY_NOTE}"
+
+
 def _sent_token_size(messages: list[dict]) -> tuple[int | None, str]:
     """Our own size for a payload, and WHICH counter produced it.
 
@@ -11783,7 +12153,81 @@ async def chat_completions(request: Request) -> Any:
         and guard_report.get("measured") is not None
         and guard_report["measured"] <= enforced_limit
     )
-    calibration_overflow = guard_measured_overflow and not _reserve_band
+    # v3.1.9.6 (lane v3196-overflow, item 1 REWORK). The FIRST cut of this
+    # lane refused to forward whenever the guard missed the POLICY limit
+    # (`effective_limit`, GENERATION_RESERVE folded in) after full shedding
+    # — and the coordinator caught it against real pod evidence: vLLM 0.19.0
+    # (read from the pinned image; see MIN_GENERATION_FLOOR's own comment)
+    # only refuses on the REAL ceiling, MAX_MODEL_LEN, not on our own
+    # generosity policy. `_fit_request_for_vllm` is that real check —
+    # `refuse` is True only when even `MIN_GENERATION_FLOOR` tokens of reply
+    # would not fit beside `measured` (plus the `_BUDGET_MARGIN` safety
+    # cushion) inside MAX_MODEL_LEN. Everything that fails the OLD
+    # `calibration_overflow` signal but passes this one now falls through
+    # and is forwarded, `max_tokens` clamped if the client asked for more
+    # room than is actually left (same function, see its own docstring).
+    body, _refuse, _over_by = _fit_request_for_vllm(
+        body, guard_report.get("measured"), conv_id, effective_limit,
+    )
+    if _refuse:
+        # Whether the last-resort pass reached the TRUE floor — the
+        # caller's own system prompt plus the newest turn, neither of which
+        # _enforce_hard_budget may ever spend — or merely hit its own
+        # measurement cap with content nominally still spendable (a
+        # separate, already-logged WARNING; see _shed_last_resort's own
+        # docstring). Recomputed with the SAME pure helper the guard itself
+        # used, on the SAME shed array (`body["messages"]` here is exactly
+        # what `_enforce_hard_budget` returned — the merges and tail repair
+        # below have not run yet), rather than a second copy of the floor
+        # logic that could drift from the first: this module's own most-
+        # repeated lesson.
+        _residual_droppable = _droppable_system_indices(
+            body["messages"], caller_system
+        )
+        _overflow_message = _guard_predicted_overflow_reply(
+            guard_report, guard_report.get("measured"), _over_by,
+            irreducible=not _residual_droppable,
+        )
+        logger.error(
+            f"conv={conv_id or '?'}: refusing to forward to vLLM — even "
+            f"{MIN_GENERATION_FLOOR} tokens of reply would not fit beside "
+            f"the measured input inside MAX_MODEL_LEN ({MAX_MODEL_LEN}, "
+            f"{_over_by} token(s) short); vLLM was never called for this "
+            f"turn, and nothing about it will be memorized"
+        )
+        # Same accounting the vLLM-rejected paths already give: an empty,
+        # unfinished "reply" that decide_memory_tail treats as SKIPPED_EMPTY
+        # (lossless) rather than a stored turn — the compactor's own apology
+        # can never become a memory, and this path never generated one.
+        if conv_id:
+            _run_memory_tail(
+                conv_id, "", finished=False, truncated=False, holed=False,
+                touched_facts=touched_facts, last_user_text=last_user_text,
+                turn_index=turn_index, messages=messages,
+                injected_facts=injected_facts,
+                wipe_generation=_tail_wipe_generation_snapshot,
+            )
+        if bool(body.get("stream", False)):
+            async def _overflow_stream():
+                for chunk in _request_rejected_stream_chunks(
+                    body.get("model") or MODEL_REPO or "",
+                    _overflow_message, "context_length_exceeded",
+                ):
+                    yield f"data: {json.dumps(chunk)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+            return StreamingResponse(
+                _overflow_stream(), media_type="text/event-stream"
+            )
+        return JSONResponse(
+            content={
+                "error": {
+                    "message": _overflow_message,
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                }
+            },
+            status_code=400,
+        )
     if _reserve_band and logsetup.log_once(f"time_injection.reserve_band.{conv_id or '?'}"):
         # Once per conversation, not once per process (logsetup.log_once's
         # usual grain): a process serves many conversations, and "no room for
@@ -11817,9 +12261,15 @@ async def chat_completions(request: Request) -> Any:
         # that does matter.
         logger.info(f"conv={conv_id or '?'}: {_tail_note}")
     # v3.1.9: date her newest message - the very last change to the payload.
-    # Not when the guard measured the payload as NOT fitting: that request is
-    # already over the window with nothing left the guard may spend, and a
-    # line could only make the rejection vLLM is about to send more certain.
+    # Not when the guard measured the payload as NOT fitting the POLICY
+    # limit: that conversation already has less room to reply than
+    # GENERATION_RESERVE would like (v3.1.9.6, lane v3196-overflow, item 1
+    # REWORK — this no longer means vLLM will reject the request, only that
+    # it is tight; see MIN_GENERATION_FLOOR's own comment), and spending a
+    # few more tokens on a line, when the request is already forwarding with
+    # a clamped or reduced reply budget, is not worth it. Unchanged by this
+    # lane's rework — a smaller, separate policy choice this fix leaves as
+    # it found it.
     if _time_line is not None:
         if guard_measured_overflow:
             logger.info(
@@ -11847,86 +12297,225 @@ async def chat_completions(request: Request) -> Any:
 
         async def event_stream():
             vllm_failed = False
+            # v3.1.9.6 (lane v3196-overflow, item 2): the body actually sent
+            # this attempt. Starts as the request as prepared above; a
+            # context-overflow rejection that TAUGHT the calibration
+            # something (see `tightened` below) replaces it with a re-shed
+            # copy for exactly one more attempt — never more, see the
+            # `_attempt == 0` gate a few lines down.
+            send_body = body
             try:
                 try:
-                    stream_cm = client.stream(
-                        "POST", f"{VLLM_URL}/v1/chat/completions", json=body
-                    )
-                    async with stream_cm as r:
-                        if r.status_code >= 400:
-                            # vLLM rejected the request (e.g. a 400 from chat-
-                            # template validation). Relaying its JSON error body
-                            # raw into a text/event-stream gives the UI a garbled
-                            # reply; degrade visibly instead, like the
-                            # connection-error branch below.
-                            #
-                            # v3.1: "visibly" used to mean visible to a HUMAN
-                            # only. The pair below ended finish_reason "stop"
-                            # and the response had already committed HTTP 200,
-                            # so a rejection was indistinguishable from a reply
-                            # to every machine in the path — INCIDENT §4.3 A5.
-                            # On 2026-08-24 23:49 that is exactly what happened:
-                            # a context-length 400 after 139.9s of compaction,
-                            # 200 in openwebui.log, 200 in compactor.log, and
-                            # the only trace two unattributed WARNINGs. So the
-                            # branch now says what happened at ERROR, and hands
-                            # the client an error-typed pair.
-                            vllm_failed = True
-                            # Truncate AFTER parsing, not before. vLLM states
-                            # the true prompt size mid-sentence, so the old
-                            # 300-char cut ran through the one number that
-                            # explains the rejection — in the body shape seen in
-                            # production it landed just inside the cut, which is
-                            # luck, not a margin. The log line still shows 300.
-                            err_body = (await r.aread()).decode("utf-8", "replace")[:2000]
-                            sent_tokens, sent_source = await run_in_threadpool(
-                                _sent_token_size, body["messages"]
-                            )
-                            # Before _note_backend_rejection, which is what moves
-                            # the margin the line reports against.
-                            _log_request_rejected(
-                                conv_id, r.status_code, err_body, sent_tokens,
-                                sent_source, enforced_limit, streaming=True,
-                            )
-                            # v3.1 A8: enforced_limit is what the guard
-                            # ACTUALLY shed against. Without it the calibration
-                            # reconstructed a limit from HARD_INPUT_LIMIT and
-                            # only ever understated the overshoot, so a client
-                            # asking for a large completion could learn nothing
-                            # and still be told to retry.
-                            tightened = _note_backend_rejection(
-                                err_body, enforced_limit,
-                                guard_measured_overflow=calibration_overflow,
-                            )
-                            if r.status_code < 500:
-                                # A 4xx means the backend is HEALTHY and refused
-                                # our request; only 5xx/unreachable justifies the
-                                # "starting up or restarting" message.
-                                message, code = _rejection_user_message(
-                                    err_body, tightened
+                    # At most two POSTs to vLLM for this turn: the original,
+                    # and — only when eligible — one automatic retry. Every
+                    # branch below either `return`s (nothing left to try),
+                    # `yield`s the client its answer and falls through to
+                    # `finally` (also nothing left to try), or `continue`s
+                    # with `send_body` replaced (the one retry). No bytes are
+                    # ever yielded before `r.status_code` is known — see the
+                    # `else:` branch below, which is the ONLY place this
+                    # generator yields real content — so a retry can never
+                    # fire after anything has reached the client; a request
+                    # that surprises us AFTER we started streaming is not
+                    # something a second POST could fix anyway.
+                    for _attempt in range(2):
+                        stream_cm = client.stream(
+                            "POST", f"{VLLM_URL}/v1/chat/completions",
+                            json=send_body,
+                        )
+                        async with stream_cm as r:
+                            if r.status_code >= 400:
+                                # vLLM rejected the request (e.g. a 400 from chat-
+                                # template validation). Relaying its JSON error body
+                                # raw into a text/event-stream gives the UI a garbled
+                                # reply; degrade visibly instead, like the
+                                # connection-error branch below.
+                                #
+                                # v3.1: "visibly" used to mean visible to a HUMAN
+                                # only. The pair below ended finish_reason "stop"
+                                # and the response had already committed HTTP 200,
+                                # so a rejection was indistinguishable from a reply
+                                # to every machine in the path — INCIDENT §4.3 A5.
+                                # On 2026-08-24 23:49 that is exactly what happened:
+                                # a context-length 400 after 139.9s of compaction,
+                                # 200 in openwebui.log, 200 in compactor.log, and
+                                # the only trace two unattributed WARNINGs. So the
+                                # branch now says what happened at ERROR, and hands
+                                # the client an error-typed pair.
+                                vllm_failed = True
+                                # Truncate AFTER parsing, not before. vLLM states
+                                # the true prompt size mid-sentence, so the old
+                                # 300-char cut ran through the one number that
+                                # explains the rejection — in the body shape seen in
+                                # production it landed just inside the cut, which is
+                                # luck, not a margin. The log line still shows 300.
+                                err_body = (await r.aread()).decode("utf-8", "replace")[:2000]
+                                sent_tokens, sent_source = await run_in_threadpool(
+                                    _sent_token_size, send_body["messages"]
                                 )
-                                chunks = _request_rejected_stream_chunks(
-                                    body.get("model") or MODEL_REPO or "",
-                                    message, code, detail=err_body[:300],
+                                # Before _note_backend_rejection, which is what moves
+                                # the margin the line reports against.
+                                _log_request_rejected(
+                                    conv_id, r.status_code, err_body, sent_tokens,
+                                    sent_source, enforced_limit, streaming=True,
                                 )
+                                # v3.1 A8: enforced_limit is what the guard
+                                # ACTUALLY shed against. Without it the calibration
+                                # reconstructed a limit from HARD_INPUT_LIMIT and
+                                # only ever understated the overshoot, so a client
+                                # asking for a large completion could learn nothing
+                                # and still be told to retry.
+                                #
+                                # guard_measured_overflow=False, ALWAYS, by
+                                # construction (v3.1.9.6 REWORK): the pre-flight
+                                # check above (`_fit_request_for_vllm`) only ever
+                                # refuses when even MIN_GENERATION_FLOOR tokens of
+                                # reply would not fit inside MAX_MODEL_LEN — and
+                                # that case never reaches this line at all (it
+                                # returns before vLLM is ever called). Every
+                                # rejection vLLM sends US is therefore a genuine
+                                # surprise: either the input itself was
+                                # undercounted past MAX_MODEL_LEN, or a clamped/
+                                # requested max_tokens was computed from an
+                                # undercounted `measured`. Both are real evidence
+                                # the calibration should learn from — unlike the
+                                # OLD policy-relative signal this replaces
+                                # (`calibration_overflow`), which was True on
+                                # every ordinary "exceeded GENERATION_RESERVE but
+                                # still servable" request and would have wrongly
+                                # suppressed learning from exactly these
+                                # surprises.
+                                tightened = _note_backend_rejection(
+                                    err_body, enforced_limit,
+                                    guard_measured_overflow=False,
+                                )
+                                # v3.1.9.6 (lane v3196-overflow, item 2): vLLM's
+                                # 400 reports the ACTUAL prompt size —
+                                # `_reported_prompt_tokens`, already parsed inside
+                                # `_note_backend_rejection` — an exact measurement
+                                # of our own undercount, not a guess. Re-shed and
+                                # resend ONCE, transparently, instead of handing
+                                # the user a failure a second POST could have
+                                # avoided. Four conditions, all necessary:
+                                #   - `_attempt == 0`: the one retry budget, spent.
+                                #     A SECOND rejection (of the retry itself)
+                                #     always falls through to the honest message
+                                #     below, no matter what it says.
+                                #   - `r.status_code < 500`: the backend is
+                                #     healthy and refused OUR request; a 5xx/
+                                #     unreachable is the restarting-backend
+                                #     branch below, and nothing there is helped
+                                #     by resending sooner.
+                                #   - `_is_context_overflow(err_body)`: the ONE
+                                #     rejection shape re-shedding can fix. Every
+                                #     other 4xx (modality, alternation, a
+                                #     malformed payload) needs a different
+                                #     remedy, and re-shedding tokens would not
+                                #     touch it.
+                                #   - `tightened`: the margin ACTUALLY moved.
+                                #     `_enforce_hard_budget` reads `_BUDGET_MARGIN`
+                                #     as a module global, so calling it again
+                                #     below picks up the correction for free — but
+                                #     only if there IS one. Without this gate a
+                                #     rejection the margin was already wide enough
+                                #     for (already at its MAX_MODEL_LEN // 4 cap,
+                                #     say) would re-shed the SAME array against
+                                #     the SAME limit, resend an IDENTICAL payload,
+                                #     and fail identically — the "three
+                                #     consecutive failures ... +127 each time"
+                                #     loop `_note_backend_rejection`'s own P0-0b
+                                #     comment already warns against, one layer up
+                                #     and now spending a real vLLM round trip on
+                                #     it instead of just a log line.
+                                if (
+                                    _attempt == 0
+                                    and r.status_code < 500
+                                    and _is_context_overflow(err_body)
+                                    and tightened
+                                ):
+                                    _retry_report: dict = {}
+                                    _resent = await run_in_threadpool(
+                                        _enforce_hard_budget,
+                                        send_body["messages"],
+                                        effective_limit - _time_reserve,
+                                        caller_system,
+                                        _retry_report,
+                                        _time_reserve,
+                                        _standin_protected,
+                                    )
+                                    _resent = _merge_adjacent_system_messages(_resent)
+                                    _resent = _merge_consecutive_same_role(_resent)
+                                    _retry_body = {**send_body, "messages": _resent}
+                                    _repair_template_invalid_tail(_retry_body)
+                                    # v3.1.9.6 (lane v3196-overflow, item 4): the
+                                    # SAME serve/clamp rule the original send used
+                                    # — the re-shed retry can still carry an
+                                    # explicit max_tokens (the client's own, or an
+                                    # earlier clamp) that no longer fits beside
+                                    # the NEWLY measured retry body. `_refuse`
+                                    # here is intentionally not acted on: a retry
+                                    # this lane already decided to attempt (via
+                                    # `tightened`) that turns out to be
+                                    # genuinely unservable is rare enough (the
+                                    # margin that made `tightened` True already
+                                    # narrows the target) that falling through to
+                                    # vLLM's own rejection and the existing
+                                    # honest-message machinery below is simpler
+                                    # and no less correct than a second
+                                    # pre-flight refusal path here.
+                                    _retry_body, _, _ = _fit_request_for_vllm(
+                                        _retry_body, _retry_report.get("measured"),
+                                        conv_id, effective_limit,
+                                    )
+                                    logger.warning(
+                                        f"conv={conv_id or '?'}: vLLM rejected "
+                                        f"this payload as over its context "
+                                        f"window (our estimate undercounted it "
+                                        f"by the amount just logged above); "
+                                        f"re-shedding against the just-widened "
+                                        f"budget margin and resending ONCE, "
+                                        f"before the user sees a failure"
+                                    )
+                                    send_body = _retry_body
+                                    continue
+                                if r.status_code < 500:
+                                    # A 4xx means the backend is HEALTHY and refused
+                                    # our request; only 5xx/unreachable justifies the
+                                    # "starting up or restarting" message.
+                                    message, code = _rejection_user_message(
+                                        err_body, tightened
+                                    )
+                                    chunks = _request_rejected_stream_chunks(
+                                        body.get("model") or MODEL_REPO or "",
+                                        message, code, detail=err_body[:300],
+                                    )
+                                else:
+                                    chunks = _vllm_unreachable_stream_chunks(
+                                        body.get("model") or MODEL_REPO or ""
+                                    )
+                                for chunk in chunks:
+                                    yield f"data: {json.dumps(chunk)}\n\n".encode()
+                                yield b"data: [DONE]\n\n"
                             else:
-                                chunks = _vllm_unreachable_stream_chunks(
-                                    body.get("model") or MODEL_REPO or ""
-                                )
-                            for chunk in chunks:
-                                yield f"data: {json.dumps(chunk)}\n\n".encode()
-                            yield b"data: [DONE]\n\n"
-                        else:
-                            # v3.1 A10: vLLM accepted this payload. That is the
-                            # only evidence that exists for whether the learned
-                            # margin is still needed, so it is counted here —
-                            # at the moment the status line arrives, not after
-                            # the body, because a client hanging up mid-stream
-                            # says nothing about whether the prompt fitted.
-                            _note_backend_accepted()
-                            async for chunk in r.aiter_raw():
-                                yield chunk
-                                accumulator.feed(chunk)
+                                # v3.1 A10: vLLM accepted this payload. That is the
+                                # only evidence that exists for whether the learned
+                                # margin is still needed, so it is counted here —
+                                # at the moment the status line arrives, not after
+                                # the body, because a client hanging up mid-stream
+                                # says nothing about whether the prompt fitted.
+                                #
+                                # v3.1.9.6: also clears `vllm_failed` — this branch
+                                # runs on a RETRY's success too (`_attempt == 1`
+                                # after the first attempt set it True), and the
+                                # finally-block's "the backend failed during this
+                                # stream" WARNING must describe the FINAL outcome,
+                                # not the attempt that the retry just fixed.
+                                vllm_failed = False
+                                _note_backend_accepted()
+                                async for chunk in r.aiter_raw():
+                                    yield chunk
+                                    accumulator.feed(chunk)
+                            break
                 except httpx.RequestError as e:
                     # V2.3 Theme 2: vLLM unreachable mid-stream (down /
                     # restarting). Degrade visibly — emit the friendly
@@ -12019,74 +12608,134 @@ async def chat_completions(request: Request) -> Any:
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     # Non-streaming path
+    # v3.1.9.6 (lane v3196-overflow, item 2): the body actually sent this
+    # attempt — see the streaming path's identical variable for the full
+    # reasoning. At most two POSTs to vLLM for this turn.
+    send_body = body
     try:
-        try:
-            r = await client.post(f"{VLLM_URL}/v1/chat/completions", json=body)
-        except httpx.RequestError as e:
-            # V2.3 Theme 2: vLLM unreachable (down / restarting). Clean 503,
-            # not an opaque 500. No async tail — there's no assistant turn.
-            logger.warning(f"vLLM unreachable (non-stream): {type(e).__name__}: {e}")
-            return JSONResponse(
-                content=_vllm_unreachable_body(f"{type(e).__name__}: {e}"),
-                status_code=503,
-            )
-        try:
-            response_json = r.json()
-        except ValueError as e:
-            # vLLM (or something in front of it) returned a non-JSON body — an
-            # HTML 502, a truncated response, a plain-text 5xx. Without this
-            # guard the JSONDecodeError escapes as an opaque 500; httpx's
-            # RequestError above only covers connection-level faults.
-            body_head = (r.text or "")[:200]
-            logger.warning(
-                f"vLLM returned non-JSON (HTTP {r.status_code}): {type(e).__name__}: {body_head!r}"
-            )
-            return JSONResponse(
-                content=_vllm_unreachable_body(
-                    f"non-JSON response (HTTP {r.status_code}): {body_head}"
-                ),
-                status_code=502,
-            )
-        if r.status_code >= 400:
-            # Return BEFORE the memory tail, and say so at ERROR.
-            #
-            # v3.1 F20: the status check used to sit after the tail was fired,
-            # so a rejected request still ran the tail — harmless only by
-            # accident, because assistant_text happens to come out empty and
-            # every job in the tail happens to gate on it. One shape does get
-            # through even today: with extraction disabled the tail takes
-            # conv_lock and rewrites the facts file for a turn the model never
-            # answered. A request the backend refused has nothing to remember.
-            #
-            # The relay itself is unchanged — this path already hands the
-            # client vLLM's real status, which is why the incident's invisible
-            # failure was the STREAM path and not this one. What was missing
-            # here is the same thing: a line naming the conversation and the
-            # counts. (This is also the path OpenWebUI's background title/tag
-            # tasks take, so conv_id is often None; the line still says which.)
-            sent_tokens, sent_source = await run_in_threadpool(
-                _sent_token_size, body["messages"]
-            )
-            _log_request_rejected(
-                conv_id, r.status_code, str(response_json), sent_tokens,
-                sent_source, enforced_limit, streaming=False,
-            )
-            # v3.1 A8: same fix as the streaming path — the limit the guard
-            # enforced, not one reconstructed from HARD_INPUT_LIMIT. This path
-            # still discards the return value: it relays vLLM's own body to the
-            # client verbatim, so there is no compactor-authored message for
-            # `tightened` to steer. The calibration still happens; only the
-            # advice-to-the-user half is absent here.
-            _note_backend_rejection(
-                str(response_json)[:2000], enforced_limit,
-                guard_measured_overflow=calibration_overflow,
-            )
-            return JSONResponse(content=response_json, status_code=r.status_code)
+        for _attempt in range(2):
+            try:
+                r = await client.post(
+                    f"{VLLM_URL}/v1/chat/completions", json=send_body
+                )
+            except httpx.RequestError as e:
+                # V2.3 Theme 2: vLLM unreachable (down / restarting). Clean 503,
+                # not an opaque 500. No async tail — there's no assistant turn.
+                logger.warning(f"vLLM unreachable (non-stream): {type(e).__name__}: {e}")
+                return JSONResponse(
+                    content=_vllm_unreachable_body(f"{type(e).__name__}: {e}"),
+                    status_code=503,
+                )
+            try:
+                response_json = r.json()
+            except ValueError as e:
+                # vLLM (or something in front of it) returned a non-JSON body — an
+                # HTML 502, a truncated response, a plain-text 5xx. Without this
+                # guard the JSONDecodeError escapes as an opaque 500; httpx's
+                # RequestError above only covers connection-level faults.
+                body_head = (r.text or "")[:200]
+                logger.warning(
+                    f"vLLM returned non-JSON (HTTP {r.status_code}): {type(e).__name__}: {body_head!r}"
+                )
+                return JSONResponse(
+                    content=_vllm_unreachable_body(
+                        f"non-JSON response (HTTP {r.status_code}): {body_head}"
+                    ),
+                    status_code=502,
+                )
+            if r.status_code >= 400:
+                # Return BEFORE the memory tail, and say so at ERROR.
+                #
+                # v3.1 F20: the status check used to sit after the tail was fired,
+                # so a rejected request still ran the tail — harmless only by
+                # accident, because assistant_text happens to come out empty and
+                # every job in the tail happens to gate on it. One shape does get
+                # through even today: with extraction disabled the tail takes
+                # conv_lock and rewrites the facts file for a turn the model never
+                # answered. A request the backend refused has nothing to remember.
+                #
+                # The relay itself is unchanged — this path already hands the
+                # client vLLM's real status, which is why the incident's invisible
+                # failure was the STREAM path and not this one. What was missing
+                # here is the same thing: a line naming the conversation and the
+                # counts. (This is also the path OpenWebUI's background title/tag
+                # tasks take, so conv_id is often None; the line still says which.)
+                err_body = str(response_json)
+                sent_tokens, sent_source = await run_in_threadpool(
+                    _sent_token_size, send_body["messages"]
+                )
+                _log_request_rejected(
+                    conv_id, r.status_code, err_body, sent_tokens,
+                    sent_source, enforced_limit, streaming=False,
+                )
+                # v3.1 A8: same fix as the streaming path — the limit the guard
+                # enforced, not one reconstructed from HARD_INPUT_LIMIT. This path
+                # still discards the return value on a FINAL rejection: it relays
+                # vLLM's own body to the client verbatim, so there is no
+                # compactor-authored message for `tightened` to steer. The
+                # calibration still happens; only the advice-to-the-user half is
+                # absent here.
+                #
+                # guard_measured_overflow=False, ALWAYS, by construction
+                # (v3.1.9.6 REWORK) — see the streaming path's identical call
+                # for the full reasoning; the short version is that the
+                # pre-flight refusal above only fires on a real MAX_MODEL_LEN
+                # shortfall, which never reaches this line, so every
+                # rejection here is genuine new evidence.
+                tightened = _note_backend_rejection(
+                    err_body[:2000], enforced_limit,
+                    guard_measured_overflow=False,
+                )
+                # v3.1.9.6 (lane v3196-overflow, item 2): the same one-shot,
+                # transparent retry the streaming path takes — re-shed against
+                # the just-widened `_BUDGET_MARGIN` and resend ONCE before
+                # handing the client vLLM's raw rejection. Same four gates, same
+                # reasoning; see the streaming path's own comment for the full
+                # argument.
+                if (
+                    _attempt == 0
+                    and r.status_code < 500
+                    and _is_context_overflow(err_body)
+                    and tightened
+                ):
+                    _retry_report: dict = {}
+                    _resent = await run_in_threadpool(
+                        _enforce_hard_budget,
+                        send_body["messages"],
+                        effective_limit - _time_reserve,
+                        caller_system,
+                        _retry_report,
+                        _time_reserve,
+                        _standin_protected,
+                    )
+                    _resent = _merge_adjacent_system_messages(_resent)
+                    _resent = _merge_consecutive_same_role(_resent)
+                    _retry_body = {**send_body, "messages": _resent}
+                    _repair_template_invalid_tail(_retry_body)
+                    # v3.1.9.6 (lane v3196-overflow, item 4): same serve/clamp
+                    # rule as the original send and the streaming retry — see
+                    # the streaming path's identical call for the reasoning.
+                    _retry_body, _, _ = _fit_request_for_vllm(
+                        _retry_body, _retry_report.get("measured"), conv_id,
+                        effective_limit,
+                    )
+                    logger.warning(
+                        f"conv={conv_id or '?'}: vLLM rejected this "
+                        f"non-streaming payload as over its context window "
+                        f"(our estimate undercounted it by the amount just "
+                        f"logged above); re-shedding against the "
+                        f"just-widened budget margin and resending ONCE, "
+                        f"before the caller sees a failure"
+                    )
+                    send_body = _retry_body
+                    continue
+                return JSONResponse(content=response_json, status_code=r.status_code)
 
-        # v3.1 A10: the counterpart to the rejection path above. Without a call
-        # here the release logic in _note_backend_accepted is unreachable and
-        # the margin stays monotonic exactly as it was before this branch.
-        _note_backend_accepted()
+            # v3.1 A10: the counterpart to the rejection path above. Without a call
+            # here the release logic in _note_backend_accepted is unreachable and
+            # the margin stays monotonic exactly as it was before this branch.
+            _note_backend_accepted()
+            break
 
         # Extract assistant text for fact extraction
         assistant_text = ""
