@@ -11,19 +11,27 @@ on Docker Hub.
 
 ## [3.1.9.5] — the deploy docs match what ships
 
-**Documentation only. No application code changed:** every file the image
-copies (`compactor/`, `stt/`, `tts/`, `entrypoint.sh`, `supervisord.conf`,
-`clean-models.sh`) and the `Dockerfile` are byte-identical to v3.1.9.4, so
-`:v3.1.9.5-cu12` behaves exactly like `:v3.1.9.4-cu12` and the latter is its
-rollback target. It exists so that the deploy docs someone follows for v3.1.9.4's
-fixes stop contradicting them. Found by a release-readiness review of
-v3.1.9.1-v3.1.9.4 on 2026-09-21.
+**Documentation only, and NOT a new image.** Every file the image copies
+(`compactor/*.py` apart from tests, `stt/`, `tts/`, `entrypoint.sh`,
+`supervisord.conf`, `clean-models.sh`) and the `Dockerfile` are
+byte-identical to v3.1.9.4. So `:v3.1.9.5-cu12` is published as a second tag
+on the existing `:v3.1.9.4-cu12` image, digest
+`sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65`
+(RUNPOD_DEPLOY.md Step 3), not rebuilt. A rebuild would re-resolve
+`apt-get upgrade`, unpinned pip dependencies, the Piper voice URL and the
+CUDA base tag, and produce a different, unvalidated image (hostile pass
+#18, B1). The release exists so the deploy docs someone follows for
+v3.1.9.4's fixes stop contradicting them. The problems were found by a
+release-readiness review of v3.1.9.1-v3.1.9.4 on 2026-09-21. Hostile pass
+#18 then reviewed this release, and its findings (1 blocker, 7 should-fix,
+5 nits) are closed below.
 
 ### Fixed (documentation)
 - **runpod.env.template, "the single source of truth for the image tag",
   named `v3.1.6-cu12`.** It now names `v3.1.9.5-cu12`, and the image-variant
   list names the current tag and its rollback target instead of v3.0 only.
-- **The template re-added the rows v3.1.9.4's release note said to remove.**
+- **The template re-added the rows v3.1.9.4's git tag annotation said to
+  remove.**
   `COMPACTOR_INJECTION_BUDGET_FRACTION` and `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`
   are now commented out there, with the reason: they equal the image
   defaults (0.75 / 15000), so the rows only pin the value against a later
@@ -33,20 +41,41 @@ v3.1.9.1-v3.1.9.4 on 2026-09-21.
 - **There was no upgrade path for a pod already on v3.1.9.x.** RUNPOD_DEPLOY.md
   only covered v3.1.8 → v3.1.9 and rollback to v3.1.8. A new section,
   "Upgrading within v3.1.9.x, and rolling back", covers it. It notes that
-  there is no `v3.1.9.3-cu12` image on Docker Hub. It also covers what an
-  image older than v3.1.9.4 does with the backfill states v3.1.9.4 writes:
-  `"abandoned"` goes back to being retried; `"wiped"` stays refused through
-  its empty facts file. OPERATIONS.md's rollback step named `v3.1.6.1-cu12`
-  as the last-good image and now points there.
+  there is no `v3.1.9.3-cu12` image on Docker Hub. It also says what
+  rolling back below v3.1.9.4 costs, all of it in `backfill.py`
+  `needs_backfill` (hostile pass #18, S3):
+  - Older images stop at "a facts file exists", so an unfinished backfill
+    on a conversation with live facts is dropped for good (P15-2 undone).
+  - They retry `"abandoned"` backfills and capped crashed ones again.
+  - They honour `/forget` only through its empty facts file, which is
+    skipped or only logged in two failure cases.
+
+  RUNPOD_DEPLOY.md §6 (rollback to v3.1.8) points there too.
+  OPERATIONS.md's rollback step named `v3.1.6.1-cu12` as the last-good
+  image. It now names v3.1.9.4 by digest, says tags can be overwritten, and
+  says never to roll back to `:latest`, which is still V3.0 and has no
+  documented way back from a v3.1.9.x `/data` (S7).
 - **The database move was called "the v3.1.9.1 feature"** in the template and
-  RUNPOD_DEPLOY.md. That number went to the reuse fix, and no v3.1.9.x image
-  moves the database. `WEBUI_DB_LOCAL=false` stays required.
-- **The RunPod CLI example would have moved her database.** It omitted
-  `WEBUI_DB_LOCAL`, and a missing row means `true`. It also named the
-  text-only model repo and no `shm` multimodal cache. It now matches the
-  template and says it is a minimum. The volume pre-warm step named the
-  same text-only repo. It now names the vision variant, which is both the
-  image default and the template's value.
+  RUNPOD_DEPLOY.md, but that number went to the reuse fix. The corrected
+  wording (S6): no v3.1.9.x release is meant to run with the move, but every
+  v3.1.9.x image WILL move the database if `WEBUI_DB_LOCAL` is missing,
+  blank or true (entrypoint.sh). `WEBUI_DB_LOCAL=false` stays required.
+- **The RunPod CLI example could not have worked, and would have moved her
+  database.** It passed flags the `runpod` Python CLI's `pod create` does
+  not accept (S2), and it left out `WEBUI_DB_LOCAL`, where a missing row
+  means `true`. It is removed. The guide now says to deploy from the
+  template.
+- **Model and weights.** The volume pre-warm step and the GPU table named
+  the text-only model repo. They now name the vision variant, which is both
+  the image default and the template's value. The env-var table's
+  `MODEL_REPO` (magnum-v4-22b, "set -12b on A40") and `VLLM_EXTRA_ARGS`
+  ("do not add --quantization fp8 on A40") described a config that
+  production has not run since rc8, and now match the Dockerfile and
+  template (S4). The pre-warm step said "optional" and Troubleshooting said
+  "vLLM downloads weights on first start". Under the template's
+  `HF_HUB_OFFLINE=1` neither is true: the pre-warm is REQUIRED for the model
+  `MODEL_REPO` names, and entrypoint.sh's "weights present" check passes on
+  ANY cached snapshot (S5).
 - **RUNPOD_DEPLOY.md said the template "does not carry" `WEBUI_DB_LOCAL`**
   (it does) and counted "42 vars" (51 uncommented rows).
 - **Three settings added in v3.1.9.4 were documented nowhere:**
@@ -54,12 +83,25 @@ v3.1.9.1-v3.1.9.4 on 2026-09-21.
   `COMPACTOR_BACKFILL_RETRY_BACKOFF_S` (600, doubled per attempt). They are now
   commented rows in runpod.env.template. None of them needs setting.
 - **README's image-tag table still called v3.0 the current release.** It
-  now lists the v3.1.9.x tags, the missing v3.1.9.3 image, and that `:latest`
-  is still v3.0 until a v3.1.x image passes the on-pod gate.
-- **.env.example** (local `docker compose` only) had no `WEBUI_DB_LOCAL` row,
-  which moves the database on a local run. It also pinned
-  `COMPACTOR_MAX_FACTS_TOKENS=1500` over the image's 3500. The first is added,
-  as `false`; the second is commented out.
+  now lists the v3.1.x and v3.0.x tags that exist, the missing v3.1.9.3
+  image, and that `:latest` is still v3.0 until a v3.1.x image passes the
+  on-pod gate.
+- **.env.example** is used for local `docker compose` only, once copied to
+  `.env`. It had no `WEBUI_DB_LOCAL` row, which moves the database on a
+  local run, and it pinned `COMPACTOR_MAX_FACTS_TOKENS=1500` over the
+  image's 3500. The first is added, as `false`; the second is commented out.
+- **Build and deploy order.** Step 3 now publishes v3.1.9.5 as a digest
+  retag, and builds any real code release from a clean checkout of its tag.
+  It says to push the image before pointing the template at it (N5).
+
+### Tests
+- **`compactor/test_reuse_fit.py` checked a comment (S1).** Its
+  template-vs-Dockerfile check used an unanchored
+  `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=(\d+)`, which now matched the
+  commented-out example, so it no longer checked what its message claimed.
+  It now asserts two things. Any LIVE row must equal the Dockerfile, which
+  is the stale-row shape of hostile pass #9. The commented example must show
+  the Dockerfile value. Test files are not copied into the image.
 - The v3.1.9.3 entry's two "known residual" notes (P14-1, P14-2) now point at
   their fix in v3.1.9.4. V314_BACKLOG.md's OPEN list has a status note: A-05
   is fixed, A-10 (`read=None`) is still open, and the rest has not been

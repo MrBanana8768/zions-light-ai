@@ -1310,8 +1310,12 @@ COMPACTOR_ALERT_WEBHOOK=https://hooks.example/zions ...
 
 ## Rolling back a bad release
 
-Image tags are immutable snapshots (see
-[README → Image tags](README.md#image-tags)). To roll back:
+Each release tag is pushed once and not re-pushed by this project (see
+[README → Image tags](README.md#image-tags)), but Docker Hub tags CAN be
+overwritten. For a rollback you must be able to trust, pin by digest
+(`angreg/zions-light-ai:<tag>@sha256:...`; `docker buildx imagetools inspect
+<tag>` prints it), and write the current image's digest down before every
+deploy. To roll back:
 
 1. **If the History cap filter is installed, set its `max_turns` valve to 0
    first** (OpenWebUI → Admin Panel → Functions → History cap → Valves), and
@@ -1321,7 +1325,8 @@ Image tags are immutable snapshots (see
    RUNBOOK_MEMORY_IDENTITY.md "Rolling the IMAGE back".
 2. In the RunPod template, change **Container Image** to the last-good tag.
    From v3.1.9.5 that is `angreg/zions-light-ai:v3.1.9.4-cu12` (the same
-   application code). Going further back within v3.1.9.x has one
+   image: v3.1.9.5's tag points at it), digest
+   `sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65`. Going further back within v3.1.9.x has one
    consequence to know about, and there is no `v3.1.9.3-cu12` image: see
    RUNPOD_DEPLOY.md "Upgrading within v3.1.9.x, and rolling back". Pre-v3.1.9
    targets are covered by RUNPOD_DEPLOY.md "6. Rollback to v3.1.8".
@@ -1335,9 +1340,11 @@ Image tags are immutable snapshots (see
    only the code image changes. The `X-Conversation-Id` connection header
    lives in OpenWebUI's database, not the image, so it stays set.
 
-The `:latest` tag is only ever promoted to a release that has passed its
-boot self-test on a real pod, so `:latest` should always be safe; pinned
-tags exist for deterministic rollback regardless.
+**Never roll back to `:latest`.** It is still `:v3.0` (the same digest) at
+v3.1.9.5, because no v3.1.x image has passed the on-pod gate that promotes
+it. Nothing documents or tests going from a v3.1.9.x `/data` back to V3.0
+code. Roll back only to a pinned tag or digest that this document or
+RUNPOD_DEPLOY.md names as a rollback target.
 
 ---
 

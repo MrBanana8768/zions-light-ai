@@ -1384,17 +1384,33 @@ _G12_SHIPPED_DOCKERFILE = _g12_shipped_sbmax_from(
     _G12_ROOT / "Dockerfile",
     r'ENV COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS="(\d+)"',
 )
-_G12_SHIPPED_RUNPOD = _g12_shipped_sbmax_from(
-    _G12_ROOT / "runpod.env.template",
-    r"COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=(\d+)",
+# v3.1.9.5 (hostile pass #18, S1): the template no longer SETS this row — it
+# is commented out so a pasted template cannot pin the value against a later
+# image's default — so the unanchored search this used to do matched the
+# COMMENT and checked nothing it claimed to. Two anchored checks instead: a
+# live row, if anyone adds one back, must equal the Dockerfile (a stale row
+# is the hostile-pass-#9 shape); and the documented commented-out example
+# must still show the Dockerfile's value.
+_G12_TEMPLATE_TEXT = (_G12_ROOT / "runpod.env.template").read_text(encoding="utf-8")
+_g12_live_rows = re.findall(
+    r"^COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=(\S*)", _G12_TEMPLATE_TEXT, re.M
 )
 check(
-    _G12_SHIPPED_DOCKERFILE == _G12_SHIPPED_RUNPOD,
-    f"*** P10-2: Dockerfile ({_G12_SHIPPED_DOCKERFILE}) and "
-    f"runpod.env.template ({_G12_SHIPPED_RUNPOD}) ship the SAME "
-    f"COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS default — the two are hand-kept "
-    f"in sync (see each file's own comment) and this is what would catch "
-    f"them drifting apart",
+    all(v == str(_G12_SHIPPED_DOCKERFILE) for v in _g12_live_rows),
+    f"*** P10-2 / pass #18: every live COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS row "
+    f"in runpod.env.template equals the Dockerfile's "
+    f"{_G12_SHIPPED_DOCKERFILE} (got {_g12_live_rows}; v3.1.9.5 ships none)",
+)
+_g12_doc_rows = re.findall(
+    r"^#\s*COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=(\d+)\s*$", _G12_TEMPLATE_TEXT, re.M
+)
+check(
+    bool(_g12_doc_rows)
+    and all(int(v) == _G12_SHIPPED_DOCKERFILE for v in _g12_doc_rows),
+    f"*** P10-2 / pass #18: runpod.env.template's commented-out "
+    f"COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS example shows the Dockerfile's "
+    f"{_G12_SHIPPED_DOCKERFILE} (got {_g12_doc_rows}) — the two are "
+    f"hand-kept in sync and this is what would catch them drifting apart",
 )
 _G12_SHIPPED_SBMAX = _G12_SHIPPED_DOCKERFILE
 

@@ -97,9 +97,10 @@ Pin a specific version for reproducible deploys.
 
 | Tag | Contents |
 |---|---|
-| `:v3.1.9.5-cu12` | **Current release** — the deploy target named in [runpod.env.template](runpod.env.template). Application code identical to `:v3.1.9.4-cu12`; v3.1.9.5 changed documentation only. CUDA-12 profile (any A40 host) |
-| `:v3.1.9.4-cu12` | Rollback target for v3.1.9.5 — see [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md#upgrading-within-v319x-and-rolling-back) |
+| `:v3.1.9.5-cu12` | **Current release** — the deploy target named in [runpod.env.template](runpod.env.template). The SAME image as `:v3.1.9.4-cu12` (same digest, `sha256:c1295894dd58…`): v3.1.9.5 changed documentation only, so its tag points at the published v3.1.9.4 image instead of a rebuild. CUDA-12 profile (any A40 host) |
+| `:v3.1.9.4-cu12` | The image both tags name, and the rollback target from v3.1.9.5 — see [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md#upgrading-within-v319x-and-rolling-back) |
 | `:v3.1-cu12` … `:v3.1.9.2-cu12` | The superseded v3.1.x patch line (v3.1-cu12, v3.1.1 to v3.1.4.1, v3.1.5, v3.1.6, v3.1.6.1, v3.1.7, v3.1.8, v3.1.9, v3.1.9.1, v3.1.9.2 — each `-cu12`); per-version notes in [CHANGELOG.md](CHANGELOG.md). There is no `:v3.1.9.3-cu12` image. `:v3.1-cu12` is NOT `:v3.1`, which is the older `:v3.1-vision` feature image below |
+| `:v3.0.1-cu12` / `:v3.0.4-cu12` / `:v3.0.5-cu12` | Superseded V3.0 patches (CHANGELOG [3.0.1] and the v3.0.x git tags) |
 | `:v3.0-cu12` = `:v3.0` = `:latest` | The last release promoted to `:latest` (= the validated rc8 build) — V3.0 consolidation: audited dep pins, OpenWebUI 0.11, SQLite network-volume hardening, chat-proxy guards; CUDA-12 profile (any A40 host) |
 | `:v3.0-rc5-cu12` / `:v3.0-rc6-cu12` / `:v3.0-rc7-cu12` | Superseded rcs — rc5 lacks the overflow fix; rc6 lacks the rc7 review fixes (compaction alternation blocker); rc7 is code-identical to rc8 but ships the old unbootable-on-A40 22B default |
 | `:v3-snapshot` | Frozen last-known-good V3.3 image (= `:v3.3-tts`) — rollback target |
