@@ -1308,6 +1308,74 @@ a slow or broken webhook is logged and ignored, never blocking the job.
 COMPACTOR_ALERT_WEBHOOK=https://hooks.example/zions ...
 ```
 
+## Closing stale backfill records before upgrading past v3.1.9.3
+
+Only relevant if this pod has EVER run v3.1.9.3 or earlier. Skip this if it
+has only ever run v3.1.9.4 or later.
+
+**Why.** Every release up to v3.1.9.3 decided whether a conversation needed
+a lazy history backfill by checking whether a facts file already existed —
+so a stale `in_progress` or `failed` backfill record on a conversation that
+also had live facts was ignored forever, silently. v3.1.9.4 fixed that:
+`backfill.needs_backfill()` now reads the RECORD first, and RESUMES a stale
+`in_progress` or backed-off `failed` record. Correct, but it means the
+upgrade itself is the trigger: the instant each such conversation's next
+eligible request arrives, its backfill restarts from scratch. A pod that
+has been running v3.1.9.3 or earlier for a while can have several of these
+sitting on the volume at once, and each one spends a background run of
+vLLM calls proportional to that conversation's ENTIRE history — hundreds to
+low thousands of calls, all competing with her live chat on the one GPU.
+See RUNPOD_DEPLOY.md's "Upgrading within v3.1.9.x, and rolling back" for
+the full explanation.
+
+**Is the script on the pod?**
+```bash
+ls -la /data/scripts/backfill-records.py
+```
+If not, copy `scripts/backfill-records.py` from this repo to `/data/scripts/`
+on the pod (Web Terminal upload, or `scp`).
+
+**Dry run first: reports only, writes nothing.**
+```bash
+/opt/compactor-venv/bin/python /data/scripts/backfill-records.py
+```
+Read the report. Each record is classified `leave` (already terminal —
+nothing to do), `would-resume` (this is what an upgrade past v3.1.9.3 would
+restart), or `needs-review` (ambiguous — read the reason printed under it).
+A dry run exits 3 if any record would resume; that is informational, not a
+failure.
+
+**Close what's safe to close.** This rewrites every `would-resume` record
+that also has a facts file to the terminal state `abandoned` — the same
+state `backfill.py` itself writes once a record has spent its retries —
+after backing up the original beside it (`<name>.backfill.json.bak-<UTC
+stamp>`, never deleted, never overwritten by a later run):
+```bash
+/opt/compactor-venv/bin/python /data/scripts/backfill-records.py --apply
+```
+It refuses to run while anything answers the compactor's `/health` (the
+compactor could be writing these exact files right now); stop it first
+(`supervisorctl stop compactor`) if the dry run above found anything to
+close, or pass `--force` to override with a loud warning. It also refuses,
+without `--force`, to close a `would-resume` record whose conversation has
+NO facts file at all — that conversation has never had a fact extracted,
+and closing its only open backfill attempt would cancel that, not defuse a
+hazard.
+
+**Machine-readable output**, for scripting a fleet of pods: add `--json`.
+**One conversation only**: add `--conv <conv_id>` (repeatable).
+
+**The alternative**, if you would rather not touch any records by hand:
+set `COMPACTOR_BACKFILL_MAX_ATTEMPTS=0` in the template before upgrading.
+That does not close the stale records — they stay `in_progress`/`failed`
+on disk — but it makes `needs_backfill()` treat every one of them as
+already at the attempt cap, so none of them resume. Prefer running the
+script instead when you have the chance: it leaves the store in the same
+terminal shape backfill.py's own retry-exhaustion path produces, rather
+than relying on a template setting nobody has to remember to remove later.
+
+---
+
 ## Rolling back a bad release
 
 Each release tag is pushed once and not re-pushed by this project (see

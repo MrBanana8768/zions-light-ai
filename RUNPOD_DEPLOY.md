@@ -1021,7 +1021,7 @@ listed under "Rolling back" in the next section; read them first.
 
 ## Upgrading within v3.1.9.x, and rolling back
 
-For a pod already on any v3.1.9.x image (v3.1.9 through v3.1.9.4). Every
+For a pod already on any v3.1.9.x image (v3.1.9 through v3.1.9.5). Every
 v3.1.9.x release is an image-tag change against the SAME Network Volume: none
 of them moves or reformats anything on `/data`, and none needs a restore.
 
@@ -1035,18 +1035,43 @@ details in the CHANGELOG entry of the same number):
 | v3.1.9.3 | Reuse never costs her previous exchange; images are priced correctly (opencv, image ~152 MB larger). |
 | v3.1.9.4 | Replies no longer wait ~30 s on fact selection; `/forget` stays forgotten; cut summaries are handled. |
 | v3.1.9.5 | Documentation only — the SAME image as v3.1.9.4 (same digest), under a new tag. |
+| v3.1.9.6 | Scripts and docs only — the SAME image as v3.1.9.5 (same digest), under a new tag. |
 
 No new REQUIRED settings in any of them.
+
+**Before upgrading a pod that has EVER run v3.1.9.3 or earlier** (skip this
+if it has only ever run v3.1.9.4 or later): v3.1.9.4's own fix to
+`backfill.needs_backfill()` (the table row above) means the upgrade itself
+RESUMES every stale backfill record already sitting on the volume —
+potentially thousands of background
+vLLM calls competing with her live chat, on the pod's one GPU, the moment
+each affected conversation is next used. Either:
+- run `scripts/backfill-records.py` (copied to `/data/scripts/`) in dry-run
+  mode first, then with `--apply`, to close the stale ones — see
+  OPERATIONS.md "Closing stale backfill records before upgrading past
+  v3.1.9.3" for the full walkthrough; or
+- set `COMPACTOR_BACKFILL_MAX_ATTEMPTS=0` in the template, which leaves the
+  stale records on disk but makes `needs_backfill()` treat all of them as
+  already at the attempt cap, so none of them resume.
+
+  While you are in the template: **the live template still carries
+  `COMPACTOR_INJECTION_BUDGET_FRACTION=.6`**, the same stale hostile-pass-#9
+  row v3.1.9.5's own fix (CHANGELOG.md) removed from this repo's
+  `runpod.env.template` — it was never removed from the pod's actual RunPod
+  template. Delete that row now if you have not already — the same thing
+  step 2 below (Template) tells you to do for
+  `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`. Left in place it pins the fraction
+  below the v3.1.9.2+ image default (`0.75`).
 
 1. **Pre-checks and backup:** do steps 1 and 2 of the v3.1.8 procedure above
    on the running pod — `/health/full` explained, `WEBUI_DB_LOCAL=false`
    confirmed in `/proc/1/environ`, writers stopped, `backup.py --once` then
    `--verify` both `[OK]`.
 2. **Template:** write down the Container Image the pod runs now (your
-   rollback target). Once `v3.1.9.5-cu12` is published (Step 3 at the top of
+   rollback target). Once `v3.1.9.6-cu12` is published (Step 3 at the top of
    this guide; check with `docker buildx imagetools inspect
-   angreg/zions-light-ai:v3.1.9.5-cu12`), set Container Image to
-   `angreg/zions-light-ai:v3.1.9.5-cu12`; confirm `WEBUI_DB_LOCAL=false`;
+   angreg/zions-light-ai:v3.1.9.6-cu12`), set Container Image to
+   `angreg/zions-light-ai:v3.1.9.6-cu12`; confirm `WEBUI_DB_LOCAL=false`;
    **delete any
    `COMPACTOR_INJECTION_BUDGET_FRACTION` and
    `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` rows** (see step 3 above for why).
@@ -1061,8 +1086,9 @@ No new REQUIRED settings in any of them.
 **Rolling back.** Keep the History cap rule from
 [Rolling back to an older image](CHANGELOG.md#rolling-back-to-an-older-image)
 (`max_turns` to 0 first) and `WEBUI_DB_LOCAL=false`.
-- **To v3.1.9.4** (`v3.1.9.4-cu12`): from v3.1.9.5 this is not really a
-  rollback: both tags name the same image digest, so nothing can differ.
+- **To v3.1.9.5 or v3.1.9.4** (`v3.1.9.5-cu12` / `v3.1.9.4-cu12`): from
+  v3.1.9.6 this is not really a rollback: all three tags name the same
+  image digest, so nothing can differ.
 - **To v3.1.9.3 or earlier (and to v3.1.8):** there is **no `v3.1.9.3-cu12`
   image** on Docker Hub (`v3.1.9.2-cu12` and `v3.1.9.1-cu12` exist). A
   rebuild from the tag is a new, unvalidated image (see Step 3). Every image

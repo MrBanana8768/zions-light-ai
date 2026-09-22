@@ -9,6 +9,77 @@ on Docker Hub.
 
 ---
 
+## [3.1.9.6] — a script to close stale backfill records before an upgrade
+
+**Scripts and docs only, and NOT a new image.** Every file the image copies
+(`compactor/*.py` apart from tests, `stt/`, `tts/`, `entrypoint.sh`,
+`supervisord.conf`, `clean-models.sh`) and the `Dockerfile` are
+byte-identical to v3.1.9.5, which was itself byte-identical to v3.1.9.4. So
+`:v3.1.9.6-cu12` is published as a third tag on the existing
+`:v3.1.9.4-cu12` image, digest
+`sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65`
+(RUNPOD_DEPLOY.md Step 3), not rebuilt, for the same reason v3.1.9.5 was
+not rebuilt: a rebuild re-resolves `apt-get upgrade`, unpinned pip
+dependencies, the Piper voice URL and the CUDA base tag, and produces a
+different, unvalidated image.
+
+**Why this exists.** v3.1.9.4's own fix to `backfill.needs_backfill()` —
+reading a conversation's `facts/<conv>.backfill.json` RECORD before
+deciding whether it needs a lazy history backfill, rather than stopping the
+instant a facts file exists — is correct (a stale record on a conversation
+that also had live facts used to be ignored forever, silently), but it
+turns every upgrade of a pod that has ever run v3.1.9.3 or earlier into the
+TRIGGER: every stale `in_progress` or backed-off `failed` record already on
+the volume resumes the moment its conversation is next used. Verified on a
+real 2026-09-22 production backup: four conversations carry a stale
+`in_progress` record (6/1908, 296/793, 572/732 and 589/626 exchanges) that
+v3.1.9.4+ would resume all at once — roughly 2,600 background vLLM
+extraction calls competing with her live chat on the pod's one GPU.
+RUNPOD_DEPLOY.md's "Upgrading within v3.1.9.x" already named this cost;
+nothing before this release gave an operator a way to close those records
+ahead of time short of hand-editing JSON on the volume.
+
+### Added
+- **`scripts/backfill-records.py`.** Reads every `facts/*.backfill.json`
+  record under a compactor store and classifies each one `leave` (already
+  terminal — complete / abandoned / wiped), `would-resume` (v3.1.9.4+'s
+  `needs_backfill()` will restart this), or `needs-review` (an
+  `in_progress` record not yet stale, a `failed` one still inside its
+  backoff window, or one this script could not read). It asks the REAL
+  `compactor/backfill.py` module beside it for the verdict (`is_stale`,
+  `_backoff_ready`, `_MAX_BACKFILL_ATTEMPTS`) rather than keeping a second
+  copy of that logic, the same discipline `scripts/merge-conversations.py`
+  already follows for `portability.merge_conversation`. Dry run (the
+  default) only reports. `--apply` rewrites every `would-resume` record
+  that also has a facts file to the terminal state `abandoned` — after
+  backing up the original beside it, refusing outright if that exact
+  backup path already exists — and prints exactly what it changed, one
+  line per record. It refuses to close a `would-resume` record with NO
+  facts file (that conversation has never had a fact extracted; closing it
+  would cancel its one chance, not defuse a hazard) and refuses to run
+  `--apply` at all while anything answers the compactor's `/health`; both
+  refusals take `--force`. `--json` gives machine-readable output; `--conv`
+  limits the run to specific conversations. It never touches
+  `facts/<conv>.json`, `facts/<conv>.archive.json`, `summaries/`,
+  `chromadb/` or `personas/`. See its own module docstring for the full
+  exit-code contract (0 nothing-to-do/succeeded, 1 error, 3 dry-run-found-
+  work), and `compactor/test_backfill_records_script.py` for coverage
+  built from the four real stale records above — including the actual
+  point of the tool: after `--apply`, `backfill.needs_backfill()` really
+  does return `False` for all four.
+
+### Documentation
+- **OPERATIONS.md** gains "Closing stale backfill records before upgrading
+  past v3.1.9.3", in the same copy-to-`/data/scripts`-and-run-with-the-venv
+  shape as RUNBOOK_DB_JOURNAL.md's recovery-script section.
+- **RUNPOD_DEPLOY.md**'s "Upgrading within v3.1.9.x, and rolling back" now
+  tells an operator upgrading a pod that has ever run v3.1.9.3 or earlier to
+  run this script (or set `COMPACTOR_BACKFILL_MAX_ATTEMPTS=0`) first, and
+  flags that the live template still carries
+  `COMPACTOR_INJECTION_BUDGET_FRACTION=.6` — the same stale hostile-pass-#9
+  row v3.1.9.5's fix removed from this repo's `runpod.env.template`, never
+  removed from the pod's actual RunPod template — to delete while there.
+
 ## [3.1.9.5] — the deploy docs match what ships
 
 **Documentation and one test only, and NOT a new image.** Every file the image copies
