@@ -1,0 +1,32 @@
+# Phase-1 spike only. Registers a one-shot import appservice that can send
+# messages "as" the two synthetic users already registered on the dev stack
+# (@alice_spike:localhost, @zla_bot:localhost) with timestamp massaging.
+# Tokens are throwaway dev secrets for a localhost-only container network.
+id: "zlaspike_importer"
+url: "http://spike-as-stub:9200"
+sender_localpart: "zlaspike_as_bot"
+namespaces:
+  users:
+    - exclusive: false
+      regex: "@alice_spike:localhost"
+    - exclusive: false
+      regex: "@zla_bot:localhost"
+    - exclusive: false
+      regex: "@elem_owner:localhost"
+    - exclusive: false
+      regex: "@elem_owner2:localhost"
+    - exclusive: false
+      regex: "@elem_owner7:localhost"
+    - exclusive: false
+      regex: "@elem_owner9:localhost"
+    - exclusive: false
+      regex: "@elem_owner10:localhost"
+    - exclusive: false
+      regex: "@elem_owner11:localhost"
+    - exclusive: true
+      regex: "@zlaspike_as_bot:localhost"
+  aliases: []
+  rooms: []
+rate_limited: false
+as_token: "CHANGE_ME_as_token"   # must match the homeserver copy; local spike stack only
+hs_token: "CHANGE_ME_hs_token"   # must match the homeserver copy; local spike stack only

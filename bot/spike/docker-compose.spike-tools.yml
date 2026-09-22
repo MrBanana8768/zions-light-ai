@@ -1,0 +1,41 @@
+# Phase-1 spike tooling. Joins the zlaspike_default network created by the
+# copied chat-app dev stack (SP\v4spike\chat-app\docker-compose.yml) so these
+# containers can resolve `synapse` and `postgres` by name. Run with
+# `docker compose -p zlaspike -f docker-compose.spike-tools.yml up -d`
+# from this directory -- same project name as the chat-app stack so
+# `docker compose -p zlaspike down` tears down everything this lane created,
+# and nothing else.
+services:
+  spike-as-stub:
+    build: .
+    command: python3 as_stub.py
+    networks:
+      default:
+        aliases: [spike-as-stub]
+    ports: []
+
+  stub-compactor:
+    build: .
+    command: python3 stub_compactor.py
+    volumes:
+      - ./out:/work/out
+    networks:
+      default:
+        aliases: [stub-compactor]
+
+  bot:
+    build: .
+    command: python3 bot.py
+    environment:
+      SPIKE_HS_URL: http://synapse:8008
+      SPIKE_PG_CRYPTO_DSN: postgresql://synapse:devpassword@postgres:5432/botcrypto
+      SPIKE_COMPACTOR_URL: http://stub-compactor:8090/v1/chat
+    depends_on:
+      - stub-compactor
+    networks:
+      default: {}
+
+networks:
+  default:
+    name: zlaspike_default
+    external: true

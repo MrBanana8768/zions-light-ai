@@ -1,0 +1,4 @@
+# Spike evidence: crypto stores, pickled keys, recovery keys and screenshots from a
+# throwaway local stack. Never commit key material, even synthetic.
+out/
+__pycache__/
