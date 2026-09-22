@@ -72,6 +72,19 @@ def _wipe_storage():
     memory.ensure_storage_layout()
 
 
+def _seed_conv(conv_id: str) -> None:
+    """B5 (v3.1.9.6): the script now refuses before any work -- dry run
+    included -- unless the conversation's summaries file already exists
+    under --store (a typo'd --store used to silently build a brand-new
+    phantom store and burn real vLLM time treating an existing backlog
+    as fresh). Most of the tests in this file are about the catch-up
+    behaviour on a conversation the store already tracks, so this just
+    materializes the same empty default state `load_state` would have
+    fabricated in memory anyway -- functionally identical to "before
+    this fix", just written to disk first so B5's precondition holds."""
+    summarizer.save_state(conv_id, summarizer.load_state(conv_id))
+
+
 # ---------------------------------------------------------------------------
 # Synthetic webui.db builder
 # ---------------------------------------------------------------------------
@@ -265,6 +278,7 @@ def test_dry_run_writes_nothing_and_calls_no_model_and_exits_3():
     db = _new_db_path()
     messages, current_id = _linear_history(24)  # > L1_CHUNK_SIZE (20) -> 1 chunk due
     _build_webui_db(db, {"dry-conv": _history_chat(messages, current_id)})
+    _seed_conv("dry-conv")  # B5: the conv's summary file must pre-exist
 
     before = _snapshot()
     LLM_CALLS.clear()
@@ -275,8 +289,8 @@ def test_dry_run_writes_nothing_and_calls_no_model_and_exits_3():
     assert_eq(LLM_CALLS, [], "no LLM call was made during a dry run")
     assert_eq(_snapshot(), before, "not one byte under the storage root changed")
     assert_true("DRY RUN" in out, "the report says DRY RUN")
-    assert_true(not summarizer.summary_path("dry-conv").exists(),
-                "no summary state file was created")
+    assert_true(summarizer.summary_path("dry-conv").exists(),
+                "the pre-seeded (B5) summary state file is there, but untouched")
 
 
 def test_dry_run_json_reports_l1_due_and_no_work_exits_0():
@@ -285,6 +299,7 @@ def test_dry_run_json_reports_l1_due_and_no_work_exits_0():
     db = _new_db_path()
     messages, current_id = _linear_history(24)
     _build_webui_db(db, {"dry-json": _history_chat(messages, current_id)})
+    _seed_conv("dry-json")  # B5
 
     rc, out = run_script([
         "--webui-db", str(db), "--chat-id", "dry-json", "--store", _TMP_ROOT, "--json",
@@ -296,11 +311,14 @@ def test_dry_run_json_reports_l1_due_and_no_work_exits_0():
     assert_true(payload["estimated_real_vllm_calls"] >= 1, "at least 1 call estimated")
     assert_true("estimate" in payload["estimated_wall_clock"].lower(),
                 "the wall-clock figure is labelled an estimate")
+    assert_eq(payload["resume_offset"], 0,
+               "a fresh conversation with nothing summarized needs no anchor -> offset 0")
 
     # A conversation too short for even one L1 chunk: nothing due, exit 0.
     db2 = _new_db_path()
     messages2, current_id2 = _linear_history(4)
     _build_webui_db(db2, {"tiny": _history_chat(messages2, current_id2)})
+    _seed_conv("tiny")  # B5
     rc2, out2 = run_script([
         "--webui-db", str(db2), "--chat-id", "tiny", "--store", _TMP_ROOT, "--json",
     ])
@@ -330,6 +348,7 @@ def test_apply_advances_watermark_and_writes_readable_state():
     db = _new_db_path()
     messages, current_id = _linear_history(24)
     _build_webui_db(db, {"apply-conv": _history_chat(messages, current_id)})
+    _seed_conv("apply-conv")  # B5
 
     LLM_CALLS.clear()
     rc, out = run_script([
@@ -344,8 +363,10 @@ def test_apply_advances_watermark_and_writes_readable_state():
     assert_eq(len(state["l1"]), 1, "one L1 chunk was written")
     payload = json.loads(out)
     assert_eq(payload["last_summarized_turn_after"], 20, "the report matches what is on disk")
-    assert_true(payload["backup"] is None,
-                "no backup was made — there was no pre-existing summary file")
+    assert_true(payload["backup"] is not None,
+                "a backup WAS made — B5 requires the summary file to "
+                "already exist (even trivially empty), so there is "
+                "always something to back up before --apply writes")
 
 
 def test_apply_with_nothing_due_is_a_no_op_and_idempotent():
@@ -354,6 +375,7 @@ def test_apply_with_nothing_due_is_a_no_op_and_idempotent():
     db = _new_db_path()
     messages, current_id = _linear_history(24)
     _build_webui_db(db, {"idem-conv": _history_chat(messages, current_id)})
+    _seed_conv("idem-conv")  # B5
     argv = [
         "--webui-db", str(db), "--chat-id", "idem-conv", "--store", _TMP_ROOT,
         "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json",
@@ -443,6 +465,16 @@ def test_interrupted_apply_leaves_valid_state_and_resumes():
     # 44 turns: two L1 chunks due (20 + 20), 4 turns left over.
     messages, current_id = _linear_history(44)
     _build_webui_db(db, {"interrupt-conv": _history_chat(messages, current_id)})
+    _seed_conv("interrupt-conv")  # B5
+
+    # Pin distinct backup stamps per run rather than relying on wall-clock
+    # seconds ticking over between the two `run_script` calls below (both
+    # runs can land in the same UTC second on a fast machine, which would
+    # make the second run's backup collide with the first's — nothing to
+    # do with the behaviour this test is actually about).
+    _stamps = iter(["20260101T000000Z", "20260101T000001Z"])
+    real_stamp = _script._utc_stamp
+    _script._utc_stamp = lambda: next(_stamps)
 
     call_count = [0]
 
@@ -469,9 +501,15 @@ def test_interrupted_apply_leaves_valid_state_and_resumes():
     finally:
         summarizer._llm_summarize = _fake_llm
 
-    assert_eq(rc, 0, "a run that stopped on an LLM failure is still a completed --apply")
+    # H2 (v3.1.9.6): real progress (one whole chunk) was made, but the
+    # LLM failure left more work due (44 turns, only 20 summarized) --
+    # that is exit 4 ("re-run to continue"), not the old silent 0.
+    assert_eq(rc, 4,
+               f"a run that stopped on an LLM failure with more work still "
+               f"due is exit 4, not a silent 0 (out={out!r})")
     payload = json.loads(out)
     assert_true(payload["stopped_because"], "the report names why it stopped")
+    assert_true(payload["still_due"], "44 turns with only 20 summarized: more is due")
 
     state_after_failure = summarizer.load_state("interrupt-conv")
     assert_eq(state_after_failure["last_summarized_turn"], 20,
@@ -496,6 +534,7 @@ def test_interrupted_apply_leaves_valid_state_and_resumes():
                "the already-finished first chunk was NOT redone or altered")
     assert_true(len(state_after_resume["l1"]) >= 2,
                 "a second chunk was added rather than the first being replaced")
+    _script._utc_stamp = real_stamp
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +547,7 @@ def test_refuses_apply_while_compactor_is_live_unless_forced():
     db = _new_db_path()
     messages, current_id = _linear_history(24)
     _build_webui_db(db, {"live-conv": _history_chat(messages, current_id)})
+    _seed_conv("live-conv")  # B5
 
     real_alive = _script._compactor_is_alive
     _script._compactor_is_alive = lambda url=_script.DEFAULT_HEALTH_URL: True
@@ -535,15 +575,35 @@ def test_refuses_when_backup_path_already_exists():
     print("\n[test] --apply refuses if the backup path already exists")
     _wipe_storage()
     db = _new_db_path()
-    messages, current_id = _linear_history(24)
+    # 30 turns, 8 already summarized: 22 new turns -> 1 L1 chunk (20) due,
+    # AND the pre-existing chunk's span (8) clears B1's own
+    # _MIN_ANCHOR_FINGERPRINTS(8) floor -- a 24-turn/4-already-summarized
+    # shape (the original numbers here) cannot satisfy both at once
+    # (there is no room for an 8-turn anchor AND >=20 new turns in only
+    # 24 total), so this test's numbers moved rather than the floor.
+    messages, current_id = _linear_history(30)
     _build_webui_db(db, {"backup-conv": _history_chat(messages, current_id)})
 
     # Seed an existing summary file so the FIRST apply has something to
-    # back up, at a stamp we pin.
-    summarizer.save_state("backup-conv", {
-        "l1": [{"text": "pre-existing", "first_turn": 1, "last_turn": 4}],
-        "l2": [], "l3": None, "last_summarized_turn": 4,
-    })
+    # back up, at a stamp we pin. B1 (v3.1.9.6): the pre-existing chunk's
+    # covered-turn record must be REAL (matching what turns 1-8 of this
+    # conversation actually fingerprint as) so the new resume-offset
+    # verification has genuine evidence to anchor on, rather than reading
+    # as an inconsistent state file (last_summarized_turn > 0 with no
+    # covered-turn record at all) and refusing before ever reaching the
+    # backup-collision check this test is actually about.
+    pre_turns = [
+        {"role": "user" if i % 2 == 0 else "assistant",
+         "content": f"{'user' if i % 2 == 0 else 'assistant'} turn {i}"}
+        for i in range(8)
+    ]
+    covered_fps = "".join(summarizer._covered_turn_fingerprints(pre_turns))
+    seeded_state = {
+        "l1": [{"text": "pre-existing", "first_turn": 1, "last_turn": 8}],
+        "l2": [], "l3": None, "last_summarized_turn": 8,
+        "covered_fps": covered_fps,
+    }
+    summarizer.save_state("backup-conv", seeded_state)
     fixed_stamp = "20260101T000000Z"
     argv = [
         "--webui-db", str(db), "--chat-id", "backup-conv", "--store", _TMP_ROOT,
@@ -562,10 +622,7 @@ def test_refuses_when_backup_path_already_exists():
 
         # Put the file back the way it was (a fresh pre-existing summary,
         # same content) WITHOUT touching the backup, to force the collision.
-        summarizer.save_state("backup-conv", {
-            "l1": [{"text": "pre-existing", "first_turn": 1, "last_turn": 4}],
-            "l2": [], "l3": None, "last_summarized_turn": 4,
-        })
+        summarizer.save_state("backup-conv", seeded_state)
         backup_bytes_before = backup_path.read_bytes()
 
         rc2, out2 = run_script(argv)
@@ -584,6 +641,7 @@ def test_refuses_on_journal_beside_the_database_unless_forced():
     db = _new_db_path()
     messages, current_id = _linear_history(4)
     _build_webui_db(db, {"journal-conv": _history_chat(messages, current_id)})
+    _seed_conv("journal-conv")  # B5
     journal = db.with_name(db.name + "-journal")
     # Empty, not garbage: an empty -journal is what SQLite itself treats
     # as "no journal" once opened, so --force's forced read-only open
@@ -613,9 +671,15 @@ def test_unknown_chat_id_is_an_error():
     db = _new_db_path()
     messages, current_id = _linear_history(4)
     _build_webui_db(db, {"known-conv": _history_chat(messages, current_id)})
+    # B5: the CONV (not the chat-id) is what must already be tracked, so
+    # --conv-id points at a seeded conv while --chat-id stays bogus --
+    # otherwise B5's own refusal (a different, earlier gate) would fire
+    # first and this would stop testing what it says it tests.
+    _seed_conv("tracked-conv-id")
 
     rc, out = run_script([
-        "--webui-db", str(db), "--chat-id", "does-not-exist", "--store", _TMP_ROOT,
+        "--webui-db", str(db), "--chat-id", "does-not-exist",
+        "--conv-id", "tracked-conv-id", "--store", _TMP_ROOT,
     ])
     assert_eq(rc, 1, "an unknown chat id is exit 1")
     assert_true("no chat" in out.lower() or "does-not-exist" in out,
@@ -650,6 +714,7 @@ def test_anomalous_transcript_reported_not_crashed():
         "d": _msg("d", "c", "user", "question two, no reply came"),
     }
     _build_webui_db(db, {"anomaly-conv": _history_chat(messages, "d")})
+    _seed_conv("anomaly-conv")  # B5
 
     rc, out = run_script([
         "--webui-db", str(db), "--chat-id", "anomaly-conv", "--store", _TMP_ROOT, "--json",
@@ -719,6 +784,7 @@ def test_reports_which_pkg_source_was_used():
     db = _new_db_path()
     messages, current_id = _linear_history(4)
     _build_webui_db(db, {"pkg-report-conv": _history_chat(messages, current_id)})
+    _seed_conv("pkg-report-conv")  # B5
     rc, out = run_script([
         "--webui-db", str(db), "--chat-id", "pkg-report-conv", "--store", _TMP_ROOT, "--json",
     ])
@@ -740,6 +806,7 @@ def test_capability_check_refuses_cleanly_on_a_package_missing_required_symbols(
     db = _new_db_path()
     messages, current_id = _linear_history(4)
     _build_webui_db(db, {"stub-pkg-conv": _history_chat(messages, current_id)})
+    _seed_conv("stub-pkg-conv")  # B5
     with tempfile.TemporaryDirectory() as td:
         stub_pkg = Path(td) / "compactor"
         stub_pkg.mkdir()
@@ -883,6 +950,646 @@ def test_apply_history_from_a_different_conversation_is_still_refused():
 
 
 # ---------------------------------------------------------------------------
+# 12. B1 (v3.1.9.6): the resume offset is derived from the store's own
+#     covered-turn record (piecewise position->branch mapping), not a
+#     single flat `position - len(window)`. Built on a synthetic store
+#     with a scattered missing position (an abandoned-branch deletion
+#     early in the history, well before the resume point), the same
+#     shape the real 2026-09-22 backup has (0, -6, -16, -18, -22).
+# ---------------------------------------------------------------------------
+
+def _build_piecewise_scenario():
+    """A 100-turn original conversation with 2 turns (original positions
+    11-12) abandoned/deleted, giving a 98-turn CURRENT branch whose
+    position->branch mapping is piecewise: +0 for positions 1-10, +2
+    (this script's own `offset` convention: branch = position - offset)
+    for everything from position 13 on. The store has already summarized
+    through original position 40 (an L1 chunk 1-20, another 21-40 -- both
+    entirely inside the SETTLED +2 region, so the anchor itself is
+    unambiguous), and `turns_seen` reflects the CURRENT (post-deletion)
+    branch length rather than the pre-deletion one -- ordinary once a
+    live tail has observed the abandonment happen turn-by-turn. Returns
+    (db_path, conv_id, state, turns) where `turns` is what
+    reconstruct_transcript actually returns for this db.
+    """
+    conv_id = "piecewise-conv"
+    messages = {}
+    parent = None
+    ids = []
+    for i in range(100):
+        role = "user" if i % 2 == 0 else "assistant"
+        mid = f"pw{i}"
+        messages[mid] = _msg(mid, parent, role, f"turn {i}")
+        ids.append(mid)
+        parent = mid
+    # Delete original positions 11,12 (0-indexed 10,11); re-parent
+    # position 13's message onto position 10's.
+    messages[ids[12]]["parentId"] = ids[9]
+    del messages[ids[10]]
+    del messages[ids[11]]
+    current_id = ids[-1]
+
+    db = _new_db_path()
+    _build_webui_db(db, {conv_id: _history_chat(messages, current_id)})
+
+    def orig_turns(lo, hi):
+        return [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+            for i in range(lo - 1, hi)
+        ]
+
+    covered_fps = "".join(summarizer._covered_turn_fingerprints(orig_turns(1, 40)))
+    state = {
+        "conv_id": conv_id,
+        "l1": [
+            {"text": "chunk1", "first_turn": 1, "last_turn": 20},
+            {"text": "chunk2", "first_turn": 21, "last_turn": 40},
+        ],
+        "l2": [], "l3": None,
+        "last_summarized_turn": 40,
+        "turns_seen": 98,  # == the CURRENT branch length, not the pre-deletion 100
+        "covered_fps": covered_fps,
+        "tail_fp": [], "head_fp": "", "window_turns": 0,
+    }
+    summarizer.save_state(conv_id, state)
+    return db, conv_id, state
+
+
+async def _echoing_llm(client, vllm_url, model, system_prompt, body_text,
+                        max_tokens, *, timeout=300.0):
+    """Echoes the piece text back (truncated) instead of a fixed string,
+    so a test can see WHICH turns a chunk actually read, not just how
+    many characters they were."""
+    return f"summary of: {body_text}"
+
+
+def test_b1_piecewise_offset_resolves_uniquely_and_apply_stays_contiguous():
+    print("\n[test] B1: a piecewise (scattered-deletion) store resolves a "
+          "unique offset, and --apply stays contiguous with it")
+    _wipe_storage()
+    db, conv_id, state = _build_piecewise_scenario()
+
+    con = _script._open_ro(db)
+    try:
+        turns, _src, _notes = _script.reconstruct_transcript(con, conv_id)
+    finally:
+        con.close()
+
+    offset, detail = _script._resolve_resume_offset(
+        state, turns, summarizer, summarizer.L1_CHUNK_SIZE
+    )
+    assert_eq(offset, 2,
+               f"the verified offset is +2 (the SETTLED offset at the resume "
+               f"point), not the flat 98-98=0 a naive length comparison "
+               f"would use (got {offset}, detail={detail!r})")
+
+    real_llm = summarizer._llm_summarize
+    summarizer._llm_summarize = _echoing_llm
+    try:
+        rc, out = run_script([
+            "--webui-db", str(db), "--chat-id", conv_id, "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json", "--max-calls", "10",
+        ])
+    finally:
+        summarizer._llm_summarize = real_llm
+    assert_eq(rc, 0, f"the piecewise apply completes cleanly (out={out!r})")
+    final = summarizer.load_state(conv_id)
+    new_chunks = [c for c in final["l1"] if c["first_turn"] > 40]
+    assert_true(len(new_chunks) >= 1, "at least one new chunk was written")
+    first_new = new_chunks[0]
+    assert_eq((first_new["first_turn"], first_new["last_turn"]), (41, 60),
+               "the first new chunk is labelled turns 41-60")
+    # SEAM CONTIGUITY: the label claims coverage of ORIGINAL position 41,
+    # whose actual text is "turn 40" (0-indexed) -- not "turn 42", which is
+    # what the OLD flat offset (0, since turns_seen(98) == full branch
+    # length(98)) would have summarized under this exact label, silently
+    # skipping positions 41-42 for good (a 2-turn hole -- see this
+    # release's hostile review, B1).
+    import re as _re
+    first_turn_num = int(_re.search(r"turn (\d+)", first_new["text"]).group(1))
+    assert_eq(first_turn_num, 40,
+               f"the chunk labelled 41-60 actually summarizes text "
+               f"starting at ORIGINAL position 41 ('turn 40', 0-indexed), "
+               f"not 'turn 42' (the OLD flat-offset text, 2 turns later) "
+               f"(got {first_new['text']!r})")
+
+    # LABEL ALIGNMENT: every NEWLY recorded covered-turn position (41
+    # onward -- positions 1-40 predate this apply and are in the
+    # offset-0 region, not offset-2) matches the transcript at
+    # position - offset (B1 step 4's own check, independently
+    # re-verified here against the real pre-apply record).
+    before_fps = summarizer._covered_fps(state)
+    after_fps = summarizer._covered_fps(final)
+    mismatch = _script._verify_offset_after_apply(before_fps, after_fps, turns, offset, summarizer)
+    assert_true(mismatch is None,
+                f"every newly recorded position maps to the transcript at "
+                f"position-offset (mismatch={mismatch!r})")
+
+
+def test_b1_red_green_flat_offset_creates_the_two_turn_hole():
+    print("\n[test] B1 RED->GREEN: reverting to the old flat offset (0) on "
+          "the piecewise scenario mislabels the seam; the fix does not")
+    _wipe_storage()
+    db, conv_id, state = _build_piecewise_scenario()
+
+    # RED: simulate the OLD (pre-B1) behaviour by forcing offset 0 and no
+    # window trimming -- the exact shape `window_offset = position -
+    # len(window)` degenerates to when turns_seen already equals the
+    # full (post-deletion) branch length.
+    real_resolve = _script._resolve_resume_offset
+    real_apply_offset = _script._apply_resume_offset
+    _script._resolve_resume_offset = (
+        lambda state, turns, summarizer_mod, l1_chunk_size: (0, "OLD flat offset (reverted)")
+    )
+    _script._apply_resume_offset = lambda turns, offset, position: turns
+    real_llm = summarizer._llm_summarize
+    summarizer._llm_summarize = _echoing_llm
+    try:
+        rc_red, out_red = run_script([
+            "--webui-db", str(db), "--chat-id", conv_id, "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json", "--max-calls", "10",
+        ])
+    finally:
+        _script._resolve_resume_offset = real_resolve
+        _script._apply_resume_offset = real_apply_offset
+        summarizer._llm_summarize = real_llm
+
+    assert_eq(rc_red, 0, f"the reverted run still reports success (that IS the bug: "
+              f"a silent mislabelling, not a crash) (out={out_red!r})")
+    red_state = summarizer.load_state(conv_id)
+    red_new = [c for c in red_state["l1"] if c["first_turn"] > 40][0]
+    assert_true("turn 42" in red_new["text"],
+                f"RED: with the old flat offset, the chunk labelled 41-60 "
+                f"actually summarizes 'turn 42' (position 43) -- positions "
+                f"41-42 are silently skipped forever (got {red_new['text']!r})")
+
+    # GREEN: the real (unreverted) code, from a clean copy of the same
+    # scenario, gets the seam right.
+    _wipe_storage()
+    db2, conv_id2, state2 = _build_piecewise_scenario()
+    summarizer._llm_summarize = _echoing_llm
+    try:
+        rc_green, out_green = run_script([
+            "--webui-db", str(db2), "--chat-id", conv_id2, "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json", "--max-calls", "10",
+        ])
+    finally:
+        summarizer._llm_summarize = real_llm
+    assert_eq(rc_green, 0, f"GREEN: the fixed apply also completes cleanly (out={out_green!r})")
+    green_state = summarizer.load_state(conv_id2)
+    green_new = [c for c in green_state["l1"] if c["first_turn"] > 40][0]
+    assert_true("turn 40" in green_new["text"],
+                f"GREEN: the fixed code labels 41-60 over the text that "
+                f"actually starts at position 41 ('turn 40') "
+                f"(got {green_new['text']!r})")
+
+
+def test_b1_ambiguous_anchor_is_refused():
+    print("\n[test] B1: an anchor that matches more than one branch "
+          "position (a periodic transcript) is refused, not guessed at")
+    _wipe_storage()
+    conv_id = "ambiguous-conv"
+    # A 60-turn transcript that repeats a 20-turn block 3 times: the
+    # store's last 20 recorded fingerprints (an exact copy of that block)
+    # then match at branch positions 20, 40 AND 60 -- genuinely
+    # ambiguous, and growing K cannot resolve it (the whole record is
+    # only 20 entries long, so K can never grow past what's available).
+    block = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(20)
+    ]
+    turns = block + block + block
+    covered_fps = "".join(summarizer._covered_turn_fingerprints(block))
+    state = {
+        "conv_id": conv_id,
+        "l1": [{"text": "chunk1", "first_turn": 1, "last_turn": 20}],
+        "l2": [], "l3": None,
+        "last_summarized_turn": 20,
+        "turns_seen": 60,
+        "covered_fps": covered_fps,
+        "tail_fp": [], "head_fp": "", "window_turns": 0,
+    }
+    offset, detail = _script._resolve_resume_offset(
+        state, turns, summarizer, summarizer.L1_CHUNK_SIZE
+    )
+    assert_true(offset is None, f"an ambiguous anchor refuses rather than "
+                f"guesses (got offset={offset!r}, detail={detail!r})")
+
+
+def test_b1_one_turn_coincidence_is_refused():
+    print("\n[test] B1/M2: a transcript sharing only ONE turn with the "
+          "anchor is refused (the coincidence _prefix_matches_store alone "
+          "could not tell from a real match)")
+    _wipe_storage()
+    conv_id = "coincidence-conv"
+    # The store's anchor: 20 real, distinct turns.
+    anchor_turns = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"real turn {i}"}
+        for i in range(20)
+    ]
+    covered_fps = "".join(summarizer._covered_turn_fingerprints(anchor_turns))
+    state = {
+        "conv_id": conv_id,
+        "l1": [{"text": "chunk1", "first_turn": 1, "last_turn": 20}],
+        "l2": [], "l3": None,
+        "last_summarized_turn": 20,
+        "turns_seen": 20,
+        "covered_fps": covered_fps,
+        "tail_fp": [], "head_fp": "", "window_turns": 0,
+    }
+    # A totally unrelated 500-turn transcript, except ONE turn (deep in
+    # the middle) that happens to be byte-identical to anchor[0].
+    unrelated = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"unrelated {i}"}
+        for i in range(500)
+    ]
+    unrelated[250] = dict(anchor_turns[0])
+
+    offset, detail = _script._resolve_resume_offset(
+        state, unrelated, summarizer, summarizer.L1_CHUNK_SIZE
+    )
+    assert_true(offset is None,
+                f"one coincidental shared turn out of 20 required is not "
+                f"enough evidence -- refused, not accepted "
+                f"(got offset={offset!r}, detail={detail!r})")
+
+
+def test_b1_wrong_conversation_offset_refused_end_to_end():
+    print("\n[test] B1 end to end: --apply refuses on a genuinely wrong "
+          "export even though the length-only shape would have proceeded")
+    _wipe_storage()
+    conv_id = "b1-wrong-export-conv"
+    anchor_turns = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"real turn {i}"}
+        for i in range(20)
+    ]
+    covered_fps = "".join(summarizer._covered_turn_fingerprints(anchor_turns))
+    summarizer.save_state(conv_id, {
+        "conv_id": conv_id,
+        "l1": [{"text": "chunk1", "first_turn": 1, "last_turn": 20}],
+        "l2": [], "l3": None,
+        "last_summarized_turn": 20,
+        "turns_seen": 20,
+        "covered_fps": covered_fps,
+        "tail_fp": [], "head_fp": "", "window_turns": 0,
+    })
+    unrelated, unrelated_id = _linear_history(40, prefix="wrong-conv")
+    db = _new_db_path()
+    _build_webui_db(db, {"wrong-chat": _history_chat(unrelated, unrelated_id)})
+
+    rc, out = run_script([
+        "--webui-db", str(db), "--chat-id", "wrong-chat", "--conv-id", conv_id,
+        "--store", _TMP_ROOT, "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json",
+    ])
+    assert_eq(rc, 1, f"refused (out={out!r})")
+    payload = json.loads(out)
+    assert_true("refus" in payload.get("error", "").lower(),
+                "the refusal names itself")
+
+
+def test_b1_offset_longer_than_transcript_is_refused():
+    print("\n[test] B1: an offset/position combination that would need a "
+          "window LONGER than the transcript (double coverage) is refused")
+    turns = [{"role": "user", "content": f"t{i}"} for i in range(10)]
+    # position(20) - offset(2) = 18 turns needed, but the transcript only
+    # has 10 -- the store claims more coverage than this transcript has.
+    result = _script._apply_resume_offset(turns, 2, 20)
+    assert_true(result is None,
+                "a position/offset combination needing more turns than "
+                "the transcript has refuses rather than silently "
+                "truncate the wrong way")
+    # A negative keep (offset bigger than position itself) refuses too.
+    result2 = _script._apply_resume_offset(turns, 15, 10)
+    assert_true(result2 is None, "offset > position also refuses")
+    ok = _script._apply_resume_offset(turns, 3, 10)
+    assert_eq(len(ok), 7, "a sane offset/position trims the tail to the expected length")
+
+
+# ---------------------------------------------------------------------------
+# 13. B4: MODEL_REPO is actually read.
+# ---------------------------------------------------------------------------
+
+def test_b4_model_repo_env_var_is_read_when_no_model_flag_given():
+    print("\n[test] B4: --apply without --model falls back to $MODEL_REPO")
+    _wipe_storage()
+    db = _new_db_path()
+    messages, current_id = _linear_history(24)
+    _build_webui_db(db, {"b4-conv": _history_chat(messages, current_id)})
+    _seed_conv("b4-conv")
+
+    assert_eq(os.environ.get("MODEL_REPO"), "test-model",
+               "sanity: MODEL_REPO is set in this test process' environment")
+    LLM_CALLS.clear()
+    rc, out = run_script([
+        "--webui-db", str(db), "--chat-id", "b4-conv", "--store", _TMP_ROOT,
+        "--vllm-url", VLLM_URL, "--apply", "--json",
+        # deliberately NO --model
+    ])
+    assert_eq(rc, 0, f"MODEL_REPO alone is enough for --apply to run (out={out!r})")
+    assert_true(len(LLM_CALLS) > 0, "the model was actually called using MODEL_REPO")
+
+
+def test_b4_no_model_and_no_model_repo_refuses_with_a_true_message():
+    print("\n[test] B4: with neither --model nor MODEL_REPO, --apply "
+          "refuses with a message that is actually true")
+    _wipe_storage()
+    db = _new_db_path()
+    messages, current_id = _linear_history(24)
+    _build_webui_db(db, {"b4-noenv-conv": _history_chat(messages, current_id)})
+    _seed_conv("b4-noenv-conv")
+
+    real_model_repo = os.environ.pop("MODEL_REPO", None)
+    try:
+        rc, out = run_script([
+            "--webui-db", str(db), "--chat-id", "b4-noenv-conv", "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--apply", "--json",
+        ])
+    finally:
+        if real_model_repo is not None:
+            os.environ["MODEL_REPO"] = real_model_repo
+    assert_eq(rc, 1, "refused: no model available at all")
+    assert_true("MODEL_REPO" in out, "the message names MODEL_REPO")
+
+
+# ---------------------------------------------------------------------------
+# 14. B5: --store is validated before any work, dry run and --apply alike.
+# ---------------------------------------------------------------------------
+
+def test_b5_nonexistent_store_refuses_before_any_work():
+    print("\n[test] B5: a --store that does not exist refuses immediately")
+    _wipe_storage()
+    db = _new_db_path()
+    messages, current_id = _linear_history(4)
+    _build_webui_db(db, {"b5-conv": _history_chat(messages, current_id)})
+    bogus_store = os.path.join(_TMP_ROOT, "typo-store-does-not-exist")
+
+    rc, out = run_script([
+        "--webui-db", str(db), "--chat-id", "b5-conv", "--store", bogus_store,
+    ])
+    assert_eq(rc, 1, "dry run refuses on a nonexistent --store")
+    assert_true("does not exist" in out, "the message names the problem")
+    assert_true(not os.path.exists(bogus_store),
+                "the phantom store was never created (B5's whole point)")
+
+    rc2, out2 = run_script([
+        "--webui-db", str(db), "--chat-id", "b5-conv", "--store", bogus_store,
+        "--vllm-url", VLLM_URL, "--model", MODEL, "--apply",
+    ])
+    assert_eq(rc2, 1, "--apply refuses the same way on the same bad --store")
+    assert_true(not os.path.exists(bogus_store), "still never created, even under --apply")
+
+
+def test_b5_store_without_summaries_subdir_refuses():
+    print("\n[test] B5: a --store directory with no summaries/ subdirectory refuses")
+    db = _new_db_path()
+    messages, current_id = _linear_history(4)
+    _build_webui_db(db, {"b5-conv2": _history_chat(messages, current_id)})
+    bare_dir = os.path.join(_TMP_ROOT, "bare-store-no-summaries")
+    os.makedirs(bare_dir, exist_ok=True)
+
+    rc, out = run_script([
+        "--webui-db", str(db), "--chat-id", "b5-conv2", "--store", bare_dir,
+    ])
+    assert_eq(rc, 1, "refused: no summaries/ subdirectory")
+    assert_true("summaries" in out, "the message names the missing subdirectory")
+
+
+def test_b5_missing_conv_summary_file_refuses_dry_run_and_apply():
+    print("\n[test] B5: a valid --store with no summary file yet for THIS "
+          "conv_id refuses, dry run and --apply alike")
+    _wipe_storage()
+    db = _new_db_path()
+    messages, current_id = _linear_history(24)
+    _build_webui_db(db, {"never-seen-conv": _history_chat(messages, current_id)})
+    # Deliberately NOT calling _seed_conv here.
+
+    rc, out = run_script([
+        "--webui-db", str(db), "--chat-id", "never-seen-conv", "--store", _TMP_ROOT,
+    ])
+    assert_eq(rc, 1, "dry run refuses: this conv_id has no summary file yet")
+    assert_true("never-seen-conv" in out, "the message names the conv_id")
+
+    rc2, out2 = run_script([
+        "--webui-db", str(db), "--chat-id", "never-seen-conv", "--store", _TMP_ROOT,
+        "--vllm-url", VLLM_URL, "--model", MODEL, "--apply",
+    ])
+    assert_eq(rc2, 1, "--apply refuses the same way")
+    assert_true(not summarizer.summary_path("never-seen-conv").exists(),
+                "still nothing was written")
+
+
+# ---------------------------------------------------------------------------
+# 15. H2: the exit-code table. Code 4 (real progress, more due) is
+#     covered by test_interrupted_apply_leaves_valid_state_and_resumes
+#     above; this covers code 1 (--apply ran but accomplished nothing).
+# ---------------------------------------------------------------------------
+
+def test_h2_apply_with_zero_progress_exits_1():
+    print("\n[test] H2: --apply that never advances the watermark at all exits 1")
+    _wipe_storage()
+    db = _new_db_path()
+    messages, current_id = _linear_history(24)
+    _build_webui_db(db, {"h2-conv": _history_chat(messages, current_id)})
+    _seed_conv("h2-conv")
+
+    async def _always_fails(client, vllm_url, model, system_prompt, body_text,
+                             max_tokens, *, timeout=300.0):
+        raise RuntimeError("vLLM totally unreachable")
+
+    real_llm = summarizer._llm_summarize
+    summarizer._llm_summarize = _always_fails
+    try:
+        rc, out = run_script([
+            "--webui-db", str(db), "--chat-id", "h2-conv", "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json",
+        ])
+    finally:
+        summarizer._llm_summarize = real_llm
+
+    assert_eq(rc, 1, f"zero progress is exit 1, not a silent 0 (out={out!r})")
+    payload = json.loads(out)
+    assert_eq(payload["last_summarized_turn_after"], payload["last_summarized_turn_before"],
+               "the watermark genuinely never moved")
+    assert_true("no progress" in payload["note"] or "never advanced" in payload["note"],
+                f"the report says nothing was accomplished (note={payload['note']!r})")
+
+
+# ---------------------------------------------------------------------------
+# 16. H3: the archive sidecar is backed up too, and restored on the B1
+#     step-4 belt-and-braces rollback.
+# ---------------------------------------------------------------------------
+
+def test_h3_archive_sidecar_is_backed_up_alongside_the_summary_file():
+    print("\n[test] H3: an existing summaries/<conv>.archive.json is "
+          "backed up (with the same stamp) alongside the summary file")
+    _wipe_storage()
+    conv_id = "h3-conv"
+    db = _new_db_path()
+    messages, current_id = _linear_history(24)
+    _build_webui_db(db, {conv_id: _history_chat(messages, current_id)})
+    _seed_conv(conv_id)
+    archive_path = memory.summary_archive_path(conv_id)
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_path.write_text('{"chapters": ["pre-existing chapter"]}', encoding="utf-8")
+    original_archive_bytes = archive_path.read_bytes()
+
+    rc, out = run_script([
+        "--webui-db", str(db), "--chat-id", conv_id, "--store", _TMP_ROOT,
+        "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json",
+    ])
+    assert_eq(rc, 0, f"apply succeeds (out={out!r})")
+    payload = json.loads(out)
+    assert_true(payload.get("archive_backup") is not None,
+                "the report names an archive backup path")
+    archive_backup_path = Path(payload["archive_backup"])
+    assert_true(archive_backup_path.is_file(), "the archive backup file exists")
+    assert_eq(archive_backup_path.read_bytes(), original_archive_bytes,
+               "the archive backup is byte-identical to the pre-apply archive")
+    assert_eq(archive_path.read_bytes(), original_archive_bytes,
+               "this apply (no L2/L3 unit ran) never touched the archive itself")
+
+
+def test_h3_and_b1step4_restore_both_files_on_a_detected_mismatch():
+    print("\n[test] H3 + B1 step 4: a detected offset mismatch after "
+          "--apply restores BOTH the summary file and the archive sidecar")
+    _wipe_storage()
+    db, conv_id, state = _build_piecewise_scenario()
+    archive_path = memory.summary_archive_path(conv_id)
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_path.write_text('{"chapters": ["untouched"]}', encoding="utf-8")
+    original_summary_bytes = summarizer.summary_path(conv_id).read_bytes()
+    original_archive_bytes = archive_path.read_bytes()
+
+    # Decouple the offset VALUE (kept correct, so the initial anchor
+    # verification still passes) from the window actually handed to the
+    # drain (forced back to the untrimmed full array) -- simulating a
+    # hypothetical bug downstream of a correctly-verified offset, which
+    # is exactly the class of mistake B1 step 4 exists to catch.
+    real_apply_offset = _script._apply_resume_offset
+    _script._apply_resume_offset = lambda turns, offset, position: turns
+    try:
+        rc, out = run_script([
+            "--webui-db", str(db), "--chat-id", conv_id, "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json", "--max-calls", "10",
+        ])
+    finally:
+        _script._apply_resume_offset = real_apply_offset
+
+    assert_eq(rc, 1, f"the mismatch is caught and refused, not silently written (out={out!r})")
+    assert_true("disagrees" in out.lower() or "refus" in out.lower(),
+                "the refusal explains itself")
+    assert_eq(summarizer.summary_path(conv_id).read_bytes(), original_summary_bytes,
+               "the summary file was restored to its pre-apply content")
+    assert_eq(archive_path.read_bytes(), original_archive_bytes,
+               "the archive sidecar was restored too (H3), not left holding "
+               "chapters from the discarded run")
+
+
+# ---------------------------------------------------------------------------
+# 17. M3: --health-url, and an ambiguous probe (timeout, or anything else
+#     short of a clean refusal) refuses --apply instead of failing open.
+# ---------------------------------------------------------------------------
+
+def test_m3_connection_refused_is_read_as_not_running():
+    print("\n[test] M3: a clean connection refusal is read as 'not running'")
+    real_urlopen = _script.urllib.request.urlopen
+
+    def _raise_refused(*a, **kw):
+        raise ConnectionRefusedError(61, "Connection refused")
+
+    _script.urllib.request.urlopen = _raise_refused
+    try:
+        result = _script._compactor_is_alive("http://127.0.0.1:1/health")
+    finally:
+        _script.urllib.request.urlopen = real_urlopen
+    assert_eq(result, False, "a clean refusal reads as not-alive (safe to proceed)")
+
+
+def test_m3_timeout_is_ambiguous_and_refuses_apply_unless_forced():
+    print("\n[test] M3: a timeout (or anything else ambiguous) refuses "
+          "--apply instead of failing open, unless --force")
+    real_urlopen = _script.urllib.request.urlopen
+
+    def _raise_timeout(*a, **kw):
+        raise TimeoutError("timed out")
+
+    _script.urllib.request.urlopen = _raise_timeout
+    try:
+        result = _script._compactor_is_alive("http://127.0.0.1:1/health")
+        assert_eq(result, "ambiguous", "a timeout is neither a clean up nor a clean refusal")
+
+        _wipe_storage()
+        db = _new_db_path()
+        messages, current_id = _linear_history(24)
+        _build_webui_db(db, {"m3-conv": _history_chat(messages, current_id)})
+        _seed_conv("m3-conv")
+
+        before = _snapshot()
+        rc, out = run_script([
+            "--webui-db", str(db), "--chat-id", "m3-conv", "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply",
+        ])
+        assert_eq(rc, 1, "an ambiguous health check refuses --apply")
+        assert_true("REFUSING" in out, "the refusal names itself")
+        assert_eq(_snapshot(), before, "nothing was written on the refusal")
+
+        rc2, out2 = run_script([
+            "--webui-db", str(db), "--chat-id", "m3-conv", "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--force",
+        ])
+        assert_eq(rc2, 0, "--force overrides the ambiguous-health refusal")
+        assert_true("WARNING" in out2 and "AMBIGUOUS" in out2,
+                    "the override is a loud warning naming the ambiguity")
+    finally:
+        _script.urllib.request.urlopen = real_urlopen
+
+
+# ---------------------------------------------------------------------------
+# 18. Mutation-tooling kills: IH3 (the no-anchor length-fallback refusal)
+#     and IH4 (off-by-one in the L1 due arithmetic).
+# ---------------------------------------------------------------------------
+
+def test_ih3_no_anchor_length_fallback_refusal_fires():
+    print("\n[test] IH3 kill: matches=None (no tail_fp) + current_turns < "
+          "recorded_position refuses, with no anchor evidence either way")
+    _wipe_storage()
+    conv_id = "ih3-conv"
+    summarizer.save_state(conv_id, {
+        "l1": [], "l2": [], "l3": None,
+        "last_summarized_turn": 0, "turns_seen": 50,
+        "tail_fp": [], "head_fp": "", "window_turns": 0,
+    })
+    messages, current_id = _linear_history(10, prefix="ih3")
+    db = _new_db_path()
+    _build_webui_db(db, {conv_id: _history_chat(messages, current_id)})
+
+    rc, out = run_script([
+        "--webui-db", str(db), "--chat-id", conv_id, "--store", _TMP_ROOT,
+    ])
+    assert_eq(rc, 1, "refused: 10 turns found against recorded_position 50, no anchor")
+    assert_true("REFUSING" in out, "the refusal names itself")
+    assert_true("no content evidence" in out.lower(),
+                "the message is specifically the no-anchor fallback, not "
+                "the wrong-conversation (matches=False) refusal")
+
+
+def test_ih4_l1_due_off_by_one_at_the_chunk_boundary():
+    print("\n[test] IH4 kill: 19 new turns (just under one L1 chunk) is 0 "
+          "due, not 1 (the exact off-by-one IH4 introduces)")
+    l1_due, l2_due, l3_due = _script.estimate_due(
+        {"last_summarized_turn": 0, "l1": [], "l2": []},
+        19, 20, 10, 5,
+    )
+    assert_eq(l1_due, 0, f"19 new turns under a 20-turn L1 chunk is 0 due "
+              f"(got {l1_due}) -- IH4's (new_turns+1)//l1_size would give 1")
+    l1_due2, _, _ = _script.estimate_due(
+        {"last_summarized_turn": 0, "l1": [], "l2": []},
+        20, 20, 10, 5,
+    )
+    assert_eq(l1_due2, 1, "exactly 20 new turns is 1 due")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -923,6 +1630,31 @@ if __name__ == "__main__":
         test_prefix_matches_store_none_when_store_has_no_anchor_yet()
         test_apply_history_shorter_than_recorded_position_but_content_matches_is_not_refused()
         test_apply_history_from_a_different_conversation_is_still_refused()
+
+        test_b1_piecewise_offset_resolves_uniquely_and_apply_stays_contiguous()
+        test_b1_red_green_flat_offset_creates_the_two_turn_hole()
+        test_b1_ambiguous_anchor_is_refused()
+        test_b1_one_turn_coincidence_is_refused()
+        test_b1_wrong_conversation_offset_refused_end_to_end()
+        test_b1_offset_longer_than_transcript_is_refused()
+
+        test_b4_model_repo_env_var_is_read_when_no_model_flag_given()
+        test_b4_no_model_and_no_model_repo_refuses_with_a_true_message()
+
+        test_b5_nonexistent_store_refuses_before_any_work()
+        test_b5_store_without_summaries_subdir_refuses()
+        test_b5_missing_conv_summary_file_refuses_dry_run_and_apply()
+
+        test_h2_apply_with_zero_progress_exits_1()
+
+        test_h3_archive_sidecar_is_backed_up_alongside_the_summary_file()
+        test_h3_and_b1step4_restore_both_files_on_a_detected_mismatch()
+
+        test_m3_connection_refused_is_read_as_not_running()
+        test_m3_timeout_is_ambiguous_and_refuses_apply_unless_forced()
+
+        test_ih3_no_anchor_length_fallback_refusal_fires()
+        test_ih4_l1_due_off_by_one_at_the_chunk_boundary()
 
         print("\nAll import-history.py script tests passed.")
     finally:

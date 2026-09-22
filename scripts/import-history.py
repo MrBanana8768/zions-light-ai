@@ -93,29 +93,41 @@ result. Non-alternating turns (two user turns in a row, a missing
 assistant reply) are reported as anomalies and handled — the reconstructed
 array is still built and handed to the drain — never crashed on.
 
-EXIT CODES. The same convention as scripts/backfill-records.py and
-scripts/setup-sshd.py — normalized across all three (see CHANGELOG.md and
-OPERATIONS.md; setup-sshd.py used to have 0 and 3 swapped from this):
-    0   success — nothing was due (dry run), or `--apply` ran to
-        completion (even if it stopped early on its own call budget or an
-        LLM failure — see `stopped_because` in its report; that is not a
-        script error)
-    1   a refusal or an error the operator needs to look at: a bad
-        `--webui-db` or `--store`, an unknown `--chat-id`, a
-        `-journal`/`-wal` beside the database without `--force`, no
-        usable compactor package (or one missing what this script needs
-        from it — see PACKAGE RESOLUTION above), a refused `--apply`
-        precondition (live compactor without `--force`, an existing
-        backup path, no `--model`/`MODEL_REPO`), or a reconstructed
-        transcript whose content does not match what the store already
-        has confirmed (see _prefix_matches_store — NOT simply "fewer
-        turns than recorded_position", which a normal edit or abandoned
-        branch can cause on its own)
-    3   a DRY RUN found one or more rollup units due — informational, not
-        a failure: re-run with `--apply` once ready
-    (argparse's own usage errors — unknown flags, missing required values
-    — exit 2, the standard library's own convention, unrelated to the
-    three above)
+EXIT CODES. The architect's ruling for v3.1.9.6, normalized across all
+three operator scripts (scripts/backfill-records.py, scripts/setup-
+sshd.py, and this one) -- closing H2, where there used to be no code
+meaning "ran but accomplished nothing", so a dead vLLM and an exhausted
+--apply both silently read as ordinary success:
+
+    Code  Meaning
+    0     Desired end state reached (a no-op --apply is 0)
+    1     Refusal or error, OR --apply accomplished nothing (the
+          watermark did not move at all)
+    2     argparse usage error (unrelated to the rest of this table --
+          the standard library's own convention)
+    3     A DRY RUN found pending work -- informational, not a failure:
+          re-run with --apply once ready
+    4     --apply made real progress but work remains (most commonly
+          the --max-calls budget ran out): re-run to continue
+
+Concretely, for THIS script: 1 covers a bad `--webui-db` or `--store`
+(including a `--store` that exists but has no `summaries/`, or whose
+conv_id has no summaries file yet under it), an unknown `--chat-id`, a
+`-journal`/`-wal` beside the database without `--force`, no usable
+compactor package (or one missing what this script needs from it -- see
+PACKAGE RESOLUTION above), a refused `--apply` precondition (live
+compactor without `--force`, an AMBIGUOUS compactor health check
+without `--force`, an existing backup path, no `--model`/`MODEL_REPO`),
+a reconstructed transcript whose content does not match what the store
+already has confirmed (see _prefix_matches_store -- NOT simply "fewer
+turns than recorded_position", which a normal edit or abandoned branch
+can cause on its own), an unverifiable/ambiguous resume offset against
+the store's own covered-turn record (see _resolve_resume_offset), AND
+an `--apply` that ran but never advanced the watermark at all (vLLM
+unreachable from the first call, or an offset-consistency check failed
+after writing -- see _resolve_resume_offset's own docstring). 3 is the
+dry-run-found-work case. 4 is `--apply` making real, verified progress
+but stopping with more due.
 
 POD PROCEDURE
     1. Get this script (and the matching `compactor` package) onto the
@@ -152,6 +164,7 @@ POD PROCEDURE
 
 import argparse
 import asyncio
+import errno
 import importlib.util
 import json
 import os
@@ -257,7 +270,7 @@ _REQUIRED_SUMMARIZER_SYMBOLS = (
     "_turn_fingerprints", "_align_candidates", "_covered_fps",
     "_covered_turn_fingerprints", "_FP_UNKNOWN",
 )
-_REQUIRED_MEMORY_SYMBOLS = ("conv_lock",)
+_REQUIRED_MEMORY_SYMBOLS = ("conv_lock", "summary_archive_path")
 
 
 def _check_summarizer_capability(summarizer_mod, memory_mod, pkg_source: str) -> str | None:
@@ -303,17 +316,47 @@ def _format_eta(seconds: float) -> str:
     return f"{minutes / 60:.1f}h"
 
 
-def _compactor_is_alive(url: str = DEFAULT_HEALTH_URL) -> bool:
-    """True if anything answers `url`. Same liveness probe
-    scripts/backfill-records.py uses — --apply's blast radius is a state
-    file the live compactor's own rollup could be mid-write on."""
+def _connection_was_refused(exc: BaseException) -> bool:
+    """True only for a CLEAN refusal (ECONNREFUSED) -- the one condition
+    that reliably means "nothing is listening at this address", safe to
+    read as "the compactor is not running". `urllib` sometimes raises the
+    OSError bare and sometimes wraps it as `URLError(reason=...)`; this
+    checks both shapes."""
+    if isinstance(exc, urllib.error.URLError):
+        exc = exc.reason if isinstance(exc.reason, BaseException) else exc
+    return isinstance(exc, ConnectionRefusedError) or (
+        isinstance(exc, OSError) and exc.errno == errno.ECONNREFUSED
+    )
+
+
+def _compactor_is_alive(url: str = DEFAULT_HEALTH_URL) -> bool | str:
+    """True for a clean 200 from `url`. False for a clean CONNECTION
+    REFUSED (nothing listening there -- safe to read as "not running"),
+    or for a real HTTP response that just isn't 200 (something else is
+    listening, but it answered cleanly, which is not the ambiguous case
+    below). The string "ambiguous" for everything this cannot tell apart
+    from "not running": a timeout, a DNS failure, or any other exception.
+
+    M3 (hostile review, this release). Until now every one of those
+    non-200 conditions collapsed into plain `False`, which FAILS OPEN:
+    "starting up, not yet bound", "a 3s timeout under GPU load", and
+    "bound on a different port" all used to read exactly like "not
+    running" and let `--apply` proceed -- racing a live rollup that may
+    be writing this exact state file. Only a clean refusal is now trusted
+    as evidence of "not running"; everything else refuses `--apply`
+    (see the caller) unless `--force` says the operator has confirmed it
+    some other way."""
     try:
         with urllib.request.urlopen(url, timeout=HEALTH_PROBE_TIMEOUT_S) as r:
             return r.status == 200
-    except (urllib.error.URLError, OSError, ValueError):
+    except urllib.error.HTTPError:
+        # A real HTTP response, just not 200 -- something answered
+        # cleanly; simply not (yet) a healthy compactor. Not ambiguous.
         return False
-    except Exception:
-        return False
+    except Exception as e:
+        if _connection_was_refused(e):
+            return False
+        return "ambiguous"
 
 
 class ChatNotFound(Exception):
@@ -613,6 +656,205 @@ def _prefix_matches_store(
 
 
 # ---------------------------------------------------------------------------
+# B1 (v3.1.9.6 fix pass 1). _prefix_matches_store above answers "is this
+# roughly the right conversation" from a 4-turn tail_fp anchor -- good
+# enough to gate reporting, but too weak to trust for the number that
+# actually decides where new text gets labelled. Her real store's own
+# position -> branch mapping is PIECEWISE (0, -6, -16, -18, -22): the
+# missing turns are scattered abandoned-branch messages, not a clean
+# prefix, so the drain's single flat `window_offset = position -
+# len(window)` is wrong for everything after the first scatter. This
+# derives that offset from harder evidence -- the store's own per-
+# position covered-turn record (`_covered_fps` / `_record_chunk_fps`) --
+# and requires the match to be UNIQUE before any real work runs. This is
+# also the fix for M2 (a transcript sharing exactly one turn with a
+# 4-turn anchor could satisfy _prefix_matches_store's weaker check); at
+# least 8 independent non-empty fingerprints must agree, in order, for
+# --apply to proceed.
+# ---------------------------------------------------------------------------
+
+# Never anchor on fewer than this many independent, non-empty covered-turn
+# fingerprints, even when the last L1 chunk's own span is shorter (a small
+# L1_CHUNK_SIZE, or a store recorded before this release). This is the
+# floor that makes a one-turn (or few-turn) coincidence unable to pass --
+# see M2.
+_MIN_ANCHOR_FINGERPRINTS = 8
+
+
+def _chunk_span_ending_at(state: dict, last_turn: int) -> int | None:
+    """The `last_turn - first_turn + 1` span of whichever stored chunk
+    (l1, l2, or l3) claims to END exactly at `last_turn` -- the chunk
+    that `last_summarized_turn` names, wherever an L2 fold or L3 refresh
+    has since moved it to. None if no chunk claims that turn (a fresh
+    conversation, or a state file predating chunk-level spans)."""
+    l1 = [c for c in (state.get("l1") or []) if isinstance(c, dict)]
+    l2 = [c for c in (state.get("l2") or []) if isinstance(c, dict)]
+    l3 = state.get("l3") if isinstance(state.get("l3"), dict) else None
+    for c in l1 + l2 + ([l3] if l3 else []):
+        ft, lt = c.get("first_turn"), c.get("last_turn")
+        if isinstance(ft, int) and isinstance(lt, int) and lt == last_turn:
+            return lt - ft + 1
+    return None
+
+
+def _resolve_resume_offset(
+    state: dict, turns: list[dict], summarizer_mod, l1_chunk_size: int
+) -> tuple[int | None, str]:
+    """(offset, detail). `offset` is `position - len(window)` VERIFIED
+    against the store's own covered-turn record, or None with a refusal
+    detail if it cannot be determined uniquely.
+
+    Algorithm (the architect's B1 design, v3.1.9.6): take the store's
+    recorded covered-turn fingerprints (`summarizer._covered_fps`) for
+    the last K positions ending at `last_summarized_turn`. K starts at
+    the span of whichever chunk claims that turn (or `l1_chunk_size` if
+    none does), never fewer than `_MIN_ANCHOR_FINGERPRINTS` non-UNKNOWN
+    entries. Find the branch index j such that `turns`' own
+    covered-turn fingerprints for the K turns ending at j equal that
+    slice exactly, position for position (an _FP_UNKNOWN slot in the
+    store's record can never match a real turn -- see
+    summarizer._FP_UNKNOWN -- so only the non-UNKNOWN slots are
+    required to match, but there must be at least
+    `_MIN_ANCHOR_FINGERPRINTS` of them). If that match is not unique,
+    grow K (reach further back into the record) and retry, until it is
+    unique or the record runs out. `offset = last_summarized_turn - j`.
+
+    A fresh conversation (nothing summarized: last_summarized_turn <= 0
+    and no covered-fp record at all) needs no anchor -- offset 0, the
+    ordinary case, unchanged from before this fix.
+    """
+    last = int(state.get("last_summarized_turn") or 0)
+    entries = summarizer_mod._covered_fps(state)
+    if last <= 0 and not entries:
+        return 0, "nothing summarized yet for this conversation -- no anchor needed"
+    if last <= 0:
+        return None, (
+            "the store has a covered-turn record but last_summarized_turn "
+            "is 0 -- an inconsistent state file; refusing rather than "
+            "guessing an offset"
+        )
+    if last > len(entries):
+        return None, (
+            f"the store's covered-turn record has only {len(entries)} "
+            f"entries but last_summarized_turn is {last} -- an "
+            f"inconsistent state file; refusing rather than guessing an "
+            f"offset"
+        )
+
+    min_span = _chunk_span_ending_at(state, last) or l1_chunk_size
+    transcript_fps = summarizer_mod._covered_turn_fingerprints(turns)
+    fp_unknown = getattr(summarizer_mod, "_FP_UNKNOWN", None)
+    n = len(transcript_fps)
+
+    k = max(min_span, _MIN_ANCHOR_FINGERPRINTS)
+    while True:
+        if k > last:
+            return None, (
+                f"could not find a unique, sufficiently-anchored match "
+                f"against the store's covered-turn record for conv "
+                f"{state.get('conv_id')!r} even using the entire "
+                f"{last}-position record ending at turn {last} -- "
+                f"refusing rather than guess a resume offset"
+            )
+        target = entries[last - k:last]
+        known = [(i, fp) for i, fp in enumerate(target) if fp != fp_unknown]
+        if len(known) < _MIN_ANCHOR_FINGERPRINTS:
+            k += 1
+            continue
+        matches = [
+            j for j in range(k, n + 1)
+            if all(transcript_fps[j - k + i] == fp for i, fp in known)
+        ]
+        if len(matches) == 1:
+            j = matches[0]
+            return last - j, (
+                f"verified against {len(known)} non-empty covered-turn "
+                f"fingerprint(s) of the store's last {k} recorded "
+                f"position(s) ending at turn {last}, uniquely matching "
+                f"branch turn {j}"
+            )
+        if len(matches) == 0:
+            return None, (
+                f"none of the store's last {k} recorded covered-turn "
+                f"fingerprint(s) ending at turn {last} ({len(known)} "
+                f"non-empty) appear anywhere in this reconstruction -- "
+                f"refusing rather than risk labelling a chunk over text "
+                f"it did not summarize"
+            )
+        # Ambiguous (M2): more than one branch position is consistent
+        # with the evidence so far. Reach further back for more evidence
+        # rather than trust a coincidence.
+        k += 1
+
+
+def _apply_resume_offset(
+    turns: list[dict], offset: int, position: int
+) -> list[dict] | None:
+    """The window to hand the drain so that, inside the frozen
+    `summarizer` module, `position - len(window) == offset` exactly (B1
+    step 2): trimmed at the TAIL, preserving every leading turn
+    (including any leading system messages) up through the
+    `position - offset`-th non-system turn.
+
+    `position` is the STORE's own recorded position (turns_seen /
+    `summarizer.recorded_position`), NOT `len(turns)` -- those two
+    legitimately differ (the real 2026-09-22 backup: turns_seen=3883
+    against a 3863-turn reconstruction), and it is `position`, not the
+    reconstructed branch's own length, that the frozen module's
+    `_observed_position` converges on whenever the window handed to it
+    is at least `highest_chunk_turn(state)` long (true for any offset
+    this function is ever asked to apply, by construction of
+    `_resolve_resume_offset`). Trimming by the branch's own length
+    instead of `position` was caught by the real-backup test: it silently
+    computed the wrong window length whenever the two differ, and B1
+    step 4's belt-and-braces check refused the resulting write outright.
+
+    None if `position - offset` is negative, or LONGER than the
+    reconstructed transcript actually has turns for (the "double
+    coverage" case -- the store claims more coverage than this
+    transcript contains at all), either of which the caller must refuse
+    rather than silently truncate the wrong way."""
+    non_system_idx = [i for i, t in enumerate(turns) if t.get("role") != "system"]
+    keep = position - offset
+    if keep < 0 or keep > len(non_system_idx):
+        return None
+    if keep == 0:
+        return []
+    cutoff = non_system_idx[keep - 1]
+    return turns[:cutoff + 1]
+
+
+def _verify_offset_after_apply(
+    before_entries: list[str], after_entries: list[str], turns: list[dict],
+    offset: int, summarizer_mod,
+) -> str | None:
+    """Belt-and-braces (B1 step 4): re-map every NEWLY recorded
+    covered-turn position to this same transcript at `position - offset`
+    and assert the fingerprint the run just wrote agrees. None if every
+    newly recorded entry checks out; otherwise a detail string naming
+    the first position that does not, so the caller can restore the
+    backup and refuse rather than trust a write that disagrees with the
+    very transcript it was supposedly built from."""
+    transcript_fps = summarizer_mod._covered_turn_fingerprints(turns)
+    fp_unknown = getattr(summarizer_mod, "_FP_UNKNOWN", None)
+    n = len(transcript_fps)
+    start = len(before_entries)
+    for pos in range(start + 1, len(after_entries) + 1):
+        fp = after_entries[pos - 1]
+        if fp == fp_unknown:
+            continue
+        j = pos - offset
+        expected = transcript_fps[j - 1] if 1 <= j <= n else None
+        if expected is None or fp != expected:
+            return (
+                f"position {pos}: recorded fingerprint {fp!r} does not "
+                f"match the transcript at branch turn {j} (offset "
+                f"{offset}) -- expected {expected!r}"
+            )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -636,6 +878,15 @@ def _build_argparser() -> argparse.ArgumentParser:
                      help=f"compactor storage root (default: {DEFAULT_STORE})")
     ap.add_argument("--vllm-url", default=DEFAULT_VLLM_URL, metavar="URL",
                      help=f"default: {DEFAULT_VLLM_URL}")
+    ap.add_argument("--health-url", default=DEFAULT_HEALTH_URL, metavar="URL",
+                     help=f"the live compactor's own health endpoint, "
+                          f"probed before --apply (default: "
+                          f"{DEFAULT_HEALTH_URL}). A clean connection "
+                          f"refusal is read as 'not running' and --apply "
+                          f"proceeds; a timeout or any other ambiguous "
+                          f"response REFUSES --apply (M3, v3.1.9.6) "
+                          f"unless --force says you have confirmed it "
+                          f"some other way")
     ap.add_argument("--model", default=None, metavar="NAME",
                      help="default: $MODEL_REPO")
     ap.add_argument("--max-calls", type=int, default=DEFAULT_MAX_CALLS,
@@ -694,6 +945,49 @@ def main(argv=None) -> int:
             f"beside {db_path} that suggest a live or crashed database."
         )
 
+    # B5 (v3.1.9.6). Validate --store BEFORE any work at all -- checked
+    # with plain pathlib, before even resolving the compactor package, so
+    # a typo is caught as early as a bad --webui-db is. The hostile review
+    # found a typo'd --store silently building a brand-new phantom store
+    # from scratch and reporting an encouraging "re-run with --apply",
+    # while the REAL store (and the operator's belief that the backlog
+    # was closing) sat untouched. This script exists to catch an EXISTING
+    # conversation's hierarchy up from a backlog, so the conversation's
+    # own summary file is required to already be there too: a bootstrap
+    # of a conv_id the store has never seen is indistinguishable, from
+    # here, from exactly that --store/--conv-id typo.
+    conv_id = args.conv_id or args.chat_id
+    store_root = Path(args.store)
+    if not store_root.is_dir():
+        return _fatal(
+            args,
+            f"ERROR: --store {store_root} does not exist or is not a "
+            f"directory. Refusing before any work -- a typo here would "
+            f"otherwise silently build a brand-new store from scratch and "
+            f"treat an existing backlog as fresh, burning real vLLM time "
+            f"against the wrong place.",
+        )
+    summaries_dir = store_root / "summaries"
+    if not summaries_dir.is_dir():
+        return _fatal(
+            args,
+            f"ERROR: --store {store_root} exists but has no summaries/ "
+            f"subdirectory -- this does not look like a real compactor "
+            f"storage root. Refusing before any work.",
+        )
+    conv_summary_file = summaries_dir / f"{conv_id}.json"
+    if not conv_summary_file.is_file():
+        return _fatal(
+            args,
+            f"ERROR: {conv_summary_file} does not exist -- conv "
+            f"{conv_id!r} has no summary state under --store {store_root} "
+            f"yet. This script catches an EXISTING conversation's "
+            f"hierarchy up from a backlog; a conv_id the store has never "
+            f"seen is indistinguishable, from here, from a --store or "
+            f"--conv-id/--chat-id typo pointed at the wrong place. "
+            f"Refusing before any work.",
+        )
+
     pkg_dir, tried, already_importable = _resolve_compactor_pkg(args.compactor_pkg)
     if pkg_dir is None and not already_importable:
         lines = ["ERROR: no compactor package found. Tried, in order:"]
@@ -724,8 +1018,11 @@ def main(argv=None) -> int:
 
     warnings.append(f"NOTE: compactor package resolved from {pkg_source}")
 
-    conv_id = args.conv_id or args.chat_id
-    model = args.model  # default handled below, only required for --apply
+    # B4 (v3.1.9.6). The module docstring, the argparser's own --model
+    # help text, and the error message below all say MODEL_REPO is a
+    # fallback -- it never was read. Every documented invocation that
+    # omits --model used to fail every time.
+    model = args.model or os.environ.get("MODEL_REPO")
 
     try:
         con = _open_ro(db_path)
@@ -780,6 +1077,14 @@ def main(argv=None) -> int:
             f"export is not older than the store under --store.",
         )
 
+    # B1 (v3.1.9.6): the verified resume offset, computed for BOTH dry
+    # run and --apply so the report always says where the next chunk
+    # would actually start -- only --apply refuses on it (below), since
+    # only --apply can do the damage a wrong offset causes.
+    resume_offset, resume_offset_detail = _resolve_resume_offset(
+        state, turns, summarizer, summarizer.L1_CHUNK_SIZE
+    )
+
     l1_due, l2_due, l3_due = estimate_due(
         state, current_turns,
         summarizer.L1_CHUNK_SIZE, summarizer.L2_CHUNK_SIZE, summarizer.L3_CHUNK_SIZE,
@@ -811,6 +1116,8 @@ def main(argv=None) -> int:
         "anomalies": anomalies,
         "apply": args.apply,
         "warnings": warnings,
+        "resume_offset": resume_offset,
+        "resume_offset_detail": resume_offset_detail,
     }
 
     if not args.apply:
@@ -842,23 +1149,86 @@ def main(argv=None) -> int:
             "ERROR: --apply needs a model — pass --model or set MODEL_REPO.",
         )
 
-    alive = _compactor_is_alive()
-    if alive and not args.force:
+    # M3 (v3.1.9.6). A clean connection refusal is the only condition
+    # trusted as "not running"; a timeout or anything else ambiguous now
+    # REFUSES rather than failing open (see _compactor_is_alive's own
+    # docstring).
+    health = _compactor_is_alive(args.health_url)
+    if health == "ambiguous":
+        if not args.force:
+            return _fatal(
+                args,
+                f"REFUSING --apply: {args.health_url} did not answer "
+                f"clearly within {HEALTH_PROBE_TIMEOUT_S}s (a timeout, or "
+                f"something short of a clean connection refusal) -- this "
+                f"cannot be told apart from the compactor starting up, "
+                f"overloaded, or bound on a different port, and "
+                f"--apply's blast radius is a state file it may be "
+                f"writing right now. Pass --force to override only if "
+                f"you have confirmed some other way that it is not "
+                f"running.",
+            )
+        warnings.append(
+            f"WARNING: --force overriding an AMBIGUOUS health check at "
+            f"{args.health_url} (a timeout, not a clean refusal) -- "
+            f"proceeding anyway."
+        )
+        health = False
+    if health and not args.force:
         return _fatal(
             args,
-            f"REFUSING --apply: something is answering {DEFAULT_HEALTH_URL} "
+            f"REFUSING --apply: something is answering {args.health_url} "
             f"— the live compactor may be writing this exact state file "
             f"right now. Stop it first (supervisorctl stop compactor) or "
             f"pass --force to override.",
         )
-    if alive and args.force:
+    if health and args.force:
         warnings.append(
             f"WARNING: --force overriding a live compactor detected at "
-            f"{DEFAULT_HEALTH_URL} — proceeding anyway."
+            f"{args.health_url} — proceeding anyway."
         )
 
+    # B1 (v3.1.9.6): the verified offset (computed above, for the report,
+    # regardless of --apply) is what actually gates real work. Refuse
+    # rather than let the frozen drain apply a single flat offset to a
+    # PIECEWISE position->branch mapping (see _resolve_resume_offset and
+    # _apply_resume_offset's own docstrings).
+    if resume_offset is None:
+        return _fatal(args, f"REFUSING --apply: {resume_offset_detail}")
+    # The EFFECTIVE position to trim against: recorded_position(state) is
+    # what the store believed BEFORE this run and is what the frozen
+    # _observed_position converges on whenever it already exceeds the
+    # window we hand it (the ordinary catch-up case: a real store's
+    # turns_seen already reflects live traffic ahead of what any single
+    # export reconstructs). But a conversation with NOTHING summarized
+    # yet has recorded_position 0, which is stale/uninformative for a
+    # transcript that is otherwise fully new -- there _observed_position
+    # converges on the window's OWN length instead (I2/I3's "the larger
+    # of two lower bounds"). Taking the max of both matches whichever
+    # regime this run is actually in, so `keep = effective_position -
+    # resume_offset` is the window length that makes the frozen module's
+    # own `window_offset` come out to exactly `resume_offset` either way.
+    effective_position = max(recorded_position, current_turns)
+    window = _apply_resume_offset(turns, resume_offset, effective_position)
+    if window is None:
+        return _fatal(
+            args,
+            f"REFUSING --apply: the verified resume offset "
+            f"({resume_offset}) would need a window longer than this "
+            f"{current_turns}-turn reconstruction actually is -- the "
+            f"store may already claim more coverage than this transcript "
+            f"contains at all (double coverage). Refusing rather than "
+            f"risk a gap or a duplicate.",
+        )
+    warnings.append(
+        f"NOTE: resume offset verified at {resume_offset} -- "
+        f"{resume_offset_detail}"
+    )
+
     summary_path = summarizer.summary_path(conv_id)
+    archive_path = memory.summary_archive_path(conv_id)
     backup_path = None
+    archive_backup_path = None
     if summary_path.exists():
         stamp = _utc_stamp()
         backup_path = summary_path.with_name(summary_path.name + f".bak-{stamp}")
@@ -869,12 +1239,74 @@ def main(argv=None) -> int:
                 f"{backup_path}. Remove or rename it before re-running.",
             )
         shutil.copy2(summary_path, backup_path)
+        # H3 (v3.1.9.6). An L2 fold or L3 refresh rewrites the archive
+        # sidecar too (_archive_chapters) -- "its entire blast radius is
+        # one file" was not true once either ran, and a rollback after
+        # B1 is exactly the moment this matters: restoring only
+        # summary_path would leave the archive holding chapters from the
+        # discarded run.
+        if archive_path.exists():
+            archive_backup_path = archive_path.with_name(
+                archive_path.name + f".bak-{stamp}"
+            )
+            if archive_backup_path.exists():
+                return _fatal(
+                    args,
+                    f"REFUSING --apply: backup path already exists: "
+                    f"{archive_backup_path}. Remove or rename it before "
+                    f"re-running.",
+                )
+            shutil.copy2(archive_path, archive_backup_path)
 
-    passes = asyncio.run(_run_apply_loop(summarizer, memory, conv_id, turns,
-                                          args.vllm_url, model, args.max_calls))
+    before_covered_fps = summarizer._covered_fps(state)
+
+    try:
+        passes = asyncio.run(_run_apply_loop(summarizer, memory, conv_id, window,
+                                              args.vllm_url, model, args.max_calls))
+    except KeyboardInterrupt:
+        return _fatal(
+            args,
+            "INTERRUPTED: --apply was interrupted (Ctrl-C) before this "
+            "pass finished. Any rollup unit that had already completed "
+            "was already saved (state is saved after every unit, never "
+            "batched); if none had completed yet, the pre-apply anchor "
+            "was put back so the next run has real evidence to align "
+            "against. Re-run to continue -- nothing needs cleanup.",
+        )
 
     final_state = summarizer.load_state(conv_id)
+
+    # B1 step 4 (belt-and-braces, v3.1.9.6): re-map every NEWLY recorded
+    # covered-turn position back onto this same transcript at
+    # `position - resume_offset` and assert the fingerprint just written
+    # agrees. Never expected to fire when the arithmetic above is right;
+    # if it does, trust the backup over the write just made rather than
+    # leave a state file that mislabels its own chunks.
+    after_covered_fps = summarizer._covered_fps(final_state)
+    verify_detail = _verify_offset_after_apply(
+        before_covered_fps, after_covered_fps, turns, resume_offset, summarizer
+    )
+    if verify_detail is not None:
+        if backup_path is not None:
+            shutil.copy2(backup_path, summary_path)
+        else:
+            summary_path.unlink(missing_ok=True)
+        if archive_backup_path is not None:
+            shutil.copy2(archive_backup_path, archive_path)
+        elif archive_path.exists() and backup_path is None:
+            archive_path.unlink(missing_ok=True)
+        return _fatal(
+            args,
+            f"REFUSING: the covered-turn record this run just wrote "
+            f"disagrees with the transcript it was built from "
+            f"({verify_detail}) -- restored the pre-apply backup and "
+            f"refusing rather than leave a state file that mislabels its "
+            f"own chunks. This should be unreachable; if it fires, the "
+            f"offset arithmetic above has a bug.",
+        )
+
     report["backup"] = str(backup_path) if backup_path else None
+    report["archive_backup"] = str(archive_backup_path) if archive_backup_path else None
     report["passes"] = passes["log"]
     report["rollup_calls"] = passes["rollup_calls"]
     report["vllm_calls_spent"] = passes["vllm_calls_spent"]
@@ -885,16 +1317,34 @@ def main(argv=None) -> int:
     report["still_due"] = summarizer.needs_rollup(
         final_state, summarizer.recorded_position(final_state)
     )
-    report["note"] = (
-        "apply complete" if not report["still_due"]
-        else "apply stopped with more work due — re-run to continue"
+
+    # H2 (v3.1.9.6): the exit-code table in the module docstring. An
+    # --apply that never advanced the watermark at all accomplished
+    # nothing -- vLLM unreachable from the first call, or every pass
+    # failing immediately -- which is a 1, not a silent 0. Real progress
+    # with more still due is a 4 (re-run to continue); real progress
+    # that reaches "nothing left due" is a plain 0.
+    watermark_advanced = (
+        report["last_summarized_turn_after"] > report["last_summarized_turn_before"]
     )
+    if not watermark_advanced:
+        report["note"] = (
+            "apply ran but made no progress at all — the watermark never "
+            "advanced (see stopped_because); nothing was accomplished"
+        )
+        rc = 1
+    elif report["still_due"]:
+        report["note"] = "apply stopped with more work due — re-run to continue"
+        rc = 4
+    else:
+        report["note"] = "apply complete"
+        rc = 0
 
     if args.json:
         print(json.dumps(report, indent=2))
     else:
         _print_apply_report(report)
-    return 0
+    return rc
 
 
 async def _run_apply_loop(summarizer, memory, conv_id, messages, vllm_url, model, max_calls):
@@ -909,9 +1359,27 @@ async def _run_apply_loop(summarizer, memory, conv_id, messages, vllm_url, model
     # chat path may not match this reconstruction's own tail, which would
     # misalign the first chunk's offset. Dropped once, under conv_lock;
     # every later pass re-derives its own anchor from this same array.
+    #
+    # v3.1.9.6 (B1's Ctrl-C window, closed). This clears the anchor on
+    # disk BEFORE any vLLM call, and KeyboardInterrupt is a BaseException
+    # the ordinary `except Exception` below does not catch -- a Ctrl-C
+    # landing between this save and the first successfully completed pass
+    # used to leave tail_fp empty on disk with nothing having run yet to
+    # give it a fresh one, closing the documented "re-run to continue"
+    # path (the next run's _observed_position would see no anchor at all
+    # against a full-history resend). The ORIGINAL anchor is kept here
+    # and restored by the `except BaseException` below, but only if the
+    # loop is interrupted before ANY pass completed -- once one has, that
+    # pass already wrote a fresh, self-consistent anchor of its own.
+    _orig_anchor: tuple[list, str, int] | None = None
     async with memory.conv_lock(conv_id):
         _state = summarizer.load_state(conv_id)
         if _state.get("tail_fp"):
+            _orig_anchor = (
+                _state.get("tail_fp"),
+                _state.get("head_fp", ""),
+                _state.get("window_turns", 0),
+            )
             _state["tail_fp"] = []
             _state["head_fp"] = ""
             _state["window_turns"] = 0
@@ -919,27 +1387,36 @@ async def _run_apply_loop(summarizer, memory, conv_id, messages, vllm_url, model
 
     calls = 0
     stopped_because = None
-    with summarizer.vllm_call_budget_ctx(max_calls) as budget:
-        while calls < max_calls:
-            prev = summarizer.load_state(conv_id).get("last_summarized_turn", 0)
-            try:
-                await summarizer.maybe_rollup(conv_id, messages, vllm_url, model)
-            except Exception as e:
-                stopped_because = f"{type(e).__name__}: {e}"
-                break
-            calls += 1
-            now = summarizer.load_state(conv_id).get("last_summarized_turn", 0)
-            log.append({"pass": calls, "last_summarized_turn": now})
-            if now <= prev:
-                stopped_because = "the watermark stopped advancing"
-                break
-            if budget["remaining"] <= 0:
-                stopped_because = f"hit max_calls={max_calls} (vLLM calls)"
-                break
-        else:
-            stopped_because = f"hit max_calls={max_calls} (rollup passes)"
-        vllm_calls_spent = max_calls - budget["remaining"]
-        exhausted = budget["exhausted"]
+    try:
+        with summarizer.vllm_call_budget_ctx(max_calls) as budget:
+            while calls < max_calls:
+                prev = summarizer.load_state(conv_id).get("last_summarized_turn", 0)
+                try:
+                    await summarizer.maybe_rollup(conv_id, messages, vllm_url, model)
+                except Exception as e:
+                    stopped_because = f"{type(e).__name__}: {e}"
+                    break
+                calls += 1
+                now = summarizer.load_state(conv_id).get("last_summarized_turn", 0)
+                log.append({"pass": calls, "last_summarized_turn": now})
+                if now <= prev:
+                    stopped_because = "the watermark stopped advancing"
+                    break
+                if budget["remaining"] <= 0:
+                    stopped_because = f"hit max_calls={max_calls} (vLLM calls)"
+                    break
+            else:
+                stopped_because = f"hit max_calls={max_calls} (rollup passes)"
+            vllm_calls_spent = max_calls - budget["remaining"]
+            exhausted = budget["exhausted"]
+    except BaseException:
+        if _orig_anchor is not None and calls == 0:
+            async with memory.conv_lock(conv_id):
+                _s = summarizer.load_state(conv_id)
+                if not _s.get("tail_fp"):
+                    _s["tail_fp"], _s["head_fp"], _s["window_turns"] = _orig_anchor
+                    summarizer.save_state(conv_id, _s)
+        raise
 
     return {
         "log": log,
@@ -968,6 +1445,7 @@ def _print_dry_run_report(report: dict) -> None:
           f"L3 refreshes={report['l3_refreshes_due_estimate']}")
     print(f"estimated calls:  {report['estimated_real_vllm_calls']}")
     print(f"estimated time:   {report['estimated_wall_clock']}")
+    print(f"resume offset:    {report['resume_offset']} ({report['resume_offset_detail']})")
     if report["anomalies"]:
         print("anomalies:")
         for a in report["anomalies"]:
@@ -985,6 +1463,7 @@ def _print_apply_report(report: dict) -> None:
     print(f"import-history.py — --apply for conv={report['conv_id']}")
     print("=" * 70)
     print(f"backup:           {report['backup']}")
+    print(f"archive backup:   {report.get('archive_backup')}")
     for p in report["passes"]:
         print(f"  pass {p['pass']}: last_summarized_turn -> {p['last_summarized_turn']}")
     print(f"rollup passes:    {report['rollup_calls']}")
