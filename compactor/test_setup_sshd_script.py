@@ -555,7 +555,11 @@ def test_dry_run_writes_nothing_and_installs_nothing():
             if line.startswith("apt-get ") and "install" in line and " -s " not in f" {line} ":
                 assert_true(False, f"a non-simulated apt-get install ran in dry run: {line}")
         assert_true("DRY RUN" in out, "human output says DRY RUN")
-        assert_eq(rc, 0, "dry run on a fresh container reports real work pending -> exit 0")
+        # Defect 4: normalized to match scripts/backfill-records.py and
+        # scripts/import-history.py — a DRY RUN that finds pending work is
+        # exit 3, not 0 (this script briefly had 0 and 3 swapped from that
+        # convention; see CHANGELOG.md v3.1.9.6 "Fixed").
+        assert_eq(rc, 3, "dry run on a fresh container reports real work pending -> exit 3")
 
 
 def test_dry_run_reports_planned_action_and_key():
@@ -636,8 +640,8 @@ def test_apply_never_reads_or_prints_a_private_key():
 # 3. Idempotency
 # ---------------------------------------------------------------------------
 
-def test_apply_twice_is_idempotent_and_second_run_exits_3():
-    print("\n[test] --apply twice leaves the same state; the second is a no-op, exit 3")
+def test_apply_twice_is_idempotent_and_second_run_exits_0():
+    print("\n[test] --apply twice leaves the same state; the second is a no-op, exit 0")
     with _Fixture() as fx:
         rc1, out1 = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
         assert_eq(rc1, 0, "first --apply succeeds")
@@ -651,11 +655,36 @@ def test_apply_twice_is_idempotent_and_second_run_exits_3():
         after = fx.snapshot()
         payload2 = json.loads(out2)
 
-        assert_eq(rc2, 3, "second --apply reports nothing-to-do -> exit 3")
+        # Defect 4: a no-op --apply is SUCCESS (0), not "nothing to do" (3)
+        # — 3 is reserved for a DRY RUN finding pending work. This script
+        # briefly had 0 and 3 swapped from the convention
+        # scripts/backfill-records.py and scripts/import-history.py
+        # already followed; see CHANGELOG.md v3.1.9.6 "Fixed".
+        assert_eq(rc2, 0, "second --apply (a no-op) succeeds -> exit 0")
         assert_eq(payload2["action"], "already-current", "package already at candidate")
         assert_eq(payload2["keys_added"], [], "no new key the second time")
         assert_eq(payload2["daemon"], "already-running", "daemon left alone, not restarted")
         assert_eq(before, after, "not one byte changed on the second, idempotent --apply")
+
+
+def test_dry_run_after_apply_finds_nothing_to_do_and_exits_0():
+    print("\n[test] a DRY RUN after --apply finds nothing pending and exits 0")
+    with _Fixture() as fx:
+        rc1, _ = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+        assert_eq(rc1, 0, "the --apply that sets everything up succeeds")
+        before = fx.snapshot()
+
+        # A dry run (no --apply) now, with everything already in place: no
+        # refusals, nothing pending -> exit 0, distinct from the DRY RUN
+        # in test_dry_run_writes_nothing_and_installs_nothing (fresh
+        # container, pending work, exit 3).
+        rc2, out2 = fx.run(["--json", "--authorized-key", _ED25519_KEY_A])
+        after = fx.snapshot()
+        payload2 = json.loads(out2)
+
+        assert_eq(rc2, 0, "a dry run finding nothing to do exits 0, not 3")
+        assert_eq(payload2["mode"], "dry-run", "still reports itself as a dry run")
+        assert_eq(before, after, "a dry run, even with nothing to do, writes nothing")
 
 
 # ---------------------------------------------------------------------------
@@ -973,7 +1002,8 @@ if __name__ == "__main__":
     test_apply_on_clean_container_installs_keys_and_starts()
     test_apply_never_reads_or_prints_a_private_key()
 
-    test_apply_twice_is_idempotent_and_second_run_exits_3()
+    test_apply_twice_is_idempotent_and_second_run_exits_0()
+    test_dry_run_after_apply_finds_nothing_to_do_and_exits_0()
 
     test_existing_authorized_keys_preserved_and_appended_not_clobbered()
     test_duplicate_key_is_not_added_twice()

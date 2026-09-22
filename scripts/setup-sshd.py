@@ -114,18 +114,28 @@ that new program and left every other program's own RUNNING state alone —
 never one supervisord already has running unchanged. Kept, on that
 evidence; see OPERATIONS.md for the transcript.
 
-EXIT CODES
-    0   `--apply` performed real work (installed/upgraded, added a key,
-        (re)started the daemon), or a dry run found something it WOULD do
+EXIT CODES. The same convention as scripts/backfill-records.py and
+scripts/import-history.py — normalized across all three (see
+CHANGELOG.md and OPERATIONS.md). Defect 4 / hostile-pass finding: THIS
+SCRIPT USED TO HAVE 0 AND 3 SWAPPED FROM THIS CONVENTION (its own author
+flagged it) — three sibling scripts sharing the same flags with opposite
+exit meanings is exactly the kind of thing that burns an operator writing
+`if script; then`.
+    0   success — the desired end state is in place. Either `--apply`
+        completed (installed/upgraded, added a key, (re)started the
+        daemon, or was a NO-OP because everything was already correct —
+        including a second `--apply` right after the first), or a DRY RUN
+        found nothing to do (openssh-server already at the apt candidate
+        version, no new key to add, and the daemon already running with
+        this script's own config unchanged)
     1   a refusal the operator needs to look at (see `refusals` in
         `--json` output): not root, does not look like this container,
         no usable public key anywhere, a malformed key, `apt-get install`
         failed, `sshd -t`/`sshd -T` failed or would allow password login,
         `sshd` failed to (re)start, or `--supervise`'s `reread` failed
-    3   nothing to do: openssh-server already at the apt candidate
-        version, no new key to add, and the daemon already running with
-        this script's own config unchanged — including a second `--apply`
-        right after the first
+    3   a DRY RUN found something `--apply` WOULD do (install/upgrade, add
+        a key, or start/restart the daemon) — informational, not a
+        failure: re-run with `--apply` once ready
     (argparse's own usage errors — unknown flags, missing required values
     — exit 2, the Python standard library's own convention)
 """
@@ -889,12 +899,22 @@ def _nothing_to_do(report: dict, args) -> bool:
 def _finish(args, report: dict, refusals: list[str], warnings: list[str]) -> int:
     report["refusals"] = refusals
     report["warnings"] = warnings
+    # Defect 4 (normalized against scripts/backfill-records.py and
+    # scripts/import-history.py, whose exit codes were always right: 0 is
+    # success — the desired end state is in place, or --apply completed,
+    # INCLUDING an --apply that was a no-op because everything was already
+    # correct (a second --apply right after the first). 3 means a DRY RUN
+    # found pending work --apply would change; a dry run that finds
+    # nothing to do is 0, not 3. This script used to have 0 and 3 swapped
+    # from that convention — its own author flagged it — which is exactly
+    # the trap of three sibling scripts sharing flags with opposite exit
+    # meanings: `if script; then` reads backwards on two of the three.
     if refusals:
         exit_code = 1
-    elif _nothing_to_do(report, args):
-        exit_code = 3
-    else:
+    elif args.apply:
         exit_code = 0
+    else:
+        exit_code = 0 if _nothing_to_do(report, args) else 3
     report["exit_code"] = exit_code
 
     if args.json:
@@ -936,11 +956,16 @@ def _print_human(report: dict, args) -> None:
         for r in report["refusals"]:
             print(f"  - {r}")
     print()
-    if report["exit_code"] == 3:
-        print("Nothing to do — already installed, keyed and running.")
-    elif not args.apply and not report.get("refusals"):
-        print("DRY RUN — nothing was written, installed, or started. "
-              "Re-run with --apply.")
+    if report.get("refusals"):
+        pass  # already printed above
+    elif args.apply:
+        print("APPLY complete.")
+    elif report["exit_code"] == 3:
+        print("DRY RUN — nothing was written, installed, or started, and "
+              "there is work to do. Re-run with --apply.")
+    else:
+        print("Nothing to do — already installed, keyed and running "
+              "(dry run: nothing was written, installed, or started).")
 
 
 def main(argv=None) -> int:

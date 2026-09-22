@@ -2,10 +2,50 @@
 """Inspect compactor backfill records and, only on request, close the
 stale ones before an upgrade resumes them.
 
-    /opt/compactor-venv/bin/python /data/scripts/backfill-records.py
-    /opt/compactor-venv/bin/python /data/scripts/backfill-records.py --json
-    /opt/compactor-venv/bin/python /data/scripts/backfill-records.py --apply
-    /opt/compactor-venv/bin/python /data/scripts/backfill-records.py --conv <id> --apply
+SUPPORTED INVOCATION — from a clone, not a copy (see "PACKAGE RESOLUTION"
+below for why a copy to /data/scripts/ fails on a pre-v3.1.9.4 pod):
+
+    git clone --depth 1 --branch <tag-or-branch> \\
+        https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+    /opt/compactor-venv/bin/python /opt/zl-repo/scripts/backfill-records.py \\
+        --store /data/openwebui/compactor
+    /opt/compactor-venv/bin/python /opt/zl-repo/scripts/backfill-records.py \\
+        --store /data/openwebui/compactor --json
+    /opt/compactor-venv/bin/python /opt/zl-repo/scripts/backfill-records.py \\
+        --store /data/openwebui/compactor --apply
+    /opt/compactor-venv/bin/python /opt/zl-repo/scripts/backfill-records.py \\
+        --store /data/openwebui/compactor --conv <id> --apply
+
+`--compactor-pkg PATH` overrides package auto-detection entirely, if you
+need to point this at a package that isn't beside the script and isn't at
+/opt/compactor (see "PACKAGE RESOLUTION").
+
+PACKAGE RESOLUTION. Copying just this one file to /data/scripts/ and
+running it from there used to fail with "no compactor package beside this
+script (/data/compactor)" — HERE.parent/"compactor" resolves relative to
+wherever THIS FILE sits, and /data/scripts/../compactor does not exist.
+Resolved now, in order: `--compactor-pkg PATH` (explicit, highest
+precedence) > `HERE.parent/"compactor"` (the repo/clone layout — the
+SUPPORTED way, see above) > `/opt/compactor` (the image's own layout) > an
+already-importable `backfill` on sys.path. If every one of those fails,
+the error lists every path tried and prints the clone command above. See
+_resolve_compactor_pkg's own docstring for the full reasoning, including a
+layout trap that can make a substitute package silently invisible.
+
+WHY THIS DOES NOT ALSO WORK BY JUST COPYING NEWER FILES IN. On a pod that
+has never run v3.1.9.4 or later, the INSTALLED `compactor/backfill.py`
+itself lacks `_MAX_BACKFILL_ATTEMPTS` and `_backoff_ready` — this script
+asks the real module for its verdict rather than keeping a second copy of
+the rules (see below), and that pre-v3.1.9.4 module simply does not have
+them yet. Substituting a newer `backfill.py` onto that older package does
+not work either (verified): v3.1.9.4's `backfill.py` imports
+`current_wipe_generation` from `memory`, which the older `memory.py` does
+not have. This script detects the missing capability before classifying
+anything and refuses with an actionable message rather than an
+`AttributeError` — see _check_backfill_capability. The only self-consistent
+fix is the WHOLE target release together, which is exactly what a clone
+supplies, and is why the clone above is the only invocation that works on
+such a pod.
 
 WHY THIS EXISTS. `compactor/backfill.py`'s `needs_backfill()` decides "does
 this conversation need a lazy history backfill?" by reading the
@@ -65,13 +105,18 @@ would cancel its one chance at ever getting one, not close a hazard.
 `--force` also overrides the refusal to run `--apply` while something
 answers the compactor's `/health` — see `_compactor_is_alive` below.
 
-EXIT CODES
-    0   nothing to do (no `would-resume` records found), or `--apply`
-        completed without a hard error (a `--force`-gated skip is not an
-        error: it is this script refusing to do something unsafe)
-    1   an error the operator needs to look at: a bad `--store`, an
-        unreadable compactor package, a refused `--apply` precondition
-        without `--force`, or a backup path that already existed
+EXIT CODES. The same convention as scripts/import-history.py and
+scripts/setup-sshd.py — normalized across all three (see CHANGELOG.md and
+OPERATIONS.md; setup-sshd.py used to have 0 and 3 swapped from this):
+    0   success — the desired end state is in place, or `--apply` completed
+        (including a `--apply` that was a no-op because nothing was
+        `would-resume`; a `--force`-gated skip is not an error either: it
+        is this script refusing to do something unsafe, not a failure)
+    1   a refusal or an error the operator needs to look at: a bad
+        `--store`, no usable compactor package (or one too old to answer
+        the questions this script asks it — see PACKAGE RESOLUTION
+        above), a refused `--apply` precondition without `--force`, or a
+        backup path that already existed
     3   a DRY RUN found one or more `would-resume` records — informational,
         not a failure: it means "re-run with --apply once you're ready"
     (argparse's own usage errors — unknown flags, missing required values —
@@ -80,6 +125,7 @@ EXIT CODES
 """
 
 import argparse
+import importlib.util
 import json
 import shutil
 import sys
@@ -89,13 +135,96 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-PKG = HERE.parent / "compactor"
+# A module-level name (not inlined at the call site) so a test can
+# monkeypatch it to a temp directory, the same reason HERE itself is a
+# module global rather than computed fresh inside every function.
+OPT_COMPACTOR = Path("/opt/compactor")
 
 DEFAULT_STORE = "/data/openwebui/compactor"
 DEFAULT_HEALTH_URL = "http://127.0.0.1:8080/health"
 HEALTH_PROBE_TIMEOUT_S = 3
 
 TERMINAL_STATES = ("complete", "abandoned", "wiped")
+
+# The one invocation verified end to end against a pre-v3.1.9.4 pod (see
+# RUNPOD_DEPLOY.md "Upgrading within v3.1.9.x" and OPERATIONS.md). Printed
+# whenever no compactor package could be found at all, and whenever the one
+# found is too old to answer the questions this script asks it (see
+# _check_backfill_capability) — in both cases a clone is the fix.
+_CLONE_HINT = """\
+On a pod, the supported way to run this script is from a clone of this
+public repo (git ships in the image; there is no ssh/scp/rsync in it):
+
+  git clone --depth 1 --branch <tag-or-branch> \\
+      https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+  /opt/compactor-venv/bin/python /opt/zl-repo/scripts/backfill-records.py \\
+      --store /data/openwebui/compactor
+
+A clone always carries a self-consistent target-release `compactor`
+package beside this script, which is the one thing a pre-v3.1.9.4 pod's
+own installed package cannot supply for itself."""
+
+
+# ---------------------------------------------------------------------------
+# Where the real compactor/backfill.py lives — resolved fresh every run,
+# never assumed (Defect 1). Copied to /data/scripts/, HERE.parent/"compactor"
+# resolves to /data/compactor, which does not exist: that is the exact
+# operator error this function exists to stop happening again.
+# ---------------------------------------------------------------------------
+
+# The module this script actually needs from the package, used both to
+# decide whether "already importable on sys.path" (source 4) is true, and
+# to import it for real once a directory is chosen.
+_PROBE_MODULE = "backfill"
+
+
+def _resolve_compactor_pkg(explicit: str | None) -> tuple[Path | None, list[str], bool]:
+    """(pkg_dir, tried, already_importable).
+
+    Tried in order, and the first hit wins:
+      1. --compactor-pkg PATH — explicit always wins.
+      2. HERE.parent / "compactor" — the repo/clone layout. THE SUPPORTED
+         way to run this script (see the module docstring and _CLONE_HINT).
+      3. /opt/compactor — the image's own layout, in case a copy of this
+         script ends up sitting somewhere the image also mounts/keeps the
+         package.
+      4. an already-importable `backfill` on sys.path (e.g. PYTHONPATH
+         already points at a package, or a test harness pre-imported one).
+
+    `pkg_dir` is None with `already_importable=True` for source 4 — there
+    is no directory to insert into sys.path, the caller just imports.
+    `pkg_dir` is None with `already_importable=False` if every source
+    failed; `tried` then lists every path (and the sys.path probe) in the
+    order they were checked, for the caller's error message.
+
+    THE TRAP (see the module docstring): a script living directly at
+    `/opt/sim/x.py` (not nested under a `scripts/` directory) has
+    HERE.parent == /opt, so source 2 resolves to /opt/compactor — the
+    SAME path as source 3. A substituted package placed at
+    /opt/sim/compactor (sibling of the script itself, not of its parent)
+    is never tried at all, and a test built that way would "pass" against
+    the image's own /opt/compactor without ever exercising source 2 or 3
+    as distinct candidates. Exercising them as distinct requires nesting
+    the probe script one level deeper, e.g. /opt/sim/scripts/x.py.
+    """
+    tried: list[str] = []
+    if explicit:
+        p = Path(explicit)
+        tried.append(f"{p} (--compactor-pkg)")
+        if p.is_dir():
+            return p, tried, False
+    p2 = HERE.parent / "compactor"
+    tried.append(f"{p2} (repo/clone layout beside this script — the supported way)")
+    if p2.is_dir():
+        return p2, tried, False
+    p3 = OPT_COMPACTOR
+    tried.append(f"{p3} (image layout)")
+    if p3.is_dir():
+        return p3, tried, False
+    tried.append(f"an already-importable {_PROBE_MODULE!r} on sys.path")
+    if importlib.util.find_spec(_PROBE_MODULE) is not None:
+        return None, tried, True
+    return None, tried, False
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +310,45 @@ def _compactor_is_alive(url: str = DEFAULT_HEALTH_URL) -> bool:
         return False
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Capability check (Defect 2) — this script is a PRE-upgrade step that
+# learns its rules from the INSTALLED package, which on a pre-v3.1.9.4 pod
+# is exactly the version that does not have them yet. `_classify` below
+# reads `backfill_mod._MAX_BACKFILL_ATTEMPTS` and calls
+# `backfill_mod._backoff_ready`; neither exists before v3.1.9.4 (verified:
+# v3.1.9/.1/.2/.3 have `is_stale`/`_STALE_SECONDS`/`atomic_write_json` but
+# not those two). Detected BEFORE classifying anything, so the failure is
+# one actionable message naming the pod's version state, never a raw
+# AttributeError out of `_classify`.
+#
+# This is NOT fixed by substituting a newer backfill.py onto an older
+# package on disk — verified to fail differently: v3.1.9.4's backfill.py
+# imports `current_wipe_generation` from `memory`, which v3.1.9/.1/.2/.3's
+# `memory.py` does not have. The only self-consistent fix is the whole
+# target release together, which is exactly what a clone supplies.
+# ---------------------------------------------------------------------------
+
+_REQUIRED_BACKFILL_SYMBOLS = ("_MAX_BACKFILL_ATTEMPTS", "_backoff_ready")
+
+
+def _check_backfill_capability(backfill_mod, pkg_source: str) -> str | None:
+    """None if `backfill_mod` has everything `_classify` needs; otherwise
+    the full actionable error message (never a bare AttributeError)."""
+    missing = [n for n in _REQUIRED_BACKFILL_SYMBOLS if not hasattr(backfill_mod, n)]
+    if not missing:
+        return None
+    return (
+        f"ERROR: the compactor package at {pkg_source} is missing "
+        f"{', '.join(missing)} — this pod's installed compactor predates "
+        f"v3.1.9.4 (backfill.needs_backfill() gained the record-first "
+        f"rules, and this script asks the REAL module for its verdict "
+        f"rather than keeping a second copy of the logic — see this "
+        f"script's own module docstring). Classifying records against a "
+        f"package this old would misjudge every one of them, silently.\n\n"
+        f"{_CLONE_HINT}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +581,12 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="override the live-compactor refusal and the no-facts-file "
              "refusal (see the module docstring)",
     )
+    ap.add_argument(
+        "--compactor-pkg", default=None, metavar="PATH",
+        help="explicit path to the compactor package directory (highest "
+             "precedence; overrides the repo/clone-layout and /opt/compactor "
+             "auto-detection — see the module docstring's resolution order)",
+    )
     return ap
 
 
@@ -430,23 +604,36 @@ def main(argv=None) -> int:
     store_root = Path(args.store)
     facts_dir = store_root / "facts"
 
-    if not PKG.is_dir():
-        return _fatal(args, f"ERROR: no compactor package beside this script ({PKG}).")
+    pkg_dir, tried, already_importable = _resolve_compactor_pkg(args.compactor_pkg)
+    if pkg_dir is None and not already_importable:
+        lines = ["ERROR: no compactor package found. Tried, in order:"]
+        lines += [f"  - {t}" for t in tried]
+        lines += ["", _CLONE_HINT]
+        return _fatal(args, "\n".join(lines))
 
-    sys.path.insert(0, str(PKG))
+    if pkg_dir is not None:
+        sys.path.insert(0, str(pkg_dir))
+        pkg_source = str(pkg_dir)
+    else:
+        pkg_source = f"an already-importable {_PROBE_MODULE!r} on sys.path (no package directory)"
+
     try:
         import backfill  # noqa: E402
     except Exception as e:
         return _fatal(
             args,
-            f"ERROR importing compactor/backfill.py from {PKG}: "
+            f"ERROR importing compactor/backfill.py from {pkg_source}: "
             f"{type(e).__name__}: {e}",
         )
+
+    capability_error = _check_backfill_capability(backfill, pkg_source)
+    if capability_error is not None:
+        return _fatal(args, capability_error)
 
     if not facts_dir.is_dir():
         return _fatal(args, f"ERROR: {facts_dir} does not exist or is not a directory.")
 
-    warnings: list[str] = []
+    warnings: list[str] = [f"NOTE: compactor package resolved from {pkg_source}"]
     if args.conv_ids:
         paths = []
         for cid in args.conv_ids:

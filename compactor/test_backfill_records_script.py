@@ -368,6 +368,153 @@ def test_json_output_parses_and_carries_the_same_verdicts_as_text():
 
 
 # ---------------------------------------------------------------------------
+# Defect 1: package resolution — HERE.parent/"compactor" (the repo/clone
+# layout) resolving to /data/compactor when copied to /data/scripts/ was
+# the real operator error. Covered two ways: the pure resolution function
+# (fast, deterministic, no subprocess), and --compactor-pkg end to end
+# through the real CLI (a proper real-image test drives the full
+# fallback-to-/opt/compactor and multi-path-failure paths against the
+# real image — see compactor/test_real_image_operator_scripts.py).
+# ---------------------------------------------------------------------------
+
+def test_resolve_compactor_pkg_explicit_flag_wins_over_the_repo_layout():
+    print("\n[test] --compactor-pkg wins even when the repo-layout package also exists")
+    with tempfile.TemporaryDirectory() as td:
+        real_pkg = Path(td) / "explicit-pkg"
+        real_pkg.mkdir()
+        here = Path(td) / "repo" / "scripts"
+        here.mkdir(parents=True)
+        (here.parent / "compactor").mkdir()  # would win as candidate 2 if not overridden
+        with patch.object(_script, "HERE", here):
+            pkg, tried, already = _script._resolve_compactor_pkg(str(real_pkg))
+        assert_eq(pkg, real_pkg, "the explicit --compactor-pkg path wins")
+        assert_true(already is False, "not reported as sys.path-importable")
+        assert_true("--compactor-pkg" in tried[0], "the explicit path is listed first, and labelled")
+
+
+def test_resolve_compactor_pkg_repo_layout_beats_opt_compactor():
+    print("\n[test] the repo/clone layout beside the script wins over /opt/compactor")
+    with tempfile.TemporaryDirectory() as td:
+        here = Path(td) / "repo" / "scripts"
+        here.mkdir(parents=True)
+        repo_pkg = here.parent / "compactor"
+        repo_pkg.mkdir()
+        opt_pkg = Path(td) / "opt-compactor"
+        opt_pkg.mkdir()
+        with patch.object(_script, "HERE", here), patch.object(_script, "OPT_COMPACTOR", opt_pkg):
+            pkg, tried, already = _script._resolve_compactor_pkg(None)
+        assert_eq(pkg, repo_pkg, "the repo/clone layout resolves first")
+
+
+def test_resolve_compactor_pkg_falls_back_to_opt_compactor():
+    print("\n[test] with no repo-layout package (the /data/scripts/ shape), resolution falls through to /opt/compactor")
+    with tempfile.TemporaryDirectory() as td:
+        # HERE simulates /data/scripts: its PARENT has no "compactor" child
+        # — the exact real operator error (HERE.parent/"compactor" ==
+        # /data/compactor, which does not exist).
+        here = Path(td) / "data" / "scripts"
+        here.mkdir(parents=True)
+        opt_pkg = Path(td) / "opt-compactor"
+        opt_pkg.mkdir()
+        with patch.object(_script, "HERE", here), patch.object(_script, "OPT_COMPACTOR", opt_pkg):
+            pkg, tried, already = _script._resolve_compactor_pkg(None)
+        assert_eq(pkg, opt_pkg, "falls back to the image layout")
+        assert_true(
+            any(str(here.parent / "compactor") in t for t in tried),
+            "the failed repo-layout candidate is still named in tried",
+        )
+
+
+def test_resolve_compactor_pkg_reports_every_path_tried_when_none_exist():
+    print("\n[test] when nothing resolves, every path tried is reported — never a bare crash")
+    with tempfile.TemporaryDirectory() as td:
+        here = Path(td) / "data" / "scripts"
+        here.mkdir(parents=True)
+        missing_opt = Path(td) / "does-not-exist"
+        with patch.object(_script, "HERE", here), patch.object(_script, "OPT_COMPACTOR", missing_opt):
+            pkg, tried, already = _script._resolve_compactor_pkg(None)
+        # `already` (source 4, an already-importable `backfill` on
+        # sys.path) is NOT asserted here either way: this test module
+        # itself does `import backfill` at the top, so in THIS process
+        # `backfill` really is already importable — that is a true fact
+        # about the test environment, not something this function gets
+        # to decide. `pkg is None` is what "no PACKAGE DIRECTORY found"
+        # actually means; main()'s own multi-path error additionally
+        # requires `not already_importable` (see test_capability_check_*
+        # and compactor/test_real_image_operator_scripts.py for that path
+        # exercised in a real subprocess with a clean sys.path).
+        assert_true(pkg is None, "no package directory found")
+        assert_eq(len(tried), 3,
+                   "repo-layout, /opt/compactor, and the sys.path probe were all tried "
+                   f"(got {tried!r})")
+
+
+def test_reports_which_pkg_source_was_used():
+    print("\n[test] the report names which compactor package source was resolved")
+    _wipe_storage()
+    _seed_terminal_records()
+    r = _run_script(_store_args() + ["--json"])
+    payload = json.loads(r.stdout)
+    assert_true(
+        any("compactor package resolved from" in w for w in payload["warnings"]),
+        f"a NOTE names the resolved package source (warnings={payload['warnings']!r})",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Defect 2: a pre-v3.1.9.4 package (missing _MAX_BACKFILL_ATTEMPTS and
+# _backoff_ready) must refuse with an actionable message, never a raw
+# AttributeError. Simulated here with a minimal stand-in package via
+# --compactor-pkg; compactor/test_real_image_operator_scripts.py proves
+# the same thing against a REAL git-archived v3.1.9 compactor/backfill.py.
+# ---------------------------------------------------------------------------
+
+def _write_stub_pre_v3194_backfill_pkg(root: Path) -> Path:
+    """A --compactor-pkg stand-in with `is_stale`/`atomic_write_json` (this
+    script's OTHER real dependencies) but not
+    `_MAX_BACKFILL_ATTEMPTS`/`_backoff_ready` — the exact shape verified
+    across v3.1.9/.1/.2/.3's real backfill.py."""
+    pkg = root / "compactor"
+    pkg.mkdir()
+    (pkg / "backfill.py").write_text(
+        "_STALE_SECONDS = 600\n"
+        "def is_stale(record):\n"
+        "    return True\n"
+        "def atomic_write_json(path, data):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    return pkg
+
+
+def test_capability_check_refuses_cleanly_on_a_pre_v3194_package():
+    print("\n[test] a --compactor-pkg missing _MAX_BACKFILL_ATTEMPTS/_backoff_ready refuses, never crashes")
+    _wipe_storage()
+    _seed_real_stale_records()
+    with tempfile.TemporaryDirectory() as td:
+        stub_pkg = _write_stub_pre_v3194_backfill_pkg(Path(td))
+        r = _run_script(_store_args() + ["--compactor-pkg", str(stub_pkg)])
+    assert_eq(r.returncode, 1, "refuses with exit 1, not a crash")
+    assert_true("_MAX_BACKFILL_ATTEMPTS" in r.stdout, "names the missing symbol")
+    assert_true("_backoff_ready" in r.stdout, "names the other missing symbol")
+    assert_true("predates v3.1.9.4" in r.stdout, "names the pod's version state")
+    assert_true("Traceback" not in r.stdout and "Traceback" not in r.stderr,
+                "no raw traceback anywhere")
+    assert_true("git clone" in r.stdout, "prints the clone command")
+
+
+def test_capability_check_json_mode_also_refuses_cleanly():
+    print("\n[test] the same capability refusal in --json mode is still clean JSON, not a crash")
+    _wipe_storage()
+    with tempfile.TemporaryDirectory() as td:
+        stub_pkg = _write_stub_pre_v3194_backfill_pkg(Path(td))
+        r = _run_script(_store_args() + ["--compactor-pkg", str(stub_pkg), "--json"])
+    assert_eq(r.returncode, 1, "refuses with exit 1")
+    payload = json.loads(r.stdout)  # raises if not valid JSON
+    assert_true("_MAX_BACKFILL_ATTEMPTS" in payload["error"], "the JSON error names the missing symbol")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -386,6 +533,15 @@ if __name__ == "__main__":
         test_malformed_records_are_reported_not_crashed_on_and_never_rewritten()
 
         test_json_output_parses_and_carries_the_same_verdicts_as_text()
+
+        test_resolve_compactor_pkg_explicit_flag_wins_over_the_repo_layout()
+        test_resolve_compactor_pkg_repo_layout_beats_opt_compactor()
+        test_resolve_compactor_pkg_falls_back_to_opt_compactor()
+        test_resolve_compactor_pkg_reports_every_path_tried_when_none_exist()
+        test_reports_which_pkg_source_was_used()
+
+        test_capability_check_refuses_cleanly_on_a_pre_v3194_package()
+        test_capability_check_json_mode_also_refuses_cleanly()
 
         print("\nAll backfill-records.py script tests passed.")
     finally:

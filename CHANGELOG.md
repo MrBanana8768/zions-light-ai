@@ -156,8 +156,10 @@ script under `scripts/` rather than a change to what the image ships:
   overrides only that check), or if no usable key exists anywhere. Never
   touches any other supervisord program, and finds sshd by its own
   pidfile — never a blanket `pkill` — to restart it. See its own module
-  docstring for the full exit-code contract (0 success, 1
-  refusal/failure, 3 nothing-to-do) and `compactor/test_setup_sshd_script.py`
+  docstring for the full exit-code contract (0 success — including a
+  no-op `--apply`; 1 refusal/failure; 3 a dry run found pending work —
+  see "Fixed" below: this was briefly the inverse) and
+  `compactor/test_setup_sshd_script.py`
   for coverage: a dry run that writes nothing, a clean install,
   idempotency, append-not-clobber, every refusal path, that `apt-get
   upgrade`/`dist-upgrade` is never invoked, and that no private key
@@ -194,6 +196,86 @@ script under `scripts/` rather than a change to what the image ships:
 - **RUNPOD_DEPLOY.md** gets a pointer to that section right after "Access
   Your Deployment", and a row in "Upgrading within v3.1.9.x" naming
   `scripts/setup-sshd.py`. Neither implies the image changed.
+
+### Fixed
+
+Four defects in the three scripts above, found by the owner running
+`backfill-records.py` on the real production pod **after** a 143-test
+green gate — the standing lesson being that these scripts are only ever
+run on a pod, against an OLDER installed compactor, from a path that is
+not the repo, and the unit suite never exercised any of that combination.
+
+- **Package resolution assumed the repo layout.** `PKG = HERE.parent /
+  "compactor"` (`backfill-records.py`, `import-history.py`) resolves to
+  `/data/compactor` when the script is copied to `/data/scripts/`, which
+  does not exist: `ERROR: no compactor package beside this script
+  (/data/compactor)`. Both scripts now resolve, in order, an explicit
+  `--compactor-pkg PATH`, then `HERE.parent/"compactor"` (the repo/clone
+  layout — the SUPPORTED way), then `/opt/compactor` (the image layout),
+  then an already-importable module on `sys.path`, reporting which one it
+  used; if every one fails, the error lists every path tried and prints
+  the clone command below. `setup-sshd.py` needed no change here — it
+  never imports the `compactor` package, only checks for
+  `/opt/compactor/main.py` as a container marker.
+- **Both scripts crash with a raw `AttributeError` on a pre-v3.1.9.4
+  pod.** `backfill-records.py` reads `backfill_mod._MAX_BACKFILL_
+  ATTEMPTS` and calls `backfill_mod._backoff_ready`, neither of which
+  exists before v3.1.9.4 — verified across tags: v3.1.9/.1/.2/.3 have
+  `is_stale`/`_STALE_SECONDS`/`atomic_write_json` but not those two. This
+  is structural, not a typo: the script is a PRE-upgrade step that learns
+  its rules from the INSTALLED package, which on such a pod is exactly
+  the version that lacks those rules — and substituting a newer
+  `backfill.py` onto the older package fails differently (verified): it
+  imports `current_wipe_generation` from `memory`, which the older
+  `memory.py` does not have. Both scripts now check every symbol they
+  need is present BEFORE classifying or running anything, and exit 1 with
+  an actionable message naming the pod's version state and the clone
+  command, instead of a traceback. Neither script silently falls back to
+  hardcoded constants when the package is too old — that risks closing
+  (or catching up) real records against the wrong rules.
+- **`import-history.py`'s guard contradicted the compactor's own
+  invariant.** It refused whenever the reconstructed transcript had FEWER
+  turns than the store's `recorded_position` — but `summarizer.
+  _recorded_position` (via `turns_seen`) is a documented MONOTONIC LOWER
+  BOUND: "a deletion, an edit, a branch switch or a bounded client window
+  all shrink len(messages)+1" (`summarizer.py`, `_observed_position`,
+  invariant I2). Verified against the real 2026-09-22 backup: `recorded_
+  position` 3883 against a 3863-turn linear reconstruction of the SAME
+  conversation, fully explained by ~153 messages sitting on abandoned
+  edit/regeneration branches — not a wrong `--chat-id`, not a stale
+  export. The guard now compares CONTENT instead of length: the store's
+  own `tail_fp` anchor (the same fingerprint primitive `_observed_
+  position` uses to align a window) is searched for inside the
+  reconstructed transcript via `summarizer._align_candidates`; found
+  anywhere, the run proceeds regardless of the turn-count comparison, and
+  not found anywhere, it refuses — still catching a genuinely wrong
+  export or chat id, now proven by a dedicated test rather than by a rule
+  that flags legitimate edits too.
+- **Exit-code semantics were inverted between the three scripts.**
+  `backfill-records.py` and `import-history.py` already used 3 for "a dry
+  run found pending work" and 0 for success (including a no-op);
+  `setup-sshd.py`'s own author flagged that it had implemented 3 as
+  "nothing to do" — the exact inverse. Three sibling scripts sharing the
+  same flags with opposite exit meanings is exactly what burns an
+  operator writing `if script; then`. `setup-sshd.py` is now normalized
+  to the same rule (0 success — including a no-op `--apply`; 1 refusal;
+  3 a dry run found pending work; argparse keeps its own 2), stated once
+  in each script's own docstring and in OPERATIONS.md.
+
+**New real-image test.** `compactor/test_real_image_operator_scripts.py`
+builds a faithful v3.1.9 `compactor` package with `git archive v3.1.9
+compactor`, bind-mounts it read-only over `/opt/compactor` in a container
+started from the exact published digest
+(`sha256:c1295894…`), and mounts a COPY (never the live backup, never
+writable) of the real stale-record facts under `/data/openwebui/
+compactor`. It asserts: a pre-v3.1.9.4 pod gives the actionable
+capability error rather than a traceback; the clone invocation (`git
+archive` of this same working tree standing in for a tagged release)
+produces `4 would-resume / 16 leave / exit 3` and writes nothing (byte-
+compared before/after); running from a copy at `/data/scripts` gives the
+actionable multi-path resolution error; and the same coverage for
+`import-history.py`'s dry run. Wired into the same gate as the rest of
+the unit suite.
 
 ## [3.1.9.5] — the deploy docs match what ships
 

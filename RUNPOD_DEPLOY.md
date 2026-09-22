@@ -1058,10 +1058,14 @@ RESUMES every stale backfill record already sitting on the volume —
 potentially thousands of background
 vLLM calls competing with her live chat, on the pod's one GPU, the moment
 each affected conversation is next used. Either:
-- run `scripts/backfill-records.py` (copied to `/data/scripts/`) in dry-run
-  mode first, then with `--apply`, to close the stale ones — see
-  OPERATIONS.md "Closing stale backfill records before upgrading past
-  v3.1.9.3" for the full walkthrough; or
+- run `scripts/backfill-records.py` from a CLONE of this repo (there is no
+  `ssh`/`scp`/`rsync` in the image, and this script imports the
+  `compactor` package, which a pre-v3.1.9.4 pod's own installed copy is
+  too old to answer this script's questions with — only a clone supplies
+  a self-consistent whole release) in dry-run mode first, then with
+  `--apply`, to close the stale ones — see OPERATIONS.md "Closing stale
+  backfill records before upgrading past v3.1.9.3" for the full
+  walkthrough and the exact clone command; or
 - set `COMPACTOR_BACKFILL_MAX_ATTEMPTS=0` in the template, which leaves the
   stale records on disk but makes `needs_backfill()` treat all of them as
   already at the attempt cap, so none of them resume.

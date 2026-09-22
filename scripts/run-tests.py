@@ -21,7 +21,23 @@ fixture-backed suites need their own stack and will honestly SKIP in both:
     python scripts/run-tests.py --fast         # skip the suites over 60s
     python scripts/run-tests.py --only tail    # substring filter
     python scripts/run-tests.py --saturation   # add the long soak
+    python scripts/run-tests.py --real-image   # add the real-image operator-script suite
     python scripts/run-tests.py --list         # names and known timings
+
+A THIRD suite needs its own thing this runner cannot give it either: a real
+Docker daemon, the published image already pulled, `git`, and (for the
+version-gating and content-guard cases specifically) the real 2026-09-22
+pod-export backup on this host. `compactor/test_real_image_operator_scripts.py`
+drives `scripts/backfill-records.py` and `scripts/import-history.py` against
+containers started from the exact published digest — the only way to catch
+what a 143-test all-mocked gate already missed once (see CHANGELOG.md
+v3.1.9.6 "Fixed"): these scripts are only ever run ON A POD, against an OLDER
+installed compactor, from a path that is not the repo. It is excluded from
+the default run, the same way SATURATION is, and SKIPS honestly (exit 3) if
+Docker or the backup path is not reachable, the same way the tokenizer
+contract suite does:
+
+    python scripts/run-tests.py --real-image
 
 THESE ARE TWO DIFFERENT SERVICES IN THE SAME COMPOSE FILE, AND RUNNING ONE
 DOES NOT RUN THE OTHER (P9-6, re-confirmed P11, v3.1.9.2 -> v3.1.9.3: the
@@ -151,6 +167,16 @@ FAST_CUTOFF_S = 15
 # usable during development.
 SATURATION = {"test_saturation.py", "test_soak_conversation.py"}
 
+# Not run unless --real-image. Needs a real docker daemon, the published
+# image, git, and the real backup path on this host — none of which the
+# sandboxed unit-tests container has. Kept OUT of the default selection so
+# `docker compose -f docker-compose.tests.yml run --rm --build unit-tests`
+# keeps its documented baseline (145 passed / 1 skipped): were this suite
+# discovered there too it would report a SECOND skip, honestly, but a
+# baseline that drifts every time a new docker-dependent suite is added is
+# not a baseline anyone can gate on. Run it explicitly, on the host.
+NEEDS_DOCKER = {"test_real_image_operator_scripts.py"}
+
 PASS, FAIL, SKIP, INCONCLUSIVE = "PASS", "FAIL", "SKIP", "INCONCLUSIVE"
 
 
@@ -223,6 +249,10 @@ def main() -> int:
                     help=f"skip suites known to exceed {FAST_CUTOFF_S}s")
     ap.add_argument("--saturation", action="store_true",
                     help="include the scale suites (slow, off by default)")
+    ap.add_argument("--real-image", action="store_true",
+                    help="include the real-image operator-script suite "
+                         "(needs docker + the published image + the real "
+                         "backup path on this host; off by default)")
     ap.add_argument("--allow-skips", action="store_true",
                     help="a SKIP does not fail the run")
     ap.add_argument("--timeout", type=int, default=600,
@@ -240,6 +270,8 @@ def main() -> int:
     suites = discover(args.only)
     if not args.saturation:
         suites = [(d, p) for d, p in suites if p.name not in SATURATION]
+    if not args.real_image:
+        suites = [(d, p) for d, p in suites if p.name not in NEEDS_DOCKER]
     if args.fast:
         suites = [(d, p) for d, p in suites if SLOW_S.get(p.name, 0) < FAST_CUTOFF_S]
     if not suites:

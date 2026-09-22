@@ -1328,22 +1328,39 @@ low thousands of calls, all competing with her live chat on the one GPU.
 See RUNPOD_DEPLOY.md's "Upgrading within v3.1.9.x, and rolling back" for
 the full explanation.
 
-**Is the script on the pod?**
+**Run this BEFORE upgrading, from a clone — not a copy.** This script
+imports `compactor/backfill.py` (see WHY below), so `HERE.parent /
+"compactor"` has to resolve to a REAL package. Copying just the one file
+to `/data/scripts/` makes that resolve to `/data/compactor`, which does
+not exist — and there is no `ssh`/`scp`/`rsync` in the image to copy the
+rest of a release in anyway. On a pod that has ever run v3.1.9.3 or
+earlier the installed `compactor/backfill.py` ALSO lacks
+`_MAX_BACKFILL_ATTEMPTS`/`_backoff_ready` (v3.1.9.4 added them), so even a
+correctly-resolved but too-old package cannot answer this script's
+questions — the script detects that and refuses with an actionable
+message rather than crashing, but the only way to actually RUN it on such
+a pod is a clone, which supplies the whole self-consistent release:
 ```bash
-ls -la /data/scripts/backfill-records.py
+git clone --depth 1 --branch <tag-or-branch> \
+    https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
 ```
-If not, copy `scripts/backfill-records.py` from this repo to `/data/scripts/`
-on the pod (Web Terminal upload, or `scp`).
+(`git` ships in the image.) `/opt` is container-local: nothing lands on
+the network volume, and the clone disappears on the next restart — clone
+again next time you need it. `--compactor-pkg PATH` overrides package
+auto-detection entirely, if you have a package somewhere else.
 
 **Dry run first: reports only, writes nothing.**
 ```bash
-/opt/compactor-venv/bin/python /data/scripts/backfill-records.py
+/opt/compactor-venv/bin/python /opt/zl-repo/scripts/backfill-records.py \
+    --store /data/openwebui/compactor
 ```
-Read the report. Each record is classified `leave` (already terminal —
-nothing to do), `would-resume` (this is what an upgrade past v3.1.9.3 would
-restart), or `needs-review` (ambiguous — read the reason printed under it).
-A dry run exits 3 if any record would resume; that is informational, not a
-failure.
+(the compactor's storage root is `/data/openwebui/compactor`, **not**
+`/data/compactor` — see COMMANDS.md). Read the report. Each record is
+classified `leave` (already terminal — nothing to do), `would-resume`
+(this is what an upgrade past v3.1.9.3 would restart), or `needs-review`
+(ambiguous — read the reason printed under it). A dry run exits 3 if any
+record would resume; that is informational, not a failure — a dry run
+that finds nothing to resume exits 0.
 
 **Close what's safe to close.** This rewrites every `would-resume` record
 that also has a facts file to the terminal state `abandoned` — the same
@@ -1351,7 +1368,8 @@ state `backfill.py` itself writes once a record has spent its retries —
 after backing up the original beside it (`<name>.backfill.json.bak-<UTC
 stamp>`, never deleted, never overwritten by a later run):
 ```bash
-/opt/compactor-venv/bin/python /data/scripts/backfill-records.py --apply
+/opt/compactor-venv/bin/python /opt/zl-repo/scripts/backfill-records.py \
+    --store /data/openwebui/compactor --apply
 ```
 It refuses to run while anything answers the compactor's `/health` (the
 compactor could be writing these exact files right now); stop it first
@@ -1363,7 +1381,11 @@ and closing its only open backfill attempt would cancel that, not defuse a
 hazard.
 
 **Machine-readable output**, for scripting a fleet of pods: add `--json`.
-**One conversation only**: add `--conv <conv_id>` (repeatable).
+**One conversation only**: add `--conv <conv_id>` (repeatable). See the
+script's own module docstring for the full exit-code contract — the same
+convention as `import-history.py`/`setup-sshd.py` (0 success, including a
+run that finds nothing to resume; 1 refusal/error; 3 a dry run found
+`would-resume` records).
 
 **The alternative**, if you would rather not touch any records by hand:
 set `COMPACTOR_BACKFILL_MAX_ATTEMPTS=0` in the template before upgrading.
@@ -1373,6 +1395,19 @@ already at the attempt cap, so none of them resume. Prefer running the
 script instead when you have the chance: it leaves the store in the same
 terminal shape backfill.py's own retry-exhaustion path produces, rather
 than relying on a template setting nobody has to remember to remove later.
+
+**Timing, on a v3.1.9 pod specifically.** The four stale records verified
+on the real 2026-09-22 backup are already INERT under v3.1.9 itself:
+`needs_backfill()` on that release returns False at the facts-file check
+before it ever reads `state`, so they are not resuming anything today.
+`v3.1.9` also does not recognize `"abandoned"` as a state at all — it
+knows only `in_progress`/`failed`/`complete` — so a record this script
+writes as `abandoned` falls into v3.1.9's own retry branch if somehow
+re-read by that release. Harmless there only because a facts file already
+exists for all four (the same facts-file check short-circuits it), which
+is exactly why this is worth doing at UPGRADE time (when the newer
+`needs_backfill()` would actually act on `state`) rather than treating it
+as urgent on an unpatched v3.1.9 pod.
 
 ## Catching a conversation's summary hierarchy up from a webui.db export
 
@@ -1397,12 +1432,20 @@ rollup at all. See RUNPOD_DEPLOY.md's "Upgrading within v3.1.9.x" for why
 turning the cap on before this catch-up runs would strand the backlog for
 good.
 
-**Is the script on the pod?**
+**Run this from a clone — not a copy.** This script imports
+`compactor/summarizer.py` and `compactor/memory.py`, so, exactly like
+`backfill-records.py` above, `HERE.parent / "compactor"` has to resolve
+to a REAL package — copying just the one file to `/data/scripts/` makes
+that resolve to `/data/compactor`, which does not exist, and there is no
+`ssh`/`scp`/`rsync` in the image to copy the rest of a release in anyway:
 ```bash
-ls -la /data/scripts/import-history.py
+git clone --depth 1 --branch <tag-or-branch> \
+    https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
 ```
-If not, copy `scripts/import-history.py` from this repo to `/data/scripts/`
-on the pod (Web Terminal upload, or `scp`).
+(`git` ships in the image.) `/opt` is container-local: nothing lands on
+the network volume, and the clone disappears on the next restart — clone
+again next time you need it. `--compactor-pkg PATH` overrides package
+auto-detection entirely, if you have a package somewhere else.
 
 **Get a webui.db export.** Never point this at the live database — it
 refuses outright if a `-journal` or `-wal` file sits beside the path you
@@ -1417,23 +1460,36 @@ supervisorctl stop compactor
 
 **Dry run first: reports only, makes zero vLLM calls.**
 ```bash
-/opt/compactor-venv/bin/python /data/scripts/import-history.py \
-    --webui-db /path/to/webui.db.export --chat-id <conversation id>
+/opt/compactor-venv/bin/python /opt/zl-repo/scripts/import-history.py \
+    --webui-db /path/to/webui.db.export --chat-id <conversation id> \
+    --store /data/openwebui/compactor
 ```
-Read the report: which source it used to reconstruct the transcript
-(`history.messages` JSON, or the `chat_message` table fallback), how many
-turns it found against the watermark already on disk, how many L1/L2/L3
-units are estimated due, an estimated (floor) count of real vLLM calls, an
-ESTIMATED wall-clock (`--seconds-per-call`, default 40s, labelled an
-estimate — a chunk needing map-reduce costs more than one call), and every
-anomaly found in the transcript (a missing reply, non-alternating turns).
-A dry run exits 3 if anything is due; that is informational, not a
-failure.
+(the compactor's storage root is `/data/openwebui/compactor`, **not**
+`/data/compactor` — see COMMANDS.md). Read the report: which source it
+used to reconstruct the transcript (`history.messages` JSON, or the
+`chat_message` table fallback), how many turns it found against the
+watermark already on disk, how many L1/L2/L3 units are estimated due, an
+estimated (floor) count of real vLLM calls, an ESTIMATED wall-clock
+(`--seconds-per-call`, default 40s, labelled an estimate — a chunk needing
+map-reduce costs more than one call), and every anomaly found in the
+transcript (a missing reply, non-alternating turns). A dry run exits 3 if
+anything is due; that is informational, not a failure — a dry run that
+finds nothing due exits 0.
+
+Note on a short-turn-count report: this script checks the transcript's
+CONTENT against the store, not merely its length, before refusing. A
+conversation with edited or abandoned messages can legitimately
+reconstruct SHORTER than the store's `recorded_position` — that is
+expected (see the script's own `_prefix_matches_store` docstring) and is
+not refused. What IS refused is content that does not match what the
+store already has confirmed — the actual signature of a wrong
+`--chat-id`/`--conv-id` or an export of a different conversation.
 
 **Run it for real:**
 ```bash
-/opt/compactor-venv/bin/python /data/scripts/import-history.py \
-    --webui-db /path/to/webui.db.export --chat-id <conversation id> --apply
+/opt/compactor-venv/bin/python /opt/zl-repo/scripts/import-history.py \
+    --webui-db /path/to/webui.db.export --chat-id <conversation id> \
+    --store /data/openwebui/compactor --apply
 ```
 It backs up the existing `summaries/<conv_id>.json` beside itself
 (`<name>.json.bak-<UTC stamp>`, never deleted, never overwritten by a
@@ -1462,10 +1518,12 @@ large number it was stuck at before the catch-up ran.
 — that is a retrieval backlog, a different job. It never touches
 `facts/`, `chromadb/` or `personas/` — its entire blast radius is one
 `summaries/<conv_id>.json` file and its own dated backup. See the
-script's own module docstring for the full exit-code contract (0
-nothing-due/apply-succeeded, 1 error, 3 dry-run-found-work), and
+script's own module docstring for the full exit-code contract — the same
+convention as `backfill-records.py`/`setup-sshd.py` (0
+nothing-due/apply-succeeded, 1 refusal/error, 3 dry-run-found-work), and
 `compactor/test_import_history_script.py` for coverage, including the
-fork-in-history and interrupted-and-resumed-apply cases.
+fork-in-history, interrupted-and-resumed-apply, and content-vs-length
+guard cases.
 
 ---
 
@@ -1488,15 +1546,31 @@ running container's own writable overlay, never touching the image.
 on every restart — everything this script writes to `/etc/ssh` (and, with
 `--supervise`, `/etc/supervisor/conf.d/`) lives on the overlay, not on
 `/data`. It is idempotent and safe to run again on a pod that already has
-sshd running; a re-run with nothing to do exits 3 and changes nothing.
+sshd running; a re-run with nothing left to do exits **0** and changes
+nothing (see EXIT CODES below — this script used to have 0 and 3 swapped
+from the other two operator scripts; normalized in v3.1.9.6).
 
 **Is the script on the pod?**
 ```bash
 ls -la /data/scripts/setup-sshd.py
 ```
-If not, copy `scripts/setup-sshd.py` from this repo to `/data/scripts/` on
-the pod (Web Terminal upload, or `scp`), so it survives on the volume even
-though it has to be RE-RUN after each restart.
+There is no `ssh`/`scp`/`rsync` in the image. If the script is not
+already at that path, get it there by either:
+- cloning the repo, same as `backfill-records.py`/`import-history.py`
+  below (this script does not import the `compactor` package, so it does
+  not strictly need the rest of the clone, but this keeps one consistent
+  method for all three):
+  ```bash
+  git clone --depth 1 --branch <tag-or-branch> \
+      https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+  ```
+  then run it from `/opt/zl-repo/scripts/setup-sshd.py`; or
+- uploading just this one file through the RunPod Web Terminal, or with
+  `runpodctl send`/`receive` (RunPod injects `runpodctl` into the pod at
+  runtime — it is **not** shipped in this image; `/usr/local/bin` is
+  empty here) to `/data/scripts/setup-sshd.py`, so a persistent copy
+  survives on the volume across restarts (it still has to be RE-RUN after
+  each one — see above).
 
 **Dry run first.** Runs a real `apt-get update` (package lists only,
 nothing installed — Dockerfile prunes them, so this is required every
@@ -1580,9 +1654,11 @@ a scoped `supervisorctl restart sshd`, with the other programs again
 untouched throughout.
 
 **Machine-readable output**, for scripting a fleet of pods: add `--json`.
-See the script's own module docstring for the full exit-code contract (0
-success, 1 refusal/failure, 3 nothing-to-do — including a repeat `--apply`
-right after the first) and `compactor/test_setup_sshd_script.py` for
+See the script's own module docstring for the full exit-code contract —
+the same convention as `backfill-records.py`/`import-history.py` (0
+success, including a no-op `--apply` right after the first; 1
+refusal/failure; 3 a dry run found pending work) — and
+`compactor/test_setup_sshd_script.py` for
 coverage: a dry run that writes nothing, a clean install, idempotency,
 append-not-clobber on an existing `authorized_keys`, every refusal path
 (not root, no usable key, a malformed key, a config that would allow

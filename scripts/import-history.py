@@ -2,12 +2,45 @@
 """Catch a conversation's hierarchical summary up from a `webui.db` export,
 for a backlog the admin endpoint cannot reach.
 
-    /opt/compactor-venv/bin/python /data/scripts/import-history.py \\
-        --webui-db /data/openwebui/webui.db --chat-id <id>
-    /opt/compactor-venv/bin/python /data/scripts/import-history.py \\
-        --webui-db /data/openwebui/webui.db --chat-id <id> --json
-    /opt/compactor-venv/bin/python /data/scripts/import-history.py \\
-        --webui-db /data/openwebui/webui.db --chat-id <id> --apply
+SUPPORTED INVOCATION — from a clone, not a copy (see "PACKAGE RESOLUTION"
+below for why a copy to /data/scripts/ fails on a pre-v3.1.9.4 pod):
+
+    git clone --depth 1 --branch <tag-or-branch> \\
+        https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+    /opt/compactor-venv/bin/python /opt/zl-repo/scripts/import-history.py \\
+        --webui-db /data/openwebui/webui.db --chat-id <id> \\
+        --store /data/openwebui/compactor
+    /opt/compactor-venv/bin/python /opt/zl-repo/scripts/import-history.py \\
+        --webui-db /data/openwebui/webui.db --chat-id <id> \\
+        --store /data/openwebui/compactor --json
+    /opt/compactor-venv/bin/python /opt/zl-repo/scripts/import-history.py \\
+        --webui-db /data/openwebui/webui.db --chat-id <id> \\
+        --store /data/openwebui/compactor --apply
+
+`--compactor-pkg PATH` overrides package auto-detection entirely, if you
+need to point this at a package that isn't beside the script and isn't at
+/opt/compactor (see "PACKAGE RESOLUTION").
+
+PACKAGE RESOLUTION. Copying just this one file to /data/scripts/ and
+running it from there used to fail with "no compactor package beside this
+script (/data/compactor)" — HERE.parent/"compactor" resolves relative to
+wherever THIS FILE sits, and /data/scripts/../compactor does not exist.
+Resolved now, in order: `--compactor-pkg PATH` (explicit, highest
+precedence) > `HERE.parent/"compactor"` (the repo/clone layout — the
+SUPPORTED way, see above) > `/opt/compactor` (the image's own layout) > an
+already-importable `summarizer` on sys.path. If every one of those fails,
+the error lists every path tried and prints the clone command above. See
+_resolve_compactor_pkg's own docstring (and scripts/backfill-records.py's
+twin of it) for the full reasoning, including a layout trap that can make
+a substitute package silently invisible.
+
+WHY THIS DOES NOT ALSO WORK BY JUST COPYING NEWER FILES IN. This script
+asks the real `summarizer`/`memory` modules for their own rules rather
+than keeping a second copy of them (see _check_summarizer_capability); a
+package too old or too different to have them refuses with an actionable
+message rather than an `AttributeError` partway through a run. The only
+self-consistent fix for a genuinely incompatible package is the WHOLE
+target release together, which is exactly what the clone above supplies.
 
 WHY THIS EXISTS, AND WHY `POST /admin/conversations/{conv_id}/compact`
 CANNOT DO IT. That endpoint (`compactor/main.py`, `admin_compact`) drains
@@ -60,16 +93,24 @@ result. Non-alternating turns (two user turns in a row, a missing
 assistant reply) are reported as anomalies and handled — the reconstructed
 array is still built and handed to the drain — never crashed on.
 
-EXIT CODES
-    0   nothing was due (dry run), or `--apply` ran to completion (even if
-        it stopped early on its own call budget or an LLM failure — see
-        `stopped_because` in its report; that is not a script error)
-    1   an error the operator needs to look at: a bad `--webui-db` or
-        `--store`, an unknown `--chat-id`, a `-journal`/`-wal` beside the
-        database without `--force`, a refused `--apply` precondition
-        (live compactor without `--force`, an existing backup path, no
-        `--model`/`MODEL_REPO`), or a transcript shorter than the position
-        already recorded in the store
+EXIT CODES. The same convention as scripts/backfill-records.py and
+scripts/setup-sshd.py — normalized across all three (see CHANGELOG.md and
+OPERATIONS.md; setup-sshd.py used to have 0 and 3 swapped from this):
+    0   success — nothing was due (dry run), or `--apply` ran to
+        completion (even if it stopped early on its own call budget or an
+        LLM failure — see `stopped_because` in its report; that is not a
+        script error)
+    1   a refusal or an error the operator needs to look at: a bad
+        `--webui-db` or `--store`, an unknown `--chat-id`, a
+        `-journal`/`-wal` beside the database without `--force`, no
+        usable compactor package (or one missing what this script needs
+        from it — see PACKAGE RESOLUTION above), a refused `--apply`
+        precondition (live compactor without `--force`, an existing
+        backup path, no `--model`/`MODEL_REPO`), or a reconstructed
+        transcript whose content does not match what the store already
+        has confirmed (see _prefix_matches_store — NOT simply "fewer
+        turns than recorded_position", which a normal edit or abandoned
+        branch can cause on its own)
     3   a DRY RUN found one or more rollup units due — informational, not
         a failure: re-run with `--apply` once ready
     (argparse's own usage errors — unknown flags, missing required values
@@ -77,15 +118,17 @@ EXIT CODES
     three above)
 
 POD PROCEDURE
-    1. Copy this file to `/data/scripts/import-history.py` (Web Terminal
-       upload, or `scp`) if it is not already there:
-           ls -la /data/scripts/import-history.py
+    1. Get this script (and the matching `compactor` package) onto the
+       pod — there is no `ssh`/`scp`/`rsync` in the image, so clone the
+       repo (see SUPPORTED INVOCATION above):
+           git clone --depth 1 --branch <tag-or-branch> \\
+               https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
     2. Stop the compactor so nothing else is writing the same state file:
            supervisorctl stop compactor
     3. Dry run first — reports only, makes no vLLM calls:
-           /opt/compactor-venv/bin/python /data/scripts/import-history.py \\
+           /opt/compactor-venv/bin/python /opt/zl-repo/scripts/import-history.py \\
                --webui-db /data/openwebui/webui.db \\
-               --chat-id <conversation id>
+               --chat-id <conversation id> --store /data/openwebui/compactor
     4. Read the report. It states plainly whether `--apply` is safe: the
        source used to build the transcript, turns found, the existing
        watermark against what the transcript implies, how many L1/L2/L3
@@ -94,9 +137,10 @@ POD PROCEDURE
        estimate because a chunk needing map-reduce costs more than one
        call), and every anomaly found.
     5. Run it for real:
-           /opt/compactor-venv/bin/python /data/scripts/import-history.py \\
+           /opt/compactor-venv/bin/python /opt/zl-repo/scripts/import-history.py \\
                --webui-db /data/openwebui/webui.db \\
-               --chat-id <conversation id> --apply
+               --chat-id <conversation id> --store /data/openwebui/compactor \\
+               --apply
        Interrupting it (Ctrl-C, a pod restart) is safe: state is saved
        after every rollup unit, never batched, so re-running resumes from
        the real watermark and never redoes finished work.
@@ -108,6 +152,7 @@ POD PROCEDURE
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import os
 import shutil
@@ -120,7 +165,10 @@ from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).resolve().parent
-PKG = HERE.parent / "compactor"
+# A module-level name (not inlined at the call site) so a test can
+# monkeypatch it to a temp directory, the same reason HERE itself is a
+# module global rather than computed fresh inside every function.
+OPT_COMPACTOR = Path("/opt/compactor")
 
 DEFAULT_STORE = "/data/openwebui/compactor"
 DEFAULT_VLLM_URL = "http://127.0.0.1:8000"
@@ -130,6 +178,106 @@ DEFAULT_SECONDS_PER_CALL = 40.0
 HEALTH_PROBE_TIMEOUT_S = 3
 
 _IMAGE_TYPES = ("image_url", "image", "input_image")
+
+# The one invocation verified end to end against a pre-v3.1.9.4 pod (see
+# RUNPOD_DEPLOY.md "Upgrading within v3.1.9.x" and OPERATIONS.md). Printed
+# whenever no compactor package could be found at all, and whenever the one
+# found is too old to answer the questions this script asks it (see
+# _check_summarizer_capability) — in both cases a clone is the fix.
+_CLONE_HINT = """\
+On a pod, the supported way to run this script is from a clone of this
+public repo (git ships in the image; there is no ssh/scp/rsync in it):
+
+  git clone --depth 1 --branch <tag-or-branch> \\
+      https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+  /opt/compactor-venv/bin/python /opt/zl-repo/scripts/import-history.py \\
+      --webui-db /path/to/webui.db.export --chat-id <conversation id> \\
+      --store /data/openwebui/compactor
+
+A clone always carries a self-consistent target-release `compactor`
+package beside this script, which is the one thing an old pod's own
+installed package cannot supply for itself."""
+
+
+# ---------------------------------------------------------------------------
+# Where the real compactor package lives — resolved fresh every run, never
+# assumed (Defect 1). Copied to /data/scripts/, HERE.parent/"compactor"
+# resolves to /data/compactor, which does not exist: that is the exact
+# operator error this function exists to stop happening again. Identical in
+# spirit to scripts/backfill-records.py's own _resolve_compactor_pkg — see
+# that function's docstring for the full reasoning and the layout trap.
+# ---------------------------------------------------------------------------
+
+_PROBE_MODULE = "summarizer"
+
+
+def _resolve_compactor_pkg(explicit: str | None) -> tuple[Path | None, list[str], bool]:
+    """(pkg_dir, tried, already_importable) — see
+    scripts/backfill-records.py's `_resolve_compactor_pkg` for the full
+    docstring; this is the same resolution order, probing for `summarizer`
+    (this script's own entry point into the package) instead of
+    `backfill`."""
+    tried: list[str] = []
+    if explicit:
+        p = Path(explicit)
+        tried.append(f"{p} (--compactor-pkg)")
+        if p.is_dir():
+            return p, tried, False
+    p2 = HERE.parent / "compactor"
+    tried.append(f"{p2} (repo/clone layout beside this script — the supported way)")
+    if p2.is_dir():
+        return p2, tried, False
+    p3 = OPT_COMPACTOR
+    tried.append(f"{p3} (image layout)")
+    if p3.is_dir():
+        return p3, tried, False
+    tried.append(f"an already-importable {_PROBE_MODULE!r} on sys.path")
+    if importlib.util.find_spec(_PROBE_MODULE) is not None:
+        return None, tried, True
+    return None, tried, False
+
+
+# ---------------------------------------------------------------------------
+# Capability check (Defect 2) — the same discipline scripts/backfill-
+# records.py applies to compactor/backfill.py, applied here to the
+# summarizer/memory symbols this script depends on, so an incompatible
+# package refuses with an actionable message rather than a raw
+# AttributeError partway through a run. Every one of these has in fact been
+# present continuously from v3.1.9 through v3.1.9.4 (verified), so this is
+# a defensive floor against a package older or stranger than that range,
+# not a fix for a known gap the way _check_backfill_capability is.
+# ---------------------------------------------------------------------------
+
+_REQUIRED_SUMMARIZER_SYMBOLS = (
+    "load_state", "save_state", "recorded_position", "summary_path",
+    "needs_rollup", "maybe_rollup", "vllm_call_budget_ctx",
+    "L1_CHUNK_SIZE", "L2_CHUNK_SIZE", "L3_CHUNK_SIZE",
+    # Defect 3's content guard: the fingerprint primitives it reuses rather
+    # than reinventing (see _prefix_matches_store below).
+    "_turn_fingerprints", "_align_candidates", "_covered_fps",
+    "_covered_turn_fingerprints", "_FP_UNKNOWN",
+)
+_REQUIRED_MEMORY_SYMBOLS = ("conv_lock",)
+
+
+def _check_summarizer_capability(summarizer_mod, memory_mod, pkg_source: str) -> str | None:
+    """None if the package has everything this script needs; otherwise the
+    full actionable error message (never a bare AttributeError)."""
+    missing = [n for n in _REQUIRED_SUMMARIZER_SYMBOLS if not hasattr(summarizer_mod, n)]
+    missing += [f"memory.{n}" for n in _REQUIRED_MEMORY_SYMBOLS if not hasattr(memory_mod, n)]
+    if not missing:
+        return None
+    return (
+        f"ERROR: the compactor package at {pkg_source} is missing "
+        f"{', '.join(missing)} — this pod's installed compactor is too old "
+        f"(or too different) for this script's rollup-catch-up drain, "
+        f"which asks the REAL summarizer/memory modules for their own "
+        f"rules rather than keeping a second copy of them (see this "
+        f"script's own module docstring). Running against a package "
+        f"missing these would either crash mid-drain or silently "
+        f"misjudge what is due.\n\n"
+        f"{_CLONE_HINT}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +554,65 @@ def estimate_due(
 
 
 # ---------------------------------------------------------------------------
+# Defect 3: verify CONTENT, not turn COUNT, against the store.
+# ---------------------------------------------------------------------------
+
+def _prefix_matches_store(
+    state: dict, turns: list[dict], summarizer_mod
+) -> tuple[bool | None, str]:
+    """Whether `turns` (this run's reconstructed linear branch) is
+    content-consistent with what the store already has recorded for this
+    conversation — using the SAME fingerprint primitives
+    `summarizer._observed_position` itself uses to align a window
+    (`tail_fp` plus `_turn_fingerprints`/`_align_candidates`), rather than
+    a plain turn-count comparison.
+
+    WHY A LENGTH COMPARISON IS THE WRONG GUARD. `summarizer._recorded_
+    position` (invariant I2 in `_observed_position`'s own docstring) is a
+    MONOTONIC lower bound: `turns_seen` only ever grows, by design,
+    because "a deletion, an edit, a branch switch or a bounded client
+    window all shrink len(messages)+1" — quoting that docstring directly.
+    This script reconstructs the CURRENT linear branch from
+    `history.messages`, which is exactly the shape that shrinks once an
+    earlier edit or an abandoned regeneration takes a message off the
+    branch the user actually sees. A real 2026-09-22 backup proved this is
+    not hypothetical: `recorded_position` 3883 against a 3863-turn linear
+    reconstruction of the SAME conversation, fully explained by ~153
+    messages sitting on abandoned branches — not a wrong `--chat-id`, not
+    a stale export, and not something `--apply` should ever refuse over.
+
+    Returns (matches, detail):
+      True  — the store's own anchor (the last confirmed live turns) was
+              found somewhere in this reconstruction. Proceed regardless
+              of how `current_turns` compares to `recorded_position`.
+      False — the anchor was searched for and is NOT anywhere in this
+              reconstruction. Refuse: wrong conversation, or an export
+              from a different lineage than the one the store tracks.
+      None  — no anchor recorded yet (`tail_fp` empty — a conversation
+              that has never been through a live rollup, or mid-reset).
+              Nothing to check content against; the caller falls back to
+              the length comparison this replaces.
+    """
+    anchor = [x for x in (state.get("tail_fp") or []) if isinstance(x, str)]
+    if not anchor:
+        return None, "the store has no recorded anchor (tail_fp) to check content against"
+    fps = summarizer_mod._turn_fingerprints(turns)
+    cands = summarizer_mod._align_candidates(anchor, fps)
+    if cands:
+        return True, (
+            f"the store's last {len(anchor)} confirmed turn(s) were found in "
+            f"this reconstruction — content confirmed. A turn count below "
+            f"recorded_position is expected here if edits or abandoned "
+            f"branches have shrunk the linear history since those turns "
+            f"were last seen live (see this function's own docstring)"
+        )
+    return False, (
+        f"the store's last {len(anchor)} confirmed turn(s) do not appear "
+        f"anywhere in this reconstruction"
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -447,6 +654,12 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--force", action="store_true",
                      help="override the live-database, live-compactor and "
                           "backup-collision refusals (see the module docstring)")
+    ap.add_argument(
+        "--compactor-pkg", default=None, metavar="PATH",
+        help="explicit path to the compactor package directory (highest "
+             "precedence; overrides the repo/clone-layout and /opt/compactor "
+             "auto-detection — see the module docstring's resolution order)",
+    )
     return ap
 
 
@@ -481,20 +694,35 @@ def main(argv=None) -> int:
             f"beside {db_path} that suggest a live or crashed database."
         )
 
-    if not PKG.is_dir():
-        return _fatal(args, f"ERROR: no compactor package beside this script ({PKG}).")
+    pkg_dir, tried, already_importable = _resolve_compactor_pkg(args.compactor_pkg)
+    if pkg_dir is None and not already_importable:
+        lines = ["ERROR: no compactor package found. Tried, in order:"]
+        lines += [f"  - {t}" for t in tried]
+        lines += ["", _CLONE_HINT]
+        return _fatal(args, "\n".join(lines))
+
+    if pkg_dir is not None:
+        sys.path.insert(0, str(pkg_dir))
+        pkg_source = str(pkg_dir)
+    else:
+        pkg_source = f"an already-importable {_PROBE_MODULE!r} on sys.path (no package directory)"
 
     os.environ["COMPACTOR_STORAGE_ROOT"] = str(Path(args.store).resolve())
-    sys.path.insert(0, str(PKG))
     try:
         import summarizer  # noqa: E402
         import memory  # noqa: E402
     except Exception as e:
         return _fatal(
             args,
-            f"ERROR importing compactor package from {PKG}: "
+            f"ERROR importing compactor package from {pkg_source}: "
             f"{type(e).__name__}: {e}",
         )
+
+    capability_error = _check_summarizer_capability(summarizer, memory, pkg_source)
+    if capability_error is not None:
+        return _fatal(args, capability_error)
+
+    warnings.append(f"NOTE: compactor package resolved from {pkg_source}")
 
     conv_id = args.conv_id or args.chat_id
     model = args.model  # default handled below, only required for --apply
@@ -524,15 +752,32 @@ def main(argv=None) -> int:
     state = summarizer.load_state(conv_id)
     recorded_position = summarizer.recorded_position(state)
 
-    if current_turns < recorded_position:
+    # Defect 3: a CONTENT check, not a turn-count check. See
+    # _prefix_matches_store's own docstring for why "current_turns <
+    # recorded_position" alone is the wrong guard — recorded_position is a
+    # monotonic lower bound that a legitimate edit or abandoned
+    # regeneration can leave the (shorter) current linear branch below,
+    # with no wrong-export or wrong-chat-id involved at all.
+    matches, match_detail = _prefix_matches_store(state, turns, summarizer)
+    if matches is False:
+        return _fatal(
+            args,
+            f"REFUSING: {match_detail} for conv {conv_id!r} "
+            f"({current_turns} turn(s) reconstructed from {source}). This "
+            f"usually means the wrong --chat-id/--conv-id, or an export of "
+            f"a different conversation than the one already tracked under "
+            f"--store.",
+        )
+    if matches is None and current_turns < recorded_position:
         return _fatal(
             args,
             f"REFUSING: the reconstructed transcript has {current_turns} "
             f"turn(s), but conv {conv_id!r}'s store already records "
-            f"position {recorded_position}. Running would summarize text "
-            f"that is not the text the existing chunk labels claim — check "
-            f"--chat-id/--conv-id, or that this export is not older than "
-            f"the store under --store.",
+            f"position {recorded_position}, and {match_detail} — there is "
+            f"no content evidence either way. Running would risk "
+            f"summarizing text that is not the text the existing chunk "
+            f"labels claim — check --chat-id/--conv-id, or that this "
+            f"export is not older than the store under --store.",
         )
 
     l1_due, l2_due, l3_due = estimate_due(
