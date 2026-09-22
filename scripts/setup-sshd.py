@@ -24,15 +24,34 @@ this after every pod restart — it is idempotent and safe to run on a pod
 that already has sshd running.
 
 WHAT --apply DOES, IN ORDER
+    0. Refuse outright, before writing anything, if the config already on
+       disk is unsafe in a way this script cannot fix on its own: a
+       `Match` block anywhere in `sshd_config` or `sshd_config.d/*.conf`
+       (a `Match` can make password login live for some client contexts
+       while a plain `sshd -T` — no `-C` — reports it disabled: see
+       B2/hostile-pass finding), another drop-in that sorts before this
+       script's own `00-zions.conf` (first-match-wins order), or a
+       conflicting active `Port` directive anywhere else (OpenSSH
+       ACCUMULATES `Port` lines across files instead of first-match-wins
+       — see M8 below). Since nothing has been written yet, this refusal
+       needs no rollback.
     1. `apt-get update` (package lists are pruned from the image — Dockerfile
        runs `rm -rf /var/lib/apt/lists/*` — so this is required every time).
     2. Install `openssh-server` if missing, or `--only-upgrade` it to the
        apt candidate if already present. NEVER `apt-get upgrade` or
        `dist-upgrade` — see the module-level safety notes below.
-    3. Resolve one usable Ed25519/RSA/ECDSA PUBLIC key (never a private
-       one) from, in order: `--authorized-key-file`, `--authorized-key`,
-       the RunPod-injected `$PUBLIC_KEY`, or an existing non-empty
-       `/root/.ssh/authorized_keys`. Refuses outright if none is usable.
+    3. Resolve one or more usable Ed25519/RSA/ECDSA PUBLIC keys (never a
+       private one) from, in order: `--authorized-key-file`,
+       `--authorized-key`, the RunPod-injected `$PUBLIC_KEY`, or an
+       existing non-empty `/root/.ssh/authorized_keys`. Refuses outright
+       if none is usable. A candidate must start with a known
+       public-key-type token and be a single line containing no
+       `PRIVATE KEY` — `ssh-keygen -l -f` alone is NOT trusted for this
+       (it returns 0 on a private key file too — see B3). `/root/.ssh` is
+       always forced to 0700 and `authorized_keys` to 0600 (plus
+       ownership) EVERY apply, even when there is no new key to add (H7).
+       Only FINGERPRINTS — never key text — ever appear in the report or
+       `--json` output's `keys_added`.
     4. Write the hardening directives — see "THE HARD SAFETY RULES" below
        — to a drop-in under `/etc/ssh/sshd_config.d/`, or fall back to
        editing `sshd_config` directly with a backup, WHICHEVER the real
@@ -42,14 +61,40 @@ WHAT --apply DOES, IN ORDER
     5. Ensure host keys exist (`ssh-keygen -A`), and by default persist
        them to `/data/ssh/` so the pod keeps the same host identity across
        restarts — see "HOST KEYS" below.
-    6. Validate the result for REAL with `sshd -t` then `sshd -T` (never
-       just by reading back the file this script itself wrote) and REFUSE,
-       rolling back, if the effective config would allow password login.
+    6. Validate the result for REAL: `sshd -t`, then `sshd -T` with NO
+       `-C` AND `sshd -T -C` for both a loopback and a non-local client
+       address (never just by reading back the file this script itself
+       wrote), and REFUSE — rolling back the config write and any
+       `authorized_keys` append made this run (see ROLLBACK below) — if
+       the effective config would allow password login for ANY of those
+       contexts, or would leave sshd listening on any port other than the
+       one requested.
     7. Start (or, if already running and the binary/config changed,
        restart — by pid, never a blanket pkill) `/usr/sbin/sshd` as a
        plain background daemon. `--supervise` (opt-in, OFF by default)
        instead adds it as a supervisord program — see that flag's own
-       section below for why it defaults off.
+       section below for why it defaults off. Either way, "started" is
+       decided by what is REALLY listening on IPv4 at the configured
+       port — read from `/proc/net/tcp`, never inferred from sshd's own
+       exit status, which returns 0 even on a partial bind failure (see
+       H6). If it is not confirmed listening, that is a refusal (exit 1),
+       with the same rollback as step 6.
+
+ROLLBACK. A refusal discovered AFTER step 3/4 has already written
+something undoes exactly what this run wrote: the config write (drop-in
+or fallback edit) is restored to its prior content, and an
+`authorized_keys` append is restored from this run's own backup (or the
+file is removed if this run created it fresh). Host key files under
+`/data/ssh` are the one deliberate exception — they are NEVER rolled
+back, because they are never what causes a refusal and deleting or
+regenerating them would only churn the pod's host-key fingerprint for no
+security benefit (see HOST KEYS below); an operator connecting after a
+refused run still sees the same host identity. When a refusal happens
+after this script had to stop an already-running standalone `sshd` to
+attempt a handoff (`--supervise`) or a restart, it makes one best-effort
+attempt to bring some sshd back up and verify it is really listening
+before returning — see H5/H6 — so the pod is not left with literally no
+sshd whenever this script is the one that took it down.
 
 DRY RUN IS THE DEFAULT (no `--apply`). It runs a REAL `apt-get update`
 (package lists only — nothing is installed, and the report says so) and a
@@ -60,7 +105,10 @@ openssh-server is not installed yet, `sshd -t`/`sshd -T` cannot run (the
 binary does not exist), so the dry run says so honestly instead of
 pretending to have verified the resulting config — that verification is
 real and happens automatically during `--apply` (step 6 above), which
-refuses if it does not pass.
+refuses if it does not pass. The step-0 config-safety refusal (Match
+blocks, drop-in ordering, conflicting Port directives) is checked — and
+enforced — in a dry run too, same as the "not root" / "not this
+container" refusals always were.
 
 THE HARD SAFETY RULES (see also inline comments at each site)
   - Never `apt-get upgrade`/`dist-upgrade` — only ever `apt-get install
@@ -69,19 +117,43 @@ THE HARD SAFETY RULES (see also inline comments at each site)
     `sshd_config` (or, once this script has run once, its own drop-in)
     never gets silently clobbered by a package-shipped default, and no
     unrelated package on the pod is ever touched while vLLM is running.
-  - Never print, log, copy or otherwise handle a PRIVATE key. Only ever a
-    PUBLIC key (validated with `ssh-keygen -l -f`) goes into
-    `authorized_keys`. Host PRIVATE keys are created by `ssh-keygen -A`
-    (never generated or read by this script's own code) and this script
-    never reads their contents, only their existence, size and mtime.
-  - Never enable password login. The directives this script writes are,
-    at minimum: `PasswordAuthentication no`, `PermitEmptyPasswords no`,
-    `KbdInteractiveAuthentication no`, `ChallengeResponseAuthentication
-    no`, `PubkeyAuthentication yes`, `PermitRootLogin prohibit-password`.
-    `sshd -T` on this image's own OpenSSH 9.6 build always PRINTS
-    `permitrootlogin` back as `without-password` regardless of which of
-    the two synonymous spellings was written — both are accepted when
-    checking the real outcome; nothing else is.
+  - Never print, log, copy or otherwise handle a PRIVATE key. A candidate
+    must start with a known public-key type token
+    (`ssh-ed25519`/`ssh-rsa`/`ecdsa-sha2-nistp256`/`384`/`521`/
+    `sk-ssh-ed25519@openssh.com`/`sk-ecdsa-sha2-nistp256@openssh.com`),
+    be a single line, and contain no `PRIVATE KEY` substring — checked
+    BEFORE this script ever shells out to `ssh-keygen`, because the real
+    `ssh-keygen -l -f` returns exit 0 on a PRIVATE key file too (confirmed
+    against the real image — see B3). Options prefixes (`command=...`,
+    `environment=...`) are deliberately NOT supported; the safer choice is
+    to reject them rather than parse them. Only a validated PUBLIC key
+    ever goes into `authorized_keys`; only its FINGERPRINT — never the key
+    text — ever appears in a report. Host PRIVATE keys are created by
+    `ssh-keygen -A` (never generated or read by this script's own code)
+    and this script never reads their contents, only their existence,
+    size and mtime.
+  - Never enable password login, for ANY client. The directives this
+    script writes are, at minimum: `PasswordAuthentication no`,
+    `PermitEmptyPasswords no`, `KbdInteractiveAuthentication no`,
+    `ChallengeResponseAuthentication no`, `PubkeyAuthentication yes`,
+    `PermitRootLogin prohibit-password`. Before ever writing anything,
+    this script refuses outright if a `Match` block exists anywhere in
+    the shipped config (a `Match` can flip password auth on for some
+    client contexts while a plain `sshd -T` reports it off); after
+    writing, it verifies with `sshd -T` AND `sshd -T -C` for both a
+    loopback and a non-local address (see B2). `sshd -T` on this image's
+    own OpenSSH 9.6 build always PRINTS `permitrootlogin` back as
+    `without-password` regardless of which of the two synonymous
+    spellings was written — both are accepted when checking the real
+    outcome; nothing else is.
+  - Never leave sshd listening on any port but the one requested. OpenSSH
+    ACCUMULATES `Port` directives across the main file and every loaded
+    drop-in instead of first-match-wins — writing `Port 2222` in this
+    script's own drop-in does NOT suppress an unrelated active `Port 22`
+    elsewhere; both would apply. This script refuses outright (step 0) if
+    it finds such a conflict anywhere it does not itself control, and
+    re-verifies the REAL, POST-write set of listening ports via `sshd -T`
+    as part of step 6 (see M8).
   - Never touch any other supervisord program. The default start path
     (plain `/usr/sbin/sshd`) never goes near supervisord at all; even
     `--supervise`'s `supervisorctl update` only starts the ONE newly added
@@ -89,6 +161,13 @@ THE HARD SAFETY RULES (see also inline comments at each site)
   - Never restart anything by killing broadly. The daemon is found by its
     own pidfile (`/run/sshd.pid`, confirmed to be `sshd` via
     `/proc/<pid>/comm`) or not touched at all.
+  - Never leave the pod with no sshd if this script is the one that took
+    it down. `--supervise`'s handoff stops any standalone daemon first
+    (supervisord's own child cannot bind the same port otherwise); if the
+    handoff then fails, this script restarts the standalone daemon and
+    re-verifies it is really listening before refusing (see H5). The same
+    applies to a standalone restart whose replacement does not come up
+    listening.
 
 HOST KEYS. Default: persist to `/data/ssh/` (0700, key files 0600) and
 copy them into `/etc/ssh/` on every run, so the pod's host key fingerprint
@@ -101,43 +180,51 @@ restart. `compactor/backup.py`'s archive is built from exactly two things
 (`/data/openwebui/compactor` by default) — never a walk of `/data` itself,
 so `/data/ssh/` is NOT swept into it. Confirmed by reading
 `compactor/backup.py`'s `create_backup`, not assumed; see OPERATIONS.md.
+Host key files are the one thing a refusal on this run never rolls back
+— see ROLLBACK above.
 
 --SUPERVISE (opt-in, OFF by default). Appends a `[program:sshd]` block to
 `/etc/supervisor/conf.d/supervisord.conf` (backed up first; the append is
 validated with `supervisorctl reread`, and the backup is restored and the
-run refused if that fails) and runs `supervisorctl update`. Verified
-against a throwaway container running this image's real supervisord (no
-GPU — vllm alone goes FATAL, everything else comes up): adding ONE new
+run refused if that fails, or if `supervisorctl update` completes but
+sshd does not come up really listening) and runs `supervisorctl update`.
+Refuses cleanly (exit 1, full `--json`) rather than raising if
+`supervisord.conf` does not exist at all — appending to a file supervisord
+was never told to read would be pointless (see M8). Verified against a
+throwaway container running this image's real supervisord (no GPU — vllm
+alone goes FATAL, everything else comes up): adding ONE new
 `[program:sshd]` section and running `reread` + `update` started only
 that new program and left every other program's own RUNNING state alone —
 `update` only (re)starts a program whose OWN section changed or is new,
 never one supervisord already has running unchanged. Kept, on that
 evidence; see OPERATIONS.md for the transcript.
 
-EXIT CODES. The same convention as scripts/backfill-records.py and
-scripts/import-history.py — normalized across all three (see
-CHANGELOG.md and OPERATIONS.md). Defect 4 / hostile-pass finding: THIS
-SCRIPT USED TO HAVE 0 AND 3 SWAPPED FROM THIS CONVENTION (its own author
-flagged it) — three sibling scripts sharing the same flags with opposite
-exit meanings is exactly the kind of thing that burns an operator writing
-`if script; then`.
-    0   success — the desired end state is in place. Either `--apply`
-        completed (installed/upgraded, added a key, (re)started the
-        daemon, or was a NO-OP because everything was already correct —
-        including a second `--apply` right after the first), or a DRY RUN
-        found nothing to do (openssh-server already at the apt candidate
-        version, no new key to add, and the daemon already running with
-        this script's own config unchanged)
-    1   a refusal the operator needs to look at (see `refusals` in
-        `--json` output): not root, does not look like this container,
-        no usable public key anywhere, a malformed key, `apt-get install`
-        failed, `sshd -t`/`sshd -T` failed or would allow password login,
-        `sshd` failed to (re)start, or `--supervise`'s `reread` failed
-    3   a DRY RUN found something `--apply` WOULD do (install/upgrade, add
-        a key, or start/restart the daemon) — informational, not a
-        failure: re-run with `--apply` once ready
-    (argparse's own usage errors — unknown flags, missing required values
-    — exit 2, the Python standard library's own convention)
+EXIT CODES. The architect's ruling, normalized across all three operator
+scripts (scripts/backfill-records.py, scripts/import-history.py, and this
+one — see CHANGELOG.md and OPERATIONS.md):
+    0   Desired end state reached. Either `--apply` completed
+        (installed/upgraded, added a key, (re)started the daemon and
+        confirmed it listening, or was a NO-OP because everything was
+        already correct — including a second `--apply` right after the
+        first, which is idempotent), or a DRY RUN found nothing to do.
+    1   A refusal or error the operator needs to look at (see `refusals`
+        in `--json` output): not root, does not look like this
+        container, a config-safety refusal (Match block / drop-in
+        ordering / conflicting Port — step 0 above), no usable public key
+        anywhere, a malformed or private key, `apt-get install` failed,
+        `sshd -t`/`sshd -T`(`-C`) failed or would allow password login or
+        the wrong port, `sshd` failed to (re)start, sshd not confirmed
+        LISTENING after a start/restart, or `--supervise`'s `reread`
+        failed or its conf file does not exist.
+    2   argparse's own usage errors — unknown flags, missing required
+        values — the Python standard library's own convention.
+    3   A DRY RUN found something `--apply` WOULD do (install/upgrade,
+        add a key, or start/restart the daemon) — informational, not a
+        failure: re-run with `--apply` once ready.
+    4   `--apply` made progress but work remains. Unused by this script —
+        every `--apply` here either fully succeeds (0) or refuses (1);
+        listed for consistency with the other two operator scripts, which
+        share this same exit-code convention.
 """
 
 import argparse
@@ -145,6 +232,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -186,8 +274,19 @@ MARKER_MAIN = Path(os.environ.get("SETUP_SSHD_MARKER_MAIN", "/opt/compactor/main
 HOST_KEY_TYPES = ("rsa", "ecdsa", "ed25519")
 DEFAULT_LOG_DIR = os.environ.get("LOG_DIR", "/data/logs")
 
+# /proc/net/tcp is kernel-global truth, never something a test should
+# redirect to a fake tree — H6's listening check reads the real one.
+PROC_NET_TCP = Path("/proc/net/tcp")
+
 CMD_TIMEOUT_S = 90
 
+# "Port" is included here even though it is NOT first-match-wins in real
+# OpenSSH (it ACCUMULATES across files) — it still needs to be recognised
+# as "a directive this script manages" so _dropin_usable's ordering check
+# and the fallback path's _comment_out_conflicts both see and neutralize
+# an active Port line in the MAIN file (see M8). A conflicting Port line
+# in some OTHER file is handled separately, by outright refusal — see
+# _conflicting_port_sources.
 DIRECTIVE_KEYS = (
     "PasswordAuthentication",
     "PermitEmptyPasswords",
@@ -195,10 +294,28 @@ DIRECTIVE_KEYS = (
     "ChallengeResponseAuthentication",
     "PubkeyAuthentication",
     "PermitRootLogin",
+    "Port",
 )
 
 INCLUDE_RE = re.compile(
     r"^[ \t]*Include[ \t]+\S*sshd_config\.d\S*\*\.conf[ \t]*$", re.I | re.M
+)
+
+MATCH_RE = re.compile(r"^[ \t]*Match\b", re.I | re.M)
+PORT_LINE_RE = re.compile(r"^[ \t]*Port\b[ \t]+(\S+)", re.I | re.M)
+
+# Known public-key type tokens (B3). Deliberately closed-world: anything
+# not starting with one of these — including an options-prefixed line
+# like `command="..." ssh-ed25519 ...` — is refused. The safer choice is
+# to reject options rather than parse them.
+_PUBKEY_TYPE_TOKENS = (
+    "ssh-ed25519",
+    "ssh-rsa",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
 )
 
 BEGIN_MARK = "# --- BEGIN scripts/setup-sshd.py hardening (see OPERATIONS.md) ---"
@@ -242,14 +359,30 @@ def _run(args, timeout: int = CMD_TIMEOUT_S) -> subprocess.CompletedProcess:
 
 
 def _make_backup(path: Path) -> Path:
-    """Back up `path` beside itself as `<name>.bak-<UTC stamp>`, refusing
-    outright if that exact backup path already exists — same convention
-    scripts/backfill-records.py and scripts/import-history.py use, so a
-    backup is never silently overwritten."""
+    """Back up `path` beside itself as `<name>.bak-<UTC stamp>[-N]` —
+    never overwriting an existing backup. A bare UTC-second stamp collides
+    whenever this script runs twice in the same wall-clock second (M8:
+    this used to raise an unhandled RuntimeError straight out of
+    `_make_backup`, past every caller's own --json/refusal handling); a
+    numeric suffix is added instead, so a same-second collision is
+    resolved rather than crashing. Only if 1000 suffixes in the same
+    second are ALSO taken (never observed; kept as a last-resort
+    safety net, not a realistic case) does this still raise — every
+    caller already runs inside `main()`'s own exception-free control
+    flow, so even that would need a caller-side fix if it were ever hit."""
     stamp = _utc_stamp()
     backup = path.with_name(path.name + f".bak-{stamp}")
     if backup.exists():
-        raise RuntimeError(f"refused — backup path already exists: {backup}")
+        for n in range(1, 1000):
+            candidate = path.with_name(path.name + f".bak-{stamp}-{n}")
+            if not candidate.exists():
+                backup = candidate
+                break
+        else:
+            raise RuntimeError(
+                f"refused — could not find an unused backup path beside "
+                f"{path} even after 1000 suffixed attempts at stamp {stamp}"
+            )
     shutil.copy2(path, backup)
     return backup
 
@@ -264,6 +397,116 @@ def _is_root() -> bool:
 
 def _looks_like_zions_container() -> bool:
     return MARKER_VENV.is_dir() and MARKER_MAIN.is_file()
+
+
+# ---------------------------------------------------------------------------
+# B2 / M8 — config-safety preconditions, checked BEFORE any write this run
+# makes. A refusal here needs no rollback: nothing has been written yet.
+# ---------------------------------------------------------------------------
+
+def _match_block_locations() -> list[str]:
+    """Every ACTIVE (uncommented) `Match` line in sshd_config or any
+    sshd_config.d/*.conf. A `Match` block can make password login live
+    for some client contexts while `sshd -T` with no `-C` (which
+    evaluates NO Match criteria at all) reports it disabled — see B2.
+    This script does not try to reason about arbitrary Match criteria; it
+    refuses outright."""
+    locations = []
+    if SSHD_CONFIG.is_file():
+        text = SSHD_CONFIG.read_text(encoding="utf-8", errors="replace")
+        for m in MATCH_RE.finditer(text):
+            locations.append(f"{SSHD_CONFIG}:{text.count(chr(10), 0, m.start()) + 1}")
+    if SSHD_CONFIG_D.is_dir():
+        for p in sorted(SSHD_CONFIG_D.glob("*.conf")):
+            text = p.read_text(encoding="utf-8", errors="replace")
+            for m in MATCH_RE.finditer(text):
+                locations.append(f"{p}:{text.count(chr(10), 0, m.start()) + 1}")
+    return locations
+
+
+def _conflicting_dropins() -> list[str]:
+    """Other *.conf files under sshd_config.d/ that sort BEFORE
+    00-zions.conf — sshd applies sshd_config.d/*.conf in sorted glob
+    order, first-match-wins per directive, so a file sorting earlier
+    could silently win over the hardening this script writes there."""
+    if not SSHD_CONFIG_D.is_dir():
+        return []
+    our_name = DROPIN_PATH.name
+    return sorted(
+        p.name for p in SSHD_CONFIG_D.glob("*.conf")
+        if p.name != our_name and p.name < our_name
+    )
+
+
+def _active_port_values(text: str) -> list[str]:
+    return [m.group(1) for m in PORT_LINE_RE.finditer(text)]
+
+
+def _conflicting_port_sources(port: int) -> list[str]:
+    """Any file sshd will really parse that carries an ACTIVE `Port` line
+    for a value other than the target. `Port` is one of the few
+    sshd_config directives that ACCUMULATES across files instead of
+    first-match-wins (confirmed: `sshd -T` can print multiple `port`
+    lines) — writing our own `Port N` never suppresses another file's
+    `Port 22`, so the only safe response is to refuse and name the
+    source, never to assume our own write wins (see M8)."""
+    if not SSHD_CONFIG.is_file():
+        return []
+    main_text = SSHD_CONFIG.read_text(encoding="utf-8", errors="replace")
+    use_dropin, _ = _dropin_usable(main_text)
+    conflicts = []
+    if use_dropin:
+        # Fallback mode neutralizes every active directive in DIRECTIVE_KEYS
+        # (Port included) IN THE MAIN FILE itself via _comment_out_conflicts;
+        # drop-in mode never touches the main file, so an active Port line
+        # there is a real, permanent conflict.
+        for val in _active_port_values(main_text):
+            if val != str(port):
+                conflicts.append(f"{SSHD_CONFIG} (active 'Port {val}')")
+    if _include_line(main_text) is not None and SSHD_CONFIG_D.is_dir():
+        for p in sorted(SSHD_CONFIG_D.glob("*.conf")):
+            if p == DROPIN_PATH:
+                continue
+            text = p.read_text(encoding="utf-8", errors="replace")
+            for val in _active_port_values(text):
+                if val != str(port):
+                    conflicts.append(f"{p} (active 'Port {val}')")
+    return conflicts
+
+
+def _config_safety_refusal(port: int) -> str | None:
+    """A hard precondition checked before ANY write this run makes (apt,
+    keys, config, host keys). Covers B2 (Match blocks, drop-in ordering)
+    and the setup-sshd part of M8 (a conflicting Port directive
+    elsewhere). Returns a refusal string, or None if there is nothing to
+    refuse (including: openssh-server not installed yet, nothing to
+    check)."""
+    if not SSHD_CONFIG.is_file():
+        return None
+    match_hits = _match_block_locations()
+    if match_hits:
+        return (
+            "refusing — a `Match` block exists in sshd_config or "
+            "sshd_config.d/, which can make password login live for some "
+            "client contexts while a plain `sshd -T` (no -C) reports it "
+            "disabled: " + "; ".join(match_hits)
+        )
+    dropin_conflicts = _conflicting_dropins()
+    if dropin_conflicts:
+        return (
+            "refusing — other drop-in file(s) in sshd_config.d/ sort "
+            f"before {DROPIN_PATH.name} and would win first-match-wins for "
+            "any directive they also set: " + ", ".join(dropin_conflicts)
+        )
+    port_conflicts = _conflicting_port_sources(port)
+    if port_conflicts:
+        return (
+            "refusing — a conflicting active 'Port' directive exists "
+            "outside this script's own drop-in (Port accumulates across "
+            "files in OpenSSH; it does not follow first-match-wins): "
+            + "; ".join(port_conflicts)
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +556,9 @@ def _apt_install_args(action: str) -> list[str]:
 
 # ---------------------------------------------------------------------------
 # Public key resolution — file > literal > $PUBLIC_KEY > existing file.
-# Every candidate is validated with `ssh-keygen -l -f`; never a private key.
+# Every candidate is validated by _validate_key; never a private key, and
+# a FINGERPRINT (never key text) is all that is carried forward for
+# reporting (see B3).
 # ---------------------------------------------------------------------------
 
 def _read_key_lines(text: str) -> list[str]:
@@ -327,16 +572,37 @@ def _read_key_lines(text: str) -> list[str]:
 
 
 def _validate_key(line: str) -> tuple[bool, str]:
-    """True + a fingerprint line if `ssh-keygen -l -f` parses this as a
-    public key. The candidate is written to a throwaway temp file (never
-    logged) purely so ssh-keygen has a path to read; nothing about a
-    PRIVATE key ever reaches this function."""
+    """True + a FINGERPRINT (never the key text) if `line` is a genuine
+    single-line public key. `ssh-keygen -l -f`'s exit code is NOT trusted
+    on its own: the real binary returns 0 on a PRIVATE key file too
+    (confirmed against the real image) — that is exactly why B3 was
+    invisible. A type-token check and a `PRIVATE KEY` / multi-line check
+    run FIRST, before this ever shells out to ssh-keygen, and are what
+    actually keeps a private key out. Options prefixes
+    (`command="..." ssh-ed25519 ...`) are deliberately NOT supported."""
+    if "\n" in line or "\r" in line:
+        return False, "key material spans more than one line — refusing"
+    if "PRIVATE KEY" in line.upper():
+        return False, "this looks like a PRIVATE key, not a public key — refusing"
+    stripped = line.strip()
+    if not stripped.startswith(_PUBKEY_TYPE_TOKENS):
+        return False, (
+            "does not start with a known public-key type token (" +
+            ", ".join(_PUBKEY_TYPE_TOKENS) + ")"
+        )
+
     fd, tmp = tempfile.mkstemp(prefix="setup-sshd-keycheck-")
     try:
         with os.fdopen(fd, "w") as f:
-            f.write(line + "\n")
+            f.write(stripped + "\n")
         r = _run(["ssh-keygen", "-l", "-f", tmp])
-        return r.returncode == 0, (r.stdout or r.stderr).strip()
+        if r.returncode != 0:
+            return False, ((r.stdout or r.stderr).strip() or "ssh-keygen could not parse it")
+        fingerprint = ""
+        if r.stdout:
+            first_line = r.stdout.strip().splitlines()
+            fingerprint = first_line[0] if first_line else ""
+        return True, (fingerprint or "(ssh-keygen returned no fingerprint text)")
     finally:
         try:
             os.unlink(tmp)
@@ -353,11 +619,13 @@ def _key_identity(line: str) -> str | None:
     return None
 
 
-def _resolve_key_source(args) -> tuple[str | None, list[str], list[str]]:
-    """(source_label, candidate_lines_to_add, refusals). `candidate_lines`
-    is the NEW key material found at this source; it is empty (not a
-    refusal) when the source is an already-populated authorized_keys with
-    nothing new to add."""
+def _resolve_key_source(args) -> tuple[str | None, list[tuple[str, str]], list[str]]:
+    """(source_label, candidates, refusals). Each candidate is
+    `(key_line, fingerprint)` — the fingerprint (never the key line) is
+    what ends up in the report/--json's `keys_added` (see B3).
+    `candidates` is the NEW key material found at this source; it is
+    empty (not a refusal) when the source is an already-populated
+    authorized_keys with nothing new to add."""
     if args.authorized_key_file:
         p = Path(args.authorized_key_file)
         if not p.is_file():
@@ -365,37 +633,35 @@ def _resolve_key_source(args) -> tuple[str | None, list[str], list[str]]:
         lines = _read_key_lines(p.read_text(encoding="utf-8", errors="replace"))
         if not lines:
             return None, [], [f"--authorized-key-file {p} has no key lines"]
+        candidates = []
         for ln in lines:
             ok, detail = _validate_key(ln)
             if not ok:
                 return None, [], [
                     f"malformed public key in --authorized-key-file "
-                    f"{p}: {detail or 'ssh-keygen could not parse it'}"
+                    f"{p}: {detail}"
                 ]
-        return "file", lines, []
+            candidates.append((ln, detail))
+        return "file", candidates, []
 
     if args.authorized_key:
         ln = args.authorized_key.strip()
         ok, detail = _validate_key(ln)
         if not ok:
-            return None, [], [
-                f"malformed public key from --authorized-key: "
-                f"{detail or 'ssh-keygen could not parse it'}"
-            ]
-        return "literal", [ln], []
+            return None, [], [f"malformed public key from --authorized-key: {detail}"]
+        return "literal", [(ln, detail)], []
 
     pub_env = os.environ.get("PUBLIC_KEY", "")
     if pub_env.strip():
         lines = _read_key_lines(pub_env)
         if lines:
+            candidates = []
             for ln in lines:
                 ok, detail = _validate_key(ln)
                 if not ok:
-                    return None, [], [
-                        f"malformed public key in $PUBLIC_KEY: "
-                        f"{detail or 'ssh-keygen could not parse it'}"
-                    ]
-            return "env:PUBLIC_KEY", lines, []
+                    return None, [], [f"malformed public key in $PUBLIC_KEY: {detail}"]
+                candidates.append((ln, detail))
+            return "env:PUBLIC_KEY", candidates, []
 
     if AUTHORIZED_KEYS.is_file():
         existing = AUTHORIZED_KEYS.read_text(encoding="utf-8", errors="replace")
@@ -409,21 +675,26 @@ def _resolve_key_source(args) -> tuple[str | None, list[str], list[str]]:
     ]
 
 
-def _append_keys(candidate_lines: list[str]) -> tuple[list[str], str | None]:
+def _append_keys(candidates: list[tuple[str, str]]) -> tuple[list[str], str | None, bool]:
     """Append only the lines not already present (by type+base64
-    identity), never clobbering the file. Backs the file up first if it
-    already exists. Returns (keys_actually_added, backup_path_or_None)."""
+    identity), never clobbering the file. Returns
+    `(fingerprints_actually_added, backup_path_or_None, created_fresh)` —
+    `created_fresh` is True only when authorized_keys did not exist
+    before this call, so a refusal discovered later can undo exactly this
+    (see `_rollback_authorized_keys`). NEVER returns key text — only
+    fingerprints (see B3)."""
+    existed_before = AUTHORIZED_KEYS.is_file()
     existing_text = (
         AUTHORIZED_KEYS.read_text(encoding="utf-8", errors="replace")
-        if AUTHORIZED_KEYS.is_file() else ""
+        if existed_before else ""
     )
     existing_ids = {_key_identity(l) for l in _read_key_lines(existing_text)}
-    to_add = [l for l in candidate_lines if _key_identity(l) not in existing_ids]
+    to_add = [(l, fp) for l, fp in candidates if _key_identity(l) not in existing_ids]
     if not to_add:
-        return [], None
+        return [], None, False
 
     backup = None
-    if AUTHORIZED_KEYS.is_file():
+    if existed_before:
         backup = _make_backup(AUTHORIZED_KEYS)
 
     ROOT_SSH_DIR.mkdir(parents=True, exist_ok=True)
@@ -431,20 +702,62 @@ def _append_keys(candidate_lines: list[str]) -> tuple[list[str], str | None]:
     with open(AUTHORIZED_KEYS, "a", encoding="utf-8") as f:
         if existing_text and not existing_text.endswith("\n"):
             f.write("\n")
-        for l in to_add:
+        for l, _fp in to_add:
             f.write(l + "\n")
     os.chmod(AUTHORIZED_KEYS, 0o600)
-    return to_add, (str(backup) if backup else None)
+    return [fp for _l, fp in to_add], (str(backup) if backup else None), not existed_before
 
 
-def _planned_new_keys(candidate_lines: list[str]) -> list[str]:
-    """Dry-run equivalent of `_append_keys` that reads but never writes."""
+def _rollback_authorized_keys(key_backup: str | None, created_fresh: bool) -> None:
+    """Undo exactly what `_append_keys` wrote, for a refusal discovered
+    afterwards (sshd -t/-T(-C), daemon failed to start/listen,
+    --supervise's reread). A no-op if `_append_keys` added nothing this
+    run."""
+    if created_fresh:
+        try:
+            AUTHORIZED_KEYS.unlink()
+        except FileNotFoundError:
+            pass
+    elif key_backup:
+        shutil.copy2(key_backup, AUTHORIZED_KEYS)
+        os.chmod(AUTHORIZED_KEYS, 0o600)
+
+
+def _planned_new_keys(candidates: list[tuple[str, str]]) -> list[str]:
+    """Dry-run equivalent of `_append_keys` that reads but never writes.
+    Returns fingerprints, matching --apply's report shape."""
     existing_text = (
         AUTHORIZED_KEYS.read_text(encoding="utf-8", errors="replace")
         if AUTHORIZED_KEYS.is_file() else ""
     )
     existing_ids = {_key_identity(l) for l in _read_key_lines(existing_text)}
-    return [l for l in candidate_lines if _key_identity(l) not in existing_ids]
+    return [fp for l, fp in candidates if _key_identity(l) not in existing_ids]
+
+
+def _harden_ssh_dir_permissions() -> list[str]:
+    """H7: /root/.ssh must be 0700 and authorized_keys 0600, with root
+    ownership, REGARDLESS of whether any key was actually added this run
+    — a pre-existing 0777 .ssh / 0666 authorized_keys (or wrong owner) is
+    silently exploitable and must be corrected every --apply, not only
+    when there happens to be new key material to append. Ownership is
+    best-effort: production is always real root (enforced by
+    `_is_root()`), but a test environment that only patches the script's
+    OWN root check may not be real root, so a chown failure there is
+    noted, not fatal."""
+    notes: list[str] = []
+    if ROOT_SSH_DIR.is_dir():
+        os.chmod(ROOT_SSH_DIR, 0o700)
+        try:
+            os.chown(ROOT_SSH_DIR, 0, 0)
+        except OSError:
+            notes.append(f"NOTE: could not chown {ROOT_SSH_DIR} to root:root")
+    if AUTHORIZED_KEYS.is_file():
+        os.chmod(AUTHORIZED_KEYS, 0o600)
+        try:
+            os.chown(AUTHORIZED_KEYS, 0, 0)
+        except OSError:
+            notes.append(f"NOTE: could not chown {AUTHORIZED_KEYS} to root:root")
+    return notes
 
 
 # ---------------------------------------------------------------------------
@@ -453,17 +766,18 @@ def _planned_new_keys(candidate_lines: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _directive_lines(port: int) -> list[str]:
-    lines = [
+    # Port is now ALWAYS written explicitly (never implicit-22), so the
+    # written config never depends on OpenSSH's own compiled-in default —
+    # see M8.
+    return [
         "PasswordAuthentication no",
         "PermitEmptyPasswords no",
         "KbdInteractiveAuthentication no",
         "ChallengeResponseAuthentication no",
         "PubkeyAuthentication yes",
         "PermitRootLogin prohibit-password",
+        f"Port {port}",
     ]
-    if port != 22:
-        lines.append(f"Port {port}")
-    return lines
 
 
 def _dropin_content(port: int) -> str:
@@ -533,10 +847,11 @@ def _comment_out_conflicts(text: str) -> str:
 
 def _fallback_edit(sshd_config_text: str, port: int) -> str:
     """Edit sshd_config directly: comment out every active occurrence of a
-    directive this script manages (wherever it is), then prepend this
-    script's own block at the very top so first-match-wins always
-    resolves to it. Idempotent: a prior run's block is replaced, not
-    duplicated."""
+    directive this script manages (wherever it is — INCLUDING inside a
+    `Match` block, since the regex matches by line, not by block context),
+    then prepend this script's own block at the very top so first-match-
+    wins always resolves to it. Idempotent: a prior run's block is
+    replaced, not duplicated."""
     text = _strip_managed_block(sshd_config_text)
     text = _comment_out_conflicts(text)
     block = BEGIN_MARK + "\n" + "\n".join(_directive_lines(port)) + "\n" + END_MARK + "\n"
@@ -604,7 +919,7 @@ def _plan_config(port: int, apply: bool) -> dict:
 
 def _rollback_config(plan: dict) -> None:
     """Undo exactly what `_plan_config` wrote, for a refusal discovered
-    afterwards (sshd -t / sshd -T)."""
+    afterwards (sshd -t / sshd -T(-C))."""
     if plan["mode"] == "dropin":
         if plan["_old_content"] is None:
             try:
@@ -692,7 +1007,8 @@ def _ensure_host_keys(persist: bool) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Verify for real — sshd -t then sshd -T, never just reading our own file.
+# Verify for real — sshd -t then sshd -T (with and without -C), never just
+# reading our own file (B2).
 # ---------------------------------------------------------------------------
 
 def _sshd_binary() -> str:
@@ -705,24 +1021,23 @@ def _sshd_binary() -> str:
     return shutil.which("sshd") or "/usr/sbin/sshd"
 
 
-def _sshd_effective_config() -> tuple[bool, dict, str]:
-    PRIVSEP_DIR.mkdir(parents=True, exist_ok=True)
-    sshd_bin = _sshd_binary()
-
-    r = _run([sshd_bin, "-t"])
-    if r.returncode != 0:
-        return False, {}, f"sshd -t failed: {(r.stderr or r.stdout).strip()}"
-
-    r2 = _run([sshd_bin, "-T"])
-    if r2.returncode != 0:
-        return False, {}, f"sshd -T failed: {(r2.stderr or r2.stdout).strip()}"
-
-    effective: dict[str, str] = {}
-    for line in r2.stdout.splitlines():
+def _parse_effective(text: str) -> dict[str, list[str]]:
+    """Every value for every key, IN ORDER — never overwriting a prior
+    occurrence. A directive like `Port` can legitimately appear more than
+    once in `sshd -T`'s own output (it ACCUMULATES rather than
+    first-match-wins); collapsing to one value per key is exactly what
+    made the port-accumulation bug (M8) invisible to this script before."""
+    eff: dict[str, list[str]] = {}
+    for line in text.splitlines():
         parts = line.strip().split(None, 1)
         if len(parts) == 2:
-            effective[parts[0].lower()] = parts[1].strip()
+            eff.setdefault(parts[0].lower(), []).append(parts[1].strip())
+    return eff
 
+
+def _check_effective(effective: dict[str, list[str]], port: int, context: str) -> str | None:
+    """Returns a refusal string, or None if this ONE `sshd -T`(-C)
+    invocation's effective config is fully safe."""
     must_equal = {
         "passwordauthentication": "no",
         "permitemptypasswords": "no",
@@ -730,30 +1045,80 @@ def _sshd_effective_config() -> tuple[bool, dict, str]:
         "pubkeyauthentication": "yes",
     }
     for key, expected in must_equal.items():
-        got = effective.get(key)
-        if got is not None and got.lower() != expected:
-            return False, effective, (
-                f"sshd -T reports {key}={got}, expected {expected} — "
-                f"refusing to start sshd with password login reachable"
-            )
+        for got in effective.get(key, []):
+            if got.lower() != expected:
+                return (
+                    f"sshd -T{context} reports {key}={got}, expected "
+                    f"{expected} — refusing to start sshd with password "
+                    f"login reachable"
+                )
 
     # "prohibit-password" and its older synonym "without-password" mean
     # the same thing; this build's sshd -T always prints the latter back
     # (confirmed against the real image) regardless of which was written.
-    root_login = effective.get("permitrootlogin")
-    if root_login is not None and root_login.lower() not in (
-        "prohibit-password", "without-password"
-    ):
-        return False, effective, (
-            f"sshd -T reports PermitRootLogin={root_login}, expected "
-            f"prohibit-password — refusing"
-        )
+    for got in effective.get("permitrootlogin", []):
+        if got.lower() not in ("prohibit-password", "without-password"):
+            return (
+                f"sshd -T{context} reports PermitRootLogin={got}, expected "
+                f"prohibit-password — refusing"
+            )
 
-    return True, effective, "sshd -T confirms password authentication is disabled"
+    port_vals = sorted(set(effective.get("port", [])))
+    if port_vals and port_vals != [str(port)]:
+        return (
+            f"sshd -T{context} reports sshd would listen on port(s) "
+            f"{', '.join(port_vals)}, expected ONLY {port} — refusing "
+            f"(OpenSSH accumulates Port directives across the main file "
+            f"and drop-ins)"
+        )
+    return None
+
+
+def _sshd_effective_config(port: int) -> tuple[bool, dict, str]:
+    """`sshd -t`, then `sshd -T` with NO `-C`, PLUS `sshd -T -C` for both a
+    loopback and a non-local client address — a plain `sshd -T` evaluates
+    NO `Match` criteria, so it can report password auth disabled while a
+    real connection from some address would not be (see B2). Refuses if
+    ANY of the three contexts is unsafe, or if sshd would listen on
+    anything other than the requested port (see M8)."""
+    PRIVSEP_DIR.mkdir(parents=True, exist_ok=True)
+    sshd_bin = _sshd_binary()
+
+    r = _run([sshd_bin, "-t"])
+    if r.returncode != 0:
+        return False, {}, f"sshd -t failed: {(r.stderr or r.stdout).strip()}"
+
+    contexts = [("", [sshd_bin, "-T"])]
+    for addr in ("127.0.0.1", "203.0.113.9"):
+        contexts.append((
+            f" -C(addr={addr})",
+            [sshd_bin, "-T", "-C", f"user=root,host=x,addr={addr}"],
+        ))
+
+    last_effective: dict[str, list[str]] = {}
+    for context, cmd in contexts:
+        r2 = _run(cmd)
+        if r2.returncode != 0:
+            return False, last_effective, (
+                f"sshd -T{context} failed: {(r2.stderr or r2.stdout).strip()}"
+            )
+        effective = _parse_effective(r2.stdout)
+        last_effective = effective
+        problem = _check_effective(effective, port, context)
+        if problem:
+            return False, effective, problem
+
+    return True, last_effective, (
+        "sshd -T confirms password authentication is disabled for the "
+        "default context and for both a loopback and a non-local client "
+        "address (-C), and sshd would listen only on the configured port"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Daemon lifecycle — found by pidfile, never a blanket pkill.
+# Daemon lifecycle — found by pidfile, never a blanket pkill. "Started" is
+# decided by what is REALLY listening on IPv4, never sshd's own exit
+# status (H6).
 # ---------------------------------------------------------------------------
 
 def _sshd_pid_if_alive() -> int | None:
@@ -771,6 +1136,43 @@ def _sshd_pid_if_alive() -> int | None:
     except OSError:
         return None
     return pid if name == "sshd" else None
+
+
+def _sshd_listening_on_port(port: int) -> bool:
+    """True only if something is really LISTENING (TCP state 0A) on this
+    port over IPv4, read from the kernel's own /proc/net/tcp — never
+    inferred from sshd's own exit status, which returns 0 even on a
+    partial bind failure (confirmed: IPv6 up, IPv4 — the interface RunPod
+    actually proxies — down). /proc/net/tcp always exists on every Linux
+    kernel and needs no extra package; `ss` was checked against the real
+    image and is NOT guaranteed present, so it is not relied on here."""
+    try:
+        lines = PROC_NET_TCP.read_text().splitlines()[1:]
+    except OSError:
+        return False
+    target = f"{port:04X}"
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local_addr = parts[1]
+        state = parts[3]
+        if ":" not in local_addr:
+            continue
+        port_hex = local_addr.rsplit(":", 1)[1]
+        if port_hex.upper() == target and state.upper() == "0A":
+            return True
+    return False
+
+
+def _wait_until_listening(port: int, timeout_s: float = 5.0) -> bool:
+    deadline = time.time() + timeout_s
+    while True:
+        if _sshd_listening_on_port(port):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
 
 
 def _start_sshd() -> subprocess.CompletedProcess:
@@ -799,10 +1201,14 @@ def _stop_sshd(pid: int, timeout_s: float = 5.0) -> bool:
 
 def _supervise_block(port: int) -> str:
     log_dir = DEFAULT_LOG_DIR
+    # _sshd_binary() (not a hardcoded "/usr/sbin/sshd") so a test's fake
+    # bin dir is the one supervisord's own conf ends up pointing at too —
+    # in production shutil.which("sshd") resolves to the same absolute
+    # path anyway, so this changes nothing there.
     return (
         f"\n{SUP_BEGIN_MARK}\n"
         f"[program:sshd]\n"
-        f"command=/usr/sbin/sshd -D -e -o PidFile={SSHD_PIDFILE}\n"
+        f"command={_sshd_binary()} -D -e -o PidFile={SSHD_PIDFILE}\n"
         f"autostart=true\n"
         f"autorestart=true\n"
         f"priority=50\n"
@@ -818,10 +1224,23 @@ def _supervise_block(port: int) -> str:
 
 
 def _ensure_supervised(port: int, apply: bool) -> dict:
-    text = (
-        SUPERVISOR_CONF.read_text(encoding="utf-8", errors="replace")
-        if SUPERVISOR_CONF.is_file() else ""
-    )
+    if not SUPERVISOR_CONF.is_file():
+        # M8: this used to reach shutil.copy2 inside _make_backup with a
+        # file that does not exist at all, raising an unhandled
+        # FileNotFoundError (no --json output at all). Refuse cleanly
+        # instead — there is nothing sensible to append a program to.
+        return {
+            "already_present": False, "ok": False, "backup_path": None,
+            "detail": (
+                f"--supervise refuses: {SUPERVISOR_CONF} does not exist — "
+                f"supervisord is not configured on this container, so "
+                f"appending a [program:sshd] section would create a file "
+                f"supervisord was never told to read; run without "
+                f"--supervise (the plain background daemon) instead"
+            ),
+        }
+
+    text = SUPERVISOR_CONF.read_text(encoding="utf-8", errors="replace")
     already = "[program:sshd]" in text
     if already:
         return {"already_present": True, "ok": True, "backup_path": None,
@@ -1007,6 +1426,13 @@ def main(argv=None) -> int:
             f"{MARKER_VENV} and/or {MARKER_MAIN} not both present"
         )
 
+    # --- 0. B2 / M8: config-safety refusal, BEFORE any write this run
+    # makes. Nothing has been written yet, so no rollback is needed here.
+    cfg_refusal = _config_safety_refusal(args.port)
+    if cfg_refusal:
+        refusals.append(cfg_refusal)
+        return _finish(args, report, refusals, warnings)
+
     # --- 1/2. apt-get update, then install/upgrade openssh-server -------
     ok, out = _apt_update()
     if not ok:
@@ -1053,18 +1479,23 @@ def main(argv=None) -> int:
             report["simulated_install"] = "\n".join(r.stdout.splitlines()[-15:])
 
     # --- 3. resolve a public key -----------------------------------------
-    key_source, candidate_keys, key_refusals = _resolve_key_source(args)
+    key_source, candidates, key_refusals = _resolve_key_source(args)
     if key_refusals:
         refusals.extend(key_refusals)
         return _finish(args, report, refusals, warnings)
     report["key_source"] = key_source
 
+    key_backup: str | None = None
+    key_created_fresh = False
     if args.apply:
-        keys_added, key_backup = _append_keys(candidate_keys)
+        keys_added, key_backup, key_created_fresh = _append_keys(candidates)
         if key_backup:
             report["authorized_keys_backup"] = key_backup
+        # H7: enforce .ssh / authorized_keys permissions & ownership every
+        # apply, independent of whether anything was actually added.
+        warnings.extend(_harden_ssh_dir_permissions())
     else:
-        keys_added = _planned_new_keys(candidate_keys)
+        keys_added = _planned_new_keys(candidates)
     report["keys_added"] = keys_added
 
     # --- 4. sshd_config: drop-in vs. fallback ----------------------------
@@ -1078,20 +1509,23 @@ def main(argv=None) -> int:
 
     if args.apply:
         # --- 5. host keys (before verifying — sshd -t needs real ones) --
+        # NOTE: host keys under HOST_KEY_STORE are never rolled back below
+        # — see ROLLBACK in the module docstring.
         host_info = _ensure_host_keys(persist=persist_host_keys)
         report["host_keys"] = host_info["host_keys"]
         warnings.extend(host_info["notes"])
 
         # --- 6. verify for real, refuse+rollback if it fails ------------
-        ok, effective, detail = _sshd_effective_config()
+        ok, effective, detail = _sshd_effective_config(args.port)
         report["sshd_check"] = detail
         if not ok:
             if plan["changed"]:
                 _rollback_config(plan)
+            _rollback_authorized_keys(key_backup, key_created_fresh)
             refusals.append(detail)
             return _finish(args, report, refusals, warnings)
 
-        # --- 7. start / restart, by pid only -----------------------------
+        # --- 7. start / restart, by pid only, verified by REAL listening
         did_install = action in ("install", "upgrade")
         pid = _sshd_pid_if_alive()
 
@@ -1108,64 +1542,131 @@ def main(argv=None) -> int:
                 # non-supervised run) — otherwise supervisord's own child
                 # fails to bind the same port and goes FATAL (confirmed
                 # against the real image: "Bind to port 22 ... Address
-                # already in use"). Once supervisord owns it, its own
-                # autorestart=true is what keeps it alive; never done again
-                # below on an idempotent re-run.
-                if pid is not None and not _stop_sshd(pid):
-                    warnings.append(
-                        f"WARNING: a standalone sshd (pid {pid}) did not "
-                        f"exit within the timeout before handing off to "
-                        f"supervisord"
-                    )
+                # already in use"). H5: if the handoff then fails, this
+                # standalone daemon is restarted before refusing, so the
+                # pod is never left with no sshd because of this script.
+                stopped_pid = None
+                if pid is not None:
+                    if _stop_sshd(pid):
+                        stopped_pid = pid
+                    else:
+                        warnings.append(
+                            f"WARNING: a standalone sshd (pid {pid}) did not "
+                            f"exit within the timeout before handing off to "
+                            f"supervisord"
+                        )
+                        stopped_pid = pid
+
                 sup = _ensure_supervised(args.port, apply=True)
                 report["supervise"] = sup
-                if not sup["ok"]:
+
+                def _recover_standalone(reason: str) -> None:
                     if plan["changed"]:
                         _rollback_config(plan)
+                    _rollback_authorized_keys(key_backup, key_created_fresh)
+                    if stopped_pid is not None:
+                        rr = _start_sshd()
+                        if rr.returncode == 0 and _wait_until_listening(args.port):
+                            report["daemon"] = "restarted"
+                            warnings.append(
+                                f"{reason}; the standalone sshd was "
+                                f"restarted and is listening again"
+                            )
+                        else:
+                            report["daemon"] = "not-started"
+                            warnings.append(
+                                f"CRITICAL: {reason} AND the standalone sshd "
+                                f"could not be restarted — the pod may have "
+                                f"NO sshd listening; use the RunPod Web "
+                                f"Terminal to investigate"
+                            )
+                    else:
+                        report["daemon"] = "not-started"
+
+                if not sup["ok"]:
+                    _recover_standalone("the supervisord handoff failed")
                     refusals.append(sup["detail"])
                     return _finish(args, report, refusals, warnings)
-                # supervisord's own startsecs (2s, _supervise_block) is how
-                # long it waits before calling this RUNNING; give it a
-                # moment, then read the REAL state back rather than assume.
-                time.sleep(2.5)
-                new_pid = _sshd_pid_if_alive()
-                if new_pid is not None:
-                    report["daemon"] = "restarted" if pid is not None else "started"
-                else:
-                    report["daemon"] = "not-started"
-                    warnings.append(
-                        "WARNING: supervisorctl update completed but sshd "
-                        "is not showing as running yet — check "
-                        "`supervisorctl status` and its own log for why"
+
+                if not _wait_until_listening(args.port):
+                    _recover_standalone(
+                        "supervisorctl update completed but sshd never "
+                        "came up listening"
                     )
+                    refusals.append(
+                        f"supervisorctl update completed but sshd is not "
+                        f"confirmed LISTENING on IPv4 port {args.port} — "
+                        f"refusing"
+                    )
+                    return _finish(args, report, refusals, warnings)
+
+                report["daemon"] = "restarted" if pid is not None else "started"
             else:
-                # Already supervisord's program from a prior run.
-                # supervisord itself (autorestart=true) is what keeps it
-                # alive; this script only intervenes when the binary or
-                # config changed underneath it, via `supervisorctl
-                # restart`, which touches ONLY this one program.
                 report["supervise"] = {
                     "already_present": True, "ok": True, "backup_path": None,
                     "detail": "[program:sshd] already present in supervisord.conf",
                 }
+                restarted = False
                 if did_install or plan["changed"]:
                     r = _run(["supervisorctl", "-c", str(SUPERVISOR_CONF), "restart", "sshd"])
                     time.sleep(1.0)
-                    new_pid = _sshd_pid_if_alive()
-                    if r.returncode == 0 and new_pid is not None:
-                        report["daemon"] = "restarted"
-                    else:
+                    restarted = True
+                    if r.returncode != 0 or not _wait_until_listening(args.port):
+                        if plan["changed"]:
+                            _rollback_config(plan)
+                        _rollback_authorized_keys(key_backup, key_created_fresh)
                         report["daemon"] = "not-started"
-                        warnings.append(
-                            f"WARNING: 'supervisorctl restart sshd' may not "
-                            f"have succeeded: {(r.stderr or r.stdout).strip()}"
+                        refusals.append(
+                            f"'supervisorctl restart sshd' did not leave "
+                            f"sshd confirmed LISTENING on IPv4 port "
+                            f"{args.port}: {(r.stderr or r.stdout).strip()}"
                         )
-                else:
-                    report["daemon"] = "already-running" if pid is not None else "not-started"
+                        return _finish(args, report, refusals, warnings)
+                    report["daemon"] = "restarted"
+
+                if not restarted:
+                    if pid is not None and not _wait_until_listening(args.port):
+                        refusals.append(
+                            f"sshd is supposed to already be running under "
+                            f"supervisord but is not confirmed LISTENING on "
+                            f"IPv4 port {args.port} — refusing"
+                        )
+                        report["daemon"] = "not-started"
+                        return _finish(args, report, refusals, warnings)
+                    if pid is None:
+                        refusals.append(
+                            "supervisord believes [program:sshd] is already "
+                            "present but no sshd pid/listener was found — "
+                            "refusing (check `supervisorctl status`)"
+                        )
+                        report["daemon"] = "not-started"
+                        return _finish(args, report, refusals, warnings)
+                    report["daemon"] = "already-running"
         elif pid is None:
             r = _start_sshd()
             if r.returncode != 0:
+                if plan["changed"]:
+                    _rollback_config(plan)
+                _rollback_authorized_keys(key_backup, key_created_fresh)
                 refusals.append(f"sshd failed to start: {(r.stderr or r.stdout).strip()}")
+                return _finish(args, report, refusals, warnings)
+            if not _wait_until_listening(args.port):
+                # It came up (pidfile written, process alive) but never
+                # bound the port — a dead-end daemon is worse than none:
+                # stop it too, so no orphaned pidfile/process persists.
+                bogus_pid = _sshd_pid_if_alive()
+                if bogus_pid is not None:
+                    _stop_sshd(bogus_pid)
+                if plan["changed"]:
+                    _rollback_config(plan)
+                _rollback_authorized_keys(key_backup, key_created_fresh)
+                report["daemon"] = "not-started"
+                refusals.append(
+                    f"sshd started (process alive) but is not confirmed "
+                    f"LISTENING on IPv4 port {args.port} (checked "
+                    f"/proc/net/tcp, not just sshd's own exit status) — "
+                    f"refusing"
+                )
                 return _finish(args, report, refusals, warnings)
             report["daemon"] = "started"
         elif did_install or plan["changed"]:
@@ -1175,11 +1676,44 @@ def main(argv=None) -> int:
                     f"starting a new instance anyway"
                 )
             r = _start_sshd()
-            if r.returncode != 0:
-                refusals.append(f"sshd failed to restart: {(r.stderr or r.stdout).strip()}")
+            if r.returncode != 0 or not _wait_until_listening(args.port):
+                # H5/H6: the OLD daemon is already down. One best-effort
+                # attempt to bring SOME sshd back before refusing, even
+                # though it will be using the (about to be rolled back)
+                # old config.
+                if plan["changed"]:
+                    _rollback_config(plan)
+                _rollback_authorized_keys(key_backup, key_created_fresh)
+                r2 = _start_sshd()
+                if r2.returncode == 0 and _wait_until_listening(args.port):
+                    report["daemon"] = "restarted"
+                    warnings.append(
+                        "the restart with the new config did not come up "
+                        "listening; restarted again with the rolled-back "
+                        "config instead — sshd is still listening"
+                    )
+                else:
+                    report["daemon"] = "not-started"
+                    warnings.append(
+                        "CRITICAL: could not get sshd listening again after "
+                        "a failed restart — the pod may have NO sshd "
+                        "listening; use the RunPod Web Terminal to investigate"
+                    )
+                refusals.append(
+                    f"sshd failed to restart or is not confirmed LISTENING "
+                    f"on IPv4 port {args.port}: {(r.stderr or r.stdout).strip()}"
+                )
                 return _finish(args, report, refusals, warnings)
             report["daemon"] = "restarted"
         else:
+            if not _wait_until_listening(args.port):
+                refusals.append(
+                    f"sshd is believed already-running (pid {pid}) but is "
+                    f"not confirmed LISTENING on IPv4 port {args.port} — "
+                    f"refusing"
+                )
+                report["daemon"] = "not-started"
+                return _finish(args, report, refusals, warnings)
             report["daemon"] = "already-running"
     else:
         report["host_keys"] = "persisted" if persist_host_keys else "ephemeral"
@@ -1190,10 +1724,14 @@ def main(argv=None) -> int:
                 "NOTE: openssh-server is not installed yet, so sshd -t/-T "
                 "cannot verify the planned config in this dry run — --apply "
                 "verifies it for real and refuses automatically if the "
-                "effective config would allow password authentication."
+                "effective config would allow password authentication or "
+                "listen on the wrong port."
             )
         if args.supervise:
-            report["supervise"] = _ensure_supervised(args.port, apply=False)
+            sup = _ensure_supervised(args.port, apply=False)
+            report["supervise"] = sup
+            if not sup["ok"]:
+                refusals.append(sup["detail"])
 
     return _finish(args, report, refusals, warnings)
 
