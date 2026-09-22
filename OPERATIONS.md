@@ -1563,6 +1563,14 @@ guard cases.
 
 ## Getting a real shell into a pod (installing sshd, v3.1.9.6)
 
+**Do not use `scripts/setup-sshd.py` until `v3.1.9.6` is tagged.** A
+hostile review found this script could report success while a real
+password login from anywhere still worked (a `Match` block sshd's own
+`-T` cannot see without `-C`) and could accept and store a private key
+verbatim — both fixed, but only in the commit this release tags. Running
+an untagged working copy of this script is running exactly the version
+those two holes were found in.
+
 **Why the image has no sshd.** `Dockerfile:63-80` never installs
 openssh-server, and it never has — `entrypoint.sh` never mentions ssh, and
 `supervisord.conf` has no `[sshd]` program and, more to the point, no
@@ -1629,12 +1637,23 @@ which would touch unrelated packages under a live vLLM process), adds the
 key to `authorized_keys` (append-only — an existing file is backed up
 first and never clobbered), hardens the config, ensures host keys, and
 starts sshd as a plain background daemon. It verifies the result for real
-with `sshd -t` then `sshd -T` — never just by reading back the file it
-wrote — and refuses, rolling back, if the effective config would allow
-password login. At minimum it sets: `PasswordAuthentication no`,
+with `sshd -t`, then `sshd -T` with NO `-C` AND `sshd -T -C` for both a
+loopback and a non-local client address — never just by reading back the
+file it wrote, and never trusting a bare `sshd -T` alone, which cannot see
+what a `Match` block would do for a real connection — and refuses, rolling
+back the config write and any `authorized_keys` append made this run, if
+any of those contexts would allow password login or leave sshd listening
+on the wrong port. At minimum it sets: `PasswordAuthentication no`,
 `PermitEmptyPasswords no`, `KbdInteractiveAuthentication no`,
 `ChallengeResponseAuthentication no`, `PubkeyAuthentication yes`,
-`PermitRootLogin prohibit-password`.
+`PermitRootLogin prohibit-password`. Only a FINGERPRINT (never the key
+text itself) is ever reported for a key that was added — `ssh-keygen -l
+-f`'s exit code is not trusted on its own to keep a private key out (the
+real binary returns 0 on a private key file too); a candidate must start
+with a known public-key-type token and be a single line before that check
+even runs. `/root/.ssh` and `authorized_keys` are re-hardened to
+`0700`/`0600` (plus ownership) on every `--apply`, even when there is no
+new key to add.
 
 **Drop-in vs. direct edit.** The script checks THIS pod's real
 `sshd_config` fresh on every run rather than assuming: if it has an
@@ -1651,10 +1670,28 @@ after both a fresh `--apply` and a hostile override (an active
 `PasswordAuthentication yes` line inserted after the Include still lost
 to the drop-in, exactly as first-match-wins predicts).
 
+**A pre-existing `Match` block, or a conflicting drop-in, refuses the
+run outright.** `sshd -T` with no `-C` evaluates NO `Match` criteria, so
+a `Match Address * / PasswordAuthentication yes` block left by a
+previous operator or pod template made an earlier version of this
+script report "password authentication is disabled" while a real
+connection from anywhere could still log in with a password (a hostile
+review confirmed this against the published digest). The script now
+refuses — before writing anything — if it finds an active `Match` line
+anywhere in `sshd_config` or `sshd_config.d/*.conf`, another drop-in
+that sorts before its own `00-zions.conf`, or a conflicting active
+`Port` line anywhere it does not control (`Port` accumulates across
+files in OpenSSH instead of following first-match-wins, so this
+script's own `Port N` never suppresses an unrelated `Port 22`
+elsewhere). Remove or fix the conflicting file and re-run.
+
 **RunPod template.** The template's port mapping must expose the TCP port
 this script configures (default 22, `--port N` to change) for it to be
 reachable from outside the pod. The Web Terminal itself keeps working
-either way — it does not go through sshd.
+either way — it does not go through sshd. `--port N` now also verifies,
+for real, that sshd ends up listening ONLY on `N` — not also on 22 —
+refusing if a conflicting `Port` line exists anywhere else in the loaded
+config (see "Drop-in vs. direct edit" above).
 
 **Host keys and `/data/ssh/`.** By default the script persists host keys
 to `/data/ssh/` (directory `0700`, key files `0600`) and copies them into
@@ -1669,7 +1706,13 @@ the pod.** It is NOT swept into `compactor/backup.py`'s own archive:
 a walk of `/data` as a whole, so `/data/ssh/` sits outside its blast
 radius entirely (confirmed by reading `backup.py`, not assumed). Opt out
 of persistence with `--no-persist-host-keys`, at the cost of the
-fingerprint changing on every restart.
+fingerprint changing on every restart. A refusal discovered after this
+script has already written something (the config, or an
+`authorized_keys` append) rolls that write back — host key files under
+`/data/ssh/` are the one deliberate exception: they are never rolled
+back, because they are never what causes a refusal, and deleting or
+regenerating them on a refusal would only churn the pod's host-key
+fingerprint for no security benefit.
 
 **`--supervise` (opt-in, OFF by default).** Instead of a plain background
 daemon, appends a `[program:sshd]` block to
@@ -1685,7 +1728,13 @@ sequence — `supervisorctl update` never touched them. A second, idempotent
 `--apply --supervise` left `sshd`'s own pid unchanged too; changing
 `--port` while already supervised correctly bumped `sshd` to a new pid via
 a scoped `supervisorctl restart sshd`, with the other programs again
-untouched throughout.
+untouched throughout. A missing `supervisord.conf` (nothing to append a
+program to) now refuses cleanly with full `--json` output rather than
+raising an unhandled exception. If the handoff itself fails (a real
+`supervisorctl reread` failure), the standalone daemon this script
+stopped to attempt the handoff is restarted and reconfirmed listening
+before the run returns its refusal — this script never leaves the pod
+with no sshd because of its own actions.
 
 **Machine-readable output**, for scripting a fleet of pods: add `--json`.
 See the script's own module docstring for the full exit-code contract —
@@ -1693,10 +1742,26 @@ see "Exit codes — the shared convention across the operator scripts"
 above for what each code means — and `compactor/test_setup_sshd_script.py`
 for coverage: a dry run that writes nothing, a clean install, idempotency,
 append-not-clobber on an existing `authorized_keys`, every refusal path
-(not root, no usable key, a malformed key, a config that would allow
-password auth, `sshd -t` failing), that `apt-get upgrade`/`dist-upgrade`
-is never invoked, and that no private key material ever reaches stdout,
-stderr, or `--json`.
+(not root, a config-safety refusal — a `Match` block, a conflicting
+drop-in, or a conflicting `Port` directive — no usable key, a malformed
+or private key, a config that would allow password auth for the default
+context or either `-C` address, `sshd -t` failing, a missing
+`supervisord.conf`, a failed `supervisorctl reread`, and sshd not
+confirmed LISTENING after a start/restart), that `apt-get
+upgrade`/`dist-upgrade` is never invoked, and that no private key
+material ever reaches stdout, stderr, or `--json`.
+
+**Real-container verification.** `compactor/test_real_image_setup_sshd.py`
+runs the real, unmodified script inside a throwaway container from the
+published digest, with real `openssh-server`/`openssh-client` apt
+installs (needs network from inside the container) — a real key login,
+a real failed password login (including with the `Match`-block scenario
+above), a real rejected private key, a real idempotent second `--apply`,
+a real `--port 2222` listening only on 2222, and a real `--supervise`
+handoff failure that still leaves a real, listening sshd afterward. This
+is the suite that actually exercises what the unit suite's fakes cannot
+(a real `ssh-keygen -l -f` on a private key, a real bound socket, a real
+`Match` block evaluated with `-C`).
 
 **Undo.** Stop sshd (`supervisorctl stop sshd` if `--supervise` was used,
 otherwise find its pid via `/run/sshd.pid` and send it `SIGTERM`), remove

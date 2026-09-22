@@ -320,11 +320,7 @@ round of defects specific to `backfill-records.py`, closed below.
   all clear".** A store with only unreadable/ambiguous records exited 0;
   every `--conv` value given being invalid or not found also exited 0
   with nothing inspected. Both now exit 1 (human attention required) on
-  a dry run. (M8's other, `setup-sshd.py`-side items — a `--port` that
-  does not close 22, refusal paths that leave `authorized_keys`/`/data/
-  ssh` written, an unhandled `FileNotFoundError` under `--supervise`, and
-  `_make_backup`'s own same-second-collision `RuntimeError` — belong to
-  that script and are not covered by this entry.)
+  a dry run. (M8's other, `setup-sshd.py`-side items are closed below.)
 - **Mutants BR3, BR4 and BR8 (of the M4 hostile-review mutation pass)
   survived the existing suite** — a not-yet-stale `in_progress` record
   could be classified `would-resume` and closed if `is_stale` were ever
@@ -335,6 +331,93 @@ round of defects specific to `backfill-records.py`, closed below.
   still leaves `--apply` untouching it (BR8). Three new tests close all
   three; re-running the reviewer's mutation harness afterward shows 0
   surviving mutants of 8 for `backfill-records.py` (BR1-BR8).
+- **`setup-sshd.py` (hostile-review pass 2): B2, B3, H5, H6, H7, and the
+  script's own M8 items, closed.**
+  - **B2.** `sshd -T` with no `-C` evaluates NO `Match` criteria at all,
+    so a pre-existing drop-in shaped like `Match Address * /
+    PasswordAuthentication yes / PermitRootLogin yes` made the script
+    print "password authentication is disabled" and exit 0 while a real
+    connection from anywhere could log in with a password — reproduced
+    for real against the published digest. The script now refuses
+    outright, before writing anything, if it finds an active `Match`
+    line anywhere in `sshd_config` or `sshd_config.d/*.conf`, or another
+    drop-in that sorts before its own `00-zions.conf`. After writing, it
+    also verifies with `sshd -T -C` for both a loopback and a
+    `203.0.113.9` non-local address, not just a bare `sshd -T`.
+  - **B3.** The real `ssh-keygen -l -f` returns exit 0 on a PRIVATE key
+    file too (confirmed against the real image) — the test suite's own
+    fake was *stricter* than the real binary, which is exactly why this
+    was invisible. `_validate_key` now refuses anything that is not a
+    single line starting with a known public-key type token
+    (`ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-nistp256/384/521`,
+    `sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`) or
+    that contains `PRIVATE KEY`, *before* ever shelling out to
+    `ssh-keygen`. `keys_added` in the report/`--json` now holds
+    FINGERPRINTS, never key text.
+  - **H5.** A failed `--supervise` handoff (a real `supervisorctl
+    reread` failure) used to leave the pod with no sshd at all: the
+    standalone daemon was stopped before the handoff was attempted, and
+    never restarted on failure. It is now restarted, and reconfirmed
+    listening, before the run returns its refusal.
+  - **H6.** "Started"/"restarted" used to be decided by `sshd`'s own
+    exit status, which is 0 even on a partial bind failure. It is now
+    decided by what is really LISTENING on IPv4 at the configured port,
+    read from `/proc/net/tcp` (`ss` was checked against the real image
+    and is not present, so it is not relied on) — a start/restart that
+    is not confirmed listening is now a refusal (exit 1), not a silent
+    success.
+  - **H7.** `/root/.ssh` (0700) and `authorized_keys` (0600, plus
+    ownership) are now enforced on every `--apply`, even when there is
+    no new key to add — previously a pre-existing `0777`/`0666` pair was
+    never corrected in that case.
+  - **M5 (test suite gaps).** The fallback/direct-edit path
+    (`_dropin_usable` false) had no end-to-end test at all; the fake
+    `apt-cache` never produced an available upgrade, so
+    `test_never_calls_apt_get_upgrade_or_dist_upgrade` could not fail
+    even if `--only-upgrade` were replaced with a bare `apt-get
+    upgrade`; and the real `DROPIN_PATH` filename's `00-` sort-order
+    prefix (a security property) was never asserted outside a fixture
+    that could rename it invisibly. All three are now covered, plus new
+    coverage for B2/B3/H5/H6/H7 above. Re-running the reviewer's
+    mutation tooling (`mutate.py`, `m2.py`, `m3.py`) against the fixed
+    script now shows 0 surviving mutants (the handful of "PATTERN NOT
+    FOUND" entries are old mutants whose exact target text no longer
+    exists after this rewrite; the same properties are covered by new,
+    still-passing tests).
+  - **M8 (setup-sshd.py side).** `--port N` used to leave sshd listening
+    on BOTH `N` and 22: OpenSSH ACCUMULATES `Port` directives across the
+    main file and every loaded drop-in instead of first-match-wins, so
+    writing `Port N` in this script's own drop-in never suppressed an
+    unrelated active `Port 22` elsewhere. The script now refuses
+    outright if it finds a conflicting active `Port` line anywhere it
+    does not itself control, and re-verifies the real, post-write set of
+    listening ports via `sshd -T` (collecting every occurrence of a
+    directive, not just the first, so an accumulation is actually
+    visible to the check). Refusal paths now roll back the config write
+    AND an `authorized_keys` append made earlier in the same run (host
+    key files under `/data/ssh` are the one deliberate exception — see
+    below). A missing `supervisord.conf` under `--supervise` now refuses
+    cleanly with full `--json` output instead of raising an unhandled
+    `FileNotFoundError`. `_make_backup`'s same-second-stamp collision no
+    longer raises an unhandled `RuntimeError` either — a numeric suffix
+    resolves it.
+  - Exit codes are unchanged from the table already in this script's own
+    docstring and below in OPERATIONS.md, with one addition: code **4**
+    ("`--apply` made progress but work remains") is now documented as
+    part of the shared convention across all three operator scripts,
+    even though this script never uses it — every `--apply` here either
+    fully succeeds (0) or refuses (1).
+  - Verified for real against the published digest, with network access
+    inside the container: a real key login succeeds; a real root
+    password login fails, including with the Match-block drop-in
+    scenario present (the script refuses before writing, and the
+    config already on disk — unmodified by that refusal — still blocks
+    the login for real); a real private key is rejected with no leak; a
+    second `--apply` is a true no-op; `--port 2222` leaves sshd
+    listening ONLY on 2222 (confirmed via `sshd -T` and a real bound
+    socket); and a real `supervisorctl reread` failure against the real
+    supervisord still leaves a real, listening sshd afterward. See the
+    new `compactor/test_real_image_setup_sshd.py`.
 
 **New real-image test.** `compactor/test_real_image_operator_scripts.py`
 builds a faithful v3.1.9 `compactor` package with `git archive v3.1.9
@@ -351,6 +434,14 @@ actionable multi-path resolution error; and the same coverage for
 `import-history.py`'s dry run. A further scenario (added with the M6 fix
 below) runs `--apply` for real against a full copy of the real store and
 byte-compares every file, not just the dry-run ones.
+`compactor/test_real_image_setup_sshd.py` is the equivalent suite for
+`scripts/setup-sshd.py`: one throwaway container from the same published
+digest, driven with `docker exec` across every scenario (so a real
+`--supervise` handoff and real host-key persistence carry across steps
+the way they would across invocations on a real pod), with the real
+`openssh-server`/`openssh-client` apt packages installed for real — this
+one needs network access from inside the container, which the other
+real-image suites do not.
 
 **M6: this suite is NOT "wired into the same gate as the rest of the unit
 suite"** — the previous sentence here was wrong. It cannot be: it needs a

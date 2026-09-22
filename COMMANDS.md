@@ -81,9 +81,11 @@ python3 compactor/test_real_image_operator_scripts.py
 
 `--only real_image` (no trailing `_operator`) also picks up
 `compactor/test_real_image_import_apply.py` and
-`compactor/test_real_image_setup_sshd.py` once those land. A SKIP (exit 3)
-here is not evidence of anything — fix whatever precondition the printed
-reason names and re-run before shipping; do not read a skip as green.
+`compactor/test_real_image_setup_sshd.py`, the equivalent mandatory
+real-image suites for `scripts/import-history.py` and
+`scripts/setup-sshd.py`. A SKIP (exit 3) here is not evidence of
+anything — fix whatever precondition the printed reason names and
+re-run before shipping; do not read a skip as green.
 
 ### Integration suite (black box, local stack)
 
