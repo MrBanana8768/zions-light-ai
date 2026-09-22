@@ -1063,6 +1063,21 @@ each affected conversation is next used. Either:
   `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`. Left in place it pins the fraction
   below the v3.1.9.2+ image default (`0.75`).
 
+**Do NOT turn on the OpenWebUI History cap (the `max_turns` valve) until
+every conversation whose summary hierarchy has fallen behind has been
+caught up with `scripts/import-history.py`** (v3.1.9.6; see OPERATIONS.md
+"Catching a conversation's summary hierarchy up from a webui.db export").
+With the cap off, the client resends the whole conversation on every
+turn, which is what lets a background rollup (the live tail, `/compact`,
+or this script) eventually see and summarize a backlog at all. A CAPPED
+client stops resending the turns before the summary watermark — the
+compactor never sees them again, in a live request, to summarize them
+from. Turning the cap on before the catch-up runs does not merely delay
+closing that backlog; it makes the turns behind the cap unreachable by
+any of this project's rollup paths, permanently. Run the catch-up first,
+confirm `checks.hierarchy`'s lag has fallen (`/health/full`), and only
+then enable the cap.
+
 1. **Pre-checks and backup:** do steps 1 and 2 of the v3.1.8 procedure above
    on the running pod — `/health/full` explained, `WEBUI_DB_LOCAL=false`
    confirmed in `/proc/1/environ`, writers stopped, `backup.py --once` then

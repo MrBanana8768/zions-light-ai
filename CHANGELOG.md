@@ -9,7 +9,8 @@ on Docker Hub.
 
 ---
 
-## [3.1.9.6] — a script to close stale backfill records before an upgrade
+## [3.1.9.6] — closing stale backfill records, and catching a summary
+hierarchy up from webui.db
 
 **Scripts and docs only, and NOT a new image.** Every file the image copies
 (`compactor/*.py` apart from tests, `stt/`, `tts/`, `entrypoint.sh`,
@@ -23,21 +24,36 @@ not rebuilt: a rebuild re-resolves `apt-get upgrade`, unpinned pip
 dependencies, the Piper voice URL and the CUDA base tag, and produces a
 different, unvalidated image.
 
-**Why this exists.** v3.1.9.4's own fix to `backfill.needs_backfill()` —
-reading a conversation's `facts/<conv>.backfill.json` RECORD before
-deciding whether it needs a lazy history backfill, rather than stopping the
-instant a facts file exists — is correct (a stale record on a conversation
-that also had live facts used to be ignored forever, silently), but it
-turns every upgrade of a pod that has ever run v3.1.9.3 or earlier into the
-TRIGGER: every stale `in_progress` or backed-off `failed` record already on
-the volume resumes the moment its conversation is next used. Verified on a
-real 2026-09-22 production backup: four conversations carry a stale
-`in_progress` record (6/1908, 296/793, 572/732 and 589/626 exchanges) that
-v3.1.9.4+ would resume all at once — roughly 2,600 background vLLM
-extraction calls competing with her live chat on the pod's one GPU.
-RUNPOD_DEPLOY.md's "Upgrading within v3.1.9.x" already named this cost;
-nothing before this release gave an operator a way to close those records
-ahead of time short of hand-editing JSON on the volume.
+**Why this exists.** Two independent operator gaps, both closed with a
+script beside `compactor/`'s own code rather than a change to it:
+
+1. v3.1.9.4's own fix to `backfill.needs_backfill()` — reading a
+   conversation's `facts/<conv>.backfill.json` RECORD before deciding
+   whether it needs a lazy history backfill, rather than stopping the
+   instant a facts file exists — is correct (a stale record on a
+   conversation that also had live facts used to be ignored forever,
+   silently), but it turns every upgrade of a pod that has ever run
+   v3.1.9.3 or earlier into the TRIGGER: every stale `in_progress` or
+   backed-off `failed` record already on the volume resumes the moment
+   its conversation is next used. Verified on a real 2026-09-22
+   production backup: four conversations carry a stale `in_progress`
+   record (6/1908, 296/793, 572/732 and 589/626 exchanges) that v3.1.9.4+
+   would resume all at once — roughly 2,600 background vLLM extraction
+   calls competing with her live chat on the pod's one GPU.
+   RUNPOD_DEPLOY.md's "Upgrading within v3.1.9.x" already named this
+   cost; nothing before this release gave an operator a way to close
+   those records ahead of time short of hand-editing JSON on the volume.
+2. The production conversation `ea1494ea-e9d7-46fb-8b7c-3a50d685d00e`
+   (the same id, coincidentally, that carries one of the four stale
+   backfill records above) has roughly 3,850 messages in OpenWebUI, but
+   its summary hierarchy only covers the first ~1,600 turns — a ~2,200
+   turn backlog that drags the whole history around on every request and
+   blocks turning on the OpenWebUI History cap. `POST
+   /admin/conversations/{conv_id}/compact` runs the same rollup drain
+   but rebuilds its transcript from the EPISODIC store (chromadb), which
+   for this conversation holds only 70 exchanges — nowhere near enough to
+   close a gap this size. The full transcript exists only in OpenWebUI's
+   own `webui.db`.
 
 ### Added
 - **`scripts/backfill-records.py`.** Reads every `facts/*.backfill.json`
@@ -67,11 +83,47 @@ ahead of time short of hand-editing JSON on the volume.
   built from the four real stale records above — including the actual
   point of the tool: after `--apply`, `backfill.needs_backfill()` really
   does return `False` for all four.
+- **`scripts/import-history.py`.** A one-shot operator tool that catches a
+  conversation's L1/L2/L3 summary hierarchy up from a `webui.db` EXPORT
+  (never the live database — refuses outright if a `-journal` or `-wal`
+  sidecar sits beside the path given, unless `--force`). Reconstructs the
+  LINEAR branch the user actually sees — OpenWebUI 0.11's `chat.chat` JSON
+  stores every edit and regeneration as a tree, so this walks
+  `history.messages` back from `history.currentId` via `parentId` and
+  reverses it, rather than reading insertion order (which would include
+  abandoned edits); falls back to the `chat_message` table when that JSON
+  is missing or unreadable, and reports which source it used. A
+  multimodal `content` array flattens to its text parts joined, with each
+  image replaced by a `[image]` placeholder; non-alternating turns (a
+  missing reply, two user turns in a row) are reported as anomalies and
+  handled, never crashed on. Dry run (the default) makes NO vLLM calls at
+  all and reports the source used, turns found, the existing watermark
+  against what the transcript implies, how many L1/L2/L3 units are
+  estimated due, an estimated (floor) vLLM-call count, and an ESTIMATED
+  wall-clock. `--apply` backs up the existing `summaries/<conv_id>.json`
+  beside itself before writing (refusing outright if that backup path
+  already exists), then loops the REAL `compactor/summarizer.maybe_rollup`
+  — the identical drain `/compact` runs, fed from this script's own
+  transcript instead of the episodic store — under a `max_calls` budget
+  with the same unit-boundary semantics `/compact` documents (an overshoot
+  of at most one rollup unit, never more). Refuses `--apply` while
+  anything answers the compactor's `/health`, unless `--force`. Never
+  touches `facts/`, `chromadb/` or `personas/`, and never rebuilds the
+  episodic/chromadb index — see OPERATIONS.md and the script's own module
+  docstring for the full exit-code contract (0 nothing-due/succeeded, 1
+  error, 3 dry-run-found-work) and for why `/compact` cannot do this job
+  itself. `compactor/test_import_history_script.py` covers the branch
+  walk against a forked (edited-message) history, multimodal flattening,
+  the dry-run/apply/idempotent/budget-overshoot contracts, an interrupted
+  and resumed `--apply`, and every refusal path.
 
 ### Documentation
 - **OPERATIONS.md** gains "Closing stale backfill records before upgrading
   past v3.1.9.3", in the same copy-to-`/data/scripts`-and-run-with-the-venv
-  shape as RUNBOOK_DB_JOURNAL.md's recovery-script section.
+  shape as RUNBOOK_DB_JOURNAL.md's recovery-script section, and "Catching a
+  conversation's summary hierarchy up from a webui.db export" right after
+  it, with the real pod procedure (stop the compactor, dry run, `--apply`,
+  restart, confirm `checks.hierarchy`'s lag falls on `/health/full`).
 - **RUNPOD_DEPLOY.md**'s "Upgrading within v3.1.9.x, and rolling back" now
   tells an operator upgrading a pod that has ever run v3.1.9.3 or earlier to
   run this script (or set `COMPACTOR_BACKFILL_MAX_ATTEMPTS=0`) first, and
@@ -79,6 +131,11 @@ ahead of time short of hand-editing JSON on the volume.
   `COMPACTOR_INJECTION_BUDGET_FRACTION=.6` — the same stale hostile-pass-#9
   row v3.1.9.5's fix removed from this repo's `runpod.env.template`, never
   removed from the pod's actual RunPod template — to delete while there.
+  It also now states plainly that the OpenWebUI History cap (`max_turns`)
+  must not be turned on until `scripts/import-history.py` has caught up
+  every conversation whose summary hierarchy has fallen behind: a capped
+  client stops resending the turns behind the cap, which is what makes
+  them unreachable by any rollup path — permanently, not just later.
 
 ## [3.1.9.5] — the deploy docs match what ships
 

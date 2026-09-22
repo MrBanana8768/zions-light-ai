@@ -1374,6 +1374,99 @@ script instead when you have the chance: it leaves the store in the same
 terminal shape backfill.py's own retry-exhaustion path produces, rather
 than relying on a template setting nobody has to remember to remove later.
 
+## Catching a conversation's summary hierarchy up from a webui.db export
+
+**Why.** `POST /admin/conversations/{conv_id}/compact` drains the same
+L1/L2/L3 rollup loop this script uses, but it rebuilds the transcript to
+summarize from the EPISODIC store (chromadb) — a rolling window, not an
+archive. On a conversation whose hierarchy has fallen far behind (a real
+example: ~3,850 messages against a summary hierarchy that only covers the
+first ~1,600 turns), the episodic store holds as few as 70 exchanges —
+nowhere near enough for `/compact` to close the gap. It either refuses
+outright (its own guard against summarizing text that is not the text the
+chunk labels claim) or would have to cover thousands of turns as gap
+placeholders, recording them as permanently unknown. The full transcript
+exists in exactly one place outside OpenWebUI's live database: an export
+of `webui.db`. `scripts/import-history.py` reads that export and drives
+the real rollup loop over it.
+
+**This backlog is also why the OpenWebUI History cap cannot be turned on
+yet.** With the cap off, the client resends the whole conversation on
+every turn, which is the only reason the backlog is even visible to a
+rollup at all. See RUNPOD_DEPLOY.md's "Upgrading within v3.1.9.x" for why
+turning the cap on before this catch-up runs would strand the backlog for
+good.
+
+**Is the script on the pod?**
+```bash
+ls -la /data/scripts/import-history.py
+```
+If not, copy `scripts/import-history.py` from this repo to `/data/scripts/`
+on the pod (Web Terminal upload, or `scp`).
+
+**Get a webui.db export.** Never point this at the live database — it
+refuses outright if a `-journal` or `-wal` file sits beside the path you
+give it, which is what a live or crashed database leaves behind. Use a
+backup snapshot, or a copy taken while OpenWebUI is stopped.
+
+**Stop the compactor first** — this script and the live compactor would
+otherwise both be writing the same `summaries/<conv_id>.json`:
+```bash
+supervisorctl stop compactor
+```
+
+**Dry run first: reports only, makes zero vLLM calls.**
+```bash
+/opt/compactor-venv/bin/python /data/scripts/import-history.py \
+    --webui-db /path/to/webui.db.export --chat-id <conversation id>
+```
+Read the report: which source it used to reconstruct the transcript
+(`history.messages` JSON, or the `chat_message` table fallback), how many
+turns it found against the watermark already on disk, how many L1/L2/L3
+units are estimated due, an estimated (floor) count of real vLLM calls, an
+ESTIMATED wall-clock (`--seconds-per-call`, default 40s, labelled an
+estimate — a chunk needing map-reduce costs more than one call), and every
+anomaly found in the transcript (a missing reply, non-alternating turns).
+A dry run exits 3 if anything is due; that is informational, not a
+failure.
+
+**Run it for real:**
+```bash
+/opt/compactor-venv/bin/python /data/scripts/import-history.py \
+    --webui-db /path/to/webui.db.export --chat-id <conversation id> --apply
+```
+It backs up the existing `summaries/<conv_id>.json` beside itself
+(`<name>.json.bak-<UTC stamp>`, never deleted, never overwritten by a
+later run) before writing anything, and refuses outright if that exact
+backup path already exists. It refuses to run while anything answers the
+compactor's `/health` (stop it first, as above, or pass `--force` with a
+loud warning). Interrupting it — Ctrl-C, a pod restart — is safe: state is
+saved after every rollup unit, so re-running resumes from the real
+watermark and never redoes finished work. A second `--apply` once nothing
+is left due does nothing and says so.
+
+**Start the compactor again:**
+```bash
+supervisorctl start compactor
+```
+
+**Check afterward:**
+```bash
+curl -s http://127.0.0.1:8080/health/full | python3 -m json.tool
+```
+Look at `checks.hierarchy` — its lag for this conversation should be
+falling (or gone) on subsequent requests, rather than sitting at the same
+large number it was stuck at before the catch-up ran.
+
+**What this will not do.** It never rebuilds the episodic/chromadb index
+— that is a retrieval backlog, a different job. It never touches
+`facts/`, `chromadb/` or `personas/` — its entire blast radius is one
+`summaries/<conv_id>.json` file and its own dated backup. See the
+script's own module docstring for the full exit-code contract (0
+nothing-due/apply-succeeded, 1 error, 3 dry-run-found-work), and
+`compactor/test_import_history_script.py` for coverage, including the
+fork-in-history and interrupted-and-resumed-apply cases.
+
 ---
 
 ## Rolling back a bad release
