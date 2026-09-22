@@ -29,7 +29,9 @@ release-readiness review of v3.1.9.1-v3.1.9.4 on 2026-09-21. Hostile pass
 ### Fixed (documentation)
 - **runpod.env.template, "the single source of truth for the image tag",
   named `v3.1.6-cu12`.** It now names `v3.1.9.5-cu12`, and the image-variant
-  list names the current tag and its rollback target instead of v3.0 only.
+  list names the current tag (and that `:v3.1.9.4-cu12` is the same image,
+  not a rollback) instead of v3.0 only. README no longer calls the June
+  `:v3-snapshot` a rollback target.
 - **The template re-added the rows v3.1.9.4's git tag annotation said to
   remove.**
   `COMPACTOR_INJECTION_BUDGET_FRACTION` and `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`
