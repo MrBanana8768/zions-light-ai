@@ -106,6 +106,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 import subprocess
 import sys
 import time
@@ -115,20 +116,41 @@ ROOT = Path(__file__).resolve().parent.parent
 COMPACTOR = ROOT / "compactor"
 PIPELINES = ROOT / "pipelines"
 
-# The real interpreter, not the Windows Store stub that reports itself absent.
-DEFAULT_PY = Path(
-    r"C:\Users\rngge\AppData\Local\Programs\Python\Python314\python.exe"
-)
+# M7: on Windows, the real interpreter — not the Windows Store stub that
+# reports itself absent. On Linux (WSL, the Docker test image, a bare host
+# run — everywhere this project actually tests, per this file's own "PREFER
+# THE CONTAINER" above) there is no such stub problem, so default to
+# `sys.executable`, the interpreter already running this file — no
+# hardcoded Windows path to go stale, and no --python needed for the
+# documented `python3 scripts/run-tests.py` invocation. Falls back to
+# /usr/bin/python3 only in the unlikely case sys.executable is empty (an
+# embedded interpreter with no accessible path of its own).
+if platform.system() == "Windows":
+    DEFAULT_PY = Path(
+        r"C:\Users\rngge\AppData\Local\Programs\Python\Python314\python.exe"
+    )
+else:
+    DEFAULT_PY = Path(sys.executable) if sys.executable else Path("/usr/bin/python3")
 
 # Every suite runs with these. Offline flags keep a test run from reaching the
 # network for a tokenizer or an embedding model: a suite that silently
 # downloads is a suite whose result depends on the network.
+#
+# COMPACTOR_ALLOW_FIXTURE_SKIP is explicitly cleared (M6), not merely left
+# unset: test_real_image_operator_scripts.py's own `_skip` never honors it
+# regardless (that suite is the mandatory release gate itself, and its skip
+# must never be promoted to a pass), but test_soak_conversation.py and
+# test_tokenizer_contract.py's own `_skip`s DO honor it as a deliberate,
+# narrow per-suite opt-in — clearing it here means a value leaked in from
+# the CALLER's shell can never silently turn one of those into a reported
+# pass during a gate run either.
 BASE_ENV = {
     "PYTHONIOENCODING": "utf-8",
     "PYTHONPATH": ".",
     "HF_HUB_OFFLINE": "1",
     "TRANSFORMERS_OFFLINE": "1",
     "COMPACTOR_FORCE_OFFLINE": "true",
+    "COMPACTOR_ALLOW_FIXTURE_SKIP": "",
 }
 
 # Measured 2026-09-03 in the Ubuntu 24.04 test image
@@ -171,11 +193,26 @@ SATURATION = {"test_saturation.py", "test_soak_conversation.py"}
 # image, git, and the real backup path on this host — none of which the
 # sandboxed unit-tests container has. Kept OUT of the default selection so
 # `docker compose -f docker-compose.tests.yml run --rm --build unit-tests`
-# keeps its documented baseline (145 passed / 1 skipped): were this suite
-# discovered there too it would report a SECOND skip, honestly, but a
-# baseline that drifts every time a new docker-dependent suite is added is
-# not a baseline anyone can gate on. Run it explicitly, on the host.
-NEEDS_DOCKER = {"test_real_image_operator_scripts.py"}
+# keeps its own baseline stable: were one of these discovered there too it
+# would report a SECOND skip, honestly, but a baseline that drifts every
+# time a new docker-dependent suite is added is not a baseline anyone can
+# gate on. Run these explicitly, on the host — see COMMANDS.md's
+# "Real-image operator-script suite (mandatory, host-run)" for the exact
+# command; this whole group is a REQUIRED part of the release gate (M6),
+# not an optional extra, whatever the default `run-tests.py` selection
+# excludes it for.
+#
+# test_real_image_import_apply.py and test_real_image_setup_sshd.py cover
+# scripts/import-history.py and scripts/setup-sshd.py the same way
+# test_real_image_operator_scripts.py covers scripts/backfill-records.py
+# (and import-history.py's own dry run); listed here so `--real-image`
+# picks them up the moment each lands, rather than needing this set
+# touched again per suite.
+NEEDS_DOCKER = {
+    "test_real_image_operator_scripts.py",
+    "test_real_image_import_apply.py",
+    "test_real_image_setup_sshd.py",
+}
 
 PASS, FAIL, SKIP, INCONCLUSIVE = "PASS", "FAIL", "SKIP", "INCONCLUSIVE"
 

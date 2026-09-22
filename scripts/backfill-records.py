@@ -25,12 +25,27 @@ running it from there used to fail with "no compactor package beside this
 script (/data/compactor)" — HERE.parent/"compactor" resolves relative to
 wherever THIS FILE sits, and /data/scripts/../compactor does not exist.
 Resolved now, in order: `--compactor-pkg PATH` (explicit, highest
-precedence) > `HERE.parent/"compactor"` (the repo/clone layout — the
+precedence — and now validated: a `--compactor-pkg` that is not a
+directory is a fatal error, never a silent fall-through to the next
+source, see H4) > `HERE.parent/"compactor"` (the repo/clone layout — the
 SUPPORTED way, see above) > `/opt/compactor` (the image's own layout) > an
 already-importable `backfill` on sys.path. If every one of those fails,
 the error lists every path tried and prints the clone command above. See
 _resolve_compactor_pkg's own docstring for the full reasoning, including a
 layout trap that can make a substitute package silently invisible.
+
+PROVENANCE, NOT JUST A CHOSEN DIRECTORY (H4). Resolving a directory is not
+the same as importing from it — something else on `sys.path` (most often a
+stray `PYTHONPATH`) can shadow it: `sys.path.insert(0, pkg_dir)` puts the
+chosen directory first, but if `pkg_dir` itself has no `backfill.py` (an
+empty or wrong `--compactor-pkg`), Python's import machinery keeps
+searching and can silently succeed against a DIFFERENT `backfill` module
+further down `sys.path` — while this script's own NOTE still names the
+directory it *chose*, not the module it actually *got*. After importing,
+this script asserts `Path(backfill.__file__).resolve().parent` equals the
+resolved package directory and refuses, naming the real `__file__`, if
+they disagree — see main()'s provenance check, right after `import
+backfill`.
 
 WHY THIS DOES NOT ALSO WORK BY JUST COPYING NEWER FILES IN. On a pod that
 has never run v3.1.9.4 or later, the INSTALLED `compactor/backfill.py`
@@ -105,26 +120,56 @@ would cancel its one chance at ever getting one, not close a hazard.
 `--force` also overrides the refusal to run `--apply` while something
 answers the compactor's `/health` — see `_compactor_is_alive` below.
 
-EXIT CODES. The same convention as scripts/import-history.py and
-scripts/setup-sshd.py — normalized across all three (see CHANGELOG.md and
-OPERATIONS.md; setup-sshd.py used to have 0 and 3 swapped from this):
-    0   success — the desired end state is in place, or `--apply` completed
-        (including a `--apply` that was a no-op because nothing was
-        `would-resume`; a `--force`-gated skip is not an error either: it
-        is this script refusing to do something unsafe, not a failure)
+EXIT CODES. The same 5-value convention as scripts/import-history.py and
+scripts/setup-sshd.py — stated ONCE, canonically, in OPERATIONS.md's "Exit
+codes — the shared convention across the operator scripts" (see that
+section for the full rationale; setup-sshd.py used to have 0 and 3 swapped
+from this). This script's own mapping onto that table:
+    0   the desired end state is in place: a dry run that found nothing
+        `would-resume`, or an `--apply` that closed every `would-resume`
+        record it was asked to (including a no-op `--apply` because there
+        was nothing to close). A `--force`-gated skip is not an error
+        either: it is this script refusing to do something unsafe, not a
+        failure — but see H1 below for what an unsafe *outcome* still does.
     1   a refusal or an error the operator needs to look at: a bad
-        `--store`, no usable compactor package (or one too old to answer
-        the questions this script asks it — see PACKAGE RESOLUTION
-        above), a refused `--apply` precondition without `--force`, or a
-        backup path that already existed
-    3   a DRY RUN found one or more `would-resume` records — informational,
-        not a failure: it means "re-run with --apply once you're ready"
+        `--store`, no usable compactor package (or one too old, or one
+        whose provenance this script could not verify — see PACKAGE
+        RESOLUTION above), an explicit `--compactor-pkg` that is not a
+        directory, a refused `--apply` precondition without `--force`, a
+        backup path that already existed, EVERY `--conv` value given being
+        rejected (unsafe or no record found — nothing was inspected), ANY
+        record classified `needs-review` (ambiguous — a human needs to
+        read why, see the per-record reason), or an `--apply` that closed
+        NONE of the `would-resume` records it targeted (H1: this is
+        indistinguishable from doing nothing, and doing nothing is exactly
+        the upgrade-time hazard this script exists to prevent — it must
+        never look the same as success)
+    3   a DRY RUN found one or more `would-resume` records and nothing
+        else needs attention — informational, not a failure: it means
+        "re-run with --apply once you're ready"
+    4   `--apply` closed at least one `would-resume` record but at least
+        one other one is still open (H1: refused-no-facts,
+        refused-backup-exists, or a write failure) — progress was made,
+        but the upgrade hazard is not fully defused; look at what remains
+        refused, then re-run (with `--force` if that is what the
+        remaining refusal calls for)
     (argparse's own usage errors — unknown flags, missing required values —
     exit 2, the Python standard library's own convention, unrelated to the
-    three above)
+    four above)
+
+H1's rule, spelled out: after `--apply`, let TARGETED be the `would-resume`
+records this run attempted to close and CLOSED be how many it actually
+closed. `--apply` exits 0 if TARGETED == CLOSED (everything closed, or
+there was nothing to close), 4 if 0 < CLOSED < TARGETED (some progress,
+some still open), and 1 if CLOSED == 0 < TARGETED (no progress at all —
+the exact "exits 0 having closed nothing" defect this replaces). The
+needs-review and all-`--conv`-rejected rules above apply to a dry run too,
+and take priority over exit 3: a run that needs a human's eyes must never
+report the same code as one that is merely "safe to --apply now".
 """
 
 import argparse
+import errno
 import importlib.util
 import json
 import shutil
@@ -141,6 +186,11 @@ HERE = Path(__file__).resolve().parent
 OPT_COMPACTOR = Path("/opt/compactor")
 
 DEFAULT_STORE = "/data/openwebui/compactor"
+# M3: a module-level name, like HERE/OPT_COMPACTOR above — main() reassigns
+# it from --health-url before any liveness probe runs, and
+# _compactor_is_alive() reads it fresh rather than via a default-parameter
+# value (which would freeze it at function-definition time, before argparse
+# has even run).
 DEFAULT_HEALTH_URL = "http://127.0.0.1:8080/health"
 HEALTH_PROBE_TIMEOUT_S = 3
 
@@ -180,6 +230,13 @@ _PROBE_MODULE = "backfill"
 
 def _resolve_compactor_pkg(explicit: str | None) -> tuple[Path | None, list[str], bool]:
     """(pkg_dir, tried, already_importable).
+
+    An explicit `--compactor-pkg` that is NOT a directory is validated by
+    the CALLER (main()) before this function ever runs, and is a fatal
+    error there (H4) — never a silent fall-through to sources 2-4. This
+    function itself only ever sees an `explicit` that is either empty/None
+    or already a real directory; the `p.is_dir()` check below is what
+    main() itself uses to decide that.
 
     Tried in order, and the first hit wins:
       1. --compactor-pkg PATH — explicit always wins.
@@ -296,32 +353,85 @@ def _load_record(path: Path) -> tuple[dict | None, str | None]:
     return data, None
 
 
-def _compactor_is_alive(url: str = DEFAULT_HEALTH_URL) -> bool:
-    """True if anything answers `url`. The same liveness probe
-    scripts/merge-conversations.py uses against its own port, pointed at
-    the plain liveness endpoint here — --apply's blast radius is a sidecar
-    file a live backfill run could be mid-write on, not something that
-    needs the full /health/full diagnostic.
+def _compactor_is_alive(url: str | None = None) -> bool:
+    """False ONLY for an unambiguous connection refusal at `url` — the one
+    signal that unambiguously proves nothing is listening there at all.
+    Reads `DEFAULT_HEALTH_URL` fresh (a module global, like `HERE` and
+    `OPT_COMPACTOR` above — reassigned by main() from `--health-url`
+    rather than passed as a default-parameter value, so the value is live
+    at CALL time, not baked in at function-definition time) when `url` is
+    not given.
+
+    M3 (fails open, before this fix): a bare `except: return False` made a
+    timeout indistinguishable from "nothing is listening" — a compactor
+    that is merely slow to answer under GPU load, or not yet bound during
+    boot, read exactly the same as one that had genuinely stopped, and
+    `--apply` proceeded either way. Every outcome OTHER than a confirmed
+    `ECONNREFUSED` is now treated as "might be alive" and refuses --apply
+    the same way a confirmed-live compactor does: a real 200, a non-200
+    HTTP response (something else answered — still not proof the compactor
+    itself is down), a timeout, a DNS failure, or any other OSError. Only
+    "nothing is listening on this port at all" is safe to read as "not
+    running".
     """
+    if url is None:
+        url = DEFAULT_HEALTH_URL
     try:
         with urllib.request.urlopen(url, timeout=HEALTH_PROBE_TIMEOUT_S) as r:
-            return r.status == 200
-    except (urllib.error.URLError, OSError, ValueError):
+            r.read()
+        return True
+    except urllib.error.HTTPError:
+        # A real HTTP response with a non-200 status. Something IS bound
+        # to this port and answered — just not the compactor's own
+        # /health, which is always 200 when it is genuinely up. Not a
+        # connection refusal, so not "not-running": ambiguous, refuse.
+        return True
+    except urllib.error.URLError as e:
+        reason = e.reason
+        if isinstance(reason, ConnectionRefusedError) or (
+            isinstance(reason, OSError)
+            and getattr(reason, "errno", None) == errno.ECONNREFUSED
+        ):
+            return False
+        return True
+    except ConnectionRefusedError:
         return False
+    except OSError as e:
+        if getattr(e, "errno", None) == errno.ECONNREFUSED:
+            return False
+        return True
     except Exception:
-        return False
+        return True
 
 
 # ---------------------------------------------------------------------------
 # Capability check (Defect 2) — this script is a PRE-upgrade step that
 # learns its rules from the INSTALLED package, which on a pre-v3.1.9.4 pod
 # is exactly the version that does not have them yet. `_classify` below
-# reads `backfill_mod._MAX_BACKFILL_ATTEMPTS` and calls
-# `backfill_mod._backoff_ready`; neither exists before v3.1.9.4 (verified:
-# v3.1.9/.1/.2/.3 have `is_stale`/`_STALE_SECONDS`/`atomic_write_json` but
-# not those two). Detected BEFORE classifying anything, so the failure is
-# one actionable message naming the pod's version state, never a raw
-# AttributeError out of `_classify`.
+# reads `backfill_mod._MAX_BACKFILL_ATTEMPTS`, calls
+# `backfill_mod._backoff_ready` AND `backfill_mod.is_stale`, and
+# `_close_record` calls `backfill_mod.atomic_write_json` — EVERY symbol this
+# script asks the module for, not just the two that happen to be new in
+# v3.1.9.4 (M1: `is_stale`/`atomic_write_json` predate v3.1.9.4 and so were
+# wrongly assumed always-present; a package missing WHOLESALE, or a
+# fabricated stand-in missing just those two, would otherwise reach
+# `_classify`/`_close_record` and crash with a raw `AttributeError` — see
+# below for why that crash, specifically inside `_close_record`, is doubly
+# dangerous). Detected BEFORE classifying or closing anything, so the
+# failure is one actionable message naming the pod's version state, never a
+# raw AttributeError.
+#
+# WHY THIS MUST RUN BEFORE ANY BACKUP (M1). `_close_record` calls
+# `shutil.copy2` (the backup) BEFORE it calls `atomic_write_json` — if that
+# second call were to raise (missing symbol, or any other error),
+# `_close_record` would leave an ORPHAN `.bak-` file: not cleaned up, and
+# permanently arming the backup-already-exists refusal on every later
+# retry of that exact record. Requiring every symbol `_classify` AND
+# `_close_record` use to be present before either ever runs is what makes
+# that specific crash-after-backup window impossible for a missing-symbol
+# failure; `_close_record` itself also removes its own backup file if
+# `atomic_write_json` still somehow raises for an unrelated reason (disk
+# full, permissions), as defense in depth — see its own docstring.
 #
 # This is NOT fixed by substituting a newer backfill.py onto an older
 # package on disk — verified to fail differently: v3.1.9.4's backfill.py
@@ -330,7 +440,12 @@ def _compactor_is_alive(url: str = DEFAULT_HEALTH_URL) -> bool:
 # target release together, which is exactly what a clone supplies.
 # ---------------------------------------------------------------------------
 
-_REQUIRED_BACKFILL_SYMBOLS = ("_MAX_BACKFILL_ATTEMPTS", "_backoff_ready")
+_REQUIRED_BACKFILL_SYMBOLS = (
+    "_MAX_BACKFILL_ATTEMPTS",
+    "_backoff_ready",
+    "is_stale",
+    "atomic_write_json",
+)
 
 
 def _check_backfill_capability(backfill_mod, pkg_source: str) -> str | None:
@@ -443,26 +558,50 @@ def _classify(record: dict, backfill_mod) -> tuple[str, str]:
 # --apply: closing a record
 # ---------------------------------------------------------------------------
 
-def _close_record(backfill_mod, record_path: Path, record: dict) -> tuple[bool, str]:
+def _close_record(backfill_mod, record_path: Path, record: dict) -> tuple[bool, str, str]:
     """Rewrite `record_path`'s state to "abandoned", after backing up the
-    original. Returns (ok, message). Never called for a record whose
-    verdict is not `would-resume` — see `_apply`.
+    original. Returns (ok, action, message). Never called for a record
+    whose verdict is not `would-resume` — see `_apply`.
+
+    M1: the backup (`shutil.copy2`) happens BEFORE `atomic_write_json` is
+    called, which means a failure in that second call would otherwise
+    leave an ORPHAN `.bak-` file — never cleaned up, and permanently
+    arming the backup-already-exists refusal above on every later retry
+    of this exact record. The capability check in main() (see
+    `_REQUIRED_BACKFILL_SYMBOLS`) already stops a MISSING `atomic_write_json`
+    from ever reaching this far; this `try`/`except` is the second line of
+    defense, for anything else that could make the real call raise (disk
+    full, a permissions change mid-run) — the backup this run made is
+    removed before returning, so no failure downstream of the backup can
+    ever leave one behind.
     """
     stamp = _utc_stamp()
     backup_path = record_path.with_name(record_path.name + f".bak-{stamp}")
     if backup_path.exists():
-        return False, f"refused — backup path already exists: {backup_path.name}"
+        return False, "refused-backup-exists", f"refused — backup path already exists: {backup_path.name}"
     shutil.copy2(record_path, backup_path)
     updated = dict(record)
     updated["state"] = "abandoned"
     updated["closed_by"] = "scripts/backfill-records.py"
     updated["closed_at"] = _now_utc().isoformat(timespec="seconds")
-    # atomic_write_json is imported (via `backfill`, which imports it from
-    # `memory`) rather than reimplemented: same temp-file-in-same-dir +
-    # fsync + os.replace this codebase already relies on everywhere else a
-    # sidecar like this one gets written.
-    backfill_mod.atomic_write_json(record_path, updated)
-    return True, f"closed -> state=abandoned (backup: {backup_path.name})"
+    try:
+        # atomic_write_json is imported (via `backfill`, which imports it
+        # from `memory`) rather than reimplemented: same
+        # temp-file-in-same-dir + fsync + os.replace this codebase already
+        # relies on everywhere else a sidecar like this one gets written.
+        backfill_mod.atomic_write_json(record_path, updated)
+    except Exception as e:
+        try:
+            backup_path.unlink()
+        except OSError:
+            pass
+        return (
+            False,
+            "refused-write-failed",
+            f"refused — failed writing the closed record ({type(e).__name__}: "
+            f"{e}); no backup left behind",
+        )
+    return True, "closed", f"closed -> state=abandoned (backup: {backup_path.name})"
 
 
 def _apply(args, backfill_mod, rows: list[dict], raw_records: dict[str, dict]) -> tuple[list[dict], bool]:
@@ -488,12 +627,8 @@ def _apply(args, backfill_mod, rows: list[dict], raw_records: dict[str, dict]) -
                 ),
             })
             continue
-        ok, detail = _close_record(backfill_mod, record_path, raw_records[conv_id])
-        changes.append({
-            "conv_id": conv_id,
-            "action": "closed" if ok else "refused-backup-exists",
-            "detail": detail,
-        })
+        ok, action, detail = _close_record(backfill_mod, record_path, raw_records[conv_id])
+        changes.append({"conv_id": conv_id, "action": action, "detail": detail})
         if not ok:
             had_error = True
     return changes, had_error
@@ -585,7 +720,18 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--compactor-pkg", default=None, metavar="PATH",
         help="explicit path to the compactor package directory (highest "
              "precedence; overrides the repo/clone-layout and /opt/compactor "
-             "auto-detection — see the module docstring's resolution order)",
+             "auto-detection — see the module docstring's resolution order). "
+             "Must be a real directory: refused outright otherwise (H4), "
+             "never silently skipped in favor of auto-detection.",
+    )
+    ap.add_argument(
+        "--health-url", default=DEFAULT_HEALTH_URL, metavar="URL",
+        help=f"compactor health endpoint probed before --apply (default: "
+             f"{DEFAULT_HEALTH_URL}). Only an unambiguous connection "
+             f"refusal at this URL is treated as 'not running'; anything "
+             f"else (a real response, a timeout, a DNS failure) refuses "
+             f"--apply the same way a confirmed-live compactor does — see "
+             f"the module docstring, M3.",
     )
     return ap
 
@@ -599,10 +745,30 @@ def _fatal(args, message: str) -> int:
 
 
 def main(argv=None) -> int:
+    global DEFAULT_HEALTH_URL
     args = _build_argparser().parse_args(argv)
+    # M3: reassigned BEFORE any liveness probe can run, so
+    # _compactor_is_alive()'s fresh read of the global picks up
+    # --health-url (see that function's own docstring for why it is read
+    # fresh rather than bound as a default-parameter value).
+    DEFAULT_HEALTH_URL = args.health_url
 
     store_root = Path(args.store)
     facts_dir = store_root / "facts"
+
+    # H4: an explicit --compactor-pkg that is not a real directory is a
+    # fatal error here, BEFORE _resolve_compactor_pkg ever runs — never a
+    # silent fall-through to the repo-layout/opt-compactor/sys.path
+    # sources below it. The docstring's own claim ("explicit always wins")
+    # is meaningless if "wins" can mean "is quietly ignored".
+    if args.compactor_pkg is not None and not Path(args.compactor_pkg).is_dir():
+        return _fatal(
+            args,
+            f"ERROR: --compactor-pkg {args.compactor_pkg} is not a "
+            f"directory. An explicit --compactor-pkg is never skipped in "
+            f"favor of auto-detection (see the module docstring) — fix the "
+            f"path or drop the flag.",
+        )
 
     pkg_dir, tried, already_importable = _resolve_compactor_pkg(args.compactor_pkg)
     if pkg_dir is None and not already_importable:
@@ -626,6 +792,29 @@ def main(argv=None) -> int:
             f"{type(e).__name__}: {e}",
         )
 
+    # H4: pkg_source above names the directory this script CHOSE — not
+    # necessarily the module it actually GOT. Something else on sys.path
+    # (most often a stray PYTHONPATH) can shadow the chosen directory if
+    # that directory itself has no backfill.py (e.g. an empty or wrong
+    # --compactor-pkg): Python's import machinery just keeps searching and
+    # can silently succeed against a DIFFERENT backfill module further
+    # down sys.path. Verified against the real __file__, every time.
+    real_file = getattr(backfill, "__file__", None)
+    if pkg_dir is not None:
+        actual_parent = Path(real_file).resolve().parent if real_file else None
+        expected_parent = pkg_dir.resolve()
+        if actual_parent != expected_parent:
+            return _fatal(
+                args,
+                f"ERROR: resolved the compactor package at {pkg_source}, "
+                f"but the imported 'backfill' module actually loaded from "
+                f"{real_file!r} (parent {actual_parent}) — something else "
+                f"on sys.path (often a stray PYTHONPATH) is shadowing the "
+                f"intended package. Fix PYTHONPATH, or point "
+                f"--compactor-pkg at a directory that really contains "
+                f"backfill.py.",
+            )
+
     capability_error = _check_backfill_capability(backfill, pkg_source)
     if capability_error is not None:
         return _fatal(args, capability_error)
@@ -633,7 +822,11 @@ def main(argv=None) -> int:
     if not facts_dir.is_dir():
         return _fatal(args, f"ERROR: {facts_dir} does not exist or is not a directory.")
 
-    warnings: list[str] = [f"NOTE: compactor package resolved from {pkg_source}"]
+    warnings: list[str] = [
+        f"NOTE: compactor package resolved from {pkg_source} "
+        f"(backfill.__file__={real_file!r})"
+    ]
+    all_conv_rejected = False
     if args.conv_ids:
         paths = []
         for cid in args.conv_ids:
@@ -645,6 +838,15 @@ def main(argv=None) -> int:
                 warnings.append(f"WARNING: no backfill record for conv_id {cid!r} at {p}")
                 continue
             paths.append(p)
+        if not paths:
+            # M8: every --conv value given was rejected (unsafe, or no
+            # record found) — nothing was actually inspected. This must
+            # read as "look at this", not as "0 record(s), all clear".
+            all_conv_rejected = True
+            warnings.append(
+                "ERROR: none of the given --conv id(s) resolved to a "
+                "backfill record — nothing was inspected."
+            )
     else:
         paths = sorted(facts_dir.glob("*.backfill.json"))
 
@@ -694,15 +896,18 @@ def main(argv=None) -> int:
         if alive and not args.force:
             return _fatal(
                 args,
-                f"REFUSING --apply: something is answering {DEFAULT_HEALTH_URL} "
-                "— a live compactor may be writing these exact backfill "
+                f"REFUSING --apply: {args.health_url} did not give an "
+                "unambiguous 'nothing is listening' signal (a real "
+                "response, a non-200 HTTP status, or the probe itself "
+                "timed out or failed all refuse the same way — see M3) — "
+                "a live compactor may be writing these exact backfill "
                 "records right now. Stop it first (supervisorctl stop "
                 "compactor) or pass --force to override.",
             )
         if alive and args.force:
             warnings.append(
-                f"WARNING: --force overriding a live compactor detected at "
-                f"{DEFAULT_HEALTH_URL} — proceeding anyway."
+                f"WARNING: --force overriding an ambiguous or live-looking "
+                f"probe of {args.health_url} — proceeding anyway."
             )
         changes, apply_had_error = _apply(args, backfill, rows, raw_records)
 
@@ -723,8 +928,20 @@ def main(argv=None) -> int:
             print(w)
         _print_report(store_root, rows, counts, changes)
 
+    # EXIT CODES — see the module docstring's table and H1's rule spelled
+    # out there. all_conv_rejected and needs-review both mean "a human
+    # needs to look at this", and take priority over everything else.
+    if all_conv_rejected:
+        return 1
     if args.apply:
-        return 1 if apply_had_error else 0
+        targeted = sum(1 for r in rows if r["verdict"] == "would-resume")
+        closed = sum(1 for c in changes if c["action"] == "closed") if changes else 0
+        remaining_open = targeted - closed
+        if remaining_open == 0:
+            return 0
+        return 4 if closed > 0 else 1
+    if counts["needs-review"] > 0:
+        return 1
     return 3 if counts["would-resume"] > 0 else 0
 
 

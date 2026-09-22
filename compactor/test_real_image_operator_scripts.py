@@ -13,23 +13,55 @@ against a REAL v3.1.9 `compactor/backfill.py` (via `git archive v3.1.9
 compactor`, bind-mounted over `/opt/compactor` — the same package shape a
 pod that has never run v3.1.9.4 actually has) and a COPY (never the
 backup itself, never mounted writable) of the real stale backfill records
-verified on the 2026-09-22 production backup.
+verified on the 2026-09-22 production backup. One scenario
+(`test_apply_closes_exactly_the_four_real_stale_records_and_changes_nothing_else`,
+M6) goes further and actually runs `backfill-records.py --apply` against
+a full copy of the real store — every file under `facts/`, `summaries/`,
+`chromadb/` and `personas/`, not just the one conversation the dry-run
+scenarios use — and byte-compares every one of them before and after, the
+only way to prove the documented blast radius (`facts/*.backfill.json` and
+its own `.bak-` sidecars, nothing else) is actually true against the real
+data rather than a small hand-built fixture.
 
-NEEDS, and SKIPS (exit 3) HONESTLY if any is missing, same convention as
-test_tokenizer_contract.py's own `_skip`:
+MANDATORY, NOT OPTIONAL (M6). This suite is a REQUIRED part of the release
+gate — CHANGELOG.md's earlier claim that it was "wired into the same gate
+as the rest of the unit suite" was wrong: it is NOT run by `docker compose
+-f docker-compose.tests.yml run --rm unit-tests` (see scripts/run-tests.py's
+`NEEDS_DOCKER`, and the "NEEDS" list below for why it cannot be). It is its
+own separate, host-run step that a release is not allowed to skip; see
+COMMANDS.md's "Real-image operator-script suite (mandatory, host-run)"
+for the exact command and why a SKIP here must never be read as green.
+
+NEEDS, and SKIPS (exit 3) HONESTLY if any is missing:
   - a real Docker daemon
   - the published image already pulled (`docker image inspect`)
   - `git`, with the `v3.1.9` tag reachable in this checkout
   - the real 2026-09-22 pod-export backup on this host
 
-None of that is available inside the sandboxed `unit-tests` compose
-service (`network_mode: none`, no docker socket) — this suite is
-DELIBERATELY excluded from that default run (see scripts/run-tests.py's
-`NEEDS_DOCKER`) so the documented 145/1-skipped baseline does not drift.
-Run it directly, on the host:
+UNLIKE test_tokenizer_contract.py / test_soak_conversation.py's own
+`_skip`, this suite's `_skip` NEVER honors `COMPACTOR_ALLOW_FIXTURE_SKIP`
+(M6) — it always exits 3. Those two suites' skip is a deliberate, narrow
+opt-in for a fixture stack that genuinely does not apply to a given host;
+this suite is the mandatory release gate itself, and a skip here reported
+as a pass would be exactly the "green run that never actually ran the
+check" failure mode this whole file exists to stop recurring (see
+scripts/run-tests.py's own WHY THIS EXISTS). run-tests.py's `BASE_ENV`
+also clears that variable before invoking any suite, as a second line of
+defense against it leaking in from the caller's shell.
 
-    python compactor/test_real_image_operator_scripts.py
-    python scripts/run-tests.py --real-image --only real_image
+None of the Docker/backup/tag preconditions above are available inside the
+sandboxed `unit-tests` compose service (`network_mode: none`, no docker
+socket) — this suite is DELIBERATELY excluded from that default run (see
+scripts/run-tests.py's `NEEDS_DOCKER`) so the documented unit-tests
+baseline does not drift. Run it directly, on the host:
+
+    python3 compactor/test_real_image_operator_scripts.py
+    python3 scripts/run-tests.py --real-image --only real_image_operator
+
+(`--only real_image`, with no trailing `_operator`, also picks up
+`compactor/test_real_image_import_apply.py` and
+`compactor/test_real_image_setup_sshd.py` once those land — see
+run-tests.py's `NEEDS_DOCKER`.)
 
 WHY A LENGTH COMPARISON IS NOT USED FOR THE STORE BYTE-COMPARE, and other
 notes specific to each scenario, are inline at each test.
@@ -95,7 +127,16 @@ def _skip(reason: str) -> None:
     print("  2026-09-22 pod-export backup on this host. Run it directly:")
     print("    python compactor/test_real_image_operator_scripts.py")
     print("=" * 72)
-    sys.exit(0 if os.environ.get("COMPACTOR_ALLOW_FIXTURE_SKIP") else 3)
+    # M6: unlike test_soak_conversation.py / test_tokenizer_contract.py,
+    # this suite's skip must NEVER be promoted to exit 0 by
+    # COMPACTOR_ALLOW_FIXTURE_SKIP. This is the MANDATORY release-gate
+    # suite (see run-tests.py's NEEDS_DOCKER and its own module docstring,
+    # and CHANGELOG.md) — a run that could not exercise its checks must
+    # never report the same exit code as one that did. run-tests.py's own
+    # BASE_ENV clears that variable for exactly this reason; this direct
+    # refusal to honor it even if something else sets it in the caller's
+    # shell is the second line of defense.
+    sys.exit(3)
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +181,18 @@ _TMP_ROOT = Path(tempfile.mkdtemp(prefix="compactor-test-real-image-"))
 V319_PKG = _TMP_ROOT / "v319pkg" / "compactor"
 STORE_DIR = _TMP_ROOT / "store"
 SINGLE_FILE_DIR = _TMP_ROOT / "single-file-copy"
+FULL_STORE_DIR = _TMP_ROOT / "full-store"
+
+# The four real stale in_progress records verified on the 2026-09-22
+# production backup (see backfill-records.py's own module docstring and
+# compactor/test_backfill_records_script.py's REAL_STALE_RECORDS) — the
+# exact set --apply must close, and ONLY that set.
+EXPECTED_ABANDONED = {
+    "25887c0dc221f451",
+    "3863405c69ea10ad",
+    "d6fd08f99548b229",
+    "ea1494ea-e9d7-46fb-8b7c-3a50d685d00e",
+}
 
 
 def _build_v319_package() -> None:
@@ -180,6 +233,32 @@ def _seed_store() -> None:
             shutil.copy2(p, STORE_DIR / "summaries" / name)
 
 
+def _seed_full_store() -> None:
+    """A full COPY of the ENTIRE real compactor store — facts, summaries,
+    chromadb and personas, not just CHAT_ID's slice — so --apply's blast
+    radius can be proven empty everywhere else by a real byte-for-byte
+    comparison (M6). `_seed_store()` above is intentionally lighter (only
+    CHAT_ID's summaries) for the dry-run scenarios that do not need it;
+    this one is for the --apply scenario, which does. Never the backup
+    itself — `shutil.copytree` only ever READS from BACKUP_ROOT."""
+    if FULL_STORE_DIR.exists():
+        shutil.rmtree(FULL_STORE_DIR)
+    shutil.copytree(BACKUP_ROOT / "compactor", FULL_STORE_DIR)
+
+
+def _store_file_digests(root: Path) -> dict:
+    """{relative path: md5 hex} for every file under `root`. A PER-FILE
+    digest, not the single combined hash `_store_digest()` uses below —
+    so a failed assertion here can name exactly which file changed,
+    across hundreds of files (chromadb included), rather than only that
+    something did."""
+    return {
+        str(p.relative_to(root)): hashlib.md5(p.read_bytes()).hexdigest()
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
 def _seed_single_file_copies() -> None:
     """The "copied just this one file to /data/scripts/" scenario the
     real operator error came from — a bare file, no sibling compactor,
@@ -201,9 +280,22 @@ def _store_digest() -> str:
 
 
 def _docker_run(mounts: list[tuple[str, str, str]], image_args: list[str],
-                 entrypoint: str = VENV_PY) -> subprocess.CompletedProcess:
-    """`mounts` is [(host_path, container_path, mode)], mode "ro" or "rw"."""
+                 entrypoint: str = VENV_PY,
+                 run_as_host_user: bool = False) -> subprocess.CompletedProcess:
+    """`mounts` is [(host_path, container_path, mode)], mode "ro" or "rw".
+
+    `run_as_host_user`: pass `-u <host uid>:<host gid>` so files this run
+    WRITES into a `rw` mount come back owned by the host user rather than
+    root — needed by any scenario (M6's --apply one) whose test process
+    then reads those files back itself afterward for a byte-compare;
+    `atomic_write_json` (memory.py) writes its temp file via
+    `tempfile.mkstemp` at mode 0600, so a root-owned result would be
+    unreadable to a non-root host test process. The dry-run scenarios
+    above never write, so they never needed this.
+    """
     args = ["docker", "run", "--rm", "--entrypoint", entrypoint]
+    if run_as_host_user:
+        args += ["-u", f"{os.getuid()}:{os.getgid()}"]
     for host, cont, mode in mounts:
         args += ["-v", f"{host}:{cont}:{mode}"]
     args += [IMAGE_REF] + image_args
@@ -319,6 +411,75 @@ def test_clone_invocation_matches_real_pod_and_writes_nothing():
 
 
 # ---------------------------------------------------------------------------
+# 2b. --apply against a full COPY of the real store (M6: the highest-risk
+#     path the suite did not cover before — every scenario above was a
+#     dry run). Exactly the 4 real stale records end abandoned, nothing
+#     else under the store changes (chromadb/personas/summaries included,
+#     not just facts/), and a second --apply is a true no-op.
+# ---------------------------------------------------------------------------
+
+def test_apply_closes_exactly_the_four_real_stale_records_and_changes_nothing_else():
+    print("\n[test] backfill-records.py --apply against a full copy of the real store: "
+          "exactly the 4 stale records end abandoned with .bak- files, nothing else "
+          "changes, and a second --apply is a true no-op")
+    _seed_full_store()
+    before = _store_file_digests(FULL_STORE_DIR)
+
+    mounts = [
+        (str(REPO_ROOT / "scripts"), "/opt/zl-repo/scripts", "ro"),
+        (str(REPO_ROOT / "compactor"), "/opt/zl-repo/compactor", "ro"),
+        (str(FULL_STORE_DIR), "/data/openwebui/compactor", "rw"),
+    ]
+    args = ["/opt/zl-repo/scripts/backfill-records.py", "--store",
+            "/data/openwebui/compactor", "--apply", "--json"]
+
+    r = _docker_run(mounts, args, run_as_host_user=True)
+    out = r.stdout + r.stderr
+    assert_not_in("Traceback", out, "no Python traceback")
+    assert_eq(r.returncode, 0, "--apply closed every record it targeted -> exit 0 (H1)")
+    payload = json.loads(r.stdout)
+    closed_ids = {c["conv_id"] for c in payload["changes"] if c["action"] == "closed"}
+    assert_eq(closed_ids, EXPECTED_ABANDONED, "exactly the 4 real stale records were closed")
+
+    after = _store_file_digests(FULL_STORE_DIR)
+    changed_conv_ids, new_backups, other_changed = set(), set(), []
+    for rel in sorted(set(before) | set(after)):
+        if before.get(rel) == after.get(rel):
+            continue
+        if rel.startswith("facts/") and rel.endswith(".backfill.json"):
+            changed_conv_ids.add(rel[len("facts/"):-len(".backfill.json")])
+        elif rel.startswith("facts/") and ".backfill.json.bak-" in rel and rel not in before:
+            new_backups.add(rel)
+        else:
+            other_changed.append(rel)
+
+    assert_eq(changed_conv_ids, EXPECTED_ABANDONED,
+              "exactly the 4 stale conv_ids' facts/*.backfill.json changed")
+    assert_eq(len(new_backups), 4, f"exactly 4 new .bak- files appeared (got {sorted(new_backups)})")
+    for conv_id in EXPECTED_ABANDONED:
+        assert_true(
+            any(b.startswith(f"facts/{conv_id}.backfill.json.bak-") for b in new_backups),
+            f"{conv_id} has its own new .bak- file",
+        )
+        rec = json.loads((FULL_STORE_DIR / "facts" / f"{conv_id}.backfill.json").read_text())
+        assert_eq(rec["state"], "abandoned", f"{conv_id} ends state=abandoned")
+    assert_eq(other_changed, [],
+              f"nothing outside facts/*.backfill.json + its own .bak- changed under "
+              f"chromadb/personas/summaries/the rest of facts/ (got {other_changed})")
+
+    # A second --apply against the now-closed store: a true no-op.
+    before2 = _store_file_digests(FULL_STORE_DIR)
+    r2 = _docker_run(mounts, args, run_as_host_user=True)
+    out2 = r2.stdout + r2.stderr
+    assert_not_in("Traceback", out2, "no Python traceback on the second run")
+    assert_eq(r2.returncode, 0, "nothing left would-resume -> exit 0")
+    payload2 = json.loads(r2.stdout)
+    assert_eq(payload2["changes"], [], "the second --apply closed nothing")
+    after2 = _store_file_digests(FULL_STORE_DIR)
+    assert_eq(before2, after2, "the second --apply changed not one byte")
+
+
+# ---------------------------------------------------------------------------
 # 3. Running from a bare copy (no compactor package anywhere reachable)
 #    gives the actionable multi-path error, never a traceback (Defect 1).
 # ---------------------------------------------------------------------------
@@ -392,6 +553,7 @@ if __name__ == "__main__":
         test_import_history_pre_v3194_pod_dry_run_is_not_a_traceback()
 
         test_clone_invocation_matches_real_pod_and_writes_nothing()
+        test_apply_closes_exactly_the_four_real_stale_records_and_changes_nothing_else()
 
         test_bare_copy_with_no_package_anywhere_gives_multipath_error()
         test_import_history_bare_copy_with_no_package_gives_multipath_error()

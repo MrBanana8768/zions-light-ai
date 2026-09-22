@@ -167,11 +167,16 @@ script under `scripts/` rather than a change to what the image ships:
 
 ### Documentation
 - **OPERATIONS.md** gains "Closing stale backfill records before upgrading
-  past v3.1.9.3", in the same copy-to-`/data/scripts`-and-run-with-the-venv
-  shape as RUNBOOK_DB_JOURNAL.md's recovery-script section, and "Catching a
-  conversation's summary hierarchy up from a webui.db export" right after
-  it, with the real pod procedure (stop the compactor, dry run, `--apply`,
-  restart, confirm `checks.hierarchy`'s lag falls on `/health/full`).
+  past v3.1.9.3", run **from a clone of this repo, not a copy** — the
+  script imports the `compactor` package, so `HERE.parent/"compactor"`
+  has to resolve to a real package, which a bare copy to `/data/scripts/`
+  cannot supply. (This entry previously described that section as using
+  the copy-to-`/data/scripts`-and-run-with-the-venv shape — the exact
+  thing "Fixed" above calls a defect. Corrected here.) "Catching a
+  conversation's summary hierarchy up from a webui.db export" follows
+  right after it, with the real pod procedure (stop the compactor, dry
+  run, `--apply`, restart, confirm `checks.hierarchy`'s lag falls on
+  `/health/full`).
 - **RUNPOD_DEPLOY.md**'s "Upgrading within v3.1.9.x, and rolling back" now
   tells an operator upgrading a pod that has ever run v3.1.9.3 or earlier to
   run this script (or set `COMPACTOR_BACKFILL_MAX_ATTEMPTS=0`) first, and
@@ -262,6 +267,75 @@ not the repo, and the unit suite never exercised any of that combination.
   3 a dry run found pending work; argparse keeps its own 2), stated once
   in each script's own docstring and in OPERATIONS.md.
 
+A hostile review of this release (2026-09-22, against the real published
+digest and a copy of the real 2026-09-22 backup) then found a further
+round of defects specific to `backfill-records.py`, closed below.
+
+- **H1: `--apply` exited 0 having closed nothing.** With every targeted
+  `would-resume` record refused (no facts file, a backup collision, or a
+  write failure), the run reported success — an operator running
+  `backfill-records.py --apply && <upgrade>` would proceed with every
+  stale record still live, the exact ~2,600-call GPU storm this script
+  exists to prevent. `--apply` now exits 4 when it closed SOME of its
+  targeted records but at least one remains open, and 1 when it closed
+  NONE — 0 is reserved for "every targeted record actually closed, or
+  there was nothing to close". See the script's own docstring for the
+  full table and OPERATIONS.md's "Exit codes" section for the convention
+  shared with `import-history.py`/`setup-sshd.py`.
+- **H4: `--compactor-pkg` silently fell back, and could report a
+  provenance that was a lie.** A non-existent `--compactor-pkg` was
+  silently skipped in favor of auto-detection, contradicting the
+  docstring's own "explicit always wins". Worse: `pkg_source` named the
+  directory this script CHOSE, never the module it actually IMPORTED — a
+  resolvable-but-empty `--compactor-pkg` with a `backfill` module
+  elsewhere on `sys.path` (a stray `PYTHONPATH`) let Python's import
+  machinery silently fall through to that OTHER module while the NOTE
+  kept naming the intended directory. An explicit `--compactor-pkg` that
+  is not a real directory is now a fatal error, and after importing,
+  `Path(backfill.__file__).resolve().parent` is asserted against the
+  resolved directory — a mismatch refuses, naming the real `__file__`.
+- **M1: the capability check did not cover every symbol the script
+  actually uses.** It listed `_MAX_BACKFILL_ATTEMPTS`/`_backoff_ready`
+  only; `_classify` also calls `is_stale` and `_close_record` also calls
+  `atomic_write_json` — both missing from a fabricated or incomplete
+  stand-in package would crash with a raw `AttributeError`, and the
+  crash inside `_close_record` specifically happens AFTER the backup file
+  is already written, leaving an orphan `.bak-` that arms the
+  backup-already-exists refusal on every later retry. All four symbols
+  are now required before anything is classified or closed, and
+  `_close_record` itself removes its own just-written backup if
+  `atomic_write_json` still somehow raises for an unrelated reason (disk
+  full, a permissions change mid-run) — a second line of defense beyond
+  the capability check.
+- **M3: the live-compactor refusal failed open.** `_compactor_is_alive`
+  returned "not alive" for anything but a 200 within 3 seconds — a 3-second
+  timeout under GPU load, or a compactor not yet bound during boot, read
+  exactly the same as one that had genuinely stopped, and `--apply`
+  proceeded either way. Only an unambiguous connection refusal is now
+  read as "not running"; a real response, a non-200 status, a timeout or
+  any other error all refuse `--apply` the same way a confirmed-live
+  compactor does. A new `--health-url` flag points the probe elsewhere.
+- **M8 (backfill-records.py side): `needs-review` never affected the
+  exit code, and an all-rejected `--conv` still reported "0 record(s),
+  all clear".** A store with only unreadable/ambiguous records exited 0;
+  every `--conv` value given being invalid or not found also exited 0
+  with nothing inspected. Both now exit 1 (human attention required) on
+  a dry run. (M8's other, `setup-sshd.py`-side items — a `--port` that
+  does not close 22, refusal paths that leave `authorized_keys`/`/data/
+  ssh` written, an unhandled `FileNotFoundError` under `--supervise`, and
+  `_make_backup`'s own same-second-collision `RuntimeError` — belong to
+  that script and are not covered by this entry.)
+- **Mutants BR3, BR4 and BR8 (of the M4 hostile-review mutation pass)
+  survived the existing suite** — a not-yet-stale `in_progress` record
+  could be classified `would-resume` and closed if `is_stale` were ever
+  bypassed (BR3); the live-compactor `--apply` refusal had NO test
+  exercising it at all (BR4); and a terminal (`complete`/`abandoned`/
+  `wiped`) record silently misclassifying as `needs-review` instead of
+  `leave` looked the same as a passing suite, because either verdict
+  still leaves `--apply` untouching it (BR8). Three new tests close all
+  three; re-running the reviewer's mutation harness afterward shows 0
+  surviving mutants of 8 for `backfill-records.py` (BR1-BR8).
+
 **New real-image test.** `compactor/test_real_image_operator_scripts.py`
 builds a faithful v3.1.9 `compactor` package with `git archive v3.1.9
 compactor`, bind-mounts it read-only over `/opt/compactor` in a container
@@ -274,8 +348,40 @@ archive` of this same working tree standing in for a tagged release)
 produces `4 would-resume / 16 leave / exit 3` and writes nothing (byte-
 compared before/after); running from a copy at `/data/scripts` gives the
 actionable multi-path resolution error; and the same coverage for
-`import-history.py`'s dry run. Wired into the same gate as the rest of
-the unit suite.
+`import-history.py`'s dry run. A further scenario (added with the M6 fix
+below) runs `--apply` for real against a full copy of the real store and
+byte-compares every file, not just the dry-run ones.
+
+**M6: this suite is NOT "wired into the same gate as the rest of the unit
+suite"** — the previous sentence here was wrong. It cannot be: it needs a
+real Docker daemon, the published image, `git` with the release tag, and
+the real backup path, none of which the sandboxed `unit-tests` compose
+service has (`network_mode: none`, no docker socket). It is excluded from
+the default `run-tests.py` selection (`NEEDS_DOCKER`) for exactly that
+reason. It is instead a SEPARATE, MANDATORY, host-run step of the release
+gate — see COMMANDS.md's "Real-image operator-script suite (mandatory,
+host-run)" for the exact command
+(`python3 scripts/run-tests.py --python /usr/bin/python3 --real-image
+--only real_image_operator`, or the file run directly). Also fixed: its
+own `_skip` used to exit 0 (a reported PASS) when `COMPACTOR_ALLOW_
+FIXTURE_SKIP` was set in the environment — unlike `test_soak_
+conversation.py`/`test_tokenizer_contract.py`, whose narrow per-suite
+opt-in that variable legitimately is, this suite IS the mandatory gate
+and a skip here must never read as green; it now always exits 3.
+`run-tests.py`'s own `BASE_ENV` also clears that variable before invoking
+any suite, as a second line of defense against a value leaking in from
+the caller's shell. `NEEDS_DOCKER` now also names
+`compactor/test_real_image_import_apply.py` and `compactor/
+test_real_image_setup_sshd.py` so `--real-image` (with no `--only`
+filter, or `--only real_image`) picks them up the moment each lands.
+
+**M7: `run-tests.py`'s default interpreter was hardcoded to a Windows
+path.** On Linux (WSL, the Docker test image, a bare host run — the
+platform this project actually tests on) it now defaults to
+`sys.executable`, so `python3 scripts/run-tests.py` just works with no
+`--python` needed; the Windows path is kept, but only as the default on
+Windows. COMMANDS.md's interpreter note (previously pointing only at the
+Windows path) now says so.
 
 ## [3.1.9.5] — the deploy docs match what ships
 

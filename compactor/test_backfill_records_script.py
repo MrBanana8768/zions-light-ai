@@ -16,13 +16,16 @@ installed:
     python test_backfill_records_script.py
 """
 
+import http.server
 import importlib.util
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -260,7 +263,9 @@ def test_would_resume_with_no_facts_file_refused_without_force():
     before = _record_path(conv_id).read_bytes()
 
     r = _run_script(_store_args() + ["--conv", conv_id, "--apply", "--json"])
-    assert_eq(r.returncode, 0, "refusing a no-facts record is not an error")
+    assert_eq(r.returncode, 1,
+              "H1: --apply that closed NONE of its would-resume targets exits 1, "
+              "not 0 — refusing this one record left the hazard fully in place")
     payload = json.loads(r.stdout)
     assert_eq(payload["changes"][0]["action"], "refused-no-facts",
               "the record is refused, not closed")
@@ -326,7 +331,10 @@ def test_malformed_records_are_reported_not_crashed_on_and_never_rewritten():
     before = _all_backfill_bytes()
 
     r = _run_script(_store_args() + ["--json"])
-    assert_eq(r.returncode, 0, "malformed-only store is not itself would-resume, so exit 0")
+    assert_eq(r.returncode, 1,
+              "M8: a needs-review-only store exits 1 (human attention "
+              "required) even though nothing is would-resume — it used to "
+              "exit 0 as if nothing were wrong")
     payload = json.loads(r.stdout)
     by_id = {row["conv_id"]: row for row in payload["records"]}
     assert_eq(by_id["bad-json"]["verdict"], "needs-review", "invalid JSON -> needs-review")
@@ -515,6 +523,269 @@ def test_capability_check_json_mode_also_refuses_cleanly():
 
 
 # ---------------------------------------------------------------------------
+# H4: --compactor-pkg validation and provenance (a chosen directory is not
+# necessarily the module actually imported).
+# ---------------------------------------------------------------------------
+
+def test_compactor_pkg_not_a_directory_is_refused_not_silently_skipped():
+    print("\n[test] H4: an explicit --compactor-pkg that is not a directory refuses, never silently falls back to auto-detection")
+    _wipe_storage()
+    with tempfile.TemporaryDirectory() as td:
+        not_a_dir = Path(td) / "does-not-exist" / "compactor"
+        r = _run_script(_store_args() + ["--compactor-pkg", str(not_a_dir)])
+    assert_eq(r.returncode, 1, "refuses with exit 1")
+    assert_true(str(not_a_dir) in r.stdout, "names the bad path")
+    assert_true("is not a directory" in r.stdout, "says why")
+    assert_true("Traceback" not in r.stdout, "no crash")
+
+
+def test_compactor_pkg_shadowed_by_pythonpath_is_refused_not_silently_wrong():
+    print("\n[test] H4: an empty --compactor-pkg dir, shadowed by a real backfill.py on PYTHONPATH, refuses instead of silently trusting the shadow")
+    _wipe_storage()
+    _seed_real_stale_records()
+    with tempfile.TemporaryDirectory() as td:
+        empty_pkg = Path(td) / "empty-pkg"
+        empty_pkg.mkdir()
+        shadow_pkg = Path(td) / "shadow"
+        shadow_pkg.mkdir()
+        # A fully-capable stand-in on purpose: if the shadow module were
+        # ever trusted, the CAPABILITY check would not catch it either —
+        # only the provenance check (comparing backfill.__file__ against
+        # the resolved directory) can.
+        (shadow_pkg / "backfill.py").write_text(
+            "_MAX_BACKFILL_ATTEMPTS = 3\n"
+            "def _backoff_ready(record):\n    return True\n"
+            "def is_stale(record):\n    return True\n"
+            "def atomic_write_json(path, data):\n    pass\n",
+            encoding="utf-8",
+        )
+        env = {**os.environ, "PYTHONPATH": str(shadow_pkg)}
+        r = subprocess.run(
+            [sys.executable, str(_SCRIPT)] + _store_args()
+            + ["--compactor-pkg", str(empty_pkg)],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+    assert_eq(r.returncode, 1,
+              "refuses with exit 1, never silently classifies using the shadowed module")
+    assert_true("shadow" in r.stdout.lower(), "names the shadow directory")
+    assert_true(str(shadow_pkg) in r.stdout, "names the real (shadowing) __file__ location")
+    assert_true("Traceback" not in r.stdout, "no crash")
+
+
+# ---------------------------------------------------------------------------
+# M1: the capability check covers every symbol used, runs before any
+# backup, and _close_record itself cleans up if atomic_write_json still
+# somehow raises (defense in depth beyond the capability check).
+# ---------------------------------------------------------------------------
+
+def test_atomic_write_json_failure_leaves_no_orphan_backup():
+    print("\n[test] M1: if atomic_write_json still raises after the capability check passes, no orphan .bak is left and the run refuses cleanly")
+    _wipe_storage()
+    conv_id = "boom-on-write"
+    old_ts = _iso(datetime.now(timezone.utc) - timedelta(hours=1))
+    _write_record(conv_id, state="in_progress", started_at=old_ts, updated_at=old_ts,
+                  exchanges_done=5, exchanges_total=20, attempts=1, error=None)
+    _write_facts(conv_id)
+    with tempfile.TemporaryDirectory() as td:
+        pkg = Path(td) / "compactor"
+        pkg.mkdir()
+        (pkg / "backfill.py").write_text(
+            "_MAX_BACKFILL_ATTEMPTS = 3\n"
+            "def _backoff_ready(record):\n    return True\n"
+            "def is_stale(record):\n    return True\n"
+            "def atomic_write_json(path, data):\n"
+            "    raise RuntimeError('simulated write failure')\n",
+            encoding="utf-8",
+        )
+        r = _run_script(_store_args() + ["--conv", conv_id, "--compactor-pkg", str(pkg),
+                                          "--apply", "--json"])
+    assert_eq(r.returncode, 1, "H1: closed none of its targets -> exit 1")
+    payload = json.loads(r.stdout)
+    assert_eq(payload["changes"][0]["action"], "refused-write-failed",
+              "reported as a clean refusal, never a crash")
+    assert_true("Traceback" not in r.stdout and "Traceback" not in r.stderr, "no raw traceback")
+    backups = list(_record_path(conv_id).parent.glob(f"{conv_id}.backfill.json.bak-*"))
+    assert_eq(backups, [], "no orphan backup file left behind")
+    rec = json.loads(_record_path(conv_id).read_text())
+    assert_eq(rec["state"], "in_progress", "the original record was never rewritten")
+
+
+# ---------------------------------------------------------------------------
+# M3 / BR4: the live-compactor refusal must not fail open. Only an
+# unambiguous connection refusal at --health-url is safe to read as
+# "not running"; a real response OR a timeout both refuse --apply.
+# ---------------------------------------------------------------------------
+
+class _Health200Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *a, **kw):
+        pass  # keep test output quiet
+
+
+def _start_health_server():
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Health200Handler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server, port
+
+
+def test_apply_refuses_when_health_url_answers_and_force_overrides():
+    print("\n[test] M3/BR4: --apply refuses when something answers --health-url, and --force overrides it")
+    _wipe_storage()
+    conv_id = "health-check-alive"
+    old_ts = _iso(datetime.now(timezone.utc) - timedelta(hours=1))
+    _write_record(conv_id, state="in_progress", started_at=old_ts, updated_at=old_ts,
+                  exchanges_done=1, exchanges_total=10, attempts=1, error=None)
+    _write_facts(conv_id)
+    before = _record_path(conv_id).read_bytes()
+
+    server, port = _start_health_server()
+    try:
+        health_url = f"http://127.0.0.1:{port}/health"
+        r = _run_script(_store_args() + ["--conv", conv_id, "--apply", "--json",
+                                          "--health-url", health_url])
+        assert_eq(r.returncode, 1, "refused: something answered --health-url")
+        payload = json.loads(r.stdout)
+        assert_true("error" in payload, "a clean JSON refusal, not a crash")
+        assert_eq(_record_path(conv_id).read_bytes(), before,
+                  "record untouched by the refused apply")
+
+        r2 = _run_script(_store_args() + ["--conv", conv_id, "--apply", "--force", "--json",
+                                           "--health-url", health_url])
+        assert_eq(r2.returncode, 0, "--force overrides the refusal and closes it")
+        payload2 = json.loads(r2.stdout)
+        assert_true(any("overrid" in w.lower() for w in payload2["warnings"]),
+                    "a loud warning names the override")
+    finally:
+        server.shutdown()
+
+
+def test_apply_proceeds_when_health_url_connection_refused():
+    print("\n[test] M3: --apply proceeds when --health-url is an unambiguous connection refusal (nothing listening)")
+    _wipe_storage()
+    conv_id = "health-check-not-running"
+    old_ts = _iso(datetime.now(timezone.utc) - timedelta(hours=1))
+    _write_record(conv_id, state="in_progress", started_at=old_ts, updated_at=old_ts,
+                  exchanges_done=1, exchanges_total=10, attempts=1, error=None)
+    _write_facts(conv_id)
+
+    # A bound-then-closed socket's port is guaranteed refused, unlike an
+    # arbitrary high port that merely happens to be free right now.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    r = _run_script(_store_args() + ["--conv", conv_id, "--apply", "--json",
+                                      "--health-url", f"http://127.0.0.1:{port}/health"])
+    assert_eq(r.returncode, 0, "connection refused reads as not-running; apply proceeds")
+    payload = json.loads(r.stdout)
+    assert_eq(payload["changes"][0]["action"], "closed", "the record was actually closed")
+
+
+def test_apply_refuses_on_health_url_timeout():
+    print("\n[test] M3: a --health-url probe that times out is ambiguous, not 'not running' -- --apply refuses")
+    _wipe_storage()
+    conv_id = "health-check-timeout"
+    old_ts = _iso(datetime.now(timezone.utc) - timedelta(hours=1))
+    _write_record(conv_id, state="in_progress", started_at=old_ts, updated_at=old_ts,
+                  exchanges_done=1, exchanges_total=10, attempts=1, error=None)
+    _write_facts(conv_id)
+    before = _record_path(conv_id).read_bytes()
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    stop = threading.Event()
+
+    def _accept_and_hang():
+        listener.settimeout(5)
+        try:
+            conn, _ = listener.accept()
+            stop.wait(5)
+            conn.close()
+        except OSError:
+            pass
+
+    t = threading.Thread(target=_accept_and_hang, daemon=True)
+    t.start()
+    try:
+        r = _run_script(_store_args() + ["--conv", conv_id, "--apply", "--json",
+                                          "--health-url", f"http://127.0.0.1:{port}/health"])
+        assert_eq(r.returncode, 1, "a timeout is ambiguous, not 'not running' -- refused")
+        assert_eq(_record_path(conv_id).read_bytes(), before, "record untouched")
+    finally:
+        stop.set()
+        listener.close()
+
+
+# ---------------------------------------------------------------------------
+# M4 mutants BR3 and BR8: a not-yet-stale in_progress record must stay
+# needs-review (never closed), and a terminal record must stay `leave`
+# (never misclassified needs-review, which would otherwise still look
+# untouched-by-apply for the wrong reason and mask the mutant).
+# ---------------------------------------------------------------------------
+
+def test_not_yet_stale_in_progress_record_is_needs_review_and_untouched_by_apply():
+    print("\n[test] BR3: a NOT-yet-stale in_progress record is needs-review, and --apply (even --force) must never close it")
+    _wipe_storage()
+    conv_id = "freshly-running"
+    now_ts = _iso(datetime.now(timezone.utc))
+    _write_record(conv_id, state="in_progress", started_at=now_ts, updated_at=now_ts,
+                  exchanges_done=1, exchanges_total=50, attempts=1, error=None)
+    _write_facts(conv_id)
+    before = _record_path(conv_id).read_bytes()
+
+    r = _run_script(_store_args() + ["--conv", conv_id, "--json"])
+    payload = json.loads(r.stdout)
+    assert_eq(payload["records"][0]["verdict"], "needs-review",
+              "a fresh in_progress record is needs-review, not would-resume")
+
+    r2 = _run_script(_store_args() + ["--conv", conv_id, "--apply", "--force", "--json"])
+    assert_eq(r2.returncode, 0, "nothing was targeted; a no-op --apply is success")
+    assert_eq(json.loads(r2.stdout)["changes"], [], "nothing was closed")
+    assert_eq(_record_path(conv_id).read_bytes(), before,
+              "the record was never touched, even with --force")
+
+
+def test_terminal_records_are_classified_leave_not_needs_review():
+    print("\n[test] BR8: complete/abandoned/wiped records classify leave, never needs-review")
+    _wipe_storage()
+    _seed_terminal_records()
+    r = _run_script(_store_args() + ["--json"])
+    payload = json.loads(r.stdout)
+    by_id = {row["conv_id"]: row for row in payload["records"]}
+    for conv_id in ("term-complete", "term-abandoned", "term-wiped"):
+        assert_eq(by_id[conv_id]["verdict"], "leave", f"{conv_id} is classified leave")
+    assert_eq(payload["counts"]["needs-review"], 0,
+              "no terminal record is misclassified needs-review")
+    assert_eq(payload["counts"]["leave"], 3, "all three terminal records count as leave")
+
+
+# ---------------------------------------------------------------------------
+# M8: needs-review and an all-rejected --conv must both affect the exit
+# code, never silently read as "0 record(s), all clear".
+# ---------------------------------------------------------------------------
+
+def test_all_conv_values_rejected_exits_1_not_0():
+    print("\n[test] M8: every --conv value rejected (no record found) exits 1, not 0")
+    _wipe_storage()
+    _seed_terminal_records()  # a non-empty store; just none of these ids are in it
+    r = _run_script(_store_args() + ["--conv", "does-not-exist-1", "--conv", "..", "--json"])
+    assert_eq(r.returncode, 1,
+              "nothing was inspected -- must read as an error, not '0 record(s), all clear'")
+    payload = json.loads(r.stdout)
+    assert_eq(payload["records"], [], "no records were actually inspected")
+    assert_true(any("none of the given --conv" in w for w in payload["warnings"]),
+                "a clear warning explains why")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -542,6 +813,20 @@ if __name__ == "__main__":
 
         test_capability_check_refuses_cleanly_on_a_pre_v3194_package()
         test_capability_check_json_mode_also_refuses_cleanly()
+
+        test_compactor_pkg_not_a_directory_is_refused_not_silently_skipped()
+        test_compactor_pkg_shadowed_by_pythonpath_is_refused_not_silently_wrong()
+
+        test_atomic_write_json_failure_leaves_no_orphan_backup()
+
+        test_apply_refuses_when_health_url_answers_and_force_overrides()
+        test_apply_proceeds_when_health_url_connection_refused()
+        test_apply_refuses_on_health_url_timeout()
+
+        test_not_yet_stale_in_progress_record_is_needs_review_and_untouched_by_apply()
+        test_terminal_records_are_classified_leave_not_needs_review()
+
+        test_all_conv_values_rejected_exits_1_not_0()
 
         print("\nAll backfill-records.py script tests passed.")
     finally:

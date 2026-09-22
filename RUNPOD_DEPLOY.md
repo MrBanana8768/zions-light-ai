@@ -85,7 +85,7 @@ Pre-built images are published at `angreg/zions-light-ai` on Docker Hub.
 **The current deploy target is named in [runpod.env.template](runpod.env.template)'s
 header — that file is the single source of truth for the image tag and every
 env var.** Pin a version for reproducibility (today
-`angreg/zions-light-ai:v3.1.9.5-cu12`); `:latest` is only ever promoted to a
+`angreg/zions-light-ai:v3.1.9.6-cu12`); `:latest` is only ever promoted to a
 *validated* release, so it lags behind (it is still `:v3.0` at the time of
 writing). See the [image-tags table in the README](README.md#image-tags) for
 what each tag contains.
@@ -97,16 +97,25 @@ open-webui but not their dependencies, fetches the Piper voice from a moving
 source rebuilt a week apart does not give the same bytes, and it has not
 been validated on a pod.
 
-**v3.1.9.5 is therefore NOT rebuilt.** Its application code is identical to
-v3.1.9.4, so its tag points at the already-published v3.1.9.4 image, by
-digest:
+**v3.1.9.6 is therefore NOT rebuilt** — same as v3.1.9.5 before it. Its
+application code is identical to v3.1.9.5 and v3.1.9.4, so its tag points at
+the same already-published digest, directly (not via the v3.1.9.4 tag, which
+Docker Hub tags can be repointed later — see the rollback note in "Upgrading
+within v3.1.9.x, and rolling back"):
 ```bash
 docker buildx imagetools create \
-  -t angreg/zions-light-ai:v3.1.9.5-cu12 \
-  angreg/zions-light-ai:v3.1.9.4-cu12@sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65
-docker buildx imagetools inspect angreg/zions-light-ai:v3.1.9.5-cu12
-# the digest printed must equal v3.1.9.4-cu12's
+  -t angreg/zions-light-ai:v3.1.9.6-cu12 \
+  angreg/zions-light-ai@sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65
+docker buildx imagetools inspect angreg/zions-light-ai:v3.1.9.6-cu12
+# the digest printed must equal sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65
 ```
+(v3.1.9.5's own retag, for the record, used the same pattern against the
+v3.1.9.4 tag: `docker buildx imagetools create -t
+angreg/zions-light-ai:v3.1.9.5-cu12
+angreg/zions-light-ai:v3.1.9.4-cu12@sha256:c1295894…8a65`. Either form of
+source reference — a bare digest or `<tag>@<digest>` — resolves to the same
+image; v3.1.9.6 above uses the bare digest so it never depends on the
+v3.1.9.4 tag continuing to point where it does today.)
 
 For a release that DOES change code, build FROM THE RELEASE TAG (a clean
 checkout, not a working branch) with the CUDA-12 profile every v3.1.x image
@@ -132,7 +141,7 @@ Go to [Runpod Templates](https://www.runpod.io/console/user/templates) → New T
 
 - **Template Name:** `zions-light-ai`
 - **Container Image:** the tag named in [runpod.env.template](runpod.env.template)
-  (currently `angreg/zions-light-ai:v3.1.9.5-cu12`)
+  (currently `angreg/zions-light-ai:v3.1.9.6-cu12`)
 - **Container Disk:** `60 GB` (room for the image, supervisor logs, scratch)
 - **Volume Mount Path:** `/data` (← this is where the Network Volume attaches)
 - **Expose HTTP Ports:** `3000, 8080`
@@ -873,7 +882,7 @@ history cap now. Direct API callers set `X-Conversation-Id` themselves
 **Already on any v3.1.9.x image? Skip to
 [Upgrading within v3.1.9.x, and rolling back](#upgrading-within-v319x-and-rolling-back).**
 From v3.1.8, follow this section with the CURRENT image tag
-(`v3.1.9.5-cu12`) wherever it says "the v3.1.9 tag" — every v3.1.9.x release
+(`v3.1.9.6-cu12`) wherever it says "the v3.1.9 tag" — every v3.1.9.x release
 since uses this same procedure with the image tag changed.
 
 This was written as the exact sequence for the production pod when it ran
@@ -945,7 +954,7 @@ then `supervisorctl start compactor backup`.
 ### 3. Template changes (RunPod template, before redeploying)
 
 - **Container Image:** update to the current v3.1.9.x tag
-  (`angreg/zions-light-ai:v3.1.9.5-cu12`).
+  (`angreg/zions-light-ai:v3.1.9.6-cu12`).
 - **`WEBUI_DB_LOCAL=false`** — confirm the row is present and spelled exactly
   that way (a missing or blank row means `true` on v3.1.7 and later). See
   [WEBUI_DB_LOCAL — a hard deploy precondition](#webui_db_local--a-hard-deploy-precondition).

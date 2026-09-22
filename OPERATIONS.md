@@ -1308,6 +1308,32 @@ a slow or broken webhook is logged and ignored, never blocking the job.
 COMPACTOR_ALERT_WEBHOOK=https://hooks.example/zions ...
 ```
 
+## Exit codes — the shared convention across the operator scripts
+
+`scripts/backfill-records.py`, `scripts/import-history.py` and
+`scripts/setup-sshd.py` all use the same five-value exit-code convention,
+stated ONCE here — each script's own section below links back to this
+table rather than repeating it, and each script's own module docstring
+gives that script's exact per-code triggers.
+
+| Code | Meaning |
+|---|---|
+| 0 | The desired end state is in place — a dry run that found nothing pending, or an `--apply`/install that fully succeeded (including a no-op one, because there was nothing to do). |
+| 1 | A refusal or an error the operator needs to look at, OR `--apply` (or the equivalent installing step) made NO progress at all, OR the result needs human judgement (an ambiguous/needs-review record, every `--conv` value given being rejected, etc.) — never the same code as 0, however safe the refusal itself is. |
+| 2 | argparse's own usage error (an unknown flag, a missing required value) — the Python standard library's own convention, unrelated to the four codes around it. |
+| 3 | A DRY RUN found pending work — informational, not a failure: it means "re-run with `--apply` once you're ready". |
+| 4 | `--apply` (or the equivalent) made SOME progress but work still remains — re-run (with `--force` if that is what the remaining refusal calls for) to continue. |
+
+This normalizes what was, before v3.1.9.6, three scripts sharing the same
+flags with opposite exit meanings (`setup-sshd.py` originally had 0 and 3
+swapped from the other two — see CHANGELOG.md [3.1.9.6] "Fixed"), and adds
+code 4 in a later pass of the same release: `backfill-records.py`'s own
+`--apply` used to report the same "0 success" whether it closed every
+targeted record or none at all, indistinguishable from the exact upgrade
+hazard the script exists to prevent (H1). Not every script has a code-4
+case — see each script's own section below for exactly which of the five
+codes it actually returns and why.
+
 ## Closing stale backfill records before upgrading past v3.1.9.3
 
 Only relevant if this pod has EVER run v3.1.9.3 or earlier. Skip this if it
@@ -1381,11 +1407,19 @@ and closing its only open backfill attempt would cancel that, not defuse a
 hazard.
 
 **Machine-readable output**, for scripting a fleet of pods: add `--json`.
-**One conversation only**: add `--conv <conv_id>` (repeatable). See the
-script's own module docstring for the full exit-code contract — the same
-convention as `import-history.py`/`setup-sshd.py` (0 success, including a
-run that finds nothing to resume; 1 refusal/error; 3 a dry run found
-`would-resume` records).
+**One conversation only**: add `--conv <conv_id>` (repeatable). **A
+different compactor to probe before `--apply`**: add `--health-url URL`
+(default `http://127.0.0.1:8080/health`) — only an unambiguous connection
+refusal there is read as "not running"; a real response, a non-200
+status, or the probe itself timing out all refuse `--apply` the same way
+a confirmed-live compactor does. See "Exit codes — the shared convention
+across the operator scripts" above for what each code means, and the
+script's own module docstring for exactly which of them this script
+returns and why (0 succeeded or nothing to do; 1 refusal/error, or an
+`--apply` that closed NONE of its targeted records, or any record left
+`needs-review`, or every `--conv` value given being rejected; 3 a dry run
+found `would-resume` records with nothing else needing attention; 4 an
+`--apply` that closed SOME but not all of its targeted records).
 
 **The alternative**, if you would rather not touch any records by hand:
 set `COMPACTOR_BACKFILL_MAX_ATTEMPTS=0` in the template before upgrading.
@@ -1518,10 +1552,10 @@ large number it was stuck at before the catch-up ran.
 — that is a retrieval backlog, a different job. It never touches
 `facts/`, `chromadb/` or `personas/` — its entire blast radius is one
 `summaries/<conv_id>.json` file and its own dated backup. See the
-script's own module docstring for the full exit-code contract — the same
-convention as `backfill-records.py`/`setup-sshd.py` (0
-nothing-due/apply-succeeded, 1 refusal/error, 3 dry-run-found-work), and
-`compactor/test_import_history_script.py` for coverage, including the
+script's own module docstring for the full exit-code contract — see "Exit
+codes — the shared convention across the operator scripts" above for what
+each code means — and `compactor/test_import_history_script.py` for
+coverage, including the
 fork-in-history, interrupted-and-resumed-apply, and content-vs-length
 guard cases.
 
@@ -1655,11 +1689,9 @@ untouched throughout.
 
 **Machine-readable output**, for scripting a fleet of pods: add `--json`.
 See the script's own module docstring for the full exit-code contract —
-the same convention as `backfill-records.py`/`import-history.py` (0
-success, including a no-op `--apply` right after the first; 1
-refusal/failure; 3 a dry run found pending work) — and
-`compactor/test_setup_sshd_script.py` for
-coverage: a dry run that writes nothing, a clean install, idempotency,
+see "Exit codes — the shared convention across the operator scripts"
+above for what each code means — and `compactor/test_setup_sshd_script.py`
+for coverage: a dry run that writes nothing, a clean install, idempotency,
 append-not-clobber on an existing `authorized_keys`, every refusal path
 (not root, no usable key, a malformed key, a config that would allow
 password auth, `sshd -t` failing), that `apt-get upgrade`/`dist-upgrade`
@@ -1696,10 +1728,10 @@ deploy. To roll back:
    RUNBOOK_MEMORY_IDENTITY.md "Rolling the IMAGE back".
 2. In the RunPod template, change **Container Image** to the last-good
    image: the one you wrote down before deploying (RUNPOD_DEPLOY.md,
-   "Upgrading within v3.1.9.x", step 2). Note that `v3.1.9.5-cu12` and
-   `v3.1.9.4-cu12` are the SAME image (digest
+   "Upgrading within v3.1.9.x", step 2). Note that `v3.1.9.6-cu12`,
+   `v3.1.9.5-cu12` and `v3.1.9.4-cu12` are all the SAME image (digest
    `sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65`),
-   so switching between those two tags rolls nothing back. Going further back within v3.1.9.x has one
+   so switching between any of those three tags rolls nothing back. Going further back within v3.1.9.x has one
    consequence to know about, and there is no `v3.1.9.3-cu12` image: see
    RUNPOD_DEPLOY.md "Upgrading within v3.1.9.x, and rolling back". Pre-v3.1.9
    targets are covered by RUNPOD_DEPLOY.md "6. Rollback to v3.1.8".
