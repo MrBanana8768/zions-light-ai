@@ -97,7 +97,10 @@ Pin a specific version for reproducible deploys.
 
 | Tag | Contents |
 |---|---|
-| `:v3.0-cu12` = `:v3.0` | **Current release** (= the validated rc8 build) — V3.0 consolidation: audited dep pins, OpenWebUI 0.11, SQLite network-volume hardening, chat-proxy guards; CUDA-12 profile (any A40 host) |
+| `:v3.1.9.5-cu12` | **Current release** — the deploy target named in [runpod.env.template](runpod.env.template). Application code identical to `:v3.1.9.4-cu12`; v3.1.9.5 changed documentation only. CUDA-12 profile (any A40 host) |
+| `:v3.1.9.4-cu12` | Rollback target for v3.1.9.5 — see [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md#upgrading-within-v319x-and-rolling-back) |
+| `:v3.1-cu12` … `:v3.1.9.2-cu12` | The superseded v3.1.x patch line (v3.1-cu12, v3.1.1 to v3.1.4.1, v3.1.5, v3.1.6, v3.1.6.1, v3.1.7, v3.1.8, v3.1.9, v3.1.9.1, v3.1.9.2 — each `-cu12`); per-version notes in [CHANGELOG.md](CHANGELOG.md). There is no `:v3.1.9.3-cu12` image. `:v3.1-cu12` is NOT `:v3.1`, which is the older `:v3.1-vision` feature image below |
+| `:v3.0-cu12` = `:v3.0` = `:latest` | The last release promoted to `:latest` (= the validated rc8 build) — V3.0 consolidation: audited dep pins, OpenWebUI 0.11, SQLite network-volume hardening, chat-proxy guards; CUDA-12 profile (any A40 host) |
 | `:v3.0-rc5-cu12` / `:v3.0-rc6-cu12` / `:v3.0-rc7-cu12` | Superseded rcs — rc5 lacks the overflow fix; rc6 lacks the rc7 review fixes (compaction alternation blocker); rc7 is code-identical to rc8 but ships the old unbootable-on-A40 22B default |
 | `:v3-snapshot` | Frozen last-known-good V3.3 image (= `:v3.3-tts`) — rollback target |
 | `:v3.3-tts` / `:v3.2-stt` / `:v3.1-vision` | The V3.x feature line as shipped incrementally |
@@ -107,7 +110,7 @@ Pin a specific version for reproducible deploys.
 | `:v2.1-phase6.1` | + observability (`/health/full`, boot self-test) |
 | `:v2.0` | Three-layer memory (facts + RAG + hierarchical summaries) |
 | `:1.9.6` | Final V1 — auto-summarization only, no persistent memory |
-| `:latest` | Promoted to the newest validated release |
+| `:latest` | Promoted to the newest release that passed the on-pod validation gate ([TESTING.md](TESTING.md), Tier 2); still `:v3.0` until a v3.1.x image passes it |
 
 See [CHANGELOG.md](CHANGELOG.md) for full version history.
 

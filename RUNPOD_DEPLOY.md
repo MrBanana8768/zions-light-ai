@@ -61,8 +61,12 @@ cache before paying GPU prices:
    export HF_HOME=/data/models
    # For gated models (Llama, Mistral):
    # export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-   # Production A40 model (the image default since rc8):
-   huggingface-cli download coder3101/Cydonia-24B-v4.3-heretic-v4
+   # Production A40 model — the vision variant, which is both the image's
+   # built-in MODEL_REPO default (Dockerfile) and what runpod.env.template
+   # pins. This line used to name the text-only sibling,
+   # coder3101/Cydonia-24B-v4.3-heretic-v4; SERVING that one silently disables
+   # vision, and the vision variant does not need it.
+   huggingface-cli download coder3101/Cydonia-24B-v4.3-vision-heretic
    # Always-fits A40 fallback:
    # huggingface-cli download anthracite-org/magnum-v4-12b
    ```
@@ -77,22 +81,25 @@ volume — vLLM picks whichever one matches `MODEL_REPO` at runtime.
 Pre-built images are published at `angreg/zions-light-ai` on Docker Hub.
 **The current deploy target is named in [runpod.env.template](runpod.env.template)'s
 header — that file is the single source of truth for the image tag and every
-env var.** Pin a version for reproducibility (e.g.
-`angreg/zions-light-ai:v3.0-cu12`); `:latest` is only ever promoted to a
-*validated* release, so during an rc cycle it lags behind. See the
-[image-tags table in the README](README.md#image-tags) for what each tag
-contains.
+env var.** Pin a version for reproducibility (today
+`angreg/zions-light-ai:v3.1.9.5-cu12`); `:latest` is only ever promoted to a
+*validated* release, so it lags behind (it is still `:v3.0` at the time of
+writing). See the [image-tags table in the README](README.md#image-tags) for
+what each tag contains.
 
-To build and publish your own (CUDA-12 profile — runs on any A40 host; see
-the Dockerfile header for the CUDA-13 default profile):
+To build and publish your own, build FROM THE RELEASE TAG, not from a working
+branch, with the CUDA-12 profile every v3.1.x image uses (runs on any A40
+host; see the Dockerfile header for the CUDA-13 default profile):
 ```bash
+git checkout v3.1.9.5
 docker build \
   --build-arg CUDA_BASE_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04 \
   --build-arg TORCH_CUDA=cu128 \
   --build-arg VLLM_VERSION=0.19.0 \
-  -t angreg/zions-light-ai:v3.0-cu12 .
-docker push angreg/zions-light-ai:v3.0-cu12
-# :latest is promoted ONLY after the on-pod validation gate (see CHANGELOG).
+  -t angreg/zions-light-ai:v3.1.9.5-cu12 .
+docker push angreg/zions-light-ai:v3.1.9.5-cu12
+# :latest is promoted ONLY after the on-pod validation gate (TESTING.md,
+# "Tier-2 green before promoting :latest").
 ```
 
 ### Step 4: Create the Runpod Template
@@ -101,18 +108,20 @@ Go to [Runpod Templates](https://www.runpod.io/console/user/templates) → New T
 
 - **Template Name:** `zions-light-ai`
 - **Container Image:** the tag named in [runpod.env.template](runpod.env.template)
-  (currently `angreg/zions-light-ai:v3.0-cu12`)
+  (currently `angreg/zions-light-ai:v3.1.9.5-cu12`)
 - **Container Disk:** `60 GB` (room for the image, supervisor logs, scratch)
 - **Volume Mount Path:** `/data` (← this is where the Network Volume attaches)
 - **Expose HTTP Ports:** `3000, 8080`
 - **Docker Command:** (leave empty)
 - **Environment Variables:** paste the block from
-  [runpod.env.template](runpod.env.template) — it carries all 42 vars with
-  the ones that matter marked. As of rc8 the image's built-in default IS the
-  production A40 config (Cydonia-24B + runtime fp8), so the vars that
-  strictly MUST be set are `WEBUI_SECRET_KEY` and **`WEBUI_DB_LOCAL=false`**
-  (see the next section — runpod.env.template does not carry that row, so add
-  it by hand); the template pins the model
+  [runpod.env.template](runpod.env.template) — its uncommented `KEY=VALUE`
+  rows (51 as of v3.1.9.5) are the set to paste, with the ones that matter
+  marked; commented-out rows are documentation, not something to add. As of
+  rc8 the image's built-in default IS the production A40 config (Cydonia-24B
+  + runtime fp8), so the vars that strictly MUST be set are
+  `WEBUI_SECRET_KEY` and **`WEBUI_DB_LOCAL=false`** (see the next section;
+  the template carries that row, so check it survived the paste); the
+  template pins the model
   vars explicitly anyway so a future default change can never surprise a
   deploy (see GPU sizing for alternatives).
 
@@ -322,14 +331,18 @@ pip install runpod
 runpod config
 
 # Image tag + full env set: see runpod.env.template (the source of truth).
+# This is a MINIMUM, not the production set: pass every uncommented row of
+# runpod.env.template. WEBUI_DB_LOCAL=false is NOT optional (a missing row
+# means true — see "WEBUI_DB_LOCAL — a hard deploy precondition").
 runpod pod create \
   --gpu-type "NVIDIA A40" \
-  --image "angreg/zions-light-ai:v3.0-cu12" \
+  --image "angreg/zions-light-ai:v3.1.9.5-cu12" \
   --disk-size 60 \
   --network-volume-id "<your-volume-id>" \
-  --env MODEL_REPO=coder3101/Cydonia-24B-v4.3-heretic-v4 \
-  --env VLLM_EXTRA_ARGS="--quantization fp8" \
+  --env MODEL_REPO=coder3101/Cydonia-24B-v4.3-vision-heretic \
+  --env VLLM_EXTRA_ARGS="--quantization fp8 --mm-processor-cache-type shm" \
   --env WEBUI_SECRET_KEY="<openssl rand -hex 32>" \
+  --env WEBUI_DB_LOCAL=false \
   --env COMPACTOR_BACKUP_INTERVAL_HOURS=6 \
   --ports "3000/http,8080/http"
 ```
@@ -339,7 +352,7 @@ runpod pod create \
 | Model | Quant | VRAM | Suggested Runpod GPU |
 |---|---|---|---|
 | Qwen2.5-1.5B-Instruct | FP16 | ~6 GB | RTX 3090 / 4090 |
-| **coder3101/Cydonia-24B-v4.3-heretic-v4** *(production config)* | **FP8 (runtime)** | **~43 GB incl. KV** | **A40** |
+| **coder3101/Cydonia-24B-v4.3-vision-heretic** *(production config, as pinned in runpod.env.template)* | **FP8 (runtime)** | **~43 GB incl. KV** | **A40** |
 | anthracite-org/magnum-v4-12b *(A40 fallback, no quant flag)* | FP16 | ~24 GB | A40 |
 | anthracite-org/magnum-v4-22b | FP16 | ~44 GB | A100 (40/80 GB) |
 | Qwen2.5-32B-Instruct | FP16 | ~64 GB | A100 80GB |
@@ -831,13 +844,20 @@ history cap now. Direct API callers set `X-Conversation-Id` themselves
 
 ## Upgrading an existing pod from v3.1.8 to v3.1.9
 
-This is the exact sequence for the production pod: today it runs v3.1.8
-with `WEBUI_DB_LOCAL=false`, and every chat currently logs `source=hash`
-(no `X-Conversation-Id` header configured — see
-[RUNBOOK_MEMORY_IDENTITY.md](RUNBOOK_MEMORY_IDENTITY.md) if that changes
-before you upgrade). **v3.1.9 does NOT move the database to local disk —
-that is v3.1.9.1, a separate later release. Keep `WEBUI_DB_LOCAL=false`
-through this whole procedure**, on both images.
+**Already on any v3.1.9.x image? Skip to
+[Upgrading within v3.1.9.x, and rolling back](#upgrading-within-v319x-and-rolling-back).**
+From v3.1.8, follow this section with the CURRENT image tag
+(`v3.1.9.5-cu12`) wherever it says "the v3.1.9 tag" — every v3.1.9.x release
+since uses this same procedure with the image tag changed.
+
+This was written as the exact sequence for the production pod when it ran
+v3.1.8 with `WEBUI_DB_LOCAL=false` and every chat logged `source=hash` (no
+`X-Conversation-Id` header configured — see
+[RUNBOOK_MEMORY_IDENTITY.md](RUNBOOK_MEMORY_IDENTITY.md) if that has
+changed). **No v3.1.9.x image moves the database to local disk; that is a
+later release (it was once numbered "v3.1.9.1", a number that went to a
+different fix). Keep `WEBUI_DB_LOCAL=false` through this whole procedure**,
+on both images.
 
 ### 1. Pre-checks (on the running v3.1.8 pod)
 
@@ -897,7 +917,8 @@ then `supervisorctl start compactor backup`.
 
 ### 3. Template changes (RunPod template, before redeploying)
 
-- **Container Image:** update to the v3.1.9 tag.
+- **Container Image:** update to the current v3.1.9.x tag
+  (`angreg/zions-light-ai:v3.1.9.5-cu12`).
 - **`WEBUI_DB_LOCAL=false`** — confirm the row is present and spelled exactly
   that way (a missing or blank row means `true` on v3.1.7 and later). See
   [WEBUI_DB_LOCAL — a hard deploy precondition](#webui_db_local--a-hard-deploy-precondition).
@@ -912,15 +933,17 @@ then `supervisorctl start compactor backup`.
   `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=15000`,
   `COMPACTOR_STANDIN_BUDGET_FRACTION=1.0` (the last three raised/added in
   v3.1.9.2 — see [Memory budgets](#memory-budgets--raised-defaults-in-v319)
-  for why). These are now the image's own defaults, so adding the rows is
-  optional and self-documenting, not required — but if your template
-  already has a hand-added `COMPACTOR_MAX_FACTS_TOKENS` or similar row at a
-  DIFFERENT value (the pre-v3.1.9 live-pod workaround, or the v3.1.9
-  `0.6`/`6230` pair), either remove it or update it to match, or it will
-  silently override the new image default — **this specific shape (a
-  leftover `0.6`/`6230` override) is exactly what put the reuse feature
-  back to declining silently in hostile pass #9**, so check for it if
-  upgrading a pod that has ever had these rows added by hand.
+  for why). All six are the image's own defaults. **Delete
+  `COMPACTOR_INJECTION_BUDGET_FRACTION` and
+  `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` from the template if they are there,
+  whatever their value** (v3.1.9.4's release note; runpod.env.template ships
+  both commented out from v3.1.9.5): a row at today's value changes nothing,
+  but it pins the value against every later image's default, and a leftover
+  row at an OLD value — the v3.1.9 `0.6`/`6230` pair — **is exactly what put
+  the reuse feature back to declining silently in hostile pass #9**. The
+  other four rows may stay; if your template has any of them at a DIFFERENT
+  value (the pre-v3.1.9 live-pod workaround), remove it or update it to
+  match, or it will silently override the image default.
 
 ### 4. Deploy
 
@@ -977,6 +1000,56 @@ restore needed — v3.1.9 did not move or reformat anything on `/data`), then
 run the post-checks above against the v3.1.8 pod. Restore from the backup
 taken in step 2 only if you have independent evidence data was actually
 lost — a rollback alone does not require it.
+
+## Upgrading within v3.1.9.x, and rolling back
+
+For a pod already on any v3.1.9.x image (v3.1.9 through v3.1.9.4). Every
+v3.1.9.x release is an image-tag change against the SAME Network Volume: none
+of them moves or reformats anything on `/data`, and none needs a restore.
+
+What each release brings (you get every row after the one you are on;
+details in the CHANGELOG entry of the same number):
+
+| Release | For the operator |
+|---|---|
+| v3.1.9.1 | Summary reuse fires again on long recent turns. |
+| v3.1.9.2 | Loop replies are kept out of what the model is shown; Ollama's `repeat_penalty` reaches vLLM. |
+| v3.1.9.3 | Reuse never costs her previous exchange; images are priced correctly (opencv, image ~152 MB larger). |
+| v3.1.9.4 | Replies no longer wait ~30 s on fact selection; `/forget` stays forgotten; cut summaries are handled. |
+| v3.1.9.5 | Documentation only — application code identical to v3.1.9.4. |
+
+No new REQUIRED settings in any of them.
+
+1. **Pre-checks and backup:** do steps 1 and 2 of the v3.1.8 procedure above
+   on the running pod — `/health/full` explained, `WEBUI_DB_LOCAL=false`
+   confirmed in `/proc/1/environ`, writers stopped, `backup.py --once` then
+   `--verify` both `[OK]`.
+2. **Template:** set Container Image to `angreg/zions-light-ai:v3.1.9.5-cu12`;
+   confirm `WEBUI_DB_LOCAL=false`; **delete any
+   `COMPACTOR_INJECTION_BUDGET_FRACTION` and
+   `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` rows** (see step 3 above for why).
+   Nothing else in the template needs to change.
+3. **Deploy and post-check:** steps 4 and 5 above. The first-message
+   `compaction skipped` note there applies only to an upgrade from v3.1.8.
+   After the first reply from v3.1.9.4 or later, the compactor log should
+   not show a gap of tens of seconds between compaction and retrieval
+   (P15-4); the very first request after the boot still pays the cold
+   embedding cost once.
+
+**Rolling back.** Keep the History cap rule from
+[Rolling back to an older image](CHANGELOG.md#rolling-back-to-an-older-image)
+(`max_turns` to 0 first) and `WEBUI_DB_LOCAL=false`.
+- **To v3.1.9.4** (`v3.1.9.4-cu12`): the safe target from v3.1.9.5 — same
+  application code, so nothing on `/data` can differ.
+- **To v3.1.9.3 or earlier:** there is **no `v3.1.9.3-cu12` image** on Docker
+  Hub (`v3.1.9.2-cu12` and `v3.1.9.1-cu12` exist); build one from the tag
+  first if you want that target. Know what it forgets: v3.1.9.4 writes two
+  new backfill states, `"wiped"` and `"abandoned"`, and older images treat
+  both as "retry". A conversation cleared by `/forget` stays forgotten
+  (it carries an empty facts file, which older images also refuse to
+  rebuild), but a conversation whose backfill v3.1.9.4 gave up on
+  (`"abandoned"`, with no facts file) goes back to retrying on every
+  eligible request.
 
 ## Troubleshooting
 

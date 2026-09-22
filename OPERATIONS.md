@@ -1319,9 +1319,13 @@ Image tags are immutable snapshots (see
    message. Rolling back with the cap on leaves a permanent, unlogged hole in
    her summary hierarchy (hostile review of v3.1.7, reviewer C, F5). See
    RUNBOOK_MEMORY_IDENTITY.md "Rolling the IMAGE back".
-2. In the RunPod template, change **Container Image** to the last-good tag
-   (from v3.1.9 that is `angreg/zions-light-ai:v3.1.6.1-cu12`, the image the
-   pod ran before). **Leave `WEBUI_DB_LOCAL=false` exactly as it is, spelled
+2. In the RunPod template, change **Container Image** to the last-good tag.
+   From v3.1.9.5 that is `angreg/zions-light-ai:v3.1.9.4-cu12` (the same
+   application code). Going further back within v3.1.9.x has one
+   consequence to know about, and there is no `v3.1.9.3-cu12` image: see
+   RUNPOD_DEPLOY.md "Upgrading within v3.1.9.x, and rolling back". Pre-v3.1.9
+   targets are covered by RUNPOD_DEPLOY.md "6. Rollback to v3.1.8".
+   **Leave `WEBUI_DB_LOCAL=false` exactly as it is, spelled
    `false`** — v3.1.9 also accepts `0`/`no`/`off` and `1`/`yes`/`True`, but
    the older images read only the exact word `true` as true, so any other
    spelling can mean different things on the two sides of a rollback. See

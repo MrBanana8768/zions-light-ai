@@ -2011,6 +2011,16 @@ the response does not imply a guarantee the best-effort drain did not make.
 
 ## OPEN — confirmed, not yet fixed
 
+> **Status as of v3.1.9.5 (2026-09-22). This list was written at v3.1.4 and
+> has not been re-triaged item by item; do not read it as current.** Known
+> since: **A-05 is fixed** (v3.1.9.3, CHANGELOG "Concurrent merges into one
+> conversation no longer lose facts"). A-09's "no margin field in
+> `/health/full`" is fixed (v3.1.9.3, `checks.budget_margin`); whether the
+> one-step latch itself still behaves as described was not re-checked.
+> **A-10 is still open**: `compactor/main.py` still builds the vLLM client
+> with `read=None`, deliberately, so long generations are not cut off. A-06
+> to A-08 and A-11 to A-13 have not been re-verified against v3.1.9.x.
+
 ### A-05 (RACE-02) · Two concurrent `merge-into` destroy one side's facts
 
 **92% (23/25), 100% (10/10) on the current tree.** Both merges answered 200

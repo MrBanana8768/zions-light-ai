@@ -9,6 +9,71 @@ on Docker Hub.
 
 ---
 
+## [3.1.9.5] — the deploy docs match what ships
+
+**Documentation only. No application code changed:** every file the image
+copies (`compactor/`, `stt/`, `tts/`, `entrypoint.sh`, `supervisord.conf`,
+`clean-models.sh`) and the `Dockerfile` are byte-identical to v3.1.9.4, so
+`:v3.1.9.5-cu12` behaves exactly like `:v3.1.9.4-cu12` and the latter is its
+rollback target. It exists so that the deploy docs someone follows for v3.1.9.4's
+fixes stop contradicting them. Found by a release-readiness review of
+v3.1.9.1-v3.1.9.4 on 2026-09-21.
+
+### Fixed (documentation)
+- **runpod.env.template, "the single source of truth for the image tag",
+  named `v3.1.6-cu12`.** It now names `v3.1.9.5-cu12`, and the image-variant
+  list names the current tag and its rollback target instead of v3.0 only.
+- **The template re-added the rows v3.1.9.4's release note said to remove.**
+  `COMPACTOR_INJECTION_BUDGET_FRACTION` and `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`
+  are now commented out there, with the reason: they equal the image
+  defaults (0.75 / 15000), so the rows only pin the value against a later
+  image's default, the same leftover-row shape as hostile pass #9's 0.6/6230.
+  RUNPOD_DEPLOY.md's template step no longer calls adding them "optional and
+  self-documenting"; it says to delete them.
+- **There was no upgrade path for a pod already on v3.1.9.x.** RUNPOD_DEPLOY.md
+  only covered v3.1.8 → v3.1.9 and rollback to v3.1.8. A new section,
+  "Upgrading within v3.1.9.x, and rolling back", covers it. It notes that
+  there is no `v3.1.9.3-cu12` image on Docker Hub. It also covers what an
+  image older than v3.1.9.4 does with the backfill states v3.1.9.4 writes:
+  `"abandoned"` goes back to being retried; `"wiped"` stays refused through
+  its empty facts file. OPERATIONS.md's rollback step named `v3.1.6.1-cu12`
+  as the last-good image and now points there.
+- **The database move was called "the v3.1.9.1 feature"** in the template and
+  RUNPOD_DEPLOY.md. That number went to the reuse fix, and no v3.1.9.x image
+  moves the database. `WEBUI_DB_LOCAL=false` stays required.
+- **The RunPod CLI example would have moved her database.** It omitted
+  `WEBUI_DB_LOCAL`, and a missing row means `true`. It also named the
+  text-only model repo and no `shm` multimodal cache. It now matches the
+  template and says it is a minimum. The volume pre-warm step named the
+  same text-only repo. It now names the vision variant, which is both the
+  image default and the template's value.
+- **RUNPOD_DEPLOY.md said the template "does not carry" `WEBUI_DB_LOCAL`**
+  (it does) and counted "42 vars" (51 uncommented rows).
+- **Three settings added in v3.1.9.4 were documented nowhere:**
+  `COMPACTOR_VECTOR_CACHE_MAX` (8192), `COMPACTOR_BACKFILL_MAX_ATTEMPTS` (3),
+  `COMPACTOR_BACKFILL_RETRY_BACKOFF_S` (600, doubled per attempt). They are now
+  commented rows in runpod.env.template. None of them needs setting.
+- **README's image-tag table still called v3.0 the current release.** It
+  now lists the v3.1.9.x tags, the missing v3.1.9.3 image, and that `:latest`
+  is still v3.0 until a v3.1.x image passes the on-pod gate.
+- **.env.example** (local `docker compose` only) had no `WEBUI_DB_LOCAL` row,
+  which moves the database on a local run. It also pinned
+  `COMPACTOR_MAX_FACTS_TOKENS=1500` over the image's 3500. The first is added,
+  as `false`; the second is commented out.
+- The v3.1.9.3 entry's two "known residual" notes (P14-1, P14-2) now point at
+  their fix in v3.1.9.4. V314_BACKLOG.md's OPEN list has a status note: A-05
+  is fixed, A-10 (`read=None`) is still open, and the rest has not been
+  re-triaged.
+
+### Not changed, and still true
+- **Not validated on a pod.** No v3.1.9.x image has a recorded Tier-2 boot
+  self-test on a real pod, so `:latest` stays `:v3.0` (TESTING.md rule 5).
+- **Still open:** A-10 (a paused vLLM can hang a request, by design of
+  `read=None`) and the residuals listed in OPERATIONS.md and the entries
+  below.
+
+---
+
 ## [3.1.9.4] — every defect we could find
 
 The last patch before the database move. It closes hostile pass #14's
@@ -128,7 +193,8 @@ ship; its four LOWs are either fixed below or listed as known residuals.
   453. Never worse than v3.1.9.2 in the same state. Fixed by subtracting
   `_BUDGET_MARGIN` from the check's own `_effective_limit_est`, the same
   global the guard reads. The two reads are not atomic (hostile pass #14,
-  P14-1, known residual): a margin latched by another request's rejection
+  P14-1, known residual at v3.1.9.3; addressed in [3.1.9.4] "Reuse and the
+  budget guard"): a margin latched by another request's rejection
   while this one is mid-compaction applies to this request's guard but
   not its reuse decision, and can cost her previous exchange on that one
   request. The guard keeps reading the live value on purpose; forwarding
@@ -158,8 +224,9 @@ ship; its four LOWs are either fixed below or listed as known residuals.
   at peakA), and because reuse fires more often at peak sizes, facts or
   retrieval are cut on more requests (4/243 instead of 0/166 with folded
   fresh summaries; 51/307 instead of 4/225 in the un-folded worst case).
-  Her previous exchange is never lost either way. Known residual (hostile
-  pass #14, P14-2): the preview and `summarize()` ask `/tokenize`
+  Her previous exchange is never lost either way. Known residual at
+  v3.1.9.3 (hostile pass #14, P14-2; addressed in [3.1.9.4], where the
+  preview and `summarize()` share one /tokenize count): the preview and `summarize()` ask `/tokenize`
   separately, so if it fails in the milliseconds between them,
   `summarize()` can make more batches than were reserved, up to 2,048
   tokens more on a span at exactly the call cap. That costs the one
