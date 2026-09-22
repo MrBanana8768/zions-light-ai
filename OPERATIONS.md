@@ -1492,6 +1492,16 @@ otherwise both be writing the same `summaries/<conv_id>.json`:
 supervisorctl stop compactor
 ```
 
+**Before running this script, confirm `--store` points at the REAL
+compactor storage root** — it must already exist, contain a
+`summaries/` subdirectory, and already have a `summaries/<conv_id>.json`
+for the conversation being caught up, before any work, dry run or
+`--apply`. This is a catch-up tool for a conversation the compactor
+already knows about, not a bootstrap tool: a `--store`/`--chat-id`/
+`--conv-id` typo used to silently build a brand-new store from scratch
+and report an encouraging "re-run with --apply" while burning real GPU
+time against the wrong place; it now refuses outright instead (B5).
+
 **Dry run first: reports only, makes zero vLLM calls.**
 ```bash
 /opt/compactor-venv/bin/python /opt/zl-repo/scripts/import-history.py \
@@ -1506,9 +1516,29 @@ watermark already on disk, how many L1/L2/L3 units are estimated due, an
 estimated (floor) count of real vLLM calls, an ESTIMATED wall-clock
 (`--seconds-per-call`, default 40s, labelled an estimate — a chunk needing
 map-reduce costs more than one call), and every anomaly found in the
-transcript (a missing reply, non-alternating turns). A dry run exits 3 if
-anything is due; that is informational, not a failure — a dry run that
-finds nothing due exits 0.
+transcript (a missing reply, non-alternating turns). The due/call estimate
+is offset-aware: it sizes itself against `effective_position =
+max(recorded_position, current_turns)`, not the raw reconstructed branch
+length, so it does not undercount when the store's `turns_seen` already
+sits ahead of the branch (the ordinary real-backlog shape — see B1 below).
+On the real 2026-09-22 backup this reports **58 L1 chunks / 6 L2 folds / 1
+L3 refresh due, ~65 estimated vLLM calls** (58 and 65, not the 57/64 an
+earlier build of this fix under-reported by exactly one L1 chunk). A dry
+run exits 3 if anything is due; that is informational, not a failure — a
+dry run that finds nothing due exits 0.
+
+**The resume offset is verified, not assumed (B1).** Her real store's
+position-to-branch mapping is PIECEWISE (different constant offsets at
+different ranges of the transcript, from edited/abandoned messages
+scattered through the history) — a single flat `current_turns -
+len(window)` offset used to leave a real gap of turns uncovered by any
+chunk, permanently mislabelling every chunk written after it (chunk
+recording is append-only). `--apply` now derives the offset from the
+store's own covered-turn fingerprint record, growing the window it checks
+against on ambiguity and refusing outright if no single consistent offset
+exists. Both dry run and `--apply` report this as `resume_offset` (and
+`resume_offset_detail`) in `--json`; on the real backup this verifies to
+**22**, not the flat 20 the old code computed.
 
 Note on a short-turn-count report: this script checks the transcript's
 CONTENT against the store, not merely its length, before refusing. A
@@ -1525,15 +1555,27 @@ store already has confirmed — the actual signature of a wrong
     --webui-db /path/to/webui.db.export --chat-id <conversation id> \
     --store /data/openwebui/compactor --apply
 ```
-It backs up the existing `summaries/<conv_id>.json` beside itself
-(`<name>.json.bak-<UTC stamp>`, never deleted, never overwritten by a
-later run) before writing anything, and refuses outright if that exact
-backup path already exists. It refuses to run while anything answers the
-compactor's `/health` (stop it first, as above, or pass `--force` with a
-loud warning). Interrupting it — Ctrl-C, a pod restart — is safe: state is
-saved after every rollup unit, so re-running resumes from the real
-watermark and never redoes finished work. A second `--apply` once nothing
-is left due does nothing and says so.
+It backs up the existing `summaries/<conv_id>.json`, AND
+`summaries/<conv_id>.archive.json` whenever an L2 fold or L3 refresh
+actually runs (H3 — the archive sidecar changes too on those, and used to
+go unbacked-up), beside themselves (`<name>.json.bak-<UTC stamp>`, never
+deleted, never overwritten by a later run) before writing anything, and
+refuses outright if either exact backup path already exists.
+`--apply`'s report (and `--json`'s `archive_backup` field) names the
+archive backup path when one was made. It refuses to run while anything
+answers the compactor's `/health` — add `--health-url URL` to point the
+probe elsewhere (default `http://127.0.0.1:8080/health`, the real pod's
+own endpoint). A clean connection refusal there is read as "not running"
+and `--apply` proceeds; a timeout, or anything short of a clean refusal,
+now REFUSES `--apply` (M3 — it used to fail open, reading a timeout the
+same as a confirmed-stopped compactor) unless `--force` says you have
+confirmed some other way. Interrupting it — Ctrl-C, a pod restart — is
+safe: state is saved after every rollup unit, so re-running resumes from
+the real watermark and never redoes finished work — including the exact
+window between clearing the stale live-chat anchor and the first
+completed rollup pass, which a Ctrl-C landing there used to be able to
+leave in a bad state. A second `--apply` once nothing is left due does
+nothing and says so.
 
 **Start the compactor again:**
 ```bash
@@ -1550,14 +1592,20 @@ large number it was stuck at before the catch-up ran.
 
 **What this will not do.** It never rebuilds the episodic/chromadb index
 — that is a retrieval backlog, a different job. It never touches
-`facts/`, `chromadb/` or `personas/` — its entire blast radius is one
-`summaries/<conv_id>.json` file and its own dated backup. See the
-script's own module docstring for the full exit-code contract — see "Exit
-codes — the shared convention across the operator scripts" above for what
-each code means — and `compactor/test_import_history_script.py` for
-coverage, including the
-fork-in-history, interrupted-and-resumed-apply, and content-vs-length
-guard cases.
+`facts/`, `chromadb/` or `personas/` — its entire blast radius is
+`summaries/<conv_id>.json` (and `summaries/<conv_id>.archive.json`
+whenever an L2 fold or L3 refresh runs — H3) plus their own dated
+backups. See "Exit codes — the shared convention across the operator
+scripts" above for what each code means; for this script specifically, 1
+is also what `--apply` returns if it ran but the watermark never
+advanced at all (nothing reachable, or vLLM unreachable throughout), and
+4 is what it returns if the watermark DID advance but work still remains
+(most often `--max-calls` running out) — re-run to continue, the same as
+`backfill-records.py`'s own code-4 case. See the script's own module
+docstring for the exact per-code triggers, and
+`compactor/test_import_history_script.py` for coverage, including the
+fork-in-history, interrupted-and-resumed-apply, content-vs-length guard,
+and verified-resume-offset cases.
 
 ---
 

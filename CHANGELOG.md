@@ -418,6 +418,79 @@ round of defects specific to `backfill-records.py`, closed below.
     socket); and a real `supervisorctl reread` failure against the real
     supervisord still leaves a real, listening sshd afterward. See the
     new `compactor/test_real_image_setup_sshd.py`.
+- **`import-history.py` (hostile-review pass 1): B1, B4, B5, H2, H3, M2,
+  M3, and the Ctrl-C live-seam window, closed.**
+  - **B1.** `--apply` computed its resume offset as ONE flat number
+    (`current_turns - len(window)`), but her real store's
+    position-to-branch mapping is PIECEWISE — different constant offsets
+    at different ranges, from edited/abandoned messages scattered through
+    the history. The flat offset left real branch turns uncovered by any
+    chunk and permanently mislabelled every chunk written after them
+    (chunk recording is append-only). The offset is now derived from the
+    store's own covered-turn fingerprint record (growing the window
+    checked against on ambiguity, refusing outright if no single
+    consistent offset exists) and reported as `resume_offset` (plus
+    `resume_offset_detail`) in `--json`; on the real 2026-09-22 backup it
+    verifies to **22**, not the old flat 20. A belt-and-braces pass
+    re-maps every newly recorded position back onto the transcript after
+    the write and restores the backup if anything disagrees.
+  - **B4.** `--model` never actually fell back to `$MODEL_REPO`, despite
+    the docstring and every documented invocation saying it would — the
+    documented `--apply` command failed every time. It now does.
+  - **B5.** A `--store`/`--chat-id`/`--conv-id` typo used to silently
+    build a brand-new store from scratch and report an encouraging
+    "re-run with --apply" while burning real GPU time against the wrong
+    place. `--store` must now already exist, contain `summaries/`, and
+    already have a `summaries/<conv_id>.json` for the conversation being
+    caught up, before any work — dry run or `--apply`.
+  - **H2.** The architect's 0/1/2/3/4 exit-code table (see "Exit codes"
+    in OPERATIONS.md) is now this script's own: 1 when `--apply` ran but
+    the watermark never advanced at all, 4 when it advanced but work
+    remains (most often `--max-calls` running out).
+  - **H3.** `--apply` rewrites `summaries/<conv_id>.archive.json` too,
+    whenever an L2 fold or L3 refresh runs, but only backed up
+    `summaries/<conv_id>.json` — contradicting "its entire blast radius
+    is one file". The archive sidecar now gets its own matching dated
+    backup, named in the report and in `--json`'s new `archive_backup`
+    field.
+  - **M2.** A transcript sharing exactly ONE turn with the store's
+    4-turn `tail_fp` anchor could satisfy the old content guard. B1's
+    8-fingerprint offset requirement fixes this as a side effect — a
+    single shared turn can no longer satisfy it.
+  - **M3.** The live-compactor `--apply` refusal failed open on a
+    timeout, reading it the same as a confirmed-stopped compactor. Only
+    an unambiguous connection refusal is now read as "not running"; a
+    timeout or any other ambiguous response refuses `--apply` unless
+    `--force`. Added `--health-url`.
+  - **Ctrl-C / the live-seam window.** `_run_apply_loop` no longer
+    leaves a cleared live-chat anchor on disk if interrupted (Ctrl-C, a
+    pod restart) before any rollup pass completes — the original is
+    restored. A follow-up real-image test also confirms the NEXT live
+    request after `--apply` stays contiguous with what it wrote (the
+    live path's own `window_offset` lands on the same verified 22, not
+    the old flat 20 or a naive 0) — this was already correct, a
+    verification gap closed, not a bug.
+  - **Dry-run estimate made offset-aware (architect follow-up).** The
+    due/call estimate compared the raw reconstructed branch length
+    against `last_summarized_turn`, undercounting whenever the store's
+    `turns_seen` already sits ahead of the branch — the ordinary
+    real-backlog shape. It now sizes against
+    `effective_position = max(recorded_position, current_turns)`, the
+    same value `--apply` already uses. On the real 2026-09-22 backup
+    this moves the reported due count from 57 to the true **58 L1
+    chunks** (**65** estimated calls, not 64) — corrected everywhere
+    else in this changelog and in OPERATIONS.md that quoted the old
+    numbers.
+  - Re-ran the reviewer's full IH1-IH8 mutant set (adapted where this
+    pass's code moved) plus IH3/IH4/a flat-offset-revert mutant: 0
+    surviving out of 11.
+  - Verified against the real 2026-09-22 backup (published digest, fake
+    vLLM): the first new chunk starts at branch turn 2699 (not 2701),
+    every newly recorded fingerprint matches the transcript at its
+    position-offset for the whole run, only the two summary files
+    (+ `.bak-`) changed, `--max-calls` exits 4, and a real SIGINT mid-run
+    leaves the store re-runnable. See the new
+    `compactor/test_real_image_import_apply.py`.
 
 **New real-image test.** `compactor/test_real_image_operator_scripts.py`
 builds a faithful v3.1.9 `compactor` package with `git archive v3.1.9
@@ -434,6 +507,15 @@ actionable multi-path resolution error; and the same coverage for
 `import-history.py`'s dry run. A further scenario (added with the M6 fix
 below) runs `--apply` for real against a full copy of the real store and
 byte-compares every file, not just the dry-run ones.
+`compactor/test_real_image_import_apply.py` is the dedicated, deeper
+suite for `scripts/import-history.py` itself (the sentence above only
+covers the one dry-run scenario `test_real_image_operator_scripts.py`
+shares with `backfill-records.py`): it runs `--apply` for real against
+the real backup, confirms the verified `resume_offset` (22) and that the
+first new chunk lands exactly where it should with no hole or overlap,
+that both `--max-calls` and a real Ctrl-C leave the store re-runnable,
+and that the very next live request after `--apply` stays contiguous
+with what it wrote.
 `compactor/test_real_image_setup_sshd.py` is the equivalent suite for
 `scripts/setup-sshd.py`: one throwaway container from the same published
 digest, driven with `docker exec` across every scenario (so a real
@@ -461,10 +543,11 @@ opt-in that variable legitimately is, this suite IS the mandatory gate
 and a skip here must never read as green; it now always exits 3.
 `run-tests.py`'s own `BASE_ENV` also clears that variable before invoking
 any suite, as a second line of defense against a value leaking in from
-the caller's shell. `NEEDS_DOCKER` now also names
+the caller's shell. `NEEDS_DOCKER` also names
 `compactor/test_real_image_import_apply.py` and `compactor/
-test_real_image_setup_sshd.py` so `--real-image` (with no `--only`
-filter, or `--only real_image`) picks them up the moment each lands.
+test_real_image_setup_sshd.py` — both now landed alongside this one — so
+`--real-image` (with no `--only` filter, or `--only real_image`) picks up
+all three: `3 passed, 0 failed, 0 skipped, 0 inconclusive`.
 
 **M7: `run-tests.py`'s default interpreter was hardcoded to a Windows
 path.** On Linux (WSL, the Docker test image, a bare host run — the

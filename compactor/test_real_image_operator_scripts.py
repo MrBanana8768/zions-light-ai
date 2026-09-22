@@ -361,12 +361,16 @@ def test_import_history_pre_v3194_pod_dry_run_is_not_a_traceback():
     assert_eq(r.returncode, 3, "dry run against the real backlog finds work due -> exit 3")
     payload = json.loads(r.stdout)
     # The exact numbers the architect verified once this defect was fixed
-    # (see CHANGELOG.md v3.1.9.6 "Fixed" — Defect 3): roughly 57 L1 / 6 L2
-    # / 1 L3 / ~64 calls.
-    assert_eq(payload["l1_chunks_due_estimate"], 57, "57 L1 chunks due")
+    # (see CHANGELOG.md v3.1.9.6 "Fixed" — Defect 3): 58 L1 / 6 L2 / 1 L3 /
+    # 65 calls. (58, not 57: the B1 follow-up made this estimate
+    # offset-aware — effective_position = max(recorded_position,
+    # current_turns) — so it no longer undercounts by the one L1 chunk
+    # that used to hide in the 20-turn gap between turns_seen and the
+    # reconstructed branch. See docnotes-import.md / CHANGELOG.md.)
+    assert_eq(payload["l1_chunks_due_estimate"], 58, "58 L1 chunks due")
     assert_eq(payload["l2_folds_due_estimate"], 6, "6 L2 folds due")
     assert_eq(payload["l3_refreshes_due_estimate"], 1, "1 L3 refresh due")
-    assert_eq(payload["estimated_real_vllm_calls"], 64, "64 estimated calls")
+    assert_eq(payload["estimated_real_vllm_calls"], 65, "65 estimated calls")
     assert_true(
         payload["turns_found"] < payload["recorded_position_before"],
         "the reconstructed transcript IS shorter than recorded_position "
