@@ -436,6 +436,43 @@ def test_max_calls_budget_stops_the_loop_with_documented_overshoot():
                "the one unit that started was allowed to finish")
 
 
+def test_ctrlc_before_any_pass_completes_restores_the_original_anchor():
+    print("\n[test] B1 Ctrl-C window: an interrupt before ANY pass "
+          "completes restores the pre-apply anchor, not an empty one")
+    _wipe_storage()
+    conv_id = "ctrlc-conv"
+    original_anchor = ["aaaa1111aaaa1111", "bbbb2222bbbb2222",
+                        "cccc3333cccc3333", "dddd4444dddd4444"]
+    summarizer.save_state(conv_id, {
+        "l1": [], "l2": [], "l3": None,
+        "last_summarized_turn": 0, "turns_seen": 20,
+        "tail_fp": original_anchor, "head_fp": "somehead", "window_turns": 20,
+    })
+
+    async def _raises_keyboard_interrupt(conv_id, messages, vllm_url, model):
+        raise KeyboardInterrupt()
+
+    caught = False
+    try:
+        asyncio.run(
+            _script._run_apply_loop(
+                _StubModule(_raises_keyboard_interrupt), memory,
+                conv_id, [], VLLM_URL, MODEL, 10,
+            )
+        )
+    except KeyboardInterrupt:
+        caught = True
+    assert_true(caught, "KeyboardInterrupt propagates out of _run_apply_loop, "
+                "not swallowed as an ordinary rollup failure")
+
+    restored = summarizer.load_state(conv_id)
+    assert_eq(restored.get("tail_fp"), original_anchor,
+               "the pre-apply anchor was put back -- not left empty, which "
+               "would close the documented re-run-to-continue path")
+    assert_eq(restored.get("head_fp"), "somehead", "head_fp restored too")
+    assert_eq(restored.get("window_turns"), 20, "window_turns restored too")
+
+
 class _StubModule:
     """Wraps a fake maybe_rollup so _run_apply_loop's
     `summarizer.maybe_rollup(...)` call reaches it, while every other
@@ -1607,6 +1644,7 @@ if __name__ == "__main__":
         test_apply_with_nothing_due_is_a_no_op_and_idempotent()
 
         test_max_calls_budget_stops_the_loop_with_documented_overshoot()
+        test_ctrlc_before_any_pass_completes_restores_the_original_anchor()
 
         test_interrupted_apply_leaves_valid_state_and_resumes()
 
