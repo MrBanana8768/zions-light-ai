@@ -1323,10 +1323,12 @@ deploy. To roll back:
    message. Rolling back with the cap on leaves a permanent, unlogged hole in
    her summary hierarchy (hostile review of v3.1.7, reviewer C, F5). See
    RUNBOOK_MEMORY_IDENTITY.md "Rolling the IMAGE back".
-2. In the RunPod template, change **Container Image** to the last-good tag.
-   From v3.1.9.5 that is `angreg/zions-light-ai:v3.1.9.4-cu12` (the same
-   image: v3.1.9.5's tag points at it), digest
-   `sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65`. Going further back within v3.1.9.x has one
+2. In the RunPod template, change **Container Image** to the last-good
+   image: the one you wrote down before deploying (RUNPOD_DEPLOY.md,
+   "Upgrading within v3.1.9.x", step 2). Note that `v3.1.9.5-cu12` and
+   `v3.1.9.4-cu12` are the SAME image (digest
+   `sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65`),
+   so switching between those two tags rolls nothing back. Going further back within v3.1.9.x has one
    consequence to know about, and there is no `v3.1.9.3-cu12` image: see
    RUNPOD_DEPLOY.md "Upgrading within v3.1.9.x, and rolling back". Pre-v3.1.9
    targets are covered by RUNPOD_DEPLOY.md "6. Rollback to v3.1.8".

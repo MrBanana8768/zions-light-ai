@@ -11,7 +11,7 @@ on Docker Hub.
 
 ## [3.1.9.5] — the deploy docs match what ships
 
-**Documentation only, and NOT a new image.** Every file the image copies
+**Documentation and one test only, and NOT a new image.** Every file the image copies
 (`compactor/*.py` apart from tests, `stt/`, `tts/`, `entrypoint.sh`,
 `supervisord.conf`, `clean-models.sh`) and the `Dockerfile` are
 byte-identical to v3.1.9.4. So `:v3.1.9.5-cu12` is published as a second tag
@@ -47,8 +47,10 @@ release-readiness review of v3.1.9.1-v3.1.9.4 on 2026-09-21. Hostile pass
   - Older images stop at "a facts file exists", so an unfinished backfill
     on a conversation with live facts is dropped for good (P15-2 undone).
   - They retry `"abandoned"` backfills and capped crashed ones again.
-  - They honour `/forget` only through its empty facts file, which is
-    skipped or only logged in two failure cases.
+  - They honour `/forget` only through the facts file every wipe path
+    leaves behind, not through the `"wiped"` record. The one gap is a wipe
+    that fails with a write error, which reports itself as a failed
+    `/forget` (round 2 of pass #18 corrected this sentence).
 
   RUNPOD_DEPLOY.md §6 (rollback to v3.1.8) points there too.
   OPERATIONS.md's rollback step named `v3.1.6.1-cu12` as the last-good
@@ -99,9 +101,13 @@ release-readiness review of v3.1.9.1-v3.1.9.4 on 2026-09-21. Hostile pass
   template-vs-Dockerfile check used an unanchored
   `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=(\d+)`, which now matched the
   commented-out example, so it no longer checked what its message claimed.
-  It now asserts two things. Any LIVE row must equal the Dockerfile, which
-  is the stale-row shape of hostile pass #9. The commented example must show
-  the Dockerfile value. Test files are not copied into the image.
+  It now asserts two things for BOTH rows of the pass-#9 pair
+  (`COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` and
+  `COMPACTOR_INJECTION_BUDGET_FRACTION`). The template must carry no live
+  row, indented rows included. Its commented example must show the
+  Dockerfile's value. Mutation-tested: a stale row (at the end, or right
+  after the comment), a row at the current value, and a deleted or drifted
+  example each fail. Test files are not copied into the image.
 - The v3.1.9.3 entry's two "known residual" notes (P14-1, P14-2) now point at
   their fix in v3.1.9.4. V314_BACKLOG.md's OPEN list has a status note: A-05
   is fixed, A-10 (`read=None`) is still open, and the rest has not been

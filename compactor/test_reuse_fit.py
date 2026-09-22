@@ -1387,31 +1387,34 @@ _G12_SHIPPED_DOCKERFILE = _g12_shipped_sbmax_from(
 # v3.1.9.5 (hostile pass #18, S1): the template no longer SETS this row — it
 # is commented out so a pasted template cannot pin the value against a later
 # image's default — so the unanchored search this used to do matched the
-# COMMENT and checked nothing it claimed to. Two anchored checks instead: a
-# live row, if anyone adds one back, must equal the Dockerfile (a stale row
-# is the hostile-pass-#9 shape); and the documented commented-out example
-# must still show the Dockerfile's value.
+# COMMENT and checked nothing it claimed to. For BOTH rows of the pass-#9
+# pair: the template must carry NO live row (the docs say never to add one —
+# a pasted row pins the value against the next image, and a stale one is the
+# pass-#9 shape), leading whitespace included; and the documented
+# commented-out example must still show the Dockerfile's value.
 _G12_TEMPLATE_TEXT = (_G12_ROOT / "runpod.env.template").read_text(encoding="utf-8")
-_g12_live_rows = re.findall(
-    r"^COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=(\S*)", _G12_TEMPLATE_TEXT, re.M
-)
-check(
-    all(v == str(_G12_SHIPPED_DOCKERFILE) for v in _g12_live_rows),
-    f"*** P10-2 / pass #18: every live COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS row "
-    f"in runpod.env.template equals the Dockerfile's "
-    f"{_G12_SHIPPED_DOCKERFILE} (got {_g12_live_rows}; v3.1.9.5 ships none)",
-)
-_g12_doc_rows = re.findall(
-    r"^#\s*COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=(\d+)\s*$", _G12_TEMPLATE_TEXT, re.M
-)
-check(
-    bool(_g12_doc_rows)
-    and all(int(v) == _G12_SHIPPED_DOCKERFILE for v in _g12_doc_rows),
-    f"*** P10-2 / pass #18: runpod.env.template's commented-out "
-    f"COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS example shows the Dockerfile's "
-    f"{_G12_SHIPPED_DOCKERFILE} (got {_g12_doc_rows}) — the two are "
-    f"hand-kept in sync and this is what would catch them drifting apart",
-)
+for _g12_var in ("COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS",
+                 "COMPACTOR_INJECTION_BUDGET_FRACTION"):
+    _g12_df = re.search(
+        rf'^ENV {_g12_var}="([^"]+)"',
+        (_G12_ROOT / "Dockerfile").read_text(encoding="utf-8"), re.M,
+    )
+    check(bool(_g12_df), f"fixture: found ENV {_g12_var} in Dockerfile")
+    _g12_live = re.findall(rf"^[ \t]*{_g12_var}[ \t]*=(.*)$", _G12_TEMPLATE_TEXT, re.M)
+    check(
+        _g12_live == [],
+        f"*** P9-1 / pass #18: runpod.env.template carries NO live {_g12_var} "
+        f"row (the image default applies; got {_g12_live})",
+    )
+    _g12_doc = re.findall(rf"^#\s*{_g12_var}=(\S+)\s*$", _G12_TEMPLATE_TEXT, re.M)
+    check(
+        bool(_g12_doc) and bool(_g12_df)
+        and all(v == _g12_df.group(1) for v in _g12_doc),
+        f"*** P10-2 / pass #18: runpod.env.template's commented-out {_g12_var} "
+        f"example shows the Dockerfile's "
+        f"{_g12_df.group(1) if _g12_df else '?'} (got {_g12_doc}) — the two "
+        f"are hand-kept in sync and this is what would catch them drifting",
+    )
 _G12_SHIPPED_SBMAX = _G12_SHIPPED_DOCKERFILE
 
 # The give-up L3: `_do_l3_rollup`'s own comment measures 2-3 concatenated

@@ -1081,15 +1081,15 @@ No new REQUIRED settings in any of them.
      `in_progress` record, and treat both as "retry". A conversation with
      no facts file goes back to re-running its backfill on every eligible
      request, with no back-off.
-  3. **"Wiped" stays refused, with one hole.** Every v3.1.9.4 wipe path
-     (`/forget`, admin forget, `/retire`, overwrite import) leaves an empty
-     facts file, and older images refuse to backfill any conversation that
-     has one. But the marker is skipped when the facts file was unreadable
-     at the time, and only logged when writing it fails (`could not write
-     the empty-facts tombstone`, `compactor/commands.py`). In both cases
-     v3.1.9.4 relies on the `"wiped"` record instead, which older images
-     ignore, so on them that conversation can be rebuilt from her chat
-     history. Before rolling back, grep the compactor log for that line.
+  3. **"Wiped" stays refused.** Every v3.1.9.4 wipe path (`/forget`, admin
+     forget, `/retire`, overwrite import) leaves a facts file behind: an
+     empty one, the imported bundle's, or the unreadable original that the
+     wipe left in place. Older images refuse to backfill any conversation
+     that has a facts file, so they do not rebuild it from her history,
+     even though they ignore the `"wiped"` record. The one exception is a
+     wipe that failed with a write error. That shows up as a failed
+     `/forget`, not a silent one. Re-run any failed `/forget` before rolling
+     back.
 
   Roll back below v3.1.9.4 only to escape something worse than these.
 
@@ -1145,6 +1145,8 @@ command:
 ```bash
 # Inside the running pod — uses the same HF_HOME=/data/models layout vLLM expects
 HF_HUB_OFFLINE=0 HF_HOME=/data/models /opt/vllm-venv/bin/huggingface-cli download "${MODEL_REPO}"
+# huggingface_hub 1.x renamed the CLI: if huggingface-cli is missing, use
+#   HF_HUB_OFFLINE=0 HF_HOME=/data/models /opt/vllm-venv/bin/hf download "${MODEL_REPO}"
 ```
 
 For gated models, set `HF_TOKEN` in your env vars first. The cleaner pattern
