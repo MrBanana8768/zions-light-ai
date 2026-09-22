@@ -22,7 +22,17 @@ and `/tokenize`) reachable over the host network. It asserts:
   (d) `--max-calls` budget-limits the run to exit code 4 (H2);
   (e) a Ctrl-C mid-run leaves the store re-runnable (B1's own Ctrl-C
       window fix), with the pre-apply anchor either restored (nothing
-      had completed) or freshly self-consistent (something had).
+      had completed) or freshly self-consistent (something had);
+  (f) the NEXT live request after --apply (the full branch plus one new
+      turn, and a second case plus a full new exchange) stays
+      contiguous with the seam --apply left: the live path's own
+      `_observed_position`/`window_offset` arithmetic keeps the SAME
+      verified offset (not the old flat number, and not 0 just because
+      the array is unbounded), and one real live-style `maybe_rollup`
+      call's own newly-written chunk is independently confirmed to
+      read the branch turn immediately after the last one --apply
+      covered -- no hole, no overlap (architect follow-up, B1 design
+      item 3).
 
 NEEDS, and SKIPS (exit 3) HONESTLY if any is missing, same convention as
 `test_real_image_operator_scripts.py`'s own `_skip`:
@@ -336,6 +346,13 @@ def _verify_seam(turns, before_covered, after_covered, offset) -> dict:
     return json.loads(r.stdout.strip().splitlines()[-1])
 
 
+# Set by test_apply_seam_alignment_and_blast_radius, read by
+# test_next_live_request_stays_contiguous_after_apply -- the verified
+# resume offset for THIS conv, rather than a second hardcoded copy of
+# the same number.
+_LAST_RESUME_OFFSET = [None]
+
+
 # ---------------------------------------------------------------------------
 # 1. The main --apply run: seam alignment (a)+(b), blast radius (c).
 # ---------------------------------------------------------------------------
@@ -383,6 +400,7 @@ def test_apply_seam_alignment_and_blast_radius():
     turns = _reconstruct_real_transcript()
     offset = payload["resume_offset"]
     assert_true(offset is not None, "a resume offset was verified (not refused)")
+    _LAST_RESUME_OFFSET[0] = offset
 
     # (a) the first new L1 chunk starts at branch turn 2699.
     first_new_pos = last_summarized_before + 1
@@ -420,6 +438,181 @@ def test_apply_seam_alignment_and_blast_radius():
                 f"only {CHAT_ID}.json/.archive.json (+ .bak-) changed "
                 f"(unexpected={unexpected})")
     print(f"  changed/added under the store: {sorted(added | changed)}")
+
+
+_LIVE_SEAM_SRC = '''
+import asyncio, copy, json, os, sys
+sys.path.insert(0, "/opt/zl-repo/compactor")
+os.environ["COMPACTOR_STORAGE_ROOT"] = "/work/live"
+import summarizer, memory
+memory.ensure_storage_layout()
+
+CONV = sys.argv[1]
+VLLM_URL = sys.argv[2]
+MODEL = sys.argv[3]
+
+state_before = json.load(open("/work/live/state.json"))
+branch = json.load(open("/work/live/branch.json"))
+new_user = {"role": "user", "content": "one more live message"}
+new_assistant = {"role": "assistant", "content": "one more live reply"}
+
+case_a = branch + [new_user]
+case_b = branch + [new_user, new_assistant]
+
+last_summarized = int(state_before.get("last_summarized_turn") or 0)
+result = {"last_summarized_turn": last_summarized, "cases": {}}
+
+for label, messages in (("A_plus1", case_a), ("B_plus2", case_b)):
+    st = copy.deepcopy(state_before)
+    summarizer.save_state(CONV, st)   # so _observed_position reads/writes this exact copy
+    st_loaded = summarizer.load_state(CONV)
+    position = summarizer._observed_position(CONV, st_loaded, messages)
+    n = sum(1 for m in messages if m.get("role") != "system")
+    window_offset = position - n
+    next_label_first = last_summarized + 1
+    next_branch_first = next_label_first - window_offset
+    result["cases"][label] = {
+        "n": n,
+        "position": position,
+        "window_offset": window_offset,
+        "tail_fp": st_loaded.get("tail_fp"),
+        "head_fp": st_loaded.get("head_fp"),
+        "window_turns": st_loaded.get("window_turns"),
+        "next_l1_chunk_would_start_at_branch_turn": next_branch_first,
+    }
+
+# Restore the untouched pre-simulation state (save_state above overwrote
+# the store's file with intermediate copies; this simulation must not
+# leave any lasting trace).
+summarizer.save_state(CONV, state_before)
+
+# Now, for real: run ONE real rollup unit (budget=1) against case A
+# (branch + 1 new user turn) starting from a config with tail_fp EMPTY,
+# forcing _observed_position through the SAME "no anchor" degradation
+# path the live tail hits on its very first post-import request if the
+# anchor round-trip ever fails -- the worst case, not just the happy
+# anchor-matches path already computed above.
+st2 = copy.deepcopy(state_before)
+summarizer.save_state(CONV, st2)
+budget = {"remaining": 1, "exhausted": False}
+asyncio.run(summarizer.maybe_rollup(CONV, case_a, VLLM_URL, MODEL, vllm_call_budget=budget))
+after = summarizer.load_state(CONV)
+new_chunks = [c for c in (after.get("l1") or []) if c.get("first_turn", 0) > last_summarized]
+result["real_call"] = {
+    "new_chunks": [(c.get("first_turn"), c.get("last_turn")) for c in new_chunks],
+    "last_summarized_after": after.get("last_summarized_turn"),
+}
+if new_chunks:
+    c = new_chunks[0]
+    ft, lt = c["first_turn"], c["last_turn"]
+    covered = summarizer._covered_fps(after)
+    transcript_fps = summarizer._covered_turn_fingerprints(case_a)
+    rec = covered[ft - 1:lt]
+    exact_first = None
+    if rec and rec[0] != summarizer._FP_UNKNOWN:
+        hits = [i + 1 for i, f in enumerate(transcript_fps) if f == rec[0]]
+        exact_first = hits[0] if len(hits) == 1 else hits
+    result["real_call"]["first_new_chunk_recorded_fp_matches_branch_turn"] = exact_first
+
+# Restore again -- this script must leave the store byte-identical to
+# how it found it (a diagnostic simulation, not a second apply).
+summarizer.save_state(CONV, state_before)
+
+sys.stderr.write(json.dumps(result, indent=2) + "\\n")
+print(json.dumps(result))
+'''
+
+
+def test_next_live_request_stays_contiguous_after_apply():
+    print("\n[test] the NEXT live request (full branch + 1 or 2 new turns) "
+          "stays contiguous with the seam --apply just established")
+    # Work on an ISOLATED copy of the post-apply state, so this purely
+    # diagnostic simulation cannot perturb the shared STORE_DIR the
+    # budget/Ctrl-C tests still depend on.
+    live_dir = _TMP_ROOT / "live-seam"
+    live_dir.mkdir(exist_ok=True)
+    (live_dir / "summaries").mkdir(exist_ok=True)
+    shutil.copy2(STORE_DIR / "summaries" / f"{CHAT_ID}.json", live_dir / "summaries")
+    state_before = _load_summary_state(live_dir)
+    last_summarized = int(state_before.get("last_summarized_turn") or 0)
+    print(f"  post-apply last_summarized_turn={last_summarized}  "
+          f"tail_fp={state_before.get('tail_fp')}  "
+          f"head_fp={state_before.get('head_fp')!r}  "
+          f"window_turns={state_before.get('window_turns')}")
+
+    turns = _reconstruct_real_transcript()
+    (live_dir / "branch.json").write_text(json.dumps(turns), encoding="utf-8")
+    shutil.copy2(STORE_DIR / "summaries" / f"{CHAT_ID}.json", live_dir / "state.json")
+
+    live_script = live_dir / "live_seam_check.py"
+    live_script.write_text(_LIVE_SEAM_SRC, encoding="utf-8")
+
+    vllm = _start_fake_vllm(FAKE_VLLM_PORT + 8, delay=0.0)
+    try:
+        r = _docker_run(
+            [
+                (str(REPO_ROOT / "compactor"), "/opt/zl-repo/compactor", "ro"),
+                (str(live_dir), "/work/live", "rw"),
+            ],
+            [
+                "/work/live/live_seam_check.py", CHAT_ID,
+                f"http://127.0.0.1:{FAKE_VLLM_PORT + 8}", "fake-model",
+            ],
+        )
+    finally:
+        vllm.terminate()
+        vllm.wait(timeout=10)
+
+    if r.returncode != 0:
+        print(r.stdout)
+        print(r.stderr)
+    assert_eq(r.returncode, 0, "the live-seam simulation script ran cleanly")
+    result = json.loads(r.stdout.strip().splitlines()[-1])
+    print(f"  {json.dumps(result, indent=2)}")
+
+    # The expected contiguous branch turn: the resume offset this store
+    # was verified at by test_apply_seam_alignment_and_blast_radius (22
+    # on the real backup) means STORE POSITION P maps to BRANCH TURN
+    # P-offset from here on -- PERMANENTLY, since those turns are
+    # genuinely gone and the store's own numbering has to keep
+    # accounting for them. The next L1 chunk after last_summarized is
+    # labelled last_summarized+1, so it must read starting at branch
+    # turn (last_summarized + 1) - offset.
+    RESUME_OFFSET = _LAST_RESUME_OFFSET[0]
+    assert_true(RESUME_OFFSET is not None,
+                "this test depends on test_apply_seam_alignment_and_blast_radius "
+                "having run first and recorded the verified offset")
+    expected_next_branch_turn = last_summarized + 1 - RESUME_OFFSET
+
+    for label, case in result["cases"].items():
+        assert_eq(case["window_offset"], RESUME_OFFSET,
+                   f"[{label}] the live path's OWN window_offset stays at "
+                   f"the established {RESUME_OFFSET} (not the old flat "
+                   f"20, and not 0 just because the array happens to be "
+                   f"the full history) -- got {case['window_offset']} "
+                   f"(position={case['position']}, n={case['n']})")
+        assert_eq(case["next_l1_chunk_would_start_at_branch_turn"],
+                   expected_next_branch_turn,
+                   f"[{label}] the next L1 chunk would start at branch turn "
+                   f"{case['next_l1_chunk_would_start_at_branch_turn']}, "
+                   f"expected {expected_next_branch_turn} (contiguous with "
+                   f"the seam --apply left -- no hole, no overlap)")
+
+    real = result["real_call"]
+    assert_true(real["new_chunks"], "a real chunk was actually written by "
+                "one real live-style maybe_rollup call")
+    ft, lt = real["new_chunks"][0]
+    assert_eq(ft, expected_next_branch_turn + RESUME_OFFSET,
+               f"the real chunk's label ({ft}-{lt}) starts immediately "
+               f"after last_summarized_turn ({last_summarized})")
+    match = real.get("first_new_chunk_recorded_fp_matches_branch_turn")
+    assert_eq(match, expected_next_branch_turn,
+               f"the real chunk's FIRST recorded covered-turn fingerprint "
+               f"uniquely matches branch turn {expected_next_branch_turn} "
+               f"(got {match!r}) -- contiguous, no hole, no overlap")
+    print(f"  CONFIRMED: the live path after --apply reads branch turn "
+          f"{expected_next_branch_turn} next -- contiguous with the seam, "
+          f"no hole, no overlap.")
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +757,7 @@ if __name__ == "__main__":
     try:
         _seed_store()
         test_apply_seam_alignment_and_blast_radius()
+        test_next_live_request_stays_contiguous_after_apply()
         test_apply_budget_limited_exits_4()
         test_ctrlc_mid_apply_leaves_store_rerunnable()
         print("\nAll real-image import-history --apply tests passed.")

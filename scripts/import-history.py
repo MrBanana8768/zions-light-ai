@@ -573,7 +573,20 @@ def estimate_due(
     (`_needs_l1_rollup` / `_needs_l2_rollup` / `_needs_l3_rollup`). Not
     exact: it assumes one real vLLM call per unit, and an oversized chunk
     can cost more via map-reduce (see `_summarize_pieces`). Good enough to
-    size a dry run; `--apply` runs the real drain, which is exact."""
+    size a dry run; `--apply` runs the real drain, which is exact.
+
+    `current_turns` must be the EFFECTIVE position --apply will actually
+    resume against (`max(recorded_position(state), the reconstructed
+    branch's own turn count)` -- see the caller), NOT the raw
+    reconstructed branch length on its own. The two differ exactly when
+    the store's `turns_seen` already exceeds the branch (the ordinary
+    "real backlog" shape a piecewise-offset conversation has -- see B1);
+    passing the raw branch length there under-counts how many L1 chunks
+    are actually due by however many turns the offset accounts for, since
+    the count of due units depends only on how far the store's own
+    position has to advance, never on which offset maps a label to
+    branch text (v3.1.9.6 architect follow-up: this used to under-report,
+    e.g. 57 chunks on the real backup instead of the true 58)."""
     last = int(state.get("last_summarized_turn") or 0)
     l1_count = len(state.get("l1") or [])
     l2_count = len(state.get("l2") or [])
@@ -1085,8 +1098,16 @@ def main(argv=None) -> int:
         state, turns, summarizer, summarizer.L1_CHUNK_SIZE
     )
 
+    # The dry run's own due-estimate must be computed on the SAME
+    # effective position --apply resumes against (B1 architect
+    # follow-up), not the raw reconstructed branch length: those two
+    # differ whenever the store's turns_seen already exceeds the branch
+    # (the ordinary "real backlog" shape -- see _apply_resume_offset's
+    # docstring), and the raw length under-counts how many L1 chunks are
+    # actually due by however many turns the gap accounts for.
+    effective_position = max(recorded_position, current_turns)
     l1_due, l2_due, l3_due = estimate_due(
-        state, current_turns,
+        state, effective_position,
         summarizer.L1_CHUNK_SIZE, summarizer.L2_CHUNK_SIZE, summarizer.L3_CHUNK_SIZE,
     )
     est_calls = l1_due + l2_due + l3_due
@@ -1204,11 +1225,12 @@ def main(argv=None) -> int:
     # yet has recorded_position 0, which is stale/uninformative for a
     # transcript that is otherwise fully new -- there _observed_position
     # converges on the window's OWN length instead (I2/I3's "the larger
-    # of two lower bounds"). Taking the max of both matches whichever
-    # regime this run is actually in, so `keep = effective_position -
-    # resume_offset` is the window length that makes the frozen module's
-    # own `window_offset` come out to exactly `resume_offset` either way.
-    effective_position = max(recorded_position, current_turns)
+    # of two lower bounds"). Taking the max of both (computed once,
+    # above, and reused here for the dry-run due-estimate too) matches
+    # whichever regime this run is actually in, so `keep =
+    # effective_position - resume_offset` is the window length that
+    # makes the frozen module's own `window_offset` come out to exactly
+    # `resume_offset` either way.
     window = _apply_resume_offset(turns, resume_offset, effective_position)
     if window is None:
         return _fatal(

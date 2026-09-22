@@ -1627,6 +1627,61 @@ def test_ih4_l1_due_off_by_one_at_the_chunk_boundary():
 
 
 # ---------------------------------------------------------------------------
+# 19. Architect follow-up: the dry-run due-estimate must be offset-aware
+#     (computed on the same EFFECTIVE position --apply resumes against,
+#     not the raw reconstructed branch length) -- otherwise the operator
+#     decides whether to --apply from an undercount.
+# ---------------------------------------------------------------------------
+
+def test_dry_run_due_estimate_uses_effective_position_not_raw_branch_length():
+    print("\n[test] dry-run due estimate is offset-aware: turns_seen "
+          "ahead of the branch length still counts the real backlog")
+    _wipe_storage()
+    conv_id = "estimate-offset-conv"
+    # A 24-turn branch, but turns_seen (the store's own live position) is
+    # already 20 turns AHEAD of it -- the ordinary "real backlog" shape
+    # (the real 2026-09-22 backup: turns_seen 3883 vs a 3863-turn
+    # branch). Nothing has been summarized yet (last_summarized_turn=0),
+    # so this exercises _resolve_resume_offset's trivial "nothing
+    # summarized yet" path (offset 0) while still checking that the DUE
+    # COUNT reflects turns_seen, not just the branch's own length.
+    branch, current_id = _linear_history(24, prefix="est")
+    # _linear_history's own content shape is "{role} turn {i}" (the
+    # prefix only names the message id, not the content) -- match it
+    # exactly so the tail_fp anchor below is actually found in the
+    # reconstruction, rather than accidentally testing the "wrong
+    # conversation" refusal instead of the due-estimate fix.
+    branch_turns = [
+        {"role": "user" if i % 2 == 0 else "assistant",
+         "content": f"{'user' if i % 2 == 0 else 'assistant'} turn {i}"}
+        for i in range(24)
+    ]
+    tail_fp = summarizer._turn_fingerprints(branch_turns)[-4:]
+    summarizer.save_state(conv_id, {
+        "l1": [], "l2": [], "l3": None,
+        "last_summarized_turn": 0, "turns_seen": 44,
+        "tail_fp": tail_fp, "head_fp": "", "window_turns": 0,
+    })
+    db = _new_db_path()
+    _build_webui_db(db, {conv_id: _history_chat(branch, current_id)})
+
+    rc, out = run_script([
+        "--webui-db", str(db), "--chat-id", conv_id, "--store", _TMP_ROOT, "--json",
+    ])
+    assert_eq(rc, 3, f"dry run still finds work due (out={out!r})")
+    payload = json.loads(out)
+    assert_eq(payload["turns_found"], 24, "the branch reconstruction itself is unaffected")
+    assert_eq(payload["turns_seen_before"], 44, "turns_seen really is ahead of the branch")
+    assert_eq(payload["l1_chunks_due_estimate"], 2,
+               f"44 effective new turns (turns_seen=44, last_summarized_turn=0) "
+               f"is 2 L1 chunks due, not 1 -- the raw branch length (24) alone "
+               f"would under-count this by a whole chunk (got "
+               f"{payload['l1_chunks_due_estimate']})")
+    assert_eq(payload["estimated_real_vllm_calls"], 2,
+               "the estimated call count matches the corrected due count")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1693,6 +1748,8 @@ if __name__ == "__main__":
 
         test_ih3_no_anchor_length_fallback_refusal_fires()
         test_ih4_l1_due_off_by_one_at_the_chunk_boundary()
+
+        test_dry_run_due_estimate_uses_effective_position_not_raw_branch_length()
 
         print("\nAll import-history.py script tests passed.")
     finally:
