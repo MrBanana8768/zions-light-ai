@@ -1469,6 +1469,140 @@ fork-in-history and interrupted-and-resumed-apply cases.
 
 ---
 
+## Getting a real shell into a pod (installing sshd, v3.1.9.6)
+
+**Why the image has no sshd.** `Dockerfile:63-80` never installs
+openssh-server, and it never has — `entrypoint.sh` never mentions ssh, and
+`supervisord.conf` has no `[sshd]` program and, more to the point, no
+`[include]` section at all: a `.conf` file dropped straight into
+`/etc/supervisor/conf.d/` on a running pod is silently ignored by the
+supervisord process already running there. Keeping openssh out of the
+image is deliberate — v3.1.9.6 is a documentation-and-scripts release, and
+adding a daemon to the image would mean rebuilding it, which is exactly
+what this whole release avoids (see the release's own note at the top of
+CHANGELOG.md). `scripts/setup-sshd.py` is the operator's way to get a real
+shell anyway: it installs and hardens OpenSSH server LIVE, inside the
+running container's own writable overlay, never touching the image.
+
+**Re-run this after EVERY pod restart.** The container filesystem resets
+on every restart — everything this script writes to `/etc/ssh` (and, with
+`--supervise`, `/etc/supervisor/conf.d/`) lives on the overlay, not on
+`/data`. It is idempotent and safe to run again on a pod that already has
+sshd running; a re-run with nothing to do exits 3 and changes nothing.
+
+**Is the script on the pod?**
+```bash
+ls -la /data/scripts/setup-sshd.py
+```
+If not, copy `scripts/setup-sshd.py` from this repo to `/data/scripts/` on
+the pod (Web Terminal upload, or `scp`), so it survives on the volume even
+though it has to be RE-RUN after each restart.
+
+**Dry run first.** Runs a real `apt-get update` (package lists only,
+nothing installed — Dockerfile prunes them, so this is required every
+time) and reports the installed/candidate `openssh-server` version, which
+key source it would use, whether the drop-in or the direct-edit case
+applies on THIS pod's shipped `sshd_config`, and whether it would start or
+restart sshd. Nothing is written, installed, or started:
+```bash
+/opt/compactor-venv/bin/python /data/scripts/setup-sshd.py
+```
+
+**Run it for real.** RunPod injects the operator's own public key as the
+`PUBLIC_KEY` environment variable, which is the default key source (in
+order: `--authorized-key-file`, `--authorized-key`, `$PUBLIC_KEY`, then an
+existing non-empty `/root/.ssh/authorized_keys`):
+```bash
+/opt/compactor-venv/bin/python /data/scripts/setup-sshd.py --apply
+```
+This installs `openssh-server` (or `--only-upgrade`s it to the apt
+candidate if already present — **never** `apt-get upgrade`/`dist-upgrade`,
+which would touch unrelated packages under a live vLLM process), adds the
+key to `authorized_keys` (append-only — an existing file is backed up
+first and never clobbered), hardens the config, ensures host keys, and
+starts sshd as a plain background daemon. It verifies the result for real
+with `sshd -t` then `sshd -T` — never just by reading back the file it
+wrote — and refuses, rolling back, if the effective config would allow
+password login. At minimum it sets: `PasswordAuthentication no`,
+`PermitEmptyPasswords no`, `KbdInteractiveAuthentication no`,
+`ChallengeResponseAuthentication no`, `PubkeyAuthentication yes`,
+`PermitRootLogin prohibit-password`.
+
+**Drop-in vs. direct edit.** The script checks THIS pod's real
+`sshd_config` fresh on every run rather than assuming: if it has an
+`Include /etc/ssh/sshd_config.d/*.conf` line and that line appears before
+any directive the script manages that is already active (sshd is
+first-match-wins), it writes `/etc/ssh/sshd_config.d/00-zions.conf` as a
+drop-in; otherwise it edits `sshd_config` directly, backing it up first.
+**Verified against the real `angreg/zions-light-ai` image**: the shipped
+config carries `Include /etc/ssh/sshd_config.d/*.conf` at line 12, and the
+only directive the script manages that ships active in that file is
+`KbdInteractiveAuthentication no` at line 71 — well after the Include — so
+this pod always takes the drop-in case. Confirmed for real with `sshd -T`
+after both a fresh `--apply` and a hostile override (an active
+`PasswordAuthentication yes` line inserted after the Include still lost
+to the drop-in, exactly as first-match-wins predicts).
+
+**RunPod template.** The template's port mapping must expose the TCP port
+this script configures (default 22, `--port N` to change) for it to be
+reachable from outside the pod. The Web Terminal itself keeps working
+either way — it does not go through sshd.
+
+**Host keys and `/data/ssh/`.** By default the script persists host keys
+to `/data/ssh/` (directory `0700`, key files `0600`) and copies them into
+`/etc/ssh/` on every run, so the pod's SSH host-key fingerprint stays the
+same across a restart instead of changing every time — which is what
+trains an operator to click through a host-key warning instead of reading
+it. **`/data/ssh/` now holds private host keys on the network volume — do
+not include it in any bundle, snapshot, or backup archive shared outside
+the pod.** It is NOT swept into `compactor/backup.py`'s own archive:
+`create_backup` copies exactly two things — the `webui.db` snapshot and
+`COMPACTOR_STORAGE_ROOT` (`/data/openwebui/compactor` by default) — never
+a walk of `/data` as a whole, so `/data/ssh/` sits outside its blast
+radius entirely (confirmed by reading `backup.py`, not assumed). Opt out
+of persistence with `--no-persist-host-keys`, at the cost of the
+fingerprint changing on every restart.
+
+**`--supervise` (opt-in, OFF by default).** Instead of a plain background
+daemon, appends a `[program:sshd]` block to
+`/etc/supervisor/conf.d/supervisord.conf` and runs `supervisorctl reread`
+then `update` (backing the file up first; a failed `reread` restores the
+backup and refuses). **Verified against a throwaway container running
+this image's real supervisord** (no GPU — `vllm` alone goes FATAL, as
+expected, since it needs one): adding the one new `[program:sshd]` section
+and running `reread` + `update` started only that new program.
+`compactor`, `openwebui` and the `processes` event listener kept their
+exact same pids and continuously-growing uptimes across the whole
+sequence — `supervisorctl update` never touched them. A second, idempotent
+`--apply --supervise` left `sshd`'s own pid unchanged too; changing
+`--port` while already supervised correctly bumped `sshd` to a new pid via
+a scoped `supervisorctl restart sshd`, with the other programs again
+untouched throughout.
+
+**Machine-readable output**, for scripting a fleet of pods: add `--json`.
+See the script's own module docstring for the full exit-code contract (0
+success, 1 refusal/failure, 3 nothing-to-do — including a repeat `--apply`
+right after the first) and `compactor/test_setup_sshd_script.py` for
+coverage: a dry run that writes nothing, a clean install, idempotency,
+append-not-clobber on an existing `authorized_keys`, every refusal path
+(not root, no usable key, a malformed key, a config that would allow
+password auth, `sshd -t` failing), that `apt-get upgrade`/`dist-upgrade`
+is never invoked, and that no private key material ever reaches stdout,
+stderr, or `--json`.
+
+**Undo.** Stop sshd (`supervisorctl stop sshd` if `--supervise` was used,
+otherwise find its pid via `/run/sshd.pid` and send it `SIGTERM`), remove
+`/etc/ssh/sshd_config.d/00-zions.conf` (or restore the
+`sshd_config.bak-<stamp>` this script made if it used the direct-edit
+case), and remove the appended `[program:sshd]` block from
+`supervisord.conf` (or restore ITS `.bak-<stamp>`) if `--supervise` was
+used — then `supervisorctl reread && supervisorctl update`. None of this
+survives a pod restart anyway, since it all lives on the container
+overlay; the simplest "undo" on a live pod is usually just not re-running
+this script after the next restart.
+
+---
+
 ## Rolling back a bad release
 
 Each release tag is pushed once and not re-pushed by this project (see

@@ -9,8 +9,8 @@ on Docker Hub.
 
 ---
 
-## [3.1.9.6] — closing stale backfill records, and catching a summary
-hierarchy up from webui.db
+## [3.1.9.6] — closing stale backfill records, catching a summary
+hierarchy up from webui.db, and installing sshd into a running pod
 
 **Scripts and docs only, and NOT a new image.** Every file the image copies
 (`compactor/*.py` apart from tests, `stt/`, `tts/`, `entrypoint.sh`,
@@ -24,8 +24,8 @@ not rebuilt: a rebuild re-resolves `apt-get upgrade`, unpinned pip
 dependencies, the Piper voice URL and the CUDA base tag, and produces a
 different, unvalidated image.
 
-**Why this exists.** Two independent operator gaps, both closed with a
-script beside `compactor/`'s own code rather than a change to it:
+**Why this exists.** Three independent operator gaps, each closed with a
+script under `scripts/` rather than a change to what the image ships:
 
 1. v3.1.9.4's own fix to `backfill.needs_backfill()` — reading a
    conversation's `facts/<conv>.backfill.json` RECORD before deciding
@@ -54,6 +54,13 @@ script beside `compactor/`'s own code rather than a change to it:
    for this conversation holds only 70 exchanges — nowhere near enough to
    close a gap this size. The full transcript exists only in OpenWebUI's
    own `webui.db`.
+3. The image has never shipped an SSH server (`Dockerfile:63-80`; never
+   has), and `supervisord.conf` has no `[include]` section, so a `.conf`
+   file dropped into `/etc/supervisor/conf.d/` on a running pod is
+   silently ignored. Nothing before this release gave an operator a real
+   shell into a live pod other than the RunPod Web Terminal — enough for
+   the procedures above, but not for anything that needs a real
+   interactive shell, port forwarding, or `scp`.
 
 ### Added
 - **`scripts/backfill-records.py`.** Reads every `facts/*.backfill.json`
@@ -116,6 +123,45 @@ script beside `compactor/`'s own code rather than a change to it:
   walk against a forked (edited-message) history, multimodal flattening,
   the dry-run/apply/idempotent/budget-overshoot contracts, an interrupted
   and resumed `--apply`, and every refusal path.
+- **`scripts/setup-sshd.py`.** Installs and hardens OpenSSH server LIVE
+  inside a running container, without changing the image — necessary
+  because the container filesystem resets on every pod restart, so this
+  has to be re-run after each one. Dry run (the default) runs a real
+  `apt-get update` (package lists only, nothing installed) and reports
+  the installed/candidate `openssh-server` version, key source, and
+  whether the drop-in or direct-edit case applies to THIS pod's real
+  `sshd_config`. `--apply` installs it (or `--only-upgrade`s it to the
+  apt candidate if already present — never `apt-get upgrade`/
+  `dist-upgrade`, which would touch unrelated packages under a live vLLM
+  process), resolves one usable PUBLIC key (`--authorized-key-file` >
+  `--authorized-key` > the RunPod-injected `$PUBLIC_KEY` > an existing
+  `authorized_keys`; every candidate validated with `ssh-keygen -l -f`,
+  appended never clobbered, backed up first), writes
+  `PasswordAuthentication no`, `PermitEmptyPasswords no`,
+  `KbdInteractiveAuthentication no`, `ChallengeResponseAuthentication no`,
+  `PubkeyAuthentication yes`, `PermitRootLogin prohibit-password` to a
+  drop-in (or, if the pod's `sshd_config` does not support one —
+  decided fresh every run — edits it directly with a backup), ensures
+  host keys (`ssh-keygen -A`) and by default persists them to
+  `/data/ssh/` so the pod's fingerprint survives a restart
+  (`--no-persist-host-keys` opts out), then verifies the result for real
+  with `sshd -t` then `sshd -T` — never just by reading back the file it
+  wrote — refusing and rolling back if the effective config would allow
+  password login. Starts sshd as a plain background daemon by default;
+  `--supervise` (opt-in, OFF by default) instead adds it as a
+  supervisord program, verified against a throwaway container running
+  this image's real supervisord to start only the new program and leave
+  every other one's pid and uptime untouched. Refuses outright if not
+  root, if this does not look like the zions container (`--force`
+  overrides only that check), or if no usable key exists anywhere. Never
+  touches any other supervisord program, and finds sshd by its own
+  pidfile — never a blanket `pkill` — to restart it. See its own module
+  docstring for the full exit-code contract (0 success, 1
+  refusal/failure, 3 nothing-to-do) and `compactor/test_setup_sshd_script.py`
+  for coverage: a dry run that writes nothing, a clean install,
+  idempotency, append-not-clobber, every refusal path, that `apt-get
+  upgrade`/`dist-upgrade` is never invoked, and that no private key
+  material ever reaches stdout, stderr, or `--json`.
 
 ### Documentation
 - **OPERATIONS.md** gains "Closing stale backfill records before upgrading
@@ -136,6 +182,18 @@ script beside `compactor/`'s own code rather than a change to it:
   every conversation whose summary hierarchy has fallen behind: a capped
   client stops resending the turns behind the cap, which is what makes
   them unreachable by any rollup path — permanently, not just later.
+- **OPERATIONS.md** gains "Getting a real shell into a pod (installing
+  sshd, v3.1.9.6)": why the image has no sshd, that it must be re-run
+  after every pod restart, the exact Web Terminal commands, which of the
+  drop-in/direct-edit cases this pod's real shipped `sshd_config` was
+  found to be in (drop-in — `Include` at line 12, before the only
+  directive this script manages that ships active,
+  `KbdInteractiveAuthentication no` at line 71), the RunPod template port
+  change, the `/data/ssh/` private-host-key note (and that
+  `compactor/backup.py` does not sweep it up), and how to undo it.
+- **RUNPOD_DEPLOY.md** gets a pointer to that section right after "Access
+  Your Deployment", and a row in "Upgrading within v3.1.9.x" naming
+  `scripts/setup-sshd.py`. Neither implies the image changed.
 
 ## [3.1.9.5] — the deploy docs match what ships
 

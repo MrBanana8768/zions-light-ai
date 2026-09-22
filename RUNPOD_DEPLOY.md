@@ -769,6 +769,18 @@ Admin endpoints (`/admin/*` — facts, personas, export/import, dedup) are
 proxy. Use them from the RunPod Web Terminal (`curl localhost:8080/...`).
 See [USER_GUIDE.md](USER_GUIDE.md#power-user-admin-endpoints).
 
+**Need a real shell instead of the Web Terminal?** The image ships no
+sshd (never has — see OPERATIONS.md's "Why the image has no sshd"), so
+v3.1.9.6 adds `scripts/setup-sshd.py`, an operator tool that installs and
+hardens OpenSSH LIVE inside the running container. It does not change the
+image; run it from the Web Terminal and re-run it after every pod
+restart (the container filesystem resets, so nothing it did survives one
+on its own). If the port it uses (default 22, `--port N` to change) needs
+to be reachable, add that TCP port to this pod's template. Full
+walkthrough, the drop-in-vs-direct-edit decision as verified against this
+exact image, and the `/data/ssh/` private-host-key note: OPERATIONS.md
+"Getting a real shell into a pod (installing sshd, v3.1.9.6)".
+
 ## Environment Variables
 
 Override these in your Runpod template if needed:
@@ -1035,7 +1047,7 @@ details in the CHANGELOG entry of the same number):
 | v3.1.9.3 | Reuse never costs her previous exchange; images are priced correctly (opencv, image ~152 MB larger). |
 | v3.1.9.4 | Replies no longer wait ~30 s on fact selection; `/forget` stays forgotten; cut summaries are handled. |
 | v3.1.9.5 | Documentation only — the SAME image as v3.1.9.4 (same digest), under a new tag. |
-| v3.1.9.6 | Scripts and docs only — the SAME image as v3.1.9.5 (same digest), under a new tag. |
+| v3.1.9.6 | Scripts and docs only — the SAME image as v3.1.9.5 (same digest), under a new tag. Adds `scripts/setup-sshd.py`, an operator tool that installs and hardens a real sshd LIVE inside a running pod (the image itself still ships none) — see OPERATIONS.md. |
 
 No new REQUIRED settings in any of them.
 
