@@ -45,6 +45,7 @@ import os
 import shutil
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -303,7 +304,7 @@ def _resolve(path, effective, seen):
         # reproduced (see M8) instead of silently losing the second one.
         effective.setdefault(keyl, []).append(val)
 
-def _effective_config(this_addr=None):
+def _effective_config(this_addr=None, this_user=None):
     etc_ssh = os.environ.get("SETUP_SSHD_ETC_SSH_DIR", "/etc/ssh")
     cfg = os.path.join(etc_ssh, "sshd_config")
     effective = {}
@@ -314,6 +315,12 @@ def _effective_config(this_addr=None):
         effective["passwordauthentication"] = ["yes"]
     forced_addr = os.environ.get("FAKE_SSHD_FORCE_PASSWORD_AUTH_FOR_ADDR")
     if forced_addr and this_addr == forced_addr:
+        effective["passwordauthentication"] = ["yes"]
+    # A user-scoped-only override (no address involved at all) — lets a
+    # test prove the -C matrix really checks a NON-ROOT user too, not
+    # just root, for every address (N2/NM5).
+    forced_user = os.environ.get("FAKE_SSHD_FORCE_PASSWORD_AUTH_FOR_USER")
+    if forced_user and this_user == forced_user:
         effective["passwordauthentication"] = ["yes"]
     return effective
 
@@ -329,12 +336,15 @@ def main():
 
     if "-T" in args:
         this_addr = None
+        this_user = None
         if "-C" in args:
             cval = args[args.index("-C") + 1]
             for kv in cval.split(","):
                 if kv.startswith("addr="):
                     this_addr = kv.split("=", 1)[1]
-        eff = _effective_config(this_addr=this_addr)
+                elif kv.startswith("user="):
+                    this_user = kv.split("=", 1)[1]
+        eff = _effective_config(this_addr=this_addr, this_user=this_user)
         for k in sorted(eff):
             for v in eff[k]:
                 print(f"{k} {v}")
@@ -584,7 +594,8 @@ class _Fixture:
         for k in ("FAKE_APT_UPDATE_FAIL", "FAKE_APT_INSTALL_FAIL",
                   "FAKE_SSH_KEYGEN_FORCE_FAIL", "FAKE_SSHD_T_FAIL",
                   "FAKE_SSHD_FORCE_PASSWORD_AUTH", "FAKE_SUPERVISORCTL_REREAD_FAIL",
-                  "FAKE_SSHD_FORCE_PASSWORD_AUTH_FOR_ADDR", "FAKE_SSHD_SKIP_BIND"):
+                  "FAKE_SSHD_FORCE_PASSWORD_AUTH_FOR_ADDR", "FAKE_SSHD_SKIP_BIND",
+                  "FAKE_SSHD_FORCE_PASSWORD_AUTH_FOR_USER"):
             os.environ.pop(k, None)
 
         # Re-point the script's own module-level path constants — they
@@ -1618,6 +1629,440 @@ def test_dropin_path_uses_00_prefix_for_sort_order():
 
 
 # ---------------------------------------------------------------------------
+# N2 — Include closure resolution: nested/relative/globbed Include, and a
+# Match block pulled in through one is caught. Round-2 hostile review
+# finding: only sshd_config and sshd_config.d/*.conf were scanned before;
+# an arbitrary Include bypassed B2 entirely.
+# ---------------------------------------------------------------------------
+
+def test_include_closure_follows_nested_includes_and_finds_match():
+    print("\n[test] N2: a Match pulled in through a NESTED Include (not sshd_config.d itself) is caught")
+    with _Fixture() as fx:
+        site_dir = fx.etc_ssh / "site.d"
+        site_dir.mkdir(parents=True, exist_ok=True)
+        (fx.etc_ssh_d / "50-site.conf").write_text(f"Include {site_dir}/*\n", encoding="utf-8")
+        (site_dir / "private-nets").write_text(
+            "Match Address 172.16.0.0/12,10.0.0.0/8,100.64.0.0/10\n"
+            "    PasswordAuthentication yes\n    PermitRootLogin yes\n",
+            encoding="utf-8",
+        )
+        before = fx.snapshot()
+        rc, out = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+        after = fx.snapshot()
+        payload = json.loads(out)
+        assert_eq(rc, 1, "refuses with exit 1 — the N2 gap is closed")
+        assert_true(any("Match" in r for r in payload["refusals"]), "refusal names the Match block")
+        assert_eq(before, after, "nothing written — the refusal fires before any write")
+
+
+def test_include_relative_path_resolves_against_etc_ssh_dir():
+    print("\n[test] N2: a relative Include path resolves against ETC_SSH_DIR (sshd_config(5)), not the including file's own directory")
+    with _Fixture() as fx:
+        more_dir = fx.etc_ssh / "more.d"
+        more_dir.mkdir(parents=True, exist_ok=True)
+        (more_dir / "extra.conf").write_text(
+            "Match User nobody\n    PasswordAuthentication yes\n", encoding="utf-8"
+        )
+        # This Include is RELATIVE ("more.d/*.conf") and lives inside
+        # sshd_config.d/ — if it were (wrongly) resolved against that
+        # directory instead of ETC_SSH_DIR, it would never find more.d/.
+        (fx.etc_ssh_d / "50-rel.conf").write_text("Include more.d/*.conf\n", encoding="utf-8")
+        rc, out = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+        payload = json.loads(out)
+        assert_eq(rc, 1, "refuses — the relative Include was resolved against ETC_SSH_DIR and its Match found")
+        assert_true(any("Match" in r for r in payload["refusals"]), "refusal names the Match block")
+
+
+def test_include_escaping_etc_ssh_dir_refuses():
+    print("\n[test] N2: an Include resolving OUTSIDE ETC_SSH_DIR refuses outright, even with no Match")
+    with _Fixture() as fx:
+        outside = fx.root / "outside-etc-ssh"
+        outside.mkdir(parents=True, exist_ok=True)
+        (outside / "evil.conf").write_text("Banner none\n", encoding="utf-8")
+        (fx.etc_ssh_d / "50-escape.conf").write_text(f"Include {outside}/*.conf\n", encoding="utf-8")
+        before = fx.snapshot()
+        rc, out = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+        after = fx.snapshot()
+        payload = json.loads(out)
+        assert_eq(rc, 1, "refuses with exit 1")
+        assert_true(
+            any("outside" in r and str(fx.etc_ssh) in r for r in payload["refusals"]),
+            f"refusal names the Include escaping ETC_SSH_DIR (refusals={payload['refusals']})",
+        )
+        assert_eq(before, after, "nothing written")
+
+
+def test_resolve_config_closure_breaks_cycles():
+    print("\n[test] N2: a self-referencing Include cycle terminates instead of looping forever")
+    with _Fixture() as fx:
+        (fx.etc_ssh_d / "50-cycle.conf").write_text(f"Include {fx.etc_ssh_d}/*.conf\n", encoding="utf-8")
+        files, refusal = _script._resolve_config_closure(fx.sshd_config)
+        assert_true(refusal is None, "no refusal — a cycle is just deduped, not itself unsafe")
+        assert_true(fx.sshd_config in files, "the closure includes the main file")
+        seen = set()
+        for p in files:
+            real = p.resolve()
+            assert_true(real not in seen, f"{p} visited only once")
+            seen.add(real)
+
+
+def test_match_detection_is_case_insensitive_and_tolerates_indentation():
+    print("\n[test] SM1: Match detection is case-insensitive and tolerates leading whitespace, anywhere in the closure")
+    with _Fixture() as fx:
+        fx.sshd_config.write_text(
+            fx.sshd_config.read_text() + "\n    match Address *\n        PasswordAuthentication yes\n",
+            encoding="utf-8",
+        )
+        locations, refusal = _script._match_block_locations()
+        assert_true(refusal is None, "no Include-closure refusal")
+        assert_true(len(locations) >= 1, "an indented, lowercase 'match' line is still detected")
+
+
+def test_refuses_outright_on_conflicting_port_via_nested_include():
+    print("\n[test] N2/M8: a conflicting Port hidden behind a nested Include is still caught")
+    with _Fixture() as fx:
+        site_dir = fx.etc_ssh / "site.d"
+        site_dir.mkdir(parents=True, exist_ok=True)
+        (fx.etc_ssh_d / "50-site.conf").write_text(f"Include {site_dir}/*\n", encoding="utf-8")
+        (site_dir / "port-override").write_text("Port 22\n", encoding="utf-8")
+        rc, out = fx.run(["--apply", "--json", "--port", "2222", "--authorized-key", _ED25519_KEY_A])
+        payload = json.loads(out)
+        assert_eq(rc, 1, "refuses with exit 1")
+        assert_true(
+            any("Port" in r and "port-override" in r for r in payload["refusals"]),
+            f"refusal names the nested conflicting Port source (refusals={payload['refusals']})",
+        )
+
+
+# ---------------------------------------------------------------------------
+# N2 (part 2) — the -C address matrix: private ranges, CGNAT, link-local,
+# public v4/v6, and both root/non-root users are all really exercised, not
+# just loopback + one public address.
+# ---------------------------------------------------------------------------
+
+def test_refuses_when_cgnat_range_context_would_allow_password_auth():
+    print("\n[test] N2: refuses when a CGNAT-range (100.64.0.0/10) -C context would allow password auth")
+    with _Fixture() as fx:
+        os.environ["FAKE_SSHD_FORCE_PASSWORD_AUTH_FOR_ADDR"] = "100.64.1.2"
+        try:
+            rc, out = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+            payload = json.loads(out)
+            assert_eq(rc, 1, "refuses with exit 1")
+            assert_true(any("100.64.1.2" in r for r in payload["refusals"]), "refusal names the CGNAT context")
+        finally:
+            os.environ.pop("FAKE_SSHD_FORCE_PASSWORD_AUTH_FOR_ADDR", None)
+
+
+def test_refuses_when_link_local_context_would_allow_password_auth():
+    print("\n[test] N2: refuses when a link-local -C context would allow password auth")
+    with _Fixture() as fx:
+        os.environ["FAKE_SSHD_FORCE_PASSWORD_AUTH_FOR_ADDR"] = "169.254.1.1"
+        try:
+            rc, out = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+            payload = json.loads(out)
+            assert_eq(rc, 1, "refuses with exit 1")
+            assert_true(any("169.254.1.1" in r for r in payload["refusals"]), "refusal names the link-local context")
+        finally:
+            os.environ.pop("FAKE_SSHD_FORCE_PASSWORD_AUTH_FOR_ADDR", None)
+
+
+def test_refuses_when_public_v6_context_would_allow_password_auth():
+    print("\n[test] N2: refuses when a public IPv6 -C context would allow password auth (the matrix does not stop after the fixed v4 addresses)")
+    with _Fixture() as fx:
+        os.environ["FAKE_SSHD_FORCE_PASSWORD_AUTH_FOR_ADDR"] = "2001:db8::9"
+        try:
+            rc, out = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+            payload = json.loads(out)
+            assert_eq(rc, 1, "refuses with exit 1")
+            assert_true(any("2001:db8::9" in r for r in payload["refusals"]), "refusal names the public-v6 context")
+        finally:
+            os.environ.pop("FAKE_SSHD_FORCE_PASSWORD_AUTH_FOR_ADDR", None)
+
+
+def test_check_effective_rejects_permitrootlogin_yes():
+    print("\n[test] SM15: _check_effective refuses outright when PermitRootLogin=yes is among the effective values")
+    eff = {
+        "passwordauthentication": ["no"], "permitemptypasswords": ["no"],
+        "kbdinteractiveauthentication": ["no"], "pubkeyauthentication": ["yes"],
+        "permitrootlogin": ["yes"], "port": ["22"],
+    }
+    problem = _script._check_effective(eff, 22, "")
+    assert_true(problem is not None, "refuses")
+    assert_in("PermitRootLogin", problem, "refusal names PermitRootLogin")
+
+
+def test_check_effective_accepts_permitrootlogin_synonyms():
+    print("\n[test] _check_effective accepts BOTH PermitRootLogin synonyms sshd -T actually prints")
+    for value in ("prohibit-password", "without-password"):
+        eff = {
+            "passwordauthentication": ["no"], "permitemptypasswords": ["no"],
+            "kbdinteractiveauthentication": ["no"], "pubkeyauthentication": ["yes"],
+            "permitrootlogin": [value], "port": ["22"],
+        }
+        problem = _script._check_effective(eff, 22, "")
+        assert_true(problem is None, f"accepts PermitRootLogin={value}")
+
+
+def test_refuses_when_only_the_nonroot_user_context_would_allow_password_auth():
+    print("\n[test] NM5: the -C matrix refuses on a NON-ROOT-only exposure — proves the loop doesn't stop after checking root")
+    with _Fixture() as fx:
+        os.environ["FAKE_SSHD_FORCE_PASSWORD_AUTH_FOR_USER"] = "nobody"
+        try:
+            rc, out = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+            payload = json.loads(out)
+            assert_eq(rc, 1, "refuses with exit 1 even though every root context is fine")
+            assert_true(any("user=nobody" in r for r in payload["refusals"]),
+                        f"refusal names the non-root user context (refusals={payload['refusals']})")
+        finally:
+            os.environ.pop("FAKE_SSHD_FORCE_PASSWORD_AUTH_FOR_USER", None)
+
+
+def test_check_effective_rejects_an_extra_listening_port():
+    print("\n[test] SM16: _check_effective refuses when sshd would ALSO listen on a port other than the requested one")
+    eff = {
+        "passwordauthentication": ["no"], "permitemptypasswords": ["no"],
+        "kbdinteractiveauthentication": ["no"], "pubkeyauthentication": ["yes"],
+        "permitrootlogin": ["prohibit-password"], "port": ["22", "2222"],
+    }
+    problem = _script._check_effective(eff, 22, "")
+    assert_true(problem is not None, "refuses")
+    assert_in("port(s)", problem, "refusal explains multiple ports are effective")
+
+
+# ---------------------------------------------------------------------------
+# N3 — "listening" must mean OUR sshd: a foreign process, or another sshd
+# master with a different pidfile, must never be silently adopted.
+# ---------------------------------------------------------------------------
+
+def test_sshd_listening_on_port_requires_listen_state():
+    print("\n[test] SM7: _sshd_listening_on_port ignores a non-LISTEN row on the target port")
+    tmp = Path(tempfile.mkdtemp(prefix="setup-sshd-procnet-"))
+    fake_tcp = tmp / "tcp"
+    port_hex = f"{9999:04X}"
+    header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+    try:
+        fake_tcp.write_text(
+            header + f"   0: 0100007F:{port_hex} 00000000:0000 01 00000000:00000000 00:00000000 00000000     0        0 12345 1 0 20 0 0 0 0\n",
+            encoding="utf-8",
+        )
+        with patch.object(_script, "PROC_NET_TCP", fake_tcp):
+            assert_true(not _script._sshd_listening_on_port(9999), "an ESTABLISHED (01) row is never treated as LISTENING")
+
+        fake_tcp.write_text(
+            header + f"   0: 0100007F:{port_hex} 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0 20 0 0 0 0\n",
+            encoding="utf-8",
+        )
+        with patch.object(_script, "PROC_NET_TCP", fake_tcp):
+            assert_true(_script._sshd_listening_on_port(9999), "a LISTEN (0A) row on the same port is treated as listening")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_refuses_when_port_already_has_a_foreign_listener():
+    print("\n[test] N3: a stray, unrelated process already listening on the port refuses outright, before any write")
+    with _Fixture() as fx:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", int(_DEFAULT_TEST_PORT)))
+        s.listen(1)
+        try:
+            before = fx.snapshot()
+            rc, out = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+            after = fx.snapshot()
+            payload = json.loads(out)
+            assert_eq(rc, 1, "refuses with exit 1 — never silently adopts the foreign listener")
+            assert_true(
+                any("LISTEN" in r for r in payload["refusals"]),
+                f"refusal names the foreign listener (refusals={payload['refusals']})",
+            )
+            assert_eq(before, after, "nothing written — refused before any write (N3, step 0)")
+        finally:
+            s.close()
+
+
+def test_refuses_when_a_stray_sshd_with_different_pidfile_holds_the_port():
+    print("\n[test] N3: a stray sshd master using a DIFFERENT pidfile must never be adopted as 'already running'")
+    with _Fixture() as fx:
+        # The fake sshd binds whatever port its OWN config resolution
+        # currently sees — make that our test's fixed non-privileged
+        # port so the stray really occupies the exact port fx.run() will
+        # target (matching the P2 real-world repro, where the stray sshd
+        # sits on the same port this script is about to (re)configure).
+        fx.sshd_config.write_text(
+            fx.sshd_config.read_text() + f"\nPort {_DEFAULT_TEST_PORT}\n", encoding="utf-8"
+        )
+        stray_pidfile = fx.run_dir / "stray-sshd.pid"
+        stray = subprocess.Popen(
+            [str(fx.bin_dir / "sshd"), "-o", f"PidFile={stray_pidfile}"],
+            env=os.environ.copy(),
+        )
+        try:
+            deadline = time.time() + 5
+            while not stray_pidfile.is_file() and time.time() < deadline:
+                time.sleep(0.05)
+            assert_true(stray_pidfile.is_file(), "the stray fake sshd really wrote its own, different pidfile")
+            stray_pid = int(stray_pidfile.read_text().strip())
+            fx._started_pids.append(stray_pid)  # teardown reaps it too
+
+            before = fx.snapshot()
+            rc, out = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+            after = fx.snapshot()
+            payload = json.loads(out)
+            assert_eq(rc, 1, "refuses with exit 1 — never reports 'hardened' over a stray sshd")
+            assert_true(
+                any("sshd master" in r or "LISTEN" in r for r in payload["refusals"]),
+                f"refusal names the stray sshd master (refusals={payload['refusals']})",
+            )
+            assert_eq(before, after, "nothing written — refused at step 0")
+        finally:
+            stray.wait(timeout=5)
+
+
+def test_confirm_our_listener_rejects_when_owner_differs_from_pidfile():
+    print("\n[test] NM7: _confirm_our_listener refuses when SSHD_PIDFILE names a LIVE sshd pid that does NOT own THIS port's listener")
+    with _Fixture() as fx:
+        rc, out = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+        assert_eq(rc, 0, "setup apply succeeds; a real (fake) sshd is now running with a real pidfile")
+        other_port = int(_DEFAULT_TEST_PORT) + 1
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", other_port))
+        s.listen(1)
+        try:
+            ok, detail = _script._confirm_our_listener(other_port)
+            assert_true(not ok, f"refuses: our own live sshd pid is not the owner of THIS port's listener ({detail})")
+        finally:
+            s.close()
+
+
+def test_confirm_our_listener_rejects_an_unattributed_listener():
+    print("\n[test] N3: _confirm_our_listener refuses when a real listener exists but cannot be attributed to our own pidfile")
+    with _Fixture() as fx:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", int(_DEFAULT_TEST_PORT)))
+        s.listen(1)
+        try:
+            ok, detail = _script._confirm_our_listener(int(_DEFAULT_TEST_PORT))
+            assert_true(not ok, f"refuses: no pidfile means no listener can be confirmed as ours ({detail})")
+        finally:
+            s.close()
+
+
+# ---------------------------------------------------------------------------
+# N11/N15 — AuthorizedKeysFile must be the default, and a symlinked
+# .ssh/authorized_keys must never be written or chmodded through.
+# ---------------------------------------------------------------------------
+
+def test_refuses_when_authorizedkeysfile_is_not_the_default():
+    print("\n[test] N11: refuses outright when the effective AuthorizedKeysFile is not the default this script writes to")
+    with _Fixture() as fx:
+        fx.sshd_config.write_text(
+            fx.sshd_config.read_text() + "\nAuthorizedKeysFile /etc/ssh/authorized/%u\n",
+            encoding="utf-8",
+        )
+        before = fx.snapshot()
+        rc, out = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+        after = fx.snapshot()
+        payload = json.loads(out)
+        assert_eq(rc, 1, "refuses with exit 1")
+        assert_true(
+            any("AuthorizedKeysFile" in r for r in payload["refusals"]),
+            f"refusal names the non-default AuthorizedKeysFile (refusals={payload['refusals']})",
+        )
+        assert_true(not fx.root_home.joinpath(".ssh", "authorized_keys").exists(),
+                    "no key was ever written to a file sshd would not read")
+        assert_eq(before, after, "nothing written")
+
+
+def test_authorized_keys_file_default_matching():
+    print("\n[test] N11: _authorized_keys_file_is_default matches the real default forms sshd -T prints")
+    with _Fixture():
+        assert_true(_script._authorized_keys_file_is_default(".ssh/authorized_keys"), "relative default")
+        assert_true(_script._authorized_keys_file_is_default("%h/.ssh/authorized_keys"), "%h form")
+        assert_true(not _script._authorized_keys_file_is_default("/etc/ssh/authorized/%u"), "a different path is not the default")
+
+
+def test_refuses_when_authorized_keys_is_a_symlink():
+    print("\n[test] N11/N15: refuses outright when authorized_keys is a symlink — never appends or chmods through it (the /etc/hostname incident)")
+    with _Fixture() as fx:
+        target = fx.root / "victim-file.txt"
+        target.write_text("innocent bystander content\n", encoding="utf-8")
+        target.chmod(0o644)
+        fx.root_home.joinpath(".ssh").mkdir(parents=True, exist_ok=True)
+        symlink_path = fx.root_home / ".ssh" / "authorized_keys"
+        symlink_path.symlink_to(target)
+        before_target = target.read_bytes()
+        before_mode = stat.S_IMODE(target.stat().st_mode)
+
+        rc, out = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+        payload = json.loads(out)
+        assert_eq(rc, 1, "refuses with exit 1")
+        assert_true(any("symlink" in r.lower() for r in payload["refusals"]), "refusal names the symlink")
+        assert_eq(target.read_bytes(), before_target, "the symlink TARGET's content was never touched")
+        assert_eq(stat.S_IMODE(target.stat().st_mode), before_mode,
+                  "the symlink TARGET's mode was never touched (no chmod 600 through the link)")
+        assert_true(symlink_path.is_symlink(), "authorized_keys is still the untouched symlink")
+
+
+def test_refuses_when_root_ssh_dir_is_a_symlink():
+    print("\n[test] N11/N15: refuses outright when /root/.ssh itself is a symlink")
+    with _Fixture() as fx:
+        real_dir = fx.root / "elsewhere-ssh"
+        real_dir.mkdir(parents=True, exist_ok=True)
+        fx.root_home.mkdir(parents=True, exist_ok=True)
+        (fx.root_home / ".ssh").symlink_to(real_dir)
+
+        rc, out = fx.run(["--apply", "--json", "--authorized-key", _ED25519_KEY_A])
+        payload = json.loads(out)
+        assert_eq(rc, 1, "refuses with exit 1")
+        assert_true(any("symlink" in r.lower() for r in payload["refusals"]), "refusal names the symlink")
+
+
+def test_symlink_refusal_function_directly():
+    print("\n[test] NM8: _symlink_refusal itself (not just the redundant _append_keys guard) detects both symlink cases")
+    with _Fixture() as fx:
+        assert_true(_script._symlink_refusal() is None, "neither path exists yet -> no refusal")
+
+        fx.root_home.mkdir(parents=True, exist_ok=True)
+        real_dir = fx.root / "elsewhere-ssh-direct"
+        real_dir.mkdir(parents=True, exist_ok=True)
+        (fx.root_home / ".ssh").symlink_to(real_dir)
+        assert_true(_script._symlink_refusal() is not None, "a symlinked ROOT_SSH_DIR is detected directly")
+        (fx.root_home / ".ssh").unlink()
+
+        fx.root_home.joinpath(".ssh").mkdir(parents=True, exist_ok=True)
+        target = fx.root / "victim-file-direct.txt"
+        target.write_text("x", encoding="utf-8")
+        (fx.root_home / ".ssh" / "authorized_keys").symlink_to(target)
+        assert_true(_script._symlink_refusal() is not None, "a symlinked AUTHORIZED_KEYS is detected directly")
+
+
+def test_append_keys_open_is_o_nofollow_protected_independent_of_its_precheck():
+    print("\n[test] NM10: _append_keys's own os.open call refuses via O_NOFOLLOW even if its earlier is_symlink() pre-check is fooled (TOCTOU)")
+    with _Fixture() as fx:
+        fx.root_home.joinpath(".ssh").mkdir(parents=True, exist_ok=True)
+        target = fx.root / "toctou-target.txt"
+        target.write_text("original\n", encoding="utf-8")
+        symlink_path = fx.root_home / ".ssh" / "authorized_keys"
+        symlink_path.symlink_to(target)
+
+        # Simulate the exact TOCTOU race _append_keys's own docstring
+        # describes: its is_symlink() pre-checks are fooled (patched to
+        # report False for this one call), but the path on disk is
+        # STILL really a symlink when os.open() actually runs. Only
+        # O_NOFOLLOW on that real syscall can still catch it.
+        with patch.object(Path, "is_symlink", return_value=False):
+            raised = False
+            try:
+                _script._append_keys([(_ED25519_KEY_A, "SHA256:fake")])
+            except RuntimeError:
+                raised = True
+        assert_true(raised, "os.open's own O_NOFOLLOW refuses even when the is_symlink() pre-check was fooled")
+        assert_eq(target.read_text(encoding="utf-8"), "original\n", "the symlink TARGET was never written to")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1683,5 +2128,33 @@ if __name__ == "__main__":
     test_apply_uses_fallback_when_include_after_active_directive()
     test_comment_out_conflicts_reaches_inside_match_blocks()
     test_dropin_path_uses_00_prefix_for_sort_order()
+
+    test_include_closure_follows_nested_includes_and_finds_match()
+    test_include_relative_path_resolves_against_etc_ssh_dir()
+    test_include_escaping_etc_ssh_dir_refuses()
+    test_resolve_config_closure_breaks_cycles()
+    test_match_detection_is_case_insensitive_and_tolerates_indentation()
+    test_refuses_outright_on_conflicting_port_via_nested_include()
+
+    test_refuses_when_cgnat_range_context_would_allow_password_auth()
+    test_refuses_when_link_local_context_would_allow_password_auth()
+    test_refuses_when_public_v6_context_would_allow_password_auth()
+    test_refuses_when_only_the_nonroot_user_context_would_allow_password_auth()
+    test_check_effective_rejects_permitrootlogin_yes()
+    test_check_effective_accepts_permitrootlogin_synonyms()
+    test_check_effective_rejects_an_extra_listening_port()
+
+    test_sshd_listening_on_port_requires_listen_state()
+    test_refuses_when_port_already_has_a_foreign_listener()
+    test_refuses_when_a_stray_sshd_with_different_pidfile_holds_the_port()
+    test_confirm_our_listener_rejects_when_owner_differs_from_pidfile()
+    test_confirm_our_listener_rejects_an_unattributed_listener()
+
+    test_refuses_when_authorizedkeysfile_is_not_the_default()
+    test_authorized_keys_file_default_matching()
+    test_refuses_when_authorized_keys_is_a_symlink()
+    test_refuses_when_root_ssh_dir_is_a_symlink()
+    test_symlink_refusal_function_directly()
+    test_append_keys_open_is_o_nofollow_protected_independent_of_its_precheck()
 
     print("\nAll setup-sshd.py script tests passed.")

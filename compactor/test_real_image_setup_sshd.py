@@ -442,6 +442,181 @@ def test_supervise_handoff_failure_still_leaves_listening_sshd():
 
 
 # ---------------------------------------------------------------------------
+# 9. N2 — a Match pulled in by an arbitrary Include (not sshd_config.d
+#    itself) is caught, and a REAL root password login from this
+#    container's own (non-loopback) address — a RunPod-proxy stand-in,
+#    same convention the round-2 review used — still fails.
+# ---------------------------------------------------------------------------
+
+def test_include_match_bypass_refuses_and_private_address_login_fails():
+    print("\n[test] N2: a Match pulled in through an arbitrary Include is caught outright, and a real password login from a private-range address fails")
+    _docker_exec("mkdir -p /etc/ssh/site.d")
+    _docker_exec("printf 'Include /etc/ssh/site.d/*\\n' > /etc/ssh/sshd_config.d/50-site.conf")
+    _docker_exec(
+        "printf 'Match Address 172.16.0.0/12,10.0.0.0/8,100.64.0.0/10\\n"
+        "    PasswordAuthentication yes\\n    PermitRootLogin yes\\n' "
+        "> /etc/ssh/site.d/private-nets"
+    )
+
+    rc, payload, out = _apply(extra_args="--port 2223")
+    assert_eq(rc, 1, f"refuses with exit 1 (out={out[-500:]})")
+    refusals = payload.get("refusals") or []
+    assert_true(any("Match" in r for r in refusals),
+                f"refusal names the Match block pulled in via Include (refusals={refusals})")
+
+    # Independent proof of the exact B2/N2 exposure this closes: a bare
+    # `sshd -T` (no -C) looks safe, but `-C` for an address in the
+    # Match'd private range shows password auth WOULD have been enabled.
+    r = _docker_exec("/usr/sbin/sshd -T 2>/dev/null | grep -i '^passwordauthentication'")
+    assert_eq(r.stdout.strip(), "passwordauthentication no", "bare sshd -T (no -C) looks safe")
+    r2 = _docker_exec(
+        "/usr/sbin/sshd -T -C user=root,host=h,addr=172.20.5.6,laddr=0.0.0.0,lport=22 2>/dev/null "
+        "| grep -i '^passwordauthentication'"
+    )
+    assert_eq(r2.stdout.strip(), "passwordauthentication yes",
+              "a private-range -C context WOULD have had password auth enabled — the exact N2 exposure")
+
+    # And the REAL proof: a root password login attempt from this
+    # container's own (non-loopback) address — which really does fall in
+    # the Match'd 172.16.0.0/12 range docker assigns its bridge network —
+    # still fails, because nothing was ever written (the script refused
+    # before any write, so the UNMODIFIED shipped config, whatever it is,
+    # is what's actually protecting this).
+    own_addr_r = _docker_exec("hostname -I")
+    own_addrs = own_addr_r.stdout.split()
+    assert_true(len(own_addrs) > 0, "the container reports at least one address")
+    own_addr = own_addrs[0]
+
+    # Log in on whatever port sshd is REALLY listening on right now (an
+    # earlier test in this suite switches it to 2222) — connecting to a
+    # port nothing listens on would trivially "fail" without proving
+    # anything about the security config.
+    port_r = _docker_exec("/usr/sbin/sshd -T 2>/dev/null | grep -i '^port ' | awk '{print $2}' | head -1")
+    active_port = port_r.stdout.strip() or "22"
+
+    _docker_exec(f'echo "root:hunter2verifyN2-$(date +%s)" | chpasswd')
+    _docker_exec(
+        'cat > /tmp/askpassN2.sh <<AP\n#!/bin/sh\necho hunter2verifyN2-wrong-anyway\nAP\n'
+        "chmod +x /tmp/askpassN2.sh"
+    )
+    r3 = _docker_exec(
+        "export SSH_ASKPASS=/tmp/askpassN2.sh SSH_ASKPASS_REQUIRE=force DISPLAY=:0; "
+        'setsid -w ssh -v -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
+        '-o PreferredAuthentications=password -o PubkeyAuthentication=no '
+        f'-o NumberOfPasswordPrompts=1 -p {active_port} root@{own_addr} "echo SHOULD-NOT-PRINT" '
+        '>/tmp/pwloginN2.out 2>/tmp/pwloginN2.err; echo SSHEXIT=$?'
+    )
+    out3 = r3.stdout + r3.stderr
+    assert_true(
+        "SSHEXIT=0" not in out3,
+        f"a real root password login from this container's own address {own_addr} (private-range, matches the Match block) still fails",
+        out3,
+    )
+    r4 = _docker_exec("cat /tmp/pwloginN2.out")
+    assert_not_in("SHOULD-NOT-PRINT", r4.stdout, "the remote command never ran")
+
+    _docker_exec("rm -rf /etc/ssh/sshd_config.d/50-site.conf /etc/ssh/site.d")
+    print(f"  --- N2 real-container transcript (own_addr={own_addr}) ---")
+    print(f"  apply refusals: {refusals}")
+    print(f"  sshd -T (no -C):      passwordauthentication no")
+    print(f"  sshd -T -C (private): passwordauthentication yes")
+    print(f"  password login attempt from {own_addr}: {out3.strip()[-300:]}")
+    print("  --- end transcript ---")
+
+
+# ---------------------------------------------------------------------------
+# 10. N3 — "listening" must mean OUR sshd: a foreign process (P1) and a
+#     stray sshd master with a different pidfile (P2) must both be
+#     refused outright, never silently reported as "hardened".
+# ---------------------------------------------------------------------------
+
+def test_stray_listener_and_foreign_sshd_never_reported_as_hardened():
+    print("\n[test] N3: a stray listener (P1: foreign process, P2: another sshd master with a different pidfile) is refused, never adopted as 'hardened'")
+    probe_port = 2299
+
+    # --- P1: an unrelated process (plain python) already bound to the
+    # target port.
+    _docker_exec(
+        f"nohup python3 -c \""
+        f"import socket,time; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); "
+        f"s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('0.0.0.0', {probe_port})); "
+        f"s.listen(1); time.sleep(120)\" >/tmp/strayp1.log 2>&1 & echo $! > /tmp/strayp1.pid"
+    )
+    time.sleep(1)
+    ports_p1 = {p.split(":")[1] for p in _real_listening_ports()}
+    assert_true(_port_hex(probe_port) in ports_p1, f"P1: the foreign python listener is really bound (ports={ports_p1})")
+
+    rc1, payload1, out1 = _apply(extra_args=f"--port {probe_port}")
+    refusals1 = payload1.get("refusals") or []
+    assert_eq(rc1, 1, f"P1: refuses with exit 1 rather than adopt a foreign listener (out={out1[-500:]})")
+    assert_true(any("LISTEN" in r for r in refusals1),
+                f"P1: refusal names the foreign listener (refusals={refusals1})")
+
+    _docker_exec("kill $(cat /tmp/strayp1.pid) 2>/dev/null || true")
+    time.sleep(1)
+
+    # --- P2: a stray, password-enabled sshd master with a DIFFERENT
+    # pidfile, already bound to the same target port. The override lines
+    # go FIRST, before the copied file's own `Include
+    # sshd_config.d/*.conf` line — sshd is first-match-wins for globals,
+    # so putting them after the Include (which pulls in this script's
+    # OWN "PasswordAuthentication no" drop-in from an earlier test) would
+    # let the drop-in win instead and silently defeat this repro.
+    _docker_exec(
+        f"printf 'Port {probe_port}\\nPasswordAuthentication yes\\nPermitRootLogin yes\\n' "
+        f"> /tmp/insecure_config && cat /etc/ssh/sshd_config >> /tmp/insecure_config"
+    )
+    r_start = _docker_exec(f"/usr/sbin/sshd -f /tmp/insecure_config -o PidFile=/tmp/stray-sshd.pid")
+    time.sleep(1)
+    r_pf = _docker_exec("cat /tmp/stray-sshd.pid 2>/dev/null || echo NONE")
+    assert_true(r_pf.stdout.strip() != "NONE",
+                f"P2: the stray sshd master really started (stderr={r_start.stderr[:300]})")
+    ports_p2 = {p.split(":")[1] for p in _real_listening_ports()}
+    assert_true(_port_hex(probe_port) in ports_p2, f"P2: the stray sshd is really bound (ports={ports_p2})")
+
+    # Prove the stray really IS the password-enabled hazard this refusal
+    # exists for: a real root password login against IT succeeds. Fixed
+    # password, set once, then used by a fixed SSH_ASKPASS script.
+    stray_pw = "hunter2verifyN3-stray-probe"
+    _docker_exec(f'echo "root:{stray_pw}" | chpasswd')
+    _docker_exec(
+        f'printf "#!/bin/sh\\necho {stray_pw}\\n" > /tmp/askpassN3.sh; chmod +x /tmp/askpassN3.sh'
+    )
+    r_stray_login = _docker_exec(
+        "export SSH_ASKPASS=/tmp/askpassN3.sh SSH_ASKPASS_REQUIRE=force DISPLAY=:0; "
+        'setsid -w ssh -v -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
+        '-o PreferredAuthentications=password -o PubkeyAuthentication=no '
+        f'-o NumberOfPasswordPrompts=1 -p {probe_port} root@127.0.0.1 "echo STRAY-LOGIN-OK" '
+        '>/tmp/strayloginN3.out 2>/tmp/strayloginN3.err; echo SSHEXIT=$?'
+    )
+    stray_login_out = r_stray_login.stdout + r_stray_login.stderr
+    stray_login_worked = "SSHEXIT=0" in stray_login_out
+    assert_true(
+        stray_login_worked,
+        f"the stray sshd really IS password-vulnerable (proves the refusal below matters, not just a paperwork check)",
+        stray_login_out,
+    )
+
+    rc2, payload2, out2 = _apply(extra_args=f"--port {probe_port}")
+    refusals2 = payload2.get("refusals") or []
+    assert_eq(rc2, 1, f"P2: refuses with exit 1, never reports 'hardened' (out={out2[-500:]})")
+    assert_true(
+        any("sshd master" in r or "LISTEN" in r for r in refusals2),
+        f"P2: refusal names the stray sshd master (refusals={refusals2})",
+    )
+
+    _docker_exec("kill $(cat /tmp/stray-sshd.pid) 2>/dev/null || true")
+    _docker_exec("rm -f /tmp/insecure_config /tmp/stray-sshd.pid /tmp/strayp1.pid")
+
+    print("  --- N3 real-container transcript ---")
+    print(f"  P1 (foreign python listener on {probe_port}): apply refusals={refusals1}")
+    print(f"  P2 (stray sshd master on {probe_port}, different pidfile): apply refusals={refusals2}")
+    print(f"  P2 stray sshd really was password-vulnerable: real login {'SUCCEEDED' if stray_login_worked else 'did not succeed'} "
+          f"(this is exactly why silently adopting it would have been catastrophic)")
+    print("  --- end transcript ---")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -459,6 +634,8 @@ if __name__ == "__main__":
         test_preexisting_match_block_dropin_forces_refusal()
         test_missing_supervisor_conf_refuses_cleanly()
         test_supervise_handoff_failure_still_leaves_listening_sshd()
+        test_include_match_bypass_refuses_and_private_address_login_fails()
+        test_stray_listener_and_foreign_sshd_never_reported_as_hardened()
 
         print("\nAll real-image setup-sshd.py tests passed.")
     finally:

@@ -26,20 +26,32 @@ that already has sshd running.
 WHAT --apply DOES, IN ORDER
     0. Refuse outright, before writing anything, if the config already on
        disk is unsafe in a way this script cannot fix on its own: a
-       `Match` block anywhere in `sshd_config` or `sshd_config.d/*.conf`
-       (a `Match` can make password login live for some client contexts
-       while a plain `sshd -T` — no `-C` — reports it disabled: see
-       B2/hostile-pass finding), another drop-in that sorts before this
-       script's own `00-zions.conf` (first-match-wins order), or a
-       conflicting active `Port` directive anywhere else (OpenSSH
-       ACCUMULATES `Port` lines across files instead of first-match-wins
-       — see M8 below). Since nothing has been written yet, this refusal
-       needs no rollback.
+       `Match` block ANYWHERE in the real `Include` closure reachable
+       from `sshd_config` — not just `sshd_config` and
+       `sshd_config.d/*.conf` themselves; `Include` is followed
+       recursively, case-insensitively, glob-expanded, with relative
+       paths resolved against `/etc/ssh` the way sshd itself does, and
+       an `Include` resolving outside `/etc/ssh` is its own refusal (see
+       N2 — a `Match` can make password login live for some client
+       contexts while a plain `sshd -T` — no `-C` — reports it disabled:
+       see B2/N2); a stray listener already on the target port that
+       isn't the sshd this script itself manages, e.g. an unrelated
+       process or another sshd master running with a DIFFERENT pidfile
+       (see N3 — never silently adopted as "already running"); another
+       drop-in that sorts before this script's own `00-zions.conf`
+       (first-match-wins order); or a conflicting active `Port` directive
+       anywhere else (OpenSSH ACCUMULATES `Port` lines across files
+       instead of first-match-wins — see M8 below). Since nothing has
+       been written yet, this refusal needs no rollback.
     1. `apt-get update` (package lists are pruned from the image — Dockerfile
        runs `rm -rf /var/lib/apt/lists/*` — so this is required every time).
     2. Install `openssh-server` if missing, or `--only-upgrade` it to the
        apt candidate if already present. NEVER `apt-get upgrade` or
        `dist-upgrade` — see the module-level safety notes below.
+    2b. Once sshd exists, refuse if the effective `AuthorizedKeysFile`
+       (from `sshd -T`) is not the default `~root/.ssh/authorized_keys`
+       — writing a key to a file sshd was never told to read would be a
+       silent no-op (see N11).
     3. Resolve one or more usable Ed25519/RSA/ECDSA PUBLIC keys (never a
        private one) from, in order: `--authorized-key-file`,
        `--authorized-key`, the RunPod-injected `$PUBLIC_KEY`, or an
@@ -47,11 +59,16 @@ WHAT --apply DOES, IN ORDER
        if none is usable. A candidate must start with a known
        public-key-type token and be a single line containing no
        `PRIVATE KEY` — `ssh-keygen -l -f` alone is NOT trusted for this
-       (it returns 0 on a private key file too — see B3). `/root/.ssh` is
-       always forced to 0700 and `authorized_keys` to 0600 (plus
-       ownership) EVERY apply, even when there is no new key to add (H7).
-       Only FINGERPRINTS — never key text — ever appear in the report or
-       `--json` output's `keys_added`.
+       (it returns 0 on a private key file too — see B3). `/root/.ssh`
+       and `authorized_keys` are refused outright if either is a
+       SYMLINK (checked with `lstat`, plus `O_NOFOLLOW` on the actual
+       write as a second-layer guard — see N11/N15: a symlinked
+       `authorized_keys` once got a key appended straight into
+       `/etc/hostname`). Otherwise `/root/.ssh` is always forced to 0700
+       and `authorized_keys` to 0600 (plus ownership) EVERY apply, even
+       when there is no new key to add (H7). Only FINGERPRINTS — never
+       key text — ever appear in the report or `--json` output's
+       `keys_added`.
     4. Write the hardening directives — see "THE HARD SAFETY RULES" below
        — to a drop-in under `/etc/ssh/sshd_config.d/`, or fall back to
        editing `sshd_config` directly with a backup, WHICHEVER the real
@@ -62,9 +79,13 @@ WHAT --apply DOES, IN ORDER
        them to `/data/ssh/` so the pod keeps the same host identity across
        restarts — see "HOST KEYS" below.
     6. Validate the result for REAL: `sshd -t`, then `sshd -T` with NO
-       `-C` AND `sshd -T -C` for both a loopback and a non-local client
-       address (never just by reading back the file this script itself
-       wrote), and REFUSE — rolling back the config write and any
+       `-C` AND `sshd -T -C` across a full representative address matrix
+       — loopback, every RFC1918/CGNAT private range, link-local, a
+       public v4/v6 address, and this container's own address(es), each
+       for both `user=root` and a non-root user (see N2 — this is an
+       INDEPENDENT check from step 0's static Match-scan, not a
+       replacement for it; never just reading back the file this script
+       itself wrote), and REFUSE — rolling back the config write and any
        `authorized_keys` append made this run (see ROLLBACK below) — if
        the effective config would allow password login for ANY of those
        contexts, or would leave sshd listening on any port other than the
@@ -73,12 +94,16 @@ WHAT --apply DOES, IN ORDER
        restart — by pid, never a blanket pkill) `/usr/sbin/sshd` as a
        plain background daemon. `--supervise` (opt-in, OFF by default)
        instead adds it as a supervisord program — see that flag's own
-       section below for why it defaults off. Either way, "started" is
-       decided by what is REALLY listening on IPv4 at the configured
-       port — read from `/proc/net/tcp`, never inferred from sshd's own
-       exit status, which returns 0 even on a partial bind failure (see
-       H6). If it is not confirmed listening, that is a refusal (exit 1),
-       with the same rollback as step 6.
+       section below for why it defaults off. Either way, "started" means
+       more than just "something is really listening on IPv4 at the
+       configured port" (read from `/proc/net/tcp`, never inferred from
+       sshd's own exit status, which returns 0 even on a partial bind
+       failure — see H6): the listening socket's kernel inode is mapped
+       to the pid that actually holds it (via `/proc/<pid>/fd`), and that
+       pid must be the one recorded in this script's own pidfile (see
+       N3) — a foreigner holding the port, however it got there, is
+       never mistaken for "started". If it is not confirmed, that is a
+       refusal (exit 1), with the same rollback as step 6.
 
 ROLLBACK. A refusal discovered AFTER step 3/4 has already written
 something undoes exactly what this run wrote: the config write (drop-in
@@ -105,10 +130,11 @@ openssh-server is not installed yet, `sshd -t`/`sshd -T` cannot run (the
 binary does not exist), so the dry run says so honestly instead of
 pretending to have verified the resulting config — that verification is
 real and happens automatically during `--apply` (step 6 above), which
-refuses if it does not pass. The step-0 config-safety refusal (Match
-blocks, drop-in ordering, conflicting Port directives) is checked — and
-enforced — in a dry run too, same as the "not root" / "not this
-container" refusals always were.
+refuses if it does not pass. The step-0 config-safety refusal (a Match
+anywhere in the Include closure, an Include escaping /etc/ssh, a stray
+non-managed listener already on the port, drop-in ordering, conflicting
+Port directives) is checked — and enforced — in a dry run too, same as
+the "not root" / "not this container" refusals always were.
 
 THE HARD SAFETY RULES (see also inline comments at each site)
   - Never `apt-get upgrade`/`dist-upgrade` — only ever `apt-get install
@@ -137,15 +163,18 @@ THE HARD SAFETY RULES (see also inline comments at each site)
     `PermitEmptyPasswords no`, `KbdInteractiveAuthentication no`,
     `ChallengeResponseAuthentication no`, `PubkeyAuthentication yes`,
     `PermitRootLogin prohibit-password`. Before ever writing anything,
-    this script refuses outright if a `Match` block exists anywhere in
-    the shipped config (a `Match` can flip password auth on for some
-    client contexts while a plain `sshd -T` reports it off); after
-    writing, it verifies with `sshd -T` AND `sshd -T -C` for both a
-    loopback and a non-local address (see B2). `sshd -T` on this image's
-    own OpenSSH 9.6 build always PRINTS `permitrootlogin` back as
-    `without-password` regardless of which of the two synonymous
-    spellings was written — both are accepted when checking the real
-    outcome; nothing else is.
+    this script refuses outright if a `Match` block exists ANYWHERE in
+    the real Include closure reachable from sshd_config — not just
+    sshd_config and sshd_config.d/*.conf themselves (a `Match` can flip
+    password auth on for some client contexts while a plain `sshd -T`
+    reports it off; see B2/N2); after writing, it verifies with `sshd -T`
+    AND `sshd -T -C` across a full representative address matrix
+    (loopback, every RFC1918/CGNAT private range, link-local, public
+    v4/v6, and this container's own address(es), each for root and a
+    non-root user — see N2). `sshd -T` on this image's own OpenSSH 9.6
+    build always PRINTS `permitrootlogin` back as `without-password`
+    regardless of which of the two synonymous spellings was written —
+    both are accepted when checking the real outcome; nothing else is.
   - Never leave sshd listening on any port but the one requested. OpenSSH
     ACCUMULATES `Port` directives across the main file and every loaded
     drop-in instead of first-match-wins — writing `Port 2222` in this
@@ -209,13 +238,17 @@ one — see CHANGELOG.md and OPERATIONS.md):
         first, which is idempotent), or a DRY RUN found nothing to do.
     1   A refusal or error the operator needs to look at (see `refusals`
         in `--json` output): not root, does not look like this
-        container, a config-safety refusal (Match block / drop-in
-        ordering / conflicting Port — step 0 above), no usable public key
-        anywhere, a malformed or private key, `apt-get install` failed,
-        `sshd -t`/`sshd -T`(`-C`) failed or would allow password login or
-        the wrong port, `sshd` failed to (re)start, sshd not confirmed
-        LISTENING after a start/restart, or `--supervise`'s `reread`
-        failed or its conf file does not exist.
+        container, a config-safety refusal (a Match anywhere in the
+        Include closure / an Include escaping /etc/ssh / a stray
+        non-managed listener already on the port / drop-in ordering /
+        conflicting Port — step 0 above), a non-default
+        AuthorizedKeysFile or a symlinked `.ssh`/`authorized_keys` (N11),
+        no usable public key anywhere, a malformed or private key,
+        `apt-get install` failed, `sshd -t`/`sshd -T`(`-C`) failed or
+        would allow password login or the wrong port, `sshd` failed to
+        (re)start, sshd's listener not confirmed as the one THIS script
+        started after a start/restart, or `--supervise`'s `reread` failed
+        or its conf file does not exist.
     2   argparse's own usage errors — unknown flags, missing required
         values — the Python standard library's own convention.
     3   A DRY RUN found something `--apply` WOULD do (install/upgrade,
@@ -228,9 +261,11 @@ one — see CHANGELOG.md and OPERATIONS.md):
 """
 
 import argparse
+import glob
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -274,9 +309,15 @@ MARKER_MAIN = Path(os.environ.get("SETUP_SSHD_MARKER_MAIN", "/opt/compactor/main
 HOST_KEY_TYPES = ("rsa", "ecdsa", "ed25519")
 DEFAULT_LOG_DIR = os.environ.get("LOG_DIR", "/data/logs")
 
-# /proc/net/tcp is kernel-global truth, never something a test should
-# redirect to a fake tree — H6's listening check reads the real one.
+# /proc/net/tcp[6] and /proc itself are kernel-global truth, never
+# something a test should redirect to a fake tree — H6's listening check,
+# and N3's inode->pid ownership mapping, read the real ones. A test that
+# needs a real, attributable listener uses the real fake-sshd process
+# (which really forks, binds and sets its own /proc/<pid>/comm) rather
+# than faking these paths.
 PROC_NET_TCP = Path("/proc/net/tcp")
+PROC_NET_TCP6 = Path("/proc/net/tcp6")
+PROC_DIR = Path("/proc")
 
 CMD_TIMEOUT_S = 90
 
@@ -300,6 +341,12 @@ DIRECTIVE_KEYS = (
 INCLUDE_RE = re.compile(
     r"^[ \t]*Include[ \t]+\S*sshd_config\.d\S*\*\.conf[ \t]*$", re.I | re.M
 )
+
+# N2: the GENERAL form, used to walk the FULL Include closure sshd itself
+# would load (not just the one sshd_config.d/*.conf shape INCLUDE_RE
+# looks for) — case-insensitive keyword, capturing every argument on the
+# line so multiple space/quote-separated glob patterns are all followed.
+GENERIC_INCLUDE_RE = re.compile(r"^[ \t]*Include[ \t]+(.+?)[ \t]*$", re.I | re.M)
 
 MATCH_RE = re.compile(r"^[ \t]*Match\b", re.I | re.M)
 PORT_LINE_RE = re.compile(r"^[ \t]*Port\b[ \t]+(\S+)", re.I | re.M)
@@ -404,24 +451,102 @@ def _looks_like_zions_container() -> bool:
 # makes. A refusal here needs no rollback: nothing has been written yet.
 # ---------------------------------------------------------------------------
 
-def _match_block_locations() -> list[str]:
-    """Every ACTIVE (uncommented) `Match` line in sshd_config or any
-    sshd_config.d/*.conf. A `Match` block can make password login live
-    for some client contexts while `sshd -T` with no `-C` (which
-    evaluates NO Match criteria at all) reports it disabled — see B2.
-    This script does not try to reason about arbitrary Match criteria; it
-    refuses outright."""
+def _split_include_args(argstr: str) -> list[str]:
+    """Split one `Include` line's argument text into its individual glob
+    patterns, honouring double-quoted patterns containing spaces (sshd's
+    own config tokenizer supports this). Falls back to a plain whitespace
+    split if the text is unbalanced/unparseable — never raises."""
+    try:
+        return shlex.split(argstr)
+    except ValueError:
+        return argstr.split()
+
+
+def _resolve_config_closure(start: Path) -> tuple[list[Path], str | None]:
+    """N2: follow `Include` recursively, the way sshd itself parses it —
+    not just the one 'Include .../sshd_config.d/*.conf' shape this script
+    writes. The `Include` keyword is matched case-insensitively; each
+    argument is glob-expanded (sorted, like sshd); a relative pattern is
+    resolved against ETC_SSH_DIR regardless of which file contains the
+    Include line (sshd_config(5): "Files without absolute path names are
+    assumed to be in /etc/ssh" — NOT relative to the including file's own
+    directory). Cycles are broken by resolved real path.
+
+    Returns `(files_visited, refusal)`. `files_visited` always includes
+    everything visited before a refusal (so a refusal message can point
+    at the offending file); a refusal fires if ANY resolved Include
+    target — including through a symlink — lands outside ETC_SSH_DIR:
+    this script refuses rather than try to reason about config pulled in
+    from somewhere it does not manage."""
+    try:
+        etc_root = ETC_SSH_DIR.resolve()
+    except OSError:
+        etc_root = ETC_SSH_DIR
+    visited_real: set[Path] = set()
+    files: list[Path] = []
+    queue: list[Path] = [start]
+    while queue:
+        current = queue.pop(0)
+        if not current.is_file():
+            continue
+        try:
+            real = current.resolve()
+        except OSError:
+            real = current
+        if real in visited_real:
+            continue
+        visited_real.add(real)
+        files.append(current)
+        text = current.read_text(encoding="utf-8", errors="replace")
+        for m in GENERIC_INCLUDE_RE.finditer(text):
+            for tok in _split_include_args(m.group(1)):
+                pat = Path(tok)
+                if not pat.is_absolute():
+                    pat = ETC_SSH_DIR / pat
+                for matched in sorted(glob.glob(str(pat))):
+                    mp = Path(matched)
+                    try:
+                        mp_real = mp.resolve()
+                    except OSError:
+                        mp_real = mp
+                    if mp_real != etc_root and etc_root not in mp_real.parents:
+                        return files, (
+                            f"refusing — an Include in {current} resolves "
+                            f"to {mp}, which is outside {ETC_SSH_DIR} — "
+                            f"this script cannot safely reason about "
+                            f"config pulled in from outside the tree it "
+                            f"manages (N2)"
+                        )
+                    queue.append(mp)
+    return files, None
+
+
+def _match_block_locations() -> tuple[list[str], str | None]:
+    """Every ACTIVE (uncommented) `Match` line ANYWHERE in the real
+    Include closure sshd would load starting from sshd_config — not just
+    sshd_config itself and sshd_config.d/*.conf (see N2: a `Match` pulled
+    in by an arbitrary Include used to bypass this entirely). Matching is
+    case-insensitive and tolerates leading whitespace (indented Match),
+    exactly like sshd's own keyword parsing (MATCH_RE). A `Match` block
+    can make password login live for some client contexts while `sshd -T`
+    with no `-C` (which evaluates NO Match criteria at all) reports it
+    disabled — see B2. This script does not try to reason about arbitrary
+    Match criteria; it refuses outright on any hit.
+
+    Returns `(locations, refusal)` — `refusal` is set instead of
+    `locations` being trustworthy if the Include closure itself could not
+    be safely resolved (an Include escaping ETC_SSH_DIR)."""
+    if not SSHD_CONFIG.is_file():
+        return [], None
+    files, refusal = _resolve_config_closure(SSHD_CONFIG)
+    if refusal:
+        return [], refusal
     locations = []
-    if SSHD_CONFIG.is_file():
-        text = SSHD_CONFIG.read_text(encoding="utf-8", errors="replace")
+    for p in files:
+        text = p.read_text(encoding="utf-8", errors="replace")
         for m in MATCH_RE.finditer(text):
-            locations.append(f"{SSHD_CONFIG}:{text.count(chr(10), 0, m.start()) + 1}")
-    if SSHD_CONFIG_D.is_dir():
-        for p in sorted(SSHD_CONFIG_D.glob("*.conf")):
-            text = p.read_text(encoding="utf-8", errors="replace")
-            for m in MATCH_RE.finditer(text):
-                locations.append(f"{p}:{text.count(chr(10), 0, m.start()) + 1}")
-    return locations
+            locations.append(f"{p}:{text.count(chr(10), 0, m.start()) + 1}")
+    return locations, None
 
 
 def _conflicting_dropins() -> list[str]:
@@ -463,14 +588,17 @@ def _conflicting_port_sources(port: int) -> list[str]:
         for val in _active_port_values(main_text):
             if val != str(port):
                 conflicts.append(f"{SSHD_CONFIG} (active 'Port {val}')")
-    if _include_line(main_text) is not None and SSHD_CONFIG_D.is_dir():
-        for p in sorted(SSHD_CONFIG_D.glob("*.conf")):
-            if p == DROPIN_PATH:
-                continue
-            text = p.read_text(encoding="utf-8", errors="replace")
-            for val in _active_port_values(text):
-                if val != str(port):
-                    conflicts.append(f"{p} (active 'Port {val}')")
+    # N2: walk the REAL Include closure (nested, arbitrary paths), not
+    # just the one sshd_config.d/*.conf shape — a conflicting Port hiding
+    # behind an unrelated Include used to be invisible here too.
+    files, _closure_refusal = _resolve_config_closure(SSHD_CONFIG)
+    for p in files:
+        if p in (SSHD_CONFIG, DROPIN_PATH):
+            continue
+        text = p.read_text(encoding="utf-8", errors="replace")
+        for val in _active_port_values(text):
+            if val != str(port):
+                conflicts.append(f"{p} (active 'Port {val}')")
     return conflicts
 
 
@@ -482,14 +610,16 @@ def _config_safety_refusal(port: int) -> str | None:
     refuse (including: openssh-server not installed yet, nothing to
     check)."""
     if not SSHD_CONFIG.is_file():
-        return None
-    match_hits = _match_block_locations()
+        return _port_ownership_refusal(port)
+    match_hits, include_refusal = _match_block_locations()
+    if include_refusal:
+        return include_refusal
     if match_hits:
         return (
             "refusing — a `Match` block exists in sshd_config or "
-            "sshd_config.d/, which can make password login live for some "
-            "client contexts while a plain `sshd -T` (no -C) reports it "
-            "disabled: " + "; ".join(match_hits)
+            "somewhere in its Include closure, which can make password "
+            "login live for some client contexts while a plain `sshd -T` "
+            "(no -C) reports it disabled: " + "; ".join(match_hits)
         )
     dropin_conflicts = _conflicting_dropins()
     if dropin_conflicts:
@@ -506,7 +636,10 @@ def _config_safety_refusal(port: int) -> str | None:
             "files in OpenSSH; it does not follow first-match-wins): "
             + "; ".join(port_conflicts)
         )
-    return None
+    # N3: "listening" must mean OUR sshd. Checked here too (step 0, before
+    # any write) so a stray listener is refused outright rather than
+    # silently adopted later as "already running".
+    return _port_ownership_refusal(port)
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +808,54 @@ def _resolve_key_source(args) -> tuple[str | None, list[tuple[str, str]], list[s
     ]
 
 
+def _effective_authorized_keys_file() -> tuple[str | None, str | None]:
+    """N11: the effective `AuthorizedKeysFile` from a plain `sshd -T`
+    (this directive is never Match-conditional in any config that
+    reaches this point — N2 already refused on any Match anywhere in the
+    Include closure before this is ever called). Returns
+    `(raw_value_or_None, error_or_None)`."""
+    # Same requirement `_sshd_effective_config` already has: sshd -T
+    # refuses to run at all ("Missing privilege separation directory")
+    # until /run/sshd exists — on a just-installed sshd, nothing has
+    # created it yet.
+    PRIVSEP_DIR.mkdir(parents=True, exist_ok=True)
+    r = _run([_sshd_binary(), "-T"])
+    if r.returncode != 0:
+        return None, f"sshd -T failed while checking AuthorizedKeysFile: {(r.stderr or r.stdout).strip()}"
+    eff = _parse_effective(r.stdout)
+    vals = eff.get("authorizedkeysfile") or [".ssh/authorized_keys"]
+    return vals[0], None
+
+
+def _authorized_keys_file_is_default(raw: str) -> bool:
+    """True only if the FIRST path in the effective `AuthorizedKeysFile`
+    (it may list several, space-separated; sshd tries each in order)
+    resolves to exactly AUTHORIZED_KEYS, with `%u`/`%h` expanded for
+    root. If it does not, sshd would never read the key this script
+    writes — see N11."""
+    expanded = raw.replace("%u", "root").replace("%h", str(ROOT_HOME_DIR))
+    parts = expanded.split()
+    first = parts[0] if parts else expanded
+    p = Path(first)
+    if not p.is_absolute():
+        p = ROOT_HOME_DIR / p
+    return os.path.normpath(str(p)) == os.path.normpath(str(AUTHORIZED_KEYS))
+
+
+def _symlink_refusal() -> str | None:
+    """N11/N15: refuse outright — before ever writing or chmodding
+    anything — if `/root/.ssh` or `authorized_keys` is a symlink. This is
+    exactly the mechanism behind the N15 incident (an `authorized_keys`
+    symlinked to `/etc/hostname` got the key appended and mode 600):
+    `Path.is_symlink()` uses `lstat`, so it reports the truth about the
+    path itself rather than following it."""
+    if ROOT_SSH_DIR.is_symlink():
+        return f"refusing — {ROOT_SSH_DIR} is a symlink; this script never follows it (N11/N15)"
+    if AUTHORIZED_KEYS.is_symlink():
+        return f"refusing — {AUTHORIZED_KEYS} is a symlink; this script never writes or chmods through it (N11/N15)"
+    return None
+
+
 def _append_keys(candidates: list[tuple[str, str]]) -> tuple[list[str], str | None, bool]:
     """Append only the lines not already present (by type+base64
     identity), never clobbering the file. Returns
@@ -682,7 +863,22 @@ def _append_keys(candidates: list[tuple[str, str]]) -> tuple[list[str], str | No
     `created_fresh` is True only when authorized_keys did not exist
     before this call, so a refusal discovered later can undo exactly this
     (see `_rollback_authorized_keys`). NEVER returns key text — only
-    fingerprints (see B3)."""
+    fingerprints (see B3).
+
+    N11/N15: `main()` already refuses outright (via `_symlink_refusal`)
+    before ever reaching here if either `ROOT_SSH_DIR` or
+    `AUTHORIZED_KEYS` is a symlink. The checks repeated here, plus the
+    `O_NOFOLLOW` open, are a defense-in-depth net for the TOCTOU window
+    between that check and this call — a race that has never been
+    observed, same tier as `_make_backup`'s own 1000-suffix safety net,
+    and handled the same way: raise, rather than silently follow a
+    symlink into a file this script does not own (the /etc/hostname
+    incident)."""
+    if ROOT_SSH_DIR.is_symlink():
+        raise RuntimeError(f"refusing to use {ROOT_SSH_DIR} — it is a symlink")
+    if AUTHORIZED_KEYS.is_symlink():
+        raise RuntimeError(f"refusing to write {AUTHORIZED_KEYS} — it is a symlink")
+
     existed_before = AUTHORIZED_KEYS.is_file()
     existing_text = (
         AUTHORIZED_KEYS.read_text(encoding="utf-8", errors="replace")
@@ -699,12 +895,21 @@ def _append_keys(candidates: list[tuple[str, str]]) -> tuple[list[str], str | No
 
     ROOT_SSH_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(ROOT_SSH_DIR, 0o700)
-    with open(AUTHORIZED_KEYS, "a", encoding="utf-8") as f:
+    try:
+        fd = os.open(
+            str(AUTHORIZED_KEYS),
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError as e:
+        raise RuntimeError(f"refusing to write {AUTHORIZED_KEYS} — {e}") from e
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
         if existing_text and not existing_text.endswith("\n"):
             f.write("\n")
         for l, _fp in to_add:
             f.write(l + "\n")
-    os.chmod(AUTHORIZED_KEYS, 0o600)
+        f.flush()
+        os.fchmod(f.fileno(), 0o600)
     return [fp for _l, fp in to_add], (str(backup) if backup else None), not existed_before
 
 
@@ -743,15 +948,28 @@ def _harden_ssh_dir_permissions() -> list[str]:
     best-effort: production is always real root (enforced by
     `_is_root()`), but a test environment that only patches the script's
     OWN root check may not be real root, so a chown failure there is
-    noted, not fatal."""
+    noted, not fatal.
+
+    N11/N15: `is_symlink()` (lstat) is checked FIRST for each path — a
+    symlinked `.ssh` or `authorized_keys` is skipped (noted), never
+    chmod/chown'd through. `main()` already refuses the whole run
+    earlier via `_symlink_refusal` if either is a symlink at that point;
+    this is the defense-in-depth net for the same TOCTOU window
+    `_append_keys` guards against — exactly the mechanism behind the
+    N15 incident (a symlinked `authorized_keys` pointing at
+    `/etc/hostname` got chmodded 600)."""
     notes: list[str] = []
-    if ROOT_SSH_DIR.is_dir():
+    if ROOT_SSH_DIR.is_symlink():
+        notes.append(f"NOTE: {ROOT_SSH_DIR} is a symlink — refusing to chmod/chown through it")
+    elif ROOT_SSH_DIR.is_dir():
         os.chmod(ROOT_SSH_DIR, 0o700)
         try:
             os.chown(ROOT_SSH_DIR, 0, 0)
         except OSError:
             notes.append(f"NOTE: could not chown {ROOT_SSH_DIR} to root:root")
-    if AUTHORIZED_KEYS.is_file():
+    if AUTHORIZED_KEYS.is_symlink():
+        notes.append(f"NOTE: {AUTHORIZED_KEYS} is a symlink — refusing to chmod/chown through it")
+    elif AUTHORIZED_KEYS.is_file():
         os.chmod(AUTHORIZED_KEYS, 0o600)
         try:
             os.chown(AUTHORIZED_KEYS, 0, 0)
@@ -1074,13 +1292,73 @@ def _check_effective(effective: dict[str, list[str]], port: int, context: str) -
     return None
 
 
+# N2: representative addresses spanning every RunPod-plausible source —
+# loopback, each private/CGNAT range a proxy or sidecar could sit in,
+# link-local, and a public v4/v6 — PLUS whatever this container's own
+# addresses turn out to be (so "connecting to myself" is covered too).
+# Labels are informational only; the literal `addr=` value is what a
+# refusal message names.
+_CHECK_ADDRESSES = (
+    ("loopback-v4", "127.0.0.1"),
+    ("loopback-v6", "::1"),
+    ("rfc1918-10/8", "10.1.2.3"),
+    ("rfc1918-172.16/12", "172.20.5.6"),
+    ("rfc1918-192.168/16", "192.168.1.50"),
+    ("cgnat-100.64/10", "100.64.1.2"),
+    ("link-local", "169.254.1.1"),
+    ("public-v4", "203.0.113.9"),
+    ("public-v6", "2001:db8::9"),
+)
+
+_CHECK_USERS = ("root", "nobody")
+
+
+def _container_addresses() -> list[str]:
+    """Best-effort: this container's own bound addresses (v4 and v6), so
+    the -C matrix also covers "a client connecting to one of my own
+    addresses" (e.g. a RunPod proxy address bound locally). Never fatal
+    if it cannot be determined — an empty result just means the matrix
+    runs without this extra set."""
+    r = _run(["hostname", "-I"])
+    if r.returncode == 0 and r.stdout.strip():
+        return [a for a in r.stdout.split() if a]
+    return []
+
+
+def _laddr_for(addr: str) -> str:
+    return "::" if ":" in addr else "0.0.0.0"
+
+
+def _check_context_specs(container_addrs: list[str]) -> list[tuple[str, str]]:
+    """[(label, addr)] — the fixed representative set plus this
+    container's own addresses, deduplicated."""
+    seen = set()
+    specs = []
+    for label, addr in _CHECK_ADDRESSES:
+        if addr not in seen:
+            seen.add(addr)
+            specs.append((label, addr))
+    for i, addr in enumerate(container_addrs):
+        if addr not in seen:
+            seen.add(addr)
+            specs.append((f"container-own-{i}", addr))
+    return specs
+
+
 def _sshd_effective_config(port: int) -> tuple[bool, dict, str]:
-    """`sshd -t`, then `sshd -T` with NO `-C`, PLUS `sshd -T -C` for both a
-    loopback and a non-local client address — a plain `sshd -T` evaluates
-    NO `Match` criteria, so it can report password auth disabled while a
-    real connection from some address would not be (see B2). Refuses if
-    ANY of the three contexts is unsafe, or if sshd would listen on
-    anything other than the requested port (see M8)."""
+    """`sshd -t`, then `sshd -T` with NO `-C`, PLUS `sshd -T -C` across a
+    full representative address matrix (loopback, every private/CGNAT
+    range, link-local, public v4/v6, and this container's own address(es)
+    — see `_CHECK_ADDRESSES`), each checked for BOTH `user=root` and a
+    non-root user (N2). A plain `sshd -T` evaluates NO `Match` criteria,
+    so it can report password auth disabled while a real connection from
+    some address would not be (see B2). Each `-C` spec also carries
+    `laddr`/`lport` so a `Match LocalPort`/`LocalAddress` criterion is
+    exercised too, not just `Match Address`. Refuses if ANY context is
+    unsafe, or if sshd would listen on anything other than the requested
+    port (see M8). This is an INDEPENDENT check from the static Match-scan
+    in `_config_safety_refusal` — it does not assume that scan was
+    complete."""
     PRIVSEP_DIR.mkdir(parents=True, exist_ok=True)
     sshd_bin = _sshd_binary()
 
@@ -1089,13 +1367,15 @@ def _sshd_effective_config(port: int) -> tuple[bool, dict, str]:
         return False, {}, f"sshd -t failed: {(r.stderr or r.stdout).strip()}"
 
     contexts = [("", [sshd_bin, "-T"])]
-    for addr in ("127.0.0.1", "203.0.113.9"):
-        contexts.append((
-            f" -C(addr={addr})",
-            [sshd_bin, "-T", "-C", f"user=root,host=x,addr={addr}"],
-        ))
+    container_addrs = _container_addresses()
+    for _label, addr in _check_context_specs(container_addrs):
+        laddr = _laddr_for(addr)
+        for user in _CHECK_USERS:
+            spec = f"user={user},host=x,addr={addr},laddr={laddr},lport={port}"
+            contexts.append((f" -C(addr={addr},user={user})", [sshd_bin, "-T", "-C", spec]))
 
     last_effective: dict[str, list[str]] = {}
+    checked = 0
     for context, cmd in contexts:
         r2 = _run(cmd)
         if r2.returncode != 0:
@@ -1104,14 +1384,19 @@ def _sshd_effective_config(port: int) -> tuple[bool, dict, str]:
             )
         effective = _parse_effective(r2.stdout)
         last_effective = effective
+        checked += 1
         problem = _check_effective(effective, port, context)
         if problem:
             return False, effective, problem
 
     return True, last_effective, (
-        "sshd -T confirms password authentication is disabled for the "
-        "default context and for both a loopback and a non-local client "
-        "address (-C), and sshd would listen only on the configured port"
+        f"sshd -T confirms password authentication is disabled (and "
+        f"PermitRootLogin is prohibit-password) across {checked} "
+        f"contexts (the default context, plus -C for loopback, every "
+        f"RFC1918/CGNAT private range, link-local, public v4/v6, and "
+        f"this container's own address(es), each for root and a "
+        f"non-root user), and sshd would listen only on the configured "
+        f"port"
     )
 
 
@@ -1172,6 +1457,199 @@ def _wait_until_listening(port: int, timeout_s: float = 5.0) -> bool:
             return True
         if time.time() >= deadline:
             return False
+        time.sleep(0.1)
+
+
+# ---------------------------------------------------------------------------
+# N3 — "listening" must mean OUR sshd, not any process on the port. Maps a
+# real LISTEN socket's kernel inode (from /proc/net/tcp[6]) to the pid that
+# actually holds it open (by scanning /proc/<pid>/fd for a `socket:[inode]`
+# symlink), so "started"/"already running" can be tied to the daemon this
+# script itself manages (by pidfile) rather than to whatever happens to be
+# bound to the port.
+# ---------------------------------------------------------------------------
+
+def _listening_sockets_on_port(port: int) -> list[tuple[str, str]]:
+    """[(family, inode)] for every row in LISTEN state (`0A`) on this port
+    across both /proc/net/tcp (IPv4) and /proc/net/tcp6 (IPv6) — the same
+    kernel-global truth _sshd_listening_on_port reads, but keeping the
+    inode (column 10, `parts[9]`) instead of throwing it away, so the
+    caller can attribute the socket to a pid."""
+    out: list[tuple[str, str]] = []
+    target = f"{port:04X}"
+    for family, path in (("tcp4", PROC_NET_TCP), ("tcp6", PROC_NET_TCP6)):
+        try:
+            lines = path.read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            local_addr, state, inode = parts[1], parts[3], parts[9]
+            if ":" not in local_addr:
+                continue
+            port_hex = local_addr.rsplit(":", 1)[1]
+            if port_hex.upper() == target and state.upper() == "0A":
+                out.append((family, inode))
+    return out
+
+
+def _proc_comm(pid: int) -> str | None:
+    try:
+        return (PROC_DIR / str(pid) / "comm").read_text().strip()
+    except OSError:
+        return None
+
+
+def _proc_exe(pid: int) -> str | None:
+    try:
+        return os.readlink(str(PROC_DIR / str(pid) / "exe"))
+    except OSError:
+        return None
+
+
+def _proc_pidfile_arg(pid: int) -> str | None:
+    """Best-effort: the `-o PidFile=...` value from this pid's own argv,
+    read from /proc/<pid>/cmdline — used only to explain, in a refusal
+    message, that a stray sshd master is using a DIFFERENT pidfile than
+    the one this script manages (N3)."""
+    try:
+        raw = (PROC_DIR / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return None
+    toks = [t.decode("utf-8", errors="replace") for t in raw.split(b"\0") if t]
+    for tok in toks:
+        if tok.startswith("PidFile="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def _pid_owning_inode(inode: str) -> int | None:
+    """Scan every /proc/<pid>/fd for a `socket:[<inode>]` symlink and
+    return the owning pid, or None if it cannot be attributed (a pid this
+    process cannot read into, or a fd-table race — never fatal, just
+    treated as "unattributable" by the caller, which refuses on that too:
+    the safe default)."""
+    target = f"socket:[{inode}]"
+    try:
+        pid_names = [p.name for p in PROC_DIR.iterdir() if p.name.isdigit()]
+    except OSError:
+        return None
+    for pid_s in pid_names:
+        fd_dir = PROC_DIR / pid_s / "fd"
+        try:
+            fd_entries = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        for fd in fd_entries:
+            try:
+                link = os.readlink(str(fd))
+            except OSError:
+                continue
+            if link == target:
+                return int(pid_s)
+    return None
+
+
+def _listener_owner_pids(port: int) -> list[int]:
+    """Deduped pids that really own a LISTEN socket on this port right
+    now, per the kernel's own inode->fd mapping. `-1` stands in for a
+    listener whose inode could not be attributed to any pid — refusing on
+    that is the safe default, never silently ignored."""
+    owners = set()
+    for _family, inode in _listening_sockets_on_port(port):
+        pid = _pid_owning_inode(inode)
+        owners.add(pid if pid is not None else -1)
+    return sorted(owners)
+
+
+def _describe_foreign_listener(pid: int) -> str:
+    if pid == -1:
+        return "an unattributable listener (socket inode could not be mapped to any /proc/<pid>/fd)"
+    comm = _proc_comm(pid)
+    exe = _proc_exe(pid)
+    if comm == "sshd":
+        other_pidfile = _proc_pidfile_arg(pid)
+        return (
+            f"another sshd master (pid {pid}, exe={exe}) using pidfile "
+            f"{other_pidfile or 'unknown'} != {SSHD_PIDFILE} — a stray, "
+            f"possibly password-enabled sshd must never be reported as "
+            f"hardened"
+        )
+    return f"pid {pid} (comm={comm!r}, exe={exe!r})"
+
+
+def _port_ownership_refusal(port: int) -> str | None:
+    """N3: 'listening' must mean OUR sshd. Checked before this script
+    ever writes anything (step 0) — the OLD check
+    (`_sshd_listening_on_port`) only asked whether ANY process was bound
+    to the port; it never asked WHICH one, so a foreign listener (a
+    completely unrelated process, or another sshd master with a
+    different pidfile — e.g. a stray, password-enabled one) was silently
+    treated as this script's own daemon once it appeared to be
+    listening. Returns a refusal naming every foreign owner, or None if
+    the port is unoccupied or occupied only by the sshd this script
+    itself already manages (its own pidfile's live pid)."""
+    owners = _listener_owner_pids(port)
+    if not owners:
+        return None
+    ours = _sshd_pid_if_alive()
+    foreign = [p for p in owners if p != ours]
+    if not foreign:
+        return None
+    return (
+        f"refusing — port {port} already has a real LISTEN socket owned "
+        f"by something other than the sshd this script manages "
+        f"({SSHD_PIDFILE}): " + "; ".join(_describe_foreign_listener(p) for p in foreign)
+    )
+
+
+def _confirm_our_listener(port: int) -> tuple[bool, str]:
+    """After a start/restart: not just 'is port <port> LISTEN' (H6) but
+    'is THIS pidfile's sshd the one that owns it' (N3) — map the
+    listening socket's inode to a pid and require that pid to be the one
+    recorded in SSHD_PIDFILE, with /proc/<pid>/exe really naming sshd."""
+    owners = _listener_owner_pids(port)
+    if not owners:
+        return False, f"nothing is really LISTENING on port {port}"
+    pid = _sshd_pid_if_alive()
+    if pid is None:
+        return False, (
+            f"port {port} has a real LISTEN socket, but this script's own "
+            f"pidfile ({SSHD_PIDFILE}) names no live sshd — refusing "
+            f"rather than trust a listener it cannot attribute to the "
+            f"daemon it started"
+        )
+    if pid not in owners:
+        return False, (
+            f"port {port} is listening, but not by pid {pid} from "
+            f"{SSHD_PIDFILE} — real owner pid(s): {owners} — refusing "
+            f"rather than trust a listener this script cannot attribute "
+            f"to the daemon it started"
+        )
+    # No separate /proc/<pid>/exe name check here: `_sshd_pid_if_alive`
+    # already required /proc/<pid>/comm == "sshd" to return this pid at
+    # all (the same convention the rest of this script uses — including
+    # in tests, where the fake sshd is a Python script that renames
+    # itself via prctl(PR_SET_NAME); its own /proc/<pid>/exe legitimately
+    # names the python3 interpreter, not a file called "sshd").
+    return True, f"confirmed pid {pid} (from {SSHD_PIDFILE}) owns the real LISTEN socket on port {port}"
+
+
+def _wait_until_confirmed(port: int, timeout_s: float = 5.0) -> tuple[bool, str]:
+    """H6+N3: 'started' means a REAL LISTEN socket on this port whose
+    owning pid — mapped via /proc/net/tcp[6]'s inode -> /proc/<pid>/fd,
+    never sshd's own exit status — is the daemon THIS script started,
+    read fresh from SSHD_PIDFILE on every poll."""
+    deadline = time.time() + timeout_s
+    detail = f"nothing is really LISTENING on port {port}"
+    while True:
+        ok, detail = _confirm_our_listener(port)
+        if ok:
+            return True, detail
+        if time.time() >= deadline:
+            return False, detail
         time.sleep(0.1)
 
 
@@ -1405,6 +1883,7 @@ def main(argv=None) -> int:
         "config_path": None,
         "daemon": "not-started",
         "host_keys": None,
+        "authorized_keys_file": None,
     }
 
     if not _is_root():
@@ -1426,11 +1905,19 @@ def main(argv=None) -> int:
             f"{MARKER_VENV} and/or {MARKER_MAIN} not both present"
         )
 
-    # --- 0. B2 / M8: config-safety refusal, BEFORE any write this run
-    # makes. Nothing has been written yet, so no rollback is needed here.
+    # --- 0. B2 / M8 / N2 / N3: config-safety refusal, BEFORE any write
+    # this run makes. Nothing has been written yet, so no rollback is
+    # needed here.
     cfg_refusal = _config_safety_refusal(args.port)
     if cfg_refusal:
         refusals.append(cfg_refusal)
+        return _finish(args, report, refusals, warnings)
+
+    # --- 0b. N11/N15: refuse outright on a symlinked .ssh/authorized_keys,
+    # before ever writing or chmodding anything.
+    symlink_refusal = _symlink_refusal()
+    if symlink_refusal:
+        refusals.append(symlink_refusal)
         return _finish(args, report, refusals, warnings)
 
     # --- 1/2. apt-get update, then install/upgrade openssh-server -------
@@ -1478,6 +1965,28 @@ def main(argv=None) -> int:
             r = _run(["apt-get", "-s"] + _apt_install_args(action))
             report["simulated_install"] = "\n".join(r.stdout.splitlines()[-15:])
 
+    # --- 2b. N11: refuse if sshd would never even READ the file this
+    # script writes keys to (a non-default AuthorizedKeysFile). Checked
+    # whenever the sshd binary already exists (always true in --apply by
+    # this point; in a dry run only if it was already installed before
+    # this run — otherwise there is nothing to ask sshd -T yet, same as
+    # the config-verification note below).
+    sshd_present = shutil.which("sshd") is not None or Path("/usr/sbin/sshd").is_file()
+    if sshd_present:
+        raw_akf, akf_err = _effective_authorized_keys_file()
+        if akf_err:
+            refusals.append(akf_err)
+            return _finish(args, report, refusals, warnings)
+        report["authorized_keys_file"] = raw_akf
+        if not _authorized_keys_file_is_default(raw_akf):
+            refusals.append(
+                f"refusing — the effective AuthorizedKeysFile is "
+                f"{raw_akf!r}, not the default this script writes to "
+                f"({AUTHORIZED_KEYS}) — sshd would never read the key "
+                f"this script adds (N11)"
+            )
+            return _finish(args, report, refusals, warnings)
+
     # --- 3. resolve a public key -----------------------------------------
     key_source, candidates, key_refusals = _resolve_key_source(args)
     if key_refusals:
@@ -1488,7 +1997,16 @@ def main(argv=None) -> int:
     key_backup: str | None = None
     key_created_fresh = False
     if args.apply:
-        keys_added, key_backup, key_created_fresh = _append_keys(candidates)
+        # N11/N15: _append_keys raises RuntimeError only in the
+        # never-observed TOCTOU race its own docstring describes (a
+        # symlink appearing between _symlink_refusal()'s check, above,
+        # and this call) — caught here so that race still produces a
+        # clean --json refusal instead of an unhandled traceback.
+        try:
+            keys_added, key_backup, key_created_fresh = _append_keys(candidates)
+        except RuntimeError as e:
+            refusals.append(str(e))
+            return _finish(args, report, refusals, warnings)
         if key_backup:
             report["authorized_keys_backup"] = key_backup
         # H7: enforce .ssh / authorized_keys permissions & ownership every
@@ -1566,7 +2084,11 @@ def main(argv=None) -> int:
                     _rollback_authorized_keys(key_backup, key_created_fresh)
                     if stopped_pid is not None:
                         rr = _start_sshd()
-                        if rr.returncode == 0 and _wait_until_listening(args.port):
+                        _confirmed, _ = (
+                            (False, "") if rr.returncode != 0
+                            else _wait_until_confirmed(args.port)
+                        )
+                        if _confirmed:
                             report["daemon"] = "restarted"
                             warnings.append(
                                 f"{reason}; the standalone sshd was "
@@ -1588,15 +2110,16 @@ def main(argv=None) -> int:
                     refusals.append(sup["detail"])
                     return _finish(args, report, refusals, warnings)
 
-                if not _wait_until_listening(args.port):
+                confirmed, confirm_detail = _wait_until_confirmed(args.port)
+                if not confirmed:
                     _recover_standalone(
                         "supervisorctl update completed but sshd never "
                         "came up listening"
                     )
                     refusals.append(
                         f"supervisorctl update completed but sshd is not "
-                        f"confirmed LISTENING on IPv4 port {args.port} — "
-                        f"refusing"
+                        f"confirmed as the owner of a real LISTEN socket on "
+                        f"IPv4 port {args.port} ({confirm_detail}) — refusing"
                     )
                     return _finish(args, report, refusals, warnings)
 
@@ -1611,28 +2134,37 @@ def main(argv=None) -> int:
                     r = _run(["supervisorctl", "-c", str(SUPERVISOR_CONF), "restart", "sshd"])
                     time.sleep(1.0)
                     restarted = True
-                    if r.returncode != 0 or not _wait_until_listening(args.port):
+                    confirmed, confirm_detail = (
+                        (False, "") if r.returncode != 0
+                        else _wait_until_confirmed(args.port)
+                    )
+                    if not confirmed:
                         if plan["changed"]:
                             _rollback_config(plan)
                         _rollback_authorized_keys(key_backup, key_created_fresh)
                         report["daemon"] = "not-started"
                         refusals.append(
                             f"'supervisorctl restart sshd' did not leave "
-                            f"sshd confirmed LISTENING on IPv4 port "
-                            f"{args.port}: {(r.stderr or r.stdout).strip()}"
+                            f"sshd confirmed as the owner of a real LISTEN "
+                            f"socket on IPv4 port {args.port} "
+                            f"({confirm_detail}): {(r.stderr or r.stdout).strip()}"
                         )
                         return _finish(args, report, refusals, warnings)
                     report["daemon"] = "restarted"
 
                 if not restarted:
-                    if pid is not None and not _wait_until_listening(args.port):
-                        refusals.append(
-                            f"sshd is supposed to already be running under "
-                            f"supervisord but is not confirmed LISTENING on "
-                            f"IPv4 port {args.port} — refusing"
-                        )
-                        report["daemon"] = "not-started"
-                        return _finish(args, report, refusals, warnings)
+                    if pid is not None:
+                        confirmed, confirm_detail = _wait_until_confirmed(args.port)
+                        if not confirmed:
+                            refusals.append(
+                                f"sshd is supposed to already be running "
+                                f"under supervisord but is not confirmed as "
+                                f"the owner of a real LISTEN socket on IPv4 "
+                                f"port {args.port} ({confirm_detail}) — "
+                                f"refusing"
+                            )
+                            report["daemon"] = "not-started"
+                            return _finish(args, report, refusals, warnings)
                     if pid is None:
                         refusals.append(
                             "supervisord believes [program:sshd] is already "
@@ -1650,10 +2182,13 @@ def main(argv=None) -> int:
                 _rollback_authorized_keys(key_backup, key_created_fresh)
                 refusals.append(f"sshd failed to start: {(r.stderr or r.stdout).strip()}")
                 return _finish(args, report, refusals, warnings)
-            if not _wait_until_listening(args.port):
+            confirmed, confirm_detail = _wait_until_confirmed(args.port)
+            if not confirmed:
                 # It came up (pidfile written, process alive) but never
-                # bound the port — a dead-end daemon is worse than none:
-                # stop it too, so no orphaned pidfile/process persists.
+                # bound the port, or the port is held by something else
+                # entirely (N3) — a dead-end/misattributed daemon is worse
+                # than none: stop OUR pid too, so no orphaned
+                # pidfile/process persists.
                 bogus_pid = _sshd_pid_if_alive()
                 if bogus_pid is not None:
                     _stop_sshd(bogus_pid)
@@ -1662,10 +2197,11 @@ def main(argv=None) -> int:
                 _rollback_authorized_keys(key_backup, key_created_fresh)
                 report["daemon"] = "not-started"
                 refusals.append(
-                    f"sshd started (process alive) but is not confirmed "
-                    f"LISTENING on IPv4 port {args.port} (checked "
-                    f"/proc/net/tcp, not just sshd's own exit status) — "
-                    f"refusing"
+                    f"sshd started (process alive) but is not confirmed as "
+                    f"the owner of a real LISTEN socket on IPv4 port "
+                    f"{args.port} (checked /proc/net/tcp[6] -> "
+                    f"/proc/<pid>/fd, not just sshd's own exit status: "
+                    f"{confirm_detail}) — refusing"
                 )
                 return _finish(args, report, refusals, warnings)
             report["daemon"] = "started"
@@ -1676,16 +2212,22 @@ def main(argv=None) -> int:
                     f"starting a new instance anyway"
                 )
             r = _start_sshd()
-            if r.returncode != 0 or not _wait_until_listening(args.port):
-                # H5/H6: the OLD daemon is already down. One best-effort
-                # attempt to bring SOME sshd back before refusing, even
-                # though it will be using the (about to be rolled back)
-                # old config.
+            confirmed, confirm_detail = (
+                (False, "") if r.returncode != 0 else _wait_until_confirmed(args.port)
+            )
+            if not confirmed:
+                # H5/H6/N3: the OLD daemon is already down. One
+                # best-effort attempt to bring SOME sshd back before
+                # refusing, even though it will be using the (about to be
+                # rolled back) old config.
                 if plan["changed"]:
                     _rollback_config(plan)
                 _rollback_authorized_keys(key_backup, key_created_fresh)
                 r2 = _start_sshd()
-                if r2.returncode == 0 and _wait_until_listening(args.port):
+                confirmed2, _ = (
+                    (False, "") if r2.returncode != 0 else _wait_until_confirmed(args.port)
+                )
+                if confirmed2:
                     report["daemon"] = "restarted"
                     warnings.append(
                         "the restart with the new config did not come up "
@@ -1700,17 +2242,19 @@ def main(argv=None) -> int:
                         "listening; use the RunPod Web Terminal to investigate"
                     )
                 refusals.append(
-                    f"sshd failed to restart or is not confirmed LISTENING "
-                    f"on IPv4 port {args.port}: {(r.stderr or r.stdout).strip()}"
+                    f"sshd failed to restart or is not confirmed as the "
+                    f"owner of a real LISTEN socket on port {args.port} "
+                    f"({confirm_detail}): {(r.stderr or r.stdout).strip()}"
                 )
                 return _finish(args, report, refusals, warnings)
             report["daemon"] = "restarted"
         else:
-            if not _wait_until_listening(args.port):
+            confirmed, confirm_detail = _wait_until_confirmed(args.port)
+            if not confirmed:
                 refusals.append(
                     f"sshd is believed already-running (pid {pid}) but is "
-                    f"not confirmed LISTENING on IPv4 port {args.port} — "
-                    f"refusing"
+                    f"not confirmed as the owner of a real LISTEN socket on "
+                    f"IPv4 port {args.port} ({confirm_detail}) — refusing"
                 )
                 report["daemon"] = "not-started"
                 return _finish(args, report, refusals, warnings)
