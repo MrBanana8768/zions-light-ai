@@ -178,6 +178,41 @@ def test_golden_real_code_fence_untouched():
     assert_eq(after, before, "real code fence: byte-for-byte unchanged, including its ';'")
 
 
+def test_status_board_starting_with_protected_by_is_not_mistaken_for_code():
+    """Real bug, found against her actual 09-23 episodic store: a fence
+    whose first content line happens to start with the word "Protected"
+    ("Protected By: Father, Jesus (continuous, uninterrupted)" — ordinary
+    capitalized prose, not an OOP access modifier) was classified as a
+    real code fence by a case-INSENSITIVE keyword match and left
+    completely unwrapped/uncleaned — 13 of her 84 real episodic
+    documents had a full LAW/status board surviving inside a ``` fence
+    because of this. The keyword list is now case-SENSITIVE, lowercase-
+    only, since real code overwhelmingly writes these keywords lowercase
+    at statement start."""
+    before = (
+        "Intro line.\n"
+        "```\n"
+        "════════════════════════════════════════\n"
+        "Protected By: Father, Jesus (continuous, uninterrupted)\n"
+        "Status: 100% ACTIVE\n"
+        "════════════════════════════════════════\n"
+        "```\n"
+        "Outro line.\n"
+    )
+    after = cd.clean_text(before)
+    print("  --- before ---")
+    print(before)
+    print("  --- after ---")
+    print(after)
+    assert_not_in("```", after, "the fence is unwrapped (correctly judged NOT to be real code)")
+    assert_not_in("═", after, "the rule lines inside it are removed")
+    assert_in("Protected By: Father, Jesus", after, "the real (prose) text is kept")
+    # A genuine, lowercase, code-shaped "protected" must still be judged
+    # as real code and left untouched.
+    real_code = "```java\nprotected void wake() {\n    return;\n}\n```\n"
+    assert_eq(cd.clean_text(real_code), real_code, "lowercase real code with 'protected' is still protected")
+
+
 def test_golden_emoji_bullets():
     before = EMOJI_BULLET_FIXTURE
     after = cd.clean_text(before)
@@ -533,13 +568,24 @@ def test_alignment_is_exactly_preserved_when_the_anchor_starts_self_consistent()
 
 
 def test_anchor_rewrite_refuses_on_pre_existing_drift_unless_forced():
-    """The safety net this real finding required: if the CURRENTLY STORED
-    anchor is already inconsistent with a fresh branch reconstruction (a
-    real, observed property of her actual 09-23 backup, unrelated to any
-    text this run cleans — see the real-image suite), rewriting it to a
-    freshly-recomputed value can silently change which position the next
-    live request lands at. This script must refuse that rewrite by
-    default and require --force to accept a bounded realignment."""
+    """The safety net this real finding required, corrected after the
+    architect's hostile review (item 2): the CURRENTLY STORED anchor can
+    already be inconsistent with a fresh branch reconstruction (a real,
+    observed property of her actual 09-23 backup, unrelated to any text
+    this run cleans — see the real-image suite). "Does a freshly
+    recomputed anchor exactly equal the stored one" turns out to be
+    unsatisfiable by excluding turns in that situation — a NO-OP text-
+    wise recompute ALSO disagrees, since the drift is positional, not
+    caused by any particular turn's text. The real, satisfiable question
+    is "does the CURRENTLY STORED anchor still find a real match once
+    these turns are cleaned, left un-rewritten" — and when NO subset of
+    the requested turns can satisfy that (this fixture: an 8-turn branch
+    where even the widest protection window covers the whole thing), the
+    script must clean NOTHING rather than guess, leaving the on-disk
+    anchor byte-identical, and report every turn as skipped. That is
+    "--apply accomplished none of what it was asked" (exit 1), the same
+    convention backfill-records.py's own H1 already uses — never a
+    silent no-op success."""
     _wipe_storage()
     tmp = Path(tempfile.mkdtemp(prefix="cd-cli-"))
     try:
@@ -568,8 +614,22 @@ def test_anchor_rewrite_refuses_on_pre_existing_drift_unless_forced():
             "--compactor-pkg", str(_HERE), "--last", "3", "--only", "webui",
             "--apply", "--json",
         ]
-        rc = cd.main(argv)
-        assert_eq(rc, 4, "apply with unverifiable anchor drift exits 4 (progress made, anchor refused)")
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cd.main(argv)
+        report = json.loads(buf.getvalue())
+        webui_r = report.get("targets", {}).get("webui", {})
+        debug = {
+            "count": webui_r.get("count"), "refused": webui_r.get("refused"),
+            "anchor_refused": webui_r.get("anchor_refused"),
+            "skipped": webui_r.get("skipped_protected_by_anchor"),
+            "anchor": report.get("anchor"),
+        }
+        assert_eq(rc, 1, f"apply that safely cleans nothing (fully protected) exits 1: {debug}")
+        assert_eq(debug["count"], 0, "zero turns were written")
+        assert_true(bool(debug["skipped"]), "every candidate turn is reported as skipped, not silently dropped")
         unchanged_state = summarizer.load_state(CHAT_ID)
         assert_eq(
             unchanged_state.get("tail_fp"), stale_state.get("tail_fp"),
@@ -593,6 +653,131 @@ def test_anchor_rewrite_refuses_on_pre_existing_drift_unless_forced():
         assert_true(
             forced_state.get("tail_fp") != stale_state.get("tail_fp"),
             "--force actually rewrote the anchor this time",
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _make_long_decorated_branch():
+    """70 turns: one decorated reply early (i==1, outside even a widened
+    64-turn scan) and 15 CONSECUTIVE decorated replies at the tail
+    (i>=20). Shared by the two tests below. Verified empirically
+    (/tmp/zl/check_partial2.py, against the real frozen summarizer)
+    before either test was written: a SELF-CONSISTENT anchor tolerates
+    cleaning all 15 tail turns (the real _align_candidates prefix-
+    matching is deliberately forgiving of scattered edits — see its own
+    docstring on surviving a regenerated last reply); a DRIFTED anchor
+    (primed one turn short, the real 09-23 backup's own shape) does not
+    — that combination is what actually reproduces a red/no-match
+    condition, not a single edited turn in isolation."""
+    branch = []
+    for i in range(35):
+        branch.append(("user", f"question {i}"))
+        if i == 1:
+            branch.append(("assistant", "✅ decorated EARLY reply, safely outside the tail"))
+        elif i >= 20:
+            branch.append(("assistant", "▶️ LAW " + str(i) + " ✅ ACTIVE (100%)\n" + "═" * 60))
+        else:
+            branch.append(("assistant", f"plain reply {i}"))
+    return branch
+
+
+def test_cleaning_protected_turns_without_protection_goes_red():
+    """Direct proof of WHY the protection in main() exists, isolated from
+    the CLI. Cleaning turns tail_fp covers is tolerated by real alignment
+    matching when the anchor is otherwise self-consistent (real
+    _align_candidates prefix-matching is deliberately forgiving) — it is
+    specifically a DRIFTED anchor (see item 1's real finding) left
+    un-rewritten across that same cleaning that goes RED (no real
+    fingerprint match at all, align_candidates empty) — the exact shape
+    that turns into a permanent hole, and exactly what main()'s
+    protection logic (this file's other new test) exists to prevent."""
+    branch = _make_long_decorated_branch()
+    flat_turns = [{"role": r, "content": t} for r, t in branch]
+
+    self_state = summarizer._empty_state(CHAT_ID)
+    summarizer._observed_position(CHAT_ID, self_state, flat_turns)
+    self_tail_fp = [x for x in self_state.get("tail_fp") or [] if isinstance(x, str)]
+
+    stale_state = summarizer._empty_state(CHAT_ID)
+    summarizer._observed_position(CHAT_ID, stale_state, flat_turns[:-1])
+    stale_tail_fp = [x for x in stale_state.get("tail_fp") or [] if isinstance(x, str)]
+
+    dirtied = list(flat_turns)
+    for i in range(41, 70, 2):  # the 15 consecutive tail assistant turns
+        dirtied[i] = {"role": dirtied[i]["role"], "content": cd.clean_text(dirtied[i]["content"])}
+    assert_true(
+        any(dirtied[i]["content"] != flat_turns[i]["content"] for i in range(41, 70, 2)),
+        "sanity: the tail turns actually had decoration to remove",
+    )
+
+    assert_true(
+        cd._align_finds_a_match(summarizer, self_tail_fp, dirtied),
+        "a SELF-CONSISTENT anchor tolerates cleaning the tail (no drift involved)",
+    )
+    assert_true(
+        not cd._align_finds_a_match(summarizer, stale_tail_fp, dirtied),
+        "the SAME cleaning against a DRIFTED, un-rewritten anchor goes RED — "
+        "no real alignment match — this is exactly what main()'s protection "
+        "logic exists to prevent",
+    )
+
+
+def test_anchor_protection_allows_partial_cleaning_outside_the_window():
+    """The other path item 2 asks for: turns OUTSIDE tail_fp/head_fp's
+    own window are safe to clean even when the anchor can't be verified/
+    rewritten, and get cleaned; turns INSIDE it are skipped and reported.
+    Real progress plus a documented skip is exit 4, not 0 or 1."""
+    _wipe_storage()
+    tmp = Path(tempfile.mkdtemp(prefix="cd-cli-"))
+    try:
+        long_branch = _make_long_decorated_branch()
+        db_path = tmp / "webui.db"
+        _make_webui_db(db_path, CHAT_ID, long_branch)
+        original_flat_turns = [{"role": r, "content": t} for r, t in long_branch]
+
+        # A stale anchor: primed one turn short, same shape as the real
+        # 09-23 finding — so the tail's own turns can't be safely
+        # verified/cleaned, but nothing else is affected by that at all.
+        stale_state = summarizer._empty_state(CHAT_ID)
+        summarizer._observed_position(CHAT_ID, stale_state, original_flat_turns[:-1])
+        stale_state["turns_seen"] = 1000
+        summarizer.save_state(CHAT_ID, stale_state)
+
+        argv = [
+            "--webui-db", str(db_path), "--store", _TMP_ROOT, "--conv", CHAT_ID,
+            "--compactor-pkg", str(_HERE), "--last", "35", "--only", "webui", "--json",
+            "--apply",
+        ]
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cd.main(argv)
+        report = json.loads(buf.getvalue())
+        webui_r = report.get("targets", {}).get("webui", {})
+        assert_eq(rc, 4, f"partial cleaning (some safe, some protected) exits 4 (rc={rc}): "
+                          f"count={webui_r.get('count')} skipped={webui_r.get('skipped_protected_by_anchor')} "
+                          f"refused={webui_r.get('refused')} anchor={report.get('anchor')}")
+        assert_true(webui_r.get("count", 0) > 0, "at least one turn OUTSIDE the tail window was cleaned")
+        assert_true(bool(webui_r.get("skipped_protected_by_anchor")),
+                    "at least one turn INSIDE the tail window was skipped, not cleaned")
+        unchanged_state = summarizer.load_state(CHAT_ID)
+        assert_eq(unchanged_state.get("tail_fp"), stale_state.get("tail_fp"),
+                  "the stale anchor is left untouched — no rewrite was needed since the "
+                  "cleaned turns are all outside what it tracks")
+
+        # Verify the anchor STILL finds a real match post-cleaning — the
+        # actual guarantee, not just "the anchor bytes didn't change".
+        hist_texts, _, _ = _read_webui_texts(db_path, CHAT_ID)
+        cleaned_flat_turns = [
+            {"role": r, "content": hist_texts.get(f"m{i}", t)}
+            for i, (r, t) in enumerate(long_branch)
+        ]
+        old_tail_fp = [x for x in unchanged_state.get("tail_fp") or [] if isinstance(x, str)]
+        assert_true(
+            cd._align_finds_a_match(summarizer, old_tail_fp, cleaned_flat_turns),
+            "the untouched anchor still finds a real match against the partially-cleaned branch",
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

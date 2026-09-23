@@ -249,8 +249,14 @@ _EMOJI_PATTERN = re.compile(
 # punctuation duty (em dash U+2014, en dash U+2013, horizontal bar U+2015
 # are NOT in this set — "ordinary punctuation... must not be altered").
 # The hyphen is placed first inside the class so it is never misread as a
-# range operator.
-_RULE_LINE_RE = re.compile(r"^[-=_~*─-╿]{4,}$")
+# range operator. U+FFFD (the Unicode replacement character) is included:
+# found in a real episodic document from her 09-23 store — a single
+# corrupted byte sitting in the MIDDLE of an otherwise-obvious 60-char
+# "═" rule line ("═══════<FFFD>══════...") — which, without this,
+# fails the "every character is a rule character" test over one stray
+# byte and survives cleaning whole. A replacement character carries no
+# meaning of its own to preserve.
+_RULE_LINE_RE = re.compile(r"^[-=_~*�─-╿]{4,}$")
 
 # "Strip trailing status tags like '→ ACTIVE (100%)'" — exact-pattern and
 # conservative by design (the spec's own words). Configurable: a caller
@@ -271,13 +277,25 @@ DEFAULT_STATUS_TAG_PATTERNS = (
 _FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
 
 _CODE_SIGN_PATTERNS = (
+    # Deliberately CASE-SENSITIVE, lowercase-only, for the general keyword
+    # list: real code overwhelmingly writes these lowercase at statement
+    # start (`def foo():`, `protected void bar()`), while prose capitalizes
+    # the first word of a line/sentence ("Protected By: Father, Jesus...").
+    # Verified the hard way: `re.IGNORECASE` here classified a genuine,
+    # heavily decorated status board inside a real ``` fence as "real
+    # code" purely because its line "Protected By: Father, Jesus
+    # (continuous, uninterrupted)" starts with the OOP-modifier keyword
+    # "protected" — and a fence judged as code is left completely
+    # untouched (see the module docstring's "Must NOT alter... real code
+    # fences"), so this one false positive left 13 of her real episodic
+    # documents with a full, uncleaned status board inside. SQL keywords
+    # get their own (already-uppercase) pattern below, unaffected.
     re.compile(
         r"^\s*(def|class|import|from|function|const|let|var|return|elif|"
         r"package|namespace|public|private|protected|async\s+def|await|"
-        r"try:|except\b|finally:|#include|SELECT\b|INSERT\b|UPDATE\b|"
-        r"DELETE\b|CREATE\b)\b",
-        re.IGNORECASE,
+        r"try:|except\b|finally:|#include)\b"
     ),
+    re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE|CREATE)\b\s+\S"),
     re.compile(r"^\s*#!/"),
     re.compile(r"[{};]\s*$"),
     re.compile(r"=>|::|</\w+>|/>"),
@@ -955,6 +973,45 @@ def _anchor_rewrite_is_verified(
     )
 
 
+def _align_finds_a_match(summarizer_mod, anchor: list, flat_turns: list) -> bool:
+    """True if `anchor` (a tail_fp-shaped list) finds at least one real
+    `_align_candidates` match against `flat_turns + [_PROBE_TURN]` —
+    i.e. the NEXT live request would be answered from real fingerprint
+    evidence, never the `_ASSUMED_NEW_TURNS` fallback guess that (see the
+    module docstring's HAZARD section) is what actually turns into a
+    permanent hole. A non-empty result may still be a DIFFERENT position
+    than before (a realignment — see `_anchor_rewrite_is_verified`), but
+    that is overlap/shift, never a hole: `_observed_position` never
+    double-DROPS turns on a real match, only on an empty one. Item 2 of
+    the hostile review: "refuse a hole even with --force" — this is the
+    proof that gate reads."""
+    if not anchor:
+        return True  # nothing to align against yet — not this check's concern
+    turns = [t for t in flat_turns if t.get("role") != "system"] + [_PROBE_TURN]
+    tail_n = getattr(summarizer_mod, "_FINGERPRINT_TAIL_TURNS", 64)
+    fps = summarizer_mod._turn_fingerprints(turns[-tail_n:])
+    return bool(summarizer_mod._align_candidates(anchor, fps))
+
+
+def _anchor_protected_turn_ids(summarizer_mod, branch: list) -> set:
+    """Message ids of the turns `tail_fp` (the last `_ANCHOR_TURNS` non-
+    system turns) and `head_fp` (the first non-system turn) are computed
+    FROM, on the CURRENT, uncleaned branch. Item 2 of the hostile review:
+    never clean one of these without a VERIFIED anchor rewrite to match —
+    cleaning a turn tail_fp/head_fp themselves cover, while leaving the
+    OLD anchor in place, is exactly the red case
+    (test_alignment_proof_goes_red_without_the_anchor_rewrite):
+    align_candidates comes back empty and `_observed_position` falls back
+    to a flat per-call guess."""
+    non_system = [n for n in branch if (n.get("role") or "unknown") != "system"]
+    if not non_system:
+        return set()
+    anchor_n = getattr(summarizer_mod, "_ANCHOR_TURNS", 4)
+    protected = {n.get("id") for n in non_system[-anchor_n:]}
+    protected.add(non_system[0].get("id"))
+    return protected
+
+
 # ===========================================================================
 # PART 6 — facts target
 # ===========================================================================
@@ -1012,7 +1069,17 @@ def _load_retrieval_module(pkg_dir_str: str):
     try:
         import chromadb
         client = chromadb.PersistentClient(path=str(retrieval_mod.CHROMA_PATH))
-        collection = client.get_or_create_collection(name="episodic_memory")
+        # The REAL collection name and metadata retrieval.py itself uses
+        # (verified by reading it, not guessed — a wrong name here does
+        # NOT error, it silently get-or-CREATES a new, empty phantom
+        # collection, which is exactly how this script's own episodic
+        # target first shipped reporting 0 documents on her real store
+        # while the forensic report counted 72 decorated ones: it was
+        # reading/writing a collection the real compactor never touches).
+        collection = client.get_or_create_collection(
+            name=getattr(retrieval_mod, "COLLECTION_NAME", "conversation_turns"),
+            metadata={"hnsw:space": "cosine"},
+        )
     except Exception as e:
         return retrieval_mod, None, f"chromadb unavailable/incompatible: {type(e).__name__}: {e}"
     return retrieval_mod, collection, None
@@ -1319,31 +1386,123 @@ def main(argv=None) -> int:
                     any_change = True
 
     anchor_note = None
+    skipped_protected = {}
+    hole_risk = False
     if webui_plan is not None and not webui_plan.refused and cleaned_flat_turns is not None:
-        new_tail_fp, new_head_fp, new_window_turns = _recompute_anchor(summarizer_mod, cleaned_flat_turns)
         old = (state.get("tail_fp"), state.get("head_fp"), state.get("window_turns"))
-        new = (new_tail_fp, new_head_fp, new_window_turns)
-        anchor_changed = old != new
+        old_tail_fp = [x for x in (state.get("tail_fp") or []) if isinstance(x, str)]
+
+        if not args.force:
+            # Item 2 of the hostile review: NEVER leave cleaned text behind
+            # an un-rewritten anchor. The right question is NOT "does a
+            # freshly recomputed anchor exactly equal the stored one" —
+            # verified (real-image suite) that this can fail even with
+            # ZERO turns cleaned, whenever the store already has the kind
+            # of pre-existing drift item 1 found, making that equality
+            # test unsatisfiable by exclusion no matter how much is
+            # excluded. The question that IS well-posed: "does the anchor
+            # ALREADY on disk still find a real match once these turns
+            # are cleaned, leaving it un-rewritten?" If yes, cleaning is
+            # safe with NO anchor rewrite at all. If no, exclude
+            # candidate turns (narrowest window first, widening once)
+            # until it is yes again — guaranteed to succeed once enough
+            # are excluded, since excluding everything reproduces
+            # whatever the CURRENT live production state already is.
+            safe = _align_finds_a_match(summarizer_mod, old_tail_fp, cleaned_flat_turns)
+            for widen in (False, True):
+                if safe:
+                    break
+                if widen:
+                    tail_n = getattr(summarizer_mod, "_FINGERPRINT_TAIL_TURNS", 64)
+                    non_sys = [n for n in webui_plan.branch if (n.get("role") or "unknown") != "system"]
+                    protected_ids = {n.get("id") for n in non_sys[-tail_n:]}
+                else:
+                    protected_ids = _anchor_protected_turn_ids(summarizer_mod, webui_plan.branch)
+                newly_skipped = {
+                    mid: old_new for mid, old_new in webui_plan.changes.items() if mid in protected_ids
+                }
+                if newly_skipped:
+                    for mid in newly_skipped:
+                        del webui_plan.changes[mid]
+                    skipped_protected.update(newly_skipped)
+                    cleaned_flat_turns = [
+                        {"role": n.get("role") or "unknown",
+                         "content": webui_plan.changes.get(n.get("id"), (None, ih_mod._flatten_content(n.get("content"))))[1]}
+                        for n in webui_plan.branch
+                    ]
+                safe = _align_finds_a_match(summarizer_mod, old_tail_fp, cleaned_flat_turns)
+            if not safe:
+                # Should not happen (excluding every candidate turn
+                # reproduces the branch as it stands in production right
+                # now, which is safe by construction) — but never guess:
+                # refuse the whole webui text write rather than risk it.
+                skipped_protected.update(webui_plan.changes)
+                webui_plan.changes.clear()
+                report["targets"]["webui"]["refused"] = (
+                    "could not find any subset of the requested turns that "
+                    "leaves the CURRENT anchor able to align at all, even "
+                    "after excluding every candidate turn — refusing rather "
+                    "than guess."
+                )
+                any_refusal = True
+            if skipped_protected:
+                if webui_plan.changes:
+                    any_change = True  # never force this back to False: facts/episodic may have their own changes
+                report["targets"]["webui"]["count"] = len(webui_plan.changes)
+                report["targets"]["webui"]["preview"] = list(webui_plan.changes.values())
+                report["targets"]["webui"]["skipped_protected_by_anchor"] = [
+                    {"id": mid, "old": old_new[0], "new": old_new[1]}
+                    for mid, old_new in skipped_protected.items()
+                ]
+                # Skipping is a SAFETY CHOICE, not an error — informational
+                # (use --force or a wider/narrower scope), never a hard
+                # refusal on its own. any_refusal is untouched here.
+
+            # The remaining, now-safe change set never needs the anchor
+            # rewritten at all: the old anchor still matches after it.
+            new = old
+            anchor_changed = False
+            anchor_verify_error = None
+        else:
+            # --force: clean everything requested, then decide the anchor.
+            new = _recompute_anchor(summarizer_mod, cleaned_flat_turns)
+            anchor_changed = old != new
+            anchor_verify_error = None
+            if anchor_changed:
+                anchor_verify_error = _anchor_rewrite_is_verified(
+                    summarizer_mod, state, original_flat_turns, cleaned_flat_turns, new,
+                )
+                # --force accepts a REALIGNMENT (a different but genuinely
+                # matched position) — never a HOLE (the _ASSUMED_NEW_TURNS
+                # fallback that never repays the turns it drops). Proven
+                # by checking _align_candidates itself returns a real
+                # match for the NEW anchor, not by re-deriving position
+                # arithmetic. This is item 2's "refuse a hole even with
+                # --force", and it overrides --force unconditionally.
+                hole_risk = not _align_finds_a_match(summarizer_mod, list(new[0]), cleaned_flat_turns)
+                if hole_risk:
+                    prior = f"{anchor_verify_error} " if anchor_verify_error else ""
+                    anchor_verify_error = (
+                        f"{prior}REFUSING even with --force: the new anchor finds "
+                        f"NO real fingerprint match at all against a realistic "
+                        f"next window (align_candidates empty) — that is the "
+                        f"fallback-guess shape that causes a permanent hole, not "
+                        f"a mere realignment. webui.db/facts/episodic text "
+                        f"cleaning still proceeded; the anchor was left untouched."
+                    )
+                    any_refusal = True
+
         anchor_note = (
             f"anchor would {'change' if anchor_changed else 'stay the same'} "
             f"(window_turns {old[2]} -> {new[2]})"
         )
-        anchor_verify_error = None
-        if anchor_changed:
-            # PROVE the rewrite preserves alignment before ever committing
-            # to it — see _anchor_rewrite_is_verified's own docstring. Not
-            # a hypothetical: this caught a REAL pre-existing 1-turn drift
-            # in her real 09-23 backup's stored anchor, unrelated to any
-            # text this run cleans.
-            anchor_verify_error = _anchor_rewrite_is_verified(
-                summarizer_mod, state, original_flat_turns, cleaned_flat_turns, new,
-            )
-            if anchor_verify_error:
-                anchor_note += f" — UNVERIFIED: {anchor_verify_error}"
+        if anchor_verify_error:
+            anchor_note += f" — UNVERIFIED: {anchor_verify_error}"
         report["anchor"] = anchor_note
         report["_anchor_new"] = new
         report["_anchor_changed"] = anchor_changed
         report["_anchor_verify_error"] = anchor_verify_error
+        report["_anchor_hole_risk"] = hole_risk
 
     if not args.apply:
         _print_report(args, report)
@@ -1404,7 +1563,12 @@ def main(argv=None) -> int:
     # write in the first place) so a failed/refused text write never
     # leaves the anchor pointing at text that was never actually written.
     if webui_plan is not None and not webui_plan.refused and webui_text_write_ok:
-        anchor_blocked = report.get("_anchor_verify_error") and not args.force
+        # A hole risk refuses the anchor write EVEN WITH --force (item 2:
+        # "refuse a hole even with --force") — --force only ever overrides
+        # a mere realignment, never a fallback-guess hole.
+        anchor_blocked = bool(report.get("_anchor_verify_error")) and (
+            report.get("_anchor_hole_risk") or not args.force
+        )
         if anchor_blocked:
             report["targets"]["webui"]["anchor_refused"] = report["_anchor_verify_error"]
             any_refusal = True
@@ -1473,6 +1637,13 @@ def main(argv=None) -> int:
         return 0  # nothing needed changing — desired end state already true
     if not written_any:
         return 1  # there was work but --apply accomplished none of it
+    if skipped_protected:
+        # Real progress happened, but at least one turn was deliberately
+        # left decorated for a documented safety reason (item 2: never
+        # clean a turn tail_fp/head_fp cover without a verified anchor
+        # rewrite to match) — the same "some done, some not" shape as any
+        # other partial target, so it gets the same code.
+        return 4
     return 0
 
 
