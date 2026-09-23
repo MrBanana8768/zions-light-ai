@@ -211,12 +211,17 @@ SATURATION = {"test_saturation.py", "test_soak_conversation.py"}
 # (and import-history.py's own dry run); listed here so `--real-image`
 # picks them up the moment each lands, rather than needing this set
 # touched again per suite.
+# test_real_image_v3197_css.py (v3.1.9.7) covers Dockerfile.v3197's own
+# scroll-jump CSS fix -- it needs the LOCALLY BUILT trial image
+# (zla-v3197-trial:latest by default, ZLA_V3197_IMAGE_REF override), not
+# the published base digest the other suites in this set default to.
 NEEDS_DOCKER = {
     "test_real_image_operator_scripts.py",
     "test_real_image_import_apply.py",
     "test_real_image_setup_sshd.py",
     "test_real_image_clean_decoration.py",
     "test_real_image_chat_tree.py",
+    "test_real_image_v3197_css.py",
 }
 
 PASS, FAIL, SKIP, INCONCLUSIVE = "PASS", "FAIL", "SKIP", "INCONCLUSIVE"

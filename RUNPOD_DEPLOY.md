@@ -1060,7 +1060,7 @@ details in the CHANGELOG entry of the same number):
 | v3.1.9.4 | Replies no longer wait ~30 s on fact selection; `/forget` stays forgotten; cut summaries are handled. |
 | v3.1.9.5 | Documentation only — the SAME image as v3.1.9.4 (same digest), under a new tag. |
 | v3.1.9.6 | Scripts and docs only — the SAME image as v3.1.9.5 (same digest), under a new tag. Adds `scripts/setup-sshd.py`, an operator tool that installs and hardens a real sshd LIVE inside a running pod (the image itself still ships none) — see OPERATIONS.md. |
-| v3.1.9.7 | OpenWebUI 0.11.0 → 0.11.4 — the scroll-position fix while reading old messages. A NEW image (thin layer on the v3.1.9.4/.5/.6 digest) that migrates `webui.db` on first boot. See below. |
+| v3.1.9.7 | OpenWebUI 0.11.0 → 0.11.4, PLUS the verified scroll-jump CSS fix (measured 0px per older-message load, 5/5 runs — the version bump alone was inconclusive) baked into `custom.css`. A NEW image (thin layer on the v3.1.9.4/.5/.6 digest) that migrates `webui.db` on first boot. See below. |
 
 No new REQUIRED settings before v3.1.9.7.
 
@@ -1119,7 +1119,36 @@ Do **not** promote `:latest` until the on-pod validation gate passes
    # then in OpenWebUI: open her chat, confirm history renders and the
    # message count matches what /health/full or webuidb.py --status reported
    # before the switch
+   curl -sf http://localhost:8080/static/custom.css | grep -c overflow-anchor
+   # expect 1 -- the scroll-jump CSS fix (see below) is baked into the image
    ```
+
+**The scroll-jump CSS fix is now baked into the image — the manual pod
+steps from `/home/drew/zl-ops/bounce-diagnosis.md` are retired as of this
+release.** If you had been keeping the pod's scroll-jump workaround alive
+by hand (writing the two `content-visibility`/`overflow-anchor` CSS rules
+into both copies of `custom.css` inside `/app/venv` through the Web
+Terminal after every `pip install open-webui`, per that doc's section
+"(b) Fastest fix today, no new image"), **stop doing both of those once
+this pod is on `:v3.1.9.7-cu12`:**
+- the manual `custom.css` write — `Dockerfile.v3197` appends the exact
+  same two rules into both `open_webui/frontend/static/custom.css` and
+  `open_webui/static/custom.css` at build time, so they are already
+  there in the shipped image and, unlike the manual version, survive an
+  OpenWebUI process restart the same way (the rules live in
+  `frontend/static`, the copy SOURCE `config.py` re-copies from on every
+  boot, not only in the copy destination); and
+- any ad-hoc `pip install open-webui==<version>` run directly on the pod
+  to chase this fix — this release's own `pip install open-webui==0.11.4`
+  (pinned by `docs/v3197-constraints.txt`) already IS that upgrade, done
+  once, reproducibly, and tested (see CHANGELOG.md's `[3.1.9.7]` entry);
+  a further manual `pip install` on top of this image is not needed and
+  would drift the pod off what was actually tested.
+
+If the CSS check above ever returns `0`, something is wrong with the
+image on the pod (wrong tag, or a build that predates this fix) — it is
+not something to patch by hand again; rebuild/redeploy the correct
+`:v3.1.9.7-cu12` (or later) tag instead.
 
 **Rollback.** 0.11.0 (any v3.1.9.4/.5/.6 image) DOES still boot and
 correctly serve her chat against a webui.db that 0.11.4 has migrated — its

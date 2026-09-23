@@ -13,15 +13,18 @@ on Docker Hub.
 
 **An image change — a thin layer, not a retag.** `Dockerfile.v3197` builds
 `FROM angreg/zions-light-ai@sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65`
-(v3.1.9.4, also tagged v3.1.9.5/.6) and runs exactly one `pip install
+(v3.1.9.4, also tagged v3.1.9.5/.6), runs one `pip install
 open-webui==0.11.4` against `/app/venv`, constrained by
-`docs/v3197-constraints.txt`. Nothing else in the base image is touched:
-`/opt/vllm-venv`, `/opt/compactor-venv`, `/opt/compactor` (sources),
-`/opt/whisper-venv`, `/opt/tts-venv`, `entrypoint.sh`, `supervisord.conf` and
-`clean-models.sh` are byte-for-byte identical to the base — verified by
-comparing an aggregate sha256 of every file under each of those paths
-between the base image and the new one; only `/app/venv`'s file count
-differs (51,565 → 51,728 files).
+`docs/v3197-constraints.txt`, and appends the two-line scroll-jump CSS fix
+(see "The scroll-jump CSS fix" below) into OpenWebUI's own `custom.css`,
+still strictly inside `/app/venv`. Nothing else in the base image is
+touched: `/opt/vllm-venv`, `/opt/compactor-venv`, `/opt/compactor`
+(sources), `/opt/whisper-venv`, `/opt/tts-venv`, `entrypoint.sh`,
+`supervisord.conf` and `clean-models.sh` are byte-for-byte identical to
+the base — verified by comparing an aggregate sha256 of every file under
+each of those paths between the base image and the new one; only
+`/app/venv`'s file count differs (51,565 → 51,728 files), unchanged by
+the CSS append (it targets two files that already exist).
 
 **Why.** She is "bouncing" while scrolling up in her 3,885-message chat:
 older-message batches loading while she reads shift what she was looking
@@ -119,6 +122,72 @@ are safe, and that the word-ban and message-array behavior are unaffected.
 Further, cleaner browser-based measurement (ideally on a host not sharing
 CPU with concurrent Docker builds) is recommended before treating the
 scroll complaint as closed.
+
+**The scroll-jump CSS fix — verified, and now baked into this same
+release.** The upstream 0.11.1-4 code change above turned out not to be
+the fix (see the "inconclusive" measurement immediately above — it made
+no consistent difference to the jump). The actual, verified fix is two
+CSS rules, added to `Dockerfile.v3197` in addition to the OpenWebUI
+version bump:
+```css
+.message-listitem{content-visibility:visible !important;contain-intrinsic-size:none !important}
+#messages-container{overflow-anchor:none !important}
+```
+Full root-cause writeup in `/home/drew/zl-ops/bounce-diagnosis.md`.
+Mechanism, in short: OpenWebUI's `content-visibility:auto` placeholder
+height for off-screen messages (162px) is nowhere close to the real
+height of her messages (2,000-6,000px each), and Chrome's native scroll
+anchoring never engages at `scrollTop===0`, where the "load older
+messages" trigger fires — so the manual `scrollTop +=` compensation in
+`loadMoreMessages` is working from the wrong number, every time. Without
+the fix, the jump per older-message load measured **1,000-3,700px in
+every run tried, on OpenWebUI 0.11.4** (never 0). With both rules, it
+measured **0px in 5 of 5 runs** (4 Chromium, 1 Firefox) in that
+investigation. Either rule alone was not enough: `content-visibility`
+alone still left the second, closely-following load compensated twice
+(-15,360px observed); `overflow-anchor` alone still produced 18k-60kpx
+jumps.
+
+**Re-verified against THIS release's own rebuilt image
+(`zla-v3197-trial:latest`), on a scratch copy of the 2026-09-23
+05:50Z pod-export backup, real HTTP, no injected CSS** (`measure.py`'s own
+`css` field reported `null` — the styles it measured came from
+`GET /static/custom.css`, i.e. from the image, exactly as a real pod would
+serve it): three Chromium runs (steps/delta 250/150, 500/200, 250/100)
+each captured the one "load older messages" event this chat's branch
+allows (see finding 2 below — this copy's JSON history ends 13 messages
+from the tip) and measured a **-0.3px** anchor drift on every single one
+— 0px to the nearest sub-pixel budget the harness resolves. The computed
+styles were confirmed live on the page: `content-visibility: visible`,
+`overflow-anchor: none`. A ~290px non-load drift remains, unrelated to
+this fix and already known (a message growing when a nested element,
+e.g. an image, finishes loading inside it) — matches the "~290px
+remains" note in bounce-diagnosis.md exactly.
+
+`compactor/test_real_image_v3197_css.py` (new; `--real-image`) makes this
+a permanent, automated real-image check: it boots the built image, asserts
+`GET /static/custom.css` serves both rules, that both on-disk copies
+(`frontend/static/custom.css` and `static/custom.css`) carry them exactly
+once each (proving the Dockerfile's append step is idempotent, never
+duplicating), and that the fix survives a real OpenWebUI process restart
+inside the container — the scenario that matters, since
+`open_webui/config.py` deletes and re-copies `static/` from
+`frontend/static` on every process start (confirmed against the installed
+0.11.4 source, ~lines 100-117), so a fix only in one of the two files
+would silently vanish on next boot. Both `custom.css` files ship EMPTY in
+stock OpenWebUI 0.11.4 (verified against the installed package before this
+change), so this release's own rules are the entire file content, appended
+rather than written, so a future OpenWebUI release shipping real content
+there is never clobbered.
+
+**Filesystem-diff re-confirmed after this addition.** Re-running this
+release's own byte-identity check (aggregate sha256 over
+`/opt/vllm-venv`, `/opt/compactor-venv`, `/opt/compactor`,
+`/opt/whisper-venv`, `/opt/tts-venv`, `entrypoint.sh`, `supervisord.conf`,
+`clean-models.sh` against the base digest) after adding the CSS-append
+step: still byte-identical, still only `/app/venv` differs, and its file
+count is unchanged at 51,565 → 51,728 (the CSS is appended into two files
+that already existed and were already counted — no new files).
 
 **Compactor message array — unaffected.** `get_messages_map_by_chat_id`
 is unchanged (see above); the one behavior change in

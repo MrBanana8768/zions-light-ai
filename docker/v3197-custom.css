@@ -1,0 +1,17 @@
+/* v3.1.9.7 scroll-jump fix.
+ *
+ * Measured in /home/drew/zl-ops/bounce-diagnosis.md: with these two rules,
+ * the view-anchor jump per "load older messages" batch measured 0 px in
+ * 5 of 5 runs (4 Chromium, 1 Firefox); without them it measured 1,000-
+ * 3,700 px in every run tried. Both rules are required together -- either
+ * one alone still produced an 18k-60k px jump on some load.
+ *
+ * Baked into the image (Dockerfile.v3197) rather than left as a manual
+ * pod step because OpenWebUI's own config.py (~lines 100-117 in 0.11.4)
+ * deletes every top-level file under static/ and re-copies it from
+ * frontend/static on every process start, and `pip install open-webui`
+ * overwrites both files outright. Appended, never written to replace
+ * the file's existing content -- see Dockerfile.v3197's own comment.
+ */
+.message-listitem{content-visibility:visible !important;contain-intrinsic-size:none !important}
+#messages-container{overflow-anchor:none !important}

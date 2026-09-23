@@ -1,7 +1,9 @@
 # v3.1.9.7 — THIN layer on top of the exact production base image.
 # Upgrades ONLY OpenWebUI (0.11.0 -> 0.11.4) inside /app/venv. Nothing else
 # in the base image (vllm-venv, compactor-venv, compactor sources,
-# entrypoint.sh, supervisord.conf, whisper/tts venvs) is touched.
+# entrypoint.sh, supervisord.conf, whisper/tts venvs) is touched, except
+# for the two-line scroll-jump CSS fix appended into the pip-installed
+# OpenWebUI package's own custom.css (still strictly inside /app/venv).
 #
 # Reason: OpenWebUI upstream issue #23990 / PR #28657 — older messages
 # loaded while scrolling up shifted what the reader was looking at
@@ -22,6 +24,13 @@ FROM angreg/zions-light-ai@sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b
 # otherwise be free to pick.
 COPY docs/v3197-constraints.txt /tmp/v3197-constraints.txt
 
+# The measured scroll-jump fix (see /home/drew/zl-ops/bounce-diagnosis.md
+# and docker/v3197-custom.css's own header comment for the numbers: 0 px
+# in 5/5 runs with both rules, 1,000-3,700 px without). Copied in here,
+# rather than piped straight into the RUN below, so the CSS text lives in
+# the repo as a normal, reviewable, checked-in file.
+COPY docker/v3197-custom.css /tmp/v3197-custom.css
+
 RUN /app/venv/bin/pip install --no-cache-dir \
         --constraint /tmp/v3197-constraints.txt \
         open-webui==0.11.4 && \
@@ -30,3 +39,44 @@ RUN /app/venv/bin/pip install --no-cache-dir \
     find /app/venv -name "*.pyc" -delete && \
     find /app/venv -name "__pycache__" -type d -exec rm -rf {} + && \
     rm -rf /root/.cache /tmp/*.txt /tmp/v3197-constraints.txt /var/tmp/*
+
+# Bake the scroll-jump CSS into BOTH copies OpenWebUI keeps of this file.
+# Both are required: at every process start, open_webui/config.py
+# (~lines 100-117 in 0.11.4) deletes every top-level file under
+# open_webui/static/ and re-copies open_webui/frontend/static/* over it,
+# so a fix only in static/ would not survive a restart; and
+# `pip install open-webui` (the RUN above) overwrites both files outright,
+# so this step must run AFTER the pip install, not before it.
+#
+# Idempotent and fails loudly rather than silently doing nothing: refuses
+# the build if either target file is missing (a path change upstream), and
+# checks for the marker rule already being present before appending, so
+# re-running this same Dockerfile against a base that already carries the
+# fix (or building it twice) never duplicates the block. Always APPENDS —
+# 0.11.4 ships both files empty (verified against the installed package),
+# but a future OpenWebUI release shipping real content in custom.css must
+# never be clobbered by this step.
+RUN set -eu; \
+    P=/app/venv/lib/python3.12/site-packages/open_webui; \
+    F1="$P/frontend/static/custom.css"; \
+    F2="$P/static/custom.css"; \
+    for f in "$F1" "$F2"; do \
+        if [ ! -f "$f" ]; then \
+            echo "v3197-custom-css: expected target file missing: $f" >&2; \
+            exit 1; \
+        fi; \
+    done; \
+    for f in "$F1" "$F2"; do \
+        if grep -q "overflow-anchor:none !important" "$f"; then \
+            echo "v3197-custom-css: rules already present in $f, not re-appending"; \
+        else \
+            printf '\n' >> "$f"; \
+            cat /tmp/v3197-custom.css >> "$f"; \
+            echo "v3197-custom-css: appended rules to $f"; \
+        fi; \
+    done; \
+    grep -q "overflow-anchor:none !important" "$F1"; \
+    grep -q "overflow-anchor:none !important" "$F2"; \
+    grep -q "content-visibility:visible !important" "$F1"; \
+    grep -q "content-visibility:visible !important" "$F2"; \
+    rm -f /tmp/v3197-custom.css
