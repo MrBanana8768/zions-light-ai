@@ -24,7 +24,7 @@ not rebuilt: a rebuild re-resolves `apt-get upgrade`, unpinned pip
 dependencies, the Piper voice URL and the CUDA base tag, and produces a
 different, unvalidated image.
 
-**Why this exists.** Three independent operator gaps, each closed with a
+**Why this exists.** Four independent operator gaps, each closed with a
 script under `scripts/` rather than a change to what the image ships:
 
 1. v3.1.9.4's own fix to `backfill.needs_backfill()` — reading a
@@ -46,9 +46,11 @@ script under `scripts/` rather than a change to what the image ships:
 2. The production conversation `ea1494ea-e9d7-46fb-8b7c-3a50d685d00e`
    (the same id, coincidentally, that carries one of the four stale
    backfill records above) has roughly 3,850 messages in OpenWebUI, but
-   its summary hierarchy only covers the first ~1,600 turns — a ~2,200
-   turn backlog that drags the whole history around on every request and
-   blocks turning on the OpenWebUI History cap. `POST
+   its summary hierarchy only covers the first 2,720 turns (N16, round 3:
+   an earlier draft of this paragraph said "~1,600 turns" — corrected to
+   the real backup's actual `last_summarized_turn`) — a backlog that
+   drags the whole history around on every request and blocks turning on
+   the OpenWebUI History cap. `POST
    /admin/conversations/{conv_id}/compact` runs the same rollup drain
    but rebuilds its transcript from the EPISODIC store (chromadb), which
    for this conversation holds only 70 exchanges — nowhere near enough to
@@ -61,6 +63,24 @@ script under `scripts/` rather than a change to what the image ships:
    shell into a live pod other than the RunPod Web Terminal — enough for
    the procedures above, but not for anything that needs a real
    interactive shell, port forwarding, or `scp`.
+4. Her chat's message tree can develop snapped parent links (a failed
+   write to the network volume) or a stale display pointer (a stale
+   browser tab's `merge_history` post overwriting `current_message_id`),
+   both hit for real on 2026-09-22 and 2026-09-23. This is not merely
+   cosmetic: this image's `open_webui` fork treats its `chat_message` SQL
+   table, not the chat's JSON history, as the PRIMARY copy, and for a
+   saved chat `load_messages_from_db` REPLACES the client's own submitted
+   messages with a fresh walk of that same table-preferring copy before
+   the model ever sees them — a broken link or a stuck pointer corrupts
+   what the model receives as context, the same way it corrupts what she
+   sees on screen. `scripts/repair-chat-tree.py` and
+   `scripts/fix-encoded-messages.py` fix these; see RUNBOOK_CHAT_TREE.md.
+   An earlier, unreviewed version of the repair script (retired, never
+   carried into this repo) had already been run once on production
+   before this hardening pass and left some messages double-encoded, and
+   its own pointer rule could jump her onto an abandoned regenerate
+   branch newer than her real position — both fixed in the versions in
+   this repo (see "Fixed" below).
 
 ### Added
 - **`scripts/backfill-records.py`.** Reads every `facts/*.backfill.json`
@@ -164,6 +184,48 @@ script under `scripts/` rather than a change to what the image ships:
   idempotency, append-not-clobber, every refusal path, that `apt-get
   upgrade`/`dist-upgrade` is never invoked, and that no private key
   material ever reaches stdout, stderr, or `--json`.
+- **`scripts/repair-chat-tree.py`.** Andrew's original chat-tree repair
+  tool (`fix/ops-chat-tree`), imported and then hardened to the same
+  rigour as the operator scripts above: dry run by default, `--apply`,
+  `--json`, the same shared 0/1/2/3/4 exit codes, an explicit `--chat`
+  that defaults to her conversation id (never "whichever chat is
+  largest"), and its own timestamped backup (with free-space checked
+  first) before any write, restorable with `--restore <stamp>`. Reads
+  `chat_message` rows directly with `sqlite3` (bypassing OpenWebUI's ORM,
+  which is what makes `content`'s JSON-encoding visible at all — see the
+  "Why this exists" note above), relinks a message whose `parent_id` is
+  missing to the most recent turn that predates it, and keeps the
+  chat's stored display pointer whenever ITS OWN walk (forward along its
+  own children only, never sideways onto an unrelated branch) is intact
+  — falling back to a global newest-leaf search only when that walk is
+  genuinely broken. Refuses if OpenWebUI, a tab, or a live
+  `-wal`/`-journal` sidecar is present. Fixes two defects found while
+  hardening Andrew's v2: a pointer-selection bug that could otherwise
+  jump her onto an abandoned regenerate branch newer than her real
+  position (H-PTR), and a decode bug that left list-of-blocks
+  (multimodal/tool-output) message content silently double-encoded
+  (H-DEC) — v2's own `decode()` only ever unwrapped plain-string content.
+  Verified against copies of the real 2026-09-22 and 2026-09-23
+  pod-export backups under the pinned image's own `/app/venv/bin/python`;
+  see `compactor/test_repair_chat_tree_script.py` and
+  `compactor/test_real_image_chat_tree.py`.
+- **`scripts/fix-encoded-messages.py`.** Cleans up messages a retired
+  earlier version of the repair script left stored in their raw
+  JSON-encoded form (rendering with a literal quote and `\n`), given a
+  genuine pre-repair `webui.db` snapshot to recover the original text
+  from — it cannot invent one. Hardened the same way as
+  `repair-chat-tree.py`: dry run by default, `--apply`, `--json`, the
+  shared exit codes, its own backup with `--restore`, and an explicit
+  `--chat` (replacing "whichever chat has the most `chat_message` rows",
+  a real risk once any clone or fixture chat in the same database
+  outgrows hers). Fixes a verification bug found while testing against
+  the real backups: the original compared every target message's
+  history content against its pre-repair value unconditionally, which
+  always failed for a message that was legitimately table-only and
+  never actually copied into history at all (`repair-chat-tree.py`'s
+  job, not this script's) — it now only checks a copy that this run
+  actually fixed or that already existed beforehand. See
+  `compactor/test_fix_encoded_messages_script.py`.
 
 ### Documentation
 - **OPERATIONS.md** gains "Closing stale backfill records before upgrading
@@ -242,6 +304,33 @@ script under `scripts/` rather than a change to what the image ships:
   `facts/` (deliberate — never deleted or overwritten by either operator
   script) and gives a safe pruning recipe (keep the oldest and newest
   per conversation, per sidecar kind).
+- **RUNBOOK_CHAT_TREE.md** (round-3, fix pass E) switches every
+  invocation to the same clone method the other three operator scripts
+  use, and corrects two claims: "OpenWebUI's `merge_history` lets it
+  override stored messages" implied data loss — checked against the
+  pinned image's own `open_webui` source, it is a UNION of both tabs'
+  messages (nothing is deleted); only the display pointer is actually
+  clobbered, by whichever tab's own stale pointer still resolves.
+  Separately, "v3.1.9.4 ... evicts established facts" when a backfill
+  record resumes over existing facts was checked against
+  `compactor/backfill.py` directly and is not what the code does: a
+  resumed backfill with facts already on disk MERGES its extraction with
+  them, and a fresh backfill against a conversation that already has
+  facts is refused outright — v3.1.9.4 (P15-2) is where this was FIXED,
+  not where it was introduced (this repo's own v3.1.9.6 "Why this
+  exists" reason 1 above, and `backfill-records.py`'s own module
+  docstring, already frame the real hazard correctly: GPU contention
+  from every stale record resuming at once on upgrade, not fact loss —
+  the runbook was the one place still describing it as eviction). The
+  runbook's now-retired `close-stale-backfills.py` section is replaced
+  with `scripts/backfill-records.py`, which supersedes it and closes
+  five gaps the retired script had: no stale/is-running check (so it
+  could close a backfill that was genuinely in progress), no
+  compactor-liveness check, writing the closed state as `"complete"`
+  rather than `"abandoned"`, ignoring the attempt cap, and taking no
+  backup of its own. `close-stale-backfills.py` itself was never carried
+  into this repo — it existed only as an unreviewed original, and is
+  retired in favor of the reviewed, tested replacement.
 
 ### Fixed
 

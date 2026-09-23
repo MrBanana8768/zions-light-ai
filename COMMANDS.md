@@ -53,50 +53,66 @@ docker compose -f docker-compose.tokenizer-contract.yml up --build --exit-code-f
 docker compose -f docker-compose.tokenizer-contract.yml run --rm --build soak-tests
 ```
 
-### Real-image operator-script suites (mandatory, host-run — all three)
+### Real-image operator-script suites (mandatory, host-run — all five)
 
 Not part of the sandboxed `unit-tests` compose service above
 (`network_mode: none`, no docker socket) — these suites need a real Docker
 daemon, the published image already pulled, `git` with the release tag
-reachable, and the real 2026-09-22 pod-export backup on this host. They are
-EXCLUDED from the default `run-tests.py` selection for exactly that reason
-(see `scripts/run-tests.py`'s `NEEDS_DOCKER`), and each one honestly SKIPS
+reachable, and the real pod-export backup(s) on this host (the chat-tree
+suite accepts either the 2026-09-22 or the 2026-09-23 export, whichever is
+present; the others need 2026-09-22 specifically). They are EXCLUDED from
+the default `run-tests.py` selection for exactly that reason (see
+`scripts/run-tests.py`'s `NEEDS_DOCKER`), and each one honestly SKIPS
 (exit 3, never promoted to a pass — see each file's own `_skip`) if any
-precondition is missing. All THREE are **required before any release
-ships**, not optional: they run the real operator scripts, unmodified,
-against containers started from the exact published digest, and together
-they are the only suites that actually exercise `--apply`/live behaviour
-against a full copy of the real production store — the class of defect a
-143-test all-mocked gate already missed once (CHANGELOG.md [3.1.9.6]).
+precondition is missing. All FIVE are **required before any release
+ships**, not optional: they run the real operator/repair scripts,
+unmodified, against containers started from
+the exact published digest, and together they are the only suites that
+actually exercise `--apply`/live behaviour against a full copy of the real
+production store — the class of defect a 143-test all-mocked gate already
+missed once (CHANGELOG.md [3.1.9.6]).
 
 The mandatory command below runs `--only real_image` — the substring
-`real_image`, with NO trailing `_operator` — which matches ALL THREE files:
+`real_image`, with NO trailing `_operator` — which matches ALL FIVE files:
 `compactor/test_real_image_operator_scripts.py` (`backfill-records.py` and
 `import-history.py`'s dry run), `compactor/test_real_image_import_apply.py`
-(`import-history.py --apply`), and `compactor/test_real_image_setup_sshd.py`
-(`setup-sshd.py`). **Do not narrow this to `--only real_image_operator`** —
-that substring only matches the first file and silently drops the other
-two mandatory suites from the run (N9: this is exactly the mistake this
-section used to document as the "mandatory" command).
+(`import-history.py --apply`), `compactor/test_real_image_setup_sshd.py`
+(`setup-sshd.py`), `compactor/test_real_image_clean_decoration.py`
+(`clean-decoration.py`), and `compactor/test_real_image_chat_tree.py`
+(`repair-chat-tree.py` / `fix-encoded-messages.py`). **Do not narrow this
+to `--only real_image_operator`** — that substring only matches the first
+file and silently drops the other four mandatory suites from the run (N9:
+this is exactly the mistake this section used to document as the
+"mandatory" command).
 
 ```bash
 python3 scripts/run-tests.py --python /usr/bin/python3 --real-image --only real_image
 ```
 
 Or run each file directly (same checks, no `run-tests.py` wrapper — you
-must invoke all three separately this way):
+must invoke all five separately this way):
 
 ```bash
 python3 compactor/test_real_image_operator_scripts.py
 python3 compactor/test_real_image_import_apply.py
 python3 compactor/test_real_image_setup_sshd.py
+python3 compactor/test_real_image_clean_decoration.py
+python3 compactor/test_real_image_chat_tree.py
 ```
 
-A SKIP (exit 3) from any of the three is not evidence of anything — fix
+A SKIP (exit 3) from any of the five is not evidence of anything — fix
 whatever precondition the printed reason names and re-run before shipping;
 do not read a skip as green. (`--only real_image_operator`, matching only
 the first file, is occasionally useful on its own during development of
 that one suite specifically — it is never the release-gate command.)
+
+`test_real_image_chat_tree.py` copies whichever pod-export backup(s) it
+finds into a scratch directory before touching them (two `webui.db`
+copies, 500MB+ each, plus their own `.bak-` backups) — set `SCRATCH_DIR`
+to a real filesystem with room if the default (`/home/drew/scratch`) does
+not exist on this host; do not let it fall back to `/tmp`, which is a
+small tmpfs here (see the round-2 hostile review's own "I filled /tmp
+twice" incident).
 
 ### Integration suite (black box, local stack)
 
