@@ -272,19 +272,21 @@ script under `scripts/` rather than a change to what the image ships:
   vLLM for the same conversation, so real vLLM is roughly 1.5 hours or
   more), and recommends scheduling the run for a time she is not
   chatting.
-- **N1's false "a pod restart mid-import is safe" claims removed
-  (pending pass A's actual fix).** OPERATIONS.md's "Interrupting it —
-  Ctrl-C, a pod restart — is safe" and CHANGELOG.md's own "the original
-  is restored" (both from this same release's earlier hostile-review
-  fix) were contradicted by a round-2 review (N1): the anchor restore
-  only covers Ctrl-C (SIGINT); a SIGTERM, SIGHUP or real pod restart is
-  not caught at all, and `save_state` runs once at the end of the whole
-  `--apply` run, not after each rollup unit. Both docs now say plainly
-  that interrupting `--apply` is NOT currently safe, and are marked
-  `<!-- r3: import interruption semantics pending pass A -->` — the
-  actual fix (pre-seat the anchor, save state per unit, handle
-  SIGTERM/SIGHUP) lands separately; this pass only stops the docs from
-  promising something the code does not yet do.
+- **N1, now actually fixed (round-3 fix pass A) — OPERATIONS.md and this
+  file's own claims corrected to match.** The round-2 hostile review
+  found the "a pod restart mid-import is safe" claim false: the anchor
+  restore covered only Ctrl-C (SIGINT), and `save_state` ran once at the
+  end of the whole `--apply` run rather than after each rollup unit. Fix
+  pass A closes this for real: the on-disk anchor is PRE-SEATED (never
+  cleared to blank) before any vLLM call, state saves after every rollup
+  unit, and SIGINT/SIGTERM/SIGHUP are all handled the same way — a flag
+  checked between units, never raised mid-unit — so a `kill -9` or a real
+  pod restart loses at most the one unit in flight, never more. Proven at
+  7 kill points (5x `kill -9`, one SIGTERM, one SIGHUP) against the real
+  2026-09-22 backup and the published digest: every point re-runs
+  contiguously to completion. OPERATIONS.md's "Interrupting `--apply`"
+  section now describes this real behavior instead of the false claim it
+  briefly carried while the fix was pending.
 - **N16 doc nits.** The sshd procedure's "Is the script on the pod?"
   check and run commands now agree on ONE path at a time (it used to
   clone to `/opt/zl-repo` but give run commands for `/data/scripts/`,
@@ -708,18 +710,20 @@ round of defects specific to `backfill-records.py`, closed below.
   - **Ctrl-C / the live-seam window.** `_run_apply_loop` no longer
     leaves a cleared live-chat anchor on disk if interrupted by Ctrl-C
     (SIGINT) before any rollup pass completes — the original is
-    restored. <!-- r3: import interruption semantics pending pass A -->
-    A round-2 hostile review (N1) found this restore does NOT cover a
-    pod restart, SIGTERM or SIGHUP — only `except BaseException` runs
-    it, in-process, which a killed process never reaches — and found
-    that even a covered Ctrl-C discards every rollup unit already
-    completed in that run (`save_state` runs once, at the end, not
-    after each unit). Corrected claims and the actual fix land with
-    pass A. A follow-up real-image test also confirms the NEXT live
-    request after `--apply` stays contiguous with what it wrote (the
-    live path's own `window_offset` lands on the same verified 22, not
-    the old flat 20 or a naive 0) — this was already correct, a
-    verification gap closed, not a bug.
+    restored. A round-2 hostile review (N1) found this restore did NOT
+    cover a pod restart, SIGTERM or SIGHUP — only `except BaseException`
+    ran it, in-process, which a killed process never reaches — and found
+    that even a covered Ctrl-C discarded every rollup unit already
+    completed in that run (`save_state` ran once, at the end, not after
+    each unit). **Fixed for real in round-3 fix pass A** (see that
+    pass's own entry below): the anchor is now pre-seated before any
+    vLLM call rather than cleared-then-restored, state saves after every
+    unit, and SIGINT/SIGTERM/SIGHUP are all handled identically. A
+    follow-up real-image test also confirms the NEXT live request after
+    `--apply` stays contiguous with what it wrote (the live path's own
+    `window_offset` lands on the same verified 22, not the old flat 20 or
+    a naive 0) — this was already correct, a verification gap closed,
+    not a bug.
   - **Dry-run estimate made offset-aware (architect follow-up).** The
     due/call estimate compared the raw reconstructed branch length
     against `last_summarized_turn`, undercounting whenever the store's
@@ -806,6 +810,107 @@ platform this project actually tests on) it now defaults to
 `--python` needed; the Windows path is kept, but only as the default on
 Windows. COMMANDS.md's interpreter note (previously pointing only at the
 Windows path) now says so.
+
+- **`import-history.py` (round-3 hostile review, fix pass A): N1
+  (BLOCKER), N4, N5, N6, N7, N9, N10, N13 and N14 closed, plus an
+  architect follow-up cross-checking the `chat_message` table.**
+  - **N1 (BLOCKER).** `_run_apply_loop` cleared the on-disk anchor to
+    blank BEFORE the drain and saved state only ONCE, at the very end of
+    the whole run — so a SIGTERM, SIGHUP or real pod restart (none of
+    which the old `except BaseException` in-process restore could ever
+    reach) lost every completed rollup unit AND left the anchor blank,
+    making the NEXT live request compute a worse resume offset than if
+    `--apply` had never run at all; even a covered Ctrl-C discarded all
+    completed work. Fixed: the anchor is now PRE-SEATED, before any vLLM
+    call, with exactly what this run's own trimmed window will produce
+    (computed with the frozen summarizer's own helpers) — never cleared
+    to blank. The drain runs one rollup unit at a time
+    (`vllm_call_budget={"remaining": 1}`) instead of the whole run in one
+    call, and state saves after every unit. SIGINT, SIGTERM and SIGHUP
+    are now handled identically, via a flag checked between units,
+    never raised into a running one. Proven against the real 2026-09-22
+    backup and the published digest: `kill -9` at 5 distinct, counted
+    points plus one SIGTERM and one SIGHUP (7 points total), each
+    followed by a real live-style rollup unit (no hole) and a full
+    re-run to completion. Red on the pre-fix commit (blank anchor,
+    every point either refuses outright on re-run or leaves a hole);
+    green on this fix (every point contiguous and resumable).
+  - **N4.** `effective_position = max(recorded_position, current_turns)`
+    was only correct for a zero resume offset. Once the verified offset
+    is positive and the branch has unseen turns beyond it, that formula
+    let the window run past what the frozen module's own arithmetic will
+    actually converge on — burning a full drain (133 real completions in
+    the reviewer's repro) before the existing belt-and-braces verify
+    caught the mislabelling and rolled it back. Fixed: for a positive
+    offset, `effective_position` is `recorded_position` alone, bounded
+    by the store's own existing chunk coverage on one side and the
+    reconstructed transcript's actual length on the other — refusing
+    rather than guessing if either bound fails.
+  - **N5.** `--apply`'s progress used to be judged by whether
+    `last_summarized_turn` moved. An L2 fold or the L3 refresh is real,
+    saved progress that does not move it — judged by whether any UNIT
+    completed and was saved instead.
+  - **N6.** The dry run and `--apply` now share ONE function
+    (`_resolve_apply_feasibility`) for the offset check, the window
+    trim, and the position rule, so `safe_to_apply` in the dry run's
+    report is computed from the same check `--apply` will make, never
+    hard-coded `True` over a refusal the dry run never actually
+    evaluated.
+  - **N7.** `--force` no longer overrides a DETECTED live compactor at
+    all — only an AMBIGUOUS health probe (a timeout, not a clean
+    refusal) remains force-overridable, since there is no cross-process
+    lock the live compactor itself respects. Added one: `--apply` now
+    takes its own exclusive lock file
+    (`summaries/<conv_id>.json.import.lock`) for the whole run, so two
+    `import-history.py --apply` invocations against the same conversation
+    can never interleave their writes, plus a final re-verify against
+    this run's own last known state to catch a live writer the health
+    probe missed.
+  - **N9.** The real-image suite's own Ctrl-C test was vacuous — its
+    SIGINT landed before the anchor write it thought it was racing.
+    Replaced with a kill-point suite (5x `kill -9` + SIGTERM + SIGHUP,
+    each followed by a live-style seam check and a full re-run). Its
+    `_skip` now always exits 3, never 0 — `COMPACTOR_ALLOW_FIXTURE_SKIP`
+    no longer has any effect on this suite, matching
+    `test_real_image_operator_scripts.py`. The "worst case" live-seam
+    fixture script now actually clears `tail_fp` instead of only
+    claiming to.
+  - **N10.** Killed every surviving mutant from the round-2 hostile
+    review (IO1, IO5, IO8, IV1, IV3) plus new mutants for this round's
+    own code (the pre-seat, the per-unit budget, the signal handlers,
+    reverts of N4/N5/N6/N7/N14) — 30 of 30 caught after a follow-up
+    commit closed the last one (IV5) by decoupling "force a real
+    `archive.json` rewrite" from "force a mismatch".
+  - **N13 (LOW).** The archive-cleanup-on-verify-failure condition
+    checked `backup_path is None` (dead — B5 already refuses first)
+    instead of `archive_backup_path is None`, leaving a leftover archive
+    this run itself created undeleted on a detected mismatch.
+  - **N14 (LOW).** A non-200 `/health` response now reads as ambiguous
+    (refuses unless `--force`), matching `backfill-records.py`'s own
+    probe, instead of being read as "not running".
+  - **Architect follow-up: the `chat_message` table is now cross-checked
+    against the JSON history.** OpenWebUI's own `get_messages_map_by_chat_id`
+    prefers `chat_message` SQL rows over the embedded JSON when building
+    what a live request actually receives; this script walks the JSON
+    first. Verified byte-identical on both the real 2026-09-22 and
+    2026-09-23 backups (same turn count, same ids, 0 text differences),
+    so the reconstruction PRIORITY was not flipped (a materially larger,
+    riskier change than this pass had budget to re-verify safely) —
+    instead, a bounded cross-check now detects a real disagreement, when
+    one exists, and refuses (`ChatMessageTableDivergence`) rather than
+    silently trusting whichever source was tried first. Building it
+    surfaced and fixed two real, previously-latent bugs in the existing
+    `chat_message`-table FALLBACK path (used when the JSON is
+    unreadable): it keyed its lookup table on the raw, chat-id-prefixed
+    row `id` while `parent_id` uses OpenWebUI's own bare-id convention,
+    so the walk stopped after exactly one step every time it was
+    actually exercised on real `chat_message` data; and it never
+    JSON-decoded `chat_message.content` (stored encoded, e.g. `'"hi"'`
+    for a plain string), feeding raw encoded text into flattening.
+  - Verified end to end against the published digest and the real
+    backup, including the new kill-point suite: all tests pass. See
+    `compactor/test_import_history_script.py` and
+    `compactor/test_real_image_import_apply.py`.
 
 ## [3.1.9.5] — the deploy docs match what ships
 

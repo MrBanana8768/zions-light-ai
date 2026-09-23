@@ -1505,6 +1505,14 @@ not start this while she might be chatting** — schedule it for a time she
 is known to be away, and tell her chat will be unavailable for the
 duration before you start.
 
+**Interrupting a long run is now safe (round-3 fix pass A — see below),
+so you are not committed to the full 1.5+ hours in one sitting.** If the
+outage window turns out to be too short, Ctrl-C the run (or let
+`--max-calls` stop it); it stops cleanly between rollup units with
+everything already done genuinely saved, and re-running the exact same
+command later picks up exactly where it left off — see "Interrupting
+`--apply`" below for the details and the proof.
+
 **Stop the compactor first** — this script and the live compactor would
 otherwise both be writing the same `summaries/<conv_id>.json`:
 ```bash
@@ -1585,39 +1593,93 @@ archive backup path when one was made. It refuses to run while anything
 answers the compactor's `/health` — add `--health-url URL` to point the
 probe elsewhere (default `http://127.0.0.1:8080/health`, the real pod's
 own endpoint). A clean connection refusal there is read as "not running"
-and `--apply` proceeds; a timeout, or anything short of a clean refusal,
-now REFUSES `--apply` (M3 — it used to fail open, reading a timeout the
-same as a confirmed-stopped compactor) unless `--force` says you have
-confirmed some other way.
+and `--apply` proceeds. Anything else refuses, but `--force` no longer
+treats every non-refusal answer the same way (round-3 fix pass A, N7): a
+**DETECTED** live compactor (a real response — the health endpoint itself
+answered) is never overridable by `--force`, full stop, because there is
+no cross-process lock the live compactor itself respects (checked: it has
+none), so this health check is the only thing standing between `--apply`
+and a live rollup tearing the same state file. An **AMBIGUOUS** probe (a
+timeout, or any other error short of a clean connection refusal — M3) is
+still the one case `--force` can override, when you have confirmed by
+some other means (e.g. `supervisorctl status compactor`) that it is
+really stopped.
 
-<!-- r3: import interruption semantics pending pass A -->
-**Interrupting `--apply` is NOT currently safe — do not rely on the old
-claim that "a pod restart is safe" here.** A round-2 hostile review (N1)
-found: `_run_apply_loop` clears the resume anchor on disk BEFORE the
-drain and calls `save_state` only ONCE, at the very end of the run — not
-after each rollup unit, whatever an earlier version of this section
-claimed. A SIGTERM, SIGHUP or pod restart mid-run is not caught at all
-(only `except BaseException`, in-process, restores the anchor — a killed
-process never reaches that code), so it is left with NO anchor and every
-rollup unit that had already completed silently discarded. Re-running
-after that leaves the NEXT live request computing a WORSE resume offset
-than if `--apply` had never been run at all — running the import and
-being killed partway through is strictly worse than not running it.
-Even a Ctrl-C (SIGINT), the one signal this script does catch, restores
-the anchor cleanly but still discards every rollup unit already
-completed in that run — the same "nothing was saved along the way" gap,
-just without the anchor damage.
+**This run's own cross-process import lock.** Independently of the
+health probe, `--apply` also takes an exclusive OS lock on
+`summaries/<conv_id>.json.import.lock` for the whole run (round-3 fix
+pass A, N7) — importer-vs-importer protection, not a substitute for
+stopping the live compactor: the lock file holds no data, and a second
+`import-history.py --apply` against the SAME conversation while one is
+already running refuses outright, naming the lock path. The advisory
+lock is released automatically when the holding process exits, by any
+means (including a kill), so a stale lock file left behind by a killed
+run is never a deadlock — it is safe to remove by hand only if you have
+confirmed no `import-history.py` process is actually still running (the
+refusal message says this).
 
-Until pass A lands (pre-seating the anchor, saving state per rollup unit,
-and handling SIGTERM/SIGHUP), treat `--apply` as NOT safely interruptible:
-do not Ctrl-C it, do not restart the pod while it is running, and do not
-assume a killed run can simply be re-run. If it IS interrupted, do not
-re-run it against the now-damaged state — first restore
-`summaries/<conv_id>.json.bak-<stamp>` (and
-`summaries/<conv_id>.archive.json.bak-<stamp>`, if one was written) by
-hand, back to the backup made right before that run started, before
-trying again. A second `--apply` once nothing is left due, with no
-interruption in between, does nothing and says so.
+**The chat_message table is cross-checked against the JSON history
+(round-3 fix pass A, architect follow-up).** OpenWebUI's own code prefers
+the `chat_message` SQL table over the chat's embedded JSON history when
+building what a live request actually sees — this script walks the JSON
+first, falling back to the table only if the JSON is unreadable, so a
+real disagreement between the two would mean this script's transcript is
+not what the live compactor is actually working from. `--apply` (and the
+dry run) now builds both reconstructions and refuses if they disagree,
+rather than silently trusting whichever one was tried first. Verified on
+both the real 2026-09-22 and 2026-09-23 backups: the two reconstructions
+are byte-identical for her conversation (same turn count, same ids, 0
+text differences) — the cross-check exists for the day that stops being
+true, not because it already isn't.
+
+**Interrupting `--apply` — Ctrl-C (SIGINT), SIGTERM, SIGHUP, `kill -9`, or
+a pod restart — is safe (round-3 fix pass A closes N1, the round-2
+hostile review's BLOCKER finding).** Before a single vLLM call is made,
+the on-disk anchor (`tail_fp`/`head_fp`/`window_turns`) is PRE-SEATED with
+exactly what this run's own trimmed window will produce — never cleared
+to blank the way the pre-round-3 code did. The drain then runs one rollup
+UNIT (one L1 chunk, one L2 fold, or the L3 refresh) at a time, and state
+is saved to disk after EVERY unit, never batched until the end. SIGINT,
+SIGTERM and SIGHUP are all handled the same way — a flag checked between
+units, never raised into the middle of one — so the run always stops
+cleanly between units: exit **4** (progress made, work remains, re-run to
+continue) if at least one unit had already completed and was saved, or
+exit **1** if the signal landed before the very first unit finished
+(nothing accomplished yet — still safe to re-run, just not "progress").
+A `kill -9` or a real pod restart loses at most the one unit that was in
+flight when it landed, never more, because everything before it was
+already saved and the anchor was never blank to begin with. Re-running the exact same command afterward resumes from the
+real watermark and never redoes finished work, and the live compactor's
+next request stays contiguous with whatever the interrupted run actually
+finished — even if it finished zero units. Proven directly against the
+real 2026-09-22 backup and the published digest: `kill -9` at 5 distinct,
+counted points plus one SIGTERM and one SIGHUP (7 kill points total),
+each followed by a real live-style rollup check (no hole) and a full
+re-run to completion (exit 0) — see
+`compactor/test_real_image_import_apply.py`.
+
+If you want to discard an interrupted (or any) run's progress entirely
+rather than resume it, restore `summaries/<conv_id>.json.bak-<stamp>`
+(and the matching `.archive.json.bak-<stamp>`, if present) by hand over
+the live file — the importer writes this backup before touching
+anything, on every `--apply` run. This is never necessary for a normal
+interrupt-and-resume; it is only for throwing a run's progress away on
+purpose.
+
+**The feasibility check, in operator terms (round-3 fix pass A, N4/N6).**
+Both the dry run and `--apply` now run through the exact same check
+before either one reports anything: verify the resume offset against the
+store's own evidence, then compute the window this run would actually
+drain from that SAME offset, bounded so it can neither fall behind what
+the store's own chunks already claim to cover nor run past how many turns
+the reconstructed transcript actually has. If that check fails — an
+offset that cannot be verified, or a window that falls outside those
+bounds — BOTH the dry run and `--apply` refuse with the identical detail,
+exit 1. Before this fix, the dry run always printed `safe_to_apply:
+True` regardless, so an operator could see "safe to apply" and then have
+`--apply` burn real vLLM calls before refusing on exactly the case the
+dry run should have caught for free. A dry run that reports `safe_to_apply:
+True` now means what it says.
 
 **`.bak-*` files accumulate — this is by design, and needs occasional
 manual pruning (N16).** Every `--apply` run that actually writes leaves
