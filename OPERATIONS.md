@@ -1450,7 +1450,9 @@ L1/L2/L3 rollup loop this script uses, but it rebuilds the transcript to
 summarize from the EPISODIC store (chromadb) — a rolling window, not an
 archive. On a conversation whose hierarchy has fallen far behind (a real
 example: ~3,850 messages against a summary hierarchy that only covers the
-first ~1,600 turns), the episodic store holds as few as 70 exchanges —
+first 2,720 turns — N16: an earlier version of this section said "~1,600
+turns", but the real 2026-09-22 backup's `last_summarized_turn` is
+2,720), the episodic store holds as few as 70 exchanges —
 nowhere near enough for `/compact` to close the gap. It either refuses
 outright (its own guard against summarizing text that is not the text the
 chunk labels claim) or would have to cover thousands of turns as gap
@@ -1485,6 +1487,23 @@ auto-detection entirely, if you have a package somewhere else.
 refuses outright if a `-journal` or `-wal` file sits beside the path you
 give it, which is what a live or crashed database leaves behind. Use a
 backup snapshot, or a copy taken while OpenWebUI is stopped.
+
+**This is a CHAT OUTAGE for the whole run, not a quiet background job
+(N12).** OpenWebUI's own backend is the compactor listening on
+`:8080` (`OPENAI_API_BASE_URL=http://localhost:8080/v1`), and the very
+next step stops that compactor for the entire run — she cannot chat at
+all until it is started again. The dry run's own estimate (below) is a
+FLOOR, not the real duration: it reported ~65 calls / ~43 minutes at
+`--seconds-per-call 40` on the real 2026-09-22 backup, but a round-2
+hostile review measured **134 real completions** against a fake vLLM for
+that exact conversation (map-reduce chunks cost more than one call each),
+and her real replies run 7.5k-11k tokens, so real vLLM will cost more
+still. Budget **1.5 hours or more**, and remember `--max-calls 200`
+(the default) can mean this takes MULTIPLE runs if the backlog is larger
+than one budget's worth (see N5/N8-adjacent notes on re-running). **Do
+not start this while she might be chatting** — schedule it for a time she
+is known to be away, and tell her chat will be unavailable for the
+duration before you start.
 
 **Stop the compactor first** — this script and the live compactor would
 otherwise both be writing the same `summaries/<conv_id>.json`:
@@ -1569,13 +1588,68 @@ own endpoint). A clean connection refusal there is read as "not running"
 and `--apply` proceeds; a timeout, or anything short of a clean refusal,
 now REFUSES `--apply` (M3 — it used to fail open, reading a timeout the
 same as a confirmed-stopped compactor) unless `--force` says you have
-confirmed some other way. Interrupting it — Ctrl-C, a pod restart — is
-safe: state is saved after every rollup unit, so re-running resumes from
-the real watermark and never redoes finished work — including the exact
-window between clearing the stale live-chat anchor and the first
-completed rollup pass, which a Ctrl-C landing there used to be able to
-leave in a bad state. A second `--apply` once nothing is left due does
-nothing and says so.
+confirmed some other way.
+
+<!-- r3: import interruption semantics pending pass A -->
+**Interrupting `--apply` is NOT currently safe — do not rely on the old
+claim that "a pod restart is safe" here.** A round-2 hostile review (N1)
+found: `_run_apply_loop` clears the resume anchor on disk BEFORE the
+drain and calls `save_state` only ONCE, at the very end of the run — not
+after each rollup unit, whatever an earlier version of this section
+claimed. A SIGTERM, SIGHUP or pod restart mid-run is not caught at all
+(only `except BaseException`, in-process, restores the anchor — a killed
+process never reaches that code), so it is left with NO anchor and every
+rollup unit that had already completed silently discarded. Re-running
+after that leaves the NEXT live request computing a WORSE resume offset
+than if `--apply` had never been run at all — running the import and
+being killed partway through is strictly worse than not running it.
+Even a Ctrl-C (SIGINT), the one signal this script does catch, restores
+the anchor cleanly but still discards every rollup unit already
+completed in that run — the same "nothing was saved along the way" gap,
+just without the anchor damage.
+
+Until pass A lands (pre-seating the anchor, saving state per rollup unit,
+and handling SIGTERM/SIGHUP), treat `--apply` as NOT safely interruptible:
+do not Ctrl-C it, do not restart the pod while it is running, and do not
+assume a killed run can simply be re-run. If it IS interrupted, do not
+re-run it against the now-damaged state — first restore
+`summaries/<conv_id>.json.bak-<stamp>` (and
+`summaries/<conv_id>.archive.json.bak-<stamp>`, if one was written) by
+hand, back to the backup made right before that run started, before
+trying again. A second `--apply` once nothing is left due, with no
+interruption in between, does nothing and says so.
+
+**`.bak-*` files accumulate — this is by design, and needs occasional
+manual pruning (N16).** Every `--apply` run that actually writes leaves
+at least one new `summaries/<conv_id>.json.bak-<UTC stamp>` (plus a
+matching `.archive.json.bak-<stamp>` whenever that run also did an L2
+fold or L3 refresh), and NONE of them is ever deleted or overwritten by
+this script — that is deliberate: a backup that could silently vanish or
+get clobbered is not a backup, and it is what lets a bad run be undone by
+hand. Left alone forever, they add up: a backlog large enough to need
+`--max-calls 200`'s default budget spread across 11 separate runs (the
+real 2026-09-22 backup's own shape) leaves 22 `.bak-` files in
+`summaries/` for that one conversation by the time the catch-up finishes.
+`scripts/backfill-records.py --apply` does the same thing, one dated
+`.bak-` per closed record, under `facts/`.
+
+To prune safely: keep at minimum the OLDEST backup for each conversation
+(the pre-catch-up state, in case you ever need to unwind the whole run)
+and the NEWEST (in case the most recent write turns out to be wrong).
+Everything strictly between those two is redundant once you have
+confirmed (`/health/full`'s `checks.hierarchy` lag, and a normal-looking
+reply) that the catch-up worked, and is safe to delete:
+```bash
+# list a conversation's backups oldest-first, then remove all but the
+# first (oldest) and last (newest):
+ls -1tr /data/openwebui/compactor/summaries/<conv_id>.json.bak-* | \
+    sed '1d;$d' | xargs -r rm -v
+```
+Do this per conversation, and do it for `.archive.json.bak-*` and for
+`facts/*.backfill.json.bak-*` separately (the glob above only matches
+one sidecar at a time on purpose — a single wildcard across sidecar
+kinds risks matching more than you intended to delete). Never prune
+while a catch-up run for that same conversation is in flight.
 
 **Start the compactor again:**
 ```bash
@@ -1640,12 +1714,17 @@ sshd running; a re-run with nothing left to do exits **0** and changes
 nothing (see EXIT CODES below — this script used to have 0 and 3 swapped
 from the other two operator scripts; normalized in v3.1.9.6).
 
-**Is the script on the pod?**
+**Is the script on the pod?** Check BOTH of the paths the two methods
+below actually use — a script obtained by cloning ends up at
+`/opt/zl-repo/scripts/setup-sshd.py`, NOT `/data/scripts/setup-sshd.py`
+(N16: an earlier version of this procedure cloned to one path and then
+gave run commands for the other, which only worked by accident if you
+happened to use the upload method instead of the clone):
 ```bash
-ls -la /data/scripts/setup-sshd.py
+ls -la /opt/zl-repo/scripts/setup-sshd.py /data/scripts/setup-sshd.py
 ```
 There is no `ssh`/`scp`/`rsync` in the image. If the script is not
-already at that path, get it there by either:
+already at either path, get it there by either:
 - cloning the repo, same as `backfill-records.py`/`import-history.py`
   below (this script does not import the `compactor` package, so it does
   not strictly need the rest of the clone, but this keeps one consistent
@@ -1654,13 +1733,19 @@ already at that path, get it there by either:
   git clone --depth 1 --branch <tag-or-branch> \
       https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
   ```
-  then run it from `/opt/zl-repo/scripts/setup-sshd.py`; or
+  — the script then lives at `/opt/zl-repo/scripts/setup-sshd.py`, and
+  every command below must use THAT path, not `/data/scripts/...`; or
 - uploading just this one file through the RunPod Web Terminal, or with
   `runpodctl send`/`receive` (RunPod injects `runpodctl` into the pod at
   runtime — it is **not** shipped in this image; `/usr/local/bin` is
   empty here) to `/data/scripts/setup-sshd.py`, so a persistent copy
   survives on the volume across restarts (it still has to be RE-RUN after
-  each one — see above).
+  each one — see above) — every command below must use THAT path in this
+  case.
+
+The commands below use the clone path (`/opt/zl-repo/...`) — substitute
+`/data/scripts/setup-sshd.py` throughout if you used the upload method
+instead.
 
 **Dry run first.** Runs a real `apt-get update` (package lists only,
 nothing installed — Dockerfile prunes them, so this is required every
@@ -1669,7 +1754,7 @@ key source it would use, whether the drop-in or the direct-edit case
 applies on THIS pod's shipped `sshd_config`, and whether it would start or
 restart sshd. Nothing is written, installed, or started:
 ```bash
-/opt/compactor-venv/bin/python /data/scripts/setup-sshd.py
+/opt/compactor-venv/bin/python /opt/zl-repo/scripts/setup-sshd.py
 ```
 
 **Run it for real.** RunPod injects the operator's own public key as the
@@ -1677,7 +1762,7 @@ restart sshd. Nothing is written, installed, or started:
 order: `--authorized-key-file`, `--authorized-key`, `$PUBLIC_KEY`, then an
 existing non-empty `/root/.ssh/authorized_keys`):
 ```bash
-/opt/compactor-venv/bin/python /data/scripts/setup-sshd.py --apply
+/opt/compactor-venv/bin/python /opt/zl-repo/scripts/setup-sshd.py --apply
 ```
 This installs `openssh-server` (or `--only-upgrade`s it to the apt
 candidate if already present — **never** `apt-get upgrade`/`dist-upgrade`,

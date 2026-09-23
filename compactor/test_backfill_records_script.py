@@ -16,6 +16,7 @@ installed:
     python test_backfill_records_script.py
 """
 
+import hashlib
 import http.server
 import importlib.util
 import json
@@ -26,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -342,7 +344,12 @@ def test_malformed_records_are_reported_not_crashed_on_and_never_rewritten():
     assert_true(by_id["bad-json"]["reason"], "a reason string is given for bad-json")
 
     r2 = _run_script(_store_args() + ["--apply", "--json"])
-    assert_eq(r2.returncode, 0, "--apply over a malformed-only store is not an error")
+    assert_eq(r2.returncode, 1,
+              "N8: --apply over a needs-review-only store (here, malformed "
+              "records that could not even be read) must exit 1, not 0 — "
+              "matching the dry run above. Nothing was would-resume, so "
+              "there was nothing to close, but 'nothing to close' is not "
+              "the same as 'nothing needs a human'")
     payload2 = json.loads(r2.stdout)
     changed_ids = {c["conv_id"] for c in payload2["changes"]}
     assert_true("bad-json" not in changed_ids, "bad-json was never a target of --apply")
@@ -589,10 +596,33 @@ def test_atomic_write_json_failure_leaves_no_orphan_backup():
     with tempfile.TemporaryDirectory() as td:
         pkg = Path(td) / "compactor"
         pkg.mkdir()
+        # is_stale/_backoff_ready implement the REAL contract here (age-based,
+        # not hardcoded) -- this fixture is only exercising atomic_write_json
+        # failing, and a hardcoded-True stand-in would now be refused by the
+        # M1 behavioural self-check before ever reaching that write (see
+        # test_fabricated_package_with_the_right_names_but_wrong_behaviour_is_refused
+        # for that case on its own).
         (pkg / "backfill.py").write_text(
+            "from datetime import datetime, timezone\n"
             "_MAX_BACKFILL_ATTEMPTS = 3\n"
-            "def _backoff_ready(record):\n    return True\n"
-            "def is_stale(record):\n    return True\n"
+            "_STALE_SECONDS = 600\n"
+            "def is_stale(record):\n"
+            "    if record.get('state') != 'in_progress':\n"
+            "        return False\n"
+            "    updated_at = record.get('updated_at')\n"
+            "    if not updated_at:\n"
+            "        return True\n"
+            "    ts = datetime.fromisoformat(updated_at)\n"
+            "    age = (datetime.now(timezone.utc) - ts).total_seconds()\n"
+            "    return age > _STALE_SECONDS\n"
+            "def _backoff_ready(record):\n"
+            "    updated_at = record.get('updated_at')\n"
+            "    if not updated_at:\n"
+            "        return True\n"
+            "    ts = datetime.fromisoformat(updated_at)\n"
+            "    age = (datetime.now(timezone.utc) - ts).total_seconds()\n"
+            "    attempts = max(1, int(record.get('attempts') or 1))\n"
+            "    return age > (600 * (2 ** (attempts - 1)))\n"
             "def atomic_write_json(path, data):\n"
             "    raise RuntimeError('simulated write failure')\n",
             encoding="utf-8",
@@ -747,7 +777,11 @@ def test_not_yet_stale_in_progress_record_is_needs_review_and_untouched_by_apply
               "a fresh in_progress record is needs-review, not would-resume")
 
     r2 = _run_script(_store_args() + ["--conv", conv_id, "--apply", "--force", "--json"])
-    assert_eq(r2.returncode, 0, "nothing was targeted; a no-op --apply is success")
+    assert_eq(r2.returncode, 1,
+              "N8: nothing was would-resume, so there was nothing to close, "
+              "but the needs-review record (a genuinely running backfill) "
+              "is still there and --apply must exit 1, not 0, for exactly "
+              "the same reason the dry run above did")
     assert_eq(json.loads(r2.stdout)["changes"], [], "nothing was closed")
     assert_eq(_record_path(conv_id).read_bytes(), before,
               "the record was never touched, even with --force")
@@ -783,6 +817,257 @@ def test_all_conv_values_rejected_exits_1_not_0():
     assert_eq(payload["records"], [], "no records were actually inspected")
     assert_true(any("none of the given --conv" in w for w in payload["warnings"]),
                 "a clear warning explains why")
+
+
+# ---------------------------------------------------------------------------
+# N8: --apply must exit 1 whenever a needs-review record remains, exactly
+# matching the dry run's own rule and the documented exit-code table --
+# even when --apply closed every would-resume record it targeted. Before
+# this fix, --apply's exit code was derived only from the would-resume
+# tally, so a needs-review record (a running backfill, an unreadable
+# record, a capped record, a failed record still in backoff) never
+# affected --apply's exit code at all.
+# ---------------------------------------------------------------------------
+
+def test_apply_exits_1_with_only_a_running_backfill_needs_review():
+    print("\n[test] N8 (E1): --apply over a store with only a genuinely RUNNING backfill (needs-review) exits 1, not 0")
+    _wipe_storage()
+    conv_id = "genuinely-running"
+    now_ts = _iso(datetime.now(timezone.utc))
+    _write_record(conv_id, state="in_progress", started_at=now_ts, updated_at=now_ts,
+                  exchanges_done=1, exchanges_total=50, attempts=1, error=None)
+    _write_facts(conv_id)
+
+    r_dry = _run_script(_store_args() + ["--conv", conv_id, "--json"])
+    assert_eq(r_dry.returncode, 1, "dry run already exits 1 for a needs-review-only store")
+
+    r = _run_script(_store_args() + ["--conv", conv_id, "--apply", "--json"])
+    assert_eq(r.returncode, 1,
+              "N8: --apply over a needs-review-only store must exit 1 too, "
+              "matching the dry run -- a running backfill is not an --apply "
+              "TARGET at all, so it used to be invisible to --apply's exit code")
+    payload = json.loads(r.stdout)
+    assert_eq(payload["changes"], [], "nothing was closed (nothing was would-resume)")
+    rec = json.loads(_record_path(conv_id).read_text())
+    assert_eq(rec["state"], "in_progress", "the running backfill's record is untouched")
+
+
+def test_apply_exits_1_when_would_resume_closed_but_a_needs_review_record_remains():
+    print("\n[test] N8 (E2): --apply exits 1 when a needs-review record remains, even though every would-resume record was fully closed")
+    _wipe_storage()
+    old_ts = _iso(datetime.now(timezone.utc) - timedelta(hours=1))
+    now_ts = _iso(datetime.now(timezone.utc))
+    _write_record("stale-one", state="in_progress", started_at=old_ts, updated_at=old_ts,
+                  exchanges_done=4, exchanges_total=40, attempts=1, error=None)
+    _write_facts("stale-one")
+    _write_record("running-one", state="in_progress", started_at=now_ts, updated_at=now_ts,
+                  exchanges_done=1, exchanges_total=50, attempts=1, error=None)
+    _write_facts("running-one")
+
+    r = _run_script(_store_args() + ["--apply", "--json"])
+    assert_eq(r.returncode, 1,
+              "N8: a needs-review record left over makes --apply exit 1 "
+              "even though TARGETED == CLOSED for the would-resume record")
+    payload = json.loads(r.stdout)
+    closed_ids = {c["conv_id"] for c in payload["changes"] if c["action"] == "closed"}
+    assert_eq(closed_ids, {"stale-one"}, "the would-resume record was still closed")
+    rec = json.loads(_record_path("running-one").read_text())
+    assert_eq(rec["state"], "in_progress", "the running backfill's record is untouched")
+
+
+def test_apply_exits_1_with_a_capped_stale_record_needs_review():
+    print("\n[test] N8 (E9): a stale in_progress record already at the attempt cap is needs-review, and --apply exits 1")
+    _wipe_storage()
+    old_ts = _iso(datetime.now(timezone.utc) - timedelta(hours=1))
+    _write_record("capped", state="in_progress", started_at=old_ts, updated_at=old_ts,
+                  exchanges_done=1, exchanges_total=50, attempts=3, error=None)
+    _write_facts("capped")
+
+    r = _run_script(_store_args() + ["--conv", "capped", "--apply", "--json"])
+    assert_eq(r.returncode, 1, "N8: a capped-stale needs-review record makes --apply exit 1")
+    payload = json.loads(r.stdout)
+    assert_eq(payload["changes"], [], "nothing was would-resume, so nothing was targeted")
+
+
+def test_apply_exits_1_with_a_failed_record_still_in_backoff():
+    print("\n[test] N8 (E8): a failed record still inside its retry backoff is needs-review, and --apply exits 1")
+    _wipe_storage()
+    now_ts = _iso(datetime.now(timezone.utc))
+    _write_record("in-backoff", state="failed", started_at=now_ts, updated_at=now_ts,
+                  exchanges_done=1, exchanges_total=50, attempts=1, error="boom")
+    _write_facts("in-backoff")
+
+    r = _run_script(_store_args() + ["--conv", "in-backoff", "--apply", "--json"])
+    assert_eq(r.returncode, 1, "N8: a failed-but-in-backoff needs-review record makes --apply exit 1")
+
+
+# ---------------------------------------------------------------------------
+# M1 remainder: hasattr proves a NAME exists, not that it BEHAVES like the
+# real compactor/backfill.py. A fabricated package with the four required
+# symbol names, but an is_stale/_backoff_ready that simply always agree,
+# used to sail through the capability check and could close a genuinely
+# RUNNING backfill. A behavioural self-check runs synthetic in-memory
+# records through both functions, before any write, and refuses on any
+# disagreement with the documented contract.
+# ---------------------------------------------------------------------------
+
+def _write_fabricated_pkg_that_lies(root: Path) -> Path:
+    """The reviewer's round-2 M1 repro: all four required symbol names are
+    present (hasattr passes), but is_stale and _backoff_ready always say
+    "yes, go ahead" regardless of the record -- exactly a fabricated
+    stand-in that would tell this script a genuinely RUNNING backfill is
+    stale and ready to close."""
+    pkg = root / "compactor"
+    pkg.mkdir()
+    (pkg / "backfill.py").write_text(
+        "_MAX_BACKFILL_ATTEMPTS = 99\n"
+        "def _backoff_ready(record):\n    return True\n"
+        "def is_stale(record):\n    return True\n"
+        "def atomic_write_json(path, data):\n"
+        "    import json\n"
+        "    open(path, 'w').write(json.dumps(data))\n",
+        encoding="utf-8",
+    )
+    return pkg
+
+
+def test_fabricated_package_with_the_right_names_but_wrong_behaviour_is_refused():
+    print("\n[test] M1: a fabricated package with all 4 required symbol names, but is_stale/_backoff_ready that always agree, is refused before any write")
+    _wipe_storage()
+    conv_id = "genuinely-running-2"
+    now_ts = _iso(datetime.now(timezone.utc))
+    _write_record(conv_id, state="in_progress", started_at=now_ts, updated_at=now_ts,
+                  exchanges_done=1, exchanges_total=50, attempts=1, error=None)
+    _write_facts(conv_id)
+    before = _record_path(conv_id).read_bytes()
+
+    with tempfile.TemporaryDirectory() as td:
+        fake_pkg = _write_fabricated_pkg_that_lies(Path(td))
+        r = _run_script(_store_args() + ["--conv", conv_id, "--compactor-pkg", str(fake_pkg),
+                                          "--apply", "--json"])
+    assert_eq(r.returncode, 1,
+              "M1: hasattr-only capability checking is not enough -- a "
+              "package with the right names but the wrong behaviour must "
+              "still be refused, before it ever gets to close anything")
+    assert_true("Traceback" not in r.stdout and "Traceback" not in r.stderr, "no raw traceback")
+    assert_eq(_record_path(conv_id).read_bytes(), before,
+              "the running backfill's record was never touched -- the "
+              "reviewer's exact repro (a fabricated package closing a "
+              "RUNNING backfill) is now refused before any write")
+    backups = list(_record_path(conv_id).parent.glob(f"{conv_id}.backfill.json.bak-*"))
+    assert_eq(backups, [], "no backup was ever created -- refused before any write happened")
+
+
+def test_behavioural_self_check_passes_against_the_real_backfill_module():
+    print("\n[test] M1: the behavioural self-check agrees with the real compactor/backfill.py")
+    assert_eq(_script._check_backfill_behavior(backfill), None,
+              "the real module's is_stale/_backoff_ready pass the synthetic checks")
+
+
+def test_behavioural_self_check_catches_a_lying_is_stale():
+    print("\n[test] M1: the behavioural self-check catches an is_stale that always says yes")
+    with patch.object(backfill, "is_stale", lambda record: True):
+        err = _script._check_backfill_behavior(backfill)
+    assert_true(err is not None, "a lying is_stale is caught")
+    assert_true("is_stale" in err, "names the offending function")
+
+
+def test_behavioural_self_check_catches_a_lying_backoff_ready():
+    print("\n[test] M1: the behavioural self-check catches a _backoff_ready that always says yes")
+    with patch.object(backfill, "_backoff_ready", lambda record: True):
+        err = _script._check_backfill_behavior(backfill)
+    assert_true(err is not None, "a lying _backoff_ready is caught")
+    assert_true("_backoff_ready" in err, "names the offending function")
+
+
+def test_capability_check_requires_is_stale_specifically():
+    print("\n[test] M1 (BM1): a --compactor-pkg missing ONLY is_stale is refused cleanly, not silently accepted")
+    _wipe_storage()
+    with tempfile.TemporaryDirectory() as td:
+        pkg = Path(td) / "compactor"
+        pkg.mkdir()
+        (pkg / "backfill.py").write_text(
+            "_MAX_BACKFILL_ATTEMPTS = 3\n"
+            "def _backoff_ready(record):\n    return True\n"
+            "def atomic_write_json(path, data):\n    pass\n",
+            encoding="utf-8",
+        )
+        r = _run_script(_store_args() + ["--compactor-pkg", str(pkg)])
+    assert_eq(r.returncode, 1, "refuses with exit 1, not a crash")
+    assert_true("is_stale" in r.stdout, "names the specifically missing is_stale symbol")
+    assert_true("Traceback" not in r.stdout, "no raw traceback")
+
+
+def test_provenance_note_reports_the_backfill_module_sha256():
+    print("\n[test] M1: the provenance NOTE reports the compactor package's backfill.py file sha256")
+    _wipe_storage()
+    _seed_terminal_records()
+    r = _run_script(_store_args() + ["--json"])
+    payload = json.loads(r.stdout)
+    note = next(w for w in payload["warnings"] if "compactor package resolved from" in w)
+    assert_true("sha256=" in note, f"the NOTE reports a sha256 (note={note!r})")
+    real_sha = hashlib.sha256(Path(backfill.__file__).read_bytes()).hexdigest()
+    assert_true(real_sha in note, "the sha256 matches the real backfill.py file's content")
+
+
+# ---------------------------------------------------------------------------
+# M3 mutants BM4, BM5, BM13: the health-probe fail-safe (_compactor_is_alive)
+# must be pinned on every branch, not just the connection-refused and
+# timeout cases already covered above.
+# ---------------------------------------------------------------------------
+
+class _Health500Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(500)
+        self.end_headers()
+
+    def log_message(self, *a, **kw):
+        pass  # keep test output quiet
+
+
+def _start_health_server_with_status(handler_cls):
+    server = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server, port
+
+
+def test_apply_refuses_on_a_non_200_health_response():
+    print("\n[test] BM4: a real non-200 (500) --health-url response is ambiguous, not 'not running' -- --apply refuses")
+    _wipe_storage()
+    conv_id = "health-check-500"
+    old_ts = _iso(datetime.now(timezone.utc) - timedelta(hours=1))
+    _write_record(conv_id, state="in_progress", started_at=old_ts, updated_at=old_ts,
+                  exchanges_done=1, exchanges_total=10, attempts=1, error=None)
+    _write_facts(conv_id)
+    before = _record_path(conv_id).read_bytes()
+
+    server, port = _start_health_server_with_status(_Health500Handler)
+    try:
+        r = _run_script(_store_args() + ["--conv", conv_id, "--apply", "--json",
+                                          "--health-url", f"http://127.0.0.1:{port}/health"])
+        assert_eq(r.returncode, 1, "a real 500 response is a genuine HTTPError, still ambiguous -- refused")
+        assert_eq(_record_path(conv_id).read_bytes(), before, "record untouched")
+    finally:
+        server.shutdown()
+
+
+def test_health_probe_unknown_exception_is_treated_as_ambiguous_not_dead():
+    print("\n[test] BM5: an exception outside HTTPError/URLError/OSError probing --health-url is ambiguous, not 'not running'")
+    # A URL with no recognised scheme raises a bare ValueError straight out
+    # of urllib.request.urlopen -- not wrapped in URLError -- which is
+    # exactly the "any other Exception" branch BM5 targets.
+    assert_eq(_script._compactor_is_alive("not-a-url-at-all"), True,
+              "an unrecognised exception must read as 'might be alive', never 'not running'")
+
+
+def test_health_probe_urlerror_without_connection_refused_is_ambiguous_not_dead():
+    print("\n[test] BM13: a URLError whose reason is NOT a connection refusal (timeout, DNS failure) is ambiguous, not 'not running'")
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("timed out")):
+        assert_eq(_script._compactor_is_alive("http://127.0.0.1:1/health"), True,
+                  "a URLError whose reason is a plain string (timeout/DNS), "
+                  "not ECONNREFUSED, must read as 'might be alive'")
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +1112,22 @@ if __name__ == "__main__":
         test_terminal_records_are_classified_leave_not_needs_review()
 
         test_all_conv_values_rejected_exits_1_not_0()
+
+        test_apply_exits_1_with_only_a_running_backfill_needs_review()
+        test_apply_exits_1_when_would_resume_closed_but_a_needs_review_record_remains()
+        test_apply_exits_1_with_a_capped_stale_record_needs_review()
+        test_apply_exits_1_with_a_failed_record_still_in_backoff()
+
+        test_fabricated_package_with_the_right_names_but_wrong_behaviour_is_refused()
+        test_behavioural_self_check_passes_against_the_real_backfill_module()
+        test_behavioural_self_check_catches_a_lying_is_stale()
+        test_behavioural_self_check_catches_a_lying_backoff_ready()
+        test_capability_check_requires_is_stale_specifically()
+        test_provenance_note_reports_the_backfill_module_sha256()
+
+        test_apply_refuses_on_a_non_200_health_response()
+        test_health_probe_unknown_exception_is_treated_as_ambiguous_not_dead()
+        test_health_probe_urlerror_without_connection_refused_is_ambiguous_not_dead()
 
         print("\nAll backfill-records.py script tests passed.")
     finally:

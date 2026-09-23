@@ -202,8 +202,9 @@ SATURATION = {"test_saturation.py", "test_soak_conversation.py"}
 # not an optional extra, whatever the default `run-tests.py` selection
 # excludes it for.
 #
-# test_real_image_import_apply.py and test_real_image_setup_sshd.py cover
-# scripts/import-history.py and scripts/setup-sshd.py the same way
+# test_real_image_import_apply.py, test_real_image_setup_sshd.py and
+# test_real_image_clean_decoration.py cover scripts/import-history.py,
+# scripts/setup-sshd.py and scripts/clean-decoration.py the same way
 # test_real_image_operator_scripts.py covers scripts/backfill-records.py
 # (and import-history.py's own dry run); listed here so `--real-image`
 # picks them up the moment each lands, rather than needing this set
@@ -212,6 +213,7 @@ NEEDS_DOCKER = {
     "test_real_image_operator_scripts.py",
     "test_real_image_import_apply.py",
     "test_real_image_setup_sshd.py",
+    "test_real_image_clean_decoration.py",
 }
 
 PASS, FAIL, SKIP, INCONCLUSIVE = "PASS", "FAIL", "SKIP", "INCONCLUSIVE"

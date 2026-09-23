@@ -45,7 +45,25 @@ directory it *chose*, not the module it actually *got*. After importing,
 this script asserts `Path(backfill.__file__).resolve().parent` equals the
 resolved package directory and refuses, naming the real `__file__`, if
 they disagree — see main()'s provenance check, right after `import
-backfill`.
+backfill`. The NOTE also reports that file's sha256 (`_sha256_file`), so a
+diff against a known-good hash is possible after the fact, not just at
+import time.
+
+NAMES ARE NOT BEHAVIOUR (M1). `hasattr` (`_check_backfill_capability`)
+proves the four required names exist; it does not prove `is_stale` and
+`_backoff_ready` actually implement the contracts stated in their own
+docstrings in compactor/backfill.py. A fabricated `--compactor-pkg` that
+defines all four names — with `is_stale` and `_backoff_ready` that simply
+always return True — passes both the capability check above AND the
+provenance check (it really is the module at the resolved path; it is
+just not a faithful reimplementation), and can then tell `_classify` that
+a genuinely RUNNING backfill (a fresh `in_progress` record, updated
+moments ago) is stale and ready to close. `_check_backfill_behavior` runs
+a handful of synthetic, in-memory-only records through both functions —
+one "just now", one "days ago" — and refuses `--apply` outright on any
+disagreement with the documented contract, before `_apply` is ever
+called and before anything on `--store` is touched. See that function's
+own docstring for the exact cases checked.
 
 WHY THIS DOES NOT ALSO WORK BY JUST COPYING NEWER FILES IN. On a pod that
 has never run v3.1.9.4 or later, the INSTALLED `compactor/backfill.py`
@@ -126,11 +144,13 @@ codes — the shared convention across the operator scripts" (see that
 section for the full rationale; setup-sshd.py used to have 0 and 3 swapped
 from this). This script's own mapping onto that table:
     0   the desired end state is in place: a dry run that found nothing
-        `would-resume`, or an `--apply` that closed every `would-resume`
-        record it was asked to (including a no-op `--apply` because there
-        was nothing to close). A `--force`-gated skip is not an error
-        either: it is this script refusing to do something unsafe, not a
-        failure — but see H1 below for what an unsafe *outcome* still does.
+        `would-resume` and nothing `needs-review`, or an `--apply` that
+        closed every `would-resume` record it was asked to (including a
+        no-op `--apply` because there was nothing to close) AND left no
+        `needs-review` record behind either. A `--force`-gated skip is not
+        an error either: it is this script refusing to do something
+        unsafe, not a failure — but see H1 below for what an unsafe
+        *outcome* still does.
     1   a refusal or an error the operator needs to look at: a bad
         `--store`, no usable compactor package (or one too old, or one
         whose provenance this script could not verify — see PACKAGE
@@ -139,44 +159,56 @@ from this). This script's own mapping onto that table:
         backup path that already existed, EVERY `--conv` value given being
         rejected (unsafe or no record found — nothing was inspected), ANY
         record classified `needs-review` (ambiguous — a human needs to
-        read why, see the per-record reason), or an `--apply` that closed
-        NONE of the `would-resume` records it targeted (H1: this is
-        indistinguishable from doing nothing, and doing nothing is exactly
-        the upgrade-time hazard this script exists to prevent — it must
-        never look the same as success)
+        read why, see the per-record reason — and this applies to
+        `--apply` exactly as much as to a dry run, N8: closing every
+        `would-resume` record it targeted does not make a leftover
+        `needs-review` record go away, and this script must never report
+        the same success code while one is still sitting there), or an
+        `--apply` that closed NONE of the `would-resume` records it
+        targeted (H1: this is indistinguishable from doing nothing, and
+        doing nothing is exactly the upgrade-time hazard this script
+        exists to prevent — it must never look the same as success)
     3   a DRY RUN found one or more `would-resume` records and nothing
         else needs attention — informational, not a failure: it means
         "re-run with --apply once you're ready"
     4   `--apply` closed at least one `would-resume` record but at least
         one other one is still open (H1: refused-no-facts,
-        refused-backup-exists, or a write failure) — progress was made,
-        but the upgrade hazard is not fully defused; look at what remains
-        refused, then re-run (with `--force` if that is what the
-        remaining refusal calls for)
+        refused-backup-exists, or a write failure), AND no `needs-review`
+        record is present either (see exit 1 above — that takes priority
+        over this) — progress was made, but the upgrade hazard is not
+        fully defused; look at what remains refused, then re-run (with
+        `--force` if that is what the remaining refusal calls for)
     (argparse's own usage errors — unknown flags, missing required values —
     exit 2, the Python standard library's own convention, unrelated to the
     four above)
 
 H1's rule, spelled out: after `--apply`, let TARGETED be the `would-resume`
 records this run attempted to close and CLOSED be how many it actually
-closed. `--apply` exits 0 if TARGETED == CLOSED (everything closed, or
-there was nothing to close), 4 if 0 < CLOSED < TARGETED (some progress,
-some still open), and 1 if CLOSED == 0 < TARGETED (no progress at all —
-the exact "exits 0 having closed nothing" defect this replaces). The
-needs-review and all-`--conv`-rejected rules above apply to a dry run too,
-and take priority over exit 3: a run that needs a human's eyes must never
-report the same code as one that is merely "safe to --apply now".
+closed. Once no `needs-review` record remains (see immediately below),
+`--apply` exits 0 if TARGETED == CLOSED (everything closed, or there was
+nothing to close), 4 if 0 < CLOSED < TARGETED (some progress, some still
+open), and 1 if CLOSED == 0 < TARGETED (no progress at all — the exact
+"exits 0 having closed nothing" defect this replaces). The needs-review and
+all-`--conv`-rejected rules above apply to `--apply` exactly as much as to
+a dry run, and take priority over exits 0, 3 AND 4 alike (N8: a `--apply`
+that closed everything it targeted used to exit 0 even with a needs-review
+record — a genuinely running backfill, an unreadable record, a capped
+record, a failed record still in its backoff window — sitting right next
+to it; that is not the desired end state, and must never report the same
+code as one): a run that needs a human's eyes must never report the same
+code as one that is merely "safe to --apply now" or "fully applied".
 """
 
 import argparse
 import errno
+import hashlib
 import importlib.util
 import json
 import shutil
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -463,6 +495,116 @@ def _check_backfill_capability(backfill_mod, pkg_source: str) -> str | None:
         f"script's own module docstring). Classifying records against a "
         f"package this old would misjudge every one of them, silently.\n\n"
         f"{_CLONE_HINT}"
+    )
+
+
+def _sha256_file(path_str: str | None) -> str | None:
+    """sha256 of the resolved `backfill.__file__`, for the provenance NOTE
+    (M1). `hasattr` (the capability check above) and even a full round of
+    correct-name/wrong-behaviour checking (`_check_backfill_behavior`
+    below) both still only prove SOMETHING answers to the right names and
+    passes a handful of synthetic probes — they cannot prove it is
+    byte-for-byte the release's own `compactor/backfill.py`. Printing the
+    hash of the file actually loaded turns "trust me" into something an
+    operator (or a later audit) can diff against a known-good value.
+    `None` if the file cannot be read (e.g. an already-importable module
+    with no real `__file__`, source 4 in `_resolve_compactor_pkg`)."""
+    if not path_str:
+        return None
+    try:
+        return hashlib.sha256(Path(path_str).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Behavioural self-check (M1 remainder) — hasattr proves a NAME exists, not
+# that it BEHAVES like the real compactor/backfill.py. A fabricated
+# `--compactor-pkg` that defines all four `_REQUIRED_BACKFILL_SYMBOLS`
+# names — including an `is_stale` that always returns True and a
+# `_backoff_ready` that always returns True — sails through
+# `_check_backfill_capability` above and can then tell `_classify` that a
+# genuinely RUNNING backfill (a fresh `in_progress` record, untouched for
+# moments) is stale and ready to close. This runs a handful of synthetic,
+# in-memory-only records — nothing under `--store` is ever touched here —
+# through `is_stale`/`_backoff_ready` and checks the verdicts against the
+# CONTRACT stated in those functions' own docstrings in
+# compactor/backfill.py (is_stale: False unless `state == "in_progress"`
+# and stale for _STALE_SECONDS; _backoff_ready: False until the
+# attempts-doubled backoff window has elapsed). Any disagreement — or a
+# crash calling either function at all — refuses BEFORE any write: this
+# runs before the live-compactor probe and before `_apply` ever calls
+# `_close_record`/`shutil.copy2`.
+# ---------------------------------------------------------------------------
+
+def _check_backfill_behavior(backfill_mod) -> str | None:
+    """None if `is_stale`/`_backoff_ready` agree with the documented
+    contract on synthetic records; otherwise the full actionable refusal
+    message. Never touches `--store` — every record here is built
+    in-memory, purely to probe the two functions' behaviour."""
+    now = _now_utc()
+    cases = [
+        (
+            "is_stale",
+            {"state": "in_progress", "updated_at": now.isoformat(timespec="seconds"), "attempts": 1},
+            False,
+            "an in_progress record updated moments ago must NOT be stale — "
+            "a genuinely RUNNING backfill must never be closed",
+        ),
+        (
+            "is_stale",
+            {
+                "state": "in_progress",
+                "updated_at": (now - timedelta(days=3)).isoformat(timespec="seconds"),
+                "attempts": 1,
+            },
+            True,
+            "an in_progress record untouched for 3 days must be stale — a "
+            "crashed backfill must be resumable",
+        ),
+        (
+            "_backoff_ready",
+            {"state": "failed", "updated_at": now.isoformat(timespec="seconds"), "attempts": 1},
+            False,
+            "a failed record that failed moments ago must NOT be "
+            "backoff-ready yet",
+        ),
+        (
+            "_backoff_ready",
+            {
+                "state": "failed",
+                "updated_at": (now - timedelta(days=3)).isoformat(timespec="seconds"),
+                "attempts": 1,
+            },
+            True,
+            "a failed record that failed 3 days ago, at attempt 1, must be "
+            "backoff-ready by now",
+        ),
+    ]
+    disagreements: list[str] = []
+    for fn_name, record, expected, why in cases:
+        fn = getattr(backfill_mod, fn_name, None)
+        try:
+            actual = fn(dict(record))
+        except Exception as e:
+            disagreements.append(
+                f"{fn_name}({record!r}) crashed ({type(e).__name__}: {e}) rather "
+                f"than returning {expected!r} — {why}"
+            )
+            continue
+        if actual != expected:
+            disagreements.append(
+                f"{fn_name}({record!r}) returned {actual!r}, expected {expected!r} — {why}"
+            )
+    if not disagreements:
+        return None
+    return (
+        "ERROR: the compactor package's is_stale/_backoff_ready do not "
+        "behave like the real compactor/backfill.py on synthetic, "
+        "in-memory-only records (M1: a package can have the four right "
+        "symbol NAMES — passing hasattr — while still behaving nothing "
+        "like the real module). Refusing --apply before making any write. "
+        "Disagreement(s):\n  " + "\n  ".join(disagreements)
     )
 
 
@@ -822,9 +964,13 @@ def main(argv=None) -> int:
     if not facts_dir.is_dir():
         return _fatal(args, f"ERROR: {facts_dir} does not exist or is not a directory.")
 
+    # M1: the file hash, not just the chosen directory or the imported
+    # module's own claimed __file__ — see _sha256_file's own docstring for
+    # why "the right names, behaving correctly on a handful of probes" is
+    # still short of "this is really the release's own backfill.py".
     warnings: list[str] = [
         f"NOTE: compactor package resolved from {pkg_source} "
-        f"(backfill.__file__={real_file!r})"
+        f"(backfill.__file__={real_file!r}, sha256={_sha256_file(real_file)})"
     ]
     all_conv_rejected = False
     if args.conv_ids:
@@ -892,6 +1038,15 @@ def main(argv=None) -> int:
     changes = None
     apply_had_error = False
     if args.apply:
+        # M1: run BEFORE anything else in this block — before the
+        # live-compactor probe, and long before _apply/_close_record ever
+        # touches a record on disk. hasattr proved the four names exist;
+        # this proves the two decision functions actually behave like the
+        # real compactor/backfill.py, on records this script builds itself
+        # (never anything from --store).
+        behavior_error = _check_backfill_behavior(backfill)
+        if behavior_error is not None:
+            return _fatal(args, behavior_error)
         alive = _compactor_is_alive()
         if alive and not args.force:
             return _fatal(
@@ -930,8 +1085,18 @@ def main(argv=None) -> int:
 
     # EXIT CODES — see the module docstring's table and H1's rule spelled
     # out there. all_conv_rejected and needs-review both mean "a human
-    # needs to look at this", and take priority over everything else.
+    # needs to look at this", and take priority over everything else —
+    # INCLUDING a fully-successful --apply (N8: this used to be checked
+    # only in the dry-run branch below, so --apply exited 0 or 4 purely
+    # from the would-resume tally, even with a needs-review record sitting
+    # right next to it — a genuinely running backfill, an unreadable
+    # record, a capped record, a failed record still in backoff. Those are
+    # exactly the cases a human needs to look at, on --apply exactly as
+    # much as on a dry run, so this check now runs before the --apply
+    # branch, not only after it).
     if all_conv_rejected:
+        return 1
+    if counts["needs-review"] > 0:
         return 1
     if args.apply:
         targeted = sum(1 for r in rows if r["verdict"] == "would-resume")
@@ -940,8 +1105,6 @@ def main(argv=None) -> int:
         if remaining_open == 0:
             return 0
         return 4 if closed > 0 else 1
-    if counts["needs-review"] > 0:
-        return 1
     return 3 if counts["would-resume"] > 0 else 0
 
 

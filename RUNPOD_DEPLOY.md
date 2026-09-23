@@ -1088,6 +1088,34 @@ each affected conversation is next used. Either:
   `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`. Left in place it pins the fraction
   below the v3.1.9.2+ image default (`0.75`).
 
+**Where `scripts/import-history.py`'s catch-up fits relative to the image
+switch (N16): backfill cleanup above runs BEFORE switching images; run
+`import-history.py` AFTER the pod is already on the new v3.1.9.6 (or
+v3.1.9.4/.5 — same digest) image.** The on-disk state schema
+`import-history.py` reads and writes (`summaries/<conv_id>.json`,
+`.archive.json`, the `tail_fp`/`head_fp`/`window_turns` anchor
+`summarizer.py` checks) is identical across v3.1.9 through v3.1.9.6 —
+confirmed against `compactor/summarizer.py`'s own state shape and its
+`current_wipe_generation` check (imported from `memory.py`, unchanged
+since v3.1.9.4) — so running it before or after the switch is not a data
+hazard either way. Two operational reasons still favor running it AFTER:
+- **The backlog is smaller there.** With the History cap still off (see
+  below), the ordinary live tail keeps closing part of the same backlog
+  on every real turn once the pod is back up and chatting on the new
+  image — every turn `import-history.py` does not have to cover itself
+  is fewer vLLM calls and less of the chat-outage window described in
+  OPERATIONS.md (N12).
+- **The importer's liveness refusal is cleaner there.** `--health-url`
+  is only ever a proxy for "is something else about to write the same
+  `summaries/<conv_id>.json` right now" (`_compactor_is_alive` in both
+  operator scripts) — running post-switch means the compactor being
+  probed is the SAME release as the `compactor/summarizer.py` this
+  script's clone writes with, so `supervisorctl stop compactor` /
+  `start compactor` around the run is unambiguous. Running it pre-switch
+  against the OLD image's compactor still works (the refusal logic does
+  not care which release answers), but ties the run to a process you are
+  about to replace anyway.
+
 **Do NOT turn on the OpenWebUI History cap (the `max_turns` valve) until
 every conversation whose summary hierarchy has fallen behind has been
 caught up with `scripts/import-history.py`** (v3.1.9.6; see OPERATIONS.md

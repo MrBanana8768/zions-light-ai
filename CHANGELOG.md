@@ -201,6 +201,47 @@ script under `scripts/` rather than a change to what the image ships:
 - **RUNPOD_DEPLOY.md** gets a pointer to that section right after "Access
   Your Deployment", and a row in "Upgrading within v3.1.9.x" naming
   `scripts/setup-sshd.py`. Neither implies the image changed.
+- **(round-2 hostile review, fix pass C) N12: the import procedure never
+  said it is a chat outage.** OpenWebUI's own backend is the compactor
+  on `:8080`, and the procedure keeps it stopped for the entire run.
+  OPERATIONS.md now says so plainly, up front, with the measured
+  duration (the dry run's own ~65-call / ~43-minute estimate is a
+  floor; a round-2 review measured 134 real completions against a fake
+  vLLM for the same conversation, so real vLLM is roughly 1.5 hours or
+  more), and recommends scheduling the run for a time she is not
+  chatting.
+- **N1's false "a pod restart mid-import is safe" claims removed
+  (pending pass A's actual fix).** OPERATIONS.md's "Interrupting it —
+  Ctrl-C, a pod restart — is safe" and CHANGELOG.md's own "the original
+  is restored" (both from this same release's earlier hostile-review
+  fix) were contradicted by a round-2 review (N1): the anchor restore
+  only covers Ctrl-C (SIGINT); a SIGTERM, SIGHUP or real pod restart is
+  not caught at all, and `save_state` runs once at the end of the whole
+  `--apply` run, not after each rollup unit. Both docs now say plainly
+  that interrupting `--apply` is NOT currently safe, and are marked
+  `<!-- r3: import interruption semantics pending pass A -->` — the
+  actual fix (pre-seat the anchor, save state per unit, handle
+  SIGTERM/SIGHUP) lands separately; this pass only stops the docs from
+  promising something the code does not yet do.
+- **N16 doc nits.** The sshd procedure's "Is the script on the pod?"
+  check and run commands now agree on ONE path at a time (it used to
+  clone to `/opt/zl-repo` but give run commands for `/data/scripts/`,
+  which only worked by accident if the upload method was used instead).
+  OPERATIONS.md's "~1,600 turns" example is corrected to the real
+  backup's actual `last_summarized_turn`, 2,720. RUNPOD_DEPLOY.md's
+  upgrade section now states the recommended order explicitly: the
+  backfill cleanup runs BEFORE the image switch (already true, now
+  said outright), and `scripts/import-history.py`'s catch-up runs AFTER
+  the pod is on the new image — the state schema is identical either
+  way (verified against `compactor/summarizer.py`'s state shape and its
+  `current_wipe_generation` check), but the backlog is smaller by then
+  (the ordinary live tail keeps closing part of it once real chat
+  resumes) and the health-probe refusal is unambiguous about which
+  release's compactor it is actually stopping/starting. OPERATIONS.md
+  also now explains why `.bak-` files accumulate under `summaries/` and
+  `facts/` (deliberate — never deleted or overwritten by either operator
+  script) and gives a safe pruning recipe (keep the oldest and newest
+  per conversation, per sidecar kind).
 
 ### Fixed
 
@@ -331,6 +372,60 @@ round of defects specific to `backfill-records.py`, closed below.
   still leaves `--apply` untouching it (BR8). Three new tests close all
   three; re-running the reviewer's mutation harness afterward shows 0
   surviving mutants of 8 for `backfill-records.py` (BR1-BR8).
+- **`backfill-records.py` (round-2 hostile review, fix pass C): N8 and
+  the M1 remainder closed; mutants BM1, BM4, BM5 and BM13 killed.**
+  - **N8: `--apply` could exit 0 with a `needs-review` record still
+    sitting there.** The exit code after `--apply` was derived only from
+    the `would-resume` tally (TARGETED vs CLOSED); a genuinely running
+    backfill, an unreadable record, a capped record, or a failed record
+    still in its backoff window never affected it at all — `--apply`
+    over a store with only a needs-review record exited 0 (nothing was
+    targeted, so "nothing to close" read as success), and even closing
+    every targeted `would-resume` record did not stop a leftover
+    needs-review record from making the run report 0. The needs-review
+    (and all-`--conv`-rejected) check now runs before the `--apply`
+    branch, not only after it, so it takes priority over exit 0, 3 AND 4
+    alike — matching the dry run's own rule and the documented table.
+  - **M1 remainder: `hasattr` proved a name existed, not that it
+    behaved correctly.** A fabricated `--compactor-pkg` with all four
+    required symbol names — `is_stale`/`_backoff_ready` hardcoded to
+    always return True — passed the capability check added in round 1
+    and could close a genuinely RUNNING backfill (reproduced and
+    confirmed refused — see this pass's own report). A new behavioural
+    self-check (`_check_backfill_behavior`) runs a handful of synthetic,
+    in-memory-only records through `is_stale`/`_backoff_ready` before
+    any write and refuses `--apply` outright on any disagreement with
+    the documented contract. The provenance NOTE also now reports the
+    resolved `backfill.py`'s file sha256, so "the right module" can be
+    verified after the fact, not just asserted at import time.
+  - **Mutants BM1 (`is_stale` dropped from the required-symbols list),
+    BM4 (a non-200 health response reads as not-running), BM5 (an
+    unrecognised probe exception reads as not-running) and BM13 (every
+    `URLError` reads as a connection refusal, so a timeout or DNS
+    failure proceeds) all survived the round-2 mutation pass** — the
+    fail-safe behaviour was correct but untested on those specific
+    branches. New tests pin each one directly (a real 500 response, a
+    bare `ValueError` from a malformed URL, and a mocked plain-string
+    `URLError` reason) plus a dedicated capability test for `is_stale`
+    specifically (the round-1 pre-v3.1.9.4 stub always included
+    `is_stale`, so removing it from the required list alone was never
+    exercised). Re-running the reviewer's mutation harness (adjusted for
+    an incidental string-uniqueness collision the new behavioural-check
+    code introduced against the original BM1 old/new pair — same target
+    line, same mutant) shows all 13 backfill mutants (BM1-BM13) caught.
+- **N9: COMMANDS.md's own "mandatory" real-image command only ran 1 of
+  the 3 mandatory real-image suites.** `--only real_image_operator`
+  matches only `test_real_image_operator_scripts.py`'s filename —
+  `test_real_image_import_apply.py` and `test_real_image_setup_sshd.py`
+  were silently never run by the documented command, even though the
+  same section calls all three mandatory. The primary command is now
+  `--only real_image` (no trailing `_operator`), which matches all
+  three; verified with `scripts/run-tests.py --real-image --only
+  real_image --list` against `--only real_image_operator --list` side
+  by side (3 suites selected vs 1). `test_real_image_operator_scripts.py`'s
+  own `_skip` already never honoured `COMPACTOR_ALLOW_FIXTURE_SKIP` (an
+  unconditional `sys.exit(3)`, unlike the two fixture-backed suites) —
+  confirmed still true, no code change needed there.
 - **`setup-sshd.py` (hostile-review pass 2): B2, B3, H5, H6, H7, and the
   script's own M8 items, closed.**
   - **B2.** `sshd -T` with no `-C` evaluates NO `Match` criteria at all,
@@ -463,9 +558,16 @@ round of defects specific to `backfill-records.py`, closed below.
     timeout or any other ambiguous response refuses `--apply` unless
     `--force`. Added `--health-url`.
   - **Ctrl-C / the live-seam window.** `_run_apply_loop` no longer
-    leaves a cleared live-chat anchor on disk if interrupted (Ctrl-C, a
-    pod restart) before any rollup pass completes — the original is
-    restored. A follow-up real-image test also confirms the NEXT live
+    leaves a cleared live-chat anchor on disk if interrupted by Ctrl-C
+    (SIGINT) before any rollup pass completes — the original is
+    restored. <!-- r3: import interruption semantics pending pass A -->
+    A round-2 hostile review (N1) found this restore does NOT cover a
+    pod restart, SIGTERM or SIGHUP — only `except BaseException` runs
+    it, in-process, which a killed process never reaches — and found
+    that even a covered Ctrl-C discards every rollup unit already
+    completed in that run (`save_state` runs once, at the end, not
+    after each unit). Corrected claims and the actual fix land with
+    pass A. A follow-up real-image test also confirms the NEXT live
     request after `--apply` stays contiguous with what it wrote (the
     live path's own `window_offset` lands on the same verified 22, not
     the old flat 20 or a naive 0) — this was already correct, a

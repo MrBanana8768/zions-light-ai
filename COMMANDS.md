@@ -53,39 +53,50 @@ docker compose -f docker-compose.tokenizer-contract.yml up --build --exit-code-f
 docker compose -f docker-compose.tokenizer-contract.yml run --rm --build soak-tests
 ```
 
-### Real-image operator-script suite (mandatory, host-run)
+### Real-image operator-script suites (mandatory, host-run — all three)
 
 Not part of the sandboxed `unit-tests` compose service above
-(`network_mode: none`, no docker socket) — this suite needs a real Docker
+(`network_mode: none`, no docker socket) — these suites need a real Docker
 daemon, the published image already pulled, `git` with the release tag
-reachable, and the real 2026-09-22 pod-export backup on this host. It is
+reachable, and the real 2026-09-22 pod-export backup on this host. They are
 EXCLUDED from the default `run-tests.py` selection for exactly that reason
-(see `scripts/run-tests.py`'s `NEEDS_DOCKER`), and honestly SKIPS (exit 3,
-never promoted to a pass — see that file's own `_skip`) if any precondition
-is missing. It is **required before any release ships**, not optional: it
-runs the real operator scripts, unmodified, against containers started
-from the exact published digest, and it is the one suite that actually
-exercises `--apply` against a full copy of the real production store — the
-class of defect a 143-test all-mocked gate already missed once (CHANGELOG.md
-[3.1.9.6]).
+(see `scripts/run-tests.py`'s `NEEDS_DOCKER`), and each one honestly SKIPS
+(exit 3, never promoted to a pass — see each file's own `_skip`) if any
+precondition is missing. All THREE are **required before any release
+ships**, not optional: they run the real operator scripts, unmodified,
+against containers started from the exact published digest, and together
+they are the only suites that actually exercise `--apply`/live behaviour
+against a full copy of the real production store — the class of defect a
+143-test all-mocked gate already missed once (CHANGELOG.md [3.1.9.6]).
+
+The mandatory command below runs `--only real_image` — the substring
+`real_image`, with NO trailing `_operator` — which matches ALL THREE files:
+`compactor/test_real_image_operator_scripts.py` (`backfill-records.py` and
+`import-history.py`'s dry run), `compactor/test_real_image_import_apply.py`
+(`import-history.py --apply`), and `compactor/test_real_image_setup_sshd.py`
+(`setup-sshd.py`). **Do not narrow this to `--only real_image_operator`** —
+that substring only matches the first file and silently drops the other
+two mandatory suites from the run (N9: this is exactly the mistake this
+section used to document as the "mandatory" command).
 
 ```bash
-python3 scripts/run-tests.py --python /usr/bin/python3 --real-image --only real_image_operator
+python3 scripts/run-tests.py --python /usr/bin/python3 --real-image --only real_image
 ```
 
-Or run the file directly (same checks, no `run-tests.py` wrapper):
+Or run each file directly (same checks, no `run-tests.py` wrapper — you
+must invoke all three separately this way):
 
 ```bash
 python3 compactor/test_real_image_operator_scripts.py
+python3 compactor/test_real_image_import_apply.py
+python3 compactor/test_real_image_setup_sshd.py
 ```
 
-`--only real_image` (no trailing `_operator`) also picks up
-`compactor/test_real_image_import_apply.py` and
-`compactor/test_real_image_setup_sshd.py`, the equivalent mandatory
-real-image suites for `scripts/import-history.py` and
-`scripts/setup-sshd.py`. A SKIP (exit 3) here is not evidence of
-anything — fix whatever precondition the printed reason names and
-re-run before shipping; do not read a skip as green.
+A SKIP (exit 3) from any of the three is not evidence of anything — fix
+whatever precondition the printed reason names and re-run before shipping;
+do not read a skip as green. (`--only real_image_operator`, matching only
+the first file, is occasionally useful on its own during development of
+that one suite specifically — it is never the release-gate command.)
 
 ### Integration suite (black box, local stack)
 
@@ -392,5 +403,5 @@ back to `/usr/bin/python3`), so the plain invocation just works with no
 `--python` needed:
 
 ```bash
-python3 scripts/run-tests.py --real-image --only real_image_operator
+python3 scripts/run-tests.py --real-image --only real_image
 ```
