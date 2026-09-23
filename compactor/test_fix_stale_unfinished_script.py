@@ -282,6 +282,180 @@ def test_all_branches_widens_scope_but_never_touches_tip_or_inflight():
 
 
 # ===========================================================================
+# regression: the branch walk must be TABLE-FIRST (live-pod bug, found
+# after OpenWebUI 0.11.4 let the JSON copy lag the table) -- a message
+# that exists ONLY in chat_message, with no entry anywhere in
+# history.messages, must not truncate the walk. Reproduces the real
+# failure: a JSON-only walk died a few hops from the tip (the table-only
+# gap is usually near the RECENT end, since that's what lags), so
+# everything root-ward of it -- including the real stale targets -- read
+# as "off-branch", finding 0 in scope though nothing was written.
+# ===========================================================================
+
+
+def _gap_scenario_messages(now):
+    """root..tip with ONE node (`gap_stale`) that is table-only: it has a
+    real `chat_message` row (parent_id=q3, an assistant reply never
+    folded into the JSON) but NO entry in `history.messages` at all --
+    not even a broken one. `q4`'s JSON `parentId` points straight at
+    that missing id. `a1_stale` sits further toward the root, past the
+    gap -- the deep, real target a JSON-only walk would wrongly exclude."""
+    OLD = now - 100_000
+    msgs = {}
+    msgs.update(dict([
+        ("root", _hist_msg("root", "user", OLD)),
+        ("q1", _hist_msg("q1", "user", OLD, parent="root")),
+        ("a1_stale", _hist_msg("a1_stale", "assistant", OLD, parent="q1", content="", done=False)),
+        ("q2", _hist_msg("q2", "user", OLD, parent="a1_stale")),
+        ("a2_done", _hist_msg("a2_done", "assistant", OLD, parent="q2", content="hi", done=True)),
+        ("q3", _hist_msg("q3", "user", OLD, parent="a2_done")),
+        # gap_stale intentionally NOT included here -- table-only.
+        ("q4", _hist_msg("q4", "user", OLD, parent="gap_stale")),
+        ("tip", _hist_msg("tip", "assistant", OLD, parent="q4", content="", done=False)),
+    ]))
+    return _link(msgs)
+
+
+def _make_gap_db(path, now=None, current_message_id="tip"):
+    now = int(now if now is not None else time.time())
+    con = sqlite3.connect(str(path))
+    con.executescript(_CHAT_SCHEMA)
+    con.executescript(_CHAT_MESSAGE_SCHEMA)
+
+    msgs = _gap_scenario_messages(now)
+    blob = json.dumps({"history": {"messages": msgs, "currentId": current_message_id}, "messages": []})
+    con.execute(
+        "insert into chat (id, user_id, title, archived, created_at, updated_at, chat, meta, current_message_id) "
+        "values (?,?,?,?,?,?,?,?,?)",
+        (CHAT_ID, "u1", "her chat", 0, now, now, blob, "{}", current_message_id),
+    )
+    prefix = CHAT_ID + "-"
+    for mid, m in msgs.items():
+        ts = m["timestamp"]
+        con.execute(
+            "insert into chat_message (id, chat_id, role, parent_id, content, done, created_at, updated_at) "
+            "values (?,?,?,?,?,?,?,?)",
+            (prefix + mid, CHAT_ID, m["role"], m.get("parentId"), json.dumps(m["content"]), 0 if mid in
+             ("a1_stale", "tip") else (1 if mid == "a2_done" else None), ts, ts),
+        )
+    # gap_stale: a real chat_message row with NO corresponding history.messages entry.
+    con.execute(
+        "insert into chat_message (id, chat_id, role, parent_id, content, done, created_at, updated_at) "
+        "values (?,?,?,?,?,?,?,?)",
+        (prefix + "gap_stale", CHAT_ID, "assistant", "q3", json.dumps(""), 0, OLD_TS(now), OLD_TS(now)),
+    )
+    con.commit()
+    con.close()
+
+
+def OLD_TS(now):
+    return int(now) - 100_000
+
+
+def test_table_only_gap_does_not_truncate_the_branch_walk():
+    tmp = Path(tempfile.mkdtemp(prefix="fsu-gap-"))
+    try:
+        db = tmp / "webui.db"
+        now = time.time()
+        _make_gap_db(db, now=now)
+        chat, table, cur_col, _ = _read_chat(db)
+
+        # sanity: gap_stale really is table-only
+        assert_true("gap_stale" not in chat["history"]["messages"], "gap_stale has no JSON entry at all")
+        assert_true("gap_stale" in table, "gap_stale has a real chat_message row")
+
+        targets = S.build_targets(chat, table, cur_col, min_age_minutes=10, branch_only=True, now=now)
+        by_id = {t.mid: t for t in targets}
+
+        assert_true("a1_stale" in by_id, "a1_stale (past the gap, toward root) is still found at all")
+        assert_true(by_id["a1_stale"].on_branch,
+                    "a1_stale is correctly ON-branch despite the table-only gap between it and the tip -- "
+                    "the live-pod regression this test reproduces")
+        assert_true(by_id["a1_stale"].in_scope, "a1_stale is therefore in scope, not silently dropped")
+        assert_true(by_id["a1_stale"].branch_pos is not None and by_id["a1_stale"].branch_pos > 1,
+                    "a1_stale has a real branch position, not None")
+
+        assert_true("gap_stale" in by_id, "the table-only node itself is found as a candidate")
+        gap_t = by_id["gap_stale"]
+        assert_eq(gap_t.category, "a", "gap_stale categorized as stale-unfinished")
+        assert_eq(gap_t.json_present, False, "gap_stale is correctly flagged as having no JSON copy")
+        assert_true(gap_t.on_branch, "gap_stale itself is on-branch (it's the JSON's own missing link)")
+        assert_true(gap_t.in_scope, "gap_stale is in scope")
+
+        assert_true(by_id["tip"].branch_pos > by_id["a1_stale"].branch_pos > 0,
+                    "branch positions are ordered root..tip across the gap, not reset by it")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_table_only_target_apply_writes_only_the_table_copy():
+    tmp = Path(tempfile.mkdtemp(prefix="fsu-gap-apply-"))
+    forensics = tmp / "forensics"
+    try:
+        db = tmp / "webui.db"
+        _make_gap_db(db)
+        rc, out, err = run_script([str(db), "--apply", "--json"], env={"FSU_FORENSICS_DIR": str(forensics)})
+        assert_eq(rc, 0, f"apply succeeds across the table-only gap (stderr={err!r})")
+        result = json.loads(out)
+        assert_eq(result["written"], 2, "both a1_stale and the table-only gap_stale are written")
+        assert_true(result["verify_ok"], "verification passes")
+
+        chat, table, _, _ = _read_chat(db)
+        assert_eq(table["gap_stale"]["done"], 1, "gap_stale's table row is flipped")
+        assert_true("gap_stale" not in chat["history"]["messages"],
+                    "gap_stale is STILL absent from the JSON -- never created, per THE WRITE")
+        assert_eq(chat["history"]["messages"]["a1_stale"]["done"], True, "a1_stale's JSON copy is flipped too")
+        assert_eq(table["a1_stale"]["done"], 1, "a1_stale's table copy is flipped too")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_broken_chain_that_never_reaches_root_refuses_instead_of_guessing():
+    tmp = Path(tempfile.mkdtemp(prefix="fsu-broken-"))
+    forensics = tmp / "forensics"
+    try:
+        db = tmp / "webui.db"
+        now = time.time()
+        con = sqlite3.connect(str(db))
+        con.executescript(_CHAT_SCHEMA)
+        con.executescript(_CHAT_MESSAGE_SCHEMA)
+        # "orphan" points at a parent id that exists NOWHERE -- not in the
+        # JSON, not in the table -- a genuinely broken chain, distinct
+        # from a table-only gap (which resolves once merged with the table).
+        msgs = _link({
+            "orphan": _hist_msg("orphan", "assistant", now - 1000, parent="nowhere-at-all", content="", done=False),
+        })
+        blob = json.dumps({"history": {"messages": msgs, "currentId": "orphan"}, "messages": []})
+        con.execute(
+            "insert into chat (id, user_id, title, archived, created_at, updated_at, chat, meta, current_message_id) "
+            "values (?,?,?,?,?,?,?,?,?)",
+            (CHAT_ID, "u1", "her chat", 0, int(now), int(now), blob, "{}", "orphan"),
+        )
+        con.execute(
+            "insert into chat_message (id, chat_id, role, parent_id, content, done, created_at, updated_at) "
+            "values (?,?,?,?,?,?,?,?)",
+            (CHAT_ID + "-orphan", CHAT_ID, "assistant", "nowhere-at-all", json.dumps(""), 0, int(now) - 1000, int(now) - 1000),
+        )
+        con.commit()
+        con.close()
+
+        chat, table, cur_col, _ = _read_chat(db)
+        raised = False
+        try:
+            S.build_targets(chat, table, cur_col, min_age_minutes=10, branch_only=True, now=now)
+        except S.BranchWalkIncomplete:
+            raised = True
+        assert_true(raised, "build_targets raises BranchWalkIncomplete rather than silently mis-scoping")
+
+        rc, out, err = run_script([str(db), "--json"], env={"FSU_FORENSICS_DIR": str(forensics)})
+        assert_eq(rc, 1, f"the CLI refuses (exit 1), not exit 3/0 (stderr={err!r})")
+        assert_true("REFUSING" in out, "refusal message printed", out)
+        assert_true("root" in out, "refusal names the actual problem (not reaching a root)", out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ===========================================================================
 # end-to-end: --apply changes only the intended flags, in both copies,
 # leaves every byte of content alone, and is idempotent
 # ===========================================================================
@@ -512,6 +686,9 @@ def test_chat_default_is_her_id():
 if __name__ == "__main__":
     test_build_targets_categorizes_and_scopes_correctly()
     test_all_branches_widens_scope_but_never_touches_tip_or_inflight()
+    test_table_only_gap_does_not_truncate_the_branch_walk()
+    test_table_only_target_apply_writes_only_the_table_copy()
+    test_broken_chain_that_never_reaches_root_refuses_instead_of_guessing()
     test_apply_changes_only_targets_in_both_copies_and_preserves_content()
     test_apply_never_touches_tip_or_inflight_even_with_all_branches()
     test_backup_uses_forensics_dir_and_restore_is_md5_identical()

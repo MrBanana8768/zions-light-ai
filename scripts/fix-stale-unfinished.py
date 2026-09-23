@@ -29,21 +29,51 @@ defensively). `get_messages_map_by_chat_id` reads the TABLE first and only
 uses the JSON to fill gaps the table's own graph cannot resolve — the
 table is the copy OpenWebUI itself already treats as authoritative.
 
-CATEGORIES (both fixed by `--apply`; reported as separate counts):
-  (a) STALE UNFINISHED — `done` is not `True` in the JSON (missing or
-      `False`) AND the table's `done` column is not `1` (0 or missing).
-      Both copies agree the message never finished — this is the actual
-      spinner bug. Fixed by setting `done=True` in the JSON and `done=1`
-      in the table.
-  (b) JSON-ONLY GAP — the JSON `done` key is MISSING (not `False`) while
-      the table already says `done=1`. The table is authoritative, so
-      this was never rendering as a live spinner the same way (a) does;
-      it is a plain hygiene backfill, not the bug fix. Fixed by setting
-      `done=True` in the JSON only (the table needs no write). Counted
-      and printed separately from (a) so a dry run cannot make (b) look
-      like additional instances of the actual bug.
-  Measured on the real 2026-09-23 backup: (a) 19 total (6 on the current
-  branch, 13 off it), (b) 9 total (0 on the current branch, all off it).
+BRANCH CONSTRUCTION MUST BE TABLE-FIRST (fixed after a live-pod bug,
+2026-09-23). Once the pod moved to OpenWebUI 0.11.4, the JSON copy started
+lagging the table — some messages exist ONLY in `chat_message`, not yet
+folded into `chat.chat["history"]["messages"]` at all. A first version of
+this script walked ancestors through the JSON dict alone; on the real
+chat that walk died after 9 hops (the first table-only gap), reported the
+tip at branch position 9 instead of ~3,889, and reclassified every real
+target past that gap — including `dd9292d9` at the true position ~2672 —
+as "off-branch", finding 0 in scope. Nothing was written (the guards did
+their job), but the report was silently wrong. Fixed by walking a
+TABLE-FIRST merge (`merged_for_walk`): every `chat_message` row counts as
+a real node for parent/child purposes even when the JSON has never heard
+of it, exactly the shape `get_messages_map_by_chat_id` and
+`repair-chat-tree.py`'s own `build_plan` merge already use. Unlike that
+script, this merge is READ-ONLY and never written back — see CATEGORIES
+and THE WRITE below for why a table-only message stays out of the JSON
+forever rather than being folded in.
+
+CATEGORIES (all fixed by `--apply`; reported as separate counts):
+  (a) STALE UNFINISHED — `done` is not `True` in the JSON (missing,
+      `False`, or the message doesn't exist in the JSON at all) AND the
+      table's `done` column is not `1` (0 or missing). Both copies agree
+      the message never finished — this is the actual spinner bug. Fixed
+      by setting `done=True` in the JSON (if a JSON entry exists — see
+      the table-only note below) and `done=1` in the table.
+      TABLE-ONLY variant: when the message has no JSON entry at all
+      (a table-only row not yet folded into the JSON — see BRANCH
+      CONSTRUCTION above), there is nothing to set `done=True` ON in the
+      JSON, so only `chat_message.done` is written; reported with
+      `json_present: false` so this is visible, not silent. A table-only
+      row whose `done` is already `1` is not a candidate at all — its
+      only copy already agrees, nothing to fix and nothing to report.
+  (b) JSON-ONLY GAP — the message DOES have a JSON entry, its `done` key
+      is MISSING there (not `False`), while the table already says
+      `done=1`. The table is authoritative, so this was never rendering
+      as a live spinner the same way (a) does; it is a plain hygiene
+      backfill, not the bug fix. Fixed by setting `done=True` in the
+      JSON only (the table needs no write). Counted and printed
+      separately from (a) so a dry run cannot make (b) look like
+      additional instances of the actual bug.
+  Measured on the real 2026-09-23 backup with the ORIGINAL (JSON-only)
+  branch walk, now known wrong: (a) 19 total (6 on the current branch,
+  13 off it), (b) 9 total (0 on the current branch, all off it). Rerun
+  after this fix — see the module's own test suite and CHANGELOG-style
+  note in the commit for the corrected, table-first numbers.
 
 TARGETING RULES.
   - `--chat` selects the conversation (exact id or unique prefix), default
@@ -51,13 +81,19 @@ TARGETING RULES.
   - `--branch-only` (default) restricts BOTH categories to messages that
     are ancestors of the stored pointer (`chat.current_message_id`, or
     `history.currentId` if the column is unset — same fallback order as
-    `repair-chat-tree.py`'s `pick_stored_pointer`, and the same `walk_up`
-    definition of "branch"). `--all-branches` lifts that restriction.
+    `repair-chat-tree.py`'s `pick_stored_pointer`), walked table-first per
+    BRANCH CONSTRUCTION above. `--all-branches` lifts that restriction.
+    If the pointer's own walk does not reach a genuine root (a broken
+    link or a cycle — a tree-structure problem, not this script's job),
+    this REFUSES outright (`BranchWalkIncomplete`) rather than silently
+    treating the unreached remainder as off-branch, the same silent-wrong
+    shape the live-pod bug above took.
   - The current tip itself, and any of its direct children (an in-flight
     reply actually generating right now would be exactly this: a fresh
-    assistant child of the pointer), are NEVER touched, regardless of the
-    branch/age flags below — this is the one exclusion this script will
-    not override.
+    assistant child of the pointer, table-only if it is new enough that
+    OpenWebUI has not yet folded it into the JSON), are NEVER touched,
+    regardless of the branch/age flags below — this is the one exclusion
+    this script will not override.
   - `--min-age-minutes` (default 10): a candidate is only a target if it
     is older than this, using `max(chat_message.created_at,
     chat_message.updated_at)` (falling back to the JSON message's own
@@ -66,19 +102,24 @@ TARGETING RULES.
     that is genuinely mid-generation — belt-and-suspenders alongside the
     tip exclusion above, not a replacement for it.
 
-THE WRITE. Sets `done=True`/`done=1` for exactly the in-scope targets.
-Nothing else changes: not `content`, not `created_at`/`updated_at` on
-either copy, not `chat.updated_at`, not `current_message_id`, not the flat
-`chat.chat["messages"]` list. `chat.updated_at` is read once before the
-write (to detect a concurrent change, the same guard
-`repair-chat-tree.py` uses) and deliberately never written back — this
-fix is plumbing, not a user-visible edit, and must not appear as one.
+THE WRITE. Sets `done=True`/`done=1` for exactly the in-scope targets, in
+whichever copy actually has an entry for that message (a table-only
+target gets only `chat_message.done=1` — see CATEGORIES). Nothing else
+changes: not `content`, not `created_at`/`updated_at` on either copy, not
+`chat.updated_at`, not `current_message_id`, not the flat
+`chat.chat["messages"]` list, and a table-only message is never folded
+into the JSON (that permanent merge is `repair-chat-tree.py`'s job, not
+this script's). `chat.updated_at` is read once before the write (to
+detect a concurrent change, the same guard `repair-chat-tree.py` uses)
+and deliberately never written back — this fix is plumbing, not a
+user-visible edit, and must not appear as one.
 
 REFUSALS (checked before any backup or write): another process holding
 `webui.db` open (`/proc/<pid>/fd` scan — same check
-`scripts/clean-decoration.py` and `scripts/repair-chat-tree.py` use), or a
+`scripts/clean-decoration.py` and `scripts/repair-chat-tree.py` use), a
 `-wal`/`-journal` sidecar beside it (that failure mode belongs to
-RUNBOOK_DB_JOURNAL.md, not this script).
+RUNBOOK_DB_JOURNAL.md, not this script), or the pointer's branch walk not
+reaching a genuine root (see TARGETING RULES above).
 
 BACKUP. Unlike `repair-chat-tree.py`/`fix-encoded-messages.py` (which use
 a plain `shutil.copy2` beside the live db specifically so `--restore` can
@@ -311,6 +352,61 @@ def pick_stored_pointer(cur_col, hist_current, msgs):
     return cur_col or hist_current or None
 
 
+class BranchWalkIncomplete(Exception):
+    """The pointer's ancestor walk did not reach a genuine root (a node
+    whose own `parentId` is `None`) — a broken link or a cycle. Raised
+    instead of silently truncating the branch and mis-classifying
+    everything past the break as "off-branch" (the real bug this pass
+    fixes: `dd9292d9` at the real branch position ~2672 read as
+    off-branch and 0-in-scope on a live pod purely because the walk had
+    already died at position 9)."""
+
+    def __init__(self, pointer, stopped_at, parent_id):
+        self.pointer, self.stopped_at, self.parent_id = pointer, stopped_at, parent_id
+        super().__init__(
+            f"branch walk from pointer {pointer!r} stopped at {stopped_at!r} "
+            f"(parentId={parent_id!r}) without reaching a root"
+        )
+
+
+def merged_for_walk(hist, table):
+    """A read-only merge of the JSON history and the `chat_message` table,
+    for WALKING the branch only — table rows first, filling in only the
+    ids the JSON does not have at all, mirroring `get_messages_map_by_chat_id`
+    (table primary, JSON fills gaps) and `repair-chat-tree.py`'s own
+    `build_plan` merge step. UNLIKE that script, this merge is never
+    written back: this script's whole mandate is to touch only `done`
+    flags, never to fold a table-only message permanently into the JSON
+    blob, so a table-only node stays out of `chat.chat` forever — this
+    dict exists only so a branch walk does not die at the first gap
+    (the real pod bug this pass fixes: OpenWebUI 0.11.4's JSON lagged the
+    table by several messages, several of them mid-branch, and the old
+    JSON-only walk stopped after 9 hops instead of the true 3,889)."""
+    msgs = {}
+    for mid, m in hist.items():
+        msgs[mid] = {"parentId": m.get("parentId"), "childrenIds": [], "role": m.get("role")}
+    for mid, r in table.items():
+        if mid not in msgs:
+            msgs[mid] = {"parentId": r.get("parentId"), "childrenIds": [], "role": r.get("role")}
+    for mid, m in msgs.items():
+        p = m.get("parentId")
+        if p in msgs and mid not in msgs[p]["childrenIds"]:
+            msgs[p]["childrenIds"].append(mid)
+    return msgs
+
+
+def branch_from_pointer(merged, pointer):
+    """Ancestors of `pointer` (root-most last), or raises
+    `BranchWalkIncomplete` if the walk does not end at a genuine root —
+    see that exception's own docstring for why this refuses rather than
+    treating the unreached remainder as simply off-branch."""
+    path = walk_up(merged, pointer)
+    last = path[-1] if path else None
+    if last is None or merged.get(last, {}).get("parentId") is not None:
+        raise BranchWalkIncomplete(pointer, last, merged.get(last, {}).get("parentId") if last else None)
+    return path
+
+
 def load_table(con, chat_id):
     prefix = chat_id + "-"
     table = {}
@@ -362,9 +458,9 @@ def msg_age_minutes(mid, hist, table, now):
 
 class Target:
     __slots__ = ("mid", "category", "on_branch", "branch_pos", "age_minutes",
-                 "json_len", "table_len", "in_scope", "skip_reason")
+                 "json_len", "table_len", "json_present", "in_scope", "skip_reason")
 
-    def __init__(self, mid, category, on_branch, branch_pos, age_minutes, json_len, table_len):
+    def __init__(self, mid, category, on_branch, branch_pos, age_minutes, json_len, table_len, json_present):
         self.mid = mid
         self.category = category
         self.on_branch = on_branch
@@ -372,39 +468,53 @@ class Target:
         self.age_minutes = age_minutes
         self.json_len = json_len
         self.table_len = table_len
+        self.json_present = json_present
         self.in_scope = True
         self.skip_reason = None
 
 
 def build_targets(chat, table, cur_col, min_age_minutes, branch_only, now=None):
+    """Raises `BranchWalkIncomplete` if a stored pointer exists but its
+    ancestor walk (table-first, see `merged_for_walk`) does not reach a
+    genuine root — see that exception's docstring."""
     now = now if now is not None else time.time()
     hist = chat.get("history", {}).get("messages", {})
     hist_current = chat.get("history", {}).get("currentId")
-    pointer = pick_stored_pointer(cur_col, hist_current, hist)
+    merged = merged_for_walk(hist, table)
+    pointer = pick_stored_pointer(cur_col, hist_current, merged)
 
-    branch = set(walk_up(hist, pointer)) if pointer else set()
-    branch_order = list(reversed(walk_up(hist, pointer))) if pointer else []  # root..pointer
-    branch_pos = {mid: i + 1 for i, mid in enumerate(branch_order)}
-
+    branch = set()
+    branch_pos = {}
     protected = set()
     if pointer:
+        path = branch_from_pointer(merged, pointer)  # raises BranchWalkIncomplete on a broken/cyclic chain
+        branch = set(path)
+        branch_pos = {mid: i + 1 for i, mid in enumerate(reversed(path))}  # root..pointer
         protected.add(pointer)
-        for child in (hist.get(pointer) or {}).get("childrenIds") or []:
-            if (hist.get(child) or {}).get("role") == "assistant":
+        for child in merged.get(pointer, {}).get("childrenIds") or []:
+            if merged.get(child, {}).get("role") == "assistant":
                 protected.add(child)
 
     targets = []
-    for mid, m in hist.items():
-        if m.get("role") != "assistant":
-            continue
+    for mid in set(hist) | set(table):
+        hist_m = hist.get(mid)
         row = table.get(mid)
-        json_done = m.get("done") is True
-        json_missing = "done" not in m
+        role = (hist_m or {}).get("role") or (row or {}).get("role")
+        if role != "assistant":
+            continue
+
+        json_present = hist_m is not None
+        json_done = json_present and hist_m.get("done") is True
+        json_missing_key = json_present and "done" not in hist_m
         table_done = bool(row and row.get("done") == 1)
 
-        if not json_done and not table_done:
+        if not json_present:
+            if table_done:
+                continue  # its only copy already says done -- nothing to fix, nothing to report
+            category = "a"  # table-only AND not done: set chat_message.done only (see THE WRITE)
+        elif not json_done and not table_done:
             category = "a"
-        elif json_missing and table_done:
+        elif json_missing_key and table_done:
             category = "b"
         else:
             continue  # already done in both, or the (unmentioned) reverse case — not this script's job
@@ -413,7 +523,9 @@ def build_targets(chat, table, cur_col, min_age_minutes, branch_only, now=None):
         t = Target(
             mid, category, on_b, branch_pos.get(mid),
             msg_age_minutes(mid, hist, table, now),
-            content_len(m.get("content")), content_len(row.get("content")) if row else None,
+            content_len(hist_m.get("content")) if hist_m else None,
+            content_len(row.get("content")) if row else None,
+            json_present,
         )
         if mid in protected:
             t.in_scope = False
@@ -437,19 +549,22 @@ def build_targets(chat, table, cur_col, min_age_minutes, branch_only, now=None):
 
 def summarize(targets):
     in_scope = [t for t in targets if t.in_scope]
+    table_only = [t for t in targets if not t.json_present]
     return {
         "found_total": len(targets),
         "found_category_a": sum(1 for t in targets if t.category == "a"),
         "found_category_b": sum(1 for t in targets if t.category == "b"),
+        "found_table_only": len(table_only),
         "in_scope_total": len(in_scope),
         "in_scope_category_a": sum(1 for t in in_scope if t.category == "a"),
         "in_scope_category_b": sum(1 for t in in_scope if t.category == "b"),
+        "in_scope_table_only": sum(1 for t in in_scope if not t.json_present),
         "targets": [
             {
                 "id": t.mid[:8], "category": t.category, "on_branch": t.on_branch,
                 "branch_pos": t.branch_pos, "age_minutes": round(t.age_minutes, 1) if t.age_minutes is not None else None,
                 "json_content_len": t.json_len, "table_content_len": t.table_len,
-                "in_scope": t.in_scope, "skip_reason": t.skip_reason,
+                "json_present": t.json_present, "in_scope": t.in_scope, "skip_reason": t.skip_reason,
             }
             for t in targets
         ],
@@ -462,14 +577,17 @@ def emit(result, as_json):
         return
     print(f"chat {result.get('chat_id', '?')[:8]}: found {result['found_total']} not-fully-done assistant "
           f"message(s) — category (a) stale-unfinished: {result['found_category_a']}, "
-          f"category (b) json-only-gap: {result['found_category_b']}")
+          f"category (b) json-only-gap: {result['found_category_b']}, "
+          f"of which {result['found_table_only']} exist ONLY in the table (JSON copy lacks them entirely)")
     print(f"in scope for this run: {result['in_scope_total']} "
-          f"(a: {result['in_scope_category_a']}, b: {result['in_scope_category_b']})")
+          f"(a: {result['in_scope_category_a']}, b: {result['in_scope_category_b']}, "
+          f"table-only: {result['in_scope_table_only']})")
     for t in result["targets"]:
         pos = f"pos {t['branch_pos']}" if t["branch_pos"] else "off-branch"
         scope = "TARGET" if t["in_scope"] else f"skip ({t['skip_reason']})"
+        where = "table-only, JSON copy lacks it" if not t["json_present"] else "both copies"
         print(f"  {t['id']} [{t['category']}] {pos} age={t['age_minutes']}m "
-              f"json_len={t['json_content_len']} table_len={t['table_content_len']} — {scope}")
+              f"json_len={t['json_content_len']} table_len={t['table_content_len']} ({where}) — {scope}")
     if "written" in result:
         print(f"written: {result['written']} | verification: {'OK' if result['verify_ok'] else 'FAILED'}")
         print(f"integrity: {result.get('integrity')}")
@@ -523,7 +641,13 @@ def main():
     chat = json.loads(blob)
     table = load_table(con, cid)
 
-    targets = build_targets(chat, table, cur_col, a.min_age_minutes, branch_only)
+    try:
+        targets = build_targets(chat, table, cur_col, a.min_age_minutes, branch_only)
+    except BranchWalkIncomplete as e:
+        print(f"REFUSING: {e}. This is a tree-structure problem (a broken link or a cycle), "
+              f"not something this script repairs — run scripts/repair-chat-tree.py first.")
+        con.close()
+        sys.exit(1)
     result = summarize(targets)
     result["chat_id"] = cid
     in_scope = [t for t in targets if t.in_scope]
@@ -572,11 +696,12 @@ def main():
 
     hist = chat["history"]["messages"]
     for t in in_scope:
-        hist[t.mid]["done"] = True
+        if t.json_present:  # a table-only target has no JSON entry to set -- and none is created (THE WRITE)
+            hist[t.mid]["done"] = True
     new_blob = json.dumps(chat)
     con.execute("update chat set chat=? where id=?", (new_blob, cid))
     for t in in_scope:
-        if t.category == "a":  # category b's table row is already done=1
+        if t.category == "a" and t.mid in table:  # category b's table row is already done=1
             row = table[t.mid]
             con.execute("update chat_message set done=1 where id=?", (row["row"],))
     con.execute("COMMIT")
@@ -594,7 +719,7 @@ def main():
     unexpected_table_change = [mid for mid in pre_table_done
                                 if back_table.get(mid, {}).get("done") != pre_table_done[mid]
                                 and mid not in in_scope_ids]
-    flags_ok = all(back_hist.get(t.mid, {}).get("done") is True for t in in_scope) and \
+    flags_ok = all(back_hist.get(t.mid, {}).get("done") is True for t in in_scope if t.json_present) and \
         all(back_table.get(t.mid, {}).get("done") == 1 for t in in_scope) and \
         not unexpected_json_change and not unexpected_table_change
 
