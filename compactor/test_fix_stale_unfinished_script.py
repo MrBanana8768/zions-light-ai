@@ -456,6 +456,124 @@ def test_broken_chain_that_never_reaches_root_refuses_instead_of_guessing():
 
 
 # ===========================================================================
+# regression: the age guard must key off CREATION time, never
+# chat_message.updated_at (live-pod bug: OpenWebUI 0.11.4 re-saves the
+# whole chat on every open, bumping every row's updated_at to "now" --
+# a dry run against the live pod measured age=6.6m on every single row
+# and skipped both real, months-old, on-branch targets it found as
+# "too young").
+# ===========================================================================
+
+
+def _make_age_db(path, now=None):
+    """A minimal branch with two assistant candidates whose `created_at`
+    and `updated_at` deliberately disagree, to prove which one the age
+    guard actually uses:
+      - `stale_but_touched`: created OLD, updated JUST NOW (exactly the
+        live-pod shape -- a genuinely old message OpenWebUI re-saved on
+        open) -- must be treated as OLD, i.e. in scope.
+      - `fresh_new`: created JUST NOW, updated OLD (the reverse -- an
+        artificial combination no real message would have, but it is
+        the one shape that PROVES the guard reads created_at and not
+        updated_at, rather than merely "the newer of the two") -- must
+        be treated as NEW, i.e. skipped.
+    """
+    now = int(now if now is not None else time.time())
+    OLD, JUST_NOW = now - 100_000, now - 5  # 5s old -- inside any sane --min-age-minutes
+    con = sqlite3.connect(str(path))
+    con.executescript(_CHAT_SCHEMA)
+    con.executescript(_CHAT_MESSAGE_SCHEMA)
+
+    msgs = _link({
+        "root": _hist_msg("root", "user", OLD),
+        "q1": _hist_msg("q1", "user", OLD, parent="root"),
+        "stale_but_touched": _hist_msg("stale_but_touched", "assistant", OLD, parent="q1", content="", done=False),
+        "q2": _hist_msg("q2", "user", OLD, parent="stale_but_touched"),
+        "fresh_new": _hist_msg("fresh_new", "assistant", JUST_NOW, parent="q2", content="", done=False),
+        "q3": _hist_msg("q3", "user", OLD, parent="fresh_new"),
+        "tip": _hist_msg("tip", "assistant", OLD, parent="q3", content="", done=False),
+    })
+    blob = json.dumps({"history": {"messages": msgs, "currentId": "tip"}, "messages": []})
+    con.execute(
+        "insert into chat (id, user_id, title, archived, created_at, updated_at, chat, meta, current_message_id) "
+        "values (?,?,?,?,?,?,?,?,?)",
+        (CHAT_ID, "u1", "her chat", 0, now, now, blob, "{}", "tip"),
+    )
+    prefix = CHAT_ID + "-"
+    # (mid, table created_at, table updated_at) -- created/updated deliberately
+    # independent of each other and of the JSON `timestamp` above.
+    rows = [
+        ("root", OLD, OLD), ("q1", OLD, OLD),
+        ("stale_but_touched", OLD, JUST_NOW),   # OLD created, JUST re-saved
+        ("q2", OLD, OLD),
+        ("fresh_new", JUST_NOW, OLD),           # JUST created, stale updated_at
+        ("q3", OLD, OLD), ("tip", OLD, JUST_NOW),
+    ]
+    for mid, created, updated in rows:
+        m = msgs[mid]
+        con.execute(
+            "insert into chat_message (id, chat_id, role, parent_id, content, done, created_at, updated_at) "
+            "values (?,?,?,?,?,?,?,?)",
+            (prefix + mid, CHAT_ID, m["role"], m.get("parentId"), json.dumps(m["content"]),
+             0 if m["role"] == "assistant" else None, created, updated),
+        )
+    con.commit()
+    con.close()
+    return now
+
+
+def test_age_guard_uses_creation_time_not_updated_at():
+    tmp = Path(tempfile.mkdtemp(prefix="fsu-age-"))
+    try:
+        db = tmp / "webui.db"
+        now = time.time()
+        _make_age_db(db, now=now)
+        chat, table, cur_col, _ = _read_chat(db)
+        targets = S.build_targets(chat, table, cur_col, min_age_minutes=10, branch_only=True, now=now)
+        by_id = {t.mid: t for t in targets}
+
+        stale = by_id["stale_but_touched"]
+        assert_true(stale.age_minutes > 60, "stale_but_touched's measured age reflects its OLD created_at",
+                    stale.age_minutes)
+        assert_true(stale.in_scope,
+                    "stale_but_touched stays IN SCOPE despite a just-now updated_at -- "
+                    "the live-pod regression this test reproduces (OpenWebUI 0.11.4 re-saving the "
+                    "whole chat on open used to make every row look freshly touched)")
+
+        fresh = by_id["fresh_new"]
+        assert_true(fresh.age_minutes < 1, "fresh_new's measured age reflects its JUST-NOW created_at",
+                    fresh.age_minutes)
+        assert_true(not fresh.in_scope, "fresh_new is correctly skipped -- it really is new")
+        assert_true("younger than" in (fresh.skip_reason or ""), "fresh_new's skip reason names the age guard",
+                    fresh.skip_reason)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_creation_ts_prefers_the_older_of_json_and_table_and_normalizes_units():
+    # both present, disagreeing -- the OLDER one wins.
+    hist = {"m": {"timestamp": 2_000_000_000}}
+    table = {"m": {"created": 1_000_000_000}}
+    assert_eq(S.creation_ts("m", hist, table), 1_000_000_000, "the older (table) timestamp is used")
+
+    hist2 = {"m": {"timestamp": 1_000_000_000}}
+    table2 = {"m": {"created": 2_000_000_000}}
+    assert_eq(S.creation_ts("m", hist2, table2), 1_000_000_000, "the older (json) timestamp is used")
+
+    # nanoseconds convention (repair-chat-tree.py's own >1e11 threshold)
+    # normalized to seconds before comparing.
+    hist3 = {"m": {"timestamp": 1_000_000_000}}
+    table3 = {"m": {"created": 1_000_000_000 * 1_000_000_000}}  # same instant, in ns
+    assert_eq(S.creation_ts("m", hist3, table3), 1_000_000_000,
+              "a nanosecond-convention table timestamp normalizes to the same value as the seconds one")
+
+    # only one copy has a usable timestamp.
+    assert_eq(S.creation_ts("m", {"m": {}}, {"m": {"created": 500}}), 500, "table-only timestamp used when JSON lacks one")
+    assert_eq(S.creation_ts("m", {"m": {"timestamp": 500}}, {}), 500, "JSON-only timestamp used when the table lacks a row")
+    assert_true(S.creation_ts("missing", {}, {}) is None, "no timestamp anywhere -> None")
+
+
+# ===========================================================================
 # end-to-end: --apply changes only the intended flags, in both copies,
 # leaves every byte of content alone, and is idempotent
 # ===========================================================================
@@ -689,6 +807,8 @@ if __name__ == "__main__":
     test_table_only_gap_does_not_truncate_the_branch_walk()
     test_table_only_target_apply_writes_only_the_table_copy()
     test_broken_chain_that_never_reaches_root_refuses_instead_of_guessing()
+    test_age_guard_uses_creation_time_not_updated_at()
+    test_creation_ts_prefers_the_older_of_json_and_table_and_normalizes_units()
     test_apply_changes_only_targets_in_both_copies_and_preserves_content()
     test_apply_never_touches_tip_or_inflight_even_with_all_branches()
     test_backup_uses_forensics_dir_and_restore_is_md5_identical()

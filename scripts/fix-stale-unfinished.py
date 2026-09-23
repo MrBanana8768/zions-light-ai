@@ -95,12 +95,21 @@ TARGETING RULES.
     regardless of the branch/age flags below — this is the one exclusion
     this script will not override.
   - `--min-age-minutes` (default 10): a candidate is only a target if it
-    is older than this, using `max(chat_message.created_at,
-    chat_message.updated_at)` (falling back to the JSON message's own
-    `timestamp` field for a message that somehow has no table row at
-    all). This is a second, independent guard against touching a reply
-    that is genuinely mid-generation — belt-and-suspenders alongside the
-    tip exclusion above, not a replacement for it.
+    is older than this, using its CREATION time — the older of
+    `chat_message.created_at` and the JSON message's own `timestamp`
+    when both exist (never `chat_message.updated_at` — live-pod bug,
+    fixed here: OpenWebUI 0.11.4 re-saves the whole chat on every open,
+    which bumps EVERY row's `updated_at` to "now" regardless of how old
+    the message actually is, so a dry run against the live pod measured
+    age=6.6m on every single row and skipped both real, months-old,
+    on-branch targets it found — `879773d7` at position 604 and
+    `dd9292d9` at position 2672 — as "too young"). Both the seconds and
+    nanoseconds timestamp conventions are handled (see `normalize_ts`).
+    This is a second, independent guard against touching a reply that
+    is genuinely mid-generation — belt-and-suspenders alongside the tip
+    exclusion above, not a replacement for it (the tip exclusion is what
+    actually covers a real in-flight reply; this guard is why `--min-
+    age-minutes 0` is safe to run on the pod while this fix lands).
 
 THE WRITE. Sets `done=True`/`done=1` for exactly the in-scope targets, in
 whichever copy actually has an entry for that message (a table-only
@@ -201,11 +210,24 @@ def utc_stamp():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def fmt_ts(t):
+def normalize_ts(t):
+    """A raw timestamp in either of the two conventions seen on this
+    schema — plain seconds, or nanoseconds (repair-chat-tree.py's own
+    `fmt()` uses this identical `>1e11` threshold) — normalized to
+    seconds. Returns `None` for a falsy input, so a caller can use this
+    directly in an `or`/comprehension without a separate truthiness
+    check."""
     if not t:
-        return "?"
+        return None
     if t > 1e11:
         t = t / 1e9
+    return t
+
+
+def fmt_ts(t):
+    t = normalize_ts(t)
+    if t is None:
+        return "?"
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%m-%d %H:%M:%SZ")
 
 
@@ -441,19 +463,29 @@ def content_len(v):
         return len(str(v))
 
 
-def msg_age_minutes(mid, hist, table, now):
+def creation_ts(mid, hist, table):
+    """The message's CREATION time in seconds — the OLDER of
+    `chat_message.created_at` and the JSON message's own `timestamp`
+    when both exist, `None` if neither does. Deliberately never
+    `chat_message.updated_at` (live-pod bug, see `msg_age_minutes` and
+    the module docstring's `--min-age-minutes` entry: OpenWebUI 0.11.4
+    re-saves the whole chat on every open, which bumps EVERY row's
+    `updated_at` to "now" — using it made every message on the pod
+    measure as a few minutes old, skipping real, months-old targets as
+    "too young"). Both timestamp conventions on this schema (seconds and
+    nanoseconds) are normalized via `normalize_ts` before comparing."""
     row = table.get(mid)
-    if row is not None and (row.get("created") or row.get("updated")):
-        ts = max(row.get("created") or 0, row.get("updated") or 0)
-        if ts > 1e11:  # ms -> s, defensive; not observed in the real schema
-            ts = ts / 1000
-        return (now - ts) / 60.0
-    ts = (hist.get(mid) or {}).get("timestamp")
-    if ts:
-        if ts > 1e11:
-            ts = ts / 1000
-        return (now - ts) / 60.0
-    return None  # unknown age -> caller treats as "too new to touch"
+    table_ts = normalize_ts(row.get("created")) if row else None
+    hist_ts = normalize_ts((hist.get(mid) or {}).get("timestamp"))
+    candidates = [t for t in (table_ts, hist_ts) if t is not None]
+    return min(candidates) if candidates else None
+
+
+def msg_age_minutes(mid, hist, table, now):
+    ts = creation_ts(mid, hist, table)
+    if ts is None:
+        return None  # unknown age -> caller treats as "too new to touch"
+    return (now - ts) / 60.0
 
 
 class Target:
