@@ -513,6 +513,65 @@ round of defects specific to `backfill-records.py`, closed below.
     socket); and a real `supervisorctl reread` failure against the real
     supervisord still leaves a real, listening sshd afterward. See the
     new `compactor/test_real_image_setup_sshd.py`.
+- **`setup-sshd.py` (round-2 hostile review, fix pass B): N2, N3 and
+  N11/N15 closed; mutants SM1, SM7, SM15 and SM16 killed.**
+  - **B2's fix above only refused a `Match` in `sshd_config` or
+    `sshd_config.d/*.conf` themselves (N2).** A `Match` pulled in by an
+    `Include` from anywhere else — a real shape a pre-existing config can
+    have — bypassed the refusal entirely: a `Match Address
+    172.16.0.0/12,10.0.0.0/8,100.64.0.0/10` plus `PasswordAuthentication
+    yes`/`PermitRootLogin yes`, reached through one extra `Include`, let
+    the script report success while a real root password login succeeded
+    from a private-range address (reproduced against the published
+    digest). The script now resolves the FULL `Include` closure reachable
+    from `sshd_config` — recursive, case-insensitive, glob-expanded,
+    relative paths resolved against `/etc/ssh` the way sshd itself does —
+    and refuses on a `Match` line found ANYWHERE in that closure, and
+    refuses outright if any `Include` resolves outside `/etc/ssh`. The
+    `sshd -T -C` verification step is no longer just loopback and one
+    public address: it now covers a full representative matrix (loopback
+    v4/v6, one address in each of 10/8, 172.16/12, 192.168/16 and
+    100.64/10, link-local, a public v4/v6 address, and the container's
+    own address(es) via `hostname -I`), each checked for both `user=root`
+    and a non-root user.
+  - **"Listening" meant any process on the port, not the sshd this script
+    manages (N3).** A Python server bound to `0.0.0.0:22` while this
+    script's own sshd bound only `[::]:22` was reported "started" (H6
+    again, a narrower case than H6's original fix caught); a stray sshd
+    already running a DIFFERENT pidfile with password auth enabled was
+    also reported "started" with password auth "disabled", while a real
+    root password login succeeded. Before writing anything, the script
+    now refuses if the target port already has a real LISTEN socket
+    (kernel inode mapped via `/proc/net/tcp`/`tcp6` to `/proc/<pid>/fd`)
+    owned by anything other than the sshd it itself manages by pidfile;
+    after starting or restarting, the same inode-to-pid mapping confirms
+    the daemon that came up listening is the one THIS run actually
+    started, not merely that something is bound to the port.
+  - **N11/N15: a non-default `AuthorizedKeysFile`, or a symlinked
+    `.ssh`/`authorized_keys`, made the script report success with no
+    working login.** `AuthorizedKeysFile /etc/ssh/authorized/%u` gave
+    "APPLY complete" while the key was written somewhere sshd was never
+    told to read, so login failed with "Permission denied (publickey)";
+    a symlinked `/root/.ssh` pointing into `/tmp` had its chmod/chown
+    applied to the symlink's TARGET, not the link, and login still
+    failed. The script now reads the effective `AuthorizedKeysFile` from
+    `sshd -T` before writing any key and refuses if it is not the default
+    `~root/.ssh/authorized_keys`; `/root/.ssh` and `authorized_keys` are
+    refused outright if either is a symlink (`lstat`-based, with
+    `O_NOFOLLOW` on the actual write as a second-layer TOCTOU guard).
+  - **Mutants SM1 (Match matched only at column 0, case-sensitive), SM7
+    (`/proc/net/tcp` accepted any connection state, not just LISTEN),
+    SM15 (`PermitRootLogin yes` accepted as hardened) and SM16 (extra
+    listening ports accepted) survived the round-2 mutation pass** — new
+    tests cover an indented/lowercase `Match`, a non-LISTEN `/proc/net/tcp`
+    row, an explicit `PermitRootLogin yes`, and a second listening port,
+    alongside full new coverage for the `Include`-closure resolution, the
+    `-C` address matrix, the inode-to-pid ownership mapping, and the
+    symlink refusals. Verified for real against the published image:
+    real password login from a private-range address through an
+    `Include`d `Match` now fails; a foreign listener (another process, or
+    another sshd with a different pidfile) is refused rather than adopted
+    as "started"; a symlinked `authorized_keys`/`.ssh` is refused outright.
 - **`import-history.py` (hostile-review pass 1): B1, B4, B5, H2, H3, M2,
   M3, and the Ctrl-C live-seam window, closed.**
   - **B1.** `--apply` computed its resume offset as ONE flat number

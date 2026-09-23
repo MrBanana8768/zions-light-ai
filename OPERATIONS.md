@@ -1770,13 +1770,25 @@ which would touch unrelated packages under a live vLLM process), adds the
 key to `authorized_keys` (append-only — an existing file is backed up
 first and never clobbered), hardens the config, ensures host keys, and
 starts sshd as a plain background daemon. It verifies the result for real
-with `sshd -t`, then `sshd -T` with NO `-C` AND `sshd -T -C` for both a
-loopback and a non-local client address — never just by reading back the
-file it wrote, and never trusting a bare `sshd -T` alone, which cannot see
-what a `Match` block would do for a real connection — and refuses, rolling
-back the config write and any `authorized_keys` append made this run, if
-any of those contexts would allow password login or leave sshd listening
-on the wrong port. At minimum it sets: `PasswordAuthentication no`,
+with `sshd -t`, then `sshd -T` with NO `-C` AND `sshd -T -C` across a full
+representative address matrix (loopback v4/v6, one address in each of
+10/8, 172.16/12, 192.168/16 and 100.64/10, a link-local address, a public
+v4/v6 address, and this container's own address(es) via `hostname -I`),
+each checked for both `user=root` and a non-root user (round 3, N2 —
+round 1 checked only loopback and one public address, which missed a
+`Match` reachable only from a private-range client, the shape a RunPod
+proxy actually connects from) — never just by reading back the file it
+wrote, and never trusting a bare `sshd -T` alone, which cannot see what a
+`Match` block would do for a real connection — and refuses, rolling back
+the config write and any `authorized_keys` append made this run, if any
+of those contexts would allow password login or leave sshd listening on
+the wrong port. "Listening" is also no longer just "something answers on
+the port": the listening socket's kernel inode is mapped to the pid that
+holds it (via `/proc/<pid>/fd`), and that pid must be the one this run's
+own pidfile actually recorded — a foreign process (or another sshd
+running with a different pidfile) already holding the port is refused
+outright, before anything is written, rather than mistaken for "already
+hardened" (round 3, N3). At minimum it sets: `PasswordAuthentication no`,
 `PermitEmptyPasswords no`, `KbdInteractiveAuthentication no`,
 `ChallengeResponseAuthentication no`, `PubkeyAuthentication yes`,
 `PermitRootLogin prohibit-password`. Only a FINGERPRINT (never the key
@@ -1787,6 +1799,19 @@ with a known public-key-type token and be a single line before that check
 even runs. `/root/.ssh` and `authorized_keys` are re-hardened to
 `0700`/`0600` (plus ownership) on every `--apply`, even when there is no
 new key to add.
+
+**Two more hard preconditions, refused outright rather than warned about
+(round 3, N11/N15).** Before writing any key, the script reads the
+EFFECTIVE `AuthorizedKeysFile` from `sshd -T` and refuses if it is not
+the default `~root/.ssh/authorized_keys` — writing a key to a path sshd
+was never configured to read used to report success ("APPLY complete")
+while login still failed with "Permission denied (publickey)". And
+`/root/.ssh`/`authorized_keys` are refused outright if either is a
+SYMLINK (checked with `lstat`, plus `O_NOFOLLOW` on the actual write as a
+second-layer guard against a race) — a symlinked `authorized_keys`
+pointing elsewhere (e.g. into `/etc/hostname`) used to get a real key
+appended into whatever it pointed at, chmodded 600, with the script still
+reporting success.
 
 **Drop-in vs. direct edit.** The script checks THIS pod's real
 `sshd_config` fresh on every run rather than assuming: if it has an
@@ -1803,20 +1828,32 @@ after both a fresh `--apply` and a hostile override (an active
 `PasswordAuthentication yes` line inserted after the Include still lost
 to the drop-in, exactly as first-match-wins predicts).
 
-**A pre-existing `Match` block, or a conflicting drop-in, refuses the
-run outright.** `sshd -T` with no `-C` evaluates NO `Match` criteria, so
-a `Match Address * / PasswordAuthentication yes` block left by a
-previous operator or pod template made an earlier version of this
-script report "password authentication is disabled" while a real
-connection from anywhere could still log in with a password (a hostile
-review confirmed this against the published digest). The script now
-refuses — before writing anything — if it finds an active `Match` line
-anywhere in `sshd_config` or `sshd_config.d/*.conf`, another drop-in
-that sorts before its own `00-zions.conf`, or a conflicting active
-`Port` line anywhere it does not control (`Port` accumulates across
-files in OpenSSH instead of following first-match-wins, so this
-script's own `Port N` never suppresses an unrelated `Port 22`
-elsewhere). Remove or fix the conflicting file and re-run.
+**A pre-existing `Match` block anywhere in the config `Include` closure,
+or a conflicting drop-in, refuses the run outright.** `sshd -T` with no
+`-C` evaluates NO `Match` criteria, so a `Match Address * /
+PasswordAuthentication yes` block left by a previous operator or pod
+template made an earlier version of this script report "password
+authentication is disabled" while a real connection from anywhere could
+still log in with a password (a hostile review confirmed this against
+the published digest). The script now refuses — before writing anything
+— if it finds an active `Match` line anywhere in the FULL `Include`
+closure reachable from `sshd_config` — not just `sshd_config` and
+`sshd_config.d/*.conf` themselves. Round 1's fix only scanned those two
+locations, which a round-2 hostile review found was not enough: a
+`Match` pulled in by an `Include` from a THIRD location (e.g. a
+`sshd_config.d/*.conf` drop-in that itself does nothing but
+`Include /etc/ssh/site.d/*`) bypassed the refusal entirely, and a real
+root password login succeeded from a private-range address through it
+(N2). `Include` is now followed recursively, case-insensitively,
+glob-expanded, with relative paths resolved against `/etc/ssh` the same
+way sshd itself resolves them — and an `Include` that resolves to
+anything OUTSIDE `/etc/ssh` is its own refusal. The script also still
+refuses on another drop-in that sorts before its own `00-zions.conf`, or
+a conflicting active `Port` line anywhere it does not control (`Port`
+accumulates across files in OpenSSH instead of following
+first-match-wins, so this script's own `Port N` never suppresses an
+unrelated `Port 22` elsewhere). Remove or fix the conflicting file and
+re-run.
 
 **RunPod template.** The template's port mapping must expose the TCP port
 this script configures (default 22, `--port N` to change) for it to be
