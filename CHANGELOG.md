@@ -24,7 +24,7 @@ not rebuilt: a rebuild re-resolves `apt-get upgrade`, unpinned pip
 dependencies, the Piper voice URL and the CUDA base tag, and produces a
 different, unvalidated image.
 
-**Why this exists.** Four independent operator gaps, each closed with a
+**Why this exists.** Five independent operator gaps, each closed with a
 script under `scripts/` rather than a change to what the image ships:
 
 1. v3.1.9.4's own fix to `backfill.needs_backfill()` — reading a
@@ -81,6 +81,15 @@ script under `scripts/` rather than a change to what the image ships:
    its own pointer rule could jump her onto an abandoned regenerate
    branch newer than her real position — both fixed in the versions in
    this repo (see "Fixed" below).
+5. The model keeps copying its own decoration — emoji, rule-line
+   "walls", LAW-board status tags — back into new replies, because that
+   decoration sits in her stored history, active facts, and episodic
+   memory and gets re-read every time. There was no way to remove it
+   short of `/forget`, which would also throw away everything real in
+   that memory. `scripts/clean-decoration.py` strips only the decoration
+   — deterministically, no LLM, never a word she wrote — from all three
+   places at once; see OPERATIONS.md "Removing decoration from her
+   stored replies, facts and episodic memory".
 
 ### Added
 - **`scripts/backfill-records.py`.** Reads every `facts/*.backfill.json`
@@ -226,6 +235,40 @@ script under `scripts/` rather than a change to what the image ships:
   job, not this script's) — it now only checks a copy that this run
   actually fixed or that already existed beforehand. See
   `compactor/test_fix_encoded_messages_script.py`.
+- **`scripts/clean-decoration.py`.** Strips emoji, rule-line "walls"
+  (`═══`, `━━━`, long `====` runs) and LAW-board status tags out of her
+  stored chat replies, active facts, and episodic (chromadb) memory —
+  deterministic, no LLM, never touches a word she wrote, never runs
+  `/forget` (see OPERATIONS.md "Removing decoration from her stored
+  replies, facts and episodic memory" for the full walkthrough, exact
+  real-data counts, and the anchor-safety rule). Reuses
+  `scripts/import-history.py`'s own resume-offset/branch-reconstruction
+  helpers (beside it in a clone, same "one copy of the rule" discipline
+  as the other operator scripts) rather than re-deriving them. Three
+  independently-backed-up targets behind `--only` (default all three):
+  `webui` (her current branch, all THREE of OpenWebUI's own copies of an
+  assistant turn's text kept in sync or none touched — refuses outright
+  if the JSON and `chat_message` table copies already disagree), `facts`
+  (active fact text; a fact that would clean to empty or to a duplicate
+  is reported and left untouched rather than deleted), and `episodic`
+  (chromadb documents for `--conv`, re-embedded with the compactor's own
+  `retrieval._embed` under a new content-addressed id when their text
+  changes). Never rewrites a turn inside the summarizer's covered/
+  summarized region; the anchor (`tail_fp`/`head_fp`/`window_turns`) is
+  either left alone when it still finds a real fingerprint match after
+  cleaning, or specific candidate turns are excluded from cleaning
+  (reported as `skipped_protected_by_anchor`) until it does — `--force`
+  accepts a verified realignment but still refuses a rewrite that would
+  produce no match at all (a hole, not a realignment). Same shared
+  0/1/2/3/4 exit-code convention as the other operator scripts (4 =
+  some turns skipped for the anchor reason, 1 = nothing changed at all),
+  plus `--restore <stamp>`. Verified end to end against the real
+  2026-09-23 backup and the published digest: default scope cleans 4 of
+  6 requested assistant replies (2 skipped, inside the drifted anchor
+  window), 17 of 190 active facts, and 81 of 84 episodic documents; a
+  follow-up `--force` run accepts the realignment. See
+  `compactor/test_clean_decoration_script.py` and
+  `compactor/test_real_image_clean_decoration.py`.
 
 ### Documentation
 - **OPERATIONS.md** gains "Closing stale backfill records before upgrading

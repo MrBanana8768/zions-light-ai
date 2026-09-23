@@ -2008,6 +2008,134 @@ this script after the next restart.
 
 ---
 
+## Removing decoration from her stored replies, facts and episodic memory (v3.1.9.6)
+
+**This is the answer to "how do I remove the symbols without running
+`/forget`."** `scripts/clean-decoration.py` strips emoji, rule-line
+"walls" (`═══`, `━━━`, long `====` runs) and LAW-board status tags
+("✅ ... → ACTIVE (100%)") out of the three places the model re-reads its
+own decoration from — her stored chat replies, active facts, and episodic
+(chromadb) memory — deterministically, with no LLM call. It never touches
+a word she actually wrote, and it never runs `/forget`: nothing is
+deleted, only decoration is stripped from text that is kept.
+
+**This is a SHORT chat outage, both services stopped.** `webui.db` and
+the compactor's `facts/`/`summaries/`/`chromadb/` are live files each
+service reads and writes on every request — the same hazard
+`import-history.py` and `backfill-records.py` already refuse against, and
+this script refuses the same way. Dry run makes no writes and finishes in
+well under a minute; `--apply` on a store her size is a few seconds of
+I/O plus one CPU embedding pass per changed episodic document — call it
+under two minutes end to end:
+
+```bash
+git clone --depth 1 --branch <tag-or-branch> \
+    https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+supervisorctl stop openwebui compactor
+/opt/compactor-venv/bin/python /opt/zl-repo/scripts/clean-decoration.py \
+    --webui-db /data/openwebui/webui.db --store /data/openwebui/compactor \
+    --conv <chat id>
+# read the report, then:
+/opt/compactor-venv/bin/python /opt/zl-repo/scripts/clean-decoration.py \
+    --webui-db /data/openwebui/webui.db --store /data/openwebui/compactor \
+    --conv <chat id> --apply
+supervisorctl start openwebui compactor
+```
+
+**The three targets** (`--only`, default all three; each independently
+backed up before any write):
+- **webui** — her current branch (walked via `currentId`/`parentId`,
+  never insertion order). OpenWebUI 0.11 keeps an assistant turn's text in
+  THREE places at once (`history.messages[id].content`, the small flat
+  `messages[]` tail cache, and the `chat_message` table's own row) and
+  this script updates all three together or none — it refuses outright
+  if the JSON and table copies of an in-scope message already disagree,
+  rather than clean one and leave the other stale. Only `role: "assistant"`
+  turns are ever in scope; a `role: "user"` message is never touched.
+- **facts** — `facts/<conv>.json`'s active fact text. There is no
+  embedding cache on a fact record to invalidate (verified against both
+  v3.1.9 and v3.1.9.4), so cleaning the text is the whole job. A fact
+  that would clean to empty, or to a duplicate of another fact's text, is
+  reported and left byte-for-byte as it was — never deleted; that would
+  be `/forget` semantics by another name.
+- **episodic** — the chromadb documents for `--conv`, in the REAL
+  collection compactor's own `retrieval.py` uses
+  (`retrieval.COLLECTION_NAME`, `"conversation_turns"` — an earlier
+  build of this script had this hardcoded to the wrong name,
+  `"episodic_memory"`, which does not error but silently creates and
+  writes an empty phantom collection the live compactor never reads;
+  fixed to read the real name from the module). Ids are content-addressed
+  (sha256 of the stored text), so a changed document gets re-embedded
+  with the compactor's own `retrieval._embed` (same model, same code path
+  the live compactor uses) under a new id, upserted with the original
+  metadata, and the old id deleted. Only the `[assistant]: ...` half of a
+  stored exchange is ever cleaned — the `[user]: ...` half never is.
+  Documents that exist for what is content-wise the same conversation but
+  under a DIFFERENT, older `conv_id` (a real thing found in her store) are
+  correctly left alone: her live retrieval filters strictly by exact
+  `conv_id` and can never reach them, so they are genuinely out of scope,
+  not a miss.
+
+**The anchor rule (why some turns can be "skipped" even without
+`--force`).** `compactor/summarizer.py` fingerprints the WHOLE,
+decoration-and-all text of each turn to track where it is in the
+conversation (`tail_fp`/`head_fp`/`window_turns`, the same anchor
+`import-history.py`'s B1 fix made offset-aware). Rewriting a turn's text
+inside that anchor's own window, without also rewriting the anchor to
+match, would leave the NEXT live request unable to align — a permanent
+hole in the summary hierarchy from then on. Her real store's tail anchor
+already has a small pre-existing drift against a fresh branch
+reconstruction (independent of anything this script does), which this
+script works around rather than blindly trusting: before writing, it
+asks a well-posed question — does the CURRENTLY STORED anchor still find
+a real fingerprint match once these specific turns are cleaned, left
+un-rewritten? If yes for the whole requested scope, everything is
+cleaned and the anchor is left alone (it still works). If no, candidate
+turns are excluded from cleaning — narrowest window first — until it is
+yes again; every excluded turn is reported. **`--force`** cleans the full
+requested scope anyway and accepts a verified REALIGNMENT of the anchor
+(a different but genuinely-matched position) — but still refuses, even
+under `--force`, if the new anchor would find NO fingerprint match at all
+(a hole, not a realignment); text cleaning still proceeds in that case,
+only the anchor is left untouched.
+
+**Exit codes** — the same 5-value convention as the other operator
+scripts (see "Exit codes" above). For this script specifically: **4**
+means at least one target changed but at least one requested turn was
+skipped for the anchor reason above (or a target was refused/failed); **1**
+means nothing was changed at all — every candidate turn had to be
+excluded, or every target refused. `--restore <stamp>` puts every target
+this script backed up under that stamp back exactly as it was, and exits
+0 if every backup was found and restored, 1 if any named target's backup
+was missing or restoring it failed.
+
+**Verified on the real 2026-09-23 backup, default scope (`--last 6`,
+unforced):**
+
+| target | changed | of |
+|---|---|---|
+| webui (assistant replies) | 4 | 6 requested (2 skipped — inside the drifted anchor window) |
+| facts | 17 | 190 active facts examined |
+| episodic | 81 | 84 documents for her conv_id |
+
+That run exits 4 (real progress, 2 turns skipped, anchor left untouched:
+`window_turns` unchanged at 3880). A follow-up `--force` run, with
+nothing left to re-clean, accepts the realignment and rewrites the
+anchor, and exits 0.
+
+**Liveness refusals (only for `--apply`)**, all overridden together by
+`--force` (never the underlying risk): a `-wal`/`-journal` file beside
+`webui.db`; OpenWebUI detected via `supervisorctl status openwebui`
+combined with a raw port probe (default 8080, `--openwebui-port`) so
+either signal alone can't be trusted; the compactor's `/health`, same
+convention as the other operator scripts; and a `/proc/<pid>/fd` scan for
+any OTHER process with `webui.db` open. `--force` does NOT override a
+failed `PRAGMA integrity_check` after a write, a refused resume-offset, a
+history/`chat_message` disagreement, or a hole-risk anchor rewrite (the
+anchor rule above) — those always refuse.
+
+---
+
 ## Rolling back a bad release
 
 Each release tag is pushed once and not re-pushed by this project (see
