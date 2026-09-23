@@ -1,0 +1,11 @@
+# V4 lab model shim: gives llama.cpp's OpenAI-compatible server the two
+# vLLM-shaped endpoints the compactor actually calls (compactor/main.py):
+#   POST /tokenize        -> {"count": N}            (vLLM shape, not llama.cpp's)
+#   POST /v1/chat/completions -> proxied as-is (already OpenAI-compatible)
+# Deliberately torch-free, same reasoning as compactor/requirements.txt:
+# AutoTokenizer works tokenizer-only with the fast (rust) tokenizer.
+fastapi==0.138.2
+uvicorn[standard]==0.49.0
+httpx==0.28.1
+transformers==5.12.1
+jinja2==3.1.6

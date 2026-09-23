@@ -1,0 +1,71 @@
+# =============================================================================
+# V4 LOCAL LAB — Synapse config. Adapted from chat-app's synapse/homeserver.
+# template.yaml for a fully offline, localhost-only lab. NEVER point this at
+# anything but the lab's own Postgres. NEVER copy this to production.
+# =============================================================================
+server_name: "localhost"
+pid_file: /data/homeserver.pid
+public_baseurl: "http://localhost:18008/"
+
+listeners:
+  - port: 8008
+    tls: false
+    type: http
+    x_forwarded: false
+    bind_addresses: ['0.0.0.0']
+    resources:
+      - names: [client, federation]
+        compress: false
+
+database:
+  name: psycopg2
+  args:
+    user: synapse
+    password: labdevpassword
+    database: synapse
+    host: v4lab-postgres
+    port: 5432
+    cp_min: 5
+    cp_max: 10
+
+log_config: "/data/lab.log.config"
+media_store_path: /data/media_store
+signing_key_path: "/data/localhost.signing.key"
+
+# The importer masquerades as @her and @bot (non-exclusive namespace -- both
+# are ordinary registered users too) to set historical origin_server_ts on
+# imported events. See scripts/import_history.py and
+# synapse/appservice-registration.lab.yaml.
+app_service_config_files:
+  - "/data/appservice-registration.lab.yaml"
+
+# Registration is CLOSED. The lab creates its three test users
+# (@her, @owner, @bot) with the admin CLI (register_new_matrix_user), which
+# uses registration_shared_secret below and works regardless of this flag.
+enable_registration: false
+enable_registration_without_verification: false
+
+# LAB-ONLY secrets. Not used for anything outside this docker network.
+registration_shared_secret: "LAB_ONLY_DO_NOT_REUSE_aaaaaaaaaaaaaaaaaaaaaaaa"
+macaroon_secret_key: "LAB_ONLY_DO_NOT_REUSE_bbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+form_secret: "LAB_ONLY_DO_NOT_REUSE_cccccccccccccccccccccccccccccccc"
+
+report_stats: false
+
+# No federation, no trusted key servers -- this homeserver never talks to
+# anything outside the docker-compose network.
+trusted_key_servers: []
+federation_domain_whitelist: []
+
+# Per-user rate limits are overridden for @bot:localhost at runtime via the
+# admin API (see scripts/v4lab-create-users.sh) rather than here, so the
+# override is visible in the same place the account is created.
+rc_message:
+  per_second: 20
+  burst_count: 100
+rc_login:
+  address:
+    per_second: 20
+    burst_count: 100
+
+# E2EE is on by default; Element negotiates Olm/Megolm automatically.

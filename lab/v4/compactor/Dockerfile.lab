@@ -1,0 +1,42 @@
+# V4 lab: the real compactor (this branch's compactor/), CPU-only, pointed at
+# the lab's tiny model instead of vLLM-on-GPU. No OpenWebUI, no vLLM, no
+# Whisper/Piper -- those are the production Dockerfile's job (see
+# /home/drew/code/zl-v4lab/Dockerfile), not this lab's.
+#
+# Build context is the zl-v4lab REPO ROOT:
+#   docker build -f lab/v4/compactor/Dockerfile.lab .
+# so this can COPY the real compactor/ sources and share lab/v4/guard.py.
+FROM python:3.11-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/compactor
+
+COPY compactor/requirements.txt /opt/compactor/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r /opt/compactor/requirements.txt
+
+# Pre-download the bge-small ONNX embedding model, same as the production
+# image, so episodic-memory (RAG) retrieval works offline at runtime.
+RUN python3 -c \
+    "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5', cache_dir='/opt/embeddings')" && \
+    rm -rf /root/.cache
+
+# The whole compactor package, minus tests and docs (kept out of the image
+# deliberately, same reasoning as the production Dockerfile: copy the real
+# directory rather than an explicit file list, so a new module can never be
+# "forgotten" out of a lab rebuild the way v3.1.4 forgot tokenhealth.py out
+# of an explicit COPY list in production).
+COPY compactor/ /opt/compactor/
+RUN rm -f /opt/compactor/test_*.py /opt/compactor/*.md
+
+COPY lab/v4/guard.py /opt/compactor/lab_guard.py
+COPY lab/v4/compactor/entrypoint-guard.sh /entrypoint-guard.sh
+RUN chmod +x /entrypoint-guard.sh
+
+ENV FASTEMBED_CACHE_PATH=/opt/embeddings
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8080
+ENTRYPOINT ["/entrypoint-guard.sh"]

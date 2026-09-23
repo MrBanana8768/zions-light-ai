@@ -1,0 +1,25 @@
+# Claim 3b: drives real Element Web through a browser to prove Element
+# itself (not our own verifier code) can read imported + backup-restored
+# history. Pinned to the browser build already baked into the base image
+# (v1.46.0-jammy) so `pip install playwright==1.46.0` matches exactly --
+# mismatched versions fail to launch (missing browser binary).
+FROM mcr.microsoft.com/playwright/python:v1.46.0-jammy
+
+WORKDIR /work
+RUN pip install --no-cache-dir playwright==1.46.0 aiohttp asyncpg \
+    && apt-get update && apt-get install -y --no-install-recommends socat \
+    && rm -rf /var/lib/apt/lists/*
+# Chromium (even headed/headless) only enables WebCrypto/randomUUID etc. on a
+# "secure context" -- https, or the special-cased http://localhost. Element's
+# own config.json hardcodes the homeserver at http://localhost:8008 (meant
+# for a browser on the Windows host, where that port really is published).
+# From inside this container "localhost" is just this container, so we
+# socat-forward localhost:8009->element:80 and localhost:8008->synapse:8008
+# and navigate to http://localhost:8009, giving the unmodified Element
+# config exactly the origin it expects while still getting a secure context.
+COPY docker-entrypoint-playwright.sh /usr/local/bin/pw-entrypoint.sh
+RUN chmod +x /usr/local/bin/pw-entrypoint.sh
+
+COPY . .
+ENTRYPOINT ["/usr/local/bin/pw-entrypoint.sh"]
+CMD ["python3"]

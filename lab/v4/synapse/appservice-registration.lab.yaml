@@ -1,0 +1,20 @@
+# Lab-only appservice registration. Lets the importer (scripts/
+# import_history.py) masquerade as @her:localhost and @bot:localhost with
+# ?ts=<original timestamp> when replaying her history, and as @her for the
+# rebackup operation (V4_DESIGN.md R2-M4 pattern, "masquerade and no
+# device"). Namespaces are non-exclusive because both users are also
+# ordinary registered accounts (created by v4lab-create-users.sh).
+id: "v4lab_importer"
+url: null
+sender_localpart: "v4lab_importer_as"
+namespaces:
+  users:
+    - exclusive: false
+      regex: "@her:localhost"
+    - exclusive: false
+      regex: "@bot:localhost"
+  aliases: []
+  rooms: []
+rate_limited: false
+as_token: "v4lab_as_token_LAB_ONLY_do_not_reuse"
+hs_token: "v4lab_hs_token_LAB_ONLY_do_not_reuse"

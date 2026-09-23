@@ -1,0 +1,177 @@
+# V4 LOCAL LAB — the whole Element front end, end to end, on this machine.
+# No GPU, nothing live. See LAB.md for how to use this.
+#
+# HARD SAFETY RULE, enforced in code (lab/v4/guard.py), not just here: every
+# service that talks outward (bot, compactor, model-shim) refuses to start
+# unless every URL it is configured with resolves to localhost, a
+# docker-compose service name, or a private address. There is no path from
+# this compose file to the live pod or the live Synapse -- nothing here is
+# even given those addresses to try.
+#
+# Run with (scripts/v4lab-up.sh wraps this):
+#   docker compose -f lab/v4/docker-compose.lab.yml -p v4lab up -d
+# Build contexts below are "../.." -- relative to THIS file's directory
+# (lab/v4/), i.e. the zl-v4lab repo root -- so the compactor/bot/shim images
+# can COPY the real compactor/ and bot/ sources plus lab/v4/guard.py.
+name: v4lab
+
+services:
+  v4lab-postgres:
+    image: postgres:16-alpine
+    container_name: v4lab-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD: labdevpassword
+      POSTGRES_DB: synapse
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - v4lab_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synapse"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [v4lab]
+
+  v4lab-synapse:
+    image: matrixdotorg/synapse:latest
+    container_name: v4lab-synapse
+    restart: unless-stopped
+    environment:
+      SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+    volumes:
+      - ./synapse/data-run:/data
+    ports:
+      - "18008:8008"
+    depends_on:
+      v4lab-postgres:
+        condition: service_healthy
+    networks: [v4lab]
+
+  v4lab-element:
+    image: vectorim/element-web:latest
+    container_name: v4lab-element
+    restart: unless-stopped
+    volumes:
+      - ./element/config.lab.json:/app/config.json:ro
+    ports:
+      - "18009:80"
+    depends_on:
+      - v4lab-synapse
+    networks: [v4lab]
+
+  # Tiny CPU model behind an OpenAI-compatible server. See LAB.md "Model
+  # parity gaps" for why this is llama.cpp's server rather than vLLM CPU.
+  v4lab-model:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: v4lab-model
+    restart: unless-stopped
+    command: >
+      -hf ${LAB_MODEL_GGUF_REPO:-Qwen/Qwen2.5-0.5B-Instruct-GGUF}:${LAB_MODEL_GGUF_FILE:-Q4_K_M}
+      --host 0.0.0.0 --port 8000 --ctx-size 8192 --threads 6 --jinja
+    volumes:
+      - v4lab_model_cache:/root/.cache
+    networks: [v4lab]
+
+  # Gives llama.cpp's server the vLLM-shaped /tokenize endpoint the real
+  # compactor calls, and proxies /v1/chat/completions unchanged. See
+  # model-shim/shim.py.
+  v4lab-model-shim:
+    build:
+      context: ../..
+      dockerfile: lab/v4/model-shim/Dockerfile
+    container_name: v4lab-model-shim
+    restart: unless-stopped
+    environment:
+      LLAMA_CPP_URL: http://v4lab-model:8000
+      MODEL_REPO: ${LAB_MODEL_REPO:-Qwen/Qwen2.5-0.5B-Instruct}
+      SHIM_PORT: "8000"
+      SHIM_MAX_MODEL_LEN: "8192"
+    depends_on:
+      - v4lab-model
+    networks: [v4lab]
+
+  # The real compactor (this branch's compactor/), pointed at the tiny
+  # model, loaded with a COPY of her memory store.
+  v4lab-compactor:
+    build:
+      context: ../..
+      dockerfile: lab/v4/compactor/Dockerfile.lab
+    container_name: v4lab-compactor
+    restart: unless-stopped
+    environment:
+      VLLM_URL: http://v4lab-model-shim:8000
+      MODEL_REPO: ${LAB_MODEL_REPO:-Qwen/Qwen2.5-0.5B-Instruct}
+      COMPACTOR_STORAGE_ROOT: /data/compactor
+      COMPACTOR_MAX_RETAINED_IMAGES: "0"
+      COMPACTOR_HOST: "0.0.0.0"
+      COMPACTOR_PORT: "8080"
+      COMPACTOR_SELFTEST_ON_BOOT: "false"
+      COMPACTOR_BACKUP_ENABLED: "false"
+      COMPACTOR_ADMIN_BIND: "0.0.0.0"
+      # CPU/tiny-model budgets -- documented in LAB.md "Lab-appropriate
+      # budgets": smaller than production so CPU prefill/summarize finishes
+      # in a reasonable time on a 0.5B model with an 8k context.
+      COMPACTOR_KEEP_RECENT_TURNS: "4"
+      COMPACTOR_SUMMARY_MAX_TOKENS: "384"
+      COMPACTOR_MAX_FACTS_TOKENS: "800"
+      COMPACTOR_INJECT_FACTS_TOKENS: "200"
+      COMPACTOR_MAX_RETRIEVAL_TOKENS: "800"
+      COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS: "1500"
+      LOG_DIR: /data/logs
+    volumes:
+      # Bind-mounted from a COPY under /home/drew/scratch/v4lab/data/ --
+      # never the read-only pod-export originals. See scripts/
+      # v4lab-copy-data.sh, which enforces read-only access to the source.
+      - ${LAB_DATA_DIR:-/home/drew/scratch/v4lab/data}/compactor:/data/compactor
+    ports:
+      - "18080:8080"
+    depends_on:
+      - v4lab-model-shim
+    networks: [v4lab]
+
+  v4lab-bot:
+    build:
+      context: ../..
+      dockerfile: lab/v4/bot/Dockerfile.lab
+    container_name: v4lab-bot
+    restart: unless-stopped
+    environment:
+      SYNAPSE_URL: http://v4lab-synapse:8008
+      COMPACTOR_URL: http://v4lab-compactor:8080
+      BOT_MXID: "@bot:localhost"
+      BOT_PASSWORD: ${LAB_BOT_PASSWORD:?set LAB_BOT_PASSWORD in lab/v4/.env.lab}
+      PG_CRYPTO_DSN: postgresql://synapse:labdevpassword@v4lab-postgres:5432/v4lab_botcrypto
+      HER_ROOM_ID: ${LAB_HER_ROOM_ID:-}
+      HER_CONV_ID: "ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"
+    depends_on:
+      - v4lab-synapse
+      - v4lab-compactor
+    networks: [v4lab]
+
+  # Not started by `up`. Run with:
+  #   docker compose ... run --rm v4lab-importer python3 import_history.py [args]
+  v4lab-importer:
+    build:
+      context: ../..
+      dockerfile: lab/v4/importer/Dockerfile
+    container_name: v4lab-importer
+    profiles: ["tools"]
+    environment:
+      SYNAPSE_URL: http://v4lab-synapse:8008
+      HER_ROOM_ID: ${LAB_HER_ROOM_ID:-}
+      HER_PASSWORD: ${LAB_HER_PASSWORD:-}
+      HER_CONV_ID: "ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"
+    volumes:
+      - ${LAB_DATA_DIR:-/home/drew/scratch/v4lab/data}:/data/her-copy:ro
+      - ./importer/out:/work/out
+    networks: [v4lab]
+
+networks:
+  v4lab:
+    name: v4lab_default
+
+volumes:
+  v4lab_postgres_data:
+  v4lab_model_cache:

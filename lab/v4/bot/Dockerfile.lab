@@ -1,0 +1,18 @@
+# V4 lab bot: mautrix-python 0.21.1 (V4_DESIGN.md r5 3.1's library choice),
+# E2EE, pinned device id, Postgres-persisted crypto store.
+#
+# Build context is the zl-v4lab REPO ROOT (see docker-compose.lab.yml).
+FROM python:3.11-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libolm-dev libolm3 build-essential && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+COPY lab/v4/bot/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY lab/v4/bot/lab_bot.py lab/v4/guard.py ./
+
+ENV PYTHONUNBUFFERED=1
+CMD ["python3", "lab_bot.py"]

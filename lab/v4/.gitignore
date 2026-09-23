@@ -1,0 +1,10 @@
+# Secrets and generated state. Never commit these.
+.env.lab
+synapse/data-run/
+importer/out/
+*.log
+
+# Defensive: her data copies belong under /home/drew/scratch/v4lab/data/,
+# outside this repo entirely, but if anything is ever copied under this
+# directory by mistake, don't let git see it either.
+data/

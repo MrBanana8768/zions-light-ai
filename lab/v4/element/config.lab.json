@@ -1,0 +1,19 @@
+{
+  "default_server_config": {
+    "m.homeserver": {
+      "base_url": "http://localhost:18008",
+      "server_name": "localhost"
+    }
+  },
+  "brand": "V4 Local Lab",
+  "default_country_code": "US",
+  "show_labs_settings": false,
+  "default_federate": false,
+  "disable_guests": true,
+  "disable_3pid_login": true,
+  "permalink_prefix": "http://localhost:18009",
+  "default_theme": "light",
+  "room_directory": {
+    "servers": ["localhost"]
+  }
+}
