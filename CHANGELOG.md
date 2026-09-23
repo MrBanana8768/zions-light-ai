@@ -24,7 +24,7 @@ not rebuilt: a rebuild re-resolves `apt-get upgrade`, unpinned pip
 dependencies, the Piper voice URL and the CUDA base tag, and produces a
 different, unvalidated image.
 
-**Why this exists.** Five independent operator gaps, each closed with a
+**Why this exists.** Six independent operator gaps, each closed with a
 script under `scripts/` rather than a change to what the image ships:
 
 1. v3.1.9.4's own fix to `backfill.needs_backfill()` — reading a
@@ -90,6 +90,16 @@ script under `scripts/` rather than a change to what the image ships:
    — deterministically, no LLM, never a word she wrote — from all three
    places at once; see OPERATIONS.md "Removing decoration from her
    stored replies, facts and episodic memory".
+6. Upstream OpenWebUI issue #14806: an assistant message stored with
+   `done: false` renders as a permanent loading spinner, and OpenWebUI's
+   own on-load repair only ever fixes the NEWEST one — every older stale
+   spinner stays broken forever. Her real 2026-09-23 backup has 6 of
+   these on her current branch (positions 508, 516, 604, 1371, 1818,
+   2672). `scripts/fix-stale-unfinished.py` flips just the `done` flag,
+   in both stored copies, never touching message text — so compactor
+   alignment (fingerprinted from text, not the `done` flag) is
+   unaffected; see OPERATIONS.md "Fixing stale 'permanent spinner'
+   replies".
 
 ### Added
 - **`scripts/backfill-records.py`.** Reads every `facts/*.backfill.json`
@@ -269,6 +279,35 @@ script under `scripts/` rather than a change to what the image ships:
   follow-up `--force` run accepts the realignment. See
   `compactor/test_clean_decoration_script.py` and
   `compactor/test_real_image_clean_decoration.py`.
+- **`scripts/fix-stale-unfinished.py`.** Fixes upstream OpenWebUI issue
+  #14806 (a `done: false` assistant message renders as a permanent
+  spinner; OpenWebUI's own on-load repair only ever fixes the newest
+  one) by flipping the stale `done` flag directly, in both `chat.chat`'s
+  JSON history and the `chat_message` table's own column together, for
+  exactly the in-scope messages — never touching `content`,
+  `created_at`/`updated_at`, `chat.updated_at`, or `current_message_id`
+  on either copy. Two categories, reported separately: (a) STALE
+  UNFINISHED, where neither copy says done — the actual spinner bug (19
+  total on her real backup, 6 of them on her current branch at
+  positions 508/516/604/1371/1818/2672 — `--branch-only`, the default,
+  targets only those 6); (b) JSON-ONLY GAP, where the table already
+  says done but the JSON key is simply missing — a hygiene backfill,
+  not the bug fix (9 total, all off-branch). Never touches the current
+  branch tip or its direct children (an in-flight reply looks exactly
+  like a stale one until it finishes), and independently excludes
+  anything younger than `--min-age-minutes` (default 10). Refuses if
+  another process holds `webui.db` open or a `-wal`/`-journal` sidecar
+  is present. Backs up via `sqlite3`'s own online backup API into
+  `/data/forensics/fix-stale-unfinished-<stamp>/` (unlike its siblings'
+  plain sibling-file copy, since this is narrowly-scoped flag-flipping
+  rather than tree surgery) and supports `--restore <stamp>`. Because
+  compactor fingerprints are computed from a turn's text, never its
+  `done` flag, this write cannot affect compactor alignment at all.
+  Verified against the real 2026-09-23 backup: `--apply` flips exactly
+  the 6 on-branch targets in both copies, a full diff shows zero other
+  bytes changed anywhere in the chat, a second run is a clean no-op, and
+  `--restore` round-trips byte-identical. See
+  `compactor/test_fix_stale_unfinished_script.py`.
 
 ### Documentation
 - **OPERATIONS.md** gains "Closing stale backfill records before upgrading

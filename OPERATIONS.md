@@ -2136,6 +2136,87 @@ anchor rule above) — those always refuse.
 
 ---
 
+## Fixing stale "permanent spinner" replies (v3.1.9.6)
+
+**What it fixes.** Upstream OpenWebUI issue #14806: an assistant message
+stored with `done: false` renders as a permanent loading spinner forever
+— on chat load, OpenWebUI's own code repairs only the NEWEST unfinished
+response; every OLDER `done: false` message is left exactly as it was,
+indefinitely. `scripts/fix-stale-unfinished.py` finds and flips those
+stale flags directly. On the real 2026-09-23 backup it found 6 empty,
+stale `done: false` assistant replies on her current branch, at branch
+positions **508, 516, 604, 1371, 1818 and 2672**.
+
+**What it changes, and what it does not.** It flips only the `done`
+flag — `done: True` in the `chat.chat` JSON history AND `done=1` in the
+`chat_message` table's own column, both copies together, for exactly the
+in-scope messages. It never touches `content` on either copy, never
+`created_at`/`updated_at`, never `chat.updated_at`, never
+`current_message_id`. Because `compactor/summarizer.py`'s fingerprints
+are computed from a turn's TEXT, not its `done` flag, this write cannot
+affect compactor alignment (`tail_fp`/`head_fp`/`covered_fps`) at all —
+unlike `clean-decoration.py` above, there is no anchor to protect here.
+
+**What it refuses to touch, even with `--apply`.** The current branch tip
+and any of its direct children — an in-flight reply generating right now
+looks exactly like a stale one until it finishes, so the tip and its
+children are never eligible, full stop. Independently, `--min-age-minutes`
+(default 10) excludes anything not yet older than that, using the
+message's own recorded timestamp — belt-and-suspenders alongside the tip
+exclusion, not a replacement for it. It also refuses outright (before any
+backup or write) if another process holds `webui.db` open, or a
+`-wal`/`-journal` sidecar sits beside it (see RUNBOOK_DB_JOURNAL.md).
+
+**Backup and restore.** Unlike `repair-chat-tree.py`/`fix-encoded-messages.py`
+(a plain sibling copy), this script backs up via `sqlite3`'s own online
+backup API into a dedicated forensics directory:
+`/data/forensics/fix-stale-unfinished-<UTC stamp>/webui.db`. `--restore
+<stamp>` copies that file back over the live path, byte-identical.
+
+**Procedure (on the pod):**
+```bash
+git clone --depth 1 --branch <tag-or-branch> \
+    https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+# 1. Ask her to close every browser tab on this chat.
+supervisorctl stop openwebui backup
+/app/venv/bin/python /opt/zl-repo/scripts/fix-stale-unfinished.py \
+    /data/openwebui/webui.db                    # dry run — writes nothing
+/app/venv/bin/python /opt/zl-repo/scripts/fix-stale-unfinished.py \
+    /data/openwebui/webui.db --apply
+supervisorctl start openwebui backup
+# Have her hard-refresh the chat (Ctrl+F5).
+```
+Exit codes are the same shared 0/1/2/3/4 convention (see "Exit codes"
+above); for this script, 1 also covers a post-`--apply` verification
+failure — by that point the write has already committed (SQLite has no
+rollback after commit), so recovery is `--restore <the stamp this run
+printed>`, not a retry.
+
+**Two categories, both fixed, reported separately — do not read the dry
+run's combined number as "the bug count".** (a) STALE UNFINISHED:
+`done` is not `True` in EITHER copy — this is the actual spinner bug (19
+total on her backup, 6 of them on the current branch — `--branch-only`
+is the default, so a default run only ever targets those 6; add
+`--all-branches` to also reach the other 13, off-branch). (b) JSON-ONLY
+GAP: the JSON `done` key is simply MISSING while the table already says
+`done=1` — the table is authoritative, so this was never rendering as a
+live spinner the way (a) does; it is a hygiene backfill, not the bug fix
+(9 total, all off-branch, 0 in the default scope).
+
+**The pod's OpenWebUI was upgraded to 0.11.4 IN PLACE on 2026-09-23 —
+this does NOT survive a pod restart.** The container filesystem resets
+on every restart the same way it does for `setup-sshd.py`'s work above;
+the in-place upgrade lives only on the running container's overlay, not
+on `/data`, so a restarted pod goes back to whatever OpenWebUI version
+the image itself ships until v3.1.9.7 makes the newer version permanent
+(bakes it into the image rather than a live patch). Upstream, the related
+scroll-jump behavior on a stale spinner was only fixed in OpenWebUI
+0.11.1 and later — this pod's pre-upgrade version predated that fix,
+which is part of why the stale spinners were visibly disruptive rather
+than a silent cosmetic detail.
+
+---
+
 ## Rolling back a bad release
 
 Each release tag is pushed once and not re-pushed by this project (see
