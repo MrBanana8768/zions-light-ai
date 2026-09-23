@@ -487,6 +487,24 @@ def _walk_branch_from_history(history: dict) -> list[dict] | None:
     return chain
 
 
+def _decode_chat_message_content(raw: Any) -> Any:
+    """`chat_message.content` is JSON-encoded (confirmed empirically
+    against the real 2026-09-22/23 backups: a plain string turn is
+    stored as e.g. `'"hello"'`, quotes included) -- decode it once here
+    before handing it to `_flatten_content`, which otherwise returns the
+    raw JSON text (quotes, brackets and all) as if it were the turn's
+    actual content. Used by both `_reconstruct_from_chat_message` (the
+    fallback source) and `_cross_check_against_chat_message_table`
+    (the divergence check) -- one site so the fix cannot drift between
+    the two."""
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+    return raw
+
+
 def _reconstruct_from_chat_message(con: sqlite3.Connection, chat_id: str) -> list[dict]:
     """Fallback source: the `chat_message` table (`chat_id`, `parent_id`,
     `role`, `content`, `created_at`). No `currentId` exists at this layer,
@@ -503,16 +521,38 @@ def _reconstruct_from_chat_message(con: sqlite3.Connection, chat_id: str) -> lis
         return []
     if not rows:
         return []
-    by_id = {r[0]: {"id": r[0], "parent_id": r[1], "role": r[2], "content": r[3],
-                    "created_at": r[4]} for r in rows}
+    # N-round-3-pass-A follow-up (chat_message id/parent_id convention).
+    # OpenWebUI 0.11's `chat_message.id` is "<chat_id>-<msg_id>", but
+    # `parent_id` is the BARE `msg_id` -- the same key space
+    # `history.messages` itself uses. Keying `by_id` on the raw `id`
+    # column (as this function used to) means `by_id[node["parent_id"]]`
+    # (a bare id) can never match a key (always chat_id-prefixed): every
+    # row looks like a leaf (`r[0] not in parent_ids` is vacuously true
+    # for ALL rows, since prefixed ids never appear in the bare
+    # parent_ids set either), and the walk from whichever leaf sorts
+    # last by created_at stops after exactly one step, every time.
+    # Verified empirically against the real 2026-09-22 and 2026-09-23
+    # backups: this fallback would have reconstructed a 1-turn
+    # "transcript" for a 3863+ turn conversation. Stripping the
+    # `<chat_id>-` prefix once here, up front, is the fix -- the rest of
+    # this function's own logic (leaf selection by created_at, walking
+    # via parent_id) already assumed the bare key space.
+    prefix = f"{chat_id}-"
+
+    def _bare(raw_id):
+        return raw_id[len(prefix):] if raw_id.startswith(prefix) else raw_id
+
+    by_id = {_bare(r[0]): {"id": _bare(r[0]), "parent_id": r[1], "role": r[2],
+                           "content": _decode_chat_message_content(r[3]),
+                           "created_at": r[4]} for r in rows}
     parent_ids = {r[1] for r in rows if r[1] is not None}
-    leaves = [r for r in rows if r[0] not in parent_ids]
+    leaves = [r for r in rows if _bare(r[0]) not in parent_ids]
     if not leaves:
         leaves = rows
     leaf = max(leaves, key=lambda r: (r[4] if r[4] is not None else 0))
     chain: list[dict] = []
     seen: set[str] = set()
-    node_id = leaf[0]
+    node_id = _bare(leaf[0])
     while node_id is not None and node_id in by_id and node_id not in seen:
         seen.add(node_id)
         node = by_id[node_id]
@@ -525,13 +565,133 @@ def _reconstruct_from_chat_message(con: sqlite3.Connection, chat_id: str) -> lis
     ]
 
 
+class ChatMessageTableDivergence(Exception):
+    """Raised when the chat_message table's own reconstruction of this
+    conversation's current branch disagrees with the history.messages
+    (chat.chat JSON) walk -- see _cross_check_against_chat_message_table's
+    own docstring for why this is checked at all."""
+
+
+def _cross_check_against_chat_message_table(
+    con: sqlite3.Connection, chat_id: str, history_messages: dict, current_id: str | None,
+) -> str | None:
+    """None if the chat_message table either has no rows for this chat (a
+    conversation OpenWebUI has never backfilled -- nothing to cross-check)
+    or its own branch reconstruction agrees with the history.messages walk;
+    otherwise a detail string describing the disagreement.
+
+    WHY THIS EXISTS (architect follow-up, round-3 fix pass A). OpenWebUI
+    0.11's OWN `get_messages_map_by_chat_id` (open_webui/models/chats.py)
+    prefers `chat_message` rows over the embedded JSON history -- "Fast
+    path: build from normalized chat_message rows" -- falling back to (or
+    merging gaps from) `history.messages` only when the row-based parent
+    graph has unresolved references. That is what the LIVE compactor
+    actually receives on every real request; this script's own
+    `reconstruct_transcript` walks `history.messages` FIRST instead,
+    falling back to the table only if the JSON is unreadable. Verified
+    empirically against the real 2026-09-22 and 2026-09-23 backups for the
+    conversation this script exists for: the two reconstructions are
+    byte-identical (same 3863/3879-turn branch, same ids, 0 text
+    differences) -- so flipping the priority order is not motivated by an
+    observed divergence on the one conversation this matters for, and
+    doing so is a materially larger, riskier change than this fix pass has
+    budget to re-verify safely. What IS cheap and safe: detecting a
+    disagreement, when one exists, and refusing rather than silently
+    trusting whichever source happened to be tried first.
+
+    `chat_message.id` is "<chat_id>-<msg_id>" (confirmed empirically);
+    `parent_id` is the bare `msg_id`, matching `history.messages`' own key
+    space -- see `_reconstruct_from_chat_message`'s own docstring for the
+    identical fix this same convention needed there.
+
+    This mirrors (not byte-for-byte, but in effect) OpenWebUI's own
+    `get_unresolved_parent_ids` + gap-fill: any parent id a table row
+    references but the table itself does not contain is filled in from
+    `history_messages` (if present there), exactly as OpenWebUI's real
+    algorithm does before walking the branch.
+    """
+    try:
+        rows = con.execute(
+            "SELECT id, parent_id, role, content FROM chat_message WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    if not rows:
+        return None
+
+    prefix = f"{chat_id}-"
+
+    def _bare(raw_id):
+        return raw_id[len(prefix):] if raw_id.startswith(prefix) else raw_id
+
+    table_map = {
+        _bare(r[0]): {"id": _bare(r[0]), "parentId": r[1], "role": r[2],
+                      "content": _decode_chat_message_content(r[3])}
+        for r in rows
+    }
+    unresolved = {
+        n["parentId"] for n in table_map.values()
+        if n.get("parentId") and n["parentId"] not in table_map
+    }
+    for missing_id in unresolved:
+        node = history_messages.get(missing_id)
+        if isinstance(node, dict):
+            table_map[missing_id] = node
+
+    table_chain = _walk_branch_from_history({"messages": table_map, "currentId": current_id})
+    if table_chain is None:
+        return (
+            "the chat_message table has rows for this chat but its own "
+            "branch walk from currentId is broken (missing node or a "
+            "cycle) -- refusing rather than trust the history.messages "
+            "walk without being able to cross-check it"
+        )
+
+    json_chain = _walk_branch_from_history({"messages": history_messages, "currentId": current_id})
+    if json_chain is None:
+        return None  # nothing to compare against; the caller already
+        # refuses elsewhere if history.messages itself produced nothing
+
+    table_turns = [
+        {"role": n.get("role") or "unknown", "content": _flatten_content(n.get("content"))}
+        for n in table_chain
+    ]
+    json_turns = [
+        {"role": n.get("role") or "unknown", "content": _flatten_content(n.get("content"))}
+        for n in json_chain
+    ]
+    if table_turns == json_turns:
+        return None
+    if len(table_turns) != len(json_turns):
+        return (
+            f"the chat_message table's own branch reconstruction has "
+            f"{len(table_turns)} turn(s) against {len(json_turns)} from "
+            f"history.messages -- OpenWebUI's own code prefers the table; "
+            f"this export's history.messages walk disagrees with what the "
+            f"live compactor actually received"
+        )
+    for i, (t, j) in enumerate(zip(table_turns, json_turns)):
+        if t != j:
+            return (
+                f"the chat_message table's own branch reconstruction "
+                f"disagrees with history.messages at turn {i + 1} "
+                f"(role/content differ) -- OpenWebUI's own code prefers "
+                f"the table; this export's history.messages walk "
+                f"disagrees with what the live compactor actually received"
+            )
+    return None  # unreachable (table_turns == json_turns already handled)
+
+
 def reconstruct_transcript(
     con: sqlite3.Connection, chat_id: str
 ) -> tuple[list[dict], str, list[str]]:
     """(turns, source, notes). `turns` is `[{"role", "content"}, ...]`, the
     same shape the compactor receives. Raises ChatNotFound if no `chat`
     row matches `chat_id`; TranscriptUnavailable if neither source could
-    produce anything."""
+    produce anything. Raises ChatMessageTableDivergence if history.messages
+    was used but disagrees with the chat_message table's own reconstruction
+    -- see _cross_check_against_chat_message_table's own docstring."""
     notes: list[str] = []
     row = con.execute("SELECT chat FROM chat WHERE id = ?", (chat_id,)).fetchone()
     if row is None:
@@ -539,11 +699,15 @@ def reconstruct_transcript(
     raw = row[0]
 
     chain = None
+    history_messages: dict | None = None
+    current_id = None
     try:
         data = json.loads(raw) if isinstance(raw, (str, bytes)) else None
         history = data.get("history") if isinstance(data, dict) else None
         if isinstance(history, dict):
             chain = _walk_branch_from_history(history)
+            history_messages = history.get("messages")
+            current_id = history.get("currentId")
         else:
             notes.append(
                 "chat.chat has no readable history.messages/currentId; "
@@ -561,6 +725,12 @@ def reconstruct_transcript(
             for n in chain
         ]
         if turns:
+            if isinstance(history_messages, dict):
+                divergence = _cross_check_against_chat_message_table(
+                    con, chat_id, history_messages, current_id
+                )
+                if divergence is not None:
+                    raise ChatMessageTableDivergence(divergence)
             return turns, "history.messages (chat.chat JSON)", notes
         notes.append(
             "history.messages/currentId walk produced an empty branch; "
@@ -1394,6 +1564,15 @@ def main(argv=None) -> int:
             f"ERROR: could not reconstruct a transcript for chat "
             f"{args.chat_id!r} from either history.messages or "
             f"chat_message — neither source produced any turns.",
+        )
+    except ChatMessageTableDivergence as e:
+        return _fatal(
+            args,
+            f"REFUSING: {e} -- this export's history.messages "
+            f"reconstruction does not match what OpenWebUI's own code "
+            f"(which prefers chat_message rows) would have built for "
+            f"chat {args.chat_id!r}. Running would risk summarizing text "
+            f"that is not what the live compactor actually received.",
         )
     finally:
         con.close()

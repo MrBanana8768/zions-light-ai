@@ -246,6 +246,136 @@ def test_chat_message_fallback_also_follows_the_current_branch():
               "the fallback picks the most recently CREATED leaf's branch")
 
 
+def test_chat_message_fallback_handles_the_real_prefixed_id_convention():
+    print("\n[test] chat_message fallback kill: OpenWebUI 0.11's real "
+          "id convention (id = '<chat_id>-<msg_id>', parent_id = the bare "
+          "msg_id -- confirmed against the real 2026-09-22/23 backups) "
+          "reconstructs the whole branch, not just its last turn")
+    db = _new_db_path()
+    chat_id = "real-prefix-chat"
+    rows = [
+        (f"{chat_id}-m1", chat_id, None, "user", "q1", 100),
+        (f"{chat_id}-m2", chat_id, "m1", "assistant", "a1", 101),
+        (f"{chat_id}-m3", chat_id, "m2", "user", "q2", 102),
+        (f"{chat_id}-m4", chat_id, "m3", "assistant", "a2", 103),
+    ]
+    _build_webui_db(db, {chat_id: None}, chat_messages=rows)
+
+    con = _script._open_ro(db)
+    try:
+        turns, source, notes = _script.reconstruct_transcript(con, chat_id)
+    finally:
+        con.close()
+
+    assert_eq(source, "chat_message table", "source is the fallback table")
+    assert_eq([t["content"] for t in turns], ["q1", "a1", "q2", "a2"],
+               f"RED check (this is the exact bug the old by_id keying had): "
+               f"the whole 4-turn branch is reconstructed, not just the "
+               f"leaf ('a2' alone) that a raw (unstripped) id/parent_id "
+               f"mismatch would produce (got {[t['content'] for t in turns]!r})")
+
+
+def test_chat_message_table_content_is_json_decoded():
+    print("\n[test] architect follow-up kill: chat_message.content is "
+          "JSON-encoded on the real backups (e.g. a plain string turn is "
+          "stored as '\"hello\"', quotes included) -- both the fallback "
+          "reconstruction and the divergence cross-check must decode it "
+          "once, not hand the raw JSON text to _flatten_content")
+    db = _new_db_path()
+    chat_id = "json-content-chat"
+    rows = [
+        (f"{chat_id}-m1", chat_id, None, "user", json.dumps("hello"), 100),
+        (f"{chat_id}-m2", chat_id, "m1", "assistant", json.dumps("hi there"), 101),
+    ]
+    _build_webui_db(db, {chat_id: None}, chat_messages=rows)
+
+    con = _script._open_ro(db)
+    try:
+        turns, source, notes = _script.reconstruct_transcript(con, chat_id)
+    finally:
+        con.close()
+    assert_eq(source, "chat_message table", "source is the fallback table")
+    assert_eq([t["content"] for t in turns], ["hello", "hi there"],
+               f"content is decoded -- not '\"hello\"' with the JSON "
+               f"quoting still in it (got {[t['content'] for t in turns]!r})")
+
+
+def test_chat_message_table_divergence_from_history_messages_is_refused():
+    print("\n[test] architect follow-up: when chat_message rows exist AND "
+          "disagree with history.messages' own branch, --apply/dry-run "
+          "refuse rather than trust whichever source was tried first")
+    _wipe_storage()
+    db = _new_db_path()
+    chat_id = "divergent-chat"
+    # history.messages: m1 -> m2 -> m3 (3 turns), currentId=m3.
+    messages, current_id = _linear_history(3, prefix="div")
+    # chat_message table for the SAME chat: m3's own parent is DIFFERENT
+    # content than what history.messages has at that position -- the
+    # table (which OpenWebUI's own code prefers) disagrees with the JSON
+    # this script currently walks by default.
+    table_rows = [
+        (f"{chat_id}-div0", chat_id, None, "user", "user turn 0", 100),
+        (f"{chat_id}-div1", chat_id, "div0", "assistant", "assistant turn 1", 101),
+        (f"{chat_id}-div2", chat_id, "div1", "user", "TABLE SAYS SOMETHING ELSE", 102),
+    ]
+    _build_webui_db(
+        db, {chat_id: _history_chat(messages, current_id)}, chat_messages=table_rows
+    )
+
+    con = _script._open_ro(db)
+    try:
+        raised = None
+        try:
+            _script.reconstruct_transcript(con, chat_id)
+        except _script.ChatMessageTableDivergence as e:
+            raised = e
+    finally:
+        con.close()
+    assert_true(raised is not None,
+                "ChatMessageTableDivergence is raised, not silently "
+                "swallowed by trusting history.messages alone")
+    assert_true("turn 3" in str(raised) or "disagrees" in str(raised).lower(),
+                f"the detail names the disagreement (got {raised!r})")
+
+    # End to end: the dry run refuses too, not just the raw function.
+    _seed_conv(chat_id)  # B5: the conv's summary file must pre-exist
+    rc, out = run_script([
+        "--webui-db", str(db), "--chat-id", chat_id, "--store", _TMP_ROOT, "--json",
+    ])
+    assert_eq(rc, 1, f"the dry run refuses on a real divergence (out={out!r})")
+    assert_true("chat_message" in out.lower() or "disagrees" in out.lower(),
+                f"the refusal names the divergence (out={out!r})")
+
+
+def test_chat_message_table_agreeing_is_not_refused():
+    print("\n[test] architect follow-up: when chat_message rows exist AND "
+          "agree with history.messages, nothing is refused")
+    db = _new_db_path()
+    chat_id = "agreeing-chat"
+    messages, current_id = _linear_history(4, prefix="agree")
+    # Build matching chat_message rows using the REAL id convention
+    # (id = "<chat_id>-<msg_id>", parent_id = the bare msg_id) for the
+    # exact same branch history.messages has.
+    ids = list(messages.keys())
+    table_rows = []
+    for mid in ids:
+        node = messages[mid]
+        table_rows.append((
+            f"{chat_id}-{mid}", chat_id, node.get("parentId"), node["role"],
+            node["content"], 100,
+        ))
+    _build_webui_db(
+        db, {chat_id: _history_chat(messages, current_id)}, chat_messages=table_rows
+    )
+    _seed_conv(chat_id)
+
+    rc, out = run_script([
+        "--webui-db", str(db), "--chat-id", chat_id, "--store", _TMP_ROOT, "--json",
+    ])
+    assert_true(rc != 1, f"an agreeing chat_message table is not refused "
+                f"(rc={rc}, out={out!r})")
+
+
 # ---------------------------------------------------------------------------
 # 2. Multimodal content flattens; images become placeholders.
 # ---------------------------------------------------------------------------
@@ -2323,51 +2453,58 @@ def test_iv5_archive_restored_on_a_detected_mismatch_when_a_backup_existed():
     print("\n[test] IV5 kill: on a detected offset mismatch, an EXISTING "
           "archive backup is actually copied back, not silently skipped")
     _wipe_storage()
-    db, conv_id, state = _build_piecewise_scenario()
+    conv_id = "iv5-conv"
+    db = _new_db_path()
+    # A fresh 20-turn conv, L2_CHUNK_SIZE=1: unit 1 creates the one L1
+    # chunk due (1-20); unit 2 immediately folds it (len(l1)=1>=1), which
+    # calls the REAL _archive_chapters and genuinely rewrites
+    # archive_path -- decoupled from needing an actual offset bug (which
+    # repeated attempts at combining "force a fold" with "force a
+    # mismatch via the offset machinery" could not reliably produce; see
+    # this file's own history). Instead, the mismatch itself is forced
+    # directly on _verify_offset_after_apply, independent of whether a
+    # real one can be constructed here -- this test is about the RESTORE
+    # path, not about re-proving a mismatch can happen (the piecewise
+    # tests already do that).
+    messages, current_id = _linear_history(20)
+    _build_webui_db(db, {conv_id: _history_chat(messages, current_id)})
+    _seed_conv(conv_id)
     archive_path = memory.summary_archive_path(conv_id)
     archive_path.parent.mkdir(parents=True, exist_ok=True)
-    # A properly-shaped chapter (a dict, not a bare string) -- this test
-    # forces a REAL L2 fold below (L2_CHUNK_SIZE=1), which calls the real
-    # _archive_chapters, and that reads each existing row with `.get(...)`
-    # (summarizer.py:3334); a bare string here (like the OTHER archive
-    # seeds in this file, which never trigger a real fold) raises
-    # AttributeError and was masking this test's own real mutant-kill
-    # behind a crash during development -- caught by direct isolation
-    # while writing this round's tests, which is exactly why this
-    # comment is here.
     archive_path.write_text(
         '{"chapters": [{"text": "pre-existing chapter", "first_turn": 1, "last_turn": 10}]}',
         encoding="utf-8",
     )
     original_archive_bytes = archive_path.read_bytes()
 
-    real_apply_offset = _script._apply_resume_offset
-    _script._apply_resume_offset = lambda turns, offset, position: turns
-    real_llm = summarizer._llm_summarize
-    summarizer._llm_summarize = _echoing_llm
-    # L2_CHUNK_SIZE=1 (not the default 10): the FIRST new L1 chunk this
-    # run creates folds immediately, so archive_path is ACTUALLY
-    # rewritten during this run -- without this, the piecewise
-    # scenario's own --max-calls=10 budget never reaches a fold at all,
-    # and "archive unchanged after the mismatch" would hold trivially
-    # whether or not the restore-copy this test is pinning ever ran.
+    real_verify = _script._verify_offset_after_apply
+    _script._verify_offset_after_apply = (
+        lambda before, after, turns, offset, summ: "SIMULATED mismatch for IV5"
+    )
     real_l2 = summarizer.L2_CHUNK_SIZE
+    real_l3 = summarizer.L3_CHUNK_SIZE
+    # archive.json is only ever written by an L3 REFRESH's own
+    # _archive_chapters call -- an L2 fold alone (_do_l2_rollup) never
+    # touches it (confirmed directly: L2_CHUNK_SIZE=1 alone folds l1
+    # into l2 correctly but leaves archive.json byte-identical).
+    # L3_CHUNK_SIZE=1 makes unit 3 (right after unit 2's fold leaves
+    # l2=1) an L3 refresh, which genuinely calls _archive_chapters.
     summarizer.L2_CHUNK_SIZE = 1
+    summarizer.L3_CHUNK_SIZE = 1
     try:
-        # Corrupt the archive AFTER the run's own backup would have been
-        # taken but framed as "what the run itself wrote", by running
-        # --apply (forced into a mismatch) and confirming the restore.
         rc, out = run_script([
             "--webui-db", str(db), "--chat-id", conv_id, "--store", _TMP_ROOT,
             "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json", "--max-calls", "10",
         ])
     finally:
-        _script._apply_resume_offset = real_apply_offset
-        summarizer._llm_summarize = real_llm
+        _script._verify_offset_after_apply = real_verify
         summarizer.L2_CHUNK_SIZE = real_l2
-    assert_eq(rc, 1, f"the mismatch is caught and refused (out={out!r})")
+        summarizer.L3_CHUNK_SIZE = real_l3
+    assert_eq(rc, 1, f"the (simulated) mismatch is caught and refused (out={out!r})")
+    assert_true("SIMULATED mismatch for IV5" in out, "the simulated detail reached the refusal")
     assert_eq(archive_path.read_bytes(), original_archive_bytes,
-               "the pre-existing archive backup was restored")
+               "the pre-existing archive backup was restored, undoing "
+               "the L3 refresh's REAL archive.json rewrite")
 
 
 def test_r3_n1b_per_unit_budget_is_exactly_one_not_the_whole_run():
@@ -2543,16 +2680,31 @@ def test_r3_n13_leftover_archive_removed_when_none_existed_before():
           "itself created (none existed before) is removed on a "
           "detected mismatch, not left holding discarded chapters")
     _wipe_storage()
-    db, conv_id, state = _build_piecewise_scenario()
+    conv_id = "r3n13-conv"
+    db = _new_db_path()
+    # Same decoupled shape as IV5's test: a fresh 20-turn conv with
+    # L2_CHUNK_SIZE=1 makes unit 2 fold and genuinely create archive.json
+    # (none existed before); the mismatch itself is simulated directly
+    # on _verify_offset_after_apply.
+    messages, current_id = _linear_history(20)
+    _build_webui_db(db, {conv_id: _history_chat(messages, current_id)})
+    _seed_conv(conv_id)
     archive_path = memory.summary_archive_path(conv_id)
     assert_true(not archive_path.exists(), "sanity: no archive exists before this run")
 
     real_l2 = summarizer.L2_CHUNK_SIZE
-    summarizer.L2_CHUNK_SIZE = 1  # any new L1 chunk folds immediately -> a fresh archive.json
-    real_apply_offset = _script._apply_resume_offset
-    _script._apply_resume_offset = lambda turns, offset, position: turns
-    real_llm = summarizer._llm_summarize
-    summarizer._llm_summarize = _echoing_llm
+    real_l3 = summarizer.L3_CHUNK_SIZE
+    # archive.json is only written by an L3 refresh's own
+    # _archive_chapters call, never by an L2 fold alone -- see IV5's
+    # own test comment for how this was confirmed directly. Unit 2
+    # folds unit 1's chunk (L2_CHUNK_SIZE=1); unit 3 then refreshes L3
+    # (L3_CHUNK_SIZE=1) and genuinely creates archive.json fresh.
+    summarizer.L2_CHUNK_SIZE = 1
+    summarizer.L3_CHUNK_SIZE = 1
+    real_verify = _script._verify_offset_after_apply
+    _script._verify_offset_after_apply = (
+        lambda before, after, turns, offset, summ: "SIMULATED mismatch for R3-N13"
+    )
     try:
         rc, out = run_script([
             "--webui-db", str(db), "--chat-id", conv_id, "--store", _TMP_ROOT,
@@ -2560,9 +2712,9 @@ def test_r3_n13_leftover_archive_removed_when_none_existed_before():
         ])
     finally:
         summarizer.L2_CHUNK_SIZE = real_l2
-        _script._apply_resume_offset = real_apply_offset
-        summarizer._llm_summarize = real_llm
-    assert_eq(rc, 1, f"the mismatch is caught and refused (out={out!r})")
+        summarizer.L3_CHUNK_SIZE = real_l3
+        _script._verify_offset_after_apply = real_verify
+    assert_eq(rc, 1, f"the (simulated) mismatch is caught and refused (out={out!r})")
     assert_true(not archive_path.exists(),
                 "N13: the archive this run itself created is removed, "
                 "not left behind holding chapters from the discarded run")
@@ -2712,6 +2864,10 @@ if __name__ == "__main__":
     try:
         test_fork_returns_current_branch_not_insertion_order()
         test_chat_message_fallback_also_follows_the_current_branch()
+        test_chat_message_fallback_handles_the_real_prefixed_id_convention()
+        test_chat_message_table_content_is_json_decoded()
+        test_chat_message_table_divergence_from_history_messages_is_refused()
+        test_chat_message_table_agreeing_is_not_refused()
 
         test_multimodal_content_flattens_with_image_placeholders()
 
