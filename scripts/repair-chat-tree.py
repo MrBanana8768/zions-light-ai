@@ -257,8 +257,12 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _webui_live_path as _live  # noqa: E402
+
 DEFAULT_CHAT_ID = "ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"
 JOURNAL_RUNBOOK = "RUNBOOK_DB_JOURNAL.md"
+TOOL_NAME = "repair-chat-tree.py"
 
 
 def fmt(t):
@@ -345,6 +349,20 @@ def verify_backup_openable(bak):
     return None
 
 
+def _backup_target(db_path, stamp):
+    """Where this run's own safety backup goes. D10: when `db_path` IS the
+    local, ephemeral disk file, a backup left beside it (this script's
+    prior, only behaviour) rides the same container overlay and is lost
+    on a pod stop -- so it goes to the durable
+    `/data/forensics/repair-chat-tree-<stamp>/` instead. Unchanged
+    (beside `db_path`) in every other case."""
+    src = Path(db_path)
+    forensics_dir = _live.forensics_backup_dir("repair-chat-tree", stamp, src)
+    if forensics_dir is not None:
+        return forensics_dir / (src.name + f".bak-{stamp}")
+    return src.with_name(src.name + f".bak-{stamp}")
+
+
 def backup_db(db_path, stamp):
     """A plain byte-for-byte copy — see the module docstring's BACKUP
     section for why this, not sqlite3's own backup API, is the right tool
@@ -352,10 +370,11 @@ def backup_db(db_path, stamp):
     PRAGMA integrity_check before returning, so a backup that failed to
     copy correctly is caught immediately, not at --restore time."""
     src = Path(db_path)
-    err = check_free_space(src, src.stat().st_size)
+    bak = _backup_target(db_path, stamp)
+    bak.parent.mkdir(parents=True, exist_ok=True)
+    err = check_free_space(bak, src.stat().st_size)
     if err:
         raise OSError(err)
-    bak = src.with_name(src.name + f".bak-{stamp}")
     if bak.exists():
         raise FileExistsError(f"backup already exists: {bak}")
     shutil.copy2(src, bak)
@@ -368,7 +387,7 @@ def backup_db(db_path, stamp):
 
 def restore_db(db_path, stamp):
     src = Path(db_path)
-    bak = src.with_name(src.name + f".bak-{stamp}")
+    bak = _backup_target(db_path, stamp)
     if not bak.is_file():
         return None, f"REFUSED: no backup found at {bak}"
     shutil.copy2(bak, src)
@@ -1008,6 +1027,7 @@ def run_sync_json_only(a):
     --apply flow (PART 5) rather than interleaved with it, so this mode
     cannot accidentally inherit any of build_plan's relinking/pointer
     behaviour -- see PART 3B for the algorithm itself."""
+    _live.refuse_if_snapshot_in_local_mode(a.db, tool_name=TOOL_NAME, dry_run=not a.apply)
     if a.apply:
         who = openers(a.db)
         if who:
@@ -1120,6 +1140,8 @@ def run_sync_json_only(a):
     integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
     print("integrity:", integrity)
     con.close()
+    if integrity == "ok":
+        _live.maybe_print_final_sync_hint(TOOL_NAME, a.db)
     sys.exit(0 if integrity == "ok" else 1)
 
 
@@ -1138,14 +1160,19 @@ def main():
     a = ap.parse_args()
 
     if a.restore:
+        _live.refuse_if_snapshot_in_local_mode(a.db, tool_name=TOOL_NAME, dry_run=False)
         bak, msg = restore_db(a.db, a.restore)
         result = {"action": "restore", "stamp": a.restore, "ok": bak is not None, "detail": msg}
         emit(result, a.json) if a.json else print(msg)
+        if bak is not None:
+            _live.maybe_print_final_sync_hint(TOOL_NAME, a.db)
         sys.exit(0 if bak is not None else 1)
 
     if a.sync_json_only:
         run_sync_json_only(a)
         return
+
+    _live.refuse_if_snapshot_in_local_mode(a.db, tool_name=TOOL_NAME, dry_run=not a.apply)
 
     if a.apply:
         who = openers(a.db)
@@ -1247,6 +1274,7 @@ def main():
 
     if integrity != "ok":
         sys.exit(1)
+    _live.maybe_print_final_sync_hint(TOOL_NAME, a.db)
     if plan.unlinkable:
         sys.exit(4)
     sys.exit(0)

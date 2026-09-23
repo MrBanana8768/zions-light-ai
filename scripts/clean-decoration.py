@@ -193,8 +193,12 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 OPT_COMPACTOR = Path("/opt/compactor")
 
+sys.path.insert(0, str(HERE))
+import _webui_live_path as _live  # noqa: E402
+
+TOOL_NAME = "clean-decoration.py"
+
 DEFAULT_STORE = "/data/openwebui/compactor"
-DEFAULT_WEBUI_DB = "/data/openwebui/webui.db"
 DEFAULT_HEALTH_URL = "http://127.0.0.1:8080/health"
 DEFAULT_OPENWEBUI_PORT = 8080
 HEALTH_PROBE_TIMEOUT_S = 3
@@ -699,15 +703,30 @@ def _verify_backup_openable(bak: Path) -> str:
     return None
 
 
-def _backup_file(path: Path, stamp: str) -> Path:
+def _webui_backup_target(db_path: Path, stamp: str) -> Path:
+    """D10: where the webui.db safety backup goes. When `db_path` IS the
+    local, ephemeral disk file, a backup left beside it (the plain
+    `path.with_name(...)` scheme every other target here still uses)
+    rides the same container overlay and is lost on a pod stop -- so it
+    goes to the durable `/data/forensics/clean-decoration-<stamp>/`
+    instead. Unchanged (beside `db_path`) in every other case."""
+    forensics_dir = _live.forensics_backup_dir("clean-decoration", stamp, db_path)
+    if forensics_dir is not None:
+        return forensics_dir / (db_path.name + f".bak-{stamp}")
+    return db_path.with_name(db_path.name + f".bak-{stamp}")
+
+
+def _backup_file(path: Path, stamp: str, bak_override: Path = None) -> Path:
     """A plain, exact byte-for-byte copy — see `_sqlite_online_backup`'s
     own docstring for why that API, despite being named in the operator
     brief, is the wrong choice for the RESTORABLE copy specifically. For a
     `.db` file this also verifies the fresh copy opens cleanly under
     `PRAGMA integrity_check` before returning, so a backup that silently
     failed to copy correctly is caught immediately, not discovered later
-    at `--restore` time."""
-    bak = path.with_name(path.name + f".bak-{stamp}")
+    at `--restore` time. `bak_override` (used for the webui target, D10)
+    sends the backup somewhere other than beside `path`."""
+    bak = bak_override if bak_override is not None else path.with_name(path.name + f".bak-{stamp}")
+    bak.parent.mkdir(parents=True, exist_ok=True)
     if bak.exists():
         raise FileExistsError(str(bak))
     shutil.copy2(path, bak)
@@ -727,8 +746,8 @@ def _backup_dir(path: Path, stamp: str) -> Path:
     return bak
 
 
-def _restore_file(original: Path, stamp: str) -> str:
-    bak = original.with_name(original.name + f".bak-{stamp}")
+def _restore_file(original: Path, stamp: str, bak_override: Path = None) -> str:
+    bak = bak_override if bak_override is not None else original.with_name(original.name + f".bak-{stamp}")
     if not bak.is_file():
         return f"REFUSED: no backup found at {bak}"
     shutil.copy2(bak, original)
@@ -1134,7 +1153,15 @@ def _build_argparser() -> argparse.ArgumentParser:
         "decoration from her stored chat history, active facts, and "
         "episodic memory — no LLM, no /forget. Dry run by default.",
     )
-    ap.add_argument("--webui-db", default=DEFAULT_WEBUI_DB, metavar="PATH")
+    # D3: this used to default to a hardcoded "/data/openwebui/webui.db"
+    # -- the SNAPSHOT's own path, unconditionally, even once
+    # WEBUI_DB_LOCAL=true moves the live database to local disk. Resolve
+    # the live path fresh, the same way the image does, every time this
+    # parser is built (see _webui_live_path.py) -- an operator who needs
+    # the snapshot specifically (WEBUI_DB_LOCAL=false, or a genuine
+    # off-pod copy) still gets it by default, since live_db_path()
+    # returns SNAPSHOT_DB whenever local mode is not active.
+    ap.add_argument("--webui-db", default=str(_live.live_db_path()[0]), metavar="PATH")
     ap.add_argument("--store", default=DEFAULT_STORE, metavar="PATH")
     ap.add_argument("--conv", required=False, metavar="CONV_ID",
                      help="the conversation id to clean (required unless --restore)")
@@ -1228,6 +1255,19 @@ def main(argv=None) -> int:
     db_path = Path(args.webui_db)
     if "webui" in targets and not db_path.is_file():
         return _fatal(args, f"ERROR: --webui-db {db_path} does not exist or is not a file.")
+    if "webui" in targets:
+        # D3: refuse to --apply against the snapshot while local mode
+        # looks active (silently edits the snapshot; the next sync cycle
+        # publishes local over it and the change is gone). A dry run only
+        # warns and still runs -- see _webui_live_path.py.
+        problem = _live.snapshot_problem_message(db_path, TOOL_NAME, dry_run=not args.apply)
+        if problem:
+            if args.apply:
+                return _fatal(args, f"REFUSED: {problem}")
+            if args.json:
+                print(json.dumps({"warning": problem}), file=sys.stderr)
+            else:
+                print(f"WARNING: {problem}", file=sys.stderr)
 
     pkg_dir, tried, already_importable = _resolve_compactor_pkg(args.compactor_pkg)
     if pkg_dir is None and not already_importable:
@@ -1519,12 +1559,14 @@ def main(argv=None) -> int:
     if webui_plan is not None and not webui_plan.refused and webui_plan.changes:
         try:
             size = db_path.stat().st_size
-            fs_err = _check_free_space(db_path, size)
+            webui_bak = _webui_backup_target(db_path, stamp)  # D10: off local disk, if that's where db_path is
+            webui_bak.parent.mkdir(parents=True, exist_ok=True)
+            fs_err = _check_free_space(webui_bak, size)
             if fs_err:
                 report["targets"]["webui"]["refused"] = fs_err
                 any_refusal = True
             else:
-                bak = _backup_file(db_path, stamp)
+                bak = _backup_file(db_path, stamp, bak_override=webui_bak)
                 backups["webui"] = str(bak)
                 con = sqlite3.connect(str(db_path))
                 try:
@@ -1627,6 +1669,9 @@ def main(argv=None) -> int:
     if not args.json:
         print(f"\nrestore stamp: {stamp}")
 
+    if "webui" in targets and report["targets"].get("webui", {}).get("backup"):
+        _live.maybe_print_final_sync_hint(TOOL_NAME, db_path)
+
     if any_refusal and written_any:
         return 4
     if any_refusal and not written_any:
@@ -1651,7 +1696,16 @@ def _do_restore(args) -> int:
     stamp = args.restore
     results = []
     if "webui" in (args.only or ALL_TARGETS):
-        results.append(("webui", _restore_file(Path(args.webui_db), stamp)))
+        webui_db_path = Path(args.webui_db)
+        problem = _live.snapshot_problem_message(webui_db_path, TOOL_NAME, dry_run=False)
+        if problem:
+            print(f"webui: REFUSED: {problem}")
+            return 1
+        webui_bak = _webui_backup_target(webui_db_path, stamp)
+        msg = _restore_file(webui_db_path, stamp, bak_override=webui_bak)
+        results.append(("webui", msg))
+        if not msg.startswith("REFUSED"):
+            _live.maybe_print_final_sync_hint(TOOL_NAME, webui_db_path)
     if "facts" in (args.only or ALL_TARGETS) and args.conv:
         os.environ["COMPACTOR_STORAGE_ROOT"] = str(Path(args.store).resolve())
         pkg_dir, _, already = _resolve_compactor_pkg(args.compactor_pkg)

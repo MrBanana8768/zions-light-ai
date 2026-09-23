@@ -801,6 +801,90 @@ def test_chat_default_is_her_id():
     assert_eq(S.DEFAULT_CHAT_ID, "ea1494ea-e9d7-46fb-8b7c-3a50d685d00e", "--chat defaults to her conversation id")
 
 
+# ===========================================================================
+# D3 -- the database-move rehearsal's defect: this script used to accept
+# /data/openwebui/webui.db unconditionally, even once WEBUI_DB_LOCAL=true
+# moves OpenWebUI's live database to local disk and leaves /data holding
+# only a periodically-published snapshot. See scripts/_webui_live_path.py
+# and dbmove/findings.md section 4.
+# ===========================================================================
+
+
+def test_d3_apply_against_snapshot_in_local_mode_refuses():
+    tmp = Path(tempfile.mkdtemp(prefix="fsu-d3-refuse-"))
+    try:
+        snapshot = tmp / "webui.db"
+        _make_db(snapshot)
+        local = tmp / "local.db"
+        forensics = tmp / "forensics"
+        rc, out, err = run_script(
+            [str(snapshot), "--apply"],
+            env={"WEBUI_DB_LOCAL": "true", "WEBUI_SNAPSHOT_DB": str(snapshot),
+                 "WEBUI_LOCAL_DB": str(local), "FSU_FORENSICS_DIR": str(forensics)},
+        )
+        assert_eq(rc, 1, "D3: --apply against the snapshot in local mode refuses (exit 1)")
+        assert_true("REFUSING" in err, "D3: refusal is printed", err)
+        assert_true(str(local) in err, "D3: refusal names the live (local) path", err)
+        assert_true("webuidb-sync" in err and "openwebui" in err,
+                    "D3: refusal names both services to stop", err)
+        assert_true(not forensics.exists(), "D3: a refused write takes no backup at all", str(list(tmp.iterdir())))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_dry_run_against_snapshot_in_local_mode_warns_but_runs():
+    tmp = Path(tempfile.mkdtemp(prefix="fsu-d3-warn-"))
+    try:
+        snapshot = tmp / "webui.db"
+        _make_db(snapshot)
+        local = tmp / "local.db"
+        rc, out, err = run_script(
+            [str(snapshot), "--json"],
+            env={"WEBUI_DB_LOCAL": "true", "WEBUI_SNAPSHOT_DB": str(snapshot), "WEBUI_LOCAL_DB": str(local)},
+        )
+        assert_eq(rc, 3, "D3: a read-only dry run against the snapshot in local mode still runs and reports "
+                          "its own pending-work exit code")
+        assert_true("WARNING" in err, "D3: dry run warns rather than refusing", err)
+        json.loads(out)  # must still be clean JSON -- the warning goes to stderr, never stdout
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_local_mode_off_snapshot_path_behaves_as_before():
+    tmp = Path(tempfile.mkdtemp(prefix="fsu-d3-off-"))
+    try:
+        snapshot = tmp / "webui.db"
+        _make_db(snapshot)
+        forensics = tmp / "forensics"
+        rc, out, err = run_script(
+            [str(snapshot), "--apply"],
+            env={"WEBUI_DB_LOCAL": "false", "WEBUI_SNAPSHOT_DB": str(snapshot), "FSU_FORENSICS_DIR": str(forensics)},
+        )
+        assert_eq(rc, 0, "D3: WEBUI_DB_LOCAL=false: --apply against /data works exactly as before")
+        assert_true("REFUSING" not in err, "D3: no D3 refusal when local mode is off", err)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_apply_against_live_local_path_succeeds_and_prints_sync_hint():
+    tmp = Path(tempfile.mkdtemp(prefix="fsu-d3-hint-"))
+    try:
+        local = tmp / "webui.db"
+        _make_db(local)
+        forensics = tmp / "forensics"
+        rc, out, err = run_script(
+            [str(local), "--apply"],
+            env={"WEBUI_DB_LOCAL": "true", "WEBUI_LOCAL_DB": str(local),
+                 "WEBUI_SNAPSHOT_DB": str(tmp / "snapshot-not-used.db"), "FSU_FORENSICS_DIR": str(forensics)},
+        )
+        assert_eq(rc, 0, "D3: --apply against the LIVE local path succeeds")
+        assert_true("supervisorctl stop openwebui webuidb-sync" in out,
+                    "D3: success prints the final-sync stop command", out)
+        assert_true("--sync-once --force" in out, "D3: success prints the final-sync command itself", out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_build_targets_categorizes_and_scopes_correctly()
     test_all_branches_widens_scope_but_never_touches_tip_or_inflight()
@@ -818,6 +902,11 @@ if __name__ == "__main__":
     test_wal_and_journal_sidecars_are_detected()
     test_dry_run_writes_nothing()
     test_chat_default_is_her_id()
+
+    test_d3_apply_against_snapshot_in_local_mode_refuses()
+    test_d3_dry_run_against_snapshot_in_local_mode_warns_but_runs()
+    test_d3_local_mode_off_snapshot_path_behaves_as_before()
+    test_d3_apply_against_live_local_path_succeeds_and_prints_sync_hint()
 
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILURE(S): {_FAILS}")

@@ -783,6 +783,124 @@ def test_sync_dry_run_reports_pending_work_exit_3():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ===========================================================================
+# D3 -- the database-move rehearsal's defect: this script used to accept
+# /data/openwebui/webui.db unconditionally, even once WEBUI_DB_LOCAL=true
+# moves OpenWebUI's live database to local disk and leaves /data holding
+# only a periodically-published snapshot. See scripts/_webui_live_path.py
+# and dbmove/findings.md section 4.
+# ===========================================================================
+
+
+def _make_healthy_single_message_db(path, chat_id="ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"):
+    """The simplest possible ALREADY-repaired tree: one root message,
+    pointer already at its own tip. A dry run against this reports
+    nothing pending (exit 0), so these D3 tests never depend on the
+    tree-repair logic itself -- only on whether the write/refusal
+    happens at all."""
+    con = sqlite3.connect(str(path))
+    con.execute("create table chat (id text primary key, chat text, current_message_id text, updated_at int)")
+    con.execute("create table chat_message (id text primary key, chat_id text, parent_id text, role text, "
+                "content text, created_at int)")
+    msgs = {"m1": {"id": "m1", "parentId": None, "childrenIds": [], "role": "user",
+                   "content": "hi", "timestamp": 1}}
+    blob = json.dumps({"history": {"messages": msgs, "currentId": "m1"}, "messages": []})
+    con.execute("insert into chat values (?,?,?,?)", (chat_id, blob, "m1", int(time.time())))
+    con.commit()
+    con.close()
+
+
+def _make_fixable_single_orphan_db(path, chat_id="ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"):
+    """One root plus one orphaned assistant reply with no stored parent
+    link -- build_plan relinks it by nearest-earlier-opposite-role, a
+    real write on --apply, so the D3 success+sync-hint test has an
+    actual commit to observe."""
+    con = sqlite3.connect(str(path))
+    con.execute("create table chat (id text primary key, chat text, current_message_id text, updated_at int)")
+    con.execute("create table chat_message (id text primary key, chat_id text, parent_id text, role text, "
+                "content text, created_at int)")
+    msgs = {
+        "m1": {"id": "m1", "parentId": None, "childrenIds": [], "role": "user", "content": "hi", "timestamp": 1},
+        "m2": {"id": "m2", "parentId": None, "childrenIds": [], "role": "assistant", "content": "hey", "timestamp": 2},
+    }
+    blob = json.dumps({"history": {"messages": msgs, "currentId": "m1"}, "messages": []})
+    con.execute("insert into chat values (?,?,?,?)", (chat_id, blob, "m1", int(time.time())))
+    con.commit()
+    con.close()
+
+
+def test_d3_apply_against_snapshot_in_local_mode_refuses():
+    import subprocess
+    tmp = Path(tempfile.mkdtemp(prefix="rct-d3-refuse-"))
+    try:
+        snapshot = tmp / "webui.db"
+        _make_healthy_single_message_db(snapshot)
+        local = tmp / "local.db"
+        env = {**os.environ, "WEBUI_DB_LOCAL": "true",
+               "WEBUI_SNAPSHOT_DB": str(snapshot), "WEBUI_LOCAL_DB": str(local)}
+        r = subprocess.run([sys.executable, str(_SCRIPT), str(snapshot), "--apply"],
+                            capture_output=True, text=True, env=env)
+        assert_eq(r.returncode, 1, "D3: --apply against the snapshot in local mode refuses (exit 1)")
+        assert_true("REFUSING" in r.stderr, "D3: refusal is printed", r.stderr)
+        assert_true(str(local) in r.stderr, "D3: refusal names the live (local) path", r.stderr)
+        assert_true("webuidb-sync" in r.stderr and "openwebui" in r.stderr,
+                    "D3: refusal names both services to stop", r.stderr)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_dry_run_against_snapshot_in_local_mode_warns_but_runs():
+    import subprocess
+    tmp = Path(tempfile.mkdtemp(prefix="rct-d3-warn-"))
+    try:
+        snapshot = tmp / "webui.db"
+        _make_healthy_single_message_db(snapshot)
+        local = tmp / "local.db"
+        env = {**os.environ, "WEBUI_DB_LOCAL": "true",
+               "WEBUI_SNAPSHOT_DB": str(snapshot), "WEBUI_LOCAL_DB": str(local)}
+        r = subprocess.run([sys.executable, str(_SCRIPT), str(snapshot)],
+                            capture_output=True, text=True, env=env)
+        assert_eq(r.returncode, 0, "D3: a read-only dry run against the snapshot in local mode still runs")
+        assert_true("WARNING" in r.stderr, "D3: dry run warns rather than refusing", r.stderr)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_local_mode_off_snapshot_path_behaves_as_before():
+    import subprocess
+    tmp = Path(tempfile.mkdtemp(prefix="rct-d3-off-"))
+    try:
+        snapshot = tmp / "webui.db"
+        _make_healthy_single_message_db(snapshot)
+        env = {**os.environ, "WEBUI_DB_LOCAL": "false", "WEBUI_SNAPSHOT_DB": str(snapshot)}
+        r = subprocess.run([sys.executable, str(_SCRIPT), str(snapshot), "--apply"],
+                            capture_output=True, text=True, env=env)
+        assert_eq(r.returncode, 0, "D3: WEBUI_DB_LOCAL=false: --apply against /data works exactly as before")
+        assert_true("REFUSING" not in r.stderr, "D3: no refusal when local mode is off", r.stderr)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_apply_against_live_local_path_succeeds_and_prints_sync_hint():
+    import subprocess
+    tmp = Path(tempfile.mkdtemp(prefix="rct-d3-hint-"))
+    try:
+        local = tmp / "webui.db"
+        _make_fixable_single_orphan_db(local)
+        env = {**os.environ, "WEBUI_DB_LOCAL": "true", "WEBUI_LOCAL_DB": str(local),
+               "WEBUI_SNAPSHOT_DB": str(tmp / "snapshot-not-used.db"),
+               "WEBUI_DB_FORENSICS": str(tmp / "forensics")}
+        r = subprocess.run([sys.executable, str(_SCRIPT), str(local), "--apply"],
+                            capture_output=True, text=True, env=env)
+        assert_eq(r.returncode, 0, "D3: --apply against the LIVE local path succeeds")
+        assert_true("supervisorctl stop openwebui webuidb-sync" in r.stdout,
+                    "D3: success prints the final-sync stop command", r.stdout)
+        assert_true("--sync-once --force" in r.stdout,
+                    "D3: success prints the final-sync command itself", r.stdout)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_decode_plain_text()
     test_decode_list_of_blocks()
@@ -834,6 +952,11 @@ if __name__ == "__main__":
     test_diff_preexisting_messages_catches_an_unexpected_field_change()
     test_sync_apply_is_byte_identical_on_chat_message_and_idempotent()
     test_sync_dry_run_reports_pending_work_exit_3()
+
+    test_d3_apply_against_snapshot_in_local_mode_refuses()
+    test_d3_dry_run_against_snapshot_in_local_mode_warns_but_runs()
+    test_d3_local_mode_off_snapshot_path_behaves_as_before()
+    test_d3_apply_against_live_local_path_succeeds_and_prints_sync_hint()
 
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILURE(S): {_FAILS}")

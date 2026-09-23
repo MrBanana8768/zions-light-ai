@@ -2134,6 +2134,29 @@ failed `PRAGMA integrity_check` after a write, a refused resume-offset, a
 history/`chat_message` disagreement, or a hole-risk anchor rewrite (the
 anchor rule above) — those always refuse.
 
+**Local-disk placement (`WEBUI_DB_LOCAL=true`) — D3.** `--webui-db`'s
+default now RESOLVES the live path (`scripts/_webui_live_path.py`, the
+same fold `compactor/webuidb.py`'s `live_webui_db()` uses, widened with a
+filesystem/process check for a shell that never inherited the flag)
+instead of hardcoding `/data/openwebui/webui.db`. If local mode is
+active and `--webui-db` (explicit or defaulted) still names the snapshot,
+`--apply` REFUSES outright — writing there only edits the periodically-
+published snapshot, and the next `webuidb-sync` cycle silently publishes
+the local database over it, losing the change with no warning (measured
+in the database-move rehearsal, `dbmove/findings.md` D3). A dry run only
+WARNS and still runs. A successful `--apply` against the live LOCAL path
+prints the exact final-sync recipe:
+```
+supervisorctl stop openwebui webuidb-sync
+WEBUI_DB_LOCAL=true /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --sync-once --force
+```
+run it to make the fix durable immediately, rather than waiting for (or
+risking a pod stop before) the next sync interval. The webui-target
+safety backup also moves off local disk in local mode, to
+`/data/forensics/clean-decoration-<stamp>/` (D10) — a backup left beside
+the LOCAL file would be lost on a pod stop exactly like everything else
+on that ephemeral disk.
+
 ---
 
 ## Fixing stale "permanent spinner" replies (v3.1.9.6)
@@ -2171,7 +2194,27 @@ backup or write) if another process holds `webui.db` open, or a
 (a plain sibling copy), this script backs up via `sqlite3`'s own online
 backup API into a dedicated forensics directory:
 `/data/forensics/fix-stale-unfinished-<UTC stamp>/webui.db`. `--restore
-<stamp>` copies that file back over the live path, byte-identical.
+<stamp>` copies that file back over the live path, byte-identical. This
+backup was already off local disk before D3 (see below) — nothing about
+it changed.
+
+**Local-disk placement (`WEBUI_DB_LOCAL=true`) — D3.** The positional
+`<webui.db>` argument below is `/data/openwebui/webui.db` for the pod as
+it runs TODAY (`WEBUI_DB_LOCAL=false`). If a later release moves the live
+database to local disk, this script (and `repair-chat-tree.py` /
+`fix-encoded-messages.py` / `clean-decoration.py`) resolves and checks
+that live path itself (`scripts/_webui_live_path.py`) and REFUSES
+`--apply`/`--restore` outright if the path given is the snapshot while
+local mode is active — writing there only edits the snapshot, and the
+next `webuidb-sync` cycle silently publishes local over it, losing the
+fix with no warning (D3, `dbmove/findings.md`). A dry run only WARNS and
+still runs. Point it at `/var/lib/openwebui/webui.db` instead (the
+refusal message names it), and after a successful `--apply` run the
+final-sync recipe it prints:
+```
+supervisorctl stop openwebui webuidb-sync
+WEBUI_DB_LOCAL=true /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --sync-once --force
+```
 
 **Procedure (on the pod):**
 ```bash
@@ -2185,6 +2228,9 @@ supervisorctl stop openwebui backup
     /data/openwebui/webui.db --apply
 supervisorctl start openwebui backup
 # Have her hard-refresh the chat (Ctrl+F5).
+# On a WEBUI_DB_LOCAL=true pod, use /var/lib/openwebui/webui.db above
+# instead, stop openwebui + webuidb-sync (not backup), and run the
+# final-sync command --apply prints when it succeeds.
 ```
 Exit codes are the same shared 0/1/2/3/4 convention (see "Exit codes"
 above); for this script, 1 also covers a post-`--apply` verification

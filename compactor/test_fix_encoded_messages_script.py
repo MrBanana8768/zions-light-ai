@@ -201,6 +201,117 @@ def test_wal_and_journal_sidecars_detected():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ===========================================================================
+# D3 -- the database-move rehearsal's defect: this script used to accept
+# /data/openwebui/webui.db unconditionally, even once WEBUI_DB_LOCAL=true
+# moves OpenWebUI's live database to local disk and leaves /data holding
+# only a periodically-published snapshot. See scripts/_webui_live_path.py
+# and dbmove/findings.md section 4. Only the LIVE positional argument is
+# ever subject to this check -- `pre` is a read-only reference copy, never
+# a write target.
+# ===========================================================================
+
+
+def _run(args, env):
+    import subprocess
+    full_env = dict(os.environ)
+    full_env.update(env)
+    r = subprocess.run([sys.executable, str(_SCRIPT), *args], capture_output=True, text=True, env=full_env)
+    return r.returncode, r.stdout, r.stderr
+
+
+def test_d3_apply_against_snapshot_in_local_mode_refuses():
+    tmp = Path(tempfile.mkdtemp(prefix="fem-d3-refuse-"))
+    try:
+        pre = tmp / "pre.db"
+        snapshot = tmp / "live.db"
+        _mk_db(pre, CHAT_ID, {}, {})
+        _mk_db(snapshot, CHAT_ID, {}, {})
+        local = tmp / "local.db"
+        rc, out, err = _run(
+            [str(snapshot), str(pre), "--apply"],
+            {"WEBUI_DB_LOCAL": "true", "WEBUI_SNAPSHOT_DB": str(snapshot), "WEBUI_LOCAL_DB": str(local)},
+        )
+        assert_eq(rc, 1, "D3: --apply against the snapshot in local mode refuses (exit 1)")
+        assert_true("REFUSING" in err, "D3: refusal is printed", err)
+        assert_true(str(local) in err, "D3: refusal names the live (local) path", err)
+        assert_true("webuidb-sync" in err and "openwebui" in err,
+                    "D3: refusal names both services to stop", err)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_dry_run_against_snapshot_in_local_mode_warns_but_runs():
+    tmp = Path(tempfile.mkdtemp(prefix="fem-d3-warn-"))
+    try:
+        pre = tmp / "pre.db"
+        snapshot = tmp / "live.db"
+        # find_chat_row derives the chat id from chat_message rows, so
+        # each fixture needs at least one -- an already-healthy one
+        # (present, decoded, matching on both sides) so this is a clean
+        # no-op dry run, not a v1-damage case.
+        good_raw = json.dumps("hi")
+        _mk_db(pre, CHAT_ID, history_messages={}, table_rows={"m1": good_raw})
+        _mk_db(snapshot, CHAT_ID, history_messages={"m1": {"id": "m1", "role": "assistant", "content": "hi",
+                                                            "parentId": None, "childrenIds": []}},
+               table_rows={"m1": good_raw})
+        local = tmp / "local.db"
+        rc, out, err = _run(
+            [str(snapshot), str(pre)],
+            {"WEBUI_DB_LOCAL": "true", "WEBUI_SNAPSHOT_DB": str(snapshot), "WEBUI_LOCAL_DB": str(local)},
+        )
+        assert_eq(rc, 0, "D3: a read-only dry run against the snapshot in local mode still runs")
+        assert_true("WARNING" in err, "D3: dry run warns rather than refusing", err)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_local_mode_off_snapshot_path_behaves_as_before():
+    tmp = Path(tempfile.mkdtemp(prefix="fem-d3-off-"))
+    try:
+        pre = tmp / "pre.db"
+        snapshot = tmp / "live.db"
+        good_raw = json.dumps("hi")
+        _mk_db(pre, CHAT_ID, history_messages={}, table_rows={"m1": good_raw})
+        _mk_db(snapshot, CHAT_ID, history_messages={"m1": {"id": "m1", "role": "assistant", "content": "hi",
+                                                            "parentId": None, "childrenIds": []}},
+               table_rows={"m1": good_raw})
+        rc, out, err = _run(
+            [str(snapshot), str(pre)],
+            {"WEBUI_DB_LOCAL": "false", "WEBUI_SNAPSHOT_DB": str(snapshot)},
+        )
+        assert_eq(rc, 0, "D3: WEBUI_DB_LOCAL=false: a dry run against /data works exactly as before")
+        assert_true("REFUSING" not in err, "D3: no D3 refusal when local mode is off", err)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_apply_against_live_local_path_succeeds_and_prints_sync_hint():
+    tmp = Path(tempfile.mkdtemp(prefix="fem-d3-hint-"))
+    try:
+        pre = tmp / "pre.db"
+        local = tmp / "live.db"
+        good_text = "hello world"
+        good_raw = json.dumps(good_text)
+        _mk_db(pre, CHAT_ID, history_messages={}, table_rows={"m1": good_raw})
+        live_hist = {"m1": {"id": "m1", "role": "assistant", "content": good_raw,
+                             "parentId": None, "childrenIds": []}}
+        double_encoded = json.dumps(good_raw)
+        _mk_db(local, CHAT_ID, history_messages=live_hist, table_rows={"m1": double_encoded})
+        rc, out, err = _run(
+            [str(local), str(pre), "--apply"],
+            {"WEBUI_DB_LOCAL": "true", "WEBUI_LOCAL_DB": str(local),
+             "WEBUI_SNAPSHOT_DB": str(tmp / "snapshot-not-used.db"),
+             "WEBUI_DB_FORENSICS": str(tmp / "forensics")},
+        )
+        assert_eq(rc, 0, "D3: --apply against the LIVE local path succeeds")
+        assert_true("supervisorctl stop openwebui webuidb-sync" in out,
+                    "D3: success prints the final-sync stop command", out)
+        assert_true("--sync-once --force" in out, "D3: success prints the final-sync command itself", out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_decode_once_only_accepts_str_deliberately()
     test_find_chat_row_is_exact_or_unambiguous_prefix_never_biggest()
@@ -210,6 +321,11 @@ if __name__ == "__main__":
     test_chat_default_is_her_id()
     test_backup_then_restore_round_trip()
     test_wal_and_journal_sidecars_detected()
+
+    test_d3_apply_against_snapshot_in_local_mode_refuses()
+    test_d3_dry_run_against_snapshot_in_local_mode_warns_but_runs()
+    test_d3_local_mode_off_snapshot_path_behaves_as_before()
+    test_d3_apply_against_live_local_path_succeeds_and_prints_sync_hint()
 
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILURE(S): {_FAILS}")

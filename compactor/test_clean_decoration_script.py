@@ -1057,6 +1057,160 @@ def test_restore_roundtrip():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ===========================================================================
+# D3 -- the database-move rehearsal's defect: this script used to default
+# to, and accept, /data/openwebui/webui.db unconditionally, even once
+# WEBUI_DB_LOCAL=true moves OpenWebUI's live database to local disk and
+# leaves /data holding only a periodically-published snapshot. See
+# scripts/_webui_live_path.py and dbmove/findings.md section 4.
+#
+# `cd._live.LOCAL_DB`/`SNAPSHOT_DB` are frozen at import time from
+# WEBUI_LOCAL_DB/WEBUI_SNAPSHOT_DB (this module was already imported by
+# the time these tests run), so -- unlike WEBUI_DB_LOCAL itself, read
+# fresh from os.environ on every call -- they are patched directly on
+# the module object rather than through the environment.
+# ===========================================================================
+
+
+class _PatchLive:
+    def __init__(self, **attrs):
+        self._attrs = attrs
+        self._env_keys = ("WEBUI_DB_LOCAL",)
+
+    def __enter__(self):
+        self._saved_attrs = {k: getattr(cd._live, k) for k in self._attrs}
+        for k, v in self._attrs.items():
+            setattr(cd._live, k, v)
+        self._saved_env = {k: os.environ.get(k) for k in self._env_keys}
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self._saved_attrs.items():
+            setattr(cd._live, k, v)
+        for k, v in self._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return False
+
+
+def _run_cd(argv):
+    import contextlib
+    import io
+    buf = io.StringIO()
+    errbuf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(errbuf):
+        rc = cd.main(argv)
+    return rc, buf.getvalue() + errbuf.getvalue()
+
+
+_PLAIN_BRANCH = [("user", "hi"), ("assistant", "hello there, nothing to clean here")]
+_DECORATED_BRANCH = [
+    ("user", "hi"),
+    ("assistant", "✅ done\n" + "=" * 60),
+]
+
+
+def test_d3_apply_against_snapshot_in_local_mode_refuses():
+    _wipe_storage()
+    tmp = Path(tempfile.mkdtemp(prefix="cd-d3-refuse-"))
+    try:
+        snapshot = tmp / "webui.db"
+        _make_webui_db(snapshot, CHAT_ID, _PLAIN_BRANCH)
+        local = tmp / "local.db"
+        with _PatchLive(LOCAL_DB=local, SNAPSHOT_DB=snapshot):
+            os.environ["WEBUI_DB_LOCAL"] = "true"
+            rc, out = _run_cd([
+                "--webui-db", str(snapshot), "--store", _TMP_ROOT, "--conv", CHAT_ID,
+                "--compactor-pkg", str(_HERE), "--only", "webui", "--apply", "--force", "--json",
+            ])
+        assert_eq(rc, 1, "D3: --apply against the snapshot in local mode refuses (exit 1)")
+        assert_true("REFUS" in out, "D3: refusal is printed")
+        assert_true(str(local) in out, "D3: refusal names the live (local) path")
+        assert_true("webuidb-sync" in out and "openwebui" in out, "D3: refusal names both services to stop")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_dry_run_against_snapshot_in_local_mode_warns_but_runs():
+    _wipe_storage()
+    tmp = Path(tempfile.mkdtemp(prefix="cd-d3-warn-"))
+    try:
+        snapshot = tmp / "webui.db"
+        _make_webui_db(snapshot, CHAT_ID, _PLAIN_BRANCH)
+        local = tmp / "local.db"
+        with _PatchLive(LOCAL_DB=local, SNAPSHOT_DB=snapshot):
+            os.environ["WEBUI_DB_LOCAL"] = "true"
+            rc, out = _run_cd([
+                "--webui-db", str(snapshot), "--store", _TMP_ROOT, "--conv", CHAT_ID,
+                "--compactor-pkg", str(_HERE), "--only", "webui", "--json",
+            ])
+        assert_eq(rc, 0, "D3: a read-only dry run (nothing decorated) against the snapshot in local mode "
+                          "still runs and finds nothing pending")
+        # --json means the warning is a JSON {"warning": ...} line (lowercase key), not the
+        # plain-text "WARNING: ..." _webui_live_path.py prints for a non-json invocation.
+        assert_true("warning" in out.lower(), "D3: dry run warns rather than refusing")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_local_mode_off_snapshot_path_behaves_as_before():
+    _wipe_storage()
+    tmp = Path(tempfile.mkdtemp(prefix="cd-d3-off-"))
+    try:
+        snapshot = tmp / "webui.db"
+        _make_webui_db(snapshot, CHAT_ID, _PLAIN_BRANCH)
+        with _PatchLive(SNAPSHOT_DB=snapshot):
+            os.environ["WEBUI_DB_LOCAL"] = "false"
+            rc, out = _run_cd([
+                "--webui-db", str(snapshot), "--store", _TMP_ROOT, "--conv", CHAT_ID,
+                "--compactor-pkg", str(_HERE), "--only", "webui", "--apply", "--force", "--json",
+            ])
+        assert_eq(rc, 0, "D3: WEBUI_DB_LOCAL=false: --apply against /data works exactly as before")
+        assert_true("REFUS" not in out, "D3: no D3 refusal when local mode is off")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_apply_against_live_local_path_succeeds_and_prints_sync_hint():
+    _wipe_storage()
+    tmp = Path(tempfile.mkdtemp(prefix="cd-d3-hint-"))
+    try:
+        local = tmp / "webui.db"
+        _make_webui_db(local, CHAT_ID, _DECORATED_BRANCH)
+        forensics = tmp / "forensics"
+        with _PatchLive(LOCAL_DB=local, FORENSICS_ROOT=forensics):
+            os.environ["WEBUI_DB_LOCAL"] = "true"
+            rc, out = _run_cd([
+                "--webui-db", str(local), "--store", _TMP_ROOT, "--conv", CHAT_ID,
+                "--compactor-pkg", str(_HERE), "--only", "webui", "--apply", "--force", "--json",
+            ])
+        assert_eq(rc, 0, "D3: --apply against the LIVE local path succeeds")
+        assert_true("supervisorctl stop openwebui webuidb-sync" in out,
+                    "D3: success prints the final-sync stop command")
+        assert_true("--sync-once --force" in out, "D3: success prints the final-sync command itself")
+        assert_true(forensics.exists(), "D10: the safety backup landed under /data/forensics, off local disk")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_default_webui_db_resolves_live_path_not_hardcoded_snapshot():
+    """The other half of D3 for this script specifically: --webui-db used
+    to default to a hardcoded "/data/openwebui/webui.db" even in local
+    mode. Build a fresh argparser (the default is computed at parser-
+    build time) and check it resolves through _webui_live_path instead."""
+    local = Path("/some/local/webui.db")
+    snapshot = Path("/some/snapshot/webui.db")
+    with _PatchLive(LOCAL_DB=local, SNAPSHOT_DB=snapshot):
+        os.environ["WEBUI_DB_LOCAL"] = "true"
+        default_local = cd._build_argparser().parse_args(["--conv", "x"]).webui_db
+        os.environ["WEBUI_DB_LOCAL"] = "false"
+        default_off = cd._build_argparser().parse_args(["--conv", "x"]).webui_db
+    assert_eq(default_local, str(local), "D3: default --webui-db resolves to the LIVE local path when local mode is on")
+    assert_eq(default_off, str(snapshot), "D3: default --webui-db still resolves to the snapshot when local mode is off")
+
+
 def run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

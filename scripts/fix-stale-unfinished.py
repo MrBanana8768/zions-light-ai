@@ -196,10 +196,14 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _webui_live_path as _live  # noqa: E402
+
 DEFAULT_CHAT_ID = "ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"
 JOURNAL_RUNBOOK = "RUNBOOK_DB_JOURNAL.md"
 DEFAULT_MIN_AGE_MINUTES = 10
 FORENSICS_DIRNAME = "fix-stale-unfinished"
+TOOL_NAME = "fix-stale-unfinished.py"
 
 
 def forensics_base():
@@ -643,13 +647,18 @@ def main():
     branch_only = not a.all_branches
 
     if a.restore:
+        _live.refuse_if_snapshot_in_local_mode(a.db, tool_name=TOOL_NAME, dry_run=False)
         dest, msg = restore_db(a.db, a.restore)
         result = {"action": "restore", "stamp": a.restore, "ok": dest is not None, "detail": msg}
         if a.json:
             print(json.dumps(result, indent=2, sort_keys=True))
         else:
             print(msg)
+        if dest is not None:
+            _live.maybe_print_final_sync_hint(TOOL_NAME, a.db)
         sys.exit(0 if dest is not None else 1)
+
+    _live.refuse_if_snapshot_in_local_mode(a.db, tool_name=TOOL_NAME, dry_run=not a.apply)
 
     if a.apply:
         who = openers(a.db)
@@ -775,6 +784,7 @@ def main():
             print(f"VERIFICATION FAILED after an already-committed write. Restore with: "
                   f"--restore {stamp}")
         sys.exit(1)
+    _live.maybe_print_final_sync_hint(TOOL_NAME, a.db)
     sys.exit(0)
 
 
