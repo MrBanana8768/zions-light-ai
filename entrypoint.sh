@@ -349,6 +349,50 @@ fi
 echo "      no interrupted restore found"
 
 if [ "${WEBUI_DB_LOCAL}" = "true" ]; then
+    # BEGIN DATABASE_URL GATE CHECK (D12, findings.md; test_entrypoint_database_url_gate.py extracts this block)
+    # D12 (findings.md). `export DATABASE_URL="${DATABASE_URL:-...}"` below
+    # ONLY sets DATABASE_URL when it is unset - a row left on the RunPod
+    # template from before the move (or set by hand, or by an old copy of
+    # this script) wins over the derived value, silently. That is the
+    # DB-MOVE-RUNBOOK's own explicit warning under "These rows must NOT
+    # exist": with WEBUI_DB_LOCAL=true and a stale DATABASE_URL still
+    # pointing at /data, OpenWebUI keeps writing to /data exactly as
+    # before, while webuidb.py's sync daemon (which reads the GATE, not
+    # DATABASE_URL, for its own idea of "live" - see webuidb.live_webui_db)
+    # believes the live database is WEBUI_LOCAL_DB and publishes whatever
+    # stale or empty file sits there OVER the real one on every cycle. This
+    # is found by inspection in findings.md, not by a rehearsal that hit
+    # it - refuse before it can happen on a real pod rather than wait for one.
+    _expected_database_url="sqlite:///${WEBUI_LOCAL_DB}"
+    if [ -n "${DATABASE_URL:-}" ] && [ "${DATABASE_URL}" != "${_expected_database_url}" ]; then
+        echo ""
+        echo "      ============================================================"
+        echo "      DATABASE_URL DISAGREES WITH WEBUI_DB_LOCAL=true - REFUSING TO START."
+        echo ""
+        echo "      DATABASE_URL is set to: ${DATABASE_URL}"
+        echo "      but WEBUI_DB_LOCAL=true expects: ${_expected_database_url}"
+        echo ""
+        echo "      A DATABASE_URL row on the template silently defeats the"
+        echo "      whole point of the database move (D12): OpenWebUI would"
+        echo "      keep writing wherever DATABASE_URL points - almost always"
+        echo "      still /data, left over from before WEBUI_DB_LOCAL=true was"
+        echo "      set - while the sync daemon believes the live database is"
+        echo "      ${WEBUI_LOCAL_DB} and publishes THAT (stale, or empty on a"
+        echo "      brand-new pod) file over the real one every"
+        echo "      WEBUI_DB_SYNC_INTERVAL_S. DB-MOVE-RUNBOOK.md says exactly"
+        echo "      this: the DATABASE_URL row 'must NOT exist' once"
+        echo "      WEBUI_DB_LOCAL is true."
+        echo ""
+        echo "      Delete the DATABASE_URL row from the RunPod template (let"
+        echo "      this script derive it from WEBUI_LOCAL_DB below) and"
+        echo "      redeploy. If you genuinely need a non-default DATABASE_URL"
+        echo "      with the database moved locally, set it to exactly"
+        echo "      ${_expected_database_url} so the two agree."
+        echo "      ============================================================"
+        echo ""
+        exit 1
+    fi
+    # END DATABASE_URL GATE CHECK
     export DATABASE_URL="${DATABASE_URL:-sqlite:///${WEBUI_LOCAL_DB}}"
     export WEBUIDB_SYNC_ENABLED=true
     mkdir -p "$(dirname "${WEBUI_LOCAL_DB}")"

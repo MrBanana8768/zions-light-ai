@@ -39,13 +39,16 @@ archive in backup.py is the second line. Postgres removes this trade
 entirely and is the strategic answer; this removes the instability today.
 """
 
+import argparse
 import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import signal
 import sqlite3
+import sys
 import time
 from pathlib import Path
 
@@ -1188,18 +1191,6 @@ def restore_on_boot() -> dict:
         return result
 
     if snap_there:
-        ok, detail = integrity(SNAPSHOT_DB)
-        if not ok:
-            # The snapshot lives on the flaky volume, so a hot journal here
-            # is the exact production failure. Do NOT copy a half-rolled-back
-            # database down and call it live.
-            logger.error(
-                f"snapshot {SNAPSHOT_DB} failed quick_check ({detail}). NOT "
-                f"restoring it. Recover it first: "
-                f"scripts/recover-webui-db.py, or restore from /data/backups."
-            )
-            result["action"] = "snapshot_unhealthy"
-            return result
         # Against the RESOLVED path. os.replace does not follow a symlink at
         # its destination — it replaces the link — while the shutil.copy2 this
         # used to be followed it and wrote the target. So a staged rename onto
@@ -1210,29 +1201,92 @@ def restore_on_boot() -> dict:
         # change did exactly that, and the exit-code row caught it.
         dest = LOCAL_DB.resolve()
         staged = dest.with_name(f"{dest.name}.restoring-{_stamp()}")
+
+        def _cleanup_staged() -> None:
+            for suffix in ("",) + SIDECARS:
+                try:
+                    staged.with_name(staged.name + suffix).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        # D5 (findings.md, 2026-09-23 rehearsal). integrity() USED TO run
+        # directly against SNAPSHOT_DB, on /data: pragma quick_check reads
+        # the whole file (measured 96.5s of a 98.7s cold boot restore), and
+        # — the worse half — a HOT ROLLBACK JOURNAL beside the snapshot made
+        # that same open FINISH THE ROLLBACK, which is a WRITE, on the one
+        # volume this whole module exists to keep off the live write path.
+        #
+        # Copy first, unconditionally (a plain file copy touches no sqlite
+        # lock and costs only however long /data itself takes, never LONGER
+        # for holding one open), THEN check and roll back the LOCAL copy,
+        # where a write costs milliseconds regardless of /data's mood.
+        #
+        # Sidecars ARE copied here, unlike the single self-contained-
+        # snapshot copy this replaces: that assumption ("sqlite3's backup
+        # API produces a self-contained database") holds for a snapshot
+        # sync_once itself wrote, but not for one still carrying a hot
+        # journal from being written to DIRECTLY (the WEBUI_DB_LOCAL=false
+        # placement, or an operator's own tool touching /data by hand).
+        # Copying the pair together and rolling back the copy is exactly
+        # backup.py._snapshot_via_rollback_copy's own rule for the identical
+        # failure shape.
         try:
-            # Staged and renamed, so a crash mid-copy leaves LOCAL_DB absent
-            # (and the next boot simply restores again) rather than a truncated
-            # file that the next boot finds, fails quick_check on, and has to
-            # quarantine. Sidecars are deliberately NOT copied: the snapshot is
-            # written by sqlite3's backup API, which produces a self-contained
-            # database, and a journal beside it would belong to a different
-            # generation of the file.
             shutil.copy2(SNAPSHOT_DB, staged)
-            os.replace(staged, dest)
+            for suffix in SIDECARS:
+                side = SNAPSHOT_DB.with_name(SNAPSHOT_DB.name + suffix)
+                if side.is_file():
+                    shutil.copy2(side, staged.with_name(staged.name + suffix))
         except Exception as e:
-            try:
-                staged.unlink(missing_ok=True)
-            except Exception:
-                pass
+            _cleanup_staged()
+            logger.error(
+                f"could not copy snapshot to local staging: "
+                f"{type(e).__name__}: {e}"
+            )
+            result["action"] = "restore_failed"
+            return result
+
+        # LOCAL, not SNAPSHOT_DB — see the comment above. Opening `staged`
+        # also replays/rolls back any -journal that came with it, on local
+        # disk; /data is not written to by this call.
+        ok, detail = integrity(staged)
+        if not ok:
+            # The snapshot lives on the flaky volume, so a hot journal here
+            # is the exact production failure. Do NOT copy a half-rolled-back
+            # database down and call it live.
+            logger.error(
+                f"snapshot {SNAPSHOT_DB} failed quick_check ({detail}) once "
+                f"copied to local staging. NOT restoring it; {SNAPSHOT_DB} "
+                f"on /data is untouched. Recover it first: "
+                f"scripts/recover-webui-db.py, or restore from /data/backups."
+            )
+            _cleanup_staged()
+            result["action"] = "snapshot_unhealthy"
+            return result
+
+        try:
+            os.replace(staged, dest)
+            # A successful rollback consumes its own -journal; a -wal/-shm
+            # pair under WAL mode does not vanish on a plain open. Anything
+            # left over under the STAGED name must move to match `dest`'s
+            # name, or the next boot's _clear_orphan_sidecars would not
+            # recognise it as belonging to LOCAL_DB.
+            for suffix in SIDECARS:
+                leftover = staged.with_name(staged.name + suffix)
+                if leftover.exists():
+                    shutil.move(
+                        str(leftover), str(dest.with_name(dest.name + suffix))
+                    )
+        except Exception as e:
+            _cleanup_staged()
             logger.error(
                 f"could not restore snapshot: {type(e).__name__}: {e}"
             )
             result["action"] = "restore_failed"
             return result
-        # VERIFIED AFTER IT LANDS. A restore that is not checked where it
-        # landed is not a restore; the snapshot passed quick_check on /data,
-        # and that says nothing about the copy on local disk.
+        # VERIFIED AFTER IT LANDS TOO. A restore that is not checked where it
+        # landed is not a restore; `staged` passed quick_check under its own
+        # name, and that says nothing about the file that rename/replace
+        # actually put at LOCAL_DB.
         landed_ok, landed_detail = integrity(LOCAL_DB)
         if not landed_ok:
             logger.error(
@@ -2242,8 +2296,68 @@ def sync_once(force: bool = False) -> dict:
     return out
 
 
+class _ShutdownRequested(BaseException):
+    """Raised from _sigterm_handler to unwind sync_loop's time.sleep (or an
+    in-flight sync_once) so the final publish (D1, findings.md) runs
+    immediately instead of waiting out the rest of the current interval.
+
+    DELIBERATELY A BaseException, not an Exception — the same reason
+    KeyboardInterrupt and SystemExit are not Exception subclasses either.
+    sync_once() has its own broad `except Exception` (see its docstring:
+    "not raising is the actual contract now") so it can turn a genuine
+    internal failure into out["error"] instead of killing the loop: if this
+    were an Exception, a SIGTERM landing WHILE sync_once() is running would
+    be swallowed by that same handler and reported as an ordinary result,
+    silently discarding the signal instead of triggering the final sync.
+
+    time.sleep() is documented (PEP 475) to sleep the FULL requested time
+    even across a caught signal UNLESS the handler raises — which is
+    exactly why this raises rather than only setting a flag: a flag would
+    still wait out up to SYNC_INTERVAL_S (300s default) before the process
+    noticed, almost certainly past supervisord's stopwaitsecs.
+    """
+
+
+def _sigterm_handler(signum, frame) -> None:
+    raise _ShutdownRequested()
+
+
+def _final_sync_on_shutdown() -> None:
+    """D1 (findings.md). Runs the same publish the DB-MOVE-RUNBOOK's manual
+    "final sync" step performs by hand (`sync_once(force=True)`), so a
+    `supervisorctl stop` — which sends SIGTERM and then waits `stopwaitsecs`
+    (120s, supervisord.conf, comfortably longer than a warm publish's
+    13-23s) before SIGKILLing — captures her last write automatically.
+
+    force=True deliberately: an ordinary sync_once() would very likely hit
+    the ordinary "unchanged since last sync" skip (nothing is more likely
+    than there being no NEW write in the seconds since the last periodic
+    publish), and this is the one caller that must not accept that skip
+    quietly — if there IS something unpublished this is the last chance,
+    and if there is not, force=True republishing identical content is a
+    no-op cost, not a correctness problem.
+
+    Never raises: the process is exiting either way, and an unhandled
+    exception here would trade the one line an operator needs to see
+    (published / skipped / error) for a stack trace in the shutdown log.
+    A SECOND SIGTERM arriving while this runs is not caught here — supervisord
+    does not send one before stopwaitsecs elapses, and a caller who really
+    wants a hard stop should get one.
+    """
+    try:
+        r = sync_once(force=True)
+    except Exception as e:
+        logger.error(f"final sync on SIGTERM raised: {type(e).__name__}: {e}")
+        return
+    if r["error"]:
+        logger.error(f"final sync on SIGTERM did not publish: {r}")
+    else:
+        logger.info(f"final sync on SIGTERM: {r}")
+
+
 def sync_loop() -> None:
     """Daemon entry point (supervisord program `webuidb-sync`)."""
+    signal.signal(signal.SIGTERM, _sigterm_handler)
     logger.info(
         f"webui.db sync: {LOCAL_DB} -> {SNAPSHOT_DB} every "
         f"{SYNC_INTERVAL_S:.0f}s"
@@ -2263,28 +2377,9 @@ def sync_loop() -> None:
     # is counted, on the same shout-on-first-then-hourly-forever shape as
     # the failure counter below.
     consecutive_no_local = 0
-    while True:
-        time.sleep(SYNC_INTERVAL_S)
-        # p3-b F7. sync_once's own try/except already covers everything
-        # from staging onward, and moving the mtime-skip block inside it
-        # (the actual F7 fix) closed the one gap that used to let an
-        # OSError escape sync_once entirely and kill this loop.
-        #
-        # A belt-and-braces try/except HERE too was tried and reverted:
-        # it silently swallowed test_webuidb_publish_guards.py's own
-        # `_drive_sync_loop` sentinel (`_StopLoop`, an Exception subclass
-        # used to end the otherwise-infinite `while True:` in a test with
-        # `time.sleep` patched to a no-op) — turning "stop the loop" into
-        # "log a failure and spin at full CPU forever", a real hang this
-        # was caught doing on a real run (the whole-unit-suite pass this
-        # lane finished with). A bare `except Exception` at a `while True:`
-        # boundary cannot tell a genuine escaped error from a caller's own
-        # control-flow exception, and the loop already has no story for
-        # how a *test* is supposed to stop it short of that. sync_once()
-        # not raising is the actual contract now; if a future change
-        # breaks that again, the fix belongs inside sync_once's own try,
-        # the same place this one did.
-        r = sync_once()
+
+    def _account(r: dict) -> None:
+        nonlocal consecutive_failures, consecutive_no_local
         if r["error"]:
             consecutive_failures += 1
             consecutive_no_local = 0
@@ -2328,14 +2423,111 @@ def sync_loop() -> None:
             consecutive_failures = 0
             consecutive_no_local = 0
 
+    # D11/D14 (findings.md). Publish once IMMEDIATELY, rather than waiting a
+    # full SYNC_INTERVAL_S before the first cycle. Before this fix,
+    # /health/full's snapshot check read "stale: true" (with a huge
+    # local_lag_s) for up to SYNC_INTERVAL_S after every boot — a false
+    # alarm: restore_on_boot's copy2 leaves LOCAL_DB's mtime matching the
+    # snapshot it was restored from, so there is nothing actually stale,
+    # only nothing published YET. Safe to run this early: sync_once()
+    # already treats "LOCAL_DB does not exist yet" as an ordinary skip, not
+    # an error, which is what covers a boot ordering where this program's
+    # priority (supervisord.conf) puts it ahead of OpenWebUI itself.
+    try:
+        _account(sync_once())
+    except _ShutdownRequested:
+        _final_sync_on_shutdown()
+        return
+
+    while True:
+        # p3-b F7. sync_once's own try/except already covers everything
+        # from staging onward, and moving the mtime-skip block inside it
+        # (the actual F7 fix) closed the one gap that used to let an
+        # OSError escape sync_once entirely and kill this loop. That
+        # `except Exception` boundary is why _ShutdownRequested above is a
+        # BaseException, not an Exception — see its own docstring.
+        #
+        # A belt-and-braces try/except Exception HERE too was tried and
+        # reverted: it silently swallowed test_webuidb_publish_guards.py's
+        # own `_drive_sync_loop` sentinel (`_StopLoop`, an Exception
+        # subclass used to end this otherwise-infinite loop in a test with
+        # `time.sleep` patched to a no-op) — turning "stop the loop" into
+        # "log a failure and spin at full CPU forever", a real hang this
+        # was caught doing on a real run (the whole-unit-suite pass this
+        # lane finished with). A bare `except Exception` at a `while True:`
+        # boundary cannot tell a genuine escaped error from a caller's own
+        # control-flow exception, and the loop already has no story for how
+        # a *test* is supposed to stop it short of that. sync_once() not
+        # raising (Exception) is the actual contract now; if a future
+        # change breaks that again, the fix belongs inside sync_once's own
+        # try, the same place this one did.
+        try:
+            time.sleep(SYNC_INTERVAL_S)
+            r = sync_once()
+        except _ShutdownRequested:
+            _final_sync_on_shutdown()
+            return
+        _account(r)
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """D6 (findings.md). This used to be a hand-rolled `"--x" in sys.argv`
+    chain with no real parser behind it: an UNRECOGNISED flag — including
+    `--help` — matched none of the `elif` arms and fell straight through to
+    the bare `else: sync_loop()`, so `webuidb.py --help` silently started
+    the daemon loop instead of printing usage (the DB-MOVE-RUNBOOK's own
+    "There is NO --sync-now. `--help`, or any unknown flag, starts a
+    second daemon loop" is this exact defect, in the operator's own
+    words). argparse rejects an unrecognised argument with exit 2 and
+    handles `-h`/`--help` itself (prints usage, exit 0) — the fix is
+    switching parsers, not hand-writing either of those two behaviours.
+    """
+    p = argparse.ArgumentParser(
+        prog="webuidb.py",
+        description=(
+            "Sync OpenWebUI's live database (local disk) to the /data "
+            "snapshot, or run one of the boot/CLI actions supervisord and "
+            "entrypoint.sh use. With no mode flag: run the sync daemon "
+            "loop (supervisord program webuidb-sync)."
+        ),
+    )
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--check-restore-marker", action="store_true",
+        help="report whether an interrupted restore_backup() marker exists, then exit",
+    )
+    mode.add_argument(
+        "--restore", action="store_true",
+        help="run restore_on_boot() once, then exit (entrypoint.sh's boot step)",
+    )
+    mode.add_argument(
+        "--sync-once", action="store_true",
+        help="publish the local database to the /data snapshot once, then exit",
+    )
+    mode.add_argument(
+        "--status", action="store_true",
+        help="print the health of both the local and snapshot copies, then exit",
+    )
+    p.add_argument(
+        "--force", action="store_true",
+        help="with --sync-once, publish even if unchanged since the last sync",
+    )
+    return p
+
 
 if __name__ == "__main__":
-    import sys
-
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
     )
-    if "--check-restore-marker" in sys.argv:
+    _parser = _build_arg_parser()
+    _args = _parser.parse_args()
+    if _args.force and not _args.sync_once:
+        # Not folded into the mutually exclusive group above: --force is not
+        # a MODE, it modifies --sync-once, so it needs its own check rather
+        # than being forbidden from combining with every other mode too.
+        _parser.error("--force is only meaningful together with --sync-once")
+
+    if _args.check_restore_marker:
         # p4-b G3. PLACEMENT-INDEPENDENT: entrypoint.sh runs this BEFORE the
         # `if [ "${WEBUI_DB_LOCAL}" = "true" ]` split, so it also covers
         # WEBUI_DB_LOCAL=false (production, the shipped default) — the
@@ -2372,7 +2564,7 @@ if __name__ == "__main__":
             sys.exit(0)
         print(json.dumps(interrupted, indent=1))
         sys.exit(1)
-    elif "--restore" in sys.argv:
+    elif _args.restore:
         r = restore_on_boot()
         print(r)
         # THE EXIT CODE IS THE ONLY THING THE BOOT SCRIPT CAN SEE, and this
@@ -2392,8 +2584,22 @@ if __name__ == "__main__":
         # defect pre-installed: a future branch returning a new action string
         # would get a silent pass on the one path that loses everything.
         sys.exit(RESTORE_EXIT_CODES.get(r.get("action"), 6))
-    elif "--sync-once" in sys.argv:
-        r = sync_once(force="--force" in sys.argv)
+    elif _args.sync_once:
+        # D4 (findings.md): ALWAYS force, regardless of whether the caller
+        # also passed --force. This is the one-shot CLI action an operator
+        # or a script runs BY HAND expecting it to actually publish - the
+        # DB-MOVE-RUNBOOK's own "There is NO --sync-now" complaint is
+        # exactly this: `--restore` (a backup.py::restore_backup undo, or
+        # any restore that preserves the old file's mtime via copy2 or
+        # tar) can leave LOCAL_DB's mtime at or before the snapshot's, so a
+        # plain `--sync-once` silently hit sync_once's own "unchanged since
+        # last sync" mtime-skip and printed success (exit 0) without
+        # publishing anything. The DAEMON's periodic cycle (sync_loop, via
+        # a bare `sync_once()`) still uses the mtime skip deliberately -
+        # each cycle would otherwise rewrite the whole database onto /data
+        # even when nothing changed - this is only about the explicit,
+        # one-shot CLI action, which has no "next cycle" to catch up on.
+        r = sync_once(force=True)
         print(r)
         # The sibling, fixed at the same time and for the same reason. A
         # refused publish is the guard working, and it still must not report
@@ -2403,7 +2609,7 @@ if __name__ == "__main__":
         # "done". A skip (unchanged, or no local database yet) IS success:
         # nothing needed doing.
         sys.exit(1 if r["error"] else 0)
-    elif "--status" in sys.argv:
+    elif _args.status:
         # --status stays exit 0 even when it reports an unhealthy database,
         # deliberately: it is a report, not a gate, and the WARNING text in
         # entrypoint.sh tells an operator to run it while investigating. A

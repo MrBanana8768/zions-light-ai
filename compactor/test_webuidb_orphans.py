@@ -304,6 +304,71 @@ else:
           "and the database landed at the link's target, whole")
     LOCAL.unlink()
 
+# ---------------------------------------------------------------------------
+print()
+print("[D5] a HOT ROLLBACK JOURNAL ON THE SNAPSHOT ITSELF is rolled back "
+      "LOCALLY - /data is never opened read-write")
+# findings.md D5. restore_on_boot() used to call integrity(SNAPSHOT_DB)
+# DIRECTLY: pragma quick_check opens the file where it sits, and opening a
+# database with a hot rollback journal beside it makes SQLite finish that
+# rollback right there - a WRITE, on /data, the one volume this whole
+# module exists to keep off the live path (measured: 96.5s of a 98.7s cold
+# boot restore was this single quick_check on /data). The fix copies the
+# snapshot AND its sidecars to local staging FIRST, and only ever opens
+# (and rolls back) the LOCAL copy.
+#
+# This is a MATCHING hot journal, not an orphan: hot_journal() below builds
+# it against SNAP's own real content, so replaying it produces the correct,
+# healthy, rolled-back database - not the deliberately-mismatched-donor
+# corruption case in [0] above.
+reset()
+_snap_clean_bytes = hot_journal(SNAP, rows=200)
+# hot_journal()'s own con.rollback() already completed the undo and removed
+# the real journal - SNAP right now IS the correct post-recovery state.
+# Capture it, then re-inject the same journal bytes to recreate "a crash
+# landed before recovery ran", the state a real boot would find.
+_snap_correct_state = SNAP.read_bytes()
+Path(str(SNAP) + "-journal").write_bytes(_snap_clean_bytes)
+_snap_before = SNAP.read_bytes()
+_snap_journal_before = Path(str(SNAP) + "-journal").read_bytes()
+check(not LOCAL.exists(), "fixture: no local database yet (pod-recreate path)")
+
+r = webuidb.restore_on_boot()
+
+check(r["action"] == "restored_from_snapshot", f"the restore completed (got {r['action']!r})")
+check(
+    SNAP.read_bytes() == _snap_before,
+    "SNAPSHOT_DB on /data is BYTE-IDENTICAL to before the restore - it was "
+    "never opened read-write, so its own hot journal was never touched "
+    "there",
+)
+check(
+    Path(str(SNAP) + "-journal").exists()
+    and Path(str(SNAP) + "-journal").read_bytes() == _snap_journal_before,
+    "and its -journal sidecar is STILL THERE on /data, byte-identical too "
+    "- nothing rolled it back in place",
+)
+ok, detail = webuidb.integrity(LOCAL)
+check(ok, f"the LOCAL copy passes quick_check ({detail!r}) - the rollback "
+      f"happened there instead")
+check(not Path(str(LOCAL) + "-journal").exists(),
+      "and LOCAL's own journal is gone - SQLite's normal open-time recovery "
+      "consumed it, on local disk")
+_con = sqlite3.connect(str(LOCAL))
+_rows = _con.execute("select chat from chat order by id").fetchall()
+_con.close()
+check(
+    all(row[0].startswith("x") for row in _rows) and len(_rows) == 200,
+    "and the recovered content is CORRECT - every row rolled back to its "
+    "pre-transaction value, not the in-flight update the crash interrupted",
+)
+check(
+    LOCAL.read_bytes() == _snap_correct_state,
+    "CONTROL: byte-for-byte identical to hot_journal()'s own recovery of "
+    "the same journal against the same starting content - the local "
+    "rollback reached the same answer SQLite's own crash recovery would",
+)
+
 shutil.rmtree(_ROOT, ignore_errors=True)
 if FAILED:
     print(f"\n{len(FAILED)} check(s) FAILED")

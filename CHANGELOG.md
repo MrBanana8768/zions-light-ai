@@ -17,14 +17,24 @@ on Docker Hub.
 open-webui==0.11.4` against `/app/venv`, constrained by
 `docs/v3197-constraints.txt`, and appends the two-line scroll-jump CSS fix
 (see "The scroll-jump CSS fix" below) into OpenWebUI's own `custom.css`,
-still strictly inside `/app/venv`. Nothing else in the base image is
-touched: `/opt/vllm-venv`, `/opt/compactor-venv`, `/opt/compactor`
-(sources), `/opt/whisper-venv`, `/opt/tts-venv`, `entrypoint.sh`,
-`supervisord.conf` and `clean-models.sh` are byte-for-byte identical to
-the base — verified by comparing an aggregate sha256 of every file under
-each of those paths between the base image and the new one; only
-`/app/venv`'s file count differs (51,565 → 51,728 files), unchanged by
-the CSS append (it targets two files that already exist).
+still strictly inside `/app/venv`.
+
+**UPDATED for the database-move redeploy (see "D1-D14" below).** The
+paragraph above described the FIRST cut of this layer, before the
+2026-09-23 `WEBUI_DB_LOCAL` rehearsal's findings were folded in. As of
+this redeploy, `Dockerfile.v3197` ALSO `COPY`s four patched files over the
+base image's own copies: `compactor/webuidb.py`, `compactor/backup.py`,
+`supervisord.conf` and `entrypoint.sh` — the D1/D2/D5/D6/D11/D12/D14 fixes
+below live there. Confirmed via `git log` that all four were byte-for-byte
+unmodified on this branch relative to the commit the base image was built
+from, before this redeploy's edits. Everything else is still untouched:
+`/opt/vllm-venv`, `/opt/compactor-venv`, every OTHER file under
+`/opt/compactor`, `/opt/whisper-venv`, `/opt/tts-venv` and
+`clean-models.sh` remain byte-for-byte identical to the base — verified by
+re-running this release's own aggregate-sha256 diff, with an ALLOWLIST of
+exactly these four files (plus `/app/venv`, already expected to differ)
+as the only permitted differences. See "D1-D14" below for the measured
+before/after numbers.
 
 **Why.** She is "bouncing" while scrolling up in her 3,885-message chat:
 older-message batches loading while she reads shift what she was looking
@@ -206,6 +216,186 @@ and are unrelated to the OpenWebUI version bump (they come from historical
 additionally surfaced a resume-offset arithmetic case it labels
 "should be unreachable" firing on her real data — spun off as a separate,
 unrelated fix.
+
+**D1-D14 — fixes from the 2026-09-23 `WEBUI_DB_LOCAL` rehearsal
+(findings.md, DB-MOVE-RUNBOOK.md), folded into this same redeploy per the
+owner's "fix D1-D3 first, then one redeploy" decision.** Reuses the
+rehearsal's own harness (`/home/drew/zl-ops/bin/dbm-*.sh`,
+`/home/drew/zl-ops/dbmove/tools/`: a dm-delay loop device standing in for
+a slow/stalling MooseFS, plus a writer probe) against a copy of the real
+`/home/drew/pod-exports/2026-09-23/backup-1355Z/webui.db`.
+
+- **D2 (fixed first — hourly backups are live in production now).**
+  `backup.py`'s `_snapshot_sqlite` held the live database's read lock for
+  the full length of a `Connection.backup()` whose destination was
+  already inside the /data staging directory — so a slow /data held the
+  lock open too. New `_snapshot_sqlite_to_data` mirrors
+  `webuidb.sync_once`'s own two-stage split: the backup API is only ever
+  pointed at a LOCAL staging file (`COMPACTOR_BACKUP_LOCAL_STAGING_DIR`,
+  default `/var/lib/openwebui/.backup-staging`), and only a lock-free
+  plain copy crosses onto /data afterward. Checks local free space first
+  and falls back to the old direct-to-/data behaviour if there is no
+  room, rather than failing the backup. Applies to both the `webui.db`
+  and `chroma.sqlite3` snapshots `create_backup` takes, and on both
+  `WEBUI_DB_LOCAL` placements. Four new unit tests in
+  `compactor/test_backup.py` prove: the live lock is released before the
+  /data-bound copy starts (a writer commits successfully mid-copy), the
+  backup API's own destination is verifiably under the local staging
+  dir, the fallback path engages when local disk has no room, and
+  `run_once` produces zero "database is locked" errors on a live writer
+  even with a stalling copy2 injected on the /data side.
+
+  **Re-measured on the real rebuilt image**, full stack, simulated slow
+  MooseFS (5ms read / 20ms write dm-delay + 80MB/s read / 30MB/s write
+  docker throttle), a copy of the real 2026-09-23 13:55Z 505 MB
+  production `webui.db`, and the rehearsal's own writer probe (1 commit
+  per 100ms, `busy_timeout` 10s, `WEBUI_DB_LOCAL=true` placement) running
+  concurrently with `backup.py --once`: **before** (the old
+  `_snapshot_sqlite` called straight onto /data, same probe, same
+  conditions) — 1 `"database is locked"` error plus a 7.66s commit, out
+  of 1,409 commits. **After** (`backup.py --once`, the fix) — **0
+  errors**, worst commit **3.14s**, out of 1,520 commits. The lock error
+  is eliminated outright; the worst-case commit time dropped by ~59%.
+  (The `WEBUI_DB_LOCAL=false` placement's own writer probe — the live
+  database ON /data in that placement — showed 3 commits over 1s
+  including one at 10.6s, matching findings.md's own characterization of
+  that placement's INHERENT slowness, about a third of the local
+  placement's commit throughput: this is the underlying-disk-speed
+  problem the database move itself exists to solve, not something D2's
+  backup-lock fix alone reaches.)
+- **D1. A final sync on SIGTERM, and the stop order.** `webuidb.py`'s
+  `sync_loop` now installs a `SIGTERM` handler (`_ShutdownRequested`, a
+  `BaseException` — deliberately not an `Exception`, so it cannot be
+  swallowed by `sync_once`'s own broad `except Exception`) that runs
+  `sync_once(force=True)` before exiting. `supervisord.conf` gives
+  `[program:webuidb-sync]` `stopwaitsecs=120` (room for a warm 13-23s or
+  cold ~71s publish) and lowers its `priority` from 25 to 19 — BELOW
+  `openwebui`'s 20 — so per supervisord's own documented rule ("lower
+  priorities... shut down last") it now stops AFTER OpenWebUI, not
+  before. New `compactor/test_supervisord_stop_order.py` pins the
+  ordering and the `stopwaitsecs` floor statically; new SIGTERM-handling
+  tests in `test_webuidb_publish_guards.py`'s `[D1]` section drive the
+  real `sync_loop()` through a simulated SIGTERM landing both during the
+  sleep and mid-`sync_once()`, proving the final sync runs either way.
+  **What this does not change:** a `docker stop -t 10` grace period is
+  shorter than a cold publish, so a stop that races one can still lose
+  up to the last `WEBUI_DB_SYNC_INTERVAL_S`; the manual final-sync
+  runbook step remains the only actual guarantee. Documented plainly
+  here rather than papered over.
+
+  **Re-measured on the real rebuilt image**, full stack (real
+  `entrypoint.sh` → `supervisord`), the same simulated slow MooseFS and
+  13:55Z 505 MB production backup as D2 above. `supervisorctl status`
+  confirmed `webuidb-sync` and `openwebui` both `RUNNING` before the
+  test. A message written through OpenWebUI's own HTTP API was absent
+  from the /data snapshot at the moment of the stop (fingerprinted by
+  content hash). `supervisorctl stop all` (unbounded grace):
+  `supervisord.log` shows `openwebui` stopped first, THEN `webuidb-sync`
+  ran for ~19s (`published local -> snapshot (504.9 MB, 52 chats)`,
+  `final sync on SIGTERM: {'synced': True, ...}`) before stopping clean
+  (exit status 0) — the message's content hash on /data afterward was
+  **byte-identical** to the local copy's, and a fresh container booted
+  from that same volume reads it back: **zero loss**. A second message,
+  written fresh, then `docker stop -t 10` (RunPod's real grace period):
+  the container took 22s to actually stop, and a fresh container booted
+  from that volume did **not** have the second message — the final sync
+  needs longer than a 10s grace period gives it for a cold ~505 MB
+  publish, exactly the residual risk documented above.
+- **D5. The boot restore no longer opens the snapshot on /data
+  read-write.** `restore_on_boot()` used to call `integrity(SNAPSHOT_DB)`
+  directly — `pragma quick_check` on /data (measured 96.5s of a 98.7s
+  cold boot restore), and, worse, a hot rollback journal beside the
+  snapshot made that same open FINISH THE ROLLBACK there — a write, on
+  the volume this whole module exists to keep off the live path. Now the
+  snapshot AND its `-journal`/`-wal`/`-shm` sidecars are copied to local
+  staging first (a plain file copy, no sqlite lock), and the integrity
+  check plus any hot-journal rollback run against that LOCAL copy — /data
+  is only ever read, never opened for writing, during boot. New `[D5]`
+  section in `compactor/test_webuidb_orphans.py` builds a genuinely hot,
+  MATCHING rollback journal against the snapshot's own real content
+  (reusing that file's existing `hot_journal()` fixture technique) and
+  proves the snapshot and its journal are byte-identical before and
+  after the restore, while the local copy ends up correctly rolled back.
+- **D6. Unknown arguments no longer start the daemon.** `webuidb.py`'s
+  hand-rolled `"--x" in sys.argv` dispatch is now `argparse`: an
+  unrecognised flag exits 2 (was: silently started `sync_loop()`), and
+  `--help` prints usage and exits 0 (was: also silently started
+  `sync_loop()` — confirmed against the pre-fix file: `--help` logged
+  the sync-loop startup banner and never printed any usage text).
+  `--force` is rejected (exit 2) unless paired with `--sync-once`.
+- **D11/D14. No more false "stale" reading right after boot.**
+  `sync_loop()` now runs one `sync_once()` immediately at loop start
+  instead of waiting a full `SYNC_INTERVAL_S` (up to 300s default) for
+  the first cycle — `/health/full`'s snapshot check used to read `stale:
+  true` with a large `local_lag_s` for that whole window after every
+  boot, a false alarm (the restore's `copy2` leaves the right mtime;
+  nothing is actually stale, only unpublished yet).
+- **D12. A stray `DATABASE_URL` can no longer silently defeat the
+  move.** `entrypoint.sh`'s `WEBUI_DB_LOCAL=true` branch now refuses to
+  boot (banner, exit 1) if `DATABASE_URL` is set to anything other than
+  exactly `sqlite:///${WEBUI_LOCAL_DB}` — closing the exact silent
+  failure DB-MOVE-RUNBOOK.md already warned operators about by hand. New
+  `compactor/test_entrypoint_database_url_gate.py` extracts and runs the
+  real shell block (same technique as
+  `test_config_supervisord_bool.py`) against every case the finding
+  names: unset, matching, stale-/data, non-sqlite, and a
+  non-default `WEBUI_LOCAL_DB`.
+- **D4 (partial).** The CLI action `webuidb.py --sync-once` now ALWAYS
+  publishes with `force=True`, regardless of whether `--force` was also
+  passed — closing the case where a restore that preserves an old mtime
+  (`copy2`/`tar`) made a plain `--sync-once` silently report
+  `'skipped': 'unchanged since last sync'` at exit 0. The daemon's own
+  periodic cycle is deliberately untouched (still a bare `sync_once()`,
+  still skips on an unchanged mtime — rewriting the whole database onto
+  /data every cycle regardless of content is its own cost). **Deferred:**
+  a persisted (mtime, size, inode) or hash-based identity sidecar, so the
+  DAEMON's own automatic cycle also survives an mtime-preserving restore
+  without an operator remembering `--force` — a larger design surface
+  than fit this pass; the manual `--sync-once` (now always forced) and
+  the runbook's documented `WEBUI_DB_ALLOW_OLDER_GENERATION=1 --force`
+  undo recipe remain the operator's tools meanwhile.
+- **D9. Deferred, not fixed.** A local database kept at boot
+  (`kept_local`) that is actually OLDER than the snapshot (by
+  per-conversation `updated_at`) is not currently detected —
+  `restore_on_boot()`'s existing docstring argues deliberately for
+  keeping local unconditionally in that branch (guarded later, at
+  publish time, by `sync_once`'s own generation guard). Adding a
+  boot-time comparison needs to reconcile with that existing rationale
+  rather than override it casually; left for a follow-up rather than
+  rushed into this redeploy.
+- **D3.** Being fixed concurrently by another lane against the main
+  working tree (`scripts/repair-chat-tree.py`,
+  `scripts/fix-stale-unfinished.py`, `scripts/fix-encoded-messages.py`,
+  `scripts/clean-decoration.py`, `uibranch.py`), not this image layer —
+  not duplicated here.
+- **D7, D8, D10, D13.** Left for a future release; not attempted here
+  (each is either a bigger redesign — Postgres/incremental copies for
+  D7, the chroma store's own move for D8 — or a cosmetic log-path fix
+  with no correctness impact, D13).
+
+**Filesystem-diff allowlist, re-confirmed after these fixes.** Re-running
+this release's own aggregate-sha256 diff between the base image and the
+rebuilt `zla-v3197-trial:latest` (63,013 files hashed on each side), over
+every path the original check covered, shows exactly four differences
+and no others: `/opt/compactor/webuidb.py`, `/opt/compactor/backup.py`,
+`/etc/supervisor/conf.d/supervisord.conf`, `/entrypoint.sh` — plus
+`/app/venv`'s file count (51,565 → 51,728, the pre-existing OpenWebUI
+0.11.4 + CSS change, unaffected by this pass, checked separately since
+that whole tree is expected to differ). Nothing else changed; nothing
+was removed or added outside `/app/venv`.
+
+**A mistake this same check caught, worth recording.** An earlier pass
+at the `supervisord.conf` priority/`stopwaitsecs` edit above
+accidentally dropped that section's `command=`/`directory=` lines while
+rewriting the surrounding comment block — supervisord refused to boot
+the WHOLE container on it ("does not specify a command in section
+'program:webuidb-sync'"). Not caught by any unit test at the time; only
+found by actually booting the rebuilt image under the rehearsal harness
+for the D1 measurement below. Fixed, and now guarded permanently: a new
+`[GENERAL]` check in `compactor/test_supervisord_stop_order.py` scans
+EVERY `[program:*]`/`[eventlistener:*]` section in the shipped
+`supervisord.conf`, found generically rather than by a hardcoded list,
+and fails if any of them lacks a non-empty `command=` line.
 
 ## [3.1.9.6] — closing stale backfill records, catching a summary
 hierarchy up from webui.db, and installing sshd into a running pod

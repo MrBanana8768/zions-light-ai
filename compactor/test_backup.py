@@ -26,6 +26,8 @@ import sqlite3
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 _TMP = Path(tempfile.mkdtemp(prefix="zions-backup-test-"))
@@ -38,6 +40,10 @@ _DB = _DATA / "webui.db"
 # (the first restore_backup call), or the module default (/data/forensics)
 # would apply and tests would write outside the sandbox.
 _QUARANTINE = _TMP / "quarantine"
+# D2: a sandboxed local-disk staging dir for _snapshot_sqlite_to_data, set
+# BEFORE import so the module default (/var/lib/openwebui/.backup-staging)
+# never applies and no test writes outside the sandbox.
+_LOCAL_STAGING = _TMP / "local-staging"
 
 os.environ["DATA_DIR"] = str(_DATA)
 os.environ["COMPACTOR_STORAGE_ROOT"] = str(_STORE)
@@ -45,6 +51,7 @@ os.environ["COMPACTOR_BACKUP_DIR"] = str(_BACKUPS)
 os.environ["COMPACTOR_BACKUP_WEBUI_DB"] = str(_DB)
 os.environ["COMPACTOR_BACKUP_RETAIN"] = "3"
 os.environ["WEBUI_DB_QUARANTINE"] = str(_QUARANTINE)
+os.environ["COMPACTOR_BACKUP_LOCAL_STAGING_DIR"] = str(_LOCAL_STAGING)
 
 import backup  # noqa: E402
 
@@ -536,6 +543,163 @@ def test_chroma_is_snapshotted_and_integrity_checked():
     assert_true("chroma.sqlite3" in detail, "detail names chroma.sqlite3")
 
 
+# ---------------------------------------------------------------------------
+# D2: the live DB's read lock must never span the write to /data.
+# ---------------------------------------------------------------------------
+
+def test_snapshot_to_data_releases_the_live_lock_before_touching_data():
+    print("\n[test] D2: the live db's read lock is released before the /data copy, "
+          "not held across it")
+    _seed_sources()
+    _clean_backups()
+    dest = _TMP / "d2-dest.sqlite3"
+    dest.unlink(missing_ok=True)
+
+    # Stand in for a slow/stalling /data: block inside shutil.copy2 (stage 2,
+    # the plain file copy) until the test has had a chance to write to the
+    # LIVE source. If stage 1's backup-API lock were still held at that
+    # point, this commit would raise "database is locked" (busy_timeout is
+    # 0 by default on a plain sqlite3.connect, so it would fail immediately
+    # rather than wait).
+    copy_started = threading.Event()
+    release_copy = threading.Event()
+    orig_copy2 = shutil.copy2
+
+    def _slow_copy2(src, dst, *a, **kw):
+        copy_started.set()
+        release_copy.wait(timeout=10)
+        return orig_copy2(src, dst, *a, **kw)
+
+    backup.shutil.copy2 = _slow_copy2
+    try:
+        t = threading.Thread(
+            target=lambda: backup._snapshot_sqlite_to_data(_DB, dest)
+        )
+        t.start()
+        assert_true(copy_started.wait(timeout=10),
+                    "the /data-bound copy started (stage 2 reached)")
+        # The live database's own lock must already be free here.
+        con = sqlite3.connect(str(_DB), timeout=0)
+        con.execute("insert into chat (body) values ('written mid-copy')")
+        con.commit()
+        con.close()
+        release_copy.set()
+        t.join(timeout=10)
+        assert_true(not t.is_alive(), "the snapshot call finished")
+    finally:
+        backup.shutil.copy2 = orig_copy2
+        release_copy.set()
+
+    assert_true(dest.exists(), "the /data-side destination was written")
+    con = sqlite3.connect(str(dest))
+    n = con.execute("select count(*) from chat").fetchone()[0]
+    con.close()
+    assert_true(n >= 1, "the published snapshot is a real, readable copy")
+
+
+def test_snapshot_to_data_stages_locally_first():
+    print("\n[test] D2: the backup API's destination is a LOCAL file, never /data "
+          "directly")
+    _seed_sources()
+    dest = _TMP / "d2-dest2.sqlite3"
+    dest.unlink(missing_ok=True)
+    seen_dests = []
+    orig_snapshot_sqlite = backup._snapshot_sqlite
+
+    def _spy(src, d):
+        seen_dests.append(d)
+        return orig_snapshot_sqlite(src, d)
+
+    backup._snapshot_sqlite = _spy
+    try:
+        ok = backup._snapshot_sqlite_to_data(_DB, dest)
+    finally:
+        backup._snapshot_sqlite = orig_snapshot_sqlite
+    assert_true(ok, "the snapshot reported success")
+    assert_eq(len(seen_dests), 1, "the backup API ran exactly once")
+    assert_true(
+        _LOCAL_STAGING in seen_dests[0].parents,
+        f"the backup API's own destination ({seen_dests[0]}) is under the "
+        f"LOCAL staging dir, not {dest}",
+    )
+    assert_true(dest.exists(), "the final /data-side copy still landed")
+
+
+def test_snapshot_to_data_falls_back_when_local_disk_is_full():
+    print("\n[test] D2: falls back to the old direct-to-/data path when local "
+          "disk has no room, rather than failing the backup")
+    _seed_sources()
+    dest = _TMP / "d2-dest3.sqlite3"
+    dest.unlink(missing_ok=True)
+    orig_free_mb = backup._free_mb
+    backup._free_mb = lambda p: 0.0  # "no room anywhere"
+    direct_calls = []
+    orig_snapshot_sqlite = backup._snapshot_sqlite
+
+    def _spy(src, d):
+        direct_calls.append(d)
+        return orig_snapshot_sqlite(src, d)
+
+    backup._snapshot_sqlite = _spy
+    try:
+        ok = backup._snapshot_sqlite_to_data(_DB, dest)
+    finally:
+        backup._free_mb = orig_free_mb
+        backup._snapshot_sqlite = orig_snapshot_sqlite
+    assert_true(ok, "still succeeds — a full local disk falls back, it does not fail")
+    assert_eq(direct_calls, [dest],
+              "fell back to the old direct call, straight onto dest")
+    assert_true(dest.exists(), "and the backup still landed on /data")
+
+
+def test_backup_once_survives_a_stalling_data_with_a_live_writer():
+    print("\n[test] D2: backup.run_once (webui.db path) does not fail while a "
+          "writer is committing to the live db, even with a slow /data")
+    _seed_sources()
+    _clean_backups()
+    orig_copy2 = shutil.copy2
+
+    def _stalling_copy2(src, dst, *a, **kw):
+        if str(_BACKUPS) in str(dst):
+            time.sleep(0.4)
+        return orig_copy2(src, dst, *a, **kw)
+
+    backup.shutil.copy2 = _stalling_copy2
+    stop = threading.Event()
+    errors = []
+
+    def _writer():
+        # timeout=10 mirrors OpenWebUI's own DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT
+        # (10s, see _snapshot_sqlite_to_data's docstring) - a real writer waits
+        # out a brief lock rather than failing on it instantly. The assertion
+        # below is about "database is locked" errors that OUTLAST that
+        # tolerance, which is exactly what D2 used to produce.
+        con = sqlite3.connect(str(_DB), timeout=10)
+        i = 0
+        while not stop.is_set():
+            try:
+                con.execute("insert into chat (body) values (?)", (f"row{i}",))
+                con.commit()
+            except sqlite3.OperationalError as e:
+                errors.append(str(e))
+            i += 1
+            time.sleep(0.05)
+        con.close()
+
+    t = threading.Thread(target=_writer)
+    t.start()
+    try:
+        time.sleep(0.1)
+        rep = backup.run_once()
+    finally:
+        stop.set()
+        t.join(timeout=10)
+        backup.shutil.copy2 = orig_copy2
+    assert_true(rep["ok"], "run_once still succeeds with /data stalling")
+    assert_eq(errors, [], "no 'database is locked' errors on the live writer "
+              "while the /data copy stalled (D2)")
+
+
 def test_payload_collapse_is_refused_and_does_not_prune():
     print("\n[test] F2: an archive under 50% of the previous one is not published")
     _seed_sources(n_facts=40, pad=4000)
@@ -758,6 +922,10 @@ def _all():
         test_verify_rejects_census_shortfall,
         test_manifest_records_the_per_conversation_census,
         test_chroma_is_snapshotted_and_integrity_checked,
+        test_snapshot_to_data_releases_the_live_lock_before_touching_data,
+        test_snapshot_to_data_stages_locally_first,
+        test_snapshot_to_data_falls_back_when_local_disk_is_full,
+        test_backup_once_survives_a_stalling_data_with_a_live_writer,
         test_payload_collapse_is_refused_and_does_not_prune,
         test_census_regression_publishes_but_refuses_to_prune,
         test_prune_keeps_everything_inside_the_age_window,

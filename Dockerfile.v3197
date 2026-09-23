@@ -1,20 +1,58 @@
 # v3.1.9.7 — THIN layer on top of the exact production base image.
-# Upgrades ONLY OpenWebUI (0.11.0 -> 0.11.4) inside /app/venv. Nothing else
-# in the base image (vllm-venv, compactor-venv, compactor sources,
-# entrypoint.sh, supervisord.conf, whisper/tts venvs) is touched, except
-# for the two-line scroll-jump CSS fix appended into the pip-installed
-# OpenWebUI package's own custom.css (still strictly inside /app/venv).
+# Upgrades OpenWebUI (0.11.0 -> 0.11.4) inside /app/venv, with the two-line
+# scroll-jump CSS fix appended into the pip-installed OpenWebUI package's
+# own custom.css (still strictly inside /app/venv) — AND, per the
+# 2026-09-23 WEBUI_DB_LOCAL rehearsal (findings.md, DB-MOVE-RUNBOOK.md),
+# four files patched for the D1/D2/D3 fixes the owner approved shipping
+# with this same redeploy: compactor/webuidb.py, compactor/backup.py,
+# supervisord.conf and entrypoint.sh (COPYd below, over the base image's
+# own copies at /opt/compactor/{webuidb,backup}.py,
+# /etc/supervisor/conf.d/supervisord.conf and /entrypoint.sh).
 #
-# Reason: OpenWebUI upstream issue #23990 / PR #28657 — older messages
-# loaded while scrolling up shifted what the reader was looking at
-# ("bouncing"). Fixed per the 0.11.1 release notes. Owner chose 0.11.4
-# (latest at the time of this release) as the thin-layer target rather than
-# the minimal 0.11.1.
+# Nothing else in the base image (vllm-venv, compactor-venv, every OTHER
+# compactor source file, whisper/tts venvs) is touched. The filesystem-diff
+# allowlist proof (docs/v3197-fsdiff-allowlist.txt, or the CHANGELOG entry)
+# names exactly these four files plus /app/venv as the total surface.
+#
+# Reason (OpenWebUI/CSS): OpenWebUI upstream issue #23990 / PR #28657 —
+# older messages loaded while scrolling up shifted what the reader was
+# looking at ("bouncing"). Fixed per the 0.11.1 release notes. Owner chose
+# 0.11.4 (latest at the time of this release) as the thin-layer target
+# rather than the minimal 0.11.1.
+#
+# Reason (D1/D2/D3): see findings.md for the measurements. D2 (backup.py
+# holding the live db's read lock across a slow /data write) ships first
+# because hourly backups are live in production now; D1 (no final sync on
+# stop, wrong stop order) and D3 (operator tools targeting the snapshot
+# after the move) round out the set the owner approved for this redeploy.
+# D5/D6/D11/D12/D14 (boot-restore /data writes, unknown-argument daemon
+# start, false post-boot staleness, a stale DATABASE_URL defeating the
+# move) are also included below as small, directly-provable fixes found by
+# the same rehearsal; D4/D9 are partially addressed (see each file's own
+# comments) with the harder remainder explicitly deferred.
 #
 # Base image is pinned by DIGEST (not tag) so this layer is reproducible
 # against the exact bits production runs today (v3.1.9.4, also tagged
 # v3.1.9.5; v3.1.9.6 is a pending retag of the same digest).
 FROM angreg/zions-light-ai@sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65
+
+# D1/D2/D5/D6/D11/D12/D14 fixes (findings.md). Confirmed byte-identical to
+# the base image's own copies before this patch (git log on this branch,
+# and the pre-fix filesystem diff) — this COPY is the ONLY change to any of
+# these four files' shipped location; nothing else about the base image is
+# touched by it.
+COPY compactor/webuidb.py /opt/compactor/webuidb.py
+COPY compactor/backup.py /opt/compactor/backup.py
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+COPY entrypoint.sh /entrypoint.sh
+# The base Dockerfile's own `COPY entrypoint.sh /entrypoint.sh` is
+# immediately followed by `RUN chmod +x /entrypoint.sh` — COPY alone does
+# not make the base image's already-executable file executable again once
+# this layer overwrites it with a fresh copy from the build context (where
+# it is checked in as mode 644; git does not track the execute bit on this
+# file). Skipping this would build successfully and fail at container
+# start (`exec /entrypoint.sh: permission denied`), silently.
+RUN chmod +x /entrypoint.sh
 
 # Constraints file pins every package whose resolved version actually
 # changed when open-webui was bumped 0.11.0 -> 0.11.4 (see

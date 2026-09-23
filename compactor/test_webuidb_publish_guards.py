@@ -471,6 +471,56 @@ check(
     f"WEBUI_DB_ALLOW_ROW_LOSS=1 webuidb.py --sync-once publishes it once (rc={rc})",
 )
 
+# ===========================================================================
+print()
+print("[D4] `--sync-once` (the CLI action) ALWAYS forces, so a restore that "
+      "preserves an old mtime cannot make it silently do nothing")
+# ===========================================================================
+# findings.md D4. backup.py::restore_backup (and copy2/tar restores generally)
+# preserve the ORIGINAL file's mtime, so a local database restored from an
+# archive can carry a mtime OLDER than (or equal to) the snapshot's, even
+# though its CONTENT is what the operator just deliberately put there.
+# sync_once's periodic mtime-skip (`snap_mtime >= mtime` -> "unchanged since
+# last sync") then answered that as "nothing to do" - and a plain
+# `webuidb.py --sync-once` (no --force) printed exit 0 with `'skipped':
+# 'unchanged since last sync'`, which LOOKS like success to anything that
+# checks the exit code, while publishing nothing.
+wipe()
+owui(SNAP, [("c1", 2000, conversation(4))])   # the snapshot: newer mtime
+owui(LOCAL, [("c1", 2000, conversation(4)), ("c2", 2001, conversation(4))])
+# Restored "an hour ago" - copy2/tar-preserved, older than the snapshot's
+# own mtime, exactly the shape a restore leaves behind.
+os.utime(LOCAL, (time.time() - 3600, time.time() - 3600))
+check(
+    SNAP.stat().st_mtime > LOCAL.stat().st_mtime,
+    "PRECONDITION: the snapshot's mtime is NEWER than local's, despite "
+    "local holding an extra conversation - this is the state a copy2/tar "
+    "restore leaves and the mtime-skip alone cannot tell apart from "
+    "'nothing changed'",
+)
+rc, out = run_cli(["--sync-once"])
+check(
+    rc == 0 and "'synced': True" in out and "'skipped': None" in out,
+    f"webuidb.py --sync-once (no --force flag) still PUBLISHES rather than "
+    f"silently skipping on the stale mtime (rc={rc}, out={out.strip()!r})",
+)
+check(chats(SNAP) == 2, "and the extra conversation actually landed on the snapshot")
+
+print("    CONTROL: the DAEMON's own periodic cycle still uses the ordinary "
+      "mtime skip, unaffected by this fix - only the one-shot CLI action "
+      "changed")
+wipe()
+owui(SNAP, [("c1", 2000, conversation(4))])
+owui(LOCAL, [("c1", 2000, conversation(4))])
+os.utime(LOCAL, (SNAP.stat().st_mtime - 5, SNAP.stat().st_mtime - 5))
+r = webuidb.sync_once()  # bare call, force defaults to False - what sync_loop uses
+check(
+    r["skipped"] == "unchanged since last sync" and r["synced"] is False,
+    f"a bare sync_once() (the daemon's own call, sync_loop never passes "
+    f"force=True on an ordinary cycle) still skips on an unchanged mtime "
+    f"(got {r})",
+)
+
 
 # ===========================================================================
 print()
@@ -998,6 +1048,128 @@ check(
     logged(logging.ERROR, "snapshot publish has failed 3 times"),
     "the failure counter's own shout-at-3 still fires - this fix must not "
     "shadow it",
+)
+
+# ===========================================================================
+print()
+print("[D1] SIGTERM runs a final forced sync before the loop exits")
+# ===========================================================================
+# findings.md D1: webuidb-sync had no SIGTERM handling at all, and a publish
+# (13-23s warm) is longer than RunPod's grace period. `supervisorctl stop`
+# must now capture the last write automatically rather than relying on an
+# operator remembering the manual final-sync step.
+
+_order: list[str] = []
+
+
+def _tracking_sleep(_s):
+    _order.append("slept")
+
+
+def _drive_with_sigterm(results, *, raise_on_call: int):
+    """Like _drive_sync_loop, but instead of exhausting `results` the
+    (1-indexed) call number `raise_on_call` raises webuidb._ShutdownRequested
+    - standing in for a real SIGTERM landing there - and every OTHER call
+    returns the next canned result. Returns the list of sync_once() calls
+    actually observed (including the raising one) and whatever
+    sync_once(force=...) was called with on each one."""
+    it = iter(results)
+    calls: list[dict] = []
+    n = [0]
+
+    def fake_sync_once(force=False):
+        n[0] += 1
+        calls.append({"n": n[0], "force": force})
+        if n[0] == raise_on_call:
+            raise webuidb._ShutdownRequested()
+        return next(it)
+
+    orig_sleep, orig_sync_once = time.sleep, webuidb.sync_once
+    time.sleep = _tracking_sleep
+    webuidb.sync_once = fake_sync_once
+    try:
+        webuidb.sync_loop()
+    finally:
+        time.sleep = orig_sleep
+        webuidb.sync_once = orig_sync_once
+    return calls
+
+
+CAP.records.clear()
+_order.clear()
+calls = _drive_with_sigterm([_SYNCED, _SYNCED], raise_on_call=2)
+check(
+    len(calls) == 3,
+    f"3 sync_once calls total: the immediate first sync, the cycle the "
+    f"simulated SIGTERM landed on, and _final_sync_on_shutdown's own "
+    f"call - and nothing after that (got {len(calls)})",
+)
+check(
+    calls[0] == {"n": 1, "force": False} and calls[1]["n"] == 2
+    and calls[2] == {"n": 3, "force": True},
+    f"call 1 is the D11/D14 immediate first sync (force=False, an ordinary "
+    f"cycle); call 2 is where the simulated SIGTERM landed; call 3 is the "
+    f"final sync, forced (got {calls})",
+)
+check(
+    _order == ["slept"],
+    f"exactly one sleep happened, BEFORE the SIGTERM's own sync_once call - "
+    f"call 1 (the immediate first sync) ran with NO preceding sleep "
+    f"(got {_order})",
+)
+check(
+    logged(logging.INFO, "final sync on SIGTERM"),
+    "a final sync_once(force=True) ran and its result was logged",
+)
+_final_calls = [c for c in CAP.records if "final sync on SIGTERM" in c[1]]
+check(len(_final_calls) == 1, "logged exactly once, not once per SIGTERM path")
+
+print("    CONTROL: a SIGTERM landing INSIDE sync_once (not just during the "
+      "sleep) still reaches the final sync - not swallowed by sync_once's "
+      "own `except Exception`")
+CAP.records.clear()
+_order.clear()
+calls = _drive_with_sigterm([_SYNCED], raise_on_call=1)
+check(
+    len(calls) == 2 and calls[0]["force"] is False and calls[1] == {"n": 2, "force": True},
+    f"the SIGTERM landed on the very first (immediate) sync_once call, "
+    f"before any sleep, and the final sync still ran right after it "
+    f"(got {calls})",
+)
+check(
+    logged(logging.INFO, "final sync on SIGTERM"),
+    "and the final sync still ran - webuidb._ShutdownRequested is a "
+    "BaseException, not an Exception, so it is not one sync_once's own "
+    "internal `except Exception` could have caught and turned into an "
+    "ordinary result",
+)
+
+print("    CONTROL: the final sync always forces, even though every ordinary "
+      "cycle above used force=False")
+CAP.records.clear()
+_forced = []
+_orig_sync_once = webuidb.sync_once
+webuidb.sync_once = lambda force=False: (_forced.append(force), _SYNCED)[1]
+try:
+    webuidb._final_sync_on_shutdown()
+finally:
+    webuidb.sync_once = _orig_sync_once
+check(_forced == [True], f"_final_sync_on_shutdown always calls force=True (got {_forced})")
+
+print("    CONTROL: _final_sync_on_shutdown never raises, even when "
+      "sync_once itself blows up - the process is exiting either way")
+webuidb.sync_once = lambda force=False: (_ for _ in ()).throw(RuntimeError("boom"))
+try:
+    webuidb._final_sync_on_shutdown()
+    _raised = False
+except Exception:
+    _raised = True
+finally:
+    webuidb.sync_once = _orig_sync_once
+check(not _raised, "no exception escaped _final_sync_on_shutdown")
+check(
+    logged(logging.ERROR, "final sync on SIGTERM raised"),
+    "and the failure was logged instead of silently disappearing",
 )
 
 # ---------------------------------------------------------------------------

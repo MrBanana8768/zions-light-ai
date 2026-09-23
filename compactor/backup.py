@@ -155,6 +155,20 @@ STORAGE_ROOT = Path(
 # Where backups land. Default is a sibling dir on the same volume.
 BACKUP_DIR = Path(os.environ.get("COMPACTOR_BACKUP_DIR", "/data/backups"))
 
+# D2 (findings.md, the 2026-09-23 WEBUI_DB_LOCAL rehearsal). Local-disk
+# scratch for _snapshot_sqlite_to_data: the destination `Connection.backup()`
+# itself writes to MUST be on the same fast disk as the live database, never
+# on /data — see that function's docstring for the lock this avoids holding
+# open across a slow or stalling volume. A sibling of the live LOCAL
+# database's own directory under the shipped default, so it is local disk
+# on both WEBUI_DB_LOCAL placements (this is about where backup.py's own
+# scratch copy lands, not about where the live database lives).
+LOCAL_STAGING_DIR = Path(
+    os.environ.get(
+        "COMPACTOR_BACKUP_LOCAL_STAGING_DIR", "/var/lib/openwebui/.backup-staging"
+    )
+)
+
 # How many archives to keep. No longer a cap — since v3.1 F7 this is a
 # *floor* on the number retained, one of several tiers in _keep_set. As a
 # cap it was the mechanism of the loss: RETAIN=7 with a prune at the end of
@@ -333,6 +347,94 @@ def _snapshot_via_rollback_copy(src: Path, dest: Path) -> bool:
         return True
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _snapshot_sqlite_to_data(
+    src: Path, dest: Path, *, local_staging_dir: Path | None = None
+) -> bool:
+    """Like _snapshot_sqlite, but keeps /data out of the backup API's own
+    lock-holding write.
+
+    D2 (findings.md, the 2026-09-23 WEBUI_DB_LOCAL rehearsal). The old call
+    was `_snapshot_sqlite(src, dest)` with `dest` already inside the /data
+    staging directory create_backup builds each cycle. sqlite3's
+    `Connection.backup()` defaults to `pages=-1` — one
+    `sqlite3_backup_step(-1)` that holds a read lock on `src` (the LIVE
+    database) until the LAST destination page is written. With `dest` on
+    MooseFS that lock was held for as long as /data's writes took, and
+    OpenWebUI's own busy timeout (10s) turned a slow cycle into "database is
+    locked" plus multi-second commits on EVERY backup — measured (both
+    WEBUI_DB_LOCAL placements): ~1 lock error plus commits from 5.9 to
+    10.8s. It happens on every scheduled backup, every `--once`, and at
+    boot.
+
+    Mirrors webuidb.sync_once's own two-stage split (see that function's
+    docstring for the same reasoning in more depth): the backup API is only
+    ever pointed at LOCAL disk, where a live lock resolves in about a
+    second regardless of /data's mood; only a lock-free plain file copy —
+    no sqlite3 connection open on either end — crosses onto /data, so a
+    stall there costs time, never the live database's lock.
+
+    Falls back to the OLD direct-to-/data behaviour when local disk does
+    not have room for a second copy of `src` (checked FIRST, deliberately,
+    so a full local disk fails exactly as safely — and as slowly — as
+    backups always have, rather than raising past this guard entirely). A
+    slow backup is still a backup.
+    """
+    local_dir = local_staging_dir or LOCAL_STAGING_DIR
+    needed_mb = 0.0
+    if src.is_file():
+        # 10% headroom over the source size, same margin _require_free_space
+        # uses elsewhere in this file, plus a small fixed floor so a tiny
+        # source database doesn't pass on a filesystem that is otherwise
+        # completely full.
+        needed_mb = (src.stat().st_size / (1024 * 1024)) * 1.1 + 8
+    local_free = _free_mb(local_dir) if needed_mb else float("inf")
+    if needed_mb and local_free < needed_mb:
+        logger.warning(
+            f"only {local_free:.0f} MB free at {local_dir} (need ~"
+            f"{needed_mb:.0f} MB to stage {src} locally first) — falling "
+            f"back to backing it up straight onto {dest.parent}, which "
+            f"holds the live database's read lock for as long as that "
+            f"volume takes (D2, findings.md)"
+        )
+        return _snapshot_sqlite(src, dest)
+
+    try:
+        local_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning(
+            f"could not create local staging dir {local_dir} "
+            f"({type(e).__name__}: {e}) — falling back to backing up "
+            f"{src} straight onto {dest.parent} (D2, findings.md)"
+        )
+        return _snapshot_sqlite(src, dest)
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix="webuidb-local-", suffix=".sqlite3", dir=str(local_dir)
+    )
+    os.close(fd)
+    local_tmp = Path(tmp_name)
+    try:
+        local_tmp.unlink()  # sqlite3.connect creates it fresh; an empty
+        # file left by mkstemp is a harmless but pointless extra open.
+    except OSError:
+        pass
+    try:
+        wrote = _snapshot_sqlite(src, local_tmp)
+        if not wrote:
+            return False
+        # STAGE 2: a plain byte copy, no sqlite3 connection open on either
+        # side — the live lock (held only during the stage above) is
+        # already released by the time this line runs, no matter how long
+        # /data takes to accept the write.
+        shutil.copy2(local_tmp, dest)
+        return True
+    finally:
+        try:
+            local_tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _tree_bytes(p: Path) -> int:
@@ -1116,7 +1218,7 @@ def create_backup(
         # process on the pod, and a gate flipped under it was invisible
         # until restart (A3-9). See live_webui_db.
         live_db = live_webui_db()
-        if _snapshot_sqlite(live_db, db_dest):
+        if _snapshot_sqlite_to_data(live_db, db_dest):
             manifest["sources"]["webui.db"] = {
                 "present": True, "bytes": db_dest.stat().st_size,
             }
@@ -1235,7 +1337,7 @@ def create_backup(
         chroma_present = False
         if chroma_src.is_file():
             chroma_dest.parent.mkdir(parents=True, exist_ok=True)
-            chroma_present = _snapshot_sqlite(chroma_src, chroma_dest)
+            chroma_present = _snapshot_sqlite_to_data(chroma_src, chroma_dest)
         else:
             logger.warning(
                 f"episodic store {chroma_src} not found — this archive carries "
