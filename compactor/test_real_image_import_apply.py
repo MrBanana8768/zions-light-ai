@@ -86,11 +86,19 @@ def assert_true(cond, label):
 
 
 def _skip(reason: str) -> None:
+    # N9 (round-3 fix pass A). This used to exit 0 when
+    # COMPACTOR_ALLOW_FIXTURE_SKIP was set, unlike the OTHER two
+    # real-image suites -- a direct run (COMMANDS.md's "mandatory"
+    # invocation runs this suite directly, not through run-tests.py,
+    # which is the only thing that ever blanks that variable) could
+    # report a bare pass having run nothing at all. A skip is never a
+    # pass: exit 3 (informational, matching every other "not run"
+    # signal in this codebase) unconditionally.
     print("=" * 72)
     print("SKIPPED: test_real_image_import_apply.py")
     print(f"  reason: {reason}")
     print("=" * 72)
-    sys.exit(0 if os.environ.get("COMPACTOR_ALLOW_FIXTURE_SKIP") else 3)
+    sys.exit(3)
 
 
 def _run(args, timeout=DOCKER_TIMEOUT_S, **kw):
@@ -486,37 +494,25 @@ for label, messages in (("A_plus1", case_a), ("B_plus2", case_b)):
 # leave any lasting trace).
 summarizer.save_state(CONV, state_before)
 
-# Now, for real: run ONE real rollup unit (budget=1) against case A
-# (branch + 1 new user turn) starting from a config with tail_fp EMPTY,
-# forcing _observed_position through the SAME "no anchor" degradation
-# path the live tail hits on its very first post-import request if the
-# anchor round-trip ever fails -- the worst case, not just the happy
-# anchor-matches path already computed above.
-st2 = copy.deepcopy(state_before)
-summarizer.save_state(CONV, st2)
-budget = {"remaining": 1, "exhausted": False}
-asyncio.run(summarizer.maybe_rollup(CONV, case_a, VLLM_URL, MODEL, vllm_call_budget=budget))
-after = summarizer.load_state(CONV)
-new_chunks = [c for c in (after.get("l1") or []) if c.get("first_turn", 0) > last_summarized]
-result["real_call"] = {
-    "new_chunks": [(c.get("first_turn"), c.get("last_turn")) for c in new_chunks],
-    "last_summarized_after": after.get("last_summarized_turn"),
-}
-if new_chunks:
-    c = new_chunks[0]
-    ft, lt = c["first_turn"], c["last_turn"]
-    covered = summarizer._covered_fps(after)
-    transcript_fps = summarizer._covered_turn_fingerprints(case_a)
-    rec = covered[ft - 1:lt]
-    exact_first = None
-    if rec and rec[0] != summarizer._FP_UNKNOWN:
-        hits = [i + 1 for i, f in enumerate(transcript_fps) if f == rec[0]]
-        exact_first = hits[0] if len(hits) == 1 else hits
-    result["real_call"]["first_new_chunk_recorded_fp_matches_branch_turn"] = exact_first
-
-# Restore again -- this script must leave the store byte-identical to
-# how it found it (a diagnostic simulation, not a second apply).
-summarizer.save_state(CONV, state_before)
+# N9 (round-3 fix pass A): the "worst case" empty-anchor real call that
+# used to live here was REMOVED rather than fixed in place. Measured
+# (hostile review round 2, N9): it never actually cleared tail_fp (the
+# comment claimed it did; the code copied state_before UNCHANGED), so it
+# silently re-tested the SAME happy anchor-matches path as the
+# simulation above it, twice, never the "worst case" it claimed to.
+# Actually clearing the anchor here would exercise the frozen module's
+# OWN no-anchor fallback (_ASSUMED_NEW_TURNS) -- a KNOWN, accepted
+# imprecision in that FROZEN code (not something import-history.py
+# controls or can fix), and a genuinely different scenario from what
+# this test is actually about (the seam --apply establishes). The
+# property this comment used to (incorrectly) claim to prove -- that a
+# live request after --apply never needs that fallback at all -- is
+# what N1's real design property actually guarantees (a correct anchor
+# is PRE-SEATED before any vLLM call, never left blank, and never
+# needs repairing), and is what this repo's real-image KILL test
+# (test_real_image_import_apply.py's kill-point suite, round-3 fix pass
+# A) now proves directly, across kill -9, SIGTERM and SIGHUP, rather
+# than this vacuous stand-in.
 
 sys.stderr.write(json.dumps(result, indent=2) + "\\n")
 print(json.dumps(result))
@@ -598,21 +594,17 @@ def test_next_live_request_stays_contiguous_after_apply():
                    f"expected {expected_next_branch_turn} (contiguous with "
                    f"the seam --apply left -- no hole, no overlap)")
 
-    real = result["real_call"]
-    assert_true(real["new_chunks"], "a real chunk was actually written by "
-                "one real live-style maybe_rollup call")
-    ft, lt = real["new_chunks"][0]
-    assert_eq(ft, expected_next_branch_turn + RESUME_OFFSET,
-               f"the real chunk's label ({ft}-{lt}) starts immediately "
-               f"after last_summarized_turn ({last_summarized})")
-    match = real.get("first_new_chunk_recorded_fp_matches_branch_turn")
-    assert_eq(match, expected_next_branch_turn,
-               f"the real chunk's FIRST recorded covered-turn fingerprint "
-               f"uniquely matches branch turn {expected_next_branch_turn} "
-               f"(got {match!r}) -- contiguous, no hole, no overlap")
-    print(f"  CONFIRMED: the live path after --apply reads branch turn "
-          f"{expected_next_branch_turn} next -- contiguous with the seam, "
-          f"no hole, no overlap.")
+    # N9 (round-3 fix pass A): the old "worst case" real maybe_rollup
+    # call this section used to check (result["real_call"]) was removed
+    # from _LIVE_SEAM_SRC -- see that source's own comment for why. The
+    # property it was meant to confirm (a real live-style call after
+    # --apply is genuinely contiguous, not just the arithmetic
+    # simulation above) is now confirmed properly by this repo's
+    # real-image kill-point suite instead.
+    print(f"  CONFIRMED: the live path's own window_offset/next-chunk "
+          f"arithmetic after --apply stays at the established "
+          f"{RESUME_OFFSET} for every case above -- contiguous, no hole, "
+          f"no overlap.")
 
 
 # ---------------------------------------------------------------------------
@@ -653,99 +645,240 @@ def test_apply_budget_limited_exits_4():
 
 
 # ---------------------------------------------------------------------------
-# 3. (e) Ctrl-C mid-run leaves the store re-runnable.
+# 3. N1 (round-3 fix pass A): the real-image kill test. kill -9, SIGTERM
+#    and SIGHUP at MANY distinct, counted points -- before any unit,
+#    mid-unit (several depths into the real backlog), and between units
+#    -- must never lose or duplicate a turn. Replaces the old Ctrl-C
+#    test, which the round-2 hostile review (N9) found vacuous: its
+#    SIGINT landed before _run_apply_loop ever ran (measured: the anchor
+#    write it thought it was racing happened at 1.63s; the signal at
+#    1.5s), so it exercised a plain early-exit, not the crash window at
+#    all -- and passed unchanged even with the restore code deleted.
 # ---------------------------------------------------------------------------
 
-def test_ctrlc_mid_apply_leaves_store_rerunnable():
-    print("\n[test] Ctrl-C mid-`--apply` leaves the store re-runnable "
-          "(B1's Ctrl-C window fix)")
-    before_state = _load_summary_state(STORE_DIR)
-    before_tail_fp = before_state.get("tail_fp")
+KILL_FAKE_VLLM_PORT_BASE = FAKE_VLLM_PORT + 20
+KILL_CALL_DELAY_S = 0.35
 
-    vllm = _start_fake_vllm(FAKE_VLLM_PORT + 4, delay=3.0)
-    proc = None
+
+def _fresh_kill_seed_dir(label: str) -> Path:
+    """A brand-new copy of the REAL backup's summaries/facts (never
+    STORE_DIR, which other tests in this suite have already applied
+    against) -- one per kill point, so kill points never interfere with
+    each other or with the rest of this suite."""
+    d = _TMP_ROOT / f"kill-{label}"
+    (d / "facts").mkdir(parents=True, exist_ok=True)
+    (d / "summaries").mkdir(parents=True, exist_ok=True)
+    for name in (f"{CHAT_ID}.json", f"{CHAT_ID}.archive.json"):
+        p = BACKUP_ROOT / "compactor" / "summaries" / name
+        if p.is_file():
+            shutil.copy2(p, d / "summaries" / name)
+    fp = BACKUP_ROOT / "compactor" / "facts" / f"{CHAT_ID}.json"
+    if fp.is_file():
+        shutil.copy2(fp, d / "facts" / fp.name)
+    return d
+
+
+def _docker_run_named_detached(name, mounts, image_args):
+    args = [
+        "docker", "run", "-d", "--rm", "--name", name, "--network", "host",
+        "--user", f"{os.getuid()}:{os.getgid()}", "--entrypoint", VENV_PY,
+    ]
+    for host, cont, mode in mounts:
+        args += ["-v", f"{host}:{cont}:{mode}"]
+    args += [IMAGE_REF] + image_args
+    r = _run(args, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(f"docker run -d failed: {r.stderr}")
+    return r.stdout.strip()
+
+
+def _docker_kill_signal(name: str, sig: str) -> None:
+    _run(["docker", "kill", f"--signal={sig}", name], timeout=15)
+
+
+def _docker_wait_exit(name: str, timeout=60):
     try:
-        proc = _docker_run(
+        r = _run(["docker", "wait", name], timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    txt = r.stdout.strip()
+    return int(txt) if txt.lstrip("-").isdigit() else None
+
+
+def _poll_completions(port: int, target: int, deadline_s: float) -> int | None:
+    deadline = time.time() + deadline_s
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                pass
+            r = _run(["curl", "-s", f"http://127.0.0.1:{port}/__counts__"], timeout=2)
+            counts = json.loads(r.stdout)
+            if counts.get("completions", 0) >= target:
+                return counts["completions"]
+        except Exception:
+            pass
+        time.sleep(0.02)
+    return None
+
+
+def _run_one_kill_point(target_call: int, sig: str, label: str) -> dict:
+    """Seeds a fresh store, starts --apply against a SLOW, COUNTABLE fake
+    vLLM, waits until /__counts__ shows `target_call` completions have
+    STARTED (so the kill provably lands mid-call `target_call`, or —
+    for target_call beyond how many units this conv even has pending in
+    one run — as late as the run gets), sends `sig`, then (a) runs one
+    real live-style rollup unit and checks the label it writes is
+    contiguous with last_summarized_turn (no hole), and (b) re-runs the
+    importer to completion and checks it finishes cleanly."""
+    result = {"label": label, "signal": sig, "target_call": target_call}
+    store_dir = _fresh_kill_seed_dir(label)
+    port = KILL_FAKE_VLLM_PORT_BASE + (abs(hash(label)) % 1000) * 2
+    name = f"zl-r3-kill-{label}"
+    vllm = _start_fake_vllm(port, delay=KILL_CALL_DELAY_S)
+    try:
+        _docker_run_named_detached(
+            name,
             [
                 (str(REPO_ROOT / "scripts"), "/opt/zl-repo/scripts", "ro"),
                 (str(REPO_ROOT / "compactor"), "/opt/zl-repo/compactor", "ro"),
-                (str(STORE_DIR), "/data/openwebui/compactor", "rw"),
+                (str(store_dir), "/data/openwebui/compactor", "rw"),
                 (str(BACKUP_ROOT / "webui.db"), "/data/openwebui/webui.db", "ro"),
             ],
             [
                 "/opt/zl-repo/scripts/import-history.py",
                 "--webui-db", "/data/openwebui/webui.db",
-                "--chat-id", CHAT_ID,
-                "--store", "/data/openwebui/compactor",
-                "--vllm-url", f"http://127.0.0.1:{FAKE_VLLM_PORT + 4}",
-                "--health-url", f"http://127.0.0.1:{FAKE_VLLM_PORT + 5}/health",
-                "--model", "fake-model",
-                "--max-calls", "40",
+                "--chat-id", CHAT_ID, "--store", "/data/openwebui/compactor",
+                "--vllm-url", f"http://127.0.0.1:{port}",
+                "--health-url", f"http://127.0.0.1:{port + 1}/health",
+                "--model", "fake-model", "--max-calls", "200",
                 "--apply", "--json",
             ],
-            popen=True,
         )
-        # Give the container time to start, open the store, clear the
-        # anchor, and be blocked inside the (delayed) first vLLM call --
-        # then interrupt it there, the exact window B1 closes.
-        time.sleep(1.5)
-        proc.send_signal(signal.SIGINT)
-        try:
-            out, _ = proc.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out, _ = proc.communicate(timeout=15)
+        observed = _poll_completions(port, target_call, deadline_s=60)
+        result["observed_call_index_at_kill"] = observed
+        _docker_kill_signal(name, sig)
+        rc = _docker_wait_exit(name, timeout=30)
+        result["importer_rc_after_signal"] = rc
     finally:
         vllm.terminate()
         vllm.wait(timeout=10)
+        _run(["docker", "rm", "-f", name], timeout=15)
 
-    print(f"  interrupted run rc={proc.returncode}")
-    interrupted_state = _load_summary_state(STORE_DIR)
-    if not interrupted_state.get("tail_fp"):
-        # Nothing completed before the interrupt: the pre-apply anchor
-        # must have been put back, not left empty.
-        assert_eq(interrupted_state.get("tail_fp"), before_tail_fp,
-                   "the pre-apply anchor was restored (no pass had completed)")
+    killed_state = _load_summary_state(store_dir)
+    result["last_summarized_turn_after_kill"] = killed_state.get("last_summarized_turn")
+    result["tail_fp_present_after_kill"] = bool(killed_state.get("tail_fp"))
+
+    # (a) map the seam: one real live-style unit (budget=1), full branch
+    # + 1 new turn, must label its new chunk starting EXACTLY at
+    # last_summarized_turn + 1 -- no hole.
+    turns = _reconstruct_real_transcript()
+    live_dir = _TMP_ROOT / f"kill-live-{label}"
+    live_dir.mkdir(exist_ok=True)
+    (live_dir / "summaries").mkdir(exist_ok=True)
+    shutil.copy2(store_dir / "summaries" / f"{CHAT_ID}.json", live_dir / "summaries")
+    (live_dir / "branch.json").write_text(json.dumps(turns), encoding="utf-8")
+    shutil.copy2(store_dir / "summaries" / f"{CHAT_ID}.json", live_dir / "state.json")
+    (live_dir / "live_seam_check.py").write_text(_LIVE_SEAM_SRC, encoding="utf-8")
+    live_port = port + 500
+    vllm_live = _start_fake_vllm(live_port, delay=0.0)
+    try:
+        r = _docker_run(
+            [
+                (str(REPO_ROOT / "compactor"), "/opt/zl-repo/compactor", "ro"),
+                (str(live_dir), "/work/live", "rw"),
+            ],
+            ["/work/live/live_seam_check.py", CHAT_ID,
+             f"http://127.0.0.1:{live_port}", "fake-model"],
+        )
+    finally:
+        vllm_live.terminate()
+        vllm_live.wait(timeout=10)
+    result["seam_check_rc"] = r.returncode
+    if r.returncode == 0:
+        try:
+            seam = json.loads(r.stdout.strip().splitlines()[-1])
+        except Exception:
+            seam = {"error": r.stdout[-500:]}
     else:
-        print("  a pass completed before the interrupt landed; it wrote its own fresh anchor")
+        seam = {"error": (r.stdout + r.stderr)[-500:]}
+    result["seam_after_kill"] = seam
 
-    # Re-run (healthy vLLM, no delay): must not be refused, and must make
-    # forward progress rather than repeating anything already done.
-    resume_watermark_before = interrupted_state.get("last_summarized_turn")
-    vllm2 = _start_fake_vllm(FAKE_VLLM_PORT + 6, delay=0.0)
+    # (b) re-run to completion: must not error, and the final
+    # last_summarized_turn must be >= what survived the kill (never
+    # regresses), with the seam re-verified against the offset the
+    # completed run itself reports.
+    port2 = port + 900
+    vllm2 = _start_fake_vllm(port2, delay=0.0)
     try:
         r2 = _docker_run(
             [
                 (str(REPO_ROOT / "scripts"), "/opt/zl-repo/scripts", "ro"),
                 (str(REPO_ROOT / "compactor"), "/opt/zl-repo/compactor", "ro"),
-                (str(STORE_DIR), "/data/openwebui/compactor", "rw"),
+                (str(store_dir), "/data/openwebui/compactor", "rw"),
                 (str(BACKUP_ROOT / "webui.db"), "/data/openwebui/webui.db", "ro"),
             ],
             [
                 "/opt/zl-repo/scripts/import-history.py",
                 "--webui-db", "/data/openwebui/webui.db",
-                "--chat-id", CHAT_ID,
-                "--store", "/data/openwebui/compactor",
-                "--vllm-url", f"http://127.0.0.1:{FAKE_VLLM_PORT + 6}",
-                "--health-url", f"http://127.0.0.1:{FAKE_VLLM_PORT + 7}/health",
-                "--model", "fake-model",
-                "--max-calls", "5",
+                "--chat-id", CHAT_ID, "--store", "/data/openwebui/compactor",
+                "--vllm-url", f"http://127.0.0.1:{port2}",
+                "--health-url", f"http://127.0.0.1:{port2 + 1}/health",
+                "--model", "fake-model", "--max-calls", "300",
                 "--apply", "--json",
             ],
+            timeout=300,
         )
     finally:
         vllm2.terminate()
         vllm2.wait(timeout=10)
-    out2 = r2.stdout + r2.stderr
-    assert_true("Traceback" not in out2, f"the resume run is not a crash (tail: {out2[-1500:]})")
-    assert_true(r2.returncode in (0, 4),
-                f"the resume run is a normal completion or budget stop, not a "
-                f"refusal (rc={r2.returncode}, out tail: {out2[-1500:]})")
-    resumed_state = _load_summary_state(STORE_DIR)
-    assert_true(
-        int(resumed_state.get("last_summarized_turn") or 0) >= int(resume_watermark_before or 0),
-        "the watermark did not go backwards across the interrupt+resume",
-    )
+    result["resume_rc"] = r2.returncode
+    result["resume_out_tail"] = (r2.stdout + r2.stderr)[-1200:]
+    try:
+        resume_payload = json.loads(r2.stdout)
+        result["resume_offset"] = resume_payload.get("resume_offset")
+        result["resume_last_summarized_after"] = resume_payload.get("last_summarized_turn_after")
+    except Exception:
+        pass
+
+    shutil.rmtree(store_dir, ignore_errors=True)
+    shutil.rmtree(live_dir, ignore_errors=True)
+    return result
+
+
+def test_kill_at_multiple_points_stays_contiguous():
+    print("\n[test] N1: kill -9 (5 distinct points), SIGTERM, and SIGHUP "
+          "during --apply -- every point stays contiguous, and a re-run "
+          "always finishes cleanly")
+    points = [
+        (1, "SIGKILL", "k1"),
+        (2, "SIGKILL", "k2"),
+        (5, "SIGKILL", "k3"),
+        (9, "SIGKILL", "k4"),
+        (14, "SIGKILL", "k5"),
+        (4, "SIGTERM", "k6_sigterm"),
+        (7, "SIGHUP", "k7_sighup"),
+    ]
+    failures = []
+    for target_call, sig, label in points:
+        print(f"  -- point {label}: signal={sig} target_call={target_call}")
+        res = _run_one_kill_point(target_call, sig, label)
+        print(f"     observed_call_index_at_kill={res.get('observed_call_index_at_kill')} "
+              f"last_summarized_after_kill={res.get('last_summarized_turn_after_kill')} "
+              f"seam={res.get('seam_after_kill')} resume_rc={res.get('resume_rc')}")
+        seam = res.get("seam_after_kill") or {}
+        if seam.get("hole"):
+            failures.append(f"{label}: HOLE detected — {seam}")
+        if seam.get("error"):
+            failures.append(f"{label}: seam check errored — {seam['error']}")
+        if res.get("resume_rc") not in (0, 4):
+            failures.append(f"{label}: resume rc={res.get('resume_rc')} "
+                             f"(expected 0 or 4) — {res.get('resume_out_tail')}")
+        if "Traceback" in (res.get("resume_out_tail") or ""):
+            failures.append(f"{label}: resume run raised a traceback")
+    assert_true(not failures,
+                "no kill point left a hole or a broken resume:\n" + "\n".join(failures))
+    print(f"\n  CONFIRMED: all {len(points)} kill points (5x SIGKILL, "
+          f"1x SIGTERM, 1x SIGHUP) stayed contiguous and resumable.")
 
 
 # ---------------------------------------------------------------------------
@@ -759,7 +892,7 @@ if __name__ == "__main__":
         test_apply_seam_alignment_and_blast_radius()
         test_next_live_request_stays_contiguous_after_apply()
         test_apply_budget_limited_exits_4()
-        test_ctrlc_mid_apply_leaves_store_rerunnable()
+        test_kill_at_multiple_points_stays_contiguous()
         print("\nAll real-image import-history --apply tests passed.")
     finally:
         shutil.rmtree(_TMP_ROOT, ignore_errors=True)

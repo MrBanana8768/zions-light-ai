@@ -436,20 +436,78 @@ def test_max_calls_budget_stops_the_loop_with_documented_overshoot():
                "the one unit that started was allowed to finish")
 
 
-def test_ctrlc_before_any_pass_completes_restores_the_original_anchor():
-    print("\n[test] B1 Ctrl-C window: an interrupt before ANY pass "
-          "completes restores the pre-apply anchor, not an empty one")
+def test_preseat_writes_the_windows_own_anchor_not_the_stale_original():
+    print("\n[test] N1 round-3: the anchor is PRE-SEATED from this run's "
+          "own window before any unit runs, replacing the OLD "
+          "stale-original one -- never cleared to empty")
     _wipe_storage()
-    conv_id = "ctrlc-conv"
-    original_anchor = ["aaaa1111aaaa1111", "bbbb2222bbbb2222",
-                        "cccc3333cccc3333", "dddd4444dddd4444"]
+    conv_id = "preseat-conv"
+    stale_original_anchor = ["aaaa1111aaaa1111", "bbbb2222bbbb2222",
+                              "cccc3333cccc3333", "dddd4444dddd4444"]
     summarizer.save_state(conv_id, {
         "l1": [], "l2": [], "l3": None,
         "last_summarized_turn": 0, "turns_seen": 20,
-        "tail_fp": original_anchor, "head_fp": "somehead", "window_turns": 20,
+        "tail_fp": stale_original_anchor, "head_fp": "stalehead", "window_turns": 20,
     })
+    window = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(10)
+    ]
+    expected_tail_fp, expected_head_fp, expected_n = _script._compute_pre_seat_anchor(
+        window, summarizer
+    )
 
-    async def _raises_keyboard_interrupt(conv_id, messages, vllm_url, model):
+    async def _never_runs(conv_id, messages, vllm_url, model, *, vllm_call_budget=None):
+        raise AssertionError("should not be called before the pre-seat write is checked")
+
+    # Interrupt-flag already set BEFORE the loop's first iteration: the
+    # loop must still perform the pre-seat write (it happens before the
+    # loop starts at all) and then stop immediately, never calling
+    # maybe_rollup.
+    result = asyncio.run(
+        _script._run_apply_loop(
+            _StubModule(_never_runs), memory, conv_id, window, VLLM_URL, MODEL, 10,
+            interrupt_flag={"signal": "SIGTERM"},
+        )
+    )
+    assert_eq(result["rollup_calls"], 0, "no unit ran")
+    assert_eq(result["interrupted_signal"], "SIGTERM", "the signal is reported")
+
+    seated = summarizer.load_state(conv_id)
+    assert_eq(seated.get("tail_fp"), expected_tail_fp,
+               "the anchor is THIS window's own tail, not the stale "
+               "original and not empty")
+    assert_eq(seated.get("head_fp"), expected_head_fp, "head_fp pre-seated too")
+    assert_eq(seated.get("window_turns"), expected_n, "window_turns pre-seated too")
+    assert_true(seated.get("tail_fp") != stale_original_anchor,
+                "the stale original anchor was overwritten, not preserved")
+    assert_true(seated.get("tail_fp") != [],
+                "the anchor was never left blank at any point")
+
+
+def test_a_raised_exception_before_any_unit_leaves_the_preseated_anchor_intact():
+    print("\n[test] N1 round-3: if something still raises before any unit "
+          "completes, the ALREADY-WRITTEN pre-seated anchor (not a blank "
+          "one, and not the old stale one) is what is left on disk")
+    _wipe_storage()
+    conv_id = "raise-conv"
+    stale_original_anchor = ["aaaa1111aaaa1111", "bbbb2222bbbb2222",
+                              "cccc3333cccc3333", "dddd4444dddd4444"]
+    summarizer.save_state(conv_id, {
+        "l1": [], "l2": [], "l3": None,
+        "last_summarized_turn": 0, "turns_seen": 20,
+        "tail_fp": stale_original_anchor, "head_fp": "stalehead", "window_turns": 20,
+    })
+    window = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(10)
+    ]
+    expected_tail_fp, _expected_head, _expected_n = _script._compute_pre_seat_anchor(
+        window, summarizer
+    )
+
+    async def _raises_keyboard_interrupt(conv_id, messages, vllm_url, model, *,
+                                          vllm_call_budget=None):
         raise KeyboardInterrupt()
 
     caught = False
@@ -457,29 +515,41 @@ def test_ctrlc_before_any_pass_completes_restores_the_original_anchor():
         asyncio.run(
             _script._run_apply_loop(
                 _StubModule(_raises_keyboard_interrupt), memory,
-                conv_id, [], VLLM_URL, MODEL, 10,
+                conv_id, window, VLLM_URL, MODEL, 10,
             )
         )
     except KeyboardInterrupt:
         caught = True
-    assert_true(caught, "KeyboardInterrupt propagates out of _run_apply_loop, "
-                "not swallowed as an ordinary rollup failure")
+    assert_true(caught, "a BaseException not caught by the per-unit loop's "
+                "own `except Exception` still propagates -- there is no "
+                "restore logic left to swallow it (N1 round-3: the "
+                "pre-seated anchor needs no restoring, it was already "
+                "correct when it was written)")
 
-    restored = summarizer.load_state(conv_id)
-    assert_eq(restored.get("tail_fp"), original_anchor,
-               "the pre-apply anchor was put back -- not left empty, which "
-               "would close the documented re-run-to-continue path")
-    assert_eq(restored.get("head_fp"), "somehead", "head_fp restored too")
-    assert_eq(restored.get("window_turns"), 20, "window_turns restored too")
+    left_on_disk = summarizer.load_state(conv_id)
+    assert_eq(left_on_disk.get("tail_fp"), expected_tail_fp,
+               "the pre-seated anchor (written BEFORE the loop, "
+               "synchronously, before any await that a signal/exception "
+               "could land inside) is exactly what is left -- correct, "
+               "not a placeholder needing repair")
 
 
 class _StubModule:
     """Wraps a fake maybe_rollup so _run_apply_loop's
     `summarizer.maybe_rollup(...)` call reaches it, while every other
-    attribute (load_state, save_state, vllm_call_budget_ctx, conv_lock use
-    via `memory`) still goes to the real summarizer module — matching how
-    the real drain only ever swaps out the rollup call itself in
-    test_admin_compact.py's own [5c]."""
+    attribute (load_state, save_state, _turn_fingerprints, _ANCHOR_TURNS,
+    _FINGERPRINT_TAIL_TURNS, conv_lock use via `memory`) still goes to
+    the real summarizer module — matching how the real drain only ever
+    swaps out the rollup call itself in test_admin_compact.py's own [5c].
+
+    Round-3 fix pass A: `_run_apply_loop` now calls `maybe_rollup` with
+    an explicit `vllm_call_budget={"remaining": 1, ...}` on every call
+    (one unit per call, N1) instead of relying on an ambient contextvar
+    set once for the whole loop -- this mirrors the REAL `maybe_rollup`
+    wrapper's own handling of that keyword (set the contextvar, call the
+    body, reset it), so a fake that reads the ambient
+    `summarizer._vllm_call_budget.get()` (as several fakes below do)
+    keeps working unchanged."""
 
     def __init__(self, fake_maybe_rollup):
         self._fake = fake_maybe_rollup
@@ -487,8 +557,16 @@ class _StubModule:
     def __getattr__(self, name):
         return getattr(summarizer, name)
 
-    async def maybe_rollup(self, conv_id, messages, vllm_url, model):
-        return await self._fake(conv_id, messages, vllm_url, model)
+    async def maybe_rollup(self, conv_id, messages, vllm_url, model, *,
+                            vllm_call_budget=None):
+        token = None
+        if vllm_call_budget is not None:
+            token = summarizer._vllm_call_budget.set(vllm_call_budget)
+        try:
+            return await self._fake(conv_id, messages, vllm_url, model)
+        finally:
+            if token is not None:
+                summarizer._vllm_call_budget.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -578,8 +656,10 @@ def test_interrupted_apply_leaves_valid_state_and_resumes():
 # 7. Refusal paths.
 # ---------------------------------------------------------------------------
 
-def test_refuses_apply_while_compactor_is_live_unless_forced():
-    print("\n[test] --apply refuses while the compactor answers /health, unless --force")
+def test_refuses_apply_while_compactor_is_live_even_with_force():
+    print("\n[test] N7 round-3: --apply refuses while the compactor "
+          "answers /health, and -- unlike before -- --force can no "
+          "longer override a DETECTED live compactor at all")
     _wipe_storage()
     db = _new_db_path()
     messages, current_id = _linear_history(24)
@@ -598,12 +678,20 @@ def test_refuses_apply_while_compactor_is_live_unless_forced():
         assert_true("REFUSING" in out, "the refusal names itself")
         assert_eq(_snapshot(), before, "nothing was written on the refusal")
 
+        # N7 (round-3 fix pass A): --force used to override this exact
+        # refusal, which is precisely what let a live rollup race the
+        # importer's drain in the hostile review's t_conc.sh (the live
+        # copy won on disk, and the importer still printed "apply
+        # complete", exit 0). --force no longer has any effect here.
         rc2, out2 = run_script([
             "--webui-db", str(db), "--chat-id", "live-conv", "--store", _TMP_ROOT,
             "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--force",
         ])
-        assert_eq(rc2, 0, "--force overrides the live-compactor refusal")
-        assert_true("WARNING" in out2, "the override is a loud warning, not silent")
+        assert_eq(rc2, 1, "--force does NOT override a DETECTED live compactor")
+        assert_true("REFUSING" in out2, "still refuses, loudly")
+        assert_true("cannot override" in out2 or "N7" in out2,
+                    "the refusal explains that --force does not apply here")
+        assert_eq(_snapshot(), before, "still nothing written, even with --force")
     finally:
         _script._compactor_is_alive = real_alive
 
@@ -924,7 +1012,13 @@ def test_prefix_matches_store_none_when_store_has_no_anchor_yet():
 
 
 def test_apply_history_shorter_than_recorded_position_but_content_matches_is_not_refused():
-    print("\n[test] end to end: a shorter-but-content-matching reconstruction is NOT refused")
+    print("\n[test] end to end: a shorter-but-content-matching reconstruction "
+          "is NOT refused -- and (N6 follow-up, round-3 fix pass A) --apply "
+          "actually succeeds on it too: the trivial offset-0 case falls "
+          "back to the WHOLE (untrimmed) reconstruction plus the frozen "
+          "module's own dynamic bounded-window offset, rather than "
+          "refusing 'double coverage' the way trimming to "
+          "recorded_position would")
     _wipe_storage()
     conv_id = "edited-history-conv"
     long_ago = _fp_turns(50, prefix=conv_id)
@@ -958,6 +1052,21 @@ def test_apply_history_shorter_than_recorded_position_but_content_matches_is_not
     assert_eq(payload["recorded_position_before"], 50, "recorded_position really is above turns_found")
     assert_true(payload["turns_found"] < payload["recorded_position_before"],
                 "confirms this is exactly the shape the old length-only guard refused")
+    assert_eq(payload["safe_to_apply"], True,
+               "N6: honestly computed (not hard-coded) as True -- a real "
+               "window IS resolvable here")
+
+    rc2, out2 = run_script([
+        "--webui-db", str(db), "--chat-id", conv_id, "--store", _TMP_ROOT,
+        "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json",
+    ])
+    assert_eq(rc2, 0, f"--apply actually succeeds on this ordinary "
+              f"real-backlog shape, not just the dry run (out={out2!r})")
+    payload2 = json.loads(out2)
+    assert_eq(payload2["resume_offset"], 26,
+               "the dynamic bounded-window offset (recorded_position 50 - "
+               "current_turns 24) is what actually governs the write, not "
+               "the trivial 0 _resolve_resume_offset started from")
 
 
 def test_apply_history_from_a_different_conversation_is_still_refused():
@@ -1682,6 +1791,920 @@ def test_dry_run_due_estimate_uses_effective_position_not_raw_branch_length():
 
 
 # ---------------------------------------------------------------------------
+# 20. N4 (round-3 fix pass A): effective_position = max(recorded, current)
+#     is wrong once the verified offset is positive AND the branch is
+#     LONGER than recorded_position (unseen turns > offset). Both the
+#     dramatic repro and the routine (offset+1, one unseen exchange)
+#     shape must resolve correctly, never burn the drain then refuse.
+# ---------------------------------------------------------------------------
+
+def _build_piecewise_scenario_with_extra_unseen_turns(n_delete_at, extra_n,
+                                                        conv_id="n4-conv",
+                                                        n_original=100,
+                                                        chunk2_last_turn=40):
+    """Like `_build_piecewise_scenario` (a settled +`len(n_delete_at)`
+    offset region, TWO L1 chunks -- chunk1 covering the deletion point
+    itself, chunk2 covering ONLY positions entirely AFTER it, exactly
+    the shape that lets `_chunk_span_ending_at` anchor on chunk2's own
+    (short) span rather than needing an impossible exact match across
+    the deletion -- see `_build_piecewise_scenario`'s own docstring for
+    why this two-chunk shape matters), but with `extra_n` further turns
+    appended to the END of the branch that `turns_seen` (recorded_
+    position) does NOT yet account for -- the exact shape N4 is about:
+    the export has MORE turns than the store has observed. Returns
+    (conv_id, state, turns, offset)."""
+    orig = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(n_original)
+    ]
+    branch = [t for i, t in enumerate(orig) if i not in n_delete_at]
+    extra = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"extra turn {i}"}
+        for i in range(extra_n)
+    ]
+    turns = branch + extra
+    offset = len(n_delete_at)
+    chunk1_last_turn = max(n_delete_at) + 2  # 1-indexed, past every deletion
+    covered_fps = "".join(
+        summarizer._covered_turn_fingerprints(orig[:chunk2_last_turn])
+    )
+    state = {
+        "conv_id": conv_id,
+        "l1": [
+            {"text": "chunk1", "first_turn": 1, "last_turn": chunk1_last_turn},
+            {"text": "chunk2", "first_turn": chunk1_last_turn + 1, "last_turn": chunk2_last_turn},
+        ],
+        "l2": [], "l3": None,
+        "last_summarized_turn": chunk2_last_turn,
+        "turns_seen": len(branch),  # R -- does NOT include `extra`
+        "covered_fps": covered_fps,
+        "tail_fp": [], "head_fp": "", "window_turns": 0,
+    }
+    return conv_id, state, turns, offset
+
+
+def test_n4_dramatic_repro_unseen_turns_far_exceed_the_offset():
+    print("\n[test] N4: the reviewer's +30-turn repro -- branch longer "
+          "than recorded_position by far more than the verified offset "
+          "-- resolves feasibly instead of burning the drain then "
+          "refusing as unreachable")
+    _wipe_storage()
+    conv_id, state, turns, offset = _build_piecewise_scenario_with_extra_unseen_turns(
+        {10, 11}, extra_n=30, conv_id="n4-dramatic-conv",
+    )
+    recorded_position = summarizer.recorded_position(state)
+    current_turns = len(turns)
+    assert_eq(offset, 2, "sanity: the settled offset is +2")
+    assert_true(current_turns - recorded_position > offset,
+                f"sanity: unseen turns ({current_turns - recorded_position}) "
+                f"exceed the offset ({offset}) -- N4's trigger condition")
+
+    feas = _script._resolve_apply_feasibility(
+        state, turns, summarizer, current_turns, recorded_position,
+        summarizer.L1_CHUNK_SIZE,
+    )
+    assert_eq(feas.resume_offset, offset, "the offset itself still resolves")
+    assert_eq(feas.effective_position, recorded_position,
+               f"N4: effective_position must be recorded_position "
+               f"({recorded_position}) alone, NOT "
+               f"max(recorded_position, current_turns) "
+               f"({max(recorded_position, current_turns)}) -- the OLD "
+               f"formula (got {feas.effective_position})")
+    assert_true(feas.feasible, f"a feasible window IS resolvable once "
+                f"effective_position is corrected (refusal={feas.refusal!r})")
+    assert_eq(len(feas.window), recorded_position - offset,
+               "the window's length is recorded_position - offset, not "
+               "current_turns - offset")
+
+    # RED: reproduce the OLD (buggy) formula directly and show it
+    # produces a DIFFERENT (wrong) window length -- proving this test
+    # would have failed against the pre-fix code, not just describing it.
+    old_effective_position = max(recorded_position, current_turns)
+    old_window = _script._apply_resume_offset(turns, offset, old_effective_position)
+    assert_true(
+        old_window is not None and len(old_window) != len(feas.window),
+        f"RED check: the old max(recorded,current) formula gives a "
+        f"DIFFERENT window length ({len(old_window) if old_window else None}) "
+        f"than the corrected one ({len(feas.window)}) -- confirming N4 is "
+        f"a real behavioural difference, not a no-op"
+    )
+
+
+def test_n4_routine_case_offset_plus_one_with_one_unseen_exchange():
+    print("\n[test] N4: offset +1 with exactly one unseen exchange (2 "
+          "turns) -- unseen (2) > offset (1), the ROUTINE shape for a "
+          "conversation with live traffic just ahead of the store -- "
+          "also resolves correctly, not just the dramatic +30 repro")
+    _wipe_storage()
+    conv_id, state, turns, offset = _build_piecewise_scenario_with_extra_unseen_turns(
+        {4}, extra_n=2, conv_id="n4-routine-conv", n_original=60, chunk2_last_turn=20,
+    )
+    recorded_position = summarizer.recorded_position(state)
+    current_turns = len(turns)
+    assert_eq(offset, 1, "sanity: the settled offset is +1")
+    assert_true(current_turns - recorded_position > offset,
+                "sanity: 2 unseen turns exceed the +1 offset")
+
+    feas = _script._resolve_apply_feasibility(
+        state, turns, summarizer, current_turns, recorded_position,
+        summarizer.L1_CHUNK_SIZE,
+    )
+    assert_eq(feas.resume_offset, offset, "the +1 offset resolves")
+    assert_eq(feas.effective_position, recorded_position,
+               "the routine case is governed by the same N4 rule as the "
+               "dramatic one")
+    assert_true(feas.feasible, f"the routine case is feasible "
+                f"(refusal={feas.refusal!r})")
+
+
+def test_n4_estimate_due_is_offset_aware_too():
+    print("\n[test] N4: the dry-run due estimate uses the CORRECTED "
+          "effective_position, so it does not over-count phantom "
+          "backlog beyond what the store has actually confirmed")
+    _wipe_storage()
+    conv_id, state, turns, offset = _build_piecewise_scenario_with_extra_unseen_turns(
+        {10, 11}, extra_n=30, conv_id="n4-estimate-conv",
+    )
+    recorded_position = summarizer.recorded_position(state)
+    current_turns = len(turns)
+    feas = _script._resolve_apply_feasibility(
+        state, turns, summarizer, current_turns, recorded_position,
+        summarizer.L1_CHUNK_SIZE,
+    )
+    l1_due, _l2_due, _l3_due = _script.estimate_due(
+        state, feas.effective_position,
+        summarizer.L1_CHUNK_SIZE, summarizer.L2_CHUNK_SIZE, summarizer.L3_CHUNK_SIZE,
+    )
+    old_l1_due, _, _ = _script.estimate_due(
+        state, max(recorded_position, current_turns),
+        summarizer.L1_CHUNK_SIZE, summarizer.L2_CHUNK_SIZE, summarizer.L3_CHUNK_SIZE,
+    )
+    assert_true(l1_due < old_l1_due,
+                f"the corrected estimate ({l1_due}) is smaller than the "
+                f"old over-counted one ({old_l1_due}) -- the old formula "
+                f"counted the 30 unseen-but-unconfirmed turns as backlog "
+                f"the store has not actually confirmed under this offset")
+
+
+def test_n4_followup_large_owning_chapter_span_falls_back_to_l1_granularity():
+    print("\n[test] N4 follow-up (found by this round's real-image kill "
+          "test): once L1 has folded away and last_summarized_turn is "
+          "owned by a large L2 chapter (or the L3 refresh), the offset "
+          "search must NOT demand an exact match across that whole "
+          "span -- a single edited/regenerated turn anywhere inside it "
+          "(ordinary, and expected) would fail the entire span with "
+          "nothing smaller ever tried")
+    _wipe_storage()
+    conv_id = "n4-largespan-conv"
+    n = 260
+    orig = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(n)
+    ]
+    branch = list(orig)
+    # An edit/regeneration deep inside the chapter's own 240-turn span
+    # (turn 131, 1-indexed) -- the store's covered_fps record (below)
+    # still reflects the ORIGINAL text, exactly what a real edit after
+    # summarization leaves behind (see _prefix_matches_store's own
+    # docstring, and the real backup's own "102 holes" of this shape).
+    branch[130] = {"role": branch[130]["role"], "content": "EDITED turn 130"}
+    covered_fps = "".join(summarizer._covered_turn_fingerprints(orig[:240]))
+    state = {
+        "conv_id": conv_id,
+        "l1": [],
+        "l2": [{"text": "chapter", "first_turn": 1, "last_turn": 240}],
+        "l3": None,
+        "last_summarized_turn": 240,
+        "turns_seen": 240,
+        "covered_fps": covered_fps,
+        "tail_fp": [], "head_fp": "", "window_turns": 0,
+    }
+    offset, detail = _script._resolve_resume_offset(
+        state, branch, summarizer, summarizer.L1_CHUNK_SIZE
+    )
+    assert_eq(offset, 0,
+               f"resolves via the ordinary l1_chunk_size granularity "
+               f"despite the owning L2 chapter's own 240-turn span "
+               f"having one edited turn inside it (got offset={offset!r}, "
+               f"detail={detail!r}) -- the REAL bug this pins closed "
+               f"refused with 'none of the store's last 240 recorded "
+               f"... appear anywhere', a real-image kill -9 landing "
+               f"exactly on an L2 chapter boundary on the real backup")
+
+    # RED: the OLD behavior (anchoring on the owning chunk's FULL span
+    # unconditionally) reproduces exactly that failure.
+    old_min_span = _script._chunk_span_ending_at(state, 240)
+    assert_eq(old_min_span, 240, "sanity: the owning chapter's own span really is 240")
+    k = old_min_span
+    transcript_fps = summarizer._covered_turn_fingerprints(branch)
+    target = [covered_fps[i:i + 16] for i in range(0, len(covered_fps), 16)][240 - k:240]
+    matches = [
+        j for j in range(k, len(transcript_fps) + 1)
+        if all(transcript_fps[j - k + i] == fp for i, fp in enumerate(target))
+    ]
+    assert_eq(len(matches), 0,
+               f"RED check: anchoring on the full 240-turn span finds "
+               f"ZERO matches (the edit at turn 131 breaks the exact "
+               f"match everywhere) -- confirming this really would have "
+               f"refused under the old code, not just in theory "
+               f"(matches={matches!r})")
+
+
+# ---------------------------------------------------------------------------
+# 21. N6 (round-3 fix pass A): the dry run and --apply share ONE
+#     feasibility function -- a refusal --apply would give is reported
+#     by the dry run too, never hidden behind a hard-coded True.
+# ---------------------------------------------------------------------------
+
+def test_n6_dry_run_reports_the_same_refusal_apply_would_give():
+    print("\n[test] N6: an edit inside the last covered chunk (an "
+          "unresolvable offset) makes the dry run report safe_to_apply "
+          "False and exit 1, matching what --apply itself would do -- "
+          "not the old hard-coded safe_to_apply True / exit 3")
+    _wipe_storage()
+    conv_id = "n6-conv"
+    anchor_turns = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"real turn {i}"}
+        for i in range(20)
+    ]
+    covered_fps = "".join(summarizer._covered_turn_fingerprints(anchor_turns))
+    summarizer.save_state(conv_id, {
+        "conv_id": conv_id,
+        "l1": [{"text": "chunk1", "first_turn": 1, "last_turn": 20}],
+        "l2": [], "l3": None,
+        "last_summarized_turn": 20,
+        "turns_seen": 20,
+        "covered_fps": covered_fps,
+        "tail_fp": [], "head_fp": "", "window_turns": 0,
+    })
+    # An export whose content shares nothing with the anchor at all
+    # (a totally different, unrelated conversation) -- resume_offset
+    # cannot be resolved, so BOTH the dry run and --apply must refuse.
+    unrelated, unrelated_id = _linear_history(40, prefix="n6-unrelated")
+    db = _new_db_path()
+    _build_webui_db(db, {"n6-chat": _history_chat(unrelated, unrelated_id)})
+
+    rc_dry, out_dry = run_script([
+        "--webui-db", str(db), "--chat-id", "n6-chat", "--conv-id", conv_id,
+        "--store", _TMP_ROOT, "--json",
+    ])
+    payload_dry = json.loads(out_dry)
+    assert_eq(payload_dry["safe_to_apply"], False,
+               "N6: safe_to_apply is False, never hard-coded True over an "
+               "unresolvable offset")
+    assert_eq(rc_dry, 1, f"the dry run exits 1 -- exactly what --apply "
+              f"would give, not 3 (out={out_dry!r})")
+
+    rc_apply, out_apply = run_script([
+        "--webui-db", str(db), "--chat-id", "n6-chat", "--conv-id", conv_id,
+        "--store", _TMP_ROOT, "--vllm-url", VLLM_URL, "--model", MODEL,
+        "--apply", "--json",
+    ])
+    assert_eq(rc_apply, 1, "--apply itself also refuses, for the same reason")
+    payload_apply = json.loads(out_apply)
+    assert_true("refus" in payload_apply.get("error", "").lower(),
+                "the SAME refusal reason, in both reports")
+
+
+# ---------------------------------------------------------------------------
+# 22. N5 (round-3 fix pass A): a re-run whose only due work is folds must
+#     not drift turns_seen, and must report the fold work as progress.
+# ---------------------------------------------------------------------------
+
+def test_n5_fold_only_rerun_reports_progress_and_does_not_drift_turns_seen():
+    print("\n[test] N5: a re-run where only an L2 fold is due reports "
+          "real progress (exit 0/4, not a false exit 1), and turns_seen "
+          "does not drift")
+    _wipe_storage()
+    db = _new_db_path()
+    # 24 turns -> exactly one L1 chunk (1-20) with the run's own
+    # COMPACTOR_L2_CHUNK_SIZE lowered to 1, so ONE L1 chunk immediately
+    # triggers an L2 fold in the SAME --apply run this first call makes
+    # (matching this test's premise: a run that does real fold work).
+    messages, current_id = _linear_history(24)
+    _build_webui_db(db, {"n5-conv": _history_chat(messages, current_id)})
+    _seed_conv("n5-conv")
+
+    real_l2_chunk_size = summarizer.L2_CHUNK_SIZE
+    summarizer.L2_CHUNK_SIZE = 1
+    try:
+        rc, out = run_script([
+            "--webui-db", str(db), "--chat-id", "n5-conv", "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json",
+        ])
+    finally:
+        summarizer.L2_CHUNK_SIZE = real_l2_chunk_size
+    assert_true(rc in (0, 4), f"the fold-producing run reports real "
+                f"progress, not a false 'nothing accomplished' (rc={rc}, "
+                f"out={out!r})")
+    payload = json.loads(out)
+    assert_true(payload["rollup_calls"] >= 1, "at least one unit (the "
+                "L1 chunk, possibly folded) counted as progress")
+    turns_seen_after = payload["turns_seen_after"]
+    assert_eq(turns_seen_after, 24,
+               f"turns_seen tracks the true branch length (24) exactly -- "
+               f"no drift from the pre-seated anchor's own bookkeeping "
+               f"(got {turns_seen_after})")
+
+
+# ---------------------------------------------------------------------------
+# 23. N7 (round-3 fix pass A): a cross-process lock refuses a second
+#     concurrent --apply against the same conv, regardless of --force.
+# ---------------------------------------------------------------------------
+
+def test_n7_second_concurrent_apply_is_refused_by_the_lock():
+    print("\n[test] N7: a second --apply against the same conv, while "
+          "the first still holds the import lock, is refused -- even "
+          "with --force")
+    _wipe_storage()
+    db = _new_db_path()
+    messages, current_id = _linear_history(24)
+    _build_webui_db(db, {"n7-conv": _history_chat(messages, current_id)})
+    _seed_conv("n7-conv")
+
+    lock_path = summarizer.summary_path("n7-conv").with_name(
+        summarizer.summary_path("n7-conv").name + ".import.lock"
+    )
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    _script.fcntl.flock(lock_fd, _script.fcntl.LOCK_EX | _script.fcntl.LOCK_NB)
+    try:
+        before = _snapshot()
+        rc, out = run_script([
+            "--webui-db", str(db), "--chat-id", "n7-conv", "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--force", "--json",
+        ])
+        assert_eq(rc, 1, "refused while another apply holds the lock, "
+                  "even with --force")
+        payload = json.loads(out)
+        assert_true("lock" in payload.get("error", "").lower(),
+                    "the refusal names the lock")
+        assert_eq(_snapshot(), before, "nothing was written")
+    finally:
+        _script.fcntl.flock(lock_fd, _script.fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    # Sanity: with the lock released, the same invocation now succeeds.
+    rc2, _out2 = run_script([
+        "--webui-db", str(db), "--chat-id", "n7-conv", "--store", _TMP_ROOT,
+        "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json",
+    ])
+    assert_eq(rc2, 0, "once the lock is released, --apply proceeds normally")
+
+
+def test_n7_final_reverify_catches_a_race_and_refuses():
+    print("\n[test] N7: if the store changed underneath this run between "
+          "its own last write and the final re-check, --apply refuses "
+          "rather than report success over a race")
+    _wipe_storage()
+    db = _new_db_path()
+    messages, current_id = _linear_history(24)
+    _build_webui_db(db, {"n7-race-conv": _history_chat(messages, current_id)})
+    _seed_conv("n7-race-conv")
+
+    # `_state_fingerprint` is called exactly twice, back to back, at the
+    # very end of a successful run: once for `racing_state` and once for
+    # `final_state` (see main()'s own comment above that comparison).
+    # Forcing it to return a DIFFERENT value each call -- regardless of
+    # what the store actually holds -- directly and robustly exercises
+    # "the two reads disagree", independent of exactly how many
+    # load_state calls the rest of the run happens to make (which varies
+    # with the scenario and is not this test's concern).
+    real_fingerprint = _script._state_fingerprint
+    calls = [0]
+
+    def _alternating_fingerprint(state):
+        calls[0] += 1
+        return (real_fingerprint(state), calls[0])
+
+    _script._state_fingerprint = _alternating_fingerprint
+    try:
+        rc, out = run_script([
+            "--webui-db", str(db), "--chat-id", "n7-race-conv", "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json",
+        ])
+    finally:
+        _script._state_fingerprint = real_fingerprint
+    assert_eq(rc, 1, f"the race is caught and refused (out={out!r})")
+    assert_true("underneath" in out.lower() or "race" in out.lower(),
+                "the refusal explains itself")
+
+
+# ---------------------------------------------------------------------------
+# 24. N14 (round-3 fix pass A): a non-200 /health is ambiguous, matching
+#     backfill's own more conservative fail-safe -- not "not running".
+# ---------------------------------------------------------------------------
+
+def test_n14_non_200_health_is_ambiguous_not_not_running():
+    print("\n[test] N14: a non-200 /health response is ambiguous (refuses "
+          "unless --force), matching backfill's own probe -- not read "
+          "as 'not running' the way it used to be")
+    real_urlopen = _script.urllib.request.urlopen
+
+    def _raise_http_error(*a, **kw):
+        raise _script.urllib.error.HTTPError(
+            "http://x/health", 503, "Service Unavailable", {}, None
+        )
+
+    _script.urllib.request.urlopen = _raise_http_error
+    try:
+        result = _script._compactor_is_alive("http://127.0.0.1:1/health")
+    finally:
+        _script.urllib.request.urlopen = real_urlopen
+    assert_eq(result, "ambiguous",
+               "N14: a non-200 response is ambiguous, not False/'not "
+               "running' -- something IS answering on this port")
+
+
+# ---------------------------------------------------------------------------
+# 25. Mutants -- import mutants surviving round 2 (IO1), plus targeted
+#     kills for this round's NEW code (pre-seat, per-unit save).
+# ---------------------------------------------------------------------------
+
+def test_io5_inconsistent_record_last_exceeds_entries_is_refused():
+    print("\n[test] IO5 kill: last_summarized_turn above the covered-fps "
+          "record's own length is an inconsistent state file -- refused, "
+          "not guessed at")
+    state = {
+        "conv_id": "io5-conv",
+        "last_summarized_turn": 50,
+        "covered_fps": "".join(["a" * 16] * 10),  # only 10 entries, but last=50
+        "l1": [{"text": "x", "first_turn": 1, "last_turn": 50}],
+        "l2": [], "l3": None,
+    }
+    turns = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(60)
+    ]
+    offset, detail = _script._resolve_resume_offset(
+        state, turns, summarizer, summarizer.L1_CHUNK_SIZE
+    )
+    assert_true(offset is None,
+                f"refuses rather than guess (got offset={offset!r}, detail={detail!r})")
+    assert_true("only 10" in detail or "inconsistent" in detail.lower(),
+                f"the refusal names the inconsistency (detail={detail!r})")
+
+
+def test_io8_last_at_or_below_zero_with_a_record_is_refused():
+    print("\n[test] IO8 kill: last_summarized_turn<=0 WITH a covered-fps "
+          "record already present is an inconsistent state file -- "
+          "refused, not treated as 'nothing summarized yet'")
+    state = {
+        "conv_id": "io8-conv",
+        "last_summarized_turn": 0,
+        "covered_fps": "".join(["b" * 16] * 5),
+        "l1": [], "l2": [], "l3": None,
+    }
+    turns = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(10)
+    ]
+    offset, detail = _script._resolve_resume_offset(
+        state, turns, summarizer, summarizer.L1_CHUNK_SIZE
+    )
+    assert_true(offset is None,
+                f"refuses rather than treat this as a fresh conversation "
+                f"(got offset={offset!r}, detail={detail!r})")
+    # IO8 specifically removes the "if last <= 0: return None" refusal,
+    # which without it falls through to the k>last "could not find a
+    # unique match" refusal instead -- ALSO None, so the assertion above
+    # alone cannot tell the two apart. The wording pins the real branch.
+    assert_true("inconsistent" in detail.lower(),
+                f"refused for the RIGHT reason -- an inconsistent state "
+                f"file, not merely 'could not find a match' (detail={detail!r})")
+
+
+def test_iv1_a_position_mapping_past_the_transcript_is_flagged():
+    print("\n[test] IV1 kill: a newly recorded position whose "
+          "position-offset maps OUTSIDE the transcript is flagged as a "
+          "mismatch, not silently accepted")
+    turns = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(5)
+    ]
+    fps = summarizer._covered_turn_fingerprints(turns)
+    # offset=10, one new recorded position (pos=1): j = 1 - 10 = -9,
+    # which is out of [1, len(turns)] -- there is no real text this
+    # could legitimately map to.
+    mismatch = _script._verify_offset_after_apply(
+        before_entries=[], after_entries=[fps[0]], turns=turns,
+        offset=10, summarizer_mod=summarizer,
+    )
+    assert_true(mismatch is not None,
+                "a position mapping outside the transcript is caught, "
+                "not treated as fine because 'expected' came back None")
+
+
+def test_iv3_a_mismatch_anywhere_in_the_run_is_caught_not_just_the_first():
+    print("\n[test] IV3 kill: a mismatch at the SECOND (not first) newly "
+          "recorded position is still caught -- the whole run is "
+          "verified, not just its first new position")
+    turns = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(4)
+    ]
+    fps = summarizer._covered_turn_fingerprints(turns)
+    # Two new positions (1 and 2). Position 1's recorded fp is correct
+    # (matches turns[0] at offset 0); position 2's is deliberately wrong
+    # (some other fingerprint entirely) -- a mismatch that only shows up
+    # if EVERY new position is checked, not only the first.
+    bogus_fp = "0" * len(fps[0])
+    mismatch = _script._verify_offset_after_apply(
+        before_entries=[], after_entries=[fps[0], bogus_fp], turns=turns,
+        offset=0, summarizer_mod=summarizer,
+    )
+    assert_true(mismatch is not None,
+                "the second position's mismatch is caught even though "
+                "the first position was fine")
+    assert_true("position 2" in (mismatch or ""),
+                f"names the actual mismatching position (got {mismatch!r})")
+
+
+def test_iv5_archive_restored_on_a_detected_mismatch_when_a_backup_existed():
+    print("\n[test] IV5 kill: on a detected offset mismatch, an EXISTING "
+          "archive backup is actually copied back, not silently skipped")
+    _wipe_storage()
+    db, conv_id, state = _build_piecewise_scenario()
+    archive_path = memory.summary_archive_path(conv_id)
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    # A properly-shaped chapter (a dict, not a bare string) -- this test
+    # forces a REAL L2 fold below (L2_CHUNK_SIZE=1), which calls the real
+    # _archive_chapters, and that reads each existing row with `.get(...)`
+    # (summarizer.py:3334); a bare string here (like the OTHER archive
+    # seeds in this file, which never trigger a real fold) raises
+    # AttributeError and was masking this test's own real mutant-kill
+    # behind a crash during development -- caught by direct isolation
+    # while writing this round's tests, which is exactly why this
+    # comment is here.
+    archive_path.write_text(
+        '{"chapters": [{"text": "pre-existing chapter", "first_turn": 1, "last_turn": 10}]}',
+        encoding="utf-8",
+    )
+    original_archive_bytes = archive_path.read_bytes()
+
+    real_apply_offset = _script._apply_resume_offset
+    _script._apply_resume_offset = lambda turns, offset, position: turns
+    real_llm = summarizer._llm_summarize
+    summarizer._llm_summarize = _echoing_llm
+    # L2_CHUNK_SIZE=1 (not the default 10): the FIRST new L1 chunk this
+    # run creates folds immediately, so archive_path is ACTUALLY
+    # rewritten during this run -- without this, the piecewise
+    # scenario's own --max-calls=10 budget never reaches a fold at all,
+    # and "archive unchanged after the mismatch" would hold trivially
+    # whether or not the restore-copy this test is pinning ever ran.
+    real_l2 = summarizer.L2_CHUNK_SIZE
+    summarizer.L2_CHUNK_SIZE = 1
+    try:
+        # Corrupt the archive AFTER the run's own backup would have been
+        # taken but framed as "what the run itself wrote", by running
+        # --apply (forced into a mismatch) and confirming the restore.
+        rc, out = run_script([
+            "--webui-db", str(db), "--chat-id", conv_id, "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json", "--max-calls", "10",
+        ])
+    finally:
+        _script._apply_resume_offset = real_apply_offset
+        summarizer._llm_summarize = real_llm
+        summarizer.L2_CHUNK_SIZE = real_l2
+    assert_eq(rc, 1, f"the mismatch is caught and refused (out={out!r})")
+    assert_eq(archive_path.read_bytes(), original_archive_bytes,
+               "the pre-existing archive backup was restored")
+
+
+def test_r3_n1b_per_unit_budget_is_exactly_one_not_the_whole_run():
+    print("\n[test] N1 round-3 mutant kill: every maybe_rollup call in "
+          "the per-unit loop gets vllm_call_budget={'remaining': 1, ...} "
+          "-- never the whole run's max_calls")
+    _wipe_storage()
+    conv_id = "r3n1b-conv"
+    seen_budgets = []
+
+    # Reads the AMBIENT vllm_call_budget contextvar, exactly like the
+    # real maybe_rollup's own callers do (and like
+    # test_max_calls_budget_stops_the_loop_with_documented_overshoot's
+    # fake already does) -- NOT a directly-passed kwarg. _StubModule.
+    # maybe_rollup mirrors the real maybe_rollup wrapper precisely: it
+    # sets the contextvar around the call and does NOT forward
+    # vllm_call_budget to the fake as an argument. A fake that expects
+    # the kwarg directly (as an earlier draft of this test did) never
+    # sees a budget to decrement, so `_run_apply_loop`'s own
+    # `vllm_calls_spent` never advances and its while loop never
+    # terminates -- caught by running this exact shape in isolation
+    # with a hard iteration safety-stop during this round's own
+    # development, which is exactly why this comment is here.
+    async def _spy(conv_id, messages, vllm_url, model):
+        budget = summarizer._vllm_call_budget.get()
+        seen_budgets.append(dict(budget) if budget is not None else None)
+        if budget is not None:
+            budget["remaining"] -= 1
+        st = summarizer.load_state(conv_id)
+        st["last_summarized_turn"] = st.get("last_summarized_turn", 0) + 20
+        summarizer.save_state(conv_id, st)
+        return st
+
+    asyncio.run(
+        _script._run_apply_loop(
+            _StubModule(_spy), memory, conv_id, [], VLLM_URL, MODEL, 3,
+        )
+    )
+    assert_true(len(seen_budgets) >= 2, "more than one call happened")
+    assert_true(all(b is not None and b["remaining"] == 1 for b in seen_budgets),
+                f"every call's STARTING budget was 1, not max_calls "
+                f"(got {seen_budgets})")
+
+
+def test_r3_n1d_sigterm_and_sighup_handlers_are_installed_too():
+    print("\n[test] N1 round-3 mutant kill: main() installs handlers for "
+          "SIGTERM and SIGHUP, not just SIGINT")
+    _wipe_storage()
+    db = _new_db_path()
+    # 24 turns -- real work due, so main() actually reaches the loop
+    # (and so the signal-handler installation) rather than returning
+    # early on the "nothing due" no-op path.
+    messages, current_id = _linear_history(24)
+    _build_webui_db(db, {"r3n1d-conv": _history_chat(messages, current_id)})
+    _seed_conv("r3n1d-conv")
+
+    registered = []
+    real_signal_fn = _script.signal.signal
+
+    def _spy_signal(sig, handler):
+        registered.append(sig)
+        return real_signal_fn(sig, handler)
+
+    _script.signal.signal = _spy_signal
+    try:
+        run_script([
+            "--webui-db", str(db), "--chat-id", "r3n1d-conv", "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json",
+        ])
+    finally:
+        _script.signal.signal = real_signal_fn
+    for expected in (_script.signal.SIGINT, _script.signal.SIGTERM, _script.signal.SIGHUP):
+        assert_true(expected in registered,
+                    f"{expected!r} was registered (got {registered})")
+
+
+def test_r3_n4b_bound_violation_is_refused_not_silently_applied():
+    print("\n[test] N4 round-3 mutant kill: a positive-offset window that "
+          "would need MORE turns than the reconstruction actually has "
+          "is refused by the bound check itself, in _resolve_apply_feasibility")
+    _wipe_storage()
+    conv_id, state, turns, offset = _build_piecewise_scenario_with_extra_unseen_turns(
+        {10, 11}, extra_n=0, conv_id="n4b-conv",
+    )
+
+    # Upper-bound violation (keep > current_turns): _apply_resume_offset
+    # ALSO independently refuses this shape on its own (keep > len(turns)),
+    # so it alone would not distinguish the bound check this mutant
+    # removes from that other, separate guard.
+    truncated_turns = turns[:50]
+    recorded_position = summarizer.recorded_position(state)
+    feas_upper = _script._resolve_apply_feasibility(
+        state, truncated_turns, summarizer, len(truncated_turns), recorded_position,
+        summarizer.L1_CHUNK_SIZE,
+    )
+    assert_true(not feas_upper.feasible,
+                f"refuses when the window would need more turns than "
+                f"this (truncated) reconstruction has "
+                f"(feasible={feas_upper.feasible}, refusal={feas_upper.refusal!r})")
+
+    # Lower-bound violation (keep < highest_chunk_turn): moving the
+    # window BACKWARD below what the store's own chunks already claim
+    # coverage through. _apply_resume_offset's own bounds check (keep<0
+    # or keep>len) does NOT catch this on its own -- only the N4 bound
+    # check does. Force it by lowering turns_seen so recorded_position
+    # sits below highest_chunk_turn(40) once the offset is subtracted.
+    state_lower = dict(state)
+    state_lower["turns_seen"] = 35
+    recorded_position_lower = summarizer.recorded_position(state_lower)
+    highest = summarizer._highest_chunk_turn(state_lower)
+    assert_true(recorded_position_lower - offset < highest,
+                f"sanity: keep ({recorded_position_lower - offset}) really "
+                f"is below highest_chunk_turn ({highest})")
+    feas_lower = _script._resolve_apply_feasibility(
+        state_lower, turns, summarizer, len(turns), recorded_position_lower,
+        summarizer.L1_CHUNK_SIZE,
+    )
+    assert_true(not feas_lower.feasible,
+                f"refuses when the window would move backward below the "
+                f"store's own existing chunk coverage (feasible="
+                f"{feas_lower.feasible}, refusal={feas_lower.refusal!r})")
+
+
+def test_r3_n5_pure_fold_only_progress_is_not_mistaken_for_none():
+    print("\n[test] N5 round-3 mutant kill: a run whose ONLY due work is "
+          "a fold (last_summarized_turn does not move at all) still "
+          "counts as progress -- exit 0/4, never a false exit 1")
+    _wipe_storage()
+    conv_id = "r3n5-pure-fold-conv"
+    pre_turns = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(20)
+    ]
+    covered_fps = "".join(summarizer._covered_turn_fingerprints(pre_turns))
+    summarizer.save_state(conv_id, {
+        "l1": [{"text": "chunk1", "first_turn": 1, "last_turn": 20}],
+        "l2": [], "l3": None,
+        # Nothing NEW is due: last_summarized_turn already equals the
+        # branch length -- ONLY the pre-existing L1 chunk's own fold
+        # (forced below) is due.
+        "last_summarized_turn": 20, "turns_seen": 20,
+        "covered_fps": covered_fps,
+        "tail_fp": [], "head_fp": "", "window_turns": 0,
+    })
+    messages_dict, current_id, parent = {}, None, None
+    for i, t in enumerate(pre_turns):
+        mid = f"m{i}"
+        messages_dict[mid] = _msg(mid, parent, t["role"], t["content"])
+        parent, current_id = mid, mid
+    db = _new_db_path()
+    _build_webui_db(db, {conv_id: _history_chat(messages_dict, current_id)})
+
+    real_l2 = summarizer.L2_CHUNK_SIZE
+    summarizer.L2_CHUNK_SIZE = 1  # the one existing L1 chunk folds immediately
+    try:
+        rc, out = run_script([
+            "--webui-db", str(db), "--chat-id", conv_id, "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json",
+        ])
+    finally:
+        summarizer.L2_CHUNK_SIZE = real_l2
+    payload = json.loads(out)
+    assert_eq(payload["last_summarized_turn_before"], payload["last_summarized_turn_after"],
+               "the watermark truly never moves -- this run is pure fold work")
+    assert_true(rc in (0, 4),
+                f"a pure-fold run is real progress, not a false 'no "
+                f"progress' exit 1 (rc={rc}, out={out!r})")
+    assert_true(payload["rollup_calls"] >= 1, "the fold counted as a completed unit")
+
+
+def test_r3_n13_leftover_archive_removed_when_none_existed_before():
+    print("\n[test] N13 round-3 mutant kill: a NEW archive.json this run "
+          "itself created (none existed before) is removed on a "
+          "detected mismatch, not left holding discarded chapters")
+    _wipe_storage()
+    db, conv_id, state = _build_piecewise_scenario()
+    archive_path = memory.summary_archive_path(conv_id)
+    assert_true(not archive_path.exists(), "sanity: no archive exists before this run")
+
+    real_l2 = summarizer.L2_CHUNK_SIZE
+    summarizer.L2_CHUNK_SIZE = 1  # any new L1 chunk folds immediately -> a fresh archive.json
+    real_apply_offset = _script._apply_resume_offset
+    _script._apply_resume_offset = lambda turns, offset, position: turns
+    real_llm = summarizer._llm_summarize
+    summarizer._llm_summarize = _echoing_llm
+    try:
+        rc, out = run_script([
+            "--webui-db", str(db), "--chat-id", conv_id, "--store", _TMP_ROOT,
+            "--vllm-url", VLLM_URL, "--model", MODEL, "--apply", "--json", "--max-calls", "10",
+        ])
+    finally:
+        summarizer.L2_CHUNK_SIZE = real_l2
+        _script._apply_resume_offset = real_apply_offset
+        summarizer._llm_summarize = real_llm
+    assert_eq(rc, 1, f"the mismatch is caught and refused (out={out!r})")
+    assert_true(not archive_path.exists(),
+                "N13: the archive this run itself created is removed, "
+                "not left behind holding chapters from the discarded run")
+
+
+def test_io1_min_anchor_fingerprints_floor_is_load_bearing():
+    print("\n[test] IO1 kill: lowering _MIN_ANCHOR_FINGERPRINTS below 8 "
+          "would accept a match this test proves is NOT unique with "
+          "fewer than 8 known fingerprints")
+    _wipe_storage()
+    conv_id = "io1-conv"
+    # Only 3 non-UNKNOWN covered-turn fingerprints ever recorded (the
+    # rest of the record is _FP_UNKNOWN placeholders) -- never enough to
+    # clear the real floor (8), so the real code must refuse ("could not
+    # find a unique, sufficiently-anchored match ... even using the
+    # entire record") no matter how far k grows. A floor of 1 (IO1's
+    # mutation) would instead accept the first candidate it tries.
+    fp_unknown = summarizer._FP_UNKNOWN
+    known_turns = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"known turn {i}"}
+        for i in range(3)
+    ]
+    known_fps = summarizer._covered_turn_fingerprints(known_turns)
+    covered_fps = "".join([fp_unknown] * 17 + known_fps)  # 20 entries total
+    state = {
+        "conv_id": conv_id,
+        "l1": [{"text": "chunk1", "first_turn": 1, "last_turn": 20}],
+        "l2": [], "l3": None,
+        "last_summarized_turn": 20,
+        "turns_seen": 20,
+        "covered_fps": covered_fps,
+        "tail_fp": [], "head_fp": "", "window_turns": 0,
+    }
+    # A branch that reproduces those exact 3 known turns at the end,
+    # uniquely (nowhere else in the branch), which is exactly the shape
+    # a floor-of-1 mutant would accept on the strength of ONE matching
+    # fingerprint alone once k reaches the point only 1 known entry is
+    # in view.
+    filler = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"filler {i}"}
+        for i in range(50)
+    ]
+    turns = filler + known_turns
+    offset, detail = _script._resolve_resume_offset(
+        state, turns, summarizer, summarizer.L1_CHUNK_SIZE
+    )
+    assert_true(offset is None,
+                f"the real 8-fingerprint floor refuses (only 3 known "
+                f"fingerprints ever exist in the record) rather than "
+                f"accept a match on fewer (got offset={offset!r}, "
+                f"detail={detail!r})")
+    assert_true("could not find" in (detail or "").lower(),
+                "the refusal names the record as insufficient")
+
+
+def test_mutant_pre_seat_disabled_produces_a_hole_after_a_simulated_kill():
+    print("\n[test] N1 mutant kill: if the pre-seat write were skipped "
+          "entirely (reverting to 'leave the anchor as whatever it "
+          "was'), a kill before any unit completes leaves the STALE "
+          "anchor on disk, which the live path misreads -- proving the "
+          "pre-seat write is load-bearing, not decorative")
+    _wipe_storage()
+    conv_id = "mutant-preseat-conv"
+    stale_anchor = ["ffff9999ffff9999", "eeee8888eeee8888",
+                     "dddd7777dddd7777", "cccc6666cccc6666"]
+    summarizer.save_state(conv_id, {
+        "l1": [], "l2": [], "l3": None,
+        "last_summarized_turn": 0, "turns_seen": 20,
+        "tail_fp": stale_anchor, "head_fp": "stale", "window_turns": 20,
+    })
+    window = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(10)
+    ]
+
+    # MUTANT: _run_apply_loop with the pre-seat step deleted (simulated
+    # inline here, rather than patching the real function, so this test
+    # documents exactly what the mutant would look like and asserts the
+    # real code does NOT behave this way).
+    async def _fake_maybe_rollup_never_called(*a, **kw):
+        raise AssertionError("not reached -- the interrupt fires first")
+
+    result = asyncio.run(
+        _script._run_apply_loop(
+            _StubModule(_fake_maybe_rollup_never_called), memory,
+            conv_id, window, VLLM_URL, MODEL, 10,
+            interrupt_flag={"signal": "SIGKILL-simulated"},
+        )
+    )
+    assert_eq(result["rollup_calls"], 0, "no unit ran")
+    after_real_code = summarizer.load_state(conv_id).get("tail_fp")
+    assert_true(after_real_code != stale_anchor,
+                "the REAL code's pre-seat write already overwrote the "
+                "stale anchor before the interrupt was even checked -- "
+                "a mutant that deleted this write would instead leave "
+                "the stale anchor in place, which is the bug this test "
+                "pins closed")
+
+
+def test_mutant_per_unit_save_disabled_loses_completed_work_on_a_failure():
+    print("\n[test] N1 mutant kill: if maybe_rollup were called once "
+          "for the WHOLE budget (the old shape) instead of once per "
+          "unit, a persistent failure after unit 1 would lose unit 1's "
+          "own progress too, since nothing saved it separately")
+    _wipe_storage()
+    db = _new_db_path()
+    messages, current_id = _linear_history(44)  # 2 L1 chunks due
+    _build_webui_db(db, {"mutant-perunit-conv": _history_chat(messages, current_id)})
+    _seed_conv("mutant-perunit-conv")
+
+    call_count = [0]
+
+    async def _fails_from_second_call_on(client, vllm_url, model, system_prompt,
+                                          body_text, max_tokens, *, timeout=300.0):
+        call_count[0] += 1
+        if call_count[0] >= 2:
+            raise RuntimeError("simulated persistent vLLM failure")
+        return f"summary of {len(body_text)} chars"
+
+    real_llm = summarizer._llm_summarize
+    summarizer._llm_summarize = _fails_from_second_call_on
+    try:
+        rc, out = run_script([
+            "--webui-db", str(db), "--chat-id", "mutant-perunit-conv",
+            "--store", _TMP_ROOT, "--vllm-url", VLLM_URL, "--model", MODEL,
+            "--apply", "--json",
+        ])
+    finally:
+        summarizer._llm_summarize = real_llm
+    # The REAL (per-unit) code: unit 1 (chunk 1-20) is saved before unit
+    # 2 is even attempted, so its progress survives the later failure.
+    assert_eq(rc, 4, f"real progress with more due is exit 4, proving "
+              f"unit 1 was NOT lost when unit 2 failed (out={out!r})")
+    state = summarizer.load_state("mutant-perunit-conv")
+    assert_eq(state.get("last_summarized_turn"), 20,
+               "unit 1's progress (chunk 1-20) survived -- a mutant that "
+               "batched everything into one call/one save (the pre-N1 "
+               "shape) would have discarded it along with the failed "
+               "unit 2, saving nothing at all for this run")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1699,11 +2722,12 @@ if __name__ == "__main__":
         test_apply_with_nothing_due_is_a_no_op_and_idempotent()
 
         test_max_calls_budget_stops_the_loop_with_documented_overshoot()
-        test_ctrlc_before_any_pass_completes_restores_the_original_anchor()
+        test_preseat_writes_the_windows_own_anchor_not_the_stale_original()
+        test_a_raised_exception_before_any_unit_leaves_the_preseated_anchor_intact()
 
         test_interrupted_apply_leaves_valid_state_and_resumes()
 
-        test_refuses_apply_while_compactor_is_live_unless_forced()
+        test_refuses_apply_while_compactor_is_live_even_with_force()
         test_refuses_when_backup_path_already_exists()
         test_refuses_on_journal_beside_the_database_unless_forced()
         test_unknown_chat_id_is_an_error()
@@ -1750,6 +2774,35 @@ if __name__ == "__main__":
         test_ih4_l1_due_off_by_one_at_the_chunk_boundary()
 
         test_dry_run_due_estimate_uses_effective_position_not_raw_branch_length()
+
+        test_n4_dramatic_repro_unseen_turns_far_exceed_the_offset()
+        test_n4_routine_case_offset_plus_one_with_one_unseen_exchange()
+        test_n4_estimate_due_is_offset_aware_too()
+        test_n4_followup_large_owning_chapter_span_falls_back_to_l1_granularity()
+
+        test_n6_dry_run_reports_the_same_refusal_apply_would_give()
+
+        test_n5_fold_only_rerun_reports_progress_and_does_not_drift_turns_seen()
+
+        test_n7_second_concurrent_apply_is_refused_by_the_lock()
+        test_n7_final_reverify_catches_a_race_and_refuses()
+
+        test_n14_non_200_health_is_ambiguous_not_not_running()
+
+        test_io5_inconsistent_record_last_exceeds_entries_is_refused()
+        test_io8_last_at_or_below_zero_with_a_record_is_refused()
+        test_iv1_a_position_mapping_past_the_transcript_is_flagged()
+        test_iv3_a_mismatch_anywhere_in_the_run_is_caught_not_just_the_first()
+        test_iv5_archive_restored_on_a_detected_mismatch_when_a_backup_existed()
+        test_r3_n1b_per_unit_budget_is_exactly_one_not_the_whole_run()
+        test_r3_n1d_sigterm_and_sighup_handlers_are_installed_too()
+        test_r3_n4b_bound_violation_is_refused_not_silently_applied()
+        test_r3_n5_pure_fold_only_progress_is_not_mistaken_for_none()
+        test_r3_n13_leftover_archive_removed_when_none_existed_before()
+
+        test_io1_min_anchor_fingerprints_floor_is_load_bearing()
+        test_mutant_pre_seat_disabled_produces_a_hole_after_a_simulated_kill()
+        test_mutant_per_unit_save_disabled_loses_completed_work_on_a_failure()
 
         print("\nAll import-history.py script tests passed.")
     finally:
