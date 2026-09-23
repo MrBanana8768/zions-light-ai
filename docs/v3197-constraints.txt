@@ -1,0 +1,15 @@
+# Pip constraints for the v3.1.9.7 thin layer (OpenWebUI 0.11.0 -> 0.11.4).
+#
+# These pin every package whose resolved version in /app/venv actually
+# changed as a side effect of the open-webui bump. Without this file, a
+# future rebuild of this same Dockerfile.v3197 layer is free to resolve
+# newer transitive versions of these packages if they are released later —
+# this file freezes today's resolution so the layer stays reproducible.
+# See docs/v3197-pip-diff.txt for the full before/after `pip freeze` diff
+# this was derived from (base image v3.1.9.4/.5/.6, digest
+# sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65).
+aiodns==3.6.1
+google-re2==1.1.20251105
+langchain-core==1.4.8
+pycares==4.11.0
+python-docx==1.2.0

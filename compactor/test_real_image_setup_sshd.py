@@ -52,6 +52,7 @@ multiple invocations on a real pod. The container is ALWAYS removed
 import json
 import shutil
 import subprocess
+import os
 import sys
 import time
 import uuid
@@ -59,7 +60,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 IMAGE_DIGEST = "sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65"
-IMAGE_REF = f"angreg/zions-light-ai@{IMAGE_DIGEST}"
+# ZLA_REAL_IMAGE_REF lets this suite point at a locally built candidate image
+# (e.g. the v3.1.9.7 thin OpenWebUI-upgrade layer) instead of the published
+# base digest, without changing the default every other caller relies on.
+IMAGE_REF = os.environ.get("ZLA_REAL_IMAGE_REF") or f"angreg/zions-light-ai@{IMAGE_DIGEST}"
 VENV_PY = "/opt/compactor-venv/bin/python"
 DOCKER_TIMEOUT_S = 180
 CONTAINER_NAME = f"zl-test-real-image-setup-sshd-{uuid.uuid4().hex[:10]}"

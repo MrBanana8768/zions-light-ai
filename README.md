@@ -97,6 +97,7 @@ Pin a specific version for reproducible deploys.
 
 | Tag | Contents |
 |---|---|
+| `:v3.1.9.7-cu12` | **Pending review + owner OK** — not yet the deploy target in [runpod.env.template](runpod.env.template). A thin layer FROM the v3.1.9.6 digest: OpenWebUI 0.11.0 → 0.11.4 only (the scroll-position fix), everything else byte-identical (CHANGELOG [3.1.9.7], `docs/v3197-pip-diff.txt`). Migrates `webui.db` on first boot — see RUNPOD_DEPLOY.md before deploying |
 | `:v3.1.9.6-cu12` | **Current release** — the deploy target named in [runpod.env.template](runpod.env.template). The SAME image as `:v3.1.9.5-cu12`/`:v3.1.9.4-cu12` (same digest, `sha256:c1295894dd58…`): v3.1.9.6 changed scripts and docs only, so its tag points at the already-published image instead of a rebuild. CUDA-12 profile (any A40 host) |
 | `:v3.1.9.5-cu12` / `:v3.1.9.4-cu12` | The same image as `:v3.1.9.6-cu12`, so NOT a rollback target from it; for rollback see [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md#upgrading-within-v319x-and-rolling-back) |
 | `:v3.1-cu12` … `:v3.1.9.2-cu12` | The superseded v3.1.x patch line (v3.1-cu12, v3.1.1 to v3.1.4.1, v3.1.5, v3.1.6, v3.1.6.1, v3.1.7, v3.1.8, v3.1.9, v3.1.9.1, v3.1.9.2 — each `-cu12`); per-version notes in [CHANGELOG.md](CHANGELOG.md). There is no `:v3.1.9.3-cu12` image. `:v3.1-cu12` is NOT `:v3.1`, which is the older `:v3.1-vision` feature image below |

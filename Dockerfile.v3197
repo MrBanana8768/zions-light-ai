@@ -1,0 +1,32 @@
+# v3.1.9.7 — THIN layer on top of the exact production base image.
+# Upgrades ONLY OpenWebUI (0.11.0 -> 0.11.4) inside /app/venv. Nothing else
+# in the base image (vllm-venv, compactor-venv, compactor sources,
+# entrypoint.sh, supervisord.conf, whisper/tts venvs) is touched.
+#
+# Reason: OpenWebUI upstream issue #23990 / PR #28657 — older messages
+# loaded while scrolling up shifted what the reader was looking at
+# ("bouncing"). Fixed per the 0.11.1 release notes. Owner chose 0.11.4
+# (latest at the time of this release) as the thin-layer target rather than
+# the minimal 0.11.1.
+#
+# Base image is pinned by DIGEST (not tag) so this layer is reproducible
+# against the exact bits production runs today (v3.1.9.4, also tagged
+# v3.1.9.5; v3.1.9.6 is a pending retag of the same digest).
+FROM angreg/zions-light-ai@sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65
+
+# Constraints file pins every package whose resolved version actually
+# changed when open-webui was bumped 0.11.0 -> 0.11.4 (see
+# docs/v3197-pip-diff.txt for the full before/after `pip freeze` diff this
+# was derived from). Pinning keeps a future rebuild of this same layer from
+# silently drifting onto newer transitive versions pip's resolver would
+# otherwise be free to pick.
+COPY docs/v3197-constraints.txt /tmp/v3197-constraints.txt
+
+RUN /app/venv/bin/pip install --no-cache-dir \
+        --constraint /tmp/v3197-constraints.txt \
+        open-webui==0.11.4 && \
+    find /app/venv -type f \( -name "*.so" -o -name "*.so.*" \) \
+        -exec strip --strip-unneeded {} + 2>/dev/null || true && \
+    find /app/venv -name "*.pyc" -delete && \
+    find /app/venv -name "__pycache__" -type d -exec rm -rf {} + && \
+    rm -rf /root/.cache /tmp/*.txt /tmp/v3197-constraints.txt /var/tmp/*

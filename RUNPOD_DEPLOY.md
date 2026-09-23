@@ -1042,9 +1042,12 @@ listed under "Rolling back" in the next section; read them first.
 
 ## Upgrading within v3.1.9.x, and rolling back
 
-For a pod already on any v3.1.9.x image (v3.1.9 through v3.1.9.5). Every
-v3.1.9.x release is an image-tag change against the SAME Network Volume: none
-of them moves or reformats anything on `/data`, and none needs a restore.
+For a pod already on any v3.1.9.x image (v3.1.9 through v3.1.9.6). Every
+v3.1.9.x release through v3.1.9.6 is an image-tag change against the SAME
+Network Volume: none of them moves or reformats anything on `/data`, and
+none needs a restore. **v3.1.9.7 is the first exception** — it is a real
+(if thin) image change and it migrates `webui.db`; see its own section
+below.
 
 What each release brings (you get every row after the one you are on;
 details in the CHANGELOG entry of the same number):
@@ -1057,8 +1060,79 @@ details in the CHANGELOG entry of the same number):
 | v3.1.9.4 | Replies no longer wait ~30 s on fact selection; `/forget` stays forgotten; cut summaries are handled. |
 | v3.1.9.5 | Documentation only — the SAME image as v3.1.9.4 (same digest), under a new tag. |
 | v3.1.9.6 | Scripts and docs only — the SAME image as v3.1.9.5 (same digest), under a new tag. Adds `scripts/setup-sshd.py`, an operator tool that installs and hardens a real sshd LIVE inside a running pod (the image itself still ships none) — see OPERATIONS.md. |
+| v3.1.9.7 | OpenWebUI 0.11.0 → 0.11.4 — the scroll-position fix while reading old messages. A NEW image (thin layer on the v3.1.9.4/.5/.6 digest) that migrates `webui.db` on first boot. See below. |
 
-No new REQUIRED settings in any of them.
+No new REQUIRED settings before v3.1.9.7.
+
+### Upgrading to v3.1.9.7 (OpenWebUI 0.11.0 → 0.11.4)
+
+Unlike every other v3.1.9.x step, this one changes the image (not just the
+tag pointed at the same digest) and runs a real alembic migration on
+`webui.db` at first boot. It is still low-risk — the migration only adds
+indexes and one column and measured at ~114ms on a full copy of the
+2026-09-23 production backup — but treat it with a real pre-upgrade backup,
+not just the tag-swap confidence the v3.1.9.4→.6 steps above have.
+
+**Build and push (architect runs this, after review; NOT part of the
+routine deploy — do this once per release):**
+```bash
+git checkout v3.1.9.7
+docker build -f Dockerfile.v3197 -t angreg/zions-light-ai:v3.1.9.7-cu12 .
+# verify it is a THIN layer before pushing: only /app/venv should differ
+# from the base digest (see docs/v3197-pip-diff.txt and the CHANGELOG entry
+# for the exact proof this release's testing ran)
+docker push angreg/zions-light-ai:v3.1.9.7-cu12
+```
+Do **not** promote `:latest` until the on-pod validation gate passes
+(TESTING.md).
+
+**Deploy order for her pod (currently on v3.1.9):**
+1. **Run `scripts/backfill-records.py` BEFORE switching to any
+   v3.1.9.4+ image**, if this pod has never run one — same reasoning as
+   the v3.1.9.4→.6 step above: the four stale `in_progress` backfill
+   records on her volume would otherwise resume, roughly 2,600 extraction
+   calls competing with her live chat. Skip this only if the pod already
+   ran v3.1.9.4 or later at some point (already closed). Alternatively,
+   set `COMPACTOR_BACKFILL_MAX_ATTEMPTS=0` in the template instead of
+   running the script.
+2. **Take a verified backup right before the switch** — this is the
+   webui.db rollback point, and unlike a same-digest retag it actually
+   matters here:
+   ```bash
+   # on the running pod, before touching the template
+   /opt/compactor-venv/bin/python /opt/compactor/backup.py --once
+   /opt/compactor-venv/bin/python /opt/compactor/backup.py --verify
+   # confirm [OK] on both before proceeding
+   ```
+3. **Switch the image tag** in the RunPod template to
+   `angreg/zions-light-ai:v3.1.9.7-cu12` and redeploy. The migration
+   (`f0bd01a18a3d → 1ce6ade7d93b → 6d09d1bf1f23 → d4c1a8e37b62`) runs
+   automatically on OpenWebUI's first boot — it is fast (well under a
+   second even on a ~500 MB database in this project's own testing) but a
+   RunPod network volume is slower than local disk, so allow a little
+   margin; it is not the bottleneck in the total boot time either way
+   (OpenWebUI's own default RAG embedding-model download dominates the
+   first boot, unrelated to this release).
+4. **Verify:**
+   ```bash
+   curl -sf http://localhost:8080/health/full   # ok/degraded, not 503
+   # then in OpenWebUI: open her chat, confirm history renders and the
+   # message count matches what /health/full or webuidb.py --status reported
+   # before the switch
+   ```
+
+**Rollback.** 0.11.0 (any v3.1.9.4/.5/.6 image) DOES still boot and
+correctly serve her chat against a webui.db that 0.11.4 has migrated — its
+alembic does not recognize the new head revision and logs a loud but
+harmless traceback on every boot, but the chat itself reads back
+correctly through 0.11.0's own ORM. Even so, **the supported rollback is
+restoring the pre-upgrade `webui.db` backup from step 2 above**, not
+relying on that tolerance:
+```bash
+# on the pod, writers stopped
+/opt/compactor-venv/bin/python /opt/compactor/backup.py --restore <the pre-v3.1.9.7 backup timestamp>
+# then switch the template's Container Image back to the v3.1.9.6 (or .5/.4) tag and redeploy
+```
 
 **Before upgrading a pod that has EVER run v3.1.9.3 or earlier** (skip this
 if it has only ever run v3.1.9.4 or later): v3.1.9.4's own fix to

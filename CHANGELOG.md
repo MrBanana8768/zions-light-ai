@@ -9,6 +9,135 @@ on Docker Hub.
 
 ---
 
+## [3.1.9.7] — OpenWebUI 0.11.0 → 0.11.4, a thin image layer, for the scroll fix
+
+**An image change — a thin layer, not a retag.** `Dockerfile.v3197` builds
+`FROM angreg/zions-light-ai@sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65`
+(v3.1.9.4, also tagged v3.1.9.5/.6) and runs exactly one `pip install
+open-webui==0.11.4` against `/app/venv`, constrained by
+`docs/v3197-constraints.txt`. Nothing else in the base image is touched:
+`/opt/vllm-venv`, `/opt/compactor-venv`, `/opt/compactor` (sources),
+`/opt/whisper-venv`, `/opt/tts-venv`, `entrypoint.sh`, `supervisord.conf` and
+`clean-models.sh` are byte-for-byte identical to the base — verified by
+comparing an aggregate sha256 of every file under each of those paths
+between the base image and the new one; only `/app/venv`'s file count
+differs (51,565 → 51,728 files).
+
+**Why.** She is "bouncing" while scrolling up in her 3,885-message chat:
+older-message batches loading while she reads shift what she was looking
+at. This is upstream OpenWebUI issue #23990 / PR #28657; the 0.11.1 release
+notes say it is fixed ("older messages loaded while scrolling up no longer
+shift what you were reading"). The owner chose 0.11.4 (latest at release
+time) as the thin-layer target rather than the minimal 0.11.1.
+
+**The pip diff** (full diff in `docs/v3197-pip-diff.txt`; six lines changed
+out of 282/284 total packages in `/app/venv`):
+```
+aiodns          4.0.4  -> 3.6.1   (downgrade, open-webui 0.11.4's own resolution)
+google-re2      (new)  -> 1.1.20251105
+langchain-core  1.6.3  -> 1.4.8   (downgrade)
+open-webui      0.11.0 -> 0.11.4
+pycares         5.0.1  -> 4.11.0  (downgrade)
+python-docx     (new)  -> 1.2.0
+```
+The three downgraded packages and the two new ones are pinned in
+`docs/v3197-constraints.txt` so a future rebuild of this layer cannot drift
+onto a newer release of any of them.
+
+**Highlights from 0.11.1 → 0.11.4 relevant to her.** Four alembic
+migrations land between 0.11.0 and 0.11.4, all already present by 0.11.1
+(`1ce6ade7d93b` group_member index, `6d09d1bf1f23` double-encoded-oauth
+repair, `b10670c03dd5` user-table update — on a separate branch, not
+reachable from her DB's history and NOT applied to it — and
+`d4c1a8e37b62` chat `timer_at` + chat/unread/timer indexes, the new head).
+The scroll fix itself: `open_webui/utils/middleware.py`'s
+`load_messages_from_db` (the function that assembles what a saved chat
+replays) gained a `MESSAGE_REPLAY_KEYS` allowlist (adds `model` to the
+forwarded fields) and a new filter that drops an assistant message with
+`error` set and empty `content`/`output` from what gets replayed — checked
+against her real chat's `chat_message` table: zero rows meet that
+condition for her chat, so this change does not alter what she gets sent
+today. `Chats.get_messages_map_by_chat_id` and
+`ChatMessageTable.get_messages_map_by_chat_id` — the chat_message-table-
+first walk this fork's compactor integration depends on — are
+byte-identical between 0.11.0 and 0.11.4.
+
+**DB migration, on a copy of the 2026-09-23 production backup
+(`webui.db`, her chat `ea1494ea-e9d7-46fb-8b7c-3a50d685d00e`).** The three
+migrations that apply to her DB (`f0bd01a18a3d → 1ce6ade7d93b →
+6d09d1bf1f23 → d4c1a8e37b62`) run in ~114ms — they only add indexes and one
+column, not a rewrite of the chat blob. `PRAGMA integrity_check` returns
+`ok`; `chat` (52), `chat_message` (12,496), `model` (4), `user` (2) and
+`auth` (2) row counts are unchanged; her chat's branch from `currentId`
+still walks the same 3,879 messages before and after. Total container boot
+to serving-ready was ~2m35s, almost entirely OpenWebUI's own default RAG
+embedding-model download (`sentence-transformers/all-MiniLM-L6-v2`, not
+baked into this image, unrelated to this release) — the migration itself
+is not the slow part even on a network volume.
+
+**Rollback.** 0.11.0 (the base image) DOES still boot and correctly serve
+her chat against a DB that 0.11.4 has migrated to `d4c1a8e37b62` — verified
+by reading the chat back through 0.11.0's own `Chats` ORM (same message
+count, same branch walk). But 0.11.0's alembic does not recognize
+`d4c1a8e37b62` as a revision it knows, and its migration runner
+(`open_webui/config.py:run_migrations`) catches that `CommandError` in a
+bare `except Exception` and logs a full traceback rather than failing the
+boot — so every 0.11.0 boot against a 0.11.4-migrated DB prints an alarming
+but harmless startup error, indefinitely. The clean rollback is still:
+restore the pre-upgrade `webui.db` backup taken before the switch (see
+RUNPOD_DEPLOY.md's new v3.1.9.7 section); do not rely on 0.11.0 tolerating
+the newer schema as a substitute for that backup.
+
+**Word-ban / custom_params byte-identity.** Reproduced the model row's
+real `custom_params` (`repetition_penalty`, `bad_words`, then
+`structured_outputs` — the 25 KB grammar — then `bad_words` + `logit_bias`)
+through real OpenWebUI → real compactor → a recording vLLM stand-in that
+runs vLLM 0.19's own request-validation/xgrammar-compile front half. All
+four request shapes across all three phases are byte-identical between
+0.11.0 and 0.11.4: same `bad_words` counts and content, same
+`structured_outputs` grammar (identical sha256 in both runs), same
+`logit_bias`, `repetition_penalty`, `min_p`, `temperature` and
+`presence_penalty`.
+
+**Scroll-bug reproduction — inconclusive, reported plainly rather than
+overclaimed.** A real headless-browser reproduction (Chromium, logged into
+a copy of her DB with a test-only local admin password) DID measure an
+anchor-position shift when scrolling up through her real chat and
+triggering an older-message batch load, on both 0.11.0 and 0.11.4. The
+magnitude was NOT consistently smaller on 0.11.4 in this environment: one
+paired trial (identical starting anchor position, identical scroll
+gesture) measured +100px on 0.11.0 versus +4,036px on 0.11.4, and a repeat
+trial was confounded by an unrelated effect specific to this chat — several
+of her real messages are extremely long (thousands of pixels of rendered
+content per message), and their own height continues to settle/expand
+after mount, independent of any older-message pagination, on both
+versions. This makes the anchor-shift measurement noisy for HER SPECIFIC
+chat in this environment. **This release does not claim the upstream fix
+is proven for her chat** — only that the underlying OpenWebUI code changed
+in the direction the release notes describe, that migration and rollback
+are safe, and that the word-ban and message-array behavior are unaffected.
+Further, cleaner browser-based measurement (ideally on a host not sharing
+CPU with concurrent Docker builds) is recommended before treating the
+scroll complaint as closed.
+
+**Compactor message array — unaffected.** `get_messages_map_by_chat_id`
+is unchanged (see above); the one behavior change in
+`load_messages_from_db` (dropping empty-error assistant replays) does not
+fire on her chat's `chat_message` rows today. No difference observed in
+message count, order or content reaching the compactor between 0.11.0 and
+0.11.4 for her chat.
+
+**Operator scripts against the 0.11.4-migrated schema.**
+`scripts/repair-chat-tree.py`, `scripts/clean-decoration.py` and
+`scripts/import-history.py` all run against the migrated copy without any
+schema-compatibility error — the pre-existing decoration/orphan/anchor
+findings each script's dry run reports on her chat predate this release
+and are unrelated to the OpenWebUI version bump (they come from historical
+`chat_message`/JSON-history divergence). `import-history.py`'s dry run
+additionally surfaced a resume-offset arithmetic case it labels
+"should be unreachable" firing on her real data — spun off as a separate,
+unrelated fix.
+
 ## [3.1.9.6] — closing stale backfill records, catching a summary
 hierarchy up from webui.db, and installing sshd into a running pod
 

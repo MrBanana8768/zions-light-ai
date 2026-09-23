@@ -1,0 +1,55 @@
+v3.1.9.7 — /app/venv pip freeze diff (OpenWebUI 0.11.0 -> 0.11.4)
+==================================================================
+
+Base image:  angreg/zions-light-ai
+             @sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65
+             (v3.1.9.4, also tagged v3.1.9.5; v3.1.9.6 is a pending retag of
+             the same digest)
+
+Command:     /app/venv/bin/pip install --no-cache-dir \
+                 --constraint docs/v3197-constraints.txt open-webui==0.11.4
+
+Captured via:
+  docker run --rm --entrypoint /app/venv/bin/pip <image> freeze
+
+Baseline /app/venv had 282 installed packages. After the upgrade: 284
+(net +2: google-re2, python-docx newly pulled in; open-webui bumped in
+place; three already-present transitive deps — aiodns, langchain-core,
+pycares — were DOWNGRADED to versions open-webui 0.11.4's own dependency
+resolution requires).
+
+Full diff (`diff baseline-pipfreeze.txt trial-pipfreeze.txt`), unified:
+
+  3c3
+  < aiodns==4.0.4
+  ---
+  > aiodns==3.6.1
+  76a77
+  > google-re2==1.1.20251105
+  112c113
+  < langchain-core==1.6.3
+  ---
+  > langchain-core==1.4.8
+  159c160
+  < open-webui==0.11.0
+  ---
+  > open-webui==0.11.4
+  191c192
+  < pycares==5.0.1
+  ---
+  > pycares==4.11.0
+  208a210
+  > python-docx==1.2.0
+
+Six lines changed out of 282/284 total. Nothing else in /app/venv's
+dependency graph moved. All five non-open-webui packages that changed are
+now hash-pinned in docs/v3197-constraints.txt (passed to pip via
+--constraint) so a future rebuild of this same layer cannot silently drift
+onto newer releases of them.
+
+No other venv (/opt/vllm-venv, /opt/compactor-venv, /opt/whisper-venv,
+/opt/tts-venv) was touched — this Dockerfile.v3197 layer only runs
+`pip install` against /app/venv. See the filesystem-diff proof
+(aggregate sha256 of every other venv/dir, entrypoint.sh, supervisord.conf)
+recorded in the same release's CHANGELOG entry / commit for confirmation
+that those directories are byte-for-byte identical to the base image.

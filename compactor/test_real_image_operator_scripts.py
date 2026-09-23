@@ -79,7 +79,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKUP_ROOT = Path("/home/drew/pod-exports/2026-09-22/backup")
 IMAGE_DIGEST = "sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65"
-IMAGE_REF = f"angreg/zions-light-ai@{IMAGE_DIGEST}"
+# ZLA_REAL_IMAGE_REF lets this suite point at a locally built candidate image
+# (e.g. the v3.1.9.7 thin OpenWebUI-upgrade layer) instead of the published
+# base digest, without changing the default every other caller relies on.
+IMAGE_REF = os.environ.get("ZLA_REAL_IMAGE_REF") or f"angreg/zions-light-ai@{IMAGE_DIGEST}"
 VENV_PY = "/opt/compactor-venv/bin/python"
 CHAT_ID = "ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"
 DOCKER_TIMEOUT_S = 180
