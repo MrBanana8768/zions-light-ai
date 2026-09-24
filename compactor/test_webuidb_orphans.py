@@ -25,9 +25,11 @@ them can pass because the journal was never dangerous.
 
 import os
 import shutil
+import signal
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -73,6 +75,78 @@ def hot_journal(path: Path, rows: int = 200) -> bytes:
     jb = Path(str(path) + "-journal").read_bytes()
     con.rollback()
     con.close()
+    assert jb[:8] == MAGIC, f"fixture: journal magic is {jb[:8].hex()}, not hot"
+    return jb
+
+
+def make_genuinely_torn(path: Path, rows: int = 200, blob_kb: int = 4) -> bytes:
+    """review1-v3197-65ea196, H-3: 'the D5 test's snapshot is already in
+    its post-rollback state before the journal is re-injected, so not
+    copying the journal at all survives (W6)'. hot_journal() above builds
+    a real hot journal but then calls con.rollback() ITSELF and hands back
+    only the journal bytes, for use as an orphan/mismatched sidecar
+    elsewhere - so `path` is clean again by the time it returns, and the
+    matching-journal [D5] test below used to re-inject those bytes beside
+    an ALREADY-clean file, making "not copying the journal" indistinguishable
+    from "copying it": the answer was identical either way.
+
+    THIS forks a child that begins the same real transaction (cache_size=1
+    still spills real dirty pages into the journal, same as hot_journal()),
+    signals the parent once it has done so, and is SIGKILLed — never
+    reaching commit(), rollback(), or even sqlite3's own connection-close
+    cleanup, which is what actually removes an in-progress journal on a
+    graceful exit. What is left on disk afterward is the SAME pair a real
+    process crash leaves: `path`'s own pages already dirtied in place
+    (DELETE-mode journaling writes to the main file as it goes) holding
+    the "q"-filled UPDATE, and a live -journal holding the original
+    "x"-filled pre-image. Reproduces review1-v3197-65ea196's own
+    `r197-hj-make.py` technique (tiny cache_size + SIGKILL mid-transaction)
+    inside the unit suite instead of a throwaway rehearsal script.
+
+    Returns the journal bytes, for the same byte-for-byte CONTROL checks
+    hot_journal() supports elsewhere in this file.
+    """
+    mk(path, rows, blob_kb)
+    ready = Path(str(path) + ".fixture-ready")
+    ready.unlink(missing_ok=True)
+    pid = os.fork()
+    if pid == 0:
+        # Child: open the real transaction, dirty it for real, signal, then
+        # just sit — os._exit skips Python's own atexit/gc-driven cleanup
+        # too, but the SIGKILL from the parent below is what actually
+        # matters: this process never gets to run ANY cleanup at all.
+        try:
+            con = sqlite3.connect(str(path))
+            con.isolation_level = None
+            con.execute("PRAGMA journal_mode=DELETE")
+            con.execute("PRAGMA cache_size=1")
+            con.execute("BEGIN IMMEDIATE")
+            for i in range(rows):
+                con.execute(
+                    "update chat set chat=? where id=?",
+                    ("q" * (blob_kb * 1024), f"c{i}"),
+                )
+            ready.write_text("ready")
+            time.sleep(30)
+        finally:
+            os._exit(1)  # only reached if 30s passes without a SIGKILL
+    # Parent: wait for the child's signal, then kill it with NO chance to
+    # clean up — a plain os.kill(SIGTERM) would let Python's signal
+    # handling unwind the stack and close the connection normally.
+    deadline = time.time() + 10
+    while not ready.exists():
+        if time.time() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            raise RuntimeError("fixture: child never signaled ready in time")
+        time.sleep(0.02)
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    ready.unlink(missing_ok=True)
+    jpath = Path(str(path) + "-journal")
+    if not jpath.exists():
+        raise RuntimeError("fixture: no journal left behind - the child was not actually torn")
+    jb = jpath.read_bytes()
     assert jb[:8] == MAGIC, f"fixture: journal magic is {jb[:8].hex()}, not hot"
     return jb
 
@@ -317,30 +391,39 @@ print("[D5] a HOT ROLLBACK JOURNAL ON THE SNAPSHOT ITSELF is rolled back "
 # snapshot AND its sidecars to local staging FIRST, and only ever opens
 # (and rolls back) the LOCAL copy.
 #
-# This is a MATCHING hot journal, not an orphan: hot_journal() below builds
-# it against SNAP's own real content, so replaying it produces the correct,
-# healthy, rolled-back database - not the deliberately-mismatched-donor
-# corruption case in [0] above.
+# review1-v3197-65ea196, H-3: a GENUINELY torn snapshot, not a clean one
+# with borrowed journal bytes re-injected afterward (see
+# make_genuinely_torn's own docstring for exactly why the old fixture could
+# not distinguish "copied the journal" from "didn't"). SNAP's own on-disk
+# .db pages are left mid-update ("q"-filled) by a forked child SIGKILLed
+# before it could commit, rollback, or even run SQLite's own close-time
+# cleanup; its -journal holds the real pre-image ("x"-filled) needed to
+# undo that.
 reset()
-_snap_clean_bytes = hot_journal(SNAP, rows=200)
-# hot_journal()'s own con.rollback() already completed the undo and removed
-# the real journal - SNAP right now IS the correct post-recovery state.
-# Capture it, then re-inject the same journal bytes to recreate "a crash
-# landed before recovery ran", the state a real boot would find.
-_snap_correct_state = SNAP.read_bytes()
-Path(str(SNAP) + "-journal").write_bytes(_snap_clean_bytes)
-_snap_before = SNAP.read_bytes()
-_snap_journal_before = Path(str(SNAP) + "-journal").read_bytes()
+make_genuinely_torn(SNAP, rows=200)
 check(not LOCAL.exists(), "fixture: no local database yet (pod-recreate path)")
+_snap_dirty_before = SNAP.read_bytes()
+_snap_journal_before = Path(str(SNAP) + "-journal").read_bytes()
+_con = sqlite3.connect(f"file:{SNAP}?mode=ro", uri=True)
+try:
+    _dirty_rows = _con.execute("select chat from chat order by id").fetchall()
+finally:
+    _con.close()
+check(
+    all(row[0].startswith("q") for row in _dirty_rows) and len(_dirty_rows) == 200,
+    "CONTROL, fixture sanity: SNAP's own on-disk pages really do hold the "
+    "mid-transaction 'q'-filled UPDATE right now, unrolled-back, proving "
+    "this fixture starts genuinely dirty rather than already-clean",
+)
 
 r = webuidb.restore_on_boot()
 
 check(r["action"] == "restored_from_snapshot", f"the restore completed (got {r['action']!r})")
 check(
-    SNAP.read_bytes() == _snap_before,
-    "SNAPSHOT_DB on /data is BYTE-IDENTICAL to before the restore - it was "
-    "never opened read-write, so its own hot journal was never touched "
-    "there",
+    SNAP.read_bytes() == _snap_dirty_before,
+    "SNAPSHOT_DB on /data is BYTE-IDENTICAL to before the restore, STILL "
+    "DIRTY - it was never opened read-write, so its own hot journal was "
+    "never touched there",
 )
 check(
     Path(str(SNAP) + "-journal").exists()
@@ -360,13 +443,135 @@ _con.close()
 check(
     all(row[0].startswith("x") for row in _rows) and len(_rows) == 200,
     "and the recovered content is CORRECT - every row rolled back to its "
-    "pre-transaction value, not the in-flight update the crash interrupted",
+    "ORIGINAL 'x'-filled pre-transaction value, not the 'q'-filled in-flight "
+    "update the crash interrupted (this is the assertion W6 - 'snapshot "
+    "sidecars not copied to staging' - could not fail before: the old "
+    "fixture's SNAP was already at this exact clean state before "
+    "restore_on_boot() ever ran, so skipping the journal copy entirely "
+    "still produced 200 'x'-rows here. This fixture's LOCAL only ends up "
+    "'x'-filled if the journal genuinely reached local staging and SQLite "
+    "genuinely rolled it back there - skip the copy and this reads "
+    "'q'-filled instead, or the connect() above fails quick_check first)",
 )
+
+# ---------------------------------------------------------------------------
+print()
+print("[D5/W7] a leftover -wal/-shm under the STAGED name is renamed to "
+      "match LOCAL_DB, not left orphaned under the .restoring-<stamp> name")
+# review1-v3197-65ea196 mutant W7: `if leftover.exists(): shutil.move(...)`
+# after `os.replace(staged, dest)` — a plain open does not make a -wal/-shm
+# pair vanish the way a rollback journal does, so anything left staged
+# under the temp name must be renamed to LOCAL_DB's own name or the next
+# boot's orphan sweep would not recognise it as belonging to LOCAL_DB.
+reset()
+mk(SNAP, 30)
+_con = sqlite3.connect(str(SNAP))
+_con.execute("PRAGMA journal_mode=WAL")
+_con.execute("insert into chat values ('extra', 999, ?)", ("y" * 4096,))
+_con.commit()
+_con.close()
 check(
-    LOCAL.read_bytes() == _snap_correct_state,
-    "CONTROL: byte-for-byte identical to hot_journal()'s own recovery of "
-    "the same journal against the same starting content - the local "
-    "rollback reached the same answer SQLite's own crash recovery would",
+    Path(str(SNAP) + "-wal").exists(),
+    "fixture: SNAP is in WAL mode with an actual -wal file present "
+    "(uncheckpointed) beside it",
+)
+check(not LOCAL.exists(), "fixture: no local database yet")
+
+r = webuidb.restore_on_boot()
+check(r["action"] == "restored_from_snapshot", f"restored ({r['action']!r})")
+check(
+    Path(str(LOCAL) + "-wal").exists() or webuidb._has_rows(LOCAL) == 31,
+    "LOCAL_DB itself is whole either way (WAL is checkpointed into the "
+    "main file on close/open in some builds); the leftover-naming bug this "
+    "guards is specifically about anything left under the STAGED temp "
+    "name, checked next",
+)
+_leftover_staged = list(LOCAL.parent.glob(LOCAL.name + ".restoring-*-wal")) + \
+    list(LOCAL.parent.glob(LOCAL.name + ".restoring-*-shm"))
+check(
+    not _leftover_staged,
+    f"and nothing is left behind under the STAGED name (found: "
+    f"{_leftover_staged}) - W7 would leave the -wal/-shm pair stranded "
+    f"there instead of renamed to LOCAL_DB's own name",
+)
+
+# ---------------------------------------------------------------------------
+print()
+print("[D5/W8] an UNHEALTHY staged copy is removed from local disk, not "
+      "left behind as dead weight")
+# review1-v3197-65ea196 mutant W8: `_cleanup_staged()` removed from the
+# snapshot_unhealthy branch — without it, a multi-hundred-MB staged copy of
+# a database SQLite could not even roll back sits on the pod's local disk
+# forever, one failed boot at a time.
+reset()
+mk(SNAP, 40)
+# A DONOR journal (a real hot journal, but from a DIFFERENT database) is a
+# genuinely dangerous MISMATCH here - unlike [D5] above where the journal
+# must match to prove correct recovery, this test wants integrity() to
+# fail outright once the mismatched journal is replayed against SNAP's
+# copy, the same technique [0]'s own CONTROL at the top of this file uses.
+Path(str(SNAP) + "-journal").write_bytes(DONOR)
+check(not LOCAL.exists(), "fixture: no local database yet")
+
+r = webuidb.restore_on_boot()
+check(
+    r["action"] == "snapshot_unhealthy",
+    f"the mismatched journal makes the staged copy fail quick_check, "
+    f"correctly refusing rather than restoring a half-rolled-back database "
+    f"(got {r['action']!r})",
+)
+_stray_staged = list(LOCAL.parent.glob(LOCAL.name + ".restoring-*"))
+check(
+    not _stray_staged,
+    f"and every file under the STAGED name is gone from local disk "
+    f"afterward (found: {_stray_staged}) - W8 would leave the whole staged "
+    f"copy (main file plus sidecars) behind on every future failed boot",
+)
+check(not LOCAL.exists(), "and LOCAL_DB itself was never created")
+
+# ---------------------------------------------------------------------------
+print()
+print("[D5/W14] a copy failure PARTWAY through staging (main file OK, a "
+      "sidecar fails) cleans up what it already wrote, not just what it "
+      "was about to write")
+# review1-v3197-65ea196 mutant W14: the `_cleanup_staged()` call in the
+# copy-failure except block removed — a partial staged copy (the main
+# file successfully copied, then a sidecar copy raises) would otherwise
+# strand that partial copy on local disk exactly like W8, just reached via
+# a different failure point in the same try block.
+reset()
+mk(SNAP, 20)
+Path(str(SNAP) + "-journal").write_bytes(DONOR)  # gives copy2 a sidecar to iterate
+check(not LOCAL.exists(), "fixture: no local database yet")
+
+_orig_copy2 = shutil.copy2
+_copy2_calls = [0]
+
+
+def _fail_second_copy2(src, dst, *a, **kw):
+    _copy2_calls[0] += 1
+    if _copy2_calls[0] == 2:
+        raise OSError("fixture: simulated I/O error mid-staging")
+    return _orig_copy2(src, dst, *a, **kw)
+
+
+webuidb.shutil.copy2 = _fail_second_copy2
+try:
+    r = webuidb.restore_on_boot()
+finally:
+    webuidb.shutil.copy2 = _orig_copy2
+check(
+    r["action"] == "restore_failed" and _copy2_calls[0] >= 2,
+    f"the main file's copy succeeded, the sidecar's copy raised, and the "
+    f"failure was reported rather than swallowed (action={r['action']!r}, "
+    f"copy2 calls={_copy2_calls[0]})",
+)
+_stray_partial = list(LOCAL.parent.glob(LOCAL.name + ".restoring-*"))
+check(
+    not _stray_partial,
+    f"and the PARTIAL staged copy (the main file that DID succeed before "
+    f"the sidecar failed) is cleaned up too (found: {_stray_partial}) - "
+    f"W14 would leave exactly that partial file behind",
 )
 
 shutil.rmtree(_ROOT, ignore_errors=True)
