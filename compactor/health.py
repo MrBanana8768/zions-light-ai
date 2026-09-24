@@ -802,6 +802,33 @@ def probe_snapshot() -> dict:
             f"clock: the snapshot's mtime is {round(-age)}s in the future"
         )
         return out
+
+    # H-2/D11 (review1-v3197-65ea196): prefer the check-in sidecar webuidb.py
+    # now touches (see webuidb.SYNCED_AT_SIDECAR's own comment) every time
+    # sync_once() completes a real cycle -- published OR the ordinary
+    # "unchanged since last sync" skip. Its mtime answers "when did the
+    # daemon last check in", which is what "is the daemon keeping up"
+    # actually needs, and it stays fresh across a boot no matter how old
+    # SNAPSHOT_DB's own content mtime is. This is the file the module
+    # docstring for local_lag_s (below) already specified but did not build
+    # ("if that file starts existing, prefer it outright over both age_s and
+    # local_lag_s"); it now exists.
+    #
+    # Without this, the FIRST write after a restore made local_lag_s huge:
+    # SNAPSHOT_DB's mtime is copied from local's mtime at restore time,
+    # which can be hours old (whatever she last wrote before the pod
+    # stopped), so `local_mtime(now, her first write) - snap_mtime(hours
+    # old)` read as hours of "lag" even though the very next cycle -
+    # immediate at boot, D14 - was always going to publish it fine.
+    try:
+        checkin_mtime = os.path.getmtime(f"{snap}.synced_at")
+        checkin_age = time.time() - checkin_mtime
+    except OSError:
+        checkin_age = None
+    if checkin_age is not None:
+        out["checkin_age_s"] = round(checkin_age)
+        out["stale"] = checkin_age > 3 * interval
+        return out
     # v3.1.9 (OPEN_ISSUES2 webuidb MEDIUM, "the one durability alarm
     # measures her IDLE TIME"). webuidb.sync_once() stamps the published
     # snapshot with `min(local_mtime, time.time())` - the LOCAL database's

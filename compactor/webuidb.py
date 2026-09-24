@@ -64,6 +64,37 @@ SNAPSHOT_DB = Path(
     os.environ.get("WEBUI_SNAPSHOT_DB", "/data/openwebui/webui.db")
 )
 SYNC_INTERVAL_S = env_float("WEBUI_DB_SYNC_INTERVAL_S", 300)
+# H-2/D11 (review1-v3197-65ea196). health.py's probe_snapshot() used to
+# judge staleness from SNAPSHOT_DB's own content mtime vs LOCAL_DB's --
+# exactly the daemon's own "has anything changed" question, which is right
+# for "should the next cycle publish?" but wrong for "is the daemon keeping
+# up?": right after a restore, SNAPSHOT_DB's mtime is copied FROM a possibly
+# many-hours-old local mtime (whatever she last wrote before the pod
+# stopped), so her FIRST message after boot makes `now - snap_mtime` read as
+# hours of "lag" even though the very next cycle (at most SYNC_INTERVAL_S
+# away, and immediate at boot per D14) will publish it fine. This sidecar
+# is touched by sync_once() every time it completes a cycle that means the
+# daemon actually looked -- published OR the ordinary "unchanged since last
+# sync" skip -- so its mtime answers "when did the daemon last check in",
+# which stays fresh across a boot regardless of how old the snapshot's own
+# content happens to be. health.py prefers it when present; see that
+# module's probe_snapshot().
+SYNCED_AT_SIDECAR = SNAPSHOT_DB.with_name(SNAPSHOT_DB.name + ".synced_at")
+
+
+def _touch_synced_at() -> None:
+    try:
+        SYNCED_AT_SIDECAR.parent.mkdir(parents=True, exist_ok=True)
+        SYNCED_AT_SIDECAR.touch(exist_ok=True)
+        os.utime(SYNCED_AT_SIDECAR, None)  # touch(exist_ok=True) alone does
+        # not bump mtime on every filesystem/Python version if the file
+        # already existed; os.utime(None) always sets it to "now".
+    except OSError as e:
+        logger.warning(
+            f"could not touch check-in marker {SYNCED_AT_SIDECAR} "
+            f"({type(e).__name__}: {e}); /health/full's staleness check "
+            f"will fall back to comparing file mtimes directly"
+        )
 # Where a local database that fails its integrity check is set aside. Never
 # deleted: this project's rule is that anything removing state is reversible.
 QUARANTINE = Path(os.environ.get("WEBUI_DB_QUARANTINE", "/data/forensics"))
@@ -1756,6 +1787,7 @@ def sync_once(force: bool = False) -> dict:
                     # Nothing has been written since the last publish. Skipping
                     # matters: each sync writes the whole database onto the
                     # volume whose write reliability is the problem.
+                    _touch_synced_at()  # H-2/D11: the daemon DID check in.
                     out["skipped"] = "unchanged since last sync"
                     return out
 
@@ -2261,6 +2293,7 @@ def sync_once(force: bool = False) -> dict:
             pass  # a filesystem that refuses utime costs an extra sync, no more
         out["synced"] = True
         out["bytes"] = SNAPSHOT_DB.stat().st_size
+        _touch_synced_at()  # H-2/D11: the daemon DID check in, right now.
         logger.info(
             f"published local -> snapshot ({out['bytes'] / 1e6:.1f} MB, "
             f"{chats} chats)"
@@ -2319,6 +2352,21 @@ class _ShutdownRequested(BaseException):
 
 
 def _sigterm_handler(signum, frame) -> None:
+    # H-1 (review1-v3197-65ea196, X2c). A SECOND SIGTERM arriving while the
+    # first is still being handled -- i.e. while _final_sync_on_shutdown's
+    # own sync_once() is running -- used to invoke THIS handler again,
+    # raising a second _ShutdownRequested that escaped every `except
+    # Exception` in sync_once and _final_sync_on_shutdown alike (both
+    # deliberately catch only Exception, not BaseException -- see
+    # _ShutdownRequested's own docstring for why). The result was an
+    # unhandled exception, a traceback, and exit status 1: no final
+    # publish, and supervisord's autorestart made a clean shutdown look
+    # like a crash. Setting SIG_IGN as the FIRST action of every
+    # invocation -- including this, the first one -- means any SIGTERM
+    # that lands after this point is simply ignored: the process keeps
+    # running the shutdown it already started instead of being asked to
+    # start a second one.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     raise _ShutdownRequested()
 
 
@@ -2329,28 +2377,49 @@ def _final_sync_on_shutdown() -> None:
     (120s, supervisord.conf, comfortably longer than a warm publish's
     13-23s) before SIGKILLing — captures her last write automatically.
 
-    force=True deliberately: an ordinary sync_once() would very likely hit
-    the ordinary "unchanged since last sync" skip (nothing is more likely
-    than there being no NEW write in the seconds since the last periodic
-    publish), and this is the one caller that must not accept that skip
-    quietly — if there IS something unpublished this is the last chance,
-    and if there is not, force=True republishing identical content is a
-    no-op cost, not a correctness problem.
+    NOT force=True (H-1, review1-v3197-65ea196, H-1/X6): that was this
+    function's ORIGINAL shape, and the docstring's claim that "force=True
+    republishing identical content is a no-op cost" was false -- measured
+    at 27s for a whole-DB republish onto the simulated volume with NOTHING
+    changed since the last periodic publish, because force=True bypasses
+    sync_once's own mtime-based skip (`elif snap_mtime >= mtime: skip`)
+    unconditionally. Plain sync_once() (no force) asks exactly the
+    question this caller needs answered -- "is the snapshot's mtime older
+    than local's (or is a clock skewed)?" -- and already publishes in
+    every case that matters here: something unpublished, or a poisoned
+    future-dated snapshot. The only case force=True added over plain
+    sync_once() was "publish even though nothing changed", which is pure
+    cost on the shutdown path: it makes every stop take a full publish
+    (widening the window a second SIGTERM or a `docker stop -t 10` can
+    land in) even on a pod nobody has written to since the last cycle.
 
     Never raises: the process is exiting either way, and an unhandled
     exception here would trade the one line an operator needs to see
     (published / skipped / error) for a stack trace in the shutdown log.
-    A SECOND SIGTERM arriving while this runs is not caught here — supervisord
-    does not send one before stopwaitsecs elapses, and a caller who really
-    wants a hard stop should get one.
+    A SECOND SIGTERM arriving while this runs is ignored, not caught here
+    -- see _sigterm_handler's own SIG_IGN fix.
     """
     try:
-        r = sync_once(force=True)
+        r = sync_once()
     except Exception as e:
         logger.error(f"final sync on SIGTERM raised: {type(e).__name__}: {e}")
         return
     if r["error"]:
         logger.error(f"final sync on SIGTERM did not publish: {r}")
+    elif r["skipped"] == "another sync is in progress":
+        # P1 (review1-v3197-65ea196): a SIGTERM landing inside sync_once's
+        # own `finally`, before _release_sync_lock runs, can leave the
+        # flock held by the still-unwinding frame long enough that THIS
+        # call sees it busy and skips -- meaning NO final publish happened,
+        # though the result dict reads exactly like the harmless "another
+        # sync is in progress" skip logged elsewhere at INFO. WARNING here,
+        # deliberately: an operator must not read this line as "the final
+        # sync ran".
+        logger.warning(
+            f"final sync on SIGTERM found a sync already in progress and "
+            f"could NOT publish (the shutdown may have lost unpublished "
+            f"writes): {r}"
+        )
     else:
         logger.info(f"final sync on SIGTERM: {r}")
 
@@ -2424,15 +2493,24 @@ def sync_loop() -> None:
             consecutive_no_local = 0
 
     # D11/D14 (findings.md). Publish once IMMEDIATELY, rather than waiting a
-    # full SYNC_INTERVAL_S before the first cycle. Before this fix,
-    # /health/full's snapshot check read "stale: true" (with a huge
-    # local_lag_s) for up to SYNC_INTERVAL_S after every boot — a false
-    # alarm: restore_on_boot's copy2 leaves LOCAL_DB's mtime matching the
-    # snapshot it was restored from, so there is nothing actually stale,
-    # only nothing published YET. Safe to run this early: sync_once()
-    # already treats "LOCAL_DB does not exist yet" as an ordinary skip, not
-    # an error, which is what covers a boot ordering where this program's
-    # priority (supervisord.conf) puts it ahead of OpenWebUI itself.
+    # full SYNC_INTERVAL_S before the first cycle. Safe to run this early:
+    # sync_once() already treats "LOCAL_DB does not exist yet" as an
+    # ordinary skip, not an error, which is what covers a boot ordering
+    # where this program's priority (supervisord.conf) puts it ahead of
+    # OpenWebUI itself.
+    #
+    # THIS ALONE DID NOT FIX D11 (review1-v3197-65ea196, H-2): this first
+    # cycle runs before OpenWebUI has taken a single write, sees LOCAL_DB's
+    # mtime unchanged from the snapshot it was just restored from, and
+    # takes the ordinary "unchanged since last sync" skip below - which
+    # does now touch SYNCED_AT_SIDECAR (the actual D11 fix), but her FIRST
+    # message after that still used to make /health/full read "stale: true"
+    # with a huge local_lag_s for up to SYNC_INTERVAL_S, because the OLD
+    # staleness check compared LOCAL_DB's fresh mtime against SNAPSHOT_DB's
+    # stale one. health.py's probe_snapshot() now prefers
+    # SYNCED_AT_SIDECAR's own mtime instead, which this immediate first
+    # cycle sets to "now" before she can possibly have written anything -
+    # so the false alarm this comment used to describe can no longer occur.
     try:
         _account(sync_once())
     except _ShutdownRequested:
@@ -2464,10 +2542,18 @@ def sync_loop() -> None:
         try:
             time.sleep(SYNC_INTERVAL_S)
             r = sync_once()
+            # H-1 (review1-v3197-65ea196): _account used to run AFTER this
+            # try/except, so a SIGTERM landing during _account itself (it
+            # only mutates two closure ints and calls logger.error, so this
+            # is theoretical, not measured) would escape sync_loop with no
+            # final sync at all -- the same gap _ShutdownRequested being a
+            # BaseException exists to close everywhere else. Moved inside
+            # so every path through this iteration is covered by the same
+            # except below.
+            _account(r)
         except _ShutdownRequested:
             _final_sync_on_shutdown()
             return
-        _account(r)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
