@@ -9,6 +9,370 @@ on Docker Hub.
 
 ---
 
+## [3.1.9.2] — repetition-loop hardening
+
+**The bug (production logs):** the model (Cydonia-24B, vLLM 0.19.0) sometimes
+degenerates into one token or phrase repeated, or an unbroken line of short
+fragments. `reply_is_degenerate` already kept such a reply out of what gets
+memorized, but OpenWebUI still re-sends it as ordinary chat history on every
+later request, and the hard-budget guard's ~5-turn window makes a recent loop
+reply a large fraction of everything the model is shown right after it loops
+— plausibly why the reply after a loop has come back empty. Separately, the
+owner's `repeat_penalty` (Ollama's name) rode through OpenWebUI's
+pass-through-unknown-keys behavior to vLLM, which does not recognise it —
+`repetition_penalty` silently stayed at its default, and nothing said so.
+
+### Fixed
+- **Ollama sampling-name translation.** `repeat_penalty` is translated to
+  `repetition_penalty` before forwarding (coerced to a positive float; a bad
+  value is dropped with a WARNING, never forwarded). If both are present,
+  `repetition_penalty` wins **when it is itself valid**; otherwise the
+  coerced `repeat_penalty` is used instead of losing both values.
+  `repeat_last_n` has no vLLM equivalent and is dropped with a note. A
+  numeric-string `repetition_penalty` is coerced to float. **Non-finite
+  values are rejected** (a string `"inf"`/`"Infinity"`/`"1e999"`, or a
+  numeric `1e999`, used to be coerced to a real `inf` and forwarded, which
+  httpx's encoder then refused to serialize — a 500 from inside the proxy,
+  after compaction and memory injection had already spent the turn; hostile
+  pass #7, F4). Logged at INFO, at most once per conversation-id per process
+  (bounded set — see `_translate_ollama_sampling_params` in `main.py`).
+- **Detected loop replies are now kept out of what is FORWARDED to vLLM**,
+  not only out of what is memorized. After compaction and memory injection,
+  before the hard-budget guard, every non-newest degenerate ASSISTANT turn is
+  replaced (`_redact_forwarded_loop_replies` in `main.py`) — but **only the
+  flagged SPAN is collapsed, not the whole reply**, when the detector can
+  locate one (a token run, a phrase repeating to the end, a single-character
+  run, or an unbroken fragment line): the clean text before it, and after it
+  when the span sits mid-reply, both reach the model. Real-data measurement
+  (hostile pass #7, F2) showed the earlier whole-reply-replacement rule threw
+  away a real, clean answer of up to 21.6k characters on 33 of 68 flagged
+  replies, because a PHRASE loop ends on sentence boundaries and the old
+  "trim to the last sentence, re-judge" rule could not cut it at all. The
+  cut repeats until what is left is no longer flagged (the phrase rule looks
+  at a 4,000-character window, so one cut can leave part of a long loop in
+  place; on the 2026-09-16 backup that was 10 of 67 flagged replies before
+  this, 0 after). A reply with no span to cut around (decoration fraction,
+  script drift, the short-list-run backstop) falls back to its clean
+  sentence head; only a reply with no clean text worth keeping gets the
+  whole-reply placeholder (10 of 67 on that backup, down from 51 of 68).
+  **Fenced code was excluded from the token-run rule for one release
+  (hostile pass #7, F3) and is NOT any more — see the "REMOVED, not
+  narrowed" entry under hostile pass #9 below; that history is kept here
+  for context, not as a description of current behaviour.** User turns,
+  system messages and the newest message are never touched. Logged at INFO
+  as a count only (no text) — `touched=<n> whole=<k> cut=<n-k>` (hostile
+  pass #8, P8-8: the line used to say "replaced N ... with a placeholder"
+  unconditionally, which stopped being true once span-cutting made a
+  placeholder the MINORITY outcome — 10 of 66 flagged replies on the
+  2026-09-16 backup, not all of them). Apart from the fence-exemption
+  history described below, the detection rules and thresholds are
+  unchanged.
+  A new internal helper (`_reply_degenerate_verdict`) exposes the flagged
+  span alongside the same reason string, cached per 128-bit content digest
+  (not the text itself, so the VERDICT cache holds no reply text) so a
+  conversation OpenWebUI resends unchanged on every later request only pays
+  the detection cost once per turn, not once per request (measured
+  0.78-0.83s CPU per request on an 811-message real conversation before
+  caching; hostile pass #7, F5). A SEPARATE cache
+  (`_DEGENERATE_CUT_CACHE`) memoizes the cut-and-re-judge loop's own
+  result, keyed the same way — its VALUES **are** the kept replacement
+  text (a correction to this entry's earlier wording, which claimed
+  neither cache held reply text; hostile pass #8, P8-8), capped at 1,024
+  entries and now honouring `COMPACTOR_DEGENERATE_VERDICT_CACHE_SIZE=0`
+  the same way the verdict cache does (it used to keep caching regardless
+  of that setting). The ROLLUP-input redaction (`_redact_degenerate_turns`,
+  memory-side, pre-existing) is UNCHANGED — this release does not have the
+  real-data basis to prove the same span-cutting rule is safe there.
+- **The hard-budget guard's recent-turn floor is now aligned the same way
+  `split_messages` aligns its own kept-recent window** (starts on a user
+  turn; an odd turn count means the real window can hold one fewer message
+  than `KEEP_RECENT_TURNS`). The floor used to be the raw message count, so
+  an old, unpaired turn (most often a retained image) sitting in the
+  misaligned slot was protected from the pre-shed loop and could cost
+  injected memory (facts/retrieval halved or dropped) to keep a turn that
+  was not actually inside the real recent window — and could still be
+  dropped anyway by a later shedding stage, spending the memory for nothing
+  (hostile pass #7, F1). **Correction (hostile pass #8, P8-1):** the first
+  version of this fix only stripped a leading turn of the WRONG role from
+  the aligned window, which happened to fully cover a stale ASSISTANT-role
+  test fixture but not what production actually sends — OpenWebUI puts an
+  uploaded image on a USER turn, so a preserved old image sat in front of
+  another USER turn and the role check alone found nothing to strip,
+  leaving the floor unaligned exactly as before for that shape. The floor
+  now also strips a leading turn that shares its role with the turn right
+  after it (a real recent window always alternates roles; two consecutive
+  user turns at the front means the first one is not actually recent).
+- **Fence exemption fixes (hostile pass #8), and REMOVAL (hostile pass #9):**
+  - **P8-2 (regression, was flagged correctly by v3.1.9):** the token-run
+    fence exemption above treated an UNCLOSED ` ``` ` opener as fencing
+    everything after it forever — this model uses bare ` ``` ` lines as
+    decorative boxes (128 of 1,709 unique real replies in the 2026-09-16
+    backup have an odd count), so a real identifier loop starting after
+    the last unmatched opener and running to the end of the reply was
+    silently exempted and stored to memory/forwarded verbatim. "Fixed" at
+    the time: a run only counts as fenced when the fence actually CLOSES
+    again later, and never when the run reaches the end of the reply
+    either way.
+  - **P9-3 (hostile pass #9): P8-2's own fix does not work, and the
+    exemption is now REMOVED entirely rather than narrowed a third time.**
+    The "never when the run reaches the end of the reply" half is
+    logically unsatisfiable together with "only inside a fence that
+    CLOSES": for a fence to be judged closed, a LATER `` ``` `` toggle
+    must exist past the run, which makes "reaches the end" false by
+    construction every time "closed" is true. The clause never fired —
+    mutation-measured, 0 of 20,000 synthetic verdicts depended on it — so
+    a loop sitting inside an ordinary CLOSED decorative box (the common
+    case for this model, not the exotic one) was exempted regardless of
+    position: stored to facts/episodic/rollups and forwarded on the wire
+    unredacted. v3.1.9 flagged this shape; v3.1.9.2 (through this release,
+    until now) silently did not. The token-run rule now judges text
+    exactly as v3.1.9 did, with **no fence awareness of any kind**. The p7
+    F3 complaint this exemption was originally written for (a legitimate
+    repeated-value array losing the whole reply) is already answered by
+    the span-cut described above, which keeps the rest of the reply and
+    drops only the flagged span — so the cost of losing the exemption is
+    that such a reply is skipped from MEMORY only, exactly as v3.1.9 did;
+    not a regression, simply not the improvement F3/P8-2 attempted.
+  - **P8-3:** the forwarded-window cut's clean-prefix rule reused
+    `trim_to_last_sentence`, which refuses any boundary inside a fence —
+    correct for the memory-side redaction (an unterminated opener must
+    never reach fact extraction), wrong for the forwarded view, where
+    nothing is extracted. This model's boxed reply style put the last
+    real sentence end inside a box often enough to discard up to the
+    WHOLE reply before a loop in one real case, and roughly 11k
+    characters of boxes-and-prose in another. A new
+    `_trim_forwarded_prefix` (forwarded path only; the memory-side rule is
+    unchanged) allows a boundary inside a fence and falls back to the
+    last line break when no sentence end is available, self-balancing any
+    fence it leaves open.
+  - **P8-4:** a mid-reply cut that splits one CLOSED fence across the kept
+    prefix and suffix used to leave a stray, unbalanced ` ``` ` marker,
+    misreading the rest of the reply as code. The cut now balances the
+    fence count of what it actually emits.
+  - **P8-5:** the cut-and-re-judge loop's pass budget is now bounded by
+    total CHARACTERS scanned across all passes, not a flat pass count — a
+    300k-character pathological loop (far beyond her longest real reply,
+    51k) now costs a fraction of the 2.2s of GIL-bound CPU it measured
+    before, with no change for anything her real conversations produce.
+    Falling back to the whole-reply placeholder because the pass budget
+    was exhausted is now logged at WARNING (it used to be silent).
+- **`max_tokens: 1e999` (and any other numeral that overflows to `inf`, in
+  any numeric request field) is now rejected at JSON-parse time with a 400**
+  (hostile pass #8, P8-6), the same way the existing `NaN`/`Infinity`
+  constant guard works. It used to reach `int(body.get("max_tokens") or 0)`
+  and raise `OverflowError`, which the surrounding `except
+  (TypeError, ValueError)` did not catch — a 500 from inside the proxy for
+  a client-supplied number, now caught before compaction or memory
+  injection ever run. `OverflowError` was also added to that except clause
+  as a second line of defence, which now drops (and logs) an unparseable
+  `max_tokens` instead of leaving the client's own bad value sitting
+  untouched in the forwarded body.
+- **A 4-space-indented ` ``` ` line is no longer misread as a fence
+  delimiter** (hostile pass #9, P9-6): CommonMark treats text indented 4+
+  spaces as an indented code block, so a ``` at that indentation is
+  literal content, not markup — `_fence_toggle_offsets` used to strip all
+  leading whitespace before checking, so such a line was counted as a
+  toggle and could mis-pair a real fence's open/close state one line
+  later than it should. Affects `trim_to_last_sentence` and
+  `_trim_forwarded_prefix`'s cut-boundary decisions only; the token-run
+  rule has no fence reading of its own to affect (see P9-3 above).
+
+### Fixed (hostile pass #10)
+
+- **P10-1 (HIGH): the hard-budget guard spent injected memory it never
+  needed to spend, then shed the previous exchange anyway.** On a reusing
+  request the array is usually exactly at the recent-window floor
+  (`[U_prev, A_prev, U_new]`); the guard's floor alignment used to run
+  only when the array held MORE turns than the floor, so it stayed
+  unaligned on that exact shape, persona/facts/retrieval were halved and
+  dropped for nothing, and the previous exchange was shed anyway by the
+  plain fallback loop right after — finishing 6,187-9,213 tokens under the
+  limit with memory gone AND the exchange gone. Measured on her real
+  branch: 24 of 472 positions (5.1%). Fixed: the compacted branch now
+  decides once, by arithmetic, whether spending every spendable injected
+  block could ever cover the gap before it crosses into the protected
+  recent window — memory pays when it can, the exchange pays only when
+  memory provably cannot (`compactor/main.py`, `_enforce_hard_budget`).
+- **P10-2 (HIGH): the reuse ceiling's "11,300-token capacity" was in the
+  wrong unit, and 12,000 did not clear what her hierarchy actually
+  renders at.** `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` raised 12000 ->
+  15000, sized off a measured render (her real per-tier chunk sizes plus
+  a give-up L3 concatenation — routine whenever `/tokenize` is down) with
+  real margin, not the nominal per-tier maxima. Every comment and doc
+  citing the old, wrong-unit figure corrected. See [Memory
+  budgets](RUNPOD_DEPLOY.md#memory-budgets--raised-defaults-in-v319).
+- **P10-3 (MEDIUM): `checks.reuse` could read as a healthy reuse while
+  the attempt had actually crashed.** The attempt counter lived at a call
+  site three `if`s deep that four of five failure shapes never reached;
+  the decline counter lived in one further-nested `if`, so an exception
+  left `attempted` incremented with nothing to show it had failed. Both
+  now record once, at the top and bottom of the same block, with a
+  `reason` (`success`/`no_state`/`no_coverage`/`budget`/`error`) — see
+  OPERATIONS.md's `checks.reuse` section.
+- **P10-4 (MEDIUM): the P9-6 indent fix (4-space-indented ``` lines) was
+  applied to `_fence_toggle_offsets` alone; two siblings still counted
+  fences the old, indent-blind way and could disagree by one, inserting
+  an unmatched real fence opener into a reply that had none.**
+  `_trim_forwarded_prefix` and `_cut_degenerate_span_once`'s
+  belt-and-braces check now both use `_fence_toggle_offsets`. The
+  fragment-line rule's two inline fence walks (P9-5) are still not
+  migrated — reasoned in a code comment (main.py, above the fragment-line
+  loop) and in the fix lane's own report, not silently left as-is.
+- **P10-5 (LOW, informational): raising Max Tokens past
+  `COMPACTOR_GENERATION_RESERVE` lets the reuse stand-in claim up to 75%
+  of the window** (72% at or below the recommended Max Tokens, up from
+  58% before P10-2 raised the ceiling default — a side effect worth
+  knowing if you tune Max Tokens upward). Not triggered at the documented
+  Max Tokens (12000). See [RUNPOD_DEPLOY.md → Max
+  Tokens](RUNPOD_DEPLOY.md#sampling-parameters).
+
+Operator note: see [RUNPOD_DEPLOY.md → Sampling parameters](RUNPOD_DEPLOY.md#sampling-parameters)
+for the mapping between OpenWebUI's Advanced/Custom Parameters and vLLM's
+names, and recommended starting values for this model — **Max Tokens 12000,
+not 7000**: this model measures 2.0-2.4 characters/token on assistant
+replies (not the 4 chars/token a naive estimate assumes), so 7000 tokens is
+only ~14-17k characters and would cut some of her ordinary long replies
+mid-sentence (hostile pass #7, F6). `repetition_penalty` is now recommended
+at 1.05 with Frequency Penalty 0.3, because vLLM 0.19 applies
+`repetition_penalty` to prompt tokens as well as output — a high value
+discourages words already in the conversation/memory context, not only
+words already said in this reply.
+
+Does NOT fix: the model degenerating in the first place (that is a sampling/
+model-behavior problem, mitigated by the `repetition_penalty` translation
+above, not eliminated by it); the injected-memory-hierarchy's own
+(`_redact_degenerate_turns`) whole-reply placeholder wording, left
+unchanged; the decoration-fraction/script-drift/short-list-run verdicts,
+which still fall back to whole-reply replacement in the forwarded window
+because they have no single span to cut around; the pre-existing
+TARGET-based stand-in budget gap above roughly 16k max_tokens (not
+triggered at the recommended 12000; tracked, deferred); the
+cut-and-re-judge loop's algorithm itself (hostile pass #8, P8-5) — passes
+are now budgeted by total characters scanned rather than redesigned to
+extend a tail cut backwards in one pass, which would need its own
+mutation-tested coverage beyond this lane's scope; a merge of two
+concurrent conversations losing acknowledged facts (hostile pass #8's
+gate note; pre-existing, untouched by this diff, needs its own ticket);
+`~~~`-delimited fences, still invisible to `_fence_toggle_offsets`
+(hostile pass #9, P9-6) — CommonMark treats ``` and ~~~ as independent
+fence-marker families that do not cross-close each other, and this
+detector's toggle list is a single flat, character-agnostic parity count,
+so adding ~~~ without also tracking marker type would let a ``` block and
+a ~~~ block mis-pair under a mixed-marker reply; a real fix needs
+per-marker pairing, judged not worth the redesign risk for a LOW-severity
+gap on the last V3 release.
+
+---
+
+## [3.1.9.1] — reuse was declining on every production request
+
+Production, 2026-09-16 11:06Z: 37 of 37 requests on one live conversation
+logged `compaction skipped: 806 turns need 45 summarization calls, over the
+4-call per-request cap` — the exact failure v3.1.9 shipped to remove. The
+line before it, every time:
+
+```
+summary block: dropped 3 tier item(s) to fit the 1846-token block budget ...
+kept 1/4 chapter(s), 1/1 scene(s) and the caller asked for all-or-nothing,
+so NOTHING is returned ...
+the stored summaries cover 792 of the turns this request would compact,
+but they do not fit whole in the 1846 token(s) TARGET (15576) leaves
+beside the system prompt, images and recent turns (12706) and one fresh
+summary (1024); summarizing from scratch ...
+```
+
+**Cause**: `compact_if_needed`'s stand-in for the stored hierarchy was
+budgeted against `TARGET_TOKENS` alone, as if the request would ALSO inject
+a second, separate copy of the summary — but on a reusing turn that second
+copy is always skipped (`sum(in-array)`), freeing its share of the injection
+budget. The stand-in never got to spend that freed share, so with long
+recent turns it was squeezed to a few hundred tokens and `all_or_nothing`
+declined reuse on every single request.
+
+**Fix**: the stand-in may now claim up to what the skipped summary
+injection would have spent (60% of the injection budget, capped at
+`COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`) when that is larger than the
+TARGET-derived figure — computed by one helper both the array's stand-in and
+the separate injection path call, so they cannot drift apart again. At the
+numbers above, this is the difference between a ~1,846-token squeeze and a
+~6,230-token one; her hierarchy (~5.1k tokens) fits the latter and reuse
+fires.
+
+**What the operator sees now, on the same shape of request**: `compacted:
+summarized N text turn(s), forwarded 0 verbatim, ... M covered by stored
+summaries` instead of `compaction skipped: ... over the 4-call per-request
+cap`. N is the turns the stored summaries do not cover yet (the tail past the
+last L1 chunk, plus any turn the covered-turn record does not pair); it falls
+as L1 rollups catch up. On a copy of the production data: 792 turns replaced,
+27 summarized fresh, 1,172,733 -> ~18.7k tokens before memory injection.
+
+**What this does NOT fix**: a hierarchy that still cannot fit even the
+larger, injected-share budget still declines exactly as before (same log
+line, now naming the real budget source) — no partial/squeezed stand-in was
+added, to avoid removing turns the log could not honestly say were covered.
+
+**Correction (hostile pass #9, P9-1/P9-2): the fix above stopped working on
+her own conversation within days, and the "her hierarchy (~5.1k tokens) fits
+... and reuse fires" claim two paragraphs up was already stale by the time
+this release reached hostile review.** Both terms of the stand-in's budget
+are capped by `SUMMARY_BLOCK_MAX_TOKENS`, and the fix's own 60%-of-
+inject_budget share is a hard-coded `0.6` multiplier that
+`SUMMARY_BLOCK_MAX_TOKENS` can only ever LOWER, never raise past. At the
+values this release actually shipped (`COMPACTOR_INJECTION_BUDGET_
+FRACTION=0.6`, `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=6230`) the ceiling is a
+flat 6,230 tokens — below her hierarchy one day later (~9,050 tokens, up
+from ~5.1k) — so reuse silently declined on every request again, the exact
+2026-09-16 failure this entry describes fixing. Raising `SUMMARY_BLOCK_MAX_
+TOKENS` alone does not help: even at `0.75`/`20000` the ceiling is pinned at
+~9,345 by the `0.6` multiplier, still 1,955 tokens short of the hierarchy's
+own documented construction capacity (9 L1 scenes + 4 L2 chapters + 1 L3 at
+their max sizes = 11,300 tokens), so reuse would turn itself off again
+within one L1 rollup chunk regardless of how the fraction is tuned. **Fixed
+in v3.1.9.2** (hostile pass #9): the reuse stand-in now has its OWN budget
+formula (`_standin_reuse_ceiling`, `COMPACTOR_STANDIN_BUDGET_FRACTION`,
+default 1.0 of the injection budget) instead of sharing the separately-
+injected summary block's 60% formula — the two situations only looked
+alike; nothing else spends the stand-in's share on a reusing turn, because
+the separate injection is SKIPPED, not shrunk. Shipped defaults moved to
+`COMPACTOR_INJECTION_BUDGET_FRACTION=0.75` and `COMPACTOR_SUMMARY_BLOCK_
+MAX_TOKENS=12000`, which together clear the 11,300-token capacity with
+margin (empirically measured against a hierarchy built to exactly that
+capacity: true render cost 11,400-11,500 tokens). `/health/full` now
+reports `checks.reuse` (`attempted`, `declined_budget`,
+`declined_recently`, and the two numbers — ceiling and other-consumers
+total — behind the most recent decline; no conversation text, ever), so
+the next time her data outgrows the arithmetic again the operator sees it
+without reading request logs.
+
+**Correction (hostile pass #10, P10-2): "clears the 11,300-token capacity
+with margin" was also wrong, in a way the "empirically measured" render
+above happened to paper over.** The 11,300 figure (`9*L1_MAX_TOKENS +
+4*L2_MAX_TOKENS + L3_MAX_TOKENS`) is in OUTPUT tokens; the ceiling above is
+checked against `_estimate_block_tokens`, which prices non-ASCII at one
+token per UTF-8 BYTE — up to 4.27x over for CJK, 2.34x for Greek — so the
+two numbers were never in the same unit, and this user quotes scripture.
+Separately, her real L1/L2 chunks already exceed the PER-TIER maxima that
+figure assumes (measured: 8 L1 chunks mean 561, max 792 against
+`L1_MAX_TOKENS=500`; 4 L2 chapters mean 1,102, max 1,271 against
+`L2_MAX_TOKENS=1200`), and L3 is not bounded by `L3_MAX_TOKENS` in
+practice — a stalled `/tokenize` (a live state on this pod) routinely
+makes the L3 rollup give up and CONCATENATE 2-3 parts instead of
+summarizing them, and that concatenation is what gets stored and carried
+into every later refresh. Measured against her real chunks plus a real L3:
+steady-state peak 11,728 (272 tokens of the claimed margin, not "1,955
+short" nor comfortably clear); with a 2x-part give-up concatenation,
+13,860 — over 12,000, and reuse declines again exactly as it did before
+this entry's own fix. **Fixed in v3.1.9.2** (hostile pass #10):
+`COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` raised to `15000`, sized off the
+measured give-up-L3 peak (13,860) with ~1,140 tokens of real margin rather
+than off the wrong-unit nominal figure — see that variable's own comment
+in `Dockerfile`/`runpod.env.template` for the full arithmetic. This does
+not claim the ceiling "cannot be outgrown"; a 3x-part give-up
+concatenation (~15,860) still declines, safely, back to summarizing from
+scratch.
+
+---
+
 ## [3.1.9] — operator notes (the last V3 release)
 
 Operator-facing notes only: what to check on the pod, what not to run, and

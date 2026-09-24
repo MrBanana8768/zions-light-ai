@@ -198,35 +198,98 @@ disk on this boot.
 
 ### Memory budgets — raised defaults in v3.1.9
 
-Five environment variables control how much of her own facts/retrieval/
-summary memory is stored and injected per turn. The owner raised all five
-by hand on the running pod (2026-09-15, a `supervisorctl` `environment=`
-edit on the `compactor` program — lost on every container restart, so it
-had to be reapplied after any redeploy). **v3.1.9 bakes the same five
-values into the image and this template, so that live edit is no longer
-needed:**
+*(Two of these six rows were raised again, and a sixth added, in v3.1.9.2
+— see below; the anchor name is kept as-is so existing links into this
+section do not break.)*
 
-| Variable | Code default | v3.1.9 shipped default |
-|---|---|---|
-| `COMPACTOR_MAX_FACTS_TOKENS` | 1500 | 3500 |
-| `COMPACTOR_INJECT_FACTS_TOKENS` | 400 | 600 |
-| `COMPACTOR_MAX_RETRIEVAL_TOKENS` | 1500 | 3500 |
-| `COMPACTOR_INJECTION_BUDGET_FRACTION` | 0.5 | 0.6 |
-| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | 12000 | 6230 |
+Six environment variables control how much of her own facts/retrieval/
+summary memory is stored and injected per turn. The owner raised the first
+five by hand on the running pod (2026-09-15, a `supervisorctl` `environment=`
+edit on the `compactor` program — lost on every container restart, so it
+had to be reapplied after any redeploy). **v3.1.9 baked the same five
+values into the image and this template, so that live edit is no longer
+needed; v3.1.9.2 (hostile pass #9, P9-1/P9-2) raised the fraction and
+summary-block cap again and added the sixth row, for a DIFFERENT reason —
+see below:**
+
+| Variable | Code default | v3.1.9 shipped default | v3.1.9.2 shipped default |
+|---|---|---|---|
+| `COMPACTOR_MAX_FACTS_TOKENS` | 1500 | 3500 | 3500 (unchanged) |
+| `COMPACTOR_INJECT_FACTS_TOKENS` | 400 | 600 | 600 (unchanged) |
+| `COMPACTOR_MAX_RETRIEVAL_TOKENS` | 1500 | 3500 | 3500 (unchanged) |
+| `COMPACTOR_INJECTION_BUDGET_FRACTION` | 0.5 | 0.6 | **0.75** |
+| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | 12000 | 6230 | **15000** (was 12000; raised again, hostile pass #10, P10-2 — see below) |
+| `COMPACTOR_STANDIN_BUDGET_FRACTION` | 1.0 (no v3.1.9 equivalent) | — | **1.0** |
 
 **Why the fraction and summary-block rows moved together with the two
-raised caps, not independently:** `inject_budget = effective_limit ×
-COMPACTOR_INJECTION_BUDGET_FRACTION` is shared by persona + summary + facts
-+ retrieval. Retrieval is the lowest-priority block and is dropped WHOLE
-(not trimmed) by `_bound_injected_blocks` when it does not fit. At the
+raised caps in v3.1.9, not independently:** `inject_budget = effective_limit
+× COMPACTOR_INJECTION_BUDGET_FRACTION` is shared by persona + summary +
+facts + retrieval. Retrieval is the lowest-priority block and is dropped
+WHOLE (not trimmed) by `_bound_injected_blocks` when it does not fit. At the
 raised facts/retrieval caps (3500/3500) under the OLD fraction (0.5, about
 10,384 tokens of her 20,768-token window), retrieval would have been
 silently dropped from every request. At 0.6 (about 12,460 tokens) retrieval
-has room, with the summary block pinned at what it measured itself needing
-(6,230 — lower than its own 12,000 code default, not a further raise). **Do
-not change one of these five without the others.**
+had room, with the summary block pinned at what it measured itself needing
+at the time (6,230). **Do not change one of the first five without the
+others.**
 
-Evidence behind these numbers (2026-09-15 pod measurement, before the
+**Why the fraction and summary-block cap moved AGAIN in v3.1.9.2, and why a
+sixth variable was added:** these two rows do double duty. Besides the
+facts/retrieval room above, they also set the ceiling for the REUSE
+STAND-IN — the array-embedded substitute `compact_if_needed` returns in
+place of older turns a stored summary hierarchy already covers, main.py
+`_standin_reuse_ceiling`. At the v3.1.9 pair (0.6/6230) that ceiling was a
+flat 6,230 tokens, below her hierarchy within a day of the fix that
+introduced it (~9,050 tokens, up from ~5.1k when v3.1.9.1 shipped) — reuse
+silently declined on every request again, exactly the 2026-09-16 failure
+v3.1.9.1 was written to remove, with `/health/full` and the CHANGELOG both
+saying it worked. Raising `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` alone does
+not fix this: the stand-in's OLD formula multiplied the injection budget by
+a hard-coded 0.6 before ever reaching the SUMMARY_BLOCK_MAX_TOKENS cap, so
+even `0.75`/`20000` only reached a ~9,345-token ceiling. `COMPACTOR_
+STANDIN_BUDGET_FRACTION` (new) is the stand-in's OWN fraction of the
+injection budget, separate from the 0.6 the separately-injected summary
+block still uses (that block, unlike the stand-in, has to leave room for
+facts/retrieval in the SAME inject_budget — the stand-in does not, because
+on a reusing turn that separate injection is skipped entirely). **The
+separately-injected block's own share is unaffected by this row**: it still
+computes `min(SUMMARY_BLOCK_MAX_TOKENS, int(inject_budget × 0.6))` ≈ 9,345
+tokens at the 0.75 fraction, comfortably under `inject_budget` (15,576)
+with facts (600) and retrieval (3,500) still fitting. `/health/full`'s
+`checks.reuse` now reports `attempted`/`declined_budget`/
+`declined_recently` and the two numbers behind the most recent decline —
+watch that field after any future change to these three rows; the ceiling
+can be outgrown as the hierarchy grows, and this is how the operator would
+see it happen instead of reading request logs.
+
+**Correction (hostile pass #10, P10-2): at 1.0/12000 the ceiling was
+`min(SUMMARY_BLOCK_MAX_TOKENS, inject_budget)` = `min(12000, 15576)` =
+12,000, and this section used to say that "clears the 11,300-token
+capacity with measured margin." That comparison was wrong on its own
+terms: 11,300 (`9*L1_MAX_TOKENS + 4*L2_MAX_TOKENS + L3_MAX_TOKENS`) is in
+OUTPUT tokens, but the ceiling is checked against `_estimate_block_tokens`,
+which prices non-ASCII at one token per UTF-8 BYTE — never the same unit.
+Separately, her real L1/L2 chunks already exceed the per-tier maxima that
+figure assumes (measured: 8 L1 chunks mean 561, max 792 against
+`L1_MAX_TOKENS=500`; 4 L2 chapters mean 1,102, max 1,271 against
+`L2_MAX_TOKENS=1200`), and a stalled `/tokenize` (a live state on this pod)
+routinely makes the L3 rollup give up and concatenate 2-3 parts instead of
+summarizing them — that concatenation is what gets stored, and it carries
+into every later refresh. Measured against her real chunks plus a real L3:
+steady-state peak 11,728 (272 tokens of headroom against 12,000, not a
+comfortable margin); with a 2x-part give-up concatenation, 13,860 — OVER
+12,000, so reuse would have declined again as her hierarchy grew past
+today's state. **`COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` is now `15000`**
+(table above), sized off that measured give-up-L3 peak (13,860) with
+~1,140 tokens of real margin rather than the wrong-unit nominal figure. It
+is still capped by `inject_budget` (15,576 at 0.75) regardless of this
+value, and it does not claim to be un-outgrowable — a 3x-part give-up
+concatenation (~15,860) still declines, safely, back to summarizing from
+scratch. `test_reuse_fit.py` pins a fixture built from these measured tier
+sizes (not the nominal maxima) so a future default that stops clearing
+this peak fails the suite instead of the pod.
+
+Evidence behind the v3.1.9 numbers (2026-09-15 pod measurement, before that
 raise): roughly 16 new facts extracted per exchange with roughly 16 evicted
 (the 1500-token store churning), only 6-12 of about 160 stored facts
 actually reaching injection, retrieval keeping only 1 of 5 candidate hits,
@@ -390,6 +453,155 @@ name regardless.
 **Turn it off.** `COMPACTOR_TIME_INJECTION=false` (also `0`, `no`, `off`) and
 redeploy.
 
+### Sampling parameters
+
+OpenWebUI's **Advanced Params** (per-model or per-chat) only map a fixed set
+of names onto the OpenAI-shaped request it sends: `temperature`, `top_p`,
+`min_p`, `max_tokens`, `frequency_penalty`, `presence_penalty`,
+`reasoning_effort`, `seed`, `stop`, `logit_bias`, `response_format`. Anything
+else — including any name from an Ollama-style setup — has to go under
+**Custom Parameters** instead, where OpenWebUI passes it through to the
+request body verbatim, under whatever key you typed.
+
+vLLM's name for what Ollama calls `repeat_penalty` is **`repetition_penalty`**.
+Before v3.1.9.2, setting `repeat_penalty` as a Custom Parameter did nothing —
+vLLM does not recognise the key, silently ignores it, and
+`repetition_penalty` stayed at its default of 1.0. **From v3.1.9.2 on**, the
+compactor translates `repeat_penalty` to `repetition_penalty` before
+forwarding (and drops `repeat_last_n`, which has no vLLM equivalent at all).
+It is still better to set `repetition_penalty` directly under Custom
+Parameters, by its real name, so nothing depends on the translation.
+
+**Recommended starting values for this model** (Cydonia-24B):
+
+| Setting | Where in OpenWebUI | Value |
+|---|---|---|
+| `repetition_penalty` | Custom Parameters (name typed exactly) | `1.05` |
+| Frequency Penalty | Advanced Params | `0.3` |
+| Max Tokens | Advanced Params | `12000` |
+
+Leaving Max Tokens unset means the request carries no ceiling at all: a
+runaway reply continues until it fills the context window or someone presses
+Stop. **7000 tokens is NOT "roughly 28,000 characters" on this model** — that
+assumes 4 characters/token, and this model's own measured pairs (see
+`count_tokens_exact`'s docstring in `compactor/main.py`, production data,
+2026-08-28) run 2.0-2.4 characters/token on assistant replies, because this
+model's heavy use of box-drawing and other decoration characters prices high.
+At that rate 7000 tokens is roughly 14,000-17,000 characters — below her
+normal p90 reply length (measured ~17,000 characters on her main chat,
+hostile pass #7), so a real, non-runaway reply would routinely hit the
+ceiling and come back cut mid-sentence, and get stored to memory trimmed the
+same way (`stream truncated at the generation ceiling`). **12000 tokens**
+(roughly 24,000-29,000 characters at the same measured rate) covers ordinary
+long replies with headroom and does not change memory's budgets: the
+compactor already reserves the larger of `COMPACTOR_GENERATION_RESERVE`
+(12000) and Max Tokens, so 12000 is the value it already plans around. To
+check the real rate on your own pod rather than trust this range, POST a
+sample of her actual replies to vLLM's `/tokenize` endpoint and compare the
+returned token count against the character count directly, rather than
+estimating.
+
+**P10-5 (hostile pass #10): raising Max Tokens above `COMPACTOR_
+GENERATION_RESERVE` (12000) lets the reuse stand-in claim up to 75% of
+the whole window, not just its documented 72%.** `_standin_reuse_ceiling`
+is `min(COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS, inject_budget *
+COMPACTOR_STANDIN_BUDGET_FRACTION)`, and `inject_budget = effective_limit
+× COMPACTOR_INJECTION_BUDGET_FRACTION`, where `effective_limit =
+MAX_MODEL_LEN - max(COMPACTOR_GENERATION_RESERVE, Max Tokens)`. At Max
+Tokens 12000 (recommended, above) or anywhere at or below the reserve,
+`effective_limit` stays at its floor (20,768) and the ceiling is capped
+by `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` itself — 15,000 of 20,768, 72%.
+Raise Max Tokens PAST the reserve and `effective_limit` shrinks with it;
+past roughly 15,000, `inject_budget` itself drops below
+`COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` and becomes the binding constraint,
+which is a flat `COMPACTOR_INJECTION_BUDGET_FRACTION` (75%) of whatever
+window is left — the stand-in alone can then occupy three-quarters of the
+context, leaving that much less room for the recent turns actually being
+answered. **Not triggered at the recommended Max Tokens 12000** (the
+reserve's own floor keeps `effective_limit` from shrinking at or below
+it), so this is informational, not an operational alarm — but the 72%
+figure itself is already higher than it was before hostile pass #10
+raised `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` from 12,000 to 15,000 (was
+58%; see [Memory budgets](#memory-budgets--raised-defaults-in-v319)), a
+side effect of that fix worth knowing about if you tune Max Tokens
+upward. `test_reuse_fit.py`'s `[13]` section pins this table so a future
+change to any of the three budget variables is measured, not guessed.
+
+vLLM 0.19 applies `repetition_penalty` to **prompt tokens as well as output**
+(verified by reading `model_executor/layers/utils.py::apply_penalties` and
+the V2 GPU sampler kernel in the served image) — it is not output-only the
+way Ollama's `repeat_penalty` behaves. Against a prompt that can run to
+~20,000 tokens of her own conversation and injected memory, a HIGH
+`repetition_penalty` discourages the model from using words that are already
+sitting in that history, not only words it has already said in this reply —
+which can flatten normal vocabulary, not just break loops. The values above
+lean on Frequency Penalty (output-only) to do most of the anti-loop work and
+keep `repetition_penalty` closer to its default; if loops return, raise
+Frequency Penalty before raising `repetition_penalty` further.
+
+**Confirming from the log that loops are being caught.** A repetition-loop
+reply produces a WARNING when it is detected. The wording split is **FINISHED
+vs CUT (Stop or the generation ceiling), not streamed vs non-streamed** —
+both paths run through the same `decide_memory_tail`, and either shape can
+happen on a streamed or non-streamed request: `reply looks like a repetition
+loop (...)` for a reply the model finished on its own, `... look like a
+repetition loop (...)` for one that was cut. One grep catches both:
+
+```bash
+grep -a 'like a repetition loop' /data/logs/compactor.log | tail
+```
+
+and, once that reply is later replayed back as history, an INFO line at the
+point it is kept out of what is forwarded:
+
+```
+conv=<id>: touched <N> degenerate assistant turn(s) in the forwarded window (whole=<K> cut=<N-K>)
+```
+
+**`whole` vs `cut` (from v3.1.9.2 hostile pass #8, P8-8):** this line used to
+read `replaced <N> ... with a placeholder` unconditionally. That is only true
+for the `whole` count — most flagged replies keep a clean head (and, for a
+mid-reply span, a clean tail too) and only lose the flagged span itself; on
+the 2026-09-16 backup that was 10 of 66 touched replies replaced whole, not
+all of them. Read `whole` as "the model lost the whole answer for that turn"
+and `cut` as "one span was removed from an otherwise-intact reply".
+
+**These counts do not have to match the WARNING count above, and a mismatch
+is not a bug.** A CUT loop reply whose trimmed sentence head reads clean is
+stored TRIMMED in memory (`stored_trimmed`, no loop WARNING at all —
+memory's own judgement only sees the kept head) even though the detector
+flagged the FULL text, and that full text is still touched in the forwarded
+window on every later request (counted in the `touched <N>` INFO line). So it
+is normal to see a `touched` count with no matching `like a repetition loop`
+WARNING for the same turn; do not read that as the detector missing
+something. Neither line names the reply's own text. If `repeat_penalty` was
+translated because `repetition_penalty` was absent, that is a separate INFO
+line at request time: `conv=<id>: translated Ollama repeat_penalty=... to
+vLLM repetition_penalty=...` (logged once per conversation, not on every
+turn).
+
+**`max_tokens` and other numeric sampling fields (v3.1.9.2, hostile pass
+#8, P8-6).** A request body whose JSON carries a numeral that overflows to
+`inf` (for example `"max_tokens": 1e999`, in any numeric field, not only
+the sampling penalties) is now rejected at parse time with an HTTP 400,
+the same way a bare `NaN`/`Infinity` constant already was — it used to 500
+from inside the proxy instead, after compaction and memory injection had
+already run. An unparseable `max_tokens` (a string, a list, ...) is
+dropped from the forwarded body with a WARNING rather than left in place
+unexamined; a VALID `max_tokens` is never rewritten, only capped against
+the model's context window as before.
+
+**Preserved images and the recent-turn floor (v3.1.9.1 hostile pass #7 F1,
+corrected in v3.1.9.2 hostile pass #8 P8-1).** An uploaded image always
+arrives as a part of a USER turn (see "Vision" below) — never an assistant
+one. The hard-budget guard's recent-turn floor accounts for that: an old,
+preserved image sitting in front of the real recent window no longer
+counts as part of "recent" merely because both it and the turn after it
+are user turns; it is recognised by the role-alternation break instead, so
+it is available to be shed ahead of injected memory (facts/retrieval) the
+same as any other old turn, whether it happens to be a USER-role image or
+(the pre-P8-1 test shape) an orphaned ASSISTANT turn.
+
 ### Vision (V3.1) — enabling image understanding
 
 Set `MODEL_REPO` to a vision-language model (see presets in `.env.example`)
@@ -545,8 +757,9 @@ Override these in your Runpod template if needed:
 | `COMPACTOR_MAX_RETRIEVAL_TOKENS` | code default `1500`, **image/template default `3500`** (v3.1.9) | Token budget for the whole retrieved-exchange block. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
 | `COMPACTOR_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (prebaked ONNX in the image) |
 | `COMPACTOR_HIERARCHICAL_SUMMARY` | `true` | L1→L2→L3 rolling summaries. Set `false` to disable. |
-| `COMPACTOR_INJECTION_BUDGET_FRACTION` | code default `0.5`, **image/template default `0.6`** (v3.1.9) | Fraction of the effective input limit shared by persona + summary + facts + retrieval. Must move together with the facts/retrieval caps above — see [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
-| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | code default `12000`, **image/template default `6230`** (v3.1.9) | Cap on the rendered summary block. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
+| `COMPACTOR_INJECTION_BUDGET_FRACTION` | code default `0.5`, **image/template default `0.75`** (v3.1.9.2; was `0.6` in v3.1.9) | Fraction of the effective input limit shared by persona + summary + facts + retrieval, AND the input to the reuse stand-in's own ceiling. Must move together with the facts/retrieval caps and the summary-block cap above — see [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
+| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | code default `12000`, **image/template default `15000`** (v3.1.9.2; was lowered to `6230` in v3.1.9, then `12000`, then `15000` — hostile pass #10, P10-2) | Outer cap on the rendered summary block AND the reuse stand-in. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
+| `COMPACTOR_STANDIN_BUDGET_FRACTION` | code default `1.0` | **New in v3.1.9.2.** Fraction of the injection budget the reuse stand-in's own ceiling may claim — separate from the 60% the separately-injected summary block still uses. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
 | `COMPACTOR_TAIL_ROLLUP_MAX_CALLS` | `4` | Per-turn budget for the background tail (and the one-shot backfill rollup) catching up a summary hierarchy that has fallen far behind (a vLLM outage, days of rollup failures). Bounds where a rollup unit is allowed to **start**, not a hard per-turn ceiling: a unit that starts always finishes, so one turn can spend up to `(budget − 1)` plus that unit's own real cost — normally a few calls, but measured at 6-16 calls for one unit when `/tokenize` is down. Converges over successive turns either way; see CHANGELOG.md "Summary hierarchy catch-up" (v3.1.9). |
 | `COMPACTOR_DEDUP_SIMILARITY` | `0.75` | Cosine threshold for fact-dedup candidate clustering |
 | `COMPACTOR_DEDUP_MAX_LLM_CALLS` | `10` | Cap on LLM merge calls per dedup pass |
@@ -673,16 +886,21 @@ then `supervisorctl start compactor backup`.
   model is told the real date/time; do NOT edit her model's system prompt to
   add the `User timezone:` line yet — that forks a hash-identity chat's
   memory. See [The current date and time](#the-current-date-and-time).
-- **The five memory-budget rows** — `COMPACTOR_MAX_FACTS_TOKENS=3500`,
+- **The six memory-budget rows** — `COMPACTOR_MAX_FACTS_TOKENS=3500`,
   `COMPACTOR_INJECT_FACTS_TOKENS=600`, `COMPACTOR_MAX_RETRIEVAL_TOKENS=3500`,
-  `COMPACTOR_INJECTION_BUDGET_FRACTION=0.6`,
-  `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=6230`. These are now the image's own
-  defaults (see [Memory budgets](#memory-budgets--raised-defaults-in-v319)),
-  so adding the rows is optional and self-documenting, not required — but if
-  your v3.1.8 template already has a hand-added `COMPACTOR_MAX_FACTS_TOKENS`
-  or similar row at a DIFFERENT value (the pre-v3.1.9 live-pod workaround),
-  either remove it or update it to match, or it will silently override the
-  new image default.
+  `COMPACTOR_INJECTION_BUDGET_FRACTION=0.75`,
+  `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=15000`,
+  `COMPACTOR_STANDIN_BUDGET_FRACTION=1.0` (the last three raised/added in
+  v3.1.9.2 — see [Memory budgets](#memory-budgets--raised-defaults-in-v319)
+  for why). These are now the image's own defaults, so adding the rows is
+  optional and self-documenting, not required — but if your template
+  already has a hand-added `COMPACTOR_MAX_FACTS_TOKENS` or similar row at a
+  DIFFERENT value (the pre-v3.1.9 live-pod workaround, or the v3.1.9
+  `0.6`/`6230` pair), either remove it or update it to match, or it will
+  silently override the new image default — **this specific shape (a
+  leftover `0.6`/`6230` override) is exactly what put the reuse feature
+  back to declining silently in hostile pass #9**, so check for it if
+  upgrading a pod that has ever had these rows added by hand.
 
 ### 4. Deploy
 

@@ -154,7 +154,20 @@ while the tree also sends `{messages, assistant-final}` (main.summarize) and
 `{prompt}` (summarizer._count_tokens, a second and entirely independent HTTP
 client). The two it did not cover are the two that broke.
 
-POST /_fixture/reset clears mode, stats and shapes.
+GET /_fixture/last_chats (advfix, v3.1.9.2 adversarial coverage) returns one
+record per /v1/chat/completions BODY received:
+
+    {"sampling": {<subset of repeat_penalty, repetition_penalty, temperature,
+     presence_penalty, frequency_penalty, top_p, top_k that were present>},
+     "messages": [{"role": str, "len": int, "markers": [str, ...]}, ...]}
+
+so a test can assert what a sampling-name translation or a forwarded-window
+redaction actually put on the wire. Deliberately carries no message content —
+only length and any `ADVFIX-WIRE-MARKER-*` token a test embedded on purpose —
+so this fixture never becomes a second place production or synthetic prose
+ends up recorded.
+
+POST /_fixture/reset clears mode, stats, shapes and last_chats.
 """
 
 import asyncio
@@ -196,6 +209,58 @@ _MODE: dict[str, Any] = {
 }
 _STATS: dict[str, int] = {}
 _SHAPES: list[dict[str, Any]] = []
+
+# advfix (v3.1.9.2 adversarial coverage, P8 gate item 4). Same shape and same
+# reason as `_SHAPES` above: nothing in this fixture previously recorded what
+# a /v1/chat/completions BODY actually contained, so no adversarial test
+# could assert what reached "vLLM" for a sampling-param translation
+# (repeat_penalty -> repetition_penalty) or a reused/redacted message array —
+# only what came BACK (usage.prompt_tokens) could be inspected, which proves
+# a token COUNT but not which keys or which message shapes arrived. Captures
+# only the sampling keys main.py's translation touches (never full message
+# content — this fixture already exists to avoid needing production text; no
+# reason to start collecting it here) plus a lightweight per-message summary
+# (role, content length, and whether a caller-supplied marker substring is
+# present — see `chat_completions` below) so a test can assert on SHAPE
+# without this file ever holding arbitrary text. Purely additive: a new
+# module-level list, one call at the top of the existing handler (wrapped so
+# it can never affect the response), one new GET endpoint, cleared by the
+# existing /_fixture/reset. Nothing already served, and no other suite that
+# never calls the new endpoint, is affected.
+_LAST_CHATS_MAX = 64
+_LAST_CHATS: list[dict[str, Any]] = []
+_SAMPLING_KEYS = (
+    "repeat_penalty", "repetition_penalty", "temperature",
+    "presence_penalty", "frequency_penalty", "top_p", "top_k",
+)
+# Test-only marker a caller can embed in message content to ask this fixture
+# to report whether it survived to the wire, without echoing the content
+# itself. Chosen to be unmistakably synthetic and never legitimate prose.
+_MARKER = "ADVFIX-WIRE-MARKER-"
+
+
+def _record_chat(body: dict) -> None:
+    try:
+        sampling = {k: body[k] for k in _SAMPLING_KEYS if k in body}
+        msgs = body.get("messages") or []
+        shapes = []
+        for m in msgs:
+            content = m.get("content")
+            text = content if isinstance(content, str) else json.dumps(content)
+            shapes.append({
+                "role": m.get("role"),
+                "len": len(text) if text else 0,
+                "markers": sorted({
+                    tok for tok in (text or "").split()
+                    if tok.startswith(_MARKER)
+                }),
+            })
+        _LAST_CHATS.append({"sampling": sampling, "messages": shapes})
+        while len(_LAST_CHATS) > _LAST_CHATS_MAX:
+            _LAST_CHATS.pop(0)
+    except Exception:
+        # Introspection must never be able to break the endpoint it watches.
+        pass
 
 # Cap the shape log so a long test run cannot grow it without bound. Tests read
 # it immediately after a reset, so a few hundred is far more than any of them
@@ -645,6 +710,7 @@ def _reply_for(body: dict) -> str:
 async def chat_completions(request: Request):
     _bump("chat_completions")
     body = await request.json()
+    _record_chat(body)
     messages = body.get("messages") or []
     max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
 
@@ -814,6 +880,17 @@ async def shapes():
     return {"shapes": list(_SHAPES), "truncated": len(_SHAPES) >= _SHAPES_MAX}
 
 
+@app.get("/_fixture/last_chats")
+async def last_chats():
+    """advfix (P8 gate item 4): one record per /v1/chat/completions BODY
+    received (sampling keys + per-message role/len/marker — see
+    `_record_chat`'s comment for why not full content), most recent last.
+    Lets an adversarial test assert what a sampling-name translation or a
+    forwarded-window redaction actually put on the wire, the same way
+    `/_fixture/shapes` already lets one assert on /tokenize."""
+    return {"chats": list(_LAST_CHATS), "truncated": len(_LAST_CHATS) >= _LAST_CHATS_MAX}
+
+
 @app.post("/_fixture/reset")
 async def reset():
     _MODE.update(
@@ -827,6 +904,7 @@ async def reset():
     )
     _STATS.clear()
     _SHAPES.clear()
+    _LAST_CHATS.clear()
     return {"reset": True}
 
 

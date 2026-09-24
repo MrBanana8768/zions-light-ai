@@ -16,9 +16,12 @@ V2.0 additions:
 import asyncio
 import bisect
 import codecs
+import collections
 import dataclasses
+import hashlib
 import json
 import logging
+import math
 import warnings
 import os
 import re
@@ -277,6 +280,38 @@ def _env_float(name: str, default: float) -> float:
 # re-tune every time any of those change. 0.5 says: whatever else happens, half
 # the window belongs to the conversation.
 INJECTION_BUDGET_FRACTION = _env_float("COMPACTOR_INJECTION_BUDGET_FRACTION", 0.5)
+
+# P9-1/P9-2 (hostile pass #9): a SEPARATE fraction for the reuse stand-in's
+# ceiling (see `_standin_reuse_ceiling` below), deliberately NOT the same
+# 0.6 constant `_standin_injected_share` uses for the separately-injected
+# summary block. The two situations only look alike. The injected block
+# competes for room in `inject_budget` alongside persona, facts and
+# retrieval (all four bounded together by `_bound_injected_blocks`), so it
+# only gets a slice. The stand-in is different: on a REUSING turn the
+# summary injection site skips its own copy entirely (`sum(in-array)`,
+# search `_compaction_stored_turns` in chat_completions) — nothing else in
+# `inject_budget` spends this share, so there is no reason to multiply it
+# down by 0.6 as though it still had to leave room for a sibling that this
+# turn never renders. v3.1.9.1 and v3.1.9.2 used the SAME function for
+# both (deliberately, "so the two call sites cannot drift apart") and that
+# is exactly what starved the stand-in: at the shipped 0.6/6230 defaults
+# the ceiling was 6,230 against her ~9,050-token hierarchy (P9-1); even at
+# the planned 0.75/10000 it was 9,345, still short of what her hierarchy
+# renders at once it holds an L3 (P10-2, hostile pass #10 — NOT the
+# "9*L1_MAX + 4*L2_MAX + L3_MAX = 11,300" figure a previous version of this
+# comment cited: that arithmetic is in OUTPUT tokens, a different unit from
+# what this ceiling is actually checked against, `_estimate_block_tokens`,
+# which prices non-ASCII per UTF-8 BYTE — see SUMMARY_BLOCK_MAX_TOKENS's
+# own env comment in Dockerfile/runpod.env.template for the measured
+# render this is sized against instead). Default 1.0: the stand-in may
+# claim the WHOLE freed share, capped only by SUMMARY_BLOCK_MAX_TOKENS
+# (15,000 shipped — see that constant's own comment for the arithmetic).
+# The guard downstream
+# (`_enforce_hard_budget`) is still free to shed OTHER injected memory if
+# the whole request runs over effective_limit — this fraction only decides
+# whether the stand-in is ALLOWED to render whole, not whether the request
+# fits.
+STANDIN_BUDGET_FRACTION = _env_float("COMPACTOR_STANDIN_BUDGET_FRACTION", 1.0)
 
 # ...and a much tighter one for a request with no conversational history.
 #
@@ -1851,9 +1886,222 @@ def split_messages(messages: list[dict]) -> tuple[list[dict], list[dict], list[d
 COMPACTION_SUMMARY_HEADER = "[Summary of earlier conversation]"
 
 
+def _standin_injected_share(inject_budget: int) -> int:
+    """How many tokens the SEPARATELY-INJECTED summary block (search
+    `format_summary_block` in chat_completions, the non-reuse call site)
+    may claim from the injection budget.
+
+    60% of the injection budget, capped at SUMMARY_BLOCK_MAX_TOKENS. This
+    block competes for `inject_budget` alongside persona, facts and
+    retrieval (`_bound_injected_blocks` bounds all four together), so it
+    only gets a share, not the whole thing.
+
+    NOT used for the reuse stand-in any more (P9-1/P9-2, hostile pass #9)
+    — see `_standin_reuse_ceiling` below and `STANDIN_BUDGET_FRACTION`'s
+    comment for why the two needed to stop sharing one formula. Kept as
+    its own function because this call site's constraint (room must be
+    left for three siblings) is real and unrelated to the stand-in's.
+    """
+    return min(
+        summarizer.SUMMARY_BLOCK_MAX_TOKENS,
+        int(inject_budget * 0.6),
+    )
+
+
+def _standin_reuse_ceiling(inject_budget: int) -> int:
+    """How many tokens a REUSED-hierarchy stand-in (the array-embedded
+    substitute `compact_if_needed` returns in place of the turns it
+    removed) may render at, when reuse is being attempted.
+
+    `STANDIN_BUDGET_FRACTION` (default 1.0) of the injection budget,
+    capped at SUMMARY_BLOCK_MAX_TOKENS — see that env var's own comment
+    (Dockerfile / runpod.env.template) for the arithmetic (why 0.6,
+    `_standin_injected_share`'s fraction, is wrong here).
+
+    P10-2 (hostile pass #10): this docstring used to say the default
+    "clears the hierarchy's documented 9*L1_MAX + 4*L2_MAX + L3_MAX
+    construction capacity" — that 11,300 figure is in OUTPUT tokens, but
+    this ceiling is compared against `_estimate_block_tokens` (see
+    `format_summary_block`'s own docstring), which prices non-ASCII per
+    UTF-8 BYTE, not per token. The two were never in the same unit, so
+    "clears the capacity" was a claim about arithmetic this ceiling does
+    not perform. The default is now sized off a MEASURED render (real
+    chunk sizes, including a give-up L3 concatenation — see
+    SUMMARY_BLOCK_MAX_TOKENS's env comment), not the nominal per-tier
+    maxima; it clears that measured peak with margin but is not claimed to
+    be unable to be outgrown — a hierarchy can still legitimately decline
+    reuse, and that is a safe (if suboptimal) fallback, not a bug.
+
+    P10-5 (hostile pass #10, LOW — recorded, not changed this pass): this
+    is `min(SUMMARY_BLOCK_MAX_TOKENS, inject_budget)` with NOTHING
+    bounding it relative to the window itself. `inject_budget` shrinks as
+    `effective_limit` shrinks (a larger `max_tokens` request reserves more
+    generation room), so once `inject_budget` drops below
+    `SUMMARY_BLOCK_MAX_TOKENS` it becomes the binding term — a flat
+    `INJECTION_BUDGET_FRACTION` (75% shipped) of whatever window is left,
+    with no separate reserve for the recent turns the stand-in is supposed
+    to leave room for. Not reachable at the documented Max Tokens
+    (RUNPOD_DEPLOY.md recommends 12000, equal to the generation reserve
+    floor, so `effective_limit` never shrinks at that setting); reachable
+    if an operator raises Max Tokens past the reserve. See
+    RUNPOD_DEPLOY.md's "Max Tokens" section for the measured table across
+    `max_tokens` values, and `test_reuse_fit.py`'s `[13]` for the pinned
+    regression test. A real fix would give this function the window as
+    well as the injection budget
+    (`min(SUMMARY_BLOCK_MAX_TOKENS, inject_budget, effective_limit -
+    SUMMARY_MAX_TOKENS - a recent-window reserve)`) — deferred: LOW
+    severity, not triggered at the recommended setting, and this
+    function's callers do not currently pass `effective_limit` through.
+    """
+    return min(
+        summarizer.SUMMARY_BLOCK_MAX_TOKENS,
+        int(inject_budget * STANDIN_BUDGET_FRACTION),
+    )
+
+
+# P9-1/P9-2 (hostile pass #9): reuse decline accounting, for /health/full's
+# `checks.reuse`. Before this, the ONLY evidence a decline ever happened was
+# the INFO log line inside compact_if_needed (see the "the stored summaries
+# cover ... but they do not fit whole" message below) plus the WARNING that
+# follows it when the 4-call summarize() cap then fires — this is the exact
+# failure mode P9-1 says shipped invisibly (green health, CHANGELOG claiming
+# the feature worked). Cheap and in-process, same shape as tailhealth.py's
+# counters (module-level dict + lock, numbers only): NO conversation text,
+# NO conv_id, NO hierarchy content — only counts and the two numbers
+# (ceiling, other-consumers total) that explain a decline. Windowed the
+# same way tailhealth/bgwork are (`declined_recently`) so a burst of
+# declines is visible while it is happening and for one window after, not
+# pinned forever by one squeeze early in a long-lived process.
+#
+# P10-3 (hostile pass #10): P9's version counted `attempted` at a call site
+# four of five reuse-failure shapes never reached (no stored hierarchy at
+# all; a hierarchy that covers none of this array; every covered turn being
+# an image; an exception anywhere in the block) and recorded a decline in
+# exactly ONE `if`, nested inside the same reachability problem — so
+# `attempted=0, declined_budget=0, declined_recently=false` meant FOUR
+# different things (a fresh process; no state; no coverage; a request that
+# never needed to check) and an exception left `attempted` incremented (had
+# it reached that call site) with no decline to match, reading as a
+# successful reuse. Fixed by giving every reachable outcome its own reason
+# — "success", "no_state" (nothing stored yet), "no_coverage" (a hierarchy
+# exists but does not cover this array, or covers only images), "budget"
+# (exists, covers this array, still does not fit whole) or "error" (the
+# `except` fired) — recorded in exactly ONE place
+# (`compact_if_needed`'s `finally`, one call per request that reached the
+# top of its `if conv_id:` block) instead of scattered across `if`s an
+# earlier return could skip.
+_REUSE_STATS_LOCK = threading.Lock()
+_reuse_stats: dict = {
+    "attempted": 0,
+    "succeeded": 0,
+    "declined_no_state": 0,
+    "declined_no_coverage": 0,
+    "declined_budget": 0,
+    "errored": 0,
+    "last_attempt_monotonic": None,
+    "last_reason": None,
+    "last_declined_monotonic": None,
+    "last_declined_ceiling": None,
+    "last_declined_others": None,
+}
+REUSE_DECLINE_DEGRADE_WINDOW_S = _env_float(
+    "COMPACTOR_REUSE_DECLINE_DEGRADE_WINDOW_S", 300.0
+)
+_REUSE_OUTCOME_COUNTER_KEYS = {
+    "no_state": "declined_no_state",
+    "no_coverage": "declined_no_coverage",
+    "budget": "declined_budget",
+    "error": "errored",
+}
+
+
+def _record_reuse_attempt() -> None:
+    """One request that reached the top of `compact_if_needed`'s
+    `if conv_id:` block — i.e. reuse was a live QUESTION for this request,
+    whatever the answer turns out to be. See that call site's own comment
+    for why this moved there in P10-3."""
+    with _REUSE_STATS_LOCK:
+        _reuse_stats["attempted"] += 1
+        _reuse_stats["last_attempt_monotonic"] = time.monotonic()
+
+
+def _record_reuse_outcome(
+    reason: str, ceiling: int | None = None, others: int | None = None
+) -> None:
+    """The ONE outcome a reuse attempt resolved to. `reason` is one of
+    "success", "no_state", "no_coverage", "budget" or "error" — see the
+    module comment above `_reuse_stats` for what each means. `ceiling`/
+    `others` are only meaningful (and only ever passed) for "budget": the
+    two numbers the decline's own log line names."""
+    with _REUSE_STATS_LOCK:
+        _reuse_stats["last_reason"] = reason
+        if reason == "success":
+            _reuse_stats["succeeded"] += 1
+            return
+        key = _REUSE_OUTCOME_COUNTER_KEYS.get(reason)
+        if key is None:
+            # Never reached by this module's own callers (both pass a
+            # reason from the fixed set above); a backstop against a
+            # future caller passing a typo rather than silently losing
+            # the count.
+            key = "declined_budget"
+        _reuse_stats[key] += 1
+        _reuse_stats["last_declined_monotonic"] = time.monotonic()
+        _reuse_stats["last_declined_ceiling"] = ceiling
+        _reuse_stats["last_declined_others"] = others
+
+
+def reuse_decline_state() -> dict:
+    """CONTRACT for health.py's `_reuse_state()` (the same call-time,
+    sys.modules-based read `_tokenizer_state()` already uses — health.py
+    cannot import main at module scope, see that function's docstring).
+
+    Returns {"attempted": int, "succeeded": int, "declined_no_state": int,
+    "declined_no_coverage": int, "declined_budget": int, "errored": int,
+    "declined_recently": bool, "last_reason": str | None,
+    "last_attempt_age_s": float | None, "last_declined_ceiling": int |
+    None, "last_declined_others": int | None}. Read-only, cheap (one lock,
+    no I/O), never raises.
+
+    P10-3: `declined_budget` keeps its P9 name and meaning (a budget-
+    specific decline) for callers/dashboards already reading it; the three
+    new counters are additive, not a rename — nothing that read this dict
+    before P10-3 sees a field disappear or change meaning.
+    `last_attempt_age_s` (new) is what makes `attempted: 0` unambiguous:
+    `None` means no candidate request has occurred in this process yet;
+    a real number, however large, means at least one has, however long
+    ago — restart resets both, see OPERATIONS.md.
+    """
+    with _REUSE_STATS_LOCK:
+        last_at = _reuse_stats["last_declined_monotonic"]
+        declined_recently = (
+            last_at is not None
+            and (time.monotonic() - last_at) <= REUSE_DECLINE_DEGRADE_WINDOW_S
+        )
+        last_attempt_at = _reuse_stats["last_attempt_monotonic"]
+        last_attempt_age_s = (
+            (time.monotonic() - last_attempt_at)
+            if last_attempt_at is not None else None
+        )
+        return {
+            "attempted": _reuse_stats["attempted"],
+            "succeeded": _reuse_stats["succeeded"],
+            "declined_no_state": _reuse_stats["declined_no_state"],
+            "declined_no_coverage": _reuse_stats["declined_no_coverage"],
+            "declined_budget": _reuse_stats["declined_budget"],
+            "errored": _reuse_stats["errored"],
+            "declined_recently": declined_recently,
+            "last_reason": _reuse_stats["last_reason"],
+            "last_attempt_age_s": last_attempt_age_s,
+            "last_declined_ceiling": _reuse_stats["last_declined_ceiling"],
+            "last_declined_others": _reuse_stats["last_declined_others"],
+        }
+
+
 async def compact_if_needed(
     messages: list[dict], conv_id: str | None = None,
     *, stored_turns_out: list | None = None,
+    inject_budget: int | None = None,
 ) -> list[dict]:
     """
     `stored_turns_out`, if given, receives one `int` — how many older turns
@@ -1875,6 +2123,19 @@ async def compact_if_needed(
     caller learns to skip its own copy without re-deriving the decision (or
     changing this function's return type, which test_compaction_reuse.py
     and its mutation suite pin as `list[dict]`).
+
+    `inject_budget`, if given, is the caller's already-computed injection
+    budget (v3.1.9.1) — the figure the caller's own summary injection is
+    capped against on a NON-reusing turn (60% of it, via
+    `_standin_injected_share`). On a reusing turn that injection is
+    skipped (see hostile2-reuse M1 above), which frees the WHOLE share for
+    the stand-in here (P9-1/P9-2, hostile pass #9: `_standin_reuse_ceiling`,
+    a separate and larger fraction of the same `inject_budget` — see
+    STANDIN_BUDGET_FRACTION's comment for why 60% was wrong for this call
+    site), used whenever it is larger than what TARGET_TOKENS alone would
+    leave. Omitted (as every call before 3.1.9.1 omits it), the stand-in
+    gets exactly the old TARGET-only figure — this keeps existing callers
+    and their pinned arithmetic unchanged.
     """
     current = count_tokens(messages)
     if current <= TARGET_TOKENS:
@@ -1920,6 +2181,26 @@ async def compact_if_needed(
     # summarize() ahead of the uncovered turns, in their original order.
     refreshed: list[dict] = []
     if conv_id:
+        # P10-3 (hostile pass #10): ONE attempt is recorded here, the
+        # instant this function knows reuse is a live QUESTION for this
+        # request (over TARGET, has older text turns, a conv_id to look
+        # up) — not down at "a hierarchy with coverage exists," which is
+        # already an ANSWER. The old placement (`_record_reuse_attempt()`
+        # just above the budget check, further down) meant a request with
+        # no stored hierarchy at all, or one whose hierarchy covers none of
+        # this array, recorded NOTHING — `attempted=0` looked identical to
+        # "reuse has never been possible" and to "the process just
+        # restarted," and an exception anywhere in the block below left
+        # `attempted` incremented (by the OLD call site, once execution
+        # reached it) with no matching decline, reading as a silent
+        # success. `_reuse_reason` is set on every path through this
+        # block, including the `except`, and recorded exactly ONCE at the
+        # bottom (`finally`) — so the exception path is visible as
+        # `"error"`, not indistinguishable from `"success"`.
+        _record_reuse_attempt()
+        _reuse_reason: str | None = None
+        _reuse_ceiling: int | None = None
+        _reuse_others: int | None = None
         try:
             _st = summarizer.load_state(conv_id)
             # WHAT MAY BE REPLACED, decided by CONTENT (v3.1.9; realigned
@@ -1974,6 +2255,13 @@ async def compact_if_needed(
                 summarizer._coverage_plan, _st, to_summarize
             )
             if _covered == 0 and summarizer._covered_fps(_st):
+                # P10-3: "C" in the finding's own lettering — a hierarchy
+                # EXISTS but covers none of THIS array (a different branch,
+                # a delete-and-regenerate, a store rebuild). Not
+                # hypothetical: this is the condition on which four of
+                # v3.1.9's earlier reuse gates failed (see the coverage
+                # comment above `_coverage_plan` was written to replace).
+                _reuse_reason = "no_coverage"
                 logger.info(
                     f"conv={conv_id}: none of the turns this request would "
                     f"compact appear in the stored summaries' covered-turn "
@@ -1981,6 +2269,12 @@ async def compact_if_needed(
                     f"does not reach); summarizing from scratch rather than "
                     f"replacing them"
                 )
+            elif _covered == 0:
+                # P10-3: "B" — no stored hierarchy at all yet (a new
+                # conversation, or one still short of its first L1 chunk).
+                # Distinct from "C" above: nothing to reuse FROM, not a
+                # coverage miss against something that exists.
+                _reuse_reason = "no_state"
             elif _changed:
                 # Every request, not once: a refreshed span that is growing is
                 # the early warning of the cap refusal, and this is the only
@@ -2030,6 +2324,15 @@ async def compact_if_needed(
                     ),
                     len(text_only),
                 )
+                if stored_turns == 0:
+                    # P10-3: `_covered > 0` but every covered turn is an
+                    # image (preserved verbatim, never reused as text) — a
+                    # real, if narrow, "nothing to substitute" state,
+                    # grouped with "no_coverage" rather than given its own
+                    # reason: from the operator's chair it is the same
+                    # advice ("this array has nothing the stand-in can
+                    # stand in for"), not a budget or storage problem.
+                    _reuse_reason = "no_coverage"
                 if stored_turns > 0:
                     # BUDGETED AGAINST WHAT ELSE THIS ARRAY MUST HOLD (hostile
                     # pass #3, F5; pass #2's H5). The stand-in was rendered
@@ -2048,13 +2351,76 @@ async def compact_if_needed(
                     # summarize() and the injected block, where the guard
                     # sheds the OLDEST verbatim turns first, never the recent
                     # ones this budget exists to keep.
+                    #
+                    # v3.1.9.1: THE ABOVE WAS THE WHOLE BUG (production,
+                    # 2026-09-16 11:06Z — see CHANGELOG). On a reusing turn
+                    # the injection site below skips its own copy of the
+                    # summary (`sum(in-array)`), which frees that block's
+                    # share of the injection budget — but this TARGET-only
+                    # figure never counted that share, so the stand-in was
+                    # squeezed as if the summary were STILL going to be
+                    # injected separately too. With long recent turns
+                    # (`_others` ~12.7k against TARGET 15,576) that leaves
+                    # only ~1,846 tokens for a hierarchy that needs ~5.1k,
+                    # so all_or_nothing declined reuse on EVERY request and
+                    # the 4-call cap fired 37/37 times — the exact failure
+                    # v3.1.9 shipped to remove. Fixed in v3.1.9.1: the
+                    # stand-in may use up to what the summary injection
+                    # would have spent, via `_standin_injected_share`.
+                    #
+                    # P9-1/P9-2 (hostile pass #9): that first fix reused
+                    # `_standin_injected_share`'s 0.6-of-inject_budget
+                    # formula verbatim — the SAME cap the separately
+                    # injected block uses to leave room for facts and
+                    # retrieval — which this call site does not need to
+                    # leave room for anything: the summary injection this
+                    # freed share came from is SKIPPED on a reusing turn,
+                    # not shrunk. At the shipped 0.6/6230 defaults that
+                    # pinned the ceiling at 6,230 (below her ~9,050-token
+                    # hierarchy — reuse never fired); at the planned
+                    # 0.75/10000 it was still only 9,345 (below what her
+                    # hierarchy renders at once it holds an L3 — measured
+                    # 11,728+, P10-2, hostile pass #10 — reuse would turn
+                    # itself off again as she accumulates one). Now uses
+                    # `_standin_reuse_ceiling`, its own
+                    # formula at `STANDIN_BUDGET_FRACTION` (default 1.0 —
+                    # see that constant's comment for the arithmetic) —
+                    # whichever of the two figures (TARGET-based or
+                    # injection-based) is larger. Only proceeds when
+                    # `inject_budget` was passed (chat_completions always
+                    # passes it now); a caller that does not — an old or a
+                    # direct test call — gets exactly the pre-3.1.9.1
+                    # TARGET-only figure, so no existing test's arithmetic
+                    # changes under it.
+                    #
+                    # P10-3: the attempt itself is now recorded once, at the
+                    # top of the `if conv_id:` block above — this used to be
+                    # where the ONLY attempt counter lived, which meant a
+                    # request that never reached this line (no stored
+                    # hierarchy, or one with no coverage) recorded nothing
+                    # at all. See that comment for the full reasoning.
                     _others = await run_in_threadpool(
                         count_tokens, system_msgs + preserved_images + keep_recent
                     )
-                    _standin_budget = min(
+                    _target_based_budget = min(
                         summarizer.SUMMARY_BLOCK_MAX_TOKENS,
                         TARGET_TOKENS - _others - SUMMARY_MAX_TOKENS,
                     )
+                    _standin_budget = _target_based_budget
+                    if inject_budget is not None:
+                        # P9-1/P9-2 (hostile pass #9): was
+                        # `_standin_injected_share(inject_budget)` (the
+                        # SEPARATELY-injected block's 0.6-of-inject_budget
+                        # formula) — starved the stand-in to 6,230 tokens
+                        # at the shipped defaults and 9,345 at the planned
+                        # ones, both under what her hierarchy measurably
+                        # renders at with an L3 (P10-2). `_standin_reuse_ceiling`
+                        # is the stand-in's OWN formula now; see
+                        # STANDIN_BUDGET_FRACTION's comment.
+                        _standin_budget = max(
+                            _target_based_budget,
+                            _standin_reuse_ceiling(inject_budget),
+                        )
                     if _standin_budget > 0:
                         # all_or_nothing: a squeezed block drops the OLDEST
                         # scenes, which are the same turns removed below. See
@@ -2067,17 +2433,37 @@ async def compact_if_needed(
                             all_or_nothing=True,
                         ) or ""
                     if not stored_text:
+                        # P9-1/P9-2 (hostile pass #9), reason recorded once
+                        # at the bottom of the block (P10-3): a budget
+                        # decline, specifically — the hierarchy exists,
+                        # covers this array, and still does not fit the
+                        # stand-in's budget whole.
+                        _reuse_reason = "budget"
+                        _reuse_ceiling, _reuse_others = _standin_budget, _others
+                        # v3.1.9.1: the budget named here is no longer always
+                        # the TARGET-derived figure — it is whichever of that
+                        # and the injected share (see `_standin_injected_
+                        # share`) was larger, so the message names the real
+                        # source rather than always blaming TARGET.
+                        _budget_source = (
+                            "the injection budget's summary share"
+                            if inject_budget is not None
+                            and _standin_budget > _target_based_budget
+                            else f"TARGET ({TARGET_TOKENS})"
+                        )
                         logger.info(
                             f"conv={conv_id}: the stored summaries cover "
                             f"{stored_turns - len(_changed)} of the turns this "
                             f"request would compact, but they do not fit whole "
-                            f"in the {max(0, _standin_budget)} token(s) TARGET "
-                            f"({TARGET_TOKENS}) leaves beside the system prompt, "
+                            f"in the {max(0, _standin_budget)} token(s) "
+                            f"{_budget_source} leaves beside the system prompt, "
                             f"images and recent turns ({_others}) and one fresh "
                             f"summary ({SUMMARY_MAX_TOKENS}); summarizing from "
                             f"scratch rather than letting the stand-in push the "
                             f"recent turns out of the window"
                         )
+                    else:
+                        _reuse_reason = "success"
                     # Image turns are preserved verbatim whatever their
                     # fingerprint says, so only text turns can need it.
                     refreshed = [
@@ -2087,6 +2473,13 @@ async def compact_if_needed(
             if not stored_text:
                 stored_turns = 0
                 refreshed = []
+                if _reuse_reason is None:
+                    # Every reachable branch above sets this; this is a
+                    # backstop, not a path this repo's tests exercise on
+                    # purpose — an unreached case reads as "budget" (the
+                    # closest true statement: no text came out) rather than
+                    # silently reporting nothing.
+                    _reuse_reason = "budget"
         except Exception as e:
             # Never fail a request over an optimisation. Falling back is
             # exactly today's behaviour.
@@ -2097,6 +2490,26 @@ async def compact_if_needed(
             stored_text = ""
             stored_turns = 0
             refreshed = []
+            # P10-3 (hostile pass #10): this is the exception path
+            # `_reuse_stats["attempted"]` used to increment for (from the
+            # OLD call site, if execution had reached it) with NO matching
+            # decline — `checks.reuse` then read as a healthy reuse while
+            # the attempt had actually crashed. Recorded explicitly as its
+            # own reason so it cannot be mistaken for "success" or for a
+            # plain budget decline.
+            _reuse_reason = "error"
+        finally:
+            # Recorded exactly ONCE per request that reached the top of
+            # this `if conv_id:` block, on every path including the
+            # exception above — see that block's own comment for why the
+            # attempt and the outcome used to live at different, and
+            # sometimes unreachable, call sites.
+            if _reuse_reason == "success":
+                _record_reuse_outcome("success")
+            else:
+                _record_reuse_outcome(
+                    _reuse_reason or "budget", _reuse_ceiling, _reuse_others
+                )
 
     fresh_input = refreshed + text_only[stored_turns:]
     async with httpx.AsyncClient() as client:
@@ -2300,6 +2713,72 @@ _TAIL_LOOP_MAX_UNIT = 400
 # characters. 250 is also verdict-identical (211 ms) if more headroom is
 # wanted; 40 is the fastest of the verified set.
 _TOKEN_RUN_RE = re.compile(r"(\S{3,40})(?:[ _\n\t]*\1){3,}")
+
+
+# Shared by trim_to_last_sentence and _trim_forwarded_prefix: each
+# independently scanned `text.splitlines(keepends=True)` for lines starting
+# with ``` and built the same list of toggle offsets, before this existed
+# (P8-2, hostile pass #8 review follow-up — "a rule applied at one call site
+# and missed at its identical sibling"). One function now, so a future
+# change to what counts as a fence delimiter cannot update one copy and
+# miss the other.
+#
+# `_reply_degenerate_verdict_uncached`'s token-run rule used to be a third
+# caller (a fence exemption, via a now-deleted `_in_closed_fence`), removed
+# entirely at P9-3 (hostile pass #9) — see that function's comment. It does
+# not use fence offsets at all any more.
+def _fence_toggle_offsets(text: str) -> list[int]:
+    """Character offsets of every ``` fence-delimiter LINE in `text`, in
+    order of appearance. `bisect.bisect_right(offsets, i) % 2 == 1` means
+    position `i` sits after an ODD number of toggles — i.e. inside a fence
+    that has opened but not (yet, by position `i`) closed again.
+
+    P9-6 (hostile pass #9), 4-SPACE INDENT: a line indented 4+ spaces is an
+    indented CODE BLOCK under CommonMark, not a fence delimiter, even if it
+    starts with ``` after the indent — that text is literal code content,
+    not markup. `.strip()` used to remove indentation before the check, so
+    such a line was wrongly counted as a toggle. Checked on the RAW line
+    now: only whitespace narrow enough that a renderer still reads the
+    ``` as markup counts. (Tabs are not special-cased into CommonMark's
+    4-space tab-stop rule here — this is the same "close enough, matches
+    every real case this model produces" simplification the rest of this
+    detector already makes; her replies use bare, unindented ``` lines.)
+
+    NOT FIXED (documented, not silent): `~~~` fences are invisible here —
+    only ``` is recognised. CommonMark treats ``` and ~~~ as independent
+    fence-marker families (a ``` opener is closed only by another ```
+    line, never by ~~~, and vice versa); this function's toggle list is a
+    single flat, character-agnostic parity count, so adding ~~~ blindly
+    would let a ``` block and a ~~~ block CROSS-CLOSE each other under a
+    mixed-marker reply — trading one false negative (a ~~~ box read as
+    plain text) for a false positive of a different, worse shape (a block
+    boundary computed wrong instead of just not computed). A correct fix
+    needs per-marker-type pairing, not a one-line change, and this
+    function has already been the site of three hostile-pass regressions
+    from smaller "just add the missing case" patches (F3, P8-2, P9-3) —
+    not worth the risk on the last V3 release for a LOW-severity gap. The
+    two remaining callers (`trim_to_last_sentence`, `_trim_forwarded_
+    prefix`) both fail toward keeping MORE text out of a cut boundary when
+    they misjudge a fence, so the failure mode of missing ~~~ is losing a
+    boundary that would have been fine to use, not corrupting one that
+    exists — see each caller's own fence-direction comment.
+    """
+    toggles: list[int] = []
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        _stripped = line.lstrip(" ")
+        if len(line) - len(_stripped) < 4 and _stripped.startswith("```"):
+            toggles.append(pos)
+        pos += len(line)
+    return toggles
+
+
+def _in_open_fence(toggles: list[int], i: int) -> bool:
+    """True when `i` sits inside a fence, whether or not that fence ever
+    closes again later in the text. This is trim_to_last_sentence's rule: a
+    cut boundary must never land inside an unterminated ``` opener, closed
+    or not — the store never sees an unbalanced fence either way."""
+    return bool(toggles) and bisect.bisect_right(toggles, i) % 2 == 1
 
 
 def _tail_loop_span(text: str) -> int:
@@ -2585,26 +3064,89 @@ def _trailing_ends_in_real_sentence(text: str) -> bool:
     return _is_real_sentence_end(text, m.start())
 
 
-def reply_is_degenerate(text: str) -> str | None:
-    """Why this reply looks like a repetition loop, or None if it looks fine.
+# v3.1.9.2 (p7 hostile pass #7, F2/F3): the forwarded-window redaction needs
+# to know WHERE the degenerate span is, not just THAT the reply is
+# degenerate, so it can keep clean text around a loop instead of throwing the
+# whole reply away (see _degenerate_replacement_content). Rather than
+# maintaining a second copy of this detection logic — which is exactly the
+# kind of "two copies eventually disagree" risk the shared-helper comment
+# above _degenerate_replacement_content already warns about for the
+# clean-head rule — `reply_is_degenerate` is now a thin wrapper around this
+# function, which returns the same reason string PLUS the span (character
+# offsets into `text`) the firing rule can point to. Existing callers of
+# `reply_is_degenerate` see no change: same input, same string-or-None
+# return.
+#
+# Not every rule has a localized span. The character-run, phrase/tail-loop,
+# token-run and fragment-line rules each flag a specific run of text and
+# report (start, end). The decoration-fraction rule, the script-drift rule
+# and the list-run backstop are measured over the WHOLE reply (a fraction,
+# a script mix, a count of short list lines scattered through it) and have
+# no single span to cut around, so they report (None, None) — callers that
+# want a span fall back to the old whole-reply clean-head rule for those.
+#
+# Cached: _redact_forwarded_loop_replies (below, main.py:6907) runs this over
+# EVERY historical assistant turn on EVERY request that declines reuse — on
+# her real main chat that is ~800 turns, and the token/tail-loop/fragment-line
+# scans in this function cost real CPU per call (see _TAIL_LOOP_WINDOW's and
+# _TOKEN_RUN_RE's comments for measured per-call costs). A turn's text is
+# fixed once written; OpenWebUI resends the same turns unchanged on every
+# later request, so the verdict for a given exact text never changes.
+# The cache is keyed on a 128-bit BLAKE2b digest of the text, NOT the text
+# itself (coordinator review): an lru_cache keyed on the string keeps every
+# cached reply alive — 4,096 of her replies at ~10k characters each is tens
+# of MB, over 100 MB for non-ASCII text, held for the life of the process.
+# The digest costs one pass over the bytes (~10 ms for an 800-turn array)
+# and a 128-bit collision is not a practical risk, so this still only skips
+# RECOMPUTING a verdict for text already judged; it cannot skip a turn that
+# reaches vLLM. A lock guards the dict: callers run in the threadpool.
+_DEGENERATE_VERDICT_CACHE_SIZE = _env_int(
+    "COMPACTOR_DEGENERATE_VERDICT_CACHE_SIZE", 4096
+)
 
-    On 2026-08-29 the model entered a loop emitting U+2501 and produced three
-    consecutive replies that were 50-79% box-drawing, each ending mid-rule after
-    a single unbroken run of 386, 425 and 569 characters. Decoration fraction
-    climbed 6.7% -> 50% -> 67% -> 79% across four turns, because each reply
-    entered the history and the guard — shedding to the most recent handful of
-    messages — made that pattern most of what the model could still see.
 
-    This does NOT stop the reply reaching the user; by the time we can measure
-    it, she has already read it, and silently rewriting model output is not
-    something this system does. It stops the reply being MEMORISED, so a loop
-    cannot write itself into facts, episodic and summaries and be injected back
-    as though it were something worth remembering. Same doctrine as the
-    finish_reason=="length" gate: a reply that is not a real answer is not a
-    memory.
+_DEGENERATE_VERDICT_CACHE: "collections.OrderedDict[bytes, tuple]" = collections.OrderedDict()
+_DEGENERATE_VERDICT_LOCK = threading.Lock()
+
+
+def _reply_degenerate_verdict(text: str) -> tuple[str | None, int | None, int | None]:
+    """Cached front of `_reply_degenerate_verdict_uncached` (see the block
+    comment above for why the key is a digest)."""
+    if not text:
+        return None, None, None
+    key = hashlib.blake2b(
+        text.encode("utf-8", "surrogatepass"), digest_size=16
+    ).digest()
+    with _DEGENERATE_VERDICT_LOCK:
+        hit = _DEGENERATE_VERDICT_CACHE.get(key)
+        if hit is not None:
+            _DEGENERATE_VERDICT_CACHE.move_to_end(key)
+            return hit
+    verdict = _reply_degenerate_verdict_uncached(text)
+    if _DEGENERATE_VERDICT_CACHE_SIZE > 0:
+        with _DEGENERATE_VERDICT_LOCK:
+            _DEGENERATE_VERDICT_CACHE[key] = verdict
+            _DEGENERATE_VERDICT_CACHE.move_to_end(key)
+            while len(_DEGENERATE_VERDICT_CACHE) > _DEGENERATE_VERDICT_CACHE_SIZE:
+                _DEGENERATE_VERDICT_CACHE.popitem(last=False)
+    return verdict
+
+
+def _reply_degenerate_verdict_uncached(text: str) -> tuple[str | None, int | None, int | None]:
+    """(reason, span_start, span_end) — see the block comment above.
+
+    `reason` is None (and start/end are None) when the reply looks fine.
+
+    Detection itself is unchanged from the original reply_is_degenerate
+    (see the 2026-08-29/09-01/09-07/09-08 history in the per-rule comments
+    below for why each rule and threshold exists). On 2026-08-29 the model
+    entered a loop emitting U+2501 and produced three consecutive replies
+    that were 50-79% box-drawing; this stops the reply being MEMORISED, so a
+    loop cannot write itself into facts, episodic and summaries and be
+    injected back as though it were something worth remembering.
     """
     if not text:
-        return None
+        return None, None, None
     n = len(text)
     # LONGEST match, not the first. re.search returns the earliest match, so a
     # reply with a brief repetition early and a runaway later was judged on the
@@ -2619,6 +3161,42 @@ def reply_is_degenerate(text: str) -> str | None:
     # the stricter one would win, making the measured character threshold a
     # lie. Requiring an alphanumeric in the repeated unit keeps them disjoint:
     # decoration to the character rule, identifiers to this one.
+    #
+    # F3 (p7 hostile pass #7) added a fence exemption here so a legitimate
+    # repeated-value array inside a ```fence``` (a `[0.00, 0.00, ...]`
+    # matrix; a repeated placeholder token) would not be flagged the same as
+    # a real identifier loop. P8-2 (hostile pass #8) narrowed it after that
+    # first shape let an identifier loop after an UNMATCHED ``` opener run
+    # to the end of the reply, unflagged, because an odd toggle count has no
+    # later toggle to end it and bisect reads every position past it as
+    # still "in fence".
+    #
+    # P9-3 (hostile pass #9): P8-2's narrowed guard — exempt only inside a
+    # fence that goes on to CLOSE, and only if the run does not reach the
+    # (stripped) end of the reply — is UNSATISFIABLE in the one shape that
+    # matters. For `_in_closed_fence(i)` to be true a later toggle (the
+    # closing ``` line) must exist, and that toggle sits AFTER the run, so
+    # `j < _stripped_len` is true every time the fence-closed test is true:
+    # the two conditions are mutually exclusive, and the "reaches the end"
+    # half can never fire. A loop that sits inside a fence that closes —
+    # the ordinary shape, since this model writes decorative boxes
+    # constantly and finishes most of them — was exempted regardless of
+    # whether it ran to the end of the reply. v3.1.9 flagged it; the
+    # exemption silently un-flagged it. Mutation-measured: deleting the
+    # "reaches the end" clause changed 0 of 20,000 synthetic verdicts — it
+    # was dead code from the day it shipped.
+    #
+    # Two hostile reviews caught two different shapes of the same mistake:
+    # a fence-awareness carve-out in a rule whose whole job is to catch text
+    # that never terminates. REMOVED, not narrowed. This rule now judges
+    # text exactly as v3.1.9 did, with no fence awareness at all. F3's
+    # complaint is answered elsewhere: `decide_memory_tail` /
+    # `_trim_forwarded_prefix` already cut the flagged span out (with a
+    # marker) and keep the rest of the reply, so a legitimate repeated-value
+    # array only costs its own span, not the reply. The remaining cost of
+    # losing the exemption is that such a reply is skipped from MEMORY —
+    # exactly what v3.1.9 already did. No regression; simply not the
+    # improvement F3/P8-2 tried to make.
     tm = max(
         (
             x for x in _TOKEN_RUN_RE.finditer(text)
@@ -2632,20 +3210,24 @@ def reply_is_degenerate(text: str) -> str | None:
             f"the token {tm.group(1)[:24]!r} repeated for "
             f"{len(tm.group(0))} characters (limit "
             f"{DEGENERATE_TOKEN_RUN_CHARS})"
-        )
+        ), tm.start(), tm.end()
     # The repeated PHRASE, which the token rule above cannot represent.
     _loop = _tail_loop_span(text)
     if _loop >= DEGENERATE_TAIL_LOOP_CHARS:
+        # Anchored at the end by construction (_tail_loop_span only ever
+        # looks at text.rstrip()'s tail), so the span always runs to the
+        # (stripped) end of the reply — there is no "after" to keep here.
+        _stripped_len = len(text.rstrip())
         return (
             f"a phrase repeating to the end of the reply for {_loop} "
             f"characters (limit {DEGENERATE_TAIL_LOOP_CHARS})"
-        )
+        ), _stripped_len - _loop, _stripped_len
     m = max(_RUN_RE.finditer(text), key=lambda x: len(x.group(0)), default=None)
     if m and len(m.group(0)) >= DEGENERATE_RUN_CHARS:
         return (
             f"a single character repeated {len(m.group(0))} times "
             f"(limit {DEGENERATE_RUN_CHARS})"
-        )
+        ), m.start(), m.end()
     # Script drift. Counted over LETTERS, not characters, so punctuation,
     # markdown and code do not dilute it.
     # NFKC first: MATHEMATICAL BOLD / DOUBLE-STRUCK / FULLWIDTH letters are
@@ -2689,19 +3271,25 @@ def reply_is_degenerate(text: str) -> str | None:
         if (frac >= DEGENERATE_NONLATIN_FRACTION and len(scripts) >= 5) or (
             frac >= 0.20 and len(scripts) >= 3
         ):
+            # No localized span: this is a property of the WHOLE reply (a
+            # letter-count fraction and a script count), not one run of
+            # text. Callers that want a span (F2/F3) fall back to the old
+            # whole-reply clean-head rule for this verdict.
             return (
                 f"{100 * frac:.0f}% of letters are non-Latin over "
                 f"{lat + non} letters across {len(scripts)} script(s) "
                 f"(limit {100 * DEGENERATE_NONLATIN_FRACTION:.0f}% over "
                 f"5+ scripts, or 20% over 3+)"
-            )
+            ), None, None
     if n >= DEGENERATE_MIN_CHARS:
         decor = sum(1 for c in text if c in _DECOR_CHARS)
         if decor / n >= DEGENERATE_DECOR_FRACTION:
+            # Same as script drift: a fraction over the whole reply, no
+            # single span. No end paren here either — completed below.
             return (
                 f"{100 * decor / n:.0f}% decoration characters over {n} chars "
                 f"(limit {100 * DEGENERATE_DECOR_FRACTION:.0f}%)"
-            )
+            ), None, None
     # Structural collapse (see the block comment above the DEGENERATE_LINE_*
     # constants). One pass over lines.
     #
@@ -2801,7 +3389,42 @@ def reply_is_degenerate(text: str) -> str | None:
     for _i, _raw in enumerate(lines):
         if _raw.strip():
             last_nonblank_idx = _i
+    # F2/F3: character offset of each line's start, so the fragment-line
+    # rule below can report a span (start, end) instead of only a reason.
+    # splitlines(keepends=True) segments text identically to splitlines()
+    # (same line boundaries; only the trailing separator differs), so the
+    # two lists stay index-aligned.
+    _line_offsets: list[int] = []
+    _pos = 0
+    for _kept in text.splitlines(keepends=True):
+        _line_offsets.append(_pos)
+        _pos += len(_kept)
 
+    # P9-5 / P10-4 (hostile pass #10): this is the FOURTH place in this
+    # module that reads ``` fences, and it is NOT migrated to
+    # `_fence_toggle_offsets` in this pass — deliberately, written down
+    # rather than left silent. `_fence_toggle_offsets` answers "is
+    # character offset i inside an open fence"; this loop needs "is line
+    # N inside an open fence" while walking `lines` (already `.strip()`ped
+    # at each entry, one per iteration) to decide run-length and
+    # fragment-shape, an orthogonal per-LINE question the offset-based
+    # reader was not built to answer directly — bridging the two would
+    # mean computing `_line_offsets[line_idx]` (already available, see
+    # above) and calling `_in_open_fence` at every line, correct in
+    # principle but touching the hottest, most mutation-tested loop in the
+    # degenerate-reply detector (test_degenerate_reply.py's C5-6 fixtures)
+    # for a fence-INDENT edge case neither inline walk below has been
+    # shown to hit on real data: both still use the OLD, indent-blind
+    # `.startswith("```")` test (the same class of gap `_fence_toggle_
+    # offsets` fixed at P9-6), but unlike `_trim_forwarded_prefix` and the
+    # belt-and-braces check above (fixed this pass), a wrong read HERE
+    # fails toward re-including a fragment-shaped line the exemption would
+    # otherwise have excused, or vice versa — a false-positive/negative
+    # RATE question on the exemption, not an unmatched-fence-reaches-the-
+    # model correctness bug like the two fixed sites. Left open rather
+    # than risk this loop's calibration on the last V3 release without a
+    # real-data reproduction to test against (real data was refused to
+    # this lane).
     run = 0
     in_fence = False
     for line_idx, raw in enumerate(lines):
@@ -2985,24 +3608,42 @@ def reply_is_degenerate(text: str) -> str | None:
                                     # does here too: exempt.
                                     exempt = True
                 if not exempt:
+                    _fl_start = _line_offsets[line_idx]
                     return (
                         f"an unbroken line of {ln} characters made of "
                         f"{breaks + 1} fragments averaging "
                         f"{ln / (breaks + 1):.0f} characters (limit "
                         f"{DEGENERATE_LINE_SENTENCE_CHARS} over "
                         f"{DEGENERATE_LINE_CHARS}+ characters)"
-                    )
+                    ), _fl_start, _fl_start + len(raw)
     # R19: gated on DEGENERATE_MIN_CHARS like the decoration-fraction rule
     # above — this file's own doctrine (see MIN_MEMORABLE_TRIMMED_CHARS)
     # calls that the floor below which nothing is judged structurally, and
     # this branch was the one exception.
     if n >= DEGENERATE_MIN_CHARS and run >= DEGENERATE_LIST_RUN:
+        # No localized span reported (deferred): the run is a COUNT of short
+        # list lines, not necessarily contiguous text free of other content
+        # in between (blank lines interleave without resetting it), so
+        # "first line of the run" is not as clean a boundary as the other
+        # rules' regex matches. Callers needing a span fall back to the old
+        # whole-reply clean-head rule for this verdict too.
         return (
             f"a run of {run} consecutive list items of "
             f"{DEGENERATE_LIST_ITEM_CHARS} characters or fewer (limit "
             f"{DEGENERATE_LIST_RUN})"
-        )
-    return None
+        ), None, None
+    return None, None, None
+
+
+def reply_is_degenerate(text: str) -> str | None:
+    """Why this reply looks like a repetition loop, or None if it looks fine.
+
+    Thin wrapper around `_reply_degenerate_verdict` (defined just above)
+    that keeps the original signature every existing caller relies on. See
+    that function for the detection rules themselves and for why the span
+    it also computes lives there instead of in a second copy of this logic.
+    """
+    return _reply_degenerate_verdict(text)[0]
 
 
 # v3.1.3: the skip does not do what its docstring promises without this.
@@ -3035,6 +3676,277 @@ _DEGENERATE_HISTORY_PLACEHOLDER = (
     "[a reply here looked like a repetition loop and was left out of "
     "everything memorized about this conversation]"
 )
+
+
+# Shared by _redact_degenerate_turns (the rollup-input redaction) and
+# _redact_forwarded_loop_replies (v3.1.9.2, the forwarded-window redaction,
+# below chat_completions): BOTH need the same "keep the clean sentence head,
+# else fall back to the placeholder" decision on a turn reply_is_degenerate
+# has flagged, and a rule this load-bearing must not exist twice — two copies
+# is how the two sites would eventually disagree about what "clean" means.
+_DEGENERATE_SPAN_MARKER = "[a repeated section was left out here]"
+
+
+def _degenerate_replacement_content(
+    text: str, placeholder: str, *, keep_middle: bool = False
+) -> tuple[str, bool]:
+    """-> (replacement content, whether any clean text was kept).
+
+    `text` must already be known-degenerate (caller has checked
+    `reply_is_degenerate`).
+
+    `keep_middle=False` (the default; used by `_redact_degenerate_turns`,
+    the ROLLUP-input redaction, which this lane leaves alone — see the
+    module note above `_redact_degenerate_turns` for why): applies the
+    original cut rule `decide_memory_tail` applies to a cut reply — keep the
+    longest prefix of the WHOLE text ending on a sentence boundary if that
+    prefix clears MIN_MEMORABLE_TRIMMED_CHARS, else use `placeholder` whole.
+
+    `keep_middle=True` (used by `_redact_forwarded_loop_replies`, v3.1.9.2):
+    v3.1.9.2 (p7 hostile pass #7, F2/F3). The `keep_middle=False` rule
+    trims to the last sentence boundary of the WHOLE reply and re-judges
+    that prefix with `reply_is_degenerate` — which does not help when the
+    degenerate span itself ends on sentence boundaries (a phrase loop:
+    "Absolutely. With Desperation. With Humility. ..." is fine prose by
+    that measure) or sits in the MIDDLE of an otherwise clean reply (a
+    120+-character scream or a zeros array in a code fence). Real corpus
+    measurement (SP\\p7\\real_head.py, hostile pass #7): 33 of 68 flagged
+    replies had a clean head of 416-21,569 characters the old rule threw
+    away whole. Here, instead, the SAME position `_reply_degenerate_verdict`
+    already located for the rule that fired is used to cut around just the
+    flagged span:
+      - span reaches the (stripped) end of the reply (the tail-loop rule is
+        always this shape; the other three can be): keep
+        `trim_to_last_sentence(text[:start])` if it clears
+        MIN_MEMORABLE_TRIMMED_CHARS, else `placeholder` whole — same floor
+        as before, but the sentence search is now confined to the text
+        BEFORE the loop, so it can no longer land on a sentence boundary
+        INSIDE the loop the way searching the whole text did.
+      - span sits in the middle: keep `trim_to_last_sentence(text[:start])`
+        before it AND `text[end:]` after it, with only the flagged span
+        itself collapsed to `_DEGENERATE_SPAN_MARKER` — the reader (the
+        model, on the next request) sees everything except the loop/scream/
+        array itself, not a placeholder standing in for the whole answer.
+      - no span (decoration fraction, script drift, the list-run backstop —
+        see `_reply_degenerate_verdict`'s comment on which rules have one):
+        falls back to the `keep_middle=False` rule above; there is nothing
+        to cut AROUND.
+    Only a single span is handled (the one `_reply_degenerate_verdict`'s
+    "longest match wins" logic already picked as worst); a reply with two
+    independently-flagged spans is not split apart further, same limit the
+    detector itself already has (see its own docstring on LONGEST match).
+    """
+    if not keep_middle:
+        head = decide_memory_tail(text, finished=False, truncated=True, holed=False)
+        if head.store and head.text.strip():
+            return head.text, True
+        return placeholder, False
+
+    # REPEATED UNTIL CLEAN (coordinator review, real data). One cut is not
+    # always enough: the span the detector reports can start after the loop
+    # really began (a phrase loop measured from its tail window; a fragment
+    # line inside a longer degenerate stretch), so the kept head can itself
+    # still be flagged. On the 2026-09-16 backup, 10 of 67 flagged replies
+    # were still flagged after one cut. The tail-loop rule looks at most
+    # _TAIL_LOOP_WINDOW characters, so each pass removes at most that much of
+    # a phrase loop: a 22k-character loop needs ~6 passes. Re-judge and cut
+    # again while the text keeps shrinking, up to a budget-derived pass count
+    # (her longest reply, 51k characters, needs ~13, well inside it); whatever
+    # is still flagged after that goes out as the placeholder, never as loop
+    # text, and it is LOGGED (P8-5/P8-8, hostile pass #8 — the old version
+    # fell back silently, so an operator could not tell "a real loop this
+    # large happened" from any other placeholder cause).
+    #
+    # P8-5: a fixed PASS COUNT bounds passes, not CPU — each pass costs
+    # roughly len(content) of regex scanning, so _DEGENERATE_CUT_MAX_PASSES
+    # (64) over a 300k-character pathological loop measured 2.2s of
+    # GIL-bound CPU on first sight; no real reply has come anywhere near
+    # that (her longest is 51k). Bound total CHARACTERS scanned across all
+    # passes instead of a flat pass count: for anything up to several times
+    # her real maximum this is still the full 64 passes (unchanged
+    # behaviour); a pathological input far beyond that gets fewer, cheaper
+    # passes before giving up, instead of grinding through 64 of them.
+    # Memoized per (digest, placeholder): OpenWebUI resends the same flagged
+    # turn on every later request, and this is several detector passes.
+    key = (
+        hashlib.blake2b(text.encode("utf-8", "surrogatepass"), digest_size=16).digest(),
+        placeholder,
+    )
+    # P8-8 (hostile pass #8): COMPACTOR_DEGENERATE_VERDICT_CACHE_SIZE=0 used
+    # to disable only _reply_degenerate_verdict's cache — this cache, whose
+    # VALUES are the kept replacement TEXT (not just a verdict tuple), kept
+    # caching regardless, at a hard-coded 1,024 entries. An operator who set
+    # that env var to 0 specifically to stop caching reply content in this
+    # process (the CHANGELOG's own "the cache holds no reply text" claim was
+    # false for exactly this cache, see P8-8) got no effect here at all.
+    # Same env var, both caches.
+    if _DEGENERATE_VERDICT_CACHE_SIZE > 0:
+        with _DEGENERATE_VERDICT_LOCK:
+            hit = _DEGENERATE_CUT_CACHE.get(key)
+        if hit is not None:
+            return hit
+    _max_passes = max(
+        1, min(_DEGENERATE_CUT_MAX_PASSES, _DEGENERATE_CUT_BUDGET_CHARS // max(1, len(text)))
+    )
+    content, kept = _cut_degenerate_span_once(text, placeholder)
+    for _ in range(_max_passes):
+        if not kept or not reply_is_degenerate(content):
+            break
+        nxt, nkept = _cut_degenerate_span_once(content, placeholder)
+        if nkept and len(nxt) >= len(content):
+            logger.warning(
+                f"degenerate-cut: a cut pass on a {len(text)}-char reply "
+                f"stopped shrinking at {len(content)} chars while still "
+                f"flagged degenerate; falling back to the whole-reply "
+                f"placeholder"
+            )
+            content, kept = placeholder, False
+            break
+        content, kept = nxt, nkept
+    else:
+        if kept and reply_is_degenerate(content):
+            logger.warning(
+                f"degenerate-cut: a {len(text)}-char reply was still "
+                f"flagged after {_max_passes} cut pass(es); falling back "
+                f"to the whole-reply placeholder instead of forwarding or "
+                f"storing loop text"
+            )
+            content, kept = placeholder, False
+    result = (content, kept)
+    if _DEGENERATE_VERDICT_CACHE_SIZE > 0:
+        with _DEGENERATE_VERDICT_LOCK:
+            _DEGENERATE_CUT_CACHE[key] = result
+            while len(_DEGENERATE_CUT_CACHE) > 1024:
+                _DEGENERATE_CUT_CACHE.popitem(last=False)
+    return result
+
+
+_DEGENERATE_CUT_MAX_PASSES = 64
+# P8-5: total characters a reply may have scanned across every cut pass
+# combined (see the comment at this constant's one use, above). 60,000 is
+# comfortably above her longest real reply (51k), so nothing observed in
+# production loses even one pass to this; it only shortens the pathological
+# tail (a loop far beyond anything her real replies reach).
+_DEGENERATE_CUT_BUDGET_CHARS = _DEGENERATE_CUT_MAX_PASSES * 60_000
+_DEGENERATE_CUT_CACHE: "collections.OrderedDict[tuple, tuple[str, bool]]" = collections.OrderedDict()
+
+
+def _trim_forwarded_prefix(text: str) -> str:
+    """The longest prefix of `text` to keep before a degenerate span, for
+    the FORWARDED window only (`_cut_degenerate_span_once`'s `pre`).
+
+    P8-3 (hostile pass #8): `trim_to_last_sentence` refuses any boundary
+    inside a ``` fence — the right rule for the MEMORY-side redaction
+    (`_redact_degenerate_turns`, keep_middle=False): an unterminated opener
+    must never reach facts.py's line filter, and a `.` inside code is not a
+    sentence end anyway. It is the wrong rule here: this text is shown to
+    the model as ordinary conversation HISTORY, nothing is extracted from
+    it, so a boundary INSIDE a fence costs nothing. Real-data measurement
+    (P8-3): this model writes long replies as prose broken up by
+    decorative ``` boxes, and the fence exclusion can throw away
+    everything back to the last sentence end OUTSIDE a box — the WHOLE
+    reply in one real case (the last sentence sat inside a box 4 characters
+    before the loop), about 11,080 characters of boxes-and-prose in
+    another.
+
+    Longest prefix ending at a real sentence boundary (fence or no fence)
+    OR a line break, whichever reaches further: a code box rarely ends in
+    terminal punctuation, so the line-break fallback is what actually saves
+    most of a box's own content when the true sentence boundary sits well
+    before it or inside it.
+
+    Self-balancing (P8-4): if the kept prefix has an ODD number of ```
+    lines (opened, never closed within it — the cut can now legally land
+    there, unlike trim_to_last_sentence), a closing ``` line is appended so
+    this prefix ALONE stays a well-formed fence pair. Otherwise everything
+    the model reads after it — the marker, and any `post` text
+    `_cut_degenerate_span_once` appends after that — would open as code.
+    """
+    if not text:
+        return ""
+    end = 0
+    for m in _SENTENCE_END_RE.finditer(text):
+        i = m.start()
+        if not _is_real_sentence_end(text, i):
+            continue
+        end = m.end()
+    cut_end = max(end, text.rfind("\n") + 1)
+    if cut_end <= 0:
+        return ""
+    cut = text[:cut_end]
+    # P10-4 (hostile pass #10): this used to count fence lines with
+    # `line.strip().startswith("```")`, which — unlike `_fence_toggle_
+    # offsets` since P9-6 — does not know a 4-space-indented ``` line is
+    # literal CommonMark code content, not a real delimiter. For a `cut`
+    # that ends with such a line, the two readers disagreed by one: this
+    # one saw an unbalanced fence and appended a REAL closing ``` line,
+    # which then opened an unmatched fence of its own (the only genuine
+    # delimiter in what this function emits), reading the rest of the
+    # forwarded reply as code. `len(_fence_toggle_offsets(cut)) % 2` is the
+    # same parity question asked with the same indent-aware reader every
+    # other fence decision in this module now uses.
+    if len(_fence_toggle_offsets(cut)) % 2 == 1:
+        cut = cut.rstrip("\n") + "\n```"
+    return cut
+
+
+def _cut_degenerate_span_once(text: str, placeholder: str) -> tuple[str, bool]:
+    """One cut around the span `_reply_degenerate_verdict` reports (see
+    `_degenerate_replacement_content(keep_middle=True)` for the rules)."""
+    _reason, start, end = _reply_degenerate_verdict(text)
+    if _reason is None:
+        return text, True
+    if start is None or end is None:
+        head = decide_memory_tail(text, finished=False, truncated=True, holed=False)
+        if head.store and head.text.strip():
+            return head.text, True
+        return placeholder, False
+
+    # P8-3: use the forwarded-only prefix rule (fence boundaries allowed,
+    # self-balanced) instead of the memory-side trim_to_last_sentence — see
+    # _trim_forwarded_prefix's docstring.
+    pre = _trim_forwarded_prefix(text[:start]).strip()
+    post = text[end:].strip()
+    if end >= len(text.rstrip()):
+        # Runs to the end: nothing after it worth keeping.
+        if len(pre) >= MIN_MEMORABLE_TRIMMED_CHARS:
+            return pre, True
+        return placeholder, False
+    if pre or post:
+        # P8-4 (hostile pass #8): a MID-reply span inside a CLOSED fence
+        # splits one box across `pre` (keeps the opener, now self-balanced
+        # by _trim_forwarded_prefix above) and `post` (keeps the box's own
+        # closer). Joined as `pre + marker + post`, the marker sits right
+        # after pre's own synthetic close, so post's leading text — which
+        # was INSIDE the box in the original — would read as plain prose
+        # until its own closer, then everything AFTER that stray closer
+        # opens as code with nothing left to end it. If the span started
+        # inside a fence in the ORIGINAL text, post is picking back up
+        # inside that same fence; prefix it with a fresh opener so its own
+        # leading text (up to its own real closer) renders exactly as it
+        # did originally.
+        if post and _in_open_fence(_fence_toggle_offsets(text), start):
+            post = "```\n" + post
+        combined = "\n\n".join(p for p in (pre, _DEGENERATE_SPAN_MARKER, post) if p)
+        # Belt-and-braces: regardless of what the two pieces above did
+        # individually, the text actually forwarded must never itself
+        # carry an odd ``` count — an unbalanced fence here is exactly what
+        # leaves the REST of the conversation misread as code from this
+        # point on (P8-4's failure mode).
+        #
+        # P10-4 (hostile pass #10): this belt-and-braces check used to
+        # count with `ln.strip().startswith("```")` — the SAME wrong
+        # counter that created the P10-4 defect at `_trim_forwarded_
+        # prefix` above, which is exactly why it was not a backstop for
+        # it: both readers agreed with each other (both indent-blind) and
+        # disagreed with `_fence_toggle_offsets` (indent-aware since
+        # P9-6), so an indented ``` line fooled them identically instead
+        # of one catching the other's mistake. `_fence_toggle_offsets` is
+        # the one reader every other fence decision in this module trusts.
+        if len(_fence_toggle_offsets(combined)) % 2 == 1:
+            combined = combined.rstrip() + "\n```"
+        return combined, True
+    return placeholder, False
 
 
 def _redact_degenerate_turns(messages: list[dict]) -> list[dict]:
@@ -3086,14 +3998,12 @@ def _redact_degenerate_turns(messages: list[dict]) -> list[dict]:
             and m.get("role") == "assistant"
             and reply_is_degenerate(_message_text(m))
         ):
-            head = decide_memory_tail(
-                _message_text(m), finished=False, truncated=True, holed=False
+            content, kept_head = _degenerate_replacement_content(
+                _message_text(m), _DEGENERATE_HISTORY_PLACEHOLDER
             )
-            if head.store and head.text.strip():
-                m = {**m, "content": head.text}
+            m = {**m, "content": content}
+            if kept_head:
                 kept_heads += 1
-            else:
-                m = {**m, "content": _DEGENERATE_HISTORY_PLACEHOLDER}
             redacted += 1
         out.append(m)
     if redacted:
@@ -3311,19 +4221,19 @@ def trim_to_last_sentence(text: str) -> str:
     if not text:
         return ""
     # Fence toggles as text offsets, so each candidate costs one bisect
-    # rather than a re-scan of everything before it. Same "line starts with
-    # ```" test reply_is_degenerate uses, so the two agree on what a fence is.
-    toggles: list[int] = []
-    pos = 0
-    for line in text.splitlines(keepends=True):
-        if line.strip().startswith("```"):
-            toggles.append(pos)
-        pos += len(line)
+    # rather than a re-scan of everything before it. Shares
+    # `_fence_toggle_offsets`/`_in_open_fence` with `_trim_forwarded_prefix`
+    # so the two agree on what a fence is — this function wants ANY open
+    # fence, closed or not (a cut must never land inside an unterminated
+    # opener). `reply_is_degenerate`'s token-run rule no longer has a fence
+    # reading of its own at all (P9-3, hostile pass #9 — the exemption it
+    # used to share this offset list with was removed, not narrowed).
+    toggles = _fence_toggle_offsets(text)
     end = 0
     n = len(text)
     for m in _SENTENCE_END_RE.finditer(text):
         i = m.start()
-        if toggles and bisect.bisect_right(toggles, i) % 2 == 1:
+        if _in_open_fence(toggles, i):
             continue  # inside an open fence
         if not _is_real_sentence_end(text, i):
             continue
@@ -4825,10 +5735,130 @@ def _enforce_hard_budget(
             # test_p5_guard.py's timing section for the measured bound.
             _turn_idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
             _floor = max(1, KEEP_RECENT_TURNS)
+            # F1 (p7 hostile pass #7): split_messages ALIGNS its kept-recent
+            # window to start on a USER turn (leading non-user turns move
+            # into the summarized portion — required so the template stays
+            # valid; see split_messages's docstring). At KEEP_RECENT_TURNS=4
+            # a real request keeps 3 messages, not 4. This floor used to be
+            # the raw KEEP_RECENT_TURNS message count, so with any preserved
+            # OLD turn (an image, most often) sitting where the 4th-from-end
+            # slot would be, this guard counted it as "recent" and protected
+            # it from the shed loop above — spending injected memory (halving,
+            # then dropping facts/retrieval) to keep a turn split_messages had
+            # already decided was old enough to summarize away. If the array
+            # still didn't fit, the plain shed loop a few lines down dropped
+            # that same turn anyway, so the memory was spent for nothing.
+            # Fix: align the floor the same way split_messages aligns its
+            # window, so "recent" means the same thing in both places.
+            #
+            # P10-1 (hostile pass #10): this alignment used to run only
+            # `if len(_turn_idxs) >= _floor`, i.e. only when the array held
+            # MORE turns than the floor. On a reusing request the array
+            # compact_if_needed returns is usually exactly AT the floor —
+            # `[U_prev, A_prev, U_new]`, three turns for KEEP_RECENT_TURNS=4
+            # — so the gate was false, `_floor` stayed at the raw
+            # KEEP_RECENT_TURNS count, and the shed loop below never even
+            # started (`_n_turns - _cut > _floor` was false immediately, 3
+            # is not > 4). Every one of those turns then read as
+            # "protected", the branch went straight to spending injected
+            # memory (persona, facts, retrieval — halved six times, then
+            # dropped), and STILL did not fit, because `U_prev`/`A_prev` can
+            # legitimately run to 16k+ tokens on their own. Control then
+            # fell out of this branch into the plain shed loop a few lines
+            # down, which has no floor and no pairing, and it dropped
+            # `U_prev` then `A_prev` anyway — spending memory for nothing
+            # and finishing 6,187-9,213 tokens under the limit with persona,
+            # facts and retrieval all gone (measured on her real branch,
+            # 24/472 positions, 5.1%). Aligning unconditionally fixes what
+            # `_floor` MEANS; the loop below fixes what happens when even
+            # that aligned floor is too large to keep whole.
+            _aligned_tail = _turn_idxs[-min(_floor, len(_turn_idxs)):]
+            while (
+                len(_aligned_tail) > 1
+                and msgs[_aligned_tail[0]].get("role") != "user"
+            ):
+                _aligned_tail = _aligned_tail[1:]
+            # P8-1 (hostile pass #8): the role check above only strips a
+            # WRONG role. OpenWebUI sends an uploaded image as a USER
+            # turn (RUNPOD_DEPLOY.md: "OpenAI's standard multimodal
+            # format" puts an image part on the user message, never the
+            # assistant's), and compact_if_needed inserts its preserved
+            # OLD images (`preserved_images`) directly in front of the
+            # true keep_recent window — `system + summary_blocks +
+            # deferred + preserved_images + keep_recent`. So on a real
+            # request the window this floor looks at is
+            # [old_image(user), prev-u(user), prev-a(assistant),
+            # newest(user)]: it already "starts on a user turn" whether
+            # that first entry is the old image or the real first
+            # recent turn, so the check above strips nothing and the
+            # floor stayed at the raw KEEP_RECENT_TURNS count —
+            # protecting the old image from the shed loop below at the
+            # cost of injected memory (halved, then dropped) it never
+            # needed to spend. split_messages's own keep_recent window
+            # always ALTERNATES roles (a real exchange is never two
+            # consecutive user turns); an old image sitting in front of
+            # it breaks that alternation, so strip the front entry
+            # whenever it shares a role with the entry right after it —
+            # exactly the case the role-only check above cannot see.
+            while (
+                len(_aligned_tail) > 1
+                and msgs[_aligned_tail[0]].get("role")
+                == msgs[_aligned_tail[1]].get("role")
+            ):
+                _aligned_tail = _aligned_tail[1:]
+            _floor = max(1, len(_aligned_tail))
             _n_turns = len(_turn_idxs)
             _cut = 0        # how many of the OLDEST entries of _turn_idxs go
             _freed = 0      # tokens that shedding them frees
-            while running - _freed > limit and _n_turns - _cut > _floor:
+            # P10-1: the most memory could ever free from here — every
+            # spendable injected block gone entirely (the trim loop below
+            # only ever approaches this by halving; the drop loop after it
+            # is what reaches it), never the stand-in itself (protected
+            # here, dropped only as a true last resort elsewhere in this
+            # function). This does not depend on which turns get cut below
+            # (`_turn_idxs` holds only non-system entries), so ONE value
+            # would do — but it is computed LAZILY, only the first time the
+            # loop actually needs it (immediately below), not up front. In
+            # the common cap-refusal regime (test_p5_guard.py's sweep and
+            # its linear-time fixture: hundreds of deferred exchanges, none
+            # of them covered by any summary) the turns-above-floor shed
+            # alone already satisfies `limit` before the loop ever reaches
+            # the floor, so this stays unpaid — an extra O(n) scan for a
+            # number the loop was never going to consult would have widened
+            # the linear bound test_p5_guard.py's `[4]` pins for no reason.
+            _mem_ceiling = None
+            while _n_turns - _cut > 1:
+                if running - _freed <= limit:
+                    break  # fits from turns alone already; leave memory whole
+                if _n_turns - _cut <= _floor:
+                    if _mem_ceiling is None:
+                        _mem_ceiling = sum(
+                            per[i]
+                            for i in _droppable_system_indices(msgs, protect_system)
+                            if not _is_compaction_standin(msgs[i])
+                        )
+                    if running - _freed - _mem_ceiling <= limit:
+                        # P10-1 (hostile pass #10): below this point we would
+                        # be cutting into the protected recent window itself
+                        # — the turns the floor above exists to keep whole.
+                        # That is only ever worth doing when nothing else
+                        # can make the array fit: if spending every
+                        # spendable injected block down to nothing (the two
+                        # loops right after this one, taken to their limit)
+                        # would already cover the remaining gap, stop here
+                        # and let THEM pay — exactly the "memory goes first"
+                        # order the comment above this branch states. Only
+                        # when even that maximum spend still cannot cover it
+                        # (her 16k-token `A_prev` outweighs persona + facts +
+                        # retrieval combined) does shedding the next old
+                        # exchange win anything — and it wins the WHOLE
+                        # exchange at once, rather than every injected block
+                        # halved to nothing first for a saving that shedding
+                        # the exchange would have made unnecessary. Measured:
+                        # 24/24 of her affected requests fit whole, memory
+                        # untouched, once the previous exchange is shed
+                        # before memory is spent rather than after.
+                        break
                 i0 = _turn_idxs[_cut]
                 # A whole exchange: the oldest surviving turn, plus its reply
                 # if (and only if) that reply immediately follows it in the
@@ -4842,8 +5872,8 @@ def _enforce_hard_budget(
                     and msgs[_turn_idxs[_cut + 1]].get("role") == "assistant"
                     else 1
                 )
-                if _n_turns - (_cut + pair_len) < _floor:
-                    break  # the recent window starts here; stop, don't split it
+                if _n_turns - (_cut + pair_len) < 1:
+                    break  # never drop the newest turn, whole exchange or not
                 _freed += sum(per[_turn_idxs[_cut + k]] for k in range(pair_len))
                 _cut += pair_len
             if _cut:
@@ -6749,6 +7779,36 @@ def _reject_json_constant(name: str):
     """
     raise ValueError(f"{name} is not valid JSON for a request body")
 
+
+def _finite_json_float(s: str) -> float:
+    """`parse_float` for `json.loads`: like the default `float(s)`, but
+    raises for a numeral that parses to a NON-FINITE value.
+
+    P8-6 (hostile pass #8): `_reject_json_constant` above only intercepts
+    the bare `NaN` / `Infinity` / `-Infinity` CONSTANT names — an ordinary-
+    looking JSON NUMBER that merely overflows float range, like
+    `1e999`, never calls it at all; Python's json module hands it to
+    `parse_float` (or plain `float()`) which silently returns `inf`. That
+    body then parsed cleanly and looked ordinary: `{"max_tokens": 1e999}`
+    reached `int(body.get("max_tokens") or 0)` below, and `int(inf)` raises
+    `OverflowError`, which the surrounding `except (TypeError, ValueError)`
+    did not catch — a 500 from a client-supplied number the parser itself
+    could reject far more cheaply, before compaction or memory injection
+    ever touch the request. Any OTHER numeric sampling key (temperature,
+    presence/frequency penalty, ...) sending the same digits would reach
+    httpx's `allow_nan=False` encoder and 500 the same way F4 already
+    documented for repeat_penalty/repetition_penalty. Rejecting at PARSE
+    time, like `_reject_json_constant`, covers every numeric field at once
+    — the same reasoning that function's own docstring gives for NaN and
+    the bare Infinity constant applies just as well to an ordinary numeral
+    that merely evaluates to one.
+    """
+    f = float(s)
+    if not math.isfinite(f):
+        raise ValueError(f"{s} is not a finite JSON number")
+    return f
+
+
 def _unpaired_surrogate(obj: Any) -> str | None:
     """The UnicodeEncodeError text if `obj` cannot be written as UTF-8 JSON.
 
@@ -6792,6 +7852,244 @@ def _refuse_unpaired_surrogate(body: Any) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# v3.1.9.2: keep detected loop replies out of what is FORWARDED to vLLM, not
+# only out of what is memorized.
+#
+# reply_is_degenerate + _redact_degenerate_turns already keep a repetition
+# loop out of the rollup/fact-extraction input. They do NOT touch what
+# chat_completions sends back to vLLM: OpenWebUI keeps the loop reply in chat
+# history and re-sends it on every later request, and the hard-budget guard
+# leaves only ~5 turns in the forwarded window, so right after a loop the
+# loop reply can be a large fraction of everything the model sees — which is
+# exactly the conditioning that makes the NEXT reply degenerate too (observed
+# in production: the reply after a loop came back empty).
+#
+# The placeholder is deliberately generic and inert: it must read as
+# ordinary history (the chat template refuses empty assistant content, so it
+# cannot be blank) and must not use the words "loop" or "repetition" the
+# model could itself latch onto and echo — the failure this exists to stop
+# is exactly the model fixating on a short phrase.
+_DEGENERATE_FORWARD_PLACEHOLDER = "[a short reply was given here]"
+
+
+def _redact_forwarded_loop_replies(messages: list[dict]) -> tuple[list[dict], int, int]:
+    """-> (copy of `messages` with degenerate ASSISTANT turns touched, count
+    touched, count of those replaced WHOLE by the placeholder).
+
+    Mirrors _redact_degenerate_turns (same detector, same clean-head rule,
+    via the shared `_degenerate_replacement_content` helper) but is a
+    SEPARATE call, on the FORWARDED window, because the two redactions run at
+    different times for different reasons and must not be collapsed into
+    one: this one runs on every request (see the call site in
+    chat_completions for why it must run AFTER compaction/injection and
+    BEFORE _enforce_hard_budget), the other runs once per rollup.
+
+    Only assistant turns are touched — never a user turn, a system message,
+    the compaction stand-in, or (by construction, since only PRIOR turns are
+    degenerate-checkable — the newest message is always the one this request
+    is asking a reply TO) the newest message.
+
+    P8-8 (hostile pass #8): `touched` used to be the only count returned,
+    and the call site logged it as "replaced N ... with a placeholder" —
+    true in v3.1.9.2's first cut, false since P8-3/P8-4's span-cut fix: on
+    the 2026-09-16 backup only 10 of 66 flagged replies were replaced
+    WHOLE, the other 56 kept a clean head/tail and lost only the flagged
+    span. An operator could not tell "a whole answer vanished" from "one
+    short span was cut out of an otherwise-intact reply" from the log
+    alone. The third return value is exactly that split.
+    """
+    out = []
+    touched = 0
+    whole = 0
+    last_index = len(messages) - 1
+    for i, m in enumerate(messages):
+        if (
+            i != last_index  # never the newest message (continue_final_message
+            # can make it an assistant turn; it is what THIS request is about,
+            # not history to sanitize)
+            and isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and reply_is_degenerate(_message_text(m))
+        ):
+            content, kept_head = _degenerate_replacement_content(
+                _message_text(m), _DEGENERATE_FORWARD_PLACEHOLDER, keep_middle=True
+            )
+            m = {**m, "content": content}
+            touched += 1
+            if not kept_head:
+                whole += 1
+        out.append(m)
+    return out, touched, whole
+
+
+# ---------------------------------------------------------------------------
+# v3.1.9.2: Ollama sampling-name translation.
+#
+# The owner's OpenWebUI model had `repeat_penalty` set (Ollama's name for
+# vLLM's `repetition_penalty`). OpenWebUI's `apply_model_params_to_body_openai`
+# passes UNKNOWN keys through verbatim rather than dropping them, so
+# `repeat_penalty` rode all the way to vLLM 0.19, which does not recognise it
+# — it lands in pydantic's `model_extra` and `SamplingParams.repetition_penalty`
+# stayed at its default of 1.0. Nothing rejected the request and nothing
+# logged: the knob just did nothing, silently, for as long as it was set that
+# way. `repeat_last_n` has no vLLM equivalent at all (vLLM's repetition
+# penalty has no window) and gets the same silent-drop treatment upstream, so
+# it is named here too.
+#
+# Bounded per-conversation-id "already logged" set, not logsetup.log_once:
+# log_once's set is keyed by call site and is meant to hold a handful of
+# entries for the process's lifetime; keying it by conv_id here would grow it
+# by one entry per DISTINCT conversation forever. This set is capped and
+# evicts the oldest entry, because the goal is "don't repeat the line on every
+# turn of the SAME conversation", not "remember every conversation ever seen".
+_SAMPLING_TRANSLATION_LOGGED: dict[str, None] = {}
+_SAMPLING_TRANSLATION_LOGGED_CAP = 2000
+
+
+def _log_sampling_translation_once(key: str) -> bool:
+    """True the first time `key` is seen; False after. Bounded (see above)."""
+    if key in _SAMPLING_TRANSLATION_LOGGED:
+        return False
+    if len(_SAMPLING_TRANSLATION_LOGGED) >= _SAMPLING_TRANSLATION_LOGGED_CAP:
+        # dicts preserve insertion order; drop the oldest entry to make room
+        # rather than let this grow without bound across a long-lived process.
+        _SAMPLING_TRANSLATION_LOGGED.pop(next(iter(_SAMPLING_TRANSLATION_LOGGED)))
+    _SAMPLING_TRANSLATION_LOGGED[key] = None
+    return True
+
+
+def _translate_ollama_sampling_params(body: dict, conv_id: str | None) -> None:
+    """Mutate `body` in place: translate Ollama-named sampling keys vLLM does
+    not understand into the vLLM name, or drop them, before forwarding.
+
+    - `repeat_penalty` -> `repetition_penalty` when the latter is absent.
+      When BOTH are present, `repetition_penalty` (the name the client meant
+      for vLLM) wins and `repeat_penalty` is simply removed — a client
+      sending both is not asking for two penalties, and picking the vLLM
+      name is the one reading that cannot silently double-apply anything.
+    - `repeat_penalty` is coerced to float; a value that is not a positive
+      number (non-numeric, zero, or negative — vLLM requires > 0) is dropped
+      with a WARNING rather than forwarded, since a bad value forwarded as
+      `repetition_penalty` would 400 the request AFTER compaction and
+      injection have already spent the turn.
+    - `repetition_penalty` itself, if the client sent it as a numeric
+      string (OpenWebUI json-decodes Custom Parameters, so this is normally
+      a number, but a hand-built client can send "1.1"), is coerced to
+      float in place so vLLM's schema does not reject it.
+    - `repeat_last_n` has no vLLM equivalent and is removed either way, with
+      an INFO note that it was dropped (not silently, the whole point here).
+
+    No other sampling key is touched.
+    """
+    conv_key = conv_id or "?"
+
+    def _coerce_positive_float(value):
+        # F4 (p7 hostile pass #7): a string "inf" / "Infinity" / "1e999" (or
+        # a numeric 1e999, which `json.loads`'s default float() already
+        # parses to inf) satisfied `f > 0` and was forwarded as-is. httpx
+        # 0.28.1 encodes the outgoing JSON with `allow_nan=False`, so the
+        # forward raised `ValueError: Out of range float values are not
+        # JSON compliant: inf` from inside the proxy, AFTER compaction and
+        # injection had already spent the turn on a request that was never
+        # going to reach vLLM (see the docstring above this function). Also
+        # reject bool: `isinstance(True, float)` is False but `float(True)
+        # == 1.0` silently accepts it as if it were a real penalty someone
+        # chose, when it is almost certainly a client typo (a flag value
+        # leaking into a numeric field).
+        if isinstance(value, bool):
+            return None
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not (f > 0) or not math.isfinite(f):
+            return None
+        return f
+
+    had_repeat_penalty = "repeat_penalty" in body
+    had_repetition_penalty = "repetition_penalty" in body
+
+    if had_repeat_penalty:
+        raw = body.pop("repeat_penalty")
+        coerced_repeat = _coerce_positive_float(raw)
+        if had_repetition_penalty:
+            # F4: repetition_penalty used to win unconditionally, even when
+            # ITS OWN value was invalid — so
+            # {"repeat_penalty": 1.1, "repetition_penalty": "abc"} forwarded
+            # NEITHER penalty: the invalid repetition_penalty was dropped
+            # below and the client's one valid value (repeat_penalty) had
+            # already been discarded here. repetition_penalty still wins
+            # when it is itself valid; otherwise fall back to the coerced
+            # repeat_penalty rather than losing both.
+            existing_valid = _coerce_positive_float(body.get("repetition_penalty"))
+            if existing_valid is not None:
+                if _log_sampling_translation_once(f"repeat_penalty.both.{conv_key}"):
+                    logger.info(
+                        f"conv={conv_key}: request set both repeat_penalty and "
+                        f"repetition_penalty; keeping repetition_penalty="
+                        f"{body['repetition_penalty']!r} and dropping repeat_penalty"
+                    )
+            elif coerced_repeat is not None:
+                _invalid = body.get("repetition_penalty")
+                body["repetition_penalty"] = coerced_repeat
+                logger.warning(
+                    f"conv={conv_key}: repetition_penalty="
+                    f"{_invalid!r} was invalid; using "
+                    f"repeat_penalty={raw!r} ({coerced_repeat!r}) instead of "
+                    f"dropping both"
+                )
+            # else: both invalid — the general repetition_penalty validation
+            # below drops whatever invalid value is still sitting in body.
+        else:
+            if coerced_repeat is None:
+                logger.warning(
+                    f"conv={conv_key}: dropping repeat_penalty={raw!r} (not a "
+                    f"positive finite number) — not forwarded as "
+                    f"repetition_penalty"
+                )
+            else:
+                body["repetition_penalty"] = coerced_repeat
+                if _log_sampling_translation_once(f"repeat_penalty.{conv_key}"):
+                    logger.info(
+                        f"conv={conv_key}: translated Ollama repeat_penalty="
+                        f"{raw!r} to vLLM repetition_penalty={coerced_repeat!r} "
+                        f"(vLLM 0.19 does not recognise repeat_penalty and "
+                        f"ignores it silently otherwise)"
+                    )
+
+    # Any repetition_penalty (numeric or string, however it arrived) must be
+    # a positive FINITE float by the time it reaches vLLM's schema — not only
+    # a string one. A numeric 1e999 (parsed to inf at JSON-decode time) or a
+    # string "inf"/"Infinity" both used to pass the old `isinstance(..., str)`
+    # gate straight through (the numeric case) or be coerced to `inf` itself
+    # (the string case), and either one 500s the forward the same way F4
+    # documents for repeat_penalty.
+    if "repetition_penalty" in body and not (
+        isinstance(body["repetition_penalty"], (int, float))
+        and not isinstance(body["repetition_penalty"], bool)
+        and math.isfinite(body["repetition_penalty"])
+        and body["repetition_penalty"] > 0
+    ):
+        coerced = _coerce_positive_float(body["repetition_penalty"])
+        if coerced is None:
+            logger.warning(
+                f"conv={conv_key}: dropping invalid repetition_penalty="
+                f"{body['repetition_penalty']!r}"
+            )
+            del body["repetition_penalty"]
+        else:
+            body["repetition_penalty"] = coerced
+
+    if "repeat_last_n" in body:
+        dropped = body.pop("repeat_last_n")
+        if _log_sampling_translation_once(f"repeat_last_n.{conv_key}"):
+            logger.info(
+                f"conv={conv_key}: dropping repeat_last_n={dropped!r} — vLLM's "
+                f"repetition penalty has no windowed equivalent"
+            )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Any:
     # PARSE DEFENSIVELY. The careful empty/invalid-messages 400 below is
@@ -6808,7 +8106,9 @@ async def chat_completions(request: Request) -> Any:
     # and a client that sent nonsense deserves to be told which nonsense.
     _raw = await request.body()
     try:
-        body = json.loads(_raw, parse_constant=_reject_json_constant)
+        body = json.loads(
+            _raw, parse_constant=_reject_json_constant, parse_float=_finite_json_float
+        )
     except Exception as e:
         logger.warning(
             f"rejected chat request with an unparseable body "
@@ -6925,6 +8225,15 @@ async def chat_completions(request: Request) -> Any:
     except Exception as e:
         logger.warning(f"conv_id resolution failed: {e}")
 
+    # v3.1.9.2: translate/drop Ollama-named sampling keys BEFORE anything
+    # else touches `body`, so every later stage (including the eventual
+    # forward to vLLM) sees the vLLM-shaped body. See
+    # _translate_ollama_sampling_params's docstring for why this exists.
+    try:
+        _translate_ollama_sampling_params(body, conv_id)
+    except Exception as e:
+        logger.warning(f"conv={conv_id or '?'}: sampling param translation failed (non-fatal): {e}")
+
     # The latest user message — used both as the RAG retrieval query and,
     # later, as the exchange's user half for the async indexing/facts tail.
     # Computed from the ORIGINAL messages (compaction preserves the last
@@ -7025,24 +8334,6 @@ async def chat_completions(request: Request) -> Any:
             status_code=200,
         )
 
-    # V1 compaction
-    # hostile2-reuse M1: `_compaction_stored_turns` is how the summary
-    # injection below (search `format_summary_block`) learns whether THIS
-    # call already put a stand-in for the hierarchy in the array, so it can
-    # skip injecting its own, separately-trimmed copy of the same summaries
-    # — see compact_if_needed's docstring for why this is an out-param
-    # rather than a return-type change.
-    _compaction_stored_turns: list[int] = []
-    try:
-        body["messages"] = await compact_if_needed(
-            messages, conv_id, stored_turns_out=_compaction_stored_turns
-        )
-    except Exception as e:
-        logger.exception(
-            f"compaction failed; falling through with the original messages — "
-            f"the hard-budget guard will shed content if they don't fit: {e}"
-        )
-
     # The window this request will finally be measured against, computed HERE
     # rather than at the pre-flight below because the memory injection that
     # follows has to be bounded by it. vLLM enforces prompt + max_tokens <=
@@ -7050,9 +8341,36 @@ async def chat_completions(request: Request) -> Any:
     # completion still 400able; and a memory budget expressed as a token
     # constant cannot see any of that. Nothing between here and the guard
     # depends on the value, and it depends on nothing but `body`.
+    #
+    # v3.1.9.1: moved ahead of V1 compaction (was after it) so that
+    # `inject_budget`, below, exists before `compact_if_needed` runs — see
+    # that move's reason on `inject_budget` itself.
     try:
         req_max_tokens = int(body.get("max_tokens") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # P8-6 (hostile pass #8): `int(inf)` raises OverflowError, not
+        # TypeError/ValueError — not caught here before this fix, so a
+        # non-finite max_tokens 500'd the proxy instead of falling into
+        # this branch. `_finite_json_float` (chat_completions's
+        # `json.loads`) now rejects a non-finite NUMERAL at parse time for
+        # every numeric field, closing that off before this line ever
+        # runs; this except is the second line of defence for any other
+        # unparseable shape (a string, a list, ...). Either way, the
+        # CLIENT'S OWN bad value must not silently ride along in `body` —
+        # this branch decided the budget math would treat it as absent (0)
+        # while leaving whatever the client actually sent untouched, so a
+        # value this guard could not parse could still reach vLLM as-is
+        # and fail there instead. Drop it and log, the same way
+        # _translate_ollama_sampling_params drops an invalid penalty
+        # rather than forwarding it unexamined — never silently REWRITE a
+        # value the client chose, only ever drop an invalid one.
+        if "max_tokens" in body:
+            logger.warning(
+                f"conv={conv_id or '?'}: dropping invalid max_tokens="
+                f"{body['max_tokens']!r} (not a finite integer) — not "
+                f"forwarded"
+            )
+            del body["max_tokens"]
         req_max_tokens = 0
     if req_max_tokens > MAX_MODEL_LEN // 2:
         # Pair with the reserve cap in effective_limit so prompt+completion
@@ -7063,6 +8381,41 @@ async def chat_completions(request: Request) -> Any:
         MAX_MODEL_LEN,
         max(256, MAX_MODEL_LEN - max(GENERATION_RESERVE, req_max_tokens)),
     )
+
+    # v3.1.9.1: also moved ahead of V1 compaction, for the same reason —
+    # `has_history` only reads `messages` (unchanged, still the client's
+    # original array; compaction hasn't run yet) and `inject_budget` only
+    # reads `effective_limit`, computed just above, so nothing here depends
+    # on compaction having happened.
+    has_history = _has_conversational_history(messages)
+    inject_budget = int(
+        effective_limit
+        * (
+            INJECTION_BUDGET_FRACTION
+            if has_history
+            else INJECTION_NO_HISTORY_FRACTION
+        )
+    )
+
+    # V1 compaction
+    # hostile2-reuse M1: `_compaction_stored_turns` is how the summary
+    # injection below (search `format_summary_block`) learns whether THIS
+    # call already put a stand-in for the hierarchy in the array, so it can
+    # skip injecting its own, separately-trimmed copy of the same summaries
+    # — see compact_if_needed's docstring for why this is an out-param
+    # rather than a return-type change.
+    _compaction_stored_turns: list[int] = []
+    try:
+        body["messages"] = await compact_if_needed(
+            messages, conv_id,
+            stored_turns_out=_compaction_stored_turns,
+            inject_budget=inject_budget,
+        )
+    except Exception as e:
+        logger.exception(
+            f"compaction failed; falling through with the original messages — "
+            f"the hard-budget guard will shed content if they don't fit: {e}"
+        )
 
     # V2.0 memory injection. ALL three layers (facts, RAG, summary) are
     # collected into a SINGLE combined system message and injected in one
@@ -7204,21 +8557,11 @@ async def chat_completions(request: Request) -> Any:
         except Exception as e:
             logger.warning(f"conv={conv_id}: retrieval load failed (non-fatal): {e}")
 
-        # Injection budget, computed HERE rather than at the inject point
-        # below, because the summary block needs its share of it first: the
-        # block's own 12,000-token cap exceeds this whole budget at
-        # production config, and capping only inside summarizer meant
-        # _bound_injected_blocks dropped whole layers (facts gone from ~50%
-        # tier fill, everything but persona at ~70%).
-        has_history = _has_conversational_history(messages)
-        inject_budget = int(
-            effective_limit
-            * (
-                INJECTION_BUDGET_FRACTION
-                if has_history
-                else INJECTION_NO_HISTORY_FRACTION
-            )
-        )
+        # has_history / inject_budget: computed ABOVE, before V1 compaction
+        # (search "also moved ahead of V1 compaction") — compact_if_needed
+        # now needs inject_budget too, for the reused-hierarchy stand-in's
+        # budget, so both moved up together rather than being computed twice
+        # with two chances to drift apart.
 
         # --- Hierarchical summary stack (Phase 4) ---
         # State only grows via the async tail (rollups post-response), so
@@ -7254,17 +8597,19 @@ async def chat_completions(request: Request) -> Any:
                 sblock = None
                 log_parts.append("sum(in-array)")
             else:
-                # 60% of the injection budget: at production config that is
-                # ~4,900 tokens, which reproduces the old working behaviour
-                # (summary trimmed newest-kept, facts and persona still fit)
-                # and leaves 40% for the other three layers.
+                # 60% of the injection budget, capped at SUMMARY_BLOCK_MAX_
+                # TOKENS: leaves the other 40% (persona, facts, retrieval)
+                # room in `inject_budget`, all four bounded together by
+                # `_bound_injected_blocks`. P9-1/P9-2 (hostile pass #9):
+                # this is NOT what a REUSING turn's stand-in claims any
+                # more — that call site (compact_if_needed) has its own
+                # formula, `_standin_reuse_ceiling`, because it does not
+                # share this constraint (nothing else spends its share on
+                # a reusing turn — see STANDIN_BUDGET_FRACTION's comment).
                 sblock = await run_in_threadpool(
                     summarizer.format_summary_block,
                     sstate,
-                    min(
-                        summarizer.SUMMARY_BLOCK_MAX_TOKENS,
-                        int(inject_budget * 0.6),
-                    ),
+                    _standin_injected_share(inject_budget),
                 )
                 if sblock:
                     injected_blocks.append(
@@ -7430,6 +8775,36 @@ async def chat_completions(request: Request) -> Any:
     # indistinguishable from one that surprised it, and the calibration learns
     # a process-global margin from the first kind.
     guard_report: dict = {}
+    # v3.1.9.2: redact detected loop replies out of the FORWARDED window here
+    # — after compaction and memory injection, before _enforce_hard_budget —
+    # so the guard measures what is actually sent (it must see the shorter
+    # placeholder text, not the runaway original) and NOT before compaction:
+    # compaction pairs recent turns against the stored covered-turn record by
+    # CONTENT, and redacting first would make a degenerate turn unpaired,
+    # so it would be treated as new and re-summarized on every request
+    # instead of being recognised as already covered.
+    body["messages"], _loop_touched, _loop_whole = await run_in_threadpool(
+        _redact_forwarded_loop_replies, body["messages"]
+    )
+    if _loop_touched:
+        # Count only — no text. The rollup-input redaction already logs a
+        # near-identical line for the same underlying detector; this one is
+        # the forwarded-window twin and can fire on requests that never
+        # trigger a rollup at all.
+        #
+        # P8-8 (hostile pass #8): this used to say "replaced N ... with a
+        # placeholder" unconditionally, which stopped being true once
+        # P8-3/P8-4 made cutting-around-the-span the common case (10 of 66
+        # flagged replies replaced whole on the 2026-09-16 backup, not all
+        # 66) — an operator could not tell a vanished answer from a
+        # trimmed one. whole=<k> names how many actually got the
+        # placeholder; the rest (touched - whole) kept a clean head/tail
+        # around the collapsed span.
+        logger.info(
+            f"conv={conv_id or '?'}: touched {_loop_touched} degenerate "
+            f"assistant turn(s) in the forwarded window (whole={_loop_whole} "
+            f"cut={_loop_touched - _loop_whole})"
+        )
     body["messages"] = await run_in_threadpool(
         _enforce_hard_budget,
         body["messages"],
