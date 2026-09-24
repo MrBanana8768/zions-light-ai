@@ -46,6 +46,35 @@ BOT_LOCALPART = "bot"
 DEVICE_HER = "V4LAB_IMPORTER_HER"
 DEVICE_BOT = "V4LAB_IMPORTER_BOT"
 SESSION_MAX_MSGS = 40
+# Her real wire turns run up to 85,005 bytes (V4_DESIGN.md 4.3); Synapse's
+# default max_event_size (65536 B) refuses an m.room.encrypted event that
+# large once Megolm/base64/JSON overhead is added -- hit this for real on
+# idx 83 (HTTP 413 M_TOO_LARGE) on the unabridged full-history run. The
+# production bot's answer is the 40,000-byte encrypted-size split (H-8);
+# this lab importer does the simpler text-side equivalent: split the BODY
+# at a conservative character budget, at the last line boundary that fits,
+# and send each part as its own message under the same Megolm session (the
+# ratchet just advances an extra step per part -- never re-encrypted on
+# resume, same as a single-part turn).
+SPLIT_MAX_CHARS = 28000
+
+
+def split_body(body: str, max_chars: int = SPLIT_MAX_CHARS) -> list[str]:
+    if len(body) <= max_chars:
+        return [body]
+    parts = []
+    remaining = body
+    while len(remaining) > max_chars:
+        cut = remaining.rfind("\n", 0, max_chars)
+        if cut <= 0:
+            cut = max_chars  # no line boundary in range -- hard cut
+        parts.append(remaining[:cut])
+        remaining = remaining[cut:]
+        if remaining.startswith("\n"):
+            remaining = remaining[1:]
+    if remaining:
+        parts.append(remaining)
+    return parts
 PICKLE_KEY = hashlib.sha256(b"v4lab importer journal pickle key -- lab only").digest()
 
 OUT_DIR = os.environ.get("IMPORT_OUT_DIR", "/work/out")
@@ -75,12 +104,42 @@ def export_branch(db_path: str, chat_id: str) -> list[tuple[int, str, int, str, 
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    row = cur.execute("select current_message_id from chat where id=?", (chat_id,)).fetchone()
-    if not row or not row["current_message_id"]:
-        raise RuntimeError(f"chat {chat_id} has no current_message_id in {db_path}")
+    # `chat.current_message_id` LAGS (V4_DESIGN.md 5.2 point 2) and can point
+    # at a row that no longer exists at all -- observed on this export, not
+    # hypothetical. Table-first per the brief: derive the newest leaf from
+    # chat_message itself. A leaf is a message no other row's parent_id
+    # names; among leaves, the newest by created_at is the tip.
+    all_rows = cur.execute(
+        "select id, parent_id, created_at from chat_message where chat_id=?",
+        (chat_id,),
+    ).fetchall()
+    if not all_rows:
+        raise RuntimeError(f"chat {chat_id} has no chat_message rows in {db_path}")
+    referenced_as_parent = {
+        f"{chat_id}-{r['parent_id']}" for r in all_rows if r["parent_id"]
+    }
+    leaves = [r for r in all_rows if r["id"] not in referenced_as_parent]
+    if not leaves:
+        raise RuntimeError(f"chat {chat_id}: no leaf found (every row is someone's parent?)")
+    leaf = max(leaves, key=lambda r: r["created_at"])
+    if len(leaves) > 1:
+        print(
+            f"note: {len(leaves)} leaf candidates (abandoned regenerations/off-branch "
+            f"replies); picked the newest by created_at, id={leaf['id'][-8:]}"
+        )
+    tip_full_id = leaf["id"]
+    stale_ptr = cur.execute(
+        "select current_message_id from chat where id=?", (chat_id,)
+    ).fetchone()
+    stale_full_id = f"{chat_id}-{stale_ptr['current_message_id']}" if stale_ptr and stale_ptr["current_message_id"] else None
+    if stale_full_id != tip_full_id:
+        print(
+            f"note: table-derived newest leaf differs from chat.current_message_id "
+            f"(the lagging pointer) -- using the table, as the brief requires"
+        )
 
     chain: list[sqlite3.Row] = []
-    local_id = row["current_message_id"]
+    local_id = tip_full_id[len(chat_id) + 1:]  # strip "<chat_id>-" back to the local id
     seen = set()
     while local_id:
         full_id = f"{chat_id}-{local_id}"
@@ -356,7 +415,7 @@ async def run(db_path: str, chat_id: str, room: str, her_password: str, last_n: 
             body = body_by_idx[idx]
             if state == "sent":
                 continue
-            if state == "planned":
+            async def get_usable_session():
                 row = c.execute(
                     "select session_id,pickle,uses from sessions where sender=? and retired=0 "
                     "and backed_up=1 order by rowid desc limit 1", (snd,),
@@ -364,57 +423,76 @@ async def run(db_path: str, chat_id: str, room: str, her_password: str, last_n: 
                 if row and row[2] >= SESSION_MAX_MSGS:
                     c.execute("update sessions set retired=1 where session_id=?", (row[0],))
                     row = None
-                if row is None:
-                    v2, p2, _ = await backup_version(s, her_tok)
-                    if (v2, p2) != (meta_get(c, "backup_version"), meta_get(c, "backup_pub")):
-                        print(f"HALT: backup version changed to {v2} before a new session; stopping")
-                        return 4
-                    gs = vz.GroupSession()
+                if row is not None:
+                    return row
+                v2, p2, _ = await backup_version(s, her_tok)
+                if (v2, p2) != (meta_get(c, "backup_version"), meta_get(c, "backup_pub")):
+                    print(f"HALT: backup version changed to {v2} before a new session; stopping")
+                    raise SystemExit(4)
+                gs_new = vz.GroupSession()
+                c.execute(
+                    "insert into sessions(session_id,sender,pickle,backup_version) values(?,?,?,?)",
+                    (gs_new.session_id, snd, gs_new.pickle(PICKLE_KEY), v2),
+                )
+                await upload_and_readback(s, her_tok, room, v2, p2, idents[snd], gs_new)
+                c.execute("update sessions set backed_up=1 where session_id=?", (gs_new.session_id,))
+                return (gs_new.session_id, gs_new.pickle(PICKLE_KEY), 0)
+
+            if state == "planned":
+                body_parts = split_body(body)
+                parts_content = []
+                parts_txn = []
+                for part_n, part_body in enumerate(body_parts):
+                    row = await get_usable_session()
+                    gs = vz.GroupSession.from_pickle(row[1], PICKLE_KEY)
+                    plain_content = {"msgtype": "m.text", "body": part_body, "zl.import": {"idx": idx, "part": part_n}}
+                    if len(body_parts) > 1:
+                        plain_content["zl.import"]["parts"] = len(body_parts)
+                    plaintext = canon({"room_id": room, "type": "m.room.message", "content": plain_content})
+                    ct = gs.encrypt(plaintext.encode()).to_base64()
+                    part_content = canon({
+                        "algorithm": "m.megolm.v1.aes-sha2", "sender_key": idents[snd]["curve"],
+                        "ciphertext": ct, "session_id": gs.session_id, "device_id": idents[snd]["dev"],
+                    })
+                    c.execute("begin")
                     c.execute(
-                        "insert into sessions(session_id,sender,pickle,backup_version) values(?,?,?,?)",
-                        (gs.session_id, snd, gs.pickle(PICKLE_KEY), v2),
+                        "update sessions set pickle=?, uses=uses+1 where session_id=?",
+                        (gs.pickle(PICKLE_KEY), gs.session_id),
                     )
-                    await upload_and_readback(s, her_tok, room, v2, p2, idents[snd], gs)
-                    c.execute("update sessions set backed_up=1 where session_id=?", (gs.session_id,))
-                    row = (gs.session_id, gs.pickle(PICKLE_KEY), 0)
-                gs = vz.GroupSession.from_pickle(row[1], PICKLE_KEY)
-                plaintext = canon({
-                    "room_id": room, "type": "m.room.message",
-                    "content": {"msgtype": "m.text", "body": body, "zl.import": {"idx": idx}},
-                })
-                mi = gs.message_index
-                ct = gs.encrypt(plaintext.encode()).to_base64()
-                content = canon({
-                    "algorithm": "m.megolm.v1.aes-sha2", "sender_key": idents[snd]["curve"],
-                    "ciphertext": ct, "session_id": gs.session_id, "device_id": idents[snd]["dev"],
-                })
-                txn = f"v4limp-{idx}"
-                c.execute("begin")
+                    c.execute("commit")
+                    parts_content.append(part_content)
+                    parts_txn.append(f"v4limp-{idx}-{part_n}")
+                content = json.dumps(parts_content)
+                txn = json.dumps(parts_txn)
                 c.execute(
-                    "update sessions set pickle=?, uses=uses+1 where session_id=?",
-                    (gs.pickle(PICKLE_KEY), gs.session_id),
+                    "update msgs set state='encrypted', content=?, txn=? where idx=?",
+                    (content, txn, idx),
                 )
-                c.execute(
-                    "update msgs set state='encrypted', session_id=?, message_index=?, content=?, txn=? where idx=?",
-                    (gs.session_id, mi, content, txn, idx),
-                )
-                c.execute("commit")
-            else:  # 'encrypted' -- resume: reconcile by ciphertext, never re-encrypt
-                ct = json.loads(content)["ciphertext"]
+
+            parts_content = json.loads(content)
+            parts_txn = json.loads(txn)
+            event_ids = []
+            for part_content, part_txn in zip(parts_content, parts_txn):
+                ct = json.loads(part_content)["ciphertext"]
                 found = await find_ciphertext(s, her_tok, room, ct)
                 if found:
-                    c.execute("update msgs set state='sent', event_id=? where idx=?", (found, idx))
+                    event_ids.append(found)
                     skipped_resume += 1
                     continue
-            st, d = await as_req(
-                s, "PUT", f"/_matrix/client/v3/rooms/{quote(room, safe='')}/send/m.room.encrypted/{txn}",
-                snd, ts=ts, body=json.loads(content), ok=None,
+                st, d = await as_req(
+                    s, "PUT",
+                    f"/_matrix/client/v3/rooms/{quote(room, safe='')}/send/m.room.encrypted/{part_txn}",
+                    snd, ts=ts, body=json.loads(part_content), ok=None,
+                )
+                if st != 200:
+                    print(f"SEND FAILED idx={idx} sender={snd} status={st} {str(d)[:200]}")
+                    return 5
+                event_ids.append(d["event_id"])
+                sent += 1
+            c.execute(
+                "update msgs set state='sent', event_id=? where idx=?",
+                (json.dumps(event_ids), idx),
             )
-            if st != 200:
-                print(f"SEND FAILED idx={idx} sender={snd} status={st} {str(d)[:200]}")
-                return 5
-            c.execute("update msgs set state='sent', event_id=? where idx=?", (d["event_id"], idx))
-            sent += 1
         dt = time.time() - t0
         result = {
             "branch_length": total_len,

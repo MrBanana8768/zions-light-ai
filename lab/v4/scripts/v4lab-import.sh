@@ -34,7 +34,7 @@ mkdir -p "${LAB_DIR}/importer/out"
 
 docker compose -f "${LAB_DIR}/docker-compose.lab.yml" \
     -p v4lab --env-file "${ENV_FILE}" --profile tools \
-    run --rm v4lab-importer python3 import_history.py \
+    run --build --rm v4lab-importer python3 import_history.py \
     --db /data/her-copy/webui.db \
     --room "${LAB_HER_ROOM_ID}" \
     --her-password "${LAB_HER_PASSWORD}" \

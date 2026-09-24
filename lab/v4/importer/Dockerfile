@@ -14,5 +14,6 @@ WORKDIR /work
 COPY lab/v4/importer/import_history.py lab/v4/guard.py ./
 
 ENV PYTHONUNBUFFERED=1
-ENTRYPOINT ["python3"]
-CMD ["import_history.py", "--help"]
+# No ENTRYPOINT -- v4lab-import.sh passes the full "python3 import_history.py
+# ..." command via `docker compose run`, so it isn't prefixed twice.
+CMD ["python3", "import_history.py", "--help"]
