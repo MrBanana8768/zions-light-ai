@@ -265,6 +265,43 @@ def _free_mb(path: Path) -> float:
         return float("inf")  # can't tell → don't block
 
 
+def sweep_stale_local_staging(max_age_s: float = 3600.0) -> list[str]:
+    """M-1 (review1-v3197-65ea196). An orphaned `.backup-staging/webuidb-
+    local-*.sqlite3` file — left behind when a cycle is SIGKILLed between
+    `tempfile.mkstemp` and the `finally: local_tmp.unlink(missing_ok=True)`
+    in `_snapshot_sqlite_to_data` — sits on local disk forever (mutation
+    B3, "local staging file never unlinked", SURVIVED: nothing in the
+    gate's own tests notices). Every orphan left there burns exactly the
+    local disk space this module's own free-space check above exists to
+    protect, silently shrinking the margin every later backup or sync
+    cycle actually gets.
+
+    Called once at process start (`main()`, before any argument is acted
+    on) rather than every cycle: a cycle in progress right now legitimately
+    has a same-shaped file open, so sweeping here rather than mid-run means
+    this can only ever remove a file from a run that is not this process's
+    own and is old enough (`max_age_s`, default 1h — no real backup stage
+    takes anywhere near that) that nothing still using it is plausible.
+    """
+    removed: list[str] = []
+    if not LOCAL_STAGING_DIR.is_dir():
+        return removed
+    now = time.time()
+    for f in LOCAL_STAGING_DIR.glob("webuidb-local-*.sqlite3"):
+        try:
+            if now - f.stat().st_mtime > max_age_s:
+                f.unlink()
+                removed.append(str(f))
+        except OSError:
+            pass
+    if removed:
+        logger.warning(
+            f"swept {len(removed)} orphaned local backup-staging file(s) "
+            f"from a previous interrupted cycle: {removed}"
+        )
+    return removed
+
+
 def _snapshot_sqlite(src: Path, dest: Path) -> bool:
     """Consistent online snapshot of a (possibly live) SQLite db via the
     backup API. Returns True if a snapshot was written, False if the source
@@ -382,28 +419,52 @@ def _snapshot_sqlite_to_data(
     slow backup is still a backup.
     """
     local_dir = local_staging_dir or LOCAL_STAGING_DIR
+    # M-1 (review1-v3197-65ea196, X7b). This used to reserve only ~1.1x the
+    # source's size - room for THIS function's own local_tmp copy, nothing
+    # else. But webuidb-sync's own sync_once() stages its OWN local copy of
+    # the SAME live database on the SAME local disk, on its own independent
+    # schedule (every WEBUI_DB_SYNC_INTERVAL_S), and the two are not
+    # coordinated: measured with 819 MB free (this check's old ~538 MB
+    # threshold passed easily), the backup's local stage and webuidb-sync's
+    # local temp overlapped and free space fell to 257 MB — live DB (already
+    # on disk) + this function's local_tmp + webuidb-sync's own local_tmp,
+    # all at once. ~0.8 GB less disk under the same timing would ENOSPC the
+    # LIVE database's own journal, not merely fail this backup. Reserving
+    # 2x (this copy AND a possible concurrent sync copy) plus a fixed margin
+    # is the honest number for what can actually be on this disk at once.
+    _CONCURRENT_COPIES = 2
+    _MARGIN_MB = 32
     needed_mb = 0.0
     if src.is_file():
-        # 10% headroom over the source size, same margin _require_free_space
-        # uses elsewhere in this file, plus a small fixed floor so a tiny
-        # source database doesn't pass on a filesystem that is otherwise
-        # completely full.
-        needed_mb = (src.stat().st_size / (1024 * 1024)) * 1.1 + 8
+        needed_mb = (
+            (src.stat().st_size / (1024 * 1024)) * 1.1 * _CONCURRENT_COPIES
+            + _MARGIN_MB
+        )
     local_free = _free_mb(local_dir) if needed_mb else float("inf")
     if needed_mb and local_free < needed_mb:
-        logger.warning(
+        # ERROR, not WARNING (M-1): this fallback silently brings BACK the
+        # exact D2 symptom it exists to avoid — a lock error plus a
+        # multi-second commit stall on the live database, on every backup
+        # cycle for as long as local disk stays this full. A WARNING here
+        # read like routine noise in backup.log while the live writer took
+        # the hit; an operator needs this to be as loud as the problem it
+        # causes.
+        logger.error(
             f"only {local_free:.0f} MB free at {local_dir} (need ~"
-            f"{needed_mb:.0f} MB to stage {src} locally first) — falling "
-            f"back to backing it up straight onto {dest.parent}, which "
-            f"holds the live database's read lock for as long as that "
-            f"volume takes (D2, findings.md)"
+            f"{needed_mb:.0f} MB — room for this backup's own local copy "
+            f"AND a possible concurrent webuidb-sync cycle — to stage "
+            f"{src} locally first) — falling back to backing it up "
+            f"straight onto {dest.parent}, which holds the live "
+            f"database's read lock for as long as that volume takes (D2, "
+            f"findings.md). Free up local disk or raise "
+            f"COMPACTOR_BACKUP_LOCAL_STAGING_DIR's volume."
         )
         return _snapshot_sqlite(src, dest)
 
     try:
         local_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        logger.warning(
+        logger.error(
             f"could not create local staging dir {local_dir} "
             f"({type(e).__name__}: {e}) — falling back to backing up "
             f"{src} straight onto {dest.parent} (D2, findings.md)"
@@ -420,6 +481,33 @@ def _snapshot_sqlite_to_data(
         # file left by mkstemp is a harmless but pointless extra open.
     except OSError:
         pass
+
+    # M-1 (review1-v3197-65ea196, X7b): serialise THIS function's local
+    # stage with webuidb-sync's own — both stage a same-sized local copy of
+    # the same live database on the same local disk on independent
+    # schedules, and the two landing at once is exactly what turned 819 MB
+    # "free" into 257 MB actually free (see the free-space check above).
+    # Reusing webuidb's OWN sync flock, rather than inventing a second lock
+    # file that could itself disagree with the first, asks "is a sync
+    # cycle using local disk right now" the one place that already knows.
+    # Non-blocking with a short bounded retry, never an indefinite wait —
+    # this lock DEGRADES SAFELY (see _acquire_sync_lock's own docstring),
+    # and a backup must still complete even on a platform or a filesystem
+    # where flock is not available.
+    import webuidb
+    _sync_lock = None
+    for _attempt in range(5):
+        _sync_lock = webuidb._acquire_sync_lock()
+        if _sync_lock is not None:
+            break
+        time.sleep(1.0)
+    if _sync_lock is None:
+        logger.warning(
+            "webuidb-sync's own sync was still running after 5s; staging "
+            "this backup locally anyway rather than waiting indefinitely "
+            "for it (both briefly want the same local disk headroom — see "
+            "the 2x free-space reservation above)"
+        )
     try:
         wrote = _snapshot_sqlite(src, local_tmp)
         if not wrote:
@@ -431,6 +519,8 @@ def _snapshot_sqlite_to_data(
         shutil.copy2(local_tmp, dest)
         return True
     finally:
+        if _sync_lock is not None and _sync_lock is not webuidb._LOCK_DEGRADED:
+            webuidb._release_sync_lock(_sync_lock)
         try:
             local_tmp.unlink(missing_ok=True)
         except OSError:
@@ -3137,6 +3227,14 @@ def main(argv: list[str] | None = None) -> int:
 
     import logsetup
     logsetup.configure()  # honors COMPACTOR_LOG_FORMAT (text/json)
+
+    # M-1 (review1-v3197-65ea196): sweep any orphaned local staging file
+    # left by a previous interrupted cycle before this one can add its own
+    # — see sweep_stale_local_staging's docstring. Runs for every
+    # invocation (--once, --daemon, --verify, ...), which is "at boot" for
+    # both the supervisord daemon and every manual/CLI call this process
+    # ever makes.
+    sweep_stale_local_staging()
 
     if args.list:
         archives = list_backups()
