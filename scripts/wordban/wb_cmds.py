@@ -330,8 +330,10 @@ def cmd_release(args):
 def render_report(rev, man, stamp, e2e, bl, prompt_line, written, out, notes):
     rows = [r for r in stamp["rows"] if r["check"] != "corpus facts"]
     facts = next((json.loads(r["detail"]) for r in stamp["rows"] if r["check"] == "corpus facts"), None)
+    withdrawn = {int(k): v for k, v in (bl.get("withdrawn_revisions") or {}).items()}
     prev = sorted((int(m.group(1)) for p in out.glob("word-ban-structured_outputs.value.v*.txt")
-                   for m in [re.search(r"\.v(\d+)\.txt$", p.name)] if m and int(m.group(1)) < rev), reverse=True)
+                   for m in [re.search(r"\.v(\d+)\.txt$", p.name)]
+                   if m and int(m.group(1)) < rev and int(m.group(1)) not in withdrawn), reverse=True)
     L = [f"# Word ban, revision {rev}", "",
          f"Built by `scripts/wordban/wordban.py` from `scripts/wordban/banlist.yaml` (sha256 "
          f"`{man['banlist_sha256'][:16]}…`), verified {stamp['when']}"
@@ -359,7 +361,10 @@ def render_report(rev, man, stamp, e2e, bl, prompt_line, written, out, notes):
           "on the build machine, CPU).", "",
           "### Rollback", "",
           (f"Paste `word-ban-structured_outputs.value.v{prev[0]}.txt` (or an earlier one) into the row, or delete the row."
-           if prev else "Delete the `structured_outputs` row."), "",
+           if prev else "Delete the `structured_outputs` row."), ""]
+    for k, why in sorted(withdrawn.items()):
+        L += [f"**Never roll back to revision {k}:** {why}", ""]
+    L += [
           "## Verification", "", "| check | result |", "|---|---|"]
     for r in rows:
         L.append(f"| {r['check']} | {'**PASS**' if r['pass'] else '**FAIL**'} {r['detail'].replace('|', '/')} |")
