@@ -546,6 +546,45 @@ if [ "${WEBUI_DB_LOCAL}" = "true" ]; then
         echo "      marker by hand and the next sync overwrites the snapshot."
     fi
 else
+    # M-2 (review1-v3197-65ea196): mirror of the DATABASE_URL GATE CHECK
+    # above, for the ROLLBACK direction. `export DATABASE_URL="${DATABASE_URL:-...}"`
+    # below only sets it when unset - a row left over from a PRIOR
+    # WEBUI_DB_LOCAL=true deploy (or set by hand) wins silently, exactly the
+    # true-branch defect, just in reverse: with WEBUI_DB_LOCAL=false and
+    # DATABASE_URL still pointing at ${WEBUI_LOCAL_DB} (the pod's own
+    # overlay disk), OpenWebUI would build/use its schema THERE while this
+    # banner claims "webui.db stays on ${WEBUI_SNAPSHOT_DB}" - and
+    # WEBUIDB_SYNC_ENABLED=false means nothing ever publishes that local
+    # file to /data, so every message would be lost outright on the next
+    # pod stop, with no sync daemon left running to have even a chance of
+    # saving it. Refuse before OpenWebUI can start on it, the same as the
+    # true branch does.
+    _expected_database_url_false="sqlite:///${WEBUI_SNAPSHOT_DB}"
+    if [ -n "${DATABASE_URL:-}" ] && [ "${DATABASE_URL}" != "${_expected_database_url_false}" ]; then
+        echo ""
+        echo "      ============================================================"
+        echo "      DATABASE_URL DISAGREES WITH WEBUI_DB_LOCAL=false - REFUSING TO START."
+        echo ""
+        echo "      DATABASE_URL is set to: ${DATABASE_URL}"
+        echo "      but WEBUI_DB_LOCAL=false expects: ${_expected_database_url_false}"
+        echo ""
+        echo "      A DATABASE_URL row left over from a WEBUI_DB_LOCAL=true"
+        echo "      deploy (or set by hand) would make OpenWebUI build/use its"
+        echo "      database on the pod's own disposable disk (${WEBUI_LOCAL_DB})"
+        echo "      while WEBUIDB_SYNC_ENABLED=false means NOTHING ever copies"
+        echo "      it to /data - every message would be lost outright on the"
+        echo "      next pod stop, with no sync daemon running to save it (M-2,"
+        echo "      review1-v3197-65ea196)."
+        echo ""
+        echo "      Delete the DATABASE_URL row from the RunPod template (let"
+        echo "      this script derive it from WEBUI_SNAPSHOT_DB below) and"
+        echo "      redeploy. If you genuinely need a non-default DATABASE_URL"
+        echo "      with the database on /data, set it to exactly"
+        echo "      ${_expected_database_url_false} so the two agree."
+        echo "      ============================================================"
+        echo ""
+        exit 1
+    fi
     # THE SYNC DAEMON MUST NOT RUN HERE, and this is the whole safety of the
     # flag. It publishes the LOCAL file over the snapshot path; with the
     # live database sitting at that same snapshot path, a single publish
