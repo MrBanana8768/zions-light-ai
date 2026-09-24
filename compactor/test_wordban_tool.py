@@ -125,15 +125,20 @@ def test_real_banlist_has_no_trap_and_the_live_trap_prefixes_are_refused(build_d
     A = core.Automaton(ebnf)
     traps, _prev, _ = A.trap_states()
     assert_eq(traps, [], "no reachable state without an ordinary way to finish (character level)")
-    for prefix, stem in (("a small angelĂ", "a small angel"), ("RU and Angelø", None),
-                         ("our angeléñÖs", "our angel")):
+    for prefix in ("a small angelĂ", "RU and Angelø", "our angeléñÖs"):
         s, at = A.run(prefix)
         assert_true(s is None, f"{prefix!r} is refused")
-        if stem:
-            assert_eq(at, len(stem), f"{prefix!r} is refused AT the accented letter, not later")
-            s0, _ = A.run(stem)
-            assert_true(s0 not in traps and A.run(stem + "a")[0] is not None,
-                        f"after {stem!r} a normal continuation remains ('Angela')")
+        assert_true(at is not None and at <= prefix.index("gel") + 3, f"{prefix!r} is refused by the accented letter at the latest")
+        s0, _ = A.run(prefix[:at])
+        assert_true(s0 is not None and s0 not in traps, f"just before the refusal in {prefix!r} a normal continuation remains")
+    # revision 6: the stem itself is refused (no name exceptions), glued and split forms too; real words pass
+    for t in ("angel", "theangel", "an-gel", "g\u200bold", "g\u043eld", "angeI", "candleflame", "flamenco", "los ángeles"):
+        assert_true(not A.accepts(t), f"{t!r} is refused (rev 6)")
+    for t in ("evangelical", "strangely", "marigold", "inflammation", "flammable", "Los Angeles",
+              "\U0001f468\u200d\U0001f469\u200d\U0001f467", "e.g. old", "gol de Messi"):
+        assert_true(A.accepts(t), f"{t!r} passes (rev 6)")
+    s0, _ = A.run("Los Angel")
+    assert_true(s0 is not None and not A.accepts("Los Angel\u0301es"), "no combining mark right after a banned stem")
     rc, out = run_tool(["verify", "--no-image", "--fuzz", "2000", "--build-dir", str(build_dir)])
     assert_eq(rc, 0, "verify --no-image passes on the real banlist")
     assert_true("VERIFY PASSED" in out and "reference definition agrees" in out,
@@ -243,6 +248,10 @@ def test_release_refuses_without_a_full_passing_verify():
         rc, out = run_tool(["release", "--build-dir", str(d), "--out-dir", str(out_dir), "--allow-no-e2e"])
         assert_true(rc != 0 and "--no-image" in out, "a local-only verify is not enough", out[-300:])
         st = json.loads((d / "verify-stamp.json").read_text(encoding="utf-8"))
+        st.update(full=True, corpus=True, tool_sha256="0" * 64)
+        (d / "verify-stamp.json").write_text(json.dumps(st), encoding="utf-8")
+        rc, out = run_tool(["release", "--build-dir", str(d), "--out-dir", str(out_dir), "--allow-no-e2e"])
+        assert_true(rc != 0 and "different tool code" in out, "a stamp written by other tool code: refused", out[-300:])
         st.update(full=True, corpus=True)
         (d / "verify-stamp.json").write_text(json.dumps(st), encoding="utf-8")
         (d / "wb_ban.ebnf").write_text((d / "wb_ban.ebnf").read_text(encoding="utf-8") + "\n", encoding="utf-8")
@@ -250,6 +259,39 @@ def test_release_refuses_without_a_full_passing_verify():
         assert_true(rc != 0 and "does not match its manifest" in out, "an artifact edited after the build: refused",
                     out[-300:])
         assert_true(not out_dir.exists() or not any(out_dir.iterdir()), "nothing was written by a refused release")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_pod_check_reports_a_truncated_paste_without_a_traceback(build_dir):
+    src = (WB / "check_template.py").read_text(encoding="utf-8")
+    ebnf = (build_dir / "wb_ban.ebnf").read_text(encoding="utf-8")
+    import hashlib
+    src = (src.replace("__REVISION__", "6").replace("__SHA__", hashlib.sha256(ebnf.encode()).hexdigest())
+           .replace("__MODEL__", '"m/x"').replace("__PROMPT__", '"p"').replace("__ALLOWED__", "[]"))
+    tmp = Path(tempfile.mkdtemp(prefix="wb-chk-"))
+    try:
+        chk = tmp / "word-ban-check.py"
+        chk.write_text(src, encoding="utf-8")
+        value = json.dumps({"grammar": ebnf})
+        lines = ebnf.splitlines()
+        cases = {
+            "cut in the middle of the JSON": value[:len(value) // 2],
+            "cut at a rule boundary, JSON re-closed": json.dumps({"grammar": "\n".join(lines[:len(lines) // 2]) + "\n"}),
+            "cut inside a char class, JSON re-closed": json.dumps({"grammar": ebnf[:ebnf.index("[", len(ebnf) // 2) + 5]}),
+        }
+        for name, saved in cases.items():
+            db = tmp / "webui.db"
+            db.unlink(missing_ok=True)
+            c = sqlite3.connect(db)
+            c.execute("create table model (id text, params json)")
+            c.execute("insert into model values ('m/x', ?)", (json.dumps({"custom_params": {"structured_outputs": saved}}),))
+            c.commit()
+            c.close()
+            p = subprocess.run([sys.executable, str(chk), str(db)], capture_output=True, text=True, timeout=60)
+            outp = p.stdout + p.stderr
+            assert_true(p.returncode == 1 and "Traceback" not in outp and "truncated or corrupt" in outp,
+                        f"pod check, {name}: the friendly message, exit 1, no traceback", outp[-400:])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -275,6 +317,7 @@ if __name__ == "__main__":
     try:
         test_real_banlist_has_no_trap_and_the_live_trap_prefixes_are_refused(bd)
         test_pod_check_interpreter_agrees_with_the_tool(bd)
+        test_pod_check_reports_a_truncated_paste_without_a_traceback(bd)
     finally:
         shutil.rmtree(bd.parent, ignore_errors=True)
     test_verifier_fails_on_revision_4s_angel_trap()

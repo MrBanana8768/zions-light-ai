@@ -7,7 +7,9 @@ Sends one prompt that asks for the banned words, three ways:
   C  through the compactor (:8080) WITH the ban      -> the same (the production hop)
 The ban is read from the model's saved OpenWebUI settings, READ-ONLY (one SELECT; nothing is written). Each reply
 is judged by the SAVED grammar itself (a small interpreter below), so this script never goes stale.
-C uses its own test conversation id (itest-wordban-check), never hers.   Usage: python3 word-ban-check.py [webui.db]"""
+C uses its own test conversation id (itest-wordban-check), never hers.   Usage: python3 word-ban-check.py [webui.db]
+PASS needs all three: A writes a banned word (the control), B and C write none. A truncated or corrupt saved value
+is reported as such (re-paste), never as a traceback."""
 import bisect
 import hashlib
 import json
@@ -99,6 +101,9 @@ class Grammar:
                 else:
                     edges.append((a[0][1] if a[0][0] == "cc" else atoms[a[0][1]], a[1][1]))
             self.info[n] = (eps, acc, edges)
+        if "root" not in self.info or any(t not in self.info for e, _a, ed in self.info.values()
+                                          for t in list(e) + [x[1] for x in ed]):
+            raise ValueError("incomplete grammar")
 
     def _closure(self, names):
         seen, st = set(), list(names)
@@ -134,19 +139,35 @@ def word_at(text, i):
     return text[a:b + 1].strip()
 
 
+CUT = ("the saved value is truncated or corrupt (the paste was cut short?). Re-paste "
+       "word-ban-structured_outputs.value.txt into the structured_outputs row, Save & Update, and run this again.")
 con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
 row = con.execute("select params from model where id=?", (MODEL,)).fetchone()
 con.close()
 cp = (json.loads(row[0]) if row else {}).get("custom_params") or {}
 so = cp.get("structured_outputs")
-so = json.loads(so) if isinstance(so, str) else so
 if not so:
     sys.exit("structured_outputs is not saved on the model yet - do step 1 first, then Save & Update")
-got = hashlib.sha256(so.get("grammar", "").encode()).hexdigest()
-print(f"saved grammar: {len(so.get('grammar', ''))} chars, sha256 {got[:16]}... "
+raw = so if isinstance(so, str) else json.dumps(so)
+print(f"saved value: {len(raw)} characters")
+try:
+    so = json.loads(so) if isinstance(so, str) else so
+    grammar = so["grammar"]
+except Exception:                                                    # noqa: BLE001
+    print(f"saved grammar != revision {REVISION}: " + CUT)
+    print("\nRESULT: FAIL (see above)")
+    sys.exit(1)
+got = hashlib.sha256(grammar.encode()).hexdigest()
+print(f"saved grammar: {len(grammar)} chars, sha256 {got[:16]}... "
       + (f"= revision {REVISION}, pasted intact" if got == EXPECTED
          else f"!= revision {REVISION} (an older revision, or the paste was cut short)"))
-G = Grammar(so["grammar"])
+try:
+    G = Grammar(grammar)
+    G.refused_at("test")
+except Exception:                                                    # noqa: BLE001
+    print(CUT)
+    print("\nRESULT: FAIL (see above)")
+    sys.exit(1)
 
 
 def ask(port, extra, headers):
@@ -156,7 +177,8 @@ def ask(port, extra, headers):
                                  headers={"Content-Type": "application/json", **headers})
     t = time.time()
     with urllib.request.urlopen(req, timeout=900) as r:
-        return json.load(r)["choices"][0]["message"]["content"], time.time() - t
+        ch = json.load(r)["choices"][0]
+        return ch["message"]["content"] or "", ch.get("finish_reason"), time.time() - t
 
 
 ok = got == EXPECTED
@@ -166,18 +188,26 @@ for label, port, extra, hdr, want in [
     ("C compactor + ban    ", 8080, {"structured_outputs": so}, {"X-Conversation-Id": "itest-wordban-check"}, True),
 ]:
     try:
-        out, dt = ask(port, extra, hdr)
+        out, finish, dt = ask(port, extra, hdr)
     except Exception as e:                                           # noqa: BLE001
         body = getattr(e, "read", lambda: b"")().decode(errors="replace")[:300]
         print(f"{label} REQUEST FAILED: {e} {body}")
         ok = False
         continue
     at = G.refused_at(out)
+    if at is not None and at >= len(out) and finish == "length":
+        at = None                  # stopped at max_tokens in the middle of a word: unfinished, not a banned word
+        note = " (stopped at max_tokens mid-word)"
+    else:
+        note = ""
     kept = [w for w in ALLOWED if w.lower() in out.lower()]
-    verdict = "no banned word (the grammar accepts it)" if at is None else f"BANNED WORD near {word_at(out, at)!r}"
+    verdict = ("no banned word (the grammar accepts it)" + note) if at is None else f"BANNED WORD near {word_at(out, at)!r}"
     print(f"{label} {dt:5.1f}s  {verdict}  | allowed words it wrote: {kept}")
     print("      " + out.replace("\n", " ")[:600])
     if want and at is not None:
         ok = False
+    if not want and at is None:
+        ok = False
+        print("      CONTROL FAILED: without the ban the model wrote no banned word, so B and C prove nothing.")
 print("\nRESULT:", "PASS" if ok else "FAIL (see above)")
 sys.exit(0 if ok else 1)

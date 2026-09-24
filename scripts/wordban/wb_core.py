@@ -14,6 +14,7 @@ import collections
 import hashlib
 import itertools
 import json
+import os
 import sqlite3
 import sys
 import unicodedata
@@ -48,7 +49,12 @@ class Folder:
         self.latin = [tuple(x) for x in cfg.get("latin_blocks", [])]
         self.greek = [tuple(x) for x in cfg.get("greek_blocks", [])]
         self.extra = dict(cfg.get("extra", {}))
+        self.conf = {str(k): str(v) for k, v in (cfg.get("confusables") or {}).items()}
         self._cache = {}
+
+    def confusable(self, ch):
+        """the ASCII letter a look-alike from another script stands for (Cyrillic а, Greek Α ...), or None"""
+        return self.conf.get(ch)
 
     def fold(self, ch):
         """the single letter `ch` counts as (ASCII Latin, or a base Greek letter), else None."""
@@ -110,6 +116,10 @@ def parse_pattern(s, seps):
             if i < len(s) and s[i] == "*":
                 kind = "star"
                 i += 1
+            elif i < len(s) and s[i] == "+":           # one or more
+                i += 1
+                steps.append(("c", items))
+                kind = "star"
             steps.append(("opt" if opt else kind, items))
             continue
         if ch == "[":
@@ -137,16 +147,18 @@ def expand_optional(steps):
 
 
 def spaced(word, sepname):
+    """a run of one or more separators between every two letters"""
     s = []
     for n, ch in enumerate(word):
         if n:
             s.append(("c", [("sep", sepname)]))
+            s.append(("star", [("sep", sepname)]))
         s.append(("c", [("let", ch.lower())]))
     return s
 
 
 class Spec:
-    """the banlist, compiled: character classes + patterns + continuation tries."""
+    """the banlist, compiled: character classes + patterns + continuation tries + in-word escapes."""
 
     def __init__(self, bl, source_bytes=b""):
         self.bl = bl
@@ -161,90 +173,136 @@ class Spec:
         self.mark_cap = fcfg.get("mark_cap")
         self.mark_cap_hebrew = fcfg.get("mark_cap_hebrew") if self.mark_cap else None
         self.hebrew_marks = [tuple(x) for x in fcfg.get("hebrew_marks", [])] if self.mark_cap_hebrew else []
+        self.lookalikes = {str(x).lower(): [str(c) for c in v] for x, v in (fcfg.get("lookalikes") or {}).items()}
+        self.forbidden = sorted(int(x) for x in (fcfg.get("forbidden_chars") or []))
+        self.zwj_rule = bool(fcfg.get("zwj_not_between_letters"))
+        self.marks_after_stem = fcfg.get("marks_after_stem", "allow")
         self.seps = {k: list(v) for k, v in (bl.get("separators") or {}).items()}
         self._compile_rules()
         self._compile_classes()
         self._resolve()
 
     # ---------------------------------------------------------------- rules
+    def _variants(self, r, src):
+        if r.get("spaced"):
+            return [spaced(src, r["spaced"])]
+        if r.get("split"):
+            word = src
+            out = []
+            for i in range(1, len(word)):
+                steps = [("c", [("let", ch.lower())]) for ch in word[:i]]
+                steps += [("c", [("sep", r["split"])]), ("star", [("sep", r["split"])])]
+                steps += [("c", [("let", ch.lower())]) for ch in word[i:]]
+                out.append(steps)
+            return out
+        return expand_optional(parse_pattern(src, self.seps))
+
     def _compile_rules(self):
         self.pats = []            # Pattern objects (ban / stem / ctx)
         self.stems = []           # continuation specs, one per stem variant
         self.rules = []           # (family, rule dict) flat list, for reporting
+        self.escapes = []         # in-word escape tries (word prefixes that exempt a rule)
         for fam, fdef in (self.bl.get("families") or {}).items():
             for r in fdef.get("rules", []):
                 self.rules.append((fam, r))
                 rid = r["id"]
                 where = r.get("where", "word_start")
-                if where not in ("word_start", "anywhere"):
-                    raise ValueError(f"{rid}: where must be word_start or anywhere")
-                wi = where == "word_start"
+                if where not in ("word_start", "anywhere", "inside"):
+                    raise ValueError(f"{rid}: where must be word_start, anywhere or inside")
                 src = r.get("stem", r.get("match"))
                 if src is None:
                     raise ValueError(f"{rid}: needs match: or stem:")
-                if r.get("spaced"):
-                    steps0 = spaced(src, r["spaced"])
-                else:
-                    steps0 = parse_pattern(src, self.seps)
-                variants = expand_optional(steps0)
+                variants = self._variants(r, src)
+                esc_id = None
+                if r.get("allow_in_words"):
+                    ws = [w.lower() for w in r["allow_in_words"]]
+                    for w in ws:
+                        if not (w.isascii() and w.isalpha()):
+                            raise ValueError(f"{rid}: allow_in_words must be plain ASCII letters: {w!r}")
+                    esc_id = len(self.escapes)
+                    self.escapes.append({"rule": rid, "trie": build_trie([], ws)})
+                ctx = r.get("context")
+                ctx_id = None
+                if ctx:
+                    ctx_id = len([p for p in self.pats if p.kind == "ctx"])
+                    self.pats.append(Pattern(id=f"{rid}@ctx", family=fam, kind="ctx", where="word_start",
+                                             steps=parse_pattern(ctx["after"], self.seps), wild=False, ctx_id=ctx_id,
+                                             ctx_of=None, variant=None, stem_id=None, esc_id=None, plain=False))
+                fffd = r.get("fffd", "default")
                 for vi, steps in enumerate(variants):
                     if steps[0][0] == "star":
                         raise ValueError(f"{rid}: a pattern may not start with a *-step")
                     only_letters = all(it[0] in ("let", "any") for st in steps if st[0] == "c" for it in st[1])
-                    wild = r.get("fffd", self.fffd_default and only_letters and not r.get("spaced"))
-                    if wild and not self.fffd_default:
+                    if fffd == "transparent":
+                        wild = "transparent"
+                    elif fffd is True or (fffd == "default" and only_letters and not r.get("spaced")
+                                          and not r.get("split")):
+                        wild = "one" if self.fffd_default else False
+                    else:
                         wild = False
                     name = rid if len(variants) == 1 else f"{rid}#{vi}"
+                    base = dict(family=fam, where=where, steps=steps, wild=wild, esc_id=esc_id, ctx_id=None,
+                                plain=False)
                     if "stem" in r:
-                        for w in (r.get("allow_words") or []) + (r.get("allow_prefixes") or []):
+                        for w in (r.get("allow_words") or []) + (r.get("allow_prefixes") or []) + (r.get("ban_words") or []):
                             if not (w.isascii() and w.isalpha()):
                                 raise ValueError(f"{rid}: allowed continuations must be plain ASCII letters: {w!r}")
-                        ctx = r.get("context")
-                        base = dict(alone=r.get("alone", "ban"), other=r.get("other", "ban"), rule=rid, family=fam)
                         sid = len(self.stems)
-                        self.stems.append(dict(base, trie=build_trie(r.get("allow_words") or [],
-                                                                     r.get("allow_prefixes") or []), variant="normal"))
-                        ctx_id = None
-                        if ctx:
-                            ctx_id = len([p for p in self.pats if p.kind == "ctx"])
-                            csteps = parse_pattern(ctx["after"], self.seps)
-                            self.pats.append(Pattern(id=f"{name}@ctx", family=fam, kind="ctx", word_init=True,
-                                                     steps=csteps, wild=False, ctx_id=ctx_id, ctx_of=None,
-                                                     variant=None, stem_id=None))
-                            sid2 = len(self.stems)
-                            self.stems.append(dict(base, trie=build_trie(ctx.get("allow_words") or [],
-                                                                         ctx.get("allow_prefixes") or r.get("allow_prefixes") or []),
-                                                   variant="ctx"))
-                            self.pats.append(Pattern(id=f"{name}@after-ctx", family=fam, kind="stem", word_init=wi,
-                                                     steps=steps, wild=wild, stem_id=sid2, ctx_of=ctx_id,
-                                                     variant="ctx", ctx_id=None))
-                        self.pats.append(Pattern(id=name, family=fam, kind="stem", word_init=wi, steps=steps,
-                                                 wild=wild, stem_id=sid, ctx_of=ctx_id,
-                                                 variant="normal" if ctx else None, ctx_id=None))
+                        self.stems.append(dict(alone=r.get("alone", "ban"), other=r.get("other", "ban"), rule=rid,
+                                               family=fam, variant="normal",
+                                               trie=build_trie(r.get("allow_words") or [], r.get("allow_prefixes") or [],
+                                                              r.get("ban_words") or [])))
+                        self.pats.append(Pattern(id=name, kind="stem", stem_id=sid, ctx_of=ctx_id,
+                                                 variant="normal" if ctx else None, **base))
                     else:
-                        self.pats.append(Pattern(id=name, family=fam, kind="ban", word_init=wi, steps=steps,
-                                                 wild=wild, stem_id=None, ctx_of=None, variant=None, ctx_id=None))
+                        self.pats.append(Pattern(id=name, kind="ban", stem_id=None, ctx_of=ctx_id,
+                                                 variant="normal" if ctx else None, **base))
+                    if ctx:
+                        sid2 = len(self.stems)
+                        self.stems.append(dict(alone="ban", other="ban", rule=rid, family=fam, variant="ctx",
+                                               trie=build_trie(ctx.get("allow_words") or [], ctx.get("allow_prefixes") or [])))
+                        b2 = dict(base, where="word_start", wild=False if ctx.get("plain") else wild,
+                                  plain=bool(ctx.get("plain")), esc_id=None)
+                        self.pats.append(Pattern(id=f"{name}@after-ctx", kind="stem", stem_id=sid2, ctx_of=ctx_id,
+                                                 variant="ctx", **b2))
         for st in self.stems:
             check_trie(st)
+        # one shared trie over every rule's in-word escapes: a word is tracked by ONE thread, not one per rule
+        self.esc_trie = [{"ch": {}, "eids": set()}]
+        for eid, e in enumerate(self.escapes):
+            for w in Reference._words(e["trie"]):
+                n = 0
+                for ch in w:
+                    nx = self.esc_trie[n]["ch"].get(ch)
+                    if nx is None:
+                        self.esc_trie.append({"ch": {}, "eids": set()})
+                        nx = len(self.esc_trie) - 1
+                        self.esc_trie[n]["ch"][ch] = nx
+                    n = nx
+                self.esc_trie[n]["eids"].add(eid)
 
     # ---------------------------------------------------------------- classes
     def _compile_classes(self):
-        letters_ascii, letters_other, chars = set(), set(), set()
+        letters, chars, lits = set(), set(), set()
+        sepmem = collections.defaultdict(set)
         uses_ws = False
 
         def see_items(items):
             nonlocal uses_ws
             for it in items:
                 if it[0] == "let":
-                    (letters_ascii if it[1].isascii() else letters_other).add(it[1])
+                    x = it[1]
+                    letters.add(x if x.isascii() else (self.folder.fold(x) or x).lower())
                 elif it[0] == "chr":
                     chars.add(it[1])
+                    lits.add(it[1])
                 elif it[0] == "sep":
                     for c in self.seps[it[1]]:
                         if c == "WS":
                             uses_ws = True
                         else:
                             chars.add(c)
+                            sepmem[c].add(it[1])
         for p in self.pats:
             for st in p.steps:
                 see_items(st[1])
@@ -252,38 +310,61 @@ class Spec:
         for st in self.stems:
             for node in st["trie"]:
                 for ch in node["ch"]:
-                    letters_ascii.add(ch)
+                    letters.add(ch)
                     split.add(ch)
-        # non-ASCII pattern letters are matched by their folded, lower-case form
-        lo = set()
-        for x in letters_other:
-            f = self.folder.fold(x) or x
-            lo.add(f.lower())
-        self.letters_ascii = sorted(letters_ascii)
-        self.letters_other = sorted(lo)
+        for p in self.pats:
+            if p.plain:                        # a plain-letters-only stem: its accented forms must be told apart
+                for st in p.steps:
+                    split.update(it[1] for it in st[1] if it[0] == "let" and it[1].isascii())
+        # look-alikes (other scripts, I/1/0) only stand in for the letters of the banned patterns themselves
+        self.stem_letters = frozenset(letters)
+        for e in self.escapes:
+            for node in e["trie"]:
+                letters.update(node["ch"])
+        for x, lst in self.lookalikes.items():
+            if x in self.stem_letters:
+                chars.update(c for c in lst if not c.isalpha())
+        self.pletters = frozenset(letters)
+        # non-letter characters with the same role everywhere (same separator sets, same look-alike letter, not
+        # used literally) share one class: fewer classes, a smaller grammar
+        sig = {}
+        for ch in sorted(chars):
+            look = frozenset(x for x, lst in self.lookalikes.items() if ch in lst and x in self.stem_letters)
+            key = (frozenset(sepmem[ch]), look, ch if ch in lits else None)
+            sig.setdefault(key, []).append(ch)
+        self.char_class = {}
+        self.char_meta = {}
+        for key, group in sig.items():
+            name = group[0] if len(group) == 1 else "s:" + "".join(group)
+            for ch in group:
+                self.char_class[ch] = name
+            self.char_meta[name] = {"letter": False, "ptype": "non", "key": None, "matches": key[1]}
         self.split = sorted(split)
         self.chars = sorted(chars)
         self.uses_ws = uses_ws
-        specific = sorted(set([c for ch in self.letters_ascii for c in (ch, ch.upper())] + self.chars))
-        variants = sorted(c + "~" for ch in self.split for c in (ch, ch.upper()))
-        other = [f"g:{x}" for x in self.letters_other]
-        marks = ["MARK"] + (["HMARK"] if self.mark_cap_hebrew else [])
-        self.classes = specific + variants + other + (["WS"] if uses_ws else []) + \
-            ["FFFD", "LOWER_OTHER", "UPPER_OTHER"] + marks + ["LETTER_OTHER", "NONLETTER"]
+        self.meta = {}
         self.cps = collections.defaultdict(list)
         prev = "NONLETTER"
         for cp in range(0x110000):
             if 0xD800 <= cp <= 0xDFFF:
                 continue
-            if unicodedata.category(chr(cp)) == "Cn":
+            if unicodedata.category(chr(cp)) == "Cn" and cp not in self.forbidden:
                 c = prev if prev in BIG else "NONLETTER"
             else:
                 c = self.classify(cp)
             self.cps[c].append(cp)
             prev = c
-        missing = set(self.cps) - set(self.classes)
-        assert not missing, missing
-        self.classes = [c for c in self.classes if self.cps.get(c)]
+        for c, m in (("MARK", "M"), ("HMARK", "M"), ("FFFD", "non"), ("INVIS", "non"), ("ZWJ", "zwj"),
+                     ("NONLETTER", "non"), ("WS", "non"), ("LETTER_OTHER", "let"), ("LOWER_OTHER", "lo"),
+                     ("UPPER_OTHER", "up")):
+            if c in self.cps and c not in self.meta:
+                self.meta[c] = {"letter": m in ("lo", "up", "let"), "ptype": m, "key": None, "matches": frozenset()}
+        for name, m in self.char_meta.items():
+            if name in self.cps:
+                self.meta[name] = m
+        order = {"FFFD": 0, "INVIS": 1, "ZWJ": 2, "WS": 3, "LOWER_OTHER": 4, "UPPER_OTHER": 5, "MARK": 6, "HMARK": 7,
+                 "LETTER_OTHER": 8, "NONLETTER": 9}
+        self.classes = sorted(self.cps, key=lambda c: (order.get(c, -1), c))
         self.cls_of = {}
         for c, l in self.cps.items():
             for cp in l:
@@ -293,8 +374,12 @@ class Spec:
         ch = chr(cp)
         if cp == FFFD_CP:
             return "FFFD"
-        if ch in self.chars and not ch.isalpha():
-            return ch
+        if cp in self.forbidden:
+            return "INVIS"
+        if self.zwj_rule and cp == 0x200D:
+            return "ZWJ"
+        if ch in self.char_class and not ch.isalpha():
+            return self.char_class[ch]
         if self.uses_ws and ch in WS_EXTRA:
             return "WS"
         cat = unicodedata.category(ch)
@@ -303,66 +388,83 @@ class Spec:
                 return "HMARK"
             return "MARK"
         f = self.folder.fold(ch)
-        if f is not None and f.isascii():
-            if f.lower() in self.letters_ascii:
-                return f + "~" if (not ch.isascii() and f.lower() in self.split) else f
-            return "LOWER_OTHER" if f.islower() else "UPPER_OTHER"
-        if cat.startswith("L"):
-            key = (f or ch).lower()
-            if key in self.letters_other:
-                return f"g:{key}"
-            return "LETTER_OTHER"
-        return "NONLETTER"
+        conf = self.folder.confusable(ch)
+        if conf and conf.lower() not in self.stem_letters:
+            conf = None
+        if not (cat.startswith("L") or (f is not None and f.isalpha()) or conf):
+            return "NONLETTER"
+        asc = f if (f is not None and f.isascii()) else conf
+        matches = {(f or ch).lower()}
+        if conf:
+            matches.add(conf.lower())
+        for x, lst in self.lookalikes.items():
+            if ch in lst and x in self.stem_letters:
+                matches.add(x)
+        matches &= self.pletters
+        case = ("lo" if asc.islower() else "up") if asc else "let"
+        if not matches:
+            return {"lo": "LOWER_OTHER", "up": "UPPER_OTHER"}.get(case, "LETTER_OTHER")
+        acc = (not ch.isascii()) and asc is not None and bool(({asc.lower()} | matches) & set(self.split))
+        if asc and matches == {asc.lower()}:
+            name = asc + ("~" if acc else "")
+        elif not asc and len(matches) == 1 and not next(iter(matches)).isascii():
+            name = "g:" + next(iter(matches))
+        else:
+            name = f"m:{''.join(sorted(matches))}:{asc or '-'}:{case}{'~' if acc else ''}"
+        if name not in self.meta:
+            self.meta[name] = {"letter": True, "ptype": case, "key": (asc.lower(), acc) if asc else None,
+                               "matches": frozenset(matches)}
+        return name
 
     # ---------------------------------------------------------------- resolve items -> class sets
     def is_letter_cls(self, c):
-        return (c in ("LOWER_OTHER", "UPPER_OTHER", "LETTER_OTHER") or c.startswith("g:")
-                or (len(c) == 1 and c.isascii() and c.isalpha()) or (len(c) == 2 and c[1] == "~"))
+        return self.meta[c]["letter"]
 
     def ptype(self, c):
-        base = c[0] if (len(c) == 2 and c[1] == "~") else c
-        if c == "LOWER_OTHER" or (len(base) == 1 and base.isascii() and base.isalpha() and base.islower()):
-            return "lo"
-        if c == "UPPER_OTHER" or (len(base) == 1 and base.isascii() and base.isalpha() and base.isupper()):
-            return "up"
-        if self.is_letter_cls(c):
-            return "let"
-        return "non"
+        return self.meta[c]["ptype"]
 
     def L(self, x):
-        if x.isascii():
-            return frozenset(y for y in (x, x.upper(), x + "~", x.upper() + "~") if y in self.classes)
-        return frozenset([f"g:{(self.folder.fold(x) or x).lower()}"]) & frozenset(self.classes)
+        if not x.isascii():
+            x = (self.folder.fold(x) or x).lower()
+        return frozenset(c for c in self.classes if x in self.meta.get(c, {}).get("matches", ()))
 
-    def _items_to_classes(self, items):
+    def plain_L(self, x):
+        return frozenset(c for c in self.classes if self.meta.get(c, {}).get("key") == (x, False)
+                         and all(cp < 0x80 for cp in self.cps[c]))
+
+    def _items_to_classes(self, items, plain=False):
         out = set()
         for it in items:
             if it[0] == "let":
-                out |= self.L(it[1])
+                out |= (self.plain_L(it[1]) if (plain and it[1].isascii()) else self.L(it[1]))
             elif it[0] == "chr":
-                out.add(it[1])
+                out.add(self.char_class.get(it[1], it[1]))
             elif it[0] == "sep":
                 for c in self.seps[it[1]]:
-                    out.add("WS" if c == "WS" else c)
+                    out.add("WS" if c == "WS" else self.char_class[c])
             elif it[0] == "any":
                 out |= self.any_letter
         return frozenset(out & set(self.classes))
 
     def _resolve(self):
-        self.any_letter = frozenset(c for c in self.classes if self.is_letter_cls(c))
+        self.any_letter = frozenset(c for c in self.classes if self.meta[c]["letter"])
         for p in self.pats:
             p.csteps = [(k, self._items_to_classes(items)) for k, items in p.steps]
+            p.psteps = [(k, self._items_to_classes(items, plain=True)) for k, items in p.steps] if p.plain else None
             for k, cl in p.csteps:
                 if not cl:
                     raise ValueError(f"{p.id}: a step matches no character")
+        self.ctx_first = {}
+        for p in self.pats:
+            if p.variant == "ctx":
+                self.ctx_first.setdefault(p.ctx_of, set()).update((p.psteps or p.csteps)[0][1])
+        # escape tries read letters by their match sets
+        self.esc_letters = {c: self.meta[c]["matches"] | ({self.meta[c]["key"][0]} if self.meta[c]["key"] else set())
+                            for c in self.classes}
 
     # ---------------------------------------------------------------- DFA
     def cont_key(self, c):
-        if len(c) == 1 and c.isascii() and c.isalpha():
-            return c.lower(), False
-        if len(c) == 2 and c[1] == "~":
-            return c[0].lower(), True
-        return None
+        return self.meta[c]["key"]
 
     def end_ok(self, st, node, taint):
         ok = (st["alone"] == "allow") if node == 0 else st["trie"][node]["end"]
@@ -374,8 +476,10 @@ class Spec:
         if pos < len(steps) and steps[pos][0] == "star":
             new.add(("P", pid, pos + 1, flag))
 
-    def _complete(self, p, new):
+    def _complete(self, p, new, escaped):
         if p.kind == "ban":
+            if p.esc_id is not None and p.esc_id in escaped:
+                return None                                # the word is one of the allowed words
             return DEAD
         if p.kind == "stem":
             new.add(("C", p.stem_id, 0, False))
@@ -387,9 +491,38 @@ class Spec:
         return any(self.is_letter_cls(x) for x in st[1])
 
     def advance(self, threads, prev, c):
+        meta = self.meta[c]
+        is_letter = meta["letter"]
+        if c == "INVIS":
+            return DEAD                                    # soft hyphen, zero-width space/non-joiner, word joiner
+        if c == "ZWJ" and prev in ("lo", "up", "let"):
+            return DEAD                                    # zero-width joiner right after a letter
+        if prev == "zwj" and is_letter:
+            return DEAD                                    # ... or right before one
+        up = meta["ptype"] == "up"
+        ws = prev in ("non", "zwj") or (prev == "lo" and up)          # a word starts at this character
         new = set()
+        # in-word escapes first: a word that begins with an allowed word is exempt from that rule
+        escaped = set()
+        if is_letter and self.escapes:
+            letters = self.esc_letters[c]
+            T = self.esc_trie
+            nodes = [0] if ws else [th[1] for th in threads if th[0] == "E"]
+            for th in threads:
+                if th[0] == "X" and not ws:
+                    new.add(th)
+                    escaped.add(th[1])
+            for node in nodes:
+                for x in letters:
+                    ch = T[node]["ch"].get(x)
+                    if ch is not None:
+                        for eid in T[ch]["eids"]:
+                            new.add(("X", eid))
+                            escaped.add(eid)
+                        if T[ch]["ch"]:
+                            new.add(("E", ch))
         for th in threads:
-            if th[0] == "M":
+            if th[0] in ("M", "E", "X"):
                 continue                                   # a context marker lives for one character
             if th[0] == "C":
                 _, sid, node, taint = th
@@ -397,7 +530,7 @@ class Spec:
                 trie = st["trie"]
                 if c == "FFFD":
                     return DEAD                            # an unseen character right after a banned stem
-                if self.is_letter_cls(c):
+                if is_letter:
                     k = self.cont_key(c)
                     if k and k[1]:
                         if self.mode == "dead":
@@ -419,9 +552,13 @@ class Spec:
             p = self.pats[pid]
             steps = p.csteps
             if c == "FFFD":
-                if flag in ("W", "T"):
+                if p.plain:
+                    return DEAD                            # an unseen character inside a plain-letters-only stem
+                if p.wild == "transparent":
+                    new.add(th)                            # an unseen point/accent: transparent
+                elif flag in ("W", "T"):
                     new.add(th)                            # more bytes of the same unseen character
-                elif flag == "" and p.wild:
+                elif flag == "" and p.wild == "one":
                     new.add(("P", pid, pos, "T"))          # an unseen accent inside the word
                     if self._is_letter_step(steps[pos]):
                         if pos + 1 == len(steps):
@@ -435,28 +572,37 @@ class Spec:
                     self._put(new, pid, pos, flag)
                 continue
             if c in steps[pos][1]:
+                if p.plain and c not in p.psteps[pos][1]:
+                    return DEAD                            # the right letter, but not in plain letters
                 if pos + 1 == len(steps):
-                    if self._complete(p, new) is DEAD:
+                    if self._complete(p, new, escaped) is DEAD:
                         return DEAD
                     continue
                 self._put(new, pid, pos + 1, flag)
         markers = {th[1] for th in threads if th[0] == "M"}
-        up = self.ptype(c) == "up"
         for pid, p in enumerate(self.pats):
-            if p.word_init and not (prev == "non" or (prev == "lo" and up)):
+            if p.where == "word_start" and not ws:
                 continue
-            if p.ctx_of is not None:
+            if p.where == "inside" and ws:
+                continue
+            if p.ctx_of is not None and ws:
                 has = p.ctx_of in markers
-                if (p.variant == "ctx") != has:
-                    continue
+                if p.variant == "ctx":
+                    if not has:
+                        continue
+                elif has and c in self.ctx_first.get(p.ctx_of, ()):
+                    continue                               # the context variant takes this one
+            elif p.variant == "ctx":
+                continue
+            first = p.psteps[0][1] if p.plain else p.csteps[0][1]
             if c == "FFFD":
-                if p.wild and self._is_letter_step(p.csteps[0]):
+                if p.wild == "one" and self._is_letter_step(p.csteps[0]):
                     if len(p.csteps) == 1:
                         return DEAD
                     self._put(new, pid, 1, "W")
-            elif c in p.csteps[0][1]:
+            elif c in first:
                 if len(p.csteps) == 1:
-                    if self._complete(p, new) is DEAD:
+                    if self._complete(p, new, escaped) is DEAD:
                         return DEAD
                 else:
                     self._put(new, pid, 1, "")
@@ -464,6 +610,13 @@ class Spec:
 
     def accepting(self, threads):
         return all(self.end_ok(self.stems[th[1]], th[2], th[3]) for th in threads if th[0] == "C")
+
+    def marks_ok(self, threads):
+        """combining marks are refused right after a banned stem (inside its continuation) and inside a
+        plain-letters-only stem"""
+        if self.marks_after_stem != "refuse":
+            return True
+        return not any(th[0] == "C" or (th[0] == "P" and self.pats[th[1]].plain and th[2] >= 1) for th in threads)
 
     def build_dfa(self):
         marks = [c for c in self.classes if c in ("MARK", "HMARK")]
@@ -488,7 +641,9 @@ class Spec:
             i += 1
         n = len(order)
         acc = [self.accepting(order[k][1]) for k in range(n)]
-        part = [0 if acc[k] else 1 for k in range(n)]
+        mok = [self.marks_ok(order[k][1]) for k in range(n)]
+        part0 = {}
+        part = [part0.setdefault((acc[k], mok[k]), len(part0)) for k in range(n)]
         while True:
             sig = {}
             newp = []
@@ -499,15 +654,14 @@ class Spec:
             part = newp
             if done:
                 break
-        m = len(set(part))
-        mt, macc = {}, {}
+        mt, macc, mmok = {}, {}, {}
         for k in range(n):
             b = part[k]
             macc[b] = acc[k]
+            mmok[b] = mok[k]
             for c in ordinary:
                 t = trans[(k, c)]
                 mt[(b, c)] = None if t is None else part[t]
-        # renumber: start = 0, then BFS order (deterministic)
         ren = {part[0]: 0}
         q = collections.deque([part[0]])
         while q:
@@ -521,39 +675,49 @@ class Spec:
         self.dfa_n = len(ren)
         self.dfa_t = {(ren[b], c): (None if t is None else ren[t]) for (b, c), t in mt.items() if b in ren}
         self.dfa_acc = {ren[b]: a for b, a in macc.items() if b in ren}
+        self.dfa_marks = {ren[b]: a for b, a in mmok.items() if b in ren}
         self.ordinary_classes = ordinary
         self.mark_classes = marks
         return self
 
     # ---------------------------------------------------------------- EBNF
     def emit(self):
-        atom = {}
-
         def atom_name(c):
-            if c == "MARK": return "zmk"
-            if c == "HMARK": return "zhm"
-            if c == "LETTER_OTHER": return "zlt"
-            if c == "NONLETTER": return "znl"
-            if c == "LOWER_OTHER": return "xlo"
-            if c == "UPPER_OTHER": return "xup"
-            if c == "WS": return "zws"
-            if c.startswith("g:"): return "q" + "".join(f"{ord(x):x}" for x in c[2:])
-            if len(c) == 2 and c[1] == "~": return ("vl" if c[0].islower() else "vu") + c[0].lower()
-            if len(c) == 1 and c.isascii() and c.isalpha(): return ("l" if c.islower() else "u") + c.lower()
+            fixed = {"MARK": "zmk", "HMARK": "zhm", "LETTER_OTHER": "zlt", "NONLETTER": "znl", "LOWER_OTHER": "xlo",
+                     "UPPER_OTHER": "xup", "WS": "zws", "INVIS": "zin", "ZWJ": "zzj", "FFFD": "zff"}
+            if c in fixed:
+                return fixed[c]
+            if c.startswith("g:"):
+                return "q" + "".join(f"{ord(x):x}" for x in c[2:])
+            if c.startswith(("m:", "s:")):
+                return "k" + hashlib.sha1(c.encode()).hexdigest()[:10]
+            if len(c) == 2 and c[1] == "~":
+                return ("vl" if c[0].islower() else "vu") + c[0].lower()
+            if len(c) == 1 and c.isascii() and c.isalpha():
+                return ("l" if c.islower() else "u") + c.lower()
             return None
+        atom = {}
         for c in self.classes:
             if c in BIG or c in ("MARK", "HMARK") or len(self.cps[c]) > 1:
                 nm = atom_name(c)
                 assert nm, c
                 atom[c] = nm
+        used = set()
+        groups_atoms = {}
+        SMALL = 0                                  # measured: inlining atoms makes the grammar larger
+        nranges = {c: len(ranges_of(self.cps[c])) for c in self.classes}
 
         def heads(cls_list):
-            singles = [c for c in cls_list if c not in atom]
-            h = [charclass([cp for c in singles for cp in self.cps[c]])] if singles else []
-            return h + [atom[c] for c in cls_list if c in atom]
+            # One alternative per target: the classes' code points merged into a single char class (a rule that
+            # is one char class is as fast as an inline one; a rule that is a UNION of rules is not - rev 4).
+            if len(cls_list) == 1 and cls_list[0] in atom:
+                used.add(cls_list[0])
+                return [atom[cls_list[0]]]
+            small = [c for c in cls_list if c not in atom or nranges[c] <= SMALL]
+            big = [c for c in cls_list if c not in small]
+            used.update(big)
+            return ([charclass([cp for c in small for cp in self.cps[c]])] if small else []) + [atom[c] for c in big]
         cap = self.mark_cap
-        wrapped = bool(cap)
-        core = (lambda b: f"c{b}") if wrapped else (lambda b: "root" if b == 0 else f"s{b}")
         full = lambda b: "root" if b == 0 else f"s{b}"
         lines = []
         for b in range(self.dfa_n):
@@ -564,16 +728,25 @@ class Spec:
                     groups[t].append(c)
             alts = (['""'] if self.dfa_acc[b] else []) + [f"{h} {full(t)}" for t, cl in sorted(groups.items())
                                                            for h in heads(cl)]
-            if not wrapped:
-                alts += [f"{atom[m]} {full(b)}" for m in self.mark_classes]      # marks: transparent
+            if not cap:
+                if self.dfa_marks[b]:
+                    alts += [f"{atom[m]} {full(b)}" for m in self.mark_classes]   # marks: transparent
+                    used.update(self.mark_classes)
                 lines.append(f"{full(b)} ::= " + " | ".join(alts))
                 continue
             if not alts:
                 raise ValueError(f"state {b} has no way to continue at all (a trap): refusing to emit a grammar "
                                  "that would force combining marks until max_tokens")
-            lines.append(f"{core(b)} ::= " + " | ".join(alts))
-            lines += self._mark_wrappers(b, full(b), core(b), atom)
-        lines += [f"{nm} ::= {charclass(self.cps[c])}" for c, nm in atom.items()]
+            if not self.dfa_marks[b]:
+                lines.append(f"{full(b)} ::= " + " | ".join(alts))             # no marks here at all
+                continue
+            lines.append(f"c{b} ::= " + " | ".join(alts))
+            lines += self._mark_wrappers(b, full(b), f"c{b}", atom)
+            used.update(self.mark_classes)
+        lines += [f"{nm} ::= {charclass(self.cps[c])}" for c, nm in atom.items() if c in used]
+        order = {c: i for i, c in enumerate(self.classes)}
+        for key, nm in groups_atoms.items():
+            lines.append(f"{nm} ::= " + charclass([cp for c in sorted(key, key=order.get) for cp in self.cps[c]]))
         return "\n".join(lines) + "\n"
 
     def _mark_wrappers(self, b, N, C, atom):
@@ -626,7 +799,9 @@ class Spec:
         return [b for b in range(self.dfa_n) if b not in good]
 
 
-def build_trie(words, prefixes):
+def build_trie(words, prefixes, banned=()):
+    """allowed whole words (end), allowed prefixes of other words (esc), and - for a stem whose other
+    continuations are allowed - endings that are still banned (a path that is neither end nor esc)"""
     nodes = [{"ch": {}, "end": False, "esc": False}]
 
     def path(w):
@@ -643,6 +818,8 @@ def build_trie(words, prefixes):
         nodes[path(w)]["end"] = True
     for p in prefixes:
         nodes[path(p)]["esc"] = True
+    for b in banned:
+        path(b)
     return nodes
 
 
@@ -963,38 +1140,42 @@ class Reference:
     def __init__(self, spec):
         self.s = spec
         self.split = set(spec.split)
+        self.pl = spec.pletters
         self._cc = {}
         self.pats = [p for p in spec.pats if p.kind != "ctx"]
         self.ctx_pats = {p.ctx_id: p for p in spec.pats if p.kind == "ctx"}
-        self.first = [self._first_set(p) for p in self.pats]
         self.heb = spec.hebrew_marks
+        self.forbidden = set(spec.forbidden)
+        self.look = spec.lookalikes
+        self.esc_words = {i: [w for w in self._words(e["trie"])] for i, e in enumerate(spec.escapes)}
         # index the patterns by what their first step can match, so most characters try none
-        self.by_fold, self.by_raw, self.any_letter = {}, {}, []
-        for p, (folds, raws, anyl) in zip(self.pats, self.first):
-            for f in folds:
-                self.by_fold.setdefault(f, []).append(p)
-            for r in raws:
-                self.by_raw.setdefault(r, []).append(p)
-            if anyl:
-                self.any_letter.append(p)
+        self.order = {id(p): i for i, p in enumerate(self.pats)}
+        self.by_letter, self.by_raw, self.any_letter = {}, {}, []
+        for p in self.pats:
+            for it in p.steps[0][1]:
+                if it[0] == "let":
+                    x = it[1] if it[1].isascii() else (spec.folder.fold(it[1]) or it[1]).lower()
+                    self.by_letter.setdefault(x, []).append(p)
+                elif it[0] == "chr":
+                    self.by_raw.setdefault(it[1], []).append(p)
+                elif it[0] == "sep":
+                    for c in spec.seps[it[1]]:
+                        for r in (WS_EXTRA if c == "WS" else [c]):
+                            self.by_raw.setdefault(r, []).append(p)
+                else:
+                    self.any_letter.append(p)
 
-    def _first_set(self, p):
-        kind, items = p.steps[0]
-        folds, raws, anyl = set(), set(), False
-        for it in items:
-            if it[0] == "let":
-                folds.add(it[1])
-            elif it[0] == "chr":
-                raws.add(it[1])
-            elif it[0] == "sep":
-                for c in self.s.seps[it[1]]:
-                    if c == "WS":
-                        raws.update(WS_EXTRA)
-                    else:
-                        raws.add(c)
-            else:
-                anyl = True
-        return folds, raws, anyl
+    @staticmethod
+    def _words(trie):
+        out = []
+
+        def walk(n, pre):
+            if trie[n]["esc"]:
+                out.append(pre)
+            for ch, m in trie[n]["ch"].items():
+                walk(m, pre + ch)
+        walk(0, "")
+        return out
 
     def _char(self, ch):
         r = self._cc.get(ch)
@@ -1005,19 +1186,27 @@ class Reference:
                 r = ("M", cat == "Mn" and any(a <= cp <= b for a, b in self.heb))
             else:
                 f = self.s.folder.fold(ch)
-                letter = (cat.startswith("L") or (f is not None and f.isalpha())) and ch != "�"
-                fold = (f or ch).lower() if letter else ch
-                if f is not None and f.isascii():
-                    case = "lo" if f.islower() else "up"
-                else:
-                    case = "let" if letter else "non"
-                acc = (not ch.isascii()) and f is not None and f.isascii() and f.lower() in self.split
-                r = (fold, letter, case, acc)
+                conf = self.s.folder.confusable(ch)
+                if conf and conf.lower() not in self.s.stem_letters:
+                    conf = None                            # look-alikes only for the banned patterns' letters
+                letter = (cat.startswith("L") or (f is not None and f.isalpha()) or bool(conf)) and ch != "�"
+                asc = f if (f is not None and f.isascii()) else conf
+                m = set()
+                if letter:
+                    m.add((f or ch).lower())
+                    if conf:
+                        m.add(conf.lower())
+                m |= {x for x, lst in self.look.items() if ch in lst and x in self.s.stem_letters}
+                m &= self.pl
+                case = ("lo" if asc.islower() else "up") if (letter and asc) else ("let" if letter else "non")
+                acc = letter and (not ch.isascii()) and asc is not None and bool(({asc.lower()} | m) & self.split)
+                prim = asc.lower() if (letter and asc) else None
+                r = (frozenset(m), letter, case, acc, prim)
             self._cc[ch] = r
         return r
 
     def units(self, text):
-        idx, fold, letter, case, acc, raw = [], [], [], [], [], []
+        idx, raw, mt, letter, case, acc, prim, mark_after = [], [], [], [], [], [], [], []
         runs = []
         i, n = 0, len(text)
         ch_ = self._char
@@ -1033,21 +1222,28 @@ class Reference:
                     heb = heb and rj[1]
                     j += 1
                 runs.append((i, j, j - i, heb))
+                if mark_after:
+                    mark_after[-1] = True
                 i = j
                 continue
             idx.append(i)
             raw.append(text[i])
-            fold.append(r[0])
+            mt.append(r[0])
             letter.append(r[1])
             case.append(r[2])
             acc.append(r[3])
+            prim.append(r[4])
+            mark_after.append(False)
             i += 1
-        return (idx, raw, fold, letter, case, acc), runs
+        return (idx, raw, mt, letter, case, acc, prim, mark_after), runs
 
-    def _item_ok(self, it, U, k):
-        idx, raw, fold, letter, case, acc = U
+    def _item_ok(self, it, U, k, plain=False):
+        idx, raw, mt, letter, case, acc, prim, _ma = U
         if it[0] == "let":
-            return letter[k] and fold[k] == it[1]
+            x = it[1] if it[1].isascii() else (self.s.folder.fold(it[1]) or it[1]).lower()
+            if plain and x.isascii():
+                return raw[k].isascii() and prim[k] == x
+            return x in mt[k]
         if it[0] == "chr":
             return raw[k] == it[1]
         if it[0] == "sep":
@@ -1060,21 +1256,41 @@ class Reference:
             return False
         return letter[k]
 
-    def _match(self, steps, U, k, pos, ends):
+    def _match(self, steps, U, k, pos, ends, plain=False, bad=None):
         n = len(U[0])
         if pos == len(steps):
             ends.add(k)
             return
         kind, items = steps[pos]
         if kind == "star":
-            self._match(steps, U, k, pos + 1, ends)
+            self._match(steps, U, k, pos + 1, ends, plain, bad)
             j = k
             while j < n and any(self._item_ok(it, U, j) for it in items):
                 j += 1
-                self._match(steps, U, j, pos + 1, ends)
+                self._match(steps, U, j, pos + 1, ends, plain, bad)
             return
-        if k < n and any(self._item_ok(it, U, k) for it in items):
-            self._match(steps, U, k + 1, pos + 1, ends)
+        if k < n and any(self._item_ok(it, U, k, plain) for it in items):
+            self._match(steps, U, k + 1, pos + 1, ends, plain, bad)
+        elif plain and bad is not None and k < n and (any(self._item_ok(it, U, k) for it in items)
+                                                      or U[1][k] == "�"):
+            bad.add(k)                  # the right letter in a non-plain form (or unseen) inside a plain stem
+
+    def _plain_stem(self, p, U, k):
+        """a plain-letters-only stem (the context variant): (index where it is refused, None) or (None, end)"""
+        n = len(U[0])
+        marks = self.s.marks_after_stem == "refuse"
+        for i, (kind, items) in enumerate(p.steps):
+            j = k + i
+            if i >= 1 and marks and U[7][j - 1]:
+                return j, None                              # a combining mark inside the stem
+            if j >= n:
+                return None, None
+            if any(self._item_ok(it, U, j, True) for it in items):
+                continue
+            if any(self._item_ok(it, U, j) for it in items) or U[1][j] == "�":
+                return j + 1, None                          # the right letter, but not plain
+            return None, None
+        return None, k + len(p.steps)
 
     def _word_start(self, U, k):
         if k == 0:
@@ -1082,25 +1298,46 @@ class Reference:
         letter, case = U[3], U[4]
         return (not letter[k - 1]) or (case[k - 1] == "lo" and case[k] == "up")
 
+    def _word_begin(self, U, k):
+        while k > 0 and not self._word_start(U, k):
+            k -= 1
+        return k
+
     def _cont_banned(self, st, U, k):
-        idx, raw, fold, letter, case, acc = U
+        idx, raw, mt, letter, case, acc, prim, mark_after = U
         trie = st["trie"]
         node = 0
         n = len(idx)
+        refuse_marks = self.s.marks_after_stem == "refuse"
+        if refuse_marks and k > 0 and mark_after[k - 1]:
+            return True                                    # a combining mark right after the stem
         while True:
             if k >= n or not letter[k]:
                 ok = (st["alone"] == "allow") if node == 0 else trie[node]["end"]
-                return not ok
+                return not ok or (k < n and raw[k] == "�")
             if acc[k]:
                 return True
-            f = fold[k]
-            child = trie[node]["ch"].get(f) if (f.isascii() and f.isalpha()) else None
+            child = trie[node]["ch"].get(prim[k]) if prim[k] else None
             if child is None:
                 return st["other"] == "ban"
             if trie[child]["esc"]:
                 return False
+            if refuse_marks and mark_after[k]:
+                return True
             node = child
             k += 1
+
+    def _escaped(self, p, U, k, e):
+        if p.esc_id is None:
+            return False
+        s = self._word_begin(U, k)
+        letters = U[2]
+        for w in self.esc_words[p.esc_id]:
+            if s + len(w) <= e and all(s + i < len(letters) and U[3][s + i]
+                                       and w[i] in (letters[s + i] | ({U[6][s + i]} if U[6][s + i] else set()))
+                                       for i in range(len(w)))                     and not any(self._word_start(U, j) for j in range(s + 1, e)):
+                return True
+        return False
 
     def _ctx_before(self, cp, U, k):
         for s in range(max(0, k - 16), k):
@@ -1113,42 +1350,68 @@ class Reference:
         return False
 
     def hits(self, text):
-        """[(orig start, orig end, rule id)] of every banned form, plus combining-mark-cap violations ('MARKS')."""
+        """[(orig start, orig end, rule id)]: banned forms, combining-mark-cap violations ('MARKS'), forbidden
+        invisible characters ('INVISIBLE') and zero-width joiners touching a letter ('ZWJ')."""
         U, runs = self.units(text)
-        idx, raw, fold, letter, case, acc = U
+        idx, raw, mt, letter, case, acc, prim, mark_after = U
         n = len(idx)
         out = []
-        by_fold, by_raw, anyl = self.by_fold, self.by_raw, self.any_letter
-        order = {id(p): i for i, p in enumerate(self.pats)}
         for k in range(n):
-            f, r, lt = fold[k], raw[k], letter[k]
-            cand = (by_fold.get(f, []) + anyl) if lt else []
-            if r in by_raw:
-                cand = cand + by_raw[r]
+            r = raw[k]
+            if ord(r) in self.forbidden:
+                out.append((idx[k], idx[k] + 1, "INVISIBLE"))
+                continue
+            if r == "‍" and self.s.zwj_rule and ((k > 0 and letter[k - 1]) or (k + 1 < n and letter[k + 1])):
+                out.append((idx[k], idx[k] + 1, "ZWJ"))
+                continue
+            cand = []
+            for x in mt[k]:
+                cand += self.by_letter.get(x, [])
+            if letter[k]:
+                cand += self.any_letter
+            cand += self.by_raw.get(r, [])
             if not cand:
                 continue
-            if len(cand) > 1:
-                cand = sorted({id(p): p for p in cand}.values(), key=lambda p: order[id(p)])
-            ws = None
-            for p in cand:
-                if p.word_init:
-                    if ws is None:
-                        ws = self._word_start(U, k)
-                    if not ws:
-                        continue
-                if p.ctx_of is not None:
+            ws = self._word_start(U, k)
+            for p in sorted({id(q): q for q in cand}.values(), key=lambda q: self.order[id(q)]):
+                if p.where == "word_start" and not ws:
+                    continue
+                if p.where == "inside" and ws:
+                    continue
+                if p.ctx_of is not None and ws:
                     has = self._ctx_before(self.ctx_pats[p.ctx_of], U, k)
-                    if (p.variant == "ctx") != has:
+                    first_plain = any(self._item_ok(it, U, k, True) for q in self.pats
+                                      if q.variant == "ctx" and q.ctx_of == p.ctx_of for it in q.steps[0][1])
+                    if p.variant == "ctx" and not (has and first_plain):
                         continue
+                    if p.variant == "normal" and has and first_plain:
+                        continue
+                elif p.variant == "ctx":
+                    continue
                 ends = set()
-                self._match(p.steps, U, k, 0, ends)
+                hit = None
+                if p.plain:
+                    hit, end = self._plain_stem(p, U, k)
+                    if end is not None:
+                        ends.add(end)
+                else:
+                    self._match(p.steps, U, k, 0, ends)
                 for e in sorted(ends):
-                    if p.kind == "ban" or self._cont_banned(self.s.stems[p.stem_id], U, e):
-                        g = max(e, k + 1)
-                        while g < n and letter[g]:
-                            g += 1
-                        out.append((idx[k], idx[g - 1] + 1, p.id.split("#")[0].split("@")[0]))
+                    if p.plain and self.s.marks_after_stem == "refuse" and any(mark_after[j] for j in range(k, e - 1)):
+                        hit = e
                         break
+                    if p.kind == "ban":
+                        if not self._escaped(p, U, k, e):
+                            hit = e
+                            break
+                    elif self._cont_banned(self.s.stems[p.stem_id], U, e):
+                        hit = e
+                        break
+                if hit is not None:
+                    g = max(hit, k + 1)
+                    while g < n and letter[g]:
+                        g += 1
+                    out.append((idx[k], idx[min(g, n) - 1] + 1, p.id.split("#")[0].split("@")[0]))
         cap, caph = self.s.mark_cap, self.s.mark_cap_hebrew
         if cap:
             for a, b, m, heb in runs:
@@ -1161,7 +1424,7 @@ class Reference:
 
     @staticmethod
     def _wordchar(ch):
-        return ch.isalnum() or unicodedata.category(ch) in MARK_CATS or ch in "_'’-"
+        return ch.isalnum() or unicodedata.category(ch) in MARK_CATS or ch in "_'’-" or ch in "­​‌‍⁠﻿"
 
     def mask_spans(self, text, hits, repl=" Qzx "):
         """mask exactly these hits (and the rest of their words)"""
@@ -1185,18 +1448,7 @@ class Reference:
             h = self.hits(text)
             if not h:
                 return text
-            spans = []
-            for s, e, _r in h:
-                while s > 0 and self._wordchar(text[s - 1]):
-                    s -= 1
-                while e < len(text) and self._wordchar(text[e]):
-                    e += 1
-                if spans and s <= spans[-1][1]:
-                    spans[-1][1] = max(spans[-1][1], e)
-                else:
-                    spans.append([s, e])
-            for s, e in reversed(spans):
-                text = text[:s] + repl + text[e:]
+            text = self.mask_spans(text, h, repl)
         return text
 
 
@@ -1312,6 +1564,9 @@ def derived_must_block(spec):
         if r.get("spaced"):
             sep = [c for c in spec.seps[r["spaced"]] if c != "WS"][0]
             base = sep.join(src)
+        elif r.get("split"):
+            sep = [c for c in spec.seps[r["split"]] if c != "WS"][0]
+            base = src[:1] + sep + src[1:]
         else:
             steps = expand_optional(parse_pattern(src, spec.seps))[0]
             s = []
@@ -1328,7 +1583,8 @@ def derived_must_block(spec):
             base = "".join(s)
         if "stem" in r and r.get("alone", "ban") == "allow":
             continue                          # the stem alone is allowed; its banned forms are listed by hand
-        ctx = r.get("context")
+        if r.get("where") == "inside":
+            base = "the" + base               # the banned letters glued to the end of another word
         forms = [base, base[:1].upper() + base[1:], base.upper()]
         for f in forms:
             out.append((r["id"], f))

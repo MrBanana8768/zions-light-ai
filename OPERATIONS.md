@@ -2449,5 +2449,9 @@ what `verify` proves.
   After `angel` followed by an accented letter (`angelĂ`, `Angelø`, `angeléñÖs`), the only allowed tokens were
   combining marks, and the reply could not end, so the model wrote marks until `max_tokens`. The tool's
   no-trap proof exists for exactly this, and those three prefixes are permanent regression cases.
+- **Funnels.** An allowed word that starts with banned letters (revision 5's `flamenco` after `flame`) corners
+  the model once it has written those letters. `verify` fails when any reachable state offers fewer plain ways
+  on than `funnels.min_width` in the banlist, unless that state is one of the documented funnels with a reason
+  (revision 6: "Los Angel|es", "flam|mable"). Keep an exception only if it has real use or a strong reason.
 - **To roll back:** paste the previous `word-ban-structured_outputs.value.vN.txt` into the row, or delete the
   row. Either takes effect on the next reply.

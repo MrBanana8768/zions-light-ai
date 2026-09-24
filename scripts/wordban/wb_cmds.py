@@ -255,6 +255,15 @@ def cmd_release(args):
         why.append("the verify stamp is for a different artifact")
     if not stamp.get("pass"):
         why.append("verify did not pass")
+    if stamp.get("tool_sha256") != W.tool_sha():
+        why.append("the verify stamp was written by different tool code (edit, then verify again)")
+    if stamp.get("image") != args.image:
+        why.append(f"verify ran on image {stamp.get('image')}, not {args.image}")
+    funnel = [r for r in stamp.get("rows", []) if r["check"].startswith("funnel gate")]
+    if stamp.get("full") and not funnel:
+        why.append("the verify stamp has no funnel-gate result (older tool)")
+    elif funnel and not funnel[0]["pass"]:
+        why.append("the funnel gate failed (a state narrower than allowed)")
     if not stamp.get("full"):
         why.append("verify ran with --no-image (the token-level proof did not run)")
     if not stamp.get("corpus") and not args.allow_no_corpus:

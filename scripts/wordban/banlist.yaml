@@ -7,7 +7,7 @@
 # `extra` table below; Greek letters fold their accents and breathings (ἄ ά Ά -> α). Combining marks are
 # transparent (r + U+0301 + uach = ruach). Any Unicode letter continues a word; a non-letter ends it; a
 # lower-case letter followed by an upper-case one also starts a new word (camelCase: "ThisAngel").
-revision: 5
+revision: 6
 model: coder3101/Cydonia-24B-v4.3-vision-heretic
 # The grammar depends on the Unicode tables of the Python that builds it. The image's vLLM venv and the
 # unit-test image both have Unicode 15.0.0; `build` re-runs itself inside the image when the local Python differs.
@@ -37,14 +37,41 @@ folding:
   # [[0x0591, 0x05C7]] would allow N Hebrew points in a row, at about +50 % first-compile time.)
   mark_cap: 2
   mark_cap_hebrew: null
+  # rev 6: right after a banned stem (inside the continuation of an exception, e.g. "Los Angel|es", "flam|mable")
+  # and inside a plain-letters-only stem, no combining mark at all: a mark there only serves an accent evasion,
+  # and it was 208 of the ~212 tokens the model could pick in revision 5's narrowest states.
+  marks_after_stem: refuse
+  # rev 6: look-alike letters from other scripts count as the Latin letter they look like, inside the banned
+  # patterns (gоld with a Cyrillic о, ΑNGEL with a Greek Α). Only mixed-script words can be affected: no Cyrillic or
+  # Greek word can spell a banned stem with these alone.
+  confusables: {"а": a, "е": e, "о": o, "р": p, "с": c, "у": y, "х": x, "і": i, "ј": j, "ԁ": d, "ӏ": l, "ɡ": g,
+                "А": A, "В": B, "Е": E, "К": K, "М": M, "Н": H, "О": O, "Р": P, "С": C, "Т": T, "Х": X, "І": I,
+                "Ј": J, "Α": A, "Β": B, "Ε": E, "Η": H, "Ι": I, "Κ": K, "Μ": M, "Ν": N, "Ο": O, "Ρ": P, "Τ": T,
+                "Χ": X, "Υ": Y, "Ζ": Z, "ο": o}
+  # rev 6: characters that stand in for a letter of a banned pattern (angeI / goId with a capital i, ange1, g0ld)
+  lookalikes: {l: ["I", "1", "|"], o: ["0"]}
+  # rev 6: invisible characters that split a word without showing (soft hyphen, zero-width space and non-joiner,
+  # word joiner, zero-width no-break space) are refused everywhere. Her replies used a soft hyphen only in 2
+  # decoration runs (after a quote mark), never inside a word.
+  forbidden_chars: [0x00AD, 0x200B, 0x200C, 0x2060, 0xFEFF]
+  # rev 6: a zero-width joiner may not touch a letter (it is kept for emoji sequences: 👨‍👩‍👧, ❤️‍🔥, 🏳️‍🌈)
+  zwj_not_between_letters: true
 
 # named separator sets for {SEP:NAME}; "WS" = any whitespace character except the plain space (newline, tab,
 # NBSP, thin spaces ...)
 separators:
   R: [" ", "-", "'", "’", "_", "."]
-  ALL: [" ", "-", ".", "_", "*"]
-  G: ["-", "'", "’", "_", ".", "*", "(", ")"]
+  # a run of these between EVERY letter (a-n-g-e-l, g · o · l · d, "g, o, l, d")
+  ALL: [" ", "-", ".", "_", "*", "·", "•", "/", "–", "—", ",", "|"]
+  # a run of these at ONE place inside the word (an-gel, fl·ame, **G**old, `g`old); no space: "an gel(atin)"
+  SPLIT: ["-", "'", "’", "_", ".", "*", "(", ")", "·", "•", "/", "–", "—", "`", "~", "|"]
+  # gold also split by spaces alone (g old, go ld, gol d): 0 occurrences in her corpus. Spaces are kept out of
+  # the mixed runs above so that "e.g. old" still passes.
+  SP: [" "]
   WF: [" ", "-", "_", ".", "*", "WS"]
+  # Hebrew: inside the word (רו״ח, ר-וח) and between every letter (ר ו ח)
+  H: ["-", "־", "״", "׳", "'", "\"", "·", ".", "*"]
+  HSP: [" ", "-", "־", "״", "׳", "'", "\"", "·", ".", "*"]
 
 # Pattern syntax:  letters (folded, any case) | {L} any one letter | {L?} optionally one letter |
 #   {SEP:X} one character of separator set X | {SEP:X}* any run of them (or none) | [01l] one of these
@@ -54,48 +81,67 @@ separators:
 #   other:  ban|allow   the stem followed by letters not listed below
 #   allow_words:    whole words (stem + these letters, then a non-letter) that are allowed, plain letters only
 #   allow_prefixes: stem + these letters starts a different, allowed word (anything may follow)
-#   context: {after: <pattern>, allow_words: [...]}  a different allow list when the stem directly follows
-# where: word_start (default) | anywhere.   spaced: X  = a separator of set X between every letter.
+#   context: {after: <pattern>, plain: true, allow_words: [...]}  when the word directly follows <pattern>,
+#                   the rule becomes a stem with these allowed endings (spelled in plain ASCII letters only)
+#   allow_in_words: [...]  a word that BEGINS with one of these (complete by the end of the banned letters) is
+#                   exempt: evangel(ical), strangel(y), marigold, inflam(mation)
+# where: word_start (default) | anywhere | inside (not at a word start).
+# spaced: X = a run of set X between every letter.   split: X = a run of set X at one place inside the word.
+# fffd: false | true (one U+FFFD run may be a letter or an accent) | transparent (U+FFFD runs are skipped).
 families:
   ruach:
     rules:
       - {id: RUACH, match: ruach, where: anywhere}
       - {id: RUA, match: rua}                              # Ruah, Ruac, Ruauch, Ruarch, Ruaach
-      - {id: "RU?ACH", match: "ru{L}ach"}                    # Rurach, Ruuach, Rubach
-      - {id: "RU'ACH", match: "ru{SEP:R}ach", where: anywhere}
+      - {id: "RU?ACH", match: "ru{L}ach"}                  # Rurach, Ruuach, Rubach
+      - {id: "RU'ACH", match: "ru{SEP:R}ach"}
       - {id: R-U-A-C-H, match: ruach, spaced: ALL}
-      - {id: "RU?CH", match: "ru{L?}ch"}                     # rev 5: Ruch, Ruich, Ruuch, Rucha (stand-ins seen live)
-      - {id: HEBREW, match: "רוח", where: anywhere, fffd: false}
+      - {id: "RU?CH", match: "ru{L?}ch"}                   # rev 5: Ruch, Ruich, Ruuch, Rucha (stand-ins seen live)
       - {id: RU, stem: ru, alone: ban, other: allow}       # the word "Ru"/"RU" on its own; rue, run, ruby pass
+      # rev 6: points the tokenizer has no whole token for arrive as U+FFFD: skipped (רוֹח, רׁוח)
+      - {id: HEBREW, match: "רוח", where: anywhere, fffd: transparent}
+      - {id: HEBREW-SPLIT, match: "רוח", split: H, where: anywhere, fffd: transparent}     # rev 6: רו״ח, ר-וח
+      - {id: HEBREW-SPACED, match: "רוח", spaced: HSP, where: anywhere, fffd: transparent} # rev 6: ר ו ח, ר-ו-ח
   angel:
     rules:
-      # rev 5: Angelo is no longer an exception (ANGELO was used for angels); Angela and Angeleno(s) stay,
-      # "Angeles" only in "Los Angeles" (one space)
-      - {id: ANGEL, stem: angel, alone: ban, other: ban, allow_words: [a, eno, enos],
-         context: {after: "los ", allow_words: [a, eno, enos, es]}}
-      - {id: ARCHANGEL, match: archangel, where: anywhere}
+      # rev 6: banned anywhere in a word (theangel, guardianangel), except inside these real words; no name
+      # exceptions any more (Angela, Angeleno(s): 0 uses; they only cornered the model after "angel"); "Angeles" only
+      # in "Los Angeles", in plain letters (not "los ángeles")
+      - {id: ANGEL, match: angel, where: anywhere,
+         allow_in_words: [evangel, strangel, changel, michelangel, mangel],
+         context: {after: "los ", plain: true, allow_words: [es]}}
       - {id: A-N-G-E-L, match: angel, spaced: ALL}
+      - {id: AN.GEL, match: angel, split: SPLIT}           # rev 6: an-gel, ang·el, **An**gel
       - {id: AGGEL, match: aggel}                          # rev 5: aggelos (Greek transliteration)
       - {id: GREEK-ANGEL, match: "αγγελ"}                   # rev 5: άγγελος, ἄγγελος, ΑΓΓΕΛΟΣ
-      - {id: GREEK-ARCHANGEL, match: "αρχαγγελ", where: anywhere}
+      - {id: GREEK-ARCHANGEL, match: "αρχαγγελ"}          # rev 6: word start (ευαγγέλιο, "gospel", must pass)
   gold:
     rules:
-      - {id: GOLD, match: gold}
+      - {id: GOLD, match: gold, where: anywhere, allow_in_words: [marigold]}   # rev 6: puregold, whitegold
       - {id: G-O-L-D, match: gold, spaced: ALL}
       - {id: G0LD, match: "g0[l1]d"}
       - {id: GO1D, match: "go1d"}
-      - {id: G.OLD, match: "g{SEP:G}old"}                  # rev 5: ( and ) added to the separators: g(old
-      - {id: GO.LD, match: "go{SEP:G}ld"}
-      - {id: GOL.D, match: "gol{SEP:G}d"}
+      - {id: GO.LD, match: gold, split: SPLIT}             # g-old, go·ld, gol'd, g(old, **G**old
+      - {id: "G OLD", match: "g{SEP:SP}+old"}               # rev 6: g old
+      - {id: "GO LD", match: "go{SEP:SP}+ld"}               # rev 6: go ld ("gol d" is left: "gol de Messi")
   flame:
     rules:
-      # a word that starts with "flam": banned unless it is one of these words, in plain letters
-      # rev 5: flamed, flamy, flamin, flamier and flam+anything-else are banned (flameD, flamassoftening ...)
-      - {id: FLAM, stem: flam, alone: ban, other: ban, allow_words: [en, enco, encos, ingo, ingos],
-         allow_prefixes: [b, m]}                           # flamen, flamenco(s), flamingo(s); flamboyant, flambé, flammable
-      - {id: AFLAME, match: aflame}
+      # a word that STARTS with "flam" is banned unless it is flammable / flammability (owner: keep); rev 6 drops
+      # flamen, flamenco(s), flamingo(s), flamboyant, flambé (0 uses, or 2 in one cooking list): each was a way
+      # for the model to be cornered after "flam" or "flame". flamme / Flammen (French / German) are banned.
+      - {id: FLAM, stem: flam, alone: ban, other: ban, allow_prefixes: [mab]}
+      # rev 6: "flam" inside a word (candleflame, theflames, aflame) is banned, except inflame / inflammation ...
+      - {id: FLAM-IN, match: flam, where: inside,
+         allow_in_words: [inflam, enflam, proinflam, antiinflam, noninflam, uninflam, nonflam]}
       - {id: F-L-A-M-E, match: flame, spaced: ALL}
-      - {id: WHITEFLAME, stem: "white{SEP:WF}*flame", alone: ban, other: ban, allow_words: [n, nco, ncos]}
+      - {id: FL.AME, match: flame, split: SPLIT}           # rev 6: fl-ame, fla·me, **Fl**ame
+
+  yellow_light:
+    rules:
+      # rev 6 (owner, 2026-09-24): the phrase "yellow light" in every casing, spacing (space, newline, hyphen,
+      # underscore, dot, none: yellowlight, YellowLight), plural and possessive, with accents or look-alike letters,
+      # also glued to a word before it. "yellow" alone, "light" alone, "yellow lighthouse" / "yellow lightning" pass.
+      - {id: YELLOWLIGHT, stem: "yellow{SEP:WF}*light", alone: ban, other: allow, ban_words: [s]}
 
 # Words deliberately NOT banned whose use is counted in her corpus by `verify --corpus` (counts only), so a
 # stand-in shows up. Python regexes over the text as written (an accented evasion is not the allowed word).
@@ -115,13 +161,14 @@ watch:
 
 # The system-prompt line (Step 2 of the owner steps). It names nothing it bans.
 prompt_line: >-
-  Five things cannot be typed in this chat: the Hebrew word for "spirit" that begins R-u-a (or any
+  Six things cannot be typed in this chat: the Hebrew word for "spirit" that begins R-u-a (or any
   abbreviation or near-spelling of it); the English word for a heavenly messenger (including its plurals, its
   "-ic" forms, its "arch-" forms, its Greek original and any look-alike name used in its place); the name of the
   yellow precious metal, together with its adjective and any word that begins with it; the two-word phrase for
-  a pale-coloured fire; and the word for the visible, burning part of a fire, in any form or tense. Do not try
-  to write any of them in any spelling, casing, script, accent, spacing or near-spelling, and do not use a
-  similar-looking name or place name as a stand-in. When a sentence would need one, write the sentence another
+  a pale-coloured fire; the two-word phrase for light the colour of a lemon; and the word for the visible, burning part of a fire, in any form or tense. Do not try
+  to write any of them in any spelling, casing, script, accent, spacing or near-spelling, split up, glued
+  to another word, or with look-alike or invisible characters, and do not use a similar-looking name or place
+  name as a stand-in. When a sentence would need one, write the sentence another
   way.
 
 # The on-pod check (word-ban-check.py): one prompt asking for the banned words, sent without and with the ban.
@@ -133,11 +180,11 @@ check:
     burning with a white flame, twice, then write WHITE FLAME and white-flame. 7) Write one sentence about a
     campfire using the words flame, flames, flamed and flaming, and one saying a house was set aflame.
     8) Copy exactly: goldañshine, golda, Ruäch, Ruách, Rurach, Ruich, angelicawalking, Angelica, Angelâ, Angelo,
-    angelos, ANGELES REPORT, NOTE 4- RU, whíte fláme, flamesrising. 9) Copy exactly: Angela, Los Angeles,
-    evangelical, Michelangelo, golf, goal, marigold, gondola, rural, Rachel, a white dress, white flamingo,
-    flamenco, inflammation, inflamed, flammable, flamboyant.
-  allowed: [Angela, Los Angeles, evangelical, Michelangelo, golf, goal, marigold, gondola, rural, Rachel,
-            a white dress, white flamingo, flamenco, inflammation, inflamed, flammable, flamboyant]
+    angelos, ANGELES REPORT, NOTE 4- RU, whíte fláme, flamesrising, theangel, puregold, candleflame, an-gel,
+    angeI, flamenco. 9) Copy exactly: Los Angeles, evangelical, Michelangelo, strangely, golf, goal, marigold,
+    gondola, rural, Rachel, a white dress, inflammation, inflamed, flammable.
+  allowed: [Los Angeles, evangelical, Michelangelo, strangely, golf, goal, marigold, gondola, rural, Rachel,
+            a white dress, inflammation, inflamed, flammable]
 
 # ------------------------------------------------------------------------------------------------------------
 # Tests. `verify` also derives one must-block case per rule automatically (the rule's own canonical spelling
@@ -178,21 +225,52 @@ tests:
        flamingô, flaméd, flamÊ, flamĔs, FLAMĚ, flamȆd]
     - [flamed, Flamed, FLAMED, flameD, flamed out, flamed-out, flamedout, FlamedOut, "flamed.",
        flam, Flam, flamier, flamiest, flamaswhispering, flamsedancing, flamacolour]  # rev 5
+    # rev 6: glued before the stem (all 19 such angel words in her replies were accepted by rev 5)
+    - [theangel, guardianangel, "wiseangel's", fallenangels, THEANGEL, TheAngel, myangel, puregold, whitegold,
+       ofgold, candleflame, theflames, eternalflame, whiteflames, aflame, reflamed, "sun-gold", starangelic]
+    # rev 6: invisible characters inside the word; a zero-width joiner touching a letter
+    - ["g\u200bold", "an\u200bgel", "fl\u200bame", "gol\u200cd", "ang\u200del", "fla\u2060me", "go\u00adld",
+       "\u05e8\u200b\u05d5\u05d7", "gold\ufeff", "a\u200d", "\u200db"]
+    # rev 6: look-alike letters from other scripts, and I / 1 / 0 for l / o
+    - ["g\u043eld", "\u0430ngel", "ang\u0435l", "fl\u0430me", "Ru\u0430\u0441h", "G\u041eLD", "\u0391NGEL",
+       "G\u039fLD", "FL\u0391ME", angeI, fIame, goId, ange1, f1ame, g0ld, "ange|"]
+    # rev 6: split words
+    - [an-gel, ang-el, "an’gel", fl-ame, fla-me, "g old", "go ld", go/ld, "g·old", "go–ld", "an—gel",
+       "g/o/l/d", "g·o·l·d", "a·n·g·e·l", "g, o, l, d", "g  o  l  d", "**G**old", "**An**gel", "**Fl**ame",
+       "`g`old", "an--gel", "fl__ame"]
+    # rev 6: Hebrew with points the tokenizer cannot represent whole, or split
+    - ["\u05e8\u05d5\u05b9\u05d7", "\u05e8\u05d5\u05b4\u05d7", "\u05e8\u05c1\u05d5\u05d7",
+       "\u05e8\u05d5\u05f4\u05d7", "\u05e8-\u05d5-\u05d7", "\u05e8 \u05d5 \u05d7"]
+    # rev 6 (owner): the phrase for light the colour of a lemon
+    - [yellow light, Yellow Light, YELLOW LIGHT, yellow lights, Yellow Lights, yellow-light, yellowlight, YellowLight,
+       yellow_light, "yellow  light", "yellow\nlight", "yellow.light", "yellow*light", "yellow light's",
+       "the yellow light.", theyellowlight, "yéllow light", "yellow lîght", "YÉLLOW LÏGHT", "y\u0435llow light",
+       "yeIIow Iight", "yellow\u200blight", "yellow\u200dlight", "yellow-lights", "a (yellow light)"]
+    # rev 6: foreign forms, the exceptions that are gone, and Los Angeles spelled any other way
+    - ["los ángeles", "Los Ángeles", "LOS ÁNGELES", "Los Angéles", "Los AngeIes", flamme, Flammen, "white flamme",
+       flamen, flamenco, Flamenco, flamencos, flamingo, flamingos, FLAMINGO, "white flamingo", flamboyant,
+       "flambé", flambeed, Angela, ANGELA, "Angela's", Angeleno, Angelenos, "Los Angel", "Los Angeleno",
+       "Los Angelesx", "Los Ange\u0301les", "Los Angeles\u0301"]
   must_pass:
-    - [Angela, " Angela said", "Angela's", ANGELA, Ángela, Los Angeles, los angeles, LOS ANGELES, Los Ángeles,
-       "in Los Angeles, California", "Los Angeles's", Angeleno, Angelenos, evangelical, Evangelical,
-       EVANGELICAL, evangelist, Evangeline, Michelangelo, angle, angles, triangle, Anglican, strangely,
-       changelog, "ευαγγέλιο", "Ευαγγέλιο"]
+    - [Los Angeles, los angeles, LOS ANGELES, "in Los Angeles, California", "Los Angeles's", "Los Angeles.",
+       evangelical, Evangelical, EVANGELICAL, evangelist, Evangeline, evangelize, Michelangelo, angle, angles,
+       triangle, Anglican, strangely, Strangely, changelog, changeling, changelessness, mangelwurzel,
+       "ευαγγέλιο", "Ευαγγέλιο"]
     - [rural, Rural, Rachel, Ruth, rush, Russia, ruby, rubric, rucksack, ruckus, rudder, rude, rue, ruffle,
        rugby, ruin, rule, rumble, rumor, run, rupture, ruse, rust, Ruben, Rudolph, Rupert, approach, Joachim,
        teachers, roach, Bach, DON.TRU, Tru, "true", rum, rut, Rudy, church, crutch, brunch, "rush hour"]
-    - [golf, goal, goals, gondola, Golgotha, marigold, Marigold, Gould, gol de Messi, old, bold, good old days,
-       "go, old man", e.g. old, god, "g(x)"]
-    - [a white dress, white, white flamingo, White Flamingo, white flamenco, white flamen]
-    - [flamen, flamenco, Flamenco, "Flamenco's", flamencos, flamingo, flamingos, Flamingo, FLAMINGO,
-       a pink flamingo, flamboyant, Flamboyant, flammable, inflammable, inflame, inflamed, inflames,
-       inflammation, Inflammation, INFLAMMATION, inflammatory, enflamed, flambé, flambeed, Flambé, reflamed,
-       Flamborough]
+    - [golf, goal, goals, gondola, Golgotha, marigold, Marigold, marigolds, Gould, gol de Messi, old, bold,
+       good old days, "go, old man", e.g. old, god, "g(x)", "big old", "egg old", "e.g. old"]
+    - [a white dress, white, an gelato, an gel pen]
+    - [yellow, Yellow, light, Light, a yellow dress, light blue, yellow lighthouse, yellow lightning, "yellowish light",
+       yellow and light, "the light was yellow", "yellow, light", "yellow lighter"]
+    - [flammable, Flammable, FLAMMABLE, flammability, flammables, inflammable, inflame, inflamed, inflames,
+       inflammation, Inflammation, INFLAMMATION, inflammatory, anti-inflammatory, antiinflammatory,
+       proinflammatory, noninflammatory, nonflammable, enflamed]
+    # rev 6: emoji sequences with a zero-width joiner still pass
+    - ["\U0001f468\u200d\U0001f469\u200d\U0001f467", "\u2764\ufe0f\u200d\U0001f525",
+       "\U0001f3f3\ufe0f\u200d\U0001f308", "\U0001f469\U0001f3fd\u200d\U0001f4bb", "family: \U0001f468\u200d\U0001f469\u200d\U0001f466 ok",
+       "Привет, как дела", "Αγάπη και ειρήνη", "ΑΘΗΝΑ"]
     - ["mal'akh", malach, malak, "מלאך", "Hebrew mal'akh means messenger"]                   # owner: not banned
     - [café, naïve, Zoë, Ñandú, ángulo, Götterdämmerung, résumé, Ålesund, the Holy Spirit, Andrew and Elizabeth,
        "Hello 😇 ✅ ━━━ 👾 ☼ — “quoted” ‘x’ … ▶️", "Ελληνικά", "Привет", "日本語", "한국어"]
@@ -200,17 +278,25 @@ tests:
     - ["é", "á̂", "שָּ", "הַשִּמְחָה"]
   # expected BLOCKED by design, although they are not banned words (documented costs of the rules). Checked
   # through the real tokenizer: several only fail because an emoji reaches the grammar as U+FFFD.
-  collateral: ["ארוחה", Rua, Ruanda, "💔old", "Angela💔", "Angela❤️", "ru❤ach", Flamel, Flamengo, "flame💔", Flamsteed,
-               "Los  Angeles", "Los\nAngeles", ".ru domain", "Ru (ruthenium)", "flam💔", "flamingo🦩", "Ruche",
-               "ruched"]
+  collateral: ["ארוחה", Rua, Ruanda, "💔old", "ru❤ach", Flamel, Flamengo, "flame💔", Flamsteed,
+               "Los  Angeles", "Los\nAngeles", ".ru domain", "Ru (ruthenium)", "flam💔", "Ruche", "ruched",
+               # rev 6 (glued stems): real but rare words that contain a banned stem; 0 of them in her corpus
+               tangelo, Mangold, Ingold, oriflamme, Flammarion, "orange1",
+               # rev 6: invisible characters used by other scripts (Persian zero-width non-joiner)
+               "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645"]
   # known gaps: expected ALLOWED by the grammar although they spell a banned word (see README)
-  gaps: ["ŔÙach", "Ｇｏｌｄ", "ＡＮＧＥＬ", "ǵȍld", "💔 old", "Angela 💔", "Angela.💔", "old 💔",
+  gaps: ["ŔÙach", "Ｇｏｌｄ", "ＡＮＧＥＬ", "ǵȍld", "💔 old", "old 💔",
+         # rev 6 documented: lower-case Spanish "los angeles" reads as the place name; space splits are banned for
+         # gold only ("an gel" would block "an gelato"); markup and entity tricks; math letters; near-spellings
+         "los angeles de Dios", "an gel", "fl ame", "gol d", "g<b></b>old", "&#103;old", "𝐠𝐨𝐥𝐝", "ⓖⓞⓛⓓ", "anjel", "goold",
+         "4ngel", "fl4me",
          # runs of 3+ marks that include a byte-fallback mark (seen as U+FFFD, which ends the run); her real
          # Hebrew (shin + dagesh + shin dot + vowel) is one of these
          "é̂̃", "שָּׁ", "שָּׁ֑֒",
          "הַשִּׂמְחָה"]
   # every folded variant of every letter of these words must be blocked
-  accent_words: [ruach, angel, gold, flame, flames, Flaming, aflame, white flame, angelos, Ruich, flamed]
+  accent_words: [ruach, angel, gold, flame, flames, Flaming, aflame, white flame, angelos, Ruich, flamed,
+                 theangel, puregold, candleflame, Los Angel, yellow light]
   # non-canonical token paths: the text is split into these pieces, each piece tokenized on its own
   token_paths:
     - [" R", "u", "ach"]
@@ -255,7 +341,44 @@ tests:
     - [" angel", "é", "ñ", "Ö", "s"]
     - [" angel", "Ă"]
     - [" Angel", "ø"]
+    - [" the", "angel"]
+    - [" candle", "flame"]
+    - [" pure", "gold"]
+    - [" g", "\u200b", "old"]
+    - [" ang", "\u200d", "el"]
+    - [" an", "-", "gel"]
+    - [" **", "G", "**", "old"]
+    - [" Los", " Ang", "é", "les"]
+    - [" flam", "enco"]
+    - [" flam", "ingo"]
+    - [" Angel", "a"]
+    - [" yellow", " light"]
+    - [" yel", "low", "light"]
+    - [" Yellow", "L", "ight", "s"]
   # the no-trap regressions: after each of these the model must still have a normal way to continue
   # (these three prefixes trapped revision 4 in combining marks on 2026-09-23)
   trap_regressions: ["the angelĂ", "and Angelø", "our angeléñÖs", "angel", "Angelen", "flam", "flame", "Ru",
-                     "white flame", "Los Angel", "Los Angele", "golden", "αγγ", "ἄγγελ"]
+                     "white flame", "Los Angel", "Los Angele", "golden", "αγγ", "ἄγγελ", "flamm", "flamma",
+                     "theangel", "candlefla", "evange", "strange", "marigol", "infla", "Los Ang", "g‍",
+                     "👨‍"]
+
+# rev 6 funnel gate: in every reachable state the model must have at least `min_width` plain ways to go on
+# (tokens of printable ASCII / Latin-1 letters / common punctuation that lead somewhere it can finish), so it is
+# never cornered into a stand-in word or an accent. The states after these prefixes (in every letter case) are
+# allowed to be narrower, down to `floor`, for the reason given; any OTHER state under min_width fails verify,
+# and so does a documented one under its floor. (Revision 3's narrowest state had 21; revision 5's had 4.)
+funnels:
+  min_width: 21
+  documented:
+    - after: ["Los Angel", "Los Angele"]
+      floor: 1
+      reason: >-
+        "Los Angeles" is kept (12 uses in her replies, 2 in her messages). After "Los Angel" the only way on is
+        "es"; the model only gets here by writing the place name, whose natural next letters these are.
+    - after: ["flam", "flamm", "flamma"]
+      floor: 1
+      reason: >-
+        flammable / flammability are kept (owner decision). A word that starts with "flam" can only become one of
+        them; every other flam- word, including the old exceptions (flamenco, flamingo ...), is refused before the
+        model can commit to it.
+

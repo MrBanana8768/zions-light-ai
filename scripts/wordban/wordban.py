@@ -49,6 +49,15 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def tool_sha():
+    """one sha256 over the tool's own code: a verify stamp is only trusted by the code that wrote it"""
+    h = hashlib.sha256()
+    for p in sorted(list(HERE.glob("*.py")) + list(HERE.glob("e2e/*"))):
+        if p.is_file():
+            h.update(p.relative_to(HERE).as_posix().encode() + b"\x00" + p.read_bytes() + b"\x00")
+    return h.hexdigest()
+
+
 def say(*a):
     print(*a, flush=True)
 
@@ -157,9 +166,16 @@ def fuzz_strings(spec, n, seed=11):
                  ((r.get("context") or {}).get("allow_words") or []):
             words.append(w + a)
     words += ["los ", "white ", "the ", "evangel", "tri", "Michel", "mari", "in", "en", "re", "a", "o", "s", "es",
-              "ed", "ing", "Qz", "ruch", "rich", "ruin", "rue"]
-    acc = "áàâäãåāăąǎạảéèêëēĕėęěẹíìîïīĭįǐóòôöõøōŏőǒọúùûüūŭůűųǔñńņňçćĉċčșşśŝšğĝġģĺļľłďđÀÁÂÄÅÉÈÊËÍÏÓÖØÚÜÑÇĂŐŠ"
-    seps = [" ", "-", "'", "’", "_", ".", "*", "(", ")", "\n", "\t", " ", "  ", "", "", "", "", ",", "!", "1", "0"]
+              "ed", "ing", "Qz", "ruch", "rich", "ruin", "rue", "Los Angel", "LOS ANGELES", "strange", "change",
+              "michelangelo", "marigold", "inflam", "enflam", "proinflam", "candle", "pure", "ev", "str", "flamm",
+              "flammab", "ruach", "רוח", "ר", "ו", "ח", "αγγελ", "Αγγελ"]
+    for e in spec.escapes:
+        words += core.Reference._words(e["trie"])
+    acc = ("áàâäãåāăąǎạảéèêëēĕėęěẹíìîïīĭįǐóòôöõøōŏőǒọúùûüūŭůűųǔñńņňçćĉċčșşśŝšğĝġģĺļľłďđÀÁÂÄÅÉÈÊËÍÏÓÖØÚÜÑÇĂŐŠ"
+           "аеосрухіјАЕОСРНТХΑΕΟΙΝΚο" + "I1|0")
+    seps = [" ", "-", "'", "’", "_", ".", "*", "(", ")", "\n", "\t", " ", "  ", "", "", "", "", ",", "!", "1", "0",
+            "·", "—", "`", "|", "/", "**", "​", "‌", "‍", "­", "⁠", "\U0001f468‍",
+            "‍\U0001f469", "״", "־"]
     marks = ["́", "̈", "̂", "ּ", "ָ", "ׁ"]
     out = []
     for _ in range(n):
@@ -241,6 +257,9 @@ def local_checks(spec_path, build_dir, man, res, fuzz_n=40000):
     # combining-mark runs
     cap, caph = spec.mark_cap, spec.mark_cap_hebrew
     mr = []
+    if not cap:
+        for k in range(0, 7):
+            mr.append(("e", k, True, A.accepts("x e" + "́" * k + " y")))
     if cap:
         for base, mk, lim in (("e", "́", cap), ("a", "̈", cap), ("ש", "ָ", caph or cap)):
             for k in range(0, 7):
@@ -281,6 +300,7 @@ def cmd_verify(args):
                 "trap_regressions": flat(T.get("trap_regressions")),
                 "accent": core.accent_cases(spec, T.get("accent_words") or []),
                 "mark_cap": spec.mark_cap, "mark_cap_hebrew": spec.mark_cap_hebrew,
+                "funnels": bl.get("funnels") or {},
             }
             rnd = random.Random(7)
             cps = [c for c in range(0x20, 0x110000) if not (0xD800 <= c <= 0xDFFF)]
@@ -321,6 +341,7 @@ def cmd_verify(args):
             shutil.rmtree(priv, ignore_errors=True)
     stamp = {"grammar_sha256": man["grammar_sha256"], "value_sha256": man["value_sha256"],
              "banlist_sha256": man["banlist_sha256"], "revision": man["revision"], "image": args.image,
+             "tool_sha256": tool_sha(),
              "full": not args.no_image, "corpus": bool(args.corpus), "pass": res.ok, "rows": res.rows,
              "image_facts": image_part, "when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     (build_dir / STAMP).write_text(json.dumps(stamp, indent=1, ensure_ascii=False), encoding="utf-8")

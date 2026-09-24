@@ -81,6 +81,54 @@ class Stack:
         return np.unpackbits(b, bitorder="little")[:self.V].astype(bool)
 
 
+def natural_mask(st):
+    """tokens a sampler would realistically pick in ordinary prose: printable ASCII, Latin-1 letters, common
+    typographic punctuation, whitespace; no U+FFFD, no combining marks (the hostile review's definition)"""
+    out = np.zeros(st.V, bool)
+    for i, s in enumerate(st.vocab):
+        if not s or "�" in s or i in st.special:
+            continue
+        out[i] = all(c in "\n\t" or 0x20 <= ord(c) < 0x7f or c in "’‘“”—–…" or (0xc0 <= ord(c) <= 0x17f and c.isalpha())
+                     for c in s)
+    return out
+
+
+def ender_mask(st):
+    """natural tokens that end the current word (start with whitespace or punctuation)"""
+    nat = natural_mask(st)
+    return np.array([bool(nat[i]) and (s[0].isspace() or not s[0].isalnum()) for i, s in enumerate(st.vocab)])
+
+
+def case_variants(text, limit=4096):
+    letters = [i for i, c in enumerate(text) if c.isalpha()]
+    out = set()
+    for m in range(min(2 ** len(letters), limit)):
+        t = list(text)
+        for b, i in enumerate(letters):
+            t[i] = t[i].upper() if (m >> b) & 1 else t[i].lower()
+        out.add("".join(t))
+    return out
+
+
+def funnel_check(A, pr, cfg):
+    """every reachable state must offer at least min_width natural ways on, except the documented funnels
+    (the states after the listed prefixes, in every letter case), which must offer at least their floor"""
+    minw = int(cfg.get("min_width", 0))
+    doc = {}
+    for d in cfg.get("documented") or []:
+        for pre in d.get("after") or []:
+            for v in case_variants(pre):
+                for lead in ("", " ", "x "):
+                    s, _ = A.run(lead + v)
+                    if s is not None:
+                        doc[s] = min(doc.get(s, 10 ** 9), int(d.get("floor", 1)))
+    width = pr["width"]
+    bad = [s for s, w in width.items() if (w < doc[s] if s in doc else w < minw)]
+    outside = [w for s, w in width.items() if s not in doc]
+    inside = sorted(((width[s], pr["prefix"].get(s, "?")) for s in doc if s in width))
+    return bad, (min(outside) if outside else None), inside
+
+
 def token_classes(st, A):
     """per token: the automaton interval ids of its characters (padded), its length, and whether it is ORDINARY"""
     V = st.V
@@ -131,6 +179,10 @@ def proof(st, A, max_states=200000):
     q = collections.deque([0])
     edges_ord = {}
     allowed_of = {}
+    nat_counts = {}                                        # state -> {end state: number of NATURAL tokens}
+    nat_sorted = natural_mask(st)[order]
+    ender_sorted = ender_mask(st)[order]
+    has_ender = {}
     while q:
         s = q.popleft()
         end = walk(s)
@@ -138,6 +190,9 @@ def proof(st, A, max_states=200000):
         allowed_of[s] = ok
         nxt = np.unique(end[ok])
         edges_ord[s] = set(np.unique(end[ok & ord_sorted]).tolist())
+        u, cnt = np.unique(end[ok & nat_sorted], return_counts=True)
+        nat_counts[s] = dict(zip(u.tolist(), cnt.tolist()))
+        has_ender[s] = bool((ok & ender_sorted).any())
         for t in nxt.tolist():
             if t not in seen:
                 # remember one concrete token that leads there
@@ -197,9 +252,27 @@ def proof(st, A, max_states=200000):
     ex = []
     for s in traps[:5]:
         ex.append("".join(st.vocab[t] for t in path(s)))
+    # escape width: NATURAL tokens (what a sampler realistically picks in prose) that lead to a state from which
+    # the reply can still finish through natural tokens
+    good_nat = {s for s in reach if acc[s]}
+    rev_nat = collections.defaultdict(set)
+    for s in reach:
+        for t in nat_counts[s]:
+            rev_nat[t].add(s)
+    stack = list(good_nat)
+    while stack:
+        t = stack.pop()
+        for s in rev_nat[t]:
+            if s not in good_nat:
+                good_nat.add(s)
+                stack.append(s)
+    width = {s: sum(c for t, c in nat_counts[s].items() if t in good_nat) for s in reach}
+    no_ender_no_eos = [s for s in reach if not has_ender[s] and not acc[s]]
     return dict(reach=len(reach), traps=len(traps), trap_examples=ex, mism=mism[:10], n_mism=len(mism),
                 eos_mism=len(eos_mism), compared=compared, t_sim=round(t_sim, 1), t_cmp=round(t_cmp, 1),
-                ordinary=ordinary, usable=usable)
+                ordinary=ordinary, usable=usable, width=width, prefix={s: "".join(st.vocab[t] for t in path(s))
+                                                                       for s in reach},
+                nat_traps=len(reach) - len(good_nat), no_ender_no_eos=len(no_ender_no_eos))
 
 
 WALL_MIN = 60
@@ -312,6 +385,13 @@ def cmd_verify(a):
         pr["traps"] == 0, f"{pr['reach']:,} reachable states, {pr['traps']} trap(s)"
         + (f"; e.g. after {pr['trap_examples']}" if pr["trap_examples"] else ""))
     ordinary = pr["ordinary"]
+    fcfg = tests.get("funnels") or {}
+    bad, minw_out, inside = funnel_check(A, pr, fcfg)
+    add(f"funnel gate: every state offers >= {fcfg.get('min_width', 0)} natural ways on (documented funnels: their floor)",
+        not bad, f"narrowest undocumented state {minw_out}; documented funnels {len(inside)} states, narrowest "
+        f"{inside[:3]}; natural-token traps {pr['nat_traps']}; states with no word end and no EOS "
+        f"{pr['no_ender_no_eos']}" + (f"; TOO NARROW: {[(pr['width'][s], pr['prefix'][s][-30:]) for s in bad[:8]]}"
+                                      if bad else ""))
     # the trap regressions, through the real backend
     bad = []
     for p in tests["trap_regressions"]:
@@ -330,7 +410,8 @@ def cmd_verify(a):
     heb = [i for i in mark_tokens if 0x0591 <= ord(st.vocab[i]) <= 0x05C7 and unicodedata.category(st.vocab[i]) == "Mn"]
     gen = [i for i in mark_tokens if i not in heb]
     runs = []
-    cap = tests.get("mark_cap") or 0
+    cap = tests.get("mark_cap")
+    cap = 99 if cap is None else cap                     # no cap configured: every run must pass
     caph = tests.get("mark_cap_hebrew") or cap
     for base, pool, lim in ((" e", gen, cap), (" ש", heb, caph)):
         for k in range(1, 7):
@@ -344,7 +425,8 @@ def cmd_verify(a):
                     break
             runs.append((base.strip(), k, ok, k <= lim))
     bad = [r for r in runs if r[2] != r[3]]
-    add("combining-mark cap through the real backend (whole-token marks)", not bad,
+    add("combining-mark cap through the real backend (whole-token marks)" if cap != 99 else
+        "combining marks through the real backend (no cap configured: every run passes)", not bad,
         f"{len(mark_tokens)} whole-token marks ({len(heb)} Hebrew); runs of 1-6 after 'e' and after 'ש'"
         + (f"; WRONG: {bad}" if bad else ""))
     # adversarial walks

@@ -30,7 +30,7 @@ built bytes. It also refuses unless `e2e` passed, or `--allow-no-e2e` is given.
 | `wb_image.py` | Runs inside the image: the xgrammar checks and the token-level proof. |
 | `e2e/` | Stub vLLM front half, OpenWebUI driver, and the in-container script for `e2e`. |
 | `check_template.py` | Template for `word-ban-check.py`, the on-pod check. It judges replies with the grammar saved on the pod, so it never goes stale. |
-| `compactor/test_wordban_tool.py` | Unit tests: determinism; the rev-4 trap fixture must fail; a new word gets tested; corpus walk; release refusals; the pod interpreter. |
+| `compactor/test_wordban_tool.py` | Unit tests: determinism; the rev-4 trap fixture must fail; a new word gets tested; corpus walk; release refusals (including a stamp from other tool code); the pod interpreter; a truncated paste in the pod check. |
 
 ## Workflow
 
@@ -62,16 +62,23 @@ Usually it is one line under `families:` in `banlist.yaml`, then `build`, `verif
 |---|---|
 | `gold` | letters: folded and case-insensitive (`gōld`, `ＧＯＬＤ`, `Gołd`). Greek folds its accents (`ἄ` = `α`). |
 | `{L}` / `{L?}` | any one letter / optionally one letter |
-| `{SEP:G}` / `{SEP:WF}*` | one character of separator set G / any run of set WF (or none) |
+| `{SEP:G}` / `{SEP:WF}*` / `{SEP:SP}+` | one character of separator set G / any run of set WF (or none) / a run of one or more |
 | `[l1]` | one of these characters |
-| `where: word_start` (default) / `anywhere` | a word start is after a non-letter, or a lower→Upper camelCase step |
-| `spaced: ALL` | a separator between every letter (`g-o-l-d`) |
+| `where: word_start` (default) / `anywhere` / `inside` | a word start is after a non-letter, or a lower→Upper camelCase step; `inside` = not at a word start |
+| `spaced: ALL` | a run of separators between every letter (`g-o-l-d`, `g, o, l, d`) |
+| `split: SPLIT` | a run of separators at one place inside the word (`an-gel`, `**G**old`) |
 | `match: <pattern>` | banned outright |
-| `stem: <pattern>` + `alone`, `other`, `allow_words`, `allow_prefixes`, `context` | banned, except the listed whole words (plain letters only) or prefixes of other words |
+| `allow_in_words: [evangel, ...]` | a word that BEGINS with one of these (complete by the end of the banned letters) is exempt: `evangelical`, `marigold`, `inflammation` |
+| `context: {after: "los ", plain: true, allow_words: [es]}` | right after the context, the rule becomes a stem with these endings, in plain ASCII letters only (`Los Angeles`, not `los ángeles`) |
+| `stem: <pattern>` + `alone`, `other`, `allow_words`, `allow_prefixes` | banned, except the listed whole words (plain letters only) or prefixes of other words |
+| `fffd: transparent` | U+FFFD runs (points and accents the tokenizer has no whole token for) are skipped inside the pattern |
+
+**Folding options** (`folding:`): `confusables` (Cyrillic/Greek letters that look Latin), `lookalikes` (`I`/`1`/`|` for `l`, `0` for `o`), both applied only to the letters of the banned patterns; `forbidden_chars` (refused everywhere); `zwj_not_between_letters`; `marks_after_stem: refuse`; `mark_cap`.
 
 **Examples:**
 - `{id: ZORBEX, match: zorbex}` bans every word that starts with "zorbex".
 - `flamed` was banned in revision 5 by removing `ed` from the flam stem's allowed words.
+- Revision 6 bans the stems glued to the end of other words (`theangel`, `puregold`, `candleflame`) with `where: anywhere` / `inside` and an `allow_in_words` list of the real words that contain them.
 
 `verify` adds each rule's own spelling to must-block automatically (lower, Title and UPPER case). Also add real near-misses to `tests.must_block` and legitimate words to `tests.must_pass`.
 
@@ -79,6 +86,11 @@ Usually it is one line under `families:` in `banlist.yaml`, then `build`, `verif
 - Revision 4 instead let such a letter continue while remembering it (`taint`), and then refused both the word end and every letter. That left only combining marks allowed, and the reply could not end: the **trap** of 2026-09-23.
 - `taint` still exists only so the tests can rebuild that trap.
 - A stem whose continuation could never complete is refused at build time.
+
+**Funnels** (revision 6). An allowed word that begins with banned letters (`flamenco` after `flame`, `Angela` after `angel`) corners the model once it has written those letters: in revision 5 the state after `" flame"` offered 4 plain tokens and 208 combining marks. Rules:
+- keep an exception only when it has real use or a strong reason (revision 6 keeps `Los Angeles` and `flammable`/`flammability` only);
+- no combining mark right after a banned stem (`marks_after_stem: refuse`);
+- `funnels:` in the banlist: `verify` measures, in every token-reachable state, the NATURAL escape width (printable ASCII / Latin-1 letters / common punctuation tokens that lead somewhere the reply can still finish). Every state must offer at least `min_width` (21, revision 3's narrowest), except the states after the documented prefixes (every letter case), which must offer at least their `floor` and carry a reason. `release` refuses on any funnel regression.
 
 ## What `verify` proves
 
@@ -98,6 +110,7 @@ Usually it is one line under `families:` in `banlist.yaml`, then `build`, `verif
   1. Every vocabulary token is walked from every state. This gives each state's exact allowed-token set, and every state reachable by any token sequence.
   2. At every one of those states, the set is compared with xgrammar's real bitmask, EOS included; they must be identical.
   3. On that token graph, every reachable state must reach EOS through ordinary tokens.
+- **Funnel gate** (above), plus the natural-token trap count and the number of states with no word end and no EOS.
 - **Adversarial random walks** through the real backend, biased toward marks, U+FFFD, accented letters and ban fragments. Every step must offer an ordinary token or EOS.
 - With `--corpus`: her messages through the real tokenizer, with sampled decode steps checked for a normal exit.
 
@@ -107,6 +120,11 @@ Usually it is one line under `families:` in `banlist.yaml`, then `build`, `verif
 - **Right after a banned stem, U+FFFD is refused.** So `Angela💔` and `flamingo🦩` without a space are blocked.
 - **The mark cap counts whole-token marks only.** There are 154 single-mark tokens. A byte-fallback mark is U+FFFD and ends the run, so runs of such marks are not capped.
 - **Synonyms and paraphrase are not blocked.** The prompt line covers intent.
+- **Lower-case Spanish `los angeles`** reads as the place name (the context rule cannot tell them apart); `los ángeles` is blocked.
+- **Space splits** are banned for gold (`g old`, `go ld`) but not for angel or flame (`an gel` would block "an gelato"); markup (`g<b></b>old`), HTML entities, math-alphanumeric and circled letters, leetspeak beyond `I`/`1`/`|`/`0`, and near-spellings (`anjel`) pass.
+- **Control tokens inside a word.** xgrammar sees Mistral's control tokens (`<unk>`, `[INST]` ...) as ordinary text, and vLLM drops them when it detokenises: `g` + `<unk>` + `old` shows as "gold". The model would have to sample a control token in mid-word; no grammar change can see this.
+- **Continue response.** The grammar starts again at its root on every request, so a word split across OpenWebUI's "continue response" boundary is not seen.
+- **Speculative decoding.** The token-level proof assumes the pod's configuration (no speculative decoding, so no rollback or jump-forward); re-run `verify` if `VLLM_EXTRA_ARGS` ever enables it.
 
 ## Privacy
 
