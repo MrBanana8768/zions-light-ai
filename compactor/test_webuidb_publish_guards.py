@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1106,10 +1107,14 @@ check(
 )
 check(
     calls[0] == {"n": 1, "force": False} and calls[1]["n"] == 2
-    and calls[2] == {"n": 3, "force": True},
+    and calls[2] == {"n": 3, "force": False},
     f"call 1 is the D11/D14 immediate first sync (force=False, an ordinary "
     f"cycle); call 2 is where the simulated SIGTERM landed; call 3 is the "
-    f"final sync, forced (got {calls})",
+    f"final sync - force=False since review1-v3197-65ea196's H-1 fix: "
+    f"plain sync_once() already publishes anything real (its own mtime "
+    f"comparison), and force=True's only actual effect was republishing "
+    f"even when nothing had changed, a 27s cost on every stop for no "
+    f"benefit (got {calls})",
 )
 check(
     _order == ["slept"],
@@ -1131,10 +1136,10 @@ CAP.records.clear()
 _order.clear()
 calls = _drive_with_sigterm([_SYNCED], raise_on_call=1)
 check(
-    len(calls) == 2 and calls[0]["force"] is False and calls[1] == {"n": 2, "force": True},
+    len(calls) == 2 and calls[0]["force"] is False and calls[1] == {"n": 2, "force": False},
     f"the SIGTERM landed on the very first (immediate) sync_once call, "
-    f"before any sleep, and the final sync still ran right after it "
-    f"(got {calls})",
+    f"before any sleep, and the final sync still ran right after it, "
+    f"itself with force=False (H-1) (got {calls})",
 )
 check(
     logged(logging.INFO, "final sync on SIGTERM"),
@@ -1144,8 +1149,13 @@ check(
     "ordinary result",
 )
 
-print("    CONTROL: the final sync always forces, even though every ordinary "
-      "cycle above used force=False")
+print("    CONTROL (H-1, review1-v3197-65ea196): the final sync does NOT "
+      "force - plain sync_once() already publishes anything real")
+# X6 (findings.md): the OLD force=True made a no-change stop pay a full
+# publish (measured 27s) for nothing - plain sync_once() already publishes
+# via its own mtime comparison whenever there IS something unpublished (or
+# a poisoned future-dated snapshot), and skips only when there truly is
+# nothing new, which is the correct answer on the shutdown path too.
 CAP.records.clear()
 _forced = []
 _orig_sync_once = webuidb.sync_once
@@ -1154,7 +1164,27 @@ try:
     webuidb._final_sync_on_shutdown()
 finally:
     webuidb.sync_once = _orig_sync_once
-check(_forced == [True], f"_final_sync_on_shutdown always calls force=True (got {_forced})")
+check(_forced == [False], f"_final_sync_on_shutdown calls plain sync_once(), never force=True (got {_forced})")
+
+print("    CONTROL: a genuine unpublished write still gets a final publish "
+      "with plain sync_once() - not forcing does not mean not syncing")
+CAP.records.clear()
+_orig_sync_once = webuidb.sync_once
+wipe()
+owui(LOCAL, [("c1", 100, conversation(20))])
+owui(SNAP, [("c1", 90, conversation(15))])  # snapshot older/behind -> real work to do
+os.utime(SNAP, (0, 0))  # snapshot mtime far in the past, unambiguously stale
+webuidb._final_sync_on_shutdown()  # returns None; check via the log/disk instead
+check(
+    logged(logging.INFO, "final sync on SIGTERM"),
+    "a final sync ran and logged its result",
+)
+check(
+    _has_rows(SNAP) == 20,
+    "and it actually republished LOCAL_DB's 20-row content over the stale "
+    "15-row snapshot, proving 'no force' still means 'sync if there is "
+    "real work', not 'never sync'",
+)
 
 print("    CONTROL: _final_sync_on_shutdown never raises, even when "
       "sync_once itself blows up - the process is exiting either way")
@@ -1170,6 +1200,105 @@ check(not _raised, "no exception escaped _final_sync_on_shutdown")
 check(
     logged(logging.ERROR, "final sync on SIGTERM raised"),
     "and the failure was logged instead of silently disappearing",
+)
+
+print("    CONTROL (P1, review1-v3197-65ea196): a re-entrancy skip ('another "
+      "sync is in progress', meaning NO final publish happened) is logged "
+      "at WARNING, not INFO - it must not read like an ordinary success")
+CAP.records.clear()
+webuidb.sync_once = lambda force=False: {
+    "synced": False, "skipped": "another sync is in progress", "error": None, "bytes": 0,
+}
+try:
+    webuidb._final_sync_on_shutdown()
+finally:
+    webuidb.sync_once = _orig_sync_once
+check(
+    logged(logging.WARNING, "could NOT publish")
+    and not logged(logging.INFO, "final sync on SIGTERM: "),
+    "the re-entrancy skip is a WARNING naming that nothing published, not "
+    "the plain INFO line an ordinary publish/skip gets",
+)
+
+print("    CONTROL: the ordinary 'unchanged since last sync' skip (nothing "
+      "to publish, not a re-entrancy problem) still logs at plain INFO, "
+      "not WARNING - the P1 fix must not over-fire on the harmless case")
+CAP.records.clear()
+webuidb.sync_once = lambda force=False: dict(_UNCHANGED)
+try:
+    webuidb._final_sync_on_shutdown()
+finally:
+    webuidb.sync_once = _orig_sync_once
+check(
+    logged(logging.INFO, "final sync on SIGTERM") and not any(
+        lv >= logging.WARNING for lv, _m in CAP.records
+    ),
+    "an ordinary unchanged-skip on shutdown stays at INFO, no WARNING",
+)
+
+# ===========================================================================
+print()
+print("[H-1] a SECOND SIGTERM, arriving while the first is still being "
+      "handled, is ignored rather than raising a second _ShutdownRequested")
+# ===========================================================================
+# review1-v3197-65ea196, X2c: before this fix, a second real SIGTERM
+# landing while _final_sync_on_shutdown's own sync_once() was running
+# invoked _sigterm_handler AGAIN, raising a second _ShutdownRequested that
+# escaped every `except Exception` in sync_once/_final_sync_on_shutdown
+# alike (both deliberately catch only Exception) as an unhandled exception
+# - a traceback, exit status 1, no final publish, and supervisord's
+# autorestart making a clean shutdown look like a crash.
+_orig_signal = signal.signal
+_signal_calls: list[tuple[int, object]] = []
+
+
+def _tracking_signal(signum, handler):
+    _signal_calls.append((signum, handler))
+    return _orig_signal(signum, handler) if signum != signal.SIGTERM else None
+
+
+signal.signal = _tracking_signal
+try:
+    _signal_calls.clear()
+    webuidb._sigterm_handler(signal.SIGTERM, None)
+except webuidb._ShutdownRequested:
+    pass
+finally:
+    signal.signal = _orig_signal
+check(
+    (signal.SIGTERM, signal.SIG_IGN) in _signal_calls,
+    f"the handler's FIRST action, on every invocation including this one, "
+    f"is signal.signal(SIGTERM, SIG_IGN) - so a second SIGTERM delivered "
+    f"while the first is still being handled cannot call this handler "
+    f"again (observed calls: {_signal_calls})",
+)
+check(
+    _signal_calls[0] == (signal.SIGTERM, signal.SIG_IGN),
+    "and it is the FIRST thing the handler does (before the raise), not "
+    "something that could be skipped by an early return or a re-entrant "
+    "call landing between two other statements",
+)
+
+print("    CONTROL: sync_loop() re-installs a REAL SIGTERM handler at "
+      "start, not SIG_IGN from a previous run leaking across restarts "
+      "within the same process (there is none such today, but this "
+      "guards the assumption)")
+_installed = []
+_orig_signal = signal.signal
+signal.signal = lambda signum, handler: _installed.append((signum, handler))
+try:
+    webuidb.sync_once = lambda force=False: (_ for _ in ()).throw(_StopLoop())
+    try:
+        webuidb.sync_loop()
+    except _StopLoop:
+        pass
+finally:
+    signal.signal = _orig_signal
+    webuidb.sync_once = _orig_sync_once
+check(
+    (signal.SIGTERM, webuidb._sigterm_handler) in _installed,
+    f"sync_loop() installs webuidb._sigterm_handler for SIGTERM on every "
+    f"call, unconditionally (observed: {_installed})",
 )
 
 # ---------------------------------------------------------------------------
