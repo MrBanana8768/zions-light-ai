@@ -1124,7 +1124,7 @@ check(
 )
 check(
     logged(logging.INFO, "final sync on SIGTERM"),
-    "a final sync_once(force=True) ran and its result was logged",
+    "a final sync_once() ran and its result was logged",
 )
 _final_calls = [c for c in CAP.records if "final sync on SIGTERM" in c[1]]
 check(len(_final_calls) == 1, "logged exactly once, not once per SIGTERM path")
@@ -1174,16 +1174,32 @@ wipe()
 owui(LOCAL, [("c1", 100, conversation(20))])
 owui(SNAP, [("c1", 90, conversation(15))])  # snapshot older/behind -> real work to do
 os.utime(SNAP, (0, 0))  # snapshot mtime far in the past, unambiguously stale
+
+
+def _conv_json(path):
+    """(chats(p) counts ROWS, not messages - both fixtures below use the
+    SAME single chat id 'c1', so it would read 1 either way. Read the row's
+    own content to tell LOCAL's 20-message version apart from SNAP's
+    original 15-message one.)"""
+    con = sqlite3.connect(str(path))
+    try:
+        row = con.execute("select chat from chat where id='c1'").fetchone()
+    finally:
+        con.close()
+    return json.loads(row[0])["history"]["messages"]
+
+
 webuidb._final_sync_on_shutdown()  # returns None; check via the log/disk instead
 check(
     logged(logging.INFO, "final sync on SIGTERM"),
     "a final sync ran and logged its result",
 )
 check(
-    _has_rows(SNAP) == 20,
-    "and it actually republished LOCAL_DB's 20-row content over the stale "
-    "15-row snapshot, proving 'no force' still means 'sync if there is "
-    "real work', not 'never sync'",
+    chats(SNAP) == 1 and len(_conv_json(SNAP)) == 20,
+    f"and it actually republished LOCAL_DB's 20-message conversation over "
+    f"the stale 15-message one on the snapshot (got "
+    f"{len(_conv_json(SNAP))} messages), proving 'no force' still means "
+    f"'sync if there is real work', not 'never sync'",
 )
 
 print("    CONTROL: _final_sync_on_shutdown never raises, even when "

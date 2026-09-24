@@ -585,10 +585,19 @@ def test_create_backup_uses_snapshot_to_data_at_both_call_sites():
     assert_eq(_to_data_dests, {"webui.db", "chroma.sqlite3"},
               f"the two calls target webui.db and chroma.sqlite3 by name "
               f"(got dest basenames: {_to_data_dests})")
-    assert_eq(_plain_calls, [],
-              f"the OLD direct-to-/data _snapshot_sqlite is NEVER called "
-              f"by create_backup for either site (B1/B2 would revert one "
-              f"call site back to this - got: {_plain_calls})")
+    # _snapshot_sqlite_to_data legitimately calls _snapshot_sqlite ITSELF,
+    # for its own STAGE 1 (live db -> a LOCAL staging tmp file) - that is
+    # not the defect. B1/B2 revert create_backup's OWN call site back to
+    # `_snapshot_sqlite(src, dest)` with `dest` already under /data
+    # (BACKUP_DIR), which is what actually held the live lock open across
+    # the slow volume. So the real assertion is on the DESTINATION: none
+    # of _snapshot_sqlite's own destinations may be under BACKUP_DIR.
+    _plain_dests_on_data = [d for _s, d in _plain_calls if str(_BACKUPS) in d]
+    assert_eq(_plain_dests_on_data, [],
+              f"_snapshot_sqlite is never called with a destination under "
+              f"{_BACKUPS} (B1/B2 would revert one call site back to going "
+              f"there directly - got destinations: "
+              f"{[d for _s, d in _plain_calls]})")
 
 
 # ---------------------------------------------------------------------------
