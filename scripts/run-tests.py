@@ -23,6 +23,28 @@ fixture-backed suites need their own stack and will honestly SKIP in both:
     python scripts/run-tests.py --saturation   # add the long soak
     python scripts/run-tests.py --list         # names and known timings
 
+THESE ARE TWO DIFFERENT SERVICES IN THE SAME COMPOSE FILE, AND RUNNING ONE
+DOES NOT RUN THE OTHER (P9-6, re-confirmed P11, v3.1.9.2 -> v3.1.9.3: the
+tokenizer-contract suite was SKIPPED IN EVERY GATE run for three releases in
+a row). `contract-tests` drives `compactor/test_tokenizer_contract.py` — the
+ONLY suite that exercises a real /tokenize contract, and the only suite that
+would have caught the fixture-handler change v3.1.9.2 shipped.
+`soak-tests` drives `compactor/test_soak_conversation.py` against its OWN,
+separate fixture on a different port — a scale/lag check, not a contract
+check. Every "gate" script assembled for a release so far (see the scratch
+gate3192/gate.sh's own history) ran `soak-tests` and never ran
+`contract-tests` at all, so "the gate is green" has meant "the suite that
+would have caught D1, D7 and the v3.1.9.2 fixture-handler change never ran"
+— exactly the failure mode this file's WHY THIS EXISTS section already
+describes for the plain `docker-compose.tests.yml` case, recurring one layer
+up. A release gate is not the four/five docker-compose files that happen to
+exist; it is EVERY line above this paragraph, run and its exit code read —
+in particular `contract-tests`, on its own, with `--exit-code-from
+contract-tests` so a fixture crash before the test process starts still
+fails the run. There is no single command that runs everything in this repo;
+assembling one from a subset and calling the result "the gate" is exactly
+how this suite kept getting left out.
+
 WHY THIS EXISTS. Until 2026-09-02 "all 59 suites pass" was the release signal
 on this project, and it was not true. Three suites exited 0 WITHOUT running
 their checks when a docker fixture on localhost:18000 was absent, and one of

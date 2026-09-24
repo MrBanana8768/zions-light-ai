@@ -78,6 +78,23 @@ Everything degrades to None. A memory or budgeting component must never be able
 to break chat — if mistral_common is absent, the tokenizer file is missing, or
 the model is not a Mistral model at all, the caller falls through to the tier
 below exactly as it did before this module existed.
+
+## opencv (v3.1.9.3) does NOT change anything in THIS module
+
+requirements.txt now pins opencv-python-headless because mistral_common needs
+cv2 to tokenize an actual IMAGE (image.py's transform_image ->
+assert_opencv_installed) — main.py's count_tokens() was raising ImportError
+on the chat-template tier for any message carrying an image_url part and
+falling back to its own encode()+4 tier for that call. That fix is about
+main.py, not here: `_sanitize` below reduces every image_url chunk to nothing
+(see its docstring) BEFORE a message list ever reaches
+`ChatCompletionRequest`/`encode_chat_completion`, by design, so this module's
+`count()` has never called into mistral_common's image tokenizer and does not
+start now that cv2 is importable. Its docstring's claim two paragraphs up
+("vLLM's /tokenize prices vision tokens and this cannot") stays true with or
+without opencv installed — verified in test_tokens.py's section [5], which
+traps mistral_common's own image-transform call and proves it is never
+reached.
 """
 
 from __future__ import annotations

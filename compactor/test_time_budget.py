@@ -167,7 +167,13 @@ def convo(n_exchanges, newest_pad):
     out = [{"role": "system", "content": "You are a patient assistant."}]
     for i in range(n_exchanges):
         out.append({"role": "user", "content": f"Tell me about item {i}. " + "x" * 150})
-        out.append({"role": "assistant", "content": f"Item {i} is a box. " + "y" * 150})
+        # 150 characters of NON-repeating filler (v3.1.9.2). This was "y" * 150,
+        # which reply_is_degenerate correctly flags as a repetition loop; since
+        # v3.1.9.2 the forwarded window replaces flagged replies before the
+        # guard measures them, so the sweep never needed to shed. Same length,
+        # so the token arithmetic of the sweep is unchanged.
+        _fill = " ".join(f"w{i}x{j}" for j in range(60))[:150]
+        out.append({"role": "assistant", "content": f"Item {i} is a box. " + _fill})
     out.append({"role": "user", "content": "Which is largest? " + "z" * newest_pad})
     return out
 

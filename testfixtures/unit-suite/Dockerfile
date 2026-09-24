@@ -68,6 +68,14 @@ RUN /opt/compactor-venv/bin/python -c \
     "import jinja2; print('chat-template rendering available: jinja2', jinja2.__version__)"
 RUN /opt/compactor-venv/bin/python -c \
     "import mistral_common; print('mistral_common', mistral_common.__version__)"
+# v3.1.9.3: same doctrine, for opencv -- mistral_common needs cv2 to tokenize
+# an IMAGE chunk in the chat template (image.py's transform_image), and its
+# absence fails SOFT (main.py's count_tokens falls back to encode()+4 for
+# that call, silently undercounting the one message that carries the image).
+# A test image without it would exercise a code path production does not
+# have, in the direction that hides the bug rather than catching it.
+RUN /opt/compactor-venv/bin/python -c \
+    "import cv2; print('opencv', cv2.__version__)"
 
 # uvloop, so the disconnect and streaming paths can be exercised on the loop
 # production runs rather than the one the laptop happens to have. Not in

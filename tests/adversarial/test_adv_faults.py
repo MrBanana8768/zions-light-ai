@@ -135,6 +135,62 @@ def _multi_turn_of(
     return _build_multi_turn(lo, pairs, unit)
 
 
+def _build_user_only_multi_turn(chars_per_turn: int, pairs: int, unit: str) -> list[dict]:
+    """Same shape as `_build_multi_turn`, but `unit`'s dense content sits ONLY
+    in USER turns; assistant turns are short, ordinary filler (advfix, P8-3
+    hardening — see `_user_only_multi_turn_of`'s docstring for why).
+    """
+    body = (unit * (chars_per_turn // len(unit) + 1))[:chars_per_turn]
+    msgs: list[dict] = []
+    for i in range(pairs):
+        msgs.append({"role": "user", "content": f"turn {i}. {body}"})
+        msgs.append({"role": "assistant", "content": f"reply {i}. Understood, noted."})
+    msgs.append({"role": "user", "content": "and so what should I do next?"})
+    return msgs
+
+
+def _user_only_multi_turn_of(
+    fixture_client, target_tokens: int, pairs: int = 4, unit: str = _WORD
+) -> list[dict]:
+    """`_multi_turn_of`, but the dense `unit` content is confined to USER
+    turns (advfix hardening, P8 gate).
+
+    test_compaction_triggers_on_the_discredited_counter (F-13) used
+    `_multi_turn_of(..., unit=_RULE)`, which puts the box-drawing payload in
+    BOTH roles via `_build_multi_turn`. v3.1.9.2 added
+    `_redact_forwarded_loop_replies`, which rewrites every non-newest
+    ASSISTANT turn `reply_is_degenerate` flags before forwarding — and
+    `_DECOR_CHARS` (main.py:2302-2304) classifies the ENTIRE box-drawing
+    block U+2500-U+259F as decoration, so a box-drawing-dense assistant turn
+    trips the decor-fraction rule regardless of repetition and gets shrunk.
+    That shrink cuts `usage.prompt_tokens` for a reason that has nothing to
+    do with F-13 (whether `compact_if_needed`'s TRIGGER — `count_tokens(...)
+    <= TARGET_TOKENS` at main.py:1913-1915 — still runs on the char/4
+    estimate instead of vLLM's ground truth), and was being misread as "the
+    compaction trigger no longer runs on char/4" (advfix P8 gate: a test that
+    ran the right input and, once a second subsystem entered the picture,
+    ended up asserting something else). Reproduced with a plain chat request
+    (no fault injection) against this exact fixture: `checks.tokenizer` never
+    loads in this stack (MODEL_REPO=fixture-model is not a real cached HF
+    repo under HF_HUB_OFFLINE=1), so `count_tokens` is ALWAYS the char/4
+    estimator here — nothing about the trigger changed; only the forwarded
+    text did, and only because it was an assistant turn.
+
+    Keeping the dense content in USER turns (never touched by
+    `_redact_forwarded_loop_replies` — see main.py's "only non-newest
+    ASSISTANT turns" comments) removes that confound and isolates F-13's
+    actual question.
+    """
+    lo, hi = 16, 400_000
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _true_count(fixture_client, _build_user_only_multi_turn(mid, pairs, unit)) < target_tokens:
+            lo = mid + 1
+        else:
+            hi = mid
+    return _build_user_only_multi_turn(lo, pairs, unit)
+
+
 def _chat(client, messages, conv: str, **extra):
     body = {"model": MODEL, "messages": messages, "stream": False}
     body.update(extra)
@@ -170,6 +226,76 @@ def _health(client) -> dict:
 
 def _set_mode(fixture_client, **kw) -> None:
     fixture_client.post("/_fixture/mode", json=kw)
+
+
+# Reasons that ALWAYS appear in THIS stack's /health/full, independent of any
+# fault this file injects, and must not be mistaken for evidence about the
+# thing under test (advfix, P8 gate). Confirmed with a plain, unfaulted chat
+# request against this exact compose file: `checks.tokenizer` never loads,
+# because MODEL_REPO=fixture-model names no real, cacheable HF repo and the
+# stack runs HF_HUB_OFFLINE=1/TRANSFORMERS_OFFLINE=1 with nothing baked in to
+# satisfy it (testfixtures/unit-suite/Dockerfile caches only the fastembed
+# retrieval model). The very first request that calls count_tokens() latches
+# "the local tokenizer failed to load ... the request budget sheds turns by
+# them." into status_reasons for good (health.py:1842-1856) — a real, v3.1.9
+# signal about a DIFFERENT counter (main.get_tokenizer's local estimator) than
+# either test below is manipulating (vLLM's own /tokenize, or
+# compact_if_needed's trigger), and it happens to contain both "budget" and
+# "estimate", which a naive substring filter reads as the specific reason
+# these tests are checking for absence of. Filtering on it by its own fixed
+# text (rather than widening the keyword list, which would just as easily
+# swallow a real regression) keeps both tests sensitive to an actual new
+# reason while not being fooled by this one.
+_KNOWN_TOKENIZER_NOISE = "the local tokenizer failed to load"
+
+
+def _non_noise_reasons(reasons: list[str]) -> list[str]:
+    """`reasons` minus the always-on local-tokenizer-load noise described
+    above. Exists so both call sites filter identically — see the constant's
+    comment for why a second, differently-worded copy would be how they drift.
+    """
+    return [x for x in reasons if _KNOWN_TOKENIZER_NOISE not in x]
+
+
+def test_non_noise_reasons_ignores_only_the_known_tokenizer_noise():
+    """CONTROL for `_non_noise_reasons` (advfix, P8 gate). Pure Python, no
+    stack — this is testing the FILTER two other tests rely on, not the
+    compactor, so it must not need the compactor to run.
+
+    Guards both directions:
+      - a status_reasons list holding ONLY the known, unrelated tokenizer-load
+        noise must filter to empty (the false positive this fixes: without
+        the filter, `test_an_inflated_tokenize_count_destroys_turns_while_
+        health_says_ok` and `test_compaction_triggers_on_the_discredited_
+        counter` both reported "GOOD NEWS" from this reason alone, proven
+        live against an UNFAULTED request — see `_KNOWN_TOKENIZER_NOISE`);
+      - a status_reasons list holding a GENUINE hard-budget-shed reason next
+        to that same noise must still come through, so a real fix to F-01/
+        F-13 is not silently swallowed by this filter. This is the CONTROL a
+        guard that refuses everything would fail.
+
+    FAILS IF: `_non_noise_reasons` starts dropping (or stops dropping) the
+    known noise string, or starts dropping anything else.
+    """
+    noise = (
+        "the local tokenizer failed to load (We couldn't connect to "
+        "'https://huggingface.co' ...; next retry in 30s). Token counts "
+        "that do not come from /tokenize are running on the char/4 "
+        "estimate, and the request budget sheds turns by them."
+    )
+    real = "hard budget shed 12 turn(s) because /tokenize disagreed with itself"
+
+    assert _non_noise_reasons([noise]) == [], (
+        "the known tokenizer-load noise alone must filter to nothing"
+    )
+    assert _non_noise_reasons([]) == [], "no reasons in, none out"
+    assert _non_noise_reasons([noise, real]) == [real], (
+        "a genuine reason beside the noise must survive the filter — this is "
+        "the control that proves the filter cannot pass every request"
+    )
+    assert _non_noise_reasons([real]) == [real], (
+        "a genuine reason with no noise present must survive unchanged"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +360,22 @@ def test_an_inflated_tokenize_count_destroys_turns_while_health_says_ok(
     sent, i.e. turns were dropped. `/health/full` reports no reason for it —
     there is no budget/shedding field in the payload at all.
 
+    ADVFIX (P8 gate): filters `_non_noise_reasons` out of the check below.
+    Every request in this stack latches "the local tokenizer failed to load
+    ... the request budget sheds turns by them." (see
+    `_KNOWN_TOKENIZER_NOISE`'s comment) — a real v3.1.9 reason, but about
+    main.get_tokenizer's local estimator, which this test never touches; it
+    only contains "budget" by coincidence. Without the filter this test
+    reported "GOOD NEWS" for a reason that has nothing to do with the lying
+    /tokenize oracle it drives — confirmed by re-running with NO fault
+    injected at all: the same reason appears from the first request. The
+    _enforce_hard_budget guard's shedding (driven by vLLM's own, lied-to
+    /tokenize — see _measure's "ground truth" comment, main.py ~5523) is
+    still invisible in status_reasons once that noise is excluded.
+
     FAILS IF: shedding (or a failed shed) reaches /health/full's
-    `status_reasons`, or the compactor stops believing a 1000x count.
+    `status_reasons` as anything other than the known tokenizer-load noise,
+    or the compactor stops believing a 1000x count.
     """
     msgs = _multi_turn_of(fixture_client, 12000)
     sent = _true_count(fixture_client, msgs)
@@ -263,7 +403,10 @@ def test_an_inflated_tokenize_count_destroys_turns_while_health_says_ok(
         "expected the inflated count to make the guard shed turns; it did not "
         f"({lied_tokens} vs {honest_tokens})"
     )
-    budget_reason = [x for x in h["status_reasons"] if "budget" in x or "shed" in x.lower()]
+    budget_reason = [
+        x for x in _non_noise_reasons(h["status_reasons"])
+        if "budget" in x or "shed" in x.lower()
+    ]
     assert not budget_reason, (
         "GOOD NEWS, and this test is now stale: /health/full grew a reason for "
         f"hard-budget shedding: {budget_reason}"
@@ -388,13 +531,33 @@ def test_compaction_triggers_on_the_discredited_counter(client, fixture_client):
     compaction NOT firing on the box-drawing payload. On production content the
     estimator reads LOW, which is the same defect pointing the failing way.
 
+    ADVFIX (P8 gate), read before touching this test again: the box-drawing
+    payload used to go through `_multi_turn_of` (BOTH roles). v3.1.9.2 added
+    `_redact_forwarded_loop_replies`, which rewrites every non-newest
+    ASSISTANT turn that `reply_is_degenerate` flags before forwarding, and
+    `_DECOR_CHARS` (main.py:2302-2304) makes the ENTIRE box-drawing block
+    U+2500-U+259F "decoration" regardless of repetition — so a box-drawing
+    assistant turn is shrunk by an UNRELATED subsystem, which cut
+    `usage.prompt_tokens` for the rules payload and read as "the compaction
+    trigger no longer runs on char/4". It does: `compact_if_needed` still
+    computes `current = count_tokens(messages)` (char/4 whenever the local
+    tokenizer is unavailable, which it always is in this stack — see
+    `_KNOWN_TOKENIZER_NOISE`) and compares it to TARGET_TOKENS unchanged
+    (main.py:1913-1915); nothing there consults count_tokens_exact.
+    `test_a_lying_tokenize_oracle_can_latch_the_margin` (same file) still
+    relies on this exact payload shape staying UNDER the compaction trigger
+    ("at ~1 char per token the rules payload is far under the compaction
+    trigger") and still passes, which is the same fact from the other side.
+    `_user_only_multi_turn_of` keeps the dense content in USER turns, which
+    that redaction path never touches, removing the confound.
+
     FAILS IF: compact_if_needed starts consulting count_tokens_exact.
     """
     target = (TARGET_TOKENS + HARD_INPUT_LIMIT) // 2  # above the compaction
     # target, below the hard budget, so ONLY the compaction decision is on trial
 
-    english = _multi_turn_of(fixture_client, target, unit=_WORD)
-    rules = _multi_turn_of(fixture_client, target, unit=_RULE)
+    english = _user_only_multi_turn_of(fixture_client, target, unit=_WORD)
+    rules = _user_only_multi_turn_of(fixture_client, target, unit=_RULE)
     n_english = _true_count(fixture_client, english)
     n_rules = _true_count(fixture_client, rules)
     assert abs(n_english - n_rules) <= 8, (
@@ -431,8 +594,10 @@ def test_compaction_triggers_on_the_discredited_counter(client, fixture_client):
         f"compacted too ({n_rules} true -> {fwd_rul} forwarded), so the "
         "compaction trigger no longer runs on the char/4 estimator."
     )
-    assert not any("budget" in x or "compact" in x for x in h["status_reasons"]), (
-        "GOOD NEWS: /health/full now says something about compaction not firing"
+    non_noise = [x for x in _non_noise_reasons(h["status_reasons"]) if "budget" in x or "compact" in x]
+    assert not non_noise, (
+        f"GOOD NEWS: /health/full now says something about compaction not "
+        f"firing: {non_noise}"
     )
 
 
@@ -519,25 +684,27 @@ def test_a_4xx_stream_is_error_typed(client, fixture_client):
 
 
 def test_shed_tails_are_counted_as_stored(client, fixture_client):
-    """F-07. Drive more concurrent turns than the pool's outstanding ceiling
-    (default 64). Tails past the ceiling are CLOSED UNRUN — no facts, no
-    episodic index, no rollup — and `memory_tail.stored` counts every one of
-    them as stored.
+    """F-07, ADVFIX REWRITE (P8 gate) — the original F-07 defect is FIXED;
+    this now pins the correct behaviour instead. Drive more concurrent turns
+    than the pool's outstanding ceiling (default 64). Tails past the ceiling
+    are CLOSED UNRUN — no facts, no episodic index, no rollup.
 
-    `_run_memory_tail`'s comment says the count was hoisted onto the request
-    path BECAUSE the pool sheds ("a tail dropped at the ceiling would then
-    never be counted at ALL"). The fix for "not counted" was to count it as
-    stored. `tailhealth` has no `skipped_shed` outcome.
-
-    The loss IS visible in the OTHER dict — background_work.shed_recently
-    degrades `status` with an accurate reason. The dict named after the thing
-    that was lost says the opposite.
+    Proven fixed live (`findings/faults-07-shed-counted-as-stored.md`, 160
+    concurrent turns, shed=80): `memory_tail.stored` moved by exactly the 80
+    that actually ran (not by all 160), `memory_tail.skipped` moved by the 80
+    that were shed, `tail["outcomes"]["skipped_shed"]` now exists and moved by
+    80, and BOTH `background_work` and `memory_tail`'s own status_reasons name
+    the loss — "memory tail skipping: ... that skip's outcome skipped_shed"
+    alongside "background work shedding: 80 task(s) dropped". Before this
+    fix, `tailhealth` had no `skipped_shed` outcome at all and `stored`
+    silently absorbed the shed ones; see the old assertions this replaces in
+    git history for exactly what that looked like.
 
     NOTE: this test leaves `shed_recently` true for ~300 s, so nothing after it
     may assert status == "ok".
 
-    FAILS IF: a shed tail stops being counted as stored (e.g. a `skipped_shed`
-    outcome appears).
+    FAILS IF: a shed tail is counted as `stored` again, `skipped_shed` stops
+    existing or stops moving with `shed`, or status_reasons stops naming it.
     """
     n = 160
     # Settle first: a tail still outstanding from an earlier case would show up
@@ -604,19 +771,44 @@ def test_shed_tails_are_counted_as_stored(client, fixture_client):
             f"more concurrency to reproduce faults-07."
         )
 
-    assert stored >= shed, "sanity: fewer stored than shed makes no sense here"
-    assert skipped == 0 and tail["outcomes"].get("skipped_shed") is None, (
-        "GOOD NEWS, and this test is now stale: a shed tail is no longer "
-        f"counted as stored. outcomes={tail['outcomes']}"
+    before_skipped_shed = before_tail.get("outcomes", {}).get("skipped_shed", 0)
+    after_skipped_shed = tail.get("outcomes", {}).get("skipped_shed", 0)
+    skipped_shed_delta = after_skipped_shed - before_skipped_shed
+
+    # Ledger conservation, same invariant test_saturation.py pins elsewhere:
+    # every submitted exchange is either stored or skipped, never both, never
+    # neither.
+    assert stored + skipped == n, (
+        f"sanity: {n} submitted must split exactly into stored+skipped; got "
+        f"stored={stored} skipped={skipped}"
     )
-    # The positive claim: `stored` counts the shed ones too.
-    assert stored >= n, (
-        f"expected memory_tail.stored to claim all {n} exchanges were stored; "
-        f"it claimed {stored} while the pool shed {shed} of them"
+    # The FIX (was the finding): shed tails no longer inflate `stored` — they
+    # move `skipped`, specifically via the `skipped_shed` outcome, one per
+    # shed tail.
+    assert stored == n - shed, (
+        f"GOOD NEWS did not fully land: expected memory_tail.stored to count "
+        f"only the {n - shed} exchanges that actually ran (n={n}, shed="
+        f"{shed}); it counted {stored}"
     )
+    assert skipped == shed, (
+        f"expected memory_tail.skipped to count exactly the {shed} shed "
+        f"exchanges; it counted {skipped}"
+    )
+    assert skipped_shed_delta == shed, (
+        f"expected outcomes.skipped_shed to move by exactly {shed} (the shed "
+        f"count); it moved by {skipped_shed_delta}. outcomes={tail['outcomes']}"
+    )
+    # The positive claim (CONTROL): a tail that actually ran is still counted
+    # as stored, not swept into skipped_shed too — this guard is not simply
+    # refusing everything.
+    assert stored > 0, "sanity: some tails should have run and stored under n=160"
     assert any("shedding" in reason for reason in h["status_reasons"]), (
-        "the pool's own loss is not even reported in status_reasons — that "
-        "would be worse than the finding this test is about"
+        "background_work's own loss is not even reported in status_reasons"
+    )
+    assert any("skipped_shed" in reason for reason in h["status_reasons"]), (
+        "memory_tail's status_reasons no longer names skipped_shed by name — "
+        "the fix that closed F-07 (the loss visible in ONE dict and not the "
+        "other) has regressed"
     )
 
 

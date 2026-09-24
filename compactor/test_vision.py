@@ -11,8 +11,11 @@ No GPU, no real model — summarize() is mocked. Run: python test_vision.py
 """
 
 import asyncio
+import base64
 import os
+import struct
 import sys
+import zlib
 
 # Force the char/4 estimator (no tokenizer) + a small budget so compaction
 # triggers, with a known per-image token cost. Set before importing main.
@@ -91,6 +94,229 @@ def test_count_tokens_adds_image_cost():
 
 
 # ---------------------------------------------------------------------------
+# Token accounting once opencv lets the REAL chat template succeed (v3.1.9.3)
+#
+# The tests above cover count_tokens() with NO tokenizer (char/4). These
+# cover the tokenizer-present, template-SUCCEEDS branch, which is what
+# changes once compactor/requirements.txt installs opencv-python-headless
+# (mistral_common can then tokenize an actual image; see that file's
+# comment and SP\fix-3193-opencv.md for the measurement this fix is built
+# from). No network, no real mistral_common, no GPU: a fake tokenizer class
+# (this file's `FramingTokenizer`-style pattern, matching
+# test_budget_guard.py) reproduces two things measured against the REAL
+# served model's tokenizer files, so the test is honest about what
+# production actually does rather than an idealized encode():
+#   1. the template renders each image as real marker tokens whose TOTAL
+#      COUNT matches vLLM's own usage.prompt_tokens exactly, at every size
+#      scripts/probe-vision.py measures (110/380/1406/3080 at
+#      256/512/1024/2048px);
+#   2. re-encoding that rendered STRING (what count_tokens() does,
+#      tokenize=False then encode()) does NOT price those markers at the 1
+#      token each they really are in the vocabulary -- it costs 4/7/5 raw
+#      BPE tokens per [IMG]/[IMG_BREAK]/[IMG_END] occurrence instead,
+#      measured against the real model (SP\fix-3193-opencv.md,
+#      opencv_marker_check.log). count_tokens()'s fix has to correct for
+#      BOTH or the tolerance check below would pass for the wrong reason.
+# ---------------------------------------------------------------------------
+
+# scripts/probe-vision.py's own generator: a gradient PNG, not a flat fill,
+# so a real width/height round-trips through the file's own IHDR chunk.
+# Reproduced here (not imported) because that script talks to a live vLLM
+# over HTTP and this file never does.
+def _synthetic_png(w: int, h: int) -> bytes:
+    raw = b""
+    for y in range(h):
+        row = bytes([(x * 7 + y * 3) % 256 for x in range(w) for _ in (0, 1, 2)])
+        raw += b"\x00" + row
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, 6))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _png_dims(data: bytes) -> tuple[int, int]:
+    """Width/height from a PNG's IHDR chunk -- same field probe-vision.py's
+    own identify() reads, simplified for this file's own generator only."""
+    return struct.unpack(">II", data[16:24])
+
+
+def _image_msg_with_real_png(size: int) -> dict:
+    """A user message carrying an actual synthetic PNG at `size`x`size`, not
+    a 4-byte placeholder -- so the fake tokenizer below determines the image's
+    cost from the image's own real dimensions, the way the real pipeline
+    does, rather than a side-channel test hint."""
+    png = _synthetic_png(size, size)
+    b64 = base64.b64encode(png).decode()
+    return {"role": "user", "content": [
+        {"type": "text", "text": "look at this"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+    ]}
+
+
+class VisionTemplateTokenizer:
+    """A tokenizer that renders and (mis)encodes images the way the REAL
+    served model's does, once opencv lets its chat template run (measured
+    against the actual tokenizer files -- SP\\fix-3193-opencv.md). Plain text
+    keeps this file's usual 4-chars-per-token convention."""
+
+    # measured, scripts/probe-vision.py: real per-image cost (vLLM's own
+    # usage.prompt_tokens), at the sizes it probes.
+    REAL_COST = {256: 110, 512: 380, 1024: 1406, 2048: 3080}
+    # measured, this exact model (SP\fix-3193-opencv.md,
+    # opencv_marker_check.log): raw BPE tokens a plain encode() call assigns
+    # to one occurrence of each marker, instead of the 1 it really is.
+    RAW_MARKER_COST = {"[IMG]": 4, "[IMG_BREAK]": 7, "[IMG_END]": 5}
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        parts = []
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                for p in content:
+                    if not isinstance(p, dict):
+                        continue
+                    if p.get("type") == "text":
+                        parts.append(p.get("text", ""))
+                    elif p.get("type") == "image_url":
+                        url = p.get("image_url", {}).get("url", "")
+                        b64 = url.split(",", 1)[1] if "," in url else ""
+                        w, h = _png_dims(base64.b64decode(b64)) if b64 else (0, 0)
+                        n = self.REAL_COST.get(w, 0)
+                        # n-1 [IMG] + one [IMG_END] -- matches the real
+                        # template's shape (exactly one END per image,
+                        # verified at every size tested).
+                        parts.append("[IMG]" * max(0, n - 1) + ("[IMG_END]" if n else ""))
+            else:
+                parts.append(content or "")
+        return " ".join(parts)
+
+    def encode(self, text):
+        n = 0
+        rest = text
+        for marker, raw_cost in self.RAW_MARKER_COST.items():
+            count = rest.count(marker)
+            n += count * raw_cost
+            rest = rest.replace(marker, "")
+        n += len(rest) // 4
+        return list(range(n))
+
+
+class RaisingTokenizer:
+    """Simulates tier 1 failing -- e.g. opencv genuinely absent, ImportError
+    on an image-bearing apply_chat_template call. encode() alone (used by
+    the except branch's per-message loop) still works, matching what
+    get_tokenizer() actually returns: a real, loaded tokenizer whose
+    apply_chat_template call is what fails, not the object itself."""
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        raise ImportError("`opencv` is not installed. Please install it with `pip install mistral-common[opencv]`")
+
+    def encode(self, text):
+        return list(range(len(text) // 4))
+
+
+def test_count_tokens_prices_images_at_real_cost_once_template_succeeds():
+    print("\n[test] count_tokens: template success prices images near their REAL cost")
+    orig_tok = main._tokenizer
+    try:
+        main._tokenizer = VisionTemplateTokenizer()
+        for size, real_cost in VisionTemplateTokenizer.REAL_COST.items():
+            msgs = [_image_msg_with_real_png(size)]
+            counted = main.count_tokens(msgs)
+            # Tolerance: a handful of tokens for the "look at this" text plus
+            # template framing (baseline, no image, under this same stub) --
+            # NOT a percentage of real_cost, because the point of this fix is
+            # that the image portion is no longer priced by a multiplier at
+            # all. Stated explicitly: within TEXT_MARGIN of real_cost, where
+            # TEXT_MARGIN is generous enough for the surrounding text/framing
+            # and small enough that a return of the 2-2.3x inflation (or the
+            # double-count) blows through it by thousands of tokens.
+            TEXT_MARGIN = 20
+            assert_true(
+                real_cost <= counted <= real_cost + TEXT_MARGIN,
+                f"{size}px: counted={counted}, real_cost={real_cost} "
+                f"(want within +{TEXT_MARGIN} of real, never under)",
+            )
+            # And explicitly NOT anywhere near the flat estimate stacked on
+            # top, or the un-corrected re-encode inflation -- the two
+            # regressions this fix exists to prevent.
+            image_tokens_flat = main.IMAGE_TOKEN_ESTIMATE
+            assert_true(
+                counted < real_cost + image_tokens_flat,
+                f"{size}px: {counted} must not still include the flat "
+                f"{image_tokens_flat}-token estimate on top of a priced image",
+            )
+    finally:
+        main._tokenizer = orig_tok
+
+
+def test_count_tokens_text_only_unchanged_with_template():
+    print("\n[test] count_tokens: text-only list is IDENTICAL with the template present")
+    orig_tok = main._tokenizer
+    try:
+        main._tokenizer = VisionTemplateTokenizer()
+        msgs = [
+            {"role": "system", "content": "sys prompt"},
+            {"role": "user", "content": "hello there, how are you today"},
+        ]
+        counted = main.count_tokens(msgs)
+        # Manually what the OLD (and still current, for text-only) formula
+        # computes: len(encode(apply_chat_template(msgs))) -- no markers
+        # present, so the fix's branch takes the untouched `else` path.
+        tok = main._tokenizer
+        expected = len(tok.encode(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)))
+        assert_eq(counted, expected, "text-only count via the template path is unchanged by this fix")
+    finally:
+        main._tokenizer = orig_tok
+
+
+def test_count_tokens_template_failure_unchanged():
+    print("\n[test] count_tokens: template FAILING still charges exactly today's flat estimate")
+    orig_tok = main._tokenizer
+    try:
+        main._tokenizer = RaisingTokenizer()
+        msgs = [_image_msg_with_real_png(1024)]
+        counted = main.count_tokens(msgs)
+        tok = main._tokenizer
+        n_images = sum(main._message_image_count(m) for m in msgs)
+        expected = (
+            sum(len(tok.encode(main._message_text(m))) + 4 for m in msgs)
+            + n_images * main.IMAGE_TOKEN_ESTIMATE
+        )
+        assert_eq(counted, expected,
+                   "except-branch (template failing) formula is byte-for-byte unchanged")
+    finally:
+        main._tokenizer = orig_tok
+
+
+def test_count_tokens_literal_img_end_text_not_treated_as_a_marker():
+    print("\n[test] count_tokens: a TEXT mention of '[IMG_END]' with no real image is not stripped")
+    orig_tok = main._tokenizer
+    try:
+        main._tokenizer = VisionTemplateTokenizer()
+        # No image_url part anywhere -- n_images is 0 -- but the text itself
+        # names the literal marker (e.g. someone discussing this very fix).
+        # It must be encoded like any other text, not stripped out and
+        # replaced with a single "priced marker" token.
+        msgs = [{"role": "user", "content": "what does [IMG_END] mean here?"}]
+        counted = main.count_tokens(msgs)
+        tok = main._tokenizer
+        rendered = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        expected = len(tok.encode(rendered))  # the untouched, un-stripped encode
+        assert_eq(counted, expected,
+                   "a literal '[IMG_END]' in ordinary text is encoded normally, not stripped")
+    finally:
+        main._tokenizer = orig_tok
+
+
+# ---------------------------------------------------------------------------
 # Compaction preserves image turns
 # ---------------------------------------------------------------------------
 
@@ -164,6 +390,10 @@ def _all():
     return [
         test_image_count_and_has_image,
         test_count_tokens_adds_image_cost,
+        test_count_tokens_prices_images_at_real_cost_once_template_succeeds,
+        test_count_tokens_text_only_unchanged_with_template,
+        test_count_tokens_template_failure_unchanged,
+        test_count_tokens_literal_img_end_text_not_treated_as_a_marker,
         test_compaction_preserves_image_turns,
         test_compaction_all_images_kept_unchanged,
     ]

@@ -60,3 +60,46 @@ fastembed==0.8.0           # BAAI/bge-small-en-v1.5 embeddings via ONNX (no torc
 # 2026-08-28 bug wearing a better disguise. Bump this deliberately, and check
 # what vLLM resolved when you do.
 mistral_common==1.11.7
+
+# v3.1.9.3: REQUIRED for mistral_common's image tokenizer
+# (mistral_common/tokens/tokenizers/image.py: transform_image() calls
+# assert_opencv_installed() -> imports cv2). Without it, transformers'
+# MistralCommonBackend.apply_chat_template raises ImportError the moment a
+# message carries an image_url part -- "opencv is not installed" -- logged
+# once per process (main.py count_tokens, log_once("count_tokens.chat_template")),
+# and count_tokens() falls back to its encode()+4 tier for THAT call.
+#
+# Measured (v3.1.9.3, real coder3101/Cydonia-24B-v4.3-vision-heretic tokenizer
+# files, no opencv installed): apply_chat_template already SUCCEEDS on a
+# text-only message list without this package -- jinja2 alone is sufficient
+# for that. The ImportError fires ONLY when a message actually contains an
+# image_url chunk. So this is not the "every token count undercounts" failure
+# the historical jinja2 incident was; it is scoped to image-bearing requests,
+# which the pod's default COMPACTOR_MAX_RETAINED_IMAGES=1 makes a normal,
+# not a rare, case. See tokens.py's own image handling: THIS module's count()
+# is unaffected either way, because _sanitize() strips images to text before
+# mistral_common ever sees them (by design) -- installing this package does
+# not change tokens.py's behavior, only main.py's count_tokens().
+#
+# opencv-python-headless (not opencv-python: no GUI/Qt bindings needed in a
+# headless container, and the two packages conflict if both installed) is the
+# extra mistral_common's own pyproject declares: `mistral_common[opencv]`
+# pulls `opencv-python-headless>=4.0.0`, unbounded like the [image] hazard
+# above -- pinned here directly instead, for the same reproducibility reason
+# every other line in this file is pinned exactly.
+#
+# 5.0.0.93 audited 2026-09-18 (PyPI/OSV): fixes CVE-2026-8461 (ffmpeg bundled
+# in the wheel, bumped to 8.1.2) and post-dates PYSEC-2026-2835 (libpng OOB
+# write, CVSS 7.8), whose last affected release was 4.1.1.26 -- both already
+# fixed by the time this was pinned, not something this pin newly avoids.
+# `pip check` clean against numpy==2.3.5 (already pinned above; opencv only
+# requires numpy>=2). No other package version moved when this was added.
+#
+# COST (measured, this venv): +152 MB unpacked (72 MB cv2/ + 81 MB
+# opencv_python_headless.libs/, the wheel's bundled codec shared libraries --
+# ffmpeg/libpng/etc, needed even in the "headless" build); 61 MB compressed
+# download. For comparison, mistral_common's own comment above measured +82 MB
+# for itself -- this is a bigger single addition than that was. Not measured
+# against the 21 GB production image (out of this lane's scope to build); the
+# same venv construction means the delta transfers directly.
+opencv-python-headless==5.0.0.93

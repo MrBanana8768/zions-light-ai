@@ -112,6 +112,215 @@ there, `/compact` runs the identical drain and will NOT clear the backlog;
 fix the named cause first (commonly an unreadable
 `summaries/<conv>.archive.json`).
 
+#### `checks.reuse` — is the reuse stand-in actually firing? (v3.1.9.2)
+
+```bash
+curl -s localhost:8080/health/full | python3 -c "
+import json,sys; d=json.load(sys.stdin); r=d['checks'].get('reuse') or {}
+print('attempted:', r.get('attempted'), '| succeeded:', r.get('succeeded'))
+print('declined_no_state:', r.get('declined_no_state'),
+      '| declined_no_coverage:', r.get('declined_no_coverage'),
+      '| declined_budget:', r.get('declined_budget'),
+      '| declined_window:', r.get('declined_window'),
+      '| errored:', r.get('errored'))
+print('last_reason:', r.get('last_reason'), '| last_attempt_age_s:', r.get('last_attempt_age_s'))
+print('declined_recently:', r.get('declined_recently'))
+print('last_declined_ceiling:', r.get('last_declined_ceiling'),
+      '| last_declined_others:', r.get('last_declined_others'),
+      '| last_declined_reserve:', r.get('last_declined_reserve'))"
+```
+
+Added after hostile pass #9 (P9-1/P9-2) found the reuse feature v3.1.9.1
+introduced silently declining on every request again, at the numbers
+v3.1.9.2 nearly shipped, with no signal anywhere but an INFO log line. This
+is visibility-only — it never appears in `status_reasons` and never
+degrades `status`, the same as `checks.tokenizer` — because a decline
+still falls back to summarizing from scratch and answers the turn; it is
+slower and remembers less precisely, not broken.
+
+**Hostile pass #10 (P10-3) split what used to be one `declined_budget`
+counter into five, because `attempted=0, declined_budget=0` used to mean
+FOUR different things** (a fresh process; no stored hierarchy yet; a
+hierarchy that covers none of this request's array; and — the one that
+mattered most — an exception raised partway through the attempt, which
+used to leave `attempted` incremented with nothing to show it had failed,
+reading exactly like a healthy reuse). Read `last_reason` first: it names
+what the MOST RECENT attempt resolved to — `"success"`, `"no_state"`
+(nothing stored yet, normal for a new conversation), `"no_coverage"` (a
+hierarchy exists but does not cover this array — a different branch, a
+delete-and-regenerate, or a store rebuild), `"budget"` (exists, covers
+this array, but the rendered stand-in does not fit the stand-in's OWN
+budget whole), `"window"` (hostile pass #12, P12-2 — exists, covers this
+array, the stand-in fits ITS OWN budget, but alongside the system prompt
+and the recent turns it would leave no room in the request's real window
+— a DIFFERENT decline from `"budget"`, see below) or `"error"` (an
+exception — check `/data/logs/compactor.log` for "could not reuse stored
+summaries" around `last_attempt_age_s` seconds ago). **A nonzero
+`errored` count is the one that needs a log, not a shrug**: this counter
+exists specifically because "the request still succeeded" (the `except`
+clause's whole job) used to also mean "nothing tells you this happened."
+
+`attempted`/`succeeded`/`declined_no_state`/`declined_no_coverage`/
+`declined_budget`/`declined_window`/`errored` are all cumulative since the
+process started — **a restart resets every one of them to zero, not a
+rolling window** (unlike `declined_recently`, below) — so a freshly
+restarted pod reading `attempted: 0` says nothing about whether reuse was
+healthy or broken before the restart; use `last_attempt_age_s` (`None`
+only when no candidate request has reached the reuse check yet THIS
+process) rather than assuming a low `attempted` means a quiet feature.
+`declined_budget == 0 and declined_window == 0` with `attempted > 0` means
+every stand-in attempt that reached either check fit; that is the healthy
+state to expect in normal operation. **`declined_recently`** is `true` for
+`COMPACTOR_REUSE_DECLINE_DEGRADE_WINDOW_S` (default 300s) after the most
+recent CAPACITY decline — `"budget"` OR `"window"` (P12-2 widened this
+from "budget" specifically: `no_state`/`no_coverage`/`error` still do not
+set it, but a window-squeeze decline is exactly as real a capacity squeeze
+as a budget one, and hiding it here just meant an operator staring at
+`declined_recently: false` minutes after a run of window declines) —
+check this first if you suspect the feature just stopped working, rather
+than the cumulative counters, which stay nonzero forever after even one
+decline early in a long-lived process. **Read `last_declined_ceiling`/
+`last_declined_others` together with `last_reason` — they mean a
+DIFFERENT pair of numbers depending on which reason produced them:**
+
+- **`last_reason == "budget"`**: the two numbers from that decline's own
+  log line (`the stored summaries cover N of the turns ... but they do
+  not fit whole in the <ceiling> token(s) ... leaves beside the system
+  prompt, images and recent turns (<others>) and one fresh summary`) — if
+  `declined_recently` is true for this reason, the summary hierarchy has
+  grown past what `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`/
+  `COMPACTOR_STANDIN_BUDGET_FRACTION` can hold right now (see
+  RUNPOD_DEPLOY.md's [Memory budgets](RUNPOD_DEPLOY.md#memory-budgets--raised-defaults-in-v319)
+  for the exact arithmetic and what to raise). **Do not use 11,300 as the
+  threshold to watch for** (hostile pass #10, P10-2 corrected this doc:
+  that figure is in a different unit from what `last_declined_ceiling` is
+  checked against, and her own hierarchy's measured steady-state peak with
+  a real L3 is already 11,728 — above it — while still reusing at the
+  shipped default). Compare `last_declined_ceiling` against
+  `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` itself (15,000 shipped) instead: a
+  decline with `last_declined_ceiling` at or near that configured value
+  means the hierarchy has genuinely outgrown the current setting and it is
+  time to raise it (together with `COMPACTOR_INJECTION_BUDGET_FRACTION`,
+  which the ceiling can also never exceed).
+- **`last_reason == "window"`** (hostile pass #12, P12-2): a DIFFERENT
+  check, with its own log line (`the stored summaries cover N of the
+  turns ... and the <rendered>-token stand-in fits the <budget>-token
+  ceiling, but alongside this conversation's system prompt and recent
+  turns it would leave the ~<ceiling>-token window no room for the turns
+  it exists to keep (reserve <last_declined_reserve> > <last_declined_
+  ceiling> available)`). `last_declined_ceiling` is `effective_limit_est
+  - (system prompt + the recent turns)` — the room actually available for
+  the stand-in — `last_declined_others` is what the system prompt and the
+  recent turns themselves cost, and `last_declined_reserve` (v3.1.9.3,
+  P13-3 — before this release the number was findable only in the log
+  line) is what was actually COMPARED against the ceiling: the rendered
+  stand-in, plus the fresh-summary reserve when a fresh span is pending
+  (P12-6/P13-2, below), plus a fixed 128-token drift allowance. **`last_
+  declined_ceiling` sitting at or near `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`
+  (or anywhere else) means nothing for THIS reason — it is not that
+  number.** Neither `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` nor
+  `COMPACTOR_INJECTION_BUDGET_FRACTION` can move it: raising either only
+  changes how big a stand-in is ALLOWED to render before this check runs,
+  never what this check compares it against (P12-2's own reproduction:
+  raising `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` from 15,000 to 20,000 left
+  the SAME requests declining, `last_declined_ceiling` merely following the
+  new inject-budget cap).
+
+  **What actually moves it** (corrected, hostile pass #13, P13-3 — the
+  list below used to also name `COMPACTOR_IMAGE_TOKENS`, which prices
+  nothing on this pod): a smaller learned budget margin (see
+  `checks.budget_margin`, below — a margin in force shrinks
+  `last_declined_ceiling` directly and is the single biggest lever while
+  it lasts), a smaller `last_declined_reserve` (mostly what the
+  conversation did between L1 rollups: a smaller uncovered tail, fewer
+  un-folded fresh-summary batches), fewer retained images IF AND ONLY IF
+  the recent window itself carries more images than
+  `COMPACTOR_MAX_RETAINED_IMAGES` allows (`COMPACTOR_IMAGE_TOKENS` moves
+  nothing on a pod with opencv installed — the image ships it from
+  v3.1.9.3, so this pod prices a rendered image by its real
+  per-resolution cost, not the flat estimate `COMPACTOR_IMAGE_TOKENS`
+  names), a smaller recent reply, or a smaller stored hierarchy (trigger
+  an L3 rollup early, `/admin/...` — see the hierarchy section above).
+
+  Settings that move it, each with a cost (corrected, hostile pass #14,
+  P14-3 — this used to say the reserve was "nothing to configure"):
+  `COMPACTOR_SUMMARY_MAX_TOKENS` and `COMPACTOR_MAX_SUMMARY_CALLS` scale
+  the fresh-summary part of the reserve (`min(batches, calls) x
+  max tokens`; lowering either makes fresh summaries shorter or defers
+  more of the span); `COMPACTOR_GENERATION_RESERVE` and the client's
+  `max_tokens` set the window itself (lowering them leaves less room for
+  her reply); `COMPACTOR_KEEP_RECENT_TURNS` sets the recent floor (lowering
+  it forwards fewer turns verbatim). None of these is a fix for an
+  occasional decline; they are for a conversation that declines on most
+  requests.
+
+  **A window decline is not a bug and is not data loss, but it is not
+  free either** (corrected, hostile pass #13, P13-3 — this used to say
+  "slower and forwards more raw text, not silently worse", which held for
+  the hierarchy but not for what sits above it). The declined path
+  (v3.1.9.3, hostile pass #12 P12-5) protects the SAME recent turns this
+  check exists to protect, by spending injected memory (facts, retrieval)
+  before them, and the request is always answered. But a window decline
+  resets the reuse to nothing, so `summarize()` is handed the WHOLE older
+  span, and at her size that exceeds `COMPACTOR_MAX_SUMMARY_CALLS` and is
+  refused (corrected, hostile pass #14, P14-3 — this used to blame the
+  uncovered tail alone): those turns go out VERBATIM rather than
+  summarized, and P12-5's order sheds verbatim turns above the protected
+  floor before it ever touches memory — so the uncovered tail can reach
+  the model NEITHER summarized NOR verbatim. Real-data replay (hostile
+  passes #13 and #14): after this release's fixes that still happens at
+  25-69 of 474 positions with a 20-turn uncovered tail (peakA / peakB),
+  down from 45-147 before them. If `declined_recently` is true for `"window"`
+  and the conversation's replies seem to have forgotten something recent,
+  this is the mechanism to suspect before assuming the hierarchy itself
+  lost it.
+
+#### `checks.budget_margin` — is a learned budget correction narrowing the window right now? (v3.1.9.3, P13-1/P13-3)
+
+```bash
+curl -s localhost:8080/health/full | python3 -c "
+import json,sys; d=json.load(sys.stdin); m=d['checks'].get('budget_margin') or {}
+print('margin:', m.get('margin'), '/ ceiling:', m.get('ceiling'))
+print('release_after:', m.get('release_after'), '| ok_streak:', m.get('ok_streak'))"
+```
+
+`main._BUDGET_MARGIN` is the degraded-mode backstop for when the local
+token count has been WRONG — a vLLM context-length 400 the guard did not
+already predict (a `/tokenize` outage, or a mispriced image) latches it to
+`overshoot + 512`, up to `MAX_MODEL_LEN // 4` (`ceiling` above), in ONE
+step, and it applies PROCESS-WIDE (one uvicorn worker, one margin, every
+conversation) until `release_after` (`COMPACTOR_BUDGET_MARGIN_RELEASE_
+AFTER`, default 50) consecutive ACCEPTED requests halve it (or clear it,
+once it is 512 or below) — `ok_streak` is how far into that count this
+process already is. Before this release the only way to learn a margin
+was in force was the log: the WARNING when it latches ("Tightening the
+hard limit by N for EVERY conversation"), the INFO when it is released,
+or the "margin N" suffix on a hard-budget shed line if one happened to
+fire while it was up (the boot-time "context calibration" line always
+shows a fresh process's 0); the adversarial suite's
+own F-02 finding (`tests/adversarial/test_adv_faults.py`) names the gap
+explicitly ("/health/full has no margin field"). This is visibility-only —
+it never appears in `status_reasons` and never degrades `status`: the
+process is already correcting itself, and a 400 without it would be worse.
+
+**While `margin` is nonzero, both `_enforce_hard_budget` (the hard-budget
+guard) and the P11-6/P12-1/P13-1 reuse window check subtract it from their
+own limit before deciding anything** — so a nonzero margin is the single
+biggest thing that can move `checks.reuse`'s `last_declined_ceiling` for
+`"window"` (see above) on a conversation that was reusing fine a moment
+ago. If reuse looks like it "just stopped working" and `checks.budget_
+margin.margin` is nonzero, that is very likely why, and the fix is time
+(`ok_streak` accepted requests) rather than a config change — the margin
+already IS the config change reacting to a real overshoot it measured.
+
+One request can fall between the two reads (hostile pass #14, P14-1): if
+a margin latches while a request is already past its reuse decision, that
+request's guard applies the new margin and can shed her previous exchange
+to fit. Every request after it reads the new margin in both places. The
+guard keeps the live value on purpose, because the margin was learned
+from a rejection and forwarding at the old limit risks losing the whole
+reply instead.
+
 #### `config.time_injection` — the current-time feature (v3.1.9)
 
 ```bash
@@ -243,6 +452,66 @@ itself unreachable (so "curl refused on :8080" == compactor down).
 ### Chat returns errors but the pod is up
 - Check `/health/full`. If `degraded`, vLLM is the problem (above). The
   compactor itself rarely 500s — memory failures degrade to no-ops.
+
+### Sampling parameters
+
+OpenWebUI's **Advanced Params** map only a fixed set of names onto the
+request it sends: `temperature`, `top_p`, `min_p`, `max_tokens`,
+`frequency_penalty`, `presence_penalty`, `reasoning_effort`, `seed`, `stop`,
+`logit_bias`, `response_format`. Anything else — including any Ollama-style
+name — has to be set under **Custom Parameters** instead, where OpenWebUI
+passes it through to the request body exactly as typed.
+
+vLLM's name is `repetition_penalty`; Ollama's name for the same idea is
+`repeat_penalty`. **From v3.1.9.2 on**, the compactor translates
+`repeat_penalty` to `repetition_penalty` before forwarding (a bad value is
+dropped with a WARNING, never forwarded) and drops `repeat_last_n`, which has
+no vLLM equivalent. Before v3.1.9.2, a Custom Parameter named
+`repeat_penalty` reached vLLM unrecognised and did nothing — no error, no
+log line, `repetition_penalty` just stayed at its default of 1.0.
+
+Recommended starting values for this model (Cydonia-24B):
+`repetition_penalty` 1.05 (Custom Parameter), Frequency Penalty 0.3 and Max
+Tokens 12000 (both Advanced Params) — **not** the 4 chars/token rule of thumb
+Max Tokens 7000 used to be picked by. **Correction (P11-5, hostile pass #11):**
+this used to say "2.0-2.4 chars/token" from 2026-08-28 production data, which
+was measured on unusually box-drawing-heavy replies; her current branch (476
+replies, 2026-09-17, Tekken) measures **3.77 chars/token** instead (full
+detail and the vocabulary caveat: [RUNPOD_DEPLOY.md → Sampling
+parameters](RUNPOD_DEPLOY.md#sampling-parameters)). At that rate 7000 tokens
+is ~26k characters, comfortably above her normal p90 reply length, so it is
+no longer accurate to say it "would cut ordinary long replies mid-sentence"
+— it still cuts her rare very-long replies, which is why 12000 remains the
+recommendation, not a reason to raise it further. vLLM 0.19 also applies
+`repetition_penalty` to PROMPT
+tokens, not only output, so a high value discourages words already sitting
+in her ~20k-token conversation/memory context, not just words the model has
+already said in this reply — raise Frequency Penalty (output-only) before
+raising `repetition_penalty` further if loops return. Full detail:
+[RUNPOD_DEPLOY.md → Sampling parameters](RUNPOD_DEPLOY.md#sampling-parameters).
+
+**Confirming loops are being caught.** A repetition-loop reply logs a
+WARNING at detection time (`grep -a 'like a repetition loop'` matches both
+wordings — the split is FINISHED vs CUT, not streamed vs non-streamed) and,
+once OpenWebUI replays it back as history, an INFO line each time it is
+touched in what is forwarded to vLLM: `conv=<id>: touched <N> degenerate
+assistant turn(s) in the forwarded window (whole=<K> cut=<N-K>)`. **These
+two counts can differ**: a CUT reply whose trimmed head reads clean is
+stored TRIMMED with no loop WARNING at all (memory only judges the kept
+head), but the full original text is still flagged and still touched in
+the forwarded window on every later request — a `touched` count with no
+matching WARNING for that turn is expected, not a sign the detector missed
+it. Neither line names the reply's own text. **`whole` vs `cut`** (v3.1.9.2
+hostile pass #8, P8-8): `whole` is how many of those `touched` turns lost
+the ENTIRE reply to the placeholder; the rest (`cut`) kept a clean
+head/tail around only the flagged span — on the 2026-09-16 backup that was
+10 whole out of 66 touched, so `cut` is usually the larger number, not
+`whole`.
+
+**A non-finite numeral in the request body (v3.1.9.2 hostile pass #8,
+P8-6)** — `"max_tokens": 1e999` or the same in any other numeric field —
+now gets a 400 at parse time instead of a 500 from inside the proxy after
+compaction and memory injection had already run.
 
 ### Disk is filling up
 ```bash
