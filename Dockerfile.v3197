@@ -69,14 +69,29 @@ COPY docs/v3197-constraints.txt /tmp/v3197-constraints.txt
 # the repo as a normal, reviewable, checked-in file.
 COPY docker/v3197-custom.css /tmp/v3197-custom.css
 
-RUN /app/venv/bin/pip install --no-cache-dir \
+# M-5 (review1-v3197-65ea196): `touch`ing this marker BEFORE the pip
+# install, then scoping the strip below to files `-newer` than it, is what
+# keeps `strip --strip-unneeded` off every `.so` this pip install did NOT
+# touch. The old, unscoped `find /app/venv -type f \( -name "*.so" ...`
+# rewrote bytes in pre-existing `.so` files the upgrade never changed the
+# version of — measured: bcrypt/_bcrypt.abi3.so (password auth), orjson,
+# tiktoken, two scipy modules, the triton MLIR plugin, four
+# opencv_python.libs and one av.libs library, all undisclosed, none of
+# their versions actually changed. This thin layer's entire premise is
+# that it leaves the base image's own `/app/venv` bytes alone outside what
+# it deliberately upgrades; a blanket strip broke that premise silently.
+# Any file pip DOES legitimately rewrite while resolving the new
+# constraint set gets a fresh mtime from the install itself and is still
+# stripped, same as before — this only excludes files pip left untouched.
+RUN touch /tmp/.pre-pip-install && \
+    /app/venv/bin/pip install --no-cache-dir \
         --constraint /tmp/v3197-constraints.txt \
         open-webui==0.11.4 && \
-    find /app/venv -type f \( -name "*.so" -o -name "*.so.*" \) \
+    find /app/venv -type f \( -name "*.so" -o -name "*.so.*" \) -newer /tmp/.pre-pip-install \
         -exec strip --strip-unneeded {} + 2>/dev/null || true && \
     find /app/venv -name "*.pyc" -delete && \
     find /app/venv -name "__pycache__" -type d -exec rm -rf {} + && \
-    rm -rf /root/.cache /tmp/*.txt /tmp/v3197-constraints.txt /var/tmp/*
+    rm -rf /root/.cache /tmp/*.txt /tmp/v3197-constraints.txt /tmp/.pre-pip-install /var/tmp/*
 
 # Bake the scroll-jump CSS into BOTH copies OpenWebUI keeps of this file.
 # Both are required: at every process start, open_webui/config.py
