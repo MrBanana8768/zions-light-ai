@@ -9,6 +9,53 @@ on Docker Hub.
 
 ---
 
+## [3.1.9.1] — reuse was declining on every production request
+
+Production, 2026-09-16 11:06Z: 37 of 37 requests on one live conversation
+logged `compaction skipped: 806 turns need 45 summarization calls, over the
+4-call per-request cap` — the exact failure v3.1.9 shipped to remove. The
+line before it, every time:
+
+```
+summary block: dropped 3 tier item(s) to fit the 1846-token block budget ...
+kept 1/4 chapter(s), 1/1 scene(s) and the caller asked for all-or-nothing,
+so NOTHING is returned ...
+the stored summaries cover 792 of the turns this request would compact,
+but they do not fit whole in the 1846 token(s) TARGET (15576) leaves
+beside the system prompt, images and recent turns (12706) and one fresh
+summary (1024); summarizing from scratch ...
+```
+
+**Cause**: `compact_if_needed`'s stand-in for the stored hierarchy was
+budgeted against `TARGET_TOKENS` alone, as if the request would ALSO inject
+a second, separate copy of the summary — but on a reusing turn that second
+copy is always skipped (`sum(in-array)`), freeing its share of the injection
+budget. The stand-in never got to spend that freed share, so with long
+recent turns it was squeezed to a few hundred tokens and `all_or_nothing`
+declined reuse on every single request.
+
+**Fix**: the stand-in may now claim up to what the skipped summary
+injection would have spent (60% of the injection budget, capped at
+`COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS`) when that is larger than the
+TARGET-derived figure — computed by one helper both the array's stand-in and
+the separate injection path call, so they cannot drift apart again. At the
+numbers above, this is the difference between a ~1,846-token squeeze and a
+~6,230-token one; her hierarchy (~5.1k tokens) fits the latter and reuse
+fires.
+
+**What the operator sees now, on the same shape of request**: `compacted:
+summarized N text turn(s), forwarded 0 verbatim, ... M covered by stored
+summaries` instead of `compaction skipped: ... over the 4-call per-request
+cap`. N is the turns the stored summaries do not cover yet (the tail past the
+last L1 chunk, plus any turn the covered-turn record does not pair); it falls
+as L1 rollups catch up. On a copy of the production data: 792 turns replaced,
+27 summarized fresh, 1,172,733 -> ~18.7k tokens before memory injection.
+
+**What this does NOT fix**: a hierarchy that still cannot fit even the
+larger, injected-share budget still declines exactly as before (same log
+line, now naming the real budget source) — no partial/squeezed stand-in was
+added, to avoid removing turns the log could not honestly say were covered.
+
 ## [3.1.9] — operator notes (the last V3 release)
 
 Operator-facing notes only: what to check on the pod, what not to run, and
