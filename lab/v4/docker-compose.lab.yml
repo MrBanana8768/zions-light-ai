@@ -43,7 +43,7 @@ services:
     volumes:
       - ./synapse/data-run:/data
     ports:
-      - "18008:8008"
+      - "127.0.0.1:18008:8008"
     depends_on:
       v4lab-postgres:
         condition: service_healthy
@@ -56,7 +56,7 @@ services:
     volumes:
       - ./element/config.lab.json:/app/config.json:ro
     ports:
-      - "18009:80"
+      - "127.0.0.1:18009:80"
     depends_on:
       - v4lab-synapse
     networks: [v4lab]
@@ -126,7 +126,7 @@ services:
       # v4lab-copy-data.sh, which enforces read-only access to the source.
       - ${LAB_DATA_DIR:-/home/drew/scratch/v4lab/data}/compactor:/data/compactor
     ports:
-      - "18080:8080"
+      - "127.0.0.1:18080:8080"
     depends_on:
       - v4lab-model-shim
     networks: [v4lab]
