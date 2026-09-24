@@ -46,6 +46,8 @@ from typing import Any, Callable, Awaitable
 
 import httpx
 
+from envcfg import env_float
+
 # These are only needed for the storage + facts checks. Importing at
 # module load is fine because selftest.py runs in the same compactor-venv
 # as the compactor process and uses the same /opt/compactor source dir.
@@ -76,8 +78,8 @@ SELFTEST_CONV_ID = "__selftest__"
 # delete-immediately cleanup always won the race and the tail then re-created
 # the file. That left one orphaned conversation per boot, forever: 17 of the
 # 124 buckets in the 2026-08-24 store were __selftest_oneshot_* (v3.1 F23).
-SELFTEST_TAIL_DRAIN_TIMEOUT_S = float(
-    os.environ.get("COMPACTOR_SELFTEST_TAIL_DRAIN_TIMEOUT_S", "120.0")
+SELFTEST_TAIL_DRAIN_TIMEOUT_S = env_float(
+    "COMPACTOR_SELFTEST_TAIL_DRAIN_TIMEOUT_S", 120.0
 )
 SELFTEST_TAIL_DRAIN_POLL_S = 1.0
 
@@ -86,20 +88,14 @@ SELFTEST_TAIL_DRAIN_POLL_S = 1.0
 # process while real traffic is in flight), so the thing actually asserted is
 # that the conversation is gone AND stays gone — which catches a late tail
 # write however the drain went.
-SELFTEST_CLEANUP_SETTLE_S = float(
-    os.environ.get("COMPACTOR_SELFTEST_CLEANUP_SETTLE_S", "2.0")
-)
+SELFTEST_CLEANUP_SETTLE_S = env_float("COMPACTOR_SELFTEST_CLEANUP_SETTLE_S", 2.0)
 
 # How long to wait for vLLM to come up before giving up.
-WAIT_FOR_READY_TIMEOUT_S = float(
-    os.environ.get("COMPACTOR_SELFTEST_WAIT_TIMEOUT_S", "600.0")
-)
+WAIT_FOR_READY_TIMEOUT_S = env_float("COMPACTOR_SELFTEST_WAIT_TIMEOUT_S", 600.0)
 WAIT_FOR_READY_POLL_INTERVAL_S = 5.0
 
 # Round-trip request timeout (real LLM call, can be slow on cold start).
-ROUND_TRIP_TIMEOUT_S = float(
-    os.environ.get("COMPACTOR_SELFTEST_ROUND_TRIP_TIMEOUT_S", "180.0")
-)
+ROUND_TRIP_TIMEOUT_S = env_float("COMPACTOR_SELFTEST_ROUND_TRIP_TIMEOUT_S", 180.0)
 
 # V3.2 — STT (Whisper) service probe. Gated on STT_ENABLED so the check is only
 # added when the speech service is actually part of the deployment: the image
@@ -111,7 +107,7 @@ STT_URL = (
     or f"http://127.0.0.1:{os.environ.get('STT_PORT', '9000')}"
 ).rstrip("/")
 STT_ENABLED = os.environ.get("STT_ENABLED", "false").strip().lower() == "true"
-STT_TIMEOUT_S = float(os.environ.get("COMPACTOR_SELFTEST_STT_TIMEOUT_S", "30.0"))
+STT_TIMEOUT_S = env_float("COMPACTOR_SELFTEST_STT_TIMEOUT_S", 30.0)
 
 # V3.3 — TTS (Piper) service probe. Same gating discipline as STT: only added
 # when the speech-output service is part of the deployment (image sets
@@ -121,7 +117,7 @@ TTS_URL = (
     or f"http://127.0.0.1:{os.environ.get('TTS_PORT', '9001')}"
 ).rstrip("/")
 TTS_ENABLED = os.environ.get("TTS_ENABLED", "false").strip().lower() == "true"
-TTS_TIMEOUT_S = float(os.environ.get("COMPACTOR_SELFTEST_TTS_TIMEOUT_S", "30.0"))
+TTS_TIMEOUT_S = env_float("COMPACTOR_SELFTEST_TTS_TIMEOUT_S", 30.0)
 
 # Spoken by the TTS service to make the STT probe audio. It has to be long
 # enough and speech-like enough to survive Whisper's VAD filter, which is what

@@ -25,10 +25,12 @@ import time
 
 import httpx
 
+from envcfg import env_float
+
 logger = logging.getLogger("compactor.alert")
 
 WEBHOOK = os.environ.get("COMPACTOR_ALERT_WEBHOOK", "").strip()
-TIMEOUT_S = float(os.environ.get("COMPACTOR_ALERT_TIMEOUT_S", "10") or 10)
+TIMEOUT_S = env_float("COMPACTOR_ALERT_TIMEOUT_S", 10)
 _HOST = socket.gethostname()
 
 

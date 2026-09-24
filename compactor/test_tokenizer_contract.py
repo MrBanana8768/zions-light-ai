@@ -129,7 +129,13 @@ def _skip(reason: str) -> None:
     print("  char/4 assertions — the estimator that took production down on")
     print("  2026-08-24 and 2026-08-28. This is not a neutral skip.")
     print("=" * 72)
-    sys.exit(0)
+    # EXIT 3, NOT 0. A suite that reports success without running its checks
+    # is worse than one that fails: "all suites pass" then means nothing, and
+    # that is exactly what it meant here — every green run in this branch
+    # excluded this file. 3 is the runner's SKIP code (scripts/run-tests.py);
+    # set COMPACTOR_ALLOW_FIXTURE_SKIP=1 to opt into exit 0 for a context that
+    # genuinely cannot start docker.
+    sys.exit(0 if os.environ.get("COMPACTOR_ALLOW_FIXTURE_SKIP") else 3)
 
 
 try:

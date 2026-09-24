@@ -103,7 +103,14 @@ _tail_labels: list = []
 
 
 def _spy_fire_and_forget(coro, label=None):
-    _tail_labels.append(label)
+    # TAILS ONLY (v3.1.8). A skipped reply still fires the hierarchy
+    # rollup, under its own `rollup conv=` label, because the rollup
+    # summarizes turns already in the history rather than this reply - see
+    # main._rollup_hierarchy. Counting both would make every assertion here
+    # read 1 where it means 'the reply was memorized'. This file is about
+    # the tail; test_rollup_on_skip.py is about the rollup.
+    if (label or "").startswith("tail"):
+        _tail_labels.append(label)
     try:
         coro.close()
     except Exception:
@@ -282,14 +289,18 @@ print()
 print("[2] a past degenerate reply in history is kept out of rollup input")
 
 
+LAST_RAW: list = []
+
+
 def _run_tail_capture_rollup_input(conv_id, original_messages, assistant_text):
     """Run the real _async_tail with facts extraction and dedup stubbed (no
     vLLM calls), summarizer forced on, and maybe_rollup replaced by a spy
     that records exactly the `messages` argument it was handed."""
     captured = {}
 
-    async def spy_maybe_rollup(cid, messages, vllm_url, model):
+    async def spy_maybe_rollup(cid, messages, vllm_url, model, *, raw_messages=None):
         captured["messages"] = messages
+        LAST_RAW[:] = list(raw_messages or [])
         return {"l1": [], "l2": [], "l3": None, "last_summarized_turn": 0}
 
     async def spy_extract(*_a, **_k):
@@ -324,6 +335,13 @@ assert_true(
     "outright (that would just be a different unrecorded loss)",
 )
 assert_eq(len(texts), 4, "and no turn was dropped from the array outright")
+assert_true(
+    [main._message_text(m) for m in LAST_RAW]
+    == [main._message_text(m) for m in original_messages],
+    "while raw_messages — the covered-turn record's source — is the request "
+    "exactly as sent, degenerate reply included and no reply appended "
+    "(test_compaction_reuse [18] is why)",
+)
 
 print()
 print("[3] an ordinary past reply is passed through to rollup unchanged")

@@ -6,6 +6,7 @@ against a live deploy. Localhost-only — all three endpoints are
 admin.
 """
 
+import time
 import uuid
 
 import _harness as H
@@ -99,7 +100,20 @@ def test_import_refuses_overwrite_by_default(conv_id):
         "summary_state": {},
         "episodic": [],
     }
-    status, body = H.admin_import(fake_bundle, target_conv_id=conv_id, overwrite=False)
+    # THE FLAKE, and why this retries instead of sleeping. wait_for_indexed_
+    # exchanges returns when job 1 (the episodic index) lands, but fact
+    # extraction and the rollup run after it in the same tail, and the import
+    # correctly refuses underneath a memory write in flight. That refusal is
+    # also a 400, but for a different reason, so this failed intermittently
+    # with "has a memory write in flight". Retry ONLY on that refusal,
+    # bounded; any other answer is the result.
+    deadline = time.monotonic() + 90
+    while True:
+        status, body = H.admin_import(fake_bundle, target_conv_id=conv_id, overwrite=False)
+        in_flight = "write in flight" in (body.get("detail") or "")
+        if not (status == 400 and in_flight) or time.monotonic() > deadline:
+            break
+        time.sleep(3)
     assert status == 400, (
         f"expected 400 refusal, got {status}: {body!r}"
     )

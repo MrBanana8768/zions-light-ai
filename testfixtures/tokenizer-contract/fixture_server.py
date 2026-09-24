@@ -185,6 +185,9 @@ _MODE: dict[str, Any] = {
     # this many characters, for soak testing. See _adversarial_reply.
     "reply_chars": 0,
     "reply_seq": 0,
+    # v3.1.9: False asks _body_words for non-cycling padding, so a long
+    # decorated reply is not ALSO a tail loop. See _body_words.
+    "reply_looping": True,
     "factor": 0.5,
     "status": 400,
     "delay": 15.0,
@@ -478,7 +481,7 @@ _LOREM = (
 ).split()
 
 
-def _adversarial_reply(n: int, target_chars: int) -> str:
+def _adversarial_reply(n: int, target_chars: int, looping: bool = True) -> str:
     """A reply shaped like the ones that took production down.
 
     Deterministic in `n` so a soak run is reproducible and a failure at turn 47
@@ -501,22 +504,141 @@ def _adversarial_reply(n: int, target_chars: int) -> str:
         "]",
         "```",
     ]
-    body = []
+    budget = target_chars - sum(len(x) + 1 for x in parts)
+    return "\n".join(parts) + "\n\n" + " ".join(_body_words(n, budget, looping))
+
+
+def _body_words(n: int, budget: int, looping: bool) -> list[str]:
+    """Padding words, cycling or not, and the difference is the whole point.
+
+    looping=True walks _LOREM with `(n*7 + i) % len(_LOREM)`, so the same
+    ~212-character phrase repeats every 34 words. That is deliberate and the
+    SOAK SUITE DEPENDS ON IT: the reply reads as a repetition loop, the memory
+    tail refuses it, and 22 consecutive refusals is what exercises
+    rollup-on-skip. Do not "fix" it.
+
+    looping=False exists because v3.1.8 added a FOURTH degeneracy rule — a
+    phrase repeating to the end of the reply for DEGENERATE_TAIL_LOOP_CHARS
+    (400) — and the cycling padding trips it at any length worth testing. That
+    left no way to ask this fixture for a long, heavily decorated reply that is
+    legitimate PROSE, which is precisely what the R9/R19/R24/R25 false-positive
+    family needs at integration level. The distinction matters more than an
+    ordinary skipped write: a reply refused there is replaced by a placeholder
+    in every future rollup, backfill and admin compact, permanently.
+
+    The non-looping walk is an LCG, so it stays deterministic in `n` (a soak
+    failure at turn 47 re-runs as turn 47) while emitting no phrase that
+    repeats to the end.
+    """
+    out: list[str] = []
+    used = 0
     i = 0
-    while sum(len(x) + 1 for x in parts) + sum(len(x) + 1 for x in body) < target_chars:
-        body.append(_LOREM[(n * 7 + i) % len(_LOREM)])
+    seed = (n * 7 + 1) & 0x7FFFFFFF
+    while used < budget:
+        if looping:
+            w = _LOREM[(n * 7 + i) % len(_LOREM)]
+        else:
+            seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+            w = _LOREM[seed % len(_LOREM)]
+        out.append(w)
+        used += len(w) + 1
         i += 1
         if i > 20000:  # never spin forever on a pathological target
             break
-    return "\n".join(parts) + "\n\n" + " ".join(body)
+    return out
+
+
+# --- Optional REAL model (v3.1.8) ------------------------------------------
+#
+# Set FIXTURE_MODEL_GGUF to a GGUF path and this fixture stops pretending: it
+# loads the weights with llama-cpp-python and answers from an actual model, on
+# CPU, with no GPU anywhere.
+#
+# WHY IT IS WORTH THE TROUBLE. Two integration tests seed distinctive content
+# and assert it comes back as an EXTRACTED FACT. A canned string cannot
+# satisfy them, and neither can the adversarial generator, because fact
+# extraction is itself an LLM call whose answer has to be about the input.
+# Those two were the last red in the local integration run, and everything
+# downstream of real extraction — dedup's merges, archive's evictions, what a
+# summary actually says — has never been exercised locally at all.
+#
+# WHAT IT IS NOT. A 0.5B model is not Cydonia. Its replies are worse, its
+# token counts are its own, and nothing here licenses a claim about production
+# quality or production budgets. It is enough to make extraction return
+# something ABOUT the conversation, which is all these tests need and all this
+# is for.
+#
+# Keep FIXTURE_TOKENIZER pointed at the SAME model as the GGUF. The whole
+# point of this fixture is that /tokenize and the completion agree; loading
+# one model's weights behind another model's tokenizer would reintroduce the
+# 2026-08-28 divergence deliberately.
+MODEL_GGUF = os.environ.get("FIXTURE_MODEL_GGUF", "").strip()
+MODEL_MAX_TOKENS = int(os.environ.get("FIXTURE_MODEL_MAX_TOKENS", "256"))
+_llm = None
+
+
+def _real_model_reply(body: dict) -> str | None:
+    """Generate from the GGUF, or None if no real model is configured."""
+    global _llm
+    if not MODEL_GGUF:
+        return None
+    if _llm is None:
+        from llama_cpp import Llama  # imported lazily: absent in the CPU-only image
+        _llm = Llama(
+            model_path=MODEL_GGUF,
+            n_ctx=int(os.environ.get("FIXTURE_MODEL_CTX", "4096")),
+            n_threads=int(os.environ.get("FIXTURE_MODEL_THREADS", "4")),
+            verbose=False,
+        )
+    messages = [
+        {"role": m.get("role", "user"), "content": _text_of(m)}
+        for m in (body.get("messages") or [])
+        if isinstance(m, dict)
+    ]
+    requested = body.get("max_completion_tokens") or body.get("max_tokens")
+    out = _llm.create_chat_completion(
+        messages=messages,
+        max_tokens=min(int(requested or MODEL_MAX_TOKENS), MODEL_MAX_TOKENS),
+        temperature=float(os.environ.get("FIXTURE_MODEL_TEMPERATURE", "0.3")),
+    )
+    try:
+        return out["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def _text_of(m: dict) -> str:
+    """Content as a string, whether it arrived as one or as a part list."""
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(
+            p.get("text", "") for p in c
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return ""
 
 
 def _reply_for(body: dict) -> str:
-    """The assistant text this fixture will return."""
+    """The assistant text this fixture will return.
+
+    Order matters. An explicitly requested adversarial reply wins over the
+    real model: a test that asked for 20,000 characters of decorative rules is
+    testing the compactor's handling of them and must get them whether or not
+    weights happen to be loaded.
+    """
     chars = int(_MODE.get("reply_chars") or 0)
-    if chars <= 0:
-        return _CANNED
-    return _adversarial_reply(int(_MODE.get("reply_seq") or 0), chars)
+    if chars > 0:
+        return _adversarial_reply(
+            int(_MODE.get("reply_seq") or 0),
+            chars,
+            bool(_MODE.get("reply_looping", True)),
+        )
+    real = _real_model_reply(body)
+    if real is not None:
+        return real
+    return _CANNED
 
 
 @app.post("/v1/chat/completions")
@@ -545,8 +667,30 @@ async def chat_completions(request: Request):
     created = int(time.time())
     model = body.get("model") or SERVED_MODEL_NAME
 
+    # Once, before the branch: both paths send this text and both report
+    # token counts for it. The counts used to be computed from _CANNED
+    # regardless of what was actually returned, so any non-canned reply
+    # was described by usage numbers belonging to a different string.
+    _reply_text = _reply_for(body)
+    _reply_tokens = len(_tok.encode(_reply_text))
+
     if body.get("stream"):
 
+        # ensure_ascii=False on every event below, and it is not cosmetic.
+        #
+        # json.dumps defaults to ensure_ascii=True, which escapes every
+        # non-ASCII character into an ASCII escape sequence. That put ZERO
+        # bytes above 127 on the wire - measured: 2,704 bytes over 13
+        # chunks, not one of them multibyte - so characters only became
+        # characters inside SseAccumulator's json.loads, long after any
+        # read boundary.
+        #
+        # R7/R14 is a defect about a UTF-8 character SPLIT ACROSS TWO
+        # READS. With escaped ASCII on the wire there is nothing to split,
+        # so an end-to-end test of it could not fail however broken the
+        # accumulator was: the check that cannot fail, living inside the
+        # fixture built to catch exactly this class of bug. Real vLLM
+        # emits UTF-8, so this is also simply more faithful.
         async def _sse():
             first = {
                 "id": cid,
@@ -557,8 +701,19 @@ async def chat_completions(request: Request):
                     {"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}
                 ],
             }
-            yield f"data: {json.dumps(first)}\n\n"
-            for word in _CANNED.split(" "):
+            yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n"
+            # v3.1.8: _reply_for, not _CANNED.
+            #
+            # This path used the canned string directly while its
+            # non-streaming twin (below) went through _reply_for. So the
+            # adversarial reply generator — written to reproduce
+            # "decorative rules ... markdown scaffolding that fact
+            # extraction stored as memory", i.e. exactly the box-character
+            # class of failure — has never run on the STREAMING path, and
+            # streaming is what production uses. A fixture feature that
+            # cannot reach the path under test is a fixture feature that
+            # is not there.
+            for word in _reply_text.split(" "):
                 chunk = {
                     "id": cid,
                     "object": "chat.completion.chunk",
@@ -568,7 +723,7 @@ async def chat_completions(request: Request):
                         {"index": 0, "delta": {"content": word + " "}, "finish_reason": None}
                     ],
                 }
-                yield f"data: {json.dumps(chunk)}\n\n"
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             last = {
                 "id": cid,
                 "object": "chat.completion.chunk",
@@ -577,16 +732,16 @@ async def chat_completions(request: Request):
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 "usage": {
                     "prompt_tokens": token_num,
-                    "completion_tokens": len(_tok.encode(_CANNED)),
-                    "total_tokens": token_num + len(_tok.encode(_CANNED)),
+                    "completion_tokens": _reply_tokens,
+                    "total_tokens": token_num + _reply_tokens,
                 },
             }
-            yield f"data: {json.dumps(last)}\n\n"
+            yield f"data: {json.dumps(last, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(_sse(), media_type="text/event-stream")
 
-    completion_tokens = len(_tok.encode(_CANNED))
+    completion_tokens = _reply_tokens
     return {
         "id": cid,
         "object": "chat.completion",
@@ -595,7 +750,7 @@ async def chat_completions(request: Request):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": _reply_for(body)},
+                "message": {"role": "assistant", "content": _reply_text},
                 "finish_reason": "stop",
             }
         ],
@@ -643,7 +798,7 @@ async def get_mode():
 async def set_mode(request: Request):
     body = await request.json()
     for k in ("tokenize_mode", "factor", "status", "delay", "assistant_final_400",
-              "reply_chars", "reply_seq"):
+              "reply_chars", "reply_seq", "reply_looping"):
         if k in body:
             _MODE[k] = body[k]
     return dict(_MODE)

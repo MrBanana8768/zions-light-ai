@@ -109,10 +109,135 @@ Go to [Runpod Templates](https://www.runpod.io/console/user/templates) → New T
 - **Environment Variables:** paste the block from
   [runpod.env.template](runpod.env.template) — it carries all 42 vars with
   the ones that matter marked. As of rc8 the image's built-in default IS the
-  production A40 config (Cydonia-24B + runtime fp8), so the only var that
-  strictly MUST be set is `WEBUI_SECRET_KEY`; the template pins the model
+  production A40 config (Cydonia-24B + runtime fp8), so the vars that
+  strictly MUST be set are `WEBUI_SECRET_KEY` and **`WEBUI_DB_LOCAL=false`**
+  (see the next section — runpod.env.template does not carry that row, so add
+  it by hand); the template pins the model
   vars explicitly anyway so a future default change can never surprise a
   deploy (see GPU sizing for alternatives).
+
+### WEBUI_DB_LOCAL — a hard deploy precondition
+
+**Production runs with `WEBUI_DB_LOCAL=false`, and every deploy must keep it
+that way.** It decides where her chat history physically lives. `false` keeps
+`webui.db` on the `/data` volume, where it has always been. `true` moves the
+live database to the pod's local disk at boot and starts a sync daemon that
+copies it back to `/data` every few minutes. That move is the one change in the
+v3.1.x line whose rollback is not clean, and it has not been scheduled.
+
+**The trap on every release: a MISSING or EMPTY value means `true`.** A RunPod
+template with no `WEBUI_DB_LOCAL` row, or a row that is present but blank
+(nothing after the `=`), boots with the database moved.
+
+**How other spellings are read changed in v3.1.9:**
+
+| template value | v3.1.6.1 – v3.1.8 (the pod today) | from v3.1.9 |
+|---|---|---|
+| missing, or empty | `true` — database moved | `true` — database moved |
+| `false` | `false` | `false` |
+| `False`, `0`, `no`, `off` (any case, spaces around) | `false` (anything that is not exactly `true`) | `false` |
+| `True`, `TRUE`, `1`, `yes`, `on` | **`false`** (only the exact word `true` counted) | **`true` — database moved** |
+| anything else (a typo such as `flase`) | `false` | **the pod refuses to boot** |
+
+A refused boot prints a banner in the RunPod **Logs** tab starting
+`WEBUI_DB_LOCAL=[<your value>] is not true/1/yes/on or false/0/no/off -
+REFUSING TO START.` and the container exits before anything starts, so nothing
+is touched. Fix the row and redeploy. The one spelling that means the same on
+both sides of an upgrade or a rollback is the exact lowercase word `false`.
+
+**Before every deploy**, in the RunPod template's environment variables, check
+there is a row reading exactly:
+
+```
+WEBUI_DB_LOCAL=false
+```
+
+lowercase, no spaces, no quotes, not blank. The deploy tag's own VERIFY step
+may not repeat this; it applies to every release anyway.
+
+**After every boot**, first in the RunPod **Logs** tab (the container's boot
+output). From v3.1.9 it names the value it resolved and why:
+
+```
+      WEBUI_DB_LOCAL=false (explicitly set (false))
+[2b/3] WEBUI_DB_LOCAL=false - webui.db stays on /data/openwebui/webui.db
+```
+
+On v3.1.6.1 only the `[2b/3]` line is printed. If v3.1.9 prints
+`WEBUI_DB_LOCAL=true (unset/empty -> true …)`, the row is missing or blank.
+Then, in the Web Terminal (works on every release):
+
+```bash
+tr '\0' '\n' < /proc/1/environ | grep -E '^(WEBUI_DB_LOCAL|WEBUIDB_SYNC_ENABLED|DATABASE_URL)='; supervisorctl status webuidb-sync
+```
+
+**Success** — all four of these:
+
+```
+WEBUI_DB_LOCAL=false
+WEBUIDB_SYNC_ENABLED=false
+DATABASE_URL=sqlite:////data/openwebui/webui.db
+webuidb-sync                     STOPPED   Not started
+```
+
+(the first three may print in a different order).
+
+**If you see `WEBUI_DB_LOCAL=true`, a `/var/lib/openwebui/webui.db` in
+`DATABASE_URL`, or `webuidb-sync RUNNING`:** the database was moved to local
+disk on this boot.
+
+- **If she has not sent a message since the pod booted:** nothing was written
+  to the moved copy. Fix the template row to `WEBUI_DB_LOCAL=false` and
+  redeploy. Run the check again after the boot.
+- **If she has:** her newest messages are on local disk and reach `/data` only
+  when the sync daemon publishes. Ask her to stop chatting, do NOT redeploy
+  yet, and run
+  `/opt/compactor-venv/bin/python /opt/compactor/webuidb.py --status`; ask for
+  help with its output before changing anything. A redeploy at this point can
+  lose everything written since the last sync.
+
+### Memory budgets — raised defaults in v3.1.9
+
+Five environment variables control how much of her own facts/retrieval/
+summary memory is stored and injected per turn. The owner raised all five
+by hand on the running pod (2026-09-15, a `supervisorctl` `environment=`
+edit on the `compactor` program — lost on every container restart, so it
+had to be reapplied after any redeploy). **v3.1.9 bakes the same five
+values into the image and this template, so that live edit is no longer
+needed:**
+
+| Variable | Code default | v3.1.9 shipped default |
+|---|---|---|
+| `COMPACTOR_MAX_FACTS_TOKENS` | 1500 | 3500 |
+| `COMPACTOR_INJECT_FACTS_TOKENS` | 400 | 600 |
+| `COMPACTOR_MAX_RETRIEVAL_TOKENS` | 1500 | 3500 |
+| `COMPACTOR_INJECTION_BUDGET_FRACTION` | 0.5 | 0.6 |
+| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | 12000 | 6230 |
+
+**Why the fraction and summary-block rows moved together with the two
+raised caps, not independently:** `inject_budget = effective_limit ×
+COMPACTOR_INJECTION_BUDGET_FRACTION` is shared by persona + summary + facts
++ retrieval. Retrieval is the lowest-priority block and is dropped WHOLE
+(not trimmed) by `_bound_injected_blocks` when it does not fit. At the
+raised facts/retrieval caps (3500/3500) under the OLD fraction (0.5, about
+10,384 tokens of her 20,768-token window), retrieval would have been
+silently dropped from every request. At 0.6 (about 12,460 tokens) retrieval
+has room, with the summary block pinned at what it measured itself needing
+(6,230 — lower than its own 12,000 code default, not a further raise). **Do
+not change one of these five without the others.**
+
+Evidence behind these numbers (2026-09-15 pod measurement, before the
+raise): roughly 16 new facts extracted per exchange with roughly 16 evicted
+(the 1500-token store churning), only 6-12 of about 160 stored facts
+actually reaching injection, retrieval keeping only 1 of 5 candidate hits,
+and the summary block dropping 1 of 2 chapters — against a 20,768-token
+input budget that typically used only 15.1-18.7k of it.
+
+**This changes only the environment defaults baked into the image and this
+template — it does NOT change the Python code defaults** in `facts.py`,
+`retrieval.py`, `main.py` or `summarizer.py`. If you have already overridden
+any of these five in your own template, your value is unaffected — these
+rows only change what an UNSET row now resolves to.
 
 ### Step 5: Deploy the Pod
 
@@ -178,6 +303,93 @@ As of **rc8** the image's built-in defaults are the production A40 config
 On images older than rc8 the built-in default was the 22B (unbootable on an
 A40): always override per [runpod.env.template](runpod.env.template).
 
+### The current date and time
+
+From v3.1.9 the model is told the real date and time on every message, in
+**her browser's time zone**.
+
+**1. Prerequisite: her chat must already log `source=header`.** Adding a line
+to the system prompt changes the system prompt. A conversation whose id is
+still derived by hash (`source=hash`) gets a NEW id when the system prompt
+changes, and its memory is left behind under the old one. Check first:
+`grep -aE "conv_id=[^ ]+ source=[^ ]+ msgs=" /data/logs/compactor.log | grep -v __selftest | tail -3`.
+(The boot selftest always logs `source=header`; ignore it, which is what the
+`grep -v` does.) If her chat says `source=hash`, either do
+[RUNBOOK_MEMORY_IDENTITY.md](RUNBOOK_MEMORY_IDENTITY.md) first, or skip step 2
+entirely and use step 3 on its own: the model is still told the right time, in
+the zone you set, without touching the system prompt.
+
+**2. Add one line to her model's system prompt.** OpenWebUI → Admin Panel →
+Settings → Models → her model → System Prompt. Add this line on its own, at
+the start of a line, exactly as written:
+
+```
+User timezone: {{CURRENT_TIMEZONE}}
+```
+
+OpenWebUI replaces `{{CURRENT_TIMEZONE}}` with the time zone her browser
+reports (for example `America/Phoenix`) on every message. It stays the same
+unless her device's time zone changes, so it does not slow the model down.
+Do **not** add `{{CURRENT_DATETIME}}` there: it changes every minute and would
+make the model reprocess her whole conversation on every message. A model's
+system prompt is shared by every user of that model; that is fine here,
+because there is one user.
+
+**3. Optional fallback.** For requests that do not come from her browser (a
+direct API call, a client that does not fill in `{{CURRENT_TIMEZONE}}`), set
+`COMPACTOR_TIMEZONE=America/Phoenix` in the RunPod template. The order is: her
+browser's zone, then `COMPACTOR_TIMEZONE`, then UTC. `TZ` is not used for this.
+
+**What the model sees.** One line at the start of her newest message, in the
+request sent to the model only:
+
+```
+[Current date and time: Monday, September 14, 2026, 9:41 AM MST (UTC-07:00)]
+```
+
+She never sees it, OpenWebUI never stores it, and it never enters memory
+(facts, summaries or the episodic index). `/remember`-style commands are
+unaffected. The `User timezone:` line itself stays in the system prompt the
+model reads.
+
+**Title, tag, follow-up and query-generation calls ("task traffic").** Under
+header identity (`{{CHAT_ID}}{{TASK}}`, see RUNBOOK_MEMORY_IDENTITY.md),
+these are never given the current-time line, from their first call — the
+compactor recognizes them by the `{{TASK}}` suffix. Under today's **hash**
+identity (no identity header configured), there is no such marker, so the
+same calls are recognized only once a conversation has genuinely reached
+`COMPACTOR_TASK_TRAFFIC_MIN_POSITION` (default 4) turns of real history —
+the first one or two task calls on a brand-new template may be dated
+(harmless: OpenWebUI discards what it does not use the line for). Either
+way, a real first message from her that happens to hash-collide with an
+older, already-deep conversation's opener is still dated correctly, but is
+**not memorized** under hash identity — a known limitation of deriving the
+conversation id from a content hash, not of the time feature. Configuring
+the `{{CHAT_ID}}` header removes both limitations.
+
+**Check it took.** After her next message, `curl -s localhost:8080/health/full`
+→ `config.time_injection`: `current_line` is the line the model is being
+shown. **What `last_source` should read depends on which route you are on —
+check the one that matches your setup, not always `browser`:**
+- On `source=header` with the system-prompt line added (step 2): `last_source`
+  must be `browser`, `last_timezone` her zone. `utc` with a
+  `last_browser_error` means the system-prompt line was not filled in or
+  names no real zone (the compactor log says so once).
+- On `source=hash` with `COMPACTOR_TIMEZONE` set (step 3, today's setup):
+  `last_source` is `env`, **not** `browser` — that is correct for this route,
+  not a fault. Confirm the zone itself in `last_timezone`.
+`fallback_error` (either route) names a misspelled `COMPACTOR_TIMEZONE`; the
+pod still boots, on UTC, with one `TIME ZONE NOT APPLIED` ERROR in
+`compactor.log` — and, as of this writing, `/health/full` `status` stays
+`ok` with no `status_reasons` entry for it, so check `fallback_error`
+explicitly rather than trusting `status` alone. A pre-merge zone spelling
+(`US/Arizona`, `Asia/Calcutta`, ...) resolves correctly from v3.1.9
+(`tzdata-legacy` is now in the image); prefer the zone's current canonical
+name regardless.
+
+**Turn it off.** `COMPACTOR_TIME_INJECTION=false` (also `0`, `no`, `off`) and
+redeploy.
+
 ### Vision (V3.1) — enabling image understanding
 
 Set `MODEL_REPO` to a vision-language model (see presets in `.env.example`)
@@ -238,9 +450,12 @@ compactor isn't involved (text → audio only).
   [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices)); set
   `TTS_VOICE_DIR=/data/tts-voices` so a non-default voice persists across pod
   recreation.
-- **Output format:** the service produces **WAV** natively (what OpenWebUI
-  plays). mp3/opus/aac/flac work only if `ffmpeg` is present (not bundled, to
-  keep the image lean); without it, those requests gracefully return WAV.
+- **Output format:** the service produces **WAV** natively, and OpenWebUI
+  converts it to MP3 before playing it. That conversion needs the `ffmpeg`
+  and `ffprobe` binaries. **Before v3.1.9 the image did not include them, so
+  the read-aloud button never worked**: OpenWebUI answered HTTP 200 with an
+  error body instead of audio. From v3.1.9 `ffmpeg` is installed, and the same
+  binaries let OpenWebUI transcribe recordings over 20 MB.
 - **Turn it off** per-pod with `TTS_ENABLED=false` (and/or `AUDIO_TTS_ENGINE=""`
   to hide the read-aloud control while leaving the service running).
 - Port `9001` does **not** need external exposure for the UI to work (OpenWebUI
@@ -248,6 +463,39 @@ compactor isn't involved (text → audio only).
 
 The boot self-test confirms the service actually synthesizes audio, not just
 that the port is open.
+
+### Audio and video FILES attached to a chat
+
+Attaching an audio file (WAV, MP3, M4A, OGG, WEBM) to a chat works like the
+microphone: OpenWebUI transcribes it and the model receives the transcript.
+**Video is different.** Out of the box OpenWebUI transcribes only `.webm`
+video. An `.mp4` or an iPhone `.mov` is stored with no text at all, so the
+model receives nothing from it, and nothing tells the user.
+
+To have the soundtrack of `.mp4` and `.mov` files transcribed (v3.1.9 or
+later, which has `ffmpeg`), change the setting **in OpenWebUI's Admin Panel,
+under the Audio settings, in the speech-to-text supported content types
+field**, to exactly:
+
+```text
+audio/*,video/webm,video/mp4,video/quicktime
+```
+
+Two traps, both verified on a test copy of this stack:
+- **Setting `AUDIO_STT_SUPPORTED_CONTENT_TYPES` as a RunPod template variable
+  does nothing on an existing pod.** OpenWebUI reads that variable only on its
+  very first boot and keeps the value in its database after that, so the
+  Admin Panel is the only place the change takes effect. It applies
+  immediately, with no restart.
+- **Keep `audio/*` in the list.** An empty field silently means
+  `audio/*,video/webm`. Typing only the video types removes that default, and
+  every ordinary voice recording then fails with "It seems like the file
+  format is not supported".
+
+Only the soundtrack is transcribed; the pictures are not described (that is a
+V4 roadmap item, see [V4_ROADMAP.md](V4_ROADMAP.md) §1.3). A long video takes
+a while: a 26 MB MP4 took about 48 s just to extract its audio, before
+transcription.
 
 ## Access Your Deployment
 
@@ -290,11 +538,16 @@ Override these in your Runpod template if needed:
 | Variable | Default | Description |
 |---|---|---|
 | `COMPACTOR_FACTS_EXTRACTION` | `true` | Extract durable facts after each turn. Set `false` to disable. |
-| `COMPACTOR_MAX_FACTS_TOKENS` | `1500` | Token budget for the facts block (LRU-evicted past this) |
+| `COMPACTOR_MAX_FACTS_TOKENS` | code default `1500`, **image/template default `3500`** (v3.1.9) | Token budget for the facts STORE (LRU-evicted past this). See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
+| `COMPACTOR_INJECT_FACTS_TOKENS` | code default `400`, **image/template default `600`** (v3.1.9) | Token budget for facts injected into ONE turn's prompt, ranked by relevance. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
 | `COMPACTOR_RAG_ENABLED` | `true` | Episodic RAG over past turns (ChromaDB). Set `false` to disable. |
 | `COMPACTOR_RAG_TOP_K` | `5` | How many past exchanges to retrieve per turn |
+| `COMPACTOR_MAX_RETRIEVAL_TOKENS` | code default `1500`, **image/template default `3500`** (v3.1.9) | Token budget for the whole retrieved-exchange block. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
 | `COMPACTOR_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (prebaked ONNX in the image) |
 | `COMPACTOR_HIERARCHICAL_SUMMARY` | `true` | L1→L2→L3 rolling summaries. Set `false` to disable. |
+| `COMPACTOR_INJECTION_BUDGET_FRACTION` | code default `0.5`, **image/template default `0.6`** (v3.1.9) | Fraction of the effective input limit shared by persona + summary + facts + retrieval. Must move together with the facts/retrieval caps above — see [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
+| `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` | code default `12000`, **image/template default `6230`** (v3.1.9) | Cap on the rendered summary block. See [Memory budgets](#memory-budgets--raised-defaults-in-v319). |
+| `COMPACTOR_TAIL_ROLLUP_MAX_CALLS` | `4` | Per-turn budget for the background tail (and the one-shot backfill rollup) catching up a summary hierarchy that has fallen far behind (a vLLM outage, days of rollup failures). Bounds where a rollup unit is allowed to **start**, not a hard per-turn ceiling: a unit that starts always finishes, so one turn can spend up to `(budget − 1)` plus that unit's own real cost — normally a few calls, but measured at 6-16 calls for one unit when `/tokenize` is down. Converges over successive turns either way; see CHANGELOG.md "Summary hierarchy catch-up" (v3.1.9). |
 | `COMPACTOR_DEDUP_SIMILARITY` | `0.75` | Cosine threshold for fact-dedup candidate clustering |
 | `COMPACTOR_DEDUP_MAX_LLM_CALLS` | `10` | Cap on LLM merge calls per dedup pass |
 | `COMPACTOR_ARCHIVE_DEFAULT_DAYS` | `90` | Default staleness cutoff for fact archival |
@@ -306,12 +559,14 @@ Override these in your Runpod template if needed:
 
 | Variable | Default | Description |
 |---|---|---|
-| `COMPACTOR_SELFTEST_ON_BOOT` | `true` | Run the live-stack self-test after boot, logging to `/var/log/supervisor/selftest.log` |
+| `COMPACTOR_SELFTEST_ON_BOOT` | `true` | Run the live-stack self-test after boot, logging to `/data/logs/selftest.log` |
 | `COMPACTOR_ADMIN_BIND` | `127.0.0.1` | Admin-endpoint bind address. **Keep localhost** unless you have auth/firewall in front — admin endpoints are unauthenticated. |
 | `COMPACTOR_BACKUP_ENABLED` | `true` | Run the periodic verified-backup daemon (V2.3) |
 | `COMPACTOR_MIN_FREE_MB_WRITES` | `200` | Pause new-memory writes (keep serving) below this free space on `/data` (V2.3) |
 | `COMPACTOR_LOG_FORMAT` | `text` | `text` (human) or `json` (one object/line for aggregation) |
 | `COMPACTOR_ALERT_WEBHOOK` | *(unset)* | If set, self-test + backup POST a failure alert here (Slack/Discord/generic) |
+| `WEBUI_DB_LOCAL` | `true` (also when set but EMPTY) | **Production: exactly `false`, and it is a hard precondition** — see [WEBUI_DB_LOCAL](#webui_db_local--a-hard-deploy-precondition). `false` keeps `webui.db` on `/data`; `true` moves it to local disk with a sync daemon. From v3.1.9 an unrecognised value refuses to boot, and `1`/`yes`/`True` mean true. |
+| `LOG_DIR` | `/data/logs` | Where every service log is written (on the volume, so logs survive a redeploy) |
 
 ## API Usage
 
@@ -330,38 +585,190 @@ curl https://{POD_ID}-8080.proxy.runpod.net/v1/models
 
 Long conversations are automatically compacted and memory is maintained
 per-conversation — no client changes needed. To get stable per-conversation
-memory through OpenWebUI, the bundled `pipelines/conversation_id_header.py`
-filter propagates the chat ID; direct API callers can set an
-`X-Conversation-Id` header (otherwise the compactor falls back to a content
-hash). See [USER_GUIDE.md](USER_GUIDE.md).
+memory through OpenWebUI, add a connection header in OpenWebUI (Admin Panel →
+Settings → Connections → the `http://localhost:8080/v1` connection → Headers):
+`{"X-Conversation-Id": "{{CHAT_ID}}{{TASK}}"}`. Follow
+[RUNBOOK_MEMORY_IDENTITY.md](RUNBOOK_MEMORY_IDENTITY.md) to do it on a pod that
+already has conversations: the order matters. The bundled
+`pipelines/conversation_id_header.py` filter does **not** deliver the chat ID
+on OpenWebUI 0.11.0 (OpenWebUI discards the metadata it writes); it is only a
+history cap now. Direct API callers set `X-Conversation-Id` themselves
+(otherwise the compactor falls back to a content hash). See
+[USER_GUIDE.md](USER_GUIDE.md).
+
+## Upgrading an existing pod from v3.1.8 to v3.1.9
+
+This is the exact sequence for the production pod: today it runs v3.1.8
+with `WEBUI_DB_LOCAL=false`, and every chat currently logs `source=hash`
+(no `X-Conversation-Id` header configured — see
+[RUNBOOK_MEMORY_IDENTITY.md](RUNBOOK_MEMORY_IDENTITY.md) if that changes
+before you upgrade). **v3.1.9 does NOT move the database to local disk —
+that is v3.1.9.1, a separate later release. Keep `WEBUI_DB_LOCAL=false`
+through this whole procedure**, on both images.
+
+### 1. Pre-checks (on the running v3.1.8 pod)
+
+```bash
+curl -s http://localhost:8080/health/full | python3 -m json.tool
+```
+`status` should read `ok`, or `degraded` only for a reason you already
+recognize (see [OPERATIONS.md → Reading /health/full](OPERATIONS.md#reading-healthfull--do-not-trust-status-alone)).
+Do not upgrade on top of an unexplained `degraded`/`down` — resolve it
+first.
+
+```bash
+tr '\0' '\n' < /proc/1/environ | grep -E '^WEBUI_DB_LOCAL='
+```
+Confirm it reads `WEBUI_DB_LOCAL=false` before you touch anything.
+
+### 2. Stop the writers, then back up and verify (on v3.1.8, before redeploying)
+
+Do this while she is not chatting. Stop OpenWebUI, the compactor and the
+backup daemon first, so the backup is taken with no save in flight and the
+redeploy cannot kill a write to `webui.db` half-way (on the network volume
+that is how a hot rollback journal is made — see RUNBOOK_DB_JOURNAL.md).
+
+```bash
+supervisorctl stop openwebui compactor backup
+```
+```bash
+supervisorctl status
+```
+All three must read `STOPPED`.
+
+```bash
+/opt/compactor-venv/bin/python /opt/compactor/backup.py --once; echo "EXIT=$?"
+```
+Expect `[OK] <archive-name>  ...` and `EXIT=0`.
+
+```bash
+/opt/compactor-venv/bin/python /opt/compactor/backup.py --list
+```
+Confirm the archive you just made is at the top.
+
+```bash
+/opt/compactor-venv/bin/python /opt/compactor/backup.py --verify /data/backups/<archive-you-just-made>.tar.gz
+```
+Expect `[OK] <detail>`. **Do not proceed past a `[FAIL]` on either command** —
+fix the backup first; this is the copy you would roll back to.
+
+If the volume is tight, prune old backups by hand now — see
+[OPERATIONS.md → Nightly "memory shrank" alert](OPERATIONS.md#nightly-memory-shrank-alert--noise-on-v3161-to-v318-a-real-signal-from-v319-except-one-item)
+for the manual-prune command; on v3.1.8 the nightly "memory shrank" alert
+holds the automatic prune, so old archives accumulate.
+
+If a step here fails and you are not redeploying after all, restart the
+services you stopped: `supervisorctl start openwebui` (wait for `200` from
+`curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3000/api/config`),
+then `supervisorctl start compactor backup`.
+
+### 3. Template changes (RunPod template, before redeploying)
+
+- **Container Image:** update to the v3.1.9 tag.
+- **`WEBUI_DB_LOCAL=false`** — confirm the row is present and spelled exactly
+  that way (a missing or blank row means `true` on v3.1.7 and later). See
+  [WEBUI_DB_LOCAL — a hard deploy precondition](#webui_db_local--a-hard-deploy-precondition).
+- **`COMPACTOR_TIMEZONE=<her IANA zone>`** (for example `America/Phoenix`) —
+  new in v3.1.9. While her chat is on `source=hash` (today), this is how the
+  model is told the real date/time; do NOT edit her model's system prompt to
+  add the `User timezone:` line yet — that forks a hash-identity chat's
+  memory. See [The current date and time](#the-current-date-and-time).
+- **The five memory-budget rows** — `COMPACTOR_MAX_FACTS_TOKENS=3500`,
+  `COMPACTOR_INJECT_FACTS_TOKENS=600`, `COMPACTOR_MAX_RETRIEVAL_TOKENS=3500`,
+  `COMPACTOR_INJECTION_BUDGET_FRACTION=0.6`,
+  `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS=6230`. These are now the image's own
+  defaults (see [Memory budgets](#memory-budgets--raised-defaults-in-v319)),
+  so adding the rows is optional and self-documenting, not required — but if
+  your v3.1.8 template already has a hand-added `COMPACTOR_MAX_FACTS_TOKENS`
+  or similar row at a DIFFERENT value (the pre-v3.1.9 live-pod workaround),
+  either remove it or update it to match, or it will silently override the
+  new image default.
+
+### 4. Deploy
+
+Terminate the v3.1.8 pod (or use RunPod's redeploy-on-new-image flow if your
+plan supports it) and start a new pod from the updated template, with the
+SAME `zions-data` Network Volume attached. Nothing on `/data` is touched by
+the image change alone.
+
+### 5. Post-checks (on the new v3.1.9 pod)
+
+```bash
+tr '\0' '\n' < /proc/1/environ | grep -E '^(WEBUI_DB_LOCAL|WEBUIDB_SYNC_ENABLED|DATABASE_URL)='
+supervisorctl status webuidb-sync
+```
+Expect the four-line "Success" block in
+[WEBUI_DB_LOCAL](#webui_db_local--a-hard-deploy-precondition) above —
+`WEBUI_DB_LOCAL=false`, sync disabled/stopped.
+
+```bash
+cat /data/logs/selftest.log
+```
+Expect it to end `=== N/N passed, 0 failed ===`.
+
+```bash
+curl -s http://localhost:8080/health/full | python3 -m json.tool
+```
+Expect `status: ok`, or `degraded` only for `memory tail skipping` or a
+hierarchy-lag reason with `verdict: unknown` (expected right after a
+restart — see [Summary hierarchy catch-up](CHANGELOG.md#summary-hierarchy-catch-up)).
+
+Send her one real message, then:
+- The compactor log should show `injected memory [...]` for her conversation,
+  and `/health/full`'s `memory_tail.stored` (or `stored_trimmed`) should have
+  gone up.
+- Her **first** message may still log `compaction skipped` / `hard budget
+  enforced` once (adopting the v3.1.7/v3.1.8-era summary record) — expected.
+  From her **second** message on, requests should reuse the stored hierarchy
+  with no refusals. If refusals continue past the second message, stop and
+  investigate before she sends more.
+- `config.time_injection.last_timezone` in `/health/full` matches the zone
+  you set, and `last_source` reads `env` (she is still on `source=hash`
+  today — see [The current date and time](#the-current-date-and-time) for
+  what each route should show).
+
+### 6. Rollback to v3.1.8
+
+Full procedure and the reason for the cap step:
+[CHANGELOG.md → Rolling back to an older image](CHANGELOG.md#rolling-back-to-an-older-image).
+In short: set the History cap's `max_turns` to `0` BEFORE redeploying the
+v3.1.8 image (rolling back with the cap on leaves a permanent hole in her
+summary hierarchy), keep `WEBUI_DB_LOCAL=false` spelled exactly that way on
+both images, redeploy the v3.1.8 tag against the SAME Network Volume (no
+restore needed — v3.1.9 did not move or reformat anything on `/data`), then
+run the post-checks above against the v3.1.8 pod. Restore from the backup
+taken in step 2 only if you have independent evidence data was actually
+lost — a rollback alone does not require it.
 
 ## Troubleshooting
 
 ### Is the deploy healthy?
 ```bash
 # Deep health probe (200 = ok/degraded, 503 = storage down)
-curl -s http://localhost:8080/health/full | jq
+curl -s http://localhost:8080/health/full | python3 -m json.tool
+# "ok" does not cover stopped backups: see OPERATIONS.md "Reading /health/full"
 
 # Post-boot self-test result — runs automatically on every start
-cat /var/log/supervisor/selftest.log
+cat /data/logs/selftest.log
 # Expect: "=== N/N passed, 0 failed ==="
 
 # On-demand self-test (real chat round-trip + facts read/write)
-curl -s http://localhost:8080/admin/selftest | jq
+curl -s http://localhost:8080/admin/selftest | python3 -m json.tool
 ```
 
 ### Check Logs
 ```bash
 # Via Runpod web terminal
-cat /var/log/supervisor/vllm.log         # inference engine
-cat /var/log/supervisor/compactor.log    # memory + compaction events
-cat /var/log/supervisor/openwebui.log    # frontend
-cat /var/log/supervisor/selftest.log     # boot self-test
+tail -100 /data/logs/vllm.log         # inference engine
+tail -100 /data/logs/compactor.log    # memory + compaction events
+tail -100 /data/logs/openwebui.log    # frontend
+cat /data/logs/selftest.log           # boot self-test
+cat /data/logs/boot.log               # one line per container boot
 ```
 
 ### Watch memory in real time
 ```bash
-tail -f /var/log/supervisor/compactor.log
+tail -f /data/logs/compactor.log
 # Look for, per conversation:
 #   "injected memory [persona(...) Nfact(s) Mretr sum(L1=.../L2=.../L3=...)]"
 #   "extracted N new fact(s)"  /  "extracted 0 fact(s) — model returned: ..."

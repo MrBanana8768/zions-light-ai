@@ -97,6 +97,54 @@ deployment has produced.
 **So: (a) verify, (b) prompt, (c) V4.0.** Do them in that order and each step
 may make the next unnecessary.
 
+### 1.3 Video files (MP4, MOV, WEBM) — added 2026-09-13
+
+**What happens today (OpenWebUI 0.11.0, read from `routers/files.py`):** an
+upload is transcribed only if its type matches the STT list, which defaults to
+`audio/*` and `video/webm`. Any other video (an iPhone `.mov`, an `.mp4`) is
+stored as-is and marked complete with no text extracted, so a text model
+receives nothing from it — silently. A `.webm` video gets its audio track
+transcribed and nothing else. v3.1.9 adds `ffmpeg` to the image (the read-aloud
+fix), which is what any video handling needs underneath.
+
+**Why raw video cannot go into the context.** A vision model sees video as
+sampled frames, and each frame costs roughly what an image does: about 250 to
+1,300 tokens depending on the model and resolution. At one frame per second
+that is 15,000 to 78,000 tokens per minute of video, before the soundtrack. A
+five-minute phone video would fill the context several times over, and it
+would ride along on every later turn, which is exactly the problem image
+retention (`MAX_RETAINED_IMAGES`) exists to stop for single photos. These are
+order-of-magnitude figures, not measurements on this deployment; measure on
+the model actually deployed before setting any limit.
+
+**The shape that fits this system: turn the video into text once, at upload.**
+1. **Soundtrack:** transcribe it with the existing Whisper service. This is
+   cheap, works today for `.webm`, and may be a config-only change for
+   `.mp4`/`.mov` (being verified on the v3.1.9 image; it adds those types to
+   the STT list). Real-time factor measured at ~0.44 on CPU.
+2. **Pictures:** sample a small number of keyframes (scene changes, or one
+   every N seconds, capped), and describe each once with the vision model.
+   Store the descriptions, not the frames.
+3. **Store the result as a document** of the conversation — a timestamped
+   transcript plus frame descriptions — so it enters memory through the same
+   paths as everything else (facts, episodic index, summaries), and costs
+   context only when it is retrieved.
+4. **Optionally keep the few most relevant keyframes as images** under the
+   existing retention cap, for a turn that is actually about the video.
+
+**Limits to decide, with measurements, not guesses:**
+- maximum duration (and file size, since phone video is often far over
+  OpenWebUI's 20 MB audio split threshold);
+- maximum keyframes per video, and the sampling rule;
+- where the processing runs (the GPU is shared with generation, so a long
+  video must not stall her conversation — a background job with a progress
+  note, not a blocking request);
+- what the user is told when a video is too long, or while it is processing.
+
+**Depends on:** a vision-capable model in the deployment (the default
+Cydonia-24B is text-only), and V4's background job machinery for anything
+longer than a clip.
+
 ---
 
 ## 2. What must be true before V4 starts

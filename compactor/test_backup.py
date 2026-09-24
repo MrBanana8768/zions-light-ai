@@ -33,12 +33,18 @@ _DATA = _TMP / "data" / "openwebui"
 _STORE = _DATA / "compactor"
 _BACKUPS = _TMP / "data" / "backups"
 _DB = _DATA / "webui.db"
+# v3.1.9 (A3-10): restore set-asides now land in webuidb.QUARANTINE, not
+# beside their targets. Set BEFORE backup.py can lazily `import webuidb`
+# (the first restore_backup call), or the module default (/data/forensics)
+# would apply and tests would write outside the sandbox.
+_QUARANTINE = _TMP / "quarantine"
 
 os.environ["DATA_DIR"] = str(_DATA)
 os.environ["COMPACTOR_STORAGE_ROOT"] = str(_STORE)
 os.environ["COMPACTOR_BACKUP_DIR"] = str(_BACKUPS)
 os.environ["COMPACTOR_BACKUP_WEBUI_DB"] = str(_DB)
 os.environ["COMPACTOR_BACKUP_RETAIN"] = "3"
+os.environ["WEBUI_DB_QUARANTINE"] = str(_QUARANTINE)
 
 import backup  # noqa: E402
 
@@ -95,7 +101,11 @@ def _seed_sources(*, with_db=True, facts_text="seed fact", n_facts=1,
             json.dumps({"conv_id": "conv1", "l1": [
                 {"text": f"chunk {i}", "first_turn": i, "last_turn": i + 1}
                 for i in range(n_summaries)
-            ], "l2": [], "l3": None}),
+            ], "l2": [], "l3": None,
+                # v3.1.9 (F1): the census reads this watermark now, not chunk
+                # count — see backup._census. n_summaries chunks of one turn
+                # each cover turns 1..n_summaries.
+                "last_summarized_turn": n_summaries}),
             encoding="utf-8",
         )
     if episodic is not None:
@@ -226,15 +236,35 @@ def test_restore_round_trip_recovers_data():
     assert_eq(n, 1, "db row recovered")
 
 
-def test_backup_without_db_succeeds():
-    print("\n[test] missing webui.db → backup still succeeds (memory-only)")
+def test_backup_without_db_refuses_by_default():
+    print("\n[test] p3-b F12: missing webui.db refuses the cycle by default (used to succeed silently)")
+    # v3.1 F2's own doctrine ("an archive that holds nothing is a
+    # failure") was applied to the compactor store only, not its sibling
+    # webui.db — a missing db used to log one WARNING and publish a
+    # memory-only archive anyway. p3-b F12: with the store the SMALLER
+    # half of a real payload, that archive passed the payload-ratio guard
+    # and pruned the real archives behind it. Now it refuses, matching
+    # the store's own behavior a few lines above it in create_backup.
     _seed_sources(with_db=False)
     _clean_backups()
     rep = backup.run_once()
-    assert_true(rep["ok"], "memory-only backup ok")
-    ok, detail = backup.verify_backup(_BACKUPS / rep["archive"])
-    assert_true(ok, "verifies")
-    assert_true("absent" in detail, "detail notes db absent")
+    assert_true(not rep["ok"], "F12 fix: refuses instead of publishing memory-only")
+    assert_true("webui.db" in rep["detail"], "detail names webui.db")
+
+
+def test_backup_without_db_still_succeeds_with_the_escape_hatch():
+    print("\n[test] p3-b F12 CONTROL: COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB=1 restores the old behavior")
+    _seed_sources(with_db=False)
+    _clean_backups()
+    os.environ["COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB"] = "1"
+    try:
+        rep = backup.run_once()
+        assert_true(rep["ok"], "memory-only backup ok with the escape hatch set")
+        ok, detail = backup.verify_backup(_BACKUPS / rep["archive"])
+        assert_true(ok, "verifies")
+        assert_true("absent" in detail, "detail notes db absent")
+    finally:
+        os.environ.pop("COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB", None)
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +494,9 @@ def test_manifest_records_the_per_conversation_census():
     man = backup.read_manifest(_BACKUPS / rep["archive"])
     src = man["sources"]["compactor"]
     assert_eq(src["conversations"]["conv1"]["facts"], 4, "fact count recorded")
-    assert_eq(src["conversations"]["conv1"]["summaries"], 3, "summary count recorded")
+    # v3.1.9 (F1): "summaries" (chunk count) was replaced by "summary_turn"
+    # (coverage) — see backup._census's docstring.
+    assert_eq(src["conversations"]["conv1"]["summary_turn"], 3, "summary coverage recorded")
     assert_eq(src["conversations"]["conv1"]["episodic"], 6, "episodic count recorded")
     assert_eq(src["conversations"]["conv2"]["episodic"], 2, "second conversation too")
     assert_eq(src["chroma_sqlite"], True, "chroma.sqlite3 snapshotted")
@@ -512,8 +544,21 @@ def test_payload_collapse_is_refused_and_does_not_prune():
     assert_true(first["ok"], "fat baseline backup ok")
 
     # The store shrinks to almost nothing — the shape a half-mounted volume
-    # produces, and the shape a legitimate edit does not.
-    _seed_sources(n_facts=1, pad=0, with_db=False)
+    # produces, and the shape a legitimate edit does not. This test's
+    # subject is the STORE collapsing, not the db, so webui.db is left
+    # PRESENT (with_db defaults to True, same tiny one-row db as the
+    # baseline) — p3-b F12 added its own refusal for a MISSING db, and
+    # p4-b G6 made the escape hatch that used to work around F12 here
+    # INERT once any archive exists (as one already does, from the "fat
+    # baseline" a few lines up) — so this fixture no longer touches the
+    # hatch at all, and only ever exercises the payload-collapse check it
+    # is actually about. (A previous version of this test used
+    # with_db=False plus COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB=1 to dodge
+    # F12's refusal; G6's expiry made that combination refuse for a
+    # DIFFERENT reason — "hatch no longer applies" — instead of ever
+    # reaching the payload-collapse check, a wrong-reason failure caught by
+    # this lane's own whole-suite run.)
+    _seed_sources(n_facts=1, pad=0)
     with _CapturedAlerts() as alerts:
         rep = backup.run_once()
 
@@ -525,24 +570,40 @@ def test_payload_collapse_is_refused_and_does_not_prune():
 
 
 def test_census_regression_publishes_but_refuses_to_prune():
+    """v3.1.9 (F1): this fixture used to be 6 facts -> 5, with no archive
+    sidecar touched — the exact false-positive shape hostile317-c F1 found
+    live in production (facts.prune_facts moving evictions to the archive,
+    or dedup merging duplicates, both shrink the ACTIVE count the same way
+    and neither is a loss). That shape is now covered — without regressing
+    — by test_backup_v319.py's real-writer tests. This test keeps its own
+    name and structure (publish-but-don't-prune-and-alert) but drives it
+    with a fixture that IS unrecoverable loss under the new rule: the
+    facts union going to zero, which backup._census_regressions still
+    flags (see its docstring)."""
     print("\n[test] F2: memory shrank → archive published, prune skipped, alert sent")
-    _seed_sources(n_facts=6, pad=2000)
+    # No padding on the facts themselves: webui.db's own page allocation
+    # dominates the archive's total payload either way, so zeroing 6 tiny
+    # fact entries stays comfortably above the payload-collapse guard's 50%
+    # floor — this test is about the CENSUS catching a loss the payload
+    # guard cannot see, so the fixture must not also trip THAT guard first.
+    _seed_sources(n_facts=6, pad=0)
     _clean_backups()
     first = backup.run_once()
     assert_true(first["ok"], "baseline ok")
 
     import time
     time.sleep(1.05)
-    # One fact fewer, but more bytes overall — the payload guard cannot see
-    # this, which is exactly why the census exists.
-    _seed_sources(n_facts=5, pad=4000)
+    # Every fact gone — not "one fewer", which normal eviction/dedup can
+    # produce with no loss at all (v3.1.9 F1) — which the census exists to
+    # catch even though the payload guard (checked above) cannot.
+    _seed_sources(n_facts=0, pad=0)
     with _CapturedAlerts() as alerts:
         rep = backup.run_once()
 
     assert_true(rep["ok"], "the archive still publishes — it is real data")
     assert_true(rep["archive"] is not None, "published")
     assert_eq(rep["pruned"], [], "nothing pruned on a cycle that saw a loss")
-    assert_true("conv1.facts 6->5" in rep["detail"], "detail names the loss")
+    assert_true("conv1.facts 6->0" in rep["detail"], "detail names the loss")
     assert_eq(len(alerts.sent), 1, "an alert fired")
     assert_eq(len(backup.list_backups()), 2, "both archives on disk")
 
@@ -682,7 +743,8 @@ def _all():
     return [
         test_create_verify_publish_round_trip,
         test_restore_round_trip_recovers_data,
-        test_backup_without_db_succeeds,
+        test_backup_without_db_refuses_by_default,
+        test_backup_without_db_still_succeeds_with_the_escape_hatch,
         test_verify_rejects_truncated_archive,
         test_verify_rejects_corrupt_memory_json,
         test_verify_rejects_bad_sqlite,
@@ -705,8 +767,511 @@ def _all():
         test_boot_run_suppressed_when_a_recent_archive_exists,
         test_restore_requires_confirm,
         test_restore_refuses_unverifiable_archive,
+        test_restore_moves_sqlite_sidecars_aside,
+        test_restore_targets_the_live_database_not_data_dir,
+        # v3.1.9, hostile pass #2 on restore_backup
+        test_failed_db_copy_keeps_the_original_journal,
+        test_failed_db_replace_puts_the_journal_back,
+        test_failed_store_copy_leaves_the_live_store_whole,
+        test_successful_store_restore_keeps_the_old_store,
+        test_back_to_back_set_asides_do_not_overwrite_each_other,
+        test_restore_refuses_up_front_when_there_is_no_room,
+        test_restore_fsyncs_the_staged_database_before_the_rename,
+        test_live_database_follows_the_gate_not_existence,
         test_latest_backup_info_shape,
     ]
+
+
+def test_restore_moves_sqlite_sidecars_aside():
+    """A stale -journal beside the target must not survive the restore.
+
+    SQLite derives the journal path from the database path it is GIVEN, so a
+    journal left next to the restored file belongs to the database that was
+    just replaced - and SQLite applies it on the next open. That is exactly
+    what scripts/recover-webui-db.py and OPERATIONS.md warn about, and
+    webuidb._set_aside already sweeps these three suffixes. restore_backup was
+    the sibling that did not: it did a bare copy2 over the live path.
+
+    RENAMED, NEVER DELETED - a hot journal may hold the only copy of anything
+    written since the last commit, and this path runs when an operator is
+    already recovering from something.
+    """
+    print("")
+    print("[test] restore: stale sqlite sidecars are moved aside, not left")
+    _seed_sources(facts_text="sidecar case")
+    _clean_backups()
+    rep = backup.run_once()
+    arch = _BACKUPS / rep["archive"]
+
+    # A journal from the database about to be REPLACED, carrying the real
+    # magic so nothing can pass by treating it as an ordinary file.
+    hot = bytes.fromhex("d9d505f920a163d7")
+    journal = _DB.with_name(_DB.name + "-journal")
+    journal.write_bytes(hot + b"stale rollback")
+    wal = _DB.with_name(_DB.name + "-wal")
+    wal.write_bytes(b"stale wal")
+
+    res = backup.restore_backup(arch, confirm=True)
+    assert_true(res["ok"], "restore ok")
+    assert_true(not journal.exists(),
+                "the -journal is gone from beside the restored database")
+    assert_true(not wal.exists(), "and so is the -wal")
+
+    assert_eq(sorted(_DATA.glob("webui.db-journal.pre-restore-*")), [],
+              "v3.1.9 (A3-10): not left beside the target any more")
+    aside = sorted(_QUARANTINE.glob("webui.db-journal.pre-restore-*"))
+    assert_true(len(aside) == 1,
+                "it was RENAMED rather than deleted (found %d)" % len(aside))
+    assert_eq(aside[0].read_bytes()[:8], hot,
+              "and its contents are intact - a hot journal may be the only "
+              "copy of what was written since the last commit")
+
+    # CONTROL: the restore still did its job. Without this the test passes
+    # perfectly if restore_backup simply stopped restoring anything.
+    con = sqlite3.connect(str(_DB))
+    n = con.execute("SELECT COUNT(*) FROM chat").fetchone()[0]
+    con.close()
+    assert_true(n >= 1, "and the database itself was restored and is readable")
+    assert_eq(list(_DATA.glob("webui.db.restore-*")), [],
+              "no temp file left behind by the atomic replace")
+
+
+def test_restore_targets_the_live_database_not_data_dir():
+    """restore_backup honours an explicit `webui_db=`.
+
+    This docstring used to say "WEBUI_DB follows the local-disk gate". It did
+    not — it followed Path.exists(), at import — and that sentence is what let
+    the default branch go untested: this test passes `webui_db=` explicitly, so
+    it never reaches the resolution it is named after, and a mutation replacing
+    that resolution with a bare path passed it (MX1, hostile pass #2). It
+    proves the PARAMETER works and nothing more. The default is proved by
+    test_live_database_follows_the_gate_not_existence, which unsets the
+    suite-wide COMPACTOR_BACKUP_WEBUI_DB pin so it can actually fail.
+    """
+    print("")
+    print("[test] restore: lands on the live database, not DATA_DIR/webui.db")
+    _seed_sources(facts_text="target case")
+    _clean_backups()
+    rep = backup.run_once()
+    arch = _BACKUPS / rep["archive"]
+
+    elsewhere = _TMP / "live" / "webui.db"
+    elsewhere.parent.mkdir(parents=True, exist_ok=True)
+    _DB.unlink()
+
+    res = backup.restore_backup(arch, confirm=True, webui_db=elsewhere)
+    assert_true(res["ok"], "restore ok")
+    assert_true(elsewhere.is_file(),
+                "the archive landed on the path it was told was live")
+    assert_true(not _DB.exists(),
+                "and NOT on DATA_DIR/webui.db, which nothing is reading")
+    con = sqlite3.connect(str(elsewhere))
+    n = con.execute("SELECT COUNT(*) FROM chat").fetchone()[0]
+    con.close()
+    assert_true(n >= 1, "and it is a real database, not an empty file")
+
+
+# ---------------------------------------------------------------------------
+# v3.1.9 — the second hostile pass on restore_backup. Every defect below was
+# DEMONSTRATED against the code 0123135 shipped, and 0123135 was itself the
+# fix for this function. Each test has a control, and _clear_asides runs first
+# in each, because set-asides now accumulate by design and a test that finds
+# the previous test's file passes for that test's reason.
+# ---------------------------------------------------------------------------
+
+_HOT = bytes.fromhex("d9d505f920a163d7")
+
+
+def _clear_asides():
+    for root in (_DATA, _DATA.parent, _TMP / "live", _TMP / "local", _TMP / "snap",
+                 _QUARANTINE):
+        if not root.exists():
+            continue
+        for p in list(root.iterdir()):
+            if any(t in p.name for t in (".pre-restore-", ".incoming-", ".restore-")):
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink(missing_ok=True)
+    for suffix in backup.SIDECARS:
+        _DB.with_name(_DB.name + suffix).unlink(missing_ok=True)
+
+
+def _fresh_archive(facts_text):
+    _clear_asides()
+    _seed_sources(facts_text=facts_text)
+    _clean_backups()
+    rep = backup.run_once()
+    return _BACKUPS / rep["archive"]
+
+
+def _store_text():
+    p = _STORE / "facts" / "conv1.json"
+    return p.read_text(encoding="utf-8") if p.exists() else None
+
+
+def test_failed_db_copy_keeps_the_original_journal():
+    """A3-2. A restore that FAILS must leave the original database's hot
+    journal where SQLite will find it.
+
+    The sidecars were renamed aside BEFORE the copy that could fail, so an
+    ENOSPC left the database byte-for-byte intact and its journal gone: the one
+    file that can roll back a half-applied transaction, moved away at the
+    moment an operator is already recovering. SQLite then opens the database
+    silently, because it can see nothing to replay.
+    """
+    from unittest.mock import patch
+    print("")
+    print("[test] restore: a FAILED database copy leaves the hot journal in place")
+    arch = _fresh_archive("failed-copy case")
+    journal = _DB.with_name(_DB.name + "-journal")
+    journal.write_bytes(_HOT + b"the only copy of an uncommitted write")
+    before = _DB.read_bytes()
+
+    real_copy2 = shutil.copy2
+
+    def _enospc(src, dst, *a, **k):
+        if ".restore-" in str(dst):
+            raise OSError(28, "No space left on device")
+        return real_copy2(src, dst, *a, **k)
+
+    with patch.object(backup.shutil, "copy2", _enospc):
+        assert_raises(lambda: backup.restore_backup(arch, confirm=True), OSError,
+                      "the restore failed and said so")
+    assert_true(journal.exists() and journal.read_bytes()[:8] == _HOT,
+                "the hot journal is STILL beside the database, under the name "
+                "SQLite looks for — nothing was set aside for a copy that "
+                "never happened")
+    assert_eq(sorted(_DATA.glob("webui.db-journal.pre-restore-*")), [],
+              "and no set-aside was made")
+    assert_eq(_DB.read_bytes(), before, "the database is byte-for-byte untouched")
+    assert_eq(sorted(_DATA.glob("webui.db.restore-*")), [],
+              "and the staging copy was cleaned up")
+
+
+def test_failed_db_replace_puts_the_journal_back():
+    """A3-2, the narrower window. Once staging succeeds the sidecars are moved,
+    then os.replace runs. If THAT fails, the sidecars must go back — there is
+    no path through restore that leaves the original without its journal."""
+    from unittest.mock import patch
+    print("")
+    print("[test] restore: a failed replace puts the moved journal BACK")
+    arch = _fresh_archive("failed-replace case")
+    journal = _DB.with_name(_DB.name + "-journal")
+    journal.write_bytes(_HOT + b"uncommitted")
+    real_replace = os.replace
+
+    def _refuse_db(src, dst):
+        if Path(dst) == _DB:
+            raise OSError(5, "Input/output error")
+        return real_replace(src, dst)
+
+    with patch.object(backup.os, "replace", _refuse_db):
+        assert_raises(lambda: backup.restore_backup(arch, confirm=True), OSError,
+                      "the replace failed and the restore said so")
+    assert_true(journal.exists() and journal.read_bytes()[:8] == _HOT,
+                "the journal was moved aside and then PUT BACK")
+    assert_eq(sorted(_DATA.glob("webui.db-journal.pre-restore-*")), [],
+              "so no set-aside remains")
+    # And the store was never reached: its staged copy is gone, the live one
+    # untouched.
+    assert_eq(sorted(_DATA.glob("compactor.incoming-*")), [],
+              "the store's staged copy was cleaned up too")
+    assert_true("failed-replace case" in (_store_text() or ""),
+                "and the live store was never touched")
+
+
+def test_failed_store_copy_leaves_the_live_store_whole():
+    """A3-3. The store half was rmtree(sroot) then copytree: every fact, every
+    summary tier and ChromaDB deleted before the first byte came back, with no
+    set-aside — ten lines below the database half 0123135 had just made
+    atomic."""
+    from unittest.mock import patch
+    print("")
+    print("[test] restore: a FAILED store copy leaves the live store whole")
+    arch = _fresh_archive("the ARCHIVED store")
+    _seed_sources(facts_text="the LIVE store, written after the archive")
+
+    def _enospc_tree(src, dst, *a, **k):
+        Path(dst).mkdir(parents=True, exist_ok=True)
+        (Path(dst) / "half-written.json").write_text("{", encoding="utf-8")
+        raise OSError(28, "No space left on device")
+
+    with patch.object(backup.shutil, "copytree", _enospc_tree):
+        assert_raises(lambda: backup.restore_backup(arch, confirm=True), OSError,
+                      "the restore failed and said so")
+    assert_true("the LIVE store" in (_store_text() or ""),
+                "the live store is WHOLE — rmtree did not run ahead of a copy "
+                "that failed")
+    assert_eq(sorted(_DATA.glob("compactor.incoming-*")), [],
+              "the half-written staging copy was removed")
+    assert_eq(sorted(_DATA.glob("compactor.pre-restore-*")), [],
+              "and nothing was set aside, because nothing was replaced")
+
+
+def test_successful_store_restore_keeps_the_old_store():
+    """A3-3's CONTROL, and a property of its own: the store in place before a
+    restore is SET ASIDE, never deleted. It is the only copy of everything
+    written since the archive, and an operator who restored the wrong archive
+    finds that out after the restore, not before."""
+    print("")
+    print("[test] restore: the replaced store is kept, not deleted")
+    arch = _fresh_archive("the ARCHIVED store")
+    _seed_sources(facts_text="the LIVE store, written after the archive")
+    res = backup.restore_backup(arch, confirm=True)
+    assert_true(res["ok"] and "compactor" in res["restored"], "restore ok")
+    assert_true("the ARCHIVED store" in (_store_text() or ""),
+                "CONTROL: the archive's store is what is live now")
+    assert_eq(sorted(_DATA.glob("compactor.pre-restore-*")), [],
+              "v3.1.9 (A3-10): not left beside the target any more — the "
+              "overlay a pod recreate destroys")
+    asides = sorted(_QUARANTINE.glob("compactor.pre-restore-*"))
+    assert_eq(len(asides), 1, "the previous store was set aside in quarantine")
+    kept = (asides[0] / "facts" / "conv1.json").read_text(encoding="utf-8")
+    assert_true("the LIVE store" in kept,
+                "and it holds what was live before the restore")
+
+
+def test_back_to_back_set_asides_do_not_overwrite_each_other():
+    """A3-5. The stamp was whole seconds, and on POSIX a rename onto an
+    existing name silently replaces it — so two restores in one second left
+    ONE journal set-aside, the second, and the first (older, more likely to
+    hold what the operator is chasing) was gone without a log line.
+    webuidb._stamp() carries a comment saying this already happened there.
+
+    The stamp is pinned to a constant here on purpose: that FORCES the
+    collision, so this tests the no-overwrite rule itself rather than whether
+    two calls happened to land in different milliseconds.
+    """
+    from unittest.mock import patch
+    print("")
+    print("[test] restore: two set-asides with the SAME stamp are both kept")
+    arch = _fresh_archive("collision case")
+    journal = _DB.with_name(_DB.name + "-journal")
+    with patch.object(backup, "_restore_stamp", lambda: "SAME-STAMP"):
+        journal.write_bytes(_HOT + b"FIRST journal")
+        backup.restore_backup(arch, confirm=True)
+        # Remove the first restore's STORE set-aside, and only that. Without
+        # this the second restore's store set-aside collides on a non-empty
+        # DIRECTORY, which os.replace refuses loudly (ENOTEMPTY) — so a mutant
+        # that stopped avoiding collisions went red on that crash and never
+        # reached the journal assertion below. The journal is a FILE, and a
+        # rename onto an existing file is the SILENT replace this test exists
+        # for. The store half being loud is fine; this isolates the quiet one.
+        # v3.1.9 (A3-10): set-asides land in quarantine now, not beside _DATA.
+        for _d in _QUARANTINE.glob("compactor.pre-restore-*"):
+            shutil.rmtree(_d)
+        journal.write_bytes(_HOT + b"SECOND journal")
+        backup.restore_backup(arch, confirm=True)
+    kept = sorted(_QUARANTINE.glob("webui.db-journal.pre-restore-*"))
+    bodies = {p.read_bytes()[8:] for p in kept}
+    assert_eq(len(kept), 2, "two restores, two set-aside files")
+    assert_true(b"FIRST journal" in bodies and b"SECOND journal" in bodies,
+                "and BOTH journals survive — the first was not silently "
+                "replaced by the second")
+    stamp = backup._restore_stamp()
+    assert_true(len(stamp) == 19 and stamp[15] == "-" and stamp[16:].isdigit(),
+                "the unpatched stamp carries milliseconds (got %r)" % stamp)
+
+
+def test_restore_refuses_up_front_when_there_is_no_room():
+    """A3-12. create_backup has always had a free-space guard; restore, the
+    destructive half, had none, and ENOSPC mid-copy was the named trigger for
+    both losses above. Staging no longer touches anything live, so running out
+    of space is merely a failed restore now — this makes it a clear one,
+    before a large copy, with nothing moved."""
+    from collections import namedtuple
+    from unittest.mock import patch
+    print("")
+    print("[test] restore: refuses before staging when the volume is full")
+    arch = _fresh_archive("no-room case")
+    journal = _DB.with_name(_DB.name + "-journal")
+    journal.write_bytes(_HOT + b"uncommitted")
+    _Usage = namedtuple("_Usage", "total used free")
+    with patch.object(backup.shutil, "disk_usage", lambda p: _Usage(10, 10, 1)):
+        try:
+            backup.restore_backup(arch, confirm=True)
+            raised = None
+        except RuntimeError as e:
+            raised = e
+    assert_true(raised is not None and "refusing to restore" in str(raised),
+                "it refused, by name (got %r)" % (raised,))
+    assert_true(journal.exists(), "the journal was not touched")
+    assert_true("no-room case" in (_store_text() or ""),
+                "the store was not touched")
+    assert_eq(sorted(_DATA.glob("*.incoming-*")) + sorted(_DATA.glob("*.restore-*")),
+              [], "and nothing was even staged")
+
+
+def test_restore_fsyncs_the_staged_database_before_the_rename():
+    """A3-7. The atomic replace was never fsynced, while
+    memory.atomic_write_json next door fsyncs the file AND its directory and
+    names /data being MooseFS as the reason. A rename is durable only if the
+    bytes it points at are."""
+    from unittest.mock import patch
+    print("")
+    print("[test] restore: the staged database is fsynced BEFORE it is renamed")
+    arch = _fresh_archive("fsync case")
+    events: list[tuple[str, str]] = []
+    real_fsync_file, real_replace = backup._fsync_file, os.replace
+
+    def _rec_fsync(p):
+        events.append(("fsync", Path(p).name))
+        return real_fsync_file(p)
+
+    def _rec_replace(src, dst):
+        events.append(("replace", Path(src).name))
+        return real_replace(src, dst)
+
+    with patch.object(backup, "_fsync_file", _rec_fsync), \
+         patch.object(backup.os, "replace", _rec_replace):
+        backup.restore_backup(arch, confirm=True)
+    staged = [n for k, n in events if k == "replace" and n.startswith("webui.db.restore-")]
+    assert_eq(len(staged), 1, "the staged database was renamed into place once")
+    i_sync = events.index(("fsync", staged[0])) if ("fsync", staged[0]) in events else -1
+    i_repl = events.index(("replace", staged[0]))
+    assert_true(0 <= i_sync < i_repl,
+                "and it was fsynced BEFORE that rename (events: %r)" % events)
+
+
+def test_live_database_follows_the_gate_not_existence():
+    """A3-4 and A3-9. The live database was chosen by Path.exists(), at import.
+
+    entrypoint.sh's documented rollback, WEBUI_DB_LOCAL=false, points OpenWebUI
+    at the snapshot and leaves the local file exactly where it was — so it
+    still exists, every nightly archive became a copy of the abandoned file,
+    and every CLI restore landed on it. The string WEBUI_DB_LOCAL did not
+    appear in backup.py. And a gate flipped under the running daemon was
+    invisible until restart, because the answer was computed once at import.
+
+    This suite pins COMPACTOR_BACKUP_WEBUI_DB for every other test, which
+    makes the default branch unreachable — the reason MX1 (replace the whole
+    resolution with a bare path) passed it. It is UNSET here, or this test
+    cannot fail.
+    """
+    print("")
+    print("[test] live database: the gate decides, at call time, not exists()")
+    local = _TMP / "local" / "webui.db"
+    snap = _TMP / "snap" / "webui.db"
+    for p, body in ((local, "STALE - abandoned when the flag flipped"),
+                    (snap, "LIVE - every conversation since")):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.unlink(missing_ok=True)
+        con = sqlite3.connect(str(p))
+        con.execute("CREATE TABLE chat (id INTEGER PRIMARY KEY, body TEXT)")
+        con.execute("INSERT INTO chat (body) VALUES (?)", (body,))
+        con.commit()
+        con.close()
+    keys = ("COMPACTOR_BACKUP_WEBUI_DB", "DATABASE_URL", "WEBUI_DB_LOCAL",
+            "WEBUI_LOCAL_DB", "WEBUI_SNAPSHOT_DB")
+    saved = {k: os.environ.get(k) for k in keys}
+    # v3.1.9 round 2: backup.live_webui_db() now DELEGATES its gate-fallback
+    # branch to webuidb.live_webui_db() (finding 3, "two live-db
+    # resolvers"), which returns webuidb.LOCAL_DB / webuidb.SNAPSHOT_DB —
+    # MODULE CONSTANTS read once at webuidb.py's own import, not
+    # WEBUI_LOCAL_DB/WEBUI_SNAPSHOT_DB re-read fresh from the environment
+    # the way this test used to assume (and the way the OLD, pre-fix
+    # backup.live_webui_db() genuinely did). Setting those two env vars
+    # below no longer has any effect on an ALREADY-imported webuidb module
+    # (almost certainly already imported by an earlier test in this file via
+    # backup.py's own lazy `import webuidb`) — so this test now patches
+    # webuidb.LOCAL_DB/.SNAPSHOT_DB directly for its duration instead,
+    # exactly the same way test_backup_v319.py's own agreement test does.
+    # The env vars are still set too (harmless, and correct for anything
+    # that reads them directly rather than through webuidb's constants).
+    import webuidb
+    saved_webuidb = (webuidb.LOCAL_DB, webuidb.SNAPSHOT_DB)
+    webuidb.LOCAL_DB, webuidb.SNAPSHOT_DB = local, snap
+    try:
+        os.environ.pop("COMPACTOR_BACKUP_WEBUI_DB", None)
+        os.environ.pop("DATABASE_URL", None)
+        os.environ["WEBUI_LOCAL_DB"] = str(local)
+        os.environ["WEBUI_SNAPSHOT_DB"] = str(snap)
+
+        os.environ["WEBUI_DB_LOCAL"] = "false"
+        assert_true(local.exists(), "fixture: the abandoned local file EXISTS")
+        assert_eq(backup.live_webui_db(), snap,
+                  "gate false -> the snapshot, even with a local file present")
+
+        # A3-9: same process, gate flipped, answer follows.
+        os.environ["WEBUI_DB_LOCAL"] = "true"
+        assert_eq(backup.live_webui_db(), local,
+                  "gate flipped to true in the SAME process -> local; the "
+                  "answer is not frozen at import")
+
+        # v3.1.9 round 2: this USED to pin the byte-exact shell comparison
+        # deliberately ("`True` is not `true` to entrypoint.sh"). That
+        # justification no longer holds: entrypoint.sh's own WEBUI_DB_LOCAL
+        # NORMALIZATION block (fix-webuidb.md finding 3) now folds case and
+        # whitespace before any SUPERVISED child ever sees the variable, and
+        # this function now delegates its own gate reading to
+        # webuidb.live_webui_db() (see this function's docstring) instead of
+        # re-deriving the rule a second, narrower way — so `True` now folds
+        # to true here too, exactly as entrypoint.sh's own normaliser and
+        # webuidb.live_webui_db() already agree it should.
+        os.environ["WEBUI_DB_LOCAL"] = "True"
+        assert_eq(backup.live_webui_db(), local,
+                  "`True` folds to true now - no longer a second, "
+                  "disagreeing reader of the same rule (v3.1.9 round 2)")
+
+        # DATABASE_URL is what OpenWebUI actually opens, and outranks the gate.
+        os.environ["WEBUI_DB_LOCAL"] = "true"
+        os.environ["DATABASE_URL"] = f"sqlite:///{snap}"
+        assert_eq(backup.live_webui_db(), snap,
+                  "a sqlite DATABASE_URL outranks the gate")
+        os.environ["DATABASE_URL"] = "postgresql://u@h/db"
+        assert_eq(backup.live_webui_db(), local,
+                  "a non-sqlite DATABASE_URL is not a file, and falls to the gate")
+        os.environ.pop("DATABASE_URL", None)
+
+        # End to end: gate false -> the archive holds the LIVE database, and a
+        # restore lands on it.
+        os.environ["WEBUI_DB_LOCAL"] = "false"
+        _clear_asides()
+        _seed_sources(with_db=False, facts_text="gate case")
+        _clean_backups()
+        arch = _BACKUPS / backup.run_once()["archive"]
+        with tarfile.open(arch, "r:gz") as tar:
+            # By basename: archives are written with arcname=".", so the
+            # member is "./webui.db". The first draft asked for "webui.db"
+            # and died on a KeyError that said nothing about the database.
+            dbs = [m for m in tar.getmembers()
+                   if Path(m.name).name == "webui.db" and m.isfile()]
+            assert_eq(len(dbs), 1,
+                      "the archive CONTAINS a webui.db — not a memory-only "
+                      "backup of a path that did not exist")
+            got = _TMP / "extracted.db"
+            got.write_bytes(tar.extractfile(dbs[0]).read())
+        con = sqlite3.connect(str(got))
+        archived = con.execute("SELECT body FROM chat").fetchone()[0]
+        con.close()
+        assert_true(archived.startswith("LIVE"),
+                    "the archive holds the database OpenWebUI reads, not the "
+                    "abandoned one (got %r)" % archived)
+
+        con = sqlite3.connect(str(snap))
+        con.execute("UPDATE chat SET body = 'CHANGED AFTER THE BACKUP'")
+        con.commit()
+        con.close()
+        backup.restore_backup(arch, confirm=True)
+        con = sqlite3.connect(str(snap))
+        back = con.execute("SELECT body FROM chat").fetchone()[0]
+        con.close()
+        assert_true(back.startswith("LIVE"),
+                    "and the restore landed on that same file (got %r)" % back)
+        con = sqlite3.connect(str(local))
+        untouched = con.execute("SELECT body FROM chat").fetchone()[0]
+        con.close()
+        assert_true(untouched.startswith("STALE"),
+                    "CONTROL: the abandoned local file was never written")
+    finally:
+        webuidb.LOCAL_DB, webuidb.SNAPSHOT_DB = saved_webuidb
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        _clear_asides()
 
 
 if __name__ == "__main__":

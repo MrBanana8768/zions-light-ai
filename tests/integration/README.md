@@ -41,6 +41,7 @@ The harness reads its connection settings from env vars (or `--base-url`
 | `ZIONS_TEST_MODEL` | No | Model name to use; auto-detected from `/v1/models` if unset. |
 | `ZIONS_TEST_TIMEOUT` | No | HTTP timeout in seconds (default 120) |
 | `ZIONS_TEST_TAIL_WAIT` | No | How long to wait for the async post-response work to finish before assertions (default 8s) |
+| `ZIONS_TEST_REAL_MODEL` | No | Set to `1` against a deployment with real weights (e.g. the pod) to run the `requires_real_model()` cases (fact extraction from seeded history, backfill). Unset, they SKIP — honestly, but that skip is only informative if this table says how to turn it on. |
 
 ## Four modes of running
 
@@ -64,8 +65,13 @@ source .venv/bin/activate && \
 pip install -q -r requirements.txt
 
 # Run the suite — both URLs are localhost since we're inside the pod.
+# ZIONS_TEST_REAL_MODEL=1 because this IS the deployment with real weights:
+# without it, the handful of cases that assert on an actual extraction
+# (fact-from-history, backfill) SKIP rather than run, and this on-pod path
+# is the only mode where they can pass at all.
 ZIONS_TEST_BASE_URL=http://localhost:8080 \
 ZIONS_TEST_ADMIN_URL=http://localhost:8080 \
+ZIONS_TEST_REAL_MODEL=1 \
 pytest -v
 ```
 
@@ -75,6 +81,7 @@ cd /data/integration-tests/tests/integration && \
 source .venv/bin/activate && \
 ZIONS_TEST_BASE_URL=http://localhost:8080 \
 ZIONS_TEST_ADMIN_URL=http://localhost:8080 \
+ZIONS_TEST_REAL_MODEL=1 \
 pytest -v
 ```
 

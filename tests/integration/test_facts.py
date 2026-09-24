@@ -22,7 +22,22 @@ def test_fact_extracted_and_persisted(conv_id):
     Uses wait_for_facts (polling) instead of a fixed sleep — fact
     extraction is one full LLM round-trip and on Magnum 12B / A40 can
     take 5-15s. The previous fixed 8s wait sometimes false-failed.
+
+    REAL WEIGHTS. `"lyra" in all_text` is an assertion about what an
+    extraction call SAID, and fact extraction is itself a completion: the
+    weightless fixture answers it with the same canned string it answers
+    everything with, so there is nothing for the extractor to find and this
+    fails on every run of that profile. A permanent red means "you ran the
+    wrong profile", and a suite whose red means that cannot report a real
+    regression — this one would arrive as no change at all. The flag was
+    added in 5868aed and applied only to that commit's own new tests; this
+    is the sibling it named and missed.
     """
+    H.requires_real_model(
+        "the assertion is that an extracted fact names 'Lyra', which is what "
+        "a real extraction call returned"
+    )
+
     # Fact-rich, multi-claim prompt. Single-claim prompts ("my protagonist
     # is X") sometimes get judged as NONE by Magnum 12B's extractor at
     # temp 0.2 — model variance, not a code bug. Three concrete claims
@@ -62,7 +77,19 @@ def test_fact_used_in_next_turn(conv_id):
     """The full behavioral guarantee: a fact stated in turn 1 affects
     the model's response in turn 2 — proving facts were both extracted
     AND injected on the second request.
+
+    REAL WEIGHTS, for the same reason as the test above and in both of its
+    branches: the turn-2 response is a generation, and the storage-level
+    fallback ("pirate" or "dialect" appears in an extracted fact) is the
+    output of the extraction generation. Against the canned fixture neither
+    can be true, so this is a permanent red that means nothing but the
+    profile — see 5868aed and _harness.requires_real_model.
     """
+    H.requires_real_model(
+        "both branches read a generation: the turn-2 reply, or the fact an "
+        "extraction call produced from the stated preference"
+    )
+
     # Turn 1: state the fact, get an ack.
     turn1_user = ("Important context for our chat: I prefer responses in "
                   "pirate dialect. Just say 'aye' to confirm.")

@@ -890,14 +890,18 @@ def test_cap_invisible_when_it_does_not_bind():
     hits = [_hit(10, "A" * 300), _hit(30, "B" * 300), _hit(20, "C" * 300)]
     cap = _LogCapture()
     try:
-        # 33-token header + 3 * 80 = 273 of a 1,500-token budget. (Was 272:
+        # 44-token header + 3 * 80 = 284 of a 1,500-token budget. (Was 272:
         # v3.1.3 split the estimator's non-ASCII pricing into script-vs-
         # decoration and added a +1 ceiling guard on any text containing
-        # non-ASCII; the header's em-dash pays it. The pin exists to stop an
+        # non-ASCII; the header's em-dash pays it. Then 273 -> 284: v3.1.5
+        # rewrote _RETRIEVAL_BLOCK_HEADER so this block stops presenting the
+        # model's own past prose as something to continue in — 11 tokens
+        # dearer, out of a 1,500-token budget. The pin exists to stop an
         # ambient env var changing what the fixture means, not to freeze the
-        # estimator.)
+        # estimator, so a header edit is expected to move it and expected to
+        # be re-pinned here rather than the assertion loosened.)
         assert_eq(_HEADER_TOKENS + sum(_hit_cost(h["turn_index"], h["document"])
-                                       for h in hits), 273, "fixture is well under")
+                                       for h in hits), 284, "fixture is well under")
         block = retrieval.format_retrieval_block(hits)
     finally:
         cap.stop()
@@ -956,13 +960,16 @@ def test_oversized_first_hit_is_truncated_not_dropped():
     assert_true("ENDING" not in block, "the tail is gone")
     assert_true(_TRUNCATION_MARKER in block, "and it says so, rather than ending mid-word")
 
-    # room = 1500 - 33 header - 4 (separator + its two newlines) = 1,463 tokens
+    # room = 1500 - 44 header - 4 (separator + its two newlines) = 1,452 tokens
     # of document. (Header was 32 before v3.1.3's +1 non-ASCII ceiling guard;
-    # its em-dash pays it - same shift as the fixture pin above.) Asserted as
-    # a property rather than as a character offset: A4's whole subject is
-    # that there is no fixed chars-per-token to slice at.
+    # its em-dash pays it. 33 -> 44 in v3.1.5, which rewrote
+    # _RETRIEVAL_BLOCK_HEADER so this block stops presenting the model's own
+    # past prose as something to continue in - same shift as the fixture pin
+    # above, and re-pinned for the same reason.) Asserted as a property rather
+    # than as a character offset: A4's whole subject is that there is no fixed
+    # chars-per-token to slice at.
     room = 1500 - _HEADER_TOKENS - _tokens(f"{_sep(7)}\n\n")
-    assert_eq(room, 1463, "room left for the document, in tokens")
+    assert_eq(room, 1452, "room left for the document, in tokens")
     body = block.split(f"{_sep(7)}\n", 1)[1][: -len("\n" + _TRUNCATION_MARKER)]
     assert_true(_tokens(body) <= room, f"kept body fits the room ({_tokens(body)})")
     # Maximal, not merely safe: a cap that keeps 10 tokens of a 2,258-token
@@ -1188,7 +1195,15 @@ def test_regression_20260827_three_exchanges_cannot_overflow_the_window():
 # sized so that three of them fit the SHIPPED character budget of 6,000 with
 # room to spare (3 * 1,955 + 119 = 5,984) — the teeth check below needs the old
 # rule to admit all three, or it is not demonstrating what the old rule did.
-_BOX_RULE = "━" * 1450 + "\n" + "─" * 450 + "\nHere is the table you asked for.\n"
+# 1450 -> 1400 in v3.1.5. The teeth check below reproduces the SHIPPED
+# character rule, which counts _RETRIEVAL_BLOCK_HEADER's characters too, and
+# the three fixtures fit that 6,000-char budget with only ~40 characters to
+# spare. Rewording the header (+53 chars) put it 19 over, so the check
+# admitted two exchanges instead of three and failed on its own scaffolding
+# rather than on the property it exists to demonstrate. The header is prompt
+# text tuned against a live user and will change again, so the fixture now
+# carries ~130 characters of headroom instead of ~40.
+_BOX_RULE = "━" * 1400 + "\n" + "─" * 450 + "\nHere is the table you asked for.\n"
 
 # "Please look at the light of God." — three UTF-8 bytes per character, none of
 # them ASCII, so the character count sees a third of what the encoder does.

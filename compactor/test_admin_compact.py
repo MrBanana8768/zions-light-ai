@@ -12,8 +12,8 @@ Five properties, each one a thing that would cost her something if it broke:
 
   1. an absent conversation 404s rather than inventing an empty one
   2. `dry_run` writes NOTHING — no state file, no LLM call, no watermark move
-  3. the watermark guard refuses (409) rather than pulling the watermark
-     backwards, which is how the same turns get summarized twice
+  3. the position guard refuses (409) rather than summarizing text that is
+     not the text the chunk labels will claim
   4. a path-shaped conv_id never reaches the filesystem
   5. the drain loop terminates — on progress, on failure, and on the cap
 
@@ -26,6 +26,7 @@ No server, no model, no network:
 """
 
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -69,6 +70,10 @@ def check(cond, label):
 
 
 LLM_CALLS = []
+# What was actually SENT to be summarized. LLM_CALLS answers "did a call
+# happen"; this answers "which turns did it contain", which is the only way to
+# see a misaligned chunk — the labels look right either way.
+LLM_BODIES = []
 
 
 async def _fake_llm(client, vllm_url, model, system_prompt, body_text,
@@ -76,6 +81,7 @@ async def _fake_llm(client, vllm_url, model, system_prompt, body_text,
     """Stand in for the vLLM round trip. Records that a call happened, which
     is the thing `dry_run` has to prove it did not do."""
     LLM_CALLS.append(len(body_text))
+    LLM_BODIES.append(body_text)
     return f"summary of {len(body_text)} chars"
 
 
@@ -108,6 +114,43 @@ def snapshot():
             with open(p, "rb") as fh:
                 out[os.path.relpath(p, _TMP_ROOT)] = hashlib.sha256(
                     fh.read()).hexdigest()
+    return out
+
+
+def memory_snapshot():
+    """snapshot(), minus the bookkeeping a v3.1.4 rollup writes even when it
+    summarizes nothing.
+
+    `turns_seen` / `tail_fp` are the conversation's POSITION, and recording
+    where the conversation got to is not the same act as writing a summary —
+    the position has to be persisted on every pass or the next one re-seeds
+    from the watermark, finds no anchor, and the hierarchy stops advancing
+    under a capped client window (the 2026-09-01 defect). What "a run that
+    summarized nothing wrote nothing" is protecting is the CONTENT: no chunk,
+    no chapter, no theme, no watermark move. So that is what this compares.
+    """
+    out = {}
+    for path, digest in snapshot().items():
+        full = os.path.join(_TMP_ROOT, path)
+        if os.path.dirname(path).endswith("summaries") and path.endswith(".json"):
+            with open(full, "r", encoding="utf-8") as fh:
+                try:
+                    st = json.load(fh)
+                except Exception:
+                    out[path] = digest
+                    continue
+            content = {k: v for k, v in st.items()
+                       if k not in ("turns_seen", "tail_fp", "updated_at")}
+            if not (st.get("l1") or st.get("l2") or st.get("l3")
+                    or st.get("last_summarized_turn")):
+                # A file holding nothing but the position is not a summary;
+                # dropping the KEY as well as the value is what makes "the
+                # run created no memory" testable when there was no file at
+                # all beforehand.
+                continue
+            out[path] = json.dumps(content, sort_keys=True)
+        else:
+            out[path] = digest
     return out
 
 
@@ -207,6 +250,36 @@ check(summarizer.load_state(CID)["last_summarized_turn"] == 300,
       "the watermark was NOT pulled back to 20")
 
 print()
+print("[3e] a PULLED-DOWN watermark cannot be used to permit a short rebuild")
+# v3.1.7 R12. A state file written by the pre-v3.1.4 code under a cap has its
+# watermark pulled BELOW the chunks it tracks, and no turns_seen at all. Both
+# counters then read low, so a guard that maxes only those two permits a
+# rebuild it should refuse — and the chunks come back labelled against a
+# position hundreds of turns short, which the endpoint's own comment calls
+# "worse than no chunk, because nothing downstream can tell".
+#
+# The chunk labels are the record; the watermark is a pointer derived from
+# them. summarizer._recorded_position is the one function that knows that, and
+# the endpoint has to use it or the two disagree about what a transcript is.
+CID = "watermark-pulled-down"
+summarizer.save_state(CID, {
+    # chunks reach turn 660; the watermark was dragged back to a cap of 100
+    "l1": [{"text": "scene", "first_turn": 641, "last_turn": 660}],
+    "l2": [], "l3": None, "last_summarized_turn": 100,
+})
+set_store(exchanges(60))            # 120 messages: over 100, far under 660
+before = snapshot()
+LLM_CALLS.clear()
+r = compact(CID)
+check(r.status_code == 409,
+      f"HTTP 409 — 120 messages cannot rebuild a conversation at turn 660 "
+      f"(got {r.status_code})")
+check(LLM_CALLS == [], "no LLM call was made on a position it could not trust")
+check(snapshot() == before, "the store is byte-identical after the refusal")
+check(summarizer.load_state(CID)["l1"][0]["last_turn"] == 660,
+      "and the chunk that proved the position is untouched")
+
+print()
 print("[3b] equal length is not short — the guard must not refuse a no-op")
 CID = "watermark-equal"
 summarizer.save_state(CID, {
@@ -227,6 +300,92 @@ summarizer.save_state(CID, {
 set_store(exchanges(60))
 r = compact(CID, dry_run=True)
 check(r.status_code == 200, f"HTTP 200 (got {r.status_code})")
+
+print()
+print("[3d] the guard is the POSITION, not the watermark")
+# v3.1.4. Under a capped client window the two come apart: the watermark is how
+# far the SUMMARIES got, turns_seen is how far the CONVERSATION got, and it is
+# turns_seen that drives the offset _do_l1_rollup subtracts to find a chunk's
+# text. A reconstruction that clears the watermark but not the position makes
+# that offset point at the wrong turns, and the chunk it stores is labelled
+# 21-40 with somebody else's text in it. Comparing against the watermark alone
+# lets that through with a 200.
+CID = "position-guard"
+summarizer.save_state(CID, {
+    "l1": [], "l2": [], "l3": None, "last_summarized_turn": 20,
+    "turns_seen": 300, "tail_fp": ["0123456789abcdef"],
+})
+set_store(exchanges(30))            # 60 messages: past the watermark, not the
+before_mem = memory_snapshot()      # position
+LLM_CALLS.clear()
+r = compact(CID)
+check(r.status_code == 409,
+      f"HTTP 409 for a reconstruction behind the position (got {r.status_code})")
+check("recorded position is already turn 300" in r.text,
+      "and the body names the position it is behind")
+check(LLM_CALLS == [], "no LLM call was made")
+check(memory_snapshot() == before_mem, "and no summary content was written")
+
+print()
+print("[3f] equality is admitted AND aligned — the chunk holds the turns it "
+      "is labelled with")
+# v3.1.7 R10. [3b] pins the STATUS at equality; this pins what the 200 goes on
+# to do, which is a different assertion and the one that was wrong.
+#
+# The guard is `< _pos` and that is correct: a rebuild of exactly _pos turns
+# starts at turn 1 and ends at turn _pos, so window_offset is 0 and a label is
+# an index. What broke was downstream of the guard. _observed_position aligns
+# the array against `tail_fp` — the anchor the CHAT path left behind, taken
+# from a bounded live window — and an anchor that appears nowhere in the
+# rebuild falls back to _ASSUMED_NEW_TURNS. At equality that makes the
+# position n + 2, window_offset 2, and chunk 1-20 comes back labelled 3-20
+# holding turns 1-18: a span it does not contain, turns 1-2 covered by
+# nothing, and turns_seen inflated for good.
+#
+# Only reachable while the rebuild is within one exchange of the position — a
+# longer one takes max(n, prev + 2) = n and self-corrects — so it is exactly
+# the equality case, the one this endpoint exists to serve, that broke.
+#
+# The load-bearing assertion is which exchanges were SENT. The labels look
+# right either way: 3-20 is a perfectly plausible span.
+CID = "equality-aligned"
+summarizer.save_state(CID, {
+    "l1": [], "l2": [], "l3": None, "last_summarized_turn": 0,
+    "turns_seen": 30,
+    # An anchor from a live window of 12 turns that shares nothing with the
+    # rebuild — the shape R15 describes: one fingerprint mismatch in anchor[0]
+    # defeats every prefix in _align_candidates.
+    "tail_fp": ["0123456789abcdef", "fedcba9876543210"],
+    "head_fp": "deadbeefdeadbeef", "window_turns": 12,
+})
+set_store(exchanges(15))            # exactly 30 messages against position 30
+LLM_CALLS.clear()
+LLM_BODIES.clear()
+r = compact(CID)
+body = r.json()
+check(r.status_code == 200,
+      f"HTTP 200 — equality is not short and must not be refused "
+      f"(got {r.status_code})")
+check(body.get("reconstructed_messages") == body.get("recorded_position") == 30,
+      f"the rebuild and the position are equal, which is the case under test "
+      f"({body.get('reconstructed_messages')} vs "
+      f"{body.get('recorded_position')})")
+_l1 = summarizer.load_state(CID).get("l1") or []
+check(len(_l1) == 1 and _l1[0]["first_turn"] == 1 and _l1[0]["last_turn"] == 20,
+      f"the first chunk is labelled 1-20, not shifted off the array's start "
+      f"(l1={[(c['first_turn'], c['last_turn']) for c in _l1]})")
+check(len(LLM_BODIES) >= 1, "a chunk was actually summarized")
+_first = LLM_BODIES[0] if LLM_BODIES else ""
+check(all(f"answer {i}" in _first for i in range(10)),
+      "and it HOLDS turns 1-20 — exchanges 0-9, the ten the label claims")
+check("answer 10" not in _first,
+      "with nothing from turn 21 onwards dragged into it")
+# The other half of the damage: an inflated position is written to disk and
+# every later rollup on the live path reads its text two turns early.
+check(summarizer.load_state(CID).get("turns_seen") == 30,
+      f"the position is still 30 — a full rebuild is not evidence that two "
+      f"more turns happened (got "
+      f"{summarizer.load_state(CID).get('turns_seen')})")
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +452,7 @@ async def _boom(*a, **kw):
 
 CID = "drain-fail"
 set_store(exchanges(60))
-before = snapshot()
+before_mem = memory_snapshot()
 LLM_CALLS.clear()
 summarizer._llm_summarize = _boom
 r = compact(CID)
@@ -305,8 +464,8 @@ check(body.get("rollup_calls", 999) <= 2,
       f"the loop does not spin against a failing model "
       f"(rollup_calls={body.get('rollup_calls')})")
 check(body.get("watermark_after") == 0, "the watermark did not move")
-check(snapshot() == before,
-      "a run that summarized nothing wrote nothing")
+check(memory_snapshot() == before_mem,
+      "a run that summarized nothing wrote no summary content")
 
 print()
 print("[5c] max_calls bounds a rollup that advances forever")
@@ -342,8 +501,425 @@ check("max_calls" in str(body.get("stopped_because")),
 
 
 # ---------------------------------------------------------------------------
+# 5d. v3.1.9 (hostile pass 2, MEDIUM): {"max_calls": 0} means ZERO calls, not
+# the 200-call LIVE default; a non-numeric max_calls is a 400, not a 500; and
+# an absurdly large max_calls is clamped rather than trusted outright.
+# `int(body.get("max_calls") or 200)` read 0 as falsy and silently swapped in
+# the 200 default — reproduced against the unfixed code: {"max_calls": 0} on
+# a 60-exchange backlog ran 2 live rollup calls and moved the watermark
+# 0 -> 120, exactly the write an explicit 0 is asking this loop not to make.
+# ---------------------------------------------------------------------------
 
 print()
+print("[5d] max_calls=0 makes ZERO calls; non-numeric is 400; huge is clamped")
+
+CID = "maxcalls-zero"
+set_store(exchanges(60))
+before = snapshot()
+r = compact(CID, max_calls=0)
+body = r.json()
+check(r.status_code == 200, f"max_calls=0: HTTP 200 (got {r.status_code})")
+check(body.get("rollup_calls") == 0,
+      f"max_calls=0: zero rollup calls, not the 200 default's worth "
+      f"(got {body.get('rollup_calls')})")
+check(body.get("watermark_after") == body.get("watermark_before") == 0,
+      f"max_calls=0: the watermark never moved "
+      f"(before={body.get('watermark_before')}, after={body.get('watermark_after')})")
+check("max_calls=0" in str(body.get("stopped_because")),
+      f"max_calls=0: stopped_because names the cap, not a model or "
+      f"no-progress stop (got {body.get('stopped_because')!r})")
+check(snapshot() == before,
+      "max_calls=0: not one byte under the storage root changed")
+
+CID = "maxcalls-nonnumeric"
+set_store(exchanges(60))
+before = snapshot()
+r = compact(CID, max_calls="abc")
+check(r.status_code == 400,
+      f"max_calls='abc': HTTP 400, not the unhandled-ValueError 500 the "
+      f"unfixed code raised (got {r.status_code})")
+check("max_calls" in r.text and "abc" in r.text,
+      f"max_calls='abc': the 400 body names the field and the bad value "
+      f"(got {r.text!r})")
+check(snapshot() == before, "max_calls='abc': not one byte changed")
+
+CID = "maxcalls-negative"
+set_store(exchanges(60))
+before = snapshot()
+r = compact(CID, max_calls=-5)
+body = r.json()
+check(r.status_code == 200, f"max_calls=-5: HTTP 200 (got {r.status_code})")
+check(body.get("rollup_calls") == 0,
+      f"max_calls=-5: clamped to 0 calls, not treated as unlimited "
+      f"(got {body.get('rollup_calls')})")
+# NOT a "rollup_calls == 0" check: `while calls < max_calls` already makes
+# zero iterations for ANY negative max_calls with no clamp at all (0 < -5 is
+# already False) — a check that cannot fire, caught by mutation-testing this
+# very test (removing the clamp line left this assertion green). The one
+# place the actual clamped VALUE is observable for a negative input is the
+# stopped_because message, which the while/else writes from the (post-clamp)
+# variable itself.
+check(body.get("stopped_because") == "hit max_calls=0",
+      f"max_calls=-5: the clamp actually replaced -5 with 0 (the loop "
+      f"itself would skip a negative max_calls either way, clamped or not) "
+      f"(got {body.get('stopped_because')!r})")
+check(snapshot() == before, "max_calls=-5: not one byte changed")
+
+# CONTROL: max_calls absent is still the documented 200-call LIVE default —
+# without this, a guard that refuses every max_calls value would pass [5d]
+# just as well as the real fix.
+CID = "maxcalls-absent-control"
+set_store(exchanges(60))
+before = snapshot()
+r = compact(CID)
+body = r.json()
+check(r.status_code == 200, f"CONTROL absent: HTTP 200 (got {r.status_code})")
+check(body.get("rollup_calls", 0) > 0 and snapshot() != before,
+      "CONTROL: an absent max_calls still runs live and writes "
+      f"(rollup_calls={body.get('rollup_calls')})")
+
+# The clamp itself: a max_calls past the 1000 ceiling still stops at 1000,
+# not at the caller's number — reusing [5c]'s always-advancing stub so the
+# loop has no OTHER reason to stop first. 1500 rather than something far
+# larger: the unclamped (mutated) code path below actually SPINS this many
+# times (file I/O per iteration), and the mutation record needs this section
+# to finish in seconds, not minutes, whether or not the clamp is present.
+CID = "maxcalls-clamped"
+set_store(exchanges(60))
+SPINS[0] = 0
+summarizer.maybe_rollup = _always_advances
+r = compact(CID, max_calls=1500)
+summarizer.maybe_rollup = _real_rollup
+body = r.json()
+check(r.status_code == 200, f"max_calls=1500: HTTP 200 (got {r.status_code})")
+check(SPINS[0] == 1000,
+      f"max_calls=1500: clamped to the 1000 ceiling, not the caller's "
+      f"number (ran {SPINS[0]})")
+check(body.get("rollup_calls") == 1000,
+      f"and the report says 1000 (says {body.get('rollup_calls')})")
+
+
+# ---------------------------------------------------------------------------
+# 6. R13 — a gap is FILLED at its position, not closed by concatenation
+#
+# `turns_seen` counts every exchange, including the ones decide_memory_tail
+# skipped and the ones bgwork shed; the episodic store holds only the indexed
+# ones. Concatenating what the store has therefore produced an array SHORT by
+# every gap, and short by even one turn is not merely short — every pair after
+# the gap sits one exchange early, so a chunk labelled 1-20 quietly swallows
+# exchange 11. The endpoint was right to refuse that, and refused for every
+# real conversation: 63 skips in one measured window, one gap is enough, and
+# this is the only rebuild-from-store recovery path there is.
+#
+# So place each pair at the position its `turn_index` records and fill the
+# holes with an explicit placeholder. What is left to refuse is what padding
+# cannot invent: a store that does not REACH the position.
+# ---------------------------------------------------------------------------
+
+print()
+print("[6] one un-indexed exchange in fifteen is rebuilt, not refused")
+# The backlog's exact reproduction: turns_seen=30, watermark=20,
+# concatenation=28 -> HTTP 409. Exchange 6 never reached the index, and the
+# 4-wide hole it leaves in turn_index is what production produces too — the
+# request seed (len(messages)+1) advances by 2 whether or not a row is written.
+CID = "gap-one"
+gappy = [ex for i, ex in enumerate(exchanges(15)) if i != 6]
+set_store(gappy)
+summarizer.save_state(CID, {
+    "l1": [], "l2": [], "l3": None, "last_summarized_turn": 0, "turns_seen": 30,
+})
+LLM_CALLS.clear()
+LLM_BODIES.clear()
+r = compact(CID)
+body = r.json()
+check(r.status_code == 200,
+      f"HTTP 200 — one gap no longer refuses the whole conversation "
+      f"(got {r.status_code}: {r.text[:120]})")
+check(body.get("reconstructed_messages") == 30,
+      f"the rebuild spans the full 30 turns "
+      f"(got {body.get('reconstructed_messages')})")
+check(body.get("indexed_exchanges") == 14,
+      f"...from only 14 stored rows (got {body.get('indexed_exchanges')})")
+check(body.get("gap_turns") == 2 and body.get("gap_exchanges") == 1,
+      f"and the plan REPORTS the gap rather than hiding it "
+      f"(gap_turns={body.get('gap_turns')}, "
+      f"gap_exchanges={body.get('gap_exchanges')})")
+check(body.get("recorded_position") == 30,
+      f"the plan names the position it was measured against "
+      f"(got {body.get('recorded_position')})")
+
+# The assertion that actually matters: WHICH turns went into chunk 1-20. The
+# labels are identical whether or not the alignment is right, so only the text
+# can tell. Exchanges 0-5 and 7-9 belong to it; exchange 10 does not, and
+# under the old concatenation it would have been dragged in.
+check(len(LLM_BODIES) >= 1, "a chunk was actually summarized")
+first = LLM_BODIES[0] if LLM_BODIES else ""
+check(all(f"answer {i}" in first for i in list(range(6)) + [7, 8, 9]),
+      "chunk 1-20 holds exactly the exchanges that belong to turns 1-20")
+check("answer 10" not in first,
+      "exchange 10 was NOT pulled forward into chunk 1-20 by the gap")
+check(main._UNINDEXED_TURN_PLACEHOLDER in first,
+      "and the missing exchange is present as an explicit placeholder, so the "
+      "summary can say a turn is unaccounted for rather than skip silently")
+_l1 = summarizer.load_state(CID).get("l1") or []
+check(bool(_l1) and _l1[0]["last_turn"] == 20,
+      f"the chunk is still labelled 1-20 (l1={_l1[:1]})")
+
+print()
+print("[6b] the placeholder is a summarization INPUT and never enters a store")
+# The house rule: a marker written into the memory store would be extracted as
+# a fact and become one of her memories. This one reaches maybe_rollup (proved
+# in [6] above) and nothing else. _fake_llm never echoes its input, so any
+# occurrence on disk would mean the placeholder was written directly.
+_leaked = []
+for _dirpath, _dirs, _files in os.walk(_TMP_ROOT):
+    for _name in _files:
+        _p = os.path.join(_dirpath, _name)
+        with open(_p, "rb") as _fh:
+            if main._UNINDEXED_TURN_PLACEHOLDER.encode() in _fh.read():
+                _leaked.append(os.path.relpath(_p, _TMP_ROOT))
+check(_leaked == [],
+      f"no file under the storage root contains the placeholder (found "
+      f"{_leaked})")
+
+print()
+print("[6c] a store with more gap than transcript is still refused")
+# One corrupt turn_index would otherwise open a gap as wide as the number
+# itself, and a reconstruction that is majority placeholder would spend a
+# summarization call per chunk to record that nothing is known.
+CID = "gap-majority"
+sparse = [
+    {"turn_index": 1, "document": "[user]: q\n[assistant]: a"},
+    {"turn_index": 3, "document": "[user]: q\n[assistant]: a"},
+    {"turn_index": 61, "document": "[user]: q\n[assistant]: a"},
+]
+set_store(sparse)
+summarizer.save_state(CID, {
+    "l1": [], "l2": [], "l3": None, "last_summarized_turn": 0,
+})
+before = snapshot()
+LLM_CALLS.clear()
+r = compact(CID)
+check(r.status_code == 409,
+      f"HTTP 409 for a reconstruction that is mostly holes (got {r.status_code})")
+check("more of this transcript is missing than is present" in r.text.lower(),
+      "and the body says which refusal this is")
+check(LLM_CALLS == [], "no LLM call was made")
+check(snapshot() == before, "the store is byte-identical after the refusal")
+
+print()
+print("[6d] a row whose document does not parse becomes a gap, not a shift")
+# Vanishing is what shifted everything after it. The slot is still consumed.
+CID = "gap-unparseable"
+rows = exchanges(10)
+rows[3] = {"turn_index": rows[3]["turn_index"], "document": "not an exchange"}
+set_store(rows)
+summarizer.save_state(CID, {
+    "l1": [], "l2": [], "l3": None, "last_summarized_turn": 0,
+})
+r = compact(CID, dry_run=True)
+body = r.json()
+check(r.status_code == 200, f"HTTP 200 (got {r.status_code})")
+check(body.get("reconstructed_messages") == 20,
+      f"the unparseable row still occupies its two slots "
+      f"(got {body.get('reconstructed_messages')})")
+check(body.get("gap_turns") == 2,
+      f"...counted as a gap (got {body.get('gap_turns')})")
+
+
+# ---------------------------------------------------------------------------
+
+print()
+# ---------------------------------------------------------------------------
+# 9. ?dry_run=true is HONOURED, not ignored
+# ---------------------------------------------------------------------------
+#
+# This endpoint's default is a LIVE run - up to 200 vLLM summarization calls, a
+# rewritten state file and an advanced watermark - and until v3.1.9 it read
+# dry_run from the JSON body only. So `?dry_run=true` silently performed the
+# thing it was asking to preview. The operator asked for a plan and got a
+# write. admin_merge next door learned to read the query string in v3.1.7 and
+# this one did not; its docstring even names the asymmetry.
+
+print()
+print("[9] ?dry_run=true in the QUERY STRING is honoured")
+QCID = "dryrun-query"
+set_store(exchanges(60))
+_before_q = snapshot()
+r = admin.post(f"/admin/conversations/{QCID}/compact?dry_run=true", json={})
+check(r.status_code == 200, f"HTTP 200 (got {r.status_code})")
+check(r.json().get("dry_run") is True,
+      "the report says dry_run: true (got %r)" % (r.json().get("dry_run"),))
+check(snapshot() == _before_q,
+      "and not one byte under the storage root changed")
+
+# CONTROL: the same endpoint with no flag anywhere still runs LIVE. Without
+# this, [9] passes just as well if the endpoint became dry-run-always, which
+# would be a different bug of the same size.
+# A FRESH conversation. The live run below drains this one to its
+# watermark, so reusing it for the next check leaves nothing to write and
+# "and it wrote" fails for a reason that has nothing to do with dry_run.
+QCID_LIVE = "dryrun-live"
+set_store(exchanges(60))
+_before_live = snapshot()
+r = admin.post(f"/admin/conversations/{QCID_LIVE}/compact", json={})
+check(r.status_code == 200, f"HTTP 200 for the live default (got {r.status_code})")
+check(r.json().get("dry_run") is False,
+      "an absent flag is still a LIVE run - that is the documented contract")
+check(snapshot() != _before_live,
+      "and it actually wrote something")
+
+# And the explicit opt-out still commits, so "false" is not swallowed by the
+# same parser that now accepts the query string.
+QCID_FALSE = "dryrun-false"
+set_store(exchanges(60))
+_before_false = snapshot()
+r = admin.post(f"/admin/conversations/{QCID_FALSE}/compact?dry_run=false", json={})
+check(r.json().get("dry_run") is False, "?dry_run=false means commit")
+check(snapshot() != _before_false, "and it wrote")
+
+
+# ---------------------------------------------------------------------------
+# 9b. v3.1.9 HIGH #1: an AMBIGUOUS present flag is a DRY RUN on the real
+# endpoint too - not just in _dry_run_from's own unit table
+# (test_config_dryrun.py). Each of these used to be a LIVE run because an
+# empty/malformed PRESENT value took `default`, and this endpoint's default
+# is live. Proved here end-to-end (real HTTP round trip through the app,
+# real snapshot of what did or did not get written) so the fix is checked at
+# the wire, not only inside the parser.
+# ---------------------------------------------------------------------------
+
+print()
+print("[9b] an ambiguous PRESENT dry_run (empty, bare, or a misspelled key) "
+      "is a DRY RUN, never the write")
+
+
+def _ambiguous_case(qs, label):
+    cid = f"dryrun-ambig-{len(_AMBIG_CIDS)}"
+    _AMBIG_CIDS.append(cid)
+    set_store(exchanges(60))
+    before = snapshot()
+    r = admin.post(f"/admin/conversations/{cid}/compact{qs}", json={})
+    check(r.status_code == 200, f"{label}: HTTP 200 (got {r.status_code})")
+    check(r.json().get("dry_run") is True,
+          f"{label}: reported dry_run: true (got {r.json().get('dry_run')!r})")
+    check(snapshot() == before, f"{label}: not one byte under the storage root changed")
+
+
+_AMBIG_CIDS = []
+_ambiguous_case("?dry_run=", "?dry_run= (present, empty)")
+_ambiguous_case("?dry_run", "?dry_run (bare flag)")
+_ambiguous_case("?dryrun=true", "?dryrun=true (misspelled key)")
+_ambiguous_case("?dry_run=true&dry_run=", "?dry_run=true&dry_run= (last-wins empty)")
+
+
+# ---------------------------------------------------------------------------
+# 9c. v3.1.9 HIGH #2: the BODY dialect now agrees with the query-string
+# dialect on the real endpoint. {"dry_run": null} used to COMMIT (the compact
+# endpoint's own default, read through `bool(None) is False`); it must not.
+# And {"dry_run": "false"} used to stay a DRY RUN (a non-empty string is
+# truthy) while ?dry_run=false committed on the very same endpoint; they must
+# now agree.
+# ---------------------------------------------------------------------------
+
+print()
+print("[9c] the body dialect for dry_run now agrees with the query dialect")
+
+CID_NULL = "dryrun-body-null"
+set_store(exchanges(60))
+_before_null = snapshot()
+r = admin.post(f"/admin/conversations/{CID_NULL}/compact", json={"dry_run": None})
+check(r.status_code == 200, f"{{'dry_run': None}}: HTTP 200 (got {r.status_code})")
+check(r.json().get("dry_run") is True,
+      "{'dry_run': None}: reported dry_run: true - it used to COMMIT "
+      "(got %r)" % (r.json().get("dry_run"),))
+check(snapshot() == _before_null, "{'dry_run': None}: not one byte changed")
+
+CID_STR_FALSE = "dryrun-body-str-false"
+set_store(exchanges(60))
+_before_strfalse = snapshot()
+r = admin.post(f"/admin/conversations/{CID_STR_FALSE}/compact", json={"dry_run": "false"})
+check(r.json().get("dry_run") is False,
+      "{'dry_run': \"false\"}: reported dry_run: false - it used to stay DRY "
+      "while ?dry_run=false committed on the same endpoint "
+      "(got %r)" % (r.json().get("dry_run"),))
+check(snapshot() != _before_strfalse, "{'dry_run': \"false\"}: and it wrote")
+
+
+# ---------------------------------------------------------------------------
+# 9d. GATE REVIEW round: conflicting repeated query values, and body-vs-query
+# disagreement, on the REAL endpoint (not just the unit table in
+# test_config_dryrun.py). Both used to COMMIT.
+# ---------------------------------------------------------------------------
+
+print()
+print("[9d] gate review: conflicting repeated values and body-vs-query "
+      "disagreement both resolve to DRY, not the write")
+
+CID_CONFLICT_Q = "dryrun-conflict-query"
+set_store(exchanges(60))
+_before_conflict_q = snapshot()
+r = admin.post(f"/admin/conversations/{CID_CONFLICT_Q}/compact?dry_run=true&dry_run=false", json={})
+check(r.status_code == 200, f"?dry_run=true&dry_run=false: HTTP 200 (got {r.status_code})")
+check(r.json().get("dry_run") is True,
+      "?dry_run=true&dry_run=false: reported dry_run: true - it used to COMMIT "
+      "(request.query_params.get is last-wins, so 'false' used to win) "
+      "(got %r)" % (r.json().get("dry_run"),))
+check(snapshot() == _before_conflict_q, "?dry_run=true&dry_run=false: not one byte changed")
+
+# CONTROL: repeated but AGREEING values still commit - this is not
+# "any repeated query key means dry now".
+CID_AGREE_Q = "dryrun-agree-query"
+set_store(exchanges(60))
+_before_agree_q = snapshot()
+r = admin.post(f"/admin/conversations/{CID_AGREE_Q}/compact?dry_run=false&dry_run=false", json={})
+check(r.json().get("dry_run") is False,
+      "?dry_run=false&dry_run=false: CONTROL - repeated AGREEING commit "
+      "tokens still commit (got %r)" % (r.json().get("dry_run"),))
+check(snapshot() != _before_agree_q, "?dry_run=false&dry_run=false: and it wrote")
+
+CID_CONFLICT_BQ = "dryrun-conflict-body-query"
+set_store(exchanges(60))
+_before_conflict_bq = snapshot()
+r = admin.post(f"/admin/conversations/{CID_CONFLICT_BQ}/compact?dry_run=true",
+                json={"dry_run": False})
+check(r.status_code == 200, f"body False + ?dry_run=true: HTTP 200 (got {r.status_code})")
+check(r.json().get("dry_run") is True,
+      "body False + ?dry_run=true: reported dry_run: true - the body used to "
+      "win outright and COMMIT without the query ever being consulted "
+      "(got %r)" % (r.json().get("dry_run"),))
+check(snapshot() == _before_conflict_bq, "body False + ?dry_run=true: not one byte changed")
+
+# CONTROL: body alone, query alone, and both-agree-on-commit ALL still
+# commit - the fix is "any present source can veto", not "two sources
+# present means dry no matter what".
+CID_BODY_ALONE = "dryrun-body-alone-commit"
+set_store(exchanges(60))
+_before_body_alone = snapshot()
+r = admin.post(f"/admin/conversations/{CID_BODY_ALONE}/compact", json={"dry_run": False})
+check(r.json().get("dry_run") is False,
+      "CONTROL: {'dry_run': False} alone still commits (got %r)" % (r.json().get("dry_run"),))
+check(snapshot() != _before_body_alone, "and it wrote")
+
+CID_QUERY_ALONE = "dryrun-query-alone-commit"
+set_store(exchanges(60))
+_before_query_alone = snapshot()
+r = admin.post(f"/admin/conversations/{CID_QUERY_ALONE}/compact?dry_run=false", json={})
+check(r.json().get("dry_run") is False,
+      "CONTROL: ?dry_run=false alone still commits (got %r)" % (r.json().get("dry_run"),))
+check(snapshot() != _before_query_alone, "and it wrote")
+
+CID_BOTH_AGREE = "dryrun-both-agree-commit"
+set_store(exchanges(60))
+_before_both_agree = snapshot()
+r = admin.post(f"/admin/conversations/{CID_BOTH_AGREE}/compact?dry_run=false",
+                json={"dry_run": False})
+check(r.json().get("dry_run") is False,
+      "CONTROL: body False AND ?dry_run=false together still commit "
+      "(got %r)" % (r.json().get("dry_run"),))
+check(snapshot() != _before_both_agree, "and it wrote")
+
+
 if FAILED:
     print(f"{len(FAILED)} assertion(s) failed:")
     for label in FAILED:
@@ -359,10 +935,68 @@ print("All admin compact tests passed.")
 #
 #   `if not exchanges:`            -> `if False:`            ->  [1]
 #   `if dry_run or not messages:`  -> `if not messages:`     ->  [2]
-#   `if len(messages) < _wm:`      -> `if False:`            ->  [3]
+#   `if len(messages) < _pos:`     -> `if False:`            ->  [3]
+#   `_pos = max(turns_seen, watermark)` -> `= watermark`     ->  [3d]
 #   `{conv_id}/compact`            -> `{conv_id:path}/compact`-> [4]
 #   `if now <= prev:`              -> `if False:`            ->  [5]
 #   `while calls < max_calls:`     -> `while calls < max_calls + 3:` -> [5c]
+#
+# v3.1.9 (hostile pass 2, MEDIUM), same treatment:
+#
+#   `max_calls = ...try/except/clamp...` -> the exact shipped line
+#     `max_calls = int(body.get("max_calls") or 200)`             ->  [5d]
+#     (all 8 assertions: max_calls=0 ran live, "abc" was 500, 1500
+#     ran unclamped instead of stopping at 1000)
+#   `max_calls = max(0, min(max_calls, 1000))` deleted (clamp only) -> [5d]
+#     (exactly the -5 and 1500 checks; 0 and "abc" stayed green,
+#     correctly — untouched by this mutant)
+#   `try: ... except (TypeError, ValueError): raise HTTPException(...)`
+#     deleted (bare `int(_raw_max_calls)` again, clamp kept)         -> [5d]
+#     (exactly the two "abc" checks)
+#
+# v3.1.7 (R13), same treatment:
+#
+#   `at = max(_idx(ex) - base, cursor)` -> `at = cursor`
+#     (spacing ignored, gaps closed — the pre-R13 concatenation)  ->  [6],
+#     and it comes back with the ORIGINAL defect's body verbatim:
+#     "rebuilds 28 messages ... including 0 placeholder turns"
+#   that, PLUS the unparseable-row `continue` hoisted above the
+#     slot arithmetic (the pre-R13 shape entire)                  ->  [6d]
+#   `if gap_turns > _real_turns:` -> `if False:`                  ->  [6c]
+#
+# v3.1.7 (R10), same treatment:
+#
+#   `if _state.get("tail_fp"):` -> `if False:`
+#     (the chat path's anchor is left in place for the drain)      ->  [3f],
+#     which comes back with the defect verbatim: the chunk is labelled
+#     3-20, holds turns 1-18, and turns_seen is left at 32
+#   `if len(messages) < _pos:` -> `if len(messages) <= _pos:`
+#     (the change R10 was reported as asking for)                  ->  [3b],
+#     [3f] AND [6]. It is recorded here as a mutation because it is the
+#     fix that looks right and is not: the R13 rebuild lands EXACTLY on
+#     the position whenever the store holds the head and the tail, so
+#     `<=` refuses every healthy conversation — including the one-gap
+#     case R13 exists to admit.
+#
+# Two mutations SURVIVED and are recorded because the reasons are worth
+# knowing:
+#
+#   `_state["head_fp"] = ""` / `_state["window_turns"] = 0` deleted, leaving
+# only the tail_fp clear. Nothing reads either one while the anchor is empty
+# — `window_unchanged` is only consulted on the branch where an anchor was
+# found — and _observed_position overwrites all three before it returns. They
+# are cleared together anyway because a window signature that describes an
+# array this endpoint has just declared irrelevant is a false statement on
+# disk, and the next person to add a read of it should not have to discover
+# that the three were separable.
+#
+# And the one from R13:
+# hoisting the unparseable-row `continue` above the slot arithmetic ON ITS OWN
+# changes nothing, because a slot is derived from the row's turn_index and not
+# from a running cursor — an unparseable row and a missing row are the same
+# thing to this rebuild, which is the property [6d] is really pinning. It only
+# becomes visible once placement is cursor-based as well, which is the
+# two-part mutation above.
 #
 # A test whose assertions cannot be made to fail is a test that asserts
 # nothing, and this branch has shipped two of those this week.

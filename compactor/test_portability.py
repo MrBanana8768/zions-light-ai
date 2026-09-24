@@ -9,6 +9,7 @@ no embeddings.
 Run: python test_portability.py
 """
 
+import asyncio
 import json
 import os
 import shutil
@@ -306,6 +307,578 @@ def test_export_is_json_serializable():
 
 
 # ---------------------------------------------------------------------------
+# hostile pass 3, F9: export_conversation's best-effort facts/summary read
+# used to make merge and fork treat an UNREADABLE source as "0 facts" —
+# silently, no error — instead of "unknown is not empty", the doctrine
+# import's pre-flight / health / quarantine already follow.
+# ---------------------------------------------------------------------------
+
+def _corrupt_facts_file(conv_id):
+    """A torn write: bytes on disk that are not valid JSON at all. Triggers
+    memory.StoreUnreadable from facts.load_facts, not a missing-file []."""
+    memory.facts_path(conv_id).write_bytes(b"{not valid json")
+
+
+def test_export_default_is_best_effort_on_a_corrupt_facts_file():
+    print("\n[test] F9 CONTROL: export_conversation(strict=False, the "
+          "default) still degrades gracefully on a corrupt facts file — "
+          "GET /admin/.../export must not start 400ing on a read a human "
+          "was just inspecting")
+    memory.ensure_storage_layout()
+    reset_state("f9-corrupt-1")
+    _corrupt_facts_file("f9-corrupt-1")
+    b = portability.export_conversation("f9-corrupt-1")
+    assert_eq(b["facts"], [], "best-effort default still returns an empty list, not raise")
+
+
+def test_export_strict_raises_on_unreadable_facts():
+    print("\n[test] F9: export_conversation(strict=True) raises "
+          "memory.StoreUnreadable on a corrupt facts file instead of "
+          "returning an empty list")
+    memory.ensure_storage_layout()
+    reset_state("f9-corrupt-2")
+    _corrupt_facts_file("f9-corrupt-2")
+    assert_raises(
+        lambda: portability.export_conversation("f9-corrupt-2", strict=True),
+        memory.StoreUnreadable,
+        "strict export raises rather than silently reporting 0 facts",
+    )
+
+
+def test_merge_refuses_on_unreadable_source_facts():
+    print("\n[test] F9: merge_conversation refuses (ValueError, 400-mapped) "
+          "rather than reporting src_facts=0 when the source facts file "
+          "cannot be read")
+    memory.ensure_storage_layout()
+    reset_state("f9-merge-src")
+    reset_state("f9-merge-dst")
+    _corrupt_facts_file("f9-merge-src")
+    # Give the source SOME episodic content too, so the pre-fix code's
+    # "nothing to merge" early-exit (empty facts AND empty episodic) would
+    # not have masked this — the corrupted facts file is the only reason
+    # this must refuse.
+    _STUB_STORE["f9-merge-src"] = [{"turn_index": 1, "document": "[user]: q\n[assistant]: a"}]
+    assert_raises(
+        lambda: portability.merge_conversation("f9-merge-src", "f9-merge-dst", dry_run=True),
+        ValueError,
+        "merge refuses on an unreadable source rather than treating it as "
+        "0 facts and proceeding on episodic alone",
+    )
+
+
+def test_fork_refuses_on_unreadable_source_facts():
+    print("\n[test] F9: fork_conversation refuses (ImportError_, 400-mapped) "
+          "rather than writing an empty-facts tombstone for the fork")
+    memory.ensure_storage_layout()
+    reset_state("f9-fork-src")
+    _corrupt_facts_file("f9-fork-src")
+    assert_raises(
+        lambda: portability.fork_conversation("f9-fork-src"),
+        portability.ImportError_,
+        "fork refuses on an unreadable source rather than writing an "
+        "empty-facts fork (which would also block needs_backfill later)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# merge_conversation — R5 (v3.1.7): pin/last_used must survive a collision,
+# not be silently discarded because dst's copy "wins".
+# ---------------------------------------------------------------------------
+
+def test_merge_conversation_adds_new_facts_and_leaves_source_intact():
+    print("\n[test] merge_conversation unions non-colliding facts, src untouched")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-1")
+    reset_state("merge-dst-1")
+    facts.save_facts(
+        "merge-src-1",
+        [{"text": "The lighthouse has a red door.", "added_turn": 5, "last_used": 300}],
+    )
+    facts.save_facts(
+        "merge-dst-1",
+        [{"text": "The user prefers past tense.", "added_turn": 1, "last_used": 100}],
+    )
+    result = portability.merge_conversation("merge-src-1", "merge-dst-1", dry_run=False)
+    assert_eq(result["facts_added"], 1, "one new fact added")
+    dst_texts = {f["text"] for f in facts.load_facts("merge-dst-1")}
+    assert_true("The lighthouse has a red door." in dst_texts, "new fact landed in dst")
+    assert_true("The user prefers past tense." in dst_texts, "dst's own fact still there")
+    assert_eq(len(facts.load_facts("merge-src-1")), 1, "source untouched by the merge")
+
+
+def test_merge_conversation_pins_the_destination_copy_on_collision():
+    print("\n[test] R5: a pinned source fact merging into an unpinned dst copy "
+          "comes out pinned, not silently un-pinned")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-2")
+    reset_state("merge-dst-2")
+    # _fact_key casefolds and collapses whitespace, so this is deliberately
+    # NOT byte-identical text — the backlog is explicit that R5 fires on
+    # non-identical pairs too.
+    facts.save_facts(
+        "merge-src-2",
+        [{"text": "Her name is Elena and she goes by El.",
+          "added_turn": 3, "last_used": 500, "pin": True}],
+    )
+    facts.save_facts(
+        "merge-dst-2",
+        [{"text": "her name is elena and she goes by el.",
+          "added_turn": 40, "last_used": 900, "pin": False}],
+    )
+    result = portability.merge_conversation("merge-src-2", "merge-dst-2", dry_run=False)
+    after = facts.load_facts("merge-dst-2")
+    assert_eq(len(after), 1, "still exactly one row, not two")
+    # The core R5 assertion, checked before anything about the reporting
+    # fields below — this is the one that must fail loudly on old code, not
+    # as a side effect of a KeyError on a field the fix happens to add.
+    assert_true(after[0]["pin"], "destination's copy is now pinned")
+    assert_eq(result["facts_added"], 0, "no NEW row — the key already existed")
+    assert_eq(result.get("facts_pin_or_recency_updated"), 1, "the collision is reported")
+    # last_used: the fresher of the two (dst's 900 already beat src's 500).
+    assert_eq(after[0]["last_used"], 900, "last_used is the max of the two")
+    # added_turn: dst's own value survives untouched — merging two different
+    # conversations' turn numbering is not meaningful (see
+    # _merge_fact_pin_and_recency's docstring).
+    assert_eq(after[0]["added_turn"], 40, "added_turn is dst's own, not touched")
+    # dst's own wording survives — the two texts differed only in case/full
+    # stop, and the key match does not mean byte-identical text.
+    assert_eq(after[0]["text"], "her name is elena and she goes by el.",
+              "dst's own wording is kept")
+
+
+def test_merge_conversation_last_used_takes_the_max_either_direction():
+    print("\n[test] merge collision keeps the fresher last_used, whichever side it's on")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-3")
+    reset_state("merge-dst-3")
+    facts.save_facts(
+        "merge-src-3",
+        [{"text": "The story is set on Brannock.", "added_turn": 1, "last_used": 9999}],
+    )
+    facts.save_facts(
+        "merge-dst-3",
+        [{"text": "The story is set on Brannock.", "added_turn": 1, "last_used": 100}],
+    )
+    portability.merge_conversation("merge-src-3", "merge-dst-3", dry_run=False)
+    after = facts.load_facts("merge-dst-3")
+    assert_eq(after[0]["last_used"], 9999, "src's fresher last_used wins even though src is not kept as the row")
+
+
+def test_merge_conversation_dry_run_previews_the_pin_update_without_writing():
+    print("\n[test] merge_conversation dry_run reports the pin update but changes nothing")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-4")
+    reset_state("merge-dst-4")
+    facts.save_facts(
+        "merge-src-4",
+        [{"text": "Idris keeps a logbook.", "added_turn": 1, "last_used": 50, "pin": True}],
+    )
+    facts.save_facts(
+        "merge-dst-4",
+        [{"text": "Idris keeps a logbook.", "added_turn": 1, "last_used": 50, "pin": False}],
+    )
+    result = portability.merge_conversation("merge-src-4", "merge-dst-4", dry_run=True)
+    assert_eq(result["dry_run"], True, "dry_run flag echoed")
+    assert_eq(result.get("facts_pin_or_recency_to_update"), 1, "preview reports the pending pin update")
+    after = facts.load_facts("merge-dst-4")
+    assert_eq(after[0]["pin"], False, "dry run changed nothing on disk")
+
+
+def test_merge_conversation_byte_identical_duplicate_is_a_true_no_op():
+    print("\n[test] a genuinely identical pair (same pin, same or lower last_used) "
+          "is reported as skipped, not as an update")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-5")
+    reset_state("merge-dst-5")
+    facts.save_facts(
+        "merge-src-5",
+        [{"text": "Setting: Aethermere.", "added_turn": 9, "last_used": 100, "pin": True}],
+    )
+    facts.save_facts(
+        "merge-dst-5",
+        [{"text": "Setting: Aethermere.", "added_turn": 1, "last_used": 100, "pin": True}],
+    )
+    result = portability.merge_conversation("merge-src-5", "merge-dst-5", dry_run=False)
+    assert_eq(result.get("facts_pin_or_recency_updated"), 0, "nothing actually changed")
+    assert_eq(result["facts_skipped_duplicate"], 1, "counted as a true duplicate")
+
+
+# ---------------------------------------------------------------------------
+# hostile pass 3, reviewer D F5: merge_conversation guarded only the
+# DESTINATION's lock, not the SOURCE's. On the identity runbook's own R3
+# (reverse merge), src IS the new uuid, and R2's first message under it
+# holds conv_lock(uuid) for the whole summary-rebuild drain (10-30 minutes
+# per the runbook) while her NEXT messages queue their episodic/fact tails
+# behind that same lock. A reverse merge run in that window reads an
+# INCOMPLETE src snapshot, commits, and reports success — the queued tail's
+# writes then land under the uuid after the header is already gone,
+# stranded (recoverable by re-running the merge, but silently incomplete
+# the first time).
+# ---------------------------------------------------------------------------
+
+def test_merge_refuses_while_source_has_a_write_in_flight():
+    print("\n[test] hostile pass 3 (reviewer D) F5: merge_conversation "
+          "refuses while the SOURCE (not just the destination) has a "
+          "memory write in flight — the identity runbook's R3 (reverse "
+          "merge), run while the uuid's own rebuild tail is still draining")
+    memory.ensure_storage_layout()
+    reset_state("f5d-src")
+    reset_state("f5d-dst")
+    facts.save_facts("f5d-src", [{"text": "queued fact", "added_turn": 1, "last_used": 1, "pin": False}])
+    facts.save_facts("f5d-dst", [{"text": "dst fact", "added_turn": 1, "last_used": 1, "pin": False}])
+
+    async def _while_src_locked():
+        async with memory.conv_lock("f5d-src"):
+            try:
+                portability.merge_conversation("f5d-src", "f5d-dst", dry_run=False)
+                return False
+            except ValueError:
+                return True
+
+    assert_true(
+        asyncio.run(_while_src_locked()),
+        "refuses (ValueError, 400-mapped) while a tail holds conv_lock on "
+        "the SOURCE — before this fix, only the destination's lock was "
+        "checked and this merge would have proceeded, reading whatever the "
+        "queued tail had NOT yet written",
+    )
+    # Nothing was written to dst — a mid-air refusal must not partially land.
+    assert_eq(len(facts.load_facts("f5d-dst")), 1, "dst untouched by the refused attempt")
+
+
+def test_merge_still_refuses_while_dest_has_a_write_in_flight():
+    print("\n[test] CONTROL: the pre-existing destination-lock refusal is "
+          "unchanged by adding the source check next to it")
+    memory.ensure_storage_layout()
+    reset_state("f5d-src2")
+    reset_state("f5d-dst2")
+    facts.save_facts("f5d-src2", [{"text": "src fact", "added_turn": 1, "last_used": 1, "pin": False}])
+    facts.save_facts("f5d-dst2", [{"text": "dst fact", "added_turn": 1, "last_used": 1, "pin": False}])
+
+    async def _while_dst_locked():
+        async with memory.conv_lock("f5d-dst2"):
+            try:
+                portability.merge_conversation("f5d-src2", "f5d-dst2", dry_run=False)
+                return False
+            except ValueError:
+                return True
+
+    assert_true(asyncio.run(_while_dst_locked()), "CONTROL: dst-lock refusal still fires")
+
+
+def test_merge_commits_normally_once_both_locks_are_free():
+    print("\n[test] CONTROL: with neither lock held, the merge commits "
+          "normally — this is a refusal on CONTENTION, not a new blanket "
+          "refusal on every merge")
+    memory.ensure_storage_layout()
+    reset_state("f5d-src3")
+    reset_state("f5d-dst3")
+    facts.save_facts("f5d-src3", [{"text": "src fact", "added_turn": 1, "last_used": 1, "pin": False}])
+    reset_state("f5d-dst3")
+    result = portability.merge_conversation("f5d-src3", "f5d-dst3", dry_run=False)
+    assert_eq(result["facts_added"], 1, "CONTROL: an uncontended merge still commits")
+
+
+# ---------------------------------------------------------------------------
+# merge_conversation LRU floor — v3.1.9 F6 (hostile pass 2, review B):
+# merging the hash-id store into the new chat-id store used to keep each
+# merged fact's OWN last_used. A backfill's fresh re-extractions under the
+# new id then won facts.prune_facts's LRU on the very next write, and a
+# reviewed real merge archived 115 of a user's 136 original facts.
+#
+# These tests use facts.prune_facts as the REAL evictor (not a hand-rolled
+# stand-in), exactly the brief's instruction, so the LRU ordering exercised
+# here is the one production actually runs.
+# ---------------------------------------------------------------------------
+
+def _bulk_facts(n, prefix, lu_base, lu_spread, turn_base=0):
+    """n synthetic facts shaped like the reviewed real store: distinct text,
+    a spread of last_used values, no pins. `lu_base`/`lu_spread` control
+    where in "time" this batch sits relative to another batch — the whole
+    point of these tests is comparing two batches with DIFFERENT last_used
+    neighborhoods, the way "her hours-old originals" and "backfill's
+    just-minted facts" sit in production.
+    """
+    out = []
+    for i in range(n):
+        out.append({
+            "text": f"{prefix} fact {i}: a distinct detail long enough to "
+                    f"cost real budget once rendered as a bullet line.",
+            "added_turn": turn_base + i,
+            "last_used": lu_base + (i * lu_spread // max(n, 1)),
+            "pin": False,
+        })
+    return out
+
+
+def test_merge_conversation_f6_new_facts_survive_lru_against_fresher_backfill():
+    print("\n[test] F6: merged-in facts are not archived wholesale just because "
+          "a same-moment backfill minted fresher last_used values in dst")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-f6")
+    reset_state("merge-dst-f6")
+    # src: 40 facts with OLD last_used (~1000-2000) — "her originals",
+    # hours old by the time the merge runs.
+    facts.save_facts("merge-src-f6", _bulk_facts(40, "hers", lu_base=1000, lu_spread=1000))
+    # dst: 60 facts with FRESH last_used (~99000-100000) — "backfill's",
+    # minted moments before the merge. Calibrated (not arbitrary): 60 of
+    # this exact bullet shape ALREADY slightly exceeds the default
+    # COMPACTOR_MAX_FACTS_TOKENS budget on its own (measured: 60 alone ->
+    # 57 kept, 3 dropped) — the same shape as the reviewed real store,
+    # where backfill's own batch was already most of the way to the cap
+    # before anything was merged in. This matters: with dst's own batch
+    # already filling the budget, an unprotected merge leaves ZERO slack
+    # for anything merged in, which is what makes this test actually
+    # discriminate the fix from the bug (a smaller/looser dst batch leaves
+    # enough spare capacity that some of "hers" survives by sheer room
+    # either way, and the assertion below would pass for the wrong reason).
+    facts.save_facts("merge-dst-f6", _bulk_facts(60, "backfill", lu_base=99000, lu_spread=1000))
+
+    # v3.1.9 (hostile pass 3, F6): the floor is opt-in now (see
+    # portability.merge_conversation's docstring) — this test exercises
+    # exactly the id-migration/backfill shape it was built for, so it asks
+    # for it explicitly.
+    result = portability.merge_conversation(
+        "merge-src-f6", "merge-dst-f6", dry_run=False, refresh_last_used=True
+    )
+    assert_eq(result["facts_added"], 40, "all 40 of her facts were new (no collisions)")
+
+    merged = facts.load_facts("merge-dst-f6")
+    assert_eq(len(merged), 100, "post-merge store holds both batches")
+
+    # The default budget forces real eviction — the CONTROL half: this must
+    # still be able to say yes, not just refuse to evict anything.
+    kept, dropped = facts.prune_facts(merged, conv_id="merge-dst-f6")
+    assert_true(dropped > 0, "CONTROL: eviction still happens under the real budget")
+    assert_true(len(kept) < len(merged), "CONTROL: not everything survives")
+
+    hers_kept = sum(1 for f in kept if f["text"].startswith("hers"))
+    hers_archived = 40 - hers_kept
+    # Before the fix this was 0/40 (every one of "hers" lost the LRU race to
+    # "backfill" — measured directly against the unfixed code with this
+    # exact fixture before the fix landed), matching the shape of the
+    # reviewed incident (115/136 archived, a large majority). The floor
+    # does not guarantee ALL of hers survive every possible store shape —
+    # it stops hers being the ONE-SIDED loser of a race it was never a
+    # real participant in, which this fixture is calibrated to show clearly:
+    # fixed, hers_kept measures 40/40.
+    assert_true(
+        hers_kept >= 30,
+        f"a floor-protected merge keeps the large majority of the merged-in "
+        f"facts against a dst batch that was already at/over budget before "
+        f"the merge (kept {hers_kept}/40, archived {hers_archived}/40)",
+    )
+
+
+def test_merge_conversation_f6_no_backfill_competition_all_of_hers_survive():
+    print("\n[test] F6: with an EMPTY dst (the recommended merge-before-message "
+          "order — no backfill has run), the floor is a no-op and normal "
+          "budget math applies")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-f6b")
+    reset_state("merge-dst-f6b")
+    facts.save_facts("merge-src-f6b", _bulk_facts(20, "hers", lu_base=1000, lu_spread=1000))
+    # dst starts genuinely empty — no backfill has run, matching F3's fix
+    # (merging first means the destination already has a facts file, so the
+    # backfill trigger never fires).
+    facts.save_facts("merge-dst-f6b", [])
+
+    result = portability.merge_conversation("merge-src-f6b", "merge-dst-f6b", dry_run=False)
+    assert_eq(result["facts_added"], 20, "all 20 landed, nothing to collide with")
+
+    merged = facts.load_facts("merge-dst-f6b")
+    # Budget comfortably fits all 20 — nothing should be evicted, floor or
+    # not, proving the floor logic does not invent phantom pressure when
+    # there was none.
+    kept, dropped = facts.prune_facts(merged, conv_id="merge-dst-f6b")
+    assert_eq(dropped, 0, "nothing evicted when the store fits the default budget")
+    assert_eq(len(kept), 20, "all of hers present")
+
+
+def test_merge_conversation_f6_collision_last_used_is_not_floored():
+    print("\n[test] F6's floor applies ONLY to brand-new facts, never to a "
+          "collision fold — a colliding row keeps max(dst, src), not the "
+          "destination's unrelated newest fact")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-f6c")
+    reset_state("merge-dst-f6c")
+    # Two facts in dst: one with a very high last_used (sets the floor a
+    # naive implementation might apply everywhere), and one that will
+    # COLLIDE with src's fact at a much lower last_used than the floor.
+    facts.save_facts(
+        "merge-dst-f6c",
+        [
+            {"text": "Unrelated fresh fact.", "added_turn": 0, "last_used": 90000, "pin": False},
+            {"text": "The story is set on Brannock.", "added_turn": 1, "last_used": 200, "pin": False},
+        ],
+    )
+    facts.save_facts(
+        "merge-src-f6c",
+        [{"text": "The story is set on Brannock.", "added_turn": 1, "last_used": 300, "pin": False}],
+    )
+    portability.merge_conversation("merge-src-f6c", "merge-dst-f6c", dry_run=False)
+    after = {f["text"]: f for f in facts.load_facts("merge-dst-f6c")}
+    assert_eq(len(after), 2, "still two rows — the collision did not add a third")
+    assert_eq(
+        after["The story is set on Brannock."]["last_used"], 300,
+        "collision keeps max(dst=200, src=300) — NOT floored up to the "
+        "unrelated fact's 90000",
+    )
+    assert_eq(
+        after["Unrelated fresh fact."]["last_used"], 90000,
+        "the untouched dst fact is exactly untouched",
+    )
+
+
+def test_merge_conversation_f6_reports_facts_over_budget_after_merge():
+    print("\n[test] F6: the merge response says how many facts are already "
+          "over budget right after it lands, in both dry-run and commit")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-f6d")
+    reset_state("merge-dst-f6d")
+    facts.save_facts("merge-src-f6d", _bulk_facts(40, "hers", lu_base=1000, lu_spread=1000))
+    facts.save_facts("merge-dst-f6d", _bulk_facts(25, "backfill", lu_base=99000, lu_spread=1000))
+
+    # Same numbers dry or committed — the preview must not undercount.
+    dry = portability.merge_conversation("merge-src-f6d", "merge-dst-f6d", dry_run=True)
+    assert_true("facts_over_budget_after_merge" in dry, "dry-run response carries the field")
+    assert_true(dry["facts_over_budget_after_merge"] > 0,
+                f"dry-run: the merged 40+25 facts over the "
+                f"{facts._MAX_FACTS_TOKENS}-token "
+                f"default budget is reported as already over "
+                f"(got {dry['facts_over_budget_after_merge']})")
+
+    live = portability.merge_conversation("merge-src-f6d", "merge-dst-f6d", dry_run=False)
+    assert_eq(dry["facts_over_budget_after_merge"], live["facts_over_budget_after_merge"],
+               "dry-run preview matches the committed reality (same inputs, "
+               "same LRU split)")
+
+
+# ---------------------------------------------------------------------------
+# hostile pass 3, F6: the SAME automatic floor that fixes the backfill shape
+# above INVERTS eviction for RUNBOOK_MEMORY_IDENTITY.md's "Older forks" step
+# — merging an abandoned fork into a primary conversation still being
+# chatted in, no backfill involved. These tests use facts.prune_facts as the
+# real evictor, same as the F6 tests above.
+# ---------------------------------------------------------------------------
+
+def test_merge_conversation_f6c_default_does_not_invert_older_forks_eviction():
+    print("\n[test] F6 (pass 3): the default (no refresh_last_used) merge does "
+          "NOT float 14-day-old fork facts above her own real, more-recent "
+          "ones — the runbook's own 'expect most of what they add to be "
+          "evicted' promise")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-f6e")
+    reset_state("merge-dst-f6e")
+    # dst ("her" primary, still being chatted in): 70 facts spread 1-4 days
+    # old, matching the runbook shape (a real working set, not a backfill).
+    facts.save_facts("merge-dst-f6e", _bulk_facts(
+        70, "hers", lu_base=1_000_000, lu_spread=300_000,  # ~ "1-4 days ago" scale
+    ))
+    # src (the older, abandoned fork): 50 facts, all OLDER than any of dst's
+    # — 13-14 days old, exactly what the runbook tells the operator to
+    # expect gets evicted first.
+    facts.save_facts("merge-src-f6e", _bulk_facts(
+        50, "fork", lu_base=100_000, lu_spread=50_000,  # older than dst's 1,000,000+ range
+    ))
+
+    # CONTROL: without the fix, an unconditional floor would stamp every one
+    # of the 50 fork facts up to dst's own newest last_used, inverting whose
+    # facts look oldest. Confirm the default call does not ask for that.
+    result = portability.merge_conversation("merge-src-f6e", "merge-dst-f6e", dry_run=False)
+    assert_eq(result["refresh_last_used"], False, "opt-in flag defaults off")
+
+    merged = facts.load_facts("merge-dst-f6e")
+    assert_eq(len(merged), 120, "both batches present")
+
+    kept, dropped = facts.prune_facts(merged, conv_id="merge-dst-f6e")
+    assert_true(dropped > 0, "CONTROL: eviction still happens under the real budget")
+
+    fork_kept = sum(1 for f in kept if f["text"].startswith("fork"))
+    hers_kept = sum(1 for f in kept if f["text"].startswith("hers"))
+    # Before this fix (floor unconditional): fork facts got floored to "now"
+    # and out-ranked hers, so hers_kept was the one that collapsed. Fixed:
+    # the fork's genuinely older facts are the ones the real LRU sheds first.
+    assert_true(
+        fork_kept < 50,
+        f"the 14-day-old fork facts are evicted first under real LRU "
+        f"(fork_kept={fork_kept}/50)",
+    )
+    assert_true(
+        hers_kept > fork_kept,
+        f"her more-recent facts outlive the fork's older ones "
+        f"(hers_kept={hers_kept}/70, fork_kept={fork_kept}/50) — inverted "
+        f"before this fix",
+    )
+
+
+def test_merge_conversation_f6c_refresh_last_used_opt_in_still_floors():
+    print("\n[test] F6 (pass 3) CONTROL: refresh_last_used=True still floors "
+          "merged-in facts for the id-migration/backfill recovery it exists for")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-f6f")
+    reset_state("merge-dst-f6f")
+    facts.save_facts("merge-src-f6f", _bulk_facts(40, "hers", lu_base=1000, lu_spread=1000))
+    facts.save_facts("merge-dst-f6f", _bulk_facts(60, "backfill", lu_base=99000, lu_spread=1000))
+
+    result = portability.merge_conversation(
+        "merge-src-f6f", "merge-dst-f6f", dry_run=False, refresh_last_used=True
+    )
+    assert_eq(result["refresh_last_used"], True, "the opt-in flag round-trips in the response")
+
+    merged = facts.load_facts("merge-dst-f6f")
+    kept, dropped = facts.prune_facts(merged, conv_id="merge-dst-f6f")
+    assert_true(dropped > 0, "CONTROL: eviction still happens")
+    hers_kept = sum(1 for f in kept if f["text"].startswith("hers"))
+    assert_true(
+        hers_kept >= 30,
+        f"opt-in still protects the merged-in originals against a fresher "
+        f"backfill batch (hers_kept={hers_kept}/40)",
+    )
+
+
+def test_merge_conversation_f6c_reports_eviction_by_origin():
+    print("\n[test] F6 (pass 3): facts_over_budget_after_merge is split by "
+          "origin so the operator can see WHICH side would be archived")
+    memory.ensure_storage_layout()
+    reset_state("merge-src-f6g")
+    reset_state("merge-dst-f6g")
+    facts.save_facts("merge-dst-f6g", _bulk_facts(70, "hers", lu_base=1_000_000, lu_spread=300_000))
+    facts.save_facts("merge-src-f6g", _bulk_facts(50, "fork", lu_base=100_000, lu_spread=50_000))
+
+    dry = portability.merge_conversation("merge-src-f6g", "merge-dst-f6g", dry_run=True)
+    for key in (
+        "facts_over_budget_after_merge",
+        "dst_facts_evicted_after_merge",
+        "merged_facts_evicted_after_merge",
+    ):
+        assert_true(key in dry, f"dry-run response carries {key}")
+    assert_eq(
+        dry["dst_facts_evicted_after_merge"] + dry["merged_facts_evicted_after_merge"],
+        dry["facts_over_budget_after_merge"],
+        "the per-origin split sums back to the total",
+    )
+    # The whole point of the finding: under the default (no floor), the
+    # evicted set should be overwhelmingly the OLD FORK facts, not hers.
+    assert_true(
+        dry["merged_facts_evicted_after_merge"] > dry["dst_facts_evicted_after_merge"],
+        f"the fork's older facts dominate the eviction, not her own "
+        f"(dst={dry['dst_facts_evicted_after_merge']}, "
+        f"merged={dry['merged_facts_evicted_after_merge']})",
+    )
+
+    live = portability.merge_conversation("merge-src-f6g", "merge-dst-f6g", dry_run=False)
+    assert_eq(
+        dry["dst_facts_evicted_after_merge"], live["dst_facts_evicted_after_merge"],
+        "dry-run per-origin preview matches the committed reality",
+    )
+    assert_eq(
+        dry["merged_facts_evicted_after_merge"], live["merged_facts_evicted_after_merge"],
+        "dry-run per-origin preview matches the committed reality",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -322,6 +895,25 @@ def _all_tests():
         test_fork_creates_independent_copy,
         test_fork_with_explicit_new_id,
         test_export_is_json_serializable,
+        test_export_default_is_best_effort_on_a_corrupt_facts_file,
+        test_export_strict_raises_on_unreadable_facts,
+        test_merge_refuses_on_unreadable_source_facts,
+        test_fork_refuses_on_unreadable_source_facts,
+        test_merge_conversation_adds_new_facts_and_leaves_source_intact,
+        test_merge_conversation_pins_the_destination_copy_on_collision,
+        test_merge_conversation_last_used_takes_the_max_either_direction,
+        test_merge_conversation_dry_run_previews_the_pin_update_without_writing,
+        test_merge_conversation_byte_identical_duplicate_is_a_true_no_op,
+        test_merge_refuses_while_source_has_a_write_in_flight,
+        test_merge_still_refuses_while_dest_has_a_write_in_flight,
+        test_merge_commits_normally_once_both_locks_are_free,
+        test_merge_conversation_f6_new_facts_survive_lru_against_fresher_backfill,
+        test_merge_conversation_f6_no_backfill_competition_all_of_hers_survive,
+        test_merge_conversation_f6_collision_last_used_is_not_floored,
+        test_merge_conversation_f6_reports_facts_over_budget_after_merge,
+        test_merge_conversation_f6c_default_does_not_invert_older_forks_eviction,
+        test_merge_conversation_f6c_refresh_last_used_opt_in_still_floors,
+        test_merge_conversation_f6c_reports_eviction_by_origin,
     ]
 
 

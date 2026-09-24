@@ -1,0 +1,338 @@
+# The Tier-3 integration suite, run LOCALLY, with no GPU and no model weights.
+#
+# `tests/integration/` is a black-box suite: it imports no compactor code and
+# hits the public API from outside. That made it a post-deploy tool, because
+# the only thing it could point at was the pod. This stack gives it a local
+# target.
+#
+#   # ALWAYS recreate the compactor first. `run` starts a dependency that
+#   # is not running but will NOT recreate one that is, and the container
+#   # picks up the working tree only at start — that is how this stack
+#   # once served code 49 minutes older than the commit it was verifying.
+#   # (--force-recreate is an `up` flag; `docker compose run` rejects it.)
+#   docker compose -f docker-compose.integration.yml up -d --force-recreate compactor
+#   docker compose -f docker-compose.integration.yml run --rm --no-deps integration-tests
+#
+#   # one file, or any other pytest argument:
+#   docker compose -f docker-compose.integration.yml run --rm integration-tests -k facts
+#   docker compose -f docker-compose.integration.yml run --rm integration-tests tests/integration/test_health.py -v
+#
+#   # leave the stack up to poke at by hand (compactor on localhost:8081):
+#   docker compose -f docker-compose.integration.yml up -d --force-recreate compactor
+#   docker compose -f docker-compose.integration.yml down
+#
+# WHY THIS IS POSSIBLE AT ALL. The compactor is CPU-only by design — its
+# requirements.txt is deliberately torch-free, and fastembed runs on ONNX.
+# The only GPU-bound component in the production image is vLLM, and the
+# tokenizer-contract fixture already implements everything the compactor
+# asks of it: /v1/chat/completions, /v1/models, /tokenize, /detokenize,
+# /health, plus _fixture/mode hooks for injecting refusals.
+#
+# RESULTS. Against the canned fixture the suite runs in about a minute.
+# Two cases in test_facts.py seed distinctive content and assert it comes
+# back as an EXTRACTED FACT; the weightless fixture answers every
+# completion — the extraction call included — with a canned string, so
+# there is nothing for the extractor to find. Run the `model` profile
+# below and one of them passes; the other needs a longer poll than the
+# suite's ceiling used to allow (see POLL_CEILING in _harness.py).
+#
+# They are left FAILING rather than skipped on purpose. A skip would need
+# the black-box suite to learn what a fixture is, and this project has been
+# bitten twice by suites reporting a pass they did not earn — a known,
+# explained, reproducible red is the more honest signal.
+#
+# A NOTE ON A NUMBER THAT USED TO BE HERE. This block previously stated a
+# precise pass/fail count. It was measured against a container that had
+# copied the code at start and was 49 minutes older than the commit it was
+# credited to — so the number described a build nobody had. It is not
+# replaced with a new number: a count pinned in a comment goes stale the
+# next time anyone edits anything, which is how it was wrong in the first
+# place. Run the suite; it will tell you.
+#
+# WHAT A GREEN RUN HERE DOES AND DOES NOT MEAN. It proves the WIRING and the
+# BEHAVIOUR: that facts are extracted and injected, that /forget clears what
+# it claims to, that the summarizer advances, that admin endpoints refuse
+# what they should. It proves NOTHING about the model or the numbers. The
+# fixture's tokenizer is not Cydonia's, so token counts here are fiction, and
+# reply quality is whatever the stub was told to say. Same caveat the
+# contract suite prints in its own banner, for the same reason.
+#
+# Separate from docker-compose.yml (production, GPU, weights),
+# docker-compose.tests.yml (the unit suite) and
+# docker-compose.tokenizer-contract.yml (the /tokenize contract). Nothing
+# here touches any of them.
+
+services:
+  # The vLLM stand-in. Same image as the contract suite's fixture, its own
+  # container and its own port — the contract suite deliberately injects
+  # /tokenize 400s and malformed 200s into its fixture, and a suite sharing
+  # one fixture with it fails mid-run for a reason indistinguishable from a
+  # real defect. That already happened once (see the soak comments in
+  # docker-compose.tokenizer-contract.yml); it does not happen twice.
+  vllm-fixture:
+    build:
+      context: ./testfixtures/tokenizer-contract
+      dockerfile: Dockerfile
+    # NO container_name — see the note on the same change in
+    # docker-compose.tests.yml. compactor reaches this by the compose
+    # SERVICE name (VLLM_URL: http://vllm-fixture:8000 below), never by a
+    # fixed container name, so dropping it changes nothing about how the
+    # stack wires together and lets `-p <project>` actually isolate two
+    # concurrent runs of this file instead of colliding on a fixed name.
+    environment:
+      FIXTURE_TOKENIZER: HuggingFaceTB/SmolLM2-135M-Instruct
+      FIXTURE_SERVED_MODEL_NAME: fixture-model
+      FIXTURE_MAX_MODEL_LEN: "32768"
+      FIXTURE_ERROR_STYLE: v010
+    ports:
+      - "18002:8000"   # 18000/18001 belong to the contract suite and the soak
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  # The real compactor, from the working tree, on the userland production
+  # runs. Reuses the unit-suite image: it is Ubuntu 24.04 with
+  # /opt/compactor-venv built from the same pinned requirements.txt, which is
+  # exactly what this needs, and building a second near-identical image would
+  # be a second thing to keep in step.
+  compactor:
+    build:
+      context: .
+      dockerfile: testfixtures/unit-suite/Dockerfile
+    # NO container_name — see the note on vllm-fixture above.
+    # integration-tests reaches this via network_mode: "service:compactor",
+    # not by container name, and the file's own top-of-file commands
+    # already address it by SERVICE name (`up -d --force-recreate
+    # compactor`), so nothing here depended on the fixed name.
+    depends_on:
+      vllm-fixture:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    # Runs FROM THE READ-ONLY MOUNT, not from a copy.
+    #
+    # This used to `cp -a /src/compactor /app` at container start, and that
+    # froze the code at whichever moment the container happened to start.
+    # `docker compose up -d` does not recreate a container that is already
+    # running, so the stack silently served stale code: on 2026-09-04 it was
+    # 49 minutes older than the commit it was being asked to verify, and a
+    # regression test written against that commit failed for a reason that
+    # had nothing to do with the code under test. A test stack that appears
+    # to test the working tree and does not is the exact defect class this
+    # branch has spent its life on.
+    #
+    # Running from /src removes the copy, and PYTHONDONTWRITEBYTECODE is set
+    # in the image so nothing tries to write __pycache__ into a read-only
+    # mount. The container still has to be RECREATED to pick up an edit
+    # (uvicorn is not reloading), which is why every documented command
+    # above recreates it explicitly with `up -d --force-recreate` before
+    # running the suite (`docker compose run` has no such flag).
+    # A SMALL REAL webui.db first. This stack runs no OpenWebUI, and since
+    # v3.1.9 a backup cycle that cannot find the database fails instead of
+    # publishing an archive with no chat history (pass-3 F12). The opt-out for
+    # that expires once a pod has published an archive (pass-4 G6), which is
+    # right on a pod, so the stack gets a database of the shape backup.py and
+    # webuidb read (a `chat` table with id, chat, updated_at) rather than an
+    # escape hatch. The backup tests then exercise the real path.
+    command:
+      - >
+        mkdir -p /var/lib/openwebui &&
+        /opt/compactor-venv/bin/python -c "import sqlite3,time; c=sqlite3.connect('/var/lib/openwebui/webui.db'); c.execute('create table if not exists chat (id text primary key, user_id text, title text, chat text, created_at integer, updated_at integer)'); c.execute('insert or ignore into chat values (?,?,?,?,?,?)', ('itest-chat','itest-user','integration fixture','{\"messages\": []}', int(time.time()), int(time.time()))); c.commit(); c.close()" &&
+        cd /src/compactor &&
+        exec /opt/compactor-venv/bin/uvicorn main:app
+        --host 0.0.0.0 --port 8080 --log-level info
+    volumes:
+      - ./:/src:ro
+    environment:
+      VLLM_URL: http://vllm-fixture:8000
+      MODEL_REPO: fixture-model
+      MAX_MODEL_LEN: "32768"
+      COMPACTOR_GENERATION_RESERVE: "8192"
+      # Storage lives inside the container and dies with it: every run starts
+      # from an empty store, which is what makes the suite's assertions about
+      # what it just wrote mean anything.
+      COMPACTOR_STORAGE_ROOT: /data/compactor
+      # RAG on: retrieval is a third of what this suite tests, and chromadb +
+      # fastembed are in the image. The embedder is bundled with fastembed,
+      # so this still needs no network.
+      COMPACTOR_RAG_ENABLED: "true"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    ports:
+      - "8081:8080"   # 8080 on the host is often the developer's own tunnel
+    healthcheck:
+      test: ["CMD", "/opt/compactor-venv/bin/python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health', timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  # --- The same stack, with REAL WEIGHTS (opt-in) --------------------------
+  #
+  #   docker compose -f docker-compose.integration.yml --profile model \
+  #       run --rm --build integration-tests-model
+  #
+  # A 0.5B instruct model in GGUF, CPU only, ~400 MB. It exists because two
+  # integration tests seed distinctive content and assert it comes back as an
+  # EXTRACTED FACT, and no canned string can satisfy that — fact extraction is
+  # itself an LLM call whose answer has to be about the input. Everything
+  # downstream of real extraction (dedup's merges, archive's evictions, what a
+  # summary actually says) has never been exercised locally either.
+  #
+  # Slower by a lot: seconds per generation rather than microseconds, and two
+  # generations per exchange. Expect minutes, not the 49s the canned run takes.
+  # That is why it is a profile and not the default.
+  #
+  # It is NOT a claim about production. A 0.5B model's replies are worse than
+  # Cydonia's and its token counts are its own; this proves the pipeline moves
+  # real text end to end, nothing more.
+  model-fixture:
+    profiles: ["model"]
+    build:
+      context: ./testfixtures/tokenizer-contract
+      dockerfile: Dockerfile.model
+    # NO container_name — same reasoning as vllm-fixture above;
+    # compactor-model reaches this by the service name model-fixture.
+    environment:
+      FIXTURE_MAX_MODEL_LEN: "32768"
+      FIXTURE_ERROR_STYLE: v010
+      FIXTURE_MODEL_MAX_TOKENS: "256"
+      FIXTURE_MODEL_THREADS: "4"
+    ports:
+      - "18003:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+      start_period: 30s   # loading weights is not instant
+
+  compactor-model:
+    profiles: ["model"]
+    build:
+      context: .
+      dockerfile: testfixtures/unit-suite/Dockerfile
+    # NO container_name — same reasoning as compactor above;
+    # integration-tests-model reaches this via
+    # network_mode: "service:compactor-model".
+    depends_on:
+      model-fixture:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    # Runs FROM THE READ-ONLY MOUNT, not from a copy.
+    #
+    # This used to `cp -a /src/compactor /app` at container start, and that
+    # froze the code at whichever moment the container happened to start.
+    # `docker compose up -d` does not recreate a container that is already
+    # running, so the stack silently served stale code: on 2026-09-04 it was
+    # 49 minutes older than the commit it was being asked to verify, and a
+    # regression test written against that commit failed for a reason that
+    # had nothing to do with the code under test. A test stack that appears
+    # to test the working tree and does not is the exact defect class this
+    # branch has spent its life on.
+    #
+    # Running from /src removes the copy, and PYTHONDONTWRITEBYTECODE is set
+    # in the image so nothing tries to write __pycache__ into a read-only
+    # mount. The container still has to be RECREATED to pick up an edit
+    # (uvicorn is not reloading), which is why every documented command
+    # above recreates it explicitly with `up -d --force-recreate` before
+    # running the suite (`docker compose run` has no such flag).
+    # A SMALL REAL webui.db first. This stack runs no OpenWebUI, and since
+    # v3.1.9 a backup cycle that cannot find the database fails instead of
+    # publishing an archive with no chat history (pass-3 F12). The opt-out for
+    # that expires once a pod has published an archive (pass-4 G6), which is
+    # right on a pod, so the stack gets a database of the shape backup.py and
+    # webuidb read (a `chat` table with id, chat, updated_at) rather than an
+    # escape hatch. The backup tests then exercise the real path.
+    command:
+      - >
+        mkdir -p /var/lib/openwebui &&
+        /opt/compactor-venv/bin/python -c "import sqlite3,time; c=sqlite3.connect('/var/lib/openwebui/webui.db'); c.execute('create table if not exists chat (id text primary key, user_id text, title text, chat text, created_at integer, updated_at integer)'); c.execute('insert or ignore into chat values (?,?,?,?,?,?)', ('itest-chat','itest-user','integration fixture','{\"messages\": []}', int(time.time()), int(time.time()))); c.commit(); c.close()" &&
+        cd /src/compactor &&
+        exec /opt/compactor-venv/bin/uvicorn main:app
+        --host 0.0.0.0 --port 8080 --log-level info
+    volumes:
+      - ./:/src:ro
+    environment:
+      VLLM_URL: http://model-fixture:8000
+      MODEL_REPO: fixture-model
+      MAX_MODEL_LEN: "32768"
+      COMPACTOR_GENERATION_RESERVE: "8192"
+      COMPACTOR_STORAGE_ROOT: /data/compactor
+      COMPACTOR_RAG_ENABLED: "true"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    ports:
+      - "8082:8080"
+    healthcheck:
+      test: ["CMD", "/opt/compactor-venv/bin/python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 20s
+
+  integration-tests-model:
+    profiles: ["model"]
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile
+    # NO container_name — see the note on unit-tests in
+    # docker-compose.tests.yml for why a fixed name on a `run --rm`
+    # test-runner service is actively harmful under concurrency (a wildcard
+    # cleanup filter matches it and kills a neighbour's in-flight run).
+    depends_on:
+      compactor-model:
+        condition: service_healthy
+    network_mode: "service:compactor-model"
+    environment:
+      ZIONS_TEST_BASE_URL: http://127.0.0.1:8080
+      ZIONS_TEST_ADMIN_URL: http://127.0.0.1:8080
+      ZIONS_TEST_MODEL: fixture-model
+      # THE capability flag, and the only thing here that separates this
+      # service from the weightless one. Both advertise the served model as
+      # "fixture-model", so nothing else distinguishes them — a test whose
+      # assertion needs a real generation has to be TOLD, not left to infer it
+      # from its own failure. H.requires_real_model() reads this.
+      ZIONS_TEST_REAL_MODEL: "1"
+      # Generous: a 0.5B model on CPU is slow, and a timeout here would look
+      # exactly like a hang, which is the confusion R22 was about.
+      ZIONS_TEST_TIMEOUT: "300"
+      # 240, not 30. The memory tail fires AFTER the response is returned and
+      # makes its own generation call (fact extraction), so on CPU it lands
+      # long after the reply does. At 30 the polling loop gave up and the log
+      # then showed "extracted 1 new fact(s)" moments later: a real pass
+      # reported as a failure, which is only marginally better than the
+      # reverse. Runtime is not a constraint here — the owner said so — and a
+      # wait that is too short turns this suite into a slow random number
+      # generator.
+      ZIONS_TEST_TAIL_WAIT: "240"
+    volumes:
+      - ./:/repo:ro
+    working_dir: /repo
+
+  integration-tests:
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile
+    # NO container_name — see the note on the model-profile sibling above.
+    depends_on:
+      compactor:
+        condition: service_healthy
+    # Shares the compactor's network namespace ON PURPOSE, so 127.0.0.1:8080
+    # reaches it. The admin endpoints are gated on the caller being loopback
+    # (_require_localhost, main.py) and the alternative — setting
+    # COMPACTOR_ADMIN_BIND to something permissive — would test a
+    # configuration production does not run and quietly disable the gate the
+    # suite is partly there to check.
+    network_mode: "service:compactor"
+    environment:
+      ZIONS_TEST_BASE_URL: http://127.0.0.1:8080
+      ZIONS_TEST_ADMIN_URL: http://127.0.0.1:8080
+      ZIONS_TEST_MODEL: fixture-model
+      # The stub answers instantly; the default 120s only ever hides a hang.
+      ZIONS_TEST_TIMEOUT: "30"
+    volumes:
+      - ./:/repo:ro
+    working_dir: /repo

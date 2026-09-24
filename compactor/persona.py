@@ -48,6 +48,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from envcfg import env_int
 from memory import (
     STORAGE_ROOT,
     StoreUnreadable,
@@ -61,9 +62,14 @@ logger = logging.getLogger("compactor.persona")
 # Minimum length for auto-detection of a system message as a persona.
 # Short system prompts ("be concise", "respond in JSON") aren't personas
 # — they're per-request style guidance. The threshold is a heuristic.
-AUTO_DETECT_MIN_CHARS = int(
-    os.environ.get("COMPACTOR_PERSONA_AUTO_DETECT_MIN_CHARS", "200") or 200
-)
+#
+# Read through envcfg (v3.1.9). `or 200` rescued only an EMPTY value, so a
+# mistyped one (`2OO`) still raised ValueError, and main.py imports this
+# module at module scope — a boot failure, not a knob reverting. This is the
+# one of the seven missed sites that .env.example actually documents to
+# operators (line 172, commented out), so it is the likeliest to be typed.
+# 200 is unchanged.
+AUTO_DETECT_MIN_CHARS = env_int("COMPACTOR_PERSONA_AUTO_DETECT_MIN_CHARS", 200)
 
 # Feature gate. Persona detection + injection can be disabled per-pod
 # if the operator wants V2.0 behavior.
@@ -93,7 +99,7 @@ def load_persona(conv_id: str) -> dict | None:
     misread replaced a stored persona with whatever the client happened to
     send that turn (v3.1 F1c).
     """
-    data = read_json_strict(persona_path(conv_id), default=None)
+    data = read_json_strict(persona_path(conv_id), default=None, expect=dict)
     if not isinstance(data, dict):
         return None
     text = data.get("persona_text")
@@ -318,9 +324,35 @@ def auto_capture_persona(
 # Injection block formatting
 # ---------------------------------------------------------------------------
 
+# v3.1.5 — the division of labour between the four injected blocks.
+#
+# The user reported replies growing formulaic on 2026-08-31. The 08-29
+# degeneration detector was silent throughout, so this is not that failure
+# returning: it is stylistic sameness, and the cause is ours rather than the
+# model's. Every turn the model reads ~91 fact bullets, up to 1500 tokens of
+# its own verbatim past replies, and a hierarchical summary — and all four
+# block headers asked, in one wording or another, for CONSISTENCY. Three of
+# them had no business asking. Repetition was not a malfunction; it was what
+# the prompt requested.
+#
+# So each block now claims exactly one kind of authority:
+#
+#   persona    (here)          — identity and VOICE. The only block that
+#                                governs how she speaks.
+#   facts      (facts.py)      — what is TRUE.
+#   retrieval  (retrieval.py)  — what was SAID.
+#   summary    (summarizer.py) — what HAPPENED.
+#
+# And the wording is positive throughout. The 08-29 incident established
+# that naming an unwanted output puts it in context at high attention
+# weight: `DO NOT USE BOX-DRAWING CHARACTERS` sat in the system prompt for a
+# day and the model emitted 1,710 of them anyway. So these headers say what
+# each block is FOR and leave the phrasing free, rather than prohibiting
+# repetition by name.
 _PERSONA_BLOCK_HEADER = (
-    "[Persona / role context for this conversation — treat this as the "
-    "primary identity and voice you should maintain]"
+    "[Persona / role context for this conversation — this is where your "
+    "identity and voice come from. Hold the character steady; let the "
+    "phrasing vary from turn to turn.]"
 )
 
 

@@ -53,6 +53,33 @@ def _env(name: str, default: str) -> str:
     return v if v is not None and v != "" else default
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read an int-valued env var. Unset, blank, or unparseable -> default.
+
+    A deliberate local copy of compactor/envcfg.env_int rather than an import
+    of it: this server runs from /opt/stt under its own venv with no path to
+    /opt/compactor, and keeping the voice servers dependency-free is why they
+    are laid out that way. Same contract, so the two cannot drift in meaning.
+    tts/server.py carries the identical helper for the identical reason — if
+    you change one, change both.
+
+    It exists because `int(_env("STT_PORT", "9000"))` raised ValueError at
+    import for any typo. STT_PORT is baked as an image ENV and a RunPod
+    template variable of the same name overrides it, so unlike the knobs
+    inside the compactor this one is reachable from the pod template today —
+    and supervisord runs this program with autorestart=true, so a typo is a
+    service crash-looping forever while the container's own /health stays
+    green.
+    """
+    v = os.environ.get(name, "")
+    if not v.strip():
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 # Whisper model size or HF repo. "base" is a good speed/quality balance on CPU
 # and is prebaked into the image. "small"/"medium"/"large-v3" are bigger and
 # better; pick large-v3 + WHISPER_DEVICE=cuda only with VRAM headroom.
@@ -61,7 +88,7 @@ WHISPER_DEVICE = _env("WHISPER_DEVICE", "cpu").lower()
 # Empty -> auto: int8 on CPU, float16 on CUDA.
 WHISPER_COMPUTE_TYPE = _env("WHISPER_COMPUTE_TYPE", "")
 WHISPER_DOWNLOAD_ROOT = _env("WHISPER_DOWNLOAD_ROOT", "/opt/whisper-models")
-WHISPER_BEAM_SIZE = int(_env("WHISPER_BEAM_SIZE", "5"))
+WHISPER_BEAM_SIZE = _env_int("WHISPER_BEAM_SIZE", 5)
 # Voice-activity-detection filter trims silence/noise -> far fewer
 # hallucinated transcripts on near-silent clips. faster-whisper bundles the
 # VAD model (no runtime download). Disable with WHISPER_VAD_FILTER=false.
@@ -72,7 +99,7 @@ WHISPER_VAD_FILTER = _env("WHISPER_VAD_FILTER", "true").lower() != "false"
 WHISPER_MODEL_ID = _env("WHISPER_MODEL_ID", "whisper-1")
 
 STT_HOST = _env("STT_HOST", "0.0.0.0")
-STT_PORT = int(_env("STT_PORT", "9000"))
+STT_PORT = _env_int("STT_PORT", 9000)
 
 # Load the model during startup so /health reflects true readiness (the boot
 # self-test relies on this). Tests set this false; they patch get_model.

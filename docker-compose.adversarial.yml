@@ -1,0 +1,115 @@
+# The adversarial stack: one FULLY ISOLATED copy per attacker.
+#
+#   docker compose -p adv-fuzz    -f docker-compose.adversarial.yml run --rm adversary
+#   docker compose -p adv-race    -f docker-compose.adversarial.yml run --rm adversary
+#   docker compose -p adv-faults  -f docker-compose.adversarial.yml run --rm adversary
+#   docker compose -p adv-state   -f docker-compose.adversarial.yml run --rm adversary
+#
+# Those four can run AT THE SAME TIME and cannot see each other.
+#
+# WHY THIS FILE EXISTS RATHER THAN REUSING docker-compose.integration.yml.
+# That one pins `container_name:` and publishes host ports, so a second
+# `-p` project collides on both and docker refuses. More importantly its
+# compactor is SHARED, and on 2026-09-04 three agents on one compactor
+# produced ReadTimeouts, a mid-run restart, and three tests failing with
+# "the deployment is not answering" — none of which were defects. For
+# adversarial work that is fatal: the entire job is to break things, so a
+# break caused by the NEIGHBOUR is worse than no result at all. Nothing here
+# sets container_name and nothing publishes a port; every service is reached
+# by service name on the project's own network.
+#
+# The compactor's storage is a named volume per project, so an attacker can
+# corrupt it, fill it, or delete it out from under the running process
+# without touching anyone else's.
+#
+# TEARDOWN, and it matters — these do not clean themselves up:
+#   docker compose -p <name> -f docker-compose.adversarial.yml down -v
+#
+# The `-v` removes the storage volume. Without it a later run inherits a
+# poisoned store and you will spend an hour chasing a ghost.
+
+services:
+  vllm-fixture:
+    build:
+      context: ./testfixtures/tokenizer-contract
+      dockerfile: Dockerfile
+    environment:
+      FIXTURE_TOKENIZER: HuggingFaceTB/SmolLM2-135M-Instruct
+      FIXTURE_SERVED_MODEL_NAME: fixture-model
+      FIXTURE_MAX_MODEL_LEN: "32768"
+      FIXTURE_ERROR_STYLE: v010
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  compactor:
+    build:
+      context: .
+      dockerfile: testfixtures/unit-suite/Dockerfile
+    depends_on:
+      vllm-fixture:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    # From the read-only mount, never a copy — see the long note in
+    # docker-compose.integration.yml about a stack that served code 49
+    # minutes older than the commit it was verifying.
+    command:
+      - >
+        cd /src/compactor &&
+        exec /opt/compactor-venv/bin/uvicorn main:app
+        --host 0.0.0.0 --port 8080 --log-level info
+    volumes:
+      - ./:/src:ro
+      - compactor-store:/data
+    environment:
+      VLLM_URL: http://vllm-fixture:8000
+      MODEL_REPO: fixture-model
+      MAX_MODEL_LEN: "32768"
+      COMPACTOR_GENERATION_RESERVE: "8192"
+      COMPACTOR_STORAGE_ROOT: /data/compactor
+      COMPACTOR_RAG_ENABLED: "true"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    healthcheck:
+      test: ["CMD", "/opt/compactor-venv/bin/python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health', timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  # The attacker. Shares the compactor's network namespace so 127.0.0.1:8080
+  # is genuinely loopback and the admin endpoints' _require_localhost gate is
+  # SATISFIED rather than disabled — an adversarial suite that turned off the
+  # gate it is trying to break would be worthless.
+  #
+  # It also means the attacker can reach the fixture at vllm-fixture:8000 to
+  # inject backend faults through /_fixture/mode.
+  adversary:
+    build:
+      context: ./tests/adversarial
+      dockerfile: Dockerfile
+    depends_on:
+      compactor:
+        condition: service_healthy
+    network_mode: "service:compactor"
+    environment:
+      ZIONS_TEST_BASE_URL: http://127.0.0.1:8080
+      ZIONS_TEST_ADMIN_URL: http://127.0.0.1:8080
+      ZIONS_TEST_MODEL: fixture-model
+      FIXTURE_URL: http://vllm-fixture:8000
+      # Adversarial cases deliberately provoke slow paths; a short ceiling
+      # would report the provocation as a hang.
+      ZIONS_TEST_TIMEOUT: "300"
+      ZIONS_TEST_TAIL_WAIT: "120"
+    volumes:
+      - ./:/repo:ro
+      # Findings land on the HOST, so a container that is killed mid-run (a
+      # thing these suites do on purpose) does not take the evidence with it.
+      - ./tests/adversarial/findings:/findings
+    working_dir: /repo
+
+volumes:
+  compactor-store:

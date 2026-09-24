@@ -42,8 +42,14 @@ Storage (one JSON per conv):
       "l1": [{"text": "...", "first_turn": 1, "last_turn": 20}, ...],
       "l2": [{"text": "...", "first_turn": 1, "last_turn": 200}, ...],
       "l3": {"text": "...", "first_turn": 1, "last_turn": 1000} | null,
-      "last_summarized_turn": 20  # highest turn covered by any L1 chunk
+      "last_summarized_turn": 20,  # highest turn covered by any L1 chunk
+      "turns_seen": 44,            # monotonic conversational position (v3.1.4)
+      "tail_fp": ["ab12…", ...]    # content anchor for the last few turns
     }
+
+`turns_seen` and `tail_fp` are the compactor's OWN answer to "how far has
+this conversation got", replacing the client's `len(messages)`. See
+_observed_position for why the client's array cannot be that authority.
 
 Lifecycle:
   request time (sync, cheap): load_state → format injection block from
@@ -56,18 +62,28 @@ the summarizer hit a problem.
 """
 
 import asyncio
+import bisect
+import contextlib
+import contextvars
+import hashlib
 import logging
 import os
+import re
+import time
 import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
+from starlette.concurrency import run_in_threadpool
 
 import logsetup
+import textclean
 import tokens
 import tokenhealth
+from envcfg import env_float, env_int
 from memory import (
+    StoreUnreadable,
     atomic_write_json,
     conv_lock,
     read_json_strict,
@@ -82,43 +98,44 @@ logger = logging.getLogger("compactor.summarizer")
 # Configuration (env-overridable, sensible defaults)
 # ---------------------------------------------------------------------------
 
-L1_CHUNK_SIZE = int(os.environ.get("COMPACTOR_L1_CHUNK_SIZE", "20") or 20)
-L2_CHUNK_SIZE = int(os.environ.get("COMPACTOR_L2_CHUNK_SIZE", "10") or 10)
-L3_CHUNK_SIZE = int(os.environ.get("COMPACTOR_L3_CHUNK_SIZE", "5") or 5)
+L1_CHUNK_SIZE = env_int("COMPACTOR_L1_CHUNK_SIZE", 20)
+L2_CHUNK_SIZE = env_int("COMPACTOR_L2_CHUNK_SIZE", 10)
+L3_CHUNK_SIZE = env_int("COMPACTOR_L3_CHUNK_SIZE", 5)
 
 # Per-tier token budget for the LLM's output (input tokens depend on how
 # much we're summarizing). L3 is largest because it must represent the
 # whole conversation; L1 is smallest because each chunk is one "scene."
-L1_MAX_TOKENS = int(os.environ.get("COMPACTOR_L1_MAX_TOKENS", "500") or 500)
-L2_MAX_TOKENS = int(os.environ.get("COMPACTOR_L2_MAX_TOKENS", "1200") or 1200)
-L3_MAX_TOKENS = int(os.environ.get("COMPACTOR_L3_MAX_TOKENS", "2000") or 2000)
+L1_MAX_TOKENS = env_int("COMPACTOR_L1_MAX_TOKENS", 500)
+L2_MAX_TOKENS = env_int("COMPACTOR_L2_MAX_TOKENS", 1200)
+L3_MAX_TOKENS = env_int("COMPACTOR_L3_MAX_TOKENS", 2000)
 
-# Same env var and default main.py reads for its own /tokenize call sites
-# (main.py:693, TOKENIZE_WARN_INTERVAL_S) — deliberately, not independently
-# tuned: an operator setting this once should govern every /tokenize
-# dependency in the process, not just the ones main.py happens to own.
-TOKENIZE_WARN_INTERVAL_S = float(
-    os.environ.get("COMPACTOR_TOKENIZE_WARN_INTERVAL_S", "300") or 300
-)
+# Same env var and default main.py reads for its own /tokenize call sites,
+# under its own module-level TOKENIZE_WARN_INTERVAL_S — deliberately, not
+# independently tuned: an operator setting this once should govern every
+# /tokenize dependency in the process, not just the ones main.py happens to
+# own. (hostile2-config: this pair used to disagree — main.py parsed the
+# variable with int(), so any non-integer value there silently reverted to
+# the 300 default while this module applied it correctly. Fixed by reading
+# it with env_float in both places; test_tail_tokenize_warn_interval.py
+# pins the two modules' parsing against each other directly. A line-number
+# citation was here and went stale the first time either file was edited
+# above it — the constant's own name does not.)
+TOKENIZE_WARN_INTERVAL_S = env_float("COMPACTOR_TOKENIZE_WARN_INTERVAL_S", 300)
 
 # Hard ceiling on the rendered injection block (see format_summary_block).
 # 5000 is the figure this module's own docstring always claimed as the
 # intended worst case (L3 + latest L2 + a handful of unrolled L1 chunks) —
 # this makes it a real, enforced number instead of an unverified comment
 # (MEMORY_REVIEW S-1/S-6).
-SUMMARY_BLOCK_MAX_TOKENS = int(
-    os.environ.get("COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS", "12000") or 12000
-)
+SUMMARY_BLOCK_MAX_TOKENS = env_int("COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS", 12000)
 
 # The model's context window, and the slack left inside it for a
 # summarization call's system prompt, wrapper text and chat-template framing.
 # Same env vars main.py reads, deliberately: the two summarization paths must
 # not be tunable apart, and a rollup that budgets against a different window
 # than the request path is the same defect in a second place.
-MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "32768") or 32768)
-SUMMARY_INPUT_RESERVE = int(
-    os.environ.get("COMPACTOR_SUMMARY_INPUT_RESERVE", "2048") or 2048
-)
+MAX_MODEL_LEN = env_int("MAX_MODEL_LEN", 32768)
+SUMMARY_INPUT_RESERVE = env_int("COMPACTOR_SUMMARY_INPUT_RESERVE", 2048)
 
 # Master switch — set false to fall back to v1 flat summary (or no summary).
 ENABLED = os.environ.get("COMPACTOR_HIERARCHICAL_SUMMARY", "true").lower() != "false"
@@ -151,6 +168,40 @@ def _empty_state(conv_id: str) -> dict:
         "l2": [],
         "l3": None,
         "last_summarized_turn": 0,
+        "turns_seen": 0,
+        "tail_fp": [],
+        # v3.1.7 (R18). The anchor alone cannot tell "the client re-sent the
+        # same window" from "the client appended one more exchange" when the
+        # conversation's tail REPEATS — two consecutive degenerate replies
+        # redact to byte-identical placeholders, and "ok"/"Sure." twice does
+        # it without any redaction. These two say whether the window itself
+        # changed: under a cap the first turn slides out on every exchange,
+        # and an unchanged window keeps both its head and its length.
+        "head_fp": "",
+        "window_turns": 0,
+        # v3.1.9. One fingerprint per covered position, position 1 first,
+        # written by the chunk that covers it from the turn that chunk read
+        # (as the client sees it), concatenated; _FP_UNKNOWN where no
+        # record-writing chunk read the position. Absent on every file
+        # written before this release, and absent reads as NO EVIDENCE: the
+        # reuse path declines until a rollup records it (or adopts it once,
+        # _adopt_legacy_record), which costs a summarization call and cannot
+        # cost a turn. See _record_chunk_fps.
+        "covered_fps": "",
+        # hostile pass #4 (reviewer A F6). Turns a chunk read OUT OF POSITION:
+        # request turns that paired with nothing although they sit inside
+        # the covered span (the text after a delete or regenerate of a
+        # chunk-closing exchange, an edit, a legacy position no evidence
+        # backs), re-read by the next L1 chunk as extra pieces. One
+        # [after_position, owner_last_turn, fingerprint] per turn: it sorts
+        # after record entry `after_position`, and it counts only while the
+        # chunk that read it (ending at owner_last_turn) is inside the
+        # covered prefix. See _record_sequence and _patch_candidates.
+        "covered_extra": [],
+        # hostile pass #4 (reviewer A F2/F3). Set once the one-shot adoption
+        # of pre-v3.1.9 chunks has run, so it cannot run again whatever the
+        # leading entries of the record hold. See _adopt_legacy_record.
+        "legacy_adopted": False,
     }
 
 
@@ -174,22 +225,63 @@ def load_state(conv_id: str) -> dict:
     current window — worse than the facts equivalent, because summaries are
     replaced wholesale rather than merged (v3.1 F1b).
     """
-    data = read_json_strict(summary_path(conv_id), default=None)
+    data = read_json_strict(summary_path(conv_id), default=None, expect=dict)
     if not isinstance(data, dict):
         return _empty_state(conv_id)
     # Defensive: ensure all top-level keys exist with the right types.
     state = _empty_state(conv_id)
     parked: dict = {"l1": [], "l2": [], "l3": None}
     for tier in ("l1", "l2"):
-        if isinstance(data.get(tier), list):
-            state[tier] = [x for x in data[tier] if _is_chunk(x)]
-            parked[tier] = [x for x in data[tier] if not _is_chunk(x)]
+        # v3.1.9. The FOURTH site of A3-1, and the one on the hot path; the
+        # hostile pass named three and not this. A tier that is not a list
+        # was neither loaded NOR parked — the F1b parking below only ever
+        # saw lists — so it silently read as [] and the next save_state
+        # erased that tier of the hierarchy. Parking cannot hold it either:
+        # _for_disk folds parked tiers back with list(), which turns a dict
+        # into its keys. So it raises, exactly as an unreadable file already
+        # does from this function — no caller gains a new obligation.
+        v = data.get(tier, [])
+        if not isinstance(v, list):
+            raise StoreUnreadable(
+                summary_path(conv_id),
+                TypeError(f'"{tier}" is {type(v).__name__}, not a list'),
+            )
+        state[tier] = [x for x in v if _is_chunk(x)]
+        parked[tier] = [x for x in v if not _is_chunk(x)]
     if isinstance(data.get("l3"), dict) and _is_chunk(data["l3"]):
         state["l3"] = data["l3"]
     elif data.get("l3") is not None:
         parked["l3"] = data["l3"]
     if isinstance(data.get("last_summarized_turn"), int):
         state["last_summarized_turn"] = data["last_summarized_turn"]
+    # v3.1.4. Absent on every file written before this release, which is why
+    # _observed_position seeds from last_summarized_turn rather than from 0:
+    # seeding at 0 would make the first post-upgrade turn look like a brand-new
+    # conversation and re-summarize turns 1-20 of a 651-turn history.
+    if isinstance(data.get("turns_seen"), int):
+        state["turns_seen"] = data["turns_seen"]
+    if isinstance(data.get("tail_fp"), list):
+        state["tail_fp"] = [x for x in data["tail_fp"] if isinstance(x, str)]
+    # v3.1.7. Absent on every file written before this release. Missing, they
+    # read as "the window is not known to be unchanged", which is the side
+    # that duplicates a summary rather than the side that stalls the position.
+    if isinstance(data.get("head_fp"), str):
+        state["head_fp"] = data["head_fp"]
+    if isinstance(data.get("window_turns"), int):
+        state["window_turns"] = data["window_turns"]
+    # v3.1.9. Validated as a whole (see _covered_fps). The digest keys an
+    # earlier unreleased cut of this branch wrote (`covered_fp`,
+    # `covered_fp_turns`, `covered_fp_marks`) are ignored and dropped on the
+    # next save: the first two were built over redacted text and can never
+    # match a request.
+    if _covered_fps(data):
+        state["covered_fps"] = data["covered_fps"]
+    # hostile pass #4. Invalid rows are dropped one by one rather than voiding
+    # the list: an extra entry is only ever a reason to REPLACE a turn, so a
+    # row that is not read costs a refresh, never a turn.
+    state["covered_extra"] = _covered_extra(data)
+    if isinstance(data.get("legacy_adopted"), bool):
+        state["legacy_adopted"] = data["legacy_adopted"]
     if parked["l1"] or parked["l2"] or parked["l3"] is not None:
         state[_UNRECOGNIZED] = parked
     return state
@@ -236,10 +328,18 @@ def _is_chunk(x: Any) -> bool:
 # Injection — format the existing summary stack as a system message
 # ---------------------------------------------------------------------------
 
+# v3.1.5 — this block's authority is over what HAPPENED, and nothing else.
+# "use them for continuity" was doing double duty: continuity of events is
+# wanted, continuity of phrasing is not, and the header did not distinguish
+# them. Naming it as background the model already holds also discourages
+# recapping it back at the user, which is its own species of repetition. See
+# persona.py's _PERSONA_BLOCK_HEADER for the division of labour between the
+# four injected blocks.
 _BLOCK_HEADER = (
     "[Hierarchical summary of earlier portions of this conversation, ordered "
-    "by recency — use them for continuity. Older summaries are denser; the "
-    "L3 line (if present) is the whole-conversation theme.]"
+    "by recency — background you already hold, for continuity of events. "
+    "Older summaries are denser; the L3 line (if present) is the "
+    "whole-conversation theme.]"
 )
 
 
@@ -329,9 +429,26 @@ def _summary_line(kind: str, chunk: dict) -> tuple[str, str]:
     return header, chunk.get("text", "")
 
 
-def format_summary_block(state: dict, max_tokens: int | None = None) -> str | None:
+def format_summary_block(
+    state: dict, max_tokens: int | None = None, *, all_or_nothing: bool = False
+) -> str | None:
     """Render the current summary stack into a single system-message body.
     Returns None if there's nothing to inject.
+
+    all_or_nothing=True returns None instead of a partial block whenever the
+    budget forced ANY tier item out. It exists for one caller and one reason:
+    compact_if_needed REMOVES the turns this block stands in for, and a squeeze
+    here drops the OLDEST scenes first (see below) — the same end of the
+    conversation compaction removes from the array. A partial block there is
+    not a smaller summary, it is turns deleted from the array and absent from
+    the stand-in: gone from the request entirely, with the log still reporting
+    them as "covered by stored summaries". Demonstrated at 9 L1 / 4 L2 / 1 L3,
+    a state at its documented capacity, via _estimate_block_tokens pricing
+    non-ASCII per UTF-8 BYTE while L1_MAX_TOKENS bounds output TOKENS.
+
+    Every other caller injects this block ALONGSIDE the turns rather than
+    instead of them, so a partial block is a smaller summary and nothing more.
+    They keep the default.
 
     Order in the rendered block (most-general → most-specific):
       1. L3 (whole-conversation theme), if any
@@ -442,6 +559,14 @@ def format_summary_block(state: dict, max_tokens: int | None = None) -> str | No
             f"{len(l2) - dropped_l2}/{len(l2)} chapter(s), "
             f"{len(l1) - dropped_l1}/{len(l1)} scene(s)"
         )
+        if all_or_nothing:
+            logger.warning(
+                "and the caller asked for all-or-nothing, so NOTHING is "
+                "returned: it substitutes this block for turns it removes "
+                "from the array, and a block missing its oldest scenes "
+                "cannot stand in for the oldest turns"
+            )
+            return None
 
     lines = [_BLOCK_HEADER]
     if l3_line:
@@ -469,44 +594,15 @@ def format_summary_block(state: dict, max_tokens: int | None = None) -> str | No
 # ---------------------------------------------------------------------------
 
 def _needs_l1_rollup(state: dict, current_turn_count: int) -> bool:
-    """True if there are >= L1_CHUNK_SIZE turns past last_summarized_turn."""
-    last = state.get("last_summarized_turn", 0)
-    return (current_turn_count - last) >= L1_CHUNK_SIZE
+    """True if there are >= L1_CHUNK_SIZE turns past last_summarized_turn.
 
-
-def _reconcile_watermark(state: dict, current_turn_count: int) -> bool:
-    """Pull last_summarized_turn back to what the history actually contains.
-    Returns True if the watermark moved.
-
-    `last_summarized_turn` is an absolute position in whatever array the
-    client sent (S-5 / REMEDIATION F14). Whenever the observed history is
-    SHORTER than it — a client sending a bounded window, a user deleting or
-    editing messages, a branch switch — `current_turn_count - last` is
-    negative, so `_needs_l1_rollup` is False on this turn and on every turn
-    after it. The hierarchy stops advancing permanently and silently. That
-    is not hypothetical: 19.8 hours of production logs show every summary
-    injection reading L1=5 / L2=0 while the conversation ran from turn ~42
-    to ~58.
-
-    Resetting to the observed count un-latches the gate without
-    re-summarizing anything: rollups resume once L1_CHUNK_SIZE new turns
-    arrive. If the history later grows past the old watermark again, the
-    turns between will be summarized a second time — accepting a duplicate
-    chunk is the cheap half of the trade against a hierarchy that never
-    moves again.
-
-    The L1 chunks covering turns that are no longer observable are KEPT.
-    They are the only surviving record of that material, and deleting
-    summaries to repair a counter is exactly how the five destructive
-    memory paths removed earlier on this branch started. Their turn labels
-    stay wrong until D1 gives turns durable identities; this function fixes
-    the stall, not the units.
+    `current_turn_count` is the conversation's POSITION (_observed_position),
+    not `len(messages)`. Handed the client's array length instead, this gate
+    latches shut forever the moment the client starts sending a bounded
+    window — see _observed_position.
     """
     last = state.get("last_summarized_turn", 0)
-    if current_turn_count >= last:
-        return False
-    state["last_summarized_turn"] = current_turn_count
-    return True
+    return (current_turn_count - last) >= L1_CHUNK_SIZE
 
 
 def _needs_l2_rollup(state: dict) -> bool:
@@ -556,6 +652,25 @@ def needs_rollup(state: dict, current_turn_count: int) -> bool:
     )
 
 
+def rollup_due_tiers(state: dict, current_turn_count: int) -> dict[str, bool]:
+    """Public: which tier(s) need work, individually — {"l1": bool, "l2":
+    bool, "l3": bool}. For a DIAGNOSTIC that must describe what is
+    actually pending (main._rollup_hierarchy's catch-up INFO line,
+    hostile pass #5 C5-7/E8), not for the drain itself, which reads the
+    private `_needs_*` gates directly against a `state` that changes
+    mid-call — this is a point-in-time snapshot a caller takes AFTER a
+    pass, when it is safe to read once. One seam so a future rule change
+    to any `_needs_*` gate cannot drift from what this reports, the same
+    fix-one-site-miss-the-sibling concern `needs_rollup` above already
+    avoids by delegating rather than re-deriving.
+    """
+    return {
+        "l1": _needs_l1_rollup(state, current_turn_count),
+        "l2": _needs_l2_rollup(state),
+        "l3": _needs_l3_rollup(state),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Message ↔ turn helpers
 # ---------------------------------------------------------------------------
@@ -600,6 +715,1191 @@ def _format_turns(messages: list[dict], first_turn: int, last_turn: int) -> str:
     the ground truth a budget test measures itself against.
     """
     return "\n\n".join(_turn_pieces(messages, first_turn, last_turn))
+
+
+# ---------------------------------------------------------------------------
+# Conversational position (v3.1.4)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS
+# ---------------
+# Until v3.1.4 the rollup gate compared `last_summarized_turn` against
+# `len([m for m in messages if m["role"] != "system"])` — a measurement of the
+# CLIENT'S ARRAY. pipelines/conversation_id_header.py's `max_turns` valve caps
+# that array at a constant (100 is the documented starting value, ~50
+# exchanges), and a constant is fatal to a gate expressed as a difference:
+#
+#   watermark 651, window pinned at 100 -> the old _reconcile_watermark pulled
+#   the watermark down to 100 once, and from then on (observed - watermark) is
+#   0 on EVERY subsequent request. _needs_l1_rollup is False forever, so no L1
+#   chunk is ever produced, so no L2, so no L3. Simulated against this module
+#   with the window pinned: the hierarchy freezes permanently, and the one
+#   warning that says so is logsetup.log_once — one line per process, then
+#   silence.
+#
+# That matters more than it sounds: with request-path compaction latched off,
+# the L1/L2/L3 hierarchy is the one memory layer keeping pace in production
+# (lastturn=651 against msgs=664 on 2026-09-01).
+#
+# THE FIX IS retrieval._next_turn_index's, APPLIED TO THE SUMMARIZER
+# ------------------------------------------------------------------
+# retrieval.py:294 solved exactly this for the episodic index: allocate from
+# the STORE's own maximum rather than from the request, "because a deletion, an
+# edit, a branch switch or a bounded client window all shrink len(messages)+1",
+# and let the request only ever push the sequence FORWARD. `turns_seen` is that
+# counter for the summarizer: persisted per conversation, monotonic, and owned
+# by the compactor.
+#
+# The one thing a counter cannot do on its own is notice that new material
+# arrived while the array length stayed put. That is what `tail_fp` is for —
+# the same content-addressed identity D1 gave episodic rows, used here to align
+# this request's window against the last one we saw.
+
+# How many trailing turns the anchor records. Four, not one: a single
+# fingerprint is enough to detect that SOMETHING changed but not how much, and
+# the prefix walk in _align_new_turns needs the older elements to survive a
+# regeneration (which rewrites the newest turn and nothing else).
+_ANCHOR_TURNS = 4
+
+# What to assume advanced when the anchor cannot be found anywhere in the
+# window. main.py's tail calls maybe_rollup exactly once per exchange, with the
+# user turn and the assistant turn it just produced, so one exchange is the
+# real per-call rate; assuming it degrades the mechanism to "count the calls",
+# which is right for the live path and idempotent for the admin-compact loop
+# (there the window is unchanged, so the anchor matches and this never runs).
+_ASSUMED_NEW_TURNS = 2
+
+# How many trailing turns are fingerprinted per call (v3.1.7, R17). The whole
+# history used to be hashed on the event loop inside conv_lock, on EVERY turn:
+# measured 47 ms per call at 660 turns of her real reply length, linear in
+# history and growing for the life of the conversation. The alignment below
+# only ever needs the anchor plus whatever arrived after it, and main.py calls
+# maybe_rollup once per exchange, so 64 turns is 32 exchanges of slack against
+# a per-call rate of one. Beyond that the anchor falls off the end and the
+# call degrades to _ASSUMED_NEW_TURNS with the warning that already exists —
+# the same degradation as an anchor the client never echoed back.
+_FINGERPRINT_TAIL_TURNS = 64
+
+
+def _image_only_marker(m: dict) -> str:
+    """What the EPISODIC STORE will remember an image-only turn as, or "".
+
+    The twin of main._memorable_user_text / main._message_image_count, and it
+    has to stay byte-identical to them (R15). `_message_text` is "" for a
+    content list with no text part, while the store holds "[shared 1 image]"
+    — so the live path fingerprinted one string and /admin/compact's
+    reconstruction fingerprinted another, and a mismatch in anchor[0] defeats
+    every prefix in _align_candidates. The position then inflated by 2 per
+    rollup and stayed inflated, so window_offset subtracted 2 forever and two
+    turns were summarized twice.
+
+    It cannot import main: main imports summarizer, so the constant is
+    duplicated here rather than shared. If main's marker changes, change this
+    one in the same commit — the fingerprints must agree.
+    """
+    content = m.get("content")
+    if not isinstance(content, list):
+        return ""
+    n = 0
+    for c in content:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") in ("image_url", "image", "input_image") or "image_url" in c:
+            n += 1
+    if not n:
+        return ""
+    return f"[shared {n} image{'s' if n > 1 else ''}]"
+
+
+def _turn_fingerprints(messages: list[dict]) -> list[str]:
+    """One short content hash per observed turn, oldest first, system skipped.
+
+    Whitespace-normalized before hashing. The anchor is compared across two
+    different HTTP requests — what the compactor appended after streaming a
+    reply on turn N, against what OpenWebUI reads back out of its own database
+    and re-sends on turn N+1 — and a re-flowed trailing newline must not read
+    as a different turn. Truncated to 16 hex chars: at ~10^4 turns per
+    conversation the collision probability is ~10^-11, and the whole anchor
+    lives in a state file that is read and written on every rollup.
+
+    A turn with images and no text is fingerprinted as the episodic store
+    will remember it (see _image_only_marker), not as the empty string its
+    request shape reduces to. The marker never leaves this function — it is
+    hashed, never stored and never summarized — so nothing can extract it as
+    a fact.
+    """
+    out: list[str] = []
+    for m in messages:
+        if m.get("role") == "system":
+            continue
+        text = " ".join(_message_text(m).split())
+        if not text:
+            text = _image_only_marker(m)
+        payload = f"{m.get('role', 'unknown')}\x00{text}"
+        out.append(
+            hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+        )
+    return out
+
+
+def _align_candidates(anchor: list[str], fps: list[str]) -> list[int]:
+    """Every "how many turns at the END of `fps` are new" that the anchor
+    supports, sorted ascending and de-duplicated. Empty if it cannot be told.
+
+    `anchor` is oldest-first and ends at the previous position, so a match on
+    the whole anchor ending at window slot j means slot j IS the previous
+    position and everything after it is new.
+
+    PREFIXES ARE TRIED, and that is what makes a regeneration cost nothing.
+    Regenerating the last reply rewrites the newest turn and leaves the three
+    before it alone: the full anchor is nowhere in the new window, the
+    3-element prefix is, ending one slot earlier — so `new` comes out 0, which
+    is the truth (a replaced turn is not a new turn). Without the prefix walk
+    that reads as one fresh exchange, and a position that is 2 ahead of
+    reality shifts every later chunk boundary by 2, which is a 2-turn HOLE in
+    what the hierarchy summarizes.
+
+    EVERY match is scored, not just the first one found. Until v3.1.7 the walk
+    returned the first hit of the LONGEST matching prefix, which is a
+    different rule from the one the docstring claimed ("the latest
+    occurrence"): anchor [A,B,C,D] against [A,B,C,D,X,Y,A,B,C] returned 5
+    because the 4-element prefix matches early, while the 3-element prefix
+    matches at the very end for 0 (R20). Returning the candidate list lets the
+    caller apply the recency rule uniformly AND see when the evidence is
+    ambiguous, which is the only way to tell a repeating tail (R18) from a
+    window that genuinely did not move.
+    """
+    n = len(fps)
+    out: set[int] = set()
+    for m in range(len(anchor), 0, -1):
+        prefix = anchor[:m]
+        for j in range(n, m - 1, -1):
+            if fps[j - m:j] == prefix:
+                # The prefix ends (len(anchor) - m) turns before the previous
+                # position, so those turns are already accounted for.
+                out.add(max(0, n - j - (len(anchor) - m)))
+    return sorted(out)
+
+
+def _align_new_turns(anchor: list[str], fps: list[str]) -> int | None:
+    """The SMALLEST advance the anchor supports, or None if it supports none.
+
+    Smallest, because direction matters: over-counting drops turns for good,
+    under-counting merely summarizes some of them twice. A short repeated turn
+    ("ok") that collides with an older one must land on the side that
+    duplicates rather than the side that loses.
+
+    _observed_position uses _align_candidates directly — it holds the extra
+    evidence (the window's own length and head) needed to decide whether a
+    zero-advance answer is credible when the tail repeats. This function is
+    that rule with no extra evidence, and is what the unit test pins.
+    """
+    cands = _align_candidates(anchor, fps)
+    return cands[0] if cands else None
+
+
+def _highest_chunk_turn(state: dict) -> int:
+    """The furthest turn any stored chunk claims to cover, across all tiers.
+
+    The chunk list is the RECORD of what was summarized; `last_summarized_turn`
+    is a pointer derived from it. When the two disagree the chunks are the
+    survivors — they carry text, the pointer carries none — so this is a lower
+    bound on the conversation's position that no watermark edit can erase.
+    """
+    highest = 0
+    for c in list(state.get("l1") or []) + list(state.get("l2") or []):
+        lt = c.get("last_turn") if isinstance(c, dict) else None
+        if isinstance(lt, int) and lt > highest:
+            highest = lt
+    l3 = state.get("l3")
+    if isinstance(l3, dict) and isinstance(l3.get("last_turn"), int):
+        highest = max(highest, l3["last_turn"])
+    return highest
+
+
+# Width of one covered-turn fingerprint in `covered_fps`, matching
+# _turn_fingerprints.
+_FP_WIDTH = 16
+
+# A record entry for a position no record-writing chunk read: a hole in the
+# chain, or a chunk written before v3.1.9 that no request has vouched for yet.
+# Not hex, so no request turn's fingerprint can ever equal it: the turn at
+# that position is summarized fresh, never replaced (see _record_chunk_fps).
+_FP_UNKNOWN = "-" * _FP_WIDTH
+
+# The note main._apply_image_retention leaves in place of a demoted image. It
+# cannot import main (main imports summarizer), so the format is duplicated
+# here, exactly like _image_only_marker; if main's note changes, change this
+# pattern AND _RETENTION_NOTE_TAIL in the same commit or every demotion reads
+# as an edited turn.
+_RETENTION_NOTE = re.compile(
+    r"\s*\[(\d+) images? shared earlier in this conversation\]\s*$"
+)
+# hostile pass #3 (reviewer A F6): what every note ends with. A text that does
+# not end with this (after trailing whitespace) cannot contain a note, and the
+# regex above is not run on it. See _covered_turn_fingerprint.
+_RETENTION_NOTE_TAIL = "shared earlier in this conversation]"
+# How far back from the end the note is searched for. The note is at most
+# ~50 characters plus its digits; a longer window only changes how much
+# leading whitespace the `\s*` absorbs, and whitespace is normalized away.
+_RETENTION_NOTE_WINDOW = 256
+
+# Memo of string-content fingerprints, keyed by (role, len, hash(text)).
+# hostile pass #3 (reviewer A F6): _coverage_plan fingerprints every turn
+# about to be removed on EVERY compacting request — measured 458 ms of
+# GIL-bound CPU at 1,990 turns (2.2 s at her longest replies), stalling the
+# event loop 84-141 ms from inside the threadpool. Nearly all of those turns
+# are byte-identical to the previous request's. hash() of a str is one C pass
+# (no regex, no split/join), so a steady conversation pays one pass per turn.
+#
+# Collision risk, stated because a wrong hit here would bless a changed turn:
+# CPython's str hash is SipHash keyed per process, 64 bits, and the key adds
+# role and length, so a wrong hit needs a 64-bit collision between an edited
+# turn and its original of the same length — the same odds as the 64-bit
+# truncated sha256 the fingerprint itself already is. Bounded: cleared at
+# _FP_MEMO_MAX entries (one conversation of ~2,000 turns is 2,000 entries).
+_FP_MEMO: dict[tuple[str, int, int], str] = {}
+_FP_MEMO_MAX = 50_000
+
+
+def _covered_turn_fingerprint(m: dict) -> str:
+    """One covered-turn fingerprint. See _covered_turn_fingerprints."""
+    role = str(m.get("role", "unknown"))
+    content = m.get("content")
+    key = None
+    if isinstance(content, str):
+        key = (role, len(content), hash(content))
+        hit = _FP_MEMO.get(key)
+        if hit is not None:
+            return hit
+    text = _message_text(m)
+    images = 0
+    note = None
+    # The cheap test first (F6): 60% of this function's cost was the regex
+    # attempting `\s*` at every whitespace position of every reply. It can
+    # only match a text whose stripped end is the note's own end.
+    if text.rstrip().endswith(_RETENTION_NOTE_TAIL):
+        note = _RETENTION_NOTE.search(
+            text, max(0, len(text) - _RETENTION_NOTE_WINDOW)
+        )
+    if note is not None:
+        images = int(note.group(1))
+        text = text[: note.start()]
+    elif isinstance(content, list):
+        images = sum(
+            1 for c in content
+            if isinstance(c, dict)
+            and (c.get("type") in ("image_url", "image", "input_image")
+                 or "image_url" in c)
+        )
+    payload = f"{role}\x00{' '.join(text.split())}\x00{images}"
+    fp = hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()[:_FP_WIDTH]
+    if key is not None:
+        if len(_FP_MEMO) >= _FP_MEMO_MAX:
+            _FP_MEMO.clear()
+        _FP_MEMO[key] = fp
+    return fp
+
+
+def _covered_turn_fingerprints(messages: list[dict]) -> list[str]:
+    """One fingerprint per non-system turn, for the covered-turns record ONLY.
+
+    Not _turn_fingerprints, which feeds the position anchor and must not
+    change under existing state files. This one has to be stable across
+    something the anchor never compares across: IMAGE RETENTION. An image
+    turn arrives with its image parts; a later upload demotes it to its text
+    plus a "[1 image shared earlier in this conversation]" note, and the same
+    turn now reads differently in every later request. Keyed on the raw text
+    that would read as an edit on every conversation that ever shared two
+    pictures. So a turn is its role, its whitespace-normalized text with any
+    retention note removed, and its image count — the note's count when
+    demoted, the parts' count when not — which is the same triple either way.
+    """
+    return [
+        _covered_turn_fingerprint(m) for m in messages if m.get("role") != "system"
+    ]
+
+
+def _covered_fps(state: dict) -> list[str]:
+    """The covered-turn record, position 1 first, validated.
+
+    Each entry is a 16-hex fingerprint or _FP_UNKNOWN. Stored as ONE string
+    rather than a JSON list: her conversation is ~1,900 turns and this is
+    read on every request, so it is parsed as one token rather than 1,900.
+    Anything that is not a whole number of well-formed entries voids the
+    record — a partly unreadable record was written by something that did
+    not finish, and reads as no evidence rather than as some of it.
+    """
+    raw = state.get("covered_fps")
+    if not isinstance(raw, str) or len(raw) % _FP_WIDTH:
+        return []
+    if raw.strip("0123456789abcdef-"):
+        return []
+    entries = [raw[i:i + _FP_WIDTH] for i in range(0, len(raw), _FP_WIDTH)]
+    if "-" in raw and any("-" in e and e != _FP_UNKNOWN for e in entries):
+        return []
+    return entries
+
+
+def _record_chunk_fps(
+    state: dict, first_turn: int, last_turn: int, turns: list[dict]
+) -> bool:
+    """Record what ONE chunk read: `turns` are the turns it summarized for
+    positions first_turn..last_turn, as the client sees them. True if the
+    record changed.
+
+    hostile pass #3 (reviewer A, F1 and F9, both BLOCKER). THE FOURTH SHAPE,
+    and why the third was wrong. The third recorded position N from whatever
+    request next carried position N (`_catch_up_covered_fp`), so a chunk was
+    routinely ahead of its record, and anything that changed in between was
+    blessed:
+
+      * F1. Every L1 chunk ends on the reply that was JUST streamed, which is
+        not in the request, so its fingerprint was taken from the next
+        request. Delete the last exchange, regenerate the chunk-closing
+        reply, or delete only that reply, before the next message: the next
+        request's turn at that position was recorded as covered, and from
+        then on it matched its record and was replaced by a summary of the
+        turn she had deleted. Lost for the life of the conversation.
+      * F9. /admin/.../compact summarizes a transcript rebuilt from the
+        episodic store, with a placeholder pair for every exchange the store
+        never indexed, and passed no raw array, so it recorded nothing. The
+        next live rollup then recorded every rebuilt position from her real
+        turns, and the exchanges the rebuild only had placeholders for were
+        deleted from every later request.
+
+    So the record is written HERE, by the chunk, in the same state mutation
+    that appends the chunk, from the turns the chunk read. No later event
+    writes an entry for a position a chunk already covers, except the
+    one-shot legacy adoption (_adopt_legacy_record). What "the turn it read,
+    as the client sees it" means per caller is decided by maybe_rollup: the
+    raw request plus the reply AS STREAMED for the live tail, the unredacted
+    snapshot for the backfill, and the rollup input itself for a caller with
+    no raw array (the admin rebuild), where a placeholder is recorded as a
+    placeholder and so never matches the real turn.
+
+    Append-only: an entry that already holds a fingerprint is never
+    rewritten (a turn edited after its chunk keeps its original fingerprint,
+    so exactly that turn reads as changed). Positions below `first_turn` that
+    no entry covers are padded with _FP_UNKNOWN. An _FP_UNKNOWN entry is
+    filled when a chunk reads that position, because the chunk then did read
+    it.
+    """
+    if first_turn < 1 or last_turn < first_turn:
+        return False
+    fps = _covered_turn_fingerprints(turns)
+    if len(fps) != last_turn - first_turn + 1:
+        # The chunk's span and the turns handed in disagree: record nothing
+        # rather than something misaligned. Its positions stay unrecorded
+        # (and are padded UNKNOWN by the next chunk), which costs refreshes
+        # and never a turn.
+        return False
+    entries = _covered_fps(state)
+    before = "".join(entries)
+    if len(entries) < first_turn - 1:
+        entries.extend([_FP_UNKNOWN] * (first_turn - 1 - len(entries)))
+    for k, fp in enumerate(fps, start=first_turn):
+        if k <= len(entries):
+            if entries[k - 1] == _FP_UNKNOWN:
+                entries[k - 1] = fp
+        else:
+            entries.append(fp)
+    after = "".join(entries)
+    state["covered_fps"] = after
+    return after != before
+
+
+def _covered_extra(state: dict) -> list[tuple[int, int, str]]:
+    """The out-of-position record (`covered_extra`), validated row by row.
+
+    Each row is [after_position, owner_last_turn, fingerprint]: a turn some
+    L1 chunk read as an extra piece (_patch_candidates), which sorts after
+    covered position `after_position` and was read by the chunk ending at
+    `owner_last_turn`. A malformed row is skipped, not the list: a row is
+    only ever a reason to replace a turn, so an unread row costs a refresh.
+    """
+    raw = state.get("covered_extra")
+    if not isinstance(raw, list):
+        return []
+    out: list[tuple[int, int, str]] = []
+    for row in raw:
+        if not (isinstance(row, (list, tuple)) and len(row) == 3):
+            continue
+        after, owner, fp = row
+        if (
+            type(after) is int and type(owner) is int and isinstance(fp, str)
+            and after >= 0 and owner >= 1 and len(fp) == _FP_WIDTH
+            and not fp.strip("0123456789abcdef")
+        ):
+            out.append((after, owner, fp))
+    return out
+
+
+def _record_sequence(state: dict) -> tuple[list[str], list[int]]:
+    """The record as the pairing reads it: (fingerprints, positions), in
+    conversation order.
+
+    The chunk-written entries for positions 1..eff (eff: what the unbroken
+    chunk chain from turn 1 backs, _covered_prefix), with every
+    out-of-position row (_covered_extra) inserted after the position it sorts
+    after. `positions[i]` is the covered position of sequence element i, or
+    for an extra row the position it sorts after. An extra row counts only
+    while the chunk that read it is inside that chain: a chunk parked by
+    load_state or cut off by a hole takes its extras with it.
+    """
+    entries = _covered_fps(state)
+    eff = min(_covered_prefix(state), len(entries))
+    if eff <= 0:
+        return [], []
+    extras: dict[int, list[str]] = {}
+    for after, owner, fp in _covered_extra(state):
+        if owner <= eff and after <= eff:
+            extras.setdefault(after, []).append(fp)
+    seq: list[str] = list(extras.get(0, ()))
+    pos: list[int] = [0] * len(seq)
+    for k in range(1, eff + 1):
+        seq.append(entries[k - 1])
+        pos.append(k)
+        for fp in extras.get(k, ()):
+            seq.append(fp)
+            pos.append(k)
+    return seq, pos
+
+
+def _record_patch_fps(
+    state: dict, owner_last_turn: int, rows: list[tuple[int, str]]
+) -> bool:
+    """Append out-of-position rows (after_position, fingerprint) read by the
+    chunk ending at `owner_last_turn`. True if anything was added.
+
+    Counted, not de-duplicated: a row already held for the same
+    (after_position, fingerprint) is not written again, but two identical
+    turns read together ("ok", "ok") need two rows, because one entry pairs
+    with one turn (_pairing) and the second would stay unpaired — refreshed
+    on every request and re-read by every chunk, for good."""
+    existing = _covered_extra(state)
+    held: dict[tuple[int, str], int] = {}
+    for a, _o, f in existing:
+        held[(a, f)] = held.get((a, f), 0) + 1
+    out = [list(r) for r in existing]
+    added = False
+    seen: dict[tuple[int, str], int] = {}
+    for after, fp in rows:
+        if fp == _FP_UNKNOWN:
+            continue
+        key = (int(after), fp)
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] <= held.get(key, 0):
+            continue
+        out.append([int(after), int(owner_last_turn), fp])
+        added = True
+    state["covered_extra"] = out
+    return added
+
+
+def _legacy_unread_positions(state: dict, legacy_watermark: int | None) -> set[int]:
+    """Covered positions a pre-v3.1.9 state file PROVES no chunk read.
+
+    hostile pass #4 (reviewer A F2). A v3.1.6.1 file records no text, but its
+    shape keeps three traces of the traffic that put unread turns under
+    chunk labels:
+
+      * a watermark BELOW the highest label (read before
+        _repair_watermark_below_chunks raises it). v3.1.6.1's
+        _reconcile_watermark set it to the array length on the tail after a
+        delete or an edit-and-resend, so the exchange of that tail (w-1, w)
+        and everything after it is text no chunk read — unless a chunk has
+        closed at w since, in which case only what is after w is unread and
+        the chunk's own start is the second trace;
+      * a span that starts INSIDE a span written before it (41-60, then
+        47-66): the pull-down again, and s-2, s-1 are that tail's exchange;
+      * the closing exchange of every chunk still in l1, and of the furthest
+        span: a regenerate of the reply that closed a chunk, or a delete of
+        that exchange and a new message, moves no watermark on v3.1.6.1
+        (39 + 1 = 40 is not below 40), so nothing else can tell it from the
+        exchange the chunk read.
+
+    What no trace can show, stated so nobody reads this as complete: an
+    in-place edit (OpenWebUI's edit-and-Save without a new branch), and a
+    regenerate of a closing reply whose chunk has since been consumed into
+    an L2 chapter. See _adopt_legacy_record for why those are adopted.
+    """
+    unread: set[int] = set()
+    l1 = [c for c in (state.get("l1") or []) if isinstance(c, dict)]
+    l2 = [c for c in (state.get("l2") or []) if isinstance(c, dict)]
+    l3 = state.get("l3") if isinstance(state.get("l3"), dict) else None
+    ordered = ([l3] if l3 else []) + l2 + l1
+    spans = [
+        (c.get("first_turn"), c.get("last_turn")) for c in ordered
+        if isinstance(c.get("first_turn"), int) and isinstance(c.get("last_turn"), int)
+    ]
+    highest = _highest_chunk_turn(state)
+    if isinstance(legacy_watermark, int) and 0 < legacy_watermark < highest:
+        w = legacy_watermark
+        closed_at_w = bool(spans) and spans[-1][1] == w
+        unread.update(range(max(1, w + 1 if closed_at_w else w - 1), highest + 1))
+    reach = 0
+    for ft, lt in spans:
+        if reach and ft <= reach:
+            unread.update(p for p in (ft - 2, ft - 1) if p >= 1)
+        reach = max(reach, lt)
+    # The closing exchange of the furthest span too, whatever its tier. This
+    # also absorbs the one error the position can carry into adoption: with
+    # no anchor in the file, _observed_position HOLDS where the truth may be
+    # one exchange on, so the offset can read up to _ASSUMED_NEW_TURNS low
+    # and window turn i land up to two positions below its own. Only the
+    # last two covered positions can then receive a turn past the chain,
+    # and they are never adopted.
+    for lt in [c.get("last_turn") for c in l1] + [highest]:
+        if isinstance(lt, int):
+            unread.update(p for p in range(lt - _ASSUMED_NEW_TURNS + 1, lt + 1) if p >= 1)
+    return unread
+
+
+def _adopt_legacy_record(
+    state: dict,
+    request_turns: list[dict],
+    window_offset: int,
+    legacy_watermark: int | None = None,
+) -> bool:
+    """One-shot adoption of chunks written before v3.1.9, which recorded
+    nothing. True if the record changed.
+
+    A pre-v3.1.9 hierarchy has no evidence of what its chunks read, and her
+    conversation is ~1,900 turns of such chunks: never adopting them means the
+    reuse path refreshes her whole history on every request, which is the
+    4-call cap refusal this feature exists to end. So the array in hand is
+    believed ONCE, narrowed so that it cannot become F1 or F9 again:
+
+      * ONCE, by the `legacy_adopted` flag, and only over the LEADING
+        unrecorded run (an empty record, or the _FP_UNKNOWN padding a
+        raw-less admin rebuild wrote below its own chunks).
+      * only positions chunks covered BEFORE this call (maybe_rollup calls it
+        ahead of its own rollups, whose chunks record themselves).
+      * only the request's own turns, never the reply appended after them:
+        a chunk that closed on a reply is exactly what a regenerate replaces.
+      * AT ANY WINDOW OFFSET o (hostile pass #4, reviewer A F3/F8): position
+        p takes request_turns[p - o - 1], and positions 1..o stay UNKNOWN. It
+        used to require o == 0, and o is never 0 again once the position has
+        run ahead of the array — v3.1.9 seeds the position from the highest
+        chunk label, and v3.1.6.1 kept every label while pulling its
+        watermark down after a delete or edit-and-resend. Upgrade inside that
+        window and adoption never ran: the whole legacy span was refreshed
+        on every request, for good. For a CAPPED client this reads exactly
+        the part of the window the chunks cover (position o+1 is window turn
+        1). For a full-history client whose array shrank it under-adopts by
+        o turns, never over: those are re-read by the next L1 chunks
+        (_patch_candidates).
+      * never a position _legacy_unread_positions proves no chunk read,
+        under either reading of the array (window turn i as position o+1+i,
+        or as position i+1).
+
+    WHAT IT STILL BELIEVES (reviewer A F2), and why that is the least bad
+    option. An in-place edit made on v3.1.6.1, and a regenerate of a
+    closing reply whose chunk was since folded into an L2 chapter, leave no
+    trace, and are adopted as if their chunk had read them. Two alternatives
+    were assessed:
+
+      * the episodic store as evidence (adopt a position only when its text
+        matches an indexed exchange). It cannot see the regenerate or the
+        edit-and-resend: the store is append-only across branches, so the
+        regenerated reply and the resent turn are indexed too. It does see
+        an in-place edit — and it also rejects every exchange memory never
+        stored, trimmed or was damaged on: before v3.1.4 a cut reply was
+        not stored at all (51 Stops and 12 ceilings in one 2026-09-01 log
+        window, more than half of that window's exchanges), pre-D1 rows
+        were overwritten in place, and a trimmed reply matches the re-sent
+        one only as a prefix, which is no evidence about the tail. Every
+        rejected position is refreshed on every request until re-read, and
+        at that rate the refreshed span is the cap refusal again;
+      * a rebuild of the whole covered span from the current array, the
+        complete fix, which is ~95 L1-sized summarization calls at her
+        length and is the admin endpoint's job, not a request tail's.
+
+    And relative to what she runs: v3.1.6.1 does not deliver an old
+    correction either. At ~1,700 messages its compaction needs far more than
+    MAX_SUMMARY_CALLS_PER_REQUEST batches, refuses, and the guard sheds the
+    older turns; the model receives the injected hierarchy, whose chunks
+    are these same summaries of the text before the correction. An adopted
+    position changes what reaches the model only for a turn the guard would
+    have kept verbatim — the newest few — and the closing exchanges of the
+    chunks still in l1 are exactly the ones this refuses.
+    """
+    if state.get("legacy_adopted") or len(request_turns) < 1:
+        return False
+    entries = _covered_fps(state)
+    lead = 0
+    while lead < len(entries) and entries[lead] == _FP_UNKNOWN:
+        lead += 1
+    if entries and lead == 0:
+        return False
+    upto = _covered_prefix(state)
+    if lead < len(entries):
+        upto = min(upto, lead)
+    if upto <= 0:
+        return False
+    o = max(0, int(window_offset))
+    unread = _legacy_unread_positions(state, legacy_watermark)
+    adopted: list[str] = []
+    for p in range(1, upto + 1):
+        i = p - o - 1
+        if 0 <= i < len(request_turns) and p not in unread and (i + 1) not in unread:
+            adopted.append(_covered_turn_fingerprint(request_turns[i]))
+        else:
+            adopted.append(_FP_UNKNOWN)
+    state["covered_fps"] = "".join(adopted + entries[upto:])
+    state["legacy_adopted"] = True
+    return True
+
+
+def _increasing_anchors(cand: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """The longest subsequence of `cand` (request index ascending) whose
+    record indices strictly increase. Patience sorting, O(n log n)."""
+    tails_k: list[int] = []
+    tails_i: list[int] = []
+    prev = [-1] * len(cand)
+    for i, (_j, k) in enumerate(cand):
+        p = bisect.bisect_left(tails_k, k)
+        if p > 0:
+            prev[i] = tails_i[p - 1]
+        if p == len(tails_k):
+            tails_k.append(k)
+            tails_i.append(i)
+        else:
+            tails_k[p] = k
+            tails_i[p] = i
+    out: list[tuple[int, int]] = []
+    i = tails_i[-1] if tails_i else -1
+    while i >= 0:
+        out.append(cand[i])
+        i = prev[i]
+    out.reverse()
+    return out
+
+
+def _pairing(record: list[str], now: list[str]) -> dict[int, int]:
+    """{index into `now`: index into `record`}: which request turn each
+    record entry vouches for, IN ORDER, each entry used at most once.
+
+    hostile pass #4 (reviewer A F4). The previous shape was set membership:
+    any turn whose fingerprint was ANYWHERE in the record was replaced. A
+    repeated "yes" to a new question, or a paste sent twice, was then
+    replaced by the summary of its earlier twin in another context — for
+    good when it sat where no chunk would ever read it (after a delete of the
+    exchange that closed a chunk).
+
+    ORDER-PRESERVING, AND NOT SequenceMatcher. The first cut of the content
+    gate used difflib, which junks any element repeated in over 1% of a long
+    sequence ("continue", "ok", identical redaction placeholders — refreshed
+    on every request after any delete) and measured 679 ms at 1,990 turns.
+    This is patience alignment:
+
+      1. ANCHORS: turns whose fingerprint occurs exactly once in `now` and
+         exactly once in `record`; of those, the longest run whose record
+         indices increase. Her replies are long and unique, so anchors are
+         dense — roughly every other turn.
+      2. GAPS: between two consecutive anchors, each remaining turn pairs with
+         the FIRST unused entry holding its fingerprint inside the same gap of
+         the record, in order (sorted index lists + bisect). A "continue"
+         between two unique replies sits in a one-turn gap and pairs; a
+         "yes" whose only twin is outside its gap pairs with nothing.
+
+    A turn is still replaced only when its own content is an entry a chunk
+    wrote (safety is unchanged); the order only removes pairings. A delete
+    costs nothing and an edit costs the edited turn, as before. Inside one
+    very long gap with no unique turns at all, the greedy step can pair a
+    turn with a later twin and leave the turns between unpaired: that costs
+    refreshes, which the next L1 chunk re-reads, never a turn.
+    """
+    rec_idx: dict[str, list[int]] = {}
+    for k, fp in enumerate(record):
+        if fp != _FP_UNKNOWN:
+            rec_idx.setdefault(fp, []).append(k)
+    if not rec_idx:
+        return {}
+    now_count: dict[str, int] = {}
+    for fp in now:
+        now_count[fp] = now_count.get(fp, 0) + 1
+    cand = [
+        (j, rec_idx[fp][0]) for j, fp in enumerate(now)
+        if now_count[fp] == 1 and len(rec_idx.get(fp, ())) == 1
+    ]
+    anchors = _increasing_anchors(cand)
+    pairs: dict[int, int] = {}
+    bounds = [(-1, -1)] + anchors + [(len(now), len(record))]
+    for (j0, k0), (j1, k1) in zip(bounds, bounds[1:]):
+        last_k = k0
+        for j in range(j0 + 1, j1):
+            lst = rec_idx.get(now[j])
+            if not lst:
+                continue
+            p = bisect.bisect_right(lst, last_k)
+            if p < len(lst) and lst[p] < k1:
+                pairs[j] = lst[p]
+                last_k = lst[p]
+        if j1 < len(now):
+            pairs[j1] = k1
+    return pairs
+
+
+def _paired_turns(record: list[str], now: list[str]) -> set[int]:
+    """Indices into `now` that _pairing pairs with an entry of `record`.
+
+    hostile pass #3 (reviewer A F2/F3/F7) made this content-based: the third
+    shape compared turn N of the request with record entry N, so one delete
+    shifted every later turn and the refreshed span grew until the cap
+    refused it. hostile pass #4 (F4) made it ordered; see _pairing.
+    """
+    return set(_pairing(record, now))
+
+
+def _has_image_parts(m: dict) -> bool:
+    content = m.get("content")
+    return isinstance(content, list) and any(
+        isinstance(c, dict)
+        and (c.get("type") in ("image_url", "image", "input_image") or "image_url" in c)
+        for c in content
+    )
+
+
+def _patch_candidates(
+    state: dict, raw_turns: list[dict], first_read: int
+) -> list[tuple[int, int]]:
+    """[(index into raw_turns, after_position)]: the turns the next L1 chunk
+    re-reads as extra pieces, oldest first, at most L1_CHUNK_SIZE.
+
+    hostile pass #4 (reviewer A F6). A turn inside the covered span that
+    pairs with nothing is summarized fresh by compact_if_needed on every
+    request, and nothing ever re-read it: the turns written after a delete of
+    a chunk-closing exchange (+2 per delete), a regenerated closing reply
+    (+1), an edited turn, an admin rebuild's placeholder positions, a legacy
+    position no evidence backs. Measured growth +2/+1 per event with no decay
+    across an L2 rollup; projected at her edit rate, most messages paying 3
+    summarization calls in about two months and the 4-call refusal in four
+    to six.
+
+    Computed the way the gate computes it (_pairing over _record_sequence):
+    every unpaired text turn BEFORE `first_read`, the first raw index this
+    call's chunk reads in position order. That is the gate's refreshed set
+    (unpaired turns before the last paired one) plus the unpaired turns
+    between the last paired one and where the chunk starts — the turns
+    written after a delete of the closing exchange sit exactly there, and
+    no later chunk would ever read them. Bounding by the last paired turn
+    instead left them for a second L1 cycle (measured). Nothing at or after
+    `first_read` is a candidate, so one chunk never reads a turn twice. The
+    chunk records each in `covered_extra` after the covered position of the
+    paired turn before it, so the next request pairs them. Image turns are
+    skipped (compaction never removes one).
+    """
+    seq, seq_pos = _record_sequence(state)
+    if not seq or not raw_turns:
+        return []
+    pairs = _pairing(seq, _covered_turn_fingerprints(raw_turns))
+    out: list[tuple[int, int]] = []
+    after = 0
+    for j in range(min(len(raw_turns), max(0, first_read))):
+        if j in pairs:
+            after = seq_pos[pairs[j]]
+            continue
+        m = raw_turns[j]
+        if _has_image_parts(m) or not _message_text(m).strip():
+            continue
+        out.append((j, after))
+        if len(out) >= L1_CHUNK_SIZE:
+            break
+    return out
+
+
+def _coverage_plan(state: dict, to_summarize: list[dict]) -> tuple[int, set[int]]:
+    """(covered, changed): the leading span of `to_summarize`'s non-system
+    turns the reuse path may take, and the 0-based indices inside it that it
+    must summarize fresh instead of replacing.
+
+    A turn is replaced only when it is PAIRED (_pairing, order-preserving)
+    with an equal entry of the record sequence (_record_sequence: the
+    entries the unbroken chunk chain from turn 1 backs, plus the turns a
+    chunk re-read out of position). Every entry was written from the text a
+    chunk read (_record_chunk_fps, _record_patch_fps), so a replaced turn's
+    content is in the stored summary. `covered` ends after the last replaced
+    turn; every other turn before it is `changed`. That holds for a capped
+    window, a truncated head, a delete, a regenerate, an edit and a shorter
+    branch alike, which is why no length comparison guards this any more
+    (F2/F3/F7): a window whose turns the record does not hold simply reads
+    as changed.
+
+    (0, set()) when there is no record (no evidence) or nothing pairs.
+    Pure; hashing is memoized (F6), and the gate still runs it in the
+    threadpool.
+    """
+    seq, _pos = _record_sequence(state)
+    if not seq:
+        return 0, set()
+    non_system = [m for m in to_summarize if m.get("role") != "system"]
+    if not non_system:
+        return 0, set()
+    now = _covered_turn_fingerprints(non_system)
+    matched = _paired_turns(seq, now)
+    if not matched:
+        return 0, set()
+    covered = max(matched) + 1
+    return covered, set(range(covered)) - matched
+
+
+def _covered_prefix(state: dict) -> int:
+    """The furthest turn N such that turns 1..N are covered by an UNBROKEN
+    chain of stored summaries. 0 when the chain does not start at turn 1.
+
+    _highest_chunk_turn above answers where coverage ENDS. Nothing asked
+    where it STARTS, and two shipped paths in _do_l1_rollup deliberately
+    leave a hole:
+
+      * `pos_last < 1` advances `last_summarized_turn` to `window_offset`
+        and appends NO chunk. The span is gone on purpose — the text was
+        never in a request and this module never held a copy — and the error
+        line says so, pointing at /admin/.../compact to rebuild it.
+      * `partial` records `first_turn = window_offset + 1`, deliberately
+        NARROWER than `last + 1`, precisely so the chunk does not claim
+        coverage of text the rollup never saw.
+
+    Both are correct as rollup behaviour. Both are invisible to
+    _highest_chunk_turn, which takes a max over `last_turn` and never looks
+    at `first_turn` at all. So a reader asking "how many turns can I replace
+    with stored summary text?" got a number that counted straight across the
+    hole, and the reuse path in compact_if_needed deleted turns no chunk
+    represents — logged as "N covered by stored summaries". An adversarial
+    pass demonstrated 20 such turns.
+
+    A gap also appears with no outage at all: load_state parks a chunk whose
+    shape it cannot parse (v3.1 F1b, correct on its own terms) and the
+    survivors either side are contiguous with each other but not with turn 1.
+
+    l1 + l2 + l3. An L2 rollup CONSUMES its inputs (`state["l1"] =
+    l1[L2_CHUNK_SIZE:]`) and an L3 refresh consumes every L2 chapter, so a span
+    can live in any tier. The first version EXCLUDED l3 as "a claim about a
+    claim" and argued that excluding it could only make this number smaller,
+    which is the safe direction. It is — and it also made the number ZERO for
+    every conversation after its first L3 refresh, because the refresh removes
+    the L2 chapters from 1 onward and leaves l3 as the only span that starts at
+    turn 1. Reuse was then off for good on exactly the conversations long
+    enough to need it. l3's first_turn is inherited from the previous l3, which
+    took it from l2[0] at the first refresh, so it is measured once and carried;
+    and what makes a claimed span trustworthy for substitution is the covered-
+    turn record (_coverage_plan), not this walk.
+
+    Spans may overlap, nest and arrive in any order, so the walk sorts and
+    takes `max` rather than requiring `first_turn == reach + 1`.
+    """
+    spans: list[tuple[int, int]] = []
+    tiers = list(state.get("l1") or []) + list(state.get("l2") or [])
+    if isinstance(state.get("l3"), dict):
+        tiers.append(state["l3"])
+    for c in tiers:
+        if not isinstance(c, dict):
+            continue
+        ft, lt = c.get("first_turn"), c.get("last_turn")
+        if isinstance(ft, int) and isinstance(lt, int) and ft >= 1 and lt >= ft:
+            spans.append((ft, lt))
+    reach = 0
+    for ft, lt in sorted(spans):
+        # A chunk starting past the end of what we have proven leaves a hole,
+        # and everything after it is unreachable from turn 1 no matter how
+        # much of it there is.
+        if ft > reach + 1:
+            break
+        if lt > reach:
+            reach = lt
+    return reach
+
+
+def _recorded_position(state: dict) -> int:
+    """The furthest turn this conversation is KNOWN to have reached.
+
+    Three sources, and the third is the v3.1.7 repair (R12). `turns_seen` is
+    the compactor's own counter; `last_summarized_turn` covers a state file
+    written before that counter existed; and the CHUNK LABELS cover a state
+    file whose watermark was pulled DOWN by the old _reconcile_watermark
+    (S-5 / REMEDIATION F14) while the chunks it had already written kept their
+    real labels. Seeding from the first two alone restarted the position at
+    the cap on the first post-upgrade request, which is what made every new
+    L1 chunk collide with an old label and be discarded.
+    """
+    return max(
+        int(state.get("turns_seen") or 0),
+        int(state.get("last_summarized_turn") or 0),
+        _highest_chunk_turn(state),
+    )
+
+
+def recorded_position(state: dict) -> int:
+    """Public wrapper over `_recorded_position`, for callers outside this
+    module that need to know how far a conversation has already been
+    tracked WITHOUT calling `maybe_rollup` (v3.1.9.3 / hostile317-b F3).
+
+    backfill.py used to read this before calling `maybe_rollup` with its
+    kickoff snapshot. That was check-then-act outside conv_lock (hostile pass
+    #3, reviewer E F3); the comparison now happens inside maybe_rollup
+    (`skip_if_position_past`). Kept for diagnostics and tests.
+    """
+    return _recorded_position(state)
+
+
+def _repair_watermark_below_chunks(conv_id: str, state: dict) -> bool:
+    """Raise a watermark that sits below the chunks it is supposed to track.
+
+    Every writer in this module advances `last_summarized_turn` to a chunk's
+    `last_turn` in the same state dict it appends the chunk to, so the
+    watermark is never legitimately below the highest label. Below it means
+    the file was written by the old _reconcile_watermark, which pulled the
+    watermark down to the client's array length when a cap shortened it.
+
+    Left alone, that costs twice over: turns 101-280 are re-summarized from
+    the WRONG text (the offset arithmetic no longer matches the labels), and
+    then each new chunk collides with an existing label and is thrown away by
+    the duplicate guard in _do_l1_rollup — silently, for as many turns as the
+    old chunks span. Raising the pointer to what the chunks already prove is
+    the only repair that loses nothing: the text under those labels is
+    summarized, and this module still holds the summaries.
+
+    Returns True if it changed anything, so the caller persists it.
+    """
+    highest = _highest_chunk_turn(state)
+    last = int(state.get("last_summarized_turn") or 0)
+    if highest <= last:
+        return False
+    state["last_summarized_turn"] = highest
+    logger.warning(
+        f"conv={conv_id}: the watermark was at turn {last} while stored "
+        f"chunks already cover through turn {highest} — a state file written "
+        f"by the pre-v3.1.4 watermark reset. Advancing it to {highest}, which "
+        f"is what the chunks themselves record; without this every new chunk "
+        f"would be labelled over an existing one and discarded"
+    )
+    return True
+
+
+def _observed_position(conv_id: str, state: dict, messages: list[dict]) -> int:
+    """This conversation's monotonic turn position, updated in `state`.
+
+    THE INVARIANTS, because several separate defects lived in the arithmetic
+    below and the next person needs to be able to check it:
+
+      I1. The position is the number of turns the CONVERSATION has reached.
+          It never moves backwards. That is the deliberate reversal of
+          _reconcile_watermark (S-5 / REMEDIATION F14), which pulled the
+          watermark down to the observed count: under a PERSISTENT cap the
+          pull-down happens once and the rollup gate then never opens again.
+
+      I2. `n`, the count of non-system messages, is a LOWER BOUND on the
+          position and nothing more. Every turn in the window is a real turn
+          of this conversation, so the conversation has at least n of them —
+          but a capped window is a SUFFIX, so n says nothing about how many
+          came before. Until v3.1.7 `n > prev` was read as "the array length
+          IS the position", which is true only while the window is unbounded.
+          A sliding cap does not snap from full history to short window in one
+          step: on the first request where it bites, n is still greater than
+          prev while ALREADY BEING SHORTER than the truth (cap 100, exchange
+          51: the client stores 100 turns, appends turn 101, the valve trims
+          to the last 100, the compactor appends turn 102 -> n = 101 against a
+          truth of 102). One turn of position was swallowed permanently, the
+          chunk labelled 101-120 held turns 102-121, and nothing said so
+          (R23).
+
+      I3. `prev + aligned` is the other lower bound: `prev` is monotonic and
+          `aligned` counts the turns past the anchor's match. So the position
+          is `max(n, prev + new)` — the larger of two lower bounds, which is
+          exact whenever either source is exact and never over-counts.
+
+      I4. Over-counting drops turns for good; under-counting only summarizes
+          some of them twice. Where the evidence is ambiguous, take the
+          smaller — EXCEPT that "0 new turns" under a cap is not merely
+          conservative, it is a stall: the position is the only thing that
+          advances, so a zero that repeats forever is the frozen hierarchy
+          this release exists to fix, reached by a different route (R18).
+          A zero is therefore only believed when it is unambiguous, or when
+          the window itself is unchanged (same head, same length) AND is not
+          a strict suffix of a longer conversation. The second half is not
+          decoration: a capped window that has filled with byte-identical
+          exchanges is byte-identical to the one before it, so "unchanged"
+          alone reads a live stall as the admin drain and freezes the
+          position for as long as the loop runs.
+
+      I5. An empty window is not evidence of anything. A request with no
+          non-system turns at all must leave both the position and the anchor
+          exactly as they were — advancing by an exchange invents two turns,
+          and overwriting the anchor with [] destroys the only thing that can
+          align the NEXT window (R21).
+
+      I6. `prev` comes from _recorded_position, which counts the CHUNK LABELS
+          as well as the two pointers. A chunk labelled a..b is evidence that
+          b turns existed and were summarized, and it is the only one of the
+          three that the old _reconcile_watermark could not erase. Seeding
+          from the pointers alone restarted an upgraded conversation at the
+          cap, so every new chunk was labelled over one that already existed
+          and the duplicate guard threw it away — silently, for hundreds of
+          turns (R12). Where there is no anchor, the labels are also the only
+          evidence that the window in hand is a SUFFIX rather than the whole
+          conversation; see the branch below.
+    """
+    turns = [m for m in messages if m.get("role") != "system"]
+    n = len(turns)
+    prev = _recorded_position(state)
+
+    if not turns:
+        # I5. Neither the position nor the anchor may be touched.
+        state["turns_seen"] = prev
+        return prev
+
+    # R17: only the tail is hashed. The alignment below cannot use a slot
+    # older than the anchor plus everything appended after it, and hashing the
+    # whole history cost 47 ms per call at 660 turns, on the event loop,
+    # inside conv_lock, every single turn.
+    fps = _turn_fingerprints(turns[-_FINGERPRINT_TAIL_TURNS:])
+    head_fp = _turn_fingerprints(turns[:1])[0]
+    anchor = [x for x in (state.get("tail_fp") or []) if isinstance(x, str)]
+    # Same head, same length: the client re-sent the window it sent last time.
+    # Under a cap the head slides out on every exchange, so this is USUALLY a
+    # reliable negative — and it is the only content evidence that separates
+    # the admin drain (the same transcript, looped) from a live turn whose
+    # tail repeats.
+    #
+    # USUALLY, and the exception is the whole point of the second clause
+    # below. Once a capped window has filled with byte-identical exchanges —
+    # a model looping, or `_redact_degenerate_turns` replacing every reply
+    # with the same placeholder — the window slides by two turns per exchange
+    # onto content that is period-2 identical, so the head hash repeats and
+    # the length is pinned at the cap. The two arrays are then equal BYTE FOR
+    # BYTE, and no content test of any width can tell them apart: comparing
+    # the whole window, or the whole fingerprint tail, gives the same answer
+    # as comparing the head. Measured at cap 20: the position advanced for
+    # the first ten repeated exchanges, then stalled permanently at turn 40
+    # while the conversation ran on to 68 (R18, second route).
+    #
+    # WHAT DOES SEPARATE THEM IS NOT CONTENT. `n < prev` says the window is a
+    # strict SUFFIX of a longer conversation — invariant I2's own reading of a
+    # bounded window, on the evidence rather than on the outcome (the
+    # "bounded window" line below tests `position > n`, which is the same
+    # judgement AFTER `new` has been chosen and so cannot inform the choice).
+    # The admin drain cannot be in that state: /admin/compact
+    # refuses (409) unless the rebuilt transcript REACHES
+    # _recorded_position, so throughout its loop n >= prev — and holding
+    # keeps it there, because holding leaves the position at max(n, prev) = n.
+    # So a repeating window with n < prev is a live capped turn, and the zero
+    # is the coincidence.
+    #
+    # The trade, stated because it is a trade: a state file whose watermark is
+    # stranded ABOVE its true position (the S-5 case) also reads n < prev, so
+    # if such a conversation ALSO has a repeating tail AND the client re-sends
+    # a byte-identical window, this advances 2 turns it should not have. That
+    # costs two turns of coverage once per duplicate request; the stall it
+    # replaces costs every turn of the hierarchy for as long as the loop runs,
+    # which is the failure this release exists to fix.
+    window_unchanged = (
+        n == int(state.get("window_turns") or 0)
+        and head_fp == (state.get("head_fp") or "")
+    )
+    window_is_a_suffix = n < prev
+
+    if not anchor:
+        # First sight of this conversation with no anchor to compare against —
+        # a state file from before v3.1.4, or a conversation whose very first
+        # observation is already capped.
+        #
+        # The question is whether the window in hand ALREADY contains this
+        # exchange's two turns (so holding is right) or is a suffix that sits
+        # past everything recorded (so holding loses two turns that are never
+        # repaid). `prev` cannot answer it: a watermark can be stranded above
+        # a genuinely shorter history, which is the S-5 case, and treating
+        # that as proof of a bounded window pushes the position past a history
+        # that has not caught up to it.
+        #
+        # THE CHUNK LABELS CAN. A stored chunk labelled a..b is evidence that
+        # b turns of this conversation existed and were summarized — evidence
+        # that carries text, unlike the watermark. So:
+        if n < _highest_chunk_turn(state):
+            # The window provably cannot hold the whole conversation: the
+            # chunks alone account for more turns than the client sent. It is
+            # a suffix, so this call's exchange is past everything recorded,
+            # and main.py calls maybe_rollup once per exchange. Without this
+            # the R12 upgrade path (chunks to turn 660, watermark pulled down
+            # to the cap) came back with every chunk labelled two turns off
+            # the text inside it.
+            new = _ASSUMED_NEW_TURNS
+        else:
+            # The window could contain everything the chunks prove exists, so
+            # the watermark is the suspect number, not the window. HOLD, and
+            # let THIS call lay the anchor down; from the next call on the
+            # alignment is exact. Holding is the under-counting side
+            # (invariant I4), and it is also what keeps /admin/compact's drain
+            # loop still — it re-presents ONE unchanged transcript, which
+            # n >= _highest_chunk_turn always describes.
+            new = 0
+    else:
+        cands = _align_candidates(anchor, fps)
+        if not cands:
+            new = _ASSUMED_NEW_TURNS
+            if logsetup.log_once("summarizer.position.unaligned"):
+                logger.warning(
+                    f"conv={conv_id}: none of the {len(anchor)} anchored "
+                    f"turns appear in the {n}-turn window the client sent, "
+                    f"so the conversation's position ({prev}) cannot be "
+                    f"measured against it; advancing by "
+                    f"{_ASSUMED_NEW_TURNS} (one exchange) per rollup call "
+                    f"instead. Summary turn labels will drift from the "
+                    f"client's numbering, which costs nothing, but a "
+                    f"repeat of this line means the anchor is not "
+                    f"round-tripping through the client"
+                )
+        elif (
+            cands[0] == 0
+            and len(cands) > 1
+            and not (window_unchanged and not window_is_a_suffix)
+        ):
+            # I4. The anchor occurs at the very end AND earlier, so "nothing
+            # advanced" and "one exchange advanced" are equally consistent
+            # with it — a tail of byte-identical exchanges, which
+            # _redact_degenerate_turns manufactures out of two consecutive
+            # degenerate replies. Either the window's head and length say it
+            # is not the same window, or the window is a strict suffix of a
+            # longer conversation and so cannot be the admin drain's
+            # re-presented transcript — see window_unchanged above. Either
+            # way the zero is the coincidence, not the truth.
+            new = cands[1]
+            if logsetup.log_once("summarizer.position.repeating_tail"):
+                logger.info(
+                    f"conv={conv_id}: the last {len(anchor)} turns of this "
+                    f"conversation repeat earlier ones, so the anchor alone "
+                    f"cannot say whether the window moved; "
+                    + (
+                        f"the window is {n} turns against a position of "
+                        f"{prev}, so it is a suffix of a longer conversation "
+                        f"and not a re-presented transcript"
+                        if window_is_a_suffix
+                        else "the window itself changed"
+                    )
+                    + f", so taking {new} new turns rather than 0. "
+                    f"Reading 0 here would stop the position advancing, and "
+                    f"under a cap the position is the only thing that does"
+                )
+        else:
+            new = cands[0]
+
+    position = max(n, prev + new)
+    if position > n and logsetup.log_once("summarizer.position.bounded"):
+        # Once per process: this is the tail of EVERY turn under a cap.
+        # It is the healthy shape, not a fault — logged so that an
+        # operator turning max_turns on can see the compactor noticed.
+        logger.info(
+            f"conv={conv_id}: the client is sending a bounded window "
+            f"({n} turns) while the conversation is at turn {position}; "
+            f"rollups are driven by the compactor's own counter from here "
+            f"on, and chunk text is read at an offset of {position - n}"
+        )
+
+    state["turns_seen"] = position
+    state["tail_fp"] = fps[-_ANCHOR_TURNS:]
+    state["head_fp"] = head_fp
+    state["window_turns"] = n
+    return position
 
 
 # ---------------------------------------------------------------------------
@@ -871,11 +2171,18 @@ async def _batch_to_budget(
             if current:
                 batches.append(current)
                 current, current_tokens = [], 0
+            # hostile pass #5 (C5-2): this fires for ANY oversized piece
+            # this function is handed, not only a literal conversation
+            # turn — L3's stage 2 (_do_l3_rollup) passes a prior-L3 body or
+            # a chapter-summary part here too, and "a single turn measures
+            # N tokens" pointed an operator investigating an L3 loss at her
+            # chat instead of at the rollup's own intermediate summaries.
             logger.warning(
-                f"conv={conv_id}: a single turn measures {t} tokens against a "
-                f"{budget}-token summarization budget; it has been truncated "
-                f"for the rollup so the hierarchy keeps advancing — the stored "
-                f"summary covers only the beginning of that turn"
+                f"conv={conv_id}: a single rollup input piece measures {t} "
+                f"tokens against a {budget}-token summarization budget; it "
+                f"has been truncated for the rollup so the hierarchy keeps "
+                f"advancing — the stored summary covers only the beginning "
+                f"of that piece"
             )
             batches.append([
                 await _truncate_to_budget(client, vllm_url, model, p, t, budget)
@@ -949,7 +2256,189 @@ async def _llm_summarize(
     return ((choices[0].get("message") or {}).get("content") or "").strip()
 
 
+# ---------------------------------------------------------------------------
+# v3.1.9 (hostile pass 4, F5). A budget on REAL vLLM summarization calls
+# (_llm_summarize invocations), independent of how many rollup PASSES the
+# caller makes (maybe_rollup, called once per pass) and independent of how
+# many tiers or map-reduce batches one pass touches internally. Before this,
+# `max_calls` on /compact counted calls to maybe_rollup itself, and ONE
+# maybe_rollup call drains every L1 and L2 tier that is due in its own
+# internal `while` loops — `{"max_calls": 1}` on a deep backlog still ran
+# however many vLLM calls the whole backlog needed, not one.
+#
+# A CONTEXTVAR, not a parameter threaded through every intermediate function
+# (_do_l1_rollup, _do_l2_rollup, _do_l3_rollup, _summarize_pieces,
+# _summarize_pieces_raw): every one of those five is monkeypatched with a
+# fixed-signature stub somewhere in this test suite (nine files, at last
+# count — test_compaction_reuse.py, test_l3_coverage.py,
+# test_p3a_reuse_endpoint.py, test_p3a_reuse_traffic.py,
+# test_p4a_reuse_order.py, test_review_fixes.py, test_soak_conversation.py,
+# test_time_memory.py, and main.admin_compact's own caller stubs
+# maybe_rollup wholesale in test_admin_compact.py [5c]). PLUS `maybe_rollup`
+# ITSELF, stubbed wholesale (not just one of the five below it) by at least
+# two more callers with their own fixed signature: test_admin_compact.py
+# again, and — found the hard way, by the v3.1.9 tail-catch-up feature
+# passing `vllm_call_budget=` as a keyword on the TAIL's own call to
+# maybe_rollup and breaking it — test_degenerate_skip.py's
+# `spy_maybe_rollup(cid, messages, vllm_url, model, *, raw_messages=None)`.
+# main._rollup_hierarchy uses the context-manager form for exactly the
+# reason main.admin_compact already did (see that function's own comment on
+# the point): a keyword added to the maybe_rollup CALL breaks any stub of
+# maybe_rollup ITSELF, not just of what it calls internally. Adding a keyword
+# argument to any of their signatures breaks every stub that does not also
+# grow that keyword — which is every one of them, since none takes
+# `**kwargs`. A contextvar needs no call-site change anywhere in that chain:
+# it is read at the one real HTTP-call site (`_call`, inside
+# `_summarize_pieces_raw`, for accounting) and at the L1/L2/L3 drain in
+# `_maybe_rollup_body` (via `_budget_allows_unit`, for the unit-boundary
+# gate itself — v3.1.9, tail catch-up), and a stub that replaces anything
+# ABOVE `_call` in the chain never reaches ITS read at all — exactly
+# correct, because a stub that does not make real vLLM calls has nothing to
+# bound. `_maybe_rollup_body` is not one of the nine stubbed functions
+# above, so the gate's own call site needed no signature change either.
+#
+# maybe_rollup's own `vllm_call_budget` PARAMETER (see its docstring) sets
+# this for the duration of its call, for a caller that CAN pass a keyword.
+# `vllm_call_budget_ctx` is the lower-level context-manager form for a
+# caller that must keep calling maybe_rollup with today's exact signature
+# (main.admin_compact, for the stub-compatibility reason above) — both set
+# the same underlying mechanism, and either can be read back afterward for
+# how many calls were actually spent and whether the budget ran out.
+_vllm_call_budget: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar(
+    "summarizer_vllm_call_budget", default=None
+)
+
+
+@contextlib.contextmanager
+def vllm_call_budget_ctx(max_calls: int):
+    """Bound the number of REAL vLLM summarization calls a `maybe_rollup`
+    call spends, to AT MOST `max_calls` PLUS one unit's own call cost —
+    never a hard per-call ceiling. (hostile pass #5, E9: this docstring
+    used to promise per-call refusal; the tail catch-up feature moved the
+    gate to the UNIT boundary, and this is the corrected contract.)
+
+    Yields the mutable dict `{"remaining": int, "exhausted": bool}`; read it
+    after the block to see how many calls are left (0 or negative if the
+    budget was spent, possibly past zero — see the overshoot note below)
+    and whether anything was still due when the drain stopped checking.
+    `remaining` is decremented once per REAL call to `_llm_summarize`,
+    wherever in the L1/L2/L3 drain (including a map-reduce split within any
+    one tier) it happens — never once per rollup pass or per tier, both of
+    which can spend zero-or-more real calls.
+
+    THE GATE IS AT THE UNIT BOUNDARY, NOT PER CALL. The only reader that
+    refuses anything is `_budget_allows_unit`, checked by the L1/L2/L3
+    drain in `_maybe_rollup_body` immediately before a unit (one L1 chunk,
+    one L2 fold, the L3 refresh) is allowed to START — never inside
+    `_call` itself, which only decrements. A unit that is allowed to start
+    is GUARANTEED to finish, so the true overshoot on a call that spends
+    down to (or past) zero is AT MOST one unit's own calls, not zero — see
+    `_budget_allows_unit`'s own docstring for why a strict per-call refusal
+    livelocked a budget smaller than one unit's cost. A DIRECT call into
+    `_do_l1_rollup`/`_do_l2_rollup`/`_do_l3_rollup`, or into
+    `_summarize_pieces`/`_summarize_pieces_raw`, from inside this block
+    is NOT bounded at all — those functions do not check
+    `_budget_allows_unit` themselves, only `_maybe_rollup_body`'s drain
+    does, so a caller reaching for a bounded direct tier call must go
+    through `maybe_rollup` (or replicate the unit-boundary check itself).
+
+    A state mutation for a chunk/chapter/refresh is only ever written AFTER
+    its summarize call returns non-empty text (see _do_l1_rollup,
+    _do_l2_rollup, _do_l3_rollup) — an LLM failure must not record a chunk
+    it did not produce — so a call that ran out of budget mid-unit and
+    still finished (the guaranteed-finish trade above) either records real
+    progress or records nothing, never a chunk covering text it did not
+    summarize. A resumed call (the next /compact request, or the next
+    chat-path tail) re-reads state from disk and continues from the real
+    watermark, same as any other partial-progress rollup already does.
+    """
+    budget = {"remaining": max_calls, "exhausted": False}
+    token = _vllm_call_budget.set(budget)
+    try:
+        yield budget
+    finally:
+        _vllm_call_budget.reset(token)
+
+
+def _budget_allows_unit() -> bool:
+    """True if the current vLLM call budget (if any) has room to START a new
+    rollup UNIT — one L1 chunk, one L2 fold, or the L3 refresh.
+
+    v3.1.9 (tail catch-up). Checked ONCE per unit, immediately BEFORE that
+    unit's first real vLLM call, by the L1/L2/L3 drain in
+    `_maybe_rollup_body` — never per real call within a unit. Per-call was
+    F5's original shape (see the check this replaced in
+    `_summarize_pieces_raw`'s `_call`, and the comment left there): it
+    could return "" to any ONE map batch inside a unit that had already
+    spent calls, and `_summarize_pieces_raw`'s map-reduce already treats
+    ANY empty map batch as a whole-unit failure — correct, elsewhere, for a
+    real LLM failure, but here it meant a budget smaller than one unit's
+    own call cost NEVER advanced: a 20-turn L1 chunk needing 2 map batches
+    + 1 reduce = 3 calls is ordinary at L1_MAX_TOKENS=500 (more under the
+    pessimistic /tokenize-down scale), so a budget of 1 or 2 hit the same
+    exhausted-mid-chunk failure, recorded nothing (by design — see
+    _summarize_pieces_raw), and represented the IDENTICAL too-expensive
+    chunk again next turn. Not slow progress: LIVELOCK, forever, on any
+    backlog whose chunks cost more than the configured budget.
+
+    Gating at the unit boundary instead means every unit that is ALLOWED to
+    start is GUARANTEED to finish — `remaining` is spent, possibly past
+    zero, but a started unit is never refused mid-flight. The documented
+    cost is an overshoot of AT MOST one unit's own calls: once `remaining`
+    has reached zero or below, the very NEXT check (on the next unit, not
+    this one) sees `remaining <= 0` and refuses, so only one unit per call
+    can ever run past the budget, never an unbounded number of them.
+
+    `remaining <= 0` refuses cleanly when the caller opened the budget at
+    ZERO on purpose — admin /compact's documented `{"max_calls": 0}` ("run
+    the guards, make no real calls", hostile pass 2 MEDIUM) — because 0 is
+    never `> 0`, so the first unit is never allowed to start either. The
+    tail's own default (COMPACTOR_TAIL_ROLLUP_MAX_CALLS=4, main.py) is
+    never 0 unless an operator sets it that way on purpose, in which case
+    it means the same thing admin /compact's 0 already does.
+    """
+    budget = _vllm_call_budget.get()
+    if budget is None:
+        return True
+    if budget["remaining"] > 0:
+        return True
+    budget["exhausted"] = True
+    return False
+
+
 async def _summarize_pieces(
+    conv_id: str,
+    client: httpx.AsyncClient,
+    vllm_url: str,
+    model: str,
+    system_prompt: str,
+    pieces: list[str],
+    max_tokens: int,
+) -> str:
+    """Every tier's summary text comes from here, so this is where
+    rule/box decoration comes off it (v3.1.8).
+
+    A WRAPPER rather than a strip at each `return`. _summarize_pieces_raw
+    has five return paths and four call sites; applying the rule at any
+    subset of them is the fix-one-site-miss-the-sibling defect this
+    codebase has paid for more than a dozen times. One seam, all tiers,
+    every path.
+
+    Measured before this landed: 3 of 14 summary files carried box
+    characters, 1,173 in all, including the live summary of the
+    conversation in daily use - which is injected into every request. A
+    model shown its own decoration in its memory block keeps producing
+    it, whatever the system prompt asks for.
+    """
+    return textclean.strip_rule_decoration(
+        await _summarize_pieces_raw(
+            conv_id, client, vllm_url, model, system_prompt, pieces,
+            max_tokens,
+        )
+    )
+
+
+async def _summarize_pieces_raw(
     conv_id: str,
     client: httpx.AsyncClient,
     vllm_url: str,
@@ -980,6 +2469,31 @@ async def _summarize_pieces(
     )
 
     async def _call(prompt: str, batch: list[str]) -> str:
+        # F5: the ONE real HTTP-call site every tier's every batch goes
+        # through — see the block comment above _vllm_call_budget for why
+        # the accounting lives here and nowhere else in the chain.
+        #
+        # v3.1.9 (tail catch-up): the REFUSAL that used to live here —
+        # return "" once `remaining <= 0` — moved to the UNIT boundary
+        # (`_budget_allows_unit`, checked by the L1/L2/L3 drain in
+        # `_maybe_rollup_body` before a unit starts, not here). See that
+        # function's docstring for why: refusing mid-unit is exactly the
+        # shape that livelocked a budget smaller than one unit's call cost,
+        # because this map-reduce already treats any empty map batch as a
+        # whole-unit failure. A unit that was allowed to start now always
+        # finishes; `remaining` still decrements for every real call this
+        # unit makes, including past zero (the documented overshoot), so
+        # the accounting `vllm_call_budget_ctx` promises ("remaining
+        # decremented once per real call") holds unchanged — only the
+        # refusal moved.
+        #
+        # No `await` between the read and the decrement, so concurrent
+        # map-phase callers (asyncio.gather below) cannot race past each
+        # other onto the same unit of budget — asyncio only yields at an
+        # `await`.
+        _vllm_budget = _vllm_call_budget.get()
+        if _vllm_budget is not None:
+            _vllm_budget["remaining"] -= 1
         return await _llm_summarize(
             client, vllm_url, model, prompt, "\n\n".join(batch), max_tokens
         )
@@ -1021,17 +2535,47 @@ async def _summarize_pieces(
     parts = list(raw)
 
     # Reduce, in bounded rounds, never handing a call more than it can take.
-    # If folding can make no further progress the parts are concatenated: a
-    # longer chunk than the tier intended, but a complete one, and the rollup
-    # still advances the watermark. Silence would not.
+    #
+    # v3.1.9 (hostile pass #5, C5-2). A give-up here (every batch already a
+    # singleton -- the parts on hand do not fit TOGETHER under `budget`,
+    # routine whenever /tokenize is down) used to concatenate on the spot.
+    # That let a tier's own output grow by roughly one part's width every
+    # time this ran, and a caller that feeds its own output back in as a
+    # LATER input (_do_l3_rollup's prior-L3 fold is the one that does)
+    # compounded it further, refresh after refresh, without limit -- the
+    # reduce's own "give up and concatenate" being the source of the
+    # unbounded growth a downstream truncate-to-budget was then silently
+    # cutting back down (C5-2's original finding). Now a give-up first
+    # tries PAIRING adjacent parts and folding two at a time, TOLERATING
+    # that a pair may price over `budget` under the pessimistic per-char
+    # estimate: `_WORST_TOKENS_PER_CHAR` is a worst-case INPUT-budgeting
+    # guess, not a measurement of what the model's REAL context window
+    # (MAX_MODEL_LEN) can actually hold, and two of this reduce's own
+    # bounded-output parts (each capped at `max_tokens` real model tokens)
+    # fit the real window far more often than the pessimistic estimate
+    # admits. Pairwise folding converges to ONE part in ceil(log2(N))
+    # rounds regardless of how oversized the pessimistic estimate makes
+    # each part look. This only changes behaviour ON THE GIVE-UP PATH -- a
+    # healthy /tokenize essentially never reaches it, so L1/L2's ordinary
+    # folding (and L3's, when /tokenize is up) is unaffected. If pairing
+    # still leaves one part with nothing left to fold against (an odd
+    # leftover with no partner), that is as far as this reduce can bring
+    # it, and it is concatenated same as before -- see the round-count
+    # ceiling below, sized for pairwise convergence rather than the
+    # smaller ordinary case.
     rounds = 0
-    while len(parts) > 1 and rounds < 3:
+    max_rounds = max(3, len(parts).bit_length() + 1)
+    while len(parts) > 1 and rounds < max_rounds:
         rounds += 1
         groups = await _batch_to_budget(
             conv_id, client, vllm_url, model, parts, budget
         )
         if all(len(g) == 1 for g in groups):
-            break
+            groups = [parts[i:i + 2] for i in range(0, len(parts), 2)]
+            if all(len(g) == 1 for g in groups):
+                # Only reachable with a single leftover part and nothing
+                # to pair it against -- already as folded as it gets.
+                break
         try:
             folded = await asyncio.gather(
                 *(_bounded(_PROMPT_REDUCE, g) for g in groups)
@@ -1067,35 +2611,182 @@ async def _do_l1_rollup(
     model: str,
     state: dict,
     messages: list[dict],
+    window_offset: int = 0,
+    raw_turns: list[dict] | None = None,
+    patch: list[tuple[int, int]] | None = None,
 ) -> bool:
     """Roll the next L1_CHUNK_SIZE turns after last_summarized_turn into a
-    new L1 chunk. Returns True if a chunk was produced.
+    new L1 chunk. Returns True if the watermark advanced.
+
+    `raw_turns`, if given, is the non-system turns of `messages` as the
+    client sees them, index for index (maybe_rollup builds and checks it).
+    This chunk's covered-turn record is written from it, or from `messages`
+    itself when it is None — see _record_chunk_fps.
+
+    `patch`, if given (with raw_turns), is [(non-system index, after
+    position)] from _patch_candidates: older turns inside the covered span
+    that pair with nothing. The chunk reads them as extra pieces ahead of its
+    own turns and records them out of position (_record_patch_fps) in the
+    same mutation. Its label, and so the tiling, L2 and L3, are unchanged.
+
+    `window_offset` is (position - len(window)): how many turns of this
+    conversation sit BEFORE the first turn the client sent. It is 0 for a
+    client re-sending the whole history, which is why every existing caller and
+    test that omits it gets byte-identical behaviour. Under a cap it is the
+    number that turns a turn LABEL into an index into the array in hand —
+    without it the chunk boundaries are absolute positions in an array that no
+    longer starts at turn 1, and _turn_pieces would summarize the wrong text
+    while labelling it correctly, which is worse than summarizing nothing
+    because nothing downstream can tell.
     """
     last = state.get("last_summarized_turn", 0)
     first_turn = last + 1
     last_turn = last + L1_CHUNK_SIZE
+    pos_first = first_turn - window_offset
+    pos_last = last_turn - window_offset
+
+    if pos_last < 1:
+        # This whole chunk scrolled out of the client's window before it was
+        # ever summarized — only reachable when the backlog exceeds the cap
+        # plus L1_CHUNK_SIZE (119 turns at max_turns=100), i.e. after a long
+        # rollup outage. The text is not in the request and this module never
+        # held a copy, so there is nothing to summarize. Skipping the dead span
+        # is the only alternative to a hierarchy that is stuck on it forever,
+        # and a hierarchy that stops advancing also stops recording the turns
+        # that ARE still arriving.
+        state["last_summarized_turn"] = window_offset
+        logger.error(
+            f"conv={conv_id}: turns {first_turn}-{window_offset} are behind "
+            f"the client's window and were never summarized; the watermark "
+            f"has been advanced past them so newer turns are not lost too. "
+            f"POST /admin/conversations/{conv_id}/compact rebuilds from the "
+            f"episodic store, which may still hold that text"
+        )
+        return True
+
+    covered_first = first_turn
+    partial = pos_first < 1
+    if partial:
+        pos_first = 1
+        covered_first = window_offset + 1
+
     # One piece per turn, so an oversized slice can be split rather than sent
     # whole and refused. The chunk still COVERS first_turn..last_turn either
     # way — the turn range is the contract the watermark and the L2 rollup
     # depend on, and splitting the request must not change it (v3.1 A1).
-    pieces = _turn_pieces(messages, first_turn, last_turn)
+    pieces = _turn_pieces(messages, pos_first, pos_last)
     if not any(p.strip() for p in pieces):
         return False
+    if any(
+        c.get("first_turn") == covered_first and c.get("last_turn") == last_turn
+        for c in state.get("l1") or []
+    ):
+        # Belt and braces against the hazard the old watermark reset created:
+        # an operator running /admin/conversations/<id>/compact twice appended
+        # a second identical chunk set, which then cascaded into duplicate L2
+        # chapters and a duplicate-fed L3.
+        #
+        # ERROR, not WARNING, since v3.1.7. The watermark is now repaired
+        # against the chunk list before any position is derived from it
+        # (_repair_watermark_below_chunks), and _recorded_position seeds from
+        # the labels too, so the only way to reach this line is a genuine
+        # re-presentation of a span the labels already own — the idempotent
+        # admin drain. Under the pre-v3.1.7 code this fired on the FIRST
+        # rollup of every upgraded capped conversation and threw away a real
+        # span each time, at WARNING, for hundreds of turns (R12). If it is
+        # in the log now, the position arithmetic is wrong again, and the
+        # skip below is hiding how much.
+        state["last_summarized_turn"] = last_turn
+        logger.error(
+            f"conv={conv_id}: an L1 chunk covering turns {covered_first}-"
+            f"{last_turn} already exists; advancing the watermark past it "
+            f"instead of storing a duplicate. This should be unreachable — "
+            f"the position only moves forward and is seeded from the chunk "
+            f"labels — so check turns_seen against the l1 spans in "
+            f"GET /admin/conversations/{conv_id}"
+        )
+        return True
+    # hostile pass #4 (reviewer A F6): the older unpaired turns this chunk
+    # re-reads, AHEAD of its own turns because they are older. Read from
+    # `messages` (the rollup view: a loop redacted exactly as it would be at
+    # its own position), recorded from `raw_turns` below, the same split as
+    # the chunk's own turns. Only with raw_turns: without the client's text
+    # (the admin rebuild) there is nothing to pair a re-read against.
+    _ns_msgs = [m for m in messages if m.get("role") != "system"]
+    _patch = [
+        (j, after) for j, after in (patch or [])
+        if raw_turns is not None and 0 <= j < min(len(_ns_msgs), len(raw_turns))
+        and j < pos_first - 1
+    ]
+    if _patch:
+        pieces = [
+            f"[{_ns_msgs[j].get('role', 'unknown')}] (an earlier turn, as it "
+            f"reads now): {_message_text(_ns_msgs[j])}"
+            for j, _a in _patch
+        ] + pieces
     text = await _summarize_pieces(
         conv_id, client, vllm_url, model, _PROMPT_L1, pieces, L1_MAX_TOKENS
     )
     if not text:
         return False
+    if partial:
+        # BELOW the summarization, not above it (v3.1.7, R29). Logged first,
+        # this line announced "recording that as the chunk's span" and then
+        # the vLLM call returned empty and recorded nothing — four such lines
+        # against l1=0 during an outage, which is exactly when an operator is
+        # reading the log.
+        logger.warning(
+            f"conv={conv_id}: turns {first_turn}-{window_offset} of this "
+            f"chunk are behind the client's window; summarized turns "
+            f"{covered_first}-{last_turn} and recorded that as the "
+            f"chunk's span rather than claiming coverage of text this rollup "
+            f"never saw"
+        )
     state["l1"].append({
-        "text": text, "first_turn": first_turn, "last_turn": last_turn,
+        "text": text, "first_turn": covered_first, "last_turn": last_turn,
     })
     state["last_summarized_turn"] = last_turn
+    # THE RECORD IS WRITTEN WITH THE CHUNK (hostile pass #3, F1/F9): in the
+    # same mutation, from the turns `pieces` came from — positions
+    # covered_first..last_turn are array turns pos_first..pos_last, through
+    # the same window_offset that chose the text. Never from a later request:
+    # that is what blessed a deleted or regenerated turn (F1) and every
+    # position an admin rebuild summarized from placeholders (F9).
+    #
+    # From `raw_turns` when the caller has the client's own text, because
+    # `messages` is the rollup input — degenerate replies redacted — which no
+    # request carries, and recording that switched reuse off on ordinary
+    # traffic (the 2026-09-12 soak). The raw text carries ONE documented
+    # trade: a reply reply_is_degenerate calls a loop is read as its clean
+    # sentence head (or the placeholder when it has none), so what follows
+    # its last sentence boundary is replaced by a summary that omitted it
+    # (main._redact_degenerate_turns). A STOPPED reply is no longer a second
+    # trade (hostile pass #4, reviewer A F1): the tail appends it as it
+    # streamed, so the chunk that closes on it reads the tail it records.
+    _src = (
+        raw_turns if raw_turns is not None
+        else [m for m in messages if m.get("role") != "system"]
+    )
+    _record_chunk_fps(
+        state, covered_first, last_turn, _src[pos_first - 1:pos_last]
+    )
+    if _patch:
+        _record_patch_fps(
+            state, last_turn,
+            [(after, _covered_turn_fingerprint(raw_turns[j])) for j, after in _patch],
+        )
+        logger.info(
+            f"conv={conv_id}: the L1 chunk for turns {covered_first}-"
+            f"{last_turn} also re-read {len(_patch)} earlier turn(s) that no "
+            f"stored summary held as they read now; they are reused from "
+            f"the next request on instead of summarized fresh on every one"
+        )
     # A rollup had no success line of its own, so the only evidence the
     # hierarchy was advancing was the injection counter — which is why S-5
     # froze it for the life of the deployment without anyone noticing.
     logger.info(
         f"conv={conv_id}: L1 rollup — chunk {len(state['l1'])} covers turns "
-        f"{first_turn}-{last_turn}"
+        f"{covered_first}-{last_turn}"
     )
     return True
 
@@ -1151,10 +2842,20 @@ def _archive_chapters(conv_id: str, chapters: list[dict]) -> None:
     if not chapters:
         return
     path = summary_archive_path(conv_id)
-    existing = read_json_strict(path, default={})
-    rows = existing.get("chapters") if isinstance(existing, dict) else None
+    existing = read_json_strict(path, default={}, expect=dict)
+    # v3.1.9 (A3-1). A READ-MODIFY-WRITE, so the fallback here was not a
+    # misread but a deletion: a wrong-type "chapters" became [] and the
+    # atomic_write_json below replaced the whole cold chapter store with
+    # this refresh's rows. After L3 has paraphrased a span this sidecar is
+    # the ONLY copy of its chapter-level detail. Raising aborts the L3
+    # refresh before it consumes anything — its caller already treats any
+    # archive failure that way — so the chapters stay in l2, uncompressed
+    # and intact, until someone looks at the file.
+    rows = existing.get("chapters", [])
     if not isinstance(rows, list):
-        rows = []
+        raise StoreUnreadable(
+            path, TypeError(f'"chapters" is {type(rows).__name__}, not a list')
+        )
     # Dedupe against what is already stored: the archive now runs BEFORE
     # save_state, so a failed state save retries the whole refresh next turn
     # and would re-archive the same chapters (measured: two refreshes of the
@@ -1182,9 +2883,17 @@ def _archive_chapters(conv_id: str, chapters: list[dict]) -> None:
 
 def load_chapter_archive(conv_id: str) -> list[dict]:
     """Every L2 chapter ever consumed by an L3 refresh, oldest first."""
-    data = read_json_strict(summary_archive_path(conv_id), default={})
-    rows = data.get("chapters") if isinstance(data, dict) else None
-    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+    data = read_json_strict(summary_archive_path(conv_id), default={}, expect=dict)
+    # v3.1.9 (A3-1): the same rule as _archive_chapters above and
+    # facts.load_archive — an operator asking for the cold chapters must be
+    # told the file is unreadable, not that there are none.
+    rows = data.get("chapters", [])
+    if not isinstance(rows, list):
+        raise StoreUnreadable(
+            summary_archive_path(conv_id),
+            TypeError(f'"chapters" is {type(rows).__name__}, not a list'),
+        )
+    return [r for r in rows if isinstance(r, dict)]
 
 
 async def _do_l3_rollup(
@@ -1281,9 +2990,70 @@ async def _do_l3_rollup(
         [_chapter_piece(c) for c in l2], L3_MAX_TOKENS,
     )
     if text and prior_piece:
+        # hostile pass #5 (C5-2): BOTH halves of stage 2's input are split
+        # back into pieces on their own "\n\n" join points before being
+        # handed to stage 2's map-reduce — not just the newer-chapters
+        # half. Stage 1's own map-reduce (_summarize_pieces_raw, shared
+        # with every tier) already gives up and CONCATENATES its parts,
+        # with "\n\n" as the join, whenever its reduce cannot fold them
+        # further — routine whenever /tokenize is down and the chapter
+        # count is not tiny (measured: 2-3 parts, each already at or near
+        # L3_MAX_TOKENS, so the concatenation is 2-3x one part's own
+        # bound). The first cut of this fix split only `text` (this
+        # refresh's newer-chapters half) and left `prior_piece` (the
+        # PREVIOUS refresh's stored L3 text) as one atomic string — which
+        # still broke, one refresh later: a give-up concatenation is
+        # exactly what gets STORED as state["l3"]["text"] below, so the
+        # NEXT refresh's `prior` is frequently ALREADY an oversized
+        # multi-part blob, and wrapping THAT as one piece is the identical
+        # "one blob priced as a whole and hard-truncated" failure, just
+        # moved from the newer half to the prior half (measured: 0/4
+        # refreshes truncated with only the newer half split; 3/4 with
+        # both, once a give-up concatenation had a chance to compound).
+        # Splitting BOTH halves the same way is symmetric and self-
+        # healing across any number of refreshes: whatever shape a PRIOR
+        # refresh's own give-up left in storage, splitting on its join
+        # recovers pieces that individually fit the budget by
+        # construction (each is itself the bounded output of one map or
+        # reduce call), so nothing is ever handed to `_batch_to_budget` as
+        # a piece larger than one of those calls could have produced —
+        # not on this refresh, and not on any refresh after it.
+        #
+        # No harm in the ordinary case: an unsplit single-call answer that
+        # happens to contain its own blank-line paragraph breaks is only
+        # split into SMALLER pieces, which `_batch_to_budget` batches back
+        # together under budget the same way it always groups any
+        # ordinary multi-piece input. This is a split of TEXT ALREADY
+        # PRODUCED (an ordinary string operation on `prior["text"]`), not
+        # a second seam alongside `_summarize_pieces` — test_l3_
+        # coverage.py's own monkeypatch of that ONE name is what every
+        # caller of this function must keep working through.
+        _prior_body = (prior.get("text") or "").strip() if prior else ""
+        _prior_parts = (
+            [p for p in _prior_body.split("\n\n") if p.strip()] or [_prior_body]
+        )
+        _prior_header = (
+            f"the story so far (turns {prior.get('first_turn','?')}-"
+            f"{prior.get('last_turn','?')})" if prior else "the story so far"
+        )
+        _prior_pieces = [
+            (
+                f"--- {_prior_header} (part {i} of {len(_prior_parts)}) ---"
+                if len(_prior_parts) > 1 else f"--- {_prior_header} ---"
+            ) + f"{chr(10)}{p}"
+            for i, p in enumerate(_prior_parts, 1)
+        ]
+        _newer_parts = [p for p in text.split("\n\n") if p.strip()] or [text]
+        _newer_pieces = [
+            (
+                f"--- newer chapters (part {i} of {len(_newer_parts)}) ---"
+                if len(_newer_parts) > 1 else "--- newer chapters ---"
+            ) + f"{chr(10)}{p}"
+            for i, p in enumerate(_newer_parts, 1)
+        ]
         text = await _summarize_pieces(
             conv_id, client, vllm_url, model, _PROMPT_L3,
-            [prior_piece, f"--- newer chapters ---{chr(10)}{text}"],
+            _prior_pieces + _newer_pieces,
             L3_MAX_TOKENS,
         )
     if not text:
@@ -1331,6 +3101,12 @@ async def maybe_rollup(
     messages: list[dict],
     vllm_url: str,
     model: str,
+    *,
+    raw_messages: list[dict] | None = None,
+    reply_as_streamed: str | None = None,
+    skip_if_position_past: int | None = None,
+    skipped_at: list | None = None,
+    vllm_call_budget: dict | None = None,
 ) -> dict:
     """Public entry point. Loads state, runs whichever tier(s) need work,
     saves atomically. Held under conv_lock so concurrent rollups can't tear
@@ -1341,56 +3117,403 @@ async def maybe_rollup(
     non-fatal skipped rollup. Tiers that completed before a failure are
     persisted; only the tier that failed retries on the next turn.
 
-    `messages` is the FULL message history (caller usually has the request's
-    messages list right there), so L1 rollups can format the exact turns
-    that need summarizing.
+    `messages` is whatever history the client sent — the FULL array from a
+    client that re-sends everything, or a bounded window from one that does
+    not. Which of the two it is no longer decides whether rollups happen:
+    _observed_position owns the conversation's position and `window_offset`
+    maps it back onto the array in hand (v3.1.4).
 
-    `current_turn_count` is derived from messages (non-system count) so the
-    caller doesn't have to track it.
+    `raw_messages` is the request exactly as the client sent it, WITHOUT the
+    reply the live tail appends to `messages`. `reply_as_streamed` is that
+    reply as the client received it, when it differs from the text appended
+    (a stopped reply is trimmed to its last sentence for memory; OpenWebUI
+    keeps and re-sends what streamed). Together they are what the covered-turn
+    record is written from (_record_chunk_fps). With no `raw_messages` (the
+    admin rebuild) the record is written from `messages` itself.
+
+    `skip_if_position_past`: return the loaded state untouched, writing
+    nothing, if the conversation's recorded position is already past it, and
+    append that position to `skipped_at`. For a caller holding a SNAPSHOT
+    (the backfill): the comparison has to be made here, under conv_lock after
+    the load, because one made before taking the lock let a live tail queued
+    on it run in between (hostile pass #3, reviewer E F3).
+
+    `vllm_call_budget`: optional mutable {"remaining": int, "exhausted":
+    bool} (v3.1.9, hostile pass 4, F5). Bounds REAL vLLM summarization
+    calls made during THIS call, across L1/L2/L3 and any internal
+    map-reduce split — not rollup passes (a caller making several
+    maybe_rollup calls decides its own pass count) and not tiers (one tier
+    can spend zero calls, if nothing is due, or several, if its input maps
+    to more than one batch). "remaining" is decremented once per real
+    call; "exhausted" is set True if the budget ran out before every tier
+    that needed a rollup got one. None (the default) is unlimited: today's
+    behaviour, byte-for-byte — a caller that does not pass this sees no
+    change at all. See `vllm_call_budget_ctx` (above _summarize_pieces)
+    for the equivalent context-manager form, for a caller that cannot add
+    a keyword to ITS OWN call to this function because something upstream
+    of it stubs this function WHOLESALE in a test with a fixed-argument
+    signature: main.admin_compact (test_admin_compact.py's own stub) and
+    main._rollup_hierarchy (v3.1.9, tail catch-up — test_degenerate_skip.py's
+    `spy_maybe_rollup`) both use the context-manager form for exactly this
+    reason. backfill.py's one call (v3.1.9, tail catch-up) passes this
+    keyword directly instead: nothing in its own test coverage stubs
+    maybe_rollup wholesale, so it has no fixed signature to preserve.
+
+    v3.1.9 (tail catch-up): the budget is checked at the UNIT boundary —
+    before each L1 chunk, L2 fold, or the L3 refresh starts — not before
+    each real call within one. See `_budget_allows_unit`'s docstring for
+    why: a per-call check livelocks whenever a unit's own call cost (a
+    20-turn L1 chunk needing map-reduce is ordinarily 2-3 calls) exceeds
+    the budget, because this module's map-reduce already fails the WHOLE
+    unit on any single empty batch, and an exhausted-mid-unit refusal is
+    indistinguishable from a real LLM failure to that check. So a unit
+    that is allowed to START always FINISHES — "remaining" can go
+    negative, documenting an overshoot of at most one unit's own calls,
+    never more, because the NEXT unit's boundary check sees the negative
+    balance and refuses. This is what turns "process a bounded number of
+    calls per turn" into a guarantee that a tail with work due always
+    completes at least one whole L1 chunk (or one L2 fold, or the L3
+    refresh, when no L1 chunk is due) — the property a caller bounding
+    per-turn work over a persistent backlog actually needs.
     """
-    current_turns = sum(1 for m in messages if m.get("role") != "system")
+    _budget_token = None
+    if vllm_call_budget is not None:
+        _budget_token = _vllm_call_budget.set(vllm_call_budget)
+    try:
+        return await _maybe_rollup_body(
+            conv_id, messages, vllm_url, model,
+            raw_messages=raw_messages,
+            reply_as_streamed=reply_as_streamed,
+            skip_if_position_past=skip_if_position_past,
+            skipped_at=skipped_at,
+        )
+    finally:
+        if _budget_token is not None:
+            _vllm_call_budget.reset(_budget_token)
 
+
+async def _maybe_rollup_body(
+    conv_id: str,
+    messages: list[dict],
+    vllm_url: str,
+    model: str,
+    *,
+    raw_messages: list[dict] | None = None,
+    reply_as_streamed: str | None = None,
+    skip_if_position_past: int | None = None,
+    skipped_at: list | None = None,
+) -> dict:
+    """The actual rollup logic, unchanged by F5's split — maybe_rollup
+    (above) is now a thin wrapper that sets/resets the vLLM call budget's
+    contextvar around this call and otherwise passes every argument
+    through untouched. Split out rather than wrapping the body inline so
+    the diff for F5 is "one function extracted, one small wrapper added",
+    not a full reindent of ~170 lines under a new try/finally.
+    """
     async with conv_lock(conv_id):
-        state = load_state(conv_id)
+        # OFF THE EVENT LOOP (v3.1.9.2). Benchmarked on the v3.1.9 harness:
+        # this read and the save_state below cost 3.8-4.9 ms of BLOCKING loop
+        # time on every turn the tail runs, unconditionally, producing p99
+        # loop lateness of 7.2 ms with spikes to 21.9 ms. The transfer
+        # function into request lateness measured 1:1 — every millisecond
+        # blocked here is a millisecond added to whatever else the loop was
+        # serving. Wrapped, a 500 ms stall becomes 0.75 ms p99.
+        #
+        # This was NOT where the plan said the cost was. v3.1.9 originally
+        # targeted _is_repeat_task_traffic's load_state, which measures
+        # 0.000 ms on any ongoing conversation because _has_conversational_
+        # history returns before the disk read. That would have moved ~2% of
+        # the blocking. The measurement is the reason this line changed and
+        # that one did not.
+        #
+        # conv_lock is an asyncio.Lock and it stays HELD across the await,
+        # which is the point: the IO moves to a worker, the serialisation
+        # that stops concurrent rollups tearing the file does not.
+        state = await run_in_threadpool(load_state, conv_id)
 
-        stale = state.get("last_summarized_turn", 0)
-        changed = _reconcile_watermark(state, current_turns)
-        if changed and logsetup.log_once("summarizer.watermark.reset"):
-            # WARNING, and separate from the quiet path: a negative delta
-            # reads exactly like "not enough new material" from the outside,
-            # and that is why it went unnoticed. Once per process because
-            # this is on the tail of every turn (v3.1 P0-2b).
-            logger.warning(
-                f"conv={conv_id}: observed history ({current_turns} turns) is "
-                f"shorter than last_summarized_turn ({stale}); the L1 gate was "
-                f"latched off and has been reset to {current_turns} — earlier "
-                f"chunks are kept, and their turn labels no longer line up "
-                f"with this history"
-            )
+        if (
+            skip_if_position_past is not None
+            and _recorded_position(state) > skip_if_position_past
+        ):
+            if skipped_at is not None:
+                skipped_at.append(_recorded_position(state))
+            return state
+
+        # Before anything reads the watermark: a file written by the old
+        # _reconcile_watermark can have it BELOW the chunks it wrote, and
+        # every number below is derived from it (v3.1.7, R12). The value it
+        # had is kept first: it is one of the traces the one-shot legacy
+        # adoption reads (hostile pass #4, _legacy_unread_positions).
+        _legacy_watermark = state.get("last_summarized_turn")
+        changed = _repair_watermark_below_chunks(conv_id, state)
+
+        before_position = state.get("turns_seen")
+        before_anchor = state.get("tail_fp")
+        before_window = (state.get("head_fp"), state.get("window_turns"))
+        current_turns = _observed_position(conv_id, state, messages)
+        # The position and the anchor are useless unless they are PERSISTED:
+        # unwritten, the next call re-seeds from last_summarized_turn, finds no
+        # anchor, and holds — which is the frozen hierarchy this release
+        # exists to fix, reintroduced by an unsaved counter. The window
+        # signature rides along for the same reason: unwritten, every
+        # repeating tail reads as ambiguous forever (R18).
+        changed = changed or (
+            before_position != state["turns_seen"]
+            or before_anchor != state["tail_fp"]
+            or before_window != (state.get("head_fp"), state.get("window_turns"))
+        )
+        # How many turns of this conversation sit before the array's first
+        # turn. Computed ONCE and held constant for the whole drain: the
+        # contiguity of consecutive L1 chunks is exactly the property that a
+        # varying offset would break.
+        window_offset = current_turns - sum(
+            1 for m in messages if m.get("role") != "system"
+        )
+
+        # The turns the covered-turn record is written from, index-aligned
+        # with `messages`' non-system turns (hostile pass #3, F1/F9). The
+        # rollup input differs from the raw request only in CONTENT —
+        # redaction swaps a reply's text, the tail appends one reply — so
+        # anything else is a caller bug, and recording from `messages` itself
+        # (raw_turns None) is the safe fallback: the chunk did read that text.
+        raw_turns: list[dict] | None = None
+        request_turns: list[dict] = []
+        if raw_messages is not None:
+            _rt = [m for m in raw_messages if m.get("role") != "system"]
+            _ns = [m for m in messages if m.get("role") != "system"]
+            if len(_rt) == len(_ns):
+                request_turns = _rt
+                raw_turns = _rt
+            elif (
+                len(_rt) == len(_ns) - 1
+                and _ns[-1].get("role") == "assistant"
+            ):
+                # The reply this tail appended. As STREAMED, because that is
+                # what OpenWebUI stores and re-sends: a stopped reply's
+                # trimmed text would read as changed on every later request.
+                _reply = _ns[-1]
+                if reply_as_streamed is not None:
+                    _reply = {**_reply, "content": reply_as_streamed}
+                request_turns = _rt
+                raw_turns = _rt + [_reply]
+            elif logsetup.log_once(f"summarizer.raw_misaligned.{conv_id}"):
+                logger.warning(
+                    f"conv={conv_id}: the raw request has {len(_rt)} turn(s) "
+                    f"against {len(_ns)} in the rollup input, which should "
+                    f"differ by at most the appended reply; the covered-turn "
+                    f"record is written from the rollup input instead, so "
+                    f"redacted or trimmed turns will be summarized fresh "
+                    f"rather than reused"
+                )
+            if request_turns and await run_in_threadpool(
+                _adopt_legacy_record, state, request_turns, window_offset,
+                _legacy_watermark if isinstance(_legacy_watermark, int) else None,
+            ):
+                changed = True
 
         if needs_rollup(state, current_turns):
             try:
+                # hostile pass #4 (reviewer A F6): the refreshed turns the
+                # FIRST chunk of this drain re-reads. Computed once, against
+                # the record as it stands before this call's chunks, and
+                # handed to one chunk only, so no turn is read twice.
+                _patch: list[tuple[int, int]] = []
+                if raw_turns is not None and _needs_l1_rollup(state, current_turns):
+                    _first_read = (
+                        int(state.get("last_summarized_turn", 0)) + 1
+                        - window_offset - 1
+                    )
+                    _patch = await run_in_threadpool(
+                        _patch_candidates, state, raw_turns, _first_read
+                    )
                 async with httpx.AsyncClient() as client:
-                    # Drain L1 rollups until either caught up or no more material.
-                    while _needs_l1_rollup(state, current_turns):
-                        if not await _do_l1_rollup(
-                            conv_id, client, vllm_url, model, state, messages
-                        ):
-                            break
-                        changed = True
-
-                    # Drain L2 rollups while threshold met.
-                    while _needs_l2_rollup(state):
-                        if not await _do_l2_rollup(
-                            conv_id, client, vllm_url, model, state
-                        ):
-                            break
-                        changed = True
-
-                    # L3 is at most one rollup per call (refresh, not stack).
-                    if _needs_l3_rollup(state):
-                        if await _do_l3_rollup(conv_id, client, vllm_url, model, state):
+                    # v3.1.9 (tail catch-up). ONE loop, priority order
+                    # L3 > L2 > L1 — not the old L1-then-L2-then-L3 shape,
+                    # and not three separate while loops any more.
+                    #
+                    # WHY THE ORDER FLIPPED. Under an unlimited budget
+                    # (before this feature) it never mattered: L1 fully
+                    # drained, then L2 fully drained whatever that produced,
+                    # then L3 ran once — every tier was fully caught up by
+                    # the time the call returned regardless of which order
+                    # got there. Under a PER-TURN budget, a backlog deep
+                    # enough to outlast the budget never reaches "L1 fully
+                    # drained" in one call — so draining L1 first would
+                    # spend the WHOLE per-turn budget on L1, every turn, for
+                    # as long as the L1 backlog outlasts L2's threshold.
+                    # `state["l1"]` is injected into every request
+                    # (format_summary_block, one line per chunk) — L1's own
+                    # bound on that injection is L2_CHUNK_SIZE, enforced by
+                    # L2 folding chunks out of it, and NEVER while L2 is
+                    # starved for budget. Checking the UPPER tier first,
+                    # every iteration of this loop, means l1 is folded into
+                    # l2 (and l2 into l3) the moment either crosses
+                    # threshold, whether or not L1 itself is still behind —
+                    # so injection stays bounded for the FULL length of a
+                    # catch-up that can span many turns, not just at the end
+                    # of it.
+                    #
+                    # `_l3_done` caps L3 at one refresh per call, the same
+                    # contract the old `if` (not `while`) already gave it.
+                    #
+                    # v3.1.9 (hostile follow-up): stated precisely, because
+                    # the first cut of this comment argued it wrong. A
+                    # SECOND refresh later in the same call would NOT be
+                    # re-folding what the first one already covered —
+                    # `_do_l3_rollup` clears l2 on success, so a second
+                    # trigger means genuinely NEW chapters arrived since —
+                    # it would fold them SEPARATELY from the first refresh's
+                    # batch, in a different map-reduce grouping, producing a
+                    # DIFFERENT L3 text than one consolidated refresh over
+                    # everything the call produced would have. That is the
+                    # real reason this caps at one per call rather than
+                    # looping: not "wasted work", but "a second refresh
+                    # inside one call is not equivalent to the single
+                    # consolidated one the OLD L1-then-L2-then-L3 order
+                    # always produced" — so capping and deferring the
+                    # remainder to the NEXT call is the closer match, and is
+                    # exactly what the old order already did whenever ONE
+                    # call's L1/L2 work produced more L2 growth than a
+                    # single refresh needed to consume (old code's own
+                    # trailing `if` also ran only once, catching whatever
+                    # existed in l2 AT THAT POINT — the same one-shot shape,
+                    # just checked after L1/L2 instead of interleaved with
+                    # them).
+                    #
+                    # DOES THIS REACH GENUINE STEADY STATE (not behind)?
+                    # Confirmed no, by construction, not by luck — and
+                    # proven directly in test_tail_catchup.py [3b], not just
+                    # argued here. For `_l3_done` to defer anything, L3 must
+                    # already be due (len(l2) >= L3_CHUNK_SIZE) EITHER at
+                    # this call's start OR a second time after this call's
+                    # own L1/L2 work. Under ample (non-exhausted) budget —
+                    # true for any conversation that is not behind — this
+                    # very loop's only "nothing left to do" exit already
+                    # resolves L3 (to len(l2)==0) before any call returns,
+                    # so nothing is ever left over FOR a later call to find
+                    # already due. And a single ordinary turn (one exchange)
+                    # advances the observed position by one exchange, so one
+                    # ordinary call can produce AT MOST one new L1 chunk and
+                    # therefore at most one new L2 fold — never two
+                    # independent threshold crossings for `_l3_done` to
+                    # ration between. The "lag one call behind" shape this
+                    # cap can produce is real, but only for a call that
+                    # itself processes many chunks at once — a deep catch-up
+                    # under a tight budget, or an admin/backfill rebuild
+                    # from the episodic store — never steady, one-exchange-
+                    # at-a-time chat, which is what "not behind" means.
+                    #
+                    # v3.1.9 (hostile pass #5, C5-1/E1). `_l3_failed` /
+                    # `_l2_failed` — a failed unit no longer ends the whole
+                    # pass. Before this fix, ANY upper-tier failure (a torn
+                    # summaries/<conv>.archive.json sidecar, A3-1's
+                    # deliberate raise on a wrong-typed "chapters"; an
+                    # archive write that keeps failing; an L3/L2 reply that
+                    # strips to empty) hit the `break` that used to sit in
+                    # its branch below and exited the loop for the rest of
+                    # THIS call — and because the SAME drain runs on every
+                    # later call too, a persistently failing tier froze
+                    # every LOWER tier forever: L1 stopped advancing from
+                    # that turn on, hierarchy_lag grew without bound, and
+                    # the "/compact drains the backlog" advice health gives
+                    # for a stuck hierarchy runs this identical drain and
+                    # hits the identical abort first, doing nothing.
+                    # Regression against v3.1.7/v3.1.8/21645f2, which ran
+                    # three SEPARATE `while`/`if` loops (L1 then L2 then
+                    # L3) — a broken upper tier there could only ever defer
+                    # ITSELF, never block a tier checked earlier.
+                    #
+                    # `_needs_l3_rollup(state)` (and `_needs_l2_rollup`)
+                    # already guarantee something was due before
+                    # `_do_l3_rollup`/`_do_l2_rollup` was called, so a
+                    # False return here is ALWAYS a real failure, never
+                    # "nothing to do" — see those functions' own early
+                    # returns, which are the same conditions these gates
+                    # check. Marking the tier failed FOR THIS CALL and
+                    # `continue`ing to the tier below (instead of `break`)
+                    # restores the old shape: a broken tier costs only its
+                    # own retries next call, and every lower tier keeps
+                    # covering every turn the way the three-loop version
+                    # always did. L1 has no lower tier to fall through to,
+                    # so its own failure still ends the pass, unchanged.
+                    _l3_done = False
+                    _l3_failed = False
+                    _l2_failed = False
+                    while True:
+                        if not _l3_done and not _l3_failed and _needs_l3_rollup(state):
+                            if not _budget_allows_unit():
+                                break
+                            _l3_done = True
+                            if not await _do_l3_rollup(
+                                conv_id, client, vllm_url, model, state
+                            ):
+                                _l3_failed = True
+                                _mark_tier_failed(conv_id, "l3")
+                                if logsetup.log_once(
+                                    f"summarizer.tier_stuck.l3.{conv_id}"
+                                ):
+                                    logger.error(
+                                        f"conv={conv_id}: L3 refresh failed "
+                                        f"and will be retried next turn "
+                                        f"without blocking L1/L2 — see the "
+                                        f"archive-abort or empty-reply "
+                                        f"warning above (or its absence) "
+                                        f"for why; a refresh failing on "
+                                        f"EVERY attempt usually means a "
+                                        f"torn archive sidecar that needs "
+                                        f"an operator (this message prints "
+                                        f"once per conversation)"
+                                    )
+                                continue
+                            _mark_tier_recovered(conv_id, "l3")
                             changed = True
+                        elif not _l2_failed and _needs_l2_rollup(state):
+                            if not _budget_allows_unit():
+                                break
+                            if not await _do_l2_rollup(
+                                conv_id, client, vllm_url, model, state
+                            ):
+                                _l2_failed = True
+                                _mark_tier_failed(conv_id, "l2")
+                                if logsetup.log_once(
+                                    f"summarizer.tier_stuck.l2.{conv_id}"
+                                ):
+                                    logger.error(
+                                        f"conv={conv_id}: L2 fold failed "
+                                        f"and will be retried next turn "
+                                        f"without blocking L1 — a fold "
+                                        f"failing on EVERY attempt usually "
+                                        f"means the model is returning "
+                                        f"empty content for this "
+                                        f"conversation's chapters (this "
+                                        f"message prints once per "
+                                        f"conversation)"
+                                    )
+                                continue
+                            _mark_tier_recovered(conv_id, "l2")
+                            changed = True
+                        elif _needs_l1_rollup(state, current_turns):
+                            if not _budget_allows_unit():
+                                break
+                            if not await _do_l1_rollup(
+                                conv_id, client, vllm_url, model, state, messages,
+                                window_offset, raw_turns, _patch,
+                            ):
+                                # L1 has no lower tier to fall through to;
+                                # unchanged from before this fix.
+                                break
+                            _patch = []
+                            changed = True
+                        else:
+                            # Nothing left DUE, or every due tier this call
+                            # already ran or has already failed once. The
+                            # ONLY exit that means "no work is
+                            # outstanding"; every other `break` above means
+                            # "work remains but the budget said stop" or
+                            # "L1 itself failed" — a failed L2/L3 no longer
+                            # reaches this branch on its own; it falls
+                            # through to the tier below instead (see above).
+                            break
             except Exception as e:
                 logger.exception(f"conv={conv_id}: rollup failed mid-flight: {e}")
 
@@ -1405,14 +3528,171 @@ async def maybe_rollup(
         # rollups that had already succeeded, on every turn, forever. Each
         # _do_*_rollup mutates `state` only after its own LLM call returns,
         # so `state` here is always a consistent prefix of successful
-        # rollups whether or not a later tier raised.
+        # rollups whether or not a later tier raised. That now includes the
+        # covered-turn record, which _do_l1_rollup writes in the same mutation
+        # as its chunk (hostile pass #3, F1/F9). There is deliberately no
+        # catch-up here any more: recording a position from a LATER call's
+        # array is what blessed a deleted reply and every placeholder an
+        # admin rebuild summarized.
+
         if changed:
             try:
-                save_state(conv_id, state)
+                # The expensive half: tempfile + fsync + rename, measured at
+                # 3.8-4.9 ms on the loop. Same reasoning as the load above,
+                # and the same conv_lock held across the await.
+                await run_in_threadpool(save_state, conv_id, state)
             except Exception as e:
                 logger.exception(f"conv={conv_id}: rollup state write failed: {e}")
 
         return state
+
+
+# ---------------------------------------------------------------------------
+# Tail catch-up progress — process-local, per conversation (v3.1.9, hostile
+# follow-up on the tail-catch-up feature)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. health.py's hierarchy_lag reason first tried to tell a
+# CONVERGING catch-up (self-healing, no operator action needed) from a
+# STUCK one (needs `/compact`) by comparing hierarchy_lag_recent poll to
+# poll. That is WRONG, and wrong in a way that only showed up against a
+# real pod: the Dockerfile HEALTHCHECK polls /health/full every 30 s, and
+# she sends a message — the only thing that ever advances a rollup — every
+# few minutes at most. So on a real pod, almost every pair of CONSECUTIVE
+# polls sees the exact same lag: not because the catch-up stalled, but
+# because nothing has happened between the two polls at all. The
+# "converging" wording appeared on exactly the one poll right after a tail
+# happened to run, then flipped back to the actionable "/compact" wording
+# for the next several dozen polls until her next message — poll-cadence
+# dependent, flapping, and printing the "run /compact" advice on nearly
+# every poll during a real, healthy, self-healing catch-up. The project's
+# own test for it polled once per turn, which is exactly the one cadence
+# that hid the bug.
+#
+# THE FIX: evidence the TAIL itself records, independent of how often
+# anything polls /health/full. Every BUDGETED pass (main._rollup_hierarchy,
+# and backfill.py's one-shot rollup) reports here whether the watermark it
+# just tried to advance for `conv_id` actually moved. health.py reads it
+# back and asks two cadence-independent questions: "did the watermark
+# advance RECENTLY, in wall-clock time?" (converging) and "have PASSES
+# happened, with work still due, without an advance?" (stuck) — both
+# keyed to how often SHE chats (a tail pass only ever happens on her
+# turn), never to how often the HEALTHCHECK polls.
+#
+# WHY summarizer.py AND NOT A NEW MODULE. health.py cannot import main
+# (main imports health) — the same constraint tailhealth.py's own
+# docstring names for the identical reason. This module is not that
+# precedent's twin by accident: both `main._rollup_hierarchy` (the writer)
+# and `health.py` (the reader) already import `summarizer` for unrelated
+# reasons, so no new import edge is needed anywhere. Keyed by conv_id,
+# which is not a new privacy surface here — gather_memory_stats already
+# puts a bare conv_id in this same endpoint's payload
+# (hierarchy_lag_conv/hierarchy_lag_recent_conv).
+#
+# PROCESS RESTARTS LOSE THIS. There is no disk-backed version, on purpose:
+# it exists to answer "is the CURRENT process's tail actively making
+# progress", and a value surviving a restart would describe a process that
+# no longer exists. A conv_id with no entry means "no budgeted pass has
+# run for it in this process yet" — see catchup_progress_for's own
+# docstring for what health.py does with that (the answer is: treat it the
+# same as "not converging", the safe default — see that function's own
+# comment for why).
+_catchup_progress: dict[str, dict[str, Any]] = {}
+
+
+def record_catchup_pass(
+    conv_id: str, before_watermark: int, after_watermark: int, work_due_after: bool,
+) -> None:
+    """Called after every BUDGETED maybe_rollup pass (main._rollup_hierarchy,
+    backfill.py) — never after an unbounded one (admin /compact's default
+    max_calls=200 already drains everything in a few passes; there is
+    nothing for a catch-up-rate signal to describe there).
+
+    `before_watermark`/`after_watermark` are last_summarized_turn before and
+    after this pass. `work_due_after` is whether the hierarchy still needs a
+    rollup once this pass finished (summarizer.needs_rollup on the returned
+    state) — a pass that advanced the watermark AND still has more due is
+    still "progress", tracked the same as any other advance.
+    """
+    now = time.monotonic()
+    entry = _catchup_progress.setdefault(conv_id, {
+        "last_advance_monotonic": None,
+        "passes_since_advance": 0,
+    })
+    if after_watermark > before_watermark:
+        entry["last_advance_monotonic"] = now
+        entry["passes_since_advance"] = 0
+    elif work_due_after:
+        # Only a pass that HAD work due and made none counts against the
+        # stall counter — a pass with nothing due (an ordinary, caught-up
+        # turn) is not evidence of anything stalling.
+        entry["passes_since_advance"] += 1
+    entry["watermark"] = after_watermark
+    entry["work_due"] = work_due_after
+    entry["last_pass_monotonic"] = now
+
+
+def catchup_progress_for(conv_id: str) -> dict[str, Any] | None:
+    """This process's evidence for `conv_id`, or None if no budgeted pass has
+    run for it since this process started (a fresh boot, or a conv_id that
+    has simply never been behind). health.py's own comment at the call site
+    is where "None" gets turned into a behaviour — this function only
+    reports what is known, never guesses at what a restart erased.
+
+    A shallow copy: callers get a snapshot, not a handle into the live dict
+    a later pass could mutate under them mid-read.
+    """
+    entry = _catchup_progress.get(conv_id)
+    return dict(entry) if entry is not None else None
+
+
+def _reset_catchup_progress_for_tests() -> None:
+    _catchup_progress.clear()
+    _tier_failure.clear()
+
+
+# ---------------------------------------------------------------------------
+# Which tier, if any, is stuck? (v3.1.9, hostile pass #5, C5-1/E1)
+# ---------------------------------------------------------------------------
+#
+# Companion to _catchup_progress above — same contract: in-process only,
+# keyed by conv_id, lost on restart. WHY IT EXISTS: the L3>L2>L1 drain in
+# `_maybe_rollup_body` now falls through past a failed upper tier instead
+# of freezing the whole hierarchy behind it (see that loop's own comment),
+# which fixes the freeze but leaves a NEW question an operator needs
+# answered: which tier is the one that keeps failing? `passes_since_
+# advance` (_catchup_progress) cannot say — a conversation can rack up
+# stalled passes for a reason that has nothing to do with any tier being
+# broken (no budget ever allocated, a degrade-guard pause). This dict
+# exists so health.py's "stuck" reason can name the actual failing tier
+# instead of pointing at `/compact`, which runs this identical drain and
+# hits the identical failure first — advice that cannot help.
+#
+# Set the moment a tier's unit fails; cleared the moment that SAME tier
+# next succeeds (not cleared by a different tier succeeding — L1 advancing
+# while L3 keeps failing says nothing about L3). A conv_id with no entry
+# means "no tier has failed for it in THIS process" — the same safe
+# default `catchup_progress_for`'s own docstring gives its sibling.
+_tier_failure: dict[str, str] = {}
+
+
+def _mark_tier_failed(conv_id: str, tier: str) -> None:
+    _tier_failure[conv_id] = tier
+
+
+def _mark_tier_recovered(conv_id: str, tier: str) -> None:
+    if _tier_failure.get(conv_id) == tier:
+        del _tier_failure[conv_id]
+
+
+def failing_tier_for(conv_id: str) -> str | None:
+    """"l2" or "l3" if that tier's unit most recently failed for this
+    conversation, in THIS process, and has not since succeeded; None if no
+    failure is on record (including "never observed" — a restart or a
+    conv_id this process has not rolled up). See the _tier_failure block
+    comment above for the full contract.
+    """
+    return _tier_failure.get(conv_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1428,6 +3708,9 @@ def state_summary(state: dict) -> dict:
         "l2_chapters": len(state.get("l2") or []),
         "l3_present": l3 is not None,
         "last_summarized_turn": state.get("last_summarized_turn", 0),
+        # The pair is what an operator needs to read together: a watermark
+        # that is not moving is only a fault if turns_seen IS.
+        "turns_seen": state.get("turns_seen", 0),
         "l3_turns_covered": (
             [l3.get("first_turn"), l3.get("last_turn")] if l3 else None
         ),

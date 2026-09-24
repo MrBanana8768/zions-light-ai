@@ -51,8 +51,27 @@ def test_health_full_is_ok_on_healthy_deploy():
         f"/health/full returned HTTP {status} — deploy is unhealthy.\n"
         f"body: {body!r}"
     )
-    assert body["status"] == "ok", (
+    # THE ONE REASON A WEIGHTLESS STACK CANNOT CLEAR. The default integration
+    # stack has no model weights, so the compactor's local tokenizer
+    # (MODEL_REPO=fixture-model) can never load, and since v3.1.9 that is a
+    # status reason instead of a silent fallback to char/4. That reason is
+    # correct there, and a pod that cannot load its tokenizer is degraded. So
+    # it is tolerated ONLY when this run has no real model behind it, and ONLY
+    # alone: any other reason still fails the canary, and with real weights
+    # this reason fails it too.
+    reasons = body.get("status_reasons") or []
+    tokenizer_only = (
+        not H.REAL_MODEL
+        and body["status"] == "degraded"
+        and len(reasons) == 1
+        and str(reasons[0]).startswith("the local tokenizer failed to load")
+    )
+    assert body["status"] == "ok" or tokenizer_only, (
         f"status={body['status']!r}, not 'ok'.\n"
+        # The reasons, first. Without them this failed on the merged v3.1.9
+        # run with only vllm and storage printed, both healthy, and no way
+        # to tell which of the newer reasons degraded it.
+        f"status_reasons: {body.get('status_reasons')!r}\n"
         f"vllm: {body['checks']['vllm']!r}\n"
         f"storage: {body['checks']['storage']!r}"
     )

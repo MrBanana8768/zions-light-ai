@@ -134,15 +134,100 @@ def resolve_conv_id(
 # Storage layout
 # ---------------------------------------------------------------------------
 
+class UnsafeConvId(ValueError):
+    """A conv_id that would place a file outside STORAGE_ROOT."""
+
+
+def _safe_path(subdir: str, conv_id: str, suffix: str) -> Path:
+    """Build a storage path and REFUSE to leave STORAGE_ROOT.
+
+    v3.1.8, and this one was a live arbitrary-file-write.
+
+    _sanitize strips a conv_id to [A-Za-z0-9_-], but it is called in
+    exactly one place: resolve_conv_id, on the CHAT path. The admin
+    endpoints take a conversation id straight out of the request BODY —
+    import's `target_conv_id`, fork's `new_conv_id` — and hand it to these
+    builders unsanitized. portability.py carried a comment asserting
+    "conv_id is already sanitized by memory._sanitize", which was simply
+    not true of that route.
+
+    Reproduced against a clean stack: POST /admin/conversations/import with
+    target_conv_id "../../../../../../tmp/CLAUDE_PWNED" returned HTTP 200,
+    echoed the traversal back in its own response, and wrote
+    /tmp/CLAUDE_PWNED.json — outside STORAGE_ROOT, as root.
+
+    The nastier variant needs no attacker at all. Because ".." climbs out
+    of the per-layer subdirectory, facts_path and summary_path collide on
+    one file, so an import targeting "../facts/<someone-else>" reports
+    success while emptying a bystander conversation's memory. That is
+    silent cross-conversation data loss reachable by a typo.
+
+    THE GUARD LIVES HERE, not at the endpoints, deliberately. Sanitizing
+    at each admin route would fix the two known holes and leave the sixth
+    caller to reintroduce it — the fix-one-site-miss-the-sibling defect
+    this codebase has paid for more than a dozen times. Every path into
+    the store is built by one of the five functions below, so this is the
+    chokepoint that cannot be walked past.
+
+    Raises UnsafeConvId rather than sanitizing silently: a caller that
+    passes a traversal is confused about what it is doing, and quietly
+    rewriting its target would hide that. Endpoints turn this into a 400.
+    """
+    # TWO checks, and the first is the one that matters.
+    #
+    # A resolved-path check alone is NOT enough, and the first version of
+    # this function proved it: "../facts/victim" passed facts_path,
+    # because it resolves back INTO the facts directory. Inside the root,
+    # inside the right subdirectory, and pointed at somebody else's
+    # conversation — which is the silent cross-conversation destruction
+    # this guard exists to stop. "Somewhere legal" is the wrong question;
+    # the right one is whether the conv_id is a NAME at all.
+    #
+    # So the id is validated against the SAME character class _sanitize
+    # enforces on the chat path, shared rather than restated: a conv_id
+    # the chat path would have stripped is not one the admin path may
+    # keep. That also settles ".." and "." (which produced the perfectly
+    # legal, perfectly wrong "/data/compactor/facts/...json") and any id
+    # long enough to hit a filesystem name limit.
+    if not conv_id:
+        raise UnsafeConvId("conv_id is empty")
+    if chr(0) in conv_id:
+        raise UnsafeConvId(f"conv_id contains a NUL byte: {conv_id!r}")
+    if _CONV_ID_ALLOWED.search(conv_id):
+        raise UnsafeConvId(
+            f"conv_id must match [A-Za-z0-9_-] and does not: {conv_id!r}"
+        )
+    if len(conv_id) > _CONV_ID_MAX_LEN:
+        raise UnsafeConvId(
+            f"conv_id is longer than {_CONV_ID_MAX_LEN} characters: "
+            f"{len(conv_id)}"
+        )
+
+    # Second line of defence. The check above already makes traversal
+    # unrepresentable, so this can only fire if the character class is
+    # ever widened — which is exactly when a reviewer would want it to.
+    root = STORAGE_ROOT.resolve()
+    candidate = root / subdir / f"{conv_id}{suffix}"
+    try:
+        resolved = candidate.resolve()
+    except (OSError, ValueError) as e:
+        raise UnsafeConvId(f"conv_id is not a usable path: {conv_id!r}") from e
+    if resolved.parent != root / subdir:
+        raise UnsafeConvId(
+            f"conv_id would place a file outside {subdir}/: "
+            f"{conv_id!r} -> {resolved}"
+        )
+    return candidate
+
 def facts_path(conv_id: str) -> Path:
-    return STORAGE_ROOT / "facts" / f"{conv_id}.json"
+    return _safe_path("facts", conv_id, ".json")
 
 
 def facts_archive_path(conv_id: str) -> Path:
     """V2.1 Phase 7 Step 2: cold-storage sidecar for archived facts.
     Sits next to the active facts file; list_known_conv_ids skips it
     (its stem has a dot, so the sidecar filter excludes it)."""
-    return STORAGE_ROOT / "facts" / f"{conv_id}.archive.json"
+    return _safe_path("facts", conv_id, ".archive.json")
 
 
 def persona_path(conv_id: str) -> Path:
@@ -150,11 +235,11 @@ def persona_path(conv_id: str) -> Path:
     that have facts but no persona don't pollute the persona listing,
     and vice versa.
     """
-    return STORAGE_ROOT / "personas" / f"{conv_id}.json"
+    return _safe_path("personas", conv_id, ".json")
 
 
 def summary_path(conv_id: str) -> Path:
-    return STORAGE_ROOT / "summaries" / f"{conv_id}.json"
+    return _safe_path("summaries", conv_id, ".json")
 
 
 def summary_archive_path(conv_id: str) -> Path:
@@ -168,7 +253,7 @@ def summary_archive_path(conv_id: str) -> Path:
     recursively re-paraphrased L3 had no source left to be regenerated from.
     Its stem carries a dot, so list_known_conv_ids skips it exactly as it
     skips the facts sidecar."""
-    return STORAGE_ROOT / "summaries" / f"{conv_id}.archive.json"
+    return _safe_path("summaries", conv_id, ".archive.json")
 
 
 def chromadb_path() -> Path:
@@ -296,7 +381,9 @@ class StoreUnreadable(Exception):
         self.cause = cause
 
 
-def read_json_strict(path: Path, default: Any = None) -> Any:
+def read_json_strict(
+    path: Path, default: Any = None, *, expect: type | tuple[type, ...] | None = None
+) -> Any:
     """Read JSON, raising StoreUnreadable rather than inventing a value.
 
     Returns `default` for an absent file — that case is by design and must
@@ -311,6 +398,28 @@ def read_json_strict(path: Path, default: Any = None) -> Any:
     everything else, so an EIO on the stat already reaches the caller
     (REMEDIATION.md §1.4 — both v3.1 reviews got this wrong).
 
+    `expect` is the SHAPE half of the same contract, and it exists because
+    the shape half was missing (v3.1.8, adversarial state sweep).
+
+    A file that parses but holds the wrong THING — a bare list where a dict
+    belongs, `null`, a number — used to come back to callers that wrote
+    `data.get(...) if isinstance(data, dict) else []`, i.e. as EMPTY. Not
+    unreadable: empty. Nothing raised, `stats.unreadable` did not move, and
+    the next turn's save wrote a fresh empty store OVER IT — measured, with
+    a pinned fact, gone.
+
+    That is the v3.1 F1a defect exactly, one branch over: F1a was that a
+    corrupt file returned [] and callers wrote back over the real facts, and
+    the fix taught this loader to raise on a PARSE failure while leaving the
+    wrong-shape case returning empty. So the difference between 'recoverable'
+    and 'destroyed' was whether the damage happened to break the JSON parser.
+
+    The check lives HERE rather than at the eight call sites for the reason
+    this codebase keeps relearning: a rule applied at some call sites and
+    missed at one is how the sibling defect survives. An absent file still
+    returns `default` untouched — a new conversation must not raise on its
+    first turn.
+
     This is the loader behind facts, the archive sidecar, summary state and
     personas. Callers on the request path already treat a raising load as
     "inject nothing this turn" and keep serving.
@@ -319,9 +428,35 @@ def read_json_strict(path: Path, default: Any = None) -> Any:
         return default
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
+            data = json.load(f)
+    # UnicodeDecodeError IS NOT A JSONDecodeError, and that is the whole gap
+    # (v3.1.9). Both descend from ValueError, but json.load DECODES the bytes
+    # before it parses them, so a file holding invalid UTF-8 — a write torn
+    # mid-multibyte, or the volume that already dropped I/O mid-transaction on
+    # 2026-08-31 — raised straight past this handler, unwrapped.
+    #
+    # read_json catches only StoreUnreadable, so the best-effort path missed it
+    # too, and v3.1.8 added a REQUEST-path consumer (_is_repeat_task_traffic)
+    # behind a deliberately narrow `except (OSError, StoreUnreadable)`. One bad
+    # byte therefore escaped out of _run_memory_tail inside event_stream's
+    # finally — an ASGI exception on a request the user had already seen
+    # succeed — and stats.unreadable never counted it, so v3.1.8's own
+    # "unreadable memory on disk" reason stayed silent about the one file that
+    # actually was.
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
         raise StoreUnreadable(path, e) from e
+    if expect is not None and not isinstance(data, expect):
+        # A present file holding the wrong thing is UNREADABLE, not empty.
+        # Returning it (or an empty stand-in) is what let the next save
+        # write over real memory.
+        raise StoreUnreadable(
+            path,
+            TypeError(
+                f"expected {getattr(expect, '__name__', expect)}, "
+                f"found {type(data).__name__}"
+            ),
+        )
+    return data
 
 
 def read_json(path: Path, default: Any = None) -> Any:

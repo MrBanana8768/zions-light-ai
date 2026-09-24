@@ -48,6 +48,7 @@ from typing import Any
 import httpx
 from starlette.concurrency import run_in_threadpool
 
+import envcfg
 import facts as facts_module
 import retrieval
 import summarizer
@@ -67,6 +68,43 @@ logger = logging.getLogger("compactor.backfill")
 # consider it crashed and retry. 10 minutes covers the longest plausible
 # backfill (~2000 message conversation at 300ms/call), with margin.
 _STALE_SECONDS = 600
+
+# v3.1.9 (tail catch-up). YES, this gets a budget too, and reuses the tail's
+# own knob (main.TAIL_ROLLUP_MAX_CALLS, same env var) rather than a
+# backfill-specific one.
+#
+# WHY IT NEEDS ONE AT ALL. The summary rollup below (maybe_rollup at line
+# ~394) is a SINGLE call, not a loop — unlike the live tail before this
+# release, it was never wrapped in "drain until caught up or budget spent".
+# One call still means "drain everything this state needs in its own
+# internal L1/L2/L3 loops", which is exactly the all-at-once shape this
+# whole feature exists to bound: a V1 conversation backfilled for the FIRST
+# time can be the single largest backlog in the store (its entire history,
+# discovered at once), and this module's own docstring says the backfill is
+# "Async/non-blocking" — it runs as a background task WHILE she keeps
+# chatting, on the same one GPU her live replies are being generated on.
+# Unbounded here is the tail's original defect, reintroduced by the one
+# caller that was never in scope to look at when the tail was fixed.
+#
+# WHY REUSING THE TAIL'S CONSTANT IS THE RIGHT CHOICE, not a new
+# COMPACTOR_BACKFILL_ROLLUP_MAX_CALLS. This call is functionally the same
+# kind of opportunistic, best-effort, GPU-sharing rollup attempt the live
+# tail makes every turn — the module docstring already says a rollup
+# failure here is non-fatal ("facts backfill is still considered
+# complete"), i.e. this was ALREADY designed to leave the hierarchy for a
+# later pass to finish, it just never had a "later pass" of its own. It
+# gets one for free: whatever this bounded call does not finish is exactly
+# what state.last_summarized_turn records as still due, and the FIRST live
+# tail on this conversation (the reply that triggered the backfill, or any
+# turn after) picks it up and continues under its own per-turn budget —
+# the identical persisted-watermark convergence this release already
+# proves for the tail, with no new resume logic needed here.
+#
+# `main` is not imported (nothing in this package may import it without a
+# cycle — main.py imports backfill.py to serve /admin/conversations/*), so
+# this reads the SAME env var independently through envcfg, the shared
+# softened reader every other non-main module in this package uses.
+_TAIL_ROLLUP_MAX_CALLS = envcfg.env_int("COMPACTOR_TAIL_ROLLUP_MAX_CALLS", 4)
 
 
 # Module-level set of conv_ids currently being backfilled in this process.
@@ -233,6 +271,7 @@ async def _run_backfill(
     messages: list[dict],
     vllm_url: str,
     model: str,
+    raw_messages: list[dict] | None = None,
 ) -> None:
     """The actual backfill: iterate pairs, extract facts, save state
     incrementally so a crash mid-run can resume from progress.
@@ -358,7 +397,94 @@ async def _run_backfill(
         # facts backfill is still considered complete.
         try:
             if summarizer.enabled():
-                await summarizer.maybe_rollup(conv_id, messages, vllm_url, model)
+                # `messages` has been redacted by start_backfill_if_needed;
+                # `raw_messages` is the same array snapshotted before
+                # redaction, and each chunk writes its covered-turn record
+                # from it (summarizer._record_chunk_fps). With None (a direct
+                # caller) the chunks record the redacted text they read, so a
+                # redacted reply is summarized fresh later rather than reused:
+                # it costs a summarization call and never a turn.
+                #
+                # hostile317-b F3: `messages`/`raw_messages` were snapshotted
+                # at kickoff, and this call lands MINUTES later. By then a
+                # live tail has usually rolled this conversation up already —
+                # in production order ALWAYS: the kickoff request's own reply
+                # streams in seconds, and its tail drains the whole hierarchy
+                # over the full array plus that reply (hostile pass #3,
+                # reviewer A F8). `_observed_position` trusts whatever array
+                # it is handed as the CURRENT window and overwrites the anchor
+                # with its tail, so a stale snapshot would pin the anchor to
+                # old content and put every later chunk label one turn off.
+                # The live tail owns the hierarchy; this rollup runs only when
+                # no tail has moved the conversation past the snapshot (the
+                # kickoff reply was skipped, shed, or never produced).
+                #
+                # THE CHECK IS MADE UNDER THE LOCK THE ROLLUP HOLDS (hostile
+                # pass #3, reviewer E F3). It was read here, outside conv_lock,
+                # and then maybe_rollup took the lock: a live tail queued
+                # behind this backfill's facts merge ran in between, saved its
+                # position, and the stale snapshot then rolled up over it.
+                # maybe_rollup now compares the recorded position with
+                # `snapshot_turns` itself, after loading state under the lock,
+                # and reports the skip through `skipped`.
+                snapshot_turns = sum(1 for m in messages if m.get("role") != "system")
+                skipped: list[int] = []
+                # v3.1.9 (tail catch-up): bounded the same way the live tail
+                # is now — see _TAIL_ROLLUP_MAX_CALLS' own comment for why
+                # this single call needed a budget at all. A fresh dict per
+                # backfill, same as the tail: this is a one-shot call, so
+                # there is no "next turn" of this SAME call to carry
+                # anything forward into anyway.
+                _budget = {"remaining": _TAIL_ROLLUP_MAX_CALLS, "exhausted": False}
+                # v3.1.9 (hostile follow-up). The SAME before/after watermark
+                # record the tail makes — see summarizer.record_catchup_pass's
+                # own docstring for why this has to be process-local evidence
+                # rather than something health.py re-derives by polling. A
+                # cheap extra read (this function already does several),
+                # taken just before the call so it reflects this pass's own
+                # starting point rather than an earlier snapshot from higher
+                # up in this function.
+                _before_state = summarizer.load_state(conv_id)
+                _rollup_state = await summarizer.maybe_rollup(
+                    conv_id, messages, vllm_url, model, raw_messages=raw_messages,
+                    skip_if_position_past=snapshot_turns, skipped_at=skipped,
+                    vllm_call_budget=_budget,
+                )
+                try:
+                    summarizer.record_catchup_pass(
+                        conv_id,
+                        _before_state.get("last_summarized_turn", 0),
+                        _rollup_state.get("last_summarized_turn", 0),
+                        summarizer.needs_rollup(
+                            _rollup_state, _rollup_state.get("turns_seen", 0)
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"conv={conv_id}: could not record backfill's "
+                        f"catch-up progress ({type(e).__name__}: {e}) — the "
+                        f"rollup pass above already completed regardless"
+                    )
+                if _budget["exhausted"]:
+                    logger.info(
+                        f"conv={conv_id}: backfill's summary rollup spent its "
+                        f"{_TAIL_ROLLUP_MAX_CALLS}-call budget with more of "
+                        f"the hierarchy still behind; the live tail on this "
+                        f"conversation's next turn continues the catch-up "
+                        f"from the persisted watermark"
+                    )
+                if skipped:
+                    logger.info(
+                        f"conv={conv_id}: backfill's summary rollup skipped — "
+                        f"a live tail already rolled this conversation up to "
+                        f"turn {skipped[0]}, past this backfill's snapshot "
+                        f"({snapshot_turns} turns, taken at kickoff). In "
+                        f"production order that is the kickoff request's own "
+                        f"reply, and it is the expected case: the live tail "
+                        f"owns the hierarchy. Rolling up this snapshot would "
+                        f"overwrite the position anchor with a stale tail "
+                        f"(hostile317-b F3)."
+                    )
         except Exception as e:
             logger.warning(f"conv={conv_id}: backfill summary rollup failed (non-fatal): {e}")
 
@@ -425,6 +551,11 @@ async def start_backfill_if_needed(
     if conv_id in _in_progress_local:
         return False  # already started in this process
     _in_progress_local.add(conv_id)
+    # The array exactly as the client sent it, snapshotted BEFORE redaction:
+    # the covered-turns digest must be folded from turns the next request will
+    # carry, and redaction replaces degenerate replies with placeholders that
+    # no request ever does (see summarizer._record_chunk_fps).
+    raw_snapshot = [dict(m) for m in messages]
     if redact is not None:
         # Off the event loop: this is an async function awaited on the
         # request path, and the redactor walks every historical assistant
@@ -434,5 +565,7 @@ async def start_backfill_if_needed(
         messages = await run_in_threadpool(redact, messages)
     # Snapshot messages — caller may mutate the list before backfill runs
     snapshot = [dict(m) for m in messages]
-    fire_and_forget(_run_backfill(conv_id, snapshot, vllm_url, model))
+    fire_and_forget(
+        _run_backfill(conv_id, snapshot, vllm_url, model, raw_messages=raw_snapshot)
+    )
     return True

@@ -82,6 +82,45 @@ retrieval._available = False
 retrieval._embedder = None
 retrieval._chroma_collection = None
 
+# R22. count_tokens_exact and count_text_tokens_exact (main.py) each open a
+# REAL httpx.post to f"{VLLM_URL}/tokenize" — a plain synchronous call, not
+# the async client _StubVLLM stands in for below. Nothing in this file ever
+# points VLLM_URL at a live server, so every one of those calls was ALREADY
+# failing; the fallback to the local char/4 estimator it triggers is the
+# degraded path most of this file exists to exercise ("counted by the local
+# tokenizer, UNCORRECTED"). The failure was never in question — only how long
+# it took to arrive. On this machine, "http://localhost:8000" with nothing
+# listening does not fail fast: httpx/httpcore tries the IPv6 loopback first,
+# then the IPv4 one, EACH against its own 2s connect timeout, so one
+# unstubbed call costs ~4.2s measured — and count_tokens_exact /
+# count_text_tokens_exact sit on the hot path of nearly every guard test in
+# this file, several of them more than once per test. That is the whole
+# ~239s this suite used to take: not a sleep anyone wrote, but 55+ real dead
+# TCP handshakes stacked end to end (confirmed by timing each test in
+# isolation — see V314_BACKLOG R22).
+#
+# Raising the same exception class immediately reproduces the exact
+# except-Exception branch those two functions already run against a down
+# backend in production — same log lines, same fallback, same failure
+# counters — without paying for the two-stack timeout for real. A test that
+# wants a different /tokenize behavior still can: patch.object(main.httpx,
+# "post", ...) inside a `with` block layers its own stub on top of this one
+# for its own duration and is unaffected, exactly as
+# test_a_tokenize_outage_is_reportable_more_than_once_per_process already
+# does a few hundred lines down.
+_real_httpx_post = main.httpx.post
+
+
+def _fail_tokenize_fast(url, *args, **kwargs):
+    if "/tokenize" in url:
+        raise main.httpx.ConnectError(
+            "connection refused (stubbed for test speed — see R22)"
+        )
+    return _real_httpx_post(url, *args, **kwargs)  # pragma: no cover — belt and braces
+
+
+main.httpx.post = _fail_tokenize_fast
+
 memory.ensure_storage_layout()
 
 # client=127.0.0.1 and raise_server_exceptions=False mirror test_import_guard —
@@ -1044,19 +1083,35 @@ def test_call_site_passes_the_callers_system_count():
 
     seen = {}
 
-    def recorder(messages, limit=None, protect_system=None, report=None):
+    def recorder(messages, limit=None, protect_system=None, report=None, reserve=0):
+        # reserve (hostile pass #5 F3): a real parameter of the guard now,
+        # not asserted here — this test is about protect_system (M9), and a
+        # recorder that cannot accept every argument the request path
+        # actually passes would TypeError instead of testing anything.
         seen["messages"] = list(messages)
         seen["limit"] = limit
         seen["protect_system"] = protect_system
         seen["report"] = report
         return messages
 
-    with patch.object(main, "_enforce_hard_budget", recorder):
+    # v3.1.9: the clock is pinned, because the guard is now handed the
+    # effective limit LESS the current-time line's reserve (the line is added
+    # after the guard; see main._inject_time_line), and the reserve is the
+    # line's byte length, which moves with the date.
+    import datetime as _dt
+    _at = _dt.datetime(2026, 9, 14, 16, 41, tzinfo=_dt.timezone.utc)
+    with patch.object(main, "_enforce_hard_budget", recorder), \
+         patch.object(main, "_now_utc", lambda: _at):
         r, forwarded, _records = _post_chat(msgs, cid)
 
     assert_eq(r.status_code, 200, f"the request completed (body: {r.text[:200]!r})")
     assert_true("messages" in seen, "the guard was called on the request path")
-    assert_eq(seen["limit"], main.HARD_INPUT_LIMIT, "with the request's effective limit")
+    assert_eq(
+        seen["limit"],
+        main.HARD_INPUT_LIMIT
+        - main._time_line_token_reserve(main.current_time_line(_at)),
+        "with the request's effective limit, less the time line's reserve",
+    )
     # 2, not 1 (the signature default, i.e. the M9 mutation) and not 3 (the
     # count of what was actually passed, i.e. counting the wrong array).
     assert_eq(
@@ -1522,36 +1577,78 @@ def _oversized_store(n=8, chars=1200):
     ]
 
 
-def test_extraction_is_handed_the_injected_subset_not_the_whole_store():
-    print("\n[test] handoff — the extractor sees what the MODEL saw, not the store")
-    # facts.py now trims its own input, so the whole store no longer overflows
-    # the window. It is still the wrong list: the trim it would apply is a
-    # second, later opinion about which facts matter. Handing it the injected
-    # subset means "already known" means the same thing on both sides of the
-    # exchange.
+def test_extraction_is_bounded_by_the_store_cap_not_the_injection_cap():
+    print("\n[test] handoff — the extractor's known-facts list is bounded by the "
+          "STORE cap, not the 400-token injection budget")
+    # This list is the extractor's "EXISTING FACTS", i.e. the whole of its
+    # duplicate suppression, against a prompt that also says "When in doubt,
+    # extract." Bounding it by COMPACTOR_INJECT_FACTS_TOKENS (400) instead of
+    # COMPACTOR_MAX_FACTS_TOKENS (1500) cut a realistic store's list from 114
+    # facts to 28 — ~75% of the signal — and what that buys is byte-identical
+    # re-extractions, dedup LLM calls, and faster store churn.
+    #
+    # Still BOUNDED: this is a request to vLLM, which has a window. The store
+    # cap is the bound, and it is the one prune_facts already holds the store
+    # to, so in normal operation the extractor sees the store and nothing more.
     store = _oversized_store()
     injected = facts.select_for_injection(store)
+    store_bounded = facts.select_for_injection(
+        store, max_tokens=facts._MAX_FACTS_TOKENS
+    )
     assert_true(
-        0 < len(injected) < len(store),
-        f"fixture: injection is really narrower than the store "
-        f"({len(injected)} of {len(store)})",
+        0 < len(injected) < len(store_bounded) < len(store),
+        f"fixture: the three sizes are really distinct — injected "
+        f"{len(injected)}, store-cap {len(store_bounded)}, store {len(store)}",
     )
     seen = _tail_spies("tail-injected", store, injected)
-    assert_eq(len(seen["existing"]), len(injected),
-              "the extractor was handed the injected subset")
-    assert_true(seen["existing"] is injected, "and the very list the request path built")
+    assert_eq(len(seen["existing"]), len(store_bounded),
+              "the extractor was handed the store-cap-bounded set")
+    assert_true(len(seen["existing"]) > len(injected),
+                "which is strictly more than the model was shown this turn")
+    assert_true(len(seen["existing"]) < len(store),
+                "and still not the unbounded store")
+
+
+def test_extraction_includes_what_the_model_was_actually_shown():
+    print("\n[test] handoff — an injected fact the store-cap walk left out is "
+          "still in the extractor's known list")
+    # The two selections can disagree only when the store is OVER the store cap
+    # — which v3.1 F9 allows to persist, because a failed archive write keeps
+    # the facts. There, a relevance-ranked injection can include an LRU-cold
+    # fact the store-cap walk dropped. If that fact were missing here, the
+    # extractor would be invited to re-extract something the model had just
+    # been shown, which is the same duplicate-churn failure from the other end.
+    store = _oversized_store()
+    cold = {"text": "C0 " + "s" * 1200, "added_turn": 0, "last_used": 1}
+    store = [cold] + store
+    store_bounded = facts.select_for_injection(
+        store, max_tokens=facts._MAX_FACTS_TOKENS
+    )
+    assert_true(
+        all(f["text"] != cold["text"] for f in store_bounded),
+        "fixture: the coldest fact really is outside the store-cap set",
+    )
+    seen = _tail_spies("tail-cold-injected", store, [cold])
+    texts = [f["text"] for f in seen["existing"]]
+    assert_true(cold["text"] in texts,
+                "the injected-but-LRU-cold fact reached the extractor")
+    assert_eq(len(texts), len(set(texts)),
+              "and nothing was listed twice by the union")
 
 
 def test_extraction_is_bounded_even_for_a_caller_that_passes_nothing():
-    print("\n[test] handoff — the default narrows too, so no caller can pass the store")
+    print("\n[test] handoff — the store cap applies with or without injected_facts")
     # injected_facts is keyword-only with a default so its arrival breaks no
-    # caller. The default has to be select_for_injection(store), not the store:
-    # a default that reintroduces the defect for un-updated callers is not a
-    # default, it is the defect with a nicer signature.
+    # caller. Omitting it must not push the whole store into an extraction
+    # prompt: the store-cap bound is applied to touched_facts either way, and
+    # injected_facts only ever ADDS what that bound left out.
     store = _oversized_store()
     seen = _tail_spies("tail-default", store, None)
-    assert_eq(len(seen["existing"]), len(facts.select_for_injection(store)),
-              "an omitted injected_facts still yields the bounded set")
+    assert_eq(
+        len(seen["existing"]),
+        len(facts.select_for_injection(store, max_tokens=facts._MAX_FACTS_TOKENS)),
+        "an omitted injected_facts still yields the store-cap-bounded set",
+    )
     assert_true(len(seen["existing"]) < len(store), "and not the whole store")
 
 
@@ -2086,10 +2183,22 @@ def test_a_request_with_no_prior_assistant_turn_gets_the_narrow_budget():
     # a prior assistant turn and once without.
     cid = "d3-no-history"
     persona.save_persona(cid, "PERSONA-STORE-SENTINEL " + "q" * 80, source="admin")
+    # Padding was "f" * 120 until v3.1.5, which left persona+facts costing 426
+    # against the wide budget's 400 — i.e. this fixture was passing on ~3% of
+    # headroom, and the v3.1.5 block-header reword (persona.py's
+    # _PERSONA_BLOCK_HEADER et al) tipped it over. The facts then dropped and
+    # the failure read "facts injected too", which points at the injection
+    # budget rather than at the four lines of prompt text that actually moved.
+    #
+    # The sizes here are scaffolding, not the subject: this test is about
+    # WHICH fraction the call site picks, and the sentinels only have to be
+    # big enough that the narrow budget cannot hold them. So carry real
+    # headroom, and let the block headers stay editable prompt text — they
+    # are tuned against a live user and will change again.
     facts.save_facts(
         cid,
         [
-            {"text": FACT_SENTINEL + "-" + str(i) + " " + "f" * 120,
+            {"text": FACT_SENTINEL + "-" + str(i) + " " + "f" * 60,
              "added_turn": 1, "last_used": 100}
             for i in range(3)
         ],
@@ -2111,7 +2220,11 @@ def test_a_request_with_no_prior_assistant_turn_gets_the_narrow_budget():
     assert_true(
         FACT_SENTINEL in sys_text,
         f"conversation: facts injected too — half the window is available to "
-        f"memory here: {sys_text[:200]!r}",
+        f"memory here. If this fails after an edit to a BLOCK HEADER, the "
+        f"fixture has run out of headroom rather than the code having "
+        f"regressed: check the 'injected memory over budget' line above for "
+        f"the cost against 400, and shrink the padding above. "
+        f"sys_text: {sys_text[:200]!r}",
     )
 
     _r, forwarded, records = _post_chat(no_history, cid)
@@ -2369,7 +2482,8 @@ def _all_tests():
         test_a_non_size_400_does_not_blame_the_context_window,
         test_a_backend_5xx_on_the_stream_is_also_logged_as_a_lost_turn,
         test_nonstream_400_logs_the_loss_and_skips_the_memory_tail,
-        test_extraction_is_handed_the_injected_subset_not_the_whole_store,
+        test_extraction_is_bounded_by_the_store_cap_not_the_injection_cap,
+        test_extraction_includes_what_the_model_was_actually_shown,
         test_extraction_is_bounded_even_for_a_caller_that_passes_nothing,
         test_extraction_and_dedup_are_told_which_conversation,
         test_the_request_path_hands_the_tail_the_list_it_injected,

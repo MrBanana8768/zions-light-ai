@@ -28,12 +28,13 @@ import logging
 import os
 import time
 
+from envcfg import env_int, env_window_s
 import logsetup
 
 logger = logging.getLogger("compactor.bgwork")
 
-MAX_CONCURRENT = int(os.environ.get("COMPACTOR_MAX_CONCURRENT_TAILS", "4") or 4)
-MAX_OUTSTANDING = int(os.environ.get("COMPACTOR_MAX_OUTSTANDING_TAILS", "64") or 64)
+MAX_CONCURRENT = env_int("COMPACTOR_MAX_CONCURRENT_TAILS", 4)
+MAX_OUTSTANDING = env_int("COMPACTOR_MAX_OUTSTANDING_TAILS", 64)
 
 # How long after a shed /health/full keeps calling the system "degraded"
 # (v3.1 A11).
@@ -48,9 +49,31 @@ MAX_OUTSTANDING = int(os.environ.get("COMPACTOR_MAX_OUTSTANDING_TAILS", "64") or
 #
 # 300 s spans ten consecutive 30 s HEALTHCHECK probes, so a burst that starts
 # and ends between two looks still shows up on the next one.
-SHED_DEGRADE_WINDOW_S = float(
-    os.environ.get("COMPACTOR_SHED_DEGRADE_WINDOW_S", "300") or 300
-)
+def _window_s(name: str, default: float) -> float:
+    """Read a degrade-window seconds value from the environment, safely.
+
+    A thin alias for envcfg.env_window_s (v3.1.7 R30 rest): this module's own
+    copy used to duplicate the parsing logic byte-for-byte, because it cannot
+    import main (main imports it) and main.py's helpers are not shared code.
+    envcfg.py fixes exactly that — a module with no dependency on anything
+    else in the package, so both bgwork and main (and tailhealth, which
+    keeps its own identical copy rather than importing this one, since it
+    is not owned by this change) can read through it without a cycle.
+
+    Kept as a named wrapper, not inlined at the two call sites below, so
+    every existing caller (`bgwork._window_s(...)` — see test_bgwork.py) and
+    every existing docstring reference to `bgwork._window_s` keeps working
+    unchanged. Behaviour is unchanged: unparseable/blank -> default,
+    non-positive or non-finite (`0`, a negative, `inf`, `nan`) -> default.
+    See envcfg.env_window_s's docstring for the full reasoning, including the
+    incident (an always-on `shed_recently` from an `inf` window) this guards
+    against. tailhealth._window_s is a separate, unowned copy of the same
+    logic; test_envcfg.py asserts the two still agree.
+    """
+    return env_window_s(name, default)
+
+
+SHED_DEGRADE_WINDOW_S = _window_s("COMPACTOR_SHED_DEGRADE_WINDOW_S", 300.0)
 
 
 class BackgroundPool:

@@ -53,10 +53,53 @@ MODEL = os.environ.get("ZIONS_TEST_MODEL", "")
 TIMEOUT = float(os.environ.get("ZIONS_TEST_TIMEOUT", "120") or 120)
 TAIL_WAIT = float(os.environ.get("ZIONS_TEST_TAIL_WAIT", "8") or 8)
 
+# The polling helpers' ceiling, and it must be CONFIGURABLE.
+#
+# wait_for_facts and wait_for_indexed_exchanges hardcoded max_wait=30.0 and
+# ignored TAIL_WAIT entirely, while their docstrings promised slow paths "a
+# generous ceiling". Against a CPU-only fixture model that is simply false:
+# extraction is a real generation that lands ~40-90s after the reply, the
+# poll gave up at 30, and the compactor log then said "extracted 3 new
+# fact(s)" moments later. A real pass reported as a failure, and the one
+# knob that looks like it controls this (ZIONS_TEST_TAIL_WAIT) reached only
+# the coarse sleep.
+#
+# max() so the pod default (8) does not SHORTEN the ceiling from 30, and a
+# deliberately large TAIL_WAIT can lengthen it.
+POLL_CEILING = max(30.0, TAIL_WAIT)
+
 # Only "true" if user explicitly opted in to admin tests. Bare BASE_URL
 # fallback for ADMIN_URL doesn't count — admin tests require an explicit
 # decision because they may need extra pod-side config.
 ADMIN_ENABLED = bool(os.environ.get("ZIONS_TEST_ADMIN_URL"))
+
+# Does the backend behind this run have REAL WEIGHTS?
+#
+# This cannot be inferred, and inferring it was the plan until the compose
+# files were read: BOTH integration profiles advertise the served model as
+# "fixture-model", so ZIONS_TEST_MODEL tells the two apart not at all. The
+# weightless fixture returns canned strings, which is exactly right for the
+# contract suite and useless for any test whose assertion is "the reply/the
+# extracted fact is ABOUT this conversation".
+#
+# Tests that assert on generated CONTENT fail rather than skip against the
+# weightless fixture, which is the worst of both worlds: a red suite that
+# means "you ran the wrong profile", so a real regression in those tests
+# arrives as no change at all. A capability the environment declares, rather
+# than one a test guesses from a symptom, keeps a genuine failure loud.
+#
+# IT DEFAULTS TO FALSE, AND THAT COSTS SOMETHING. The original use of this
+# suite is a POD run — `ZIONS_TEST_BASE_URL=https://<pod>-8080.proxy.runpod.net
+# pytest tests/integration/` — where the weights are Cydonia's and every
+# content assertion is meaningful. Nothing there sets this variable, so those
+# tests now SKIP on the run where they matter most unless the operator sets
+# it. That is the honest trade (a skip that names itself beats a red that
+# means nothing), but it is only honest if the skip says how to turn it on,
+# which is why the message below names the variable and not just the compose
+# command. tests/integration/README.md's variable table should carry it too.
+REAL_MODEL = os.environ.get("ZIONS_TEST_REAL_MODEL", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 
 def require_base_url() -> None:
@@ -74,6 +117,40 @@ def skip_if_no_admin(reason: str = "admin endpoint required") -> None:
     ZIONS_TEST_ADMIN_URL is unset, rather than failing with a 403/404."""
     if not ADMIN_ENABLED:
         pytest.skip(f"{reason} (set ZIONS_TEST_ADMIN_URL to enable)")
+
+
+def requires_real_model(reason: str = "assertion needs a real generation") -> None:
+    """Tests whose assertion is about the CONTENT of a model's output call
+    this. Skips, loudly and by name, against the weightless fixture.
+
+    A skip is not a pass. This one names BOTH ways to run the test, because
+    there are two backends with real weights and only one of them is a
+    compose profile:
+
+        docker compose -f docker-compose.integration.yml --profile model \\
+            run --rm --build integration-tests-model
+
+        ZIONS_TEST_REAL_MODEL=1 ...   # any pod or deployment run
+
+    The second line is not decoration. A pod run has Cydonia behind it and
+    sets none of the compose environment, so without it these tests skip on
+    the deployment they were written to validate.
+
+    NOT FOR A TEST THAT NEEDS THE FIXTURE'S CONTROL PLANE. tests that drive
+    `/_fixture/mode` (test_regression_text.py) need the WEIGHTLESS stack, not
+    this one: the model profile serves `model-fixture`, a different hostname,
+    and `vllm-fixture` is not in it at all. Guarding one of those with this
+    would skip it on the only profile that can run it.
+    """
+    if not REAL_MODEL:
+        pytest.skip(
+            f"{reason} — the weightless fixture returns canned text, so this "
+            f"can only be exercised against real weights. Either: "
+            f"docker compose -f docker-compose.integration.yml --profile model "
+            f"run --rm --build integration-tests-model  — or set "
+            f"ZIONS_TEST_REAL_MODEL=1 if the backend behind this run already "
+            f"has weights (a pod, or any deployment)."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +300,7 @@ def wait_for_facts(
     conv_id: str,
     *,
     min_count: int = 1,
-    max_wait: float = 30.0,
+    max_wait: float | None = None,
     poll_interval: float = 2.0,
 ) -> list[dict]:
     """Poll /admin/conversations/<id>/facts until at least `min_count`
@@ -241,6 +318,7 @@ def wait_for_facts(
     Falls back to a coarse sleep when admin endpoints aren't reachable
     (otherwise we'd be looping uselessly against 403s).
     """
+    max_wait = POLL_CEILING if max_wait is None else max_wait
     if not ADMIN_ENABLED:
         time.sleep(max_wait if max_wait > TAIL_WAIT else TAIL_WAIT)
         return []
@@ -260,7 +338,7 @@ def wait_for_indexed_exchanges(
     conv_id: str,
     *,
     min_count: int = 1,
-    max_wait: float = 30.0,
+    max_wait: float | None = None,
     poll_interval: float = 2.0,
 ) -> int:
     """Poll /admin/conversations/<id> until episodic.indexed_exchanges
@@ -273,6 +351,7 @@ def wait_for_indexed_exchanges(
 
     Falls back to a coarse sleep when admin endpoints aren't reachable.
     """
+    max_wait = POLL_CEILING if max_wait is None else max_wait
     if not ADMIN_ENABLED:
         time.sleep(TAIL_WAIT)
         return 0
@@ -440,13 +519,18 @@ def admin_get_archive(conv_id: str) -> list[dict]:
 
 
 def admin_restore_from_archive(
-    conv_id: str, text_substring: str | None = None
+    conv_id: str, text_substring: str | None = None, restore_all: bool = False
 ) -> dict:
-    """POST /admin/conversations/<id>/restore → {restored, filter, ...}."""
+    """POST /admin/conversations/<id>/restore → {restored, filter, ...}.
+
+    v3.1.9 (hostile pass 4, F3): an empty body is a 400, not "restore
+    everything"; restoring every archived fact takes restore_all=True."""
     assert ADMIN_URL, "admin_restore_from_archive requires ZIONS_TEST_ADMIN_URL"
     body: dict = {}
     if text_substring is not None:
         body["text_substring"] = text_substring
+    if restore_all:
+        body["restore_all"] = True
     with _client(ADMIN_URL) as c:
         r = c.post(f"/admin/conversations/{conv_id}/restore", json=body)
         r.raise_for_status()

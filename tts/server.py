@@ -52,6 +52,32 @@ def _env(name: str, default: str) -> str:
     return v if v is not None and v != "" else default
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read an int-valued env var. Unset, blank, or unparseable -> default.
+
+    A deliberate local copy of compactor/envcfg.env_int rather than an import
+    of it: this server runs from /opt/tts under its own venv with no path to
+    /opt/compactor, and keeping the voice servers dependency-free is why they
+    are laid out that way. Same contract, so the two cannot drift in meaning.
+
+    It exists because `int(_env("TTS_PORT", "9001"))` raised ValueError at
+    import for any typo. TTS_PORT is baked as an image ENV and a RunPod
+    template variable of the same name overrides it, so unlike the knobs
+    inside the compactor this one is reachable from the pod template today —
+    and supervisord runs this program with autorestart=true, so a typo is a
+    service crash-looping forever while the container's own /health stays
+    green. Losing a port override to its default is recoverable; losing voice
+    with no signal anywhere is not.
+    """
+    v = os.environ.get(name, "")
+    if not v.strip():
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 # Piper voice: a "<name>.onnx" file (with its "<name>.onnx.json" sibling) under
 # TTS_VOICE_DIR. The default is prebaked into the image; swap via TTS_VOICE.
 TTS_VOICE = _env("TTS_VOICE", "en_US-lessac-medium")
@@ -59,7 +85,7 @@ TTS_VOICE_DIR = _env("TTS_VOICE_DIR", "/opt/tts-voices")
 TTS_MODEL_ID = _env("TTS_MODEL_ID", "tts-1")  # what /v1/models reports; OpenWebUI sends this back
 
 TTS_HOST = _env("TTS_HOST", "0.0.0.0")
-TTS_PORT = int(_env("TTS_PORT", "9001"))
+TTS_PORT = _env_int("TTS_PORT", 9001)
 
 # Load the voice during startup so /health reflects true readiness. Tests set
 # this false; they patch get_engine.
@@ -104,6 +130,67 @@ def get_engine():
 
 def engine_ready() -> bool:
     return _engine is not None
+
+
+# ---------------------------------------------------------------------------
+# Voice discovery — N6 housekeeping: OpenWebUI's "OpenAI" TTS engine calls
+# GET {base_url}/audio/voices before it will let a user pick a voice at all,
+# and 404s on it (logged 10x in the review window). Piper synthesis itself
+# never needed this — TTS_VOICE picks the one voice this process loads at
+# startup — so nothing here was missing until OpenWebUI's own voice picker
+# needed something to list.
+#
+# Response shape confirmed against OpenWebUI's own fetch (backend/open_webui/
+# routers/audio.py, the openai-engine branch of get_available_voices):
+# `GET {api_base_url}/audio/voices` -> `{"voices": [{"id": ..., "name": ...},
+# ...]}`, and it builds its voice picker as `{v["id"]: v["name"] for v in
+# data["voices"]}`. api_base_url is TTS_OPENAI_API_BASE_URL, which for this
+# service is the same `.../v1` root /v1/models and /v1/audio/speech already
+# answer under, so the path this file registers is /v1/audio/voices.
+# ---------------------------------------------------------------------------
+
+def list_voices() -> list[dict]:
+    """Every voice this piper install can actually speak with right now:
+    every "<id>.onnx" file under TTS_VOICE_DIR that has its "<id>.onnx.json"
+    config sibling (PiperVoice.load needs both — an .onnx with no config
+    next to it is not loadable, so it is not "available" and is skipped
+    rather than advertised as a choice that would 500 on synthesis).
+
+    Directory-driven, not TTS_VOICE-driven, deliberately: TTS_VOICE names
+    the ONE voice this process has loaded for /v1/audio/speech.
+    list_voices answers a different question — what COULD be selected —
+    which is exactly what OpenWebUI's voice picker is calling this endpoint
+    to populate. A single-voice image (today's default) still lists that
+    one voice; a TTS_VOICE_DIR with several prebaked voices lists all of
+    them without any other code path changing.
+
+    Never raises — a missing/unreadable TTS_VOICE_DIR, or a directory with
+    no matched onnx/json pair, falls back to advertising just the
+    configured TTS_VOICE. The loaded voice is still a true answer to
+    "what's available" even when the directory it came from can't be
+    re-listed right now; the caller (the /v1/audio/voices endpoint) has no
+    other data to fall back to, and losing the endpoint over a directory
+    read failure would return exactly the same 404-shaped brokenness this
+    exists to fix.
+    """
+    try:
+        names = set(os.listdir(TTS_VOICE_DIR))
+    except OSError as e:
+        logger.warning("could not list %s for voice discovery: %s", TTS_VOICE_DIR, e)
+        return [{"id": TTS_VOICE, "name": TTS_VOICE}]
+
+    voices = []
+    for n in sorted(names):
+        if not n.endswith(".onnx"):
+            continue
+        voice_id = n[: -len(".onnx")]
+        if f"{voice_id}.onnx.json" not in names:
+            continue  # .onnx with no sibling config isn't actually loadable
+        voices.append({"id": voice_id, "name": voice_id})
+
+    if not voices:
+        return [{"id": TTS_VOICE, "name": TTS_VOICE}]
+    return voices
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +338,11 @@ async def list_models():
         "object": "list",
         "data": [{"id": TTS_MODEL_ID, "object": "model", "owned_by": "piper"}],
     }
+
+
+@app.get("/v1/audio/voices")
+async def voices_endpoint():
+    return {"voices": list_voices()}
 
 
 @app.post("/v1/audio/speech")

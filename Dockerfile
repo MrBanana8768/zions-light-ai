@@ -37,6 +37,29 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 #   released since the base image was published.
 # - apt-get clean + autoremove + lists prune keeps the layer slim.
 # ~200 MB total — necessary tax for vLLM on a slim base.
+# - ffmpeg (v3.1.9): OpenWebUI's own audio router shells out to ffmpeg/ffprobe
+#   through pydub. That covers the read-aloud button (it transcodes the TTS
+#   server's WAV to MP3 on every call), splitting a recording over its 20 MB
+#   limit, and probing uploads. None of it was installed. The Whisper venv's
+#   `av` wheel bundles its own ffmpeg libraries for faster-whisper, but that
+#   is not a binary on PATH, and pydub needs the binary. Measured on
+#   v3.1.6.1-cu12 through OpenWebUI's API:
+#   - read-aloud returned HTTP 200 with a JSON "No such file or directory:
+#     'ffprobe'" body instead of audio, on every reply;
+#   - any recording over 20 MB failed in ~4 s.
+# - tzdata-legacy (v3.1.9): Ubuntu 24.04 split the IANA "backward" links
+#   (pre-merge zone names still in everyday use — US/Arizona, Asia/Calcutta,
+#   Europe/Kiev, Asia/Katmandu, America/Buenos_Aires, Asia/Saigon,
+#   America/Godthab, ...) out of the base `tzdata` package. Without it,
+#   COMPACTOR_TIMEZONE or a browser label naming one of those resolves to
+#   UTC — the exact failure the current-time feature exists to prevent —
+#   logging one ERROR/WARNING but never degrading `/health/full` (hostile
+#   pass #5, reviewer A, F1). Confirmed present for this base image/release
+#   (`apt-cache policy tzdata-legacy` on nvidia/cuda:13.0.0-runtime-ubuntu24.04:
+#   candidate 2026c-0ubuntu0.24.04.1, noble-updates). If a future base image
+#   does not carry this package, use the zone's CURRENT canonical name
+#   instead (e.g. `America/Phoenix`, not `US/Arizona`) — every zone this
+#   project documents already has one.
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
@@ -50,7 +73,9 @@ RUN apt-get update && \
         libgomp1 \
         supervisor \
         binutils \
-        build-essential && \
+        build-essential \
+        ffmpeg \
+        tzdata-legacy && \
     apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
@@ -135,8 +160,37 @@ RUN /opt/compactor-venv/bin/python -c \
 # vLLM's /tokenize cannot answer; without it the fallback is an estimator that
 # reads up to 51% low. The module no-ops safely if the import fails, so nothing
 # breaks — which is exactly why the absence has to fail the BUILD instead.
-RUN /opt/compactor-venv/bin/python -c \
-    "import mistral_common; print('local exact tokenization available: mistral_common', mistral_common.__version__)"
+#
+# AND THE TWO VENVS MUST AGREE ON THE VERSION (v3.1.7). vLLM declares
+# mistral_common[image]>=1.10.0 — an open lower bound — so the version IT
+# resolves moves on its own while the compactor's requirements.txt stays
+# pinned, and nothing enforces agreement. tokens.check_divergence exists to
+# catch the disagreement at runtime; this catches it at build time, which is
+# where it is cheap. A local tokenizer that silently disagrees with the
+# server doing the charging is the 2026-08-28 incident with a better
+# disguise: the wrong number is HARDER to disbelieve because it comes from
+# the right library.
+#
+# This is not hypothetical drift. Production runs vLLM 0.19.0, which resolves
+# mistral_common 1.11.7 — exactly what requirements.txt pins, so they agree
+# TODAY. But the default here is VLLM_VERSION=0.24.0 and the build command in
+# the header passes --build-arg VLLM_VERSION=0.19.0, so a rebuild that simply
+# forgets the flag gets a different vLLM, a different mistral_common, and no
+# warning at all. The guard fails that build instead of shipping it.
+RUN set -e; \
+    C=$(/opt/compactor-venv/bin/python -c "import mistral_common; print(mistral_common.__version__)"); \
+    V=$(/opt/vllm-venv/bin/python -c "import mistral_common; print(mistral_common.__version__)"); \
+    echo "local exact tokenization available: mistral_common ${C} (compactor) / ${V} (vllm ${VLLM_VERSION})"; \
+    if [ "${C}" != "${V}" ]; then \
+        echo "BUILD GUARD 3 FAILED: mistral_common differs between the venvs —" >&2; \
+        echo "  compactor-venv ${C} (pinned in compactor/requirements.txt)" >&2; \
+        echo "  vllm-venv      ${V} (resolved by vllm==${VLLM_VERSION})" >&2; \
+        echo "The compactor's local token count would disagree with the server" >&2; \
+        echo "that does the charging. Re-pin mistral_common in" >&2; \
+        echo "compactor/requirements.txt to ${V}, or build the vLLM version" >&2; \
+        echo "this image is pinned against." >&2; \
+        exit 1; \
+    fi
 
 # Pre-download the bge-small ONNX embedding model into the image so the
 # first request pays no download. Static weights belong in the image, not
@@ -148,9 +202,11 @@ RUN /opt/compactor-venv/bin/python -c \
 # =============================================================================
 # Whisper (STT) venv — V3.2. Fully decoupled from vLLM AND the compactor:
 # faster-whisper pulls ctranslate2 + av + onnxruntime into its OWN venv, so its
-# deps can never disturb vLLM's torch pins or the compactor's. av ships ffmpeg
-# in its wheel, so no apt ffmpeg is needed. Same install+strip+clean atomic
-# pattern as the other venvs.
+# deps can never disturb vLLM's torch pins or the compactor's. av ships the
+# ffmpeg LIBRARIES faster-whisper needs in its wheel. That covers this venv
+# only: OpenWebUI's pydub needs the ffmpeg/ffprobe BINARIES, which the apt
+# layer above installs (v3.1.9). Same install+strip+clean atomic pattern as
+# the other venvs.
 # =============================================================================
 COPY stt/requirements.txt /opt/stt/requirements.txt
 RUN python3 -m venv /opt/whisper-venv && \
@@ -219,6 +275,7 @@ RUN python3 -m venv /app/venv && \
 # runtime module explicitly to avoid pulling test_*.py and V2_PLAN.md
 # into the production image.
 COPY compactor/main.py /opt/compactor/main.py
+COPY compactor/envcfg.py /opt/compactor/envcfg.py
 COPY compactor/memory.py /opt/compactor/memory.py
 COPY compactor/facts.py /opt/compactor/facts.py
 COPY compactor/backfill.py /opt/compactor/backfill.py
@@ -233,9 +290,44 @@ COPY compactor/persona.py /opt/compactor/persona.py
 COPY compactor/backup.py /opt/compactor/backup.py
 COPY compactor/degrade.py /opt/compactor/degrade.py
 COPY compactor/bgwork.py /opt/compactor/bgwork.py
+COPY compactor/textclean.py /opt/compactor/textclean.py
 COPY compactor/tokens.py /opt/compactor/tokens.py
+COPY compactor/tokenhealth.py /opt/compactor/tokenhealth.py
+COPY compactor/tailhealth.py /opt/compactor/tailhealth.py
+COPY compactor/webuidb.py /opt/compactor/webuidb.py
 COPY compactor/logsetup.py /opt/compactor/logsetup.py
 COPY compactor/alert.py /opt/compactor/alert.py
+
+# BUILD GUARD: every compactor module must actually be in the image.
+#
+# v3.1.4 shipped with tokenhealth.py missing from the COPY list above and the
+# compactor went FATAL on boot in production - "ModuleNotFoundError: No module
+# named 'tokenhealth'" - with the chat path down until an operator hot-copied
+# the file in. The module was new in v3.1.3; the COPY line was not added with
+# it.
+#
+# Nothing could have caught that. The test suite mounts the SOURCE directory
+# over the container's, so 39/39 unit tests, the contract suite, the soak and
+# three adversarial review gates all ran against a file set the image does not
+# have. This is a packaging defect class, not a code one, and the enumerated
+# COPY list above is what arms it every time a module is added.
+#
+# So: import every entrypoint the same way supervisord does, at build time,
+# from the image's own /opt/compactor. A missing module, a syntax error or a
+# broken import fails the BUILD instead of production. Offline and
+# network-free by construction (verified) so it cannot flake:
+#   - uvicorn main:app          -> main
+#   - selftest.py --on-boot     -> selftest
+#   - backup.py --daemon        -> backup
+# plus the modules those pull in transitively, which is the whole package.
+RUN cd /opt/compactor && \
+    MODEL_REPO=buildguard VLLM_URL=http://127.0.0.1:1 \
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    COMPACTOR_STORAGE_ROOT=/tmp/buildguard LOG_DIR=/tmp/buildguard \
+    /opt/compactor-venv/bin/python -c \
+      "import main, selftest, backup, health, commands, portability, webuidb; \
+       print('build guard: every compactor entrypoint imports from the image')" \
+    && rm -rf /tmp/buildguard /opt/compactor/__pycache__
 
 # V3.2 — STT service source (copied late, after its venv, for cache efficiency).
 COPY stt/server.py /opt/stt/server.py
@@ -294,17 +386,58 @@ ENV COMPACTOR_BACKUP_ENABLED="true"
 ENV COMPACTOR_TARGET_TOKENS=""
 ENV COMPACTOR_KEEP_RECENT_TURNS="4"
 ENV COMPACTOR_SUMMARY_MAX_TOKENS="1024"
+# v3.1.9: raised from the code default (main.py, 0.5) alongside the four
+# other memory-budget rows in this file (owner's live pod change, v3.1.8,
+# applied by hand via supervisord environment= — lost on every restart).
+# Why the fraction had to move WITH the summary block cap, not alone:
+# inject_budget = effective_limit * INJECTION_BUDGET_FRACTION is shared by
+# persona + summary + facts + retrieval. At the raised facts/retrieval caps
+# (3500/3500) but the OLD fraction (0.5, ~10,384 tokens on her 20,768-token
+# window), retrieval — priority 3, dropped WHOLE when it does not fit
+# (_bound_injected_blocks) — would have been silently cut from every
+# request. At 0.6 (~12,460 tokens) retrieval has room, with the summary
+# block pinned below at what it already measured (6,230). Raise together;
+# do not raise one without the other.
+ENV COMPACTOR_INJECTION_BUDGET_FRACTION="0.6"
+# v3.1.9: same pod change; pinned at the summary block's own measured size
+# (code default, summarizer.py, is 12000 — this is LOWER, not raised,
+# because at the new fraction the summary block only needed this much to
+# stay whole; see the comment above).
+ENV COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS="6230"
 ENV VLLM_URL="http://localhost:8000"
 
 # V2.0 Phase 2 — facts memory
 ENV COMPACTOR_FACTS_EXTRACTION="true"
-ENV COMPACTOR_MAX_FACTS_TOKENS="1500"
+# v3.1.9: raised from the code default (facts.py, 1500) to what the owner
+# ran live on the pod since v3.1.8 via a supervisord environment= edit (lost
+# on every container restart) — this bakes that edit into the image so it
+# survives a restart/redeploy instead of needing to be reapplied by hand.
+# See the four related budget rows elsewhere in this file (INJECT_FACTS,
+# just below; MAX_RETRIEVAL_TOKENS in the RAG block; INJECTION_BUDGET_FRACTION
+# and SUMMARY_BLOCK_MAX_TOKENS above, in the context-compactor settings
+# block) — they were raised together, and INJECTION_BUDGET_FRACTION's own
+# comment explains why the fraction had to move with them. Does NOT change
+# compactor/facts.py's own coded default (1500); this is an environment
+# override only.
+ENV COMPACTOR_MAX_FACTS_TOKENS="3500"
+# v3.1.9: same pod change as above, injection-side twin of MAX_FACTS_TOKENS
+# (code default 400, facts.py).
+ENV COMPACTOR_INJECT_FACTS_TOKENS="600"
 ENV COMPACTOR_ADMIN_BIND="127.0.0.1"
+# v3.1.9: the model is told the current date and time, in her browser's zone.
+# COMPACTOR_TIMEZONE (the fallback) is deliberately NOT baked; see
+# RUNPOD_DEPLOY.md "The current date and time".
+ENV COMPACTOR_TIME_INJECTION="true"
 
 # V2.0 Phase 3 — episodic memory (RAG). Embedding model baked into the
 # image at /opt/embeddings; FASTEMBED_CACHE_PATH points there so no
 # runtime download. RAG can be disabled with COMPACTOR_RAG_ENABLED=false.
 ENV COMPACTOR_RAG_ENABLED="true"
+# v3.1.9: raised from the code default (retrieval.py, 1500) alongside the
+# other memory-budget rows above — see COMPACTOR_INJECTION_BUDGET_FRACTION's
+# comment for why the fraction bump matters here specifically (this is the
+# block that gets dropped whole if it does not fit).
+ENV COMPACTOR_MAX_RETRIEVAL_TOKENS="3500"
 ENV COMPACTOR_RAG_TOP_K="5"
 ENV COMPACTOR_EMBEDDING_MODEL="BAAI/bge-small-en-v1.5"
 ENV FASTEMBED_CACHE_PATH="/opt/embeddings"

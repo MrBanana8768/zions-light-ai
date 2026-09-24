@@ -83,6 +83,7 @@ from typing import Any, Callable, Awaitable
 import bgwork
 import facts as facts_module
 import portability
+import textclean
 from memory import StoreUnreadable, conv_lock, storage_root
 
 logger = logging.getLogger("compactor.commands")
@@ -120,6 +121,16 @@ _ALIASES: dict[str, str] = {
     "list-archive": "list-archive",
     "archive": "list-archive",
     "remember": "remember",
+    # v3.1.8: pin/unpin were in _HANDLERS, advertised by /help, and MISSING
+    # HERE — and parse_command returns (None, "") for any name not in this
+    # table, so `/pin <substring>` was forwarded to vLLM as ordinary chat.
+    # _handle_pin's own comment says "Without this command the pinned tier was
+    # unreachable code"; without these two lines it stayed unreachable, and
+    # R5's fix (a pinned fact surviving a merge) protected a flag no user could
+    # set. Registered in three places, wired in two — the recurring defect, on
+    # the feature whose comment warned about exactly this.
+    "pin": "pin",
+    "unpin": "unpin",
     "forget": "forget",
     "why": "why",
     "why-did-you-say-that": "why",
@@ -180,6 +191,9 @@ async def _handle_help(arg: str, conv_id: str, ctx: dict) -> str:
         "  /list-facts          Show what I'm remembering for this conversation\n"
         "  /list-archive        Show archived (cold-storage) facts\n"
         "  /remember <text>     Manually add a fact\n"
+        "  /pin <substring>     Always send matching facts, whatever the topic\n"
+        "  /pin                 List what is pinned\n"
+        "  /unpin <substring>   Stop always sending them\n"
         "  /forget              Clear ALL memory for this conversation\n"
         "  /forget <substring>  Remove only facts matching the substring\n"
         "  /tidy                Show extraction debris I could clean up "
@@ -200,7 +214,9 @@ async def _handle_list_facts(arg: str, conv_id: str, ctx: dict) -> str:
         return "No facts stored for this conversation yet."
     lines = [f"Current facts ({len(facts)}):"]
     for f in facts:
-        lines.append(f"  - {f['text']}")
+        # The pin marker is the only visible sign that ranking cannot drop
+        # this one; without it an operator cannot tell the tiers apart.
+        lines.append(f"  {'[pinned] ' if f.get('pin') else '- '}{f['text']}")
     return "\n".join(lines)
 
 
@@ -219,6 +235,25 @@ async def _handle_remember(arg: str, conv_id: str, ctx: dict) -> str:
         return "Usage: /remember <fact text>"
     if len(arg) > 500:
         return f"Fact too long ({len(arg)} chars) — keep it under 500."
+    # v3.1.8: the same cleaning the EXTRACTED path gets.
+    #
+    # facts.is_storable_fact's docstring names this function as one of the
+    # write paths that "should share one definition rather than grow three",
+    # and until now this one shared neither: no storability check and no
+    # decoration strip. `/remember ━━━ she prefers tea ━━━` put box characters
+    # straight into the store, which is then injected on every turn — exactly
+    # the feedback loop v3.1.8 exists to break, reached by the one route that
+    # skipped both guards. The recurring defect, on a function whose own
+    # docstring warned about it.
+    #
+    # Strip first, then judge: a decorated fact is a fact, and the words are
+    # what the user asked to be remembered.
+    arg = textclean.strip_rule_decoration(arg) or arg
+    if not facts_module.is_storable_fact(arg):
+        return (
+            f"That is markup rather than a fact, so it was not stored: {arg!r}. "
+            f"Try phrasing it as a sentence."
+        )
     now = int(time.time())
     # v3.1 F22: load-modify-write, so it holds the per-conv lock for the whole
     # sequence. Unlocked, this raced _async_tail's locked write in both
@@ -239,6 +274,59 @@ async def _handle_remember(arg: str, conv_id: str, ctx: dict) -> str:
         facts_module.save_facts(conv_id, kept)
     extra = f" (archived {dropped} least-recently-used to fit budget)" if dropped else ""
     return f"Remembered: {arg!r}{extra}\nFacts now: {len(kept)}"
+
+
+async def _handle_pin(arg: str, conv_id: str, ctx: dict) -> str:
+    """Pin facts so relevance ranking can never drop them.
+
+    F1 made fact injection top-K by relevance against the current message,
+    which is what stops a 1,500-token block of everything from being sent
+    every turn. The cost is that a fact only reaches the model when it looks
+    relevant, and identity does not: "her name is X" scores near zero on a
+    turn about dinner. Pinned facts bypass ranking and the budget entirely.
+
+    Without this command the pinned tier was unreachable code - facts.py
+    exposes set_pinned() and nothing called it - so the safety existed only
+    on paper.
+    """
+    if not arg:
+        pinned = [f for f in facts_module.load_facts(conv_id) if f.get("pin")]
+        if not pinned:
+            return (
+                "Nothing is pinned yet.\n"
+                "Usage: /pin <substring>   — always send facts matching it\n"
+                "       /unpin <substring> — stop always sending them\n"
+                "Pin the handful that must reach me every turn regardless of "
+                "topic: names, who we are to each other, standing preferences."
+            )
+        lines = [f"Pinned facts ({len(pinned)}) — always sent, never ranked:"]
+        lines += [f"  - {f['text']}" for f in pinned]
+        return "\n".join(lines)
+
+    async with conv_lock(conv_id):
+        current = facts_module.load_facts(conv_id)
+        n = facts_module.set_pinned(current, text_substring=arg, pinned=True)
+        if n:
+            facts_module.save_facts(conv_id, current)
+    if not n:
+        return f"No facts matched {arg!r}. /list-facts shows what I have."
+    return (
+        f"Pinned {n} fact(s) matching {arg!r}. They will now reach me on "
+        f"every turn, whatever we are talking about."
+    )
+
+
+async def _handle_unpin(arg: str, conv_id: str, ctx: dict) -> str:
+    if not arg:
+        return "Usage: /unpin <substring>   (/pin with no argument lists them)"
+    async with conv_lock(conv_id):
+        current = facts_module.load_facts(conv_id)
+        n = facts_module.set_pinned(current, text_substring=arg, pinned=False)
+        if n:
+            facts_module.save_facts(conv_id, current)
+    if not n:
+        return f"No pinned facts matched {arg!r}."
+    return f"Unpinned {n} fact(s) matching {arg!r}."
 
 
 async def _settle_background_work() -> bool:
@@ -890,17 +978,29 @@ _TIDY_FLAG_ORDER = (
 def _tidy_survivor_index(indices: list[int], rows: list[dict]) -> int:
     """Which copy of a byte-identical group to keep.
 
-    Highest (last_used, added_turn). Both are the eviction sort keys in
-    facts._lru_split, so keeping the maximum guarantees the surviving copy is
-    the one that would have outlived the others anyway: collapsing duplicates
-    can never move a fact FORWARD in the eviction queue. That matters because
-    dedup.py's merge already does the opposite (added_turn = min over the
-    cluster, MEMORY_REVIEW F-1) and pulls consolidated facts toward eviction.
-    This must not add a second mechanism doing that.
+    Highest (pin, last_used, added_turn) — the SAME key, in the same order,
+    that facts._lru_split sorts eviction by, so keeping the maximum guarantees
+    the surviving copy is the one that would have outlived the others anyway:
+    collapsing duplicates can never move a fact FORWARD in the eviction queue.
+    That matters because dedup.py's merge already does the opposite
+    (added_turn = min over the cluster, MEMORY_REVIEW F-1) and pulls
+    consolidated facts toward eviction. This must not add a second mechanism
+    doing that.
+
+    PIN FIRST, and it is not decoration here. /pin deliberately does not touch
+    last_used (facts.set_pinned; see _lru_split's own note on why a pin needs
+    an eviction exemption at all), so a pinned copy is typically the OLDER,
+    colder one — meaning a (last_used, added_turn) ranking with no pin term
+    picks the byte-identical UNPINNED copy as the survivor and silently
+    un-pins an identity fact, exactly the failure dedup._merge_metadata's
+    `"pin": any(...)` line exists to prevent on the other collapse path.
+    Both /tidy (_tidy_plan) and /retire (_retire_plan) rank through here, so
+    this one line covers both.
     """
     return max(
         indices,
         key=lambda i: (
+            bool(rows[i].get("pin")),
             int(rows[i].get("last_used", 0) or 0),
             int(rows[i].get("added_turn", 0) or 0),
             -i,
@@ -980,6 +1080,26 @@ def _tidy_plan(rows: list[dict]) -> dict:
 
 def _tidy_allowance(total: int) -> int:
     return max(TIDY_MIN_REMOVED_ALLOWANCE, int(total * TIDY_MAX_REMOVED_FRACTION))
+
+
+def _read_back_mismatch(actual: int, expected: int, label: str) -> str | None:
+    """Compare a post-write read-back against what the write itself intended.
+    None means they agree; otherwise the sentence to surface to the operator.
+
+    Report what is on disk, not what the write intended — the rule /forget's
+    verification pass established and /tidy's apply already followed for its
+    own store. Shared here (v3.1.7) rather than reimplemented, because
+    /retire needed the identical comparison and had never had it: /tidy's
+    version only ever WARNS after the fact (its one write already landed, has
+    nothing chained after it, and cannot be undone by refusing to report).
+    /retire's is load-bearing instead — see _handle_retire, which gates the
+    irreversible source-clearing step on this being None, because "the
+    destination write silently did not land" must never be followed by
+    "and now the source is empty too."
+    """
+    if actual == expected:
+        return None
+    return f"I expected {expected} {label} and read back {actual}."
 
 
 def _tidy_show(text: str) -> str:
@@ -1100,17 +1220,28 @@ def _tidy_render_plan(rows: list[dict], plan: dict) -> str:
     return "\n".join(lines)
 
 
+# The dry-run aliases both /tidy and /retire accept as their (default,
+# no-argument) first mode. ONE list, shared by both handlers below, because
+# two independently-typed lists is exactly how /retire ended up accepting
+# only "" and "apply" while /tidy grew five aliases for the same idea (v3.1.7):
+# a fix applied to one and never carried to its sibling. Neither command
+# treats these as distinct from each other — every name here means "show the
+# plan, change nothing" — so this is a set of synonyms, not a set of modes.
+_DRY_RUN_MODE_NAMES = ("", "dry-run", "dryrun", "plan", "preview", "show")
+_APPLY_MODE_NAME = "apply"
+
+
 async def _handle_tidy(arg: str, conv_id: str, ctx: dict) -> str:
     parts = arg.split()
     mode = parts[0].lower() if parts else ""
 
-    if mode in ("", "dry-run", "dryrun", "plan", "preview", "show"):
+    if mode in _DRY_RUN_MODE_NAMES:
         rows = facts_module.load_facts(conv_id)
         if not rows:
             return "No facts stored for this conversation — nothing to tidy."
         return _tidy_render_plan(rows, _tidy_plan(rows))
 
-    if mode != "apply":
+    if mode != _APPLY_MODE_NAME:
         return (
             f"Unknown option {parts[0]!r}.\n"
             "  /tidy              show what would be removed (changes nothing)\n"
@@ -1234,12 +1365,12 @@ async def _handle_tidy(arg: str, conv_id: str, ctx: dict) -> str:
             + " in that snapshot. The facts layer — the one I just changed — "
             "was verified."
         )
-    if after != len(keep_rows):
+    mismatch = _read_back_mismatch(after, len(keep_rows), "fact(s) to remain")
+    if mismatch:
         # A tail cannot have run inside the lock, so this means the write did
         # not do what it said. Say so rather than reporting the intent.
         lines.append(
-            f"Warning: I expected {len(keep_rows)} fact(s) to remain and read "
-            f"back {after}. Please run /tidy again and mention this."
+            f"Warning: {mismatch} Please run /tidy again and mention this."
         )
     return "\n".join(lines)
 
@@ -1400,7 +1531,10 @@ def _retire_plan(
     four inputs — no I/O, no clock — so the same pair of stores always yields
     the same plan and the same confirmation code.
 
-    Positions in the returned lists index `items`.
+    Positions in the returned lists index `items`. "dest_active_updates" and
+    "dest_archive_updates" index `dest_active` / `dest_archive` instead —
+    they are folded metadata (pin/last_used) for rows that are NOT moving
+    because they already matched the destination by text, per step 3 below.
     """
     rows = [f for _, f in items]
     drop: dict[str, list[int]] = {}
@@ -1417,10 +1551,18 @@ def _retire_plan(
     # 2. Exact duplicates WITHIN the source, across both its layers.
     #
     # Which copy survives is D6's _tidy_survivor_index — highest
-    # (last_used, added_turn) — for the reason its docstring gives: those are
-    # the eviction sort keys, so keeping the maximum guarantees collapsing
-    # duplicates can never move a fact FORWARD in the eviction queue. An
-    # active-layer copy outranks an archived one regardless, per _retire_items.
+    # (pin, last_used, added_turn) — for the reason its docstring gives: those
+    # are the eviction sort keys, so keeping the maximum guarantees collapsing
+    # duplicates can never move a fact FORWARD in the eviction queue, and the
+    # pinned copy of a byte-identical pair is never the one discarded. THIS
+    # CLAIM IS SCOPED TO STEP 2 — it is about which of two SOURCE copies
+    # survives to be considered for migration. It said nothing about step 3
+    # below, where a survivor can still be dropped for already matching the
+    # DESTINATION, and until R5 (v3.1.7) that step silently un-pinned exactly
+    # this way: a pinned source row byte-identical to an unpinned destination
+    # row was dropped outright, taking its pin with it. See step 3's own
+    # comment for how that is now handled. An active-layer copy outranks an
+    # archived one regardless, per _retire_items.
     by_text: dict[str, list[int]] = {}
     for pos in survivors:
         by_text.setdefault(rows[pos].get("text", "") or "", []).append(pos)
@@ -1441,23 +1583,55 @@ def _retire_plan(
     #
     # EXACT TEXT MATCH, and only exact. This is the one comparison in the
     # operation that can discard a real memory, so it is the one held to a
-    # standard nothing can argue with: byte-identical strings carry identical
-    # information, so dropping one of them loses nothing that the destination
-    # does not already hold. Every looser test — normalized, token overlap,
-    # embedding distance — has a threshold, and a threshold has a wrong side
-    # whose cost is a memory of her own life against a saving of a few dozen
-    # tokens. Near-matches are FLAGGED and MIGRATED, below; they are never a
-    # reason to drop.
-    dest_active_texts = {f.get("text", "") or "" for f in dest_active}
-    dest_archive_texts = {f.get("text", "") or "" for f in dest_archive}
+    # standard nothing can argue with: byte-identical TEXT carries identical
+    # information, so dropping one of the two rows loses no MEANING the
+    # destination does not already hold. Every looser test — normalized,
+    # token overlap, embedding distance — has a threshold, and a threshold
+    # has a wrong side whose cost is a memory of her own life against a
+    # saving of a few dozen tokens. Near-matches are FLAGGED and MIGRATED,
+    # below; they are never a reason to drop.
+    #
+    # Byte-identical TEXT is not byte-identical METADATA, though, and that
+    # was R5's (v3.1.7) second half: this step dropped the source row outright
+    # on a text match, so a pinned source copy matching an unpinned
+    # destination copy lost its pin with no trace — step 2's guarantee a few
+    # lines up ("the pinned copy... is never the one discarded") read as
+    # covering this too, and did not. The row still does not migrate — the
+    # text is genuinely redundant — but its pin/last_used are folded into the
+    # destination's copy via the same portability._merge_fact_pin_and_recency
+    # merge_conversation uses for its own collisions, so the destination row
+    # is updated (dest_active_updates / dest_archive_updates, applied by the
+    # caller) rather than left untouched underneath a row that is about to
+    # vanish.
+    dest_active_by_text: dict[str, int] = {}
+    for i, f in enumerate(dest_active):
+        dest_active_by_text.setdefault(f.get("text", "") or "", i)
+    dest_archive_by_text: dict[str, int] = {}
+    for i, f in enumerate(dest_archive):
+        dest_archive_by_text.setdefault(f.get("text", "") or "", i)
+
     migrate_active: list[int] = []
     migrate_archive: list[int] = []
+    # Keyed by index into dest_active / dest_archive (this function's own
+    # inputs) so the caller can apply the fold to the exact rows it read and
+    # is about to write back — never to a re-read that step 3 didn't itself
+    # classify against.
+    dest_active_updates: dict[int, dict] = {}
+    dest_archive_updates: dict[int, dict] = {}
     for pos in survivors:
         text = rows[pos].get("text", "") or ""
-        if text in dest_active_texts:
+        if text in dest_active_by_text:
             drop.setdefault("already-in-destination", []).append(pos)
-        elif text in dest_archive_texts:
+            di = dest_active_by_text[text]
+            folded = portability._merge_fact_pin_and_recency(dest_active[di], rows[pos])
+            if folded != dest_active[di]:
+                dest_active_updates[di] = folded
+        elif text in dest_archive_by_text:
             drop.setdefault("already-in-destination-archive", []).append(pos)
+            di = dest_archive_by_text[text]
+            folded = portability._merge_fact_pin_and_recency(dest_archive[di], rows[pos])
+            if folded != dest_archive[di]:
+                dest_archive_updates[di] = folded
         elif items[pos][0] == "active":
             migrate_active.append(pos)
         else:
@@ -1516,6 +1690,13 @@ def _retire_plan(
         "migrate_archive": migrate_archive,
         "flag_by_rule": flags,
         "token": token,
+        # index (into the dest_active / dest_archive this call was given) ->
+        # the merged row to write there. R5 (v3.1.7): step 3 above folds a
+        # dropped source row's pin/last_used into the destination's matching
+        # row rather than discarding them; the caller applies these before
+        # persisting dest_active / dest_archive.
+        "dest_active_updates": dest_active_updates,
+        "dest_archive_updates": dest_archive_updates,
     }
 
 
@@ -1743,11 +1924,23 @@ def _retire_render_plan(
     )
     lines.append(
         "  provenance is NOT written onto the row. facts.load_facts rebuilds "
-        "every entry as exactly {text, added_turn, last_used}, so any extra "
+        "every entry as exactly {text, added_turn, last_used, pin}, so any extra "
         "key is dropped on the next read. Where each fact came from is in the "
         "snapshot and the log instead."
     )
     lines.append("")
+
+    n_dest_updates = len(plan["dest_active_updates"]) + len(plan["dest_archive_updates"])
+    if n_dest_updates:
+        lines.append(
+            f"{n_dest_updates} row(s) in the WOULD NOT MOVE list above matched "
+            f"a destination fact by text, but weren't a plain no-op: this "
+            f"conversation's copy will pick up the source row's pin (if it was "
+            f"pinned and this one wasn't) and the more recent of the two "
+            f"last_used values. Nothing about the destination's own wording "
+            f"or added_turn changes."
+        )
+        lines.append("")
 
     if dest_after["over_budget"]:
         lines.append(
@@ -1789,7 +1982,16 @@ def _retire_dest_projection(
     estimate this file would have to keep in step with facts.py."""
     incoming = [plan["rows"][p] for p in plan["migrate_active"]]
     after = list(dest_active) + incoming
-    injectable = len(facts_module.select_for_injection(after))
+    # The STORE cap, explicitly. select_for_injection's own default became
+    # the INJECTION cap (400) when F1 decoupled the two, so a bare call here
+    # started reporting "over budget" for virtually every real store and
+    # attaching an explanation that is no longer true - facts between the
+    # injection cap and the store cap stay active and are simply not all
+    # injected on a given turn. What this preview is actually about is what
+    # survives the MOVE, so it asks the question it means.
+    injectable = len(
+        facts_module.select_for_injection(after, max_tokens=facts_module._MAX_FACTS_TOKENS)
+    )
     return {
         "before_active": len(dest_active),
         "before_archive": len(dest_archive),
@@ -1830,13 +2032,13 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
         )
 
     mode = parts[1].lower() if len(parts) > 1 else ""
-    if mode not in ("", "apply"):
+    if mode not in _DRY_RUN_MODE_NAMES and mode != _APPLY_MODE_NAME:
         return (
             f"Unknown option {parts[1]!r}. I have changed nothing.\n\n"
             + _RETIRE_USAGE
         )
 
-    if mode == "":
+    if mode in _DRY_RUN_MODE_NAMES:
         source_active = facts_module.load_facts(source_id)
         source_archive = facts_module.load_archive(source_id)
         layers = _retire_other_layers(source_id)
@@ -1960,6 +2162,20 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
                     f"problem on my side — please mention it."
                 )
 
+            # 1b. Fold pin/last_used onto destination rows that matched a
+            #     dropped (not migrated) source row byte-for-byte — R5's
+            #     /retire sibling (v3.1.7). This has to land BEFORE the
+            #     migrate step below: dest_archive_updates is applied via
+            #     save_archive here, and archive_facts (next) re-reads the
+            #     archive off disk, so writing the fold first is what keeps
+            #     archive_facts from overwriting it with the pre-fold copy.
+            if plan["dest_archive_updates"]:
+                for i, updated in plan["dest_archive_updates"].items():
+                    dest_archive[i] = updated
+                facts_module.save_archive(conv_id, dest_archive)
+            for i, updated in plan["dest_active_updates"].items():
+                dest_active[i] = updated
+
             # 2. MIGRATE, and only then remove. Cold storage first, on
             #    archive_facts' own ordering rule; both are additions, so an
             #    interruption here leaves rows in two places — which the next
@@ -1968,8 +2184,46 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
             move_archive = [plan["rows"][p] for p in plan["migrate_archive"]]
             move_active = [plan["rows"][p] for p in plan["migrate_active"]]
             n_arch = facts_module.archive_facts(conv_id, move_archive)
-            if move_active:
+            if move_active or plan["dest_active_updates"]:
                 facts_module.save_facts(conv_id, dest_active + move_active)
+
+            # 2b. VERIFY the destination before touching the source (v3.1.7).
+            #     Previously this read back nothing: a destination write that
+            #     silently did not land (a permissions error, a full disk, a
+            #     bad interleave — the exact class /tidy's own read-back
+            #     exists to catch) meant the reply said "Moved N fact(s)"
+            #     while step 3 went on to empty the source anyway, and the
+            #     facts were gone from both conversations at once. Ordering
+            #     is destination-write, then verify, then source-clear: a
+            #     failed verify returns here and step 3 never runs, so the
+            #     source is untouched and the quarantine snapshot already
+            #     written is the recovery path.
+            active_mismatch = _read_back_mismatch(
+                len(facts_module.load_facts(conv_id)),
+                len(dest_active) + len(move_active),
+                "active fact(s) in the destination after the move",
+            )
+            archive_mismatch = _read_back_mismatch(
+                len(facts_module.load_archive(conv_id)),
+                len(dest_archive) + len(move_archive),
+                "archived fact(s) in the destination after the move",
+            )
+            if active_mismatch or archive_mismatch:
+                logger.error(
+                    f"conv={source_id}: /retire aborted before touching the "
+                    f"source — destination {conv_id} read-back disagreed: "
+                    f"{'; '.join(m for m in (active_mismatch, archive_mismatch) if m)}"
+                )
+                return (
+                    f"I have changed nothing in {source_id}. The move into "
+                    f"this conversation did not read back the way I expected "
+                    f"({'; '.join(m for m in (active_mismatch, archive_mismatch) if m)}), "
+                    f"so I am refusing to empty {source_id} on top of an "
+                    f"uncertain destination write. A verified snapshot of "
+                    f"{source_id} is at {snap['path']} and nothing there has "
+                    f"been touched. This is a problem on my side — please "
+                    f"mention it."
+                )
 
             # 3. Now empty the source. Sidecar, then the active set, then the
             #    layers that are not facts.
@@ -2004,7 +2258,8 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
         f"conv={source_id}: /retire into {conv_id} moved {n_move} fact(s) "
         f"({len(move_active)} active, {n_arch} archived), dropped {n_drop} "
         f"({', '.join(f'{r}={len(v)}' for r, v in sorted(plan['drop_by_rule'].items())) or 'none'}), "
-        f"cleared [{', '.join(cleared) or 'no other layer'}]; "
+        f"folded pin/last_used onto {len(plan['dest_active_updates']) + len(plan['dest_archive_updates'])} "
+        f"existing destination row(s), cleared [{', '.join(cleared) or 'no other layer'}]; "
         f"snapshot={snap['path'].name}"
     )
 
@@ -2016,6 +2271,13 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
         f"This conversation now has {after_dest_active} active fact(s) and "
         f"{after_dest_archive} archived.",
     ]
+    n_dest_updates = len(plan["dest_active_updates"]) + len(plan["dest_archive_updates"])
+    if n_dest_updates:
+        lines.append(
+            f"{n_dest_updates} row(s) already here picked up a pin and/or a "
+            f"newer last_used from their dropped, byte-identical counterpart "
+            f"in {source_id}."
+        )
     if n_drop:
         lines.append(
             f"Did not move {n_drop} row(s) — every one of them is in the "
@@ -2068,6 +2330,8 @@ _HANDLERS: dict[str, Handler] = {
     "list-facts": _handle_list_facts,
     "list-archive": _handle_list_archive,
     "remember": _handle_remember,
+    "pin": _handle_pin,
+    "unpin": _handle_unpin,
     "forget": _handle_forget,
     "why": _handle_why,
     "tidy": _handle_tidy,

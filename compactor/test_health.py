@@ -14,6 +14,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -517,6 +518,252 @@ def test_broken_storage_reports_its_reason_too():
 
 
 # ---------------------------------------------------------------------------
+# Memory-tail skips must reach `status` (v3.1.4)
+#
+# The defect: a reply that did not enter memory — she hit Stop, vLLM hit the
+# ceiling, the accumulator dropped a chunk — was a WARNING line and nothing
+# else. 63 skipped exchanges in one 2026-09-01 log window, more than half her
+# recent conversation, and /health/full said ok throughout. These pin the
+# chain the same way the shedding tests above do: the counter reaches
+# `status`, `status_reasons` says which condition it was and how many, a
+# stale skip does not pin the endpoint degraded forever, and an unreadable
+# counter does not read as a healthy one. One test uses the REAL tailhealth
+# module rather than a fake, so a health.py that reads a fake correctly but
+# never imports the real counter cannot pass.
+# ---------------------------------------------------------------------------
+
+import tailhealth  # noqa: E402
+
+
+def _quiet_tail(**over):
+    """A tail that is doing its job: everything stored, nothing skipped."""
+    base = {
+        "stored": 40, "skipped": 0, "outcomes": {}, "consecutive_skips": 0,
+        "last_skip_outcome": None, "seconds_since_last_skip": None,
+        "skipped_recently": False, "skip_window_s": 300.0,
+        "raw_chars": 0, "kept_chars": 0, "trimmed_raw_chars": 0,
+        "trimmed_kept_chars": 0, "trim_retention": None,
+    }
+    base.update(over)
+    return base
+
+
+class _BrokenTail:
+    def __call__(self):
+        raise RuntimeError("counter is wedged")
+
+
+@contextlib.contextmanager
+def _tail_reporting(snap):
+    fn = snap if isinstance(snap, _BrokenTail) else (lambda **kw: snap)
+    with patch("tailhealth.snapshot", new=fn):
+        yield
+
+
+def test_tail_skips_degrade_the_status():
+    print("\n[test] recent memory-tail skips make /health/full 'degraded'")
+
+    async def go():
+        with _healthy_vllm(), _pool_reporting(_quiet_pool()), _tail_reporting(_quiet_tail(
+            skipped=63, consecutive_skips=7, seconds_since_last_skip=12.0,
+            skipped_recently=True, last_skip_outcome="skipped_no_boundary",
+        )):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(r["status"], "degraded", "skipping is NOT 'ok'")
+    joined = " | ".join(r["status_reasons"])
+    assert_true("memory tail" in joined, "the reason names the memory tail")
+    assert_true("63" in joined, "and how many replies were not memorized")
+    assert_true("7 consecutive" in joined, "and the streak")
+    assert_true("12.0" in joined, "and how long ago the last one was")
+    assert_true("skipped_no_boundary" in joined, "and the last machine outcome")
+    assert_eq(r["memory_tail"]["skipped"], 63, "the block is in the payload")
+
+
+def test_a_tail_skip_long_ago_is_ok_again():
+    """The stale-skip case. Degrading on the CUMULATIVE count would pin the
+    endpoint 'degraded' from the first skip until the next restart — and a
+    warning that is always on is a warning nobody reads, which is how the
+    endpoint became decoration in the first place (v3.1 A11)."""
+    print("\n[test] a skip outside the window is 'ok' again, count intact")
+
+    async def go():
+        with _healthy_vllm(), _pool_reporting(_quiet_pool()), _tail_reporting(_quiet_tail(
+            skipped=63, consecutive_skips=63, seconds_since_last_skip=901.0,
+            skipped_recently=False, last_skip_outcome="skipped_no_boundary",
+        )):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(r["status"], "ok", "an aged-out skip does not pin 'degraded'")
+    assert_eq(r["status_reasons"], [], "and nothing is reported")
+    assert_eq(r["memory_tail"]["skipped"], 63,
+              "the cumulative count is still in the payload as history")
+
+
+def test_unreadable_tail_counter_is_not_reported_as_healthy():
+    print("\n[test] a tail counter we cannot read degrades rather than reading 'ok'")
+
+    async def go():
+        with _healthy_vllm(), _pool_reporting(_quiet_pool()), _tail_reporting(_BrokenTail()):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(r["status"], "degraded", "unobservable != healthy")
+    assert_true(any("memory tail unobservable" in x for x in r["status_reasons"]),
+                "and the reason says we could not see it")
+    assert_true("error" in r["memory_tail"], "the payload carries the error")
+
+
+def test_tail_skips_still_answer_200():
+    """Same deliberate choice as shedding: the signal belongs in the body.
+    Restarting the container would not bring the skipped memories back and
+    would kill every in-flight chat."""
+    print("\n[test] a skipping tail stays HEALTHY to Docker; the body carries it")
+
+    async def go():
+        with _healthy_vllm(), _pool_reporting(_quiet_pool()), _tail_reporting(_quiet_tail(
+            skipped=3, consecutive_skips=3, seconds_since_last_skip=2.0,
+            skipped_recently=True, last_skip_outcome="skipped_too_short",
+        )):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(health.status_to_http_code(r["status"]), 200, "200 — do not restart")
+    assert_true(r["status_reasons"], "but the body is not silent about it")
+
+
+def test_tail_reason_joins_the_others():
+    """Three things wrong report as three, not as whichever came first."""
+    print("\n[test] a tail skip is listed alongside vLLM and shedding")
+
+    async def go():
+        with patch("health.probe_vllm", new=AsyncMock(return_value={
+            "ok": False, "latency_ms": 3000.0, "models": [], "error": "timeout",
+        })), _pool_reporting(_quiet_pool(
+            shed=3, seconds_since_last_shed=1.0, shed_recently=True,
+        )), _tail_reporting(_quiet_tail(
+            skipped=1, consecutive_skips=1, seconds_since_last_skip=1.0,
+            skipped_recently=True, last_skip_outcome="skipped_holed",
+        )):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(len(r["status_reasons"]), 3, "ALL THREE conditions listed")
+
+
+def test_the_real_counter_is_wired():
+    """Not a fake: drive the real tailhealth module and read it back through
+    health. A health.py that handled a patched snapshot correctly but never
+    imported the real one would pass every test above and still be blind."""
+    print("\n[test] the REAL tailhealth counter reaches /health/full")
+    tailhealth._reset_for_tests()
+    try:
+        async def go():
+            with _healthy_vllm(), _pool_reporting(_quiet_pool()):
+                before = await health.gather_health_full("http://fake", 4096)
+                tailhealth.note(tailhealth.SKIPPED_NO_BOUNDARY, raw_chars=812, kept_chars=0)
+                tailhealth.note(tailhealth.SKIPPED_TOO_SHORT, raw_chars=400, kept_chars=0)
+                after = await health.gather_health_full("http://fake", 4096)
+                return before, after
+
+        before, after = asyncio.run(go())
+        assert_eq(before["status"], "ok", "fresh counter: ok")
+        assert_eq(before["memory_tail"]["skipped"], 0, "and the block reads 0")
+        assert_eq(after["status"], "degraded", "two real skips: degraded")
+        assert_eq(after["memory_tail"]["skipped"], 2, "the real count is in the payload")
+        assert_eq(after["memory_tail"]["last_skip_outcome"], "skipped_too_short",
+                  "with the real last outcome")
+        assert_true(any("2 reply(ies)" in x for x in after["status_reasons"]),
+                    "and the reason carries the real number")
+    finally:
+        tailhealth._reset_for_tests()
+
+
+def test_an_empty_reply_skip_does_not_degrade_status():
+    """v3.1.7, R27. SKIPPED_EMPTY is she-hit-Stop-before-the-first-token:
+    there was never any text to memorize, so it is the one skip label that
+    carries no loss. Keying the degrade decision off "any skip" made a run of
+    these — the release's own figure is 51 of 63 skips in one window were
+    manual stops — pin /health/full degraded for a turn that lost nothing.
+    Mirrors test_tail_skips_degrade_the_status exactly except for the
+    outcome label, so the only variable is whether that label degrades.
+
+    v3.1.9 (H-2): 63 skips, but the CURRENT RUN of empties is one short of
+    tailhealth.EMPTY_RUN_DEGRADE. A run at the limit is an outage and does
+    degrade - test_health_signals.py pins that side. This used to put the
+    run at 63 as well, which asserted exactly the state H-2 found: a backend
+    returning nothing, reply after reply, reading "ok"."""
+    print("\n[test] an empty-reply skip alone does NOT degrade /health/full")
+    below = tailhealth.EMPTY_RUN_DEGRADE - 1
+
+    async def go():
+        with _healthy_vllm(), _pool_reporting(_quiet_pool()), _tail_reporting(_quiet_tail(
+            skipped=63, consecutive_skips=below, seconds_since_last_skip=0.0,
+            skipped_recently=False, last_skip_outcome="skipped_empty",
+            consecutive_empty_replies=below, empty_replies_degraded=False,
+        )):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(r["status"], "ok", "an empty-reply skip is not memory loss")
+    assert_eq(r["status_reasons"], [], "so nothing is reported")
+    assert_eq(r["memory_tail"]["skipped"], 63,
+              "the cumulative count is still in the payload as history")
+
+
+def test_the_real_counter_does_not_degrade_on_empty_skips_alone():
+    """Not a fake: drive the real tailhealth.note() with SKIPPED_EMPTY only,
+    the way test_the_real_counter_is_wired drives it with lossy outcomes. A
+    health.py/tailhealth.py pair that passed every mocked test above but
+    still computed `skipped_recently` off ANY skip internally would be blind
+    to this.
+
+    v3.1.9 (H-2): the empties are split into runs shorter than
+    tailhealth.EMPTY_RUN_DEGRADE by a reply that carried text, which is what
+    a person pressing Stop now and then looks like. 63 empties IN A ROW is a
+    backend that has stopped generating, and degrades by design (pinned in
+    test_health_signals.py); this used to assert that it read "ok"."""
+    print("\n[test] the REAL tailhealth counter: empty skips alone stay 'ok'")
+    tailhealth._reset_for_tests()
+    try:
+        run = tailhealth.EMPTY_RUN_DEGRADE - 1
+
+        async def go():
+            with _healthy_vllm(), _pool_reporting(_quiet_pool()):
+                n = 0
+                while n < 63:
+                    for _ in range(min(run, 63 - n)):
+                        tailhealth.note(tailhealth.SKIPPED_EMPTY, raw_chars=0, kept_chars=0)
+                        n += 1
+                    if n < 63:
+                        tailhealth.note(tailhealth.STORED, raw_chars=900, kept_chars=900)
+                return await health.gather_health_full("http://fake", 4096)
+
+        r = asyncio.run(go())
+        assert_eq(r["status"], "ok", "63 real empty skips, in short runs: still ok")
+        assert_eq(r["status_reasons"], [], "nothing reported")
+        assert_eq(r["memory_tail"]["outcomes"]["skipped_empty"], 63,
+                  "but the record shows all 63")
+        assert_eq(r["memory_tail"]["skipped"], 63, "and they are the only skips")
+        assert_eq(r["memory_tail"]["last_skip_outcome"], "skipped_empty",
+                  "with the real last outcome")
+
+        # A LOSSY skip afterward still degrades — the fix must not have made
+        # tailhealth blind to real loss, only to the zero-loss label.
+        async def go2():
+            with _healthy_vllm(), _pool_reporting(_quiet_pool()):
+                tailhealth.note(tailhealth.SKIPPED_NO_BOUNDARY, raw_chars=100, kept_chars=0)
+                return await health.gather_health_full("http://fake", 4096)
+
+        r2 = asyncio.run(go2())
+        assert_eq(r2["status"], "degraded", "a real lossy skip still degrades")
+    finally:
+        tailhealth._reset_for_tests()
+
+
+# ---------------------------------------------------------------------------
 # The store scan must not run on the event loop (v3.1 A12)
 # ---------------------------------------------------------------------------
 
@@ -647,10 +894,175 @@ def _all_tests():
         test_shedding_still_answers_200,
         test_ok_carries_an_empty_reason_list,
         test_broken_storage_reports_its_reason_too,
+        # v3.1.4 — memory-tail skips have to reach `status`, and say so.
+        test_tail_skips_degrade_the_status,
+        test_a_tail_skip_long_ago_is_ok_again,
+        test_unreadable_tail_counter_is_not_reported_as_healthy,
+        test_tail_skips_still_answer_200,
+        test_tail_reason_joins_the_others,
+        test_the_real_counter_is_wired,
+        # v3.1.7, R27 — SKIPPED_EMPTY carries no loss and must not degrade.
+        test_an_empty_reply_skip_does_not_degrade_status,
+        test_the_real_counter_does_not_degrade_on_empty_skips_alone,
         # v3.1 A12 — the store scan must not block the one event loop.
         test_blocking_probes_run_off_the_event_loop,
         test_loop_stays_responsive_while_the_scan_runs,
+        test_snapshot_probe_is_silent_when_the_gate_is_off,
+        test_snapshot_probe_flags_a_snapshot_that_stopped_refreshing,
+        test_snapshot_probe_treats_a_missing_snapshot_as_stale,
+        test_hierarchy_lag_is_measured_and_reported,
+        test_hierarchy_lag_surfaces_as_a_status_reason,
     ]
+
+
+def test_snapshot_probe_is_silent_when_the_gate_is_off():
+    """With WEBUI_DB_LOCAL=false the snapshot IS the live database.
+
+    Its mtime moves on every message, so "stale" would be meaningless, and a
+    number nobody should read is worse than no number. watched=False says so.
+    """
+    print("")
+    print("[test] snapshot probe: not watched when the sync daemon is off")
+    with patch.dict(os.environ, {"WEBUIDB_SYNC_ENABLED": "false"}):
+        out = health.probe_snapshot()
+    assert_eq(out["watched"], False, "watched is False")
+    assert_eq(out["stale"], False, "and it does not claim staleness")
+    assert_eq(out["age_s"], None, "and reports no age rather than a wrong one")
+
+
+def test_snapshot_probe_flags_a_snapshot_that_stopped_refreshing():
+    """The one condition where /data holds no copy that survives a recreate.
+
+    sync_loop shouted three times and went quiet; this endpoint never looked.
+    The result was a pod reporting "ok", chat working perfectly, and an
+    unbounded durability gap.
+    """
+    print("")
+    print("[test] snapshot probe: a stale snapshot is flagged, a fresh one is not")
+    snap = os.path.join(_TMP_ROOT, "snapshot-webui.db")
+    with open(snap, "wb") as fh:
+        fh.write(b"x")
+    env = {
+        "WEBUIDB_SYNC_ENABLED": "true",
+        "WEBUI_SNAPSHOT_DB": snap,
+        "WEBUI_DB_SYNC_INTERVAL_S": "300",
+    }
+
+    # Fresh: just written, well inside one interval.
+    with patch.dict(os.environ, env):
+        fresh = health.probe_snapshot()
+    assert_eq(fresh["watched"], True, "watched is True when the daemon owns it")
+    assert_eq(fresh["stale"], False, "a just-written snapshot is not stale")
+
+    # Stale: four intervals of age, past the three-interval threshold.
+    old = time.time() - (4 * 300)
+    os.utime(snap, (old, old))
+    with patch.dict(os.environ, env):
+        gone = health.probe_snapshot()
+    assert_eq(gone["stale"], True, "four intervals of age reads as stale")
+    assert_true(gone["age_s"] >= 3 * 300, "and the age is reported")
+
+    # CONTROL on the threshold itself: two intervals must NOT trip it, or the
+    # check is just "any age at all" and cries wolf on every slow cycle.
+    recent = time.time() - (2 * 300)
+    os.utime(snap, (recent, recent))
+    with patch.dict(os.environ, env):
+        ok = health.probe_snapshot()
+    assert_eq(ok["stale"], False,
+              "two intervals is an overrun, not a dead daemon")
+
+
+def test_snapshot_probe_treats_a_missing_snapshot_as_stale():
+    """Missing is worse than stale, not better.
+
+    The daemon is supposed to be writing this file. Reporting a quiet False on
+    an OSError would be the same silence the probe exists to end.
+    """
+    print("")
+    print("[test] snapshot probe: an absent snapshot is not a quiet pass")
+    with patch.dict(os.environ, {
+        "WEBUIDB_SYNC_ENABLED": "true",
+        "WEBUI_SNAPSHOT_DB": os.path.join(_TMP_ROOT, "does-not-exist.db"),
+    }):
+        out = health.probe_snapshot()
+    assert_eq(out["stale"], True, "absent reads as stale")
+    assert_true(out["error"], "with the reason attached")
+
+
+def test_hierarchy_lag_is_measured_and_reported():
+    """The rollup's only observable.
+
+    v3.1.8's skip-path rollup has six ways to do nothing, five of them
+    completely silent, and the failure it exists to fix - a soak ending with
+    last_summarized_turn still 0 - reported status "ok" with empty reasons.
+    """
+    print("")
+    print("[test] hierarchy lag: measured by the scan and named by conversation")
+    cid = "lagging_conv"
+    st = summarizer.load_state(cid)
+    st["l1"] = [{"text": "a scene", "first_turn": 1, "last_turn": 20}]
+    st["last_summarized_turn"] = 20
+    st["turns_seen"] = 20 + (3 * summarizer.L1_CHUNK_SIZE)
+    summarizer.save_state(cid, st)
+
+    stats = health.gather_memory_stats()
+    assert_eq(stats["hierarchy_lag"], 3 * summarizer.L1_CHUNK_SIZE,
+              "the scan measured turns_seen - last_summarized_turn")
+    assert_eq(stats["hierarchy_lag_conv"], cid, "and named the conversation")
+
+    # CONTROL: a conversation keeping pace must NOT be reported, or this
+    # degrades every healthy pod and gets switched off within a week.
+    st["last_summarized_turn"] = st["turns_seen"]
+    summarizer.save_state(cid, st)
+    caught_up = health.gather_memory_stats()
+    assert_eq(caught_up["hierarchy_lag"], 0,
+              "a hierarchy that has kept pace reports no lag")
+
+
+def test_hierarchy_lag_surfaces_as_a_status_reason():
+    """Measuring it is half the fix; SAYING it is the half that matters.
+
+    stats.hierarchy_lag in the payload is what stats.unreadable used to be -
+    a number nobody reads, inside a body whose top line says everything is
+    fine. This asserts the reason, and asserts a caught-up hierarchy stays
+    quiet, because a check that degrades a healthy pod is switched off within
+    a week.
+    """
+    print("")
+    print("[test] hierarchy lag: degrades the pod, and only when it should")
+    cid = "lag_reason_conv"
+    st = summarizer.load_state(cid)
+    st["l1"] = [{"text": "a scene", "first_turn": 1, "last_turn": 20}]
+    st["last_summarized_turn"] = 20
+    st["turns_seen"] = 20 + (3 * summarizer.L1_CHUNK_SIZE)
+    summarizer.save_state(cid, st)
+
+    async def go():
+        with patch("health.probe_vllm", new=AsyncMock(return_value={
+            "ok": True, "latency_ms": 10.0, "models": ["m"], "error": None,
+        })):
+            return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_eq(r["status"], "degraded", "a lagging hierarchy degrades the pod")
+    assert_true(
+        any("summary hierarchy is" in x for x in r["status_reasons"]),
+        "and says so by name: %r" % (r["status_reasons"],),
+    )
+
+    # CONTROL, and it is ONE CHUNK of lag rather than zero on purpose.
+    # The rollup fires on the tail, so the newest turns are always ahead
+    # of the watermark - a hierarchy is never caught up in the strict
+    # sense. A control at zero would pass with the threshold set to 0 and
+    # would leave every healthy pod degraded. This pins the boundary.
+    st["last_summarized_turn"] = st["turns_seen"] - summarizer.L1_CHUNK_SIZE
+    summarizer.save_state(cid, st)
+    r2 = asyncio.run(go())
+    assert_true(
+        not any("summary hierarchy is" in x for x in r2["status_reasons"]),
+        "one chunk of ordinary drift raises no reason: %r"
+        % (r2["status_reasons"],),
+    )
 
 
 if __name__ == "__main__":
