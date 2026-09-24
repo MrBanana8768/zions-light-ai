@@ -98,7 +98,9 @@ from typing import Any, Callable, Awaitable
 
 import backfill
 import bgwork
+import continuity
 import facts as facts_module
+import memory
 import portability
 import textclean
 from memory import StoreUnreadable, bump_wipe_generation, conv_lock, storage_root
@@ -618,10 +620,28 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
             needle = arg.lower()
             to_keep = [f for f in existing if needle not in f.get("text", "").lower()]
             removed = len(existing) - len(to_keep)
+            # v3.1.9.8 `.15g`, r10 review R10-B2 (MEDIUM): this MUST run
+            # before the "No facts matched" early return below. A needle
+            # can live only in a continuity-band digest and in no fact
+            # record at all — the original ordering silently skipped
+            # exactly that case, so `/forget X` for a word she only said
+            # inside an exchange (never extracted as a fact) reported
+            # success on nothing and left the digest untouched.
+            band_suppressed = continuity.suppress_needle(conv_id, arg)
             if removed == 0:
+                if band_suppressed:
+                    noun = "summary" if band_suppressed == 1 else "summaries"
+                    return (
+                        f"No facts matched {arg!r}, but removed it from "
+                        f"{band_suppressed} remembered exchange {noun}."
+                    )
                 return f"No facts matched {arg!r}."
             facts_module.save_facts(conv_id, to_keep)
-        return f"Forgot {removed} fact(s) matching {arg!r}. {len(to_keep)} remaining."
+        reply = f"Forgot {removed} fact(s) matching {arg!r}. {len(to_keep)} remaining."
+        if band_suppressed:
+            noun = "summary" if band_suppressed == 1 else "summaries"
+            reply += f" Also removed it from {band_suppressed} remembered exchange {noun}."
+        return reply
 
     # No arg: full wipe — call into the shared clear-all-memory helper
     # provided via ctx (avoids import cycles with main.py).
@@ -2366,6 +2386,24 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
             # /retire just emptied. Still inside the same lock the bump
             # above is inside.
             backfill.mark_wiped(source_id)
+            # v3.1.9.8 `.15g` (§17.6a r9/r10; retire tombstone amended by
+            # review R10-B3). Same locked section, same placement rule as
+            # bump_wipe_generation above. Unlike a full wipe
+            # (continuity.wipe_conversation_band), retire does NOT delete
+            # the ledger file — it writes a TOMBSTONE (epoch bumped,
+            # boundary "all", needles cleared) so a later restore of a
+            # pre-retire archive of source_id cannot bring its digests
+            # back with an absent (epoch-0) ledger reading as "never
+            # wiped". The digest STORE file itself is still removed here,
+            # same as the other layers below — only the ledger is exempt
+            # from deletion.
+            continuity.retire_tombstone(source_id)
+            try:
+                _dp = memory.digests_path(source_id)
+                if _dp.is_file():
+                    _dp.unlink()
+            except Exception as e:
+                logger.warning(f"conv={source_id}: could not delete digest cache during retire: {e}")
             facts_module.save_archive(source_id, [])
             # An EMPTY facts file, not an unlinked one — /forget's tombstone,
             # for its reason: backfill.needs_backfill gates on

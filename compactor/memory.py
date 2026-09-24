@@ -256,6 +256,45 @@ def summary_archive_path(conv_id: str) -> Path:
     return _safe_path("summaries", conv_id, ".archive.json")
 
 
+def digests_path(conv_id: str) -> Path:
+    """v3.1.9.8 `.15g` (§17.6a): the continuity band's per-exchange digest
+    cache, `summaries/<conv>.digests.json`. Registered in
+    `memory_layer_paths` (r9 HIGH-B) rather than hand-added at every wipe
+    site — see that function's docstring. Read/written only through
+    continuity.py."""
+    return _safe_path("summaries", conv_id, ".digests.json")
+
+
+def wipe_marker_path(conv_id: str) -> Path:
+    """v3.1.9.8 `.15g` (§17.6a): the wipe-boundary tombstone
+    `summaries/<conv>.wipe.json`. r10: this is a CACHE derived from the
+    persistent ledger in COMPACTOR_CONTROL_ROOT (continuity.py's
+    `record_wipe`/`reapply_ledger`), the same relationship the wipe
+    generation counter above has to the durable state that survives a
+    restart."""
+    return _safe_path("summaries", conv_id, ".wipe.json")
+
+
+# Extensible registry a wipe path deletes from, IN ADDITION TO the layers
+# each wipe path already deletes by name (facts, summary, persona, ...).
+# v3.1.9.8 `.15g` (§17.6a r9 HIGH-B) adds the digest cache and its wipe
+# marker here rather than as a fourth or fifth hand-maintained deletion
+# site — the exact shape this file's own list_known_conv_ids/facts_path/
+# summary_path comment block keeps warning about ("fixed at one site,
+# missed the sibling"). A future continuity-band-style memory layer
+# registers its path function here once.
+_MEMORY_LAYER_PATH_FNS: list[Any] = [digests_path, wipe_marker_path]
+
+
+def memory_layer_paths(conv_id: str) -> list[Path]:
+    """v3.1.9.8 `.15g` (§17.6a r9 HIGH-B): every registered continuity-band
+    layer's path for this conversation. Every full-wipe path
+    (main._clear_all_memory, /retire's apply step, portability.
+    import_conversation with overwrite=True) deletes every path this
+    returns, via continuity.wipe_conversation_band."""
+    return [fn(conv_id) for fn in _MEMORY_LAYER_PATH_FNS]
+
+
 def chromadb_path() -> Path:
     """Return the ChromaDB persist directory (Phase 3 will populate it)."""
     return STORAGE_ROOT / "chromadb"

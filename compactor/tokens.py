@@ -215,6 +215,32 @@ def is_available() -> bool:
     return _load() is not None
 
 
+def raw():
+    """v3.1.9.8 `.15b`/`.15g` (§17.6, §17.6a). The RAW encode/decode
+    tokenizer mistral_common's `MistralTokenizer` wraps —
+    `.encode(s, bos=False, eos=False) -> list[int]` and
+    `.decode(ids) -> str` — rather than `count()`'s message-list
+    contract. This is what the allocator's local counting and the
+    continuity band's exact-cap `cut()` need (they tokenize plain
+    strings: a digest, a band entry, a cut message body — not a chat
+    message list). None under exactly the conditions `is_available()` is
+    False (§17.6: 'the compactor refuses to enable the allocator if the
+    tokenizer is missing')."""
+    tok = _load()
+    if tok is None:
+        return None
+    inner = getattr(tok, "instruct_tokenizer", None)
+    raw_tok = getattr(inner, "tokenizer", None) if inner is not None else None
+    if raw_tok is None and logsetup.log_once("tokens.raw_unavailable"):
+        logger.warning(
+            "mistral_common's MistralTokenizer loaded but "
+            "instruct_tokenizer.tokenizer was not found on it (an "
+            "unexpected mistral_common shape); the allocator and the "
+            "continuity band fall back to their no-tokenizer paths"
+        )
+    return raw_tok
+
+
 def count(messages: list[dict]) -> int | None:
     """Exact local token count for `messages`, or None if unavailable.
 

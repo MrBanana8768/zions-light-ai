@@ -88,6 +88,7 @@ from memory import (
     atomic_write_json,
     conv_lock,
     current_wipe_generation,
+    digests_path,
     read_json_strict,
     storage_root,
     summary_archive_path,
@@ -156,6 +157,17 @@ def summary_path(conv_id: str):
     Kept alongside facts (in the summaries/ subdir per the V2.0 layout).
     """
     return storage_root() / "summaries" / f"{conv_id}.json"
+
+
+def digest_path(conv_id: str):
+    """v3.1.9.8 `.15g` (§17.6a r9 HIGH-B): the continuity band's per-
+    exchange digest cache — the name the design text uses
+    ("summarizer.digest_path(conv)"). Delegates to memory.digests_path,
+    the path registered in memory.memory_layer_paths, rather than
+    recomputing it independently as summary_path above does — the
+    registry is exactly what lets every wipe path find this file without
+    a sixth hand-maintained duplicate."""
+    return digests_path(conv_id)
 
 
 def _now_iso() -> str:

@@ -161,6 +161,12 @@ def _conv_artifact_paths(conv_id: str) -> list[Path]:
         # other file this list did not already carry; this is it, and it
         # closes that gap rather than leaving a sixth one for later.
         memory.summary_archive_path(conv_id),
+        # v3.1.9.8 `.15g` (§17.6a r9 HIGH-B): the continuity band's digest
+        # cache and its wipe-boundary tombstone. Pulled from the registry
+        # (memory.memory_layer_paths) rather than hand-added a second time
+        # here, so a future continuity-band-style layer that registers
+        # itself there is picked up by this enumeration for free.
+        *memory.memory_layer_paths(conv_id),
     ]
 
 

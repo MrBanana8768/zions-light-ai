@@ -315,6 +315,19 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
     something removes part of it. Returns {"path", "facts", "archive",
     "episodic", "summary", "persona", "chapters", "unverified_layers"}.
 
+    v3.1.9.8 `.15g` (r10 review R10-B4, LOW): the continuity band's digest
+    cache (`memory.digests_path`, registered in `memory.memory_layer_
+    paths` so every WIPE path finds it — see continuity.
+    wipe_conversation_band) is DELIBERATELY NOT one of the layers this
+    function carries. A digest is a cache of the transcript, rebuildable
+    from the messages already in `facts`/`summary`/`episodic`/the chat
+    history itself — carrying it here would let a restored quarantine
+    snapshot bring back a digest the wipe ledger has since told every
+    other reader to hide. Do NOT iterate `memory.memory_layer_paths` (or
+    add `digests_path`/`wipe_marker_path`) into this function's layer
+    list or its `restore_hint` for that reason. See
+    test_continuity.py::test_quarantine_excludes_digests.
+
     Raises QuarantineError if the snapshot cannot be proven to hold at least
     what the store held a moment ago, OR if the facts file is unreadable and
     its raw bytes cannot be copied aside either (see F1 below) — a snapshot

@@ -39,10 +39,12 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+import allocator
 import backfill
 import backup as backup_module
 import bgwork
 import commands
+import continuity
 import dedup
 import degrade
 import facts
@@ -7017,9 +7019,98 @@ def _droppable_system_indices(msgs: list[dict], protect_system: int) -> list[int
     default is unchanged, so a direct caller that omits the argument still
     gets the pre-P13-4 behaviour — only a caller that explicitly PASSES 0
     (chat_completions, when it counted zero) sees anything spendable at
-    index 0 now."""
+    index 0 now.
+
+    v3.1.9.8 `.15p` (§17.6 r9 HIGH-A, r10 assertion). `protect_system` may
+    now ALSO be a `frozenset[str]` of system-message identities (sha256 of
+    role + content — see `_system_msg_hash`/`_caller_system_hashes`
+    below), rather than a plain count. When it is, protection is BY
+    IDENTITY, not position: every system message whose hash is in the set
+    is protected, wherever it sits and however many copies of it exist;
+    every other system message is droppable. This is what lets `.15r`
+    (v3.1.9.9) reorder the memory block ahead of her system prompt without
+    reopening HIGH-A — the caller's own message is protected regardless of
+    where compaction, injection or a future reorder put it.
+
+    A plain `int` keeps the pre-r9 POSITIONAL behaviour above, for any
+    direct caller that has not been updated to pass identities (this
+    file's own test suite, mostly). One WARNING per process names that
+    caller so a positional call that should have moved to identity
+    protection does not go unnoticed forever."""
     sys_idxs = [i for i, m in enumerate(msgs) if m.get("role") == "system"]
+    if isinstance(protect_system, (frozenset, set)):
+        if not protect_system:
+            return sys_idxs
+        return [i for i in sys_idxs if _system_msg_hash(msgs[i]) not in protect_system]
+    if logsetup.log_once("droppable_system_indices.positional"):
+        logger.warning(
+            "_droppable_system_indices called with a positional "
+            "protect_system count; the .15p identity guard (§17.6 r9/r10) "
+            "is NOT protecting this caller's system message(s) against a "
+            "reorder or duplication. Pass a frozenset from "
+            "_caller_system_hashes(...) instead."
+        )
     return sys_idxs[protect_system:]
+
+
+def _system_msg_hash(m: dict) -> str:
+    """v3.1.9.8 `.15p` (§17.6 r9 HIGH-A). sha256 of (role, content),
+    canonical-JSON-encoded so a caller that resends the same content in a
+    differently-ordered dict (or as a list of parts vs. a plain string —
+    the guard only ever calls this on `role == "system"` messages, which
+    are always plain strings in practice, but the encoding does not
+    assume that) still hashes identically. Matches `lab/r9/guard9.py`'s
+    `H` exactly: `sha256(role + "\\x00" + json.dumps(content,
+    sort_keys=True))`."""
+    role = m.get("role", "") if isinstance(m, dict) else ""
+    content = m.get("content") if isinstance(m, dict) else None
+    try:
+        canon = json.dumps(content, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        canon = repr(content)
+    return hashlib.sha256((role + "\x00" + canon).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _caller_system_hashes(messages: list[dict]) -> frozenset[str]:
+    """v3.1.9.8 `.15p` (§17.6 r9 HIGH-A). Computed at request entry, on the
+    ORIGINAL array the caller sent — before retention, compaction or any
+    injection touches it — this is what `_droppable_system_indices` (and
+    `_enforce_hard_budget`'s r10 assertion) use to protect her system
+    message(s) BY IDENTITY rather than position."""
+    return frozenset(
+        _system_msg_hash(m) for m in messages if isinstance(m, dict) and m.get("role") == "system"
+    )
+
+
+def _is_known_injected_system_block(m: dict) -> bool:
+    """v3.1.9.8 `.15p` (§17.6 r10, the `caller_system_rewritten`
+    assertion's fallback ONLY — not used in the normal identity path
+    above). Recognises the four V2.0 injected blocks (persona, facts,
+    retrieval, hierarchical summary — combined into ONE system message by
+    `inject_system_block`, but checked here by substring in case a future
+    caller injects them separately), the compaction stand-in, and the
+    `.15g` continuity band header, all by their fixed headers. A message
+    that matches none of these is treated as HERS even if its hash is
+    unrecognised — the conservative direction when the assertion has
+    already shown the identity accounting is out of sync with what the
+    guard is looking at."""
+    if not isinstance(m, dict) or m.get("role") != "system":
+        return False
+    content = m.get("content")
+    text = content if isinstance(content, str) else ""
+    if not text:
+        return False
+    for header in (
+        COMPACTION_SUMMARY_HEADER,
+        persona._PERSONA_BLOCK_HEADER,
+        facts._FACTS_BLOCK_HEADER,
+        retrieval._RETRIEVAL_BLOCK_HEADER,
+        summarizer._BLOCK_HEADER,
+        continuity.BAND_HEADER,
+    ):
+        if header in text:
+            return True
+    return False
 
 
 def _is_compaction_standin(m: dict) -> bool:
@@ -7562,7 +7653,7 @@ def _shed_last_resort(
 def _enforce_hard_budget(
     messages: list[dict],
     limit: int | None = None,
-    protect_system: int = 1,
+    protect_system: "int | frozenset[str]" = 1,
     report: dict | None = None,
     reserve: int = 0,
     standin_protected: bool = True,
@@ -7649,6 +7740,52 @@ def _enforce_hard_budget(
     # conversation succeeds on its next message.
     if _BUDGET_MARGIN:
         limit = max(256, limit - _BUDGET_MARGIN)
+
+    # v3.1.9.8 `.15p` (§17.6 r10, LOW: "a future pre-guard edit of her
+    # prompt"). If `protect_system` is a set of identities, assert every
+    # hash recorded AT REQUEST ENTRY is still present among the system
+    # messages this call actually sees. A miss means some transform
+    # rewrote, dropped or otherwise edited her system message before it
+    # reached the guard — the accounting this whole mechanism rests on is
+    # now unknown to be correct. Rather than trust the (now-suspect) set
+    # difference, fall back to the conservative rule: nothing is droppable
+    # here unless it is a RECOGNISED injected block (memory, band,
+    # persona, stand-in — by header, not by absence from the set). This
+    # never drops the edited message itself, whatever it now reads.
+    if isinstance(protect_system, (frozenset, set)) and protect_system:
+        _present = {_system_msg_hash(m) for m in messages if m.get("role") == "system"}
+        _missing = protect_system - _present
+        if _missing:
+            logger.error(
+                f"caller_system_rewritten: {len(_missing)} of "
+                f"{len(protect_system)} system message(s) recorded at "
+                f"request entry are no longer present, byte-identical, in "
+                f"the hard-budget guard's input. Something upstream edited "
+                f"her system message before this call. Not dropping any "
+                f"system message that is not a recognised injected block."
+            )
+            try:
+                # Sync alerting (matches backup.py/selftest.py's own
+                # local-import convention): this function runs off the
+                # event loop, in a threadpool worker (see its call site in
+                # chat_completions), so the async notify_async variant
+                # would have no running loop to schedule onto here.
+                import alert as _alert
+
+                _alert.notify(
+                    "compactor",
+                    "error",
+                    "caller_system_rewritten: a caller system message "
+                    "changed before the hard-budget guard",
+                    extra={"missing": len(_missing), "total": len(protect_system)},
+                )
+            except Exception:
+                pass
+            protect_system = frozenset(
+                _system_msg_hash(m)
+                for m in messages
+                if m.get("role") == "system" and not _is_known_injected_system_block(m)
+            )
 
     # Prescreen: skip the (expensive) full tokenization when the char-based
     # estimate is far under the limit.
@@ -9865,6 +10002,24 @@ async def lifespan(app: FastAPI):
         logger.info("storage layout ready")
     except Exception as e:
         logger.warning(f"could not initialize storage layout: {e}")
+    # v3.1.9.8 `.15g` (§17.6a r10 A2/A3). Refuses to start if
+    # COMPACTOR_CONTROL_ROOT resolves inside STORAGE_ROOT — the ledger
+    # must live outside backup/restore scope, or a restore could bring
+    # back exactly what a /forget already removed through the band. This
+    # is deliberately NOT wrapped in try/except: a misconfigured control
+    # root is a boot-blocking condition, per §17.6a's own wording ("The
+    # compactor refuses to start").
+    continuity.assert_control_root_safe()
+    # r10 review R10-B1 (HIGH): re-apply the wipe ledger for every
+    # conversation that has one, at every boot — not only after a
+    # restore or import run through backup.py/portability.py. This is
+    # what closes the "hand restore" gap (an operator who moves a
+    # directory back by hand, outside either of those code paths, gets
+    # the same protection the moment the compactor next starts).
+    try:
+        await run_in_threadpool(continuity.reapply_all_ledgers)
+    except Exception as e:
+        logger.warning(f"could not re-apply the wipe ledger at startup: {e}")
     # v3.1.9: an unusable COMPACTOR_TIMEZONE is an ERROR at boot, not a
     # surprise in her first reply. Never raises (see _resolve_time_zone).
     _announce_time_zone()
@@ -11102,6 +11257,70 @@ async def chat_completions(request: Request) -> Any:
         except Exception as e:
             logger.warning(f"conv={conv_id}: summary load failed (non-fatal): {e}")
 
+        # --- Continuity band (v3.1.9.8 `.15g`, §17.6a) ---
+        # Appended right after the summary block, in BUILD order — "after
+        # the summaries" (§17.6a's placement rule). "Before facts" is not
+        # achieved: this codebase's V2.0 architecture already appends
+        # facts earlier than summary in build order (see the Facts
+        # section above), which predates this branch and is out of scope
+        # to reorder here. Self-contained (re-loads state rather than
+        # depending on the summary try block's locals, which may not
+        # exist if that block raised before assigning them) so a failure
+        # here can never take the summary block down with it, and vice
+        # versa.
+        try:
+            _bstate = summarizer.load_state(conv_id)
+            _U = max(0, int(turns_seen if isinstance(turns_seen, int) else _bstate.get("turns_seen", 0))
+                      - int(_bstate.get("last_summarized_turn", 0)))
+            _non_system = [m for m in messages if m.get("role") != "system"]
+            if _U > 0 and len(_non_system) > 1:
+                # The gap: unsummarized turns strictly before the newest
+                # message (§17.6a's definition of U). Assumes the client
+                # resends the full history, so array position and turn
+                # number coincide — see allocator.py's module docstring
+                # for why this assumption is safe on this deployment and
+                # what a partial-window client would need instead.
+                _gap = _non_system[max(0, len(_non_system) - 1 - _U):-1]
+                _gap_fps = summarizer._turn_fingerprints(_gap)
+                _units: list[list[tuple[dict, str]]] = []
+                for _m, _fp in zip(_gap, _gap_fps):
+                    if not _units or _m.get("role") == "user":
+                        _units.append([(_m, _fp)])
+                    else:
+                        _units[-1].append((_m, _fp))
+                _visible = continuity.visible(conv_id)
+                _tok_raw = tokens.raw()
+                _band_units = []
+                for _unum, _unit in enumerate(_units, start=1):
+                    _her_m = next((p for p in _unit if p[0].get("role") == "user"), None)
+                    _reply_m = next((p for p in _unit if p[0].get("role") == "assistant"), None)
+                    _fp_u = _her_m[1] if _her_m else None
+                    _fp_a = _reply_m[1] if _reply_m else None
+                    _key = continuity.unit_key(_fp_u, _fp_a)
+                    _entry = _visible.get(_key)
+                    if _entry is None:
+                        _her_text = _message_text(_her_m[0]) if _her_m else ""
+                        _reply_text = _message_text(_reply_m[0]) if _reply_m else ""
+                        _text = continuity.extractive_fallback(_tok_raw, _her_text, _reply_text, _unum)
+                        # r10 review R10-B1: "the allocator applies the
+                        # same [needle] check to fallback entries it
+                        # builds" — a unit with no digest yet (GPU busy,
+                        # or purged by a wipe re-apply) must not surface
+                        # her forgotten words through the fallback path,
+                        # which visible() never sees.
+                        _text = continuity.apply_needles(conv_id, _text)
+                        _entry = {
+                            "headline": _text, "full": _text,
+                            "suppressed": _text == continuity.SUPPRESSED_MARKER,
+                        }
+                    _band_units.append(_entry)
+                _band_text = continuity.format_band(_band_units, full_n=continuity.DIGEST_FULL_UNITS)
+                if _band_text:
+                    injected_blocks.append((_INJECT_PRIORITY_SUMMARY, "band", _band_text))
+                    log_parts.append(f"band({len(_band_units)})")
+        except Exception as e:
+            logger.warning(f"conv={conv_id}: continuity band injection failed (non-fatal): {e}")
+
         # Single inject point — preserves Mistral template compatibility.
         if injected_blocks:
             # v3.1 D3: bound the SUM before it is injected, not after.
@@ -11214,13 +11433,17 @@ async def chat_completions(request: Request) -> Any:
     #    turn that sat between two system messages.
     # Pure CPU (tokenizer) work — off the event loop so a shedding pass on a
     # huge conversation can't stall every other request and the healthchecks.
-    # How many system messages the CALLER sent, counted on the original array
-    # before compaction or injection touched it. The guard may spend what we
-    # added; it may not spend what the caller sent. Without this it would delete
-    # a caller's second system message once injected memory ran out — and in the
-    # only case that reaches (one user turn larger than the whole budget) doing
-    # so does not even achieve the fit.
-    caller_system = sum(1 for m in messages if m.get("role") == "system")
+    # v3.1.9.8 `.15p` (§17.6 r9 HIGH-A). Identities of the CALLER's system
+    # message(s), computed on the original array before compaction or
+    # injection touched it — NOT a count. The guard may spend what we
+    # added; it may not spend what the caller sent, wherever it ends up
+    # sitting and however many copies of it exist by the time the guard
+    # runs (a reorder or a duplication no longer reopens HIGH-A the way a
+    # positional count did). Without this it would delete a caller's
+    # second system message once injected memory ran out — and in the
+    # only case that reaches (one user turn larger than the whole budget)
+    # doing so does not even achieve the fit.
+    caller_system = _caller_system_hashes(messages)
     # v3.1.9: the current-time line (see _inject_time_line). DECIDED here, on
     # the original request, so the guard can be handed a limit that already
     # makes room for it; ADDED after the guard, the merges and the tail
@@ -11953,6 +12176,15 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
         # current_wipe_generation() the instant it re-checks, under this
         # same lock, and discards whatever it was about to write.
         bump_wipe_generation(conv_id)
+        # v3.1.9.8 `.15g` (§17.6a r9 HIGH-B / r10 A2). Same locked section,
+        # immediately after the in-process generation bump above and
+        # before any layer is deleted: bumps the PERSISTENT ledger epoch
+        # (survives a restart, unlike the in-process counter alone) and
+        # deletes the continuity band's digest cache and wipe marker. This
+        # is the single chokepoint /forget, DELETE .../facts and the
+        # self-test cleanup all call through, so this covers all three —
+        # exactly the reasoning bump_wipe_generation's own docstring gives.
+        continuity.wipe_conversation_band(conv_id)
         # v3.1.9.4 (R5 / P16-1). Same locked section, same ordering
         # guarantee as bump_wipe_generation itself: neutralise any backfill
         # sidecar record for this conv BEFORE anything else below runs.
