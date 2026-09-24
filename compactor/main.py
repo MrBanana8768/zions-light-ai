@@ -2827,8 +2827,23 @@ async def compact_if_needed(
     *, stored_turns_out: list | None = None,
     inject_budget: int | None = None,
     reuse_margin_out: list | None = None,
+    standin_hash_out: list | None = None,
 ) -> list[dict]:
     """
+    `standin_hash_out` (v3.1.9.8 round-3 review, item 4), if given, receives
+    one `str` — `_system_msg_hash` of the compaction stand-in this call
+    actually built (the `summary_blocks[0]` constructed a few lines above
+    its use below), captured at that construction, the one place its
+    content is trustworthy. `chat_completions` uses this instead of
+    scanning the RETURNED array for anything `_is_compaction_standin`
+    recognises by header prefix — a scan like that cannot tell "this is
+    the stand-in we just built" from "the caller's own system message
+    happens to start with the same header text", and a caller prompt that
+    collides was found registering as ours and getting trimmed (probe B3).
+    Empty when no stand-in was built (nothing compacted, or the reuse path
+    took an early return before this point) — same "written once, at
+    construction, no default guess" contract as `stored_turns_out`.
+
     `reuse_margin_out`, if given, receives one `int` — the `_BUDGET_MARGIN`
     this function's reuse WINDOW CHECK read at decision time (`_BUDGET_
     MARGIN or 0`, the same value `_effective_limit_est` subtracts a few
@@ -4020,6 +4035,12 @@ async def compact_if_needed(
         "content": COMPACTION_SUMMARY_HEADER + "\n"
                    + "\n\n".join(_parts),
     }] if _parts else [])
+    # v3.1.9.8 round-3 review (item 4): capture the stand-in's identity
+    # HERE, at construction — the one place its content is trustworthy —
+    # rather than let the caller recognise it later by header prefix (see
+    # `standin_hash_out`'s own docstring for why that broke).
+    if summary_blocks and standin_hash_out is not None:
+        standin_hash_out.append(_system_msg_hash(summary_blocks[0]))
     # Order: system → summary-of-oldest → deferred turns → images → recent.
     # `deferred` is chronologically NEWER than what the summary covers and
     # OLDER than keep_recent, so it slots between them and the transcript
@@ -7670,6 +7691,7 @@ def _enforce_hard_budget(
     report: dict | None = None,
     reserve: int = 0,
     standin_protected: bool = True,
+    injected_system_hashes: "frozenset[str]" = frozenset(),
 ) -> list[dict]:
     """Last line of defense: never forward a request that vLLM must reject.
 
@@ -7745,6 +7767,26 @@ def _enforce_hard_budget(
     still never the FIRST thing spent (turns above the recent window still
     go first, same as always), and every other caller, and every round
     after this one, is completely unaffected.
+
+    `injected_system_hashes` (v3.1.9.8 `.15p`, round-2 review, item 3):
+    hashes of the system blocks THIS request's caller (chat_completions)
+    itself created and injected — `inject_system_block`'s combined
+    facts/retrieval/summary/band block, and `compact_if_needed`'s
+    stand-in — recorded at the moment each was built, before anything
+    downstream could touch it. Used ONLY inside the `caller_system_
+    rewritten` fallback below, as the one thing that can tell OURS from
+    HERS without asking the content: content-based guesses (a header
+    substring; "does it still match a hash from request entry") both
+    broke the instant a pre-guard transform edited a message that ALSO
+    happened to contain — or, after the edit, still contained — one of
+    our header strings (round-2 review's `expA` probes: a merge that
+    appended an injected facts block onto her own prompt, and a bare
+    whitespace-strip of a prompt that quotes a header; both lost her
+    content under the old content-only fallback even though neither was
+    ever ours to spend). Empty by default: a caller that does not pass
+    this (this file's own direct-call tests, mostly) gets the maximally
+    conservative fallback — nothing is recognised as ours, so nothing in
+    it is droppable, which is always SAFE, only possibly over-cautious.
     """
     if limit is None:
         limit = HARD_INPUT_LIMIT
@@ -7760,22 +7802,36 @@ def _enforce_hard_budget(
     # messages this call actually sees. A miss means some transform
     # rewrote, dropped or otherwise edited her system message before it
     # reached the guard — the accounting this whole mechanism rests on is
-    # now unknown to be correct. Rather than trust the (now-suspect) set
-    # difference, fall back to the conservative rule: nothing is droppable
-    # here unless it is a RECOGNISED injected block (memory, band,
-    # persona, stand-in — by header, not by absence from the set). This
-    # never drops the edited message itself, whatever it now reads.
+    # now unknown to be correct.
+    #
+    # v3.1.9.8 round-2 review (item 3, MEDIUM-latent, promoted from the
+    # first cut's own "conservative rule"): that first cut fell back to
+    # "droppable unless it is a RECOGNISED injected block, BY HEADER" —
+    # content, not identity. Content is exactly what a pre-guard edit can
+    # change (or, without any edit at all, what her OWN prompt can
+    # legitimately contain — see `_is_known_injected_system_block`'s
+    # docstring). Trusting it here reintroduced the same class of bug this
+    # whole mechanism exists to close, just moved one branch deeper. The
+    # only accounting immune to what the content now reads is accounting
+    # captured at the moment WE created it: `injected_system_hashes`
+    # (above). Droppable, in this fallback, is exactly "a system message
+    # in THIS call whose hash is one we recorded as our own injection" —
+    # nothing else. Everything else — her prompt, edited or not, and any
+    # message this call cannot positively identify as ours — is protected.
+    _identity_fallback_engaged = False
     if isinstance(protect_system, (frozenset, set)) and protect_system:
         _present = {_system_msg_hash(m) for m in messages if m.get("role") == "system"}
         _missing = protect_system - _present
         if _missing:
+            _identity_fallback_engaged = True
             logger.error(
                 f"caller_system_rewritten: {len(_missing)} of "
                 f"{len(protect_system)} system message(s) recorded at "
                 f"request entry are no longer present, byte-identical, in "
                 f"the hard-budget guard's input. Something upstream edited "
                 f"her system message before this call. Not dropping any "
-                f"system message that is not a recognised injected block."
+                f"system message that is not registered as OUR OWN "
+                f"injection (injected_system_hashes)."
             )
             try:
                 # Sync alerting (matches backup.py/selftest.py's own
@@ -7794,11 +7850,33 @@ def _enforce_hard_budget(
                 )
             except Exception:
                 pass
-            protect_system = frozenset(
-                _system_msg_hash(m)
-                for m in messages
-                if m.get("role") == "system" and not _is_known_injected_system_block(m)
-            )
+            _current_sys_hashes = {
+                _system_msg_hash(m) for m in messages if m.get("role") == "system"
+            }
+            protect_system = _current_sys_hashes - injected_system_hashes
+            # Diagnostic only — NEVER feeds the drop decision above. A
+            # system message that LOOKS like one of our headers by
+            # substring but was not registered in `injected_system_hashes`
+            # means some injection call site is not recording its hash;
+            # worth knowing (so the gap gets closed), not worth guessing
+            # from. Content is never trusted to move a message from
+            # protected to droppable here — that trust is exactly what
+            # this fix removes.
+            for _m in messages:
+                if (
+                    _m.get("role") == "system"
+                    and _system_msg_hash(_m) not in injected_system_hashes
+                    and _is_known_injected_system_block(_m)
+                    and logsetup.log_once("hard_budget.unregistered_injected_block")
+                ):
+                    logger.warning(
+                        "hard budget: a system message matches a known "
+                        "injected header by CONTENT but was not registered "
+                        "in injected_system_hashes at injection time — left "
+                        "PROTECTED rather than guessed droppable. Likely a "
+                        "call site that injects a system block without "
+                        "recording its hash for this guard's fallback."
+                    )
 
     # Prescreen: skip the (expensive) full tokenization when the char-based
     # estimate is far under the limit.
@@ -8464,12 +8542,33 @@ def _enforce_hard_budget(
             # without saying which case it was looking at, so it read as a
             # compactor problem for four hours.
             if not _droppable_system_indices(msgs, protect_system):
-                residual = (
-                    "Nothing injected remains: what is left is the caller's own "
-                    "system prompt and the newest turn, and neither is this "
-                    "guard's to spend. The request as SENT does not fit the "
-                    "window — that is a client-side size problem, not a memory one"
-                )
+                if _identity_fallback_engaged:
+                    # v3.1.9.8 round-2 review (item 3): the plain claim below
+                    # ("what is left is the caller's own system prompt") is
+                    # not necessarily true here — the caller_system_rewritten
+                    # fallback protects everything it cannot POSITIVELY
+                    # identify as our own injection, which can include a
+                    # genuinely-injected block from a call site that failed
+                    # to register its hash (see the unregistered_injected_
+                    # block WARNING above). Say what actually happened
+                    # instead of asserting whose content this is.
+                    residual = (
+                        "Nothing more can be shed: a caller system message "
+                        "changed before this guard ran (caller_system_"
+                        "rewritten, logged above), so this request is in the "
+                        "conservative fallback — only content this guard "
+                        "could positively identify as its own injection was "
+                        "spent, and everything else is being held as "
+                        "possibly hers. The request as SENT does not fit the "
+                        "window"
+                    )
+                else:
+                    residual = (
+                        "Nothing injected remains: what is left is the caller's own "
+                        "system prompt and the newest turn, and neither is this "
+                        "guard's to spend. The request as SENT does not fit the "
+                        "window — that is a client-side size problem, not a memory one"
+                    )
             else:
                 # Unreachable: the pass above drops every droppable block
                 # before this line can be reached. Kept as a marker, because a
@@ -10023,6 +10122,10 @@ async def lifespan(app: FastAPI):
     # root is a boot-blocking condition, per §17.6a's own wording ("The
     # compactor refuses to start").
     continuity.assert_control_root_safe()
+    # v3.1.9.8 round-4 review (item 3, MEDIUM): same guard, same reason,
+    # for the pending-intent durability sidecar's own root — see
+    # continuity.PENDING_ROOT's module-level comment.
+    continuity.assert_pending_root_safe()
     # r10 review R10-B1 (HIGH): re-apply the wipe ledger for every
     # conversation that has one, at every boot — not only after a
     # restore or import run through backup.py/portability.py. This is
@@ -11040,18 +11143,69 @@ async def chat_completions(request: Request) -> Any:
     # compact_if_needed's own docstring for `reuse_margin_out` and
     # _enforce_hard_budget's for `standin_protected`.
     _reuse_margin_at_decision: list[int] = []
+    # v3.1.9.8 `.15p` round-2 review (item 3): hashes of the system blocks
+    # THIS request injects — never anything the caller sent. Captured at
+    # the moment each one is created, which is the only point their
+    # content is trusted to mean what it says; `_enforce_hard_budget`'s
+    # `caller_system_rewritten` fallback uses this set (not a header
+    # substring check) to tell ours from hers once identity-by-request-
+    # entry-hash is no longer reliable. See that function's docstring for
+    # `injected_system_hashes`.
+    _injected_system_hashes: set[str] = set()
+    # v3.1.9.8 `.15p` (§17.6 r9 HIGH-A). Identities of the CALLER's system
+    # message(s), computed on the original array before compaction or
+    # injection touched it. Moved up from its previous site beside the
+    # guard call (round-3 review, item 4) so item 4's stand-in fix below
+    # can use it too — see that comment for why. The guard call further
+    # down still reads this SAME variable; nothing about its own contract
+    # changed, only where it is computed.
+    caller_system = _caller_system_hashes(messages)
+    # v3.1.9.8 round-3 review (item 4, LOW — probe B3): `_is_compaction_
+    # standin` recognises OUR stand-in by a HEADER PREFIX
+    # (`COMPACTION_SUMMARY_HEADER`), which is exactly what a scan of the
+    # POST-compaction array cannot tell apart from a caller system message
+    # that happens to start with the same literal text — proven by the
+    # reviewer's probe: a second caller system message beginning with
+    # "[Summary of earlier conversation]" got misregistered as ours and
+    # then TRIMMED by the guard's fallback (3064 -> 1571 chars). Fixed by
+    # capturing the stand-in's hash at the ONE place its content is
+    # actually trustworthy — inside `compact_if_needed`, at the exact
+    # `summary_blocks` construction that builds it — via the same out-
+    # param convention `stored_turns_out`/`reuse_margin_out` already use,
+    # rather than recognising it afterward by what it looks like.
+    _standin_hash_out: list[str] = []
     try:
         body["messages"] = await compact_if_needed(
             messages, conv_id,
             stored_turns_out=_compaction_stored_turns,
             inject_budget=inject_budget,
             reuse_margin_out=_reuse_margin_at_decision,
+            standin_hash_out=_standin_hash_out,
         )
     except Exception as e:
         logger.exception(
             f"compaction failed; falling through with the original messages — "
             f"the hard-budget guard will shed content if they don't fit: {e}"
         )
+    # "never record a hash that is also in the caller's own system set"
+    # (round-3 review, item 4): belt-and-braces against the one collision
+    # even an out-param cannot rule out — her system message being BYTE-
+    # IDENTICAL to the stand-in compact_if_needed just built (the stand-in
+    # is built from stored/fresh summaries, so this would need her prompt
+    # to literally equal that text; astronomically unlikely, but "never"
+    # is the word the design uses, so it is checked rather than assumed).
+    for _h in _standin_hash_out:
+        if _h in caller_system:
+            if logsetup.log_once(f"compaction_standin.collides_with_caller.{conv_id or '?'}"):
+                logger.warning(
+                    f"conv={conv_id or '?'}: the compaction stand-in this "
+                    f"request built is byte-identical to one of the "
+                    f"caller's own system messages; NOT registering it as "
+                    f"ours (identity, not content, decides this) — the "
+                    f"hard-budget guard's fallback will protect it as hers"
+                )
+        else:
+            _injected_system_hashes.add(_h)
 
     # V2.0 memory injection. ALL three layers (facts, RAG, summary) are
     # collected into a SINGLE combined system message and injected in one
@@ -11389,6 +11543,12 @@ async def chat_completions(request: Request) -> Any:
             combined = "\n\n".join(kept)
             try:
                 body["messages"] = inject_system_block(body["messages"], combined)
+                # This IS the injected block's exact content — no need to
+                # rescan the array for it afterward. See
+                # `_injected_system_hashes`'s declaration above.
+                _injected_system_hashes.add(
+                    _system_msg_hash({"role": "system", "content": combined})
+                )
                 # msgs= is repeated here from the request line ~230 lines
                 # earlier. That looks redundant and is not: on 2026-08-24 the
                 # whole diagnosis was two adjacent log lines nobody joined —
@@ -11452,17 +11612,11 @@ async def chat_completions(request: Request) -> Any:
     #    turn that sat between two system messages.
     # Pure CPU (tokenizer) work — off the event loop so a shedding pass on a
     # huge conversation can't stall every other request and the healthchecks.
-    # v3.1.9.8 `.15p` (§17.6 r9 HIGH-A). Identities of the CALLER's system
-    # message(s), computed on the original array before compaction or
-    # injection touched it — NOT a count. The guard may spend what we
-    # added; it may not spend what the caller sent, wherever it ends up
-    # sitting and however many copies of it exist by the time the guard
-    # runs (a reorder or a duplication no longer reopens HIGH-A the way a
-    # positional count did). Without this it would delete a caller's
-    # second system message once injected memory ran out — and in the
-    # only case that reaches (one user turn larger than the whole budget)
-    # doing so does not even achieve the fit.
-    caller_system = _caller_system_hashes(messages)
+    # `caller_system` (identities of the CALLER's system message(s) —
+    # §17.6 r9 HIGH-A) is computed further up now, beside the
+    # `compact_if_needed` call — round-3 review item 4 needed it there
+    # too, to check the compaction stand-in's hash against it. Same
+    # variable, same value, only relocated.
     # v3.1.9: the current-time line (see _inject_time_line). DECIDED here, on
     # the original request, so the guard can be handed a limit that already
     # makes room for it; ADDED after the guard, the merges and the tail
@@ -11570,6 +11724,7 @@ async def chat_completions(request: Request) -> Any:
         guard_report,
         _time_reserve,
         _standin_protected,
+        frozenset(_injected_system_hashes),
     )
     # The limit the FORWARDED payload is held to, REGARDLESS of the line: the
     # guard above shed against `effective_limit - _time_reserve` only to leave
@@ -12174,6 +12329,16 @@ async def admin_forget_facts(conv_id: str, request: Request):
         # refuses to block a wipe the user asked for), so the honest answer
         # is whether it succeeded.
         result["background_settled"] = settled
+        # v3.1.9.8 round-2/round-3 review (item 1): same honesty as the
+        # chat /forget reply (commands._handle_forget) — the wipe above
+        # already deleted everything regardless (record_wipe never blocks
+        # it), but a ledger write failure means this admin caller should
+        # know the ledger itself did not fully record it either.
+        # `ledger_double_failure` distinguishes the fully-recoverable
+        # pending-intent case (the common one) from the residual where
+        # even the durability sidecar failed and a restart would lose it.
+        result["ledger_degraded"] = continuity.ledger_degraded(conv_id)
+        result["ledger_double_failure"] = continuity.ledger_double_failure(conv_id)
     return result
 
 
@@ -12249,6 +12414,26 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
                 f"({e}); the other memory layers were still cleared. The facts "
                 f"file is left in place — it cannot be safely rewritten from an "
                 f"unknown state."
+            )
+        except OSError as e:
+            # v3.1.9.8 round-4 review (item 2, HIGH — "audit every write on
+            # the wipe and forget paths"): distinct from StoreUnreadable
+            # above (a READ failure — load_facts itself raised). This is a
+            # WRITE failure: the file read fine, but save_facts's own
+            # atomic write could not land (ENOSPC, a permission fault).
+            # Before this, an uncaught OSError here aborted the rest of
+            # this function — episodic, summary, persona and chapters
+            # would never even be attempted. The wipe/forget she asked for
+            # continues regardless; n_facts reports what was ACTUALLY
+            # confirmed removed (0 — we do not know the write landed).
+            n_facts = 0
+            unreadable.append("facts")
+            logger.error(
+                f"conv={conv_id}: {source} forget could not WRITE the empty "
+                f"facts file ({type(e).__name__}: {e}); the other memory "
+                f"layers were still cleared regardless. The facts file's "
+                f"final state is unknown — treat it as not yet confirmed "
+                f"empty."
             )
         # Episodic memory lives in ChromaDB.
         n_episodic = retrieval.forget_conversation(conv_id)

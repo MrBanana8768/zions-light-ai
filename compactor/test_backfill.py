@@ -87,6 +87,38 @@ def test_write_then_read_state_roundtrip():
     assert_true("updated_at" in s, "updated_at auto-set")
 
 
+def test_mark_wiped_never_raises_when_its_own_write_fails():
+    print("\n[test] round-4 item 2 — mark_wiped never raises, even when its "
+          "own state write fails")
+    # v3.1.9.8 round-4 review ("audit every write on the wipe and forget
+    # paths — none may abort the deletion"): mark_wiped is called from
+    # INSIDE main._clear_all_memory's locked wipe section, BEFORE the
+    # facts/episodic/summary/persona/chapters deletes that follow it. An
+    # unguarded write failure here used to propagate straight out and
+    # abort the wipe at this exact step — the same shape probe p2.py
+    # demonstrated for the wipe-ledger marker, for a layer whose entire
+    # purpose is a defense-in-depth signal, not something worth losing
+    # her facts over.
+    _wipe_storage()
+    cid = "mark-wiped-write-fails"
+    # A real backfill record must exist, or mark_wiped no-ops before ever
+    # reaching its own write (see its own docstring) and this test would
+    # prove nothing.
+    backfill._write_state(cid, {
+        "state": "in_progress", "started_at": "2026-05-28T00:00:00+00:00",
+        "exchanges_done": 3, "exchanges_total": 10, "error": None,
+    })
+    with patch.object(backfill, "_write_state", side_effect=OSError(28, "No space left on device")):
+        backfill.mark_wiped(cid)  # must not raise
+    print("  ok   mark_wiped did not raise despite its own write failing")
+    # The record is left in whatever state it was (the write never
+    # landed) — not rewritten, not corrupted, and importantly not
+    # crashed-into-existence half-written.
+    s = backfill.read_state(cid)
+    assert_eq(s["state"], "in_progress",
+              "the pre-existing record is untouched (the failed write left no trace)")
+
+
 # ---------------------------------------------------------------------------
 # Stale detection
 # ---------------------------------------------------------------------------
@@ -641,6 +673,7 @@ if __name__ == "__main__":
         test_state_path_in_facts_dir()
         test_read_state_missing_returns_none()
         test_write_then_read_state_roundtrip()
+        test_mark_wiped_never_raises_when_its_own_write_fails()
 
         test_is_stale_fresh_in_progress()
         test_is_stale_old_in_progress()

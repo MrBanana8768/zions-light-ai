@@ -604,6 +604,49 @@ async def _wipe_all_layers(conv_id: str, clear_all) -> dict:
     }
 
 
+def _ledger_pending_note(conv_id: str) -> str:
+    """v3.1.9.8 round-3 review (item 3, MEDIUM): the honest note appended
+    to a /forget reply when its wipe-ledger write could not be persisted.
+    Called AFTER the deletion this /forget performs has already happened
+    — record_wipe/record_targeted_forget/retire_tombstone never let a
+    ledger failure block that (Task B's whole point) — so this is purely
+    about what she is told regarding the RECORDING, not the deletion.
+
+    Round 2's note said the risk was "if this conversation is restored
+    from a backup later" — false: with the continuity band on, the words
+    could have resurfaced on her very next request, not just after some
+    future restore. Round 3's pending-intent design closes that: while a
+    ledger write is unrecorded, the conv is marked degraded and the band
+    fails CLOSED for it (continuity.ledger_degraded /
+    _read_ledger_failing_closed) until the pending intent merges into a
+    later successful write — including one retried at startup, via the
+    durability sidecar. So the correct, calm statement is that the
+    forget is done, but not yet saved durably, and the continuity summary
+    for this conversation stays paused until it is — NOT that the words
+    might come back.
+
+    The one exception is the DOUBLE FAILURE residual
+    (continuity.ledger_double_failure): the durability sidecar itself
+    also could not be written, so the pending intent exists only in this
+    process's memory, and a restart before the next successful write
+    would lose it. That is the ONLY condition under which this note
+    warns that the words could return. Returns "" when there is nothing
+    to say (the write succeeded, or nothing was ever pending)."""
+    if not continuity.ledger_degraded(conv_id):
+        return ""
+    if continuity.ledger_double_failure(conv_id):
+        return (
+            " (This is done now, but it could not be saved at all right "
+            "now — if I'm restarted before that's fixed, this may need "
+            "to be forgotten again.)"
+        )
+    return (
+        " (This is done now, but it could not be saved durably yet, so "
+        "the continuity summary for this conversation stays paused until "
+        "it is.)"
+    )
+
+
 async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
     if arg:
         # Selective: remove facts whose text contains the substring
@@ -628,20 +671,33 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
             # inside an exchange (never extracted as a fact) reported
             # success on nothing and left the digest untouched.
             band_suppressed = continuity.suppress_needle(conv_id, arg)
+            # v3.1.9.8 round-2/round-3 review (item 1/3): suppress_needle
+            # just tried to record this needle in the wipe ledger — that
+            # write can fail (an unwritable CONTROL_ROOT) without raising
+            # here (continuity._write_ledger_best_effort swallows it so
+            # the deletion below still happens). See `_ledger_pending_note`
+            # for what she is told and why: per the round-3 pending-intent
+            # design, the band fails closed for this conv until the write
+            # succeeds, so the words should NOT come back — the note says
+            # that plainly, and warns of an actual risk only in the rare
+            # double-failure residual.
+            _note = _ledger_pending_note(conv_id)
             if removed == 0:
                 if band_suppressed:
                     noun = "summary" if band_suppressed == 1 else "summaries"
-                    return (
+                    reply = (
                         f"No facts matched {arg!r}, but removed it from "
                         f"{band_suppressed} remembered exchange {noun}."
                     )
-                return f"No facts matched {arg!r}."
+                else:
+                    reply = f"No facts matched {arg!r}."
+                return reply + _note
             facts_module.save_facts(conv_id, to_keep)
         reply = f"Forgot {removed} fact(s) matching {arg!r}. {len(to_keep)} remaining."
         if band_suppressed:
             noun = "summary" if band_suppressed == 1 else "summaries"
             reply += f" Also removed it from {band_suppressed} remembered exchange {noun}."
-        return reply
+        return reply + _note
 
     # No arg: full wipe — call into the shared clear-all-memory helper
     # provided via ctx (avoids import cycles with main.py).
@@ -808,6 +864,24 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
             "wiped, so a little of it may reappear. Run /forget again if you "
             "see something come back."
         )
+
+    # v3.1.9.8 round-2/round-3/round-4 review (item 1/3/6): the full wipe
+    # records itself in the ledger via continuity.wipe_conversation_band
+    # -> record_wipe, called from inside clear_all above, UNCONDITIONALLY
+    # — record_wipe always bumps the epoch and attempts the ledger write,
+    # even on a conversation with no facts/summary/persona/chapters (i.e.
+    # `parts` empty). Round 4 review, item 6: this used to be gated on
+    # `if parts:`, so a conversation whose ONLY memory was continuity-band
+    # digests (never counted in `parts`, which only tracks the other four
+    # layers) got NO note at all when its epoch bump failed — the exact
+    # condition that needs the band to fail closed, silently unreported,
+    # while the reply claimed "Nothing to forget". The note is checked
+    # unconditionally now; see `_ledger_pending_note`'s docstring for why
+    # it says "stays paused" rather than "could come back" except in the
+    # double-failure residual.
+    _note = _ledger_pending_note(conv_id)
+    if _note:
+        lines.append(_note.strip())
 
     if not lines:
         return "Nothing to forget — this conversation had no stored memory."

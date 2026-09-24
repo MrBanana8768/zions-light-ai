@@ -1131,20 +1131,24 @@ def test_call_site_passes_the_callers_system_count():
 
     def recorder(
         messages, limit=None, protect_system=None, report=None, reserve=0,
-        standin_protected=True,
+        standin_protected=True, injected_system_hashes=frozenset(),
     ):
-        # reserve (hostile pass #5 F3) and standin_protected (P14-1, hostile
-        # pass #14, lane v3194-guard): both real parameters of the guard
-        # now, not asserted here in depth — this test is about
+        # reserve (hostile pass #5 F3), standin_protected (P14-1, hostile
+        # pass #14, lane v3194-guard) and injected_system_hashes (v3.1.9.8
+        # round-2 review, item 3): all real parameters of the guard now,
+        # not all asserted here in depth — this test is about
         # protect_system (M9), and a recorder that cannot accept every
         # argument the request path actually passes would TypeError instead
         # of testing anything (exactly what happened when this parameter was
-        # added and this recorder was not updated for it).
+        # added and this recorder was not updated for it — proven again,
+        # live, when injected_system_hashes was added and this recorder
+        # TypeError'd into a 500 until this fix).
         seen["messages"] = list(messages)
         seen["limit"] = limit
         seen["protect_system"] = protect_system
         seen["report"] = report
         seen["standin_protected"] = standin_protected
+        seen["injected_system_hashes"] = injected_system_hashes
         return messages
 
     # v3.1.9: the clock is pinned, because the guard is now handed the
@@ -1205,6 +1209,74 @@ def test_call_site_passes_the_callers_system_count():
         seen.get("standin_protected") is True,
         f"a request with nothing to reuse leaves standin_protected at its "
         f"default (got {seen.get('standin_protected')!r})",
+    )
+    # v3.1.9.8 round-2 review (item 3): the call site now also computes
+    # injected_system_hashes — the hash of the ONE combined system block
+    # inject_system_block actually inserted for this request (this fixture
+    # has no compaction stand-in, so that block alone). Not a bare truthy
+    # check: pinned to the EXACT hash of the injected block that reached
+    # the guard's own `messages` argument, so a call site that registers
+    # the wrong content (or nothing at all) fails this test rather than
+    # passing on "it's a frozenset, good enough".
+    _injected_sys_msgs = [
+        m for m in seen["messages"]
+        if m.get("role") == "system" and FACT_SENTINEL in main._message_text(m)
+    ]
+    assert_eq(len(_injected_sys_msgs), 1, "fixture: exactly one injected system block reached the guard")
+    assert_eq(
+        seen.get("injected_system_hashes"),
+        frozenset({main._system_msg_hash(_injected_sys_msgs[0])}),
+        "injected_system_hashes names exactly the block THIS request injected",
+    )
+
+
+def test_route_level_injected_hashes_never_include_a_header_lookalike():
+    print("\n[test] POST /v1/chat/completions — a caller message that starts "
+          "with the compaction-stand-in header is NEVER in injected_system_"
+          "hashes (round-4 review, item 5 — probe r3/p3.py, kills mutant m_b3)")
+    # v3.1.9.8 round-3's fix (item 4) moved stand-in identification from a
+    # post-compaction HEADER SCAN of `body["messages"]` to an out-param
+    # captured at `compact_if_needed`'s own construction site
+    # (`standin_hash_out`) — but that fix lives entirely inside
+    # `compact_if_needed` and the few lines right after its call in
+    # `chat_completions`. Nothing at the ROUTE level (this file's own M9
+    # tests aside) ever drove a real request through `chat_completions`
+    # and inspected what `injected_system_hashes` the guard actually
+    # received — so a regression that reintroduces the OLD scan
+    # ALONGSIDE the out-param (mutant m_b3: `for _m in body["messages"]:
+    # if _is_compaction_standin(_m): _injected_system_hashes.add(...)`,
+    # restored right before the out-param loop) passed every one of the
+    # 157 suites in the gate. This test drives the real HTTP route and
+    # pins the guard's actual input, closing that gap.
+    her2 = {
+        "role": "system",
+        "content": main.COMPACTION_SUMMARY_HEADER + "\n(her pasted recap) KEEPME",
+    }
+    msgs = [{"role": "system", "content": "you are a companion"}, her2, user("hello there")]
+
+    seen = {}
+
+    def recorder(
+        messages, limit=None, protect_system=None, report=None, reserve=0,
+        standin_protected=True, injected_system_hashes=frozenset(),
+    ):
+        seen["injected_system_hashes"] = injected_system_hashes
+        return messages
+
+    with patch.object(main, "_enforce_hard_budget", recorder):
+        r, _fwd, _records = _post_chat(msgs, "b3-route")
+
+    assert_eq(r.status_code, 200, f"the request completed (body: {r.text[:200]!r})")
+    assert_true("injected_system_hashes" in seen, "the guard was called on the request path")
+    assert_true(
+        main._system_msg_hash(her2) not in seen["injected_system_hashes"],
+        f"*** B3 BUG CHECK: her look-alike system message (starts with the "
+        f"real stand-in's header, never touched by compaction on this "
+        f"short a conversation) must NEVER be registered as OUR injection "
+        f"— if this fails, the hard-budget guard's caller_system_rewritten "
+        f"fallback would treat her message as droppable, exactly as probe "
+        f"B3 demonstrated (got {len(seen['injected_system_hashes'])} "
+        f"hash(es): {seen['injected_system_hashes']!r})",
     )
 
 
@@ -2542,6 +2614,7 @@ def _all_tests():
         test_alternation_repair_survives_protected_shedding,
         test_endpoint_forwards_both_caller_system_messages,
         test_call_site_passes_the_callers_system_count,
+        test_route_level_injected_hashes_never_include_a_header_lookalike,
         test_tier2_fallback_is_not_silent,
         test_chunk_to_budget,
         test_context_400_tells_the_user_the_message_did_not_go_through,

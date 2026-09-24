@@ -412,18 +412,38 @@ def mark_wiped(conv_id: str) -> None:
     extraction call) for what catches a wipe landing mid-run rather than
     mid-gap, and `_write_state_unless_wiped`'s own docstring for the
     belt-and-suspenders write-side refusal that backs those checks up.
-    """
-    state = read_state(conv_id)
-    if state is None:
-        return
-    _write_state(conv_id, {
-        "state": "wiped",
-        "started_at": state.get("started_at") or _now_iso(),
-        "exchanges_done": state.get("exchanges_done", 0),
-        "exchanges_total": state.get("exchanges_total", 0),
-        "attempts": state.get("attempts", 0),
-        "error": None,
-    })
+
+    v3.1.9.8 round-4 review (item 2, HIGH — "audit every write on the wipe
+    and forget paths"): called from INSIDE `main._clear_all_memory`'s
+    locked wipe section, before the memory-layer deletes that follow it.
+    An unguarded read or write failure here (a corrupt backfill state
+    file; an ENOSPC on the write) would propagate straight out and abort
+    the wipe at this exact step, the same shape probe p2.py demonstrated
+    for the wipe-ledger marker — for a layer (the backfill sidecar) whose
+    entire purpose is a defense-in-depth signal, not something worth
+    losing her facts over. Never raises; a failure here just means the
+    lazy-backfill gate this call exists to close stays open until the
+    next wipe attempt succeeds — degraded, not data-destroying."""
+    try:
+        state = read_state(conv_id)
+        if state is None:
+            return
+        _write_state(conv_id, {
+            "state": "wiped",
+            "started_at": state.get("started_at") or _now_iso(),
+            "exchanges_done": state.get("exchanges_done", 0),
+            "exchanges_total": state.get("exchanges_total", 0),
+            "attempts": state.get("attempts", 0),
+            "error": None,
+        })
+    except Exception as e:
+        logger.warning(
+            f"conv={conv_id}: mark_wiped could not read/write the backfill "
+            f"state ({type(e).__name__}: {e}); proceeding with the wipe "
+            f"regardless — this is a defense-in-depth signal, not the "
+            f"deletion itself. The lazy backfill gate may stay open for "
+            f"this conv until a later wipe succeeds here."
+        )
 
 
 def _facts_tombstoned(conv_id: str) -> bool:

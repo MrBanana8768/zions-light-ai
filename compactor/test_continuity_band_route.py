@@ -196,8 +196,34 @@ def test_band_injection_is_fully_off_by_default():
     _seed_unsummarized_state(conv_id)
     assert_true(main.CONTINUITY_BAND_ENABLED is False,
                 "sanity: the module-level default really is False")
-    status, bodies, log = post(conv_id, CONVO, band_enabled=False)
-    assert_true(status == 200, f"route returns 200 (got {status})")
+
+    # Task C: the log-line and forwarded-payload assertions below are
+    # necessary but not sufficient — a stray "band(" phrase elsewhere, or
+    # a swallowed exception, could make them pass for the wrong reason.
+    # Assert the actual I/O the band block does never happens when the
+    # flag is off: continuity.visible (reads the digest store) is called
+    # ONLY from inside `if CONTINUITY_BAND_ENABLED:`, so it must see zero
+    # calls. summarizer.load_state is trickier — it is ALSO called
+    # unconditionally earlier in the request (the Phase 4 hierarchical-
+    # summary section, main.py ~11243) for reasons that have nothing to do
+    # with the band, so "never called" would be the wrong assertion; the
+    # band's own extra `_bstate = summarizer.load_state(conv_id)` read
+    # (main.py's own comment just above `if CONTINUITY_BAND_ENABLED:`:
+    # "no summarizer.load_state call, no fingerprinting, no tokens.raw()")
+    # is what must not happen, so the call count is pinned at exactly the
+    # one earlier, unconditional read.
+    with patch.object(continuity, "visible", wraps=continuity.visible) as _visible_spy, \
+         patch.object(summarizer, "load_state", wraps=summarizer.load_state) as _load_state_spy:
+        status, bodies, log = post(conv_id, CONVO, band_enabled=False)
+        assert_true(status == 200, f"route returns 200 (got {status})")
+        assert_true(_visible_spy.call_count == 0,
+                    f"continuity.visible is never called when the flag is off "
+                    f"(called {_visible_spy.call_count}x) — no band digest-store read")
+        assert_true(_load_state_spy.call_count == 1,
+                    f"summarizer.load_state is called exactly once (the "
+                    f"unconditional Phase-4 read, not the band's extra "
+                    f"_bstate read) when the flag is off (called "
+                    f"{_load_state_spy.call_count}x)")
     assert_true("band(" not in log, f"no band(N) log line when the flag is off; log tail: {log[-800:]!r}")
     assert_true("continuity band injection failed" not in log,
                 "the gated-off block cannot fail — it never runs")

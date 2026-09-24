@@ -34,6 +34,7 @@ from typing import Any
 
 import httpx
 
+import continuity
 import facts
 import logsetup
 import memory
@@ -1471,6 +1472,54 @@ def _budget_margin_state() -> dict:
     return {"available": True, **st}
 
 
+def _ledger_state() -> dict:
+    """checks.ledger: continuity.ledger_health_counts() — round-2 review
+    (item 2, MEDIUM): `_read_ledger_failing_closed`'s own unreadable-
+    ledger ERROR line has always claimed "This is reported at /health";
+    nothing did, until this function. Unlike `_budget_margin_state`
+    above, `continuity` never imports `main` (its own module docstring
+    says so explicitly), so this imports it directly rather than reaching
+    through `sys.modules` — no circularity to route around.
+
+    Six counts, all DISTINCT CONVERSATIONS since process start, no conv
+    ids (matching every other aggregate in this payload). Round 3 added
+    the last three, for the PENDING INTENTS mechanism (see continuity.py's
+    module-level comment above `_pending_intents`) that replaced round
+    2's simpler (and, per the round-3 review, incomplete) process-local
+    mark:
+      - unreadable_ever: the ledger FILE could not be parsed at least once
+      - write_failed_ever: a ledger WRITE failed at least once
+      - write_failed_current: a write has failed and no later write for
+        that conv has succeeded yet
+      - pending_intent_current: conversations currently holding a pending
+        intent (needles/epoch a failed write could not persist) — this is
+        exactly the set failing the continuity band CLOSED right now,
+        whether or not its durability sidecar is intact
+      - double_failure_current: the RESIDUAL — both the ledger write AND
+        its durability sidecar failed, so the pending intent exists only
+        in this process's memory and a restart before the next successful
+        write would lose it (the one case the /forget reply warns the
+        words could come back)
+      - double_failure_ever: same, but never shrinks
+    Visibility only, like `tokenizer`/`reuse`/`budget_margin` above — a
+    nonzero count does not move `status`: the wipe/forget itself always
+    still happened (continuity's whole point), only the ledger's own
+    bookkeeping degraded, and every degraded conv already fails closed on
+    the band until repaired."""
+    try:
+        counts = continuity.ledger_health_counts()
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        return {"available": False, "reason": err, "error": err}
+    if not isinstance(counts, dict):
+        err = (
+            f"continuity.ledger_health_counts() returned "
+            f"{type(counts).__name__}, not a dict"
+        )
+        return {"available": False, "reason": err, "error": err}
+    return {"available": True, **counts}
+
+
 async def gather_health_full(
     vllm_url: str, target_tokens: int, tokenize: dict | None = None
 ) -> dict:
@@ -1543,6 +1592,9 @@ async def gather_health_full(
     # v3.1.9.4 (R4): same pattern again, for the truncated-summary counters
     # R3/round-2's M1 (P15-6) added.
     truncated_summaries = _truncated_summary_state()
+    # v3.1.9.8 round-2 review (item 2): same pattern again, for the wipe
+    # ledger's unreadable/write-failed counts.
+    ledger = _ledger_state()
 
     # Why a reason list and not a bare string: `bg` used to be computed here,
     # placed in the payload, and never read. Sustained shedding — the pool
@@ -2185,6 +2237,11 @@ async def gather_health_full(
             # `status`, the same doctrine as `tokenizer`/`reuse`/
             # `budget_margin` above.
             "truncated_summaries": truncated_summaries,
+            # v3.1.9.8 round-2 review (item 2): continuity.ledger_health_
+            # counts(), or {"available": false, ...}. Visibility only —
+            # does not affect `status`, the same doctrine as
+            # `tokenizer`/`reuse`/`budget_margin`/`truncated_summaries`.
+            "ledger": ledger,
         },
         "stats": stats,
         "backups": backup_info,

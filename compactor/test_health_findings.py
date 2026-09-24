@@ -45,6 +45,16 @@ os.environ.setdefault("VLLM_URL", "http://stub:8000")
 os.environ["COMPACTOR_RAG_ENABLED"] = "false"
 _TMP_ROOT = tempfile.mkdtemp(prefix="health-findings-store-")
 os.environ["COMPACTOR_STORAGE_ROOT"] = _TMP_ROOT
+# v3.1.9.8 round-4 review (item 6/pending-intent health counts): without
+# this, continuity.PENDING_ROOT falls back to its own default
+# (STORAGE_ROOT.parent / "compactor-pending" — i.e. a bare "/tmp/compactor-
+# pending", since tempfile.mkdtemp() puts _TMP_ROOT directly under /tmp),
+# which every OTHER test file that also omits this env var shares within
+# the same container run. This file's round-4 ledger test asserts an EXACT
+# pending_intent_current count from a "clean process", which a leftover
+# sidecar from an unrelated test file's run would silently break — set our
+# own, so this file's ledger-pending directory starts and stays private.
+os.environ["COMPACTOR_PENDING_ROOT"] = tempfile.mkdtemp(prefix="health-findings-pending-")
 os.environ["COMPACTOR_L1_CHUNK_SIZE"] = "40"
 os.environ.pop("WEBUIDB_SYNC_ENABLED", None)
 
@@ -74,6 +84,7 @@ import retrieval  # noqa: E402
 retrieval.conversation_doc_count = lambda conv_id: 0
 
 import backup  # noqa: E402
+import continuity  # noqa: E402
 import health  # noqa: E402
 import summarizer  # noqa: E402
 import tailhealth  # noqa: E402
@@ -1309,6 +1320,121 @@ def test_p13_1_budget_margin_signal_reaches_health_full():
         main._budget_ok_streak = saved_streak
 
 
+def test_round2_ledger_signal_reaches_health_full():
+    """v3.1.9.8 round-2/round-3 review (item 2, MEDIUM): `continuity._read_
+    ledger_failing_closed`'s own ERROR line claims "This is reported at
+    /health" for both the unreadable-ledger and the write-failed cases —
+    before round 2, nothing was. `health._ledger_state()` reads
+    `continuity.ledger_health_counts()` directly (continuity never
+    imports main, so no sys.modules indirection is needed the way
+    `checks.budget_margin`/`checks.tokenizer` need it above). Round 3
+    added three more counts for the PENDING INTENTS mechanism
+    (`pending_intent_current`, `double_failure_current`,
+    `double_failure_ever` — see continuity.py's module-level comment
+    above `_pending_intents`).
+
+    Same style as test_p13_1 above: drive continuity's real module-level
+    state directly (cheap, no actual unwritable directory needed) and
+    confirm the same numbers reach gather_health_full's payload, counts
+    are DISTINCT CONVERSATIONS not events, and a nonzero count never
+    takes `status` to "down" — the wipe/forget itself already happened
+    regardless; only the ledger bookkeeping degraded.
+    """
+    print("\n[round2/3-item2] checks.ledger reads continuity.ledger_health_counts()")
+    saved_current = set(continuity._ledger_write_failed)
+    saved_ever = set(continuity._ledger_write_failed_ever)
+    saved_unreadable = set(continuity._ledger_unreadable_ever)
+    saved_pending = dict(continuity._pending_intents)
+    saved_double_current = set(continuity._double_failure_current)
+    saved_double_ever = set(continuity._double_failure_ever)
+    try:
+        continuity._ledger_write_failed.clear()
+        continuity._ledger_write_failed_ever.clear()
+        continuity._ledger_unreadable_ever.clear()
+        continuity._pending_intents.clear()
+        continuity._double_failure_current.clear()
+        continuity._double_failure_ever.clear()
+
+        clean = health._ledger_state()
+        check(clean.get("available") is True,
+              f"continuity is loaded in this process, so checks.ledger must "
+              f"read it (got {clean})")
+        check(
+            clean == {
+                "available": True,
+                "unreadable_ever": 0,
+                "write_failed_ever": 0,
+                "write_failed_current": 0,
+                "pending_intent_current": 0,
+                "double_failure_current": 0,
+                "double_failure_ever": 0,
+            },
+            f"*** a clean process reads all six counts at 0 (got {clean})",
+        )
+
+        # Two convs fail to write; one of them recovers (a later write for
+        # it succeeds). A third conv's ledger FILE is unreadable. A fourth
+        # conv is in the double-failure residual (pending, but its sidecar
+        # also failed). Same distinct-conversation counting
+        # `ledger_health_counts` promises.
+        continuity._ledger_write_failed_ever.update({"conv-a", "conv-b"})
+        continuity._ledger_write_failed.add("conv-a")  # conv-b recovered
+        continuity._ledger_unreadable_ever.add("conv-c")
+        continuity._pending_intents["conv-a"] = {"epoch": 1, "boundary": None, "needles": []}
+        continuity._pending_intents["conv-d"] = {"epoch": None, "boundary": None, "needles": []}
+        continuity._double_failure_current.add("conv-d")
+        continuity._double_failure_ever.update({"conv-d", "conv-e"})
+
+        degraded = health._ledger_state()
+        check(degraded.get("write_failed_ever") == 2,
+              f"*** write_failed_ever counts both conv-a and conv-b, ever "
+              f"(got {degraded})")
+        check(degraded.get("write_failed_current") == 1,
+              f"*** write_failed_current counts only conv-a, the one still "
+              f"degraded — conv-b recovered (got {degraded})")
+        check(degraded.get("unreadable_ever") == 1,
+              f"*** unreadable_ever counts conv-c (got {degraded})")
+        check(degraded.get("pending_intent_current") == 2,
+              f"*** pending_intent_current counts conv-a and conv-d (got {degraded})")
+        check(degraded.get("double_failure_current") == 1,
+              f"*** double_failure_current counts only conv-d, the residual "
+              f"(got {degraded})")
+        check(degraded.get("double_failure_ever") == 2,
+              f"*** double_failure_ever counts conv-d and conv-e, ever "
+              f"(got {degraded})")
+        check(
+            all(cid not in str(degraded) for cid in ("conv-a", "conv-b", "conv-c", "conv-d", "conv-e")),
+            f"no conv id leaks into the /health payload, matching every "
+            f"other aggregate here (got {degraded})",
+        )
+
+        r = full()
+        check("ledger" in r["checks"],
+              "*** gather_health_full's checks dict carries 'ledger'")
+        check(r["checks"].get("ledger", {}).get("write_failed_current") == 1,
+              "and it is the SAME live state _ledger_state() reads directly, "
+              "not a stale or re-derived copy")
+        check(r["checks"].get("ledger", {}).get("double_failure_current") == 1,
+              "the double-failure residual reaches the payload too")
+        check(r["status"] != "down",
+              "visibility-only: a degraded ledger does not itself take the "
+              "pod down — the deletion it records already happened "
+              "regardless of whether the ledger write did")
+    finally:
+        continuity._ledger_write_failed.clear()
+        continuity._ledger_write_failed.update(saved_current)
+        continuity._ledger_write_failed_ever.clear()
+        continuity._ledger_write_failed_ever.update(saved_ever)
+        continuity._ledger_unreadable_ever.clear()
+        continuity._ledger_unreadable_ever.update(saved_unreadable)
+        continuity._pending_intents.clear()
+        continuity._pending_intents.update(saved_pending)
+        continuity._double_failure_current.clear()
+        continuity._double_failure_current.update(saved_double_current)
+        continuity._double_failure_ever.clear()
+        continuity._double_failure_ever.update(saved_double_ever)
+
+
 def test_p11_3_declined_recently_follows_only_a_real_budget_decline():
     """P11-3 (hostile pass #11, LOW): OPERATIONS.md documents
     `declined_recently` as following "the most recent BUDGET decline
@@ -1484,6 +1610,7 @@ TESTS = [
     test_p11_3_declined_recently_follows_only_a_real_budget_decline,
     test_p12_2_window_decline_has_its_own_reason_and_numbers,
     test_p13_1_budget_margin_signal_reaches_health_full,
+    test_round2_ledger_signal_reaches_health_full,
 ]
 
 

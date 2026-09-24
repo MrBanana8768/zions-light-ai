@@ -103,7 +103,21 @@ class _Backend:
         pass
 
 
-async def _no_compaction(messages, conv_id, stored_turns_out=None):
+async def _no_compaction(
+    messages, conv_id, stored_turns_out=None, inject_budget=None,
+    reuse_margin_out=None, standin_hash_out=None,
+):
+    # v3.1.9.8 round-4 review (item 6, LOW): this used to accept only
+    # `stored_turns_out`, so the request path's real call — which also
+    # passes `inject_budget`, `reuse_margin_out` and (since round 3)
+    # `standin_hash_out` — TypeError'd on every request this file drove.
+    # chat_completions' own `except Exception` around the compact_if_
+    # needed call swallowed that TypeError silently (logged, not raised),
+    # so this file's checks kept passing for the wrong reason: compaction
+    # never actually ran, not because these tests do not need it, but
+    # because the stand-in was broken. Accepting every keyword argument
+    # the real call site passes is what makes this a stand-in instead of
+    # a trap.
     return list(messages)
 
 
@@ -115,19 +129,27 @@ _real_guard = main._enforce_hard_budget
 
 def _spy_guard(
     msgs, limit=None, protect_system=1, report=None, reserve=0,
-    standin_protected=True,
+    standin_protected=True, injected_system_hashes=frozenset(),
 ):
-    # `reserve` (hostile pass #5 F3) and `standin_protected` (P14-1,
-    # hostile pass #14, lane v3194-guard) are real parameters of the guard
+    # `reserve` (hostile pass #5 F3), `standin_protected` (P14-1,
+    # hostile pass #14, lane v3194-guard) and `injected_system_hashes`
+    # (v3.1.9.8 round-2 review, item 3) are real parameters of the guard
     # now, not spy-only additions: passed through so this file still
     # exercises the guard's actual behaviour instead of silently dropping
     # an argument the request path sends and testing a call it never
     # makes (this file patches compact_if_needed to `_no_compaction`,
     # which never reports a stand-in, so `standin_protected` always
-    # arrives True here — forwarded anyway, on the same principle).
+    # arrives True here — forwarded anyway, on the same principle). A spy
+    # that cannot accept every argument the request path actually passes
+    # TypeErrors on the request path instead of testing anything — see
+    # test_budget_guard.py's own M9 spy, which hit exactly this when
+    # injected_system_hashes was added and it was not updated for it.
     _guard_limits.append(limit)
     _guard_reserves.append(reserve)
-    out = _real_guard(msgs, limit, protect_system, report, reserve, standin_protected)
+    out = _real_guard(
+        msgs, limit, protect_system, report, reserve, standin_protected,
+        injected_system_hashes,
+    )
     _guard_reports.append(dict(report or {}))
     return out
 

@@ -1233,6 +1233,69 @@ try:
 finally:
     summarizer._summarize_pieces = _real_pieces
 
+# ---------------------------------------------------------------------------
+# v3.1.9.8 round-3 review (item 4, LOW — probe B3, scratchpad/expC/
+# compactor/probe_guard.py). The compaction stand-in used to be recognised
+# downstream by a HEADER PREFIX scan (`_is_compaction_standin`, content-
+# based) — which cannot tell "the stand-in compact_if_needed just built"
+# from "a caller system message that happens to start with the same
+# literal header text". The reviewer's probe: a second caller system
+# message beginning with "[Summary of earlier conversation]" got
+# misregistered as ours by that scan and then TRIMMED by the hard-budget
+# guard's caller_system_rewritten fallback (3064 -> 1571 chars in the
+# probe). Fixed by capturing the stand-in's identity at `compact_if_
+# needed`'s own `summary_blocks` construction (`standin_hash_out`), the
+# one place its content is trustworthy — never by scanning the RETURNED
+# array afterward for anything that merely looks like it.
+# ---------------------------------------------------------------------------
+print("\n[B3] the compaction stand-in is identified by construction site, "
+      "never by a header-prefix scan (probe B3)")
+CONV_B3 = "b3_standin_collision"
+_her_lookalike = {
+    "role": "system",
+    "content": main.COMPACTION_SUMMARY_HEADER
+               + "\n(her own pasted recap of an earlier chat) KEEPME " + "k" * 300,
+}
+check(
+    main._is_compaction_standin(_her_lookalike),
+    "fixture: her look-alike message DOES match _is_compaction_standin's "
+    "old header-prefix test — this is exactly the collision the fix closes",
+)
+_b3_msgs = (
+    [{"role": "system", "content": "you are a companion"}, _her_lookalike]
+    + _ns(history(24))
+)
+_b3_out_hash: list = []
+_b3_out = _run(_b3_msgs, CONV_B3, standin_hash_out=_b3_out_hash)
+check(len(CALLS) >= 1, "fixture: real compaction actually ran (summarize was called)")
+_b3_standins = [
+    m for m in _b3_out
+    if m.get("role") == "system" and "FRESHLY-SUMMARIZED" in str(m.get("content", ""))
+]
+check(len(_b3_standins) == 1, f"fixture: exactly one genuine stand-in was built (got {len(_b3_standins)})")
+check(
+    any("KEEPME" in str(m.get("content", "")) for m in _b3_out),
+    "fixture: her look-alike message survived compaction untouched (compact_"
+    "if_needed carries leading system messages through as-is)",
+)
+_lookalike_hash = main._system_msg_hash(_her_lookalike)
+_standin_hash = main._system_msg_hash(_b3_standins[0]) if _b3_standins else None
+check(len(_b3_out_hash) == 1, f"exactly one hash was captured via standin_hash_out (got {_b3_out_hash})")
+check(
+    bool(_b3_out_hash) and _b3_out_hash[0] == _standin_hash,
+    f"*** the captured hash is the REAL stand-in's — construction-site "
+    f"identity, not a content guess (got {_b3_out_hash!r}, "
+    f"expected [{_standin_hash!r}])",
+)
+check(
+    _lookalike_hash not in _b3_out_hash,
+    "*** B3 BUG CHECK: her look-alike message's hash was NEVER captured as "
+    "ours via standin_hash_out, even though it starts with the exact same "
+    "header text the real stand-in does — if this fails, chat_completions "
+    "would register it as injected and the hard-budget guard's fallback "
+    "would trim it, exactly as probe B3 demonstrated pre-fix",
+)
+
 main.summarize = _real
 
 if FAILED:

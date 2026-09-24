@@ -33,6 +33,7 @@ Run: python test_degraded_forget.py
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import sys
@@ -47,6 +48,7 @@ os.environ["COMPACTOR_RAG_ENABLED"] = "false"
 os.environ["COMPACTOR_PERSONA_AUTO_DETECT_MIN_CHARS"] = "50"
 
 import backfill  # noqa: E402
+import continuity  # noqa: E402
 import facts  # noqa: E402
 import main  # noqa: E402
 import memory  # noqa: E402
@@ -183,6 +185,40 @@ def test_clear_all_memory_partial_wipe_on_corrupt_facts():
     assert_true(memory.facts_path(cid).is_file(), "facts file still in place")
     assert_eq(memory.facts_path(cid).read_text(encoding="utf-8"), before,
               "facts file byte-identical — not rewritten from an unknown state")
+
+
+def test_clear_all_memory_partial_wipe_on_facts_write_failure():
+    print("\n[test] round-4 item 2 — a facts WRITE failure (not a read "
+          "failure) does not abort the wipe of the other layers either")
+    # v3.1.9.8 round-4 review ("audit every write on the wipe and forget
+    # paths"): the sibling of test_clear_all_memory_partial_wipe_on_
+    # corrupt_facts above — that one covers load_facts raising
+    # StoreUnreadable (a READ failure); this covers facts.save_facts
+    # itself raising a plain OSError (a WRITE failure, e.g. ENOSPC) on a
+    # facts file that reads FINE. Before this fix, only StoreUnreadable
+    # was caught around this call — an OSError from the write propagated
+    # straight out of _clear_all_memory, aborting episodic/summary/
+    # persona/chapters before any of them ran.
+    _wipe_storage()
+    cid = "facts-write-fails"
+    facts.save_facts(cid, [
+        {"text": "her sister Maren has cancer", "added_turn": 1, "last_used": 1},
+    ])
+    _seed_other_layers(cid)
+
+    with patch.object(retrieval, "forget_conversation", lambda c: 7), \
+         patch.object(facts, "save_facts", side_effect=OSError(28, "No space left on device")):
+        result = _wipe(cid)
+
+    assert_eq(result["unreadable"], ["facts"],
+              "*** BUG CHECK: reported as unreadable/unconfirmed, not silently skipped")
+    assert_eq(result["forgotten_facts"], 0, "no fact count claimed — the write never confirmed landing")
+    assert_eq(result["forgotten_episodic"], 7,
+              "*** BUG CHECK: episodic still cleared — the OSError did not abort the function")
+    assert_eq(result["forgotten_summary"], True, "summary still cleared")
+    assert_eq(result["forgotten_persona"], True, "persona still cleared")
+    assert_true(not memory.summary_path(cid).is_file(), "summary file gone")
+    assert_true(not memory.persona_path(cid).is_file(), "persona file gone")
 
 
 def test_clear_all_memory_does_not_raise_on_corrupt_facts():
@@ -325,6 +361,276 @@ def test_real_forget_closes_the_backfill_gate():
 
 
 # ---------------------------------------------------------------------------
+# B2 — a ledger WRITE failure must never block the deletion she asked for
+# ---------------------------------------------------------------------------
+#
+# `_ledger_path` (continuity.py) lives in CONTROL_ROOT. Both wipe paths write
+# the ledger BEFORE deleting: commands._handle_forget's selective branch
+# calls continuity.suppress_needle -> record_targeted_forget before
+# facts_module.save_facts; the full wipe's continuity.wipe_conversation_band
+# calls record_wipe before it unlinks any memory_layer_paths. Before this
+# fix, an OSError out of `_write_ledger` (an unwritable CONTROL_ROOT, a full
+# disk) propagated straight out of record_wipe/record_targeted_forget,
+# raising through commands._handle_forget or main._clear_all_memory before
+# either reached its own deletion — so /forget raised, and her facts were
+# NOT removed. record_wipe/record_targeted_forget/retire_tombstone now catch
+# that failure (via `continuity._write_ledger_best_effort`), log it loudly at
+# ERROR, and let the deletion proceed regardless — the same "never block a
+# wipe she asked for" principle `record_wipe` already applies to an
+# unreadable EXISTING ledger, extended to a WRITE failure.
+#
+# Per the task's own guidance: monkeypatching `continuity._write_ledger` to
+# raise OSError is preferred over chmod'ing CONTROL_ROOT to 0500, both
+# because it is deterministic (a chmod is a no-op for a process running as
+# root, which would silently skip the scenario rather than test it) and
+# because it isolates the fault to exactly the write this fix is about.
+
+
+def _capture_compactor_log():
+    handler = logging.StreamHandler(stream=open(os.devnull, "w"))
+    records: list[logging.LogRecord] = []
+
+    class _Recorder(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    rec = _Recorder()
+    lg = logging.getLogger("compactor")
+    lg.addHandler(rec)
+    return lg, rec, records
+
+
+def test_selective_forget_removes_facts_even_when_the_ledger_write_fails():
+    print("\n[test] /forget X removes the fact even when the wipe ledger cannot be written")
+    _wipe_storage()
+    cid = "forget-selective-ledger-failure"
+    facts.save_facts(cid, [
+        {"text": "Lyra is a half-elf ranger.", "added_turn": 1, "last_used": 1},
+    ])
+
+    lg, rec, records = _capture_compactor_log()
+    try:
+        with patch.object(
+            continuity, "_write_ledger",
+            side_effect=OSError("[Errno 13] Permission denied: CONTROL_ROOT/wipes"),
+        ):
+            reply = _command_reply("/forget Lyra", cid)
+    finally:
+        lg.removeHandler(rec)
+
+    assert_eq(facts.load_facts(cid), [], "the fact is removed despite the ledger write failure")
+    assert_true("Forgot" in reply, f"the command reports success: {reply!r}")
+    # v3.1.9.8 round-2/round-3 review (item 1/3, HIGH/MEDIUM): she deserves
+    # to know the recording itself did not fully stick — but round 3's
+    # pending-intent design means the band still fails closed for this
+    # conv (the sidecar caught it), so the note is calm ("stays paused"),
+    # NOT a claim that the words could come back — that claim is reserved
+    # for the double-failure residual only (see commands._ledger_pending_
+    # note's docstring and test_continuity.py's double-failure test).
+    assert_true(
+        "saved durably" in reply.lower() and "paused" in reply.lower(),
+        f"the reply carries the calm, accurate note (see _ledger_pending_"
+        f"note): {reply!r}",
+    )
+    assert_true(
+        "come back" not in reply.lower() and "reappear" not in reply.lower(),
+        f"*** the reply must NOT warn the words could come back — the "
+        f"sidecar caught this pending intent, so nothing should reappear "
+        f"(got {reply!r})",
+    )
+    assert_true(
+        any(
+            r.levelno == logging.ERROR
+            and "ledger" in r.getMessage().lower()
+            and cid in r.getMessage()
+            for r in records
+        ),
+        "the ledger write failure is logged loudly (ERROR, naming the conv)",
+    )
+    assert_true(
+        any("pending intent" in r.getMessage().lower() for r in records if r.levelno == logging.ERROR),
+        "the log line names the pending-intent mechanism that is now "
+        "carrying this forward, not just a bare 'degraded' claim",
+    )
+
+
+def test_full_forget_removes_facts_even_when_the_ledger_write_fails():
+    print("\n[test] full /forget clears memory even when the wipe ledger cannot be written")
+    _wipe_storage()
+    cid = "forget-full-ledger-failure"
+    facts.save_facts(cid, [
+        {"text": "Lyra is a half-elf ranger.", "added_turn": 1, "last_used": 1},
+    ])
+    _seed_other_layers(cid)
+
+    lg, rec, records = _capture_compactor_log()
+    try:
+        with patch.object(
+            continuity, "_write_ledger",
+            side_effect=OSError("[Errno 13] Permission denied: CONTROL_ROOT/wipes"),
+        ):
+            reply = _command_reply("/forget", cid)
+    finally:
+        lg.removeHandler(rec)
+
+    assert_eq(facts.load_facts(cid), [], "facts are gone despite the ledger write failure")
+    assert_true(not memory.summary_path(cid).is_file(), "summary is gone too")
+    assert_true(not memory.persona_path(cid).is_file(), "persona is gone too")
+    assert_true("still storing" not in reply.lower(), f"the reply agrees the wipe went through: {reply!r}")
+    # v3.1.9.8 round-2/round-3 review (item 1/3, HIGH/MEDIUM): same calm,
+    # accurate note as the selective branch — see that test's comment for
+    # why "stays paused" replaces the old, overstated "could come back"
+    # (round 2) / "storage problem ... restored from a backup" (round 1)
+    # wording.
+    assert_true(
+        "saved durably" in reply.lower() and "paused" in reply.lower(),
+        f"the reply carries the calm, accurate note: {reply!r}",
+    )
+    assert_true(
+        "come back" not in reply.lower() and "reappear" not in reply.lower(),
+        f"*** the reply must NOT warn the words could come back — the "
+        f"sidecar caught this pending intent (got {reply!r})",
+    )
+    assert_true(
+        any(
+            r.levelno == logging.ERROR
+            and "ledger" in r.getMessage().lower()
+            and cid in r.getMessage()
+            for r in records
+        ),
+        "the ledger write failure is logged loudly (ERROR, naming the conv)",
+    )
+    assert_true(
+        any("pending intent" in r.getMessage().lower() for r in records if r.levelno == logging.ERROR),
+        "the log line names the pending-intent mechanism",
+    )
+
+
+def test_ledger_write_failure_does_not_bump_the_epoch():
+    print("\n[test] a failed ledger write leaves the persisted epoch unchanged "
+          "(best-effort, not a lie)")
+    # v3.1.9.8 round-2 review (item 4, LOW): record_wipe used to return the
+    # epoch it merely INTENDED to persist even when the write failed — a
+    # caller trusting that number would believe something was on disk that
+    # never got there. It now returns None on a failed write instead (and
+    # the conv is marked degraded, which fails current_ledger_epoch closed
+    # too — see test_continuity.py's item-1 tests for that half).
+    _wipe_storage()
+    cid = "forget-ledger-failure-epoch"
+    with patch.object(continuity, "_write_ledger", side_effect=OSError("no space left on device")):
+        got = continuity.record_wipe(cid)
+    assert_eq(got, None, "record_wipe returns None, not a number nothing backs")
+    assert_true(continuity.ledger_degraded(cid), "and the conv is marked degraded")
+    assert_true(not continuity._ledger_path(cid).is_file(),
+                "the ledger file itself was never written")
+
+
+# ---------------------------------------------------------------------------
+# Round-4 review, item 2 (HIGH — probe r3/p2.py): "audit every write on the
+# wipe and forget paths — none may abort the deletion." Reproduces the
+# reviewer's own probe scope: every `memory.atomic_write_json` call AND
+# `continuity._write_ledger` fail with ENOSPC — this hits the wipe LEDGER,
+# the wipe-MARKER cache (continuity.py, the specific bug the probe found),
+# and the backfill sidecar state (backfill.mark_wiped), all of which sit
+# BEFORE the facts/summary/persona/chapters deletes in the wipe sequence.
+# facts.save_facts is deliberately NOT affected by this patch (it imports
+# `atomic_write_json` by name at module load, a separate binding from
+# `memory.atomic_write_json` — the same reason the probe's own facts file
+# ends up genuinely empty), matching a realistic fault where the WIPE
+# BOOKKEEPING's own storage (a different volume, in production terms) is
+# what is out of space, not the facts store itself.
+# ---------------------------------------------------------------------------
+
+def _enospc_on_bookkeeping_writes():
+    """Context manager-ish pair of patches, matching probe r3/p2.py
+    exactly: every `memory.atomic_write_json` call and
+    `continuity._write_ledger` call raises ENOSPC."""
+    return (
+        patch.object(memory, "atomic_write_json", side_effect=OSError(28, "No space left on device")),
+        patch.object(continuity, "_write_ledger", side_effect=OSError(28, "No space left on device")),
+    )
+
+
+def test_full_wipe_still_deletes_her_data_under_enospc_on_every_bookkeeping_write():
+    print("\n[test] round-4 item 2 — a full /forget still deletes her data "
+          "when the ledger, wipe marker AND backfill state all hit ENOSPC")
+    _wipe_storage()
+    cid = "enospc-full-wipe"
+    facts.save_facts(cid, [
+        {"text": "her sister Maren has cancer", "added_turn": 1, "last_used": 1},
+    ])
+    _seed_other_layers(cid)
+
+    lg, rec, records = _capture_compactor_log()
+    p1, p2 = _enospc_on_bookkeeping_writes()
+    try:
+        with p1, p2:
+            reply = _command_reply("/forget", cid)
+    finally:
+        lg.removeHandler(rec)
+
+    # THE bug (probe p2.py): before this fix, record_wipe's marker write
+    # raised straight out of wipe_conversation_band, aborting the wipe
+    # before any deletion ran at all.
+    assert_eq(facts.load_facts(cid), [],
+              "*** BUG CHECK: facts are gone despite ENOSPC on every "
+              "bookkeeping write — the wipe was never aborted")
+    assert_true(not memory.summary_path(cid).is_file(), "summary is gone too")
+    assert_true(not memory.persona_path(cid).is_file(), "persona is gone too")
+    assert_true("Forgot" in reply or "Cleared" in reply,
+                f"the reply reports what actually happened, truthfully: {reply!r}")
+    assert_true("still storing" not in reply.lower(),
+                f"the reply does not falsely claim residue: {reply!r}")
+    # The log must not claim "proceeding with the deletion anyway" while
+    # secretly having aborted — it can only say that truthfully if the
+    # deletion that follows the log line actually runs, which this
+    # asserts indirectly via the facts/summary/persona checks above.
+    assert_true(
+        any(r.levelno == logging.ERROR and "wipe-marker" in r.getMessage().lower() for r in records),
+        f"the wipe-marker write failure is itself logged (not silently "
+        f"swallowed) (got {[r.getMessage() for r in records if r.levelno == logging.ERROR]})",
+    )
+
+
+def test_selective_forget_still_deletes_her_data_under_enospc_on_every_bookkeeping_write():
+    print("\n[test] round-4 item 2 — a selective /forget X still deletes the "
+          "fact when the ledger hits ENOSPC (facts.save_facts itself unaffected)")
+    _wipe_storage()
+    cid = "enospc-selective-forget"
+    facts.save_facts(cid, [
+        {"text": "her sister Maren has cancer", "added_turn": 1, "last_used": 1},
+    ])
+
+    lg, rec, records = _capture_compactor_log()
+    p1, p2 = _enospc_on_bookkeeping_writes()
+    try:
+        with p1, p2:
+            reply = _command_reply("/forget Maren", cid)
+    finally:
+        lg.removeHandler(rec)
+
+    assert_eq(facts.load_facts(cid), [],
+              "the fact is removed despite ENOSPC on the ledger write")
+    assert_true("Forgot" in reply, f"the reply reports success: {reply!r}")
+    # ENOSPC on `memory.atomic_write_json` also breaks the pending-intent
+    # durability sidecar (`_persist_pending_sidecar` uses it too), so this
+    # lands in the DOUBLE-FAILURE note ("could not be saved at all right
+    # now"), not the single-failure "stays paused" one — either is an
+    # honest degraded-recording note; only "come back"/"restarted" is
+    # specific to the double-failure residual this scenario actually hits.
+    assert_true(
+        "saved durably" in reply.lower() or "paused" in reply.lower()
+        or ("saved" in reply.lower() and "restart" in reply.lower()),
+        f"and honestly notes the recording itself is degraded: {reply!r}",
+    )
+    assert_true(
+        any(r.levelno >= logging.ERROR and cid in r.getMessage() for r in records),
+        "the ledger write failure is logged (ERROR for a single failure, "
+        "CRITICAL for the double-failure residual this scenario hits)",
+    )
+
+
+# ---------------------------------------------------------------------------
 # C — the slash-command reply on StoreUnreadable
 # ---------------------------------------------------------------------------
 
@@ -405,12 +711,18 @@ def _all_tests():
     return [
         test_clear_all_memory_does_not_raise_on_corrupt_facts,
         test_clear_all_memory_partial_wipe_on_corrupt_facts,
+        test_clear_all_memory_partial_wipe_on_facts_write_failure,
         test_clear_all_memory_healthy_reports_nothing_unreadable,
         test_clear_all_memory_absent_facts_is_not_unreadable,
         test_admin_forget_endpoint_reports_unreadable,
         test_forget_command_must_not_report_a_clean_wipe,
         test_real_forget_clears_every_layer_end_to_end,
         test_real_forget_closes_the_backfill_gate,
+        test_selective_forget_removes_facts_even_when_the_ledger_write_fails,
+        test_full_forget_removes_facts_even_when_the_ledger_write_fails,
+        test_ledger_write_failure_does_not_bump_the_epoch,
+        test_full_wipe_still_deletes_her_data_under_enospc_on_every_bookkeeping_write,
+        test_selective_forget_still_deletes_her_data_under_enospc_on_every_bookkeeping_write,
         test_command_reply_hides_path_when_persona_unreadable,
         test_command_reply_streams_the_same_plain_language,
         test_command_reply_hides_path_when_facts_unreadable,
