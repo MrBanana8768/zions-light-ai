@@ -543,6 +543,54 @@ def test_chroma_is_snapshotted_and_integrity_checked():
     assert_true("chroma.sqlite3" in detail, "detail names chroma.sqlite3")
 
 
+def test_create_backup_uses_snapshot_to_data_at_both_call_sites():
+    print("\n[test] H-3/D2 (review1-v3197-65ea196): create_backup calls "
+          "_snapshot_sqlite_to_data - NOT the old direct-to-/data "
+          "_snapshot_sqlite - for BOTH webui.db and chroma.sqlite3")
+    # The review's own finding: "The only end-to-end D2 test stalls
+    # shutil.copy2, which the reverted code never calls, so reverting
+    # either call site in create_backup survives (B1, B2)." A stall test
+    # proves the LOCKING behaviour when the right function is called; it
+    # says nothing about WHICH function create_backup actually calls at
+    # each site. This spies on both directly.
+    _seed_sources(episodic={"conv1": 2})
+    _clean_backups()
+
+    _to_data_calls = []
+    _plain_calls = []
+    _orig_to_data = backup._snapshot_sqlite_to_data
+    _orig_plain = backup._snapshot_sqlite
+
+    def _spy_to_data(src, dest, **kw):
+        _to_data_calls.append((str(src), str(dest)))
+        return _orig_to_data(src, dest, **kw)
+
+    def _spy_plain(src, dest):
+        _plain_calls.append((str(src), str(dest)))
+        return _orig_plain(src, dest)
+
+    backup._snapshot_sqlite_to_data = _spy_to_data
+    backup._snapshot_sqlite = _spy_plain
+    try:
+        rep = backup.run_once()
+    finally:
+        backup._snapshot_sqlite_to_data = _orig_to_data
+        backup._snapshot_sqlite = _orig_plain
+
+    assert_true(rep["ok"], "backup ok")
+    assert_eq(len(_to_data_calls), 2,
+              f"_snapshot_sqlite_to_data called exactly twice - once for "
+              f"webui.db, once for chroma.sqlite3 (got {_to_data_calls})")
+    _to_data_dests = {Path(d).name for _s, d in _to_data_calls}
+    assert_eq(_to_data_dests, {"webui.db", "chroma.sqlite3"},
+              f"the two calls target webui.db and chroma.sqlite3 by name "
+              f"(got dest basenames: {_to_data_dests})")
+    assert_eq(_plain_calls, [],
+              f"the OLD direct-to-/data _snapshot_sqlite is NEVER called "
+              f"by create_backup for either site (B1/B2 would revert one "
+              f"call site back to this - got: {_plain_calls})")
+
+
 # ---------------------------------------------------------------------------
 # D2: the live DB's read lock must never span the write to /data.
 # ---------------------------------------------------------------------------
@@ -922,6 +970,7 @@ def _all():
         test_verify_rejects_census_shortfall,
         test_manifest_records_the_per_conversation_census,
         test_chroma_is_snapshotted_and_integrity_checked,
+        test_create_backup_uses_snapshot_to_data_at_both_call_sites,
         test_snapshot_to_data_releases_the_live_lock_before_touching_data,
         test_snapshot_to_data_stages_locally_first,
         test_snapshot_to_data_falls_back_when_local_disk_is_full,

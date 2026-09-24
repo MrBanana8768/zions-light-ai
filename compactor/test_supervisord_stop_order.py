@@ -141,6 +141,24 @@ if m:
           f"(~71s) publish times")
 
 print()
+print("[D1/S1] webuidb-sync is stopped with the DEFAULT stopsignal (TERM), "
+      "not something webuidb.py's own handler cannot catch")
+# review1-v3197-65ea196 mutant S1: an added `stopsignal=INT` line makes
+# supervisord send SIGINT instead of SIGTERM on stop - webuidb.py's
+# SIGTERM handler (D1) never fires, Python's own default SIGINT action
+# (KeyboardInterrupt) unwinds the process with NO final sync, and nothing
+# about this is visible from the D1 priority/stopwaitsecs checks above,
+# which do not look at stopsignal at all.
+_stopsignal_m = re.search(r"^stopsignal=(\S+)", sync_block, re.M)
+check(
+    _stopsignal_m is None or _stopsignal_m.group(1) == "TERM",
+    f"[program:webuidb-sync] either has no stopsignal= override (supervisord's "
+    f"default is TERM, which webuidb.py's sync_loop() installs a handler "
+    f"for) or explicitly says TERM (got: "
+    f"{_stopsignal_m.group(1) if _stopsignal_m else None!r})",
+)
+
+print()
 print("    CONTROL: openwebui itself was not touched by this fix")
 webui_block = program_block("openwebui")
 check(
