@@ -1053,6 +1053,48 @@ check(
 
 # ===========================================================================
 print()
+print("[D1/W1] _ShutdownRequested raised from a REAL sync_once() call - not "
+      "a mock standing in for one - propagates OUT, not swallowed by "
+      "sync_once's own `except Exception`")
+# ===========================================================================
+# review1-v3197-65ea196, H-3: "the [D1] CONTROL... test replaces sync_once
+# with a fake that raises directly. It is vacuous: turning
+# _ShutdownRequested into an Exception survives (W1)." Every SIGTERM test
+# above drives sync_loop() with sync_once ITSELF replaced by a fake that
+# raises webuidb._ShutdownRequested() - which proves sync_loop's own
+# `except _ShutdownRequested:` branch works, but says NOTHING about
+# whether the REAL sync_once's internal `except Exception` would have
+# swallowed the same exception if it were raised from CODE SYNC_ONCE
+# ITSELF CALLS, which is what actually happens when a real SIGTERM lands
+# mid-function. This patches _sha256_file (called twice, deep inside
+# sync_once's own guarded try, well after every guard the mutation table's
+# other findings care about) to raise it instead, and drives the REAL
+# sync_once() - not a replacement for it.
+wipe()
+owui(LOCAL, [("c1", 100, conversation(5))])
+_orig_sha256 = webuidb._sha256_file
+webuidb._sha256_file = lambda _p: (_ for _ in ()).throw(webuidb._ShutdownRequested())
+_propagated = False
+try:
+    webuidb.sync_once()
+except webuidb._ShutdownRequested:
+    _propagated = True
+except Exception as e:
+    _propagated = False
+    print(f"    (sync_once instead returned/raised {type(e).__name__}: {e})")
+finally:
+    webuidb._sha256_file = _orig_sha256
+check(
+    _propagated,
+    "_ShutdownRequested raised from inside sync_once's own guarded region "
+    "propagates all the way out of the REAL sync_once() - if it were an "
+    "Exception subclass (W1's mutant), sync_once's own `except Exception` "
+    "would catch it and RETURN a normal error dict instead, and this "
+    "process would never even see an exception to catch",
+)
+
+# ===========================================================================
+print()
 print("[D1] SIGTERM runs a final forced sync before the loop exits")
 # ===========================================================================
 # findings.md D1: webuidb-sync had no SIGTERM handling at all, and a publish
