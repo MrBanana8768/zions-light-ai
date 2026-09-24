@@ -10,6 +10,8 @@ What is pinned here:
   * the real banlist has no trap, and the three prefixes that trapped revision 4 on 2026-09-23 (angelĂ,
     Angelø, angeléñÖs) are refused at the accented letter with a normal continuation left;
   * a word added to the YAML is tested automatically (derived must-block cases) and blocked;
+  * the e2e probe sentences are built from the banlist's own test lists, not hardcoded, and agree with the
+    tool's own automaton;
   * the corpus loader walks each chat's branch table-first and prefers the `output` text;
   * `release` refuses without a full, passing verify of the exact artifact;
   * the pod check script's small grammar interpreter judges text exactly like the tool's own automaton.
@@ -31,6 +33,7 @@ _HERE = Path(__file__).resolve().parent
 WB = _HERE.parent / "scripts" / "wordban"
 sys.path.insert(0, str(WB))
 import wb_core as core  # noqa: E402
+import wordban as W  # noqa: E402
 
 _FAILS = []
 
@@ -296,6 +299,25 @@ def test_pod_check_reports_a_truncated_paste_without_a_traceback(build_dir):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_e2e_probes_are_built_from_the_banlist_and_agree_with_the_automaton(build_dir):
+    bl = core.load_yaml(WB / "banlist.yaml")
+    spec, ebnf = core.build(WB / "banlist.yaml")
+    probes = W.build_probes(spec, bl)
+    T = bl.get("tests") or {}
+    mp = W.flat(T.get("must_pass"))
+    mb = W.flat(T.get("must_block")) + [f for _, f in core.derived_must_block(spec)]
+    STALE = ("The choir sang; Angela smiled in Los Angeles, and the marigold glowed.",
+              "A white flamingo, flamenco and inflammation.")                  # the old hand-written probes
+    texts = {t for t, _ in probes}
+    assert_true(not (texts & set(STALE)), "the old hand-written probe sentences are gone", texts & set(STALE))
+    got_true, got_false = {t for t, e in probes if e}, {t for t, e in probes if not e}
+    assert_true(set(mp) <= got_true, "every must_pass entry is its own True probe", sorted(set(mp) - got_true)[:5])
+    assert_true(set(mb) <= got_false, "every must_block entry is its own False probe", sorted(set(mb) - got_false)[:5])
+    A = core.Automaton(ebnf)                                  # the same local automaton `verify` judges with
+    bad = [(t, e, A.accepts(t)) for t, e in probes if A.accepts(t) != e]
+    assert_eq(bad, [], f"all {len(probes)} probes (built from the real banlist) agree with the tool's own automaton")
+
+
 def test_pod_check_interpreter_agrees_with_the_tool(build_dir):
     src = (WB / "check_template.py").read_text(encoding="utf-8")
     head = src[:src.index("con = sqlite3.connect")]
@@ -316,6 +338,7 @@ if __name__ == "__main__":
     bd = test_generator_is_deterministic()
     try:
         test_real_banlist_has_no_trap_and_the_live_trap_prefixes_are_refused(bd)
+        test_e2e_probes_are_built_from_the_banlist_and_agree_with_the_automaton(bd)
         test_pod_check_interpreter_agrees_with_the_tool(bd)
         test_pod_check_reports_a_truncated_paste_without_a_traceback(bd)
     finally:

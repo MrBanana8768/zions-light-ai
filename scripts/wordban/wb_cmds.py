@@ -46,9 +46,7 @@ def cmd_e2e(args):
         db.rename(priv / "e2e.db")
         shutil.copyfile(build_dir / W.VALUE, priv / "value.txt")
         spec = core.Spec(bl)
-        probes = [["The choir sang; Angela smiled in Los Angeles, and the marigold glowed.", True],
-                  [" ".join(f for _, f in core.derived_must_block(spec)[:3]), False],
-                  ["A white flamingo, flamenco and inflammation.", True]]
+        probes = W.build_probes(spec, bl)          # from the banlist's own test lists - never stale
         (priv / "probes.json").write_text(json.dumps(probes), encoding="utf-8")
         compactors = [("image", "/opt/compactor")]
         if args.compactor_ref:
@@ -87,12 +85,14 @@ def cmd_e2e(args):
                            bool(gr) and all(r["grammar_sha256"] == man["grammar_sha256"] for r in gr)))
             checks.append(("vLLM 0.19's own request validation + xgrammar compile accept it",
                            bool(gr) and all(r["vllm"].get("vllm_accepts_request") for r in gr)))
-            checks.append(("probe sentences judged as expected by the compiled grammar",
-                           bool(gr) and all(p["accepted"] == p["expected"] for r in gr for p in r["vllm"].get("probes", []))))
+            mism = [p for r in gr for p in r["vllm"].get("probes", []) if p["accepted"] != p["expected"]]
+            checks.append(("probe sentences judged as expected by the compiled grammar", bool(gr) and not mism))
             checks.append(("no bad_words left in the forwarded body", bool(gr) and all(r["bad_words"] is None for r in gr)))
             for name, good in checks:
                 W.say(f"  [{'PASS' if good else 'FAIL'}] {name}")
                 ok = ok and bool(good)
+            for p in mism[:20]:
+                W.say(f"    MISMATCH text={p['text']!r} expected={p['expected']} accepted={p['accepted']}")
             if gr:
                 W.say(f"  compile inside the stub: {[r['vllm'].get('compile_s') for r in gr]} s; "
                       f"grammar {gr[0]['grammar_chars']:,} chars")
@@ -134,8 +134,10 @@ def load_side(ref):
 
 
 def blocked_words(A, text, limit=400):
-    """the words the grammar stops, found by running it, masking the word it stops at, and running again"""
+    """the words the grammar stops, as (word, context) pairs: run it, mask what it stops at, run again. A refused
+    invisible character (soft hyphen, zero-width space ...) is reported and removed on its own."""
     out = []
+    wc = lambda ch: ch.isalnum() or unicodedata.category(ch) in core.MARK_CATS or ch in "_'’-"
     for _ in range(limit):
         s, at = A.run(text)
         if at is None:
@@ -143,7 +145,10 @@ def blocked_words(A, text, limit=400):
                 return out
             at = len(text) - 1
         i = at
-        wc = lambda ch: ch.isalnum() or unicodedata.category(ch) in core.MARK_CATS or ch in "_'’-"
+        if unicodedata.category(text[i]) == "Cf":
+            out.append((f"U+{ord(text[i]):04X}", text[max(0, i - 40):i + 1]))
+            text = text[:i] + text[i + 1:]
+            continue
         if not wc(text[i]):
             j = i - 1
             while j >= 0 and not wc(text[j]) and i - j < 4:
@@ -155,8 +160,8 @@ def blocked_words(A, text, limit=400):
         while b < len(text) and wc(text[b]):
             b += 1
         b = max(b, i + 1)
-        out.append(text[a:b])
-        text = text[:a] + " Qzx " + text[b:]
+        out.append((text[a:b], text[max(0, a - 40):b]))
+        text = text[:a] + " " * (b - a) + text[b:]
     return out
 
 
@@ -207,19 +212,21 @@ def cmd_diff(args):
             for m in msgs:
                 wa = blocked_words(A, m["t"])
                 wb = blocked_words(B, m["t"])
-                ca, cb = {}, {}
-                for w in wa:
+                ca, cb, ctx = {}, {}, {}
+                for w, c in wa:
                     ca[w] = ca.get(w, 0) + 1
-                for w in wb:
+                    ctx.setdefault(w, c)
+                for w, c in wb:
                     cb[w] = cb.get(w, 0) + 1
+                    ctx.setdefault(w, c)
                 for w in set(ca) | set(cb):
                     d = cb.get(w, 0) - ca.get(w, 0)
                     if not d:
                         continue
                     fam = "other"
                     if ref:
-                        h = ref.hits(w)
-                        fam = fam_of.get(h[0][2], h[0][2]) if h else "other"
+                        h = ref.hits(ctx[w]) or ref.hits(w)   # the word in its context (a phrase needs it)
+                        fam = fam_of.get(h[-1][2], h[-1][2]) if h else "other"
                     key = (m["role"], fam)
                     if d > 0:
                         newly[key] = newly.get(key, 0) + d

@@ -152,6 +152,25 @@ def flat(lists):
     return out
 
 
+def build_probes(spec, bl):
+    """e2e probe sentences, built only from the banlist's own test lists (never hardcoded) so they can never
+    drift from the rules: every must_pass entry expects True, every must_block entry (listed + derived) expects
+    False, plus one or two prose sentences that string several must_pass entries together as ordinary text."""
+    T = bl.get("tests") or {}
+    mp = flat(T.get("must_pass"))
+    mb = flat(T.get("must_block")) + [f for _, f in core.derived_must_block(spec)]
+    probes = [[t, True] for t in mp] + [[t, False] for t in mb]
+    # " and " (never a separator any family recognises) keeps adjacent entries from accidentally spelling a
+    # banned form at the join, e.g. must-pass "Yellow" next to must-pass "light" would otherwise glue into
+    # the banned "yellow.light" family across the join punctuation alone.
+    half = max(1, len(mp) // 2)
+    if mp:
+        probes.append([" and ".join(mp[:half]) + ".", True])
+    if mp[half:]:
+        probes.append([" and ".join(mp[half:]) + ".", True])
+    return probes
+
+
 def fuzz_strings(spec, n, seed=11):
     """strings built from pieces of the banned words, the allowed words, accents, separators and marks"""
     rnd = random.Random(seed)

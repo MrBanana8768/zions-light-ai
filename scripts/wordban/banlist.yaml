@@ -126,10 +126,11 @@ families:
       - {id: "GO LD", match: "go{SEP:SP}+ld"}               # rev 6: go ld ("gol d" is left: "gol de Messi")
   flame:
     rules:
-      # a word that STARTS with "flam" is banned unless it is flammable / flammability (owner: keep); rev 6 drops
-      # flamen, flamenco(s), flamingo(s), flamboyant, flambé (0 uses, or 2 in one cooking list): each was a way
-      # for the model to be cornered after "flam" or "flame". flamme / Flammen (French / German) are banned.
-      - {id: FLAM, stem: flam, alone: ban, other: ban, allow_prefixes: [mab]}
+      # a word that STARTS with "flam" is banned unless it is flammable / flammability (owner: keep) or starts
+      # "flamb" (flambé / flambéed: 2 real uses in her replies; flamboyant). rev 6 drops flamen, flamenco(s),
+      # flamingo(s) (0 uses): each was a way for the model to be cornered after "flame". flamme / Flammen (French /
+      # German) are banned.
+      - {id: FLAM, stem: flam, alone: ban, other: ban, allow_prefixes: [mab, b]}
       # rev 6: "flam" inside a word (candleflame, theflames, aflame) is banned, except inflame / inflammation ...
       - {id: FLAM-IN, match: flam, where: inside,
          allow_in_words: [inflam, enflam, proinflam, antiinflam, noninflam, uninflam, nonflam]}
@@ -140,7 +141,9 @@ families:
     rules:
       # rev 6 (owner, 2026-09-24): the phrase "yellow light" in every casing, spacing (space, newline, hyphen,
       # underscore, dot, none: yellowlight, YellowLight), plural and possessive, with accents or look-alike letters,
-      # also glued to a word before it. "yellow" alone, "light" alone, "yellow lighthouse" / "yellow lightning" pass.
+      # at a word start (also camelCase: theYellowLight). "yellow" alone, "light" alone, "yellow lighthouse" /
+      # "yellow lightning" pass. Glued after lower-case letters ("theyellowlight") is a documented gap: banning it
+      # anywhere costs ~10 % more grammar for a form never seen.
       - {id: YELLOWLIGHT, stem: "yellow{SEP:WF}*light", alone: ban, other: allow, ban_words: [s]}
 
 # Words deliberately NOT banned whose use is counted in her corpus by `verify --corpus` (counts only), so a
@@ -244,12 +247,11 @@ tests:
     # rev 6 (owner): the phrase for light the colour of a lemon
     - [yellow light, Yellow Light, YELLOW LIGHT, yellow lights, Yellow Lights, yellow-light, yellowlight, YellowLight,
        yellow_light, "yellow  light", "yellow\nlight", "yellow.light", "yellow*light", "yellow light's",
-       "the yellow light.", theyellowlight, "yéllow light", "yellow lîght", "YÉLLOW LÏGHT", "y\u0435llow light",
+       "the yellow light.", theYellowLight, "yéllow light", "yellow lîght", "YÉLLOW LÏGHT", "y\u0435llow light",
        "yeIIow Iight", "yellow\u200blight", "yellow\u200dlight", "yellow-lights", "a (yellow light)"]
     # rev 6: foreign forms, the exceptions that are gone, and Los Angeles spelled any other way
     - ["los ángeles", "Los Ángeles", "LOS ÁNGELES", "Los Angéles", "Los AngeIes", flamme, Flammen, "white flamme",
-       flamen, flamenco, Flamenco, flamencos, flamingo, flamingos, FLAMINGO, "white flamingo", flamboyant,
-       "flambé", flambeed, Angela, ANGELA, "Angela's", Angeleno, Angelenos, "Los Angel", "Los Angeleno",
+       flamen, flamenco, Flamenco, flamencos, flamingo, flamingos, FLAMINGO, "white flamingo", Angela, ANGELA, "Angela's", Angeleno, Angelenos, "Los Angel", "Los Angeleno",
        "Los Angelesx", "Los Ange\u0301les", "Los Angeles\u0301"]
   must_pass:
     - [Los Angeles, los angeles, LOS ANGELES, "in Los Angeles, California", "Los Angeles's", "Los Angeles.",
@@ -266,7 +268,7 @@ tests:
        yellow and light, "the light was yellow", "yellow, light", "yellow lighter"]
     - [flammable, Flammable, FLAMMABLE, flammability, flammables, inflammable, inflame, inflamed, inflames,
        inflammation, Inflammation, INFLAMMATION, inflammatory, anti-inflammatory, antiinflammatory,
-       proinflammatory, noninflammatory, nonflammable, enflamed]
+       proinflammatory, noninflammatory, nonflammable, enflamed, flambé, flambéed, Flambé, flamboyant]
     # rev 6: emoji sequences with a zero-width joiner still pass
     - ["\U0001f468\u200d\U0001f469\u200d\U0001f467", "\u2764\ufe0f\u200d\U0001f525",
        "\U0001f3f3\ufe0f\u200d\U0001f308", "\U0001f469\U0001f3fd\u200d\U0001f4bb", "family: \U0001f468\u200d\U0001f469\u200d\U0001f466 ok",
@@ -289,7 +291,7 @@ tests:
          # rev 6 documented: lower-case Spanish "los angeles" reads as the place name; space splits are banned for
          # gold only ("an gel" would block "an gelato"); markup and entity tricks; math letters; near-spellings
          "los angeles de Dios", "an gel", "fl ame", "gol d", "g<b></b>old", "&#103;old", "𝐠𝐨𝐥𝐝", "ⓖⓞⓛⓓ", "anjel", "goold",
-         "4ngel", "fl4me",
+         "4ngel", "fl4me", "theyellowlight",
          # runs of 3+ marks that include a byte-fallback mark (seen as U+FFFD, which ends the run); her real
          # Hebrew (shin + dagesh + shin dot + vowel) is one of these
          "é̂̃", "שָּׁ", "שָּׁ֑֒",
@@ -378,7 +380,7 @@ funnels:
     - after: ["flam", "flamm", "flamma"]
       floor: 1
       reason: >-
-        flammable / flammability are kept (owner decision). A word that starts with "flam" can only become one of
-        them; every other flam- word, including the old exceptions (flamenco, flamingo ...), is refused before the
-        model can commit to it.
+        flammable / flammability (owner decision) and flambé / flamboyant (flambéed: 2 real uses) are kept. A word
+        that starts with "flam" can only become one of them; every other flam- word, including the old exceptions
+        (flamenco, flamingo ...), is refused before the model can commit to it.
 

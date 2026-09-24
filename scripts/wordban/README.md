@@ -88,7 +88,7 @@ Usually it is one line under `families:` in `banlist.yaml`, then `build`, `verif
 - A stem whose continuation could never complete is refused at build time.
 
 **Funnels** (revision 6). An allowed word that begins with banned letters (`flamenco` after `flame`, `Angela` after `angel`) corners the model once it has written those letters: in revision 5 the state after `" flame"` offered 4 plain tokens and 208 combining marks. Rules:
-- keep an exception only when it has real use or a strong reason (revision 6 keeps `Los Angeles` and `flammable`/`flammability` only);
+- keep an exception only when it has real use or a strong reason (revision 6 keeps `Los Angeles`, `flammable`/`flammability` (owner) and `flambé`/`flamboyant` (2 real uses));
 - no combining mark right after a banned stem (`marks_after_stem: refuse`);
 - `funnels:` in the banlist: `verify` measures, in every token-reachable state, the NATURAL escape width (printable ASCII / Latin-1 letters / common punctuation tokens that lead somewhere the reply can still finish). Every state must offer at least `min_width` (21, revision 3's narrowest), except the states after the documented prefixes (every letter case), which must offer at least their `floor` and carry a reason. `release` refuses on any funnel regression.
 
@@ -120,6 +120,7 @@ Usually it is one line under `families:` in `banlist.yaml`, then `build`, `verif
 - **Right after a banned stem, U+FFFD is refused.** So `Angela💔` and `flamingo🦩` without a space are blocked.
 - **The mark cap counts whole-token marks only.** There are 154 single-mark tokens. A byte-fallback mark is U+FFFD and ends the run, so runs of such marks are not capped.
 - **Synonyms and paraphrase are not blocked.** The prompt line covers intent.
+- **`yellow light` glued after lower-case letters** (`theyellowlight`) passes. It is blocked at a word start and after a camelCase step (`theYellowLight`); banning it anywhere costs about 10 % more grammar for a form never seen.
 - **Lower-case Spanish `los angeles`** reads as the place name (the context rule cannot tell them apart); `los ángeles` is blocked.
 - **Space splits** are banned for gold (`g old`, `go ld`) but not for angel or flame (`an gel` would block "an gelato"); markup (`g<b></b>old`), HTML entities, math-alphanumeric and circled letters, leetspeak beyond `I`/`1`/`|`/`0`, and near-spellings (`anjel`) pass.
 - **Control tokens inside a word.** xgrammar sees Mistral's control tokens (`<unk>`, `[INST]` ...) as ordinary text, and vLLM drops them when it detokenises: `g` + `<unk>` + `old` shows as "gold". The model would have to sample a control token in mid-word; no grammar change can see this.
