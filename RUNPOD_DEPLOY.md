@@ -84,11 +84,16 @@ volume — vLLM picks whichever one matches `MODEL_REPO` at runtime.
 Pre-built images are published at `angreg/zions-light-ai` on Docker Hub.
 **The current deploy target is named in [runpod.env.template](runpod.env.template)'s
 header — that file is the single source of truth for the image tag and every
-env var.** Pin a version for reproducibility (today
-`angreg/zions-light-ai:v3.1.9.6-cu12`); `:latest` is only ever promoted to a
-*validated* release, so it lags behind (it is still `:v3.0` at the time of
-writing). See the [image-tags table in the README](README.md#image-tags) for
-what each tag contains.
+env var.** Pin a version for reproducibility (currently
+`angreg/zions-light-ai:v3.1.9.5-cu12`, until v3.1.9.7 clears review);
+`:latest` is only ever promoted to a *validated* release, so it lags behind
+(it is still `:v3.0` at the time of writing). See the
+[image-tags table in the README](README.md#image-tags) for what each tag
+contains — including why `:v3.1.9.6-cu12` is NOT in it: v3.1.9.6 was a
+scripts-and-docs-only change, and rather than retag a fourth already-
+published digest it was merged directly into `feature/v3.1.9.7`'s git
+history instead (H-5, review1-v3197-65ea196). It never got, and will not
+get, its own image tag — do not run the retag example below for it.
 
 **A rebuild is a new image, even from an unchanged tag.** The Dockerfile runs
 `apt-get upgrade`, upgrades pip/setuptools/wheel unpinned, pins vllm and
@@ -97,25 +102,22 @@ open-webui but not their dependencies, fetches the Piper voice from a moving
 source rebuilt a week apart does not give the same bytes, and it has not
 been validated on a pod.
 
-**v3.1.9.6 is therefore NOT rebuilt** — same as v3.1.9.5 before it. Its
-application code is identical to v3.1.9.5 and v3.1.9.4, so its tag points at
-the same already-published digest, directly (not via the v3.1.9.4 tag, which
-Docker Hub tags can be repointed later — see the rollback note in "Upgrading
-within v3.1.9.x, and rolling back"):
+**v3.1.9.5 was NOT rebuilt** — same pattern as v3.1.9.4 before it: its
+application code is identical, so its tag points at the same already-
+published digest, directly (not via the v3.1.9.4 tag, which Docker Hub tags
+can be repointed later):
 ```bash
 docker buildx imagetools create \
-  -t angreg/zions-light-ai:v3.1.9.6-cu12 \
+  -t angreg/zions-light-ai:v3.1.9.5-cu12 \
   angreg/zions-light-ai@sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65
-docker buildx imagetools inspect angreg/zions-light-ai:v3.1.9.6-cu12
+docker buildx imagetools inspect angreg/zions-light-ai:v3.1.9.5-cu12
 # the digest printed must equal sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65
 ```
-(v3.1.9.5's own retag, for the record, used the same pattern against the
-v3.1.9.4 tag: `docker buildx imagetools create -t
-angreg/zions-light-ai:v3.1.9.5-cu12
-angreg/zions-light-ai:v3.1.9.4-cu12@sha256:c1295894…8a65`. Either form of
-source reference — a bare digest or `<tag>@<digest>` — resolves to the same
-image; v3.1.9.6 above uses the bare digest so it never depends on the
-v3.1.9.4 tag continuing to point where it does today.)
+(Either form of source reference — a bare digest or `<tag>@<digest>` —
+resolves to the same image; this uses the bare digest so it never depends
+on an earlier tag continuing to point where it does today. This pattern is
+retired as of v3.1.9.7 — that release IS a rebuild, a real thin layer FROM
+this digest with OpenWebUI upgraded — see "Upgrading to v3.1.9.7" below.)
 
 For a release that DOES change code, build FROM THE RELEASE TAG (a clean
 checkout, not a working branch) with the CUDA-12 profile every v3.1.x image
@@ -141,7 +143,7 @@ Go to [Runpod Templates](https://www.runpod.io/console/user/templates) → New T
 
 - **Template Name:** `zions-light-ai`
 - **Container Image:** the tag named in [runpod.env.template](runpod.env.template)
-  (currently `angreg/zions-light-ai:v3.1.9.6-cu12`)
+  (currently `angreg/zions-light-ai:v3.1.9.5-cu12`)
 - **Container Disk:** `60 GB` (room for the image, supervisor logs, scratch)
 - **Volume Mount Path:** `/data` (← this is where the Network Volume attaches)
 - **Expose HTTP Ports:** `3000, 8080`
@@ -158,14 +160,28 @@ Go to [Runpod Templates](https://www.runpod.io/console/user/templates) → New T
   vars explicitly anyway so a future default change can never surprise a
   deploy (see GPU sizing for alternatives).
 
-### WEBUI_DB_LOCAL — a hard deploy precondition
+### WEBUI_DB_LOCAL — placement of the live database
 
-**Production runs with `WEBUI_DB_LOCAL=false`, and every deploy must keep it
-that way.** It decides where her chat history physically lives. `false` keeps
-`webui.db` on the `/data` volume, where it has always been. `true` moves the
-live database to the pod's local disk at boot and starts a sync daemon that
-copies it back to `/data` every few minutes. That move is the one change in the
-v3.1.x line whose rollback is not clean, and it has not been scheduled.
+**This changed with v3.1.9.7 (B-2, review1-v3197-65ea196).** Every deploy
+from v3.1.6.1 through v3.1.9.6 required `WEBUI_DB_LOCAL=false` as a hard
+precondition, because the local-disk placement (`true`) had not shipped
+yet. **v3.1.9.7 is that release, and `true` is now the intended deploy** —
+see "Upgrading to v3.1.9.7" above and
+[`docs/DB-MOVE-RUNBOOK.md`](docs/DB-MOVE-RUNBOOK.md) for the full
+procedure, the rows to set, and the daily-operation rules that come with
+it (most importantly: the manual final sync before any planned stop or
+redeploy). The table and the checks below describe **both** placements —
+read the row for whichever one this pod's template actually specifies.
+
+It decides where her chat history physically lives. `false` keeps
+`webui.db` on the `/data` volume. `true` moves the live database to the
+pod's local disk at boot and starts a sync daemon (`webuidb-sync`) that
+copies it back to `/data` every `WEBUI_DB_SYNC_INTERVAL_S` seconds — the
+snapshot on `/data` is what a pod stop or recreate actually preserves, so
+anything written after the last publish (an unplanned stop) or since the
+last completed sync (a planned one, if the final-sync step was skipped) is
+at risk; see docs/DB-MOVE-RUNBOOK.md's "Recovery point" for the exact
+numbers this pod is accepting.
 
 **The trap on every release: a MISSING or EMPTY value means `true`.** A RunPod
 template with no `WEBUI_DB_LOCAL` row, or a row that is present but blank
@@ -188,14 +204,17 @@ is touched. Fix the row and redeploy. The one spelling that means the same on
 both sides of an upgrade or a rollback is the exact lowercase word `false`.
 
 **Before every deploy**, in the RunPod template's environment variables, check
-there is a row reading exactly:
+there is a row reading exactly one of:
 
 ```
-WEBUI_DB_LOCAL=false
+WEBUI_DB_LOCAL=true      # v3.1.9.7+, the intended deploy — see docs/DB-MOVE-RUNBOOK.md
+WEBUI_DB_LOCAL=false     # pre-v3.1.9.7, or a deliberate rollback of the placement
 ```
 
-lowercase, no spaces, no quotes, not blank. The deploy tag's own VERIFY step
-may not repeat this; it applies to every release anyway.
+lowercase, no spaces, no quotes, not blank, and matching what this pod's
+image actually supports (an image before v3.1.9.7 has no local-disk
+placement at all and ignores this row either way). The deploy tag's own
+VERIFY step may not repeat this; it applies to every release anyway.
 
 **After every boot**, first in the RunPod **Logs** tab (the container's boot
 output). From v3.1.9 it names the value it resolved and why:
@@ -204,16 +223,22 @@ output). From v3.1.9 it names the value it resolved and why:
       WEBUI_DB_LOCAL=false (explicitly set (false))
 [2b/3] WEBUI_DB_LOCAL=false - webui.db stays on /data/openwebui/webui.db
 ```
+or, on v3.1.9.7+ with the database moved:
+```
+      WEBUI_DB_LOCAL=true (explicitly set (true))
+[2b/3] Placing webui.db on local disk (/var/lib/openwebui/webui.db)
+```
 
-On v3.1.6.1 only the `[2b/3]` line is printed. If v3.1.9 prints
-`WEBUI_DB_LOCAL=true (unset/empty -> true …)`, the row is missing or blank.
-Then, in the Web Terminal (works on every release):
+On v3.1.6.1 only the `[2b/3]` line is printed. If the resolved value does not
+match what this pod's template asked for, the row is missing, blank, or
+misspelled — see the table above. Then, in the Web Terminal (works on every
+release):
 
 ```bash
 tr '\0' '\n' < /proc/1/environ | grep -E '^(WEBUI_DB_LOCAL|WEBUIDB_SYNC_ENABLED|DATABASE_URL)='; supervisorctl status webuidb-sync
 ```
 
-**Success** — all four of these:
+**Success with `WEBUI_DB_LOCAL=false`** — all four of these:
 
 ```
 WEBUI_DB_LOCAL=false
@@ -222,21 +247,30 @@ DATABASE_URL=sqlite:////data/openwebui/webui.db
 webuidb-sync                     STOPPED   Not started
 ```
 
-(the first three may print in a different order).
+**Success with `WEBUI_DB_LOCAL=true`** (v3.1.9.7+) — see docs/DB-MOVE-
+RUNBOOK.md section C2 for the full four-line expectation
+(`WEBUI_DB_LOCAL=true`, `WEBUIDB_SYNC_ENABLED=true`,
+`DATABASE_URL=sqlite:////var/lib/openwebui/webui.db`,
+`webuidb-sync RUNNING`).
 
-**If you see `WEBUI_DB_LOCAL=true`, a `/var/lib/openwebui/webui.db` in
-`DATABASE_URL`, or `webuidb-sync RUNNING`:** the database was moved to local
-disk on this boot.
+(lines may print in a different order).
 
-- **If she has not sent a message since the pod booted:** nothing was written
-  to the moved copy. Fix the template row to `WEBUI_DB_LOCAL=false` and
+**If the boot's resolved placement does NOT match what the template
+asked for** — e.g. you wanted `false` and see `true`, a
+`/var/lib/openwebui/webui.db` in `DATABASE_URL`, or `webuidb-sync
+RUNNING`:
+
+- **If she has not sent a message since the pod booted:** nothing was
+  written to the unwanted placement yet. Fix the template row and
   redeploy. Run the check again after the boot.
-- **If she has:** her newest messages are on local disk and reach `/data` only
-  when the sync daemon publishes. Ask her to stop chatting, do NOT redeploy
-  yet, and run
-  `/opt/compactor-venv/bin/python /opt/compactor/webuidb.py --status`; ask for
-  help with its output before changing anything. A redeploy at this point can
-  lose everything written since the last sync.
+- **If she has:** her newest messages are on whichever disk this boot
+  actually used, and reach the other copy only when a sync publishes (if
+  one is even running — going FROM `true` TO an image/config that does
+  not run the sync daemon publishes nothing). Ask her to stop chatting, do
+  NOT redeploy yet, and run
+  `/opt/compactor-venv/bin/python /opt/compactor/webuidb.py --status`; ask
+  for help with its output before changing anything. A redeploy at this
+  point can lose everything written since the last sync.
 
 ### Memory budgets — raised defaults in v3.1.9
 
@@ -882,8 +916,10 @@ history cap now. Direct API callers set `X-Conversation-Id` themselves
 **Already on any v3.1.9.x image? Skip to
 [Upgrading within v3.1.9.x, and rolling back](#upgrading-within-v319x-and-rolling-back).**
 From v3.1.8, follow this section with the CURRENT image tag
-(`v3.1.9.6-cu12`) wherever it says "the v3.1.9 tag" — every v3.1.9.x release
-since uses this same procedure with the image tag changed.
+(`v3.1.9.5-cu12` — `v3.1.9.6-cu12` was never published; see "Image tags" in
+README.md) wherever it says "the v3.1.9 tag" — every v3.1.9.x release since
+uses this same procedure with the image tag changed. (v3.1.9.7 changes the
+image for real and has its own procedure — [Upgrading to v3.1.9.7](#upgrading-to-v3197-openwebui-0110--0114-and-the-database-move).)
 
 This was written as the exact sequence for the production pod when it ran
 v3.1.8 with `WEBUI_DB_LOCAL=false` and every chat logged `source=hash` (no
@@ -954,7 +990,8 @@ then `supervisorctl start compactor backup`.
 ### 3. Template changes (RunPod template, before redeploying)
 
 - **Container Image:** update to the current v3.1.9.x tag
-  (`angreg/zions-light-ai:v3.1.9.6-cu12`).
+  (`angreg/zions-light-ai:v3.1.9.5-cu12` — see "Image tags" in README.md
+  for why there is no `v3.1.9.6-cu12`).
 - **`WEBUI_DB_LOCAL=false`** — confirm the row is present and spelled exactly
   that way (a missing or blank row means `true` on v3.1.7 and later). See
   [WEBUI_DB_LOCAL — a hard deploy precondition](#webui_db_local--a-hard-deploy-precondition).
@@ -1059,12 +1096,14 @@ details in the CHANGELOG entry of the same number):
 | v3.1.9.3 | Reuse never costs her previous exchange; images are priced correctly (opencv, image ~152 MB larger). |
 | v3.1.9.4 | Replies no longer wait ~30 s on fact selection; `/forget` stays forgotten; cut summaries are handled. |
 | v3.1.9.5 | Documentation only — the SAME image as v3.1.9.4 (same digest), under a new tag. |
-| v3.1.9.6 | Scripts and docs only — the SAME image as v3.1.9.5 (same digest), under a new tag. Adds `scripts/setup-sshd.py`, an operator tool that installs and hardens a real sshd LIVE inside a running pod (the image itself still ships none) — see OPERATIONS.md. |
-| v3.1.9.7 | OpenWebUI 0.11.0 → 0.11.4, PLUS the verified scroll-jump CSS fix (measured 0px per older-message load, 5/5 runs — the version bump alone was inconclusive) baked into `custom.css`. A NEW image (thin layer on the v3.1.9.4/.5/.6 digest) that migrates `webui.db` on first boot. See below. |
+| v3.1.9.6 | Scripts and docs only — the SAME image as v3.1.9.5 (same digest). **Never published as its own image tag** (H-5, review1-v3197-65ea196) — merged directly into `feature/v3.1.9.7`'s git history instead, so its fixes ship as PART of v3.1.9.7 rather than under their own tag. Adds `scripts/setup-sshd.py`, an operator tool that installs and hardens a real sshd LIVE inside a running pod (the image itself still ships none) — see OPERATIONS.md. |
+| v3.1.9.7 | OpenWebUI 0.11.0 → 0.11.4, PLUS the verified scroll-jump CSS fix (measured 0px per older-message load, 5/5 runs — the version bump alone was inconclusive) baked into `custom.css`, PLUS moving the live database to local disk (`WEBUI_DB_LOCAL=true`, docs/DB-MOVE-RUNBOOK.md). A NEW image (thin layer on the v3.1.9.4/.5 digest) that migrates `webui.db` on first boot. See below. |
 
-No new REQUIRED settings before v3.1.9.7.
+No new REQUIRED settings before v3.1.9.7. **v3.1.9.7 itself requires
+template changes** — `WEBUI_DB_LOCAL=true` and a new
+`WEBUI_DB_SYNC_INTERVAL_S` row — see its section below.
 
-### Upgrading to v3.1.9.7 (OpenWebUI 0.11.0 → 0.11.4)
+### Upgrading to v3.1.9.7 (OpenWebUI 0.11.0 → 0.11.4, and the database move)
 
 Unlike every other v3.1.9.x step, this one changes the image (not just the
 tag pointed at the same digest) and runs a real alembic migration on
@@ -1072,6 +1111,22 @@ tag pointed at the same digest) and runs a real alembic migration on
 indexes and one column and measured at ~114ms on a full copy of the
 2026-09-23 production backup — but treat it with a real pre-upgrade backup,
 not just the tag-swap confidence the v3.1.9.4→.6 steps above have.
+
+**This release is ALSO where `WEBUI_DB_LOCAL` changes from `false` to
+`true` (B-2, review1-v3197-65ea196).** Every earlier v3.1.9.x deploy
+required `false`, and the section above still describes that as history.
+From v3.1.9.7 on, `true` — moving the live database off the `/data` network
+volume onto the pod's own disk, with a background sync back to `/data`
+every `WEBUI_DB_SYNC_INTERVAL_S` — is the intended, supported placement,
+because it is what stops MooseFS commit stalls from turning into failed
+saves. **Read [`docs/DB-MOVE-RUNBOOK.md`](docs/DB-MOVE-RUNBOOK.md) in full
+before starting** — it has the pre-flight steps, the exact template rows
+(including the two below that this section's own steps do not repeat),
+the post-boot verification, the daily-operation rules (every operator
+tool must be pointed at `/var/lib/openwebui/webui.db`, never at
+`/data/openwebui/webui.db`, once this ships), and — critically — the
+manual "final sync" that is the ONLY thing that makes any planned stop or
+redeploy lose nothing.
 
 **Build and push (architect runs this, after review; NOT part of the
 routine deploy — do this once per release):**
@@ -1104,24 +1159,76 @@ Do **not** promote `:latest` until the on-pod validation gate passes
    /opt/compactor-venv/bin/python /opt/compactor/backup.py --verify
    # confirm [OK] on both before proceeding
    ```
-3. **Switch the image tag** in the RunPod template to
-   `angreg/zions-light-ai:v3.1.9.7-cu12` and redeploy. The migration
-   (`f0bd01a18a3d → 1ce6ade7d93b → 6d09d1bf1f23 → d4c1a8e37b62`) runs
-   automatically on OpenWebUI's first boot — it is fast (well under a
-   second even on a ~500 MB database in this project's own testing) but a
-   RunPod network volume is slower than local disk, so allow a little
-   margin; it is not the bottleneck in the total boot time either way
-   (OpenWebUI's own default RAG embedding-model download dominates the
-   first boot, unrelated to this release).
-4. **Verify:**
+3. **Do the database-move pre-flight, then switch the image tag and the
+   template rows together.** Run
+   [`docs/DB-MOVE-RUNBOOK.md`](docs/DB-MOVE-RUNBOOK.md) section A on the
+   pod as it runs today (before the switch) — it closes stale backfills,
+   repairs the chat-tree JSON gap, and takes the baseline this step's
+   backup already started. Then, in the same template edit:
+   - set **Container Image** to `angreg/zions-light-ai:v3.1.9.7-cu12`;
+   - set `WEBUI_DB_LOCAL=true` (lowercase, no spaces, no quotes — see the
+     "WEBUI_DB_LOCAL" section above for the exact normalization rules);
+   - add `WEBUI_DB_SYNC_INTERVAL_S=120` (a **new** row);
+   - add `COMPACTOR_BACKUP_INTERVAL_HOURS=1`, if it is not `1` already —
+     the redeploy otherwise silently reverts POD-FIXES-2026-09-23 §5's
+     hand-applied hourly backups back to this template's older default
+     (M-4, review1-v3197-65ea196);
+   - confirm no `DATABASE_URL`, `WEBUI_LOCAL_DB`, `WEBUI_SNAPSHOT_DB`, or
+     `WEBUI_DB_ALLOW_…` row exists (delete any you find — entrypoint.sh
+     now refuses to boot if `DATABASE_URL` disagrees with `WEBUI_DB_LOCAL`
+     in EITHER direction; see D12/M-2 below);
+   - delete any `COMPACTOR_INJECTION_BUDGET_FRACTION` row still on the
+     live template from before v3.1.9.5 (see the legacy-upgrade section
+     below for why it might still be there) — leaving it in place pins
+     the fraction below this image's `0.75` default;
+
+   then redeploy. The migration (`f0bd01a18a3d → 1ce6ade7d93b →
+   6d09d1bf1f23 → d4c1a8e37b62`) runs automatically on OpenWebUI's first
+   boot against the snapshot being restored to local disk — fast (well
+   under a second even on a ~500 MB database in this project's own
+   testing) but the first boot also takes about 2 minutes longer than
+   usual for the local-disk restore-and-check itself (docs/DB-MOVE-
+   RUNBOOK.md section B).
+4. **Verify**, in order:
    ```bash
    curl -sf http://localhost:8080/health/full   # ok/degraded, not 503
    # then in OpenWebUI: open her chat, confirm history renders and the
    # message count matches what /health/full or webuidb.py --status reported
    # before the switch
-   curl -sf http://localhost:8080/static/custom.css | grep -c overflow-anchor
+   curl -sf http://127.0.0.1:${OPENWEBUI_PORT:-3000}/static/custom.css | grep -c overflow-anchor
    # expect 1 -- the scroll-jump CSS fix (see below) is baked into the image
    ```
+   **H-6 (review1-v3197-65ea196): that CSS check MUST use OpenWebUI's own
+   port (3000 by default), NEVER 8080** — 8080 is the compactor, which has
+   no `/static/custom.css` at all, so checking it there returns HTTP 404
+   and `grep -c` reports `0` on every correctly-built image, which used to
+   send the operator looking for a broken image and a redeploy that does
+   not exist. `${OPENWEBUI_PORT:-3000}` matches whatever the template
+   actually exposes OpenWebUI on if that was ever changed from the
+   default.
+   Then run `docs/DB-MOVE-RUNBOOK.md` section C in full (it has 10 more
+   checks: the boot log lines, the gate and the programs, the file
+   OpenWebUI actually has open, both copies matching the baseline, the
+   OpenWebUI version and migration log, disk space, the one-time VACUUM,
+   the first automatic sync, `/health/full`'s snapshot check, and the
+   first backup of the moved database).
+
+**Known trade-off: long back-scroll freezes (H-7, review1-v3197-65ea196).**
+The baked-in scroll-jump CSS (below) makes scrolling far back into a long
+chat freeze the tab. Measured headless against a copy of her 4,121-message
+chat, loading 8 → 328 older messages in 20 batches of "load older
+messages": at 168 messages loaded, the shipped CSS froze the tab up to
+**12.2s** per batch (vs 2.4s with the CSS reverted to stock 0.11.4
+defaults); at 328 messages, up to **16.5s** (vs 3.8s). The first several
+batches (under ~100 messages) are close between the two — 2.1s vs 0.9s at
+88 messages — which is why the original bounce-diagnosis measurement (1-2
+loads) never surfaced this. **This release ships the CSS unchanged
+regardless** — the architect is measuring alternatives (scoping
+`content-visibility` to only the batches just above the viewport, or a
+realistic `contain-intrinsic-size` placeholder instead of disabling
+containment) and will make the call in a follow-up release. Anyone
+scrolling more than ~100 messages back on this release should expect
+multi-second to 16-second freezes per "load older" batch until then.
 
 **The scroll-jump CSS fix is now baked into the image — the manual pod
 steps from `/home/drew/zl-ops/bounce-diagnosis.md` are retired as of this
@@ -1145,23 +1252,90 @@ this pod is on `:v3.1.9.7-cu12`:**
   a further manual `pip install` on top of this image is not needed and
   would drift the pod off what was actually tested.
 
-If the CSS check above ever returns `0`, something is wrong with the
-image on the pod (wrong tag, or a build that predates this fix) — it is
-not something to patch by hand again; rebuild/redeploy the correct
-`:v3.1.9.7-cu12` (or later) tag instead.
+If the CSS check above ever returns `0` **on the right port
+(`${OPENWEBUI_PORT:-3000}`, per H-6 above — checking 8080 always returns
+`0` and means nothing)**, something is wrong with the image on the pod
+(wrong tag, or a build that predates this fix). **Run the final sync
+first** (below), THEN rebuild/redeploy the correct `:v3.1.9.7-cu12` (or
+later) tag — never redeploy anything on this release without running the
+final sync immediately before it, because `WEBUI_DB_LOCAL=true` means an
+unplanned redeploy is exactly the data-loss event docs/DB-MOVE-
+RUNBOOK.md's "Recovery point" section describes.
 
-**Rollback.** 0.11.0 (any v3.1.9.4/.5/.6 image) DOES still boot and
-correctly serve her chat against a webui.db that 0.11.4 has migrated — its
-alembic does not recognize the new head revision and logs a loud but
-harmless traceback on every boot, but the chat itself reads back
-correctly through 0.11.0's own ORM. Even so, **the supported rollback is
-restoring the pre-upgrade `webui.db` backup from step 2 above**, not
-relying on that tolerance:
-```bash
-# on the pod, writers stopped
-/opt/compactor-venv/bin/python /opt/compactor/backup.py --restore <the pre-v3.1.9.7 backup timestamp>
-# then switch the template's Container Image back to the v3.1.9.6 (or .5/.4) tag and redeploy
-```
+**Rollback (B-1/H-4/H-5, review1-v3197-65ea196 — this replaces the old
+`backup.py --restore` procedure below, which must NEVER be used for this
+release's rollback):**
+
+`backup.py --restore` restores BOTH `webui.db` and the compactor memory
+store to the archive's moment, permanently discarding everything written
+since — the pod's own restore doc
+(`/home/drew/zl-ops/RESTORE-2026-09-23.md`, "Never") says exactly that:
+"Use `backup.py --restore`; it hasn't cleared review." Worse, on this
+release specifically: with `WEBUI_DB_LOCAL=true`, `backup.py --restore`
+writes to `live_webui_db()`, which is `/var/lib/openwebui/webui.db` — the
+POD'S OWN DISK. The very next step, switching the template image and
+redeploying, throws that restored file away with the rest of the
+container's disk, and the new pod instead restores whatever snapshot sits
+on `/data` — the last thing published, at v3.1.9.7-time. The net result:
+**chat history stays at v3.1.9.7-time while her MEMORY silently rolls back
+to the pre-upgrade archive** — a mixed-generation state with nothing to
+warn anyone, and memory and chat must never end up at different
+generations. (With `WEBUI_DB_LOCAL=false` — a rollback where the DB
+placement is rolled back FIRST, see docs/DB-MOVE-RUNBOOK.md section F —
+both would roll back together instead, but that discards every message
+since the upgrade outright, which the zero-loss procedure below does not
+have to.)
+
+**The correct rollback (rehearsed with zero loss, docs/DB-MOVE-
+RUNBOOK.md's "Final sync" and section F):**
+
+1. **Run the final sync first — always, before touching the template:**
+   ```bash
+   supervisorctl stop openwebui webuidb-sync
+   WEBUI_DB_LOCAL=true /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --sync-once --force
+   /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --status
+   # expect: 'synced': True, and the two --status rows show the SAME content=/newest_update=
+   ```
+   If this does not report `synced: True` with matching rows, **do not
+   proceed** — see docs/DB-MOVE-RUNBOOK.md section E1.
+2. **Switch the template's Container Image back to the tag your template
+   used before this upgrade** (the one you wrote down in step 2 of the
+   deploy order above — typically `:v3.1.9.5-cu12` or `:v3.1.9.4-cu12`;
+   never invent a tag that was not actually running). Do not use
+   `:v3.1.9.6-cu12` — it was never published as its own image (see
+   "Image tags" in README.md).
+3. **If the old image predates the local-disk move** (anything before
+   v3.1.9.7), it has no `WEBUI_DB_LOCAL` support: also set
+   `WEBUI_DB_LOCAL=false` in the template (the old image's entrypoint.sh
+   ignores this row entirely if it lacks the feature, but setting it now
+   avoids a dangling `true` confusing the NEXT upgrade). Then redeploy.
+4. **No archive restore, at any point in this procedure.** The final sync
+   in step 1 already made `/data/openwebui/webui.db` current; the old
+   image reads that file directly once `WEBUI_DB_LOCAL` no longer applies
+   to it.
+
+**H-4: rolling back to OpenWebUI 0.11.0 on this migrated database is a
+degraded state to leave quickly, NOT "harmless."** It boots and mostly
+works, but measured directly (review1-v3197-65ea196, X5): every boot logs
+`Error running migrations: Can't locate revision identified by
+'d4c1a8e37b62'` (expected, and does not stop the boot) — but a full-chat
+save on 0.11.0 against the migrated schema **timed out at 600s** in one
+trial, with `database is locked` errors from the automation scheduler, and
+when a save did land, **the JSON `history` copy and the `chat_message`
+table diverged by one save** — the exact class of bug that broke her UI on
+2026-09-23. Prefer **rolling back only the database placement**
+(`WEBUI_DB_LOCAL=false` on the CURRENT v3.1.9.7 image, docs/DB-MOVE-
+RUNBOOK.md section F) over rolling back the image itself whenever the
+problem is placement-related rather than something specific to 0.11.4.
+If an image rollback is unavoidable, get back onto 0.11.4 (redeploy
+v3.1.9.7 again) as soon as the reason for the rollback is resolved, rather
+than leaving her chat running on 0.11.0 against this schema.
+
+**H-5: before this branch is tagged, it is merged with `feature/v3.1.9.6`**
+(conflict-free per review1-v3197-65ea196) so this rollback section, the
+"Image tags" table, and every `v3.1.9.6`-named row describe what actually
+ships — v3.1.9.6 was never published as its own image tag; its
+operator-script fixes ship folded into this release instead.
 
 **Before upgrading a pod that has EVER run v3.1.9.3 or earlier** (skip this
 if it has only ever run v3.1.9.4 or later): v3.1.9.4's own fix to
@@ -1239,10 +1413,11 @@ then enable the cap.
    confirmed in `/proc/1/environ`, writers stopped, `backup.py --once` then
    `--verify` both `[OK]`.
 2. **Template:** write down the Container Image the pod runs now (your
-   rollback target). Once `v3.1.9.6-cu12` is published (Step 3 at the top of
-   this guide; check with `docker buildx imagetools inspect
-   angreg/zions-light-ai:v3.1.9.6-cu12`), set Container Image to
-   `angreg/zions-light-ai:v3.1.9.6-cu12`; confirm `WEBUI_DB_LOCAL=false`;
+   rollback target). `v3.1.9.6-cu12` was never published (H-5,
+   review1-v3197-65ea196 — see "Image tags" in README.md); set Container
+   Image to `angreg/zions-light-ai:v3.1.9.5-cu12` instead (check with
+   `docker buildx imagetools inspect angreg/zions-light-ai:v3.1.9.5-cu12`
+   — same digest as v3.1.9.4); confirm `WEBUI_DB_LOCAL=false`;
    **delete any
    `COMPACTOR_INJECTION_BUDGET_FRACTION` and
    `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` rows** (see step 3 above for why).
@@ -1257,9 +1432,10 @@ then enable the cap.
 **Rolling back.** Keep the History cap rule from
 [Rolling back to an older image](CHANGELOG.md#rolling-back-to-an-older-image)
 (`max_turns` to 0 first) and `WEBUI_DB_LOCAL=false`.
-- **To v3.1.9.5 or v3.1.9.4** (`v3.1.9.5-cu12` / `v3.1.9.4-cu12`): from
-  v3.1.9.6 this is not really a rollback: all three tags name the same
-  image digest, so nothing can differ.
+- **To v3.1.9.5 or v3.1.9.4** (`v3.1.9.5-cu12` / `v3.1.9.4-cu12`): this is
+  not really a rollback: both tags name the same image digest (and
+  v3.1.9.6, folded into v3.1.9.7's git history without its own tag, never
+  added a third), so nothing can differ.
 - **To v3.1.9.3 or earlier (and to v3.1.8):** there is **no `v3.1.9.3-cu12`
   image** on Docker Hub (`v3.1.9.2-cu12` and `v3.1.9.1-cu12` exist). A
   rebuild from the tag is a new, unvalidated image (see Step 3). Every image

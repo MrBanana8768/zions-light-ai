@@ -2280,10 +2280,12 @@ deploy. To roll back:
    RUNBOOK_MEMORY_IDENTITY.md "Rolling the IMAGE back".
 2. In the RunPod template, change **Container Image** to the last-good
    image: the one you wrote down before deploying (RUNPOD_DEPLOY.md,
-   "Upgrading within v3.1.9.x", step 2). Note that `v3.1.9.6-cu12`,
-   `v3.1.9.5-cu12` and `v3.1.9.4-cu12` are all the SAME image (digest
+   "Upgrading within v3.1.9.x", step 2). Note that `v3.1.9.5-cu12` and
+   `v3.1.9.4-cu12` are the SAME image (digest
    `sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65`),
-   so switching between any of those three tags rolls nothing back. Going further back within v3.1.9.x has one
+   so switching between those two tags rolls nothing back. (There is no
+   `v3.1.9.6-cu12` — that release was never published as its own image
+   tag; see "Image tags" in README.md.) Going further back within v3.1.9.x has one
    consequence to know about, and there is no `v3.1.9.3-cu12` image: see
    RUNPOD_DEPLOY.md "Upgrading within v3.1.9.x, and rolling back". Pre-v3.1.9
    targets are covered by RUNPOD_DEPLOY.md "6. Rollback to v3.1.8".

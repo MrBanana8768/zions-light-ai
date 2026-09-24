@@ -174,6 +174,33 @@ this fix and already known (a message growing when a nested element,
 e.g. an image, finishes loading inside it) — matches the "~290px
 remains" note in bounce-diagnosis.md exactly.
 
+**Known trade-off: long back-scrolls freeze (H-7, review1-v3197-65ea196).**
+Removing `content-visibility:auto`'s off-screen skip is what fixes the
+jump above, but it means every older message loaded into the DOM is now
+laid out and style-recalculated on every later "load older messages"
+batch too — cost that scales with how far back she has scrolled, not
+with the batch size. Measured headless against a copy of her real
+4,121-message chat, loading 8 → 328 older messages across 20 batches:
+
+| messages loaded | freeze, this release's CSS | freeze, stock 0.11.4 (no fix) |
+|---|---|---|
+| 88 | 2.1 s | 0.9 s |
+| 168 | **12.2 s** | 2.4 s |
+| 328 | **16.5 s** | 3.8 s |
+
+The first several batches (under ~100 messages back) are close between
+the two, which is why the original bounce-diagnosis measurement (1-2
+loads) never surfaced this. **Shipped as-is in v3.1.9.7 regardless** —
+reverting the fix brings back the 1,000-3,700px jump measured above,
+which is worse for ordinary use than an infrequent long back-scroll being
+slow. The architect is measuring alternatives (scoping
+`content-visibility:visible` to only the batches just above the
+viewport, or a realistic `contain-intrinsic-size` placeholder such as
+`auto 3000px` instead of disabling containment outright) for a follow-up
+release; this release does **not** change the CSS pending that decision.
+See RUNPOD_DEPLOY.md's "Upgrading to v3.1.9.7" section for the
+operator-facing version of this note.
+
 `compactor/test_real_image_v3197_css.py` (new; `--real-image`) makes this
 a permanent, automated real-image check: it boots the built image, asserts
 `GET /static/custom.css` serves both rules, that both on-disk copies
@@ -363,15 +390,114 @@ a slow/stalling MooseFS, plus a writer probe) against a copy of the real
   boot-time comparison needs to reconcile with that existing rationale
   rather than override it casually; left for a follow-up rather than
   rushed into this redeploy.
-- **D3.** Being fixed concurrently by another lane against the main
-  working tree (`scripts/repair-chat-tree.py`,
-  `scripts/fix-stale-unfinished.py`, `scripts/fix-encoded-messages.py`,
-  `scripts/clean-decoration.py`, `uibranch.py`), not this image layer —
-  not duplicated here.
+- **D3.** Fixed on `feature/v3.1.9.6` (`e6d94fc`), not this image layer —
+  see that release's own `[3.1.9.6]` entry above ("Fixed (database-move
+  rehearsal, D3)") for the full writeup. `feature/v3.1.9.6` is merged into
+  this branch (H-5, review1-v3197-65ea196) before tagging, so both ship
+  together; not duplicated here.
 - **D7, D8, D10, D13.** Left for a future release; not attempted here
   (each is either a bigger redesign — Postgres/incremental copies for
   D7, the chroma store's own move for D8 — or a cosmetic log-path fix
   with no correctness impact, D13).
+
+### Fixed (round 2, review1-v3197-65ea196)
+
+The round-1 hostile review found the D1-D14 work above real but
+incomplete against a `docker stop -t 10`, D11's own false-alarm claim
+untrue, and 18 of 28 mutants surviving. This pass:
+
+- **H-1, re-entrancy and the "no-op" cost.** `_sigterm_handler` now sets
+  `signal.signal(signal.SIGTERM, signal.SIG_IGN)` as its very first
+  action, so a SECOND SIGTERM arriving while the first is still being
+  handled (mid-`_final_sync_on_shutdown`) is ignored rather than raising
+  a second `_ShutdownRequested` that used to escape as an unhandled
+  exception (exit 1, no final publish, supervisord's autorestart making a
+  clean shutdown look like a crash — X2c). `_final_sync_on_shutdown` no
+  longer calls `sync_once(force=True)`: plain `sync_once()` already
+  publishes everything that matters here (a real change, or a
+  future-dated snapshot) via its own mtime comparison, and `force=True`'s
+  only actual effect — republishing unchanged content — was costing a
+  full 27s publish on EVERY stop, widening the very window a second
+  SIGTERM or a short-grace stop can land in. The re-entrancy skip ("another
+  sync is in progress", meaning no final publish happened) is now logged
+  at WARNING instead of INFO on the shutdown path. `_account(r)` moved
+  inside the loop's own `try` so a SIGTERM during it (theoretical) is
+  covered by the same `except` as everything else. **Still true, and now
+  documented as such rather than implied fixed:** a `docker stop -t 10`
+  (RunPod's real default) SIGKILLs before even a fast warm publish can
+  finish — this pass narrows the SIGTERM re-entrancy window and removes a
+  self-inflicted cost, it does not make an automatic publish fit under a
+  10s grace period. The manual final-sync step remains the only actual
+  guarantee for that stop path; see `docs/DB-MOVE-RUNBOOK.md`.
+- **H-2/D11, the false "stale" reading — actually fixed.** `webuidb.py`
+  now touches a check-in sidecar (`SYNCED_AT_SIDECAR`,
+  `<snapshot>.synced_at`) every time `sync_once()` completes a real
+  cycle — published, or the ordinary "unchanged since last sync" skip.
+  `health.py`'s `probe_snapshot()` prefers this sidecar's own mtime over
+  comparing `LOCAL_DB`'s mtime against `SNAPSHOT_DB`'s: the old
+  comparison read "how long since her last write, before the snapshot's
+  mtime" as staleness, which is exactly wrong right after a restore, when
+  the snapshot's mtime can be many hours old. The immediate first sync
+  (D14) now also establishes this check-in baseline before she can
+  possibly have written anything, closing the false alarm at its root
+  rather than only shortening its window.
+- **M-1, the low-disk D2 fallback.** `_snapshot_sqlite_to_data`'s
+  free-space check now reserves room for TWO concurrent local copies
+  (this function's own staging copy AND a possible concurrent
+  `webuidb-sync` cycle, which stage similarly-sized local copies on
+  independent schedules) plus a margin, not one — the old ~1.1x check
+  passed with room that a real concurrent sync then consumed (X7b: 819 MB
+  "free" fell to 257 MB actually free). The fallback path — which brings
+  back the exact D2 symptom, a lock error plus a multi-second live commit
+  stall, on every backup cycle while it is engaged — now logs at ERROR,
+  not WARNING. `_snapshot_sqlite_to_data` also now takes webuidb's own
+  sync flock (non-blocking, bounded retry) around its local stage, so the
+  two do not routinely land at the same moment in the first place. A new
+  `sweep_stale_local_staging()`, run once at every process start (both
+  `--once` and `--daemon`), removes any orphaned `webuidb-local-*` file
+  left by a previous SIGKILLed cycle (mutation B3 in the review's table
+  survived on this before — nothing noticed an unswept orphan).
+- **M-2/D12, the rollback-direction mirror.** `entrypoint.sh`'s
+  `WEBUI_DB_LOCAL=false` branch now refuses to boot (same banner shape as
+  the `true` branch's existing D12 gate) if `DATABASE_URL` disagrees with
+  what that placement expects. Before this, a `DATABASE_URL` row left
+  over from a prior `WEBUI_DB_LOCAL=true` deploy would make OpenWebUI use
+  the pod's disposable local disk while `WEBUIDB_SYNC_ENABLED=false`
+  meant nothing ever copied it to `/data` — every message lost outright
+  on the next stop, with the boot banner claiming the opposite placement.
+- **H-6, the verify step's wrong port.** RUNPOD_DEPLOY.md's post-deploy
+  CSS check now curls `http://127.0.0.1:${OPENWEBUI_PORT:-3000}/static/
+  custom.css`, not `:8080` (the compactor, which 404s there on every
+  correctly-built image) — the old check reported a correct deploy as
+  broken and then told the operator to redeploy, which under
+  `WEBUI_DB_LOCAL=true` is itself an unplanned-redeploy data-loss risk if
+  taken literally without a final sync first.
+- **M-5, the Dockerfile `strip` step.** Scoped to the files
+  `pip install`/the OpenWebUI upgrade actually created or touched, so it
+  no longer rewrites pre-existing `.so` bytes elsewhere in `/app/venv`
+  (bcrypt, orjson, tiktoken, two scipy modules, the triton MLIR plugin,
+  four opencv_python.libs and one av.libs library all changed bytes,
+  undisclosed, before this fix, even though none of those packages
+  changed version). The filesystem-diff proof below now hashes every byte
+  under `/app/venv`, not just file counts, and confirms those files are
+  now byte-identical to the base image.
+- **B-1/B-2/H-4/H-5/H-7.** Documentation-only; see RUNPOD_DEPLOY.md's
+  "Upgrading to v3.1.9.7" and "WEBUI_DB_LOCAL" sections, `docs/DB-MOVE-
+  RUNBOOK.md` (new), and the "Known trade-off" note above.
+- **H-3, the gate's own blind spots — tests added, not yet a full
+  rewrite.** New tests drive the REAL `sync_once()` (not a stand-in) through
+  a `SIGTERM` delivered mid-cycle; a genuinely torn D5 fixture (a real
+  SQLite hot journal produced by a small `cache_size` plus a `SIGKILL`
+  mid-transaction, not a pre-rolled-back snapshot); `argparse`-level tests
+  for D6 (`--help`, an unknown flag, `--force` without `--sync-once`); a
+  test that the shutdown handler is actually installed on the real
+  `sync_loop` and does real work (a real publish happens); and a static
+  check of `supervisord.conf`'s `[program:webuidb-sync]` `stopsignal` plus
+  the D2 call sites (`create_backup`'s two `_snapshot_sqlite_to_data`
+  call sites now spied on directly, rather than only through a
+  `shutil.copy2` stall the reverted code path never calls). See the
+  mutation-table update in `gate3197-summary.txt` for the resulting score
+  against the review's own 28 mutants.
 
 **Filesystem-diff allowlist, re-confirmed after these fixes.** Re-running
 this release's own aggregate-sha256 diff between the base image and the
@@ -403,14 +529,20 @@ hierarchy up from webui.db, and installing sshd into a running pod
 **Scripts and docs only, and NOT a new image.** Every file the image copies
 (`compactor/*.py` apart from tests, `stt/`, `tts/`, `entrypoint.sh`,
 `supervisord.conf`, `clean-models.sh`) and the `Dockerfile` are
-byte-identical to v3.1.9.5, which was itself byte-identical to v3.1.9.4. So
-`:v3.1.9.6-cu12` is published as a third tag on the existing
-`:v3.1.9.4-cu12` image, digest
-`sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65`
-(RUNPOD_DEPLOY.md Step 3), not rebuilt, for the same reason v3.1.9.5 was
-not rebuilt: a rebuild re-resolves `apt-get upgrade`, unpinned pip
+byte-identical to v3.1.9.5, which was itself byte-identical to v3.1.9.4,
+against the existing `:v3.1.9.4-cu12` image, digest
+`sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65`.
+
+**UPDATE (H-5, review1-v3197-65ea196): `:v3.1.9.6-cu12` was never actually
+published as a third tag.** Rather than retag a fourth already-published
+digest, this release was merged directly into `feature/v3.1.9.7`'s git
+history instead, and its operator-script fixes ship as part of that
+release. This tag does not exist on Docker Hub — see "Image tags" in
+README.md. (The reasoning below, for why it would not have been rebuilt
+had it been tagged, still applies to v3.1.9.5/.4 and is kept for the
+record: a rebuild re-resolves `apt-get upgrade`, unpinned pip
 dependencies, the Piper voice URL and the CUDA base tag, and produces a
-different, unvalidated image.
+different, unvalidated image.)
 
 **Why this exists.** Six independent operator gaps, each closed with a
 script under `scripts/` rather than a change to what the image ships:
@@ -803,6 +935,100 @@ script under `scripts/` rather than a change to what the image ships:
   backup of its own. `close-stale-backfills.py` itself was never carried
   into this repo — it existed only as an unreviewed original, and is
   retired in favor of the reviewed, tested replacement.
+
+### Fixed (database-move rehearsal, `dbmove/findings.md` D3)
+
+- **`scripts/repair-chat-tree.py`, `fix-stale-unfinished.py`,
+  `fix-encoded-messages.py`, `clean-decoration.py` and
+  `recover-webui-db.py` no longer silently edit the SNAPSHOT when
+  `WEBUI_DB_LOCAL=true` moves the live database to local disk.** Every
+  one of these scripts used to accept `/data/openwebui/webui.db`
+  unconditionally. Once local-disk placement ships, `/data/openwebui/
+  webui.db` is only the periodically-published snapshot
+  (`compactor/webuidb.py`), and the live database is
+  `/var/lib/openwebui/webui.db` — a repair aimed at the old path
+  succeeded on the snapshot, the next sync cycle silently published
+  local over it, and the repair was gone with no warning (measured
+  directly in the rehearsal's P3: "the repair succeeded on the
+  snapshot; the next cycle was a silent skip; her next message
+  published local over it; the repair was gone. No guard fired.").
+  The scripts' own "database is open by another process" refusal could
+  not catch this, because nothing holds the snapshot file open while
+  local mode is active.
+
+  Fixed with one small shared helper, `scripts/_webui_live_path.py`,
+  that resolves the live database the same way the image does
+  (`WEBUI_DB_LOCAL`, folded exactly as `webuidb.live_webui_db()` folds
+  it — trimmed, case-insensitive, empty/unset means local), widened
+  with three additional signals for a fresh Web Terminal shell that
+  never inherited the flag: `DATABASE_URL`, `/proc/1/environ`
+  (supervisord's own real environment), and a filesystem/process check
+  (the local file exists and something has it open).
+
+  - **Writing modes (`--apply`, `--restore`) REFUSE outright, exit 1,**
+    when the target path is the snapshot while local mode looks
+    active — naming the live path and telling the operator to stop
+    `openwebui` AND `webuidb-sync` first (not just `openwebui`/
+    `backup`/`compactor`, the pre-move stop list). Not overridable by
+    `--force` — this is a wrong-target refusal, not a liveness
+    precaution.
+  - **Read-only dry runs WARN, to stderr, and still run** when pointed
+    at the snapshot in local mode — an operator reading a projection
+    isn't editing anything yet, and the counts still need to reach
+    them even though they're about to be stale.
+  - **`clean-decoration.py`'s `--webui-db` default** changed from a
+    hardcoded `/data/openwebui/webui.db` to resolving the live path the
+    same way.
+  - **A successful write in local mode prints the exact final-sync
+    command** — nothing publishes a local write to the durable
+    snapshot on its own until the next `WEBUI_DB_SYNC_INTERVAL_S`
+    cycle, and a pod stop before then loses it outright:
+    ```
+    supervisorctl stop openwebui webuidb-sync
+    WEBUI_DB_LOCAL=true /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --sync-once --force
+    ```
+  - **D10 (same rehearsal): the scripts' own pre-write safety backups
+    move off local disk in local mode,** to
+    `/data/forensics/<tool>-<stamp>/`, using the sqlite backup API —
+    otherwise a pod stop loses the safety copy the same way it loses
+    everything else on the container's ephemeral overlay.
+    `fix-stale-unfinished.py`'s backup already lived under
+    `/data/forensics/` unconditionally and needed no change here;
+    the other three's plain-copy backups now redirect there only when
+    the file they're backing up IS the local, ephemeral path — the
+    non-local case (still the pod's actual placement today, before
+    v3.1.9.7) is unchanged.
+
+  `recover-webui-db.py` was in scope for the same defect (it also
+  writes `webui.db` in place, defaulting to the same snapshot path) and
+  got the same refusal/warning treatment; it did not need a D10 change,
+  since its own broken-original bookkeeping already lands under
+  `/data/forensics`.
+
+  **Verified**: a new unit suite, `compactor/test_webui_live_path.py`
+  (fold table, each detection method independently, the priority order
+  between them, the refusal/warning/hint gating, D10's redirect); new
+  `test_d3_*` cases appended to each of the four existing operator-
+  script suites (refusal on the wrong path, warning-but-runs on a dry
+  run, unchanged behaviour with `WEBUI_DB_LOCAL=false`, success +
+  sync-hint on the right path); and a real-image replay of the
+  rehearsal's own P3/P4 sequence against the exact `zla-v3197-trial`
+  image and the real 2026-09-23 pod backup — `repair-chat-tree.py` and
+  `fix-stale-unfinished.py` both now refuse `--apply` against
+  `/data/openwebui/webui.db` (md5-identical before/after, zero bytes
+  written), both succeed against `/var/lib/openwebui/webui.db` and
+  print the final-sync recipe, and running that recipe for real
+  (`webuidb.py --sync-once --force`) publishes the repair into the
+  snapshot — confirmed by re-reading it afterward (3893 messages before
+  the repair, 4072 after the publish).
+
+  Documentation: `RUNBOOK_CHAT_TREE.md`, `RUNBOOK_DB_JOURNAL.md`, and the
+  `clean-decoration.py` / `fix-stale-unfinished.py` sections of
+  `OPERATIONS.md` note the local-disk-placement paths and the
+  final-sync step. Both runbooks otherwise still describe the pod's
+  placement as of when they were written (`WEBUI_DB_LOCAL=false`) apart
+  from that callout; see `docs/DB-MOVE-RUNBOOK.md`, added in v3.1.9.7,
+  for the placement this D3 fix actually protects against.
 
 ### Fixed
 
