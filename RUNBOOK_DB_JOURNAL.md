@@ -4,6 +4,26 @@ For the pod as it runs today: `WEBUI_DB_LOCAL=false`, so OpenWebUI's database
 lives on the RunPod network volume at `/data/openwebui/webui.db`. The commands
 work on the v3.1.6.1 image and later. Run them in the pod's Web Terminal.
 
+**If a later release moves the live database to local disk
+(`WEBUI_DB_LOCAL=true`, section 5's "permanent way out"):** the journal
+described here can only ever appear beside `/var/lib/openwebui/webui.db`
+now (local disk has no MooseFS to stall), and `/data/openwebui/webui.db`
+is only a periodically-published snapshot. `recover-webui-db.py` (section
+2A) checks this itself (D3, `dbmove/findings.md`) and REFUSES to run its
+real recovery pass against `$WEBUI_DB` if that resolves to the snapshot
+while local mode is active — recovering the snapshot there would be
+invisible to OpenWebUI (still reading local disk) and the next sync
+cycle would silently publish local back over it. `--check` (read-only)
+only WARNS and still runs. Point `WEBUI_DB` at
+`/var/lib/openwebui/webui.db` instead, and every `/data/openwebui/
+webui.db` in sections 1/2B below becomes `/var/lib/openwebui/webui.db`
+too — `webuidb-sync` joins the "stop the writers" list in both 2A and
+2B, and a successful recovery on the local file prints the exact
+final-sync command (`supervisorctl stop openwebui webuidb-sync` then
+`WEBUI_DB_LOCAL=true /opt/compactor-venv/bin/python /opt/compactor/
+webuidb.py --sync-once --force`) to publish it immediately rather than
+waiting for the next interval.
+
 There is no `sqlite3` command in the image. Every database command below uses
 OpenWebUI's own Python (`/app/venv/bin/python`).
 

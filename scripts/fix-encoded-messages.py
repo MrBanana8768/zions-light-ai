@@ -64,8 +64,12 @@ import sqlite3
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _webui_live_path as _live  # noqa: E402
+
 DEFAULT_CHAT_ID = "ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"
 JOURNAL_RUNBOOK = "RUNBOOK_DB_JOURNAL.md"
+TOOL_NAME = "fix-encoded-messages.py"
 
 
 def utc_stamp():
@@ -125,12 +129,26 @@ def verify_backup_openable(bak):
     return None
 
 
+def _backup_target(db_path, stamp):
+    """Where this run's own safety backup goes. D10: when `db_path` IS the
+    local, ephemeral disk file, a backup left beside it rides the same
+    container overlay and is lost on a pod stop -- so it goes to the
+    durable `/data/forensics/fix-encoded-messages-<stamp>/` instead.
+    Unchanged (beside `db_path`) in every other case."""
+    src = Path(db_path)
+    forensics_dir = _live.forensics_backup_dir("fix-encoded-messages", stamp, src)
+    if forensics_dir is not None:
+        return forensics_dir / (src.name + f".bak-{stamp}")
+    return src.with_name(src.name + f".bak-{stamp}")
+
+
 def backup_db(db_path, stamp):
     src = Path(db_path)
-    err = check_free_space(src, src.stat().st_size)
+    bak = _backup_target(db_path, stamp)
+    bak.parent.mkdir(parents=True, exist_ok=True)
+    err = check_free_space(bak, src.stat().st_size)
     if err:
         raise OSError(err)
-    bak = src.with_name(src.name + f".bak-{stamp}")
     if bak.exists():
         raise FileExistsError(f"backup already exists: {bak}")
     shutil.copy2(src, bak)
@@ -143,7 +161,7 @@ def backup_db(db_path, stamp):
 
 def restore_db(db_path, stamp):
     src = Path(db_path)
-    bak = src.with_name(src.name + f".bak-{stamp}")
+    bak = _backup_target(db_path, stamp)
     if not bak.is_file():
         return None, f"REFUSED: no backup found at {bak}"
     shutil.copy2(bak, src)
@@ -273,13 +291,18 @@ def main():
         if not a.live:
             print("usage: fix-encoded-messages.py <live webui.db> --restore <stamp>")
             sys.exit(2)
+        _live.refuse_if_snapshot_in_local_mode(a.live, tool_name=TOOL_NAME, dry_run=False)
         bak, msg = restore_db(a.live, a.restore)
         print(msg)
+        if bak is not None:
+            _live.maybe_print_final_sync_hint(TOOL_NAME, a.live)
         sys.exit(0 if bak is not None else 1)
 
     if not a.live or not a.pre:
         print(__doc__)
         sys.exit(2)
+
+    _live.refuse_if_snapshot_in_local_mode(a.live, tool_name=TOOL_NAME, dry_run=not a.apply)
 
     if a.apply:
         who = openers(a.live)
@@ -365,6 +388,7 @@ def main():
 
     if integrity != "ok" or good_n < total:
         sys.exit(4 if good_n > 0 else 1)
+    _live.maybe_print_final_sync_hint(TOOL_NAME, a.live)
     sys.exit(0)
 
 

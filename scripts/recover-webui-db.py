@@ -45,6 +45,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _webui_live_path as _live  # noqa: E402
+
+TOOL_NAME = "recover-webui-db.py"
+
 DB = Path(os.environ.get("WEBUI_DB", "/data/openwebui/webui.db"))
 RESCUE = Path("/tmp/rescue")
 FORENSICS = Path(os.environ.get("WEBUI_DB_FORENSICS", "/data/forensics"))
@@ -128,6 +133,20 @@ def main() -> int:
     if not DB.exists():
         say(f"[FAIL] {DB} does not exist")
         return 2
+
+    # D3: this script writes DB in place (the [4/5] swap below) -- refuse
+    # outright if DB resolves to the SNAPSHOT while local mode looks
+    # active (silently "recovers" the snapshot while OpenWebUI keeps
+    # writing local disk; the next sync cycle publishes local over it and
+    # the recovery is gone, with no warning). --check never writes, so it
+    # only warns. See scripts/_webui_live_path.py / dbmove/findings.md D3.
+    problem = _live.snapshot_problem_message(DB, TOOL_NAME, dry_run=args.check)
+    if problem:
+        if args.check:
+            say(f"WARNING: {problem}")
+        else:
+            say(f"REFUSING: {problem}")
+            return 1
 
     say("=" * 62)
     say(f"webui.db recovery — {DB}")
@@ -293,6 +312,7 @@ def main() -> int:
     say("")
     say("    supervisorctl start compactor backup")
     say("")
+    _live.maybe_print_final_sync_hint(TOOL_NAME, DB)
     return 0
 
 

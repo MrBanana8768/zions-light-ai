@@ -196,7 +196,15 @@ copies it back over the live path and refuses if no such backup exists.
 
 Usage:
   repair-chat-tree.py <webui.db> [--chat <id-or-prefix>] [--apply] [--json]
+  repair-chat-tree.py <webui.db> --sync-json-only [--apply] [--json]
   repair-chat-tree.py <webui.db> --restore <stamp>
+
+--sync-json-only (PART 3B) is the conservative alternative to the default
+relinking pass above: it only copies chat_message rows missing from the
+JSON history into it, verbatim parentId, no relinking, no reparenting, and
+never writes chat_message or moves current_message_id (bar one narrow,
+reported exception on history.currentId alone). Use it when the only known
+problem is messages missing from the JSON view.
 
 Dry run by default. Output is counts, short ids and timestamps only — never
 message text (see PART 6, `_redact`).
@@ -249,8 +257,12 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _webui_live_path as _live  # noqa: E402
+
 DEFAULT_CHAT_ID = "ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"
 JOURNAL_RUNBOOK = "RUNBOOK_DB_JOURNAL.md"
+TOOL_NAME = "repair-chat-tree.py"
 
 
 def fmt(t):
@@ -337,6 +349,20 @@ def verify_backup_openable(bak):
     return None
 
 
+def _backup_target(db_path, stamp):
+    """Where this run's own safety backup goes. D10: when `db_path` IS the
+    local, ephemeral disk file, a backup left beside it (this script's
+    prior, only behaviour) rides the same container overlay and is lost
+    on a pod stop -- so it goes to the durable
+    `/data/forensics/repair-chat-tree-<stamp>/` instead. Unchanged
+    (beside `db_path`) in every other case."""
+    src = Path(db_path)
+    forensics_dir = _live.forensics_backup_dir("repair-chat-tree", stamp, src)
+    if forensics_dir is not None:
+        return forensics_dir / (src.name + f".bak-{stamp}")
+    return src.with_name(src.name + f".bak-{stamp}")
+
+
 def backup_db(db_path, stamp):
     """A plain byte-for-byte copy — see the module docstring's BACKUP
     section for why this, not sqlite3's own backup API, is the right tool
@@ -344,10 +370,11 @@ def backup_db(db_path, stamp):
     PRAGMA integrity_check before returning, so a backup that failed to
     copy correctly is caught immediately, not at --restore time."""
     src = Path(db_path)
-    err = check_free_space(src, src.stat().st_size)
+    bak = _backup_target(db_path, stamp)
+    bak.parent.mkdir(parents=True, exist_ok=True)
+    err = check_free_space(bak, src.stat().st_size)
     if err:
         raise OSError(err)
-    bak = src.with_name(src.name + f".bak-{stamp}")
     if bak.exists():
         raise FileExistsError(f"backup already exists: {bak}")
     shutil.copy2(src, bak)
@@ -360,7 +387,7 @@ def backup_db(db_path, stamp):
 
 def restore_db(db_path, stamp):
     src = Path(db_path)
-    bak = src.with_name(src.name + f".bak-{stamp}")
+    bak = _backup_target(db_path, stamp)
     if not bak.is_file():
         return None, f"REFUSED: no backup found at {bak}"
     shutil.copy2(bak, src)
@@ -470,6 +497,239 @@ def find_any_cycle(msgs):
         for p in path:
             state[p] = 1
     return None
+
+
+# ===========================================================================
+# PART 3B — --sync-json-only: copy table-only messages into the JSON view
+# and do NOTHING else. Added for one specific incident: a lock storm left
+# messages saved to chat_message (the primary copy per module docstring #1)
+# that never made it into chat.chat["history"]["messages"] (the JSON the UI
+# renders). A hostile review of the default --apply pass above found it did
+# more than that incident needs to fix it -- timestamp-guess relinking
+# WRITTEN into chat_message.parent_id (M-1), and a pointer walk that can
+# land on the wrong branch (H-5) -- neither of which this mode does. This
+# mode only ADDS nodes to the JSON, using each one's OWN parent_id from the
+# table VERBATIM (never guessed, never relinked, never rewritten), and
+# never issues a single write against chat_message.
+# ===========================================================================
+
+
+# The exact field set this mode is allowed to set on a message it copies
+# into the JSON -- fixed by the task that added this mode. audit_real_
+# message_fields() below checks this against a REAL message in THIS chat on
+# every run rather than trusting this set blindly.
+SUPPLIABLE_MESSAGE_FIELDS = {
+    "id", "parentId", "role", "content", "output", "done", "timestamp", "model", "childrenIds",
+}
+
+
+def normalize_ts(t):
+    """created_at ranges over both seconds and nanoseconds in this schema
+    (same inline check build_plan already applies) -- normalise to
+    seconds the same way, as its own named helper for this mode's tests."""
+    if not t:
+        return t
+    return int(t / 1e9) if t > 1e11 else int(t)
+
+
+def audit_real_message_fields(msgs, added_ids):
+    """Compare SUPPLIABLE_MESSAGE_FIELDS against what a REAL, pre-existing
+    assistant message and a REAL, pre-existing user message in THIS chat
+    actually carry -- measured, not assumed. Returns {"assistant": [extra
+    fields] or None, "user": [...] or None}. A field named here is one this
+    mode does NOT set; nothing is fabricated for it, it is only reported."""
+    added = set(added_ids)
+    example_a = next((m for mid, m in msgs.items() if mid not in added and m.get("role") == "assistant"), None)
+    example_u = next((m for mid, m in msgs.items() if mid not in added and m.get("role") == "user"), None)
+    report = {}
+    for label, ex in (("assistant", example_a), ("user", example_u)):
+        report[label] = sorted(set(ex.keys()) - SUPPLIABLE_MESSAGE_FIELDS) if ex is not None else None
+    return report
+
+
+def walk_up_table(table, start):
+    """Same shape as walk_up(), but walking chat_message's OWN parent_id
+    chain directly -- the independent path verification (b) compares the
+    (post-sync) JSON walk against."""
+    path, n, seen = [], start, set()
+    while n in table and n not in seen:
+        seen.add(n)
+        path.append(n)
+        n = table[n]["parentId"]
+    return path
+
+
+def hash_chat_message_table(con):
+    """A deterministic fingerprint of every row of chat_message (every
+    chat, every column). Literal byte-for-byte file comparison isn't
+    available mid-transaction, so this is the same guarantee at the row
+    level: this mode issues no write against chat_message, so this value
+    must be identical immediately before COMMIT as it was right after
+    BEGIN IMMEDIATE -- checked as part of verification (d) below."""
+    h = hashlib.md5()
+    for row in con.execute("select * from chat_message order by id"):
+        h.update(repr(row).encode("utf-8", "surrogatepass"))
+    return h.hexdigest()
+
+
+def verify_sync(msgs, table, pointer):
+    """Verification (a) and (b): the JSON walk from `pointer` reaches a
+    true root (parentId None), and its exact id sequence equals the
+    independent table walk from the same pointer. Used both for the
+    dry-run projection and, unchanged, against freshly re-read data right
+    before COMMIT."""
+    json_path = walk_up(msgs, pointer) if pointer in msgs else []
+    table_path = walk_up_table(table, pointer) if pointer in table else []
+    reaches_root = bool(json_path) and msgs.get(json_path[-1], {}).get("parentId") is None
+    matches_table = json_path == table_path
+    ok = reaches_root and matches_table
+    detail = (f"json walk from pointer: {len(json_path)} | table walk from pointer: {len(table_path)} | "
+              f"sequence match: {matches_table} | reaches root: {reaches_root}")
+    return ok, detail, json_path, table_path
+
+
+def diff_preexisting_messages(pre_snapshot, msgs, parents_appended):
+    """Verification (c): every message that existed before this run must
+    come out byte-for-byte the same, EXCEPT that its childrenIds may have
+    gained exactly the ids this run's own bookkeeping (`parents_appended`)
+    says it appended to that message -- nothing else may differ, and even
+    childrenIds may only grow by that exact set, never shrink or reorder
+    its original entries. Returns a list of problem strings; empty is
+    clean."""
+    appended_by_parent = {}
+    for parent, child in parents_appended:
+        appended_by_parent.setdefault(parent, set()).add(child)
+    problems = []
+    for mid, before in pre_snapshot.items():
+        after = msgs.get(mid)
+        if after is None:
+            problems.append(f"{mid}: existing message disappeared")
+            continue
+        before_keys, after_keys = set(before.keys()), set(after.keys())
+        if before_keys != after_keys:
+            problems.append(f"{mid}: field set changed ({sorted(before_keys)} -> {sorted(after_keys)})")
+            continue
+        for key in before_keys:
+            if key == "childrenIds":
+                continue
+            if before[key] != after[key]:
+                problems.append(f"{mid}: field {key!r} changed")
+        before_kids = before.get("childrenIds") or []
+        after_kids = after.get("childrenIds") or []
+        expected_extra = appended_by_parent.get(mid, set())
+        if after_kids[:len(before_kids)] != before_kids:
+            problems.append(f"{mid}: childrenIds prefix changed, not a pure append")
+        elif set(after_kids[len(before_kids):]) != expected_extra:
+            problems.append(f"{mid}: childrenIds appended something other than the tracked additions")
+    return problems
+
+
+class SyncPlan:
+    def __init__(self):
+        self.chat_id = None
+        self.n_history_before = 0
+        self.n_table = 0
+        self.flat_before = 0
+        self.added = []               # ids copied into the JSON, in the order added
+        self.added_fields = {}        # id -> sorted list of fields set on it
+        self.parents_appended = []    # (parent_id, child_id) pairs appended to an EXISTING parent's childrenIds
+        self.pointer_col = None       # chat.current_message_id -- read-only, NEVER written by this mode
+        self.pointer_before = None    # history.currentId before
+        self.pointer_after = None     # history.currentId after (only the one narrow exception can change this)
+        self.pointer_aligned = False
+        self.field_audit = {}
+        self.json_path_len = 0
+        self.table_path_len = 0
+        self.reaches_root = False
+        self.matches_table = False
+        self.ok = False
+        self.detail = ""
+
+
+def build_sync_plan(chat, table, cur_col):
+    """The whole --sync-json-only algorithm. Mutates `chat` in place (same
+    convention as build_plan) and returns (plan, msgs, pre_existing_snapshot)
+    -- the snapshot is a deep copy of every message that existed BEFORE
+    this call, needed by diff_preexisting_messages() for verification (c).
+
+    What this deliberately does NOT do, unlike build_plan: it never
+    inspects whether an existing message's parentId resolves, never
+    relinks an orphan, never picks a parent by timestamp, and never moves
+    chat.current_message_id or (bar the one exception below)
+    history.currentId. Every id this function adds gets its parentId from
+    the table's own parent_id column, verbatim, and nothing else."""
+    plan = SyncPlan()
+    hist = chat.setdefault("history", {})
+    msgs = hist.setdefault("messages", {})
+    plan.n_history_before = len(msgs)
+    plan.n_table = len(table)
+    plan.flat_before = len(chat.get("messages") or [])
+    plan.pointer_col = cur_col
+    plan.pointer_before = hist.get("currentId")
+
+    pre_existing_snapshot = {mid: json.loads(json.dumps(m)) for mid, m in msgs.items()}
+
+    missing = sorted((mid for mid in table if mid not in msgs),
+                      key=lambda m: (table[m]["created"] or 0, m))
+
+    for mid in missing:
+        r = table[mid]
+        node = {
+            "id": mid,
+            "parentId": r["parentId"],
+            "role": r["role"],
+            "content": decode(r["content"]),
+            "done": bool(r["done"]) if r.get("done") is not None else False,
+            "timestamp": normalize_ts(r["created"]),
+        }
+        out = r.get("output")
+        if out is not None:
+            node["output"] = decode(out) if isinstance(out, str) else out
+        if r.get("model_id"):
+            node["model"] = r["model_id"]
+        node["childrenIds"] = []
+        msgs[mid] = node
+        plan.added.append(mid)
+        plan.added_fields[mid] = sorted(node.keys())
+
+    # childrenIds for each ADDED node: computed straight from the table's
+    # own parent_id links (never guessed), restricted to ids that actually
+    # exist in msgs so an entry is never left dangling.
+    for mid in plan.added:
+        kids = sorted(
+            (k for k, v in table.items() if v["parentId"] == mid and k in msgs),
+            key=lambda k: (msgs[k].get("timestamp") or 0, k),
+        )
+        msgs[mid]["childrenIds"] = kids
+
+    # for a PARENT that already existed in the JSON: only APPEND the added
+    # child id if missing -- never rebuild or reorder its existing list
+    # (verification (c) depends on this being a pure append).
+    for mid in plan.added:
+        parent = msgs[mid]["parentId"]
+        if parent in msgs and parent not in plan.added:
+            kids_list = msgs[parent].setdefault("childrenIds", [])
+            if mid not in kids_list:
+                kids_list.append(mid)
+                plan.parents_appended.append((parent, mid))
+
+    # --- the pointer: untouched, except this one narrow, explicit case ---
+    if plan.pointer_before != cur_col and cur_col in table:
+        hist["currentId"] = cur_col
+        plan.pointer_aligned = True
+    plan.pointer_after = hist.get("currentId")
+
+    plan.field_audit = audit_real_message_fields(msgs, plan.added)
+
+    ok, detail, json_path, table_path = verify_sync(msgs, table, plan.pointer_after)
+    plan.ok = ok
+    plan.detail = detail
+    plan.json_path_len = len(json_path)
+    plan.table_path_len = len(table_path)
+    plan.reaches_root = bool(json_path) and msgs.get(json_path[-1], {}).get("parentId") is None
+    plan.matches_table = json_path == table_path
+
+    return plan, msgs, pre_existing_snapshot
 
 
 # ===========================================================================
@@ -668,14 +928,29 @@ def build_plan(chat, table, cur_col):
 # ===========================================================================
 
 
+def _table_columns(con):
+    return {row[1] for row in con.execute("PRAGMA table_info(chat_message)")}
+
+
 def load_table(con, chat_id):
+    """Base fields (id/parent_id/role/content/created_at) plus, when the
+    column exists on this schema, output/done/model_id -- needed by
+    --sync-json-only (PART 3B) below, additive so build_plan's own field
+    access (which never looks at the extra three) is unaffected."""
     prefix = chat_id + "-"
+    cols = _table_columns(con)
+    extra = [c for c in ("output", "done", "model_id") if c in cols]
+    select_cols = ["id", "parent_id", "role", "content", "created_at"] + extra
     table = {}
-    for mid, parent_id, role, content, created in con.execute(
-        "select id, parent_id, role, content, created_at from chat_message where chat_id=?", (chat_id,)
-    ):
+    for row in con.execute(f"select {', '.join(select_cols)} from chat_message where chat_id=?", (chat_id,)):
+        rec = dict(zip(select_cols, row))
+        mid = rec["id"]
         key = mid[len(prefix):] if mid.startswith(prefix) else mid
-        table[key] = {"row": mid, "parentId": parent_id, "role": role, "content": content, "created": created}
+        table[key] = {
+            "row": mid, "parentId": rec["parent_id"], "role": rec["role"],
+            "content": rec["content"], "created": rec["created_at"],
+            "output": rec.get("output"), "done": rec.get("done"), "model_id": rec.get("model_id"),
+        }
     return table
 
 
@@ -710,6 +985,166 @@ def emit(result, as_json):
     print("verification:", "OK" if p["ok"] else "FAILED")
 
 
+def emit_sync(result, as_json):
+    if as_json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    p = result
+    print(f"chat {p['chat_id'][:8]}: history {p['n_history_before']} | table {p['n_table']} | "
+          f"flat list {p['flat_before']} (left untouched)")
+    print(f"table-only messages copied into the JSON (decoded): {p['added_count']}")
+    for mid in p["added_ids"]:
+        print(f"  + {mid} fields={p['added_fields'].get(mid[:8], [])}")
+    print(f"existing parents that gained an appended child id: {len(p['parents_appended'])}")
+    for parent, child in p["parents_appended"]:
+        print(f"  {parent} += {child}")
+    print(f"pointer: chat.current_message_id={(p['pointer_col'] or '-')} | "
+          f"history.currentId {(p['pointer_before'] or '-')} -> {(p['pointer_after'] or '-')} "
+          f"({'ALIGNED to the column (exception)' if p['pointer_aligned'] else 'unchanged'})")
+    print(f"field audit -- fields a real message here carries that the table cannot supply: {p['field_audit']}")
+    print(p["detail"])
+    print("verification:", "OK" if p["ok"] else "FAILED")
+
+
+def _sync_result(plan, cid):
+    return {
+        "chat_id": cid, "n_history_before": plan.n_history_before, "n_table": plan.n_table,
+        "flat_before": plan.flat_before,
+        "added_count": len(plan.added), "added_ids": list(plan.added),
+        "added_fields": {k[:8]: v for k, v in plan.added_fields.items()},
+        "parents_appended": [(p, c) for p, c in plan.parents_appended],
+        "pointer_col": plan.pointer_col, "pointer_before": plan.pointer_before,
+        "pointer_after": plan.pointer_after, "pointer_aligned": plan.pointer_aligned,
+        "field_audit": plan.field_audit,
+        "json_path_len": plan.json_path_len, "table_path_len": plan.table_path_len,
+        "reaches_root": plan.reaches_root, "matches_table": plan.matches_table,
+        "detail": plan.detail, "ok": plan.ok,
+    }
+
+
+def run_sync_json_only(a):
+    """CLI flow for --sync-json-only, kept separate from main()'s existing
+    --apply flow (PART 5) rather than interleaved with it, so this mode
+    cannot accidentally inherit any of build_plan's relinking/pointer
+    behaviour -- see PART 3B for the algorithm itself."""
+    _live.refuse_if_snapshot_in_local_mode(a.db, tool_name=TOOL_NAME, dry_run=not a.apply)
+    if a.apply:
+        who = openers(a.db)
+        if who:
+            print(f"REFUSING: the database is open by process(es) {who}. Stop openwebui "
+                  f"and backup, close every browser tab on the chat, and retry.")
+            sys.exit(1)
+        sidecars = live_sidecars(a.db)
+        if sidecars:
+            print(f"REFUSING: {sidecars} present -- see {JOURNAL_RUNBOOK}, not this script, "
+                  f"for a live WAL/journal.")
+            sys.exit(1)
+
+    con = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True)
+    found = find_chat(con, a.chat)
+    if found is None:
+        print(f"REFUSING: no single chat matches --chat {a.chat!r}.")
+        con.close()
+        sys.exit(1)
+    cid, blob, cur_col = found
+    updated_before = con.execute("select updated_at from chat where id=?", (cid,)).fetchone()[0]
+    chat = json.loads(blob)
+    table = load_table(con, cid)
+    con.close()
+
+    plan, msgs, pre_snapshot = build_sync_plan(chat, table, cur_col)
+    plan.chat_id = cid
+    result = _sync_result(plan, cid)
+    nothing_pending = not plan.added and not plan.pointer_aligned
+
+    if not a.apply:
+        emit_sync(result, a.json)
+        if not plan.ok:
+            if not a.json:
+                print("REFUSING: the projected result would not reach/match the table branch")
+            sys.exit(1)
+        if nothing_pending:
+            if not a.json:
+                print("nothing to do")
+            sys.exit(0)
+        if not a.json:
+            print("DRY RUN -- nothing written")
+        sys.exit(3)
+
+    # --apply from here
+    emit_sync(result, a.json)
+    if not plan.ok:
+        print("verification FAILED on the projected result -- nothing written")
+        sys.exit(1)
+    if nothing_pending:
+        print("nothing to do -- nothing written")
+        sys.exit(0)
+
+    stamp = utc_stamp()
+    try:
+        bak = backup_db(a.db, stamp)
+    except (OSError, FileExistsError) as e:
+        print(f"REFUSING: backup failed: {e}")
+        sys.exit(1)
+    print(f"backed up to {bak}")
+
+    con = sqlite3.connect(a.db, timeout=60, isolation_level=None)
+    con.execute("BEGIN IMMEDIATE")
+    table_hash_before = hash_chat_message_table(con)
+    row = con.execute("select chat, current_message_id, updated_at from chat where id=?", (cid,)).fetchone()
+    if row is None or row[2] != updated_before:
+        con.execute("ROLLBACK")
+        print("the chat changed while this ran; nothing written")
+        con.close()
+        sys.exit(1)
+    fresh_blob, fresh_cur_col, _ = row
+    fresh_chat = json.loads(fresh_blob)
+    fresh_table = load_table(con, cid)
+    plan2, msgs2, pre_snapshot2 = build_sync_plan(fresh_chat, fresh_table, fresh_cur_col)
+
+    if not plan2.ok:
+        con.execute("ROLLBACK")
+        print("verification FAILED rebuilding the plan inside the write transaction -- nothing written")
+        con.close()
+        sys.exit(1)
+
+    # the ONLY write this mode ever issues: chat.chat and chat.updated_at.
+    # Never current_message_id, never chat_message.
+    con.execute("update chat set chat=?, updated_at=? where id=?",
+                (json.dumps(fresh_chat), int(time.time()), cid))
+
+    # --- verification before commit, inside this same transaction ---
+    reread_blob = con.execute("select chat from chat where id=?", (cid,)).fetchone()[0]
+    reread_chat = json.loads(reread_blob)
+    reread_msgs = reread_chat["history"]["messages"]
+    table_hash_after = hash_chat_message_table(con)
+
+    ok_ab, detail_ab, jp, tp = verify_sync(reread_msgs, fresh_table, plan2.pointer_after)
+    problems_c = diff_preexisting_messages(pre_snapshot2, reread_msgs, plan2.parents_appended)
+    table_unchanged = (table_hash_after == table_hash_before)
+
+    if not (ok_ab and not problems_c and table_unchanged):
+        con.execute("ROLLBACK")
+        print("VERIFICATION FAILED before commit -- rolled back, nothing written")
+        print(" ", detail_ab)
+        if problems_c:
+            print("  pre-existing message changes:", problems_c)
+        if not table_unchanged:
+            print("  chat_message table hash changed -- refusing to commit")
+        con.close()
+        sys.exit(1)
+
+    con.execute("COMMIT")
+    print(f"written. re-read: JSON walk from pointer {len(jp)} message(s), table walk {len(tp)} message(s), "
+          f"sequence match: {jp == tp}, chat_message unchanged: {table_unchanged}")
+    integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+    print("integrity:", integrity)
+    con.close()
+    if integrity == "ok":
+        _live.maybe_print_final_sync_hint(TOOL_NAME, a.db)
+    sys.exit(0 if integrity == "ok" else 1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("db")
@@ -718,13 +1153,26 @@ def main():
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--restore", metavar="STAMP", default=None)
+    ap.add_argument("--sync-json-only", action="store_true",
+                     help="conservative mode: only copy chat_message rows missing from the JSON "
+                          "history into it, verbatim parentId, no relinking, no reparenting, "
+                          "current_message_id column never written (see PART 3B)")
     a = ap.parse_args()
 
     if a.restore:
+        _live.refuse_if_snapshot_in_local_mode(a.db, tool_name=TOOL_NAME, dry_run=False)
         bak, msg = restore_db(a.db, a.restore)
         result = {"action": "restore", "stamp": a.restore, "ok": bak is not None, "detail": msg}
         emit(result, a.json) if a.json else print(msg)
+        if bak is not None:
+            _live.maybe_print_final_sync_hint(TOOL_NAME, a.db)
         sys.exit(0 if bak is not None else 1)
+
+    if a.sync_json_only:
+        run_sync_json_only(a)
+        return
+
+    _live.refuse_if_snapshot_in_local_mode(a.db, tool_name=TOOL_NAME, dry_run=not a.apply)
 
     if a.apply:
         who = openers(a.db)
@@ -826,6 +1274,7 @@ def main():
 
     if integrity != "ok":
         sys.exit(1)
+    _live.maybe_print_final_sync_hint(TOOL_NAME, a.db)
     if plan.unlinkable:
         sys.exit(4)
     sys.exit(0)

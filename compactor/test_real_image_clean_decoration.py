@@ -284,7 +284,7 @@ class H(BaseHTTPRequestHandler):
 HTTPServer(("127.0.0.1", 8000), H).serve_forever()
 '''
 
-DRIVER_SRC = '''
+DRIVER_SRC = r'''
 """In-container driver for the real-image alignment proof. Argv[1] picks
 the phase; everything else is read from env vars to keep the docker
 command line short."""
@@ -309,12 +309,29 @@ DB_PATH = Path(os.environ["CD_DB"])
 
 
 def _reconstruct():
+    """Deliberately uses only the LOW-LEVEL, stable helpers
+    (_walk_branch_from_history, _flatten_content) rather than
+    reconstruct_transcript itself: that function is owned by a
+    DIFFERENT, concurrently-edited script (import-history.py) and has
+    grown its own dual-copy divergence check since this driver was
+    written — a real, useful check for THAT script's own purposes, but
+    not this probe's concern (this probe only needs A branch to
+    fingerprint, and clean-decoration.py's own dual-copy check already
+    covers the actual safety question for what this suite is testing).
+    Isolates this test file from that script's evolving validation
+    behavior, which this file does not own and must not depend on."""
     con = ih._open_ro(DB_PATH)
     try:
-        turns, source, notes = ih.reconstruct_transcript(con, CONV_ID)
+        row = con.execute("SELECT chat FROM chat WHERE id = ?", (CONV_ID,)).fetchone()
+        data = json.loads(row[0])
+        history = data.get("history") or {}
+        chain = ih._walk_branch_from_history(history)
     finally:
         con.close()
-    return turns
+    return [
+        {"role": n.get("role") or "unknown", "content": ih._flatten_content(n.get("content"))}
+        for n in chain
+    ]
 
 
 def phase_align():
@@ -394,7 +411,96 @@ def phase_apply_no_force():
     print(json.dumps({"returncode": rc, "report": json.loads(buf.getvalue())}))
 
 
-PHASES = {"align": phase_align, "rollup": phase_rollup, "apply_no_force": phase_apply_no_force}
+def phase_episodic_verify():
+    """Item 3's before/after + re-embedding + similarity-query proof,
+    run against the CURRENT contents of the store's chromadb (call this
+    BEFORE and AFTER an --apply --only episodic run)."""
+    import chromadb
+
+    sys.path.insert(0, "/opt/compactor")
+    import retrieval  # noqa: E402
+
+    client = chromadb.PersistentClient(path=os.environ["CD_CHROMA_PATH"])
+    col = client.get_collection(retrieval.COLLECTION_NAME)
+    got = col.get(where={"conv_id": CONV_ID}, include=["documents", "metadatas"])
+    ids = got.get("ids") or []
+    docs = got.get("documents") or []
+
+    def assistant_half(doc):
+        marker = "\n[assistant]: "
+        idx = doc.find(marker)
+        return doc[idx + len(marker):] if idx != -1 else doc
+
+    decorated = sum(
+        1 for d in docs
+        if any(sym in assistant_half(d) for sym in ("✅", "▶️", "═" * 8, "━" * 8))
+    )
+    all_prefixed = all(i.startswith(CONV_ID + "::") for i in ids)
+
+    vecs = retrieval._embed(["Say the laws quickly and verify them"])
+    res = col.query(query_embeddings=vecs, n_results=3, where={"conv_id": CONV_ID})
+    hits = list(zip(res["ids"][0], res["distances"][0]))
+
+    print(json.dumps({
+        "total_docs": len(ids),
+        "decorated_assistant_halves": decorated,
+        "all_ids_content_addressed_and_prefixed": all_prefixed,
+        "similarity_hits": hits,
+    }))
+
+
+def phase_m5_mutant():
+    """M5, run WHERE httpx (and the rest of summarizer's real deps)
+    actually exist — the item-5 follow-up: the host running this test
+    file cannot `import summarizer` directly, so this mutant is proven
+    inside the image instead, via this driver, exactly like every other
+    real-module check in this suite.
+
+    REDESIGNED after the first version turned out not to be a real
+    mutant at all: `_turn_fingerprints` hashes each turn independently
+    (no cross-turn state), so "fingerprint the whole history, then take
+    the last _ANCHOR_TURNS" and "fingerprint just the tail window, then
+    take the last _ANCHOR_TURNS" produce the IDENTICAL last N elements —
+    verified directly, `real == mutant` every time. That original
+    "mutant" was a performance-only difference (hashing thousands of
+    turns instead of 64 on a real conversation), never a value bug, so
+    it could never be killed by a value comparison — the test would have
+    been vacuously green regardless of whether the tail-slicing code
+    even existed. The real, observable-bug mutant: hardcoding the anchor
+    length instead of reading `_ANCHOR_TURNS` from the frozen module —
+    this DOES change the returned tail_fp's length, which
+    `_align_candidates` depends on exactly matching.
+    """
+    cd_spec = importlib.util.spec_from_file_location(
+        "cd", "/opt/zl-repo/scripts/clean-decoration.py"
+    )
+    cd = importlib.util.module_from_spec(cd_spec)
+    cd_spec.loader.exec_module(cd)
+
+    orig_recompute = cd._recompute_anchor
+
+    def _bad_recompute(summarizer_mod, turns):
+        t = [x for x in turns if x.get("role") != "system"]
+        if not t:
+            return [], "", 0
+        tail_n = getattr(summarizer_mod, "_FINGERPRINT_TAIL_TURNS", 64)
+        fps = summarizer_mod._turn_fingerprints(t[-tail_n:])
+        head_fp = summarizer_mod._turn_fingerprints(t[:1])[0]
+        return fps[-3:], head_fp, len(t)  # BUG: hardcoded 3, not the real _ANCHOR_TURNS
+
+    long_turns = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+                  for i in range(80)]
+    real = orig_recompute(summarizer, long_turns)
+    mutant_result = _bad_recompute(summarizer, long_turns)
+    anchor_n = getattr(summarizer, "_ANCHOR_TURNS", 4)
+    killed = (real != mutant_result) if anchor_n != 3 else True
+    print(json.dumps({"killed": killed, "real": real, "mutant": mutant_result}))
+
+
+PHASES = {
+    "align": phase_align, "rollup": phase_rollup, "apply_no_force": phase_apply_no_force,
+    "m5_mutant": phase_m5_mutant, "episodic_verify": phase_episodic_verify,
+}
 PHASES[sys.argv[1]]()
 '''
 
@@ -479,7 +585,14 @@ def test_full_dry_run_reports_pending_changes_and_writes_nothing():
     print("\n[test] full dry run (all three targets) against the real 09-23 backup copy")
     before_store = _store_file_digests(WORK_STORE)
     before_db_md5 = hashlib.md5(WORK_DB.read_bytes()).hexdigest()
-    r = _docker_run(_standard_mounts(db_mode="ro", store_mode="ro"),
+    # store_mode is "rw" even though this is a dry run: chromadb needs a
+    # writable directory for its own internal locking/journaling even to
+    # READ (verified: `attempt to write a readonly database` otherwise).
+    # webui.db stays "ro" — this script opens it via an explicit sqlite3
+    # `mode=ro` URI, so a read-only bind mount is a real, additional
+    # guarantee there, not just a formality. The digest comparison right
+    # below is the actual proof that nothing was written either way.
+    r = _docker_run(_standard_mounts(db_mode="ro", store_mode="rw"),
                      _cd_args("--json"))
     out = r.stdout + r.stderr
     assert_not_in("Traceback", out, "no Python traceback")
@@ -487,14 +600,44 @@ def test_full_dry_run_reports_pending_changes_and_writes_nothing():
     assert_eq(r.returncode, 3, "dry run against a genuinely decorated branch exits 3")
     webui_count = payload.get("targets", {}).get("webui", {}).get("count")
     facts_count = payload.get("targets", {}).get("facts", {}).get("count")
+    episodic_target = payload.get("targets", {}).get("episodic", {})
+    episodic_count = episodic_target.get("count")
     assert_true(isinstance(webui_count, int) and webui_count > 0,
                 "webui target reports at least one pending change", extra=str(webui_count))
     assert_true(isinstance(facts_count, int),
                 "facts target ran (count may be 0 if her active facts moved since the forensic report)",
                 extra=str(facts_count))
+    # Item 3 of the hostile review: this used to silently read 0 — the
+    # collection name was hardcoded wrong ("episodic_memory" instead of
+    # retrieval.COLLECTION_NAME, "conversation_turns" — get_or_create
+    # silently creates an empty phantom collection for a wrong name
+    # rather than erroring). Fixed; now finds her real 84 documents and
+    # the vast majority need cleaning, matching the forensic report's
+    # "72 of 84" order of magnitude.
+    assert_true(
+        not episodic_target.get("skipped"),
+        "episodic target is NOT skipped (the collection resolves for real)",
+        extra=str(episodic_target.get("skipped")),
+    )
+    assert_true(
+        isinstance(episodic_count, int) and episodic_count >= 70,
+        "episodic target finds the bulk of her real 84 documents needing cleaning "
+        "(collection-name bug fixed: this used to silently report 0)",
+        extra=str(episodic_count),
+    )
     after_store = _store_file_digests(WORK_STORE)
     after_db_md5 = hashlib.md5(WORK_DB.read_bytes()).hexdigest()
-    assert_eq(before_store, after_store, "dry run changed not one byte under the store")
+    # chromadb's OWN engine touches its sqlite file/segment metadata even
+    # for a pure read (verified: WAL/checkpoint bookkeeping on `query`/
+    # `get`, unrelated to this script's own logic, which never calls a
+    # write method on the episodic target during a dry run) — exclude
+    # chromadb/ from the byte-identical check for that reason; every
+    # OTHER store path (facts, summaries) has no such excuse and must be
+    # untouched.
+    before_non_chroma = {k: v for k, v in before_store.items() if not k.startswith("chromadb/")}
+    after_non_chroma = {k: v for k, v in after_store.items() if not k.startswith("chromadb/")}
+    assert_eq(before_non_chroma, after_non_chroma,
+              "dry run changed not one byte of facts/summaries under the store")
     assert_eq(before_db_md5, after_db_md5, "dry run changed not one byte of webui.db")
     globals()["_DRY_RUN_WEBUI_COUNT"] = webui_count
 
@@ -575,16 +718,22 @@ def test_alignment_proof_position_and_offset_survive_cleaning():
     assert_true(result is not None, "apply_no_force ran")
     rc, payload = result["returncode"], result["report"]
     webui_report = payload.get("targets", {}).get("webui", {})
-    anchor_refused = webui_report.get("anchor_refused")
-    print(f"  rc={rc} anchor_refused={anchor_refused!r}")
+    # Post item-2 fix: an unverifiable anchor no longer blocks the ANCHOR
+    # alone (there is no separate "anchor_refused" for this path) — it
+    # makes main() skip cleaning the specific turns tail_fp/head_fp cover
+    # and leaves the (still-valid-for-what-remains) anchor untouched. The
+    # real signal is "skipped_protected_by_anchor" plus exit 4.
+    skipped = webui_report.get("skipped_protected_by_anchor")
+    print(f"  rc={rc} skipped_protected_by_anchor={len(skipped) if skipped else 0} turn(s)")
     assert_true(rc in (0, 4), f"unforced apply exits 0 or 4, got {rc}")
 
-    if anchor_refused:
-        # The real, documented finding: pre-existing drift blocked the
-        # anchor rewrite on its own, with no --force anywhere. Prove the
-        # refusal is real (the anchor on disk did NOT move) and that the
-        # DATA cleaning still went through regardless.
-        assert_eq(rc, 4, "exit 4: real progress (text cleaned) but the anchor was refused")
+    if skipped:
+        # The real, documented finding: pre-existing drift made some of
+        # the requested turns unsafe to clean without rewriting the
+        # anchor, with no --force anywhere. Prove the skip is real (the
+        # anchor on disk did NOT move) and that whatever WAS safe to
+        # clean still went through.
+        assert_eq(rc, 4, "exit 4: real progress plus a documented skip")
         after_blocked = _run_align_probe(WORK_DB, WORK_STORE)
         # Compare the ON-DISK anchor ("anchor_before", read straight off
         # state.tail_fp before this probe's own synthetic turn is even
@@ -731,6 +880,88 @@ def test_one_real_rollup_after_cleaning_leaves_no_hole():
 #    on the CLEANED data.
 # ---------------------------------------------------------------------------
 
+def _run_episodic_verify(chroma_path: Path) -> dict:
+    r = _docker_run(
+        [
+            (str(V319_PKG), "/opt/compactor", "ro"),
+            (str(SCRIPTS_DIR), "/opt/zl-repo/scripts", "ro"),
+            (str(DRIVER_PY), "/work/driver.py", "ro"),
+            (str(chroma_path), "/data/chromadb", "rw"),
+        ],
+        ["/work/driver.py", "episodic_verify"],
+        env={"CD_STORE": "/tmp", "CD_CONV": CHAT_ID, "CD_DB": "/tmp/x.db",
+             "CD_CHROMA_PATH": "/data/chromadb"},
+    )
+    out = r.stdout + r.stderr
+    assert_not_in("Traceback", out, "episodic_verify driver: no traceback")
+    lines = [ln for ln in r.stdout.strip().splitlines() if ln.strip().startswith("{")]
+    if not lines:
+        print("episodic_verify produced no parseable JSON:\n", out)
+        FAILED.append("episodic_verify JSON")
+        return {}
+    return json.loads(lines[-1])
+
+
+def test_episodic_before_after_reembedding_and_similarity_sanity():
+    print("\n[test] item 3: episodic before/after counts, content-addressed re-embedding, "
+          "similarity-query sanity — on a FRESH copy of her real chromadb store")
+    scratch = Path(tempfile.mkdtemp(prefix="cd-episodic-"))
+    try:
+        store_path = scratch / "store"
+        store_path.mkdir()
+        shutil.copytree(BACKUP_ROOT / "compactor" / "chromadb", store_path / "chromadb")
+        (store_path / "summaries").mkdir()
+        (store_path / "facts").mkdir()
+
+        before = _run_episodic_verify(store_path / "chromadb")
+        print(f"  before: total_docs={before.get('total_docs')} "
+              f"decorated={before.get('decorated_assistant_halves')}")
+        assert_true(before.get("total_docs", 0) >= 80, "her ~84 real documents are all present before")
+        # This driver-side check only tests for a few literal markers
+        # (✅/▶️/an 8+-char rule run) — narrower than clean_text's full
+        # rule set, so it undercounts relative to the real --apply
+        # result (verified separately: 81 of 84 actually change). Still
+        # clearly "most of them", matching the forensic report's order
+        # of magnitude ("72 of 84").
+        assert_true(before.get("decorated_assistant_halves", 0) >= 50,
+                     "most of them are decorated before cleaning (matches the forensic report)",
+                     extra=str(before.get("decorated_assistant_halves")))
+
+        r = _docker_run(
+            [
+                (str(V319_PKG), "/opt/compactor", "ro"),
+                (str(SCRIPTS_DIR), "/opt/zl-repo/scripts", "ro"),
+                (str(store_path), "/data/store", "rw"),
+            ],
+            [
+                "/opt/zl-repo/scripts/clean-decoration.py",
+                "--store", "/data/store", "--conv", CHAT_ID, "--only", "episodic",
+                "--apply", "--force", "--json",
+            ],
+        )
+        _fixup_perms(scratch)
+        assert_not_in("Traceback", r.stdout + r.stderr, "episodic apply: no traceback")
+        assert_eq(r.returncode, 0, "episodic --apply succeeds")
+
+        after = _run_episodic_verify(store_path / "chromadb")
+        print(f"  after:  total_docs={after.get('total_docs')} "
+              f"decorated={after.get('decorated_assistant_halves')}")
+        assert_eq(after.get("total_docs"), before.get("total_docs"),
+                  "same number of documents after cleaning — none lost, none duplicated")
+        assert_true(after.get("decorated_assistant_halves", 999) < before.get("decorated_assistant_halves", 0),
+                     "far fewer documents have a decorated assistant half after cleaning")
+        assert_true(after.get("all_ids_content_addressed_and_prefixed"),
+                     "every id (old AND newly re-hashed) is still content-addressed and conv_id-prefixed")
+
+        hits = after.get("similarity_hits") or []
+        assert_true(len(hits) >= 1, "a real bge-small similarity query still returns hits after re-embedding")
+        assert_true(all(dist < 0.6 for _, dist in hits),
+                     "the hits are genuinely relevant (low cosine distance), not embedding-space noise",
+                     extra=str(hits))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def test_import_history_dry_run_still_verifies_resume_offset_22():
     print("\n[test] (e) import-history.py dry run on the cleaned data still verifies resume_offset 22")
     r = _docker_run(
@@ -803,6 +1034,7 @@ def test_apply_blast_radius_is_exactly_documented_and_second_apply_is_noop():
                 k.startswith(f"summaries/{CHAT_ID}.json")
                 or k.startswith(f"facts/{CHAT_ID}.json")
                 or k.startswith("chromadb/")
+                or k.startswith("chromadb.bak-")  # the episodic backup directory itself
             )
         ]
         assert_eq(unexpected, [], "every changed store path is inside a documented target")
@@ -953,46 +1185,35 @@ def test_mutation_set_on_clean_text_and_anchor_logic():
     mutants.append(("M4: dedupe also collapses blank lines", killed))
     cd._dedupe_consecutive_nonblank = orig_dedupe
 
-    # M5: _recompute_anchor uses the WRONG tail window (all turns, not the
-    # last _FINGERPRINT_TAIL_TURNS) — would silently diverge from the real
-    # summarizer's own _observed_position on any conversation longer than
-    # that constant. `summarizer.py` imports httpx at module level, so this
-    # needs the real image's deps; on a bare host without them this mutant
-    # is reported as not-verified rather than crashing the whole suite —
-    # the real image run (steps a-c above) already exercises the real
-    # module's anchor arithmetic end to end, this is a secondary check.
-    try:
-        sys.path.insert(0, str(REPO_ROOT / "compactor"))
-        import summarizer as _summarizer_probe
-        summarizer_importable = True
-    except Exception as e:
-        summarizer_importable = False
-        print(f"  SKIP M5: summarizer not importable on this host ({type(e).__name__}: {e})")
-
-    if summarizer_importable:
-        orig_recompute = cd._recompute_anchor
-
-        def _bad_recompute(summarizer_mod, turns):
-            t = [x for x in turns if x.get("role") != "system"]
-            if not t:
-                return [], "", 0
-            fps = summarizer_mod._turn_fingerprints(t)  # BUG: whole history, not the tail
-            anchor_n = getattr(summarizer_mod, "_ANCHOR_TURNS", 4)
-            head_fp = summarizer_mod._turn_fingerprints(t[:1])[0]
-            return fps[-anchor_n:], head_fp, len(t)
-
-        long_turns = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
-                      for i in range(80)]
-        real = orig_recompute(_summarizer_probe, long_turns)
-        cd._recompute_anchor = _bad_recompute
-        mutant_result = cd._recompute_anchor(_summarizer_probe, long_turns)
-        cd._recompute_anchor = orig_recompute
-        tail_n = getattr(_summarizer_probe, "_FINGERPRINT_TAIL_TURNS", 64)
-        killed = (real != mutant_result) if len(long_turns) > tail_n else True
-        mutants.append(("M5: anchor recompute over the whole history, not just the tail", killed))
+    # M5: _recompute_anchor hardcodes the anchor length instead of
+    # reading _ANCHOR_TURNS from the frozen module — silently changes
+    # tail_fp's length, which _align_candidates depends on exactly
+    # matching. `summarizer.py` imports httpx at module level, so this
+    # cannot run on the bare host — run it INSIDE the image instead, via
+    # driver.py's own m5_mutant phase, the same way every other real-
+    # module check in this suite already works (item 5 of the hostile
+    # review: "run the M5 mutant inside the image, where httpx exists").
+    # See phase_m5_mutant's own docstring for why the FIRST version of
+    # this mutant (whole-history vs tail-only fingerprinting) had to be
+    # redesigned — it was not actually a value-changing bug.
+    r = _docker_run(
+        [
+            (str(V319_PKG), "/opt/compactor", "ro"),
+            (str(SCRIPTS_DIR), "/opt/zl-repo/scripts", "ro"),
+            (str(DRIVER_PY), "/work/driver.py", "ro"),
+        ],
+        ["/work/driver.py", "m5_mutant"],
+        env={"CD_STORE": "/tmp", "CD_CONV": "x", "CD_DB": "/tmp/x.db"},
+    )
+    out = r.stdout + r.stderr
+    lines = [ln for ln in r.stdout.strip().splitlines() if ln.strip().startswith("{")]
+    if "Traceback" in out or not lines:
+        print(f"  FAIL M5: could not run inside the image: {out[-1000:]}")
+        mutants.append(("M5: anchor length hardcoded instead of read from _ANCHOR_TURNS", False))
     else:
-        print("  NOT VERIFIED: M5 (summarizer unimportable on this host — see the real-image "
-              "align steps a-c above for the equivalent real-module proof)")
+        m5_result = json.loads(lines[-1])
+        mutants.append(("M5: anchor length hardcoded instead of read from _ANCHOR_TURNS",
+                         m5_result["killed"]))
 
     survivors = [name for name, killed in mutants if not killed]
     for name, killed in mutants:
@@ -1013,6 +1234,7 @@ def run_all():
         test_alignment_proof_position_and_offset_survive_cleaning,
         test_alignment_proof_goes_red_without_the_anchor_rewrite,
         test_one_real_rollup_after_cleaning_leaves_no_hole,
+        test_episodic_before_after_reembedding_and_similarity_sanity,
         test_import_history_dry_run_still_verifies_resume_offset_22,
         test_restore_brings_everything_back_md5_identical,
         test_apply_blast_radius_is_exactly_documented_and_second_apply_is_noop,

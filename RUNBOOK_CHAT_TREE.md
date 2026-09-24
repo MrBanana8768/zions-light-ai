@@ -57,6 +57,32 @@ script needs nothing from the compactor package (only the Python standard
 library), so `/app/venv/bin/python` (OpenWebUI's own venv, used below since
 this touches `webui.db`) and `/opt/compactor-venv/bin/python` both work.
 
+## If this pod places `webui.db` on local disk (`WEBUI_DB_LOCAL=true`)
+
+Every command below shows `/data/openwebui/webui.db` because that is
+where the live database is on THIS pod's placement
+(`WEBUI_DB_LOCAL=false`). A pod moved to local-disk placement keeps the
+live database at `/var/lib/openwebui/webui.db` instead; `/data` then
+holds only a periodically-published SNAPSHOT.
+
+`repair-chat-tree.py` and `fix-encoded-messages.py` both check this
+themselves now (D3, see `dbmove/findings.md`) and REFUSE `--apply`/
+`--restore` outright if the path you give is the snapshot while local
+mode is active — writing there only edits the snapshot, and the next
+sync cycle silently publishes local over it, losing the repair with no
+warning. A dry run only WARNS and still runs. If you see that refusal,
+re-run the SAME command with `/var/lib/openwebui/webui.db` in place of
+`/data/openwebui/webui.db` (the refusal message names the exact live
+path), and **stop `webuidb-sync` alongside `openwebui`** before
+`--apply` — not just `openwebui` and `backup` as step 3 below says for
+this pod's own placement. Once `--apply` succeeds, it prints the exact
+commands to publish the repair immediately rather than waiting for (or
+risking a pod stop before) the next sync interval:
+```bash
+supervisorctl stop openwebui webuidb-sync
+WEBUI_DB_LOCAL=true /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --sync-once --force
+```
+
 ## 1. Close every tab first
 
 **Before touching anything, close her chat on every device** — phone, tablet,

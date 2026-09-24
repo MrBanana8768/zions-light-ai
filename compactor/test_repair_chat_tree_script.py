@@ -506,6 +506,401 @@ def test_find_chat_requires_a_single_unambiguous_match():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ===========================================================================
+# --sync-json-only (PART 3B) -- the conservative mode
+# ===========================================================================
+
+
+def trow(parent, role, created, output=None, done=None, model_id=None, content="x"):
+    """A synthetic chat_message table row shaped like load_table()'s output."""
+    return {"parentId": parent, "role": role, "content": json.dumps(content), "created": created,
+            "output": json.dumps(output) if output is not None else None,
+            "done": done, "model_id": model_id}
+
+
+def test_sync_fills_a_mid_branch_gap():
+    # root -> [gap: missing from JSON, present in table] -> tip (in JSON,
+    # parentId points at the gap). Before sync, "tip" is an orphan (its
+    # parentId isn't in msgs at all); after, the gap message is copied in
+    # verbatim from the table and the walk reconnects.
+    msgs = link(tree(
+        msg("root", "user", 0),
+        msg("tip", "assistant", 20, parent="gap"),  # "gap" not in msgs yet
+    ))
+    table = {
+        "root": trow(None, "user", 0),
+        "gap": trow("root", "user", 10),
+        "tip": trow("gap", "assistant", 20),
+    }
+    plan, msgs2, pre = S.build_sync_plan({"history": {"messages": msgs}, "messages": []}, table, "tip")
+    assert_true("gap" in plan.added, "the mid-branch gap message was copied into the JSON")
+    assert_eq(msgs2["gap"]["parentId"], "root", "gap's parentId copied verbatim from the table")
+    assert_eq(msgs2["tip"]["parentId"], "gap", "tip's own parentId is untouched (never relinked)")
+    assert_true("gap" in msgs2["root"]["childrenIds"], "root's childrenIds gained the gap id")
+    assert_true("tip" in msgs2["gap"]["childrenIds"], "gap's own childrenIds computed from the table")
+    assert_true(plan.ok, "verification passes once the gap is filled")
+    assert_eq(plan.json_path_len, 3, "JSON walk from the pointer now reaches all 3 messages")
+
+
+def test_sync_table_only_chain_of_two_or_more():
+    # A whole continuation -- TWO consecutive messages -- exists only in
+    # the table, past the JSON's current tip.
+    msgs = link(tree(
+        msg("root", "user", 0),
+        msg("known_tip", "assistant", 10, parent="root"),
+    ))
+    table = {
+        "root": trow(None, "user", 0),
+        "known_tip": trow("root", "assistant", 10),
+        "cont_q": trow("known_tip", "user", 20),
+        "cont_a": trow("cont_q", "assistant", 30),
+    }
+    plan, msgs2, pre = S.build_sync_plan({"history": {"messages": msgs}, "messages": []}, table, "cont_a")
+    assert_eq(set(plan.added), {"cont_q", "cont_a"}, "both table-only continuation messages copied")
+    assert_eq(msgs2["cont_a"]["parentId"], "cont_q", "chain order preserved")
+    assert_eq(msgs2["cont_q"]["parentId"], "known_tip", "chain reattaches to the known tip verbatim")
+    assert_true("cont_q" in msgs2["known_tip"]["childrenIds"], "known_tip's childrenIds appended with cont_q")
+    assert_true(plan.ok, "verification passes for a 2-message table-only chain")
+
+
+def test_sync_output_field_is_copied():
+    output_blocks = [{"type": "message", "role": "assistant",
+                       "content": [{"type": "output_text", "text": "hi there"}]}]
+    msgs = link(tree(msg("root", "user", 0)))
+    table = {
+        "root": trow(None, "user", 0),
+        "a1": trow("root", "assistant", 10, output=output_blocks, done=True, model_id="some/model"),
+    }
+    plan, msgs2, pre = S.build_sync_plan({"history": {"messages": msgs}, "messages": []}, table, "a1")
+    assert_eq(msgs2["a1"]["output"], output_blocks,
+               "output column copied and decoded (rendering reads output[].content[].text)")
+    assert_eq(msgs2["a1"]["done"], True, "done copied as a bool")
+    assert_eq(msgs2["a1"]["model"], "some/model", "model set from model_id")
+
+
+def test_sync_output_absent_when_column_is_null():
+    msgs = link(tree(msg("root", "user", 0)))
+    table = {"root": trow(None, "user", 0), "a1": trow("root", "assistant", 10)}  # output=None
+    plan, msgs2, pre = S.build_sync_plan({"history": {"messages": msgs}, "messages": []}, table, "a1")
+    assert_true("output" not in msgs2["a1"], "no output field fabricated when the column is null")
+    assert_true("model" not in msgs2["a1"], "no model field fabricated when model_id is null")
+
+
+def test_sync_never_relinks_an_unrelated_orphan():
+    # "orphan" has a broken parentId that the table does NOT explain (its
+    # own table row, if it existed, would show a different, resolvable
+    # parent) -- this mode must leave it exactly as broken as it found it,
+    # unlike build_plan's relinking pass.
+    msgs = link(tree(
+        msg("root", "user", 0),
+        msg("orphan", "user", 50, parent="missing-parent-not-in-table-either"),
+    ))
+    table = {"root": trow(None, "user", 0)}  # orphan has no table row at all here
+    plan, msgs2, pre = S.build_sync_plan({"history": {"messages": msgs}, "messages": []}, table, "root")
+    assert_eq(msgs2["orphan"]["parentId"], "missing-parent-not-in-table-either",
+              "the orphan's parentId is byte-for-byte untouched -- never relinked")
+    assert_eq(plan.added, [], "nothing was added (orphan already existed in the JSON)")
+
+
+def test_sync_pointer_unchanged_when_column_and_json_already_agree():
+    msgs = link(tree(msg("root", "user", 0), msg("a1", "assistant", 10, parent="root")))
+    chat = {"history": {"messages": msgs, "currentId": "a1"}, "messages": []}
+    plan, msgs2, pre = S.build_sync_plan(chat, {"root": trow(None, "user", 0), "a1": trow("root", "assistant", 10)}, "a1")
+    assert_true(not plan.pointer_aligned, "no alignment needed -- column and history.currentId already agree")
+    assert_eq(plan.pointer_after, "a1", "history.currentId left exactly as it was")
+
+
+def test_sync_pointer_aligned_to_column_when_they_disagree_and_column_resolves():
+    # history.currentId is stale ("old"); chat.current_message_id ("new")
+    # is the authoritative column (module docstring #3) and DOES resolve in
+    # the table -- the one narrow exception fires, and ONLY history.currentId
+    # moves (chat.current_message_id is never written by this mode at all).
+    msgs = link(tree(msg("root", "user", 0), msg("old", "user", 5, parent="root"),
+                      msg("new", "assistant", 10, parent="root")))
+    chat = {"history": {"messages": msgs, "currentId": "old"}, "messages": []}
+    table = {"root": trow(None, "user", 0), "old": trow("root", "user", 5), "new": trow("root", "assistant", 10)}
+    plan, msgs2, pre = S.build_sync_plan(chat, table, "new")
+    assert_true(plan.pointer_aligned, "history.currentId aligned to the authoritative column")
+    assert_eq(plan.pointer_after, "new", "history.currentId now equals chat.current_message_id")
+    assert_eq(plan.pointer_col, "new", "the column value itself is only ever read, reported back unchanged")
+
+
+def test_sync_pointer_not_aligned_when_column_does_not_resolve_in_table():
+    # The exception's own guard: chat.current_message_id disagrees with
+    # history.currentId, but the column's value isn't a real table row --
+    # must NOT align to a value that doesn't resolve.
+    msgs = link(tree(msg("root", "user", 0), msg("old", "user", 5, parent="root")))
+    chat = {"history": {"messages": msgs, "currentId": "old"}, "messages": []}
+    table = {"root": trow(None, "user", 0), "old": trow("root", "user", 5)}
+    plan, msgs2, pre = S.build_sync_plan(chat, table, "does-not-exist-in-table")
+    assert_true(not plan.pointer_aligned, "guard holds: column value must resolve in the table to be used")
+    assert_eq(plan.pointer_after, "old", "history.currentId left alone when the column doesn't resolve")
+
+
+def test_sync_idempotent_second_run_reports_nothing_to_do():
+    msgs = link(tree(msg("root", "user", 0)))
+    table = {"root": trow(None, "user", 0), "a1": trow("root", "assistant", 10)}
+    chat1 = {"history": {"messages": msgs, "currentId": "a1"}, "messages": []}
+    plan1, msgs_after, pre1 = S.build_sync_plan(chat1, table, "a1")
+    assert_true(plan1.added, "first run copies the table-only message")
+
+    chat2 = {"history": {"messages": msgs_after, "currentId": plan1.pointer_after}, "messages": []}
+    plan2, msgs_after2, pre2 = S.build_sync_plan(chat2, table, "a1")
+    assert_eq(plan2.added, [], "second run finds nothing left to copy")
+    assert_true(not plan2.pointer_aligned, "second run does not touch an already-aligned pointer")
+    assert_true(plan2.ok, "second run still verifies clean")
+
+
+def test_sync_refuses_when_result_would_not_match_table_branch():
+    # The pointer's table ancestor chain includes an id that genuinely does
+    # not exist ANYWHERE (not in the table either) -- copying what the
+    # table CAN supply still leaves the JSON walk short of the table walk,
+    # so verification must report not-ok rather than pretend success.
+    msgs = link(tree(msg("root", "user", 0)))
+    table = {
+        # "root"'s own chain is fine, but "tip"'s table parent is a ghost
+        # that the table itself never records -- nothing this mode does
+        # can bridge that, so the two walks cannot end up equal.
+        "root": trow(None, "user", 0),
+        "tip": trow("ghost-nowhere", "assistant", 10),
+    }
+    plan, msgs2, pre = S.build_sync_plan({"history": {"messages": msgs}, "messages": []}, table, "tip")
+    assert_true(not plan.ok, "verification correctly refuses: JSON and table walks cannot be made to match")
+    assert_true(not plan.matches_table or not plan.reaches_root, "at least one of (a)/(b) fails as expected")
+
+
+def test_sync_field_audit_reports_what_the_table_cannot_supply():
+    msgs = link(tree(
+        msg("root", "user", 0),
+        msg("a1", "assistant", 10, parent="root"),
+    ))
+    msgs["root"]["models"] = ["some/model"]           # real field the table can't reliably reconstruct
+    msgs["a1"]["followUps"] = ["ok?"]                  # real field with no chat_message equivalent
+    msgs["a1"]["modelIdx"] = 0                          # ditto
+    table = {"root": trow(None, "user", 0), "a1": trow("root", "assistant", 10)}
+    plan, msgs2, pre = S.build_sync_plan({"history": {"messages": msgs}, "messages": []}, table, "a1")
+    assert_eq(set(plan.field_audit["assistant"]), {"followUps", "modelIdx"},
+              "assistant-only fields the table cannot supply are reported, not fabricated")
+    assert_eq(set(plan.field_audit["user"]), {"models"},
+              "the user message's 'models' list is reported as unsuppliable, not guessed from model_id")
+
+
+def test_sync_existing_parent_childrenids_is_a_pure_append():
+    # An existing parent already has a childrenIds entry recorded in some
+    # order this script must not disturb; the new id must be appended, not
+    # used to rebuild/reorder the list.
+    msgs = link(tree(msg("root", "user", 0), msg("z_existing", "assistant", 5, parent="root")))
+    msgs["root"]["childrenIds"] = ["z_existing"]  # deliberately not alphabetical/timestamp order
+    table = {"root": trow(None, "user", 0), "z_existing": trow("root", "assistant", 5),
+             "new_sibling": trow("root", "assistant", 1)}  # earlier timestamp than z_existing
+    plan, msgs2, pre = S.build_sync_plan({"history": {"messages": msgs}, "messages": []}, table, "z_existing")
+    assert_eq(msgs2["root"]["childrenIds"], ["z_existing", "new_sibling"],
+              "append only -- the pre-existing order/entry is preserved, not rebuilt")
+    problems = S.diff_preexisting_messages(pre, msgs2, plan.parents_appended)
+    assert_eq(problems, [], "diff_preexisting_messages finds the append clean")
+
+
+def test_diff_preexisting_messages_catches_an_unexpected_field_change():
+    before = {"m1": {"id": "m1", "role": "user", "content": "x", "childrenIds": []}}
+    after = {"m1": {"id": "m1", "role": "user", "content": "CHANGED", "childrenIds": []}}
+    problems = S.diff_preexisting_messages(before, after, [])
+    assert_true(any("content" in p for p in problems), "a changed field on an existing message is caught")
+
+
+# ===========================================================================
+# --sync-json-only, CLI level: table byte-identical, idempotent exit codes
+# ===========================================================================
+
+
+def _make_sync_db(path, chat_id="ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"):
+    con = sqlite3.connect(str(path))
+    con.execute("create table chat (id text primary key, chat text, current_message_id text, updated_at int)")
+    con.execute("create table chat_message (id text primary key, chat_id text, parent_id text, role text, "
+                "content text, output text, model_id text, done boolean, created_at int)")
+    msgs = link(tree(msg("root", "user", 0)))
+    blob = json.dumps({"history": {"messages": msgs, "currentId": "a1"}, "messages": []})
+    con.execute("insert into chat values (?,?,?,?)", (chat_id, blob, "a1", int(time.time())))
+    con.execute("insert into chat_message values (?,?,?,?,?,?,?,?,?)",
+                (f"{chat_id}-root", chat_id, None, "user", json.dumps("x"), None, None, None, 0))
+    con.execute("insert into chat_message values (?,?,?,?,?,?,?,?,?)",
+                (f"{chat_id}-a1", chat_id, "root", "assistant", json.dumps("hi"),
+                 json.dumps([{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}]),
+                 "some/model", True, 10))
+    con.commit()
+    con.close()
+
+
+def _chat_message_rows(db):
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    rows = list(con.execute("select * from chat_message order by id"))
+    con.close()
+    return rows
+
+
+def test_sync_apply_is_byte_identical_on_chat_message_and_idempotent():
+    import subprocess
+    tmp = Path(tempfile.mkdtemp(prefix="rct-sync-cli-"))
+    try:
+        db = tmp / "webui.db"
+        _make_sync_db(db)
+        before_rows = _chat_message_rows(db)
+
+        r1 = subprocess.run([sys.executable, str(_SCRIPT), str(db), "--sync-json-only", "--apply", "--json"],
+                             capture_output=True, text=True)
+        assert_true(r1.returncode == 0, "first --sync-json-only --apply run exits 0", r1.stdout + r1.stderr)
+        after_rows = _chat_message_rows(db)
+        assert_eq(after_rows, before_rows, "chat_message table is byte-for-byte unchanged after --apply")
+
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        chat = json.loads(con.execute("select chat from chat where id=?",
+                                       ("ea1494ea-e9d7-46fb-8b7c-3a50d685d00e",)).fetchone()[0])
+        con.close()
+        hmsgs = chat["history"]["messages"]
+        assert_true("a1" in hmsgs, "the table-only assistant message was copied into the JSON")
+        assert_eq(hmsgs["a1"].get("output"),
+                  [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+                  "output field present and decoded in the written JSON")
+
+        r2 = subprocess.run([sys.executable, str(_SCRIPT), str(db), "--sync-json-only", "--apply"],
+                             capture_output=True, text=True)
+        assert_true(r2.returncode == 0, "second run exits 0", r2.stdout + r2.stderr)
+        assert_true("nothing to do" in r2.stdout, "second run reports nothing to do", r2.stdout)
+        assert_eq(_chat_message_rows(db), before_rows, "chat_message still byte-identical after the second run")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_sync_dry_run_reports_pending_work_exit_3():
+    import subprocess
+    tmp = Path(tempfile.mkdtemp(prefix="rct-sync-dry-"))
+    try:
+        db = tmp / "webui.db"
+        _make_sync_db(db)
+        r = subprocess.run([sys.executable, str(_SCRIPT), str(db), "--sync-json-only"],
+                            capture_output=True, text=True)
+        assert_true(r.returncode == 3, "dry run with pending work exits 3", r.stdout + r.stderr)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ===========================================================================
+# D3 -- the database-move rehearsal's defect: this script used to accept
+# /data/openwebui/webui.db unconditionally, even once WEBUI_DB_LOCAL=true
+# moves OpenWebUI's live database to local disk and leaves /data holding
+# only a periodically-published snapshot. See scripts/_webui_live_path.py
+# and dbmove/findings.md section 4.
+# ===========================================================================
+
+
+def _make_healthy_single_message_db(path, chat_id="ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"):
+    """The simplest possible ALREADY-repaired tree: one root message,
+    pointer already at its own tip. A dry run against this reports
+    nothing pending (exit 0), so these D3 tests never depend on the
+    tree-repair logic itself -- only on whether the write/refusal
+    happens at all."""
+    con = sqlite3.connect(str(path))
+    con.execute("create table chat (id text primary key, chat text, current_message_id text, updated_at int)")
+    con.execute("create table chat_message (id text primary key, chat_id text, parent_id text, role text, "
+                "content text, created_at int)")
+    msgs = {"m1": {"id": "m1", "parentId": None, "childrenIds": [], "role": "user",
+                   "content": "hi", "timestamp": 1}}
+    blob = json.dumps({"history": {"messages": msgs, "currentId": "m1"}, "messages": []})
+    con.execute("insert into chat values (?,?,?,?)", (chat_id, blob, "m1", int(time.time())))
+    con.commit()
+    con.close()
+
+
+def _make_fixable_single_orphan_db(path, chat_id="ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"):
+    """One root plus one orphaned assistant reply with no stored parent
+    link -- build_plan relinks it by nearest-earlier-opposite-role, a
+    real write on --apply, so the D3 success+sync-hint test has an
+    actual commit to observe."""
+    con = sqlite3.connect(str(path))
+    con.execute("create table chat (id text primary key, chat text, current_message_id text, updated_at int)")
+    con.execute("create table chat_message (id text primary key, chat_id text, parent_id text, role text, "
+                "content text, created_at int)")
+    msgs = {
+        "m1": {"id": "m1", "parentId": None, "childrenIds": [], "role": "user", "content": "hi", "timestamp": 1},
+        "m2": {"id": "m2", "parentId": None, "childrenIds": [], "role": "assistant", "content": "hey", "timestamp": 2},
+    }
+    blob = json.dumps({"history": {"messages": msgs, "currentId": "m1"}, "messages": []})
+    con.execute("insert into chat values (?,?,?,?)", (chat_id, blob, "m1", int(time.time())))
+    con.commit()
+    con.close()
+
+
+def test_d3_apply_against_snapshot_in_local_mode_refuses():
+    import subprocess
+    tmp = Path(tempfile.mkdtemp(prefix="rct-d3-refuse-"))
+    try:
+        snapshot = tmp / "webui.db"
+        _make_healthy_single_message_db(snapshot)
+        local = tmp / "local.db"
+        env = {**os.environ, "WEBUI_DB_LOCAL": "true",
+               "WEBUI_SNAPSHOT_DB": str(snapshot), "WEBUI_LOCAL_DB": str(local)}
+        r = subprocess.run([sys.executable, str(_SCRIPT), str(snapshot), "--apply"],
+                            capture_output=True, text=True, env=env)
+        assert_eq(r.returncode, 1, "D3: --apply against the snapshot in local mode refuses (exit 1)")
+        assert_true("REFUSING" in r.stderr, "D3: refusal is printed", r.stderr)
+        assert_true(str(local) in r.stderr, "D3: refusal names the live (local) path", r.stderr)
+        assert_true("webuidb-sync" in r.stderr and "openwebui" in r.stderr,
+                    "D3: refusal names both services to stop", r.stderr)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_dry_run_against_snapshot_in_local_mode_warns_but_runs():
+    import subprocess
+    tmp = Path(tempfile.mkdtemp(prefix="rct-d3-warn-"))
+    try:
+        snapshot = tmp / "webui.db"
+        _make_healthy_single_message_db(snapshot)
+        local = tmp / "local.db"
+        env = {**os.environ, "WEBUI_DB_LOCAL": "true",
+               "WEBUI_SNAPSHOT_DB": str(snapshot), "WEBUI_LOCAL_DB": str(local)}
+        r = subprocess.run([sys.executable, str(_SCRIPT), str(snapshot)],
+                            capture_output=True, text=True, env=env)
+        assert_eq(r.returncode, 0, "D3: a read-only dry run against the snapshot in local mode still runs")
+        assert_true("WARNING" in r.stderr, "D3: dry run warns rather than refusing", r.stderr)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_local_mode_off_snapshot_path_behaves_as_before():
+    import subprocess
+    tmp = Path(tempfile.mkdtemp(prefix="rct-d3-off-"))
+    try:
+        snapshot = tmp / "webui.db"
+        _make_healthy_single_message_db(snapshot)
+        env = {**os.environ, "WEBUI_DB_LOCAL": "false", "WEBUI_SNAPSHOT_DB": str(snapshot)}
+        r = subprocess.run([sys.executable, str(_SCRIPT), str(snapshot), "--apply"],
+                            capture_output=True, text=True, env=env)
+        assert_eq(r.returncode, 0, "D3: WEBUI_DB_LOCAL=false: --apply against /data works exactly as before")
+        assert_true("REFUSING" not in r.stderr, "D3: no refusal when local mode is off", r.stderr)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_d3_apply_against_live_local_path_succeeds_and_prints_sync_hint():
+    import subprocess
+    tmp = Path(tempfile.mkdtemp(prefix="rct-d3-hint-"))
+    try:
+        local = tmp / "webui.db"
+        _make_fixable_single_orphan_db(local)
+        env = {**os.environ, "WEBUI_DB_LOCAL": "true", "WEBUI_LOCAL_DB": str(local),
+               "WEBUI_SNAPSHOT_DB": str(tmp / "snapshot-not-used.db"),
+               "WEBUI_DB_FORENSICS": str(tmp / "forensics")}
+        r = subprocess.run([sys.executable, str(_SCRIPT), str(local), "--apply"],
+                            capture_output=True, text=True, env=env)
+        assert_eq(r.returncode, 0, "D3: --apply against the LIVE local path succeeds")
+        assert_true("supervisorctl stop openwebui webuidb-sync" in r.stdout,
+                    "D3: success prints the final-sync stop command", r.stdout)
+        assert_true("--sync-once --force" in r.stdout,
+                    "D3: success prints the final-sync command itself", r.stdout)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_decode_plain_text()
     test_decode_list_of_blocks()
@@ -541,6 +936,27 @@ if __name__ == "__main__":
     test_backup_then_restore_is_byte_identical()
     test_restore_refuses_cleanly_when_no_backup_exists()
     test_find_chat_requires_a_single_unambiguous_match()
+
+    test_sync_fills_a_mid_branch_gap()
+    test_sync_table_only_chain_of_two_or_more()
+    test_sync_output_field_is_copied()
+    test_sync_output_absent_when_column_is_null()
+    test_sync_never_relinks_an_unrelated_orphan()
+    test_sync_pointer_unchanged_when_column_and_json_already_agree()
+    test_sync_pointer_aligned_to_column_when_they_disagree_and_column_resolves()
+    test_sync_pointer_not_aligned_when_column_does_not_resolve_in_table()
+    test_sync_idempotent_second_run_reports_nothing_to_do()
+    test_sync_refuses_when_result_would_not_match_table_branch()
+    test_sync_field_audit_reports_what_the_table_cannot_supply()
+    test_sync_existing_parent_childrenids_is_a_pure_append()
+    test_diff_preexisting_messages_catches_an_unexpected_field_change()
+    test_sync_apply_is_byte_identical_on_chat_message_and_idempotent()
+    test_sync_dry_run_reports_pending_work_exit_3()
+
+    test_d3_apply_against_snapshot_in_local_mode_refuses()
+    test_d3_dry_run_against_snapshot_in_local_mode_warns_but_runs()
+    test_d3_local_mode_off_snapshot_path_behaves_as_before()
+    test_d3_apply_against_live_local_path_succeeds_and_prints_sync_hint()
 
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILURE(S): {_FAILS}")

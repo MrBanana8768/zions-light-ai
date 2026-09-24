@@ -2008,6 +2008,261 @@ this script after the next restart.
 
 ---
 
+## Removing decoration from her stored replies, facts and episodic memory (v3.1.9.6)
+
+**This is the answer to "how do I remove the symbols without running
+`/forget`."** `scripts/clean-decoration.py` strips emoji, rule-line
+"walls" (`═══`, `━━━`, long `====` runs) and LAW-board status tags
+("✅ ... → ACTIVE (100%)") out of the three places the model re-reads its
+own decoration from — her stored chat replies, active facts, and episodic
+(chromadb) memory — deterministically, with no LLM call. It never touches
+a word she actually wrote, and it never runs `/forget`: nothing is
+deleted, only decoration is stripped from text that is kept.
+
+**This is a SHORT chat outage, both services stopped.** `webui.db` and
+the compactor's `facts/`/`summaries/`/`chromadb/` are live files each
+service reads and writes on every request — the same hazard
+`import-history.py` and `backfill-records.py` already refuse against, and
+this script refuses the same way. Dry run makes no writes and finishes in
+well under a minute; `--apply` on a store her size is a few seconds of
+I/O plus one CPU embedding pass per changed episodic document — call it
+under two minutes end to end:
+
+```bash
+git clone --depth 1 --branch <tag-or-branch> \
+    https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+supervisorctl stop openwebui compactor
+/opt/compactor-venv/bin/python /opt/zl-repo/scripts/clean-decoration.py \
+    --webui-db /data/openwebui/webui.db --store /data/openwebui/compactor \
+    --conv <chat id>
+# read the report, then:
+/opt/compactor-venv/bin/python /opt/zl-repo/scripts/clean-decoration.py \
+    --webui-db /data/openwebui/webui.db --store /data/openwebui/compactor \
+    --conv <chat id> --apply
+supervisorctl start openwebui compactor
+```
+
+**The three targets** (`--only`, default all three; each independently
+backed up before any write):
+- **webui** — her current branch (walked via `currentId`/`parentId`,
+  never insertion order). OpenWebUI 0.11 keeps an assistant turn's text in
+  THREE places at once (`history.messages[id].content`, the small flat
+  `messages[]` tail cache, and the `chat_message` table's own row) and
+  this script updates all three together or none — it refuses outright
+  if the JSON and table copies of an in-scope message already disagree,
+  rather than clean one and leave the other stale. Only `role: "assistant"`
+  turns are ever in scope; a `role: "user"` message is never touched.
+- **facts** — `facts/<conv>.json`'s active fact text. There is no
+  embedding cache on a fact record to invalidate (verified against both
+  v3.1.9 and v3.1.9.4), so cleaning the text is the whole job. A fact
+  that would clean to empty, or to a duplicate of another fact's text, is
+  reported and left byte-for-byte as it was — never deleted; that would
+  be `/forget` semantics by another name.
+- **episodic** — the chromadb documents for `--conv`, in the REAL
+  collection compactor's own `retrieval.py` uses
+  (`retrieval.COLLECTION_NAME`, `"conversation_turns"` — an earlier
+  build of this script had this hardcoded to the wrong name,
+  `"episodic_memory"`, which does not error but silently creates and
+  writes an empty phantom collection the live compactor never reads;
+  fixed to read the real name from the module). Ids are content-addressed
+  (sha256 of the stored text), so a changed document gets re-embedded
+  with the compactor's own `retrieval._embed` (same model, same code path
+  the live compactor uses) under a new id, upserted with the original
+  metadata, and the old id deleted. Only the `[assistant]: ...` half of a
+  stored exchange is ever cleaned — the `[user]: ...` half never is.
+  Documents that exist for what is content-wise the same conversation but
+  under a DIFFERENT, older `conv_id` (a real thing found in her store) are
+  correctly left alone: her live retrieval filters strictly by exact
+  `conv_id` and can never reach them, so they are genuinely out of scope,
+  not a miss.
+
+**The anchor rule (why some turns can be "skipped" even without
+`--force`).** `compactor/summarizer.py` fingerprints the WHOLE,
+decoration-and-all text of each turn to track where it is in the
+conversation (`tail_fp`/`head_fp`/`window_turns`, the same anchor
+`import-history.py`'s B1 fix made offset-aware). Rewriting a turn's text
+inside that anchor's own window, without also rewriting the anchor to
+match, would leave the NEXT live request unable to align — a permanent
+hole in the summary hierarchy from then on. Her real store's tail anchor
+already has a small pre-existing drift against a fresh branch
+reconstruction (independent of anything this script does), which this
+script works around rather than blindly trusting: before writing, it
+asks a well-posed question — does the CURRENTLY STORED anchor still find
+a real fingerprint match once these specific turns are cleaned, left
+un-rewritten? If yes for the whole requested scope, everything is
+cleaned and the anchor is left alone (it still works). If no, candidate
+turns are excluded from cleaning — narrowest window first — until it is
+yes again; every excluded turn is reported. **`--force`** cleans the full
+requested scope anyway and accepts a verified REALIGNMENT of the anchor
+(a different but genuinely-matched position) — but still refuses, even
+under `--force`, if the new anchor would find NO fingerprint match at all
+(a hole, not a realignment); text cleaning still proceeds in that case,
+only the anchor is left untouched.
+
+**Exit codes** — the same 5-value convention as the other operator
+scripts (see "Exit codes" above). For this script specifically: **4**
+means at least one target changed but at least one requested turn was
+skipped for the anchor reason above (or a target was refused/failed); **1**
+means nothing was changed at all — every candidate turn had to be
+excluded, or every target refused. `--restore <stamp>` puts every target
+this script backed up under that stamp back exactly as it was, and exits
+0 if every backup was found and restored, 1 if any named target's backup
+was missing or restoring it failed.
+
+**Verified on the real 2026-09-23 backup, default scope (`--last 6`,
+unforced):**
+
+| target | changed | of |
+|---|---|---|
+| webui (assistant replies) | 4 | 6 requested (2 skipped — inside the drifted anchor window) |
+| facts | 17 | 190 active facts examined |
+| episodic | 81 | 84 documents for her conv_id |
+
+That run exits 4 (real progress, 2 turns skipped, anchor left untouched:
+`window_turns` unchanged at 3880). A follow-up `--force` run, with
+nothing left to re-clean, accepts the realignment and rewrites the
+anchor, and exits 0.
+
+**Liveness refusals (only for `--apply`)**, all overridden together by
+`--force` (never the underlying risk): a `-wal`/`-journal` file beside
+`webui.db`; OpenWebUI detected via `supervisorctl status openwebui`
+combined with a raw port probe (default 8080, `--openwebui-port`) so
+either signal alone can't be trusted; the compactor's `/health`, same
+convention as the other operator scripts; and a `/proc/<pid>/fd` scan for
+any OTHER process with `webui.db` open. `--force` does NOT override a
+failed `PRAGMA integrity_check` after a write, a refused resume-offset, a
+history/`chat_message` disagreement, or a hole-risk anchor rewrite (the
+anchor rule above) — those always refuse.
+
+**Local-disk placement (`WEBUI_DB_LOCAL=true`) — D3.** `--webui-db`'s
+default now RESOLVES the live path (`scripts/_webui_live_path.py`, the
+same fold `compactor/webuidb.py`'s `live_webui_db()` uses, widened with a
+filesystem/process check for a shell that never inherited the flag)
+instead of hardcoding `/data/openwebui/webui.db`. If local mode is
+active and `--webui-db` (explicit or defaulted) still names the snapshot,
+`--apply` REFUSES outright — writing there only edits the periodically-
+published snapshot, and the next `webuidb-sync` cycle silently publishes
+the local database over it, losing the change with no warning (measured
+in the database-move rehearsal, `dbmove/findings.md` D3). A dry run only
+WARNS and still runs. A successful `--apply` against the live LOCAL path
+prints the exact final-sync recipe:
+```
+supervisorctl stop openwebui webuidb-sync
+WEBUI_DB_LOCAL=true /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --sync-once --force
+```
+run it to make the fix durable immediately, rather than waiting for (or
+risking a pod stop before) the next sync interval. The webui-target
+safety backup also moves off local disk in local mode, to
+`/data/forensics/clean-decoration-<stamp>/` (D10) — a backup left beside
+the LOCAL file would be lost on a pod stop exactly like everything else
+on that ephemeral disk.
+
+---
+
+## Fixing stale "permanent spinner" replies (v3.1.9.6)
+
+**What it fixes.** Upstream OpenWebUI issue #14806: an assistant message
+stored with `done: false` renders as a permanent loading spinner forever
+— on chat load, OpenWebUI's own code repairs only the NEWEST unfinished
+response; every OLDER `done: false` message is left exactly as it was,
+indefinitely. `scripts/fix-stale-unfinished.py` finds and flips those
+stale flags directly. On the real 2026-09-23 backup it found 6 empty,
+stale `done: false` assistant replies on her current branch, at branch
+positions **508, 516, 604, 1371, 1818 and 2672**.
+
+**What it changes, and what it does not.** It flips only the `done`
+flag — `done: True` in the `chat.chat` JSON history AND `done=1` in the
+`chat_message` table's own column, both copies together, for exactly the
+in-scope messages. It never touches `content` on either copy, never
+`created_at`/`updated_at`, never `chat.updated_at`, never
+`current_message_id`. Because `compactor/summarizer.py`'s fingerprints
+are computed from a turn's TEXT, not its `done` flag, this write cannot
+affect compactor alignment (`tail_fp`/`head_fp`/`covered_fps`) at all —
+unlike `clean-decoration.py` above, there is no anchor to protect here.
+
+**What it refuses to touch, even with `--apply`.** The current branch tip
+and any of its direct children — an in-flight reply generating right now
+looks exactly like a stale one until it finishes, so the tip and its
+children are never eligible, full stop. Independently, `--min-age-minutes`
+(default 10) excludes anything not yet older than that, using the
+message's own recorded timestamp — belt-and-suspenders alongside the tip
+exclusion, not a replacement for it. It also refuses outright (before any
+backup or write) if another process holds `webui.db` open, or a
+`-wal`/`-journal` sidecar sits beside it (see RUNBOOK_DB_JOURNAL.md).
+
+**Backup and restore.** Unlike `repair-chat-tree.py`/`fix-encoded-messages.py`
+(a plain sibling copy), this script backs up via `sqlite3`'s own online
+backup API into a dedicated forensics directory:
+`/data/forensics/fix-stale-unfinished-<UTC stamp>/webui.db`. `--restore
+<stamp>` copies that file back over the live path, byte-identical. This
+backup was already off local disk before D3 (see below) — nothing about
+it changed.
+
+**Local-disk placement (`WEBUI_DB_LOCAL=true`) — D3.** The positional
+`<webui.db>` argument below is `/data/openwebui/webui.db` for the pod as
+it runs TODAY (`WEBUI_DB_LOCAL=false`). If a later release moves the live
+database to local disk, this script (and `repair-chat-tree.py` /
+`fix-encoded-messages.py` / `clean-decoration.py`) resolves and checks
+that live path itself (`scripts/_webui_live_path.py`) and REFUSES
+`--apply`/`--restore` outright if the path given is the snapshot while
+local mode is active — writing there only edits the snapshot, and the
+next `webuidb-sync` cycle silently publishes local over it, losing the
+fix with no warning (D3, `dbmove/findings.md`). A dry run only WARNS and
+still runs. Point it at `/var/lib/openwebui/webui.db` instead (the
+refusal message names it), and after a successful `--apply` run the
+final-sync recipe it prints:
+```
+supervisorctl stop openwebui webuidb-sync
+WEBUI_DB_LOCAL=true /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --sync-once --force
+```
+
+**Procedure (on the pod):**
+```bash
+git clone --depth 1 --branch <tag-or-branch> \
+    https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+# 1. Ask her to close every browser tab on this chat.
+supervisorctl stop openwebui backup
+/app/venv/bin/python /opt/zl-repo/scripts/fix-stale-unfinished.py \
+    /data/openwebui/webui.db                    # dry run — writes nothing
+/app/venv/bin/python /opt/zl-repo/scripts/fix-stale-unfinished.py \
+    /data/openwebui/webui.db --apply
+supervisorctl start openwebui backup
+# Have her hard-refresh the chat (Ctrl+F5).
+# On a WEBUI_DB_LOCAL=true pod, use /var/lib/openwebui/webui.db above
+# instead, stop openwebui + webuidb-sync (not backup), and run the
+# final-sync command --apply prints when it succeeds.
+```
+Exit codes are the same shared 0/1/2/3/4 convention (see "Exit codes"
+above); for this script, 1 also covers a post-`--apply` verification
+failure — by that point the write has already committed (SQLite has no
+rollback after commit), so recovery is `--restore <the stamp this run
+printed>`, not a retry.
+
+**Two categories, both fixed, reported separately — do not read the dry
+run's combined number as "the bug count".** (a) STALE UNFINISHED:
+`done` is not `True` in EITHER copy — this is the actual spinner bug (19
+total on her backup, 6 of them on the current branch — `--branch-only`
+is the default, so a default run only ever targets those 6; add
+`--all-branches` to also reach the other 13, off-branch). (b) JSON-ONLY
+GAP: the JSON `done` key is simply MISSING while the table already says
+`done=1` — the table is authoritative, so this was never rendering as a
+live spinner the way (a) does; it is a hygiene backfill, not the bug fix
+(9 total, all off-branch, 0 in the default scope).
+
+**The pod's OpenWebUI was upgraded to 0.11.4 IN PLACE on 2026-09-23 —
+this does NOT survive a pod restart.** The container filesystem resets
+on every restart the same way it does for `setup-sshd.py`'s work above;
+the in-place upgrade lives only on the running container's overlay, not
+on `/data`, so a restarted pod goes back to whatever OpenWebUI version
+the image itself ships until v3.1.9.7 makes the newer version permanent
+(bakes it into the image rather than a live patch). Upstream, the related
+scroll-jump behavior on a stale spinner was only fixed in OpenWebUI
+0.11.1 and later — this pod's pre-upgrade version predated that fix,
+which is part of why the stale spinners were visibly disruptive rather
+than a silent cosmetic detail.
+
+---
+
 ## Rolling back a bad release
 
 Each release tag is pushed once and not re-pushed by this project (see

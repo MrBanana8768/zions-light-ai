@@ -412,7 +412,7 @@ not rebuilt: a rebuild re-resolves `apt-get upgrade`, unpinned pip
 dependencies, the Piper voice URL and the CUDA base tag, and produces a
 different, unvalidated image.
 
-**Why this exists.** Four independent operator gaps, each closed with a
+**Why this exists.** Six independent operator gaps, each closed with a
 script under `scripts/` rather than a change to what the image ships:
 
 1. v3.1.9.4's own fix to `backfill.needs_backfill()` — reading a
@@ -469,6 +469,25 @@ script under `scripts/` rather than a change to what the image ships:
    its own pointer rule could jump her onto an abandoned regenerate
    branch newer than her real position — both fixed in the versions in
    this repo (see "Fixed" below).
+5. The model keeps copying its own decoration — emoji, rule-line
+   "walls", LAW-board status tags — back into new replies, because that
+   decoration sits in her stored history, active facts, and episodic
+   memory and gets re-read every time. There was no way to remove it
+   short of `/forget`, which would also throw away everything real in
+   that memory. `scripts/clean-decoration.py` strips only the decoration
+   — deterministically, no LLM, never a word she wrote — from all three
+   places at once; see OPERATIONS.md "Removing decoration from her
+   stored replies, facts and episodic memory".
+6. Upstream OpenWebUI issue #14806: an assistant message stored with
+   `done: false` renders as a permanent loading spinner, and OpenWebUI's
+   own on-load repair only ever fixes the NEWEST one — every older stale
+   spinner stays broken forever. Her real 2026-09-23 backup has 6 of
+   these on her current branch (positions 508, 516, 604, 1371, 1818,
+   2672). `scripts/fix-stale-unfinished.py` flips just the `done` flag,
+   in both stored copies, never touching message text — so compactor
+   alignment (fingerprinted from text, not the `done` flag) is
+   unaffected; see OPERATIONS.md "Fixing stale 'permanent spinner'
+   replies".
 
 ### Added
 - **`scripts/backfill-records.py`.** Reads every `facts/*.backfill.json`
@@ -614,6 +633,69 @@ script under `scripts/` rather than a change to what the image ships:
   job, not this script's) — it now only checks a copy that this run
   actually fixed or that already existed beforehand. See
   `compactor/test_fix_encoded_messages_script.py`.
+- **`scripts/clean-decoration.py`.** Strips emoji, rule-line "walls"
+  (`═══`, `━━━`, long `====` runs) and LAW-board status tags out of her
+  stored chat replies, active facts, and episodic (chromadb) memory —
+  deterministic, no LLM, never touches a word she wrote, never runs
+  `/forget` (see OPERATIONS.md "Removing decoration from her stored
+  replies, facts and episodic memory" for the full walkthrough, exact
+  real-data counts, and the anchor-safety rule). Reuses
+  `scripts/import-history.py`'s own resume-offset/branch-reconstruction
+  helpers (beside it in a clone, same "one copy of the rule" discipline
+  as the other operator scripts) rather than re-deriving them. Three
+  independently-backed-up targets behind `--only` (default all three):
+  `webui` (her current branch, all THREE of OpenWebUI's own copies of an
+  assistant turn's text kept in sync or none touched — refuses outright
+  if the JSON and `chat_message` table copies already disagree), `facts`
+  (active fact text; a fact that would clean to empty or to a duplicate
+  is reported and left untouched rather than deleted), and `episodic`
+  (chromadb documents for `--conv`, re-embedded with the compactor's own
+  `retrieval._embed` under a new content-addressed id when their text
+  changes). Never rewrites a turn inside the summarizer's covered/
+  summarized region; the anchor (`tail_fp`/`head_fp`/`window_turns`) is
+  either left alone when it still finds a real fingerprint match after
+  cleaning, or specific candidate turns are excluded from cleaning
+  (reported as `skipped_protected_by_anchor`) until it does — `--force`
+  accepts a verified realignment but still refuses a rewrite that would
+  produce no match at all (a hole, not a realignment). Same shared
+  0/1/2/3/4 exit-code convention as the other operator scripts (4 =
+  some turns skipped for the anchor reason, 1 = nothing changed at all),
+  plus `--restore <stamp>`. Verified end to end against the real
+  2026-09-23 backup and the published digest: default scope cleans 4 of
+  6 requested assistant replies (2 skipped, inside the drifted anchor
+  window), 17 of 190 active facts, and 81 of 84 episodic documents; a
+  follow-up `--force` run accepts the realignment. See
+  `compactor/test_clean_decoration_script.py` and
+  `compactor/test_real_image_clean_decoration.py`.
+- **`scripts/fix-stale-unfinished.py`.** Fixes upstream OpenWebUI issue
+  #14806 (a `done: false` assistant message renders as a permanent
+  spinner; OpenWebUI's own on-load repair only ever fixes the newest
+  one) by flipping the stale `done` flag directly, in both `chat.chat`'s
+  JSON history and the `chat_message` table's own column together, for
+  exactly the in-scope messages — never touching `content`,
+  `created_at`/`updated_at`, `chat.updated_at`, or `current_message_id`
+  on either copy. Two categories, reported separately: (a) STALE
+  UNFINISHED, where neither copy says done — the actual spinner bug (19
+  total on her real backup, 6 of them on her current branch at
+  positions 508/516/604/1371/1818/2672 — `--branch-only`, the default,
+  targets only those 6); (b) JSON-ONLY GAP, where the table already
+  says done but the JSON key is simply missing — a hygiene backfill,
+  not the bug fix (9 total, all off-branch). Never touches the current
+  branch tip or its direct children (an in-flight reply looks exactly
+  like a stale one until it finishes), and independently excludes
+  anything younger than `--min-age-minutes` (default 10). Refuses if
+  another process holds `webui.db` open or a `-wal`/`-journal` sidecar
+  is present. Backs up via `sqlite3`'s own online backup API into
+  `/data/forensics/fix-stale-unfinished-<stamp>/` (unlike its siblings'
+  plain sibling-file copy, since this is narrowly-scoped flag-flipping
+  rather than tree surgery) and supports `--restore <stamp>`. Because
+  compactor fingerprints are computed from a turn's text, never its
+  `done` flag, this write cannot affect compactor alignment at all.
+  Verified against the real 2026-09-23 backup: `--apply` flips exactly
+  the 6 on-branch targets in both copies, a full diff shows zero other
+  bytes changed anywhere in the chat, a second run is a clean no-op, and
+  `--restore` round-trips byte-identical. See
+  `compactor/test_fix_stale_unfinished_script.py`.
 
 ### Documentation
 - **OPERATIONS.md** gains "Closing stale backfill records before upgrading
