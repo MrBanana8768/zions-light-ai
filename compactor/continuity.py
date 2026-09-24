@@ -398,7 +398,16 @@ def extractive_fallback(tok: Any, her_text: str, reply_text: str, unit_number: i
     strict band-OUTPUT filter — not `clean_reply` (the digest input
     filter), which let headers/banners/ALL-CAPS lines through via its
     `prose_like` override (measured: 1,122 of 1,942 fallback reply parts
-    were decoration-sourced under the un-amended r10 filter)."""
+    were decoration-sourced under the un-amended r10 filter).
+
+    `unit_number` is NOT rendered into the returned text — `format_band`
+    is the one place that numbers band entries (its own `f"{i + 1}. "`),
+    covering an LLM digest's output exactly the same way it covers a
+    fallback's. Numbering it here too used to produce "1. 1. …" on every
+    fallback-sourced entry once format_band added its own prefix.
+    `unit_number` stays a parameter because the digest store still
+    records it (see `generate_digest`'s `unit_number` field) for
+    diagnostics."""
     her_lines = clean_her(her_text)
     reply_lines = clean_band(reply_text)
     hs = (
@@ -410,7 +419,7 @@ def extractive_fallback(tok: Any, her_text: str, reply_text: str, unit_number: i
     body = cut(tok, hs, _FALLBACK_HER_CAP)
     if rs:
         body += " — answered: " + cut(tok, rs, _FALLBACK_REPLY_CAP)
-    entry = cut(tok, f"{unit_number % 100}. " + body, DIGEST_HEADLINE_TOKENS)
+    entry = cut(tok, body, DIGEST_HEADLINE_TOKENS)
     return entry
 
 
@@ -532,6 +541,25 @@ class LedgerUnreadable(RuntimeError):
 
 
 _ABSENT_LEDGER = {"epoch": 0, "boundary": None, "targeted": []}
+
+
+def _ledger_path(conv_id: str) -> Path:
+    """`CONTROL_ROOT / "wipes" / f"{conv_id}.json"` — the convention
+    `reapply_all_ledgers` below relies on (it globs `CONTROL_ROOT / "wipes"
+    / "*.json"` and recovers conv_id from each file's stem). portability.py
+    does NOT depend on this layout: it never reads or writes the ledger —
+    see `quarantine_conversation`'s own docstring for why the digest cache
+    and this ledger are deliberately excluded from what it carries.
+    conv_id reaches a filesystem path here
+    exactly as it does for every other per-conversation file, so this
+    reuses `memory._safe_path` — the one chokepoint that validates a
+    conv_id against the [A-Za-z0-9_-] charset and re-checks the resolved
+    path never leaves its root (v3.1.8's arbitrary-file-write fix) —
+    rather than restating that rule against CONTROL_ROOT instead of
+    STORAGE_ROOT. Raises memory.UnsafeConvId on a hostile conv_id (path
+    separators, "..", NUL bytes, empty, over-length); never writes
+    outside CONTROL_ROOT/wipes."""
+    return memory._safe_path("wipes", conv_id, ".json", root=CONTROL_ROOT)
 
 
 def _read_ledger(conv_id: str) -> dict:
@@ -705,14 +733,23 @@ def _needle_hit(text: str, needles: list[dict]) -> bool:
 
 
 def reapply_ledger(conv_id: str) -> dict:
-    """§17.6a r10 A3, strengthened by review R10-B1: call at the END of
-    every restore (backup.py, admin restore) and every import
-    (portability.import_conversation) for each affected conversation —
-    AND at compactor startup, for every conversation with a ledger file
-    (idempotent). Purges any digest stamped below the ledger epoch,
-    re-applies every targeted needle against what remains — checking the
-    FINAL rendered text (headline AND full), not just membership — and
-    rewrites the wipe.json cache from the ledger boundary."""
+    """§17.6a r10 A3, strengthened by review R10-B1: the DESIGN calls for
+    this to run at the end of every restore (backup.py, admin restore) and
+    every import (portability.import_conversation) for each affected
+    conversation, in addition to compactor startup. As shipped, ONLY
+    `reapply_all_ledgers` (below) calls this — once per conversation with
+    a ledger file, at startup (see main.py's lifespan handler) — and
+    idempotently, since a no-op ledger just re-derives the same wipe.json
+    cache. backup.py and portability.import_conversation do NOT call it
+    after a restore/import; a restore that lands while the process stays
+    up (rather than restarting it) will not see this re-apply until the
+    next boot. This is a documented gap, not a design change — wiring
+    those call sites is future work, not done here.
+
+    Purges any digest stamped below the ledger epoch, re-applies every
+    targeted needle against what remains — checking the FINAL rendered
+    text (headline AND full), not just membership — and rewrites the
+    wipe.json cache from the ledger boundary."""
     ledger = _read_ledger_failing_closed(conv_id, on_fail_context="reapply_ledger")
     if ledger is None:
         return {"purged": 0, "suppressed_reapplied": 0, "epoch": None, "failed_closed": True}
@@ -744,13 +781,15 @@ def reapply_ledger(conv_id: str) -> dict:
 
 
 def reapply_all_ledgers() -> dict:
-    """r10 review R10-B1: run the re-apply at compactor STARTUP too, for
-    every conversation that has a ledger file — not only after a restore
-    or import. Cheap and idempotent (a no-op ledger just re-derives the
-    same wipe.json cache), and it closes the 'hand restore' gap: an
-    operator who restores a directory by hand, outside backup.py/
-    portability.py entirely, gets the same protection the moment the
-    compactor next starts."""
+    """r10 review R10-B1: run the re-apply at compactor STARTUP, for every
+    conversation that has a ledger file. This is the ONLY caller of
+    `reapply_ledger` as shipped (see that function's own docstring for the
+    still-open gap: backup.py and portability.import_conversation do not
+    call it after a restore/import that lands without a restart). Cheap
+    and idempotent (a no-op ledger just re-derives the same wipe.json
+    cache), and it closes the 'hand restore' gap: an operator who restores
+    a directory by hand, outside backup.py/portability.py entirely, gets
+    the same protection the moment the compactor next starts."""
     wipes_dir = CONTROL_ROOT / "wipes"
     if not wipes_dir.is_dir():
         return {"conversations": 0}

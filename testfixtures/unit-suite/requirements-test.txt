@@ -1,0 +1,17 @@
+# TEST-ONLY dependencies for the unit-suite image — never added to
+# compactor/requirements.txt, which this Dockerfile ALSO installs and which
+# the production image installs verbatim. Anything in this file is not
+# present in production and must not be imported by any compactor/*.py
+# module at runtime — only by a test_*.py file, and only to analyze the
+# other files, never to run them.
+#
+# pyflakes: real, scope-aware undefined-name analysis (F821) for
+# test_no_undefined_names.py. v3.1.9.8 round 2 (post-review): that guard
+# used to fall back to a flat, whole-file AST scan when pyflakes was not
+# importable — file-wide rather than per-scope, treats `del x` as a
+# definition, and cannot see a missing attribute on an imported module
+# (e.g. `main.tokens.raw()` when `tokens` itself was never imported, which
+# is closer to an AttributeError pyflakes also catches at the call-site
+# shape it takes here). The guard now REQUIRES pyflakes and fails outright
+# if it cannot be imported, rather than silently running the weaker check.
+pyflakes==4.0.0

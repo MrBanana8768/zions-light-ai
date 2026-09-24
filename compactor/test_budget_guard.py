@@ -1165,11 +1165,17 @@ def test_call_site_passes_the_callers_system_count():
         - main._time_line_token_reserve(main.current_time_line(_at)),
         "with the request's effective limit, less the time line's reserve",
     )
-    # 2, not 1 (the signature default, i.e. the M9 mutation) and not 3 (the
-    # count of what was actually passed, i.e. counting the wrong array).
+    # v3.1.9.8 `.15p` (§17.6 r9 HIGH-A): the call site now passes IDENTITIES
+    # (a frozenset of _system_msg_hash values), not a plain count — see
+    # _caller_system_hashes's own docstring and _droppable_system_indices'
+    # `isinstance(protect_system, (frozenset, set))` branch. This used to
+    # assert the literal int 2 (the pre-.15p behaviour) and passed only
+    # because nothing had exercised the M9 call site against post-.15p
+    # production code; asserting the identity set directly names the
+    # actual contract instead of a stand-in for it.
     assert_eq(
-        seen["protect_system"], 2,
-        "protect_system == the system messages the CLIENT sent",
+        seen["protect_system"], main._caller_system_hashes(msgs),
+        "protect_system == the identities of the system messages the CLIENT sent",
     )
     assert_eq(
         len(_systems(seen["messages"])), 3,

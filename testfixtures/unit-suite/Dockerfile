@@ -57,6 +57,16 @@ RUN python3 -m venv /opt/compactor-venv && \
     /opt/compactor-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
     /opt/compactor-venv/bin/pip install --no-cache-dir -r /opt/compactor/requirements.txt
 
+# TEST-ONLY packages — a SEPARATE file and a separate layer from
+# compactor/requirements.txt above, on purpose: that file is also what the
+# production Dockerfile installs verbatim, and nothing in requirements-test.txt
+# may ever leak into it. Currently just pyflakes, for
+# test_no_undefined_names.py's real (scope-aware) undefined-name check —
+# see that file's own docstring and requirements-test.txt's comment for why
+# this is now a hard requirement, not an optional upgrade.
+COPY testfixtures/unit-suite/requirements-test.txt /opt/compactor/requirements-test.txt
+RUN /opt/compactor-venv/bin/pip install --no-cache-dir -r /opt/compactor/requirements-test.txt
+
 # The same two build-time guards the production Dockerfile carries, for the
 # same reason: both of these dependencies fail SOFT at runtime — jinja2's
 # absence silently drops ~22 tokens/message of chat framing, and

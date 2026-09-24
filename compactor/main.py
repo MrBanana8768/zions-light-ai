@@ -56,6 +56,7 @@ import retrieval
 import selftest as selftest_module
 import summarizer
 import tailhealth
+import tokens
 from envcfg import env_bool, env_float
 from memory import (
     StoreUnreadable,
@@ -6333,6 +6334,18 @@ def _is_repeat_task_traffic(conv_id: str, messages: list[dict]) -> bool:
 # variables (a direct API call) sends the literal placeholder, which falls back
 # to COMPACTOR_TIMEZONE and then UTC, and says so once.
 
+# v3.1.9.8 `.15g` (§17.6a). OFF by default. The band restates unsummarized
+# exchanges that are ALSO already forwarded verbatim in `messages` — §17.6a's
+# design assumes the allocator trims the verbatim window to exclude what the
+# band covers, and that wiring is not done (see allocator.py's own module
+# docstring). Until it is (or the gap is otherwise excluded from the verbatim
+# window), turning this on means the model sees the same exchange twice, with
+# no cap on how many band entries can pile up. Read here, at request-path
+# scope, rather than in continuity.py, because it gates the ENTIRE band
+# block below — no file reads, no tokenizing — not just whether its output
+# gets injected.
+CONTINUITY_BAND_ENABLED = env_bool("COMPACTOR_CONTINUITY_BAND", False)
+
 TIME_INJECTION_ENABLED = env_bool("COMPACTOR_TIME_INJECTION", True)
 TIME_LINE_PREFIX = "[Current date and time: "
 _TIME_LINE_SEPARATOR = "\n\n"
@@ -6973,7 +6986,7 @@ def _merge_consecutive_same_role(messages: list[dict]) -> list[dict]:
     return out
 
 
-def _droppable_system_indices(msgs: list[dict], protect_system: int) -> list[int]:
+def _droppable_system_indices(msgs: list[dict], protect_system: "int | frozenset[str]") -> list[int]:
     """Indices of the system messages this guard is allowed to spend.
 
     `protect_system` is how many system messages the CALLER sent, counted on
@@ -7173,7 +7186,7 @@ def _aligned_recent_tail(msgs: list[dict]) -> list[int]:
     return _aligned_tail
 
 
-def _has_sheddable_content(msgs: list[dict], protect_system: int) -> bool:
+def _has_sheddable_content(msgs: list[dict], protect_system: "int | frozenset[str]") -> bool:
     """Is there anything left the guard is permitted to remove?
 
     Exactly two things qualify: a non-system turn that is not the newest one,
@@ -7206,7 +7219,7 @@ def _shed_last_resort(
     per: list[int],
     running: int,
     limit: int,
-    protect_system: int,
+    protect_system: "int | frozenset[str]",
     standin_protected: bool,
     counter: str,
     dropped: int,
@@ -11268,58 +11281,64 @@ async def chat_completions(request: Request) -> Any:
         # exist if that block raised before assigning them) so a failure
         # here can never take the summary block down with it, and vice
         # versa.
-        try:
-            _bstate = summarizer.load_state(conv_id)
-            _U = max(0, int(turns_seen if isinstance(turns_seen, int) else _bstate.get("turns_seen", 0))
-                      - int(_bstate.get("last_summarized_turn", 0)))
-            _non_system = [m for m in messages if m.get("role") != "system"]
-            if _U > 0 and len(_non_system) > 1:
-                # The gap: unsummarized turns strictly before the newest
-                # message (§17.6a's definition of U). Assumes the client
-                # resends the full history, so array position and turn
-                # number coincide — see allocator.py's module docstring
-                # for why this assumption is safe on this deployment and
-                # what a partial-window client would need instead.
-                _gap = _non_system[max(0, len(_non_system) - 1 - _U):-1]
-                _gap_fps = summarizer._turn_fingerprints(_gap)
-                _units: list[list[tuple[dict, str]]] = []
-                for _m, _fp in zip(_gap, _gap_fps):
-                    if not _units or _m.get("role") == "user":
-                        _units.append([(_m, _fp)])
-                    else:
-                        _units[-1].append((_m, _fp))
-                _visible = continuity.visible(conv_id)
-                _tok_raw = tokens.raw()
-                _band_units = []
-                for _unum, _unit in enumerate(_units, start=1):
-                    _her_m = next((p for p in _unit if p[0].get("role") == "user"), None)
-                    _reply_m = next((p for p in _unit if p[0].get("role") == "assistant"), None)
-                    _fp_u = _her_m[1] if _her_m else None
-                    _fp_a = _reply_m[1] if _reply_m else None
-                    _key = continuity.unit_key(_fp_u, _fp_a)
-                    _entry = _visible.get(_key)
-                    if _entry is None:
-                        _her_text = _message_text(_her_m[0]) if _her_m else ""
-                        _reply_text = _message_text(_reply_m[0]) if _reply_m else ""
-                        _text = continuity.extractive_fallback(_tok_raw, _her_text, _reply_text, _unum)
-                        # r10 review R10-B1: "the allocator applies the
-                        # same [needle] check to fallback entries it
-                        # builds" — a unit with no digest yet (GPU busy,
-                        # or purged by a wipe re-apply) must not surface
-                        # her forgotten words through the fallback path,
-                        # which visible() never sees.
-                        _text = continuity.apply_needles(conv_id, _text)
-                        _entry = {
-                            "headline": _text, "full": _text,
-                            "suppressed": _text == continuity.SUPPRESSED_MARKER,
-                        }
-                    _band_units.append(_entry)
-                _band_text = continuity.format_band(_band_units, full_n=continuity.DIGEST_FULL_UNITS)
-                if _band_text:
-                    injected_blocks.append((_INJECT_PRIORITY_SUMMARY, "band", _band_text))
-                    log_parts.append(f"band({len(_band_units)})")
-        except Exception as e:
-            logger.warning(f"conv={conv_id}: continuity band injection failed (non-fatal): {e}")
+        #
+        # Gated on CONTINUITY_BAND_ENABLED (default False — see that
+        # constant's own comment for why): the guard sits OUTSIDE the try,
+        # so when the flag is off nothing below runs at all — no
+        # summarizer.load_state call, no fingerprinting, no tokens.raw().
+        if CONTINUITY_BAND_ENABLED:
+            try:
+                _bstate = summarizer.load_state(conv_id)
+                _U = max(0, int(turns_seen if isinstance(turns_seen, int) else _bstate.get("turns_seen", 0))
+                          - int(_bstate.get("last_summarized_turn", 0)))
+                _non_system = [m for m in messages if m.get("role") != "system"]
+                if _U > 0 and len(_non_system) > 1:
+                    # The gap: unsummarized turns strictly before the newest
+                    # message (§17.6a's definition of U). Assumes the client
+                    # resends the full history, so array position and turn
+                    # number coincide — see allocator.py's module docstring
+                    # for why this assumption is safe on this deployment and
+                    # what a partial-window client would need instead.
+                    _gap = _non_system[max(0, len(_non_system) - 1 - _U):-1]
+                    _gap_fps = summarizer._turn_fingerprints(_gap)
+                    _units: list[list[tuple[dict, str]]] = []
+                    for _m, _fp in zip(_gap, _gap_fps):
+                        if not _units or _m.get("role") == "user":
+                            _units.append([(_m, _fp)])
+                        else:
+                            _units[-1].append((_m, _fp))
+                    _visible = continuity.visible(conv_id)
+                    _tok_raw = tokens.raw()
+                    _band_units = []
+                    for _unum, _unit in enumerate(_units, start=1):
+                        _her_m = next((p for p in _unit if p[0].get("role") == "user"), None)
+                        _reply_m = next((p for p in _unit if p[0].get("role") == "assistant"), None)
+                        _fp_u = _her_m[1] if _her_m else None
+                        _fp_a = _reply_m[1] if _reply_m else None
+                        _key = continuity.unit_key(_fp_u, _fp_a)
+                        _entry = _visible.get(_key)
+                        if _entry is None:
+                            _her_text = _message_text(_her_m[0]) if _her_m else ""
+                            _reply_text = _message_text(_reply_m[0]) if _reply_m else ""
+                            _text = continuity.extractive_fallback(_tok_raw, _her_text, _reply_text, _unum)
+                            # r10 review R10-B1: "the allocator applies the
+                            # same [needle] check to fallback entries it
+                            # builds" — a unit with no digest yet (GPU busy,
+                            # or purged by a wipe re-apply) must not surface
+                            # her forgotten words through the fallback path,
+                            # which visible() never sees.
+                            _text = continuity.apply_needles(conv_id, _text)
+                            _entry = {
+                                "headline": _text, "full": _text,
+                                "suppressed": _text == continuity.SUPPRESSED_MARKER,
+                            }
+                        _band_units.append(_entry)
+                    _band_text = continuity.format_band(_band_units, full_n=continuity.DIGEST_FULL_UNITS)
+                    if _band_text:
+                        injected_blocks.append((_INJECT_PRIORITY_SUMMARY, "band", _band_text))
+                        log_parts.append(f"band({len(_band_units)})")
+            except Exception as e:
+                logger.warning(f"conv={conv_id}: continuity band injection failed (non-fatal): {e}")
 
         # Single inject point — preserves Mistral template compatibility.
         if injected_blocks:

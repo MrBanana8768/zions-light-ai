@@ -891,6 +891,18 @@ afterward before assuming the wipe itself failed; `/why` distinguishes
 the two (a rebuilt summary reads as freshly-summarized content, not a
 surviving fact).
 
+### Continuity band (`.15g`) — off by default, do not turn on yet
+`COMPACTOR_CONTINUITY_BAND` (default `false`) governs the §17.6a
+continuity band: a digest of unsummarized exchanges, appended after the
+summary block. Leave it off. The design assumes the allocator excludes
+the digested gap from the verbatim window it also forwards; that wiring
+is not done, so turning the flag on means the model is shown the SAME
+exchange twice — once verbatim, once as a digest — with no cap on how
+many band entries can pile up. Turn it on only once the allocator is
+wired to exclude the gap (or the gap is otherwise excluded from the
+verbatim window). When off, nothing in that code path runs at all — no
+file reads, no tokenizing — so leaving it off costs nothing.
+
 ---
 
 ## Cleaning up old model weights on the volume

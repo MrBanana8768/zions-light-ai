@@ -138,8 +138,16 @@ class UnsafeConvId(ValueError):
     """A conv_id that would place a file outside STORAGE_ROOT."""
 
 
-def _safe_path(subdir: str, conv_id: str, suffix: str) -> Path:
-    """Build a storage path and REFUSE to leave STORAGE_ROOT.
+def _safe_path(subdir: str, conv_id: str, suffix: str, *, root: Path | None = None) -> Path:
+    """Build a storage path and REFUSE to leave `root` (STORAGE_ROOT by
+    default).
+
+    `root` lets a caller outside this module (continuity.py's wipe ledger,
+    which lives in COMPACTOR_CONTROL_ROOT — deliberately outside
+    STORAGE_ROOT, see continuity.assert_control_root_safe) reuse the exact
+    same conv_id validation and traversal guard below instead of
+    restating it against a different root. Every check is unchanged; only
+    the root the resolved path is confined to moves.
 
     v3.1.8, and this one was a live arbitrary-file-write.
 
@@ -206,13 +214,13 @@ def _safe_path(subdir: str, conv_id: str, suffix: str) -> Path:
     # Second line of defence. The check above already makes traversal
     # unrepresentable, so this can only fire if the character class is
     # ever widened — which is exactly when a reviewer would want it to.
-    root = STORAGE_ROOT.resolve()
-    candidate = root / subdir / f"{conv_id}{suffix}"
+    root_abs = (STORAGE_ROOT if root is None else root).resolve()
+    candidate = root_abs / subdir / f"{conv_id}{suffix}"
     try:
         resolved = candidate.resolve()
     except (OSError, ValueError) as e:
         raise UnsafeConvId(f"conv_id is not a usable path: {conv_id!r}") from e
-    if resolved.parent != root / subdir:
+    if resolved.parent != root_abs / subdir:
         raise UnsafeConvId(
             f"conv_id would place a file outside {subdir}/: "
             f"{conv_id!r} -> {resolved}"

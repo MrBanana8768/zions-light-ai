@@ -293,6 +293,8 @@ COPY compactor/main.py /opt/compactor/main.py
 COPY compactor/envcfg.py /opt/compactor/envcfg.py
 COPY compactor/memory.py /opt/compactor/memory.py
 COPY compactor/facts.py /opt/compactor/facts.py
+COPY compactor/allocator.py /opt/compactor/allocator.py
+COPY compactor/continuity.py /opt/compactor/continuity.py
 COPY compactor/backfill.py /opt/compactor/backfill.py
 COPY compactor/retrieval.py /opt/compactor/retrieval.py
 COPY compactor/summarizer.py /opt/compactor/summarizer.py
