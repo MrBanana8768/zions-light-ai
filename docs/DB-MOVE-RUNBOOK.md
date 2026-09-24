@@ -300,7 +300,7 @@ curl -s http://127.0.0.1:8080/health/full | $PY -c 'import json,sys; c=json.load
 
 **Expect:** `"watched": true, … "stale": false`, and both journal entries `"hot": false`.
 
-**H-2/D11 fix (review1-v3197-65ea196):** before this release, `"stale": true` with a huge `local_lag_s` right after her FIRST message post-boot was a KNOWN FALSE ALARM (the snapshot's mtime, copied from whatever she last wrote before the pod stopped, could be many hours old). This release adds a check-in sidecar (`webuidb.py`'s `SYNCED_AT_SIDECAR`, touched every time `sync_once()` completes a real cycle) that `/health/full` now prefers over the raw mtime comparison — so this false alarm should no longer appear. If `stale: true` DOES appear here with a small `checkin_age_s` in the same response, that is a real signal, not the old false alarm — treat it as such.
+**D11/H-2 is STILL a known false alarm (NOT fixed this release, review1-v3197-65ea196):** `"stale": true` with a huge `local_lag_s` right after her FIRST message post-boot is a KNOWN FALSE ALARM (the snapshot's mtime, copied from whatever she last wrote before the pod stopped, can be many hours old). A fix was attempted — a check-in sidecar (`webuidb.py`'s `SYNCED_AT_SIDECAR`) that `/health/full` reports as a new `checkin_age_s` field — but making it decide `stale` broke a real detector (`test_health_findings.py`'s F4 suite: a quiet daemon that has genuinely stopped publishing reads identically to a fresh boot's false alarm from `checkin_age_s` alone). So `stale` is still decided by `local_lag_s`/`age_s` exactly as before; `checkin_age_s` is exposed as a diagnostic only. **If `stale: true` appears right after her first post-restore message with a huge `local_lag_s`, check whether a `published` line has appeared in `$L/webuidb-sync-error.log` since — if the daemon is actually running normally, this clears on the next cycle and is the known false alarm, not real data loss.**
 
 ### C10. The first backup of the moved database
 
@@ -555,7 +555,7 @@ has no `WEBUI_DB_LOCAL` support and simply ignores the row:
 | D8 chroma stays on /data | NOT FIXED (deferred). |
 | D9 older local kept on restart | NOT FIXED (not made worse). |
 | D10 tool backups on local disk | FIXED (`feature/v3.1.9.6`'s D3 work redirects them to `/data/forensics`). |
-| D11 false stale after boot | FIXED (H-2, this release) — a check-in sidecar (`SYNCED_AT_SIDECAR`) now backs `/health/full`'s staleness check, closing the false alarm on her first write after a restore. |
+| D11 false stale after boot | NOT FIXED (H-2, this release — attempted, reverted). A check-in sidecar (`SYNCED_AT_SIDECAR`) is reported as a new `checkin_age_s` diagnostic field, but does not decide `stale` — doing so broke a real detector for genuine unpublished activity (see the C9 note above). The false alarm on her first write after a restore is still present. |
 | D12 stray DATABASE_URL | FIXED, both directions (M-2, this release adds the `WEBUI_DB_LOCAL=false` mirror). |
 | D13 log file name | NOT FIXED — `webuidb-sync-error.log` carries the normal INFO lines too. |
 | D14 first publish one interval late | FIXED. |

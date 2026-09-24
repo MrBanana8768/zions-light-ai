@@ -429,18 +429,32 @@ untrue, and 18 of 28 mutants surviving. This pass:
   self-inflicted cost, it does not make an automatic publish fit under a
   10s grace period. The manual final-sync step remains the only actual
   guarantee for that stop path; see `docs/DB-MOVE-RUNBOOK.md`.
-- **H-2/D11, the false "stale" reading — actually fixed.** `webuidb.py`
-  now touches a check-in sidecar (`SYNCED_AT_SIDECAR`,
+- **H-2/D11, the false "stale" reading — attempted, NOT fixed; reverted
+  to the pre-existing behaviour after it broke a real detector.**
+  `webuidb.py` now touches a check-in sidecar (`SYNCED_AT_SIDECAR`,
   `<snapshot>.synced_at`) every time `sync_once()` completes a real
-  cycle — published, or the ordinary "unchanged since last sync" skip.
-  `health.py`'s `probe_snapshot()` prefers this sidecar's own mtime over
-  comparing `LOCAL_DB`'s mtime against `SNAPSHOT_DB`'s: the old
-  comparison read "how long since her last write, before the snapshot's
-  mtime" as staleness, which is exactly wrong right after a restore, when
-  the snapshot's mtime can be many hours old. The immediate first sync
-  (D14) now also establishes this check-in baseline before she can
-  possibly have written anything, closing the false alarm at its root
-  rather than only shortening its window.
+  cycle — published, or the ordinary "unchanged since last sync" skip —
+  and `health.py`'s `probe_snapshot()` reports its age as a new
+  `checkin_age_s` diagnostic field. The first version of this fix went
+  further and had `checkin_age_s` DECIDE staleness whenever the sidecar
+  exists, which does close the boot-time false alarm — but it also broke
+  `test_health_findings.py`'s own
+  `test_f4_unpublished_activity_after_a_quiet_baseline_still_fires`: that
+  test's fixture calls the real `sync_once()` moments before simulating
+  "she writes, the daemon never runs again", so `checkin_age_s` reads
+  ~0s in the genuine-lag case exactly as it does in the boot false-alarm
+  case — nothing observable here tells the two apart, because in both,
+  the daemon "just checked in" is equally true. `stale` is decided by
+  `local_lag_s`/`age_s` exactly as before this release; `checkin_age_s` is
+  reported but does not change the verdict. **D11's false alarm on the
+  first write after a restore is therefore still present.** Distinguishing
+  it for real from genuine unpublished activity needs either a
+  session/boot marker (not just a check-in time) or having
+  `restore_on_boot()` re-stamp `SNAPSHOT_DB`'s own mtime forward at boot —
+  which conflicts with D5's deliberate rule of never opening `/data`
+  read-write during boot, even for a metadata-only `utime`. Left for the
+  architect to decide between "accept the boot false alarm" and "relax
+  D5's boot-write rule for a mtime bump only."
 - **M-1, the low-disk D2 fallback.** `_snapshot_sqlite_to_data`'s
   free-space check now reserves room for TWO concurrent local copies
   (this function's own staging copy AND a possible concurrent

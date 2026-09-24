@@ -820,6 +820,14 @@ def probe_snapshot() -> dict:
     # stopped), so `local_mtime(now, her first write) - snap_mtime(hours
     # old)` read as hours of "lag" even though the very next cycle -
     # immediate at boot, D14 - was always going to publish it fine.
+    #
+    # DOES NOT RETURN EARLY (fixed after this line first shipped: it used
+    # to `return out` here, which skipped computing local_lag_s entirely
+    # whenever the sidecar existed - breaking test_health_findings.py's
+    # own F4 suite, which reads local_lag_s directly as a still-useful
+    # diagnostic signal independent of what decided `stale`). local_lag_s
+    # is still always computed and reported below; only the STALE decision
+    # itself prefers checkin_age_s when it is available.
     try:
         checkin_mtime = os.path.getmtime(f"{snap}.synced_at")
         checkin_age = time.time() - checkin_mtime
@@ -827,8 +835,6 @@ def probe_snapshot() -> dict:
         checkin_age = None
     if checkin_age is not None:
         out["checkin_age_s"] = round(checkin_age)
-        out["stale"] = checkin_age > 3 * interval
-        return out
     # v3.1.9 (OPEN_ISSUES2 webuidb MEDIUM, "the one durability alarm
     # measures her IDLE TIME"). webuidb.sync_once() stamps the published
     # snapshot with `min(local_mtime, time.time())` - the LOCAL database's
@@ -881,6 +887,26 @@ def probe_snapshot() -> dict:
     except OSError:
         local_lag_s = None
     out["local_lag_s"] = None if local_lag_s is None else round(local_lag_s)
+    # H-2/D11 (review1-v3197-65ea196): checkin_age_s is reported (above) as
+    # a genuinely new, useful diagnostic - but it does NOT decide `stale`
+    # here. Tried and REVERTED: preferring checkin_age_s whenever the
+    # sidecar exists fixes D11's false alarm (checkin_age_s is ~0 seconds
+    # after the immediate first sync at boot, regardless of how old
+    # SNAPSHOT_DB's own mtime is) but breaks test_health_findings.py's own
+    # test_f4_unpublished_activity_after_a_quiet_baseline_still_fires:
+    # that test's fixture ALSO makes a real sync_once() call moments
+    # before its "she writes, the daemon does not run again" step, so
+    # checkin_age_s is equally ~0 in the genuine-lag case as in the
+    # boot-false-alarm case - nothing observable here tells the two apart,
+    # because the daemon "just checked in" is true in both. Distinguishing
+    # them for real needs either a session/boot marker (not just a
+    # check-in time) or letting restore_on_boot() re-stamp SNAPSHOT_DB's
+    # own mtime forward at boot, which D5 deliberately avoids (never
+    # opening /data for writing during boot, even a metadata-only utime).
+    # D11 is therefore UNRESOLVED this round: the false alarm on the first
+    # write after a restore is undiminished. Flagged for the architect
+    # rather than shipping a change that trades a real detector (F4) for a
+    # cosmetic one.
     if local_lag_s is not None:
         out["stale"] = local_lag_s > 3 * interval
     else:

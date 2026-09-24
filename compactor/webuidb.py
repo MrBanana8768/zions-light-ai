@@ -2499,18 +2499,21 @@ def sync_loop() -> None:
     # where this program's priority (supervisord.conf) puts it ahead of
     # OpenWebUI itself.
     #
-    # THIS ALONE DID NOT FIX D11 (review1-v3197-65ea196, H-2): this first
-    # cycle runs before OpenWebUI has taken a single write, sees LOCAL_DB's
-    # mtime unchanged from the snapshot it was just restored from, and
-    # takes the ordinary "unchanged since last sync" skip below - which
-    # does now touch SYNCED_AT_SIDECAR (the actual D11 fix), but her FIRST
-    # message after that still used to make /health/full read "stale: true"
-    # with a huge local_lag_s for up to SYNC_INTERVAL_S, because the OLD
-    # staleness check compared LOCAL_DB's fresh mtime against SNAPSHOT_DB's
-    # stale one. health.py's probe_snapshot() now prefers
-    # SYNCED_AT_SIDECAR's own mtime instead, which this immediate first
-    # cycle sets to "now" before she can possibly have written anything -
-    # so the false alarm this comment used to describe can no longer occur.
+    # THIS ALONE DOES NOT FIX D11 (review1-v3197-65ea196, H-2), AND NEITHER
+    # DOES SYNCED_AT_SIDECAR BELOW, in the end. This first cycle runs before
+    # OpenWebUI has taken a single write, sees LOCAL_DB's mtime unchanged
+    # from the snapshot it was just restored from, and takes the ordinary
+    # "unchanged since last sync" skip below - which touches
+    # SYNCED_AT_SIDECAR. health.py's probe_snapshot() reports that
+    # sidecar's age as `checkin_age_s`, a genuinely new diagnostic, but
+    # does NOT use it to decide staleness (tried, then reverted - see
+    # health.py's own comment on that function for why: it made a boot's
+    # false alarm indistinguishable from genuine unpublished activity that
+    # has ALSO just had a sync_once() call moments earlier, which is
+    # exactly test_health_findings.py's own F4 fixture shape). Her FIRST
+    # message after a restore can still make /health/full read "stale:
+    # true" with a huge local_lag_s for up to SYNC_INTERVAL_S - D11 is not
+    # resolved this release.
     try:
         _account(sync_once())
     except _ShutdownRequested:
