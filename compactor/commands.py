@@ -22,6 +22,22 @@ Commands (case-insensitive command name, args preserved as-is):
                            layer and report what is actually gone rather than
                            what the wipe intended.
 
+                           v3.1.9.4 (R5 / P16-6, documented — not a new
+                           defect, and not something a patch here can close):
+                           this protection is FACTS-specific. The L1/L2/L3
+                           hierarchical summary has no equivalent tombstone —
+                           if the chat keeps going, OpenWebUI resends the
+                           WHOLE prior transcript with every new message (it
+                           is the client, not this service, that decides what
+                           history a request carries), and the very next
+                           ordinary turn rolls the summary hierarchy back up
+                           from watermark 0 over that full history, exactly
+                           as if she had never run /forget. /forget only
+                           clears the summaries UNTIL the next message in a
+                           chat that continues; starting a NEW conversation
+                           (a fresh conv_id) is what actually keeps old
+                           context from ever being summarized again.
+
                            What it does NOT clear, deliberately: the periodic
                            data-durability snapshots in /data/backups. Those
                            exist so that "a corrupted file, an accidental
@@ -80,11 +96,12 @@ import re
 import time
 from typing import Any, Callable, Awaitable
 
+import backfill
 import bgwork
 import facts as facts_module
 import portability
 import textclean
-from memory import StoreUnreadable, conv_lock, storage_root
+from memory import StoreUnreadable, bump_wipe_generation, conv_lock, storage_root
 
 logger = logging.getLogger("compactor.commands")
 
@@ -441,6 +458,27 @@ def _memory_residue(conv_id: str) -> tuple[list[str], list[str]]:
             f"({type(e).__name__}: {e})"
         )
 
+    # v3.1.9.4 (P15-3). The L2 chapter cold store is a memory layer this
+    # function's own docstring already promised to catch ("a layer somebody
+    # adds later and forgets to wire into the wipe shows up here on its
+    # own") — it did not, because nothing here read it. main._clear_all_memory
+    # now deletes it (see that function), so this is the belt-and-braces half:
+    # a delete failure there, or any OTHER path that ever writes to this
+    # sidecar without wiring in a wipe, still surfaces here instead of a
+    # /forget silently reporting complete.
+    try:
+        import summarizer as summarizer_module
+        n = len(summarizer_module.load_chapter_archive(conv_id))
+        if n:
+            still.append(f"{n} archived chapter(s)")
+    except StoreUnreadable:
+        unreadable.append("chapter archive")
+    except Exception as e:
+        logger.warning(
+            f"conv={conv_id}: /forget could not verify the chapter archive "
+            f"({type(e).__name__}: {e})"
+        )
+
     try:
         import retrieval as retrieval_module
         n = retrieval_module.conversation_doc_count(conv_id)
@@ -555,6 +593,9 @@ async def _wipe_all_layers(conv_id: str, clear_all) -> dict:
         "forgotten_facts": int(result.get("forgotten_facts") or 0),
         "forgotten_episodic": int(result.get("forgotten_episodic") or 0),
         "forgotten_summary": bool(result.get("forgotten_summary")),
+        # v3.1.9.4 (P15-3): passed through from _clear_all_memory the same
+        # way forgotten_summary/forgotten_persona already are.
+        "forgotten_chapters": bool(result.get("forgotten_chapters")),
         "forgotten_persona": bool(result.get("forgotten_persona")),
         "archived": n_archived,
         "unreadable": unreadable,
@@ -626,7 +667,7 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
         retry = await _wipe_all_layers(conv_id, clear_all)
         for key in ("forgotten_facts", "forgotten_episodic", "archived"):
             totals[key] += retry[key]
-        for key in ("forgotten_summary", "forgotten_persona"):
+        for key in ("forgotten_summary", "forgotten_chapters", "forgotten_persona"):
             totals[key] = totals[key] or retry[key]
         totals["unreadable"] = retry["unreadable"]
         still, residue_unreadable = _memory_residue(conv_id)
@@ -663,6 +704,13 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
         parts.append(f"{totals['forgotten_episodic']} indexed exchange(s)")
     if totals["forgotten_summary"]:
         parts.append("summary state")
+    # v3.1.9.4 (P15-3): same rule as persona below — the chapter cold store
+    # is now actually cleared by _clear_all_memory, so a /forget that cleared
+    # only chapters (a conversation whose hierarchy had refreshed L3 but had
+    # no active facts/summary/persona left) says so rather than answering
+    # "nothing to forget" while chapters quietly went with the wipe.
+    if totals["forgotten_chapters"]:
+        parts.append("chapter archive")
     # v3.1 A3: persona was cleared by _clear_all_memory and never mentioned
     # here, so a /forget on a conversation carrying only a persona deleted it
     # and replied "this conversation had no stored memory". Under-reporting a
@@ -674,6 +722,39 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
     lines: list[str] = []
     if parts:
         lines.append("Forgot: " + ", ".join(parts) + ".")
+
+    # v3.1.9.4 (R5 / P16-6, documented — not a new defect; R6 / P17-5 fix).
+    # The facts tombstone above genuinely stops the lazy backfill from
+    # reconstructing facts from history. The summary hierarchy has no
+    # equivalent: if this chat keeps going, OpenWebUI resends the whole
+    # prior transcript with the next message (the client's choice, not
+    # this service's), and the hierarchy starts rebuilding the L1/L2/L3
+    # summary from it — catch-up is bounded per turn
+    # (COMPACTOR_TAIL_ROLLUP_MAX_CALLS), so a long pre-/forget history
+    # takes several turns to fully re-summarize, not one — so say that here
+    # rather than let "Forgot: summary state." read as a permanent
+    # guarantee it is not.
+    #
+    # P17-5: this used to be gated on `forgotten_summary or
+    # forgotten_chapters` — a /forget on a conversation that had facts but
+    # no summary YET (a short chat, or the hierarchy only just enabled) got
+    # no note at all, even though the exact same rebuild happens: nothing
+    # about "the client resends the transcript and the hierarchy re-folds
+    # it" depends on whether a summary already existed to clear. The
+    # honest condition is "this /forget cleared something from a
+    # conversation whose history can still come back" — i.e. `parts` is
+    # non-empty — not "the summary specifically was one of the things
+    # cleared". Not shown on a no-op /forget (`parts` empty, "Nothing to
+    # forget"): there is nothing that could rebuild from a conversation
+    # this had no memory of in the first place.
+    if parts:
+        lines.append(
+            "Note: if you keep chatting in this conversation, the summary "
+            "will start rebuilding itself from the history your client "
+            "resends — /forget clears it only until the next message "
+            "here. Start a new conversation to keep old context from "
+            "being summarized again."
+        )
 
     # v3.1: main.py's _clear_all_memory states the contract in its return value
     # — "callers must not report a clean wipe when `unreadable` is non-empty".
@@ -1711,13 +1792,20 @@ def _retire_other_layers(conv_id: str) -> dict:
 
     Full list for this conv_id, and what happens to each:
 
-      facts/<id>.json           the active facts       — classified above
-      facts/<id>.archive.json   the cold sidecar       — classified above
-      summaries/<id>.json       L1/L2/L3 rollups       — in the snapshot, then deleted
-      personas/<id>.json        the persona            — in the snapshot, then deleted
-      facts/<id>.backfill.json  lazy-backfill state    — deleted (state, not memory)
-      ChromaDB where conv_id=   indexed exchanges      — in the snapshot, then deleted
-      dedup._REFUSAL_MEMO[id]   merge refusals         — dropped (a cache, process-local)
+      facts/<id>.json              the active facts       — classified above
+      facts/<id>.archive.json      the cold sidecar       — classified above
+      summaries/<id>.json          L1/L2/L3 rollups       — in the snapshot, then deleted
+      summaries/<id>.archive.json  the L2 chapter archive — in the snapshot, then deleted
+      personas/<id>.json           the persona            — in the snapshot, then deleted
+      facts/<id>.backfill.json     lazy-backfill state    — deleted (state, not memory)
+      ChromaDB where conv_id=      indexed exchanges      — in the snapshot, then deleted
+      dedup._REFUSAL_MEMO[id]      merge refusals         — dropped (a cache, process-local)
+
+    v3.1.9.4 (P15-3): the chapter archive row above is new. Until this fix
+    /retire neither snapshotted, moved nor deleted the source's chapter cold
+    store — it stayed orphaned under the retired id, readable by nobody and
+    never cleaned up, the identical "docstring names the rule, the code does
+    not apply it" gap the wipe/verify/import paths had for the same file.
 
     The backfill sidecar path is built here rather than imported from
     backfill.py for the reason selftest gives: importing that module for a path
@@ -1729,7 +1817,8 @@ def _retire_other_layers(conv_id: str) -> dict:
     those are opposite answers.
     """
     out: dict[str, Any] = {
-        "summary": None, "episodic": None, "persona": None, "backfill": None,
+        "summary": None, "chapters": None, "episodic": None, "persona": None,
+        "backfill": None,
     }
     try:
         import summarizer as summarizer_module
@@ -1737,6 +1826,11 @@ def _retire_other_layers(conv_id: str) -> dict:
         out["summary"] = bool(state.get("l1") or state.get("l2") or state.get("l3"))
     except Exception as e:
         logger.warning(f"conv={conv_id}: /retire could not read the summary layer: {e}")
+    try:
+        import summarizer as summarizer_module
+        out["chapters"] = len(summarizer_module.load_chapter_archive(conv_id))
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: /retire could not read the chapter archive: {e}")
     try:
         import retrieval as retrieval_module
         out["episodic"] = retrieval_module.conversation_doc_count(conv_id)
@@ -1787,6 +1881,19 @@ def _retire_clear_other_layers(conv_id: str) -> list[str]:
             cleared.append("persona")
     except Exception as e:
         logger.warning(f"conv={conv_id}: /retire persona delete failed: {e}")
+    # v3.1.9.4 (P15-3): the chapter archive, mirroring the summary-state
+    # delete a few lines up — same layer class (a file under summaries/),
+    # same "delete after the caller has already taken a verified
+    # quarantine snapshot" contract _handle_retire applies to every layer
+    # here.
+    try:
+        import summarizer as summarizer_module
+        cp = summarizer_module.summary_archive_path(conv_id)
+        if cp.is_file():
+            cp.unlink()
+            cleared.append("chapter archive")
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: /retire chapter archive delete failed: {e}")
     try:
         bp = storage_root() / "facts" / f"{conv_id}.backfill.json"
         if bp.is_file():
@@ -1813,6 +1920,7 @@ def _retire_layer_lines(label: str, layers: dict) -> list[str]:
     return [
         f"{label}",
         f"  summary state         {say(layers['summary'], 'present', 'none')}",
+        f"  chapter archive       {say(layers['chapters'], 'chapter(s)', 'none')}",
         f"  indexed exchanges     {say(layers['episodic'], 'exchange(s)', 'none')}",
         f"  persona               {say(layers['persona'], 'present', 'none')}",
         f"  lazy-backfill state   {say(layers['backfill'], 'present', 'none')}",
@@ -2042,8 +2150,17 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
         source_active = facts_module.load_facts(source_id)
         source_archive = facts_module.load_archive(source_id)
         layers = _retire_other_layers(source_id)
+        # v3.1.9.4 (P15-3): "chapters" joined this tuple. Ordinarily a
+        # conversation with a chapter archive also has current L3 state
+        # (_archive_chapters is only ever called from _do_l3_rollup, which
+        # always sets state["l3"] in the same refresh), so "summary" being
+        # true already covered it in practice — but an orphaned chapter
+        # archive with no current summary (a torn wipe, a partial delete
+        # failure) must not read as "no stored memory of any kind" while a
+        # cold copy of real conversation detail sits right there.
         if not source_active and not source_archive and not any(
-            bool(layers[k]) for k in ("summary", "episodic", "persona", "backfill")
+            bool(layers[k])
+            for k in ("summary", "chapters", "episodic", "persona", "backfill")
         ):
             return (
                 f"Conversation {source_id} has no stored memory of any kind — "
@@ -2091,9 +2208,11 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
             dest_active = facts_module.load_facts(conv_id)
             dest_archive = facts_module.load_archive(conv_id)
 
+            # v3.1.9.4 (P15-3): "chapters" joined this tuple too — see the
+            # matching comment on the dry-run gate above.
             has_anything = bool(source_active) or bool(source_archive) or any(
                 bool(layers[k])
-                for k in ("summary", "episodic", "persona", "backfill")
+                for k in ("summary", "chapters", "episodic", "persona", "backfill")
             )
             if not has_anything:
                 # Also the clean answer to "the apply already ran and you sent
@@ -2227,6 +2346,26 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
 
             # 3. Now empty the source. Sidecar, then the active set, then the
             #    layers that are not facts.
+            #
+            # v3.1.9.4 (R1 / P15-5 follow-up). Bumped here, still inside
+            # both conv_locks (first, second — source_id is one of them),
+            # and before any of the deletes below — same placement rule as
+            # main._clear_all_memory's own bump: a tail of source_id that
+            # captured its generation before this /retire apply started now
+            # disagrees with current_wipe_generation(source_id) the moment
+            # it re-checks, under this same lock, and discards whatever it
+            # was about to write into a conversation that is being retired
+            # out from under it.
+            bump_wipe_generation(source_id)
+            # v3.1.9.4 (R5 / P16-1 sibling fix). Same reasoning as
+            # main._clear_all_memory's own mark_wiped call, and needed here
+            # for the identical reason: /retire is a wipe of source_id (its
+            # facts are about to be emptied a few lines down), so a
+            # `failed`/stale `in_progress` backfill record left over from
+            # source_id must not survive to retry against a conversation
+            # /retire just emptied. Still inside the same lock the bump
+            # above is inside.
+            backfill.mark_wiped(source_id)
             facts_module.save_archive(source_id, [])
             # An EMPTY facts file, not an unlinked one — /forget's tombstone,
             # for its reason: backfill.needs_backfill gates on
@@ -2291,8 +2430,8 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
         f"A complete snapshot of {source_id} as it was a moment ago is at "
         f"{snap['path']} ({snap['facts']} active fact(s), {snap['archive']} "
         f"archived, {snap['episodic']} indexed exchange(s), summary="
-        f"{'yes' if snap['summary'] else 'no'}, persona="
-        f"{'yes' if snap['persona'] else 'no'}). Nothing deletes it "
+        f"{'yes' if snap['summary'] else 'no'}, chapters={snap['chapters']}, "
+        f"persona={'yes' if snap['persona'] else 'no'}). Nothing deletes it "
         f"automatically."
     )
 
@@ -2301,8 +2440,14 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
         residue.append(f"{after_source_active} active fact(s)")
     if after_source_archive:
         residue.append(f"{after_source_archive} archived fact(s)")
+    # v3.1.9.4 (P15-3): "chapters" joined this residue check too — a chapter
+    # archive delete that failed above (_retire_clear_other_layers logs and
+    # swallows it) must show up here exactly like a failed summary or
+    # persona delete already does, not read as "nothing left" while a file
+    # is still sitting under the retired id.
     for name, key in (
-        ("summary state", "summary"), ("indexed exchanges", "episodic"),
+        ("summary state", "summary"), ("chapter archive", "chapters"),
+        ("indexed exchanges", "episodic"),
         ("persona", "persona"), ("lazy-backfill state", "backfill"),
     ):
         v = after_layers[key]

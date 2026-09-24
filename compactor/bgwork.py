@@ -159,18 +159,84 @@ class BackgroundPool:
         if exc is not None:
             logger.exception(f"background task raised: {exc!r}")
 
-    async def drain(self, timeout: float = 10.0) -> None:
-        """Await outstanding tasks (used at shutdown)."""
+    async def drain(
+        self, timeout: float = 10.0, *, cancel_on_timeout: bool = False
+    ) -> set[asyncio.Task]:
+        """Wait up to `timeout` for outstanding tasks. Returns the tasks
+        still not done when the wait ended (empty if everything finished,
+        or if `cancel_on_timeout` forced everything to a done state).
+
+        v3.1.9.4 B3 (P15-5). Used to be `asyncio.wait_for(asyncio.gather(
+        *tasks, return_exceptions=True), timeout)`. `wait_for` CANCELS the
+        awaitable it times out on, and cancelling a gather cancels every
+        task it wraps — so a caller that only meant "stop waiting" was
+        actually killing every outstanding tail. This module's own
+        docstring says the pool is process-wide, and `commands.py`'s
+        `_settle_background_work` (the /forget wipe's drain) confirms it:
+        "a /forget on one conversation waits on another's tail". A full
+        wipe anywhere therefore CANCELLED every other conversation's
+        in-flight fact extraction, dedup and rollup, and any running lazy
+        backfill (P15-2), the instant `FORGET_SETTLE_TIMEOUT` (10s
+        default) passed — routinely, since P15-4 alone measured one
+        tail's dedup embed at ~12.9s uncached, before this release's B1
+        fix. Worse, a cancelled task is a DONE task: `_on_done` fires for
+        it exactly as for a normal completion and discards it from
+        `self._tasks`, so `_settle_background_work`'s `stats().outstanding
+        == 0` read as "everything settled" when the pool had actually just
+        been murdered — the /forget reply's own "background work was
+        still finishing" caveat (commands.py) existed but could never
+        fire, because after a cancelling drain the pool was always empty.
+
+        `asyncio.wait(tasks, timeout=timeout)` (no `wait_for`, no
+        `gather`) is the fix: it simply returns the (done, pending) split
+        when the timeout elapses, touching nothing still running. A task
+        in `pending` keeps running exactly as if drain had never been
+        called — the caller sees it in `stats().outstanding` afterwards
+        (and now honestly), and `_on_done` still fires for it, normally,
+        whenever it actually finishes.
+
+        Exceptions: unchanged. Every task submitted through `submit()`
+        already has `_on_done` as a done-callback, which logs
+        `task.exception()` regardless of whether this function is the one
+        that observes completion — `return_exceptions=True` on the old
+        `gather` was never load-bearing for that; nothing here needs to
+        replicate it.
+
+        `cancel_on_timeout=True` restores the OLD behaviour for a caller
+        that genuinely wants it — process shutdown is the one such caller
+        in this codebase (main.py's `lifespan`, outside this lane's file
+        ownership; see fix-3194-bg.md B3 for the exact line it should
+        pass). There, the loop is about to close regardless, and letting
+        each task's cancellation actually land — so its own `finally`/
+        cleanup code runs (an httpx client closing, a lock releasing) —
+        is preferable to the interpreter tearing them down mid-work with
+        no chance to clean up at all.
+        """
         if not self._tasks:
-            return
-        logger.info(f"draining {len(self._tasks)} background task(s)")
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*list(self._tasks), return_exceptions=True),
-                timeout=timeout,
+            return set()
+        tasks = list(self._tasks)
+        logger.info(f"draining {len(tasks)} background task(s)")
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        if not pending:
+            return set()
+        if cancel_on_timeout:
+            logger.warning(
+                f"{len(pending)} background task(s) didn't finish in "
+                f"{timeout}s; cancelling (cancel_on_timeout=True)"
             )
-        except asyncio.TimeoutError:
-            logger.warning(f"background tasks didn't finish in {timeout}s; abandoning")
+            for t in pending:
+                t.cancel()
+            # Wait for the cancellation to actually land — same guarantee
+            # the old wait_for(gather(...)) gave: a caller that asked to
+            # cancel sees every task done, not merely requested-to-stop.
+            await asyncio.wait(pending)
+            return set()
+        logger.warning(
+            f"{len(pending)} background task(s) still running after "
+            f"{timeout}s; left running rather than cancelled — a drain "
+            f"timing out must not destroy someone else's in-flight work"
+        )
+        return pending
 
     def stats(self) -> dict:
         """For /health/full — outstanding/shed/throughput + caps.

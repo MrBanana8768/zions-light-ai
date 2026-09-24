@@ -302,6 +302,91 @@ for _deferred, _label in ((249, "n~500"), (999, "n~2000")):
     )
 
 
+# ===========================================================================
+print("[5] P13-4 (hostile pass #13, LOW): P12-5's order must hold with no "
+      "caller system prompt too")
+# With no system message at all in the original request, chat_completions
+# computes `caller_system = sum(1 for m in messages if role == "system") ==
+# 0` and passes it straight through as this guard's `protect_system`.
+# `inject_system_block` then puts the FIRST thing it ever injects (facts,
+# here — no persona to go before it) at index 0 of the array this guard
+# sees. `_droppable_system_indices` used to clamp with `sys_idxs[max(1,
+# protect_system):]` — "protect at least the first system message, even if
+# the caller says it sent none" — which protected THAT facts block as if
+# the caller had sent it, returned `[]`, and the P12-5 branch ([1]-[4]
+# above) never even triggered: the floor-less generic shed loop a few
+# lines down (no floor, no pairing) reached her previous exchange first,
+# with facts sitting right beside it, never spent.
+#
+# Fixture: the reviewer's own repro shape (SP\p13\nosys.py) reproduced
+# here with this file's own FACTS/`tokens()` fixtures — 5 small old pairs
+# (cheap to shed), a facts block, a previous exchange, a newest turn.
+# `limit` is exactly 200 tokens under what the array costs with every old
+# pair already gone: the guard MUST spend something beyond the old pairs
+# to fit, and facts alone (400 tokens) comfortably covers that 200-token
+# gap, so a correctly-ordered guard never needs to touch the previous
+# exchange at all — the same floor-boundary choice [16]/[16a] in
+# test_reuse_fit.py exercise through compact_if_needed, here direct on
+# _enforce_hard_budget with no persona in the picture.
+def build_nosys(with_persona, old_exchanges=5):
+    msgs = []
+    if with_persona:
+        msgs.append({"role": "system", "content": "P" * 1200})
+    msgs.append({"role": "system", "content": FACTS})
+    for i in range(old_exchanges):
+        msgs.append({"role": "user", "content": f"old-u{i} " + "u" * 150})
+        msgs.append({"role": "assistant", "content": f"old-a{i} " + "a" * 1650})
+    msgs.append({"role": "user", "content": "prev-u " + "u" * 150})
+    msgs.append({"role": "assistant", "content": "prev-a " + "a" * 1650})
+    msgs.append({"role": "user", "content": "newest " + "n" * 200})
+    return msgs
+
+
+for _with_persona in (True, False):
+    _caller_system = 1 if _with_persona else 0
+    _label = "WITH a caller system prompt (CONTROL)" if _with_persona else "with NO system prompt at all"
+    _msgs = build_nosys(_with_persona)
+    _no_old = [
+        m for m in _msgs
+        if not (isinstance(m.get("content"), str) and m["content"].startswith(("old-u", "old-a")))
+    ]
+    _lim = tokens(_no_old) - 200
+    _droppable_before = main._droppable_system_indices(_msgs, _caller_system)
+    check(
+        bool(_droppable_before),
+        f"[5] {_label}: _droppable_system_indices sees the injected facts "
+        f"block as spendable (protect_system={_caller_system}, "
+        f"droppable={_droppable_before}) — before this fix this was `[]` "
+        f"whenever protect_system was 0, whatever sat at index 0",
+    )
+    _rep: dict = {}
+    _out = main._enforce_hard_budget(_msgs, _lim, _caller_system, _rep)
+    _ns_out = [m for m in _out if m.get("role") != "system"]
+    _prev_survived = (
+        any(main._message_text(m).startswith("prev-u") for m in _ns_out)
+        and any(main._message_text(m).startswith("prev-a") for m in _ns_out)
+    )
+    _memory_spent = (_rep.get("trimmed_blocks") or 0) + (_rep.get("dropped_blocks") or 0) > 0
+    _first_is_user = bool(_ns_out) and _ns_out[0].get("role") == "user"
+    check(
+        _prev_survived,
+        f"*** P13-4 [5] {_label}: her previous exchange survives — memory "
+        f"pays the 200-token gap instead ({_rep}) — before this fix, with "
+        f"no caller system prompt, the previous exchange was shed first and "
+        f"the injected facts block was never even considered spendable",
+    )
+    check(
+        _memory_spent,
+        f"[5] {_label}: injected memory (facts) was actually trimmed or "
+        f"dropped to make room — the gap was paid by memory, not by "
+        f"inventing room elsewhere ({_rep})",
+    )
+    check(
+        _first_is_user,
+        f"[5] {_label}: the array is never left assistant-first ({_rep})",
+    )
+
+
 print()
 if FAILED:
     print(f"FAILED: {len(FAILED)} check(s)")

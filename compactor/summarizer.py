@@ -71,6 +71,7 @@ import os
 import re
 import time
 import unicodedata
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -86,6 +87,7 @@ from memory import (
     StoreUnreadable,
     atomic_write_json,
     conv_lock,
+    current_wipe_generation,
     read_json_strict,
     storage_root,
     summary_archive_path,
@@ -2202,16 +2204,35 @@ async def _batch_to_budget(
 # LLM-driven summarization (one call per rollup)
 # ---------------------------------------------------------------------------
 
-_PROMPT_L1 = """Summarize the following conversation excerpt for long-term recall. Preserve:
+# v3.1.9.4 (P15-6). Every tier's prompt used to ask for content ("preserve
+# names, places...") with no LENGTH target at all, so the only thing bounding
+# the reply was the hard `max_tokens` cap passed to vLLM — every prompt below
+# is a normal-length request TO THE MODEL, and a model that is not told to be
+# brief writes until it is cut off. `_target_words` gives each tier a target
+# comfortably under its own cap (see L1_MAX_TOKENS/L2_MAX_TOKENS/L3_MAX_TOKENS
+# above), in WORDS rather than tokens because that is the unit a prompt can
+# ask a model to reason about — tokens are a serving-side accounting unit the
+# model does not see. The 0.6 factor is deliberately conservative (English
+# prose runs closer to 0.75 words/token, so "0.6 * max_tokens words" leaves
+# real headroom under the cap) — this is a steering hint, not a budget the
+# rest of this module relies on; _llm_summarize's retry-then-trim below is
+# what actually GUARANTEES a stored summary never ends mid-sentence, for the
+# reply that ignores the hint anyway.
+def _target_words(max_tokens: int) -> int:
+    return max(40, int(max_tokens * 0.6))
+
+
+_PROMPT_L1 = f"""Summarize the following conversation excerpt for long-term recall. Preserve:
 - Names, places, decisions, and concrete details.
 - The user's stated preferences and goals.
 - Code, file paths, commands, URLs, or numeric values mentioned.
 - Plot/story beats if this is creative writing.
+Keep it to roughly {_target_words(L1_MAX_TOKENS)} words or fewer — well under your length limit, so you finish with a complete final sentence rather than being cut off partway through.
 Do not greet, editorialize, or hedge. Output the summary only."""
 
-_PROMPT_L2 = """You are summarizing several earlier per-scene summaries into one "chapter-level" summary. Preserve continuity at the chapter scale: characters, settings, decisions, ongoing threads. Drop scene-by-scene minutiae but keep names and concrete decisions. Output the chapter summary only — no preamble, no hedging."""
+_PROMPT_L2 = f"""You are summarizing several earlier per-scene summaries into one "chapter-level" summary. Preserve continuity at the chapter scale: characters, settings, decisions, ongoing threads. Drop scene-by-scene minutiae but keep names and concrete decisions. Keep it to roughly {_target_words(L2_MAX_TOKENS)} words or fewer — well under your length limit, so you finish with a complete final sentence rather than being cut off partway through. Output the chapter summary only — no preamble, no hedging."""
 
-_PROMPT_L3 = """You are producing the whole-conversation "theme" summary from a list of chapter-level summaries. Capture the high-level arc, the user's overarching goals, persistent constraints, and the cast of named entities. This will be injected on every future request, so be concise but never vague. Output the theme summary only."""
+_PROMPT_L3 = f"""You are producing the whole-conversation "theme" summary from a list of chapter-level summaries. Capture the high-level arc, the user's overarching goals, persistent constraints, and the cast of named entities. This will be injected on every future request, so be concise but never vague. Keep it to roughly {_target_words(L3_MAX_TOKENS)} words or fewer — well under your length limit, so you finish with a complete final sentence rather than being cut off partway through. Output the theme summary only."""
 
 # Used only by the reduce step, when one tier's input was too large for a
 # single call and had to be summarized in parts. The parts are consecutive
@@ -2219,6 +2240,202 @@ _PROMPT_L3 = """You are producing the whole-conversation "theme" summary from a 
 # "fold", not "summarize again" — a second summarization pass is exactly the
 # summary-of-summary degradation this module's tiering exists to avoid.
 _PROMPT_REDUCE = """The following are consecutive partial summaries of a single stretch of one conversation, in order. Merge them into one continuous summary of that stretch. Keep every name, decision, concrete detail and numeric value that appears in any part; drop only repetition between the parts. Do not add framing, headings, or commentary. Output the merged summary only."""
+
+
+# v3.1.9.4 (P15-6). `_llm_summarize` is called through one seam (`_call`,
+# inside `_summarize_pieces_raw`) but MONKEYPATCHED WHOLESALE — replaced with
+# a fixed-signature stub, not wrapped — by test_admin_compact.py,
+# test_p3c_admin_fuzz.py, test_p4c_compact_verdict.py, test_p5_drain.py,
+# test_tail_catchup.py and others. Its call signature (six positional args,
+# keyword-only `timeout`) and its return type (a plain `str`) are therefore a
+# contract this fix must not touch — a conv_id/tier PARAMETER here would be a
+# TypeError against every one of those stubs the moment `_call` passed it,
+# exactly the "a parameter threaded through a stubbed seam breaks every fixed-
+# signature stub" hazard `_vllm_call_budget`'s own block comment (below)
+# already names for its sibling functions. So this reads `conv_id`/tier the
+# same way that budget reads its ceiling: a CONTEXTVAR (`_rollup_log_ctx`),
+# set by `_call` immediately around its real call into this function and
+# absent (None) for every monkeypatched test, which never reaches this body
+# at all.
+_SENTENCE_END_RE = re.compile(
+    r"""[.!?]["'”’)\]»*_~`]*(?=\s|\Z)"""
+    r"""|[。！？]["”’」』)）]*"""
+)
+
+
+def _trim_to_last_sentence(text: str) -> str:
+    """The longest prefix of `text` ending on a sentence boundary, or ""
+    when there is none — there IS no non-empty prefix that ends on a
+    boundary if the text never reaches one, so "" is the correct answer to
+    the question THIS function asks (it has no fallback of its own; see
+    `_trim_best_effort` for the chain that keeps the hierarchy advancing
+    when a cut reply never reaches a sentence boundary at all).
+
+    A deliberately SIMPLER sibling of main.trim_to_last_sentence (that
+    function's own docstring covers fence-awareness, abbreviation and
+    initials handling — main.py is another lane's region here, and importing
+    it from summarizer.py would be a cycle: main.py imports this module, not
+    the other way around). What this module needs is narrower: the input is
+    always a MODEL-WRITTEN summary (never the user's or the model's raw
+    conversational text, which is where an abbreviation like "Dr." or "e.g."
+    actually shows up often enough to matter), so a plain terminator-plus-
+    whitespace boundary is enough to satisfy the one hard requirement this
+    exists for — never store text that ends mid-sentence. Being slightly
+    over-eager about what counts as a boundary (treating "Dr." as one, say)
+    only means trimming a little earlier than strictly necessary, which is
+    the safe direction of the same trade-off, not a correctness gap.
+    """
+    last = None
+    for m in _SENTENCE_END_RE.finditer(text):
+        last = m.end()
+    return "" if last is None else text[:last]
+
+
+def _trim_best_effort(text: str) -> str:
+    """Never come back empty on a non-empty `text`, even when it has NO
+    sentence boundary anywhere — a cut summary written as a bullet or
+    numbered list (routine: see _PROMPT_L1's own "Plot/story beats" and
+    "concrete details" asks, which invite exactly that shape) can run for
+    hundreds of characters with no `.`/`!`/`?` at all, and
+    `_trim_to_last_sentence` alone returned "" for every one of them —
+    which `_llm_summarize` used to treat as "nothing usable", refusing the
+    WHOLE unit. That is not a rare degenerate case, it is a routine one,
+    and refusing it routinely is the exact stall this fix exists to avoid.
+
+    Fallback chain, best first, each strictly safer to trim to than the one
+    before it:
+      1. `_trim_to_last_sentence` — a real sentence boundary, unchanged.
+      2. The longest prefix ending on a LINE break. A cut bullet/numbered
+         list still has complete lines up to the one the cut landed inside;
+         the boundary is honest (nothing on either side of the cut is
+         invented), it just is not a sentence.
+      3. The longest prefix ending on WHITESPACE (the last complete word),
+         with " …" appended — explicit rather than silent, so nothing
+         downstream mistakes this for a naturally short, complete summary.
+         The one case with no internal whitespace at all (a single unbroken
+         token) returns that whole token with " …" appended: there is no
+         smaller safe boundary to cut to, and it is still better than "".
+
+    Returns "" only when `text` itself is empty or whitespace-only — the
+    same "nothing was said at all" case an empty reply already is, and the
+    ONLY case `_llm_summarize` still refuses the unit for.
+    """
+    if not text.strip():
+        return ""
+    by_sentence = _trim_to_last_sentence(text)
+    if by_sentence:
+        return by_sentence
+    lines = text.split("\n")
+    if len(lines) > 1:
+        by_line = "\n".join(lines[:-1]).rstrip()
+        if by_line:
+            return by_line
+    words = text.split()
+    if len(words) > 1:
+        return " ".join(words[:-1]) + " …"
+    return text.strip() + " …"
+
+
+def _retry_suffix(target_words: int) -> str:
+    """The one line added to the system prompt on the single retry a cut
+    reply gets — see _llm_summarize's block comment for why the retry keeps
+    the SAME max_tokens and changes only this instruction."""
+    return (
+        "\n\nYour previous attempt at this ran past its length limit and "
+        "was cut off mid-sentence. This time, keep it to roughly "
+        f"{target_words} words or fewer — well under the limit — and make "
+        "sure your LAST sentence is complete."
+    )
+
+# v3.1.9.4 (P15-6). How many rollup summary calls (any tier, any conv) were
+# cut at max_tokens and STILL had nothing better than a fallback-trimmed
+# result after the one retry (or after skipping it for lack of budget) — see
+# _trim_best_effort — i.e. how many times a stored summary is the model's
+# output trimmed to a sentence, line or word boundary rather than its full
+# intended text. Zero on a healthy deployment; a number that climbs is the
+# operator-visible signal this defect had NONE of before (the finding's own
+# words: "no log line, no counter"). Process-local and reset on restart, the
+# same scope tokenhealth's counters have — see tokenize_health() above for
+# the established pattern of exposing a module counter for main.py/health.py
+# (another lane's region) to surface at /health/full; nothing in this module
+# reads it back.
+_truncated_summary_calls = 0
+
+# v3.1.9.4 (R5 / P16-7 fix). How many _llm_summarize calls, across every
+# tier, actually spent a retry call at all — clean or still cut. A clean
+# retry no longer wins automatically (see _llm_summarize's own step 4), so
+# "retried" and "truncated" (above) are genuinely different now: this
+# counts the ATTEMPT, that counts the outcome "ended up trimmed". Same
+# process-local/health.py-surfaced scope as truncated_summary_count.
+_retried_summary_calls = 0
+
+
+def truncated_summary_count() -> int:
+    """How many _llm_summarize calls, across every tier, were cut at
+    max_tokens and still had no better than a fallback-trimmed result after
+    the retry (or after the retry was skipped for lack of budget) — see the
+    block comment above `_llm_summarize`. A caller in health.py can surface
+    this; this module does not read it back itself."""
+    return _truncated_summary_calls
+
+
+def retried_summary_count() -> int:
+    """How many _llm_summarize calls, across every tier, actually spent a
+    retry call (clean or still cut) — see truncated_summary_count's own
+    docstring for how this differs (P16-7)."""
+    return _retried_summary_calls
+
+
+_rollup_log_ctx: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar(
+    "summarizer_rollup_log_ctx", default=None
+)
+
+
+def _tier_of(system_prompt: str) -> str:
+    """Which tier a system prompt belongs to, for logging only. The four
+    prompts below are the only ones this module ever passes to
+    _llm_summarize, so an exact string match is unambiguous; anything else
+    (only reachable if a future caller adds a fifth) logs as "?" rather than
+    raising over a log line. Same purpose, same shape, as test_p5_drain.py's
+    own `_tier_of` helper."""
+    return {
+        _PROMPT_L1: "L1", _PROMPT_L2: "L2", _PROMPT_L3: "L3",
+        _PROMPT_REDUCE: "reduce",
+    }.get(system_prompt, "?")
+
+
+# v3.1.9.4 (R6 / P17-1 fix, part b). A minimal, LOCAL repetition check for
+# `_llm_summarize`'s retry-vs-first-attempt comparison below — needed
+# because a first attempt cut mid-loop (a model stuck repeating one line
+# until max_tokens) trims to a long but WORTHLESS candidate that must not
+# win the "longer candidate" rule just by out-wording a short, clean retry.
+# summarizer.py cannot import main.reply_is_degenerate: main.py imports
+# this module (see `import summarizer` there), not the other way, and
+# `_trim_to_last_sentence`'s own docstring already states the identical
+# constraint for the same reason. This module has never carried a
+# repetition/degeneracy detector of its own to reuse instead — grepping it
+# for one turned up only comments referencing main.py's (see
+# `_redact_degenerate_turns`, mentioned above at `maybe_rollup`'s own
+# comments, never called from here). So this reuses the one piece of
+# machinery this module DOES already have for the job: `_SENTENCE_END_RE`,
+# the same regex `_trim_to_last_sentence` uses to find sentence boundaries.
+# Splitting on it and checking whether one normalized sentence accounts for
+# most of the result is intentionally narrower than
+# main.reply_is_degenerate (which also catches fragment-run and list-run
+# loops, and is the load-bearing detector for stored replies generally) —
+# this exists only to keep a looping trimmed candidate from winning the
+# length comparison below, nothing more.
+def _is_repetition_loop(text: str) -> bool:
+    """True when `text` looks like one sentence repeated until it filled
+    the space (the P17-1 probe's case B: "She said she would think about
+    it." x60) rather than genuinely varied content. Requires at least 4
+    sentences before judging anything a loop, so an ordinary short summary
+    is never flagged."""
+    sentences = [s.strip().lower() for s in _SENTENCE_END_RE.split(text) if s.strip()]
+    if len(sentences) < 4:
+        return False
+    _, top_count = Counter(sentences).most_common(1)[0]
+    return top_count / len(sentences) >= 0.5
 
 
 async def _llm_summarize(
@@ -2231,29 +2448,226 @@ async def _llm_summarize(
     *,
     timeout: float = 300.0,
 ) -> str:
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": body_text},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.2,
-        "stream": False,
-    }
-    r = await client.post(f"{vllm_url}/v1/chat/completions", json=payload, timeout=timeout)
-    r.raise_for_status()
-    data = r.json() or {}
-    choices = data.get("choices") or []
-    if not choices:
-        # A 200 with no choices (an error-shaped body, most often) used to
-        # surface as a bare IndexError inside maybe_rollup's blanket handler —
-        # a stack trace per turn that named the wrong thing. Say what happened.
-        # Same guard main._summarize_once already carries.
-        raise ValueError(
-            f"vLLM returned no choices for a rollup summarize: {str(data)[:200]}"
-        )
-    return ((choices[0].get("message") or {}).get("content") or "").strip()
+    """Summarize once, and never hand back text a `finish_reason=length`
+    reply cut mid-sentence — siblings that already refuse this outright:
+    facts.py's extraction call ("A reply cut off at _EXTRACTION_MAX_TOKENS
+    ends mid-line ... a truncation which does not announce itself becomes a
+    wrong fact") and dedup.py's merge call (refused as "truncated"). This
+    tier could not simply copy that refusal: unlike a single fact or a single
+    merge decision, a REFUSED rollup unit does not retry in isolation — see
+    _summarize_pieces_raw's map-reduce, where ANY empty batch fails the whole
+    tier and the watermark does not advance for it. If cut summaries turn out
+    to be ROUTINE at these caps (the finding's real-data indication: most of
+    her live L1/L2 summaries end without terminal punctuation), refusing
+    every one of them would routinely stall the hierarchy — worse than the
+    defect this fixes. So the shape is graceful, not a hard refusal:
+
+      1. One real call at the caller's max_tokens.
+      2. If it finished normally (`finish_reason` anything but "length"),
+         return it untouched — this is the ordinary path and it is unchanged.
+      3. If it was cut, retry ONCE at the SAME max_tokens — the cap IS the
+         real budget (what vLLM is actually willing to generate against this
+         request); LOWERING it on retry guarantees nothing, because the
+         system prompt still carries its ORIGINAL word target
+         (_target_words(max_tokens), roughly 0.8x max_tokens in real
+         tokens), so a tighter cap and an unchanged instruction just
+         contradict each other and the retry gets cut too, one sentence
+         earlier, for no reason. What actually changes on retry is the
+         INSTRUCTION: `_retry_suffix` asks for roughly HALF the tier's
+         ordinary word target, at the SAME cap — an achievable ask instead
+         of a shrunk budget the prompt was never told to fit. Skipped
+         entirely if the shared vLLM-call budget (`_vllm_call_budget`, set
+         by a caller via `vllm_call_budget_ctx`/`maybe_rollup`'s own
+         parameter) has nothing left: `_call`'s own decrement only ever
+         accounts for the ONE guaranteed call, so this function decrements
+         the same budget itself for the retry — an uncounted second call
+         would silently let a caller's `{"max_calls": N}` spend N+1 real
+         calls. No `await` between the check and the decrement, matching
+         `_call`'s own reasoning for why that is race-safe under concurrent
+         map-phase callers. v3.1.9.4 (R6 / P17-1 fix, part a): ALSO skipped
+         when the first attempt trimmed with `_trim_best_effort` already
+         reaches at least the retry's own word target AND is not a
+         repetition loop (`_is_repetition_loop`) — step 4 below means an
+         obedient retry could not win that comparison anyway, so spending
+         the call would only pay for a result already thrown away. A
+         looping trim is the one exception: it must not block the retry
+         that would replace it, so a looping first attempt always gets the
+         retry regardless of its trimmed length.
+      4. v3.1.9.4 (R5 / P16-7 fix; R6 / P17-1 fix, part b). If the retry
+         ALSO finished normally, it no longer wins automatically.
+         `_retry_suffix` asks for roughly HALF the tier's ordinary word
+         target, so a clean retry can be much SHORTER than a first attempt
+         that was cut but still trims (step 5) to a complete sentence
+         boundary well past the retry's whole length — before the R5 fix
+         that shorter, complete retry silently replaced a longer,
+         perfectly usable trimmed first attempt, and nothing counted that
+         it had even happened. It now wins if it is AT LEAST AS LONG as
+         the first attempt trimmed with `_trim_best_effort` — the same
+         comparison step 5 already made for the "both cut" case, applied
+         here too instead of skipped — OR if the first attempt trimmed to
+         a REPETITION LOOP and the retry did not: a loop must not win this
+         comparison on raw length over a clean candidate (the P17-1
+         probe's case B — a first attempt cut mid-loop trims to hundreds of
+         repeated words and would otherwise beat a short, clean retry every
+         time).
+      5. Otherwise (the retry was cut too, was skipped for budget or for
+         step 3's length check, or lost the length comparison in step 4):
+         this is where the finding's
+         original defect used to land silently. Trim EVERY candidate
+         actually in hand (`text`, and `retry_text` if a retry ran, unless
+         it already finished clean and lost step 4 — nothing to trim there)
+         with `_trim_best_effort` — the fallback chain that finds a line or
+         word boundary when there is no sentence boundary at all — and keep
+         whichever TRIMMED result is LONGER, not automatically the retry:
+         the tighter retry target sometimes produces a cut reply that trims
+         to LESS usable content than the first attempt trimmed would have,
+         and always preferring "the newest attempt" would throw that
+         material away for no reason. Log a WARNING naming the conversation
+         and tier (from `_rollup_log_ctx`, set by `_call`) and count it
+         (truncated_summary_count). The unit still advances — it just
+         covers slightly less than the model tried to say. Every retry
+         actually made, clean or cut, is counted separately
+         (retried_summary_count), so an operator can see how often the
+         second call runs even on the turns where it wins outright.
+      6. The one case this does NOT paper over: EVERY candidate in hand is
+         itself empty or whitespace-only (a reply that said nothing at
+         all — `_trim_best_effort` returns "" only for that). That is the
+         same "reply carries no usable content" shape facts.py and dedup.py
+         already refuse, so this returns "" too — the tier fails this unit
+         and retries next turn, same as an empty reply always has. This is
+         NOT the same case as "no sentence boundary": a cut bullet list is
+         routine and _trim_best_effort keeps it (falling back to a line or
+         word boundary); only a genuinely content-free reply reaches "".
+    """
+    async def _one_call(extra_system: str = "") -> tuple[str, str | None]:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt + extra_system},
+                {"role": "user", "content": body_text},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.2,
+            "stream": False,
+        }
+        r = await client.post(f"{vllm_url}/v1/chat/completions", json=payload, timeout=timeout)
+        r.raise_for_status()
+        data = r.json() or {}
+        choices = data.get("choices") or []
+        if not choices:
+            # A 200 with no choices (an error-shaped body, most often) used to
+            # surface as a bare IndexError inside maybe_rollup's blanket
+            # handler — a stack trace per turn that named the wrong thing.
+            # Say what happened. Same guard main._summarize_once already
+            # carries.
+            raise ValueError(
+                f"vLLM returned no choices for a rollup summarize: {str(data)[:200]}"
+            )
+        choice = choices[0]
+        text = ((choice.get("message") or {}).get("content") or "").strip()
+        return text, choice.get("finish_reason")
+
+    text, finish_reason = await _one_call()
+    if finish_reason != "length":
+        return text
+
+    # Cut. v3.1.9.4 (R6 / P17-1 fix, part a). Trim what is already in hand
+    # BEFORE deciding whether a retry can even win: `_retry_suffix` asks
+    # for roughly HALF the tier's ordinary word target, at the SAME cap, so
+    # a retry that OBEYS that instruction and finishes cleanly is shorter
+    # by construction than a first attempt whose trim already reaches that
+    # many words — the "longer candidate" rule a few lines down means such
+    # a retry cannot win, so spending the call for it is pure cost with no
+    # chance of a different outcome. Skip it in that case. The exception
+    # (part b) is a first attempt that trimmed to a REPETITION LOOP: a
+    # model stuck repeating one line can out-word a clean retry by sheer
+    # repeats, and that must not block the retry that would replace the
+    # loop with something usable, nor win the length comparison below just
+    # by looping longer — see `_is_repetition_loop`.
+    trimmed_first = _trim_best_effort(text)
+    retry_words = max(20, _target_words(max_tokens) // 2)
+    first_is_looping = _is_repetition_loop(trimmed_first)
+    skip_retry_for_length = (
+        not first_is_looping and len(trimmed_first.split()) >= retry_words
+    )
+
+    # Retry ONCE at the same max_tokens (see the docstring above for why
+    # lowering it would not help), gated on the shared vLLM-call budget
+    # actually having room for a second real call, AND (P17-1 fix, part a)
+    # on the trim above not already having made the retry unwinnable.
+    retry_text: str | None = None
+    retry_finish: str | None = None
+    retried = False
+    if not skip_retry_for_length:
+        _budget = _vllm_call_budget.get()
+        if _budget is None or _budget["remaining"] > 0:
+            if _budget is not None:
+                _budget["remaining"] -= 1
+            retried = True
+            retry_text, retry_finish = await _one_call(_retry_suffix(retry_words))
+
+    if retried:
+        global _retried_summary_calls
+        _retried_summary_calls += 1
+
+    # v3.1.9.4 (R5 / P16-7 fix; R6 / P17-1 fix, part b). A clean retry
+    # (finish_reason != "length") used to win unconditionally the instant
+    # it happened. `_retry_suffix` asks for roughly HALF the tier's
+    # ordinary word target, at the SAME cap — so a retry that finishes
+    # cleanly can be much SHORTER than a first attempt that was cut but
+    # still trims to a complete sentence boundary well past the retry's
+    # whole length. It now wins if it is AT LEAST AS LONG as the first
+    # attempt trimmed — the same rule the "both cut" branch below already
+    # applies, now applied uniformly rather than skipped whenever the
+    # retry itself happens to finish clean — OR if the first attempt
+    # trimmed to a repetition loop and the retry did not: a loop must not
+    # win this comparison on raw length over a clean candidate.
+    if retry_text is not None and retry_finish != "length":
+        if len(retry_text) >= len(trimmed_first) or (
+            first_is_looping and not _is_repetition_loop(retry_text)
+        ):
+            return retry_text
+        # Falls through: trimmed_first wins the comparison below (a clean
+        # retry_text needs no further trimming of its own — see
+        # `candidates` there).
+
+    # Still cut (or no budget left for a retry at all, or a clean retry
+    # lost the length comparison above). Trim every candidate actually in
+    # hand and keep the longer trimmed result.
+    originals = [text] + ([retry_text] if retry_text is not None else [])
+    candidates = [trimmed_first] + (
+        [retry_text if retry_finish != "length" else _trim_best_effort(retry_text)]
+        if retry_text is not None else []
+    )
+    # v3.1.9.4 (R6 / P17-1 part b, both-cut path too): a candidate that
+    # trims to a repetition loop never wins on length over a clean one.
+    best_idx = max(
+        range(len(candidates)),
+        key=lambda i: (not _is_repetition_loop(candidates[i]), len(candidates[i])),
+    )
+    best = candidates[best_idx]
+    if not best:
+        # Every candidate was itself empty or whitespace-only — nothing
+        # usable anywhere, not even a fallback boundary to trim to.
+        return ""
+
+    global _truncated_summary_calls
+    _truncated_summary_calls += 1
+    _ctx = _rollup_log_ctx.get() or {}
+    _retry_note = (
+        "retried at the same cap with a tighter word target, still cut or too short"
+        if retry_text is not None
+        else "no retry: the trimmed first attempt already met the retry's word target"
+        if skip_retry_for_length
+        else "no vLLM-call budget left for a retry"
+    )
+    logger.warning(
+        f"conv={_ctx.get('conv_id', '?')}: {_ctx.get('tier', '?')}-tier rollup "
+        f"summary was cut at max_tokens={max_tokens} ({_retry_note}) — kept "
+        f"trimmed to {len(best)} of {len(originals[best_idx])} chars rather "
+        f"than stored past where the model stopped"
+    )
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -2358,6 +2772,52 @@ def vllm_call_budget_ctx(max_calls: int):
         yield budget
     finally:
         _vllm_call_budget.reset(token)
+
+
+# v3.1.9.4 (R1 / P15-5 follow-up). SAME shape as _vllm_call_budget just
+# above, and for the identical reason: maybe_rollup is monkeypatched
+# WHOLESALE by test doubles this module does not own, so a new keyword on
+# ITS signature would TypeError every one of them. A contextvar set around
+# the call, read by _maybe_rollup_body itself (not by maybe_rollup's thin
+# wrapper — this one has no per-call decrement to own, so there is nothing
+# for a wrapper layer to do), survives that: a stub which replaces
+# maybe_rollup wholesale never reads it, which is correct — a stub making
+# no real writes has nothing to discard.
+_wipe_generation: "contextvars.ContextVar[int | None]" = contextvars.ContextVar(
+    "summarizer_wipe_generation", default=None
+)
+
+
+@contextlib.contextmanager
+def wipe_generation_ctx(generation: int | None):
+    """Set the conversation's wipe generation, as captured by the caller at
+    the moment its background tail was SUBMITTED, for the duration of one
+    `maybe_rollup` call. `_maybe_rollup_body` reads it back (via
+    `_wipe_generation.get()`) immediately after loading state, under
+    conv_lock, and discards the ENTIRE rollup — no tier runs, no chapter
+    archive write, no save_state — if it disagrees with
+    `memory.current_wipe_generation(conv_id)` at that moment: a /forget (or
+    any other wipe) that ran after this tail was submitted must not have
+    its deletion undone by a rollup that reads stale content and writes it
+    back.
+
+    `generation=None` (main.admin_compact, which calls `maybe_rollup`
+    directly with no context manager at all and leaves this at its
+    contextvar default of None) disables the check entirely — an admin
+    compact is not a background tail racing a wipe; an operator is waiting
+    on it. backfill.py's rollup DOES set it (v3.1.9.4 W2): a backfill runs
+    in the background for up to hours and is exactly the stale work a wipe
+    must be able to stop. A caller inside this SAME `with` block that itself passes
+    `generation=None` (a tail that never captured one — see
+    `main._facts_tail`'s identical `wipe_generation: int | None = None`
+    convention) gets the same opt-out, for the same reason: nothing
+    changes for a direct test call or a caller not participating.
+    """
+    token = _wipe_generation.set(generation)
+    try:
+        yield
+    finally:
+        _wipe_generation.reset(token)
 
 
 def _budget_allows_unit() -> bool:
@@ -2494,9 +2954,18 @@ async def _summarize_pieces_raw(
         _vllm_budget = _vllm_call_budget.get()
         if _vllm_budget is not None:
             _vllm_budget["remaining"] -= 1
-        return await _llm_summarize(
-            client, vllm_url, model, prompt, "\n\n".join(batch), max_tokens
-        )
+        # P15-6: conv_id/tier for _llm_summarize's own WARNING and counter on
+        # a cut-then-still-cut reply, via a contextvar for the identical
+        # reason `_vllm_call_budget` is one — see _llm_summarize's own block
+        # comment. Set only around the real call, so a stub that replaces
+        # _llm_summarize wholesale never observes it either way.
+        _log_token = _rollup_log_ctx.set({"conv_id": conv_id, "tier": _tier_of(prompt)})
+        try:
+            return await _llm_summarize(
+                client, vllm_url, model, prompt, "\n\n".join(batch), max_tokens
+            )
+        finally:
+            _rollup_log_ctx.reset(_log_token)
 
     if len(batches) == 1:
         return await _call(system_prompt, batches[0])
@@ -3230,6 +3699,29 @@ async def _maybe_rollup_body(
         # which is the point: the IO moves to a worker, the serialisation
         # that stops concurrent rollups tearing the file does not.
         state = await run_in_threadpool(load_state, conv_id)
+
+        # v3.1.9.4 (R1 / P15-5 follow-up). Checked right after the load, so
+        # `state` below is always something real to return, and before
+        # anything else in this function runs — no tier check, no
+        # watermark repair, no LLM call, no _archive_chapters, no
+        # save_state. See wipe_generation_ctx's own docstring for why a
+        # single check here, this early, is enough: nothing else may hold
+        # conv_lock(conv_id) while this section does, so a wipe's bump (see
+        # memory.bump_wipe_generation) either already happened — and this
+        # call discards, correctly, because the wipe's own deletes are
+        # either already done or queued right behind it on this exact lock
+        # — or has not happened yet, in which case this call is free to
+        # proceed and whatever it writes is exactly what a wipe arriving
+        # afterward is supposed to clear.
+        _wgen = _wipe_generation.get()
+        if _wgen is not None and _wgen != current_wipe_generation(conv_id):
+            logger.warning(
+                f"conv={conv_id}: discarding a summary rollup — a wipe ran "
+                f"after this tail was submitted (generation {_wgen} != "
+                f"current {current_wipe_generation(conv_id)}); the turns it "
+                f"would have summarized were already asked to be forgotten"
+            )
+            return state
 
         if (
             skip_if_position_past is not None

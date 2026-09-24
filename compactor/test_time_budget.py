@@ -113,14 +113,21 @@ _guard_reports: list[dict] = []
 _real_guard = main._enforce_hard_budget
 
 
-def _spy_guard(msgs, limit=None, protect_system=1, report=None, reserve=0):
-    # `reserve` (hostile pass #5 F3) is a real parameter of the guard now,
-    # not a spy-only addition: passed through so this file still exercises
-    # the guard's actual reserve-band handling instead of silently dropping
-    # the argument the request path sends and testing a call it never makes.
+def _spy_guard(
+    msgs, limit=None, protect_system=1, report=None, reserve=0,
+    standin_protected=True,
+):
+    # `reserve` (hostile pass #5 F3) and `standin_protected` (P14-1,
+    # hostile pass #14, lane v3194-guard) are real parameters of the guard
+    # now, not spy-only additions: passed through so this file still
+    # exercises the guard's actual behaviour instead of silently dropping
+    # an argument the request path sends and testing a call it never
+    # makes (this file patches compact_if_needed to `_no_compaction`,
+    # which never reports a stand-in, so `standin_protected` always
+    # arrives True here — forwarded anyway, on the same principle).
     _guard_limits.append(limit)
     _guard_reserves.append(reserve)
-    out = _real_guard(msgs, limit, protect_system, report, reserve)
+    out = _real_guard(msgs, limit, protect_system, report, reserve, standin_protected)
     _guard_reports.append(dict(report or {}))
     return out
 
@@ -167,7 +174,13 @@ def convo(n_exchanges, newest_pad):
     out = [{"role": "system", "content": "You are a patient assistant."}]
     for i in range(n_exchanges):
         out.append({"role": "user", "content": f"Tell me about item {i}. " + "x" * 150})
-        out.append({"role": "assistant", "content": f"Item {i} is a box. " + "y" * 150})
+        # 150 characters of NON-repeating filler (v3.1.9.2). This was "y" * 150,
+        # which reply_is_degenerate correctly flags as a repetition loop; since
+        # v3.1.9.2 the forwarded window replaces flagged replies before the
+        # guard measures them, so the sweep never needed to shed. Same length,
+        # so the token arithmetic of the sweep is unchanged.
+        _fill = " ".join(f"w{i}x{j}" for j in range(60))[:150]
+        out.append({"role": "assistant", "content": f"Item {i} is a box. " + _fill})
     out.append({"role": "user", "content": "Which is largest? " + "z" * newest_pad})
     return out
 

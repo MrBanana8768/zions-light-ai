@@ -33,6 +33,7 @@ import logging
 import os
 import threading
 import unicodedata
+from collections import OrderedDict
 from typing import Any
 
 from envcfg import env_int
@@ -150,6 +151,135 @@ def _embed(texts: list[str]) -> list[list[float]] | None:
     except Exception as e:
         logger.warning(f"embedding failed: {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Vector cache (v3.1.9.4 B1 / P15-4)
+# ---------------------------------------------------------------------------
+#
+# facts._relevance_order (request path) and dedup._embed_facts (memory
+# tail) each used to hand `_embed` the WHOLE non-pinned fact store in one
+# padded batch, every single call — a fact's embedding is a pure function
+# of its own text, so the store barely changes turn to turn (a handful of
+# facts added/edited, the rest identical), and every call was re-paying
+# for the unchanged majority. Measured against her real ~190-fact store,
+# production image, prod embedding model: one such batch cost a MEDIAN of
+# 12.5s, inline on the event loop for select_for_injection and inline
+# under conv_lock for dedup's clustering (SP\p15\rd_embed_timing.py,
+# rd3.log; SP\p15\rd_block_e2e.py, rd5.log — see fix-3194-bg.md B1 for the
+# before/after numbers this cache produced).
+#
+# Keyed on (model identity, exact text): a byte-for-byte edit to a fact's
+# text is a different key, so an edited fact can never be served a stale
+# vector for its old wording, and a redeploy that changes
+# COMPACTOR_EMBEDDING_MODEL cannot serve one model's vector under another
+# model's key (the whole store would simply re-embed once, cold, under
+# the new key — never wrong, just not yet warm).
+#
+# Process-wide, not per-conversation: her ~190 facts alone would be a
+# rounding error, but P15-4 also measured 25 of 149 conversations with
+# >= 50 facts each, so an unbounded per-process cache over the process's
+# whole lifetime could still grow large. Bounded (LRU via OrderedDict) at
+# _VECTOR_CACHE_MAX entries for that reason — a cold entry for a
+# conversation nobody has touched in a while is cheap to recompute and
+# not worth holding onto forever.
+_VECTOR_CACHE_MAX = env_int("COMPACTOR_VECTOR_CACHE_MAX", 8192)
+_vector_cache: "OrderedDict[tuple[str, str], list[float]]" = OrderedDict()
+_vector_cache_lock = threading.Lock()
+
+
+def reset_vector_cache() -> None:
+    """Clear the vector cache. Test-only hook — production never needs to
+    invalidate by hand (the key already changes with the text), but a test
+    process that mocks `_embed` differently from one test to the next
+    would otherwise see an earlier test's mocked vector survive under an
+    identical fact text (see test_dedup.py's per-test reset convention,
+    which this mirrors — dedup.reset_refusal_memo() exists for the same
+    reason, a different piece of process-scoped state).
+    """
+    with _vector_cache_lock:
+        _vector_cache.clear()
+
+
+def _embed_cached(texts: list[str]) -> list[list[float]] | None:
+    """Like `_embed`, but only calls the model for text this process has
+    not embedded before under the current model identity; the rest is
+    served from `_vector_cache`. Same all-or-nothing contract as `_embed`
+    itself — a list of vectors, one per `texts`, in order, or None — so
+    every existing caller's None-means-fall-back handling (facts.
+    _relevance_order → LRU order, dedup._embed_facts → no-op dedup) keeps
+    working unmodified; this function only changes HOW the vectors are
+    obtained, never what a caller does with a failure.
+
+    Not used for query text: a query is different almost every turn, so
+    caching it would only evict facts that are actually reused and never
+    itself be reused — callers embed the query with plain `_embed`
+    instead and cache only the (much more stable) fact texts.
+    """
+    if not texts:
+        return []
+    model = EMBEDDING_MODEL
+    # v3.1.9.4 (R5). The all-hits fast path used to look every text up
+    # under ONE lock acquisition, decide it had a full house, then
+    # re-acquire the lock for a SEPARATE move_to_end loop. Between the two
+    # acquisitions the lock is not held at all, so a concurrent call — this
+    # function is reached from run_in_threadpool workers (B1), so real
+    # concurrent threads, not just interleaved coroutines — evicting the
+    # SAME key via its own miss path's `popitem(last=False)` left this
+    # loop calling `move_to_end` on a key no longer in the dict:
+    # OrderedDict.move_to_end raises KeyError on a missing key, uncaught,
+    # so the caller's `except Exception` degraded that whole turn to LRU
+    # order (facts._relevance_order) or skipped dedup
+    # (dedup._embed_facts) — not a crash, but a real feature silently
+    # turned off by a timing accident. Fixed by making the lookup AND the
+    # move_to_end ONE critical section: nothing else can run
+    # `popitem`/`move_to_end` while this holds the lock, so a key this
+    # function itself just read as present is still present when it
+    # touches it a few lines later.
+    with _vector_cache_lock:
+        hits = [_vector_cache.get((model, t)) for t in texts]
+        miss_idx = [i for i, v in enumerate(hits) if v is None]
+        if not miss_idx:
+            for t in texts:
+                _vector_cache.move_to_end((model, t))
+            return hits
+    fresh = _embed([texts[i] for i in miss_idx])
+    if fresh is None or len(fresh) != len(miss_idx):
+        # Same failure contract _embed already has: a caller cannot act on
+        # a partially-embedded batch. The cached HITS above are not
+        # affected by this failure — they came from earlier successful
+        # calls and stay valid for the next one; only this call's result
+        # is None.
+        return None
+    with _vector_cache_lock:
+        for i, vec in zip(miss_idx, fresh):
+            key = (model, texts[i])
+            _vector_cache[key] = vec
+            _vector_cache.move_to_end(key)
+        while len(_vector_cache) > _VECTOR_CACHE_MAX:
+            _vector_cache.popitem(last=False)
+        # v3.1.9.4 (R5). This loop touches texts that were HITS from the
+        # lookup several lines above, OUTSIDE this lock acquisition — the
+        # same sibling gap as the all-hits path this fix closes above, one
+        # level over: the lock was released between that lookup and here,
+        # so a concurrent eviction of one of those hit keys is exactly as
+        # possible. The all-hits path could be made airtight by merging
+        # two acquisitions into one (above); this one cannot, the same
+        # way it never could — `_embed(...)` a few lines up is a real,
+        # potentially slow model call that must NOT run while this lock is
+        # held, or every other cache reader/writer serializes behind it.
+        # So: tolerate a missing key instead of assuming presence. Losing
+        # this key's LRU-recency update is harmless (worst case, it is
+        # evicted a little earlier than a perfectly accurate LRU would —
+        # cheap to recompute, never wrong content, per this function's own
+        # docstring); raising KeyError and degrading the whole call is not.
+        for t in texts:
+            key = (model, t)
+            if key in _vector_cache:
+                _vector_cache.move_to_end(key)
+    for i, vec in zip(miss_idx, fresh):
+        hits[i] = vec
+    return hits
 
 
 # ---------------------------------------------------------------------------

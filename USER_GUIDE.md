@@ -59,7 +59,7 @@ they never go to the model, so they cost nothing and reply immediately.
 | `/list-facts` | `/facts` | Show everything currently remembered for this conversation |
 | `/list-archive` | `/archive` | Show facts that have been moved to cold storage |
 | `/remember <text>` | | Manually add a fact (max 500 characters) |
-| `/forget` | | **Wipe all memory** for this conversation — facts, episodic, summaries, persona |
+| `/forget` | | **Wipe all memory** for this conversation — facts, episodic, summaries, persona. Facts stay gone; if you keep chatting in the SAME conversation, the summary hierarchy rebuilds itself from the history your client resends (see the FAQ below) |
 | `/forget <substring>` | | Remove only facts whose text contains the substring (case-insensitive) |
 | `/why` | `/why-did-you-say-that` | Show what's in memory right now — your window into what the model is being told |
 
@@ -245,6 +245,20 @@ ones but you control the wording.
 
 **How do I start fresh without losing my other conversations?**
 `/forget` wipes only the current conversation. Other chats are untouched.
+
+**I ran `/forget` and kept chatting in the same conversation — why did the
+model start referencing old context again?**
+`/forget`'s facts protection is real and permanent: the empty facts store
+it leaves behind stops the lazy backfill from ever reconstructing facts
+from that conversation's history again. The summary hierarchy (L1/L2/L3)
+has no equivalent — if the conversation continues, your client (OpenWebUI)
+resends the WHOLE prior transcript with every new message, because it is
+the client, not the compactor, that decides what history a request
+carries. The very next ordinary turn rolls the summary hierarchy back up
+from scratch over that full history, exactly as if `/forget` had never
+run. `/forget` only clears the summaries UNTIL the next message in a chat
+that continues. If you want old context gone for good, start a genuinely
+new conversation instead of continuing the one you just ran `/forget` in.
 
 **It's repeating the same fact in slightly different words.**
 That's what dedup is for — it runs automatically, but you can force a pass

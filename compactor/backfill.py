@@ -13,8 +13,16 @@ Design choices (per V2.0 plan):
   next request, typically within ~30s-2min depending on conversation
   length on Magnum 12B.
 - **State tracked on disk** in `backfill_state.json` per conv so a pod
-  restart mid-backfill knows to resume rather than re-extract everything
-  (or worse, mark facts file as incomplete forever).
+  restart mid-backfill is visible and can be retried rather than the
+  record sitting `in_progress` forever with nothing reading it. v3.1.9.4
+  B2 (P15-2): this is a RETRY (restart from the top over the current
+  message history, `_merge_backfilled` deduping against whatever is on
+  disk), not an incremental resume from `exchanges_done` — a prior
+  design note here claimed resume-from-progress behaviour that the code
+  never actually had; `needs_backfill` is what decides a retry is due,
+  and it reads the RECORD, not "does a facts file exist" (a live tail's
+  own writes during an abandoned run used to look, permanently, like V2
+  had already taken over).
 - **Stale-detection** so a crashed backfill (process killed, OOM, etc.)
   gets retried on next encounter rather than blocking memory creation
   for that conv forever.
@@ -30,13 +38,77 @@ Storage:
 Format:
     {
       "conv_id": "...",
-      "state": "in_progress" | "complete" | "failed",
+      "state": "in_progress" | "complete" | "failed" | "abandoned" | "wiped",
       "started_at": "2026-05-28T...",
       "updated_at": "2026-05-28T...",
       "exchanges_done": 5,
       "exchanges_total": 47,
+      "attempts": 1,
       "error": null
     }
+
+v3.1.9.4 (R2 / P15-2 follow-up). B2's retry-by-record fix (above) turned a
+PERMANENTLY abandoned backfill into one that retries — correct for a
+transient failure (a redeploy, an OOM, a momentary vLLM outage), and wrong
+on its own for one that fails DETERMINISTICALLY: with nothing capping it,
+that conversation would spend a fresh multi-hour run of vLLM calls on every
+single eligible request from then on, forever. `attempts` (new field above)
+counts how many times a run has actually been started for this backfill
+record's current retry generation; `needs_backfill` refuses to retry a
+`failed` record until an EXPONENTIAL backoff since its last update has
+elapsed (`_backoff_ready`, keyed off `attempts`), and `_run_backfill`
+itself stops retrying and writes the new terminal state `"abandoned"`
+instead of `"failed"` once `attempts` reaches `_MAX_BACKFILL_ATTEMPTS`,
+logging one WARNING naming the conversation and its last error. A crash
+(SIGKILL, OOM) that leaves a stale `in_progress` record already at the cap
+is refused the same way, logged once via logsetup.log_once — that record
+itself is never rewritten to `"abandoned"`, because refusing a kickoff
+spends no background task to write it, so `in_progress`/stale/at-the-cap is
+its own permanent (and, via the log line, discoverable) terminal shape.
+
+v3.1.9.4 (R4 / W2, P15-5 follow-up). R2's cap/backoff above answers "how do
+we stop retrying a backfill that keeps failing"; it does not answer "what
+happens when she /forget-s the conversation a backfill is still running
+against". A backfill is submitted the same way the live memory tail is
+(`fire_and_forget`, R1's own P15-5 finding) and can run for HOURS (R2's own
+docstring above, and P15-2's real-data figures: up to 2h43m for 195
+exchanges) — the single longest-lived background writer in this codebase,
+and until this fix the one background writer R1's wipe-generation counter
+did not cover. `start_backfill_if_needed` now captures
+`memory.current_wipe_generation(conv_id)` at the moment it hands the run to
+`fire_and_forget` — submission, exactly where the live tail captures it, and
+for the identical reason (asyncio.create_task snapshots nothing FOR us here,
+since this is a plain argument rather than a monkeypatched-wholesale
+coroutine — see `_run_backfill`'s own `wipe_generation` parameter). Threaded
+through as `wipe_generation`, `_run_backfill` re-checks it under `conv_lock`
+at TWO points: right after its first lock (before spending any vLLM calls at
+all — catches a wipe that already happened by the time the backfill got its
+first turn on the event loop) and again right before its final
+`facts_module.save_facts` write (catches a wipe that arrived DURING the
+run). v3.1.9.4 (R5 / P16-2) added a THIRD check, unlocked, at the top of
+every iteration of the extraction loop BETWEEN those two: the two locked
+checks alone still let a wipe that lands mid-loop go unnoticed for as long
+as the run had left — P15-2's own real-data figures put that at up to
+2h43m — burning a real vLLM call per remaining exchange on history she just
+asked to forget, before the final locked check discarded the whole result
+anyway. The per-iteration check is a plain dict read
+(`current_wipe_generation`), not a write, so it needs no lock; the two
+locked checks stay the ones actually authoritative for what gets saved. It
+is also threaded into `summarizer.maybe_rollup` via
+`summarizer.wipe_generation_ctx`, the same mechanism `main._rollup_hierarchy`
+uses, so the hierarchical-summary half of a backfill is covered by the exact
+same generic check `summarizer._maybe_rollup_body` already has — no new
+summarizer.py logic, just this module finally passing a real value instead
+of leaving the contextvar at its `None` default.
+
+On a mismatch this module does NOT write `"failed"` (which `_backoff_ready`
+would eventually retry) or `"abandoned"` (framed as "gave up after repeated
+failures", the wrong story and the wrong log level for what is actually
+happening): it writes the new terminal state `"wiped"` — permanent, like
+`"complete"`, in `needs_backfill` — because retrying would mean
+reconstructing, from the very history she asked to forget, the exact memory
+`/forget` just deleted. That would not be a bug in backfill.py; it would be
+`/forget` failing to be `/forget`.
 """
 
 import logging
@@ -50,12 +122,14 @@ from starlette.concurrency import run_in_threadpool
 
 import envcfg
 import facts as facts_module
+import logsetup
 import retrieval
 import summarizer
 from memory import (
     StoreUnreadable,
     atomic_write_json,
     conv_lock,
+    current_wipe_generation,
     facts_path,
     read_json,
     storage_root,
@@ -68,6 +142,25 @@ logger = logging.getLogger("compactor.backfill")
 # consider it crashed and retry. 10 minutes covers the longest plausible
 # backfill (~2000 message conversation at 300ms/call), with margin.
 _STALE_SECONDS = 600
+
+# v3.1.9.4 (R2 / P15-2 follow-up). A backfill that fails deterministically
+# (a malformed history, a store this conversation will never satisfy) must
+# not re-spend a multi-hour run of vLLM calls on every future eligible
+# request forever. Three tries — the first plus two retries — is enough to
+# ride out a transient failure (the case B2 exists for) without turning a
+# permanent one into unbounded load. Small and env-overridable rather than
+# hardcoded, matching this module's other retry/budget knobs.
+_MAX_BACKFILL_ATTEMPTS = envcfg.env_int("COMPACTOR_BACKFILL_MAX_ATTEMPTS", 3)
+
+# Base backoff between a failed attempt and the next retry, DOUBLED per
+# attempt already spent (attempt 1 failed -> wait this long; attempt 2
+# failed -> wait 2x this long; attempt 3 failed -> abandoned, no more
+# retries at all). Reuses _STALE_SECONDS' own 10-minute unit as the default
+# — an operator who already knows what that number means does not need a
+# second one.
+_BACKFILL_RETRY_BACKOFF_S = envcfg.env_int(
+    "COMPACTOR_BACKFILL_RETRY_BACKOFF_S", _STALE_SECONDS
+)
 
 # v3.1.9 (tail catch-up). YES, this gets a budget too, and reuses the tail's
 # own knob (main.TAIL_ROLLUP_MAX_CALLS, same env var) rather than a
@@ -144,6 +237,267 @@ def _write_state(conv_id: str, state: dict) -> None:
     atomic_write_json(_backfill_state_path(conv_id), state)
 
 
+def _write_state_unless_wiped(conv_id: str, state: dict) -> bool:
+    """Same as `_write_state`, for every ORDINARY progress/failure/complete
+    write `_run_backfill` makes — except it refuses to overwrite a record
+    that already reads `"wiped"` on disk. v3.1.9.4 (R6 / P17-4 fix).
+
+    `_run_backfill`'s own per-iteration generation check (right before the
+    extraction call) and the two LOCKED checks (kickoff and final save)
+    cover most of a wipe landing mid-run, but there is a gap none of them
+    closes: a wipe that lands WHILE an extraction call is in flight is
+    invisible to the checks around it — the top-of-loop check already
+    passed, and on the LAST exchange there is no next iteration to run the
+    next top-of-loop check at all, so `mark_wiped`'s own `"wiped"` write
+    (inside the wipe's own lock) is the last thing on disk only until this
+    loop's unconditional post-extraction progress write lands right behind
+    it, turning `"wiped"` back into `"in_progress"`. A crash between that
+    write and the final locked check (plausible: that check waits on
+    `conv_lock`, and a live tail can hold it for as long as an extraction
+    plus a rollup) leaves exactly that clobbered `"in_progress"` on disk —
+    which later goes stale and becomes retryable, silently undoing the
+    wipe on her next message.
+
+    Re-checking the generation once more right before each of these writes
+    (see the call sites) closes the common case, but the check and the
+    write are still two separate statements with an `await`-free gap
+    between them in an async function — not proof against every interleave
+    a future change could introduce. This is the second, structural half
+    of the fix: whatever gap remains, the write itself refuses to turn a
+    `"wiped"` record into anything else, so the two together mean a wipe
+    that has already landed on disk can never be undone by a write that
+    started before it. `_write_wiped` and `mark_wiped` do not call this —
+    their entire job is to WRITE `"wiped"`, including over a record that
+    is not already wiped, and writing `"wiped"` over `"wiped"` is a
+    harmless no-op either way.
+
+    Returns True if the write went through, False if it was refused
+    (refused only when a wipe has already landed).
+    """
+    current = read_state(conv_id)
+    if current is not None and current.get("state") == "wiped":
+        logger.info(
+            f"conv={conv_id}: backfill progress write skipped — the record "
+            f"already reads 'wiped'; not resurrecting it as {state.get('state')!r}"
+        )
+        return False
+    _write_state(conv_id, state)
+    return True
+
+
+def _write_failed_or_abandoned(
+    conv_id: str,
+    attempts: int,
+    *,
+    started_at: str,
+    exchanges_done: int,
+    exchanges_total: int,
+    error: str,
+) -> None:
+    """The one place `_run_backfill` records an attempt that did not
+    succeed (v3.1.9.4, R2 / P15-2 follow-up). `attempts` is THIS run's own
+    attempt number (see `_run_backfill`'s `this_attempt`) — once it reaches
+    `_MAX_BACKFILL_ATTEMPTS`, the record becomes the terminal state
+    `"abandoned"` instead of the retryable `"failed"`, and a WARNING names
+    the conversation, the attempt count and the error, exactly once (this
+    function runs once per failed run, so no log_once is needed here — see
+    `needs_backfill` for the sibling case, a crash rather than a clean
+    failure, which DOES need one).
+
+    Two call sites share this rather than each deciding independently: the
+    fix-one-site-miss-the-sibling defect this codebase keeps paying for is
+    exactly what having only one of the two write "abandoned" would be.
+    """
+    if attempts >= _MAX_BACKFILL_ATTEMPTS:
+        logger.warning(
+            f"conv={conv_id}: backfill abandoned after {attempts} failed "
+            f"attempt(s) — the {_MAX_BACKFILL_ATTEMPTS}-attempt cap is "
+            f"reached, so this conversation's history will NOT be "
+            f"retried again; last error: {error}"
+        )
+        state_value = "abandoned"
+    else:
+        state_value = "failed"
+    # v3.1.9.4 (R6 / P17-4 fix). Wipe-safe: a wipe that landed while this
+    # run was failing must not have its "wiped" record turned back into
+    # "failed"/"abandoned" — see _write_state_unless_wiped's own docstring.
+    _write_state_unless_wiped(conv_id, {
+        "state": state_value,
+        "started_at": started_at,
+        "exchanges_done": exchanges_done,
+        "exchanges_total": exchanges_total,
+        "attempts": attempts,
+        "error": error[:500],
+    })
+
+
+def _write_wiped(
+    conv_id: str,
+    attempts: int,
+    *,
+    started_at: str,
+    exchanges_done: int,
+    exchanges_total: int,
+) -> None:
+    """The one place `_run_backfill` records that a wipe (`/forget`, the
+    admin facts-delete endpoint, the self-test cleanup, `/retire`'s apply
+    step, or an overwrite import — anything that calls
+    `memory.bump_wipe_generation`) ran on this conversation while THIS run
+    was in flight (v3.1.9.4, R4 / W2 / P15-5 follow-up).
+
+    Deliberately NOT `"failed"` and NOT `"abandoned"`: both of those
+    describe an extraction that could not finish and MIGHT succeed on a
+    later try, which is exactly why `needs_backfill` retries a `"failed"`
+    record (after `_backoff_ready`'s backoff) and only stops at
+    `"abandoned"` once `_MAX_BACKFILL_ATTEMPTS` clean failures have been
+    spent. A wipe is not a failure to retry past — the user asked for this
+    conversation's memory to be gone, and a retry that reconstructs it from
+    the very history she just asked to forget would not fix backfill.py, it
+    would undo `/forget`. `"wiped"` gets its own permanent refusal in
+    `needs_backfill` (the same terminal weight as `"complete"`), no backoff,
+    and one INFO line rather than a WARNING — discarding here is this fix
+    working as intended, not a failure worth paging anyone over.
+    """
+    logger.info(
+        f"conv={conv_id}: backfill discarded — a wipe ran on this "
+        f"conversation while this run (attempt {attempts}) was in flight; "
+        f"not retrying — the user asked for that memory to be gone"
+    )
+    _write_state(conv_id, {
+        "state": "wiped",
+        "started_at": started_at,
+        "exchanges_done": exchanges_done,
+        "exchanges_total": exchanges_total,
+        "attempts": attempts,
+        "error": None,
+    })
+
+
+def mark_wiped(conv_id: str) -> None:
+    """Neutralise any backfill record for `conv_id` so a later request's
+    `needs_backfill()` cannot retry from history a wipe just removed
+    (v3.1.9.4 R5 / P16-1).
+
+    B2 reordered `needs_backfill` to check the RECORD before the facts-file
+    tombstone (see that function's own docstring), which meant a `/forget`
+    (or the admin facts-delete endpoint, or an overwrite import) on a
+    conversation with a `failed` or stale `in_progress` backfill record left
+    that record untouched. `/forget` reported a clean wipe; her very next
+    message then re-extracted the whole forgotten history, because
+    `needs_backfill`'s record branches never got as far as the tombstone
+    check the empty facts file used to guarantee.
+
+    Called from every wipe path that reaches `memory.bump_wipe_generation`
+    for this conv_id (`main._clear_all_memory`, W1's overwrite import),
+    INSIDE the same locked section the wipe itself runs in — same ordering
+    guarantee `bump_wipe_generation`'s own docstring establishes for the
+    generation counter: a reader that takes the lock after this call sees
+    both the new generation and the neutralised record, never one without
+    the other.
+
+    No-op when there is no record at all — most conversations never had a
+    backfill, and writing one into existence here would make them start
+    appearing in the backfill index for no reason. Unconditional otherwise,
+    including over a `"complete"` or already-`"wiped"` record: the wipe just
+    made whatever that record was written against (partial or full) gone,
+    so its exact prior state does not matter, only that nothing may ever
+    retry from it again.
+
+    This alone is not the whole fix — a backfill still ACTIVELY running
+    keeps making its own progress writes (`_write_state_unless_wiped`
+    inside `_run_backfill`'s loop and around it) which, without more, could
+    land after this call and overwrite `"wiped"` back to `"in_progress"`.
+    See the generation checks inside and around that loop (P16-2's fix,
+    and P17-4's follow-up covering the gap during the LAST exchange's
+    extraction call) for what catches a wipe landing mid-run rather than
+    mid-gap, and `_write_state_unless_wiped`'s own docstring for the
+    belt-and-suspenders write-side refusal that backs those checks up.
+    """
+    state = read_state(conv_id)
+    if state is None:
+        return
+    _write_state(conv_id, {
+        "state": "wiped",
+        "started_at": state.get("started_at") or _now_iso(),
+        "exchanges_done": state.get("exchanges_done", 0),
+        "exchanges_total": state.get("exchanges_total", 0),
+        "attempts": state.get("attempts", 0),
+        "error": None,
+    })
+
+
+def _facts_tombstoned(conv_id: str) -> bool:
+    """True iff a facts file exists for this conv, is EMPTY, and the
+    archive sidecar is ALSO empty — the signature a genuine wipe's
+    tombstone leaves (`main._clear_all_memory` / `commands._wipe_all_
+    layers`' own "leave an EMPTY facts store behind rather than no facts
+    store" comment; `_wipe_all_layers` clears the archive sidecar too).
+    v3.1.9.4 (R5 / P16-1; R6 / P17-5 correction, see below).
+
+    Defense in depth, checked from `needs_backfill`'s retry branches
+    (`failed`, stale `in_progress`) regardless of what the record itself
+    says: `mark_wiped` is the primary defence (it runs inside every wipe's
+    own lock, so it cannot be raced), but a wipe path that some future
+    change adds without also calling `mark_wiped` — the "fixed at one site,
+    missed the identical sibling" defect this codebase keeps paying for —
+    must not silently reopen this exact hole.
+
+    v3.1.9.4 (R6 / P17-5 correction). This docstring used to claim "nothing
+    in this codebase ever writes an empty facts file except a wipe's
+    tombstone." Not literally true, and a hostile pass's own review of the
+    PREMISE, not just the code, is what caught it: a selective
+    `/forget <substring>` that happens to match every stored fact
+    (`commands._handle_forget`'s arg branch), `/tidy apply` removing every
+    remaining row, the admin archive-stale sweep
+    (`facts.archive_stale_facts`), and an empty-bundle import can all leave
+    `[]` too, none of them a wipe (no `bump_wipe_generation`, no
+    `mark_wiped`).
+      - Selective /forget-all and an empty-bundle import are still
+        deliberate, total deletions by her or the operator — refusing a
+        failed/stale retry afterwards is the same defensible call a real
+        wipe gets, so these two are left as-is.
+      - `/tidy` and archive-stale are categorically different: they ARCHIVE
+        rather than delete (`facts.archive_facts`/`archive_stale_facts`
+        move rows to the sidecar `restore_from_archive` can bring back),
+        so the facts are NOT gone — treating that as a wipe's tombstone
+        would refuse a legitimate retry over memory that still exists, one
+        call away from being restored. The archive-sidecar check below is
+        the fix: a genuine wipe (via `_wipe_all_layers`, the chat /forget
+        path) clears the archive too, so requiring it ALSO empty excludes
+        exactly the `/tidy`/archive-stale case while still recognizing a
+        real wipe. (The admin DELETE endpoint does not yet clear the
+        archive sidecar at all — a separate, already-acknowledged gap,
+        see `commands._wipe_all_layers`' own comment — so this check is
+        weaker defense-in-depth for that one path when the conv also has
+        older archived facts predating the wipe; `mark_wiped` remains the
+        primary defence there regardless.)
+
+    Nothing in this codebase writes an empty facts file with an EMPTY
+    archive sidecar behind it except a wipe's tombstone: extraction only
+    APPENDS (`_merge_backfilled`, the live tail's own merge), and a
+    conversation that has never had a fact extracted has no file at all
+    (G2's own reasoning — an empty merge is nothing to save). So an
+    existing-but-empty file with nothing in the archive either is never
+    ambiguous the way a non-empty one legitimately is (that case IS the
+    live tail's writes during a resumable run — see `_run_backfill`'s own
+    `existing and resuming` branch, which this function does not touch).
+
+    Unreadable (either file) is treated as "not confirmed a tombstone"
+    (returns False) rather than guessed at — the same "never rewrite the
+    unknown from a guess" rule `_run_backfill` itself follows for
+    `StoreUnreadable`; the record-based checks this backs up are still
+    there as the primary path.
+    """
+    if not facts_path(conv_id).is_file():
+        return False
+    try:
+        if facts_module.load_facts(conv_id) != []:
+            return False
+        return facts_module.load_archive(conv_id) == []
+    except StoreUnreadable:
+        return False
+
+
 def is_stale(state: dict) -> bool:
     """A state is stale if it's marked in_progress but hasn't been touched
     in _STALE_SECONDS. Indicates a crashed backfill that should be retried.
@@ -159,6 +513,39 @@ def is_stale(state: dict) -> bool:
         return True
     age = (datetime.now(timezone.utc) - ts).total_seconds()
     return age > _STALE_SECONDS
+
+
+def _backoff_ready(state: dict) -> bool:
+    """Whether enough time has passed since a `failed` backfill's last
+    update to retry it again (v3.1.9.4, R2 / P15-2 follow-up).
+
+    Round 2 (B2) made `needs_backfill` return True the instant it saw
+    `state == "failed"`, with no minimum wait at all — so a backfill
+    failing for a deterministic reason retried on the very next eligible
+    request, spending a fresh run of vLLM calls every time. The wait
+    DOUBLES per attempt already recorded (`_BACKFILL_RETRY_BACKOFF_S *
+    2 ** (attempts - 1)`), so a backfill that keeps failing spreads its
+    remaining tries out rather than burning through `_MAX_BACKFILL_
+    ATTEMPTS` inside one busy minute — the cap in `needs_backfill`/
+    `_run_backfill` is what stops it forever; this is what slows it down
+    on the way there.
+
+    Same malformed-timestamp handling as `is_stale`: a missing or
+    unparseable `updated_at` does not block a retry on a guess.
+    """
+    updated_at = state.get("updated_at")
+    if not updated_at:
+        return True
+    try:
+        ts = datetime.fromisoformat(updated_at)
+    except (ValueError, TypeError):
+        return True
+    age = (datetime.now(timezone.utc) - ts).total_seconds()
+    # At least 1: a record with no attempts recorded (pre-fix, or a
+    # malformed write) backs off by exactly the base amount, not less.
+    attempts = max(1, int(state.get("attempts") or 1))
+    backoff = _BACKFILL_RETRY_BACKOFF_S * (2 ** (attempts - 1))
+    return age > backoff
 
 
 # ---------------------------------------------------------------------------
@@ -207,28 +594,138 @@ _MIN_MESSAGES_FOR_BACKFILL = 4
 
 def needs_backfill(conv_id: str, messages: list[dict]) -> bool:
     """Return True iff this conv has enough history to be worth backfilling
-    AND has no facts file yet AND no in-progress (non-stale) backfill.
+    AND (no facts file yet, OR an earlier backfill of THIS conversation was
+    abandoned or failed) AND no in-progress (non-stale) backfill is already
+    running.
+
+    v3.1.9.4 B2 (P15-2). Until this fix, `facts_path(conv_id).is_file()`
+    was checked FIRST and unconditionally returned False the moment any
+    facts file existed — including one the KICKOFF REQUEST'S OWN live tail
+    wrote within seconds of the reply, while a lazy backfill of the same
+    conversation's full history was still minutes into running in the
+    background. A redeploy, OOM or crash any time after that first live
+    tail write (P15-2's real-data run lengths: up to 2h43m for 195
+    exchanges) left the backfill record permanently `in_progress` with no
+    reader, and every later request for that conversation saw a facts file
+    and never tried again — the history before that first live exchange
+    was gone for good, silently.
+
+    The retry condition is now the RECORD, not "does a facts file exist":
+    a facts file only means "V2 has taken over from V1" when there is no
+    unfinished backfill record for this exact conversation still open. See
+    _run_backfill's own up-front refusal, which this decision has to agree
+    with — a resumed run's `existing` facts (the live tail's writes made
+    during the abandoned attempt) must NOT cause it to refuse itself as
+    "not a V1 store"; `_merge_backfilled`'s additive merge is what makes
+    running a resumed pass over a non-empty store safe.
+
+    v3.1.9.4 (R2 / P15-2 follow-up). A `failed` record no longer retries
+    unconditionally: it waits out `_backoff_ready`'s exponential backoff
+    first, and once `attempts` reaches `_MAX_BACKFILL_ATTEMPTS` it does not
+    retry at all — see `_run_backfill`, which writes the terminal state
+    `"abandoned"` (checked here the same as `"complete"`) instead of
+    `"failed"` the moment that happens, so this branch is reached at most
+    `_MAX_BACKFILL_ATTEMPTS - 1` times for any one record. A stale
+    `in_progress` record already AT the cap (a crash on what was already
+    the Nth attempt) is refused the same way, logged once, because nothing
+    will run to rewrite THAT record to `"abandoned"` — refusing a kickoff
+    spends no background task.
+
+    v3.1.9.4 (R4 / W2 / P15-5 follow-up). `"wiped"` (see `_write_wiped`) is
+    the same terminal weight as `"complete"` for the identical reason: a
+    wipe that ran while a backfill was in flight is not evidence the next
+    attempt might succeed, it is a decision the user already made that this
+    function must not second-guess by trying again.
     """
     if len(messages) < _MIN_MESSAGES_FOR_BACKFILL:
         return False  # too short to bother
-    if facts_path(conv_id).is_file():
-        # Facts already exist — V2 took over from new. Advisory only: this
-        # runs at kickoff and the task starts later, so _run_backfill repeats
-        # the check with load_facts under the lock before it does any work
-        # (v3.1 F3). Kept as is_file() here because it is the cheaper answer
-        # and because an existing-but-empty facts file is still a store this
-        # module has no business reconstructing.
+    if not facts_module.extraction_enabled():
+        # v3.1.9.4 B2 (P15-8). Backfill's whole job is spending vLLM calls
+        # to extract facts; with extraction off there is nothing for it to
+        # do; _facts_tail already honours this switch (main.py:7381) and a
+        # sibling that runs the identical kind of call must too.
         return False
     state = read_state(conv_id)
-    if state is None:
-        return True  # never attempted
-    s = state.get("state")
-    if s == "complete":
-        return False  # already done
-    if s == "in_progress" and not is_stale(state):
-        return False  # someone else is on it
-    # "failed" or stale "in_progress" → retry
-    return True
+    if state is not None:
+        s = state.get("state")
+        if s == "complete":
+            return False  # already done
+        if s == "abandoned":
+            # v3.1.9.4 (R2). Gave up after _MAX_BACKFILL_ATTEMPTS clean
+            # failures — see _run_backfill. Same terminal weight as
+            # "complete": nothing about a future request changes what
+            # already happened this many times.
+            return False
+        if s == "wiped":
+            # v3.1.9.4 (R4 / W2, and R5 / P16-1: every wipe path now calls
+            # mark_wiped() to REACH this state even when no backfill was
+            # in flight at all). A wipe ran on this conversation — either
+            # while a backfill was in flight (_write_wiped, from inside
+            # _run_backfill) or against a `failed`/stale `in_progress`
+            # record that was just sitting there (mark_wiped, from inside
+            # the wipe itself). Refused exactly like "complete"/"abandoned":
+            # retrying would reconstruct, from the history she asked to
+            # forget, the exact memory /forget (or /retire, or an overwrite
+            # import) just deleted.
+            return False
+        if s == "in_progress":
+            if not is_stale(state):
+                return False  # someone else is on it
+            if int(state.get("attempts") or 0) >= _MAX_BACKFILL_ATTEMPTS:
+                # Crashed on an attempt that was already at the cap. This
+                # record stays in_progress/stale forever — see this
+                # function's own docstring for why nothing rewrites it —
+                # so say so exactly once rather than silently refusing
+                # every request for this conversation from now on.
+                if logsetup.log_once(f"backfill.cap_on_crash.{conv_id}"):
+                    logger.warning(
+                        f"conv={conv_id}: backfill's last attempt "
+                        f"({state.get('attempts')}) crashed rather than "
+                        f"failing cleanly, and it was already at the "
+                        f"{_MAX_BACKFILL_ATTEMPTS}-attempt cap — not "
+                        f"retrying again for this conversation"
+                    )
+                return False
+            if _facts_tombstoned(conv_id):
+                # v3.1.9.4 (R5 / P16-1). A wipe emptied the facts file since
+                # this record was written (crashed) — the primary defence is
+                # `mark_wiped` rewriting the record itself, but this record
+                # predates that call, or reached this state through a path
+                # this fix missed. Refuse the same as a "wiped" record would.
+                return False
+            return True  # stale, and under the cap — retry
+        if s == "failed":
+            attempts = int(state.get("attempts") or 0)
+            if attempts >= _MAX_BACKFILL_ATTEMPTS:
+                # Reachable only for a record written before this fix
+                # shipped (_run_backfill now writes "abandoned" instead of
+                # letting a record reach this combination) — same decision
+                # either way: defence in depth, not the primary path.
+                return False
+            if not _backoff_ready(state):
+                return False
+            if _facts_tombstoned(conv_id):
+                # v3.1.9.4 (R5 / P16-1). Same defence-in-depth as the stale
+                # in_progress branch just above: a "failed" record whose
+                # conversation was wiped in the meantime (this record
+                # predating `mark_wiped`, or a wipe path that missed it) must
+                # not retry into history the user asked to have forgotten.
+                return False
+            return True  # backoff elapsed, no tombstone — retry
+        # Any other/unknown value on disk: fall through to the facts-file
+        # check below rather than guess — same as "no record" (state=None).
+    if facts_path(conv_id).is_file():
+        # No backfill record for this conversation at all (state is None,
+        # or an unrecognised value handled just above) — the ORIGINAL v2.0
+        # gate: facts already exist, so this is not a fresh V1 conversation
+        # and there is nothing to reconstruct. Advisory only: this runs at
+        # kickoff and the task starts later, so _run_backfill repeats the
+        # check with load_facts under the lock before it does any work
+        # (v3.1 F3). Kept as is_file() here because it is the cheaper
+        # answer and because an existing-but-empty facts file is still a
+        # store this module has no business reconstructing.
+        return False
+    return True  # never attempted, and no facts file either
 
 
 # ---------------------------------------------------------------------------
@@ -272,17 +769,37 @@ async def _run_backfill(
     vllm_url: str,
     model: str,
     raw_messages: list[dict] | None = None,
+    wipe_generation: int | None = None,
 ) -> None:
     """The actual backfill: iterate pairs, extract facts, save state
     incrementally so a crash mid-run can resume from progress.
 
     Errors during individual extractions are logged but don't fail the
     whole backfill — we keep going and save whatever we got.
+
+    `wipe_generation` (v3.1.9.4, R4 / W2 / P15-5 follow-up): the
+    conversation's wipe generation as of the moment this run was SUBMITTED
+    to the pool (`start_backfill_if_needed`, via `fire_and_forget`; see
+    `memory.current_wipe_generation`'s own docstring). `None` (the default)
+    means the caller is not participating — every direct-call test double
+    of this function (`test_backfill.py`, `test_v3194_r3_r2.py`, and others
+    that call `_run_backfill` positionally with today's exact signature)
+    keeps working unchanged, and the check below is a no-op for them, same
+    convention as `main._facts_tail`'s own `wipe_generation` keyword. When
+    not None, re-checked under `conv_lock` at the two points below, and
+    threaded into `summarizer.maybe_rollup` via `wipe_generation_ctx` for
+    the hierarchical-summary half of this run.
     """
     started_at = _now_iso()
     pairs: list[tuple[str, str]] = []
     accumulated: list[dict] = []
     now_unix = _now_unix()
+    # v3.1.9.4 (R2). Sane fallback for the outer `except` below, in the
+    # (believed unreachable — read_state degrades to None rather than
+    # raising) case that something fails before this is properly computed
+    # a few lines into the try. Treated as attempt 1 rather than crashing
+    # the exception handler itself over what to log.
+    this_attempt = 1
 
     try:
         # Refuse before spending minutes of GPU on it. Backfill exists to give
@@ -292,6 +809,25 @@ async def _run_backfill(
         # main.py:1509 hands us the CLIENT's message array — under the
         # 2026-08-24 7-of-241 condition a triggered backfill extracts from 7
         # messages and saves that as the entire store (v3.1 F3).
+        # v3.1.9.4 B2 (P15-2). Read BEFORE this run's own _write_state below
+        # overwrites it: a resumed pass (a stale in_progress or a failed
+        # record for THIS conversation) is expected to find non-empty
+        # `existing` facts — the live tail wrote them seconds after the
+        # kickoff reply, minutes before the earlier attempt died — and
+        # those are not evidence this is no longer a V1 store, just the
+        # window between "backfill decided to run" and "backfill finished".
+        prior_state = read_state(conv_id)
+        resuming = prior_state is not None and (
+            prior_state.get("state") == "failed"
+            or (prior_state.get("state") == "in_progress" and is_stale(prior_state))
+        )
+        # v3.1.9.4 (R2 / P15-2 follow-up). This run's own attempt number —
+        # carried through every _write_state call below (including the
+        # per-exchange progress writes, so a crash mid-run leaves a record
+        # that already shows which attempt it was), and what
+        # _write_failed_or_abandoned compares against _MAX_BACKFILL_
+        # ATTEMPTS. A fresh backfill (no prior record) is attempt 1.
+        this_attempt = int((prior_state or {}).get("attempts") or 0) + 1
         async with conv_lock(conv_id):
             try:
                 existing = facts_module.load_facts(conv_id)
@@ -305,32 +841,99 @@ async def _run_backfill(
                     f"reconstruction"
                 )
                 return
-        if existing:
+            # v3.1.9.4 (R4 / W2 / P15-5 follow-up). Checked under the SAME
+            # conv_lock a wipe path bumps and deletes inside (see
+            # memory.bump_wipe_generation's own docstring for why that
+            # ordering makes a single check here airtight), and as early as
+            # possible: this catches the common case — a /forget that ran
+            # any time between this run being submitted and it finally
+            # getting a turn on the event loop — before a single vLLM call
+            # is spent reconstructing history she just asked to forget. A
+            # wipe arriving DURING the extraction loop below is caught by
+            # the second check, right before this run's own write.
+            # _write_wiped logs; nothing else here needs to.
+            if wipe_generation is not None and wipe_generation != current_wipe_generation(conv_id):
+                _write_wiped(
+                    conv_id, this_attempt,
+                    started_at=started_at, exchanges_done=0, exchanges_total=0,
+                )
+                return
+        if existing and not resuming:
             logger.info(
                 f"conv={conv_id}: backfill refused — {len(existing)} fact(s) "
                 f"already on disk; this is not a V1 store"
             )
             return
+        if existing and resuming:
+            logger.info(
+                f"conv={conv_id}: resuming a backfill whose earlier attempt "
+                f"left state={prior_state.get('state')!r} "
+                f"({prior_state.get('exchanges_done', 0)}/"
+                f"{prior_state.get('exchanges_total', 0)} exchanges done) — "
+                f"{len(existing)} fact(s) already on disk (from the live "
+                f"tail or a prior partial pass) will be merged with, not "
+                f"replaced by, this pass's extraction"
+            )
 
         pairs = extract_user_assistant_pairs(messages)
         if not pairs:
             logger.info(f"conv={conv_id}: backfill skipped — no user/assistant pairs found")
             return
 
-        _write_state(conv_id, {
+        # v3.1.9.4 (R6 / P17-4 fix): wipe-safe (see
+        # _write_state_unless_wiped) — the locked check just above already
+        # covers a wipe that landed before this point, but a wipe racing
+        # in right after that check and before this write is the same
+        # class of gap the loop's own checks below close for later writes.
+        _write_state_unless_wiped(conv_id, {
             "state": "in_progress",
             "started_at": started_at,
             "exchanges_done": 0,
             "exchanges_total": len(pairs),
+            "attempts": this_attempt,
             "error": None,
         })
-        logger.info(f"conv={conv_id}: backfill starting over {len(pairs)} exchange(s)")
+        logger.info(
+            f"conv={conv_id}: backfill starting over {len(pairs)} "
+            f"exchange(s) (attempt {this_attempt}/{_MAX_BACKFILL_ATTEMPTS})"
+        )
 
         async with httpx.AsyncClient() as client:
             for i, (user_text, asst_text) in enumerate(pairs, start=1):
+                # v3.1.9.4 (R5 / P16-2). Checked at the TOP of every
+                # iteration, with NO lock: a wipe that lands mid-loop used
+                # to go unnoticed until the two locked checks that bracket
+                # this loop (first turn on the event loop, and the final
+                # save) — meaning every remaining exchange still spent a
+                # real vLLM call extracting facts from history she had
+                # already asked to forget, for as long as the run had left
+                # (P15-2: up to 2h43m for 195 exchanges), before the second
+                # locked check discarded the whole result anyway. This is
+                # only a dict read (memory.current_wipe_generation), not a
+                # write, so it needs no lock of its own — the two locked
+                # checks around this loop stay the ones that are actually
+                # authoritative for what gets saved; this one just stops
+                # spending vLLM calls on a run this backfill already knows
+                # is going to be discarded. On a mismatch, write the
+                # terminal "wiped" state (same as the locked checks use) and
+                # stop — no more calls, no more progress writes that could
+                # overwrite a mark_wiped() written by the wipe itself.
+                if wipe_generation is not None and wipe_generation != current_wipe_generation(conv_id):
+                    _write_wiped(
+                        conv_id, this_attempt,
+                        started_at=started_at,
+                        exchanges_done=i - 1, exchanges_total=len(pairs),
+                    )
+                    return
                 try:
                     new_strs = await facts_module.extract_facts_from_exchange(
-                        client, vllm_url, model, user_text, asst_text, accumulated
+                        client, vllm_url, model, user_text, asst_text, accumulated,
+                        # v3.1.9.4 B2 (P15-8 fix, incidental): without this
+                        # every backfill extraction call logged
+                        # "conv=? (caller passed none)", so a backfill's
+                        # load on vLLM could not be attributed to the
+                        # conversation causing it.
+                        conv_id=conv_id,
                     )
                     for s in new_strs:
                         accumulated.append({
@@ -345,12 +948,41 @@ async def _run_backfill(
                         f"conv={conv_id}: backfill extraction failed on "
                         f"exchange {i}/{len(pairs)}: {e}"
                     )
-                # Progress update every exchange (cheap atomic write)
-                _write_state(conv_id, {
+                # v3.1.9.4 (R6 / P17-4 fix). Re-check AFTER the extraction
+                # call, before the progress write below — the top-of-loop
+                # check above only proves no wipe had landed BEFORE this
+                # exchange's (possibly slow) extraction call started. A
+                # wipe landing WHILE that call was in flight is invisible
+                # to it, and on the LAST exchange there is no next
+                # iteration to catch it at the next top-of-loop check
+                # either: the progress write below would be the last thing
+                # on disk, turning mark_wiped's "wiped" back into
+                # "in_progress" — exactly the gap the reviewer's P17-4
+                # probe demonstrated (a /forget landing during the final
+                # extraction call, then a kill before the final locked
+                # check, left a retryable "in_progress" record that
+                # re-extracted the whole forgotten history). Same
+                # terminal write and same early return as the top-of-loop
+                # check uses.
+                if wipe_generation is not None and wipe_generation != current_wipe_generation(conv_id):
+                    _write_wiped(
+                        conv_id, this_attempt,
+                        started_at=started_at,
+                        exchanges_done=i - 1, exchanges_total=len(pairs),
+                    )
+                    return
+                # Progress update every exchange (cheap atomic write).
+                # v3.1.9.4 (R6 / P17-4 fix): wipe-safe (see
+                # _write_state_unless_wiped) — belt-and-suspenders for the
+                # re-check just above, which closes the common case but is
+                # still a separate statement from this write, not an
+                # atomic check-and-write.
+                _write_state_unless_wiped(conv_id, {
                     "state": "in_progress",
                     "started_at": started_at,
                     "exchanges_done": i,
                     "exchanges_total": len(pairs),
+                    "attempts": this_attempt,
                     "error": None,
                 })
 
@@ -368,13 +1000,31 @@ async def _run_backfill(
                     f"backfill write rather than replacing the store with "
                     f"{len(accumulated)} reconstructed fact(s)"
                 )
-                _write_state(conv_id, {
-                    "state": "failed",
-                    "started_at": started_at,
-                    "exchanges_done": len(pairs),
-                    "exchanges_total": len(pairs),
-                    "error": f"facts store unreadable at write time: {e}"[:500],
-                })
+                _write_failed_or_abandoned(
+                    conv_id, this_attempt,
+                    started_at=started_at,
+                    exchanges_done=len(pairs),
+                    exchanges_total=len(pairs),
+                    error=f"facts store unreadable at write time: {e}",
+                )
+                return
+            # v3.1.9.4 (R4 / W2 / P15-5 follow-up). The second, load-bearing
+            # check: a wipe can just as easily arrive DURING the (possibly
+            # hours-long) extraction loop above as before it. Checked right
+            # after the fresh load and before ANY of `merged`/`kept`/the
+            # actual save below are computed from `accumulated` — the same
+            # "checked right after the load, before anything else runs"
+            # placement summarizer._maybe_rollup_body uses for its own
+            # generation check, for the identical reason: nothing else may
+            # hold conv_lock(conv_id) while this section does, so the wipe's
+            # own bump-and-deletes are either already fully done or queued
+            # immediately behind this exact lock.
+            if wipe_generation is not None and wipe_generation != current_wipe_generation(conv_id):
+                _write_wiped(
+                    conv_id, this_attempt,
+                    started_at=started_at,
+                    exchanges_done=len(pairs), exchanges_total=len(pairs),
+                )
                 return
             merged = _merge_backfilled(on_disk, accumulated)
             added = len(merged) - len(on_disk)
@@ -445,11 +1095,25 @@ async def _run_backfill(
                 # starting point rather than an earlier snapshot from higher
                 # up in this function.
                 _before_state = summarizer.load_state(conv_id)
-                _rollup_state = await summarizer.maybe_rollup(
-                    conv_id, messages, vllm_url, model, raw_messages=raw_messages,
-                    skip_if_position_past=snapshot_turns, skipped_at=skipped,
-                    vllm_call_budget=_budget,
-                )
+                # v3.1.9.4 (R4 / W2 / P15-5 follow-up). Same contextvar
+                # mechanism main._rollup_hierarchy uses for the live tail —
+                # summarizer._maybe_rollup_body already reads it back, under
+                # its own conv_lock, right after loading state, and discards
+                # the WHOLE rollup on a mismatch (no tier check, no LLM call,
+                # no save_state). Before this fix this call always left the
+                # contextvar at its default of None, i.e. opted out — this
+                # was the one background writer R1 did not cover: a backfill
+                # is submitted via the same fire_and_forget the live tail
+                # uses and can run for hours, not "a request an operator is
+                # waiting on" (which is what None correctly means for
+                # main.admin_compact, wipe_generation_ctx's own docstring's
+                # other example).
+                with summarizer.wipe_generation_ctx(wipe_generation):
+                    _rollup_state = await summarizer.maybe_rollup(
+                        conv_id, messages, vllm_url, model, raw_messages=raw_messages,
+                        skip_if_position_past=snapshot_turns, skipped_at=skipped,
+                        vllm_call_budget=_budget,
+                    )
                 try:
                     summarizer.record_catchup_pass(
                         conv_id,
@@ -488,7 +1152,13 @@ async def _run_backfill(
         except Exception as e:
             logger.warning(f"conv={conv_id}: backfill summary rollup failed (non-fatal): {e}")
 
-        _write_state(conv_id, {
+        # v3.1.9.4 (R6 / P17-4 fix): wipe-safe (see
+        # _write_state_unless_wiped) — this write happens AFTER the final
+        # locked generation check (above, before the facts save) and
+        # OUTSIDE conv_lock, across the summary rollup's own calls; a wipe
+        # landing in that window must not have "complete" overwrite the
+        # "wiped" it just wrote.
+        _write_state_unless_wiped(conv_id, {
             "state": "complete",
             "started_at": started_at,
             "exchanges_done": len(pairs),
@@ -499,22 +1169,28 @@ async def _run_backfill(
             # wrote underneath it while it ran — the two used to be
             # indistinguishable because the second set was gone (v3.1 F3).
             "facts_added": added,
+            # v3.1.9.4 (R2): informational only once state is "complete" —
+            # needs_backfill's "complete" branch never looks at it — but a
+            # backfill that took two or three tries to finally succeed
+            # should still SAY that, not read identically to one that
+            # finished on its first attempt.
+            "attempts": this_attempt,
             "error": None,
         })
         logger.info(
             f"conv={conv_id}: backfill complete — {added} fact(s) added to "
             f"{len(on_disk)} already on disk, {len(kept)} kept, {dropped} "
-            f"pruned, from {len(pairs)} exchanges"
+            f"pruned, from {len(pairs)} exchanges (attempt {this_attempt})"
         )
     except Exception as e:
         logger.exception(f"conv={conv_id}: backfill aborted: {e}")
-        _write_state(conv_id, {
-            "state": "failed",
-            "started_at": started_at,
-            "exchanges_done": 0,
-            "exchanges_total": len(pairs),
-            "error": str(e)[:500],
-        })
+        _write_failed_or_abandoned(
+            conv_id, this_attempt,
+            started_at=started_at,
+            exchanges_done=0,
+            exchanges_total=len(pairs),
+            error=str(e),
+        )
     finally:
         _in_progress_local.discard(conv_id)
 
@@ -556,6 +1232,29 @@ async def start_backfill_if_needed(
     # carry, and redaction replaces degenerate replies with placeholders that
     # no request ever does (see summarizer._record_chunk_fps).
     raw_snapshot = [dict(m) for m in messages]
+    # v3.1.9.4 (R5 / P16-8 fix). Captured HERE — at kickoff, the same moment
+    # `raw_snapshot` takes `messages` exactly as the client sent them —
+    # rather than after the `redact` await below. This module's own R4/W2
+    # comment used to argue a LATER capture only "widens the window this
+    # protects, never narrows it", on the theory that
+    # current_wipe_generation only moves forward. That reasoning has it
+    # backwards for what this value is actually compared against. The
+    # capture is the BASELINE `_run_backfill` diffs against later
+    # (`wipe_generation != current_wipe_generation(conv_id)`) — it is not a
+    # deadline, it is a snapshot of "what the caller's inputs already
+    # reflect". A wipe that lands DURING the redact await (up to ~0.7s at
+    # 1,000 turns) happens strictly AFTER `messages`/`raw_snapshot` were
+    # taken from the request, so it is exactly the race this check exists
+    # to catch — but capturing the baseline AFTER that wipe already
+    # happened makes the baseline itself reflect the post-wipe generation,
+    # so the later equality check in `_run_backfill` finds no mismatch at
+    # all and proceeds to extract facts from the very pre-wipe messages
+    # `raw_snapshot` already captured. Capturing before the await closes
+    # exactly that gap, at the true "request's inputs were taken" moment —
+    # matching `main._run_memory_tail`'s equivalent fix (capture when the
+    # request snapshots its inputs, not when the tail is handed to the
+    # pool).
+    wipe_generation = current_wipe_generation(conv_id)
     if redact is not None:
         # Off the event loop: this is an async function awaited on the
         # request path, and the redactor walks every historical assistant
@@ -566,6 +1265,9 @@ async def start_backfill_if_needed(
     # Snapshot messages — caller may mutate the list before backfill runs
     snapshot = [dict(m) for m in messages]
     fire_and_forget(
-        _run_backfill(conv_id, snapshot, vllm_url, model, raw_messages=raw_snapshot)
+        _run_backfill(
+            conv_id, snapshot, vllm_url, model,
+            raw_messages=raw_snapshot, wipe_generation=wipe_generation,
+        )
     )
     return True

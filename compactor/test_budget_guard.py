@@ -205,10 +205,22 @@ def _guard_with_logs(msgs, limit=None, protect=None):
 
 
 def _budget_line(records):
-    """The guard's single verdict record — WARNING when it fit, ERROR when it
-    did not. None if it never spoke (i.e. it had nothing to do)."""
+    """The guard's single VERDICT record — WARNING ("hard budget enforced:")
+    when it fit, ERROR ("hard budget FAILED to fit:") when it did not. None
+    if it never spoke (i.e. it had nothing to do).
+
+    v3.1.9.4 (v3194-r3, R6): matched on the verdict's own two exact
+    prefixes, not a bare "hard budget" substring. _shed_last_resort (main.py)
+    can now log its OWN intermediate line first ("hard budget: the
+    last-resort pass hit its N-measurement cap..." — pre-existing, not new;
+    R6's target-limiting just means this pass reaches that branch on
+    fixtures that used to converge without ever hitting the cap), which
+    also contains the substring "hard budget" and used to be picked up by
+    this function INSTEAD of the real verdict a few lines later — silently
+    reading a WARNING where an ERROR was coming, or vice versa."""
     for r in records:
-        if "hard budget" in r.getMessage():
+        msg = r.getMessage()
+        if msg.startswith("hard budget enforced:") or msg.startswith("hard budget FAILED to fit:"):
             return r
     return None
 
@@ -710,41 +722,75 @@ def test_protect_system_defaults_to_one():
     assert_eq(sys_out[0]["content"], PERSONA, "and it is the persona, kept as it always was")
     assert_eq(_sys_dropped(_budget_line(rec_omitted)), 3, "all 3 injected blocks spent")
 
-    # Behaviour CANNOT pin it below 1: both loops clamp with max(1, ...), so a
-    # default of 0 is indistinguishable at runtime from a default of 1. The
-    # written contract is still 1 — a caller reading the signature must see the
-    # protection, not infer it from a clamp twenty lines further down — so this
-    # last one asserts the literal.
+    # Behaviour now pins it below 1 as well. Until P13-4 (hostile pass #13)
+    # both loops clamped with max(1, ...), so a default of 0 was
+    # indistinguishable from 1; with the clamp gone, a default of 0 would make
+    # the persona spendable and this unfittable fixture would spend it, which
+    # the persona assertion above catches. The literal is still asserted: a
+    # caller reading the signature must see the protection.
     sig = inspect.signature(main._enforce_hard_budget)
     assert_true("protect_system" in sig.parameters, "the parameter is named protect_system")
     assert_eq(sig.parameters["protect_system"].default, 1, "and its declared default is 1")
 
 
-def test_zero_caller_system_messages_still_protects_index_zero():
-    print("\n[test] _enforce_hard_budget — max(1, protect_system) with a system-less client array")
+def test_zero_caller_system_messages_protect_the_standin_by_content():
+    print("\n[test] _enforce_hard_budget — a system-less client array protects the stand-in by content, not position")
     # A client can send a bare conversation with no system message at all;
     # compaction (the summary block) and memory injection then ADD them, so
-    # the call site's count is 0 while the final list has several. Without the
-    # max(1, ...) clamp both loops would run to zero system messages and, in
-    # the trim loop, chew the compaction summary in half on the way. The
-    # summary is 800 chars here — the largest block, and a naive pick's first
+    # the call site's count is 0 while the final list has several.
+    #
+    # This test used to pin a max(1, protect_system) clamp that protected
+    # whatever sat at index 0. P13-4 (hostile pass #13) removed it: on a
+    # declined request index 0 is injected FACTS, not the stand-in, and the
+    # clamp kept them unspendable while her previous exchange was shed. The
+    # old fixture's "summary" never carried COMPACTION_SUMMARY_HEADER, so it
+    # only ever tested the position rule. The stand-in is protected by
+    # CONTENT now (`_is_compaction_standin`, in the memory-first branch), the
+    # same way it is when a caller prompt sits in front of it.
+    summary = main.COMPACTION_SUMMARY_HEADER + " SUMMARY-SENTINEL "
+    summary += "s" * (800 - len(summary))
+    assert_true(main._is_compaction_standin({"role": "system", "content": summary}),
+                "fixture: the stand-in is the one the guard recognises")
+
+    # (1) Fits once memory is spent: memory pays, the stand-in is untouched.
+    # It is the largest block (800 chars against 600), a naive pick's first
     # target.
-    summary = "SUMMARY-SENTINEL " + "s" * 783
     msgs = [
         {"role": "system", "content": summary},
         injected("MEM0:"),
         injected("MEM1:"),
-        big("user", 2000),
+        big("user", 450),
     ]
+    before = main.count_tokens(msgs)
+    assert_true(before > main.HARD_INPUT_LIMIT, f"starts over budget ({before})")
     out, records = _guard_with_logs(msgs, None, 0)
-
-    sys_out = _systems(out)
-    assert_true(len(sys_out) >= 1, "the guard did not strip every system message")
-    assert_eq(out[0]["role"], "system", "index 0 of the final list is still a system message")
-    assert_eq(out[0]["content"], summary, "and it survives byte-for-byte — neither dropped nor trimmed")
-    assert_true(len(out) >= 2, "the conversation was not reduced to nothing")
+    assert_true(main.count_tokens(out) <= main.HARD_INPUT_LIMIT, "and fits after the guard")
+    assert_eq(out[0]["content"], summary, "the stand-in survives byte-for-byte")
+    line = _budget_line(records)
+    assert_true(_trimmed(line) + _sys_dropped(line) >= 1, "injected memory paid instead")
     assert_eq(out[-1]["content"], msgs[-1]["content"], "the user's turn is still there")
-    assert_eq(_sys_dropped(_budget_line(records)), 2, "both injected blocks were spent instead")
+
+    # (2) Cannot fit at all: the stand-in is spent as the last resort, exactly
+    # as it is behind a caller prompt. The two shapes must agree; before
+    # P13-4 only the system-less one kept it.
+    def unfittable(lead):
+        return lead + [
+            {"role": "system", "content": summary},
+            injected("MEM0:"),
+            injected("MEM1:"),
+            big("user", 2000),
+        ]
+    bare, _ = _guard_with_logs(unfittable([]), None, 0)
+    fronted, _ = _guard_with_logs(
+        unfittable([{"role": "system", "content": PERSONA}]), None, 1
+    )
+    assert_eq(_systems(fronted)[0]["content"], PERSONA, "the caller's prompt is kept")
+    assert_eq(
+        any(main._is_compaction_standin(m) for m in bare),
+        any(main._is_compaction_standin(m) for m in fronted),
+        "the stand-in gets the same treatment with or without a caller prompt",
+    )
+    assert_eq(bare[-1]["content"], "x" * 8000, "the user's turn is still there")
 
 
 def test_injected_blocks_remain_fully_spendable():
@@ -1083,15 +1129,22 @@ def test_call_site_passes_the_callers_system_count():
 
     seen = {}
 
-    def recorder(messages, limit=None, protect_system=None, report=None, reserve=0):
-        # reserve (hostile pass #5 F3): a real parameter of the guard now,
-        # not asserted here — this test is about protect_system (M9), and a
-        # recorder that cannot accept every argument the request path
-        # actually passes would TypeError instead of testing anything.
+    def recorder(
+        messages, limit=None, protect_system=None, report=None, reserve=0,
+        standin_protected=True,
+    ):
+        # reserve (hostile pass #5 F3) and standin_protected (P14-1, hostile
+        # pass #14, lane v3194-guard): both real parameters of the guard
+        # now, not asserted here in depth — this test is about
+        # protect_system (M9), and a recorder that cannot accept every
+        # argument the request path actually passes would TypeError instead
+        # of testing anything (exactly what happened when this parameter was
+        # added and this recorder was not updated for it).
         seen["messages"] = list(messages)
         seen["limit"] = limit
         seen["protect_system"] = protect_system
         seen["report"] = report
+        seen["standin_protected"] = standin_protected
         return messages
 
     # v3.1.9: the clock is pinned, because the guard is now handed the
@@ -1134,6 +1187,18 @@ def test_call_site_passes_the_callers_system_count():
         isinstance(seen["report"], dict),
         f"the call site passes a report dict for the guard's verdict: "
         f"{seen['report']!r}",
+    )
+    # P14-1 (hostile pass #14, lane v3194-guard): this fixture never
+    # attempts reuse at all (a short two-system-message conversation, no
+    # stored hierarchy for `cid`), so compact_if_needed never reports a
+    # margin the window check used, and the call site's own comparison
+    # (`_compaction_stored_turns and ... and _BUDGET_MARGIN > ...`) is
+    # False by construction — standin_protected must stay at its default,
+    # not get flipped by an unrelated code path.
+    assert_true(
+        seen.get("standin_protected") is True,
+        f"a request with nothing to reuse leaves standin_protected at its "
+        f"default (got {seen.get('standin_protected')!r})",
     )
 
 
@@ -2465,7 +2530,7 @@ def _all_tests():
         test_regression_callers_second_system_message_is_never_dropped,
         test_trim_loop_will_not_halve_a_protected_persona,
         test_protect_system_defaults_to_one,
-        test_zero_caller_system_messages_still_protects_index_zero,
+        test_zero_caller_system_messages_protect_the_standin_by_content,
         test_injected_blocks_remain_fully_spendable,
         test_protected_unfittable_payload_still_forwards_at_error,
         test_alternation_repair_survives_protected_shedding,

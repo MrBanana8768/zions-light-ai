@@ -153,6 +153,14 @@ def _conv_artifact_paths(conv_id: str) -> list[Path]:
         memory.summary_path(conv_id),
         memory.persona_path(conv_id),
         memory.storage_root() / "facts" / f"{conv_id}.backfill.json",
+        # v3.1.9.4 (P15-3). The L2 chapter cold store — summarizer.
+        # _archive_chapters' only writer, since v3.1.3 — was absent from this
+        # enumeration for every release since. A grep of every per-conv path
+        # builder (memory.py's five `_safe_path` callers, backfill.py's and
+        # summarizer.py's own hand-built sidecar paths) turned up exactly one
+        # other file this list did not already carry; this is it, and it
+        # closes that gap rather than leaving a sixth one for later.
+        memory.summary_archive_path(conv_id),
     ]
 
 

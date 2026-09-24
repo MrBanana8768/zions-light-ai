@@ -1242,6 +1242,182 @@ def _tokenizer_state() -> dict:
     return {"available": True, **st}
 
 
+def _reuse_state() -> dict:
+    """checks.reuse: main.reuse_decline_state(), or why it cannot be read.
+
+    P9-1/P9-2 (hostile pass #9): before this, a reuse decline (the stored
+    hierarchy not fitting the stand-in's budget, so the request falls back
+    to summarizing from scratch) had NO signal anywhere but an INFO log
+    line inside compact_if_needed — this is the exact failure mode P9-1
+    describes: the feature silently not firing while /health/full and the
+    CHANGELOG both said it worked. Same call-time, sys.modules-based read
+    as `_tokenizer_state` above (module-scope `import main` here would be
+    circular — see that function's docstring for the full reasoning).
+
+    CONTRACT: main.reuse_decline_state() -> {"attempted": int,
+    "succeeded": int, "declined_no_state": int, "declined_no_coverage":
+    int, "declined_budget": int, "declined_window": int, "errored": int,
+    "declined_recently": bool, "last_reason": str | None,
+    "last_attempt_age_s": float | None, "last_declined_ceiling": int |
+    None, "last_declined_others": int | None}, read-only and cheap.
+    Numbers only — no conversation text, no conv_id, no hierarchy content.
+
+    P10-3 (hostile pass #10): `attempted`/`declined_budget` alone could not
+    tell a fresh process apart from "reuse has never been possible here"
+    apart from "every attempt this process made actually crashed" — all
+    three read as `attempted=0` or as `attempted>0, declined_budget=0`.
+    `succeeded`/`declined_no_state`/`declined_no_coverage`/`errored` are
+    ADDITIVE new counters (not a rename — `attempted` and `declined_budget`
+    keep their P9 meaning for any existing reader of this dict);
+    `last_reason` names what the MOST RECENT attempt resolved to, and
+    `last_attempt_age_s` is `None` only when no candidate request has
+    reached `compact_if_needed`'s reuse check in this process at all.
+
+    P12-2 (hostile pass #12): `declined_window` is a second, ADDITIVE
+    decline reason — the stand-in fit `declined_budget`'s ceiling whole but
+    would still have squeezed the request's real window against the system
+    prompt and the recent turns (main.py's P11-6 structural check). It has
+    its own counter because it is a different decline with different
+    numbers: `last_declined_ceiling`/`last_declined_others` mean one thing
+    when `last_reason == "budget"` and another when `last_reason ==
+    "window"` — read them together with `last_reason`, never on their own.
+    """
+    main_mod = sys.modules.get("main")
+    if main_mod is None:
+        return {"available": False,
+                "reason": "main is not loaded in this process"}
+    fn = getattr(main_mod, "reuse_decline_state", None)
+    if not callable(fn):
+        return {"available": False,
+                "reason": "main.reuse_decline_state() is not present in this build"}
+    try:
+        st = fn()
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        return {"available": False, "reason": err, "error": err}
+    if not isinstance(st, dict):
+        err = f"main.reuse_decline_state() returned {type(st).__name__}, not a dict"
+        return {"available": False, "reason": err, "error": err}
+    return {"available": True, **st}
+
+
+def _truncated_summary_state() -> dict:
+    """checks.truncated_summaries: how many rollup-tier summaries
+    (summarizer.truncated_summary_count) and compaction summaries
+    (main.truncated_compaction_summary_count) were cut at max_tokens and had
+    nothing better than a fallback-trimmed result after their one retry —
+    v3.1.9.4 (R4), surfacing the counters R3/round-2's M1 (P15-6) added.
+
+    Visibility only, matching the tokenizer/reuse/budget_margin doctrine
+    just above: a nonzero count never moves `status`. A summary trimmed to
+    a sentence/line/word boundary is a degraded-but-served unit, the same
+    class of self-correcting condition `budget_margin` already documents
+    this way — not a fault worth waking an operator for on its own. Zero on
+    a healthy deployment; a number that climbs is the operator-visible
+    signal P15-6's own finding said this defect had NONE of ("no log line,
+    no counter").
+
+    `hierarchy`/`hierarchy_retried` read summarizer.truncated_summary_count()
+    / .retried_summary_count() directly (a normal module-level import — no
+    cycle; summarizer.py never imports health.py). `compaction`/
+    `compaction_retried` need the SAME call-time sys.modules lookup
+    `_tokenizer_state`/`_reuse_state`/`_budget_margin_state` already use for
+    main.py: main.py imports health.py, so a module-level `import main`
+    here would be circular.
+
+    v3.1.9.4 (R5 / P16-7 fix). `*_retried` are new: a retry that finishes
+    cleanly no longer automatically becomes the stored text (it now wins
+    only if it is at least as long as the first attempt trimmed — see
+    summarizer._llm_summarize / main._summarize_once's own docstrings), so
+    `truncated` alone no longer says how often the second call runs at all
+    — a clean win leaves `truncated` unchanged. `*_retried` counts the
+    ATTEMPT regardless of outcome, next to `*` which counts the outcome
+    "ended up trimmed".
+    """
+    hierarchy_count = summarizer.truncated_summary_count()
+    hierarchy_retried = summarizer.retried_summary_count()
+    main_mod = sys.modules.get("main")
+    if main_mod is None:
+        return {
+            "available": True,
+            "hierarchy": hierarchy_count,
+            "hierarchy_retried": hierarchy_retried,
+            "compaction": None,
+            "compaction_retried": None,
+            "compaction_reason": "main is not loaded in this process",
+        }
+    fn = getattr(main_mod, "truncated_compaction_summary_count", None)
+    retried_fn = getattr(main_mod, "retried_compaction_summary_count", None)
+    if not callable(fn):
+        return {
+            "available": True,
+            "hierarchy": hierarchy_count,
+            "hierarchy_retried": hierarchy_retried,
+            "compaction": None,
+            "compaction_retried": None,
+            "compaction_reason": (
+                "main.truncated_compaction_summary_count() is not present "
+                "in this build"
+            ),
+        }
+    try:
+        compaction_count = fn()
+        compaction_retried = retried_fn() if callable(retried_fn) else None
+    except Exception as e:
+        return {
+            "available": True,
+            "hierarchy": hierarchy_count,
+            "hierarchy_retried": hierarchy_retried,
+            "compaction": None,
+            "compaction_retried": None,
+            "compaction_reason": f"{type(e).__name__}: {e}",
+        }
+    return {
+        "available": True,
+        "hierarchy": hierarchy_count,
+        "hierarchy_retried": hierarchy_retried,
+        "compaction": compaction_count,
+        "compaction_retried": compaction_retried,
+    }
+
+
+def _budget_margin_state() -> dict:
+    """checks.budget_margin: main.budget_margin_state(), or why it cannot be
+    read. Same call-time, sys.modules-based pattern as _tokenizer_state and
+    _reuse_state above.
+
+    P13-1/P13-3 (hostile pass #13): the learned budget margin
+    (main._BUDGET_MARGIN) had no field anywhere in this endpoint — the
+    adversarial suite's own F-02 says so by name. It is reachable from a
+    single vLLM context-length 400 the guard did not predict (a `/tokenize`
+    outage, a mispriced image), it can silently cost reuse her previous
+    exchange while it is in force (see main.py's P13-1 fix in
+    compact_if_needed), and it takes up to
+    COMPACTOR_BUDGET_MARGIN_RELEASE_AFTER (default 50) consecutive accepted
+    requests to fully release. Visibility only, like `tokenizer`/`reuse`
+    above — a nonzero margin does not move `status`: it is a self-healing
+    degraded mode the process is already correcting, not a fault to alarm
+    an operator awake for.
+    """
+    main_mod = sys.modules.get("main")
+    if main_mod is None:
+        return {"available": False,
+                "reason": "main is not loaded in this process"}
+    fn = getattr(main_mod, "budget_margin_state", None)
+    if not callable(fn):
+        return {"available": False,
+                "reason": "main.budget_margin_state() is not present in this build"}
+    try:
+        st = fn()
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        return {"available": False, "reason": err, "error": err}
+    if not isinstance(st, dict):
+        err = f"main.budget_margin_state() returned {type(st).__name__}, not a dict"
+        return {"available": False, "reason": err, "error": err}
+    return {"available": True, **st}
+
+
 async def gather_health_full(
     vllm_url: str, target_tokens: int, tokenize: dict | None = None
 ) -> dict:
@@ -1306,6 +1482,14 @@ async def gather_health_full(
     hierarchy = _hierarchy_progress(stats.pop("_hierarchy_fingerprint", None), mt)
     # Pure in-memory read of main's own state; see _tokenizer_state.
     tokenizer = _tokenizer_state()
+    # P9-1/P9-2 (hostile pass #9): same pattern, for reuse declines.
+    reuse = _reuse_state()
+    # P13-1/P13-3 (hostile pass #13): same pattern again, for the learned
+    # budget margin reuse's own window check now reads (main.py P13-1).
+    budget_margin = _budget_margin_state()
+    # v3.1.9.4 (R4): same pattern again, for the truncated-summary counters
+    # R3/round-2's M1 (P15-6) added.
+    truncated_summaries = _truncated_summary_state()
 
     # Why a reason list and not a bare string: `bg` used to be computed here,
     # placed in the payload, and never read. Sustained shedding — the pool
@@ -1933,6 +2117,21 @@ async def gather_health_full(
             "hierarchy": hierarchy,
             # v3.1.9: main.tokenizer_state(), or {"available": false, ...}.
             "tokenizer": tokenizer,
+            # v3.1.9.2 (P9-1/P9-2): main.reuse_decline_state(), or
+            # {"available": false, ...}. Visibility only — does not affect
+            # `status`, the same as `tokenizer` above.
+            "reuse": reuse,
+            # v3.1.9.3 (P13-1/P13-3): main.budget_margin_state(), or
+            # {"available": false, ...}. Visibility only — does not affect
+            # `status`, the same doctrine as `tokenizer`/`reuse` above.
+            "budget_margin": budget_margin,
+            # v3.1.9.4 (R4): summarizer.truncated_summary_count() (the L1/
+            # L2/L3 hierarchy) and main.truncated_compaction_summary_count()
+            # (the request-path compaction summary), or None with a reason
+            # if either is unreachable. Visibility only — does not affect
+            # `status`, the same doctrine as `tokenizer`/`reuse`/
+            # `budget_margin` above.
+            "truncated_summaries": truncated_summaries,
         },
         "stats": stats,
         "backups": backup_info,

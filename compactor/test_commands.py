@@ -1365,8 +1365,10 @@ def test_retire_dry_run_changes_nothing():
     assert_true(bool(summarizer.load_state(src).get("l1")), "summary still there")
     assert_eq(portability.list_quarantine(src), [], "no snapshot written by a dry run")
     # Requirement 7: the plan has to name what else is keyed to that id.
-    for layer in ("summary state", "indexed exchanges", "persona",
-                  "lazy-backfill state"):
+    # v3.1.9.4 (P15-3): "chapter archive" joined this list — /retire used to
+    # neither report nor clear the source's L2 chapter cold store at all.
+    for layer in ("summary state", "chapter archive", "indexed exchanges",
+                  "persona", "lazy-backfill state"):
         assert_true(f"  {layer}" in out, f"the plan reports the {layer} layer")
 
 

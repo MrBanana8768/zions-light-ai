@@ -21,6 +21,27 @@ os.environ.setdefault("HF_HOME", tempfile.mkdtemp(prefix="tokens-test-hf-"))
 
 import tokens  # noqa: E402
 
+# v3.1.9.3: opencv-python-headless is now in requirements.txt (main.py's
+# count_tokens() needs cv2 for mistral_common to tokenize an actual image —
+# see requirements.txt's comment). Merely IMPORTING tokens.py must not
+# import mistral_common at all, let alone cv2: `_load()` resolves the
+# tokenizer lazily (inside the function, not at module scope) specifically
+# so a process that never calls count() pays nothing for a library it may
+# not have. cv2 itself turns out NOT to be a precise signal for "an image
+# was actually tokenized" -- mistral_common/tokens/tokenizers/image.py
+# imports cv2 at ITS OWN module scope the moment MistralTokenizer is loaded
+# at all, text-only or not (found the hard way: an earlier version of this
+# check asserted "cv2 not in sys.modules" after calling count() on an
+# image-bearing message and failed even though the image was correctly
+# dropped, because section [5] below had already loaded MistralTokenizer
+# for a plain text call by that point). So this early check is the only
+# place "cv2 not in sys.modules" is a meaningful assertion; section [5]
+# uses a direct call-level trap instead (see below).
+assert "cv2" not in sys.modules, (
+    "importing tokens.py must not import mistral_common (and so not cv2) as "
+    "a module-scope side effect — _load() is supposed to be lazy"
+)
+
 # `os.environ.setdefault` above is a NO-OP on the pod, and on this repo's
 # staged-cache reproduction of it (see tokens.py's own module docstring):
 # MODEL_REPO and HF_HOME are ALREADY set — to a real model repo and a
@@ -198,6 +219,52 @@ else:
     ]}])
     assert_true(isinstance(n_mm, int) and n_mm < 50,
                 f"a base64 image is dropped, not tokenized ({n_mm} tokens)")
+    # v3.1.9.3: and it must still be dropped now that opencv is genuinely
+    # installed (requirements.txt) — checked with a CALL-level trap, not an
+    # import-presence check. `"cv2" not in sys.modules` was tried first and
+    # is the wrong test: mistral_common/tokens/tokenizers/image.py imports
+    # cv2 at ITS OWN module scope the instant MistralTokenizer is loaded at
+    # all (image or no image — it happened two lines above this, for the
+    # plain-text n_asst call), so cv2 is already in sys.modules by here
+    # regardless of what count() does with an image. What actually matters
+    # is whether `transform_image` (image.py's one function that CALLS cv2,
+    # `cv2.resize`) ever runs. Patched to raise if it does, then re-run the
+    # same image-bearing count() under the trap: if a future change made
+    # count() forward image content to mistral_common instead of sanitizing
+    # it first, transform_image would fire and this would go red loudly
+    # instead of just silently returning a bigger number.
+    try:
+        import mistral_common.tokens.tokenizers.image as _mc_image
+        _had_transform_image = True
+    except ImportError:
+        _had_transform_image = False
+
+    if _had_transform_image:
+        def _trapped_transform_image(*_a, **_kw):
+            raise AssertionError(
+                "transform_image (mistral_common's cv2 image resize) was "
+                "called by tokens.count() — _sanitize stopped stripping "
+                "images before mistral_common ever saw them"
+            )
+
+        _orig_transform_image = _mc_image.transform_image
+        _mc_image.transform_image = _trapped_transform_image
+        try:
+            n_trapped = tokens.count([{"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url",
+                 "image_url": {"url": "data:image/png;base64," + "A" * 5000}},
+            ]}])
+            assert_true(
+                isinstance(n_trapped, int) and n_trapped < 50,
+                f"image still dropped with transform_image TRAPPED to raise "
+                f"if called ({n_trapped} tokens) — cv2 was never reached",
+            )
+        finally:
+            _mc_image.transform_image = _orig_transform_image
+    else:
+        print("  SKIP transform_image trap: mistral_common.tokens.tokenizers.image "
+              "not importable in this environment.")
 
     # Cross-validation of a constant chosen elsewhere from production logs.
     # summarizer._WORST_TOKENS_PER_CHAR is 2.0, derived from the 2026-08-28

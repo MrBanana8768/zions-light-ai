@@ -880,6 +880,577 @@ def test_g3_restore_marker_reason_fires_and_clears():
           "G3 CONTROL: removing the marker (the documented recovery) clears the reason on the next poll")
 
 
+def test_p9_reuse_decline_signal_reaches_health_full():
+    """P9-1/P9-2 (hostile pass #9): checks.reuse. Before this, a reuse
+    decline (the stored hierarchy not fitting the stand-in's budget) had
+    NO signal anywhere but an INFO log line inside compact_if_needed —
+    exactly how the feature shipped silently off (P9-1: green health,
+    CHANGELOG claiming it worked). `health._reuse_state()` reads
+    `main.reuse_decline_state()` via sys.modules, the same call-time
+    pattern `_tokenizer_state()` already uses for `checks.tokenizer` (see
+    that function's docstring for why a module-scope `import main` here
+    would be circular) — this test imports `main` itself (this file does
+    not, at module scope, unlike test_reuse_fit.py) so the "available"
+    path is actually exercised, not just the "main is not loaded" one.
+
+    P10-3 (hostile pass #10): the recorder API this test drives changed
+    shape (`_record_reuse_decline(ceiling, others)` -> the more general
+    `_record_reuse_outcome(reason, ceiling, others)`), and the fields this
+    test pins grew three new counters — see `test_p10_3_*` below for the
+    wiring THAT split is actually for (an exception is no longer
+    indistinguishable from a success). This test stays about the plumbing:
+    a budget decline's numbers reach `/health/full` unchanged.
+    """
+    print("\n[P9-1/P9-2] checks.reuse reads main.reuse_decline_state()")
+    import main  # local: this module does not import main at module scope
+
+    # Numbers only, and cheap: call the real recorder functions directly
+    # rather than driving a whole compact_if_needed request (that path is
+    # test_reuse_fit.py's [10]/[11]/[12] sections' job — this test is
+    # about the health WIRING, not the reuse arithmetic).
+    before = health._reuse_state()
+    check(before.get("available") is True,
+          f"main is loaded in this process, so checks.reuse must read it "
+          f"(got {before})")
+    attempted_before = before["attempted"]
+    declined_before = before["declined_budget"]
+
+    main._record_reuse_attempt()
+    main._record_reuse_outcome("budget", 9345, 12706)
+    after = health._reuse_state()
+    check(after["attempted"] == attempted_before + 1,
+          "*** attempted increments")
+    check(after["declined_budget"] == declined_before + 1,
+          "*** declined_budget increments")
+    check(after["declined_recently"] is True,
+          "*** a decline just now reads as recent")
+    check(after["last_reason"] == "budget",
+          "*** last_reason names the budget decline specifically")
+    check(
+        after["last_attempt_age_s"] is not None and after["last_attempt_age_s"] < 5,
+        f"*** last_attempt_age_s is a real, small number right after the "
+        f"attempt just recorded (got {after['last_attempt_age_s']})",
+    )
+    check(after["last_declined_ceiling"] == 9345 and after["last_declined_others"] == 12706,
+          "*** the two numbers that explain the decline are carried through, "
+          "unchanged — no conversation text, no conv_id, anywhere in this "
+          "payload")
+
+    r = full()
+    check("reuse" in r["checks"], "*** gather_health_full's checks dict carries 'reuse'")
+    check(r["checks"].get("reuse", {}).get("declined_budget") == after["declined_budget"],
+          "and it is the SAME live state _reuse_state() reads directly, not "
+          "a stale or re-derived copy")
+    check(r["status"] != "down",
+          "visibility-only: a reuse decline does not itself take the pod down")
+
+
+def test_p12_2_window_decline_has_its_own_reason_and_numbers():
+    """P12-2 (hostile pass #12): the P11-6 structural check (a stand-in
+    that fits `declined_budget`'s own ceiling whole, but would still
+    squeeze the system prompt and the recent turns out of the request's
+    real window) used to record itself as a PLAIN "budget" decline, with
+    `_standin_budget`/`_others` — the TARGET-/injection-based ceiling this
+    check never even consults. An operator reading `checks.reuse` after
+    one of these saw `last_declined_ceiling` sitting at the CONFIGURED
+    `SUMMARY_BLOCK_MAX_TOKENS` (or the injection-based figure) for a
+    decline that number had nothing to do with, and OPERATIONS.md's own
+    runbook reads that as "raise the setting" — which moves nothing here.
+    Same style as `test_p9_reuse_decline_signal_reaches_health_full`
+    above: calls the real recorder functions directly (the arithmetic
+    that DECIDES a window squeeze is test_reuse_fit.py's `[14]`'s job;
+    this test is about the health WIRING for a window decline that
+    already happened).
+    """
+    print("\n[P12-2] a window-squeeze decline gets its own reason, "
+          "counter and numbers — not folded into 'budget'")
+    import main  # local: this module does not import main at module scope
+
+    before = health._reuse_state()
+    declined_window_before = before["declined_window"]
+    declined_budget_before = before["declined_budget"]
+
+    # A real budget decline first, with its OWN numbers — establishes a
+    # baseline the window decline right after it must not clobber or be
+    # confused with.
+    main._record_reuse_attempt()
+    main._record_reuse_outcome("budget", 6230, 11459)
+    mid = health._reuse_state()
+    check(mid["declined_budget"] == declined_budget_before + 1,
+          "*** declined_budget increments on the plain budget decline")
+    check(mid["last_reason"] == "budget", "*** last_reason names it 'budget'")
+    check(mid["last_declined_ceiling"] == 6230 and mid["last_declined_others"] == 11459,
+          "*** the budget decline's own two numbers are recorded")
+
+    # Now a window-squeeze decline, with a DIFFERENT pair of numbers.
+    main._record_reuse_attempt()
+    main._record_reuse_outcome("window", 12372, 8396)
+    after = health._reuse_state()
+    check(after["declined_window"] == declined_window_before + 1,
+          "*** declined_window increments — a SEPARATE counter from declined_budget")
+    check(after["declined_budget"] == declined_budget_before + 1,
+          "*** declined_budget does NOT also increment for a window decline "
+          "— the two counters are additive, not aliased")
+    check(after["last_reason"] == "window",
+          "*** last_reason names the window decline specifically, not 'budget'")
+    check(
+        after["last_declined_ceiling"] == 12372 and after["last_declined_others"] == 8396,
+        f"*** the window decline's OWN two numbers overwrite the prior "
+        f"budget decline's (got ceiling={after['last_declined_ceiling']}, "
+        f"others={after['last_declined_others']}) — reading them together "
+        f"with last_reason='window' is what makes them meaningful, per "
+        f"_record_reuse_outcome's own docstring",
+    )
+    check(after["declined_recently"] is True,
+          "*** a window decline counts as 'recently declined' too — it is "
+          "as real a capacity squeeze as a budget decline (P12-2 widened "
+          "this from 'budget' specifically, matching OPERATIONS.md's "
+          "updated runbook text)")
+
+    r = full()
+    check(
+        r["checks"].get("reuse", {}).get("declined_window") == after["declined_window"],
+        "*** gather_health_full's checks.reuse carries declined_window too, "
+        "the same live state _reuse_state() reads directly",
+    )
+    check(r["status"] != "down",
+          "visibility-only: a window decline does not itself take the pod down")
+
+
+def _p10_3_history(n_exchanges: int, words: int = 200) -> list:
+    """Plain old turns, no system prefix — same shape as test_reuse_fit.py's
+    `history()` minus its leading system message (not needed here; this
+    fixture never goes through `_enforce_hard_budget`, only
+    `compact_if_needed`), duplicated rather than imported per this file's
+    own convention (see the module docstring's F2 note on backup.py)."""
+    out = []
+    for i in range(n_exchanges):
+        out.append({"role": "user", "content": f"q{i} " + ("word " * words)})
+        out.append({"role": "assistant", "content": f"a{i} " + ("word " * words)})
+    return out
+
+
+def test_p10_3_reuse_error_state_is_not_a_silent_success():
+    """P10-3 (hostile pass #10): the ONE case P9's own adversarial test
+    could not tell apart from a healthy reuse — an exception raised
+    partway through the reuse attempt (the `except Exception` fallback in
+    `compact_if_needed` exists precisely so an optimisation can never fail
+    a whole request, but the OLD accounting incremented `attempted` at a
+    call site downstream of where the crash happens and never recorded a
+    matching decline, so `checks.reuse` read `attempted+1, declined_budget
+    +0` — indistinguishable from a real success). Drives a REAL
+    `compact_if_needed` call (not the recorder functions directly, unlike
+    the test above — this is the "assertion that cannot be produced by a
+    crash" LOOPS5_BRIEF asks for) against a real, reuse-eligible hierarchy,
+    with `summarizer.format_summary_block` made to raise partway through.
+    """
+    print("\n[P10-3] a crash inside the reuse attempt reads as 'error', "
+          "never as a success")
+    import asyncio as _asyncio
+    import main  # local, same reason as the test above
+
+    # The reuse attempt crashes and falls back to summarizing everything
+    # from scratch (compact_if_needed's own except-clause guarantee) —
+    # which would otherwise mean a REAL vLLM call from this offline suite.
+    # Stubbed the same way test_reuse_fit.py's `_spy_summarize` is: this
+    # test is about the reuse ACCOUNTING, not summarize()'s own behavior.
+    _orig_summarize = main.summarize
+
+    async def _stub_summarize(client, to_summarize):
+        return "STUBBED-SUMMARY", []
+
+    main.summarize = _stub_summarize
+
+    conv_id = "health-p10-3-reuse-error"
+    older = _p10_3_history(30, words=200)
+    st = summarizer.load_state(conv_id)
+    st["l1"] = [{
+        "tier": "l1", "text": "L1scene " + ("filler " * 400),
+        "first_turn": 1, "last_turn": len(older),
+    }]
+    st["last_summarized_turn"] = len(older)
+    summarizer._record_chunk_fps(st, 1, len(older), older)
+    summarizer.save_state(conv_id, st)
+
+    recent = [
+        {"role": "user", "content": "prev-u " + "u" * 200},
+        {"role": "assistant", "content": "prev-a " + "a" * 200},
+        {"role": "user", "content": "newest " + "n" * 200},
+    ]
+    msgs = older + recent
+    check(main.count_tokens(msgs) > main.TARGET_TOKENS,
+          "fixture: over TARGET, so compact_if_needed actually attempts reuse")
+
+    before = health._reuse_state()
+
+    _orig_format = summarizer.format_summary_block
+
+    def _raise_partway(*a, **k):
+        raise RuntimeError("P10-3 test: simulated failure inside the reuse attempt")
+
+    summarizer.format_summary_block = _raise_partway
+    try:
+        stored_out: list = []
+        out = _asyncio.run(main.compact_if_needed(
+            list(msgs), conv_id, stored_turns_out=stored_out,
+        ))
+    finally:
+        summarizer.format_summary_block = _orig_format
+        main.summarize = _orig_summarize
+
+    check(stored_out == [] or stored_out == [0],
+          f"the crashed attempt substituted nothing (stored_turns_out="
+          f"{stored_out}) — compact_if_needed's own contract for 'nothing "
+          f"compacted or an exception': see that function's docstring")
+    check(isinstance(out, list) and len(out) > 0,
+          "*** the request itself still succeeds — an optimisation crashing "
+          "must never fail the whole reply (the guarantee this except "
+          "clause exists for)")
+
+    after = health._reuse_state()
+    check(after["attempted"] == before["attempted"] + 1,
+          "*** attempted increments once for this request")
+    check(after["errored"] == before["errored"] + 1,
+          f"*** errored increments (got {after['errored']} vs "
+          f"{before['errored']}) — the crash is COUNTED, not silent")
+    check(after["succeeded"] == before["succeeded"],
+          "*** succeeded does NOT increment — this is the exact "
+          "distinction P9's own test could not make (attempted+1 with "
+          "declined_budget unchanged used to read as a healthy reuse)")
+    check(after["declined_budget"] == before["declined_budget"],
+          "*** declined_budget (a BUDGET decline specifically) also does "
+          "not increment — this was never a budget decision, it never got "
+          "that far")
+    check(after["last_reason"] == "error",
+          f"*** last_reason is 'error', not silently absent or 'success' "
+          f"(got {after['last_reason']!r})")
+
+    r = full()
+    check(r["checks"].get("reuse", {}).get("errored") == after["errored"],
+          "and /health/full carries the SAME errored count, not a stale "
+          "or re-derived copy")
+    check(r["checks"].get("reuse", {}).get("last_reason") == "error",
+          "and /health/full's last_reason also reads 'error'")
+    check(r["status"] != "down",
+          "visibility-only: a crashed reuse attempt does not itself take "
+          "the pod down — the request still succeeded")
+
+
+def test_p11_1_reuse_success_is_not_recorded_before_the_fresh_span_summarize():
+    """P11-1 (hostile pass #11): `checks.reuse` recorded "success" the
+    INSTANT the stand-in rendered — inside the reuse block's own `try`,
+    before `compact_if_needed` returns. The request is not finished at
+    that point: on a real branch at least one covered turn usually needs
+    re-summarizing (a turn that changed since its chunk was written) and
+    the tail beyond what the hierarchy covers always does — so almost
+    every reusing request still owes a fresh-span `summarize()` call
+    AFTER the reuse block's own `try` has already exited. The P10-3 test
+    above stubs `main.summarize` so this call cannot fail in it — its own
+    docstring says so. This test does the opposite: the reuse block
+    succeeds for real (no stub on `format_summary_block`, a genuine
+    partial-coverage hierarchy so a real tail needs summarizing), and
+    `main.summarize` — the fresh-span call, not the reuse block — is what
+    raises. Before the fix, this reads `succeeded+1`; after, `errored+1`
+    and `succeeded` unchanged, matching what actually reached the wire:
+    `compact_if_needed` raises, and `chat_completions`' own `except
+    Exception` forwards the client's ORIGINAL, uncompacted messages —
+    with no stand-in on it at all.
+    """
+    print("\n[P11-1] reuse 'success' is recorded after the fresh-span "
+          "summarize(), not before it")
+    import asyncio as _asyncio
+    import main  # local, same reason as the tests above
+
+    conv_id = "health-p11-1-reuse-success-then-summarize-fails"
+    # 30 exchanges (60 turns), but the hierarchy covers only the first 20
+    # of them (40 turns) — a REAL partial-coverage state (a chunk that has
+    # not caught up to the whole conversation, the routine case between L1
+    # rollups), not a hand-picked edge. The remaining 10 exchanges (20
+    # turns) are NOT covered, so `fresh_input` is non-empty and
+    # `summarize()` genuinely gets called for them.
+    older = _p10_3_history(30, words=200)
+    covered_turns = 40
+    st = summarizer.load_state(conv_id)
+    st["l1"] = [{
+        "tier": "l1", "text": "L1scene " + ("filler " * 400),
+        "first_turn": 1, "last_turn": covered_turns,
+    }]
+    st["last_summarized_turn"] = covered_turns
+    summarizer._record_chunk_fps(st, 1, covered_turns, older[:covered_turns])
+    summarizer.save_state(conv_id, st)
+
+    recent = [
+        {"role": "user", "content": "prev-u " + "u" * 200},
+        {"role": "assistant", "content": "prev-a " + "a" * 200},
+        {"role": "user", "content": "newest " + "n" * 200},
+    ]
+    msgs = older + recent
+    check(main.count_tokens(msgs) > main.TARGET_TOKENS,
+          "fixture: over TARGET, so compact_if_needed actually attempts reuse")
+
+    # The reuse block itself is UNSTUBBED — it must succeed for real, so
+    # `_reuse_reason` is "success" and `_reuse_pending_success` is set,
+    # before this test's failure ever fires.
+    _orig_summarize = main.summarize
+
+    async def _raising_summarize(client, to_summarize):
+        raise RuntimeError(
+            "P11-1 test: simulated failure in the FRESH-SPAN summarize(), "
+            "after the reuse block's own try already succeeded"
+        )
+
+    main.summarize = _raising_summarize
+
+    before = health._reuse_state()
+    raised = None
+    try:
+        _asyncio.run(main.compact_if_needed(
+            list(msgs), conv_id, stored_turns_out=[],
+        ))
+    except RuntimeError as e:
+        raised = e
+    finally:
+        main.summarize = _orig_summarize
+
+    check(raised is not None and "simulated failure" in str(raised),
+          "*** compact_if_needed still RAISES — this test does not change "
+          "that contract, only what checks.reuse records on the way past "
+          "(chat_completions' own except clause is what forwards the "
+          "original messages; that behaviour is untouched)")
+
+    after = health._reuse_state()
+    check(after["attempted"] == before["attempted"] + 1,
+          "*** attempted increments once for this request")
+    check(after["errored"] == before["errored"] + 1,
+          f"*** errored increments (got {after['errored']} vs "
+          f"{before['errored']}) — a failure AFTER the stand-in rendered "
+          f"is still counted as a failure")
+    check(after["succeeded"] == before["succeeded"],
+          "*** succeeded does NOT increment — this is P11-1's own "
+          "distinction: the stand-in rendering is not the same fact as "
+          "the request succeeding, and recording the first as though it "
+          "were the second is exactly what read as a healthy reuse while "
+          "the original, uncompacted array reached the wire instead")
+    check(after["last_reason"] == "error",
+          f"*** last_reason is 'error', not 'success' (got "
+          f"{after['last_reason']!r}) — the render alone must not be "
+          f"allowed to win the last word")
+
+    r = full()
+    check(r["checks"].get("reuse", {}).get("errored") == after["errored"],
+          "and /health/full carries the SAME errored count")
+    check(r["checks"].get("reuse", {}).get("succeeded") == after["succeeded"],
+          "and the SAME succeeded count — no double path recorded this "
+          "as both a success and an error")
+
+
+def test_p13_1_budget_margin_signal_reaches_health_full():
+    """P13-1/P13-3 (hostile pass #13): checks.budget_margin. Before this,
+    the learned budget margin (main._BUDGET_MARGIN — the degraded-mode
+    backstop `_enforce_hard_budget` and, since P13-1, the P11-6/P12-1
+    window check both subtract from their own limit while it is in force)
+    had NO field anywhere in /health/full. The repo's own adversarial suite
+    names the gap by name (F-02, test_adv_faults.py: "/health/full has no
+    margin field") — a margin latched by one lying `/tokenize` response
+    lasts up to COMPACTOR_BUDGET_MARGIN_RELEASE_AFTER accepted requests and
+    was, until this fix, invisible to an operator reading this endpoint.
+
+    Same call-time, sys.modules-based wiring as `checks.reuse`/
+    `checks.tokenizer` above (`health._budget_margin_state()` reads
+    `main.budget_margin_state()`) — this test drives the real global
+    directly (cheap, no request needed) and confirms the SAME number
+    reaches `gather_health_full`'s payload, restoring it afterward so this
+    test cannot leak a margin into any test that runs after it.
+    """
+    print("\n[P13-1/P13-3] checks.budget_margin reads main.budget_margin_state()")
+    import main  # local: this module does not import main at module scope
+
+    saved_margin = main._BUDGET_MARGIN
+    saved_streak = main._budget_ok_streak
+    try:
+        main._BUDGET_MARGIN = 0
+        healthy = health._budget_margin_state()
+        check(healthy.get("available") is True,
+              f"main is loaded in this process, so checks.budget_margin must "
+              f"read it (got {healthy})")
+        check(healthy.get("margin") == 0,
+              f"*** a healthy process (no margin learned) reads margin=0 "
+              f"(got {healthy})")
+
+        main._BUDGET_MARGIN = 4096
+        main._budget_ok_streak = 7
+        degraded = health._budget_margin_state()
+        check(degraded.get("margin") == 4096,
+              f"*** a learned margin reaches checks.budget_margin unchanged "
+              f"(got {degraded})")
+        check(degraded.get("release_after") == main.BUDGET_MARGIN_RELEASE_AFTER,
+              f"*** release_after names the real "
+              f"COMPACTOR_BUDGET_MARGIN_RELEASE_AFTER, not a copy that can "
+              f"drift from it (got {degraded})")
+        check(degraded.get("ok_streak") == 7,
+              f"*** ok_streak is the live count toward release, not a stale "
+              f"0 (got {degraded})")
+        check(degraded.get("ceiling") == main.MAX_MODEL_LEN // 4,
+              f"*** ceiling names the real MAX_MODEL_LEN//4 cap "
+              f"_note_backend_rejection latches to, not a hand-copied "
+              f"number that can drift from it (got {degraded})")
+
+        r = full()
+        check("budget_margin" in r["checks"],
+              "*** gather_health_full's checks dict carries 'budget_margin'")
+        check(r["checks"].get("budget_margin", {}).get("margin") == 4096,
+              "and it is the SAME live state _budget_margin_state() reads "
+              "directly, not a stale or re-derived copy")
+        check(r["status"] != "down",
+              "visibility-only: a learned margin does not itself take the "
+              "pod down — it is a self-healing degraded mode, not a fault")
+    finally:
+        main._BUDGET_MARGIN = saved_margin
+        main._budget_ok_streak = saved_streak
+
+
+def test_p11_3_declined_recently_follows_only_a_real_budget_decline():
+    """P11-3 (hostile pass #11, LOW): OPERATIONS.md documents
+    `declined_recently` as following "the most recent BUDGET decline
+    specifically", and `last_declined_ceiling`/`last_declined_others` as
+    that decline's own two numbers. Before this, `_record_reuse_outcome`
+    stamped all three for EVERY non-success reason — so a brand-new
+    conversation's very first request (`no_state`: nothing stored yet, not
+    a budget squeeze at all) set `declined_recently` exactly like a real
+    one would, and overwrote a genuine budget decline's `last_declined_
+    ceiling`/`_others` with `None` at the very next unrelated decline.
+    Direct recorder calls, same style as the P9-1/P9-2 test above (this is
+    about the health WIRING, not the reuse arithmetic — test_reuse_fit.py
+    drives the arithmetic itself).
+    """
+    print("\n[P11-3] declined_recently and the two decline numbers follow "
+          "a BUDGET decline only")
+    import main  # local, same reason as the tests above
+
+    # A real budget decline first, so its numbers are in place to prove
+    # the NEXT (non-budget) outcome does not erase them.
+    main._record_reuse_attempt()
+    main._record_reuse_outcome("budget", 4321, 8765)
+    mid = health._reuse_state()
+    check(mid["last_declined_ceiling"] == 4321 and mid["last_declined_others"] == 8765,
+          f"fixture: the budget decline's own numbers are recorded (got "
+          f"{mid['last_declined_ceiling']}, {mid['last_declined_others']})")
+    check(mid["declined_recently"] is True,
+          "fixture: and it reads as a recent decline")
+
+    # A brand-new conversation's `no_state` outcome — nothing stored yet,
+    # not a budget squeeze. Before the fix this stamped `declined_recently`
+    # and wiped the budget decline's own two numbers.
+    main._record_reuse_attempt()
+    main._record_reuse_outcome("no_state")
+    after_no_state = health._reuse_state()
+    check(after_no_state["last_reason"] == "no_state",
+          "fixture: the no_state outcome is the most recent one recorded")
+    check(
+        after_no_state["declined_recently"] is True,
+        f"*** P11-3: declined_recently is STILL true after a no_state "
+        f"outcome (got {after_no_state['declined_recently']}) — it reads "
+        f"the BUDGET decline recorded just before it, not the no_state "
+        f"one, because a no_state outcome no longer re-stamps the "
+        f"'recently' clock at all",
+    )
+    check(
+        after_no_state["last_declined_ceiling"] == 4321
+        and after_no_state["last_declined_others"] == 8765,
+        f"*** P11-3: the budget decline's own two numbers SURVIVE a "
+        f"no_state outcome (got {after_no_state['last_declined_ceiling']}, "
+        f"{after_no_state['last_declined_others']}) — before the fix a "
+        f"no_state outcome overwrote both with None, so an operator "
+        f"reading 'declined_recently' straight after a fresh conversation "
+        f"started would have seen the numbers vanish",
+    )
+
+    # CONTROL: a genuine SECOND budget decline still updates both numbers
+    # — this is not "the stamp never moves again", only "a non-budget
+    # outcome does not move it".
+    main._record_reuse_attempt()
+    main._record_reuse_outcome("budget", 1111, 2222)
+    after_budget2 = health._reuse_state()
+    check(
+        after_budget2["last_declined_ceiling"] == 1111
+        and after_budget2["last_declined_others"] == 2222,
+        f"*** P11-3 CONTROL: a real second budget decline DOES update the "
+        f"two numbers (got {after_budget2['last_declined_ceiling']}, "
+        f"{after_budget2['last_declined_others']}) — the fix scopes the "
+        f"stamp to budget declines, it does not freeze it",
+    )
+
+    # Addendum: a BaseException inside the reuse block's `try` (an
+    # asyncio.CancelledError at one of its `await run_in_threadpool(...)`
+    # calls, which `except Exception` does not catch) used to leave
+    # `_reuse_reason` unset and the `finally`'s old `_reuse_reason or
+    # "budget"` fallback recorded it as a BUDGET decline — an operator
+    # chasing "reuse looks squeezed" would have found a cancellation
+    # instead. Drives a REAL compact_if_needed call (the addendum is about
+    # what actually reaches the `finally` on this exact escape path, not
+    # the recorder API alone).
+    import asyncio as _asyncio
+    import summarizer as _summarizer
+
+    conv_id = "health-p11-3-cancelled-reuse"
+    older = _p10_3_history(30, words=200)
+    st = _summarizer.load_state(conv_id)
+    st["l1"] = [{
+        "tier": "l1", "text": "L1scene " + ("filler " * 400),
+        "first_turn": 1, "last_turn": len(older),
+    }]
+    st["last_summarized_turn"] = len(older)
+    _summarizer._record_chunk_fps(st, 1, len(older), older)
+    _summarizer.save_state(conv_id, st)
+    recent = [
+        {"role": "user", "content": "prev-u " + "u" * 200},
+        {"role": "assistant", "content": "prev-a " + "a" * 200},
+        {"role": "user", "content": "newest " + "n" * 200},
+    ]
+    msgs = older + recent
+    check(main.count_tokens(msgs) > main.TARGET_TOKENS,
+          "fixture: over TARGET, so compact_if_needed actually attempts reuse")
+
+    _orig_coverage_plan = _summarizer._coverage_plan
+
+    def _cancelled(*_a, **_k):
+        raise _asyncio.CancelledError()
+
+    _summarizer._coverage_plan = _cancelled
+    before_cancel = health._reuse_state()
+    raised = None
+    try:
+        _asyncio.run(main.compact_if_needed(
+            list(msgs), conv_id, stored_turns_out=[],
+        ))
+    except _asyncio.CancelledError as e:
+        raised = e
+    finally:
+        _summarizer._coverage_plan = _orig_coverage_plan
+
+    check(raised is not None,
+          "*** compact_if_needed still propagates the CancelledError — "
+          "this test only checks what is recorded on the way past")
+    after_cancel = health._reuse_state()
+    check(
+        after_cancel["last_reason"] == "error",
+        f"*** P11-3 addendum: a cancellation records 'error', not "
+        f"'budget' (got {after_cancel['last_reason']!r}) — the old "
+        f"fallback (`_reuse_reason or \"budget\"`) guessed a budget "
+        f"verdict for an outcome this module's own branches never decided",
+    )
+    check(
+        after_cancel["declined_budget"] == after_budget2["declined_budget"],
+        "*** P11-3 addendum: declined_budget does NOT increment for the "
+        "cancellation — it was never a budget decision",
+    )
+    check(
+        after_cancel["errored"] == before_cancel["errored"] + 1,
+        f"*** P11-3 addendum: errored increments instead (got "
+        f"{after_cancel['errored']} vs {before_cancel['errored']})",
+    )
+
+
 TESTS = [
     test_f1_zero_backups_is_ok_during_the_grace_window,
     test_f1_zero_backups_after_the_grace_window_degrades,
@@ -907,6 +1478,12 @@ TESTS = [
     test_f4_three_intervals_boundary_is_pinned,
     test_f5_quality_gate_skips_are_intended_to_degrade_status,
     test_g3_restore_marker_reason_fires_and_clears,
+    test_p9_reuse_decline_signal_reaches_health_full,
+    test_p10_3_reuse_error_state_is_not_a_silent_success,
+    test_p11_1_reuse_success_is_not_recorded_before_the_fresh_span_summarize,
+    test_p11_3_declined_recently_follows_only_a_real_budget_decline,
+    test_p12_2_window_decline_has_its_own_reason_and_numbers,
+    test_p13_1_budget_margin_signal_reaches_health_full,
 ]
 
 

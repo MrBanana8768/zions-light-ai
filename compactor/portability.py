@@ -36,6 +36,7 @@ without silently truncating.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -46,6 +47,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import anyio
+
+import backfill
 import facts
 import memory
 import persona
@@ -160,14 +164,16 @@ def export_conversation(conv_id: str, *, strict: bool = False) -> dict:
 # nothing reads or a published file that has been proven readable. Never a
 # half-trusted snapshot.
 #
-# v3.1 D8 — TWO LAYERS THE BUNDLE DOES NOT CARRY, and why they are carried
-# here instead.
+# v3.1 D8 — THREE LAYERS THE BUNDLE DOES NOT CARRY, and why they are carried
+# here instead. (v3.1.9.4, P15-3: the chapter archive joined this list —
+# see the note at the end of this comment.)
 #
 # export_conversation writes exactly three payloads: facts, summary_state,
-# episodic. It does not carry the archive sidecar and it does not carry the
-# persona. For an export that is a schema question; for a PRE-REMOVAL SNAPSHOT
-# it is a correctness one, because both of those layers are things a
-# destructive admin operation deletes:
+# episodic. It does not carry the archive sidecar, it does not carry the
+# persona, and it does not carry the L2 chapter cold store. For an export
+# that is a schema question; for a PRE-REMOVAL SNAPSHOT it is a correctness
+# one, because all three of those layers are things a destructive admin
+# operation deletes:
 #
 #   - commands._wipe_all_layers clears the archive sidecar, and its own
 #     comment records that "NOTHING in this codebase has ever deleted one"
@@ -175,10 +181,16 @@ def export_conversation(conv_id: str, *, strict: bool = False) -> dict:
 #   - main._clear_all_memory calls persona.clear_persona. INCIDENT_2026-08-24
 #     D19 states the consequence in one line: "/forget can destroy a persona
 #     that no export can back up and no import can restore."
+#   - main._clear_all_memory also deletes the chapter cold store
+#     (summaries/<id>.archive.json) since v3.1.9.4 (P15-3) — the same D19
+#     consequence, one layer over: it used to survive every wipe silently
+#     (not deleted, so not even the thing this comment is about), and now
+#     that it IS deleted the same "no export can back it up" gap would
+#     apply to it too if it stopped here.
 #
 # A snapshot that is missing the layers the operation removes is not an
-# archive-before-removing; it is a partial one that reads as complete. So both
-# are measured, carried, and verified on read-back like everything else.
+# archive-before-removing; it is a partial one that reads as complete. So all
+# three are measured, carried, and verified on read-back like everything else.
 #
 # They go in the `quarantine` metadata block rather than into the bundle
 # payload. That is deliberate and it is not laziness: adding payload keys means
@@ -187,13 +199,30 @@ def export_conversation(conv_id: str, *, strict: bool = False) -> dict:
 # working the moment it changes — or silently widening a documented schema.
 # Under `quarantine`, _validate_bundle ignores the extra key, so a snapshot
 # stays a valid v2.1 bundle that import_conversation restores with no new code,
-# AND the two extra layers travel with it for an operator (or
+# AND the three extra layers travel with it for an operator (or
 # commands._handle_retire) to put back explicitly. Restoring them is a
-# `facts.save_archive` and a `persona.save_persona`; the restore_hint says so.
+# `facts.save_archive`, a `persona.save_persona`, and a
+# `summarizer._archive_chapters`; the restore_hint says so.
 #
 # This does NOT close D19 for export/import generally — export_conversation is
-# unchanged and a fork still loses the persona. It closes it for the one path
-# whose entire purpose is to make a removal reversible.
+# unchanged and a fork still loses the persona and the chapter archive. It
+# closes it for the one path whose entire purpose is to make a removal
+# reversible.
+#
+# WHY EXPORT ITSELF STILL DOES NOT CARRY THE CHAPTER ARCHIVE (P15-3 asks this
+# question explicitly, so the answer is here rather than left implicit): the
+# same BUNDLE_VERSION argument two paragraphs up applies without change — an
+# ordinary GET /admin/.../export is not a removal, so there is nothing for it
+# to be reversible AGAINST, and the chapter archive is the ONE copy of
+# chapter-level detail an L3 refresh has already paraphrased, which is a
+# reason to protect it on every REMOVAL path (done, above) but not a reason
+# to widen a schema every existing bundle and both HTTP endpoints depend on
+# staying fixed. A caller that wants the chapter archive alongside an export
+# reads it separately: summarizer.load_chapter_archive(conv_id) — there is
+# no dedicated HTTP endpoint for it today (GET /admin/conversations/<id>/
+# summary returns summary_state only, not the cold chapters); that gap is
+# real but is a separate, additive feature request, not something P15-3
+# asked this fix to close.
 
 # THIS COMMENT WAS FALSE, and it was the root of an arbitrary-file-write.
 #
@@ -284,7 +313,7 @@ def list_quarantine(conv_id: str | None = None) -> list[Path]:
 def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
     """Write a verified, restorable snapshot of this conversation before
     something removes part of it. Returns {"path", "facts", "archive",
-    "episodic", "summary", "persona", "unverified_layers"}.
+    "episodic", "summary", "persona", "chapters", "unverified_layers"}.
 
     Raises QuarantineError if the snapshot cannot be proven to hold at least
     what the store held a moment ago, OR if the facts file is unreadable and
@@ -386,6 +415,25 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
     except Exception as e:
         logger.warning(f"conv={conv_id}: quarantine could not read the persona: {e}")
         unverified.append("persona (unreadable)")
+    # v3.1.9.4 (P15-3): a THIRD layer export_conversation does not carry,
+    # same reason as the two above — summaries/<id>.archive.json
+    # (summarizer._archive_chapters' only writer) is the ONLY copy of
+    # chapter-level detail once an L3 refresh has paraphrased it, and until
+    # this fix nothing removing a conversation's state ever preserved it:
+    # /forget left it on disk unreported (fixed separately, see
+    # main._clear_all_memory and commands._memory_residue), an overwrite
+    # import left the TARGET's old chapters beside the new state (fixed
+    # below, in import_conversation), and /retire orphaned it under the
+    # retired id (fixed in commands._retire_clear_other_layers). This
+    # function is the one place all three of those removals already funnel
+    # through for a restorable copy, so it gets the same read-record-carry
+    # treatment as archived_rows/persona_record above.
+    chapter_rows: list[dict] = []
+    try:
+        chapter_rows = summarizer.load_chapter_archive(conv_id)
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: quarantine could not read the chapter archive: {e}")
+        unverified.append("chapter archive (unreadable)")
 
     expected_episodic = retrieval.conversation_doc_count(conv_id)
     if expected_episodic is None:
@@ -445,11 +493,14 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
             "facts": expected_facts,
             "episodic": expected_episodic,
             "archive": len(archived_rows),
+            "chapters": len(chapter_rows),
         },
-        # The two layers the v2.1 bundle payload has no key for. Carried
+        # The three layers the v2.1 bundle payload has no key for. Carried
         # verbatim so a restore is a copy, not a reconstruction.
         "archive": list(archived_rows),
         "persona": persona_record,
+        # v3.1.9.4 (P15-3): the third layer — see the read above.
+        "chapters": list(chapter_rows),
         "unverified_layers": list(unverified),
         # F1: filled in below once the torn-facts sibling path is known
         # (computed after `published`, a few lines down) — None when the
@@ -463,11 +514,13 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
             "whole-conversation: import_conversation(this file, "
             "target_conv_id=<conv>, overwrite=True) — discards anything "
             "learned since this file was written. import_conversation does "
-            "NOT restore the two layers under quarantine.archive and "
-            "quarantine.persona: put those back with "
-            "facts.save_archive(conv_id, bundle['quarantine']['archive']) and "
+            "NOT restore the three layers under quarantine.archive, "
+            "quarantine.persona and quarantine.chapters: put those back with "
+            "facts.save_archive(conv_id, bundle['quarantine']['archive']), "
             "persona.save_persona(conv_id, "
-            "bundle['quarantine']['persona']['persona_text'])."
+            "bundle['quarantine']['persona']['persona_text']), and "
+            "summarizer._archive_chapters(conv_id, "
+            "bundle['quarantine']['chapters'])."
         ),
     }
 
@@ -587,11 +640,11 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
                 f"conv={conv_id}: quarantine snapshot lost episodic entries "
                 f"between write and read-back"
             )
-        # Same contradiction for the two layers carried in the metadata block.
-        # Verified rather than trusted for exactly the reason the payload is:
-        # the caller is about to delete these, and a snapshot that quietly
-        # dropped them on serialization is worse than no snapshot, because the
-        # caller proceeds.
+        # Same contradiction for the three layers carried in the metadata
+        # block. Verified rather than trusted for exactly the reason the
+        # payload is: the caller is about to delete these, and a snapshot
+        # that quietly dropped them on serialization is worse than no
+        # snapshot, because the caller proceeds.
         back_q = back.get("quarantine")
         if not isinstance(back_q, dict):
             raise QuarantineError(
@@ -610,6 +663,13 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
             raise QuarantineError(
                 f"conv={conv_id}: quarantine snapshot read back without the "
                 f"persona this conversation has stored"
+            )
+        # v3.1.9.4 (P15-3): the third layer, same rule.
+        if len(back_q.get("chapters") or []) < len(chapter_rows):
+            raise QuarantineError(
+                f"conv={conv_id}: quarantine snapshot read back with "
+                f"{len(back_q.get('chapters') or [])} chapter(s), expected "
+                f"at least {len(chapter_rows)}"
             )
 
         # F1 / C5-4: stage and verify every torn layer's raw bytes exactly
@@ -651,6 +711,7 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
         f"{n_back} fact(s), {len(back_q.get('archive') or [])} archived, "
         f"{len(back.get('episodic') or [])} episodic, "
         f"summary={'yes' if _has_summary_content(back.get('summary_state')) else 'no'}, "
+        f"chapters={len(back_q.get('chapters') or [])}, "
         f"persona={'yes' if back_q.get('persona') else 'no'}"
         + (f", unverified: {'; '.join(unverified)}" if unverified else "")
         + (
@@ -666,6 +727,8 @@ def quarantine_conversation(conv_id: str, *, reason: str) -> dict:
         "episodic": len(back.get("episodic") or []),
         "summary": _has_summary_content(back.get("summary_state")),
         "persona": bool(back_q.get("persona")),
+        # v3.1.9.4 (P15-3): the third carried layer.
+        "chapters": len(back_q.get("chapters") or []),
         "unverified_layers": unverified,
         # F1: present only when the facts layer was unreadable — the raw
         # bytes of the torn file, copied aside next to this snapshot. None
@@ -1219,14 +1282,97 @@ def import_conversation(
     # additive, so it is the one thing that must be emptied — and it is now
     # emptied only after both atomic writes above it have landed.
 
+    # v3.1.9.4 (R4 / W1, P15-5 follow-up). An overwrite onto a target that
+    # already had state (pre_existing) or could not be proven empty
+    # (unverifiable) is the SAME class of wipe main._clear_all_memory and
+    # commands._handle_retire's apply step already bump for: it replaces
+    # this conv_id's facts, and — a few lines down — its facts archive,
+    # chapter archive and persona too. Without the bump, a tail submitted
+    # against `target` before this import ran, still parked on the pool's
+    # concurrency semaphore or mid a vLLM extraction call, captures the
+    # generation as it stood before the import, finds it UNCHANGED when it
+    # finally re-checks under conv_lock, and writes its pre-import facts
+    # straight into the freshly-imported store.
+    #
+    # Computed once and reused below (the archive/chapter/persona clear
+    # shares the identical condition) rather than bumping unconditionally:
+    # an overwrite=True import onto a genuinely empty, freshly-created
+    # target is not wiping anything, and a bump that fires for every import
+    # call would make the generation counter noisy for no protective
+    # benefit.
+    #
+    # WHY NO conv_lock HERE, unlike every other bump site. import_conversation
+    # is a plain `def` called from an `async def` endpoint (see
+    # _validate_target_ready's own comment on this a few lines up) and never
+    # awaits, so it runs to completion on the event loop without yielding —
+    # nothing else can observe `target`'s generation or take conv_lock(target)
+    # while this function is running. That makes the WHOLE function one
+    # atomic section from a concurrent tail's point of view, which is why
+    # _validate_target_ready's `locked()` probe was sufficient mutual
+    # exclusion for the write below and is equally sufficient here: the bump
+    # only has to happen somewhere before this function returns, not under an
+    # explicit lock it cannot await for.
+    will_replace_existing = (pre_existing or unverifiable) and overwrite
+    if will_replace_existing:
+        memory.bump_wipe_generation(target)
+        # v3.1.9.4 (R5 / P16-1 sibling fix). Same reasoning as
+        # main._clear_all_memory's own mark_wiped call: `target`'s facts are
+        # about to be replaced wholesale by the bundle below, so any
+        # `failed`/stale `in_progress` backfill record left over from
+        # `target`'s PRE-import history must not survive to retry against
+        # it later — that record's own exchanges_total was counted against
+        # a conversation this import is about to make unrecognisable.
+        # import_conversation never awaits (see this function's own comment
+        # a few lines up), so there is no lock to take here either; nothing
+        # else can observe `target` mid-function.
+        backfill.mark_wiped(target)
+
     # Restore facts wholesale (already-pruned by export, no further pruning).
     facts.save_facts(target, list(bundle.get("facts", [])))
 
     # Restore summary state wholesale.
     summarizer.save_state(target, dict(bundle.get("summary_state", {})))
 
-    if (pre_existing or unverifiable) and overwrite:
+    if will_replace_existing:
         retrieval.forget_conversation(target)
+        # v3.1.9.4 (P15-3). THREE MORE layers the bundle payload does not
+        # carry and this overwrite never touched: the target's OLD facts
+        # archive, L2 chapter cold store and persona survived every import,
+        # mixed in beside the freshly-written conversation — a "forget"
+        # this is not: the SOURCE bundle's own state lands correctly, but
+        # whatever the TARGET id had before (chapters an L3 refresh had
+        # already archived, facts an eviction had archived, a persona)
+        # stayed live under the same id. All three are already preserved —
+        # main.admin_import_conversation takes a quarantine_conversation
+        # snapshot of the target BEFORE calling here whenever overwrite is
+        # set, and that snapshot now carries all three (see the D8 block
+        # comment above quarantine_conversation) — so clearing them here is
+        # the same "write the replacement, clear what it cannot replace"
+        # shape this function already applies to the episodic index one
+        # line up, not a second archive-before-delete of its own.
+        try:
+            facts.save_archive(target, [])
+        except Exception as e:
+            logger.warning(
+                f"conv={target}: could not clear the old facts archive on "
+                f"overwrite: {e}"
+            )
+        try:
+            _chapter_path = memory.summary_archive_path(target)
+            if _chapter_path.is_file():
+                _chapter_path.unlink()
+        except Exception as e:
+            logger.warning(
+                f"conv={target}: could not clear the old chapter archive on "
+                f"overwrite: {e}"
+            )
+        try:
+            persona.clear_persona(target)
+        except Exception as e:
+            logger.warning(
+                f"conv={target}: could not clear the old persona on "
+                f"overwrite: {e}"
+            )
 
     # Re-embed and re-index each exchange.
     episodic_imported = 0
@@ -1457,6 +1603,34 @@ def _evicted_by_origin(
     return dst_evicted, len(evicted) - dst_evicted
 
 
+# v3.1.9.3 (P11 / race-merge.md, coordinator review round 2). How long
+# merge_conversation waits to ACQUIRE conv_lock(dst_conv_id) before giving up
+# and refusing (the original D18 behaviour) rather than parking the request.
+#
+# A summary rebuild can hold conv_lock for the WHOLE drain — 10-30 minutes,
+# the identity runbook's own estimate (see the source-side guard's comment
+# below) — with her extraction tails queued behind it. Waiting unboundedly
+# for that lock would park this admin request, and the threadpool thread
+# under it, for up to half an hour: past any operator's patience and past
+# any HTTP client or proxy timeout, indistinguishable from a hang. The
+# ORIGINAL code refused instantly instead ("Retry in a moment"); trading
+# that for an unbounded wait swaps a fast, clear error for a silent stall.
+#
+# This bounds it instead of choosing between those two: long enough that the
+# shapes this fix exists for — two merges racing each other, or a merge
+# landing a moment either side of /remember, import, or an ordinary
+# (sub-second) extraction tail — serialize and both land, short enough that
+# a merge queued behind a genuine multi-minute rebuild still fails FAST with
+# the original clear error instead of hanging. 10.0s matches this codebase's
+# other precedent for "a bounded wait on an admin-ish, user-triggered
+# operation" — commands.FORGET_SETTLE_TIMEOUT, which /forget uses to drain
+# the background pool before a wipe, justified there as "a command a user
+# issues rarely and deliberately, and it is bounded". merge-into is the same
+# shape (rare, deliberate, admin-triggered), so it gets the same number for
+# the same reason — not a value tuned to this function specifically.
+_MERGE_DST_LOCK_TIMEOUT_S = 10.0
+
+
 def merge_conversation(
     src_conv_id: str, dst_conv_id: str, *, dry_run: bool = True,
     refresh_last_used: bool = False,
@@ -1652,40 +1826,29 @@ def merge_conversation(
     if dry_run:
         return result
 
-    # Same mutual exclusion import_conversation uses, and for the same reason
-    # (D18): conv_lock is an ASYNCIO lock and this is a plain def called
-    # through run_in_threadpool, so it cannot await the lock - it can only
-    # refuse to write underneath a holder. The hazard is concrete: the
-    # extraction tail reads the fact list, parks on a vLLM call holding the
-    # lock, and writes that pre-merge snapshot back when it returns. The
-    # merged facts would vanish with no error anywhere.
-    if memory.conv_lock(dst_conv_id).locked():
-        raise ValueError(
-            f"conv_id {dst_conv_id!r} has a memory write in flight (extraction "
-            f"tail, archive, restore or dedup). Refusing rather than merging "
-            f"underneath it - that writer would overwrite the merged facts on "
-            f"its next save. Retry in a moment."
-        )
     # v3.1.9 (hostile pass 3, reviewer D F5). SOURCE holds the identical
-    # hazard, one step earlier, and this used to check only dst — merge is
-    # read-only on src, and "read-only" was read as "nothing to guard". It
-    # is not, on the identity runbook's own R3 (reverse merge): R2's first
-    # message under the new uuid starts a summary rebuild that holds
-    # conv_lock(uuid) for the WHOLE drain (10-30 minutes, the runbook's own
-    # estimate; 23 summarization calls measured on one branch), and her
-    # NEXT messages under the uuid queue their episodic-index and fact-
-    # extraction tails behind that same lock. Running R3 (src=uuid) in that
-    # window reads the uuid's store AS IT STANDS mid-rebuild, commits, and
-    # reports success (`exchanges_added: 1`) — then the queued tails finish
-    # and write turns 214, 216 and two facts under the uuid, AFTER the
-    # header is gone and the reverse merge already declared done (reviewer
-    # D, run ident3k: 17:12:52.069 merge logs success, 17:12:52.775 and
-    # 17:13:09.509 the queued tail's writes land). Nothing is destroyed —
-    # a second reverse merge recovers them — but R3's own success check
-    # (facts_added present) passes while the copy is silently incomplete.
-    # Same refusal, same message shape, for the same reason one call
-    # earlier: a merge that read src while its own writer was mid-drain
-    # would silently omit whatever that writer was about to add.
+    # hazard the destination guard below closes, one step earlier, and this
+    # used to check only dst — merge is read-only on src, and "read-only"
+    # was read as "nothing to guard". It is not, on the identity runbook's
+    # own R3 (reverse merge): R2's first message under the new uuid starts a
+    # summary rebuild that holds conv_lock(uuid) for the WHOLE drain (10-30
+    # minutes, the runbook's own estimate; 23 summarization calls measured
+    # on one branch), and her NEXT messages under the uuid queue their
+    # episodic-index and fact-extraction tails behind that same lock.
+    # Running R3 (src=uuid) in that window reads the uuid's store AS IT
+    # STANDS mid-rebuild, commits, and reports success (`exchanges_added:
+    # 1`) — then the queued tails finish and write turns 214, 216 and two
+    # facts under the uuid, AFTER the header is gone and the reverse merge
+    # already declared done (reviewer D, run ident3k: 17:12:52.069 merge
+    # logs success, 17:12:52.775 and 17:13:09.509 the queued tail's writes
+    # land). Nothing is destroyed — a second reverse merge recovers them —
+    # but R3's own success check (facts_added present) passes while the
+    # copy is silently incomplete. This stays a probe-and-refuse (unlike
+    # the destination fix below): src is read-only here, the read already
+    # happened above before any lock could be taken, and the failure mode
+    # is staleness (an omitted fact), not the destination's corruption
+    # (an overwritten one) — a probe close to the read narrows the window
+    # without changing merge_conversation's read-only contract on src.
     if memory.conv_lock(src_conv_id).locked():
         raise ValueError(
             f"conv_id {src_conv_id!r} has a memory write in flight (extraction "
@@ -1696,49 +1859,227 @@ def merge_conversation(
             f"moment."
         )
 
-    # Re-read rather than trusting the counters computed above: the tail may
-    # have added facts between the pre-flight read and here. Re-run the same
-    # fold against the fresh read rather than reusing the stale preview — a
-    # collision the preview never saw (because the tail added that key after
-    # the preview ran) still has to have its pin/last_used folded, not just
-    # its "already present" status re-checked.
-    current = facts.load_facts(dst_conv_id)
-    merged, actual_stats = _merge_fact_lists(
-        current, src_facts,
-        last_used_floor=_dst_last_used_floor(current) if refresh_last_used else None,
-    )
-    if merged != current:
-        facts.save_facts(dst_conv_id, merged)
-    result["facts_added"] = actual_stats["added"]
-    result["facts_pin_or_recency_updated"] = actual_stats["updated"]
-    # Re-measured against the set actually written (the preview above was
-    # against the pre-lock, possibly-stale read) — same reasoning as
-    # re-running _merge_fact_lists itself against `current`.
-    _kept_actual, _evicted_actual = facts._lru_split(merged, facts._MAX_FACTS_TOKENS)
-    result["facts_over_budget_after_merge"] = len(_evicted_actual)
-    _dst_evicted, _merged_evicted = _evicted_by_origin(merged, len(current), _evicted_actual)
-    result["dst_facts_evicted_after_merge"] = _dst_evicted
-    result["merged_facts_evicted_after_merge"] = _merged_evicted
+    # v3.1.9.3 (P11 / race-merge.md, hostile pass on v3.1.9.2). This USED to
+    # be the same probe-and-refuse D18 gave import_conversation: `if
+    # memory.conv_lock(dst_conv_id).locked(): raise ...`. That is not the
+    # same fix here, and the gap was real: import_conversation is called
+    # DIRECTLY from its async endpoint and runs to completion without
+    # yielding, so nothing else can interleave between its probe and its
+    # write — the probe alone is sufficient mutual exclusion. merge_conversation
+    # is dispatched `await run_in_threadpool(portability.merge_conversation,
+    # ...)` (main.py), so it runs on a THREADPOOL WORKER — a real OS thread —
+    # and NOTHING here ever called `conv_lock(dst).acquire()`, so the lock's
+    # state never reflected a merge in progress. Two merges into the same
+    # destination each probed `.locked()`, each saw False, and each did an
+    # unsynchronised `facts.load_facts -> _merge_fact_lists -> facts.save_facts`
+    # of the SAME file. Adversarial measurement (tests/adversarial/
+    # test_adv_race.py::test_two_merges_into_one_conversation_lose_facts,
+    # 60 reps of two merges racing into one destination): every run lost
+    # roughly half of the 40 facts both sides had just been told (HTTP 200,
+    # `facts_added` counted) were added — whichever merge's save landed
+    # first was overwritten by the second, which had read before the first
+    # wrote. The same gap reaches merge-vs-import and merge-vs-/remember on
+    # one destination (test_merge_and_import_into_one_destination,
+    # test_merge_against_a_remember_holding_the_lock): those DO take
+    # conv_lock properly, but only as an async context manager on the event
+    # loop, which a probe from a worker thread cannot see close in time.
+    #
+    # The fix: actually HOLD conv_lock(dst_conv_id) for the read-modify-write
+    # below, the way every other writer to this file already does — not
+    # probe it. A plain `def` on a worker thread cannot `await` an
+    # asyncio.Lock directly, but AnyIO gives exactly this bridge: a thread
+    # started by `anyio.to_thread.run_sync` (what `run_in_threadpool` calls)
+    # carries a "blocking portal" back to the loop that spawned it, and
+    # `anyio.from_thread.run(coro)` runs `coro` ON THAT LOOP and blocks this
+    # thread until it finishes.
+    #
+    # ONLY THE LOCK OPERATIONS cross that bridge — not the work (coordinator
+    # review round 2). An earlier version of this fix ran `_merge_commit()`
+    # itself — load_facts, _merge_fact_lists, save_facts, the exchanges loop
+    # — inside the bridged coroutine, i.e. ON THE EVENT LOOP, the one thread
+    # every other request in the process depends on. That defeats the whole
+    # reason this function is dispatched through run_in_threadpool in the
+    # first place: while a merge's file I/O ran, the loop could not service
+    # ANY other coroutine — a concurrent GET /health would stall for as long
+    # as the merge's own save took. Proven (and now guarded against) by
+    # test_merge_does_not_block_the_event_loop_while_writing, which patches
+    # save_facts to sleep and measures how long a concurrent no-op coroutine
+    # takes to get its next turn while a merge is in flight.
+    #
+    # So the bridge now carries ONLY `_acquire_dst_lock_bounded` (acquire and
+    # return) and `_release_dst_lock` (release). `_merge_commit()` runs
+    # between them on THIS thread — the worker thread merge_conversation was
+    # already running on — exactly as if no lock existed. `release()` also
+    # goes through the portal (via `anyio.from_thread.run_sync`, AnyIO's
+    # sync-callable counterpart to `run`): `asyncio.Lock.release()` wakes the
+    # next waiter by resolving a Future that belongs to the loop, so it is no
+    # more thread-safe to call directly from a worker thread than `acquire()`
+    # is — see `merge_probe3.py` in this lane's scratchpad report for a
+    # standalone confirmation of both halves of this bridge before it was
+    # wired in here.
+    #
+    # BOUNDED, not unbounded (coordinator review round 2, second finding). A
+    # summary rebuild can hold conv_lock for the WHOLE drain — 10-30 minutes,
+    # the identity runbook's own estimate (see the source-side guard's
+    # comment above) — with her extraction tails queued behind it.
+    # `_acquire_dst_lock_bounded` waits at most `_MERGE_DST_LOCK_TIMEOUT_S`
+    # (see that constant's own comment for the number and why) and, on
+    # timeout, raises the ORIGINAL D18-style refusal instead of parking the
+    # request — a merge queued behind a genuine multi-minute rebuild fails
+    # fast with a clear error rather than hanging past any caller's or
+    # proxy's timeout.
+    #
+    # `anyio.from_thread.run` raises `anyio.NoEventLoopError` when there is
+    # no portal — every existing unit test in this file calls
+    # merge_conversation() directly, with no threadpool involved at all, and
+    # that has to keep working. Two sub-cases, told apart by whether a loop
+    # is running on THIS thread:
+    #   * no loop at all (a plain script/test call, the common case here) —
+    #     nothing else can be interleaving through conv_lock on this thread
+    #     either, so there is no event loop to protect from blocking: a
+    #     fresh `asyncio.run` doing the bounded acquire, the commit, AND the
+    #     release all in one place is exactly as safe as the bridge above.
+    #   * a loop IS running on this thread (a test that calls
+    #     merge_conversation() synchronously from inside a coroutine that
+    #     ALREADY holds conv_lock(dst) itself, simulating "a write is in
+    #     flight" — see test_merge_still_refuses_while_dest_has_a_write_in_
+    #     flight): awaiting the same lock here would self-deadlock the one
+    #     coroutine that is both the holder and the would-be acquirer, and
+    #     `asyncio.run` cannot be nested inside a running loop either. This
+    #     is exactly the shape D18's probe-and-refuse was built for, and
+    #     nothing on this thread can be running concurrently with us here
+    #     (we own it), so the old probe (instant, no timeout needed — it is
+    #     a check, not a wait) is still the correct answer for it.
+    def _dst_lock_busy_error() -> ValueError:
+        # The ORIGINAL D18-style message, unchanged — used both when the
+        # bounded wait below times out and in the no-portal/loop-already-
+        # running fallback's instant probe, so a caller sees the same error
+        # regardless of which of the two ways it was refused.
+        return ValueError(
+            f"conv_id {dst_conv_id!r} has a memory write in flight (extraction "
+            f"tail, archive, restore or dedup). Refusing rather than merging "
+            f"underneath it - that writer would overwrite the merged facts on "
+            f"its next save. Retry in a moment."
+        )
 
-    added = 0
-    for e in new_exchanges:
+    def _merge_commit() -> None:
+        """The critical section itself — everything that reads-and-then-
+        writes dst. Deliberately lock-free and synchronous: every caller
+        below already holds conv_lock(dst_conv_id) (or has established, by
+        construction, that nothing else can be interleaving with it) before
+        calling this and releases it after — nothing in this function's own
+        body touches the lock, which is what lets it run on a worker thread
+        rather than the event loop.
+        """
+        # Re-read rather than trusting the counters computed above: the tail
+        # may have added facts between the pre-flight read and here. Re-run
+        # the same fold against the fresh read rather than reusing the stale
+        # preview — a collision the preview never saw (because the tail
+        # added that key after the preview ran) still has to have its
+        # pin/last_used folded, not just its "already present" status
+        # re-checked.
+        current = facts.load_facts(dst_conv_id)
+        merged, actual_stats = _merge_fact_lists(
+            current, src_facts,
+            last_used_floor=_dst_last_used_floor(current) if refresh_last_used else None,
+        )
+        if merged != current:
+            facts.save_facts(dst_conv_id, merged)
+        result["facts_added"] = actual_stats["added"]
+        result["facts_pin_or_recency_updated"] = actual_stats["updated"]
+        # Re-measured against the set actually written (the preview above
+        # was against the pre-lock, possibly-stale read) — same reasoning as
+        # re-running _merge_fact_lists itself against `current`.
+        _kept_actual, _evicted_actual = facts._lru_split(merged, facts._MAX_FACTS_TOKENS)
+        result["facts_over_budget_after_merge"] = len(_evicted_actual)
+        _dst_evicted, _merged_evicted = _evicted_by_origin(merged, len(current), _evicted_actual)
+        result["dst_facts_evicted_after_merge"] = _dst_evicted
+        result["merged_facts_evicted_after_merge"] = _merged_evicted
+
+        added = 0
+        for e in new_exchanges:
+            try:
+                if retrieval.import_indexed_exchange(
+                    dst_conv_id, e.get("turn_index"), e.get("document", "")
+                ):
+                    added += 1
+            except Exception as ex:
+                logger.warning(
+                    f"merge {src_conv_id}->{dst_conv_id}: exchange "
+                    f"{e.get('turn_index')} failed to import: {ex}"
+                )
+        result["exchanges_added"] = added
+
+    async def _acquire_dst_lock_bounded() -> None:
+        """Runs ON THE LOOP via the portal — this, and only this, is the
+        part of the fix that has to. Bounded per _MERGE_DST_LOCK_TIMEOUT_S;
+        a timeout raises the ORIGINAL refusal rather than continuing to
+        wait.
+        """
         try:
-            if retrieval.import_indexed_exchange(
-                dst_conv_id, e.get("turn_index"), e.get("document", "")
-            ):
-                added += 1
-        except Exception as ex:
-            logger.warning(
-                f"merge {src_conv_id}->{dst_conv_id}: exchange "
-                f"{e.get('turn_index')} failed to import: {ex}"
+            await asyncio.wait_for(
+                memory.conv_lock(dst_conv_id).acquire(),
+                timeout=_MERGE_DST_LOCK_TIMEOUT_S,
             )
-    result["exchanges_added"] = added
+        except asyncio.TimeoutError:
+            raise _dst_lock_busy_error() from None
+
+    def _release_dst_lock() -> None:
+        """Also runs ON THE LOOP, via anyio.from_thread.run_sync — see the
+        module comment above for why release(), like acquire(), is not
+        thread-safe to call directly from the worker thread.
+        """
+        memory.conv_lock(dst_conv_id).release()
+
+    try:
+        anyio.from_thread.run(_acquire_dst_lock_bounded)
+    except anyio.NoEventLoopError:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop on this thread at all — see the no-portal comment
+            # above. Acquire (bounded, same as the real path), commit, and
+            # release all within one fresh loop; nothing else can be
+            # running concurrently with us on this thread regardless.
+            async def _fallback_acquire_commit_release() -> None:
+                lock = memory.conv_lock(dst_conv_id)
+                try:
+                    await asyncio.wait_for(
+                        lock.acquire(), timeout=_MERGE_DST_LOCK_TIMEOUT_S
+                    )
+                except asyncio.TimeoutError:
+                    raise _dst_lock_busy_error() from None
+                try:
+                    _merge_commit()
+                finally:
+                    lock.release()
+
+            asyncio.run(_fallback_acquire_commit_release())
+        else:
+            # A loop is already running on this thread and we cannot await
+            # into it without risking a self-deadlock or a nested
+            # `asyncio.run` — fall back to the original D18 probe-and-refuse
+            # for this one shape (see the comment above). An instant check,
+            # not a wait, so no timeout applies here.
+            if memory.conv_lock(dst_conv_id).locked():
+                raise _dst_lock_busy_error()
+            _merge_commit()
+    else:
+        # The lock is ours, acquired on the loop via the portal above. The
+        # actual work happens HERE, on this worker thread — not the loop —
+        # which is the entire point of this fix; release back through the
+        # portal when done, success or not.
+        try:
+            _merge_commit()
+        finally:
+            anyio.from_thread.run_sync(_release_dst_lock)
 
     logger.info(
         f"merged conv {src_conv_id} into {dst_conv_id}: "
         f"+{result.get('facts_added', 0)} fact(s), "
         f"{result.get('facts_pin_or_recency_updated', 0)} existing fact(s) "
-        f"pin/last_used updated, +{added} exchange(s); source left intact"
+        f"pin/last_used updated, +{result.get('exchanges_added', 0)} "
+        f"exchange(s); source left intact"
     )
     return result
 

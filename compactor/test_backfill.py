@@ -235,13 +235,46 @@ def test_needs_backfill_stale_in_progress_returns_true():
     assert_eq(backfill.needs_backfill(cid, msgs), True, "stale in_progress -> retry")
 
 
-def test_needs_backfill_failed_state_returns_true():
-    print("\n[test] needs_backfill=True when previous backfill failed")
+def test_needs_backfill_failed_state_returns_true_once_the_backoff_elapses():
+    print("\n[test] needs_backfill=True when previous backfill failed AND the "
+          "backoff since its last update has elapsed")
+    # v3.1.9.4 (R2 / P15-2 follow-up). A `failed` record no longer retries
+    # the INSTANT it is seen — see test_v3194_r3_r2.py for the full cap and
+    # backoff coverage; this is the pre-existing behaviour this fix changed,
+    # updated rather than deleted.
+    #
+    # Written straight to disk, like test_needs_backfill_stale_in_progress_
+    # returns_true just above: backfill._write_state ALWAYS stamps
+    # updated_at with the current time, so it cannot be used to plant an
+    # old timestamp.
     _wipe_storage()
     cid = "broke"
-    backfill._write_state(cid, {"state": "failed", "started_at": "...", "error": "boom"})
+    old_ts = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=backfill._BACKFILL_RETRY_BACKOFF_S + 60)
+    ).isoformat()
+    state_path = backfill._backfill_state_path(cid)
+    state_path.write_text(json.dumps({
+        "conv_id": cid, "state": "failed", "started_at": old_ts,
+        "updated_at": old_ts, "attempts": 1, "error": "boom",
+    }))
     msgs = [{"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}] * 3
-    assert_eq(backfill.needs_backfill(cid, msgs), True, "failed -> retry")
+    assert_eq(backfill.needs_backfill(cid, msgs), True, "failed, backoff elapsed -> retry")
+
+
+def test_needs_backfill_failed_state_returns_false_before_the_backoff_elapses():
+    print("\n[test] needs_backfill=False for a JUST-failed backfill — it must "
+          "not retry on the very next request (the P15-2 follow-up defect)")
+    _wipe_storage()
+    cid = "just-broke"
+    backfill._write_state(cid, {
+        "state": "failed", "started_at": "...", "attempts": 1, "error": "boom",
+    })
+    msgs = [{"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}] * 3
+    assert_eq(backfill.needs_backfill(cid, msgs), False,
+              "a failure this recent has not backed off yet — retrying now "
+              "would be exactly the request-after-request re-run this fix "
+              "closes")
 
 
 # ---------------------------------------------------------------------------
@@ -623,7 +656,8 @@ if __name__ == "__main__":
         test_needs_backfill_no_state_and_long_history_returns_true()
         test_needs_backfill_complete_state_returns_false()
         test_needs_backfill_stale_in_progress_returns_true()
-        test_needs_backfill_failed_state_returns_true()
+        test_needs_backfill_failed_state_returns_true_once_the_backoff_elapses()
+        test_needs_backfill_failed_state_returns_false_before_the_backoff_elapses()
 
         test_run_backfill_end_to_end_writes_facts()
 
