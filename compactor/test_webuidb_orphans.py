@@ -404,16 +404,25 @@ make_genuinely_torn(SNAP, rows=200)
 check(not LOCAL.exists(), "fixture: no local database yet (pod-recreate path)")
 _snap_dirty_before = SNAP.read_bytes()
 _snap_journal_before = Path(str(SNAP) + "-journal").read_bytes()
-_con = sqlite3.connect(f"file:{SNAP}?mode=ro", uri=True)
-try:
-    _dirty_rows = _con.execute("select chat from chat order by id").fetchall()
-finally:
-    _con.close()
+# Read the RAW BYTES rather than opening a connection: SQLite REFUSES a
+# mode=ro open against a database with a pending hot journal ("attempt to
+# write a readonly database" - completing the rollback IS a write, and
+# ro forbids it), and a normal read-write open would perform that exact
+# rollback right here, destroying the torn fixture before restore_on_boot
+# ever sees it. A plain byte count is enough to prove which value is on
+# disk right now without opening the file at all.
+_q_run = _snap_dirty_before.count(b"q" * 500)
 check(
-    all(row[0].startswith("q") for row in _dirty_rows) and len(_dirty_rows) == 200,
-    "CONTROL, fixture sanity: SNAP's own on-disk pages really do hold the "
-    "mid-transaction 'q'-filled UPDATE right now, unrolled-back, proving "
-    "this fixture starts genuinely dirty rather than already-clean",
+    _q_run > 0,
+    f"CONTROL, fixture sanity: SNAP's own on-disk pages really do hold "
+    f"at least some of the mid-transaction 'q'-filled UPDATE right now, "
+    f"unrolled-back (found {_q_run} run(s) of 500+ 'q' bytes; page-overflow "
+    f"framing bytes break up a full 4096-byte run, so this looks for a "
+    f"shorter one instead), proving this fixture starts genuinely dirty "
+    f"rather than already-clean - exactly how many of the 200 rows were "
+    f"flushed out of SQLite's 1-page cache before the SIGKILL landed is "
+    f"not itself the guarantee; the assertion after restore_on_boot() "
+    f"below (all 200 rows correctly 'x'-filled again) is",
 )
 
 r = webuidb.restore_on_boot()
@@ -465,13 +474,27 @@ print("[D5/W7] a leftover -wal/-shm under the STAGED name is renamed to "
 # boot's orphan sweep would not recognise it as belonging to LOCAL_DB.
 reset()
 mk(SNAP, 30)
+# A SECOND connection stays open for the rest of this test, WITH
+# wal_autocheckpoint=0: SQLite performs a checkpoint (truncating -wal back
+# to empty) opportunistically around a connection closing even when
+# another connection to the same database is still open, unless automatic
+# checkpointing is explicitly disabled - both were needed to actually
+# leave a real, non-empty -wal file behind; either alone still let it get
+# checkpointed away before restore_on_boot() ever saw it.
+_con_keepalive = sqlite3.connect(str(SNAP))
+_con_keepalive.execute("PRAGMA journal_mode=WAL")
+_con_keepalive.execute("PRAGMA wal_autocheckpoint=0")
 _con = sqlite3.connect(str(SNAP))
-_con.execute("PRAGMA journal_mode=WAL")
+_con.execute("PRAGMA wal_autocheckpoint=0")
 _con.execute("insert into chat values ('extra', 999, ?)", ("y" * 4096,))
 _con.commit()
-_con.close()
+# NEITHER connection is closed here, deliberately: closing the writer (or
+# being the last one standing) is what triggers SQLite's own
+# checkpoint-on-close, which truncates -wal back to empty before this
+# fixture's own check even runs - measured directly, closing `_con` alone
+# (with `_con_keepalive` still open) was enough to make it vanish.
 check(
-    Path(str(SNAP) + "-wal").exists(),
+    Path(str(SNAP) + "-wal").exists() and Path(str(SNAP) + "-wal").stat().st_size > 0,
     "fixture: SNAP is in WAL mode with an actual -wal file present "
     "(uncheckpointed) beside it",
 )
@@ -494,6 +517,8 @@ check(
     f"{_leftover_staged}) - W7 would leave the -wal/-shm pair stranded "
     f"there instead of renamed to LOCAL_DB's own name",
 )
+_con.close()
+_con_keepalive.close()
 
 # ---------------------------------------------------------------------------
 print()
