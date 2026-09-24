@@ -2406,3 +2406,48 @@ from the Dockerfile, and one env typo used to stop the boot.
 It does not answer: anything about her actual conversation, whose state lives
 in a storage root this process cannot see. To test against real data, restore
 a backup into the shadow's root first — never point the shadow at the live one.
+
+## The word ban on her replies: adding a word and publishing (v3.1.9.6)
+
+The ban is **one OpenWebUI setting**, not an image change. It is an xgrammar grammar in the model's
+`structured_outputs` custom parameter (Admin Panel → Settings → Models → the model → Advanced Params). vLLM
+refuses, token by token, any continuation that would spell a banned word. The grammar is built, proven and
+released by `scripts/wordban/`, never by hand. That directory's `README.md` has the pattern syntax and exactly
+what `verify` proves.
+
+**To add or change a word:**
+
+1. Edit `scripts/wordban/banlist.yaml`. Usually this is one line under `families:`, for example
+   `- {id: ZORBEX, match: zorbex}`. Add real near-misses to `tests.must_block` and legitimate words that must
+   survive to `tests.must_pass`. Bump `revision:`.
+2. Run the tool on a Linux host with docker (WSL):
+
+   ```bash
+   cd ~/code/zions-light-ai/scripts/wordban
+   python3 wordban.py build
+   python3 wordban.py diff git:HEAD banlist.yaml --corpus <newest backup>/webui.db   # what changes, as counts
+   python3 wordban.py verify --corpus <newest backup>/webui.db                       # any failure = non-zero exit
+   python3 wordban.py e2e --webui-db <newest backup>/webui.db
+   python3 wordban.py release --notes notes.md                                       # -> ~/zl-ops/word-ban/
+   ```
+
+   Use the newest backup under `/home/drew/pod-exports/`. It is only read: the tool copies it into a private
+   directory, prints counts only, and deletes the copy.
+3. Follow Steps 1–3 in the `word-ban.md` that `release` writes:
+   - paste `word-ban-structured_outputs.value.txt` into the `structured_outputs` row, then Save & Update;
+   - replace the system-prompt paragraph with the new line;
+   - run `word-ban-check.py` on the pod. `RESULT: PASS` means the saved grammar arrived intact and holds on
+     both hops.
+4. Commit the banlist change.
+
+**Rules:**
+
+- **`release` refuses** unless `verify` passed in full on the exact built bytes. A full pass includes the image
+  half (vLLM 0.19's own xgrammar backend, the real tokenizer and the token-level no-trap proof) and the corpus
+  run. By default it also needs a passing `e2e`.
+- **Never hand-edit a grammar or a paste value.** A hand-built revision 4 shipped with a trap on 2026-09-23.
+  After `angel` followed by an accented letter (`angelĂ`, `Angelø`, `angeléñÖs`), the only allowed tokens were
+  combining marks, and the reply could not end, so the model wrote marks until `max_tokens`. The tool's
+  no-trap proof exists for exactly this, and those three prefixes are permanent regression cases.
+- **To roll back:** paste the previous `word-ban-structured_outputs.value.vN.txt` into the row, or delete the
+  row. Either takes effect on the next reply.

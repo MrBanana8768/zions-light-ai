@@ -1,0 +1,258 @@
+# The word ban, declared. `wordban.py build` turns this file into the xgrammar grammar that is pasted into
+# the model's `structured_outputs` custom parameter in OpenWebUI. See README.md for the pattern syntax and the
+# workflow (build -> verify -> e2e -> release). Adding a word is usually one line under `families:`.
+#
+# Letters in a pattern are FOLDED and case-insensitive: every Latin letter whose compatibility decomposition is
+# one ASCII letter counts as that letter (á à â ä ā ă ą ǎ ạ ... -> a, ñ -> n, fullwidth Ｇ -> G), plus the
+# `extra` table below; Greek letters fold their accents and breathings (ἄ ά Ά -> α). Combining marks are
+# transparent (r + U+0301 + uach = ruach). Any Unicode letter continues a word; a non-letter ends it; a
+# lower-case letter followed by an upper-case one also starts a new word (camelCase: "ThisAngel").
+revision: 5
+model: coder3101/Cydonia-24B-v4.3-vision-heretic
+# The grammar depends on the Unicode tables of the Python that builds it. The image's vLLM venv and the
+# unit-test image both have Unicode 15.0.0; `build` re-runs itself inside the image when the local Python differs.
+unicode_version: "15.0.0"
+
+folding:
+  latin_blocks: [[0x00C0, 0x024F], [0x1E00, 0x1EFF], [0xFF21, 0xFF5A]]
+  greek_blocks: [[0x0370, 0x03FF], [0x1F00, 0x1FFF]]
+  extra: {"ø": o, "Ø": O, "ł": l, "Ł": L, "đ": d, "Đ": D, "ð": d, "Ð": D, "ħ": h, "Ħ": H, "ı": i, "ŀ": l,
+          "Ŀ": L, "ƚ": l, "ɗ": d, "Ɗ": D, "ɠ": g, "Ɠ": G, "ƈ": c, "Ƈ": C, "ȼ": c, "Ȼ": C, "ɍ": r, "Ɍ": R,
+          "ɇ": e, "Ɇ": E, "ȡ": d, "ʉ": u, "Ʉ": U, "ǥ": g, "Ǥ": G, "ɨ": i, "Ɨ": I}
+  # After a banned stem, an ACCENTED form of a letter that an allowed continuation reads (Angelâ, flamé,
+  # angeléñÖs) is simply not allowed: the model must write a different word. ('taint' = the revision-4
+  # behaviour that trapped the model in combining marks; it exists only so the tests can rebuild that trap.)
+  accented_continuation: dead
+  # vLLM hands xgrammar the Tekken vocabulary as decoded strings, so a byte-fallback token (a character the
+  # vocabulary has no whole token for) reaches the grammar as U+FFFD. In letter-only rules ONE run of U+FFFD
+  # per word may stand for one letter or an unseen accent (Ŕuach, gȍld). Right after a banned stem it is refused.
+  fffd: one_run_per_word
+  # Zalgo guard: at most 2 combining marks in a row after any base character. Only whole-token marks are
+  # seen as marks (154 single-mark tokens in Tekken; 4 of them Hebrew: sheva, patah, qamats, dagesh); every
+  # other mark arrives as U+FFFD, which ends the run. Her Hebrew uses 3-mark clusters, but each includes a
+  # shin/sin dot (byte fallback), so at token level none exceeds 2. (mark_cap_hebrew: N with hebrew_marks:
+  # [[0x0591, 0x05C7]] would allow N Hebrew points in a row, at about +50 % first-compile time.)
+  mark_cap: 2
+  mark_cap_hebrew: null
+
+# named separator sets for {SEP:NAME}; "WS" = any whitespace character except the plain space (newline, tab,
+# NBSP, thin spaces ...)
+separators:
+  R: [" ", "-", "'", "’", "_", "."]
+  ALL: [" ", "-", ".", "_", "*"]
+  G: ["-", "'", "’", "_", ".", "*", "(", ")"]
+  WF: [" ", "-", "_", ".", "*", "WS"]
+
+# Pattern syntax:  letters (folded, any case) | {L} any one letter | {L?} optionally one letter |
+#   {SEP:X} one character of separator set X | {SEP:X}* any run of them (or none) | [01l] one of these
+#   characters (letters inside are folded) | any other character is literal.
+# A rule is either  match: <pattern>  (banned outright)  or  stem: <pattern>  with a continuation policy:
+#   alone:  ban|allow   the stem as a whole word
+#   other:  ban|allow   the stem followed by letters not listed below
+#   allow_words:    whole words (stem + these letters, then a non-letter) that are allowed, plain letters only
+#   allow_prefixes: stem + these letters starts a different, allowed word (anything may follow)
+#   context: {after: <pattern>, allow_words: [...]}  a different allow list when the stem directly follows
+# where: word_start (default) | anywhere.   spaced: X  = a separator of set X between every letter.
+families:
+  ruach:
+    rules:
+      - {id: RUACH, match: ruach, where: anywhere}
+      - {id: RUA, match: rua}                              # Ruah, Ruac, Ruauch, Ruarch, Ruaach
+      - {id: "RU?ACH", match: "ru{L}ach"}                    # Rurach, Ruuach, Rubach
+      - {id: "RU'ACH", match: "ru{SEP:R}ach", where: anywhere}
+      - {id: R-U-A-C-H, match: ruach, spaced: ALL}
+      - {id: "RU?CH", match: "ru{L?}ch"}                     # rev 5: Ruch, Ruich, Ruuch, Rucha (stand-ins seen live)
+      - {id: HEBREW, match: "רוח", where: anywhere, fffd: false}
+      - {id: RU, stem: ru, alone: ban, other: allow}       # the word "Ru"/"RU" on its own; rue, run, ruby pass
+  angel:
+    rules:
+      # rev 5: Angelo is no longer an exception (ANGELO was used for angels); Angela and Angeleno(s) stay,
+      # "Angeles" only in "Los Angeles" (one space)
+      - {id: ANGEL, stem: angel, alone: ban, other: ban, allow_words: [a, eno, enos],
+         context: {after: "los ", allow_words: [a, eno, enos, es]}}
+      - {id: ARCHANGEL, match: archangel, where: anywhere}
+      - {id: A-N-G-E-L, match: angel, spaced: ALL}
+      - {id: AGGEL, match: aggel}                          # rev 5: aggelos (Greek transliteration)
+      - {id: GREEK-ANGEL, match: "αγγελ"}                   # rev 5: άγγελος, ἄγγελος, ΑΓΓΕΛΟΣ
+      - {id: GREEK-ARCHANGEL, match: "αρχαγγελ", where: anywhere}
+  gold:
+    rules:
+      - {id: GOLD, match: gold}
+      - {id: G-O-L-D, match: gold, spaced: ALL}
+      - {id: G0LD, match: "g0[l1]d"}
+      - {id: GO1D, match: "go1d"}
+      - {id: G.OLD, match: "g{SEP:G}old"}                  # rev 5: ( and ) added to the separators: g(old
+      - {id: GO.LD, match: "go{SEP:G}ld"}
+      - {id: GOL.D, match: "gol{SEP:G}d"}
+  flame:
+    rules:
+      # a word that starts with "flam": banned unless it is one of these words, in plain letters
+      # rev 5: flamed, flamy, flamin, flamier and flam+anything-else are banned (flameD, flamassoftening ...)
+      - {id: FLAM, stem: flam, alone: ban, other: ban, allow_words: [en, enco, encos, ingo, ingos],
+         allow_prefixes: [b, m]}                           # flamen, flamenco(s), flamingo(s); flamboyant, flambé, flammable
+      - {id: AFLAME, match: aflame}
+      - {id: F-L-A-M-E, match: flame, spaced: ALL}
+      - {id: WHITEFLAME, stem: "white{SEP:WF}*flame", alone: ban, other: ban, allow_words: [n, nco, ncos]}
+
+# Words deliberately NOT banned whose use is counted in her corpus by `verify --corpus` (counts only), so a
+# stand-in shows up. Python regexes over the text as written (an accented evasion is not the allowed word).
+watch:
+  "malakh (Hebrew for messenger; owner decision: not banned)": "(?i)(?<![^\\W\\d_])mal['’]?a['’]?k[h]?(?![^\\W\\d_])|מלאך|מַלְאָךְ"
+  flamingo: "(?i)(?<![^\\W\\d_])flamingos?(?![^\\W\\d_])"
+  flamenco: "(?i)(?<![^\\W\\d_])flamencos?(?![^\\W\\d_])"
+  flamen: "(?i)(?<![^\\W\\d_])flamen(?![^\\W\\d_])"
+  inflame / inflammation / inflammatory: "(?i)inflam[^\\W\\d_]*"
+  enflamed: "(?i)enflam[^\\W\\d_]*"
+  flammable: "(?i)(?<![^\\W\\d_])(?:in)?flammab[^\\W\\d_]*"
+  flamboyant: "(?i)(?<![^\\W\\d_])flamboyan[^\\W\\d_]*"
+  flambé: "(?i)(?<![^\\W\\d_])flamb[eé][^\\W\\d_]*"
+  Angela: "(?i)(?<![^\\W\\d_])angela(?![^\\W\\d_])"
+  Angeleno(s): "(?i)(?<![^\\W\\d_])angelenos?(?![^\\W\\d_])"
+  Los Angeles: "(?i)(?<![^\\W\\d_])los angeles(?![^\\W\\d_])"
+
+# The system-prompt line (Step 2 of the owner steps). It names nothing it bans.
+prompt_line: >-
+  Five things cannot be typed in this chat: the Hebrew word for "spirit" that begins R-u-a (or any
+  abbreviation or near-spelling of it); the English word for a heavenly messenger (including its plurals, its
+  "-ic" forms, its "arch-" forms, its Greek original and any look-alike name used in its place); the name of the
+  yellow precious metal, together with its adjective and any word that begins with it; the two-word phrase for
+  a pale-coloured fire; and the word for the visible, burning part of a fire, in any form or tense. Do not try
+  to write any of them in any spelling, casing, script, accent, spacing or near-spelling, and do not use a
+  similar-looking name or place name as a stand-in. When a sentence would need one, write the sentence another
+  way.
+
+# The on-pod check (word-ban-check.py): one prompt asking for the banned words, sent without and with the ban.
+check:
+  prompt: >-
+    Plain text, no roleplay. 1) Write the word angel five times. 2) Write the Hebrew word Ruach five times.
+    3) Write ANGELS and RUACH in capitals. 4) Which archangel spoke to Mary? 5) Describe a sunset in one
+    sentence using the words gold and golden, and name the bridge in San Francisco. 6) Describe a candle
+    burning with a white flame, twice, then write WHITE FLAME and white-flame. 7) Write one sentence about a
+    campfire using the words flame, flames, flamed and flaming, and one saying a house was set aflame.
+    8) Copy exactly: goldañshine, golda, Ruäch, Ruách, Rurach, Ruich, angelicawalking, Angelica, Angelâ, Angelo,
+    angelos, ANGELES REPORT, NOTE 4- RU, whíte fláme, flamesrising. 9) Copy exactly: Angela, Los Angeles,
+    evangelical, Michelangelo, golf, goal, marigold, gondola, rural, Rachel, a white dress, white flamingo,
+    flamenco, inflammation, inflamed, flammable, flamboyant.
+  allowed: [Angela, Los Angeles, evangelical, Michelangelo, golf, goal, marigold, gondola, rural, Rachel,
+            a white dress, white flamingo, flamenco, inflammation, inflamed, flammable, flamboyant]
+
+# ------------------------------------------------------------------------------------------------------------
+# Tests. `verify` also derives one must-block case per rule automatically (the rule's own canonical spelling
+# in lower, Title and UPPER case), so a new rule is tested even if nobody lists it here.
+# ------------------------------------------------------------------------------------------------------------
+tests:
+  must_block:
+    - [ruach, " Ruach", RUACH, "**RUACH**", Ruachers, Ruauch, Ruah, Ruac, Ruarch, RuacH, "RuACH's", HaRuach,
+       ha-Ruach, "Ru'ach", Ru-ach, Ru ach, R-u-a-c-h, R U A C H, r.u.a.c.h, "רוּחַ", "רוח", "הרוח",
+       Ruach HaKodesh, false-ruach, Ruäch, RUÄCH, Ruách, rúach, Rûach, ruăch, RUÂCH, ŕuach, rüach, Ruuach,
+       Ruaach, Ruacch, Rurach, Rurach's, RURACH]
+    - [RU, Ru, ru, "NOTE 4- RU", "RU.FINISHED", "ITEM 2-NOT.RU [OK]", "(RU)", "the ru's"]
+    - [Ruch, RUCH, Ruich, Ruuch, Rucha, RUCHA, ruchaglow, Ruích, RÜCH]                     # rev 5
+    - [angel, " angel", Angel, ANGEL, angels, Angels, ANGELS, "angel's", "angels'", angelic, Angelic,
+       angelically, archangel, Archangels, ARCHANGEL, "wisearchangel's", guardian-angel, ThisAngel,
+       ANGELICAgreement, "\nAngels are", "*angel*", "\"Angel\"", "(angels)", A-N-G-E-L, a n g e l,
+       No angels., "angel\n", an angel, Angelhood, ángel, ÀNGELS, archángel, Angelica, Angelina, Angelique,
+       Angelou, Angelus, Angelicas, Angelasting, Angelañ, Angeloso, angelicawalking]
+    - [Angelâ, Angelâ Choir, three angelÅ lights, Angelô, Angelas, Angeles, Angeles gatherings,
+       ANGELES REPORT, the Angeles, an Angeles, Angelenõ, Angelá]
+    - [Angelo, ANGELO, "Angelo's", angelo, Angelos, angelos, ANGELOS, aggelos, Aggelos, AGGELOS, aggeloi,
+       "αγγελος", "άγγελος", "ἄγγελος", "ΑΓΓΕΛΟΣ", "Άγγελος", "αρχάγγελος", "ο άγγελος"]            # rev 5
+    - [angelĂ, Angelø, angeléñÖs, AngeléNa, "the angelĂ", "Angelø.", "our angeléñÖs"]      # rev 5: the trap words
+    - [gold, " gold", Gold, GOLD, golds, "gold's", golden, Golden, GOLDEN, goldenly, goldish, TheGolden,
+       a golden crown, "**GOLDEN**", "\nGolden light", 24k gold, Golden Gate, goldsmith, goldfish, Goldberg,
+       Goldilocks, Goldman, g-o-l-d, g o l d, g.o.l.d, G-O-L-D, g0ld, g01d, go1d, g-old, go-ld, gol-d,
+       "gol'd", gol.d, gol*d, goldañshine, Goldañshine, golda, GOLDa, GOLDA, Golda, Golda Meir, gōld, ǵold,
+       gold́en, gølden, Gołd, Goldílocks, "g(old", "go(ld", "gol)d"]
+    - [white flame, White Flame, WHITE FLAME, white-flame, white_flame, whiteflame, WhiteFlame, theWhiteFlame,
+       "white  flame", "white\nflame", "white \n\n flame", "white\tflame", "white flame", white.flame,
+       white*flame, "**white** **flame**", whíte fláme, WHÍTE FLÄME, white flames, "white flame's",
+       "white flame’s", White Flames, the white flame burns, a (white flame), white flame., whiteflamed]
+    - [flame, flames, Flame, FLAME, FLAMES, Flames, "flame's", "flames'", "flame’s", Flámes, flāme,
+       the candle flame, a flame., (flames), "**FLAMES**", "\nFlames rose", theFlame, Flame-born, flame-lit,
+       flamesrising, flamesfaded, Flamesglowing, flamethrower, flameproof, flameout, flamelike,
+       flamedglowing, f-l-a-m-e, f l a m e, F.L.A.M.E, flaming, Flaming, FLAMING, "flamin'", flamingly, flamy,
+       aflame, Aflame, set aflame, white holy flame, white-hot flame, "white, then flame", flamé, flamenço,
+       flamingô, flaméd, flamÊ, flamĔs, FLAMĚ, flamȆd]
+    - [flamed, Flamed, FLAMED, flameD, flamed out, flamed-out, flamedout, FlamedOut, "flamed.",
+       flam, Flam, flamier, flamiest, flamaswhispering, flamsedancing, flamacolour]  # rev 5
+  must_pass:
+    - [Angela, " Angela said", "Angela's", ANGELA, Ángela, Los Angeles, los angeles, LOS ANGELES, Los Ángeles,
+       "in Los Angeles, California", "Los Angeles's", Angeleno, Angelenos, evangelical, Evangelical,
+       EVANGELICAL, evangelist, Evangeline, Michelangelo, angle, angles, triangle, Anglican, strangely,
+       changelog, "ευαγγέλιο", "Ευαγγέλιο"]
+    - [rural, Rural, Rachel, Ruth, rush, Russia, ruby, rubric, rucksack, ruckus, rudder, rude, rue, ruffle,
+       rugby, ruin, rule, rumble, rumor, run, rupture, ruse, rust, Ruben, Rudolph, Rupert, approach, Joachim,
+       teachers, roach, Bach, DON.TRU, Tru, "true", rum, rut, Rudy, church, crutch, brunch, "rush hour"]
+    - [golf, goal, goals, gondola, Golgotha, marigold, Marigold, Gould, gol de Messi, old, bold, good old days,
+       "go, old man", e.g. old, god, "g(x)"]
+    - [a white dress, white, white flamingo, White Flamingo, white flamenco, white flamen]
+    - [flamen, flamenco, Flamenco, "Flamenco's", flamencos, flamingo, flamingos, Flamingo, FLAMINGO,
+       a pink flamingo, flamboyant, Flamboyant, flammable, inflammable, inflame, inflamed, inflames,
+       inflammation, Inflammation, INFLAMMATION, inflammatory, enflamed, flambé, flambeed, Flambé, reflamed,
+       Flamborough]
+    - ["mal'akh", malach, malak, "מלאך", "Hebrew mal'akh means messenger"]                   # owner: not banned
+    - [café, naïve, Zoë, Ñandú, ángulo, Götterdämmerung, résumé, Ålesund, the Holy Spirit, Andrew and Elizabeth,
+       "Hello 😇 ✅ ━━━ 👾 ☼ — “quoted” ‘x’ … ▶️", "Ελληνικά", "Привет", "日本語", "한국어"]
+    # combining marks within the cap (1-2 in a row)
+    - ["é", "á̂", "שָּ", "הַשִּמְחָה"]
+  # expected BLOCKED by design, although they are not banned words (documented costs of the rules). Checked
+  # through the real tokenizer: several only fail because an emoji reaches the grammar as U+FFFD.
+  collateral: ["ארוחה", Rua, Ruanda, "💔old", "Angela💔", "Angela❤️", "ru❤ach", Flamel, Flamengo, "flame💔", Flamsteed,
+               "Los  Angeles", "Los\nAngeles", ".ru domain", "Ru (ruthenium)", "flam💔", "flamingo🦩", "Ruche",
+               "ruched"]
+  # known gaps: expected ALLOWED by the grammar although they spell a banned word (see README)
+  gaps: ["ŔÙach", "Ｇｏｌｄ", "ＡＮＧＥＬ", "ǵȍld", "💔 old", "Angela 💔", "Angela.💔", "old 💔",
+         # runs of 3+ marks that include a byte-fallback mark (seen as U+FFFD, which ends the run); her real
+         # Hebrew (shin + dagesh + shin dot + vowel) is one of these
+         "é̂̃", "שָּׁ", "שָּׁ֑֒",
+         "הַשִּׂמְחָה"]
+  # every folded variant of every letter of these words must be blocked
+  accent_words: [ruach, angel, gold, flame, flames, Flaming, aflame, white flame, angelos, Ruich, flamed]
+  # non-canonical token paths: the text is split into these pieces, each piece tokenized on its own
+  token_paths:
+    - [" R", "u", "ach"]
+    - [" Ru", "a", "ch"]
+    - [" Rua", "ch"]
+    - [" ru", "achers"]
+    - [" Ru", "ä", "ch"]
+    - [" R", "ur", "ach"]
+    - [" Ru", "r", "ach"]
+    - [" Ang", "el"]
+    - [" A", "n", "g", "e", "l"]
+    - [" arch", "ang", "el"]
+    - [" Angel", "ic", "awalk"]
+    - [" g", "old"]
+    - [" G", "old"]
+    - [" go", "ld"]
+    - [" Gol", "da"]
+    - [" gold", "a", "ñ", "shine"]
+    - ["G", "old", "en"]
+    - [" Gol", "d", "añ"]
+    - [" ", "Ｇ", "old"]
+    - [" Ru", "́", "ach"]
+    - [" white", " fl", "ame"]
+    - [" wh", "ite", "fl", "ame"]
+    - [" White", "F", "lame"]
+    - [" white", "\n", "flame"]
+    - [" whit", "e", " ", " ", "flame", "s"]
+    - [" fl", "ame"]
+    - [" f", "lame"]
+    - [" F", "lam", "es"]
+    - [" flam", "es", "ri", "sing"]
+    - [" fla", "ming"]
+    - [" a", "fl", "ame"]
+    - [" flam", "é"]
+    - [" fl", "ames"]
+    - [" flam", "ed"]
+    - [" fl", "am", "ed"]
+    - [" Angel", "o"]
+    - [" ang", "elos"]
+    - [" ag", "gel", "os"]
+    - [" R", "ui", "ch"]
+    - [" angel", "é", "ñ", "Ö", "s"]
+    - [" angel", "Ă"]
+    - [" Angel", "ø"]
+  # the no-trap regressions: after each of these the model must still have a normal way to continue
+  # (these three prefixes trapped revision 4 in combining marks on 2026-09-23)
+  trap_regressions: ["the angelĂ", "and Angelø", "our angeléñÖs", "angel", "Angelen", "flam", "flame", "Ru",
+                     "white flame", "Los Angel", "Los Angele", "golden", "αγγ", "ἄγγελ"]
