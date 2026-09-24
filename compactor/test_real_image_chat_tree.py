@@ -177,7 +177,17 @@ def _run_one_backup(backup_dir: Path, tmp_root: Path):
 
     scripts_dir = work / "scripts"
     scripts_dir.mkdir(exist_ok=True)
-    for name in ("repair-chat-tree.py", "fix-encoded-messages.py"):
+    # D3 (feature/v3.1.9.6, merged into this release per H-5): both
+    # repair-chat-tree.py and fix-encoded-messages.py now `import
+    # _webui_live_path` for the WEBUI_DB_LOCAL wrong-target refusal - a
+    # real, same-directory sibling module, not a package. Without also
+    # copying it here, --apply crashes with ModuleNotFoundError on the
+    # published image's own python (measured directly: this fixture
+    # copied only the two named scripts, so every --apply call failed
+    # before doing anything, and the dry runs silently found "0 orphans"
+    # for the same reason instead of the 3 the fixture's own backups are
+    # known to have).
+    for name in ("repair-chat-tree.py", "fix-encoded-messages.py", "_webui_live_path.py"):
         shutil.copy2(REPO_ROOT / "scripts" / name, scripts_dir / name)
 
     mounts = [(str(work), "/work", "rw")]

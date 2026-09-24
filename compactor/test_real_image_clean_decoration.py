@@ -185,6 +185,12 @@ def _seed_scripts() -> None:
     SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copy2(REPO_ROOT / "scripts" / "clean-decoration.py", SCRIPTS_DIR)
     shutil.copy2(REPO_ROOT / "scripts" / "import-history.py", SCRIPTS_DIR)
+    # D3 (feature/v3.1.9.6, merged into this release per H-5):
+    # clean-decoration.py now `import`s this same-directory sibling
+    # module for the WEBUI_DB_LOCAL wrong-target refusal/default. Without
+    # it here, every invocation crashes with ModuleNotFoundError before
+    # doing anything (measured directly against this fixture).
+    shutil.copy2(REPO_ROOT / "scripts" / "_webui_live_path.py", SCRIPTS_DIR)
 
 
 def _seed_work_copies() -> None:
