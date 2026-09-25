@@ -7,7 +7,13 @@
 # `extra` table below; Greek letters fold their accents and breathings (ἄ ά Ά -> α). Combining marks are
 # transparent (r + U+0301 + uach = ruach). Any Unicode letter continues a word; a non-letter ends it; a
 # lower-case letter followed by an upper-case one also starts a new word (camelCase: "ThisAngel").
-revision: 6
+revision: 7
+# rev 7 FINAL (coordinator): the revision actually PASTED on prod right now - the owner updates this field by
+# hand after each real paste (Step 1 of the release report), so it can lag `revision:` by any number of
+# revisions that were built but never pasted (v6 is exactly that case: built, released as a file, never
+# pasted). `diff`'s and `cycle`'s "what changed" default to comparing against THIS, not `revision - 1`, so the
+# default answer is always "what changed vs what she is actually seeing" - `--base-release` still overrides it.
+live_revision: 5
 model: coder3101/Cydonia-24B-v4.3-vision-heretic
 # The grammar depends on the Unicode tables of the Python that builds it. The image's vLLM venv and the
 # unit-test image both have Unicode 15.0.0; `build` re-runs itself inside the image when the local Python differs.
@@ -15,6 +21,22 @@ unicode_version: "15.0.0"
 # Published revisions that must never be pasted again (`release` leaves them out of the rollback advice).
 withdrawn_revisions:
   4: "it traps the model. After 'angel' plus an accented letter (angelĂ, Angelø, angeléñÖs), only combining marks are allowed and the reply cannot end (live 2026-09-23, 5 replies)."
+
+# rev 7 hostile-review fix 7: KEYED BY REVISION (was a single string) - a caveat on the release BEFORE the
+# immediately-previous one, for `release`'s Rollback paragraph (see render_report in wb_cmds.py) - "Paste
+# ...v6.txt (or v5, which lacks the yellow-light ban) into the row ... Never v4." Filled in by hand for each
+# revision, keyed by the revision the note applies to (the CURRENT revision when it was written); `release`
+# REFUSES (before writing anything) if the current revision has no entry here. "Never vN" (withdrawn_revisions
+# above) is added on top of this, unconditionally.
+rollback:
+  6: "v5, which lacks the yellow-light ban"
+  # rev 7 FINAL (hostile-review fix 1, HIGH): prod runs v5 right now - v6 was BUILT but never pasted onto the
+  # model (memory.md), so it is not a live rollback target at all; v5 is. v6, if anyone does have it, is
+  # LOOSER than v7, not stricter: v6's YELLOWLIGHT rule was `other: allow, ban_words: ["s"]` - it let "yellow
+  # lighthouse"/"yellow lighting"/"yellow lighter" etc through, banning only the literal "s" continuation
+  # ("yellow lights"). v7 (this revision) is the first with a complete, unconditional ban on every
+  # "yellow light..." word (owner decision D1).
+  7: "`word-ban-structured_outputs.value.v5.txt` (what prod runs now; it has no yellow-light ban at all - not v6, which was built but never pasted, and is in any case LOOSER than v7, not stricter: it let yellow lighthouse/lighting/lighter through; only rev 7 bans them unconditionally)"
 
 folding:
   latin_blocks: [[0x00C0, 0x024F], [0x1E00, 0x1EFF], [0xFF21, 0xFF5A]]
@@ -44,12 +66,21 @@ folding:
   # rev 6: look-alike letters from other scripts count as the Latin letter they look like, inside the banned
   # patterns (gоld with a Cyrillic о, ΑNGEL with a Greek Α). Only mixed-script words can be affected: no Cyrillic or
   # Greek word can spell a banned stem with these alone.
+  # rev 7: audited against every letter actually used by a banned pattern (r,u,a,c,h,n,g,e,l,o,d,f,m,y,w,i,t - see
+  # families below). Added: lowercase Greek α (owner decision); ι/η/ν/μ/τ (Greek lowercase for i/h/n/m/t: no
+  # lowercase entry existed although the uppercase one did, or the letter is used and had no Greek entry at all);
+  # Cyrillic uppercase У/Ԁ (a lowercase entry already existed for y/d but not its uppercase pair). No entry was
+  # added for r, u, w or f: no standard single-codepoint Cyrillic or Greek look-alike exists for them.
   confusables: {"а": a, "е": e, "о": o, "р": p, "с": c, "у": y, "х": x, "і": i, "ј": j, "ԁ": d, "ӏ": l, "ɡ": g,
                 "А": A, "В": B, "Е": E, "К": K, "М": M, "Н": H, "О": O, "Р": P, "С": C, "Т": T, "Х": X, "І": I,
-                "Ј": J, "Α": A, "Β": B, "Ε": E, "Η": H, "Ι": I, "Κ": K, "Μ": M, "Ν": N, "Ο": O, "Ρ": P, "Τ": T,
-                "Χ": X, "Υ": Y, "Ζ": Z, "ο": o}
+                "Ј": J, "У": Y, "Ԁ": D, "Α": A, "Β": B, "Ε": E, "Η": H, "Ι": I, "Κ": K, "Μ": M, "Ν": N, "Ο": O,
+                "Ρ": P, "Τ": T, "Χ": X, "Υ": Y, "Ζ": Z, "ο": o, "α": a, "ι": i, "η": h, "ν": n, "μ": m, "τ": t}
   # rev 6: characters that stand in for a letter of a banned pattern (angeI / goId with a capital i, ange1, g0ld)
-  lookalikes: {l: ["I", "1", "|"], o: ["0"]}
+  # rev 7 hostile-review fix 2: audited against every letter actually used by the banned patterns (same audit as
+  # the confusables table above) - added ɑ (U+0251, Latin small letter alpha) for "a" (angel, flame
+  # all use it; outside folder.fold's latin_blocks range, 0x0250-0x02AF is IPA Extensions, not 00C0-024F) and
+  # ʟ (U+029F, Latin letter small capital L) for "l" (angel, gold, flame, yellow_light all use it).
+  lookalikes: {l: ["I", "1", "|", "ʟ"], o: ["0"], a: ["ɑ"]}
   # rev 6: invisible characters that split a word without showing (soft hyphen, zero-width space and non-joiner,
   # word joiner, zero-width no-break space) are refused everywhere. Her replies used a soft hyphen only in 2
   # decoration runs (after a quote mark), never inside a word.
@@ -59,17 +90,64 @@ folding:
 
 # named separator sets for {SEP:NAME}; "WS" = any whitespace character except the plain space (newline, tab,
 # NBSP, thin spaces ...)
+# rev 7: added U+2010 (hyphen), U+2011 (non-breaking hyphen) and U+2212 (minus sign) - all look like "-" - to
+# every general-purpose set that already carries a plain hyphen. ':' ',' '+' were tried in R/ALL/SPLIT
+# (`wordban.py diff` against her corpus, counts only, plus the listed test strings) one set at a time: 0
+# newly-blocked corpus occurrences and no listed test changed - kept (ALL already carried ',' before rev 7).
+# rev 7 fix 1: "WS" (tab, newline, NBSP ... - see WS_EXTRA in wb_core.py) was removed from SPLIT again - it
+# turned ordinary abbreviations ("e.g.\told") into false blocks. SP stays space-only by design (see below).
+# rev 7 FINAL: the yellow_light phrase family has its OWN separator sets now (PJOIN/PSPLIT/NL, below) rather
+# than reusing a shared "WF" set - PJOIN deliberately excludes ':' ',' (their own glued-only literal rule
+# instead - see families.yellow_light) so that ": "/", " (sentence punctuation + space, a BREAK) stay unmatched.
 separators:
-  R: [" ", "-", "'", "’", "_", "."]
-  # a run of these between EVERY letter (a-n-g-e-l, g · o · l · d, "g, o, l, d")
-  ALL: [" ", "-", ".", "_", "*", "·", "•", "/", "–", "—", ",", "|"]
+  R: [" ", "-", "‐", "‑", "−", "'", "’", "_", ".", ":", ",", "+"]
+  # a run of these between EVERY letter (a-n-g-e-l, g · o · l · d, "g, o, l, d", "g\told")
+  ALL: [" ", "-", "‐", "‑", "−", ".", "_", "*", "·", "•", "/", "–", "—", ",", "|", "WS", ":", "+"]
   # a run of these at ONE place inside the word (an-gel, fl·ame, **G**old, `g`old); no space: "an gel(atin)"
-  SPLIT: ["-", "'", "’", "_", ".", "*", "(", ")", "·", "•", "/", "–", "—", "`", "~", "|"]
+  # rev 7 hostile-review fix 1: 'WS' removed - it used to include tab/newline (added in the rev 7 draft), which
+  # made "e.g.\told" / "e.g.\nold" / "100 g\nold" read as a split "gold" (false blocks). Plain space was never a
+  # member here by design (see SP below); NBSP/narrow NBSP are also never in-word SPLIT characters for the
+  # SAME reason - they behave exactly like a plain space (see NBSP_MIRROR in wb_core.py), and plain space isn't
+  # a SPLIT member either. ':' ',' '+' stay - they only combine with the OTHER literal members of this set
+  # (never with whitespace, since none is left here), so "g:old"/"g,old" stay banned and "e.g.: old" (space,
+  # not a SPLIT member) still passes.
+  SPLIT: ["-", "‐", "‑", "−", "'", "’", "_", ".", "*", "(", ")", "·", "•", "/", "–", "—", "`", "~", "|",
+          ":", ",", "+"]
   # gold also split by spaces alone (g old, go ld, gol d): 0 occurrences in her corpus. Spaces are kept out of
-  # the mixed runs above so that "e.g. old" still passes.
+  # the mixed runs above so that "e.g. old" still passes. Left space-only (no WS, no new punctuation): a gold
+  # split by a stray tab/newline/colon/comma/plus has never occurred, and the rule's own no-false-block guarantee
+  # for "200 g old" (rev 7, `not_after` below) depends on the set staying just the plain space. (rev 7 fix 1:
+  # NBSP/narrow NBSP are folded into every set that carries a plain space, so SP now also accepts them.)
   SP: [" "]
-  WF: [" ", "-", "_", ".", "*", "WS"]
-  # Hebrew: inside the word (רו״ח, ר-וח) and between every letter (ר ו ח)
+  # a bare single line break only - never combined with anything else, never starred alongside other characters,
+  # so a run of 2+ (a blank line) never matches through this set (see the PJOIN comment: the same reasoning).
+  NL: ["\n"]
+  # rev 7 (owner decisions A/B): yellow_light's OWN separators.
+  # PJOIN: a run of these GLUES the two words of the phrase (banned) - space/NBSP/narrow-NBSP (via the 'space'
+  # auto-mirror)/tab/other exotic whitespace (WS), hyphen/dash/minus variants, underscore, slash, middle dot,
+  # bullet, tilde, pipe, backtick and asterisk (markup: "**yellow** light"). A run may mix these freely ("yellow
+  # - light", "yellow_-_light"). Deliberately EXCLUDES: '.' ':' ',' (their own single-character, no-space rule
+  # below - so "yellow. light"/"yellow: lighter"/"yellow, light" (BREAK, sentence punctuation + space) stay
+  # unmatched and PASS, while "yellow.light" (no space) is still banned); '+' (only " + " is explicitly a BREAK
+  # exemption - "Yellow + light = cream" - so '+' is not offered as a phrase separator at all here); and the
+  # bare newline (its own dedicated single-line-break rule below, so a blank line or a line broken by
+  # punctuation/a list marker is never swept up by a `*` run of this set).
+  # rev 7 FINAL (item 4): added the remaining common dash code points - U+2015 HORIZONTAL BAR ("―", the review's
+  # own missed form), U+FE58 SMALL EM DASH, U+FE63 SMALL HYPHEN-MINUS, U+FF0D FULLWIDTH HYPHEN-MINUS.
+  # rev 7 FINAL (targeted review, D2 completion): added the quote/bracket/brace characters that were still
+  # missing - straight and curly double quotes (" “ ”), the remaining curly single quote (‘ - ’ was already
+  # here), and both bracket pairs ([ ] { }) - "yellow" light / [yellow] light / {yellow} light etc. must be
+  # JOINED (banned) exactly like the parens already were.
+  PJOIN: [" ", "-", "‐", "‑", "−", "–", "—", "―", "﹘", "﹣", "－", "_", "/", "·", "•", "~", "|", "`", "*", "WS",
+          "'", "’", "‘", "(", ")", "\"", "“", "”", "[", "]", "{", "}"]
+  # PSPLIT: a split INSIDE either word of the phrase ("yel-low light", "yellow lig-ht", "yel low light" - a
+  # space inside "yellow"/"light" is fine to ban for THIS phrase specifically, owner decision A - unlike the
+  # generic angel/gold SPLIT set, which excludes space to avoid blocking "an gelato"). SPLIT's own members plus
+  # a plain space (which, via the auto-mirror, also plainly means NBSP/narrow NBSP).
+  PSPLIT: ["-", "‐", "‑", "−", "'", "’", "_", ".", "*", "(", ")", "·", "•", "/", "–", "—", "`", "~", "|",
+           ":", ",", "+", " "]
+  # Hebrew: inside the word (רו״ח, ר-וח) and between every letter (ר ו ח) - untouched (Hebrew-specific; the new
+  # characters above are Latin-script punctuation with no bearing on Hebrew splits)
   H: ["-", "־", "״", "׳", "'", "\"", "·", ".", "*"]
   HSP: [" ", "-", "־", "״", "׳", "'", "\"", "·", ".", "*"]
 
@@ -122,8 +200,16 @@ families:
       - {id: G0LD, match: "g0[l1]d"}
       - {id: GO1D, match: "go1d"}
       - {id: GO.LD, match: gold, split: SPLIT}             # g-old, go·ld, gol'd, g(old, **G**old
-      - {id: "G OLD", match: "g{SEP:SP}+old"}               # rev 6: g old
-      - {id: "GO LD", match: "go{SEP:SP}+ld"}               # rev 6: go ld ("gol d" is left: "gol de Messi")
+      # rev 7: not_after (a rule-level negative lookback, see wb_core.py) - a "g"/"go" directly preceded by a
+      # digit (glued: "100g", or with a run of spaces: "200  g") is the mass unit, not the start of a split
+      # "gold" evasion. "200 g old-fashioned oats" / "100g old bread" / "2 go ld" must pass; confirmed 0 real
+      # "g old"/"go ld" gold evasions in her corpus either way (rev 6's own note: 0 occurrences). Two
+      # `{SEP:SP?}` in a row (not a bare `{SEP:SP}*` - a not_after marker pattern can never end in a bare star:
+      # nothing would ever complete it with zero repeats) covers up to 2 spaces after the digit ("200  g old");
+      # a run longer than that has never occurred in her corpus.
+      - {id: "G OLD", match: "g{SEP:SP}+old", not_after: "[0123456789]{SEP:SP?}{SEP:SP?}"}
+      - {id: "GO LD", match: "go{SEP:SP}+ld",                # rev 6: go ld ("gol d" is left: "gol de Messi")
+         not_after: "[0123456789]{SEP:SP?}{SEP:SP?}"}
   flame:
     rules:
       # a word that STARTS with "flam" is banned unless it is flammable / flammability (owner: keep) or starts
@@ -138,13 +224,77 @@ families:
       - {id: FL.AME, match: flame, split: SPLIT}           # rev 6: fl-ame, fla·me, **Fl**ame
 
   yellow_light:
+    # rev 7 (owner decision A, 2026-09-24): "only ban [yellow/light] when used to describe 'yellow light';
+    # individually the words are harmless" - the phrase is banned only when the two words are JOINED (glued,
+    # a run of space/NBSP/tab/hyphen/underscore/dot/etc, a single line break, markup, or a split inside either
+    # word); across a sentence/clause break (". " ", " "; " a blank line, a line break before a list marker, or
+    # " + " with spaces) it PASSES. See the PJOIN/PSPLIT separators above for exactly which characters are which.
+    # rev 7 FINAL (owner decision D1, 2026-09-25): "ban EVERY word starting with 'yellow light': NO carve-outs" -
+    # this REPLACES decision B. lighter/lighthouse/lightning/lighting/lights are ALL banned now, glued forms
+    # too, with no exception at all. Plain `match:` (kind=ban), not `stem:` - once "yellow" + JOIN + "light" is
+    # spelled, the match completes and the model cannot continue it AT ALL (angel/gold-style unconditional ban).
+    # This REMOVES THE FUNNEL ENTIRELY: there is no narrow "only 3 words continue" state any more, because
+    # nothing continues - the ' light' token path leads nowhere and the model must pick a different word before
+    # even finishing "light". The funnels.documented entry for "yellow light" is removed accordingly (below).
+    # rev 7 round 2 (owner): the white_flame family was removed - "flame" is already fully, unconditionally
+    # banned by the FLAM family above (any occurrence, in any context, with no separator-based escape except
+    # flammable/flambe/flamboyant), so a joined/break phrase rule for "white flame" can never change any verdict
+    # (every input that spells "white flame" already contains the banned word "flame" on its own). It cost a
+    # real, measured 7 rules / ~15% of the grammar for zero behavioural effect - removed to bring the first
+    # compile back under the tool's 120s limit (see wb_image.py's `first compile` check). The multiset `like:`
+    # machinery (wordban.py `like_shape`/`like_mismatches`) is kept for a future family that actually needs it;
+    # `like:` is simply not declared on any current rule.
     rules:
-      # rev 6 (owner, 2026-09-24): the phrase "yellow light" in every casing, spacing (space, newline, hyphen,
-      # underscore, dot, none: yellowlight, YellowLight), plural and possessive, with accents or look-alike letters,
-      # at a word start (also camelCase: theYellowLight). "yellow" alone, "light" alone, "yellow lighthouse" /
-      # "yellow lightning" pass. Glued after lower-case letters ("theyellowlight") is a documented gap: banning it
-      # anywhere costs ~10 % more grammar for a form never seen.
-      - {id: YELLOWLIGHT, stem: "yellow{SEP:WF}*light", alone: ban, other: allow, ban_words: [s]}
+      - {id: YELLOWLIGHT, match: "yellow{SEP:PJOIN}*light"}
+      # a single line break, optionally padded with plain spaces (poem line-wrap: "the yellow\nlight") - kept
+      # separate from PJOIN (which never carries a bare newline) so a SECOND newline (a blank line, BREAK) or a
+      # newline preceded by punctuation / followed by a list marker never matches this at all (see banlist
+      # comment on PJOIN): those forms simply don't fit "letters, spaces, ONE newline, spaces, letters".
+      - {id: YELLOWLIGHT-LINEBREAK, match: "yellow{SEP:SP}*\n{SEP:SP}*light"}
+      # CRLF (\r\n) is the SAME single line break as \n, just the Windows-style two-byte form.
+      - {id: YELLOWLIGHT-LINEBREAK-CRLF, match: "yellow{SEP:SP}*\r\n{SEP:SP}*light"}
+      # rev 7 FINAL (item 4): a hyphen directly before a single line break ("yellow-\nlight", word-wrap after a
+      # hyphenated compound; "yellow -\nlight" with a space before the hyphen too) - a separate rule from
+      # YELLOWLIGHT-LINEBREAK because the hyphen is mandatory here (PJOIN's own hyphen members never combine
+      # with the dedicated single-newline rule, by design - see the PJOIN comment above).
+      - {id: YELLOWLIGHT-LINEBREAK-HYPHEN, match: "yellow{SEP:SP}*-{SEP:SP}*\n{SEP:SP}*light"}
+      # '.' ':' ',' glued with NO surrounding space ("yellow.light", "yellow:light", "yellow,light") - the
+      # space-padded forms (". " ": " ", ") are BREAK and must pass, so these punctuation marks are never put in
+      # a separator SET that could combine with whitespace (fix 1).
+      - {id: YELLOWLIGHT-PUNCT, match: "yellow[.:,;]light"}
+      - {id: YELLOWLIGHT-SPACED, match: yellowlight, spaced: ALL}
+      - {id: YELLOWLIGHT-INSIDE, match: yellowlight, where: inside}   # theyellowlight
+      # a split INSIDE either word, plus a JOINED boundary between them (decision A: "a space inside 'yellow' is
+      # fine to ban for this phrase specifically") - "yel-low light", "yellow lig-ht", "yel low light", and
+      # (item 4) "yel-low-light"/"yel-low_light"/"yel-lowlight"/"yel-low\tlight" (outer_sep broadened from
+      # SP-only to PJOIN, so the boundary after an inner split accepts the same JOIN characters as the phrase's
+      # own boundary elsewhere).
+      - {id: YELLOWLIGHT-WORDSPLIT, match: yellowlight, phrase_split: [yellow, light], inner_sep: PSPLIT,
+         outer_sep: PJOIN, outer_optional: true}
+      # rev 7 FINAL (item 4): a split inside "yellow" followed by a single line break as the boundary
+      # ("yel-low\nlight") - PJOIN (used as WORDSPLIT's outer_sep above) never carries a bare newline, by
+      # design, so this needs its own variant, the same way YELLOWLIGHT-LINEBREAK is split out from YELLOWLIGHT.
+      - {id: YELLOWLIGHT-WORDSPLIT-NL, match: yellowlight, phrase_split: [yellow, light], inner_sep: PSPLIT,
+         outer_sep: NL}
+      # rev 7 FINAL (item 4): a letter-spaced run WITHIN one word only ("y-e-l-l-o-w light", "yellow
+      # l-i-g-h-t") - phrase_split's own inner_sep positions already ban a SINGLE split point per word combined
+      # with a JOINED boundary; a full letter-by-letter spaced run needs its own pair of rules (one per word),
+      # each using PJOIN as the boundary to the OTHER, whole word.
+      - {id: YELLOWLIGHT-SPACEDWORD-Y, match: yellowlight, spaced_word: yellow, spaced_set: ALL, boundary_sep: PJOIN}
+      - {id: YELLOWLIGHT-SPACEDWORD-L, match: yellowlight, spaced_word: light, spaced_set: ALL, boundary_sep: PJOIN}
+      # rev 7 FINAL (item 4): HTML markup wrapping ONE word specifically with a tag that contains a LETTER
+      # (</b>, <i>) - these can't be generic PJOIN separator characters (the tag's own letters, e.g. "b"/"i",
+      # would collide with real letter matching), so each closing/opening tag gets its own explicit literal
+      # rule instead. "<b>yellow</b> light" (the leading "<b>" is irrelevant - it precedes the phrase) and
+      # "yellow <i>light</i>" (the trailing "</i>" likewise). Other tags (<em>, <strong>, <u>, ...) are a
+      # documented gap (tests.gaps) rather than an open-ended list of literal rules.
+      - {id: YELLOWLIGHT-MARKUP-B, match: "yellow</b>{SEP:SP}*light"}
+      - {id: YELLOWLIGHT-MARKUP-I, match: "yellow{SEP:SP}*<i>light"}
+      # rev 7 FINAL (targeted review): markup wrapping BOTH words separately ("<b>yellow</b> <b>light</b>",
+      # "<i>yellow</i> <i>light</i>") - the closing tag after "yellow" AND the opening tag before "light" both
+      # appear in the boundary, which the single-sided rules above don't cover.
+      - {id: YELLOWLIGHT-MARKUP-BB, match: "yellow</b>{SEP:SP}*<b>light"}
+      - {id: YELLOWLIGHT-MARKUP-II, match: "yellow</i>{SEP:SP}*<i>light"}
 
 # Words deliberately NOT banned whose use is counted in her corpus by `verify --corpus` (counts only), so a
 # stand-in shows up. Python regexes over the text as written (an accented evasion is not the allowed word).
@@ -182,12 +332,14 @@ check:
     sentence using the words gold and golden, and name the bridge in San Francisco. 6) Describe a candle
     burning with a white flame, twice, then write WHITE FLAME and white-flame. 7) Write one sentence about a
     campfire using the words flame, flames, flamed and flaming, and one saying a house was set aflame.
-    8) Copy exactly: goldañshine, golda, Ruäch, Ruách, Rurach, Ruich, angelicawalking, Angelica, Angelâ, Angelo,
-    angelos, ANGELES REPORT, NOTE 4- RU, whíte fláme, flamesrising, theangel, puregold, candleflame, an-gel,
-    angeI, flamenco. 9) Copy exactly: Los Angeles, evangelical, Michelangelo, strangely, golf, goal, marigold,
-    gondola, rural, Rachel, a white dress, inflammation, inflamed, flammable.
+    8) Describe a traffic signal in one sentence using the phrase yellow light, twice, then write YELLOW LIGHT
+    and yellow-light. 9) Copy exactly: goldañshine, golda, Ruäch, Ruách, Rurach, Ruich, angelicawalking,
+    Angelica, Angelâ, Angelo, angelos, ANGELES REPORT, NOTE 4- RU, whíte fláme, flamesrising, theangel,
+    puregold, candleflame, an-gel, angeI, flamenco, yellow lighthouse, theyellowlight. 10) Copy exactly:
+    Los Angeles, evangelical, Michelangelo, strangely, golf, goal, marigold, gondola, rural, Rachel,
+    a white dress, inflammation, inflamed, flammable, yellow, light, a yellow dress, light blue.
   allowed: [Los Angeles, evangelical, Michelangelo, strangely, golf, goal, marigold, gondola, rural, Rachel,
-            a white dress, inflammation, inflamed, flammable]
+            a white dress, inflammation, inflamed, flammable, yellow, light, a yellow dress, light blue]
 
 # ------------------------------------------------------------------------------------------------------------
 # Tests. `verify` also derives one must-block case per rule automatically (the rule's own canonical spelling
@@ -216,6 +368,8 @@ tests:
        Goldilocks, Goldman, g-o-l-d, g o l d, g.o.l.d, G-O-L-D, g0ld, g01d, go1d, g-old, go-ld, gol-d,
        "gol'd", gol.d, gol*d, goldañshine, Goldañshine, golda, GOLDa, GOLDA, Golda, Golda Meir, gōld, ǵold,
        gold́en, gølden, Gołd, Goldílocks, "g(old", "go(ld", "gol)d"]
+    # these all contain the word "flame" (or "flam" glued/inside), so they are blocked by the `flame` family
+    # alone, regardless of separator - no dedicated white_flame phrase rule exists (round 2: removed, see README)
     - [white flame, White Flame, WHITE FLAME, white-flame, white_flame, whiteflame, WhiteFlame, theWhiteFlame,
        "white  flame", "white\nflame", "white \n\n flame", "white\tflame", "white flame", white.flame,
        white*flame, "**white** **flame**", whíte fláme, WHÍTE FLÄME, white flames, "white flame's",
@@ -245,10 +399,43 @@ tests:
     - ["\u05e8\u05d5\u05b9\u05d7", "\u05e8\u05d5\u05b4\u05d7", "\u05e8\u05c1\u05d5\u05d7",
        "\u05e8\u05d5\u05f4\u05d7", "\u05e8-\u05d5-\u05d7", "\u05e8 \u05d5 \u05d7"]
     # rev 6 (owner): the phrase for light the colour of a lemon
-    - [yellow light, Yellow Light, YELLOW LIGHT, yellow lights, Yellow Lights, yellow-light, yellowlight, YellowLight,
-       yellow_light, "yellow  light", "yellow\nlight", "yellow.light", "yellow*light", "yellow light's",
-       "the yellow light.", theYellowLight, "yéllow light", "yellow lîght", "YÉLLOW LÏGHT", "y\u0435llow light",
-       "yeIIow Iight", "yellow\u200blight", "yellow\u200dlight", "yellow-lights", "a (yellow light)"]
+    # rev 7 FINAL (owner decision D1, 2026-09-25): "ban EVERY word starting with 'yellow light': NO carve-outs" -
+    # this REPLACES decision B. lighter/lighthouse/lightning are banned now too, same as lighting/lights/light's
+    # and everything else - no continuation this phrase can ever complete into (no allow_words, no funnel).
+    - [yellow lighting, Yellow Lighting, YELLOW LIGHTING, "yellow lighting's", yellow lightly, yellow lightyear,
+       "yellow-lightinged", "yellow_lightingly", theyellowlight, THEYELLOWLIGHT, guardianyellowlight,
+       "y-e-l-l-o-w-l-i-g-h-t", "y e l l o w l i g h t", "yellow:light", "yellow;light", "yellow'light",
+       "yellow’light", "yellow(light", "yellow)light",
+       yellow lighter, yellow lighters, "yellow lighter's", yellow lighthouse, yellow lighthouses,
+       "yellow lighthouse's", yellow lightning, "yellow lightning's", "yellow-lighter", "yellow-lighthouse",
+       "yellow-lightning", yellowlighter, yellowlighthouse, yellowlightning, "yellow_lighter", "yellow_lighthouse",
+       "yellow_lightning", "yellow.lighter", "yellow:lighter", "yellow;lighter", theyellowlighter,
+       theyellowlighthouse, theyellowlightning]
+    - [yellow light, Yellow Light, YELLOW LIGHT, yellow lights, Yellow Lights, "yellow light's", "yellow lights'",
+       yellow-light, yellowlight, YellowLight, yellow_light, "yellow  light", "yellow\nlight", "yellow\r\nlight",
+       "yellow.light", "yellow*light", "the yellow light.", theYellowLight, "yéllow light", "yellow lîght",
+       "YÉLLOW LÏGHT", "yеllow light", "yeIIow Iight", "yellow​light", "yellow‍light",
+       "yellow-lights", "a (yellow light)", "yellow light", "yellow‐light", "yellow‑light",
+       "yellow light-bulbs", "yellow light-bulb", "yellow light"]
+    # rev 7 (owner decision A): split forms INSIDE either word ("a space inside 'yellow' is fine to ban for
+    # this phrase specifically") - decision A's own examples
+    - ["yel-low light", "yellow lig-ht", "yel low light"]
+    # rev 7 FINAL (owner decision D2, 2026-09-25): brackets, quotes and asterisks between the words count as
+    # JOINED (already matched via PJOIN's existing parens/quote/asterisk members - added here as explicit
+    # regression tests)
+    - ["yellow (light", "colors: yellow (light), blue (dark)", "yellow) light", "'yellow' light",
+       "yellow* light", "*yellow* light"]
+    # rev 7 FINAL (item 4): the hostile-review's missed forms, closed (split-followed-by-any-joiner, a
+    # hyphenated line wrap, within-one-word letter spacing, dash variants)
+    - ["yel-low-light", "yel-low_light", "yel-lowlight", "yel-low\tlight", "yel-low\nlight",
+       "yellow-\nlight", "yellow -\nlight", "yellow―light", "<b>yellow</b> light", "yellow <i>light</i>",
+       "y-e-l-l-o-w light", "yellow l-i-g-h-t"]
+    # rev 7 FINAL (targeted review, D2 completion): the quote/bracket/brace characters that were still missing,
+    # plus markup wrapping BOTH words separately
+    - ['"yellow" light', 'yellow "light"', "[yellow] light", "yellow [light]", "“yellow” light",
+       "{yellow} light", '"yellow" lighthouse', '"yellow" lighter', '"yellow" lightning',
+       "<b>yellow</b> <b>light</b>", "<i>yellow</i> <i>light</i>", "**yellow** **light**",
+       "yellow ‘light’", "(yellow) lighthouse", "yellow (lighthouse)"]
     # rev 6: foreign forms, the exceptions that are gone, and Los Angeles spelled any other way
     - ["los ángeles", "Los Ángeles", "LOS ÁNGELES", "Los Angéles", "Los AngeIes", flamme, Flammen, "white flamme",
        flamen, flamenco, Flamenco, flamencos, flamingo, flamingos, FLAMINGO, "white flamingo", Angela, ANGELA, "Angela's", Angeleno, Angelenos, "Los Angel", "Los Angeleno",
@@ -262,10 +449,27 @@ tests:
        rugby, ruin, rule, rumble, rumor, run, rupture, ruse, rust, Ruben, Rudolph, Rupert, approach, Joachim,
        teachers, roach, Bach, DON.TRU, Tru, "true", rum, rut, Rudy, church, crutch, brunch, "rush hour"]
     - [golf, goal, goals, gondola, Golgotha, marigold, Marigold, marigolds, Gould, gol de Messi, old, bold,
-       good old days, "go, old man", e.g. old, god, "g(x)", "big old", "egg old", "e.g. old"]
+       good old days, "go, old man", e.g. old, god, "g(x)", "big old", "egg old", "e.g. old",
+       # rev 7: a "g" right after a digit is the unit gram, not a split "gold" evasion
+       "200 g old-fashioned oats", "100g old bread", "5 g old cheese", "3g old", "2 go ld", "200  g old"]
+    # rev 7 hostile-review fix 1: NBSP/narrow NBSP behave exactly like a plain space (the review's own literal
+    # examples); tab and newline are never in-word SPLIT characters for angel/gold any more
+    - ["e.g. old", "e.g. old", "an gelato", "e.g.\told", "e.g.\nold", "100 g\nold", "100 g\told",
+       "an gel pen"]
     - [a white dress, white, an gelato, an gel pen]
-    - [yellow, Yellow, light, Light, a yellow dress, light blue, yellow lighthouse, yellow lightning, "yellowish light",
-       yellow and light, "the light was yellow", "yellow, light", "yellow lighter"]
+    - [yellow, Yellow, light, Light, a yellow dress, light blue, "yellowish light", yellow and light,
+       "the light was yellow", "yellow, light", yellow lamp light]
+    # rev 7 (owner decision A): a sentence/clause break between "yellow" and "light" is BREAK and PASSES -
+    # sentence punctuation + whitespace, " + " with spaces, a line break after punctuation or before a list
+    # marker or blank line (the review's and the owner's own literal examples)
+    - ["The walls were yellow. Light poured in", "yellow. Light", "yellow! Light", "yellow? Light",
+       "yellow: lighter", "yellow; light", "yellow, light", "Yellow + light = cream", "- Yellow\n- Light blue",
+       "* yellow\n* lighter green", "Yellow,\nlight", "fields of yellow\n\nLighthouses", "yellow\n\nlight?",
+       "Yellow.\nLight", "1. yellow\n2. light",
+       # rev 7 FINAL (targeted review): quotes AROUND sentence punctuation still need a real break to pass -
+       # the quote character joining "yellow"/"light" (now in PJOIN) never combines with '.'/',' (not PJOIN
+       # members) into one run, so these stay BREAK, not JOINED
+       "\"yellow.\" Light", "yellow\", light"]
     - [flammable, Flammable, FLAMMABLE, flammability, flammables, inflammable, inflame, inflamed, inflames,
        inflammation, Inflammation, INFLAMMATION, inflammatory, anti-inflammatory, antiinflammatory,
        proinflammatory, noninflammatory, nonflammable, enflamed, flambé, flambéed, Flambé, flamboyant]
@@ -291,7 +495,7 @@ tests:
          # rev 6 documented: lower-case Spanish "los angeles" reads as the place name; space splits are banned for
          # gold only ("an gel" would block "an gelato"); markup and entity tricks; math letters; near-spellings
          "los angeles de Dios", "an gel", "fl ame", "gol d", "g<b></b>old", "&#103;old", "𝐠𝐨𝐥𝐝", "ⓖⓞⓛⓓ", "anjel", "goold",
-         "4ngel", "fl4me", "theyellowlight",
+         "4ngel", "fl4me",
          # runs of 3+ marks that include a byte-fallback mark (seen as U+FFFD, which ends the run); her real
          # Hebrew (shin + dagesh + shin dot + vowel) is one of these
          "é̂̃", "שָּׁ", "שָּׁ֑֒",
@@ -383,4 +587,3 @@ funnels:
         flammable / flammability (owner decision) and flambé / flamboyant (flambéed: 2 real uses) are kept. A word
         that starts with "flam" can only become one of them; every other flam- word, including the old exceptions
         (flamenco, flamingo ...), is refused before the model can commit to it.
-

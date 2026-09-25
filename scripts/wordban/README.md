@@ -42,10 +42,43 @@ python3 wordban.py verify --corpus /home/drew/pod-exports/<day>/<backup>/webui.d
 python3 wordban.py e2e    --webui-db /home/drew/pod-exports/<day>/<backup>/webui.db
 python3 wordban.py diff   git:HEAD~1 banlist.yaml --corpus <webui.db>     # what the change does, in counts
 python3 wordban.py release --notes notes.md                    # -> ~/zl-ops/word-ban/
+# or, for one revision at a time, build -> verify -> e2e -> diff -> a notes draft in a single run:
+python3 wordban.py cycle --corpus <webui.db> --build-dir ~/zl-ops/word-ban/buildN
+
+# AFTER PASTING revision N onto the model (Step 1 of the release report), set live_revision: N in banlist.yaml.
+# `diff`/`cycle` then default their "what changed" comparison to THAT revision, not revision-1 - so the default
+# answer is always "what changed vs what she is actually seeing", even when a revision was built and released
+# as a file but never pasted (e.g. v6): `wordban.py diff banlist.yaml` (old omitted) resolves to live_revision.
 ```
 
+`cycle` (revision 7) automates the loop above: it builds into `--build-dir`, runs the full `verify` (image + corpus),
+runs `e2e` against `--compactor-ref v3.1.9` (the same default `e2e` itself uses - what prod actually runs; round 2:
+by default this is the ONLY compactor e2e runs - `--e2e-both` also runs the image's own bundled one), diffs
+the new banlist against `live_revision:` if the banlist declares one (else the previous revision), found under
+`--out-dir` (`--base-release` overrides either default) (counts only), and writes a plain-English-plus-mechanical
+notes draft (`~/zl-ops/word-ban/work/notes-revN.md` - the "what changed" section comes straight from the rule/
+test-list/structural diff (`diff_rules_data`/`diff_tests_data`/`diff_struct_data`), never hand-written prose - a
+STRONG DRAFT, not a drift-proof guarantee: it is only as complete as that diff is, so still read it before using
+it). Each step's full output is logged to `~/zl-ops/word-ban/work/logs/cycle-revN-<step>.txt`. It stops at the
+first failing step and never releases: a hostile review still has to happen first, by hand, exactly as before.
+`--no-e2e` skips the e2e step (`release` still needs a passing e2e stamp of its own, or `--allow-no-e2e`).
+
+**`--recent N` (default 200), rev 7 round 2 (owner decision):** "I only pull the most recent chat for behavior,
+so only the most recent replies should be scanned." `verify`, `diff` and `cycle` default to loading only the
+MOST RECENTLY ACTIVE chat in `--corpus` (the chat with the newest message, by timestamp) - walked table-first
+exactly like the full corpus loader - and taking its last `N` messages; every corpus-based check (character-level
+false blocks and refusals, the real-tokenizer pass, sampled decode steps, and `diff`'s counts) uses only these.
+`--full-corpus` opts back into the old behaviour (every chat's whole current branch). The verify stamp records
+which mode ran (`corpus_mode`: `{"mode": "recent", "n": N, "chat_id_sha256": ..., "messages": ...}` or
+`{"mode": "full", "messages": ...}` - only a HASH of the chat id, never the id or her data) and the message
+count; `release` accepts either mode with no extra flag, and still refuses a stamp with no corpus check at all.
+Nothing about the image-half token-level proof, the funnel gate, mask equality, or the test lists changes.
+
 - `$WORDBAN_HOME` (default `~/zl-ops/word-ban`) holds `build/`, `tokenizer/` and the private scratch directory.
-- `--image` defaults to the published image digest that the pod runs.
+- `--image` (`DEFAULT_IMAGE` in `wordban.py`) is pinned to the digest of the TAG the pod actually deploys
+  (`DEFAULT_IMAGE_TAG`, e.g. `v3.1.9-cu12`) - **update both on every deploy**, or verify/e2e prove something
+  other than what's live. `verify` warns loudly if `--image` differs from `DEFAULT_IMAGE`, and the verify/e2e
+  stamps record the image tag as well as the digest.
 - **Every command needs Linux with docker**, except `build --here`, `verify --no-image` and `diff`.
 - The build depends on the Unicode tables of the Python that runs it. The banlist pins `unicode_version: "15.0.0"`, the version in the image's vLLM venv and in the unit-test image. When the local Python differs, `build` re-runs itself inside the image, so every machine produces the same bytes.
 
@@ -62,7 +95,7 @@ Usually it is one line under `families:` in `banlist.yaml`, then `build`, `verif
 |---|---|
 | `gold` | letters: folded and case-insensitive (`gōld`, `ＧＯＬＤ`, `Gołd`). Greek folds its accents (`ἄ` = `α`). |
 | `{L}` / `{L?}` | any one letter / optionally one letter |
-| `{SEP:G}` / `{SEP:WF}*` / `{SEP:SP}+` | one character of separator set G / any run of set WF (or none) / a run of one or more |
+| `{SEP:R}` / `{SEP:PJOIN}*` / `{SEP:SP}+` | one character of separator set R / any run of set PJOIN (or none) / a run of one or more |
 | `[l1]` | one of these characters |
 | `where: word_start` (default) / `anywhere` / `inside` | a word start is after a non-letter, or a lower→Upper camelCase step; `inside` = not at a word start |
 | `spaced: ALL` | a run of separators between every letter (`g-o-l-d`, `g, o, l, d`) |
@@ -70,10 +103,13 @@ Usually it is one line under `families:` in `banlist.yaml`, then `build`, `verif
 | `match: <pattern>` | banned outright |
 | `allow_in_words: [evangel, ...]` | a word that BEGINS with one of these (complete by the end of the banned letters) is exempt: `evangelical`, `marigold`, `inflammation` |
 | `context: {after: "los ", plain: true, allow_words: [es]}` | right after the context, the rule becomes a stem with these endings, in plain ASCII letters only (`Los Angeles`, not `los ángeles`) |
+| `not_after: <pattern>` | (rev 7) the opposite of `context.after` - the rule does NOT fire when the word is directly preceded by `<pattern>`. `G OLD`'s `not_after: "[0123456789]{SEP:SP?}"` keeps a "g" right after a digit (glued or with one space: `100g`, `200 g`) from reading as a split "gold" (it's the unit gram) |
+| `like: <family or rule id>` | (rev 7) declares that this family's separator policy must match the named family's IN KIND - `verify` checks a MULTISET of every separator-set NAME the family's rules reference anywhere (`match:`/`stem:` pattern text, `context.after`, `not_after`, `split:`, `spaced:`, `phrase_split`'s `inner_sep`/`outer_sep`), not "last rule wins", plus whether it has a glued `where: inside`/`anywhere` form. Not currently declared by any family (its one user, `white_flame`, was removed in round 2 - see Known limits); kept for a future pair |
+| `phrase_split: [w1, w2]` + `inner_sep`, `outer_sep` | (rev 7) a TWO-word phrase where a split is also allowed INSIDE either word ("yel-low light", "yellow lig-ht", "yel low light"): one variant per split position in `w1` (with the mandatory `outer_sep` boundary run before `w2`), and one per split position in `w2` (with `outer_sep` after `w1`). Used by `yellow_light`'s `*-WORDSPLIT` rule |
 | `stem: <pattern>` + `alone`, `other`, `allow_words`, `allow_prefixes` | banned, except the listed whole words (plain letters only) or prefixes of other words |
 | `fffd: transparent` | U+FFFD runs (points and accents the tokenizer has no whole token for) are skipped inside the pattern |
 
-**Folding options** (`folding:`): `confusables` (Cyrillic/Greek letters that look Latin), `lookalikes` (`I`/`1`/`|` for `l`, `0` for `o`), both applied only to the letters of the banned patterns; `forbidden_chars` (refused everywhere); `zwj_not_between_letters`; `marks_after_stem: refuse`; `mark_cap`.
+**Folding options** (`folding:`): `confusables` (Cyrillic/Greek letters that look Latin), `lookalikes` (`I`/`1`/`|`/`ʟ` for `l`, `0` for `o`, `ɑ` for `a` - rev 7 fix 2), both applied only to the letters of the banned patterns; `forbidden_chars` (refused everywhere); `zwj_not_between_letters`; `marks_after_stem: refuse`; `mark_cap`.
 
 **Examples:**
 - `{id: ZORBEX, match: zorbex}` bans every word that starts with "zorbex".
@@ -100,7 +136,7 @@ Usually it is one line under `families:` in `banlist.yaml`, then `build`, `verif
 - The trap regressions.
 - The combining-mark cap.
 - 40,000 fuzzed strings on which the grammar and the independent reference definition must agree.
-- With `--corpus`: her messages. The current branch of every chat is walked table-first, using the `output` text; masked text must pass, and every message with a banned word must be refused. Only counts are printed.
+- With `--corpus`: her messages - by default (rev 7 round 2) only the most recently active chat's last `--recent` messages (200), walked table-first using the `output` text; `--full-corpus` scans every chat's whole current branch instead. Masked text must pass, and every message with a banned word must be refused. Only counts are printed.
 
 **Image: vLLM 0.19's own `XgrammarBackend`, the real tokenizer, CPU.**
 - **Rebuild.** The rebuild in the image is byte-identical.
@@ -112,7 +148,7 @@ Usually it is one line under `families:` in `banlist.yaml`, then `build`, `verif
   3. On that token graph, every reachable state must reach EOS through ordinary tokens.
 - **Funnel gate** (above), plus the natural-token trap count and the number of states with no word end and no EOS.
 - **Adversarial random walks** through the real backend, biased toward marks, U+FFFD, accented letters and ban fragments. Every step must offer an ordinary token or EOS.
-- With `--corpus`: her messages through the real tokenizer, with sampled decode steps checked for a normal exit.
+- With `--corpus`: her messages (same recent-by-default / `--full-corpus` scope as above) through the real tokenizer, with sampled decode steps checked for a normal exit.
 
 ## Known limits (by design; listed in `tests.gaps` / `tests.collateral`)
 
@@ -120,7 +156,31 @@ Usually it is one line under `families:` in `banlist.yaml`, then `build`, `verif
 - **Right after a banned stem, U+FFFD is refused.** So `Angela💔` and `flamingo🦩` without a space are blocked.
 - **The mark cap counts whole-token marks only.** There are 154 single-mark tokens. A byte-fallback mark is U+FFFD and ends the run, so runs of such marks are not capped.
 - **Synonyms and paraphrase are not blocked.** The prompt line covers intent.
-- **`yellow light` glued after lower-case letters** (`theyellowlight`) passes. It is blocked at a word start and after a camelCase step (`theYellowLight`); banning it anywhere costs about 10 % more grammar for a form never seen.
+- (rev 6 only; fixed in rev 7) `yellow light` glued after lower-case letters (`theyellowlight`) used to pass. Rev
+  7 bans it (`where: inside`, like the flame family's `FLAM-IN`) per the owner's literal wording ("glued to
+  another word").
+- **"yellow light" is banned only when JOINED (owner decision A), and PASSES by design across a sentence/clause
+  break.** `"yellow. light"`, `"yellow, light"`, `"yellow; light"`, `"yellow: light"`, `"Yellow + light = cream"`,
+  a line break that follows punctuation or is followed by a list marker (`- `/`* `/`1.`) or a blank line, all
+  PASS - this REPLACES the rev-7-draft behaviour (fixed by the hostile review) where `,`/`+`/NBSP/tab/newline
+  turned ordinary sentence punctuation into a false block ("yellow, light", "e.g." NBSP "old"). Only a genuinely
+  JOINED form (space/NBSP/tab run, a single line break, a hyphen/underscore/dot/slash/etc, markup, or a split
+  inside either word) is banned. Owner decision B: inside the phrase, "yellow light/lights/light's/lighting" are
+  banned; "yellow lighter(s)/lighthouse(s)/lightning" PASS (they describe a yellow object) - a documented funnel
+  (`funnels.documented`), since only those three words are a live way on after "yellow light".
+- **"white flame" needs no phrase rule of its own.** Owner decision A originally asked for a `white_flame`
+  family with the same joined-vs-break design as `yellow_light`, "for consistency" - but "flame" alone is
+  already unconditionally banned in every context by the `flame` family (any occurrence, any separator, no
+  escape except flammable/flambé/flamboyant), so a joined/break phrase rule for "white flame" can never change
+  any verdict: every string that spells "white flame" already contains the banned word "flame" by itself. It
+  cost 7 rules (a real fraction of the grammar, part of why the first compile went over the tool's 120s limit)
+  for zero behavioural effect, so round 2 removed the family (and the `like:` pairing it existed to declare).
+  Every test that used to name "white flame" still passes, blocked by `flame` alone.
+- **NBSP (U+00A0) and narrow NBSP (U+202F) behave exactly like a plain space everywhere**; tab and newline are
+  never in-word SPLIT characters for angel/gold/flame any more (`e.g.\told`, `e.g.\nold`, `100 g\nold` all pass) -
+  fixed after the rev-7-draft added them and created false blocks. A run of other exotic whitespace (e.g. EM
+  SPACE U+2003) also does not split a word (it never did for angel/flame; it briefly did for a SPLIT-set change
+  in the rev-7 draft, since reverted).
 - **Lower-case Spanish `los angeles`** reads as the place name (the context rule cannot tell them apart); `los ángeles` is blocked.
 - **Space splits** are banned for gold (`g old`, `go ld`) but not for angel or flame (`an gel` would block "an gelato"); markup (`g<b></b>old`), HTML entities, math-alphanumeric and circled letters, leetspeak beyond `I`/`1`/`|`/`0`, and near-spellings (`anjel`) pass.
 - **Control tokens inside a word.** xgrammar sees Mistral's control tokens (`<unk>`, `[INST]` ...) as ordinary text, and vLLM drops them when it detokenises: `g` + `<unk>` + `old` shows as "gold". The model would have to sample a control token in mid-word; no grammar change can see this.

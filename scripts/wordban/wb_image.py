@@ -34,6 +34,9 @@ XGR_VERSION = _md.version("xgrammar")
 VLLM_VERSION = _md.version("vllm")
 
 rows = []
+# the decode-step sample floor: core.CORPUS_SAMPLE_FLOOR (pure Python, so it and core.corpus_sample_rate() are
+# unit-testable without the image's vllm/xgrammar/numpy dependencies - see wb_core.py).
+CORPUS_SAMPLE_FLOOR = core.CORPUS_SAMPLE_FLOOR
 
 
 def add(name, ok, detail=""):
@@ -81,12 +84,24 @@ class Stack:
         return np.unpackbits(b, bitorder="little")[:self.V].astype(bool)
 
 
+# rev 7 (hostile review of rev 6): Tekken's first 1000 token ids are its control/special vocabulary (<unk>, <s>,
+# [INST], <SPECIAL_4>..<SPECIAL_999> ...), confirmed empirically from tekken.json's own `special_tokens` array
+# (exactly 1000 entries, ranks 0-999, every one `is_control: true`) and from params.json's
+# `default_num_special_tokens: 1000`. xgrammar's own `special_token_ids` (st.special, used below) already excludes
+# most of these because they decode to short/empty strings that fail the printable-character test in
+# natural_mask, but not all of them do (a few, e.g. some <SPECIAL_N> slots, decode to strings that would
+# otherwise look "natural"). No real sampler ever picks a control token as ordinary prose, so they are excluded
+# from "natural" outright, by id, not by guessing at their decoded text.
+TEKKEN_CONTROL_TOKENS = 1000
+
+
 def natural_mask(st):
     """tokens a sampler would realistically pick in ordinary prose: printable ASCII, Latin-1 letters, common
-    typographic punctuation, whitespace; no U+FFFD, no combining marks (the hostile review's definition)"""
+    typographic punctuation, whitespace; no U+FFFD, no combining marks, no control token (the hostile review's
+    definition)"""
     out = np.zeros(st.V, bool)
     for i, s in enumerate(st.vocab):
-        if not s or "�" in s or i in st.special:
+        if not s or "�" in s or i in st.special or i < TEKKEN_CONTROL_TOKENS:
             continue
         out[i] = all(c in "\n\t" or 0x20 <= ord(c) < 0x7f or c in "’‘“”—–…" or (0xc0 <= ord(c) <= 0x17f and c.isalpha())
                      for c in s)
@@ -99,7 +114,14 @@ def ender_mask(st):
     return np.array([bool(nat[i]) and (s[0].isspace() or not s[0].isalnum()) for i, s in enumerate(st.vocab)])
 
 
-def case_variants(text, limit=4096):
+def case_variants(text, limit=1 << 20):
+    # rev 7 round 2: the default limit (4096 = 2**12) silently under-enumerates any `after` prefix longer than
+    # 12 letters - bits above 4095 (2**12-1) are NEVER set, so the LAST letters of a longer prefix are never
+    # tried uppercase at all (e.g. "yellow lightnin", 14 letters: positions 12-13 - the second "i"/"n" - stay
+    # forced lowercase for every m in range(4096), so a real reachable state reached only via an upper-tailed
+    # casing like "yellow lightNIN" is silently never checked and shows up as an undocumented funnel FAIL
+    # instead). Raised to 2**20 (~1e6): still a fast, one-off enumeration of short strings, and now covers every
+    # `after` prefix in the banlist (the longest, ~19 letters, needs 2**19).
     letters = [i for i, c in enumerate(text) if c.isalpha()]
     out = set()
     for m in range(min(2 ** len(letters), limit)):
@@ -344,8 +366,26 @@ def cmd_verify(a):
     tests = json.load(open(a.tests, encoding="utf-8"))
     st = Stack(ebnf)
     print(f"  tokenizer: {st.V:,} tokens, EOS {st.EOS}, {len(st.special)} special; xgrammar {XGR_VERSION}, vLLM {VLLM_VERSION}", flush=True)
-    add("first compile of the grammar (once per vLLM start)", st.first_compile < 120,
-        f"{st.first_compile:.1f}s; again from xgrammar's cache {st.second_compile:.3f}s")
+    # FIRST_COMPILE_LIMIT_S rationale (rev 7 round 2, confirmed with evidence, not assumed): the first request
+    # after a vLLM restart must not time out while xgrammar compiles this grammar. Both hops in the path have NO
+    # read/total timeout on prod, so a slow compile is slow but never fails there:
+    #   (a) compactor/main.py (v3.1.9):7531-7532 builds its httpx client with
+    #       `httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0))`
+    #       ("read=None keeps long generations from being cut off"); the non-streaming POST at :7709 and the
+    #       streaming call both reuse this same client, so neither path has a read timeout;
+    #   (b) OpenWebUI 0.11.4 (image zla-v3197-trial, `/app/venv/.../open_webui`), `env.py:608-611`:
+    #       `_aiohttp_timeout_raw = os.getenv('AIOHTTP_CLIENT_TIMEOUT', '')` then
+    #       `AIOHTTP_CLIENT_TIMEOUT = int(_aiohttp_timeout_raw) if _aiohttp_timeout_raw else None` - unset (as on
+    #       prod: not set in runpod.env.template/entrypoint.sh) resolves to None, not the except-branch default
+    #       of 300. `utils/session_pool.py:43` builds `aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)`, and
+    #       `routers/openai.py`'s `/chat/completions` handler (:1486, request at :1658-1667) uses exactly that
+    #       session and timeout for both streaming and non-streaming requests - so `total=None` there too.
+    # Since BOTH hops have no timeout, the limit is a quality/UX bar, not a hard cliff. rev 6 measured prod
+    # compiling at ~0.73x local wall time (63s prod vs 86s local); at that ratio the rev-7-round-2 grammar's
+    # ~117-126s local compile is ~85-92s on prod - comfortably under even the raised limit below.
+    FIRST_COMPILE_LIMIT_S = 150
+    add("first compile of the grammar (once per vLLM start)", st.first_compile < FIRST_COMPILE_LIMIT_S,
+        f"{st.first_compile:.1f}s (limit {FIRST_COMPILE_LIMIT_S}s); again from xgrammar's cache {st.second_compile:.3f}s")
     # rebuild comparison with the image's Unicode tables
     spec, again = core.build(a.banlist)
     add("artifact = banlist (rebuilt in the image, byte-identical)", again == ebnf,
@@ -441,20 +481,24 @@ def cmd_verify(a):
         corpus = json.load(open(a.corpus, encoding="utf-8"))
         t0 = time.time()
         fails = 0
-        ntok = 0
         checked = 0
         missed = 0
         trapped = 0
         rnd = random.Random(3)
         walls = 0
-        for m in corpus:
-            ids = st.enc(m["t"])
-            ntok += len(ids)
+        # encode once up front (not twice) to get the exact total token count before deciding the sample rate -
+        # see corpus_sample_rate() above.
+        encoded = [(m, st.enc(m["t"])) for m in corpus]
+        ntok = sum(len(ids) for _, ids in encoded)
+        rate = core.corpus_sample_rate(a.corpus_mode, ntok, a.corpus_sample)
+        facts["corpus_sample_rate"] = rate
+        facts["corpus_mode"] = a.corpus_mode
+        for m, ids in encoded:
             g = st.fresh()
             ok = True
             at = None
             for k, t in enumerate(ids):
-                if rnd.random() < a.corpus_sample:
+                if rnd.random() < rate:
                     bits = st.allowed(g)
                     checked += 1
                     if not ((bits & ordinary).any() or bits[st.EOS]):
@@ -484,8 +528,9 @@ def cmd_verify(a):
                      "pass": True, "detail": f"{len(mk)} messages; the real tokenizer + grammar refuse {mk_ref} of "
                      "them (the rest reach the grammar partly as U+FFFD, which ends a run)"})
         print("  [INFO] " + rows[-1]["check"] + ": " + rows[-1]["detail"], flush=True)
-        add("her corpus: sampled decode steps all have a normal exit", trapped == 0 and checked >= 100000,
-            f"{checked:,} prefixes sampled, {trapped} without a normal exit")
+        add("her corpus: sampled decode steps all have a normal exit", trapped == 0 and checked >= CORPUS_SAMPLE_FLOOR,
+            f"{checked:,} prefixes sampled, {trapped} without a normal exit, rate {rate:.4f} ({a.corpus_mode} mode, "
+            f"{ntok:,} tokens)")
         facts["corpus_tokens"] = ntok
         long_text = max((m["t"] for m in corpus if m["role"] == "assistant"), key=len)
     else:
@@ -532,6 +577,9 @@ def main():
     p.add_argument("--tests", required=True)
     p.add_argument("--corpus")
     p.add_argument("--corpus-sample", type=float, default=0.03)
+    p.add_argument("--corpus-mode", default="full", choices=["full", "recent"], help="rev 7 round 2: 'recent' "
+                   "raises the sampling rate so the decode-step sample still reaches the floor (see the decode-"
+                   "step check below); 'full' (default) keeps --corpus-sample as given")
     p.add_argument("--walk-steps", type=int, default=120000)
     p.add_argument("--out", required=True)
     p = sub.add_parser("accepts")

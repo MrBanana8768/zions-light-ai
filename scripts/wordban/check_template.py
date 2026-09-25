@@ -13,9 +13,11 @@ is reported as such (re-paste), never as a traceback."""
 import bisect
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 import time
+import unicodedata
 import urllib.request
 
 REVISION = __REVISION__
@@ -23,7 +25,47 @@ EXPECTED = "__SHA__"
 MODEL = __MODEL__
 PROMPT = __PROMPT__
 ALLOWED = __ALLOWED__
-DB = sys.argv[1] if len(sys.argv) > 1 else "/data/openwebui/webui.db"
+
+# rev 7 hostile-review fix 3: prod's web terminal has no DATABASE_URL - resolve the live db the same way v3.1.9
+# does (entrypoint.sh's WEBUI_DB_LOCAL normalization + compactor/webuidb.py's live_webui_db()), INLINED here
+# since this script runs standalone on the pod, with no import of webuidb.py available. Precedence:
+#   1. sys.argv[1], if given (explicit, as before);
+#   2. DATABASE_URL, if it is a plain "sqlite:///<path>" with no "?query" suffix - anything else DATABASE_URL
+#      might hold (a postgres URL, a query-string suffix) is NOT silently ignored: it is reported and the
+#      script exits, rather than guessing at some other file;
+#   3. else the WEBUI_DB_LOCAL-derived path - folded exactly the way entrypoint.sh's own normalization block
+#      does: true/1/yes/on -> LOCAL_DB, false/0/no/off -> SNAPSHOT_DB, unset/empty -> true (the default);
+#      anything else is a clear message, not a crash (entrypoint.sh itself refuses to boot on an unrecognised
+#      spelling, so reaching this branch on the pod means something ran outside that boot path).
+# rev 7 FINAL (hostile-review fix 6): honour WEBUI_LOCAL_DB / WEBUI_SNAPSHOT_DB / DATA_DIR exactly the way
+# v3.1.9's entrypoint.sh does (entrypoint.sh:279-280), not just the hardcoded defaults - an operator who set
+# these to move the pod's data elsewhere would otherwise have this script look in the wrong place.
+LOCAL_DB = os.environ.get("WEBUI_LOCAL_DB") or "/var/lib/openwebui/webui.db"
+SNAPSHOT_DB = os.environ.get("WEBUI_SNAPSHOT_DB") or (os.environ.get("DATA_DIR") or "/data/openwebui") + "/webui.db"
+
+
+def _resolve_db():
+    if len(sys.argv) > 1:
+        return sys.argv[1], "sys.argv[1]"
+    url = os.environ.get("DATABASE_URL", "")
+    if url:
+        if url.startswith("sqlite:///") and "?" not in url:
+            return url[len("sqlite:///"):], f"DATABASE_URL ({url})"
+        sys.exit(f"DATABASE_URL is set to {url!r}, which is not a plain sqlite:///<path> URL (a non-sqlite scheme, "
+                 "or a '?query' suffix) - refusing to silently guess a file for it. Pass the db path explicitly as "
+                 "an argument instead: python3 word-ban-check.py /path/to/webui.db")
+    raw = os.environ.get("WEBUI_DB_LOCAL", "").strip().lower()
+    if raw in ("", "true", "1", "yes", "on"):
+        return LOCAL_DB, "WEBUI_DB_LOCAL-derived (unset/true -> the local db)"
+    if raw in ("false", "0", "no", "off"):
+        return SNAPSHOT_DB, "WEBUI_DB_LOCAL-derived (false -> the /data snapshot)"
+    sys.exit(f"WEBUI_DB_LOCAL={raw!r} is neither a recognised true spelling (true/1/yes/on) nor a recognised false "
+              "spelling (false/0/no/off) - refusing to guess which physical file is live (the exact guess v3.1.9's "
+              "own boot path refuses to make). Pass the db path explicitly as an argument instead.")
+
+
+DB, _db_source = _resolve_db()
+print(f"db: {DB} ({_db_source})")
 
 
 # ---------------- a small interpreter for the grammar's EBNF (the shape wordban emits) ----------------
@@ -139,11 +181,48 @@ def word_at(text, i):
     return text[a:b + 1].strip()
 
 
+WORDCHAR = "'’-_"
+MARK_CATS = ("Mn", "Mc", "Me")
+
+
+def _is_word_char(c):
+    # rev 7 FINAL (targeted review, fix 2): letters/digits/WORDCHAR were the only things that counted, so a
+    # trailing run of combining marks or U+FFFD - EXACTLY the rev-4 trap's own shape - stopped the walk at the
+    # very first mark, leaving an EMPTY tail and silently defeating looks_like_a_trap()'s own mark/U+FFFD
+    # branch. Marks and U+FFFD are word characters for this purpose too.
+    return c.isalnum() or c in WORDCHAR or unicodedata.category(c) in MARK_CATS or c == "�"
+
+
+def trailing_unfinished_word(text):
+    """the run of word characters at the very END of text (its unfinished last word, if any) - including any
+    trailing combining marks / U+FFFD, so a trap-shaped tail is never silently truncated to empty."""
+    i = len(text)
+    while i > 0 and _is_word_char(text[i - 1]):
+        i -= 1
+    return text[i:]
+
+
+def looks_like_a_trap(tail, limit=40):
+    """rev 7 FINAL hostile-review fix 2: the SHAPE a trap produces (rev 4, 2026-09-23) - the model stuck writing
+    an ever-longer unfinished word, or writing marks/unseen characters it cannot end on. A length cutoff mid an
+    ordinary, short, plain word is not this; a long tail, or one with a combining mark or U+FFFD, is."""
+    if len(tail) > limit:
+        return True
+    return any(unicodedata.category(c) in MARK_CATS or c == "�" for c in tail)
+
+
 CUT = ("the saved value is truncated or corrupt (the paste was cut short?). Re-paste "
        "word-ban-structured_outputs.value.txt into the structured_outputs row, Save & Update, and run this again.")
-con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
-row = con.execute("select params from model where id=?", (MODEL,)).fetchone()
-con.close()
+try:
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+    row = con.execute("select params from model where id=?", (MODEL,)).fetchone()
+    con.close()
+except sqlite3.Error as e:                                           # noqa: BLE001
+    # missing file, permission denied, or a corrupt sqlite header all land here - one clear message, not a
+    # traceback (rev 7 hostile-review fix 3).
+    sys.exit(f"could not read {DB}: {e} - check the db path exists, is readable, and is a valid sqlite database")
+except OSError as e:                                                  # noqa: BLE001
+    sys.exit(f"could not read {DB}: {e}")
 cp = (json.loads(row[0]) if row else {}).get("custom_params") or {}
 so = cp.get("structured_outputs")
 if not so:
@@ -172,7 +251,7 @@ except Exception:                                                    # noqa: BLE
 
 def ask(port, extra, headers):
     body = {"model": MODEL, "messages": [{"role": "user", "content": PROMPT}],
-            "max_tokens": 450, "temperature": 0, "stream": False, **extra}
+            "max_tokens": 900, "temperature": 0, "stream": False, **extra}   # rev 7 hostile-review fix 3: was 450
     req = urllib.request.Request(f"http://localhost:{port}/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json", **headers})
     t = time.time()
@@ -194,19 +273,46 @@ for label, port, extra, hdr, want in [
         print(f"{label} REQUEST FAILED: {e} {body}")
         ok = False
         continue
+    # rev 7 (hostile review of rev 6, refined by fix 3): `refused_at` returns None only when the WHOLE text is
+    # both complete and in an ACCEPTING state (no banned word, nothing left unfinished); an index < len(out)
+    # means the grammar hit an actual DEAD state partway through (something it refuses appears in the text - a
+    # banned word IS present); an index == len(out) means the scan reached the end without ever refusing
+    # anything, but the automaton is not accepting there - i.e. the text just stops mid-word. Rev 7 used to
+    # treat that last case as a FAIL identically to an actual refusal (closing the trap-shaped gap where
+    # max_tokens is reached because every continuation was a fragment of the banned word) - but that also
+    # flagged a perfectly ordinary length cutoff mid-INNOCENT-word (e.g. mid "flammable") as if a banned word
+    # had been found. Fix 3: split these into three distinct, separately reported outcomes. Only an actual
+    # refusal (a banned word present, or the grammar refusing something outright before the end) is a FAIL.
     at = G.refused_at(out)
-    if at is not None and at >= len(out) and finish == "length":
-        at = None                  # stopped at max_tokens in the middle of a word: unfinished, not a banned word
-        note = " (stopped at max_tokens mid-word)"
+    refused = at is not None and at < len(out)          # a real DEAD state: a banned form is present
+    incomplete = at is not None and at == len(out) and not refused   # end of text, never refused, just unfinished
+    # rev 7 FINAL hostile-review fix 2 (MEDIUM): a length cutoff mid an unfinished word is not automatically
+    # fine - if the unfinished tail is long (>40 chars) or holds a combining mark / U+FFFD, that is exactly the
+    # SHAPE the rev-4 trap produced (2026-09-23: stuck writing marks/fragments because every other continuation
+    # was refused), and B/C (WITH the ban) must FAIL on it, not pass with a shrug. A short, plain, ordinary
+    # unfinished word (e.g. cut mid "flammable") stays informational, not a fail.
+    trap_shaped = incomplete and finish == "length" and looks_like_a_trap(trailing_unfinished_word(out))
+    if refused:
+        verdict = f"BANNED WORD near {word_at(out, at)!r}"
+    elif trap_shaped:
+        verdict = (f"INCONCLUSIVE/TRAP-SHAPED: cut inside an unfinished word {trailing_unfinished_word(out)!r} "
+                   f"that is long (>{40} chars) or holds a combining mark/U+FFFD - this is the shape the rev-4 "
+                   "trap produced (2026-09-23), not an ordinary length cutoff")
+    elif incomplete:
+        verdict = ("cut inside an unfinished word (informational - short and plain, no banned word found earlier "
+                   "in the text, and the grammar never refused anything; genuinely incomplete, not a fail)"
+                   if finish == "length" else
+                   "incomplete at the end (grammar not in an accepting state, and finish_reason != 'length' - "
+                   "unexpected, but no banned word was found and nothing was refused, so this is not a fail)")
     else:
-        note = ""
+        verdict = "no banned word (the grammar accepts it)" + (
+            " (stopped at max_tokens; the grammar accepts the text as complete as-is)" if finish == "length" else "")
     kept = [w for w in ALLOWED if w.lower() in out.lower()]
-    verdict = ("no banned word (the grammar accepts it)" + note) if at is None else f"BANNED WORD near {word_at(out, at)!r}"
-    print(f"{label} {dt:5.1f}s  {verdict}  | allowed words it wrote: {kept}")
+    print(f"{label} {dt:5.1f}s finish={finish}  {verdict}  | allowed words it wrote: {kept}")
     print("      " + out.replace("\n", " ")[:600])
-    if want and at is not None:
+    if want and (refused or trap_shaped):
         ok = False
-    if not want and at is None:
+    if not want and not refused:
         ok = False
         print("      CONTROL FAILED: without the ban the model wrote no banned word, so B and C prove nothing.")
 print("\nRESULT:", "PASS" if ok else "FAIL (see above)")

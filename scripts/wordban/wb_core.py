@@ -21,9 +21,24 @@ import unicodedata
 
 DEAD = "DEAD"
 FFFD_CP = 0xFFFD
-# Whitespace characters other than the plain space (the 'WS' pseudo-separator)
-WS_EXTRA = [chr(c) for c in (0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x85, 0xA0, 0x1680, *range(0x2000, 0x200B), 0x2028,
-                             0x2029, 0x202F, 0x205F, 0x3000)]
+# rev 7 hostile-review fix 1: NBSP (U+00A0) and narrow NBSP (U+202F) must behave EXACTLY like a plain space
+# everywhere - so they are NOT part of the generic 'WS' pseudo-separator (tab, newline and the other exotic
+# whitespace below); instead, wherever a separator set lists a literal plain space, NBSP_MIRROR is folded into
+# that same character class automatically (see Spec._compile_classes.see_items and Reference.__init__/_item_ok).
+NBSP_MIRROR = (" ", " ")
+# rev 7 hostile-review fix 1 (continued) / owner decision A: line-break characters (LF, CR, VT, FF, NEL, LINE
+# SEPARATOR, PARAGRAPH SEPARATOR) are excluded from the generic 'WS' pseudo-separator everywhere - a run of the
+# generic separator sets (ALL, WF, PJOIN...) must never be able to sweep up TWO OR MORE line breaks (a blank
+# line), which would silently defeat the yellow_light "blank line is BREAK, must pass" rule (owner
+# decision A) the moment any family's separator set includes 'WS'. A family that needs to recognise a line break
+# at all (yellow_light's "*-LINEBREAK" rules) does so with an explicit, dedicated, single literal
+# '\n' step instead - never through a star-repeatable separator set. Tab and the other exotic horizontal
+# whitespace stay in WS_EXTRA (decision A: tab is a JOINED separator for yellow_light; fix 1 only
+# required removing WS - tab included - from the generic in-word SPLIT set for angel/gold/flame, done above).
+LINEBREAKS = frozenset(chr(c) for c in (0x0A, 0x0B, 0x0C, 0x0D, 0x85, 0x2028, 0x2029))
+# Whitespace characters other than the plain space, the two NBSP variants and line breaks (the 'WS' pseudo-sep)
+WS_EXTRA = [chr(c) for c in (0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x85, 0x1680, *range(0x2000, 0x200B), 0x2028,
+                             0x2029, 0x205F, 0x3000) if chr(c) not in NBSP_MIRROR and chr(c) not in LINEBREAKS]
 BIG = ["MARK", "LETTER_OTHER", "NONLETTER"]
 MARK_CATS = ("Mn", "Mc", "Me")
 
@@ -146,6 +161,48 @@ def expand_optional(steps):
     return out
 
 
+def _lets(w):
+    return [("c", [("let", ch.lower())]) for ch in w]
+
+
+def _sep_run(name, star=True):
+    s = [("c", [("sep", name)])]
+    if star:
+        s.append(("star", [("sep", name)]))
+    return s
+
+
+def phrase_split(w1, w2, inner, outer, outer_star=True, outer_optional=False):
+    """rev 7 (owner decision A): a TWO-word phrase (yellow light / white flame) where a split is also allowed
+    INSIDE either word ("yel-low light", "yellow lig-ht", "yel low light" - a space inside "yellow" is fine to
+    ban for THIS phrase specifically, unlike the generic angel/gold SPLIT set). One variant per split position
+    in w1 (with the mandatory `outer` boundary run before w2), and one per split position in w2 (with the
+    mandatory `outer` boundary run after w1); `inner` is the in-word split separator set, `outer` the
+    between-words one. `outer_star=False` (rev 7 FINAL, item 4: the NL/newline outer variant) makes the outer
+    boundary EXACTLY one separator, never a run - so a blank line (2+ newlines) never matches through it, the
+    same reasoning as PJOIN never carrying a bare newline. `outer_optional=True` (item 4: "yel-lowlight", a
+    split followed directly by NO joiner at all) also emits a second, glued (zero-outer-separator) variant per
+    split position."""
+    out = []
+    for i in range(1, len(w1)):
+        out.append(_lets(w1[:i]) + _sep_run(inner) + _lets(w1[i:]) + _sep_run(outer, outer_star) + _lets(w2))
+        if outer_optional:
+            out.append(_lets(w1[:i]) + _sep_run(inner) + _lets(w1[i:]) + _lets(w2))
+    for j in range(1, len(w2)):
+        out.append(_lets(w1) + _sep_run(outer, outer_star) + _lets(w2[:j]) + _sep_run(inner) + _lets(w2[j:]))
+        if outer_optional:
+            out.append(_lets(w1) + _lets(w2[:j]) + _sep_run(inner) + _lets(w2[j:]))
+    return out
+
+
+def spaced_word(w1, w2, which, spaced_set, boundary_sep):
+    """rev 7 FINAL (item 4): a letter-spaced run WITHIN only ONE of the two words of a phrase ("y-e-l-l-o-w
+    light", "yellow l-i-g-h-t"), the other word left intact, joined by `boundary_sep` (a JOIN, e.g. PJOIN)."""
+    if which == "first":
+        return [spaced(w1, spaced_set) + _sep_run(boundary_sep) + _lets(w2)]
+    return [_lets(w1) + _sep_run(boundary_sep) + spaced(w2, spaced_set)]
+
+
 def spaced(word, sepname):
     """a run of one or more separators between every two letters"""
     s = []
@@ -181,9 +238,38 @@ class Spec:
         self._compile_rules()
         self._compile_classes()
         self._resolve()
+        self._check_funnel_prefix_lengths(bl)
+
+    # ---------------------------------------------------------------- sanity checks
+    @staticmethod
+    def _check_funnel_prefix_lengths(bl, limit=20):
+        """rev 7 FINAL (hostile-review fix 6): a documented funnel `after` prefix's letter count directly drives
+        wb_image.py's case_variants() cost (2**letters, up to its cap) - a prefix over this limit either wastes
+        that cost for nothing (case_variants' 2**20 cap already can't fully enumerate it) or, if raised further,
+        gets expensive fast. Caught here at build time, not discovered later as a slow/incomplete funnel check."""
+        for d in (bl.get("funnels") or {}).get("documented") or []:
+            for pre in d.get("after") or []:
+                n = sum(1 for c in pre if c.isalpha())
+                if n > limit:
+                    raise ValueError(f"funnels.documented: after prefix {pre!r} has {n} letters (limit {limit}) - "
+                                     "case_variants() cannot fully enumerate its casings; shorten it or split it "
+                                     "into shorter prefixes that reach the same state")
 
     # ---------------------------------------------------------------- rules
     def _variants(self, r, src):
+        if r.get("phrase_split"):
+            w1, w2 = r["phrase_split"]
+            return phrase_split(w1, w2, r["inner_sep"], r["outer_sep"], outer_star=r["outer_sep"] != "NL",
+                               outer_optional=bool(r.get("outer_optional")))
+        if r.get("spaced_word"):
+            w = r["spaced_word"]
+            if src.startswith(w):
+                w1, w2, which = w, src[len(w):], "first"
+            elif src.endswith(w):
+                w1, w2, which = src[:-len(w)], w, "second"
+            else:
+                raise ValueError(f"{r['id']}: spaced_word {w!r} is not a prefix or suffix of {src!r}")
+            return spaced_word(w1, w2, which, r["spaced_set"], r["boundary_sep"])
         if r.get("spaced"):
             return [spaced(src, r["spaced"])]
         if r.get("split"):
@@ -227,7 +313,25 @@ class Spec:
                     ctx_id = len([p for p in self.pats if p.kind == "ctx"])
                     self.pats.append(Pattern(id=f"{rid}@ctx", family=fam, kind="ctx", where="word_start",
                                              steps=parse_pattern(ctx["after"], self.seps), wild=False, ctx_id=ctx_id,
-                                             ctx_of=None, variant=None, stem_id=None, esc_id=None, plain=False))
+                                             ctx_of=None, not_ctx_of=None, variant=None, stem_id=None, esc_id=None,
+                                             plain=False))
+                # rev 7: a NEGATIVE lookback (the opposite of context.after) - the rule does not fire when the word
+                # is directly preceded by <not_after>. Built the same way as context.after (its own ctx-marker
+                # pattern(s), checked one character at a time), but the consuming pattern SKIPS when a marker is
+                # set instead of requiring one. Used for "G OLD" so "200 g old" (the unit gram) is not a split
+                # evasion. Expanded (like any {X?} pattern) into one marker per variant, since a marker pattern
+                # cannot itself end in a bare {X}* (nothing would ever complete it with zero repeats).
+                not_after = r.get("not_after")
+                not_ctx_ids = []
+                if not_after:
+                    for na_steps in expand_optional(parse_pattern(not_after, self.seps)):
+                        nid = len([p for p in self.pats if p.kind == "ctx"])
+                        self.pats.append(Pattern(id=f"{rid}@not-ctx{len(not_ctx_ids)}", family=fam, kind="ctx",
+                                                 where="word_start", steps=na_steps, wild=False, ctx_id=nid,
+                                                 ctx_of=None, not_ctx_of=None, variant=None, stem_id=None,
+                                                 esc_id=None, plain=False))
+                        not_ctx_ids.append(nid)
+                not_ctx_of = frozenset(not_ctx_ids) if not_ctx_ids else None
                 fffd = r.get("fffd", "default")
                 for vi, steps in enumerate(variants):
                     if steps[0][0] == "star":
@@ -242,7 +346,7 @@ class Spec:
                         wild = False
                     name = rid if len(variants) == 1 else f"{rid}#{vi}"
                     base = dict(family=fam, where=where, steps=steps, wild=wild, esc_id=esc_id, ctx_id=None,
-                                plain=False)
+                                not_ctx_of=not_ctx_of, plain=False)
                     if "stem" in r:
                         for w in (r.get("allow_words") or []) + (r.get("allow_prefixes") or []) + (r.get("ban_words") or []):
                             if not (w.isascii() and w.isalpha()):
@@ -303,6 +407,10 @@ class Spec:
                         else:
                             chars.add(c)
                             sepmem[c].add(it[1])
+                            if c == " ":                     # rev 7 fix 1: NBSP/narrow NBSP = a plain space,
+                                for nb in NBSP_MIRROR:        # in every separator set that carries a plain space
+                                    chars.add(nb)
+                                    sepmem[nb].add(it[1])
         for p in self.pats:
             for st in p.steps:
                 see_items(st[1])
@@ -441,7 +549,17 @@ class Spec:
                 out.add(self.char_class.get(it[1], it[1]))
             elif it[0] == "sep":
                 for c in self.seps[it[1]]:
-                    out.add("WS" if c == "WS" else self.char_class[c])
+                    if c == "WS":
+                        out.add("WS")
+                        continue
+                    out.add(self.char_class[c])
+                    if c == " ":
+                        # rev 7 fix 1: NBSP/narrow NBSP may land in a DIFFERENT character class than plain space
+                        # (e.g. a literal " " elsewhere, such as context.after "los ", forces a separate class
+                        # signature) even though see_items() above mirrored their separator-set membership -
+                        # union the mirrors' actual class in too, so a {SEP:X} transition that accepts space
+                        # always also accepts NBSP/narrow NBSP.
+                        out.update(self.char_class[nb] for nb in NBSP_MIRROR)
             elif it[0] == "any":
                 out |= self.any_letter
         return frozenset(out & set(self.classes))
@@ -594,6 +712,8 @@ class Spec:
                     continue                               # the context variant takes this one
             elif p.variant == "ctx":
                 continue
+            if p.not_ctx_of and (p.not_ctx_of & markers):
+                continue                                   # not_after matched right here: this rule does not apply
             first = p.psteps[0][1] if p.plain else p.csteps[0][1]
             if c == "FFFD":
                 if p.wild == "one" and self._is_letter_step(p.csteps[0]):
@@ -1160,7 +1280,13 @@ class Reference:
                     self.by_raw.setdefault(it[1], []).append(p)
                 elif it[0] == "sep":
                     for c in spec.seps[it[1]]:
-                        for r in (WS_EXTRA if c == "WS" else [c]):
+                        if c == "WS":
+                            rs = WS_EXTRA
+                        elif c == " ":
+                            rs = [c, *NBSP_MIRROR]
+                        else:
+                            rs = [c]
+                        for r in rs:
                             self.by_raw.setdefault(r, []).append(p)
                 else:
                     self.any_letter.append(p)
@@ -1250,6 +1376,9 @@ class Reference:
             for c in self.s.seps[it[1]]:
                 if c == "WS":
                     if raw[k] in WS_EXTRA:
+                        return True
+                elif c == " ":
+                    if raw[k] == c or raw[k] in NBSP_MIRROR:
                         return True
                 elif raw[k] == c:
                     return True
@@ -1388,6 +1517,8 @@ class Reference:
                         continue
                 elif p.variant == "ctx":
                     continue
+                if p.not_ctx_of and any(self._ctx_before(self.ctx_pats[i], U, k) for i in p.not_ctx_of):
+                    continue                               # not_after matched right here: this rule does not apply
                 ends = set()
                 hit = None
                 if p.plain:
@@ -1500,56 +1631,142 @@ def _norm_ts(t):
     return t
 
 
-def load_corpus(db_path, scope="branch"):
-    """[{role, ts, t}] for every user/assistant message on each chat's current branch (table rows first,
-    JSON history fills gaps; the pointer is chat.current_message_id, else history.currentId).
-    scope='all' adds every other stored message too (regenerations, other branches)."""
+def _chat_messages(cid, chat, cur_col, cols, con, scope="branch"):
+    """[{role, ts, t, branch}] for ONE chat row: table rows first, JSON history fills gaps; the pointer is
+    chat.current_message_id, else history.currentId. scope='all' adds every other stored message too
+    (regenerations, other branches). Factored out of load_corpus so recent_messages() can reuse it per-chat."""
+    try:
+        j = json.loads(chat) if isinstance(chat, str) else (chat or {})
+    except Exception:
+        j = {}
+    hist = ((j.get("history") or {}).get("messages") or {}) if isinstance(j, dict) else {}
+    hist_cur = (j.get("history") or {}).get("currentId") if isinstance(j, dict) else None
+    table = {}
+    if cols:
+        extra = "output" if "output" in cols else "null"
+        prefix = cid + "-"
+        for mid, pid, role, content, output, created in con.execute(
+                f"select id, parent_id, role, content, {extra}, created_at from chat_message where chat_id=?", (cid,)):
+            key = mid[len(prefix):] if mid.startswith(prefix) else mid
+            table[key] = {"parentId": pid, "role": role, "t": _text_of(content, output), "ts": _norm_ts(created)}
+    merged = {}
+    for mid, m in hist.items():
+        if not isinstance(m, dict):
+            continue
+        merged[mid] = {"parentId": m.get("parentId"), "role": m.get("role"),
+                       "t": _text_of(m.get("content"), m.get("output")), "ts": _norm_ts(m.get("timestamp"))}
+    for mid, r in table.items():
+        merged[mid] = r                                  # table first
+    ptr = cur_col if cur_col in merged else (hist_cur if hist_cur in merged else None)
+    branch = []
+    n = ptr
+    seen = set()
+    while n in merged and n not in seen:
+        seen.add(n)
+        branch.append(n)
+        n = merged[n].get("parentId")
+    ids = list(reversed(branch))
+    if scope == "all":
+        ids += sorted(set(merged) - set(branch))
+    out = []
+    for mid in ids:
+        m = merged[mid]
+        if m.get("role") in ("user", "assistant") and isinstance(m.get("t"), str) and m["t"].strip():
+            out.append({"role": m["role"], "ts": m.get("ts") or 0, "t": m["t"], "branch": mid in seen})
+    return out
+
+
+def _open_chats(db_path):
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     cols = {r[1] for r in con.execute("PRAGMA table_info(chat_message)")} if con.execute(
         "select 1 from sqlite_master where type='table' and name='chat_message'").fetchone() else set()
     chat_cols = {r[1] for r in con.execute("PRAGMA table_info(chat)")}
-    out = []
     sel = "id, chat, " + ("current_message_id" if "current_message_id" in chat_cols else "null")
-    for cid, chat, cur_col in con.execute(f"select {sel} from chat"):
-        try:
-            j = json.loads(chat) if isinstance(chat, str) else (chat or {})
-        except Exception:
-            j = {}
-        hist = ((j.get("history") or {}).get("messages") or {}) if isinstance(j, dict) else {}
-        hist_cur = (j.get("history") or {}).get("currentId") if isinstance(j, dict) else None
-        table = {}
-        if cols:
-            extra = "output" if "output" in cols else "null"
-            prefix = cid + "-"
-            for mid, pid, role, content, output, created in con.execute(
-                    f"select id, parent_id, role, content, {extra}, created_at from chat_message where chat_id=?", (cid,)):
-                key = mid[len(prefix):] if mid.startswith(prefix) else mid
-                table[key] = {"parentId": pid, "role": role, "t": _text_of(content, output), "ts": _norm_ts(created)}
-        merged = {}
-        for mid, m in hist.items():
-            if not isinstance(m, dict):
-                continue
-            merged[mid] = {"parentId": m.get("parentId"), "role": m.get("role"),
-                           "t": _text_of(m.get("content"), m.get("output")), "ts": _norm_ts(m.get("timestamp"))}
-        for mid, r in table.items():
-            merged[mid] = r                                  # table first
-        ptr = cur_col if cur_col in merged else (hist_cur if hist_cur in merged else None)
-        branch = []
-        n = ptr
-        seen = set()
-        while n in merged and n not in seen:
-            seen.add(n)
-            branch.append(n)
-            n = merged[n].get("parentId")
-        ids = list(reversed(branch))
-        if scope == "all":
-            ids += sorted(set(merged) - set(branch))
-        for mid in ids:
-            m = merged[mid]
-            if m.get("role") in ("user", "assistant") and isinstance(m.get("t"), str) and m["t"].strip():
-                out.append({"role": m["role"], "ts": m.get("ts") or 0, "t": m["t"], "branch": mid in seen})
+    return con, cols, con.execute(f"select {sel} from chat").fetchall()
+
+
+def _open_chats_with_title(db_path):
+    """like _open_chats, but each row also carries the chat's title (for _is_test_chat) - used only by
+    recent_messages, which needs it; load_corpus doesn't, so it keeps the simpler _open_chats."""
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(chat_message)")} if con.execute(
+        "select 1 from sqlite_master where type='table' and name='chat_message'").fetchone() else set()
+    chat_cols = {r[1] for r in con.execute("PRAGMA table_info(chat)")}
+    sel = ("id, chat, " + ("current_message_id" if "current_message_id" in chat_cols else "null") + ", "
+           + ("title" if "title" in chat_cols else "null"))
+    return con, chat_cols, cols, con.execute(f"select {sel} from chat").fetchall()
+
+
+def load_corpus(db_path, scope="branch"):
+    """[{role, ts, t}] for every user/assistant message on EVERY chat's current branch (table rows first, JSON
+    history fills gaps). scope='all' adds every other stored message too (regenerations, other branches)."""
+    con, cols, rows = _open_chats(db_path)
+    out = []
+    for cid, chat, cur_col in rows:
+        out += _chat_messages(cid, chat, cur_col, cols, con, scope)
     con.close()
     return out
+
+
+# the decode-step sample floor for wb_image.py's "her corpus: sampled decode steps all have a normal exit"
+# check - kept here (pure Python) so it and corpus_sample_rate() are unit-testable without the image's
+# vllm/xgrammar/numpy dependencies.
+CORPUS_SAMPLE_FLOOR = 100000
+
+
+def corpus_sample_rate(mode, ntok, corpus_sample, floor=CORPUS_SAMPLE_FLOOR):
+    """rev 7 round 2 (coordinator decision): the decode-step sample floor stays exactly as strong as ever - in
+    'recent' mode (a much smaller corpus than the old full-corpus scans this floor was calibrated against), the
+    SAMPLING RATE is raised instead of lowering the floor, so the sample count still reaches it: rate =
+    min(1.0, (floor * 1.2) / total_tokens), capped at 1.0 for every prefix's sampling decision. 'full' mode is
+    unchanged: `corpus_sample` (the --corpus-sample CLI value, default 0.03) as given, not recomputed."""
+    if mode != "recent" or not ntok:
+        return corpus_sample
+    return min(1.0, (floor * 1.2) / ntok)
+
+
+# rev 7 FINAL (hostile-review fix 6): chat ids/titles that mark a chat as a TEST fixture, not a real
+# conversation - the e2e/pod-check tooling's own test conversation ids match this (e2e uses "itest-wordban-...",
+# the pod check's control uses "itest-wordban-check"), so "the most recent chat" never accidentally picks one of
+# THIS TOOL'S OWN test probes instead of a real conversation.
+_TEST_CHAT_MARKERS = ("selftest", "itest")
+_RECENT_ACTIVE_WINDOW_S = 24 * 3600
+
+
+def _is_test_chat(cid, title):
+    hay = f"{cid or ''} {title or ''}".lower()
+    return any(m in hay for m in _TEST_CHAT_MARKERS)
+
+
+def recent_messages(db_path, n=200):
+    """(messages, chat_id, chat_id_sha256, newest_ts) for the OWNER'S "just the most recent chat" mode (rev 7):
+    walk EVERY chat's CURRENT branch table-first (exactly like load_corpus - not its whole history, just the
+    live branch, since that is what she is actually seeing), skip chats that look like this tool's own test
+    fixtures (id or title containing "selftest"/"itest" - see _TEST_CHAT_MARKERS), then, THE RULE (hostile-
+    review fix 6): among the chats active in the last 24h (their current branch's newest message within 24h of
+    the newest message found across all of them), prefer the one with the MOST messages on its current branch -
+    not simply the one with the single newest timestamp, which a lone stray ping could otherwise win. Falls back
+    to the newest chat by timestamp alone if none are within the 24h window. Returns that chat's LAST n
+    messages, in chronological order, plus the newest message timestamp found (for the corpus-age check).
+    Only the chat id's hash is ever put in a stamp/report (never the id or her data)."""
+    con, chat_cols, cols, rows = _open_chats_with_title(db_path)
+    candidates = []          # (cid, msgs, newest_ts)
+    global_newest = -1
+    for cid, chat, cur_col, title in rows:
+        msgs = _chat_messages(cid, chat, cur_col, cols, con, scope="branch")
+        if not msgs or _is_test_chat(cid, title):
+            continue
+        newest = max(m["ts"] for m in msgs)
+        candidates.append((cid, msgs, newest))
+        global_newest = max(global_newest, newest)
+    con.close()
+    if not candidates:
+        return [], None, None, None
+    active = [c for c in candidates if c[2] >= global_newest - _RECENT_ACTIVE_WINDOW_S]
+    pool = active or candidates
+    best_cid, best_msgs, best_ts = max(pool, key=lambda c: len(c[1]))
+    chat_hash = sha256_bytes(best_cid.encode())
+    return best_msgs[-n:] if n else best_msgs, best_cid, chat_hash, best_ts
 
 
 # ============================================================================================================

@@ -6,6 +6,7 @@
     wordban.py e2e      [--build-dir DIR] --webui-db webui.db [--compactor-ref v3.1.9]
     wordban.py diff     OLD NEW [--corpus webui.db] [--show-forms]
     wordban.py release  [--build-dir DIR] [--out-dir ~/zl-ops/word-ban] [--notes FILE]
+    wordban.py cycle    --corpus webui.db [--build-dir DIR] [--base-release N] [--no-e2e]
     wordban.py tokenizer [--tokenizer DIR]
 
 See README.md in this directory. The grammar is an xgrammar EBNF grammar that goes into the model's
@@ -16,10 +17,12 @@ run vLLM 0.19's own code from the published image.
 PRIVACY: `--corpus` / `--webui-db` are copied (read-only source) into a private temporary directory that is
 deleted when the command ends. Only counts are printed. Nothing from them is ever written to the repo."""
 import argparse
+import collections
 import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -32,7 +35,12 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import wb_core as core  # noqa: E402
 
-DEFAULT_IMAGE = "angreg/zions-light-ai@sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65"
+# rev 7 (owner, 2026-09-24): production runs v3.1.9 (not v3.1.9.4 = c1295894, the previous DEFAULT_IMAGE). A
+# verification on prod's own image passed revision 6 fully: vLLM 0.19.0, xgrammar 0.2.7, transformers 4.57.6,
+# mistral_common 1.11.7 and Unicode 15.0.0 are identical to c1295894; only the compactor differs. Update this
+# (and DEFAULT_IMAGE_TAG below) on every deploy - verify warns loudly when --image differs from this default.
+DEFAULT_IMAGE = "angreg/zions-light-ai@sha256:f3fafa3e1949115dfd2c1354969b03be8d852fc491b647884ccfe7a23cf998d2"
+DEFAULT_IMAGE_TAG = "v3.1.9-cu12"
 HOME = Path(os.environ.get("WORDBAN_HOME", "~/zl-ops/word-ban")).expanduser()
 TOKENIZER_REPO = "coder3101/Cydonia-24B-v4.3-vision-heretic"
 TOKENIZER_REV = "c1e236fb254bec28003e40da1f7e7a0bd426945f"
@@ -159,16 +167,19 @@ def build_probes(spec, bl):
     T = bl.get("tests") or {}
     mp = flat(T.get("must_pass"))
     mb = flat(T.get("must_block")) + [f for _, f in core.derived_must_block(spec)]
-    probes = [[t, True] for t in mp] + [[t, False] for t in mb]
+    probes = [(t, True) for t in mp] + [(t, False) for t in mb]
     # " and " (never a separator any family recognises) keeps adjacent entries from accidentally spelling a
     # banned form at the join, e.g. must-pass "Yellow" next to must-pass "light" would otherwise glue into
     # the banned "yellow.light" family across the join punctuation alone.
     half = max(1, len(mp) // 2)
     if mp:
-        probes.append([" and ".join(mp[:half]) + ".", True])
+        probes.append((" and ".join(mp[:half]) + ".", True))
     if mp[half:]:
-        probes.append([" and ".join(mp[half:]) + ".", True])
-    return probes
+        probes.append((" and ".join(mp[half:]) + ".", True))
+    # de-duplicate on (text, expected), keeping first-seen order: a must_block entry can coincide with a derived
+    # case (or, rarely, with a must_pass entry under a different expectation, which is a banlist bug elsewhere,
+    # not something to hide here) - dict.fromkeys is the same idiom cmd_diff already uses for this.
+    return [list(p) for p in dict.fromkeys(probes)]
 
 
 def fuzz_strings(spec, n, seed=11):
@@ -296,7 +307,82 @@ def local_checks(spec_path, build_dir, man, res, fuzz_n=40000):
     dis = [t for t in fz if ref.blocked(t) == A.accepts(t)]
     res.add(f"differential fuzz, grammar vs reference definition ({fuzz_n:,} strings)", not dis,
             f"{fuzz_n - len(dis):,}/{fuzz_n:,} agree ({time.time() - t0:.0f}s)" + (f"; e.g. {dis[:8]}" if dis else ""))
+    # rev 7 FINAL (hostile-review fix 6): don't count this as a check at all when no family declares `like:` -
+    # an always-trivially-PASSing row ("0 declared") is not a real check, and it was inflating the verify
+    # PASSED-count with nothing behind it.
+    targets = like_targets(bl)
+    if targets:
+        bad = like_mismatches(bl)
+        res.add("`like:` declarations match the referenced family's separator policy in kind", not bad,
+                f"{len(targets)} declared" + (f"; MISMATCH: {bad}" if bad else ""))
     return spec, ref, A, bl
+
+
+_SEP_RE = re.compile(r"\{SEP:([A-Za-z0-9_]+)\??\}")
+
+
+def like_rules(bl, name):
+    """a family name, or a rule id, -> its raw rule dicts"""
+    fams = bl.get("families") or {}
+    if name in fams:
+        return fams[name].get("rules") or []
+    return [r for f in fams.values() for r in (f.get("rules") or []) if r["id"] == name]
+
+
+def like_shape(bl, name):
+    """the checkable part of a family/rule's separator policy (`like: X`, rev 7 hostile-review fix 5): a
+    MULTISET (not "last rule wins") of every separator-set NAME referenced anywhere across ALL of the family's
+    (or rule's) rules - inside match:/stem: pattern text, context.after, not_after, split:, spaced:,
+    phrase_split's inner_sep/outer_sep - plus whether it has a glued (where: inside/anywhere) form at all. This
+    is the JOINED-vs-BREAK set distinction owner decision A asks for from any two families declared `like:` each
+    other: the exact same separator-set NAMES the exact same number of times each (round 2: no family currently
+    declares `like:` - white_flame, the only user, was removed - but the machinery stays for a future one)."""
+    names = collections.Counter()
+    glued = False
+    for r in like_rules(bl, name):
+        for key in ("match", "stem", "not_after"):
+            if r.get(key):
+                names.update(_SEP_RE.findall(str(r[key])))
+        ctx = r.get("context") or {}
+        if ctx.get("after"):
+            names.update(_SEP_RE.findall(str(ctx["after"])))
+        if r.get("split"):
+            names[r["split"]] += 1
+        if r.get("spaced"):
+            names[r["spaced"]] += 1
+        if r.get("inner_sep"):
+            names[r["inner_sep"]] += 1
+        if r.get("outer_sep"):
+            names[r["outer_sep"]] += 1
+        if r.get("where") in ("inside", "anywhere"):
+            glued = True
+    return dict(names), glued
+
+
+def like_targets(bl):
+    """{declaring family name -> target} for every `like:` in the banlist (a family-level comparison: any rule
+    in the family may carry the `like:` key, and they are expected to agree - this takes the family's first)"""
+    out = {}
+    for fam, fdef in (bl.get("families") or {}).items():
+        for r in fdef.get("rules") or []:
+            if r.get("like"):
+                out.setdefault(fam, r["like"])
+    return out
+
+
+def like_mismatches(bl):
+    bad = []
+    for name, target in like_targets(bl).items():
+        own, tgt = like_shape(bl, name), like_shape(bl, target)
+        if own != tgt:
+            bad.append(f"{name} like {target}: {own} != {tgt}")
+    return bad
+
+
+# rev 7 round 2: the yellow_light <-> white_flame `like:` pairing requirement (fix 5) was removed along with the
+# white_flame family itself (a real grammar-size cost for zero behavioural effect - see banlist.yaml). The
+# generic multiset machinery above (`like_shape`/`like_targets`/`like_mismatches`) is kept for a future family
+# that actually needs a declared, checked separator-policy match.
 
 
 def cmd_verify(args):
@@ -304,17 +390,26 @@ def cmd_verify(args):
     spec_path = build_dir / "banlist.yaml"
     res = Results()
     say(f"verify revision {man['revision']}: grammar sha256 {man['grammar_sha256']}")
+    if not args.no_image and args.image != DEFAULT_IMAGE:
+        say(f"  *** WARNING: --image {args.image} is NOT the default (DEFAULT_IMAGE = {DEFAULT_IMAGE}, tag "
+            f"{DEFAULT_IMAGE_TAG}) - this verify does not prove what prod actually runs ***")
     say("== local (the grammar's own automaton, the reference definition)")
     spec, ref, A, bl = local_checks(spec_path, build_dir, man, res, fuzz_n=args.fuzz)
     image_part = None
     priv = None
+    corpus_meta = None
     try:
         if not args.no_image:
             priv = private_dir()
             T = bl.get("tests") or {}
+            must_pass = flat(T.get("must_pass"))
+            # rev 7 (Opus review follow-up): the prose probes e2e builds from the banlist's own must_pass entries
+            # (build_probes' two " and "-joined sentences) go through the image's real tokenizer too, not just
+            # e2e's stub backend - the same fix the probe hardcoding lesson calls for, on the other half of verify.
+            must_pass += [t for t, e in build_probes(spec, bl) if e and t not in must_pass]
             tests = {
                 "must_block": flat(T.get("must_block")) + [f for _, f in core.derived_must_block(spec)],
-                "must_pass": flat(T.get("must_pass")), "collateral": flat(T.get("collateral")),
+                "must_pass": must_pass, "collateral": flat(T.get("collateral")),
                 "gaps": flat(T.get("gaps")), "token_paths": T.get("token_paths") or [],
                 "trap_regressions": flat(T.get("trap_regressions")),
                 "accent": core.accent_cases(spec, T.get("accent_words") or []),
@@ -330,8 +425,9 @@ def cmd_verify(args):
             if args.corpus:
                 say("== her corpus (READ-ONLY source copied to a private directory; counts only)")
                 db = copy_db(args.corpus, priv)
-                corpus_stats(db, spec, ref, A, bl, res, priv)
-                corpus_args = ["--corpus", "/priv/corpus.json"]
+                corpus_meta = load_corpus_mode(db, args)
+                corpus_stats(corpus_meta["msgs"], spec, ref, A, bl, res, priv, mode_desc=corpus_meta["desc"])
+                corpus_args = ["--corpus", "/priv/corpus.json", "--corpus-mode", corpus_meta["stamp"]["mode"]]
                 db.unlink()
             say("== image: vLLM 0.19's own xgrammar backend + the real tokenizer (CPU)")
             tokd = Path(args.tokenizer).expanduser().resolve()
@@ -360,8 +456,11 @@ def cmd_verify(args):
             shutil.rmtree(priv, ignore_errors=True)
     stamp = {"grammar_sha256": man["grammar_sha256"], "value_sha256": man["value_sha256"],
              "banlist_sha256": man["banlist_sha256"], "revision": man["revision"], "image": args.image,
+             "image_tag": DEFAULT_IMAGE_TAG if args.image == DEFAULT_IMAGE else "unknown (--image != DEFAULT_IMAGE)",
              "tool_sha256": tool_sha(),
-             "full": not args.no_image, "corpus": bool(args.corpus), "pass": res.ok, "rows": res.rows,
+             "full": not args.no_image, "corpus": bool(args.corpus),
+             "corpus_mode": (corpus_meta["stamp"] if corpus_meta else None),
+             "pass": res.ok, "rows": res.rows,
              "image_facts": image_part, "when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     (build_dir / STAMP).write_text(json.dumps(stamp, indent=1, ensure_ascii=False), encoding="utf-8")
     n_f = sum(1 for r in res.rows if not r["pass"])
@@ -370,9 +469,47 @@ def cmd_verify(args):
     return 0 if res.ok else 1
 
 
-def corpus_stats(db, spec, ref, A, bl, res, priv):
+CORPUS_STALE_HOURS = 12
+
+
+def _corpus_age_note(newest_ts):
+    """rev 7 FINAL hostile-review fix 3 (MEDIUM): print the age of the corpus's newest message and WARN if it
+    is over CORPUS_STALE_HOURS old - a stale backup silently proves nothing about what she is actually seeing
+    today (the exact mistake logged in memory.md: "a verifier reported prod state from an old backup")."""
+    if not newest_ts:
+        return "corpus newest message: unknown (no timestamped messages found)"
+    age_h = (time.time() - newest_ts) / 3600
+    when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(newest_ts))
+    line = f"corpus newest message: {when} ({age_h:.1f}h old)"
+    if age_h > CORPUS_STALE_HOURS:
+        line += f"  *** WARNING: over {CORPUS_STALE_HOURS}h old - this may be a STALE backup, not what she is seeing now ***"
+    return line
+
+
+def load_corpus_mode(db, args):
+    """rev 7 round 2 (owner): "just validating on the regex that is getting banned is good enough ... I only
+    pull the most recent chat for behavior, so only the most recent replies should be scanned." Default: the
+    single most-recently-active chat's last `--recent` messages (200 by default); `--full-corpus` opts back into
+    scanning every chat's whole current branch, as before. Shared by verify/diff/cycle so their corpus-based
+    checks (and stamps) agree on what "the corpus" means for a given invocation. Prints (and stamps) the age of
+    the corpus's newest message either way (fix 3)."""
+    full = bool(getattr(args, "full_corpus", False))
+    if full:
+        msgs = core.load_corpus(db)
+        newest_ts = max((m["ts"] for m in msgs), default=None)
+        say(_corpus_age_note(newest_ts))
+        return {"msgs": msgs, "desc": "every chat's current branch (--full-corpus)",
+                "stamp": {"mode": "full", "messages": len(msgs), "newest_message_ts": newest_ts}}
+    n = int(getattr(args, "recent", 200) or 200)
+    msgs, chat_id, chat_hash, newest_ts = core.recent_messages(db, n)
+    say(_corpus_age_note(newest_ts))
+    return {"msgs": msgs, "desc": f"the most recently active chat's last {n} messages",
+            "stamp": {"mode": "recent", "n": n, "chat_id_sha256": chat_hash, "messages": len(msgs),
+                      "newest_message_ts": newest_ts}}
+
+
+def corpus_stats(msgs, spec, ref, A, bl, res, priv, mode_desc="every chat's current branch"):
     import re
-    msgs = core.load_corpus(db)
     by = {"assistant": 0, "user": 0}
     fam_of = {r["id"]: fam for fam, r in spec.rules}
     fam_of["MARKS"] = "combining-mark cap"
@@ -393,7 +530,7 @@ def corpus_stats(db, spec, ref, A, bl, res, priv):
         masked.append({"role": m["role"], "t": ref.mask(m["t"]) if h else m["t"], "had_hit": bool(words),
                        "orig": ref.mask_spans(m["t"], marks) if (words and marks) else (m["t"] if words else None),
                        "mark_hit": ref.mask_spans(m["t"], words) if marks else None})
-    say(f"  {len(msgs)} messages on the current branch of every chat ({by['assistant']} replies, {by['user']} hers); "
+    say(f"  {len(msgs)} messages on {mode_desc} ({by['assistant']} replies, {by['user']} hers); "
         f"reference pass {time.time() - t0:.0f}s")
     say(f"  replies with a banned form: {with_hit['assistant']}; her messages with one: {with_hit['user']}")
     say(f"  banned-form occurrences by family: replies {hits['assistant']}; hers {hits['user']}")
@@ -459,6 +596,10 @@ def main(argv=None):
     p.add_argument("--no-image", action="store_true", help="only the local checks (no tokenizer / docker)")
     p.add_argument("--fuzz", type=int, default=40000)
     p.add_argument("--walk-steps", type=int, default=120000)
+    p.add_argument("--recent", type=int, default=200, help="with --corpus: only the most recently active chat's "
+                   "last N messages (owner decision, rev 7 round 2; default 200)")
+    p.add_argument("--full-corpus", action="store_true", help="with --corpus: scan every chat's whole current "
+                   "branch instead (the old default)")
     common(p)
     p = sub.add_parser("tokenizer", help="download the pinned Tekken tokenizer files")
     common(p, build=False)
