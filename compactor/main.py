@@ -218,6 +218,59 @@ def compaction_counters() -> dict:
 # unconditional boot failure in place of the conditional one being fixed.
 # A typo in this variable used to stop the container from starting at all.
 _PESSIMISTIC_SUMMARY_SCALE = env_float("COMPACTOR_PESSIMISTIC_SUMMARY_SCALE", 2.0)
+# The margin _min_possible_batches divides by to turn an OVERcounting local
+# tokenizer into a certain LOWER bound on the true batch count, before a
+# single /tokenize call is spent proving a refusal.
+#
+# CORRECTED 2026-09-25, hostile review round 2. The 1.10 this constant
+# shipped with came from count_tokens_exact's docstring measurement of the
+# transformers-converted tokenizer (2026-08-28): "~10% high on user/system
+# content, ~50% LOW on assistant content" — a tokenizer this deployment no
+# longer runs. The served tokenizer is now mistral_common-backed (prod
+# `token scale` reads 1.00x on ordinary content): it NEVER reads low, only
+# high, by a roughly FIXED per-message framing overhead (the role/BOS/
+# generation-prompt tokens a per-message `count_tokens([m])` call pays for
+# itself every time, instead of once for the whole conversation). That
+# overhead is a small fraction of a long message (+0.4% to +2.2% measured
+# on ordinary content) and a LARGE fraction of a short one — the hostile
+# reviewer measured a real/local ratio as low as 0.63 on 2-6-word messages
+# (i.e. local reads up to ~1/0.63 ~= 1.59x high there), which the OLD 1.10
+# ceiling does not cover: it produced wrong refusals (a floor of >=5
+# batches where the real count needed only 3-4).
+#
+# CORRECTED AGAIN 2026-09-25, hostile review round 3. 2.0 was itself still
+# a wrong ceiling — round 2 measured its worst case on 2-6-WORD messages
+# ("ok, how are you") through the per-message SINGLETON call path
+# (`count_tokens([m])`, what `_min_possible_batches` prices each turn
+# with). Round 3 measured degenerate ONE-TOKEN and EMPTY turns — "ok"/
+# "sure", "k"/"k", ""/"" — against vLLM's own chat-template tokenization
+# in the prod image (`angreg/zions-light-ai@sha256:f3fafa3e1949…998d2`,
+# `v3.1.9-cu12`, the mistral_common/tekken tokenizer this deployment
+# serves) and found the SAME per-message framing overhead is a much
+# larger fraction of NOTHING than it is of 2-6 words:
+#
+#   shape          real/local ratio   local overcounts real by
+#   "ok"/"sure"    0.43               1/0.43 ~= 2.33x
+#   "k"/"k"        0.38               1/0.38 ~= 2.63x
+#   ""/""  (empty) 0.30               1/0.30 ~= 3.33x   <- worst measured
+#
+# The 2.0 ceiling did not cover this: 15,000 "k"/"k" exchanges (a genuine
+# real-world "ok"/"k" chat) produced a certain floor of 5 batches against
+# a 4-call cap while the true count needed only 4 — a wrong "CERTAIN"
+# refusal on the safety margin's own terms, and the SAME assumption,
+# reused (wrongly) for the pre-cut trigger/target below at the old 2.0,
+# pre-cut 2,878 of 3,600 "k"/"k" exchanges whose TRUE total (18,406) was
+# already under the 20,672-token limit before any cutting was needed.
+#
+# 4.0 is a provably-safe MARGIN over the worst ratio actually measured
+# (1/0.30 ~= 3.33x): even a turn priced at the worst measured overcount
+# still has true >= local / 4.0, so a local-only floor (or pre-cut
+# ceiling) that still exceeds its target after this division proves the
+# true count does too, with real margin (4.0 vs the 3.33x actually
+# measured) to spare for content shorter than anything measured so far
+# (there is no shorter real turn than empty — this is not expected to
+# need a round 4).
+_LOCAL_OVERCOUNT_CEILING = env_float("COMPACTOR_LOCAL_OVERCOUNT_CEILING", 4.0)
 # V3.1 (Vision): a single image in a VLM request costs far more than its
 # text — hundreds to a couple thousand tokens depending on resolution and
 # the model's vision encoder. The text-only token estimate misses this
@@ -2138,6 +2191,88 @@ def _chunk_to_budget(
     return batches
 
 
+def _min_possible_batches(turns: list[dict], budget: int) -> int:
+    """A CERTAIN lower bound on how many `_chunk_to_budget` batches `turns`
+    will need — computed from the local tokenizer ALONE, no /tokenize call.
+
+    Packs on `local(m) / _LOCAL_OVERCOUNT_CEILING` per message. The served
+    tokenizer never reads low (see _LOCAL_OVERCOUNT_CEILING's own comment
+    for the 2026-09-25 recalibration away from a transformers-tokenizer
+    figure this deployment no longer runs), only high — by up to the
+    measured worst case the constant's margin covers — so this division
+    can never leave a per-message estimate ABOVE vLLM's true count. The
+    same greedy left-to-right packing `_chunk_to_budget` uses can only need
+    MORE bins as item sizes grow, never fewer, so packing on this per-item
+    floor gives a batch count that is itself a floor on the batch count
+    real (scaled) sizes would need. When that floor alone already exceeds
+    the per-request call cap, the true count exceeds it too — certainly,
+    with nothing asked of vLLM to confirm it.
+
+    Deliberately NOT implemented by calling `_chunk_to_budget` itself: that
+    function is monkeypatched (spied on) by tests exercising the SCALED
+    batching path a few lines below this one's only call site (see
+    test_tokenizer_contract.py's D2 fallback test, `[21]`, which records the
+    scale of the FIRST call it sees) — sharing the symbol would make this
+    cheap, unconditional pre-check the call that spy records, not the one
+    it exists to test. A second, smaller copy of the same loop keeps the
+    two paths from tripping over each other; see _chunk_to_budget's own
+    docstring for why the loop shape itself (greedy, single-turn-over-
+    budget gets its own batch) is what it is.
+
+    Only a COUNT, not batches: this runs ahead of any decision to batch at
+    all, on payloads this refusal exists specifically to spare a full
+    tokenization of, so it must not itself do more per-message work than
+    proving that count needs.
+    """
+    if not turns:
+        return 0
+    n_batches = 1
+    current_tokens = 0
+    current_has_item = False
+    for m in turns:
+        t = int(count_tokens([m]) / _LOCAL_OVERCOUNT_CEILING)
+        if current_has_item and current_tokens + t > budget:
+            n_batches += 1
+            current_tokens = 0
+            current_has_item = False
+        current_tokens += t
+        current_has_item = True
+    return n_batches
+
+
+def _refuse_summarization_over_cap(
+    to_summarize: list[dict], n_calls_needed: int, qualifier: str = "", detail: str = ""
+) -> tuple[str, list[dict]]:
+    """The one refusal `_summarize_body` gives when the backlog needs more
+    summarization calls than `MAX_SUMMARY_CALLS_PER_REQUEST` allows —
+    shared by both places that can reach it: the CERTAIN pre-/tokenize
+    floor (`_min_possible_batches`, before a single network call is made)
+    and the real batch count computed after batching on the measured
+    scale. Same counter, same log shape, either way — a boundary this file
+    states in two places is a boundary that drifts (see
+    `_droppable_system_indices`'s own docstring for the general version of
+    this lesson, learned once already on this exact codebase).
+
+    `qualifier`/`detail` let the pre-/tokenize caller say ITS number is a
+    floor, not the real count, without the two call sites growing two
+    different sentences a future reader (or grep) has to know are the same
+    event.
+    """
+    _COMPACTION_COUNTERS["cap_refused"] += 1
+    logger.warning(
+        f"compaction skipped: {len(to_summarize)} turns need {qualifier}"
+        f"{n_calls_needed} summarization calls{detail}, over the "
+        f"{MAX_SUMMARY_CALLS_PER_REQUEST}-call per-request cap. "
+        f"Summarizing a prefix would be redone identically every turn, "
+        f"so nothing is summarized here: the guard will shed to fit and "
+        f"the L1/L2/L3 hierarchy carries the older context. If this "
+        f"repeats, the hierarchy is behind — POST "
+        f"/admin/conversations/<id>/compact advances it off the request "
+        f"path."
+    )
+    return "", to_summarize
+
+
 async def summarize(
     client: httpx.AsyncClient, to_summarize: list[dict]
 ) -> tuple[str, list[dict]]:
@@ -2185,6 +2320,28 @@ async def _summarize_body(
         MAX_MODEL_LEN,
         max(256, MAX_MODEL_LEN - SUMMARY_MAX_TOKENS - SUMMARY_INPUT_RESERVE),
     )
+    # 2026-09-25 RCA (her chat, 4,196 resent messages / ~7.8M tokens every
+    # request): a starved conversation reached this point, and the very next
+    # line spent a real /tokenize POST — 10s read timeout — measuring a
+    # 7.8M-token payload, ONLY to discover a few lines further down that the
+    # backlog needed ~285 calls against a 4-call cap and refuse regardless.
+    # That refusal was never in doubt: _min_possible_batches proves it from
+    # the local tokenizer alone, for FREE, before the network call — see its
+    # own docstring for why the bound is certain and not a guess. Skip the
+    # /tokenize round trip (here AND the one _chunk_to_budget would make
+    # sizing real batches) entirely when it cannot change the outcome.
+    _lb_batches = await run_in_threadpool(_min_possible_batches, to_summarize, budget)
+    if _lb_batches > max(1, MAX_SUMMARY_CALLS_PER_REQUEST):
+        return _refuse_summarization_over_cap(
+            to_summarize, _lb_batches, qualifier="at least ",
+            detail=(
+                " — a CERTAIN floor from the local tokenizer alone "
+                f"(a {_LOCAL_OVERCOUNT_CEILING}x safety margin over the "
+                "worst overcount this deployment's tokenizer has measured "
+                "on any message — see _LOCAL_OVERCOUNT_CEILING), proven "
+                "without spending a /tokenize call on a payload this large"
+            ),
+        )
     # Measure the local tokenizer's error on THIS content before batching to
     # it. One /tokenize call, off the event loop, against many minutes of
     # failed map-reduce when the batches are wrong. Falls back to 1.0 — the
@@ -2293,19 +2450,7 @@ async def _summarize_body(
         # summarizes into memory on the background tail and is injected
         # separately, and the hard-budget guard sheds the rest in
         # milliseconds. Repeating work every turn helps neither.
-        _COMPACTION_COUNTERS["cap_refused"] += 1
-        logger.warning(
-            f"compaction skipped: {len(to_summarize)} turns need "
-            f"{len(batches)} summarization calls, over the "
-            f"{MAX_SUMMARY_CALLS_PER_REQUEST}-call per-request cap. "
-            f"Summarizing a prefix would be redone identically every turn, "
-            f"so nothing is summarized here: the guard will shed to fit and "
-            f"the L1/L2/L3 hierarchy carries the older context. If this "
-            f"repeats, the hierarchy is behind — POST "
-            f"/admin/conversations/<id>/compact advances it off the request "
-            f"path."
-        )
-        return "", to_summarize
+        return _refuse_summarization_over_cap(to_summarize, len(batches))
 
     logger.info(
         f"summarize: {len(to_summarize)} turns exceed the {budget}-token input "
@@ -7267,6 +7412,14 @@ def _has_sheddable_content(msgs: list[dict], protect_system: "int | frozenset[st
 # that could silently drift from it.
 _G3A_MEASURE_CAP = 6
 
+# 2026-09-25 RCA fix (the guard over-shed 7,869,389 -> 12,813 tokens against
+# a 20,672-token limit — 38% of the window left unused, on a payload that
+# had thousands more already-shed turns that would still have fit). Module-
+# level for the same reason as _G3A_MEASURE_CAP just above: a test asserting
+# the cap should assert against the value actually enforced, not a copy of
+# it. See _fill_back_dropped_turns's own docstring for what this bounds.
+_FILLBACK_MEASURE_CAP = 8
+
 
 def _shed_last_resort(
     msgs: list[dict],
@@ -7717,6 +7870,199 @@ def _shed_last_resort(
     return msgs, per, running, counter, dropped, sys_dropped
 
 
+def _precut_to_local_ceiling(
+    messages: list[dict], ceiling: float
+) -> tuple[list[dict], int]:
+    """Shed the oldest turns on LOCAL counts alone — no /tokenize call — down
+    to roughly `ceiling` tokens, before `_enforce_hard_budget` ever asks
+    vLLM to count anything.
+
+    Never touches a system message (injected memory spends itself on real
+    ground truth a few lines later in `_enforce_hard_budget` — this pass
+    only ever removes TURNS) and never cuts into the aligned recent-turn
+    floor (`_aligned_recent_tail`) — the same floor the real shedding loop
+    treats as a minimum below `_enforce_hard_budget`'s own docstring order,
+    respected here for the same reason: an estimate this rough, made before
+    a single real measurement, must never be what decides her most recent
+    turns are gone.
+
+    Per-message local counts, computed ONCE, in one O(n) pass — the
+    `_chunk_to_budget` / hostile-pass-#5 lesson repeated a third time in
+    this file: a per-drop recount over thousands of turns is quadratic on
+    the request path, in exactly the overload shape this function exists
+    to cut down before anything downstream pays for it.
+
+    hostile review round 2, finding 2: cuts whole (user, assistant)
+    EXCHANGES only, never a lone turn — the same "never a lone message"
+    rule `_enforce_hard_budget`'s own P12-5 branch and `_shed_last_resort`
+    both hold, and for the identical reason: cutting a single old USER turn
+    while its reply survives (because the reply happened to be the first
+    thing past this pass's target) can leave the kept array starting on an
+    ASSISTANT turn — a template the chat endpoint refuses outright.
+    Reproduced: with every turn priced near 1 token, an earlier, per-turn
+    version of this cut landed mid-pair and forwarded exactly that.
+    """
+    turn_idxs = [i for i, m in enumerate(messages) if m.get("role") != "system"]
+    if not turn_idxs:
+        return messages, 0
+    floor = set(_aligned_recent_tail(messages))
+    above_floor = [i for i in turn_idxs if i not in floor]
+    if not above_floor:
+        return messages, 0
+    per = [count_tokens([m]) for m in messages]
+    total_local = sum(per)
+    cut = 0
+    while cut < len(above_floor) and total_local > ceiling:
+        i0 = above_floor[cut]
+        if (
+            cut + 1 < len(above_floor)
+            and messages[i0].get("role") == "user"
+            and messages[above_floor[cut + 1]].get("role") == "assistant"
+        ):
+            pair_len = 2
+        elif messages[i0].get("role") != "user":
+            # An orphaned turn already sits here (a pre-existing anomaly
+            # this pass did not create, e.g. a prior repair's leftover) —
+            # take it alone rather than refuse to make progress.
+            pair_len = 1
+        else:
+            # This user turn's reply is not available to cut alongside it
+            # (it is the floor's own first turn, or beyond) — never cut a
+            # lone user turn and leave its reply to open the kept array.
+            # Stop here; _enforce_hard_budget's own shed loop and its
+            # ground-truth verification still run on what is left, and
+            # fill-back can still reach this turn afterward.
+            break
+        for k in range(pair_len):
+            total_local -= per[above_floor[cut + k]]
+        cut += pair_len
+    if not cut:
+        return messages, 0
+    dropped = set(above_floor[:cut])
+    return [m for i, m in enumerate(messages) if i not in dropped], cut
+
+
+def _fill_back_dropped_turns(
+    original: list[dict],
+    msgs: list[dict],
+    running: int,
+    counter: str,
+    dropped: int,
+    limit: int,
+    measure: Callable[[list[dict]], tuple[int, str]],
+) -> tuple[list[dict], int, str, int]:
+    """The guard above only ever proves "this now fits" — nothing before
+    this point asks "could more of what was just shed still fit". On a
+    payload many multiples of the window (the 2026-09-25 incident: 7.8M
+    tokens against a 20,672-token limit), the P12-5 branch and
+    `_shed_last_resort` both stop the moment cutting down to the aligned
+    recent-turn floor (`KEEP_RECENT_TURNS`) already fits — that floor is a
+    MINIMUM the guard must never shed below, not a target it fills the
+    window to. Result: 12,813 of 20,672 tokens used (38% of the window
+    empty), 4 turns kept, with thousands of shed turns sitting right above
+    them that the exact counter below would have accepted.
+
+    Restores shed TURNS ONLY — never a dropped injected-memory block or the
+    protected stand-in. Those have their own trim/halve/drop semantics this
+    pass does not repeat, and the shedding priority this file's own
+    docstring states (turns above the floor, then memory, then the recent
+    window, then the stand-in) already means memory is spent before a turn
+    this pass would ever see is. Reinstating memory would need this
+    function to re-derive a trim boundary or a halved block's original
+    text — real work with its own failure modes, for content the owner's
+    standing rule already ranks below a whole old exchange.
+
+    Only when `running` already fits AND the last measurement was vLLM's
+    own `/tokenize` — never on a local-tokenizer fallback. This is an ADD,
+    and the only thing allowed to decide "this still fits" after adding
+    content back is ground truth: `count_tokens_exact`'s own docstring
+    documents the local counter reading up to 51% low on assistant
+    content, and approving an add on that estimate could send vLLM a
+    payload it rejects — the exact failure this whole guard exists to
+    prevent. When /tokenize is down, `_measure`'s own WARNING already says
+    budgeting fell back to the local counter; this pass does nothing more,
+    the conservative side of an unverifiable decision.
+
+    Reconstructed from `original` vs `msgs` by identity (`id()`), not by
+    threading a shed-order list through every call site that can drop a
+    turn (the round loop's P12-5 branch, its floor-less generic sibling,
+    the role-alternation repair, and both of `_shed_last_resort`'s turn-
+    shedding steps) — every one of those sites removes turns from a
+    CONTIGUOUS prefix of the turn sequence (oldest first, down to whatever
+    floor applies at the time), so the turns missing from `msgs` are
+    always a contiguous prefix of `original`'s turns, in original order,
+    and diffing the two after the fact recovers exactly the same
+    information with one linear pass instead of four call sites agreeing
+    to maintain it. Groups adjacent (user, assistant) pairs so an add can
+    never leave the front of the array mid-pair; walks the groups newest-
+    first (the reverse of shed order — nearer this file's own priority
+    order, since the last thing forced out was the recent window, not the
+    turns above it) so the highest-value content is tried first, and each
+    accepted group is measured on the SAME `measure` closure the round
+    loop and `_shed_last_resort` already use, so nothing here can exceed a
+    limit those did not already verify against.
+
+    Bounded at `_FILLBACK_MEASURE_CAP` real measurements, matching
+    `_G3A_MEASURE_CAP`'s own order of cost — best-effort: it may stop with
+    headroom still unfilled rather than spend unbounded /tokenize calls to
+    find the last token of it.
+    """
+    if running > limit or counter != "vLLM's /tokenize":
+        return msgs, running, counter, dropped
+    kept_ids = {id(m) for m in msgs}
+    shed_turns = [
+        m for m in original
+        if m.get("role") != "system" and id(m) not in kept_ids
+    ]
+    if not shed_turns:
+        return msgs, running, counter, dropped
+    groups: list[list[dict]] = []
+    i = 0
+    while i < len(shed_turns):
+        if (
+            i + 1 < len(shed_turns)
+            and shed_turns[i].get("role") == "user"
+            and shed_turns[i + 1].get("role") == "assistant"
+        ):
+            groups.append(shed_turns[i:i + 2])
+            i += 2
+        else:
+            groups.append(shed_turns[i:i + 1])
+            i += 1
+    calls = 0
+    restored = 0
+    for group in reversed(groups):
+        if calls >= _FILLBACK_MEASURE_CAP:
+            break
+        insert_at = next(
+            (idx for idx, m in enumerate(msgs) if m.get("role") != "system"),
+            len(msgs),
+        )
+        candidate = msgs[:insert_at] + group + msgs[insert_at:]
+        # Defensive, not expected to trip: reconstructing exact original
+        # order should never produce an assistant-first turn sequence.
+        # Never send the template one anyway on the strength of "should".
+        first_turn = next((m for m in candidate if m.get("role") != "system"), None)
+        if first_turn is not None and first_turn.get("role") != "user":
+            break
+        cand_running, cand_counter = measure(candidate)
+        calls += 1
+        if cand_counter != "vLLM's /tokenize" or cand_running > limit:
+            break
+        msgs, running, counter = candidate, cand_running, cand_counter
+        dropped -= len(group)
+        restored += len(group)
+    if restored:
+        logger.info(
+            f"hard budget: filled back {restored} previously-shed turn(s) "
+            f"while they still fit under the {limit}-token limit ({running} "
+            f"tokens used, {calls} /tokenize call(s) spent checking) — the "
+            f"shed loop above stops the instant it fits and never checks "
+            f"whether more of what it just shed still would"
+        )
+    return msgs, running, counter, dropped
+
+
 def _enforce_hard_budget(
     messages: list[dict],
     limit: int | None = None,
@@ -7821,6 +8167,13 @@ def _enforce_hard_budget(
     conservative fallback — nothing is recognised as ours, so nothing in
     it is droppable, which is always SAFE, only possibly over-cautious.
     """
+    # 2026-09-25 RCA fix, hostile review round 2, finding 2: the fill-back
+    # pass (below) must diff against what THIS CALL was actually given, not
+    # against whatever the pre-cut pass (also below) may have already
+    # shortened `messages` to — captured before either local name is
+    # reassigned, so pre-cut turns are restorable too, not only turns the
+    # round loop/`_shed_last_resort` themselves went on to shed.
+    _original_messages = messages
     if limit is None:
         limit = HARD_INPUT_LIMIT
     # Learned correction (v3.0.5): if vLLM previously reported a true count
@@ -7980,11 +8333,72 @@ def _enforce_hard_budget(
             )
         return messages
 
+    # 2026-09-25 RCA (her chat: 4,196 resent messages, ~7.8M tokens, every
+    # request). The very next line here used to hand vLLM's /tokenize the
+    # WHOLE payload — one POST, a 10s read timeout — to count content the
+    # per-message shedding loop below (and, on a payload this starved,
+    # `_shed_last_resort`) was always going to shed nearly all of anyway,
+    # oldest turns first, down to a fixed-size floor. Pre-cut on LOCAL
+    # counts alone first, no network call, so /tokenize only ever prices
+    # what has a real chance of being kept.
+    #
+    # hostile review round 3 (fixing this comment's own former reasoning,
+    # which was wrong): the ceiling used to be `_PESSIMISTIC_SUMMARY_SCALE`
+    # (2.0x `limit`) — a constant that happens to also read 2.0 but has
+    # nothing to do with this file's OVERcount margin; it sizes an unrelated
+    # pessimistic map-reduce estimate elsewhere. The claim that "a local
+    # count of 2.0x `limit` cannot itself already be UNDER budget" is false
+    # once the true overcount ratio is worse than 2.0x — and round 3 measured
+    # exactly that on degenerate content (see `_LOCAL_OVERCOUNT_CEILING`'s
+    # own comment: "k"/"k" reads 2.63x high, empty turns 3.33x). At the old
+    # 2.0 ceiling, 3,600 "k"/"k" exchanges measured a local total that put
+    # the payload "over 2.0x the limit" while the TRUE total (18,406 tokens
+    # against a 20,672 limit) was already under it — pre-cut then dropped
+    # 2,878 turns that never needed to go. The ceiling here MUST be the same
+    # constant `_min_possible_batches` divides by
+    # (`_LOCAL_OVERCOUNT_CEILING`, now 4.0, safe over the worst measured
+    # ratio) — not a same-looking but unrelated number — so a local count
+    # under this ceiling is proof, not a guess, that the true count is still
+    # under `limit`. Below that ceiling this is a no-op.
+    #
+    # hostile review round 2, finding 4: the TRIGGER used to read
+    # `_fast_token_estimate` (a char/4 approximation) rather than the real
+    # local tokenizer, so a script this model prices far above 4 chars/token
+    # (fully-pointed Hebrew measured near 1 token/char) could sit between the
+    # ceiling and 4x it without ever tripping the pre-cut — the exact
+    # content this deployment's own vision-model tokenizer prices worst.
+    # `count_tokens(messages)` (the SAME whole-list call `local_total` below
+    # makes anyway) is what decides it now; below the char/4 prescreen this
+    # is unreached, so ordinary short requests pay nothing extra for it, and
+    # a request that reaches here was already about to pay for exactly this
+    # tokenization a few lines down.
+    _precut_dropped = 0
+    _local_before_precut = count_tokens(messages)
+    if _local_before_precut > limit * _LOCAL_OVERCOUNT_CEILING:
+        messages, _precut_dropped = _precut_to_local_ceiling(
+            messages, limit * _LOCAL_OVERCOUNT_CEILING
+        )
+        if _precut_dropped:
+            logger.info(
+                f"hard budget: pre-cut {_precut_dropped} old turn(s) on local "
+                f"counts alone, before a single /tokenize call — the local "
+                f"count ({_local_before_precut}) put this payload over "
+                f"{_LOCAL_OVERCOUNT_CEILING:.1f}x the {limit}-token limit. "
+                f"Counted in the 'dropped old turn(s)' figure below; the shed "
+                f"loop, fill-back and their ground-truth verification are "
+                f"unchanged and run on what is left."
+            )
+
     # Ground truth, once, before any decision is made on it. See
-    # count_tokens_exact: the local count reads ~50% low on assistant content,
-    # which is most of a long conversation, so "total <= limit" was answering a
+    # count_tokens_exact: the local count on THIS deployment's tokenizer can
+    # read far enough off — in either direction, depending on message
+    # length and script — that "total <= limit" was answering a
     # question about a different request than the one about to be sent.
-    local_total = count_tokens(messages)
+    # (`_local_before_precut`, computed above to decide the pre-cut trigger,
+    # IS this same whole-list count when pre-cut did not touch `messages`;
+    # recomputed only when it did, since `messages` is now a different,
+    # shorter list.)
+    local_total = count_tokens(messages) if _precut_dropped else _local_before_precut
     exact = count_tokens_exact(messages)
     total = exact if exact is not None else local_total
     # How wrong the local tokenizer is on THIS payload. The shedding loop below
@@ -8055,7 +8469,15 @@ def _enforce_hard_budget(
             else "the local tokenizer, UNCORRECTED",
         )
 
-    if total <= limit:
+    # hostile review round 2, finding 2: a payload the PRE-CUT alone already
+    # brought under `limit` used to return HERE, straight past fill-back and
+    # the "hard budget enforced" WARNING the INFO line above just promised
+    # ("counted in the 'dropped old turn(s)' figure below") — a promise this
+    # branch then never kept. Only genuinely untouched payloads (no pre-cut
+    # ever ran) take this fast path unchanged; a payload pre-cut touched
+    # falls through to the same fill-back and logging every other shed
+    # payload gets, even though the round loop below has nothing to do.
+    if total <= limit and not _precut_dropped:
         if report is not None:
             report.update(
                 {
@@ -8076,7 +8498,7 @@ def _enforce_hard_budget(
     # on arithmetic and then verifies with a real count — bounded rounds.
     per = [int(count_tokens([m]) * scale) for m in msgs]
     running = total
-    dropped = 0
+    dropped = _precut_dropped
     trimmed = 0
     sys_dropped = 0
 
@@ -8508,6 +8930,14 @@ def _enforce_hard_budget(
             counter, dropped, sys_dropped, _measure,
         )
 
+    # 2026-09-25 RCA fix: fill back up to the limit. Everything above this
+    # line only ever asks "have we shed enough" — nothing asks "did we shed
+    # too much". See _fill_back_dropped_turns's own docstring for the
+    # mechanism, the reproduction, and why it is scoped to turns only.
+    msgs, running, counter, dropped = _fill_back_dropped_turns(
+        _original_messages, msgs, running, counter, dropped, limit, _measure,
+    )
+
     # v3.1 A9/A10: the shed line now names the counter behind its numbers and
     # the margin in force. Every number in this line came from one of two
     # counters that disagree by up to 51% in the direction that overflows, and
@@ -8515,10 +8945,21 @@ def _enforce_hard_budget(
     # for the same reason — `limit` below is already NET of _BUDGET_MARGIN, so
     # a reader comparing it against HARD_INPUT_LIMIT could not see why they
     # differed.
+    #
+    # hostile review round 2, finding 3: `total` (the LEFT side of the arrow
+    # below) is measured AFTER the pre-cut above already shortened the
+    # payload — on a starved conversation this reads e.g. "78791 -> 19488",
+    # which looks like the whole request was 78,791 tokens when it was
+    # really millions. When pre-cut ran, prefix the arrow with the ORIGINAL
+    # local count so the line still says how big the request actually was.
     margin_note = f", margin {_BUDGET_MARGIN}" if _BUDGET_MARGIN else ""
+    precut_note = (
+        f"{_local_before_precut} (original local count, pre-cut before "
+        f"measurement) -> " if _precut_dropped else ""
+    )
     detail = (
-        f"{total} -> {running} tokens (limit {limit}{margin_note}), counted by "
-        f"{counter}; dropped {dropped} old "
+        f"{precut_note}{total} -> {running} tokens (limit {limit}{margin_note}), "
+        f"counted by {counter}; dropped {dropped} old "
         f"turn(s), trimmed {trimmed} injected block(s), dropped "
         f"{sys_dropped} injected block(s) entirely"
     )
