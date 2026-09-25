@@ -38,7 +38,7 @@ import os
 import shutil
 import sys
 import tempfile
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 _TMP_ROOT = tempfile.mkdtemp(prefix="compactor-test-degraded-forget-")
 os.environ["COMPACTOR_STORAGE_ROOT"] = _TMP_ROOT
@@ -210,8 +210,18 @@ def test_clear_all_memory_partial_wipe_on_facts_write_failure():
          patch.object(facts, "save_facts", side_effect=OSError(28, "No space left on device")):
         result = _wipe(cid)
 
-    assert_eq(result["unreadable"], ["facts"],
-              "*** BUG CHECK: reported as unreadable/unconfirmed, not silently skipped")
+    # v3.1.9.8 (reply-wording fix, post round-4): a WRITE failure (this one
+    # — save_facts itself raised) is reported separately from a READ
+    # failure now. `unreadable` means the facts file could not be READ
+    # (load_facts raised StoreUnreadable) — that never happened here, the
+    # read above this succeeded fine. Folding a write failure into
+    # `unreadable` is exactly what made commands._handle_forget tell her
+    # "I could not READ the stored facts" for a delete that failed, not a
+    # read.
+    assert_eq(result["unreadable"], [],
+              "*** BUG CHECK: a write failure must not be reported as unreadable")
+    assert_eq(result["write_failed"], ["facts"],
+              "*** BUG CHECK: reported as write_failed/unconfirmed, not silently skipped")
     assert_eq(result["forgotten_facts"], 0, "no fact count claimed — the write never confirmed landing")
     assert_eq(result["forgotten_episodic"], 7,
               "*** BUG CHECK: episodic still cleared — the OSError did not abort the function")
@@ -700,6 +710,273 @@ def test_command_reply_unaffected_when_store_is_healthy():
                 "the degraded message does not fire on a healthy store")
 
 
+def test_forget_command_write_failure_says_could_not_remove_not_read():
+    print("\n[test] a facts WRITE failure says 'could not remove', not 'could "
+          "not read', and keeps the truthful still-storing note")
+    # v3.1.9.8 (reply-wording fix, post round-4). Before this, a facts-wipe
+    # WRITE failure (save_facts raising OSError — the file read fine; only
+    # the delete-by-overwrite failed) was folded into the same `unreadable`
+    # bucket as a genuine READ failure (StoreUnreadable), so the reply told
+    # her "I could not read the stored facts" for a delete that failed, not
+    # a read. The facts were never actually removed, so _memory_residue's
+    # own re-check (unchanged by this fix) still finds them and appends the
+    # "still storing... run /forget again" note — that part must survive.
+    _wipe_storage()
+    cid = "forget-cmd-write-fails"
+    facts.save_facts(cid, [
+        {"text": "her sister Maren has cancer", "added_turn": 1, "last_used": 1},
+    ])
+    with patch.object(facts, "save_facts",
+                       side_effect=OSError(28, "No space left on device")):
+        reply = _command_reply("/forget", cid)
+
+    # v3.1.9.8 round-2 review (item 1, MED): "could not remove" ALONE also
+    # matches the older, unrelated "still storing... I could not remove
+    # that in this pass" sentence (_handle_forget's `still` branch), which
+    # fires anyway because the facts genuinely were not removed — so this
+    # assertion passed even with the new sentence deleted entirely
+    # (reviewer mutant m1b, EXIT=0). Assert on text unique to the NEW
+    # sentence instead: "could not remove the stored facts" only appears
+    # in the write_failed clause this fix added.
+    assert_true(
+        "could not remove the stored facts" in reply.lower(),
+        f"*** BUG CHECK: reply describes the write failure as a removal "
+        f"failure, in the NEW sentence this fix added (not just the "
+        f"pre-existing 'still storing... run /forget again' note): {reply!r}",
+    )
+    assert_true(
+        "i could not read the stored" not in reply.lower(),
+        f"*** BUG CHECK: reply must not misdescribe a write failure as a "
+        f"read failure: {reply!r}",
+    )
+    assert_true(
+        "still storing" in reply.lower() and "run /forget again" in reply.lower(),
+        f"reply keeps the truthful still-storing/run-again note: {reply!r}",
+    )
+
+
+def test_forget_reply_truthful_across_read_write_failure_combinations():
+    print("\n[test] the /forget reply is truthful for every combination of "
+          "a read failure and a write failure (table-driven)")
+    # v3.1.9.8 round-2 review (item 6, LOW). Before this, the write-failure
+    # sentence unconditionally said "even though the rest of this wipe went
+    # through" — false whenever a READ failure (summary unreadable, say)
+    # ALSO left another layer untouched: that directly contradicts the
+    # "I could not read the stored summary... so I left it untouched"
+    # sentence appended just above it. Four cases below; each asserts only
+    # what is actually true for that combination.
+    read_err = lambda cid: memory.StoreUnreadable(
+        memory.summary_path(cid), ValueError("bad json"))
+    write_err = OSError(28, "No space left on device")
+
+    def _seed(cid: str) -> None:
+        facts.save_facts(cid, [
+            {"text": "her sister Maren has cancer", "added_turn": 1, "last_used": 1},
+        ])
+
+    # --- A: read failure only (summary unreadable), no write failure -----
+    _wipe_storage()
+    cid = "table-read-only"
+    _seed(cid)
+    with patch.object(summarizer, "load_state", side_effect=read_err(cid)):
+        reply = _command_reply("/forget", cid)
+    assert_true("i could not read the stored summary" in reply.lower(),
+                f"[A] names the unreadable summary: {reply!r}")
+    assert_true("could not remove the stored" not in reply.lower(),
+                f"[A] *** BUG CHECK: no write-failure sentence when nothing "
+                f"failed to WRITE: {reply!r}")
+    assert_true("even though the rest of this wipe went through" not in reply.lower(),
+                f"[A] *** BUG CHECK: the write-failure-only claim must not "
+                f"appear without a write failure: {reply!r}")
+
+    # --- B: write failure only, no read failure ---------------------------
+    _wipe_storage()
+    cid = "table-write-only"
+    _seed(cid)
+    with patch.object(facts, "save_facts", side_effect=write_err):
+        reply = _command_reply("/forget", cid)
+    assert_true("could not remove the stored facts" in reply.lower(),
+                f"[B] names the write failure: {reply!r}")
+    assert_true("i could not read the stored" not in reply.lower(),
+                f"[B] *** BUG CHECK: no read-failure sentence when nothing "
+                f"failed to READ: {reply!r}")
+    assert_true("every other layer was cleared" in reply.lower(),
+                f"[B] the 'rest of the wipe went through' claim IS true "
+                f"here (nothing else failed), so it should still appear: "
+                f"{reply!r}")
+
+    # --- C: BOTH a read failure and a write failure ------------------------
+    _wipe_storage()
+    cid = "table-both"
+    _seed(cid)
+    with patch.object(summarizer, "load_state", side_effect=read_err(cid)), \
+         patch.object(facts, "save_facts", side_effect=write_err):
+        reply = _command_reply("/forget", cid)
+    assert_true("i could not read the stored summary" in reply.lower(),
+                f"[C] names the unreadable summary: {reply!r}")
+    assert_true("could not remove the stored facts" in reply.lower(),
+                f"[C] names the write failure: {reply!r}")
+    assert_true(
+        "even though the rest of this wipe went through" not in reply.lower()
+        and "every other layer was cleared" not in reply.lower(),
+        f"[C] *** BUG CHECK: must NOT claim every other layer was cleared "
+        f"— the summary was left untouched too (contradicts the sentence "
+        f"immediately above it): {reply!r}",
+    )
+    assert_true("some other memory layers were also left untouched" in reply.lower(),
+                f"[C] the write-failure sentence points at the read-failure "
+                f"reason instead of a false blanket claim: {reply!r}")
+
+    # --- D: write failure on the first pass, success on the bounded retry -
+    _wipe_storage()
+    cid = "table-write-then-retry-success"
+    _seed(cid)
+    # One full _wipe_all_layers pass calls facts.save_facts up to twice
+    # (once inside _clear_all_memory, once for the empty-facts tombstone —
+    # see _wipe_all_layers). Failing both calls in pass 1 leaves the facts
+    # genuinely still on disk, which is what makes _handle_forget's own
+    # bounded retry actually fire; succeeding both calls in pass 2 (the
+    # retry) is what "success on the retry" means here. A plain
+    # side_effect=[..., None, None] would make the mock swallow those
+    # calls silently (returning None without writing anything) — the
+    # "success" calls must actually reach the real save_facts so the
+    # facts genuinely land empty on disk, which is what the retry
+    # succeeding actually means.
+    _real_save_facts = facts.save_facts
+    _calls = {"n": 0}
+
+    def _flaky_save_facts(conv_id_arg, value):
+        _calls["n"] += 1
+        if _calls["n"] <= 2:
+            raise write_err
+        return _real_save_facts(conv_id_arg, value)
+
+    with patch.object(facts, "save_facts", side_effect=_flaky_save_facts):
+        reply = _command_reply("/forget", cid)
+    assert_true(
+        "could not remove" not in reply.lower(),
+        f"[D] *** BUG CHECK: the retry succeeded — must not still claim a "
+        f"removal failure that already healed: {reply!r}",
+    )
+    assert_true(
+        "still storing" not in reply.lower(),
+        f"[D] *** BUG CHECK: the retry succeeded — must not still claim "
+        f"facts are still stored: {reply!r}",
+    )
+    assert_true(
+        "fact" in reply.lower() and "forgot" in reply.lower(),
+        f"[D] the eventual success is reported as an ordinary forget: {reply!r}",
+    )
+    assert_eq(facts.load_facts(cid), [], "[D] facts are actually empty on disk")
+
+    # --- E: _clear_all_memory's own write fails, but the SAME pass's
+    #        empty-facts tombstone (moments later, same _wipe_all_layers
+    #        call) succeeds — no second full pass involved at all. -------
+    _wipe_storage()
+    cid = "table-write-heals-within-one-pass"
+    _seed(cid)
+    _real_save_facts_e = facts.save_facts
+    _calls_e = {"n": 0}
+
+    def _heals_on_second_call(conv_id_arg, value):
+        _calls_e["n"] += 1
+        if _calls_e["n"] == 1:
+            raise write_err
+        return _real_save_facts_e(conv_id_arg, value)
+
+    with patch.object(facts, "save_facts", side_effect=_heals_on_second_call):
+        reply = _command_reply("/forget", cid)
+    assert_true(
+        "could not remove" not in reply.lower(),
+        f"[E] *** BUG CHECK: _clear_all_memory's own write failed, but the "
+        f"SAME pass's empty-facts tombstone write moments later actually "
+        f"landed — write_failed must reflect the CURRENT disk truth, not "
+        f"the stale first attempt: {reply!r}",
+    )
+    assert_eq(facts.load_facts(cid), [], "[E] facts are actually empty on disk")
+
+
+def test_facts_write_failure_alerts_async_once_per_conv():
+    print("\n[test] a facts-wipe write failure alerts via notify_async "
+          "(never the sync notify — this call site holds conv_lock on the "
+          "event loop), exactly once per conversation")
+    # v3.1.9.8 round-2 review (item 5, LOW): the original version of this
+    # fix called the SYNC `alert.notify` (a blocking httpx.post, up to
+    # COMPACTOR_ALERT_TIMEOUT_S) from inside `async def _clear_all_memory`
+    # while holding conv_lock — blocking the event loop, and every OTHER
+    # conversation's request behind it, for the duration of the HTTP call.
+    # Fixed to `await alert.notify_async(...)`, gated on the conv_id being
+    # NEWLY added to `_facts_wipe_write_failed_ever` (a still-failing write
+    # retried by _wipe_all_layers must not alert twice for the same fault).
+    _wipe_storage()
+    cid = "facts-write-alert-async"
+    facts.save_facts(cid, [{"text": "x", "added_turn": 1, "last_used": 1}])
+    import alert
+    with patch.object(alert, "notify_async", new_callable=AsyncMock) as mock_async, \
+         patch.object(alert, "notify") as mock_sync, \
+         patch.object(facts, "save_facts",
+                       side_effect=OSError(28, "No space left on device")):
+        # Two wipes against the SAME still-broken conv_id, the way
+        # _wipe_all_layers' own bounded retry does within one /forget.
+        _wipe(cid)
+        _wipe(cid)
+
+    assert_true(not mock_sync.called,
+                f"*** BUG CHECK: the blocking sync alert.notify must never "
+                f"be called from this async, lock-holding call site: "
+                f"{mock_sync.call_args_list!r}")
+    assert_eq(mock_async.call_count, 1,
+              f"*** BUG CHECK: alert.notify_async must fire exactly once "
+              f"for this conv_id, not once per wipe pass: "
+              f"{mock_async.call_args_list!r}")
+    call_args = mock_async.call_args
+    args = call_args.args
+    kwargs = call_args.kwargs
+    assert_eq(args[0] if args else kwargs.get("service"), "compactor",
+              "alert.notify_async's service arg")
+    detail = args[2] if len(args) > 2 else kwargs.get("detail", "")
+    assert_true("facts-wipe write failed" in detail,
+                f"alert detail names the failure: {call_args!r}")
+    assert_true(cid in detail, f"alert detail names the conversation: {call_args!r}")
+
+
+def test_health_full_counts_facts_write_failures():
+    print("\n[test] /health/full reports the facts-wipe write-failure count "
+          "next to the ledger counts")
+    # v3.1.9.8 round-2 review (item 1, MED): `_facts_wipe_write_failed_ever`
+    # is a process-wide set that accumulates across every test in this
+    # file's run (it is never reset — same as the ledger counters
+    # `checks.ledger` already follows this doctrine for). Asserting
+    # `>= 1` passes even if THIS test's own failure never actually landed
+    # in the set (an earlier test's failure alone would satisfy it), so
+    # the BEFORE/AFTER delta is what actually proves this failure was
+    # counted.
+    r_before = client.get("/health/full")
+    assert_eq(r_before.status_code, 200, "200 (before)")
+    before = (r_before.json().get("checks", {}).get("facts_write") or {}).get(
+        "wipe_write_failed_ever", 0)
+
+    _wipe_storage()
+    cid = "facts-write-health"
+    facts.save_facts(cid, [{"text": "x", "added_turn": 1, "last_used": 1}])
+    with patch.object(facts, "save_facts",
+                       side_effect=OSError(28, "No space left on device")):
+        _wipe(cid)
+
+    r = client.get("/health/full")
+    assert_eq(r.status_code, 200, "200")
+    body = r.json()
+    fw = body.get("checks", {}).get("facts_write")
+    assert_true(fw is not None, f"checks.facts_write is present: {body.get('checks', {}).keys()}")
+    assert_true(fw.get("available"), f"*** BUG CHECK: facts_write check not available: {fw}")
+    after = fw.get("wipe_write_failed_ever", 0)
+    assert_eq(
+        after, before + 1,
+        f"*** BUG CHECK: the count did not move by exactly 1 for THIS "
+        f"conversation's failure (before={before}, after={after})",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -727,6 +1004,10 @@ def _all_tests():
         test_command_reply_streams_the_same_plain_language,
         test_command_reply_hides_path_when_facts_unreadable,
         test_command_reply_unaffected_when_store_is_healthy,
+        test_forget_command_write_failure_says_could_not_remove_not_read,
+        test_forget_reply_truthful_across_read_write_failure_combinations,
+        test_facts_write_failure_alerts_async_once_per_conv,
+        test_health_full_counts_facts_write_failures,
     ]
 
 

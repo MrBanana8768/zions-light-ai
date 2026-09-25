@@ -77,8 +77,13 @@ SYNC_INTERVAL_S = env_float("WEBUI_DB_SYNC_INTERVAL_S", 300)
 # daemon actually looked -- published OR the ordinary "unchanged since last
 # sync" skip -- so its mtime answers "when did the daemon last check in",
 # which stays fresh across a boot regardless of how old the snapshot's own
-# content happens to be. health.py prefers it when present; see that
-# module's probe_snapshot().
+# content happens to be. health.py reads it into `checkin_age_s` and
+# reports it as a diagnostic; it does NOT prefer it over the mtime
+# comparison when deciding `stale` — that was tried and reverted (e289cdf)
+# because it broke a real staleness detector (test_health_findings.py's
+# F4 case), which checkin_age_s cannot distinguish from the boot-time
+# false alarm this sidecar exists to explain. See health.py's
+# probe_snapshot() for the current logic.
 SYNCED_AT_SIDECAR = SNAPSHOT_DB.with_name(SNAPSHOT_DB.name + ".synced_at")
 
 
@@ -93,7 +98,10 @@ def _touch_synced_at() -> None:
         logger.warning(
             f"could not touch check-in marker {SYNCED_AT_SIDECAR} "
             f"({type(e).__name__}: {e}); /health/full's staleness check "
-            f"will fall back to comparing file mtimes directly"
+            f"already decides `stale` from file mtimes alone (the sidecar "
+            f"is not consulted for that — see this file's comment above "
+            f"SYNCED_AT_SIDECAR), so only the checkin_age_s diagnostic "
+            f"goes missing, not the staleness check itself"
         )
 # Where a local database that fails its integrity check is set aside. Never
 # deleted: this project's rule is that anything removing state is reversible.

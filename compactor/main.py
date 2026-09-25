@@ -611,6 +611,15 @@ def backend_is_multimodal() -> bool:
 # already predict — see _note_backend_rejection's `guard_measured_overflow`.
 _BUDGET_MARGIN = 0
 
+# v3.1.9.8: distinct conversations whose facts-wipe WRITE (the
+# save_facts(conv_id, []) inside _clear_all_memory) has failed with an
+# OSError at least once since process start — an ENOSPC or a permission
+# fault, not a read failure (see `write_failed` where it is set). Reset on
+# restart, same as the other visibility-only counters in this module
+# (_reuse_stats, _BUDGET_MARGIN). Exposed at /health/full next to the
+# continuity ledger counts via facts_write_failure_state() below.
+_facts_wipe_write_failed_ever: set[str] = set()
+
 # Every wording vLLM has used to state the prompt size in a context-length 400,
 # read out of the pinned engines rather than guessed. A regex that silently
 # fails to match here is the whole calibration path going dark while the log
@@ -2820,6 +2829,30 @@ def budget_margin_state() -> dict:
         "release_after": BUDGET_MARGIN_RELEASE_AFTER,
         "ok_streak": _budget_ok_streak,
     }
+
+
+def facts_write_failure_state() -> dict:
+    """CONTRACT for health.py's `_facts_write_state()` (same call-time,
+    sys.modules-based read as `budget_margin_state()`/`tokenizer_state()`
+    above — health.py cannot import main at module scope).
+
+    v3.1.9.8 (reply-wording fix, post round-4): `_clear_all_memory`'s
+    facts-wipe write (`save_facts(conv_id, [])`) can fail with an OSError
+    (ENOSPC, a permission fault) distinct from a read failure — see that
+    function's `write_failed` vs `unreadable`. Before this, that failure
+    was only a log line and the `/forget` reply's "could not remove"
+    note; nothing counted it at /health, unlike the continuity ledger's
+    own write-failure counters (`checks.ledger`). Reported next to those,
+    same doctrine: visibility only, does not move `status` — the wipe
+    still deleted every OTHER layer regardless, and a residual facts
+    write failure is exactly what `/forget`'s own "still storing N
+    fact(s)... run /forget again" note already surfaces to the user who
+    hit it.
+
+    Returns {"wipe_write_failed_ever": int} — distinct conversations
+    whose facts-wipe write has failed at least once since process start.
+    Read-only, cheap, never raises."""
+    return {"wipe_write_failed_ever": len(_facts_wipe_write_failed_ever)}
 
 
 async def compact_if_needed(
@@ -12386,6 +12419,15 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
         # and would report failure for work that partly succeeded. Clear what
         # is readable, and say plainly which layer could not be.
         unreadable: list[str] = []
+        # v3.1.9.8 (reply-wording fix, post round-4): kept separate from
+        # `unreadable` above. `unreadable` means a READ failed — the file's
+        # contents are unknown, so nothing may be rewritten from a guess.
+        # `write_failed` means the opposite: the read succeeded (n_facts is
+        # known) but the delete-by-overwrite itself could not land. Conflating
+        # the two made commands._handle_forget tell her "I could not READ the
+        # stored facts" for a case where we read them fine and only failed to
+        # remove them — true but describing the wrong half of the operation.
+        write_failed: list[str] = []
         try:
             existing = facts.load_facts(conv_id)
             n_facts = len(existing)
@@ -12427,7 +12469,15 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
             # continues regardless; n_facts reports what was ACTUALLY
             # confirmed removed (0 — we do not know the write landed).
             n_facts = 0
-            unreadable.append("facts")
+            write_failed.append("facts")
+            # v3.1.9.8 round-2 review (item 5, LOW): alert only when this
+            # conv_id is NEWLY added to the set, not on every pass —
+            # _wipe_all_layers retries a wipe once when residue is found
+            # (see its own docstring), so a still-failing write would
+            # otherwise alert twice per /forget for the same underlying
+            # fault.
+            _was_new_facts_write_failure = conv_id not in _facts_wipe_write_failed_ever
+            _facts_wipe_write_failed_ever.add(conv_id)
             logger.error(
                 f"conv={conv_id}: {source} forget could not WRITE the empty "
                 f"facts file ({type(e).__name__}: {e}); the other memory "
@@ -12435,6 +12485,30 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
                 f"final state is unknown — treat it as not yet confirmed "
                 f"empty."
             )
+            if _was_new_facts_write_failure:
+                try:
+                    # v3.1.9.8 round-2 review (item 5, LOW): this function
+                    # is `async def _clear_all_memory`, running on the
+                    # compactor's own event loop while holding conv_lock —
+                    # NOT off-loop like continuity.py's own ledger-write
+                    # alert this originally copied its convention from.
+                    # The sync `alert.notify` (a blocking httpx.post, up to
+                    # COMPACTOR_ALERT_TIMEOUT_S/10s) blocked the loop for
+                    # every OTHER conversation's request while held under
+                    # conv_lock here — the "no guaranteed running loop"
+                    # reasoning this comment used to give was false for
+                    # this call site. `notify_async` uses httpx.AsyncClient
+                    # and awaits properly instead.
+                    import alert as _alert
+
+                    await _alert.notify_async(
+                        "compactor", "error",
+                        f"facts-wipe write failed for conv={conv_id} during "
+                        f"{source} forget; the facts file was not confirmed "
+                        f"empty",
+                    )
+                except Exception:
+                    pass
         # Episodic memory lives in ChromaDB.
         n_episodic = retrieval.forget_conversation(conv_id)
         # Hierarchical summary state on disk.
@@ -12491,6 +12565,13 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
         # Present only when a layer could not be read. Callers must not
         # report a clean wipe when this is non-empty.
         "unreadable": unreadable,
+        # v3.1.9.8: present only when a layer was read fine but its delete
+        # (an overwrite-with-empty) failed to land. Distinct from
+        # `unreadable` — see the comment where `write_failed` is declared
+        # above. Callers must not report a clean wipe when this is
+        # non-empty either, and should say "could not remove", not "could
+        # not read".
+        "write_failed": write_failed,
     }
 
 

@@ -903,6 +903,77 @@ wired to exclude the gap (or the gap is otherwise excluded from the
 verbatim window). When off, nothing in that code path runs at all — no
 file reads, no tokenizing — so leaving it off costs nothing.
 
+The rest of §17.6a's knobs only matter once the flag above is on; each has
+a safe code-level default and none needs to be set:
+`COMPACTOR_DIGEST_LLM` (default `true`) — try the LLM digest before
+falling back to the extractive one. `COMPACTOR_DIGEST_FULL_TOKENS`
+(default `160`) / `COMPACTOR_DIGEST_HEADLINE_TOKENS` (default `40`) —
+per-digest size caps. `COMPACTOR_DIGEST_FULL_UNITS` (default `10`) — how
+many full-size digests are kept before older ones drop to headline-only.
+
+### `COMPACTOR_CONTROL_ROOT` / `COMPACTOR_PENDING_ROOT` — outside backup scope, on purpose
+
+Two directories v3.1.9.8 added, both **siblings of `COMPACTOR_STORAGE_ROOT`**
+(not nested under it) and both **deliberately outside `COMPACTOR_BACKUP_DIR`'s
+scope** — `backup.py` archives `COMPACTOR_STORAGE_ROOT` and `webui.db`, but
+neither of these two directories.
+
+- `COMPACTOR_CONTROL_ROOT` (default `<STORAGE_ROOT parent>/compactor-control`,
+  i.e. `/data/openwebui/compactor-control` alongside the default storage
+  root `/data/openwebui/compactor`) — the persistent wipe ledger. Every
+  `/forget`, `/forget-all` and full wipe records itself here so a restore
+  or restart cannot resurrect words she already asked gone. The compactor
+  refuses to start if this resolves inside `COMPACTOR_STORAGE_ROOT`
+  (`continuity.assert_control_root_safe`).
+- `COMPACTOR_PENDING_ROOT` (default `<STORAGE_ROOT parent>/compactor-pending`,
+  i.e. `/data/openwebui/compactor-pending`) — the pending-intent durability
+  sidecar: where a wipe/forget's ledger write is recorded when
+  `COMPACTOR_CONTROL_ROOT` itself could not be written (ENOSPC, a
+  permission fault), so it can be merged into the ledger on the next
+  successful write or at the next boot. Kept as a THIRD sibling, separate
+  from `COMPACTOR_CONTROL_ROOT` too, so a broken control root does not
+  also take down its own fallback. Also refused inside
+  `COMPACTOR_STORAGE_ROOT` (`continuity.assert_pending_root_safe`).
+
+**Why outside backup scope is deliberate:** if a restore rolled the ledger
+back along with `COMPACTOR_STORAGE_ROOT`, a conversation forgotten
+*after* the backup was taken could have its words resurface on restore —
+exactly the failure mode §17.6a r10 A3 closes. The deletion itself is
+never gated on the ledger (a wipe deletes regardless of whether it can
+record that it did), so a lost or never-restored `COMPACTOR_CONTROL_ROOT`
+/ `COMPACTOR_PENDING_ROOT` does not bring back anything she asked forgotten.
+
+**What this costs a rebuild from `COMPACTOR_STORAGE_ROOT` backups alone**
+(a fresh volume, or these two directories simply never having been backed
+up): the compactor boots fine and every past deletion stays deleted, but
+the ledger's own bookkeeping starts empty — any conversation that had a
+still-unresolved pending intent at the time of loss loses the record of
+*why* its continuity band was failing closed, and (once the band is ever
+turned on) that conversation's band re-opens with no memory of the
+earlier failure. If you need these directories to survive a full rebuild,
+back up `/data/openwebui/compactor-control` and
+`/data/openwebui/compactor-pending` alongside `COMPACTOR_BACKUP_DIR`
+yourself — this is not automated as of v3.1.9.8.
+
+### Allocator / image budget (`compactor/allocator.py`, v3.1.9.8) — NOT WIRED, these vars currently do nothing
+`compactor/allocator.py` is a standalone, tested module for deciding how
+much of the request budget recent image turns get, independent of the
+continuity band above — but as of v3.1.9.8 **it is not wired into the live
+request path.** `main.py` only `import`s the module (which reads the env
+vars below into constants at import time); nothing calls
+`allocator.allocate()` or reads any other `allocator.*` name at request
+time (checked with `git grep -n "allocator\."` across `compactor/*.py`).
+Every var below is validated and reserved for when the allocator is wired
+in, but changing any of them changes nothing observable today:
+`COMPACTOR_ALLOCATOR_ENABLED` (default `true`), `COMPACTOR_IMAGE_WINDOW_TURNS`
+(default `10`, how many of the most recent turns will count as "current"
+for image placement once wired), `COMPACTOR_MAX_CURRENT_IMAGES` (default
+`4`, planned cap on images placed at once), `COMPACTOR_IMAGE_TOKEN_BUDGET`
+(default `8192`, planned token budget for the image slice),
+`COMPACTOR_MIN_GENERATION_RESERVE` (default `4096`, planned floor on
+`COMPACTOR_GENERATION_RESERVE` while competing with the image slice for
+room).
+
 ---
 
 ## Cleaning up old model weights on the volume

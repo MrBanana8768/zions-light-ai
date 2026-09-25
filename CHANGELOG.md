@@ -9,6 +9,172 @@ on Docker Hub.
 
 ---
 
+## [3.1.9.8] — the continuity band (off), the identity guard, and a durable forget ledger
+
+**Not deployed. Production runs v3.1.9** (tag `978c6ac`); v3.1.9.1–.5 are
+tagged but not deployed either, and v3.1.9.6/.7 were never tagged as
+images at all (v3.1.9.6 — see its own CHANGELOG entry — was folded
+straight into v3.1.9.7's history instead of being published; see
+"Image tags" in README.md). This release is Stage C of the staged
+deploy plan in the `zl-v4lab` repo, branch `feature/v4.0.0.0`, `V4.md`
+§6 (not in this repo) — Stage A = the v3.1.9.5 image, Stage B = .6+.7,
+Stage C = .8 — and has not been cut or built as an image.
+
+Ports the core of the V4 design's r10 amendment (`V4_DESIGN.md`
+§§17.6/17.6a/17.13): a continuity band that digests unsummarized
+exchanges instead of dropping them, and an identity-based guard so her
+own system prompt is never mistaken for something the compactor injected
+and can shed under budget pressure. Three release blockers found in
+review before any of this could ship, and a four-round hostile-review
+chain on `/forget`'s durability, are covered below.
+
+### Added
+- **The continuity band (`.15g`, `compactor/continuity.py`, new module)
+  — behind `COMPACTOR_CONTINUITY_BAND`, default OFF.** Unsummarized
+  exchanges that the allocator does not place verbatim get a bounded
+  digest (≤160 tokens full, ≤40 tokens headline; an LLM digest with an
+  extractive fallback, `COMPACTOR_DIGEST_LLM` default on) instead of
+  being dropped or duplicated. **Stays off by default deliberately:**
+  the design assumes the allocator excludes the digested gap from the
+  verbatim window it also forwards, and that wiring is not done — turning
+  the flag on today would show the model the same exchange twice, with no
+  cap on how many band entries accumulate. It ships disabled, fully
+  tested at both settings (`test_continuity_band_route.py` asserts no
+  band I/O at all with the flag off), so it can be turned on later
+  without a code change once the allocator is wired.
+- **`compactor/allocator.py` (new module).** The r8/r10 allocator's
+  decision core (tiers, the previous-exchange budget, the image-window
+  split) ported as a tested standalone module, `COMPACTOR_ALLOCATOR_
+  ENABLED` default on. **Not yet wired into the live request path** in
+  place of `compact_if_needed` — this is the wiring the band above is
+  waiting on.
+- **The identity guard (`.15p`).** The hard-budget guard now protects the
+  caller's system message(s) by sha256 identity
+  (`injected_system_hashes`/`_system_msg_hash`), not by scanning content
+  for a recognised header. Before this, her own system prompt could be
+  shed under budget pressure if it happened to quote a known injected-
+  block header, and an edited or merged caller prompt could still be
+  shed afterward. Only hashes the compactor recorded as its own
+  injections are ever droppable; content is never consulted for the
+  drop decision itself (content is diagnostic-only, logged when it looks
+  like a header but was not registered — a sign some injection call site
+  isn't recording its hash). A mismatch between the hashes recorded at
+  request entry and what the guard actually sees alerts and falls back
+  to the narrower, still-identity-based rule.
+- **A durable wipe ledger and pending-intent queue for `/forget`.** A
+  full or targeted forget now always deletes — a ledger write failure
+  can no longer raise and abort the deletion itself (a separate defect
+  from the three release blockers below — see "Fixed"; that shape was
+  found and fixed across the round-2/3/4 hostile-review chain, not
+  released in any intermediate state). A write that fails is
+  kept as a pending intent (a union of needles, the max epoch, the
+  broader boundary on a tie), merged into every later write attempt and
+  recovered from a durable on-disk sidecar at startup, and the
+  continuity band fails CLOSED for that conversation — including on stat
+  errors — until the write lands. The ledger lives in
+  `COMPACTOR_CONTROL_ROOT`; the sidecar lives in `COMPACTOR_PENDING_ROOT`,
+  a third sibling directory, so one broken root cannot take out its own
+  fallback. Both refuse to resolve inside `COMPACTOR_STORAGE_ROOT`.
+- **`/health/full` gains `checks.ledger`** (unreadable/write-failed/
+  pending-intent/double-failure counts, all distinct conversations since
+  process start, visibility only — never moves `status`) **and
+  `checks.facts_write`** (the facts-wipe write-failure count, added
+  alongside it — see "Fixed" below).
+
+### Fixed
+- **Three blockers found in review before this could ship.**
+  `continuity.py` called `_ledger_path`, defined nowhere — a `NameError`
+  that broke `/forget`, `/forget-all`, `/retire` and the full wipe.
+  `main.py` used `tokens.raw()` without importing `tokens` — the band
+  injection failed (caught, logged) on every request. The production
+  Dockerfile never `COPY`d `allocator.py`/`continuity.py` — the image
+  would not have booted. All three are fixed, with a pyflakes
+  undefined-name scan added to the gate so this class of defect fails
+  the build instead of shipping.
+- **A facts-wipe WRITE failure now says "could not remove", not "could
+  not read."** `main._clear_all_memory`'s facts-wipe write (an OSError
+  from `facts.save_facts` — ENOSPC, a permission fault) used to be
+  folded into the same bucket as a genuine READ failure
+  (`StoreUnreadable`), so `/forget`'s reply told her "I could not read
+  the stored facts" for a delete that failed, not a read. Tracked
+  separately now (`write_failed`, distinct from `unreadable`); the reply
+  says "I could not remove" for this case, alerts the same way its
+  neighbouring failures do, and is counted at `/health/full` next to the
+  ledger counts (`checks.facts_write`). The existing "this conversation
+  is still storing N fact(s)… run /forget again" note is unchanged — the
+  facts genuinely were not removed, and the residue check that produces
+  that note already covers it.
+- **A failed ledger write can no longer un-forget.** Earlier rounds of
+  this fix, during development (never committed or released — each was
+  caught by hostile review before it could ship), each closed one
+  shape and opened another: fail-open lost the record that kept a
+  forgotten needle suppressed; the degraded mark cleared on any later
+  successful write even for an unrelated needle; a restart reopened the
+  band regardless of a still-unwritten intent; the durability sidecar
+  lived under `STORAGE_ROOT`, so a restore from an older backup could
+  erase it. The shipped design (pending intents, merged from memory and
+  a sidecar outside both `STORAGE_ROOT` and `CONTROL_ROOT`, fail-closed
+  until merged) is the one that survives a restart, a restore and an
+  ENOSPC on every write in the wipe path without either losing a
+  deletion or resurrecting one.
+- **No write on the wipe path can abort a deletion.** The `wipe.json`
+  marker write, `backfill.mark_wiped`, and the facts-file write are each
+  handled separately now; none of them can raise before the deletions
+  they sit beside. Tested under `ENOSPC` on every write in the path.
+
+### Operator notes
+- **New env vars**, documented in `runpod.env.template`, `OPERATIONS.md`
+  and `RUNPOD_DEPLOY.md`: `COMPACTOR_CONTINUITY_BAND` (default `false`),
+  `COMPACTOR_DIGEST_LLM`/`COMPACTOR_DIGEST_FULL_TOKENS`/
+  `COMPACTOR_DIGEST_HEADLINE_TOKENS`/`COMPACTOR_DIGEST_FULL_UNITS`,
+  `COMPACTOR_CONTROL_ROOT`, `COMPACTOR_PENDING_ROOT`,
+  `COMPACTOR_ALLOCATOR_ENABLED` (default `true`),
+  `COMPACTOR_IMAGE_WINDOW_TURNS`/`COMPACTOR_MAX_CURRENT_IMAGES`/
+  `COMPACTOR_IMAGE_TOKEN_BUDGET`/`COMPACTOR_MIN_GENERATION_RESERVE`.
+- **Two new directories**, both siblings of `COMPACTOR_STORAGE_ROOT` and
+  both deliberately **outside backup scope**
+  (`backup.py` archives `COMPACTOR_STORAGE_ROOT` and `webui.db`, but
+  neither of these):
+  `COMPACTOR_CONTROL_ROOT` (default `/data/openwebui/compactor-control`
+  on the pod) and `COMPACTOR_PENDING_ROOT` (default
+  `/data/openwebui/compactor-pending`). This is intentional — a restore
+  that rolled the ledger back with `STORAGE_ROOT` could resurrect words
+  she had already asked forgotten — but it means a rebuild from a
+  `COMPACTOR_STORAGE_ROOT` backup alone starts the ledger empty: every
+  past deletion stays deleted (never gated on the ledger), but a
+  conversation with an unresolved pending intent at the time of loss
+  loses the record of why its band was failing closed. See
+  OPERATIONS.md.
+- **The continuity band stays OFF** until the allocator is wired to
+  exclude the digested gap from the verbatim window it also forwards.
+  Do not enable `COMPACTOR_CONTINUITY_BAND` before that wiring lands.
+
+### Known LOW follow-ups
+From `f62d08e`'s own commit message (band-on only unless noted):
+- A corrupt pending-intent sidecar is overwritten on a second failure,
+  rather than renamed aside (e.g. `.corrupt-<ts>`).
+- Startup replaces an unreadable ledger rather than quarantining it.
+
+From later review, tracked separately (band-on only unless noted):
+- The digest-store/retire writes that run before a set of deletions do
+  not yet abort truthfully on their own failure.
+- The "summary paused" note can appear even with the band OFF — **not**
+  band-on only.
+
+### Tests
+`test_identity_guard.py` (new), plus new/updated cases in
+`test_continuity.py`, `test_degraded_forget.py`, `test_backfill.py`,
+`test_budget_guard.py` (route-level injected hashes),
+`test_compaction_reuse.py`, `test_health_findings.py`,
+`test_continuity_band_route.py` (no band I/O with the flag off) and
+`test_no_undefined_names.py` (pyflakes over every changed module — the
+class of defect the three blockers above were). Each fix in this release
+was confirmed by reverting it and watching its own test fail. Gate: 157
+passed, 0 failed, 1 skipped (a tokenizer contract test scoped to its own
+container), exit 3, reproduced independently by hostile review.
+
+---
+
 ## [3.1.9.7] — OpenWebUI 0.11.0 → 0.11.4, a thin image layer, for the scroll fix
 
 **An image change — a thin layer, not a retag.** `Dockerfile.v3197` builds

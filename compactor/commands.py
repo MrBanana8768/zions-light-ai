@@ -511,6 +511,13 @@ async def _wipe_all_layers(conv_id: str, clear_all) -> dict:
     """
     result = await clear_all(conv_id)
     unreadable = list(result.get("unreadable") or [])
+    # v3.1.9.8 (reply-wording fix, post round-4): distinct from `unreadable`
+    # above — a layer that was read fine but whose delete-by-overwrite
+    # failed (main._clear_all_memory's OSError branch on save_facts). See
+    # that function's `write_failed` for why this must not be folded into
+    # `unreadable`: _handle_forget tells the two apart in the reply
+    # ("could not read" vs "could not remove").
+    write_failed = list(result.get("write_failed") or [])
 
     # v3.1 A3: the archive sidecar is a memory layer and until now NOTHING in
     # this codebase has ever deleted one. prune_facts and archive_stale_facts
@@ -590,6 +597,25 @@ async def _wipe_all_layers(conv_id: str, clear_all) -> dict:
                 f"({type(e).__name__}: {e}); the lazy backfill may reconstruct "
                 f"this conversation's history from its message list"
             )
+            # v3.1.9.8 round-2 review (item 6, LOW): this write is the LAST
+            # word on whether the facts layer landed empty in THIS pass —
+            # make sure a failure here is reflected in `write_failed` even
+            # when _clear_all_memory's own earlier attempt succeeded (so
+            # the reply's "could not remove" note does not stay silent
+            # about a failure that happened here instead).
+            if "facts" not in write_failed:
+                write_failed.append("facts")
+        else:
+            # The mirror case: _clear_all_memory's OWN save_facts attempt
+            # may have failed (write_failed already has "facts" from
+            # main.py) while THIS retry write, moments later, succeeds —
+            # the facts store is now genuinely confirmed empty. Clearing
+            # the stale entry keeps `write_failed` describing the CURRENT
+            # disk state, not a transient failure that already healed;
+            # otherwise the reply would claim a removal failure for a
+            # layer that was, in fact, just removed.
+            if "facts" in write_failed:
+                write_failed.remove("facts")
 
     return {
         "forgotten_facts": int(result.get("forgotten_facts") or 0),
@@ -601,6 +627,7 @@ async def _wipe_all_layers(conv_id: str, clear_all) -> dict:
         "forgotten_persona": bool(result.get("forgotten_persona")),
         "archived": n_archived,
         "unreadable": unreadable,
+        "write_failed": write_failed,
     }
 
 
@@ -746,12 +773,14 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
         for key in ("forgotten_summary", "forgotten_chapters", "forgotten_persona"):
             totals[key] = totals[key] or retry[key]
         totals["unreadable"] = retry["unreadable"]
+        totals["write_failed"] = retry["write_failed"]
         still, residue_unreadable = _memory_residue(conv_id)
 
     unreadable = list(totals["unreadable"])
     for layer in residue_unreadable:
         if layer not in unreadable:
             unreadable.append(layer)
+    write_failed = list(totals.get("write_failed") or [])
 
     # v3.1 A3: the dedup refusal memo is per-conversation state derived from
     # this conversation's facts (sha256 of the cluster's texts -> the reason
@@ -846,6 +875,38 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
             f"overwrite something I can't see. Nothing was lost. Please "
             f"mention this if it keeps happening."
         )
+
+    # v3.1.9.8 (reply-wording fix, post round-4): the write-failure twin of
+    # the read-failure sentence above. `write_failed` layers were read fine
+    # (main._clear_all_memory knows their contents) but the delete itself —
+    # overwriting with empty — could not land (ENOSPC, a permission fault).
+    # Saying "I could not READ" here would be false; the honest verb is
+    # "remove". The retry above already attempted this layer again, so this
+    # fires only when it is still failing after both passes.
+    if write_failed:
+        # v3.1.9.8 round-2 review (item 6, LOW): "even though the rest of
+        # this wipe went through" used to be unconditional — false
+        # whenever `unreadable` is ALSO non-empty (e.g. the summary layer
+        # was left untouched because it could not be READ), which
+        # contradicts the very sentence the `unreadable` branch above just
+        # appended. Only claim the rest of the wipe went through when we
+        # actually know of no other layer left untouched — i.e. when
+        # `unreadable` is empty.
+        _also_untouched = (
+            " Some other memory layers were also left untouched, for the "
+            "reason given above."
+            if unreadable else
+            " Every other layer was cleared regardless."
+        )
+        lines.append(
+            f"I could not remove the stored "
+            f"{' and '.join(write_failed)} for this conversation — the "
+            f"delete itself failed here, so {'it' if len(write_failed) == 1 else 'they'} "
+            f"may still be there." + _also_untouched +
+            " Please mention this if it keeps happening."
+        )
+
+    if unreadable or write_failed:
         if parts:
             lines[0] = "Cleared: " + ", ".join(parts) + "."
 

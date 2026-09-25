@@ -804,31 +804,21 @@ def probe_snapshot() -> dict:
         )
         return out
 
-    # H-2/D11 (review1-v3197-65ea196): prefer the check-in sidecar webuidb.py
-    # now touches (see webuidb.SYNCED_AT_SIDECAR's own comment) every time
-    # sync_once() completes a real cycle -- published OR the ordinary
-    # "unchanged since last sync" skip. Its mtime answers "when did the
-    # daemon last check in", which is what "is the daemon keeping up"
-    # actually needs, and it stays fresh across a boot no matter how old
-    # SNAPSHOT_DB's own content mtime is. This is the file the module
-    # docstring for local_lag_s (below) already specified but did not build
-    # ("if that file starts existing, prefer it outright over both age_s and
-    # local_lag_s"); it now exists.
-    #
-    # Without this, the FIRST write after a restore made local_lag_s huge:
-    # SNAPSHOT_DB's mtime is copied from local's mtime at restore time,
-    # which can be hours old (whatever she last wrote before the pod
-    # stopped), so `local_mtime(now, her first write) - snap_mtime(hours
-    # old)` read as hours of "lag" even though the very next cycle -
-    # immediate at boot, D14 - was always going to publish it fine.
-    #
-    # DOES NOT RETURN EARLY (fixed after this line first shipped: it used
-    # to `return out` here, which skipped computing local_lag_s entirely
-    # whenever the sidecar existed - breaking test_health_findings.py's
-    # own F4 suite, which reads local_lag_s directly as a still-useful
-    # diagnostic signal independent of what decided `stale`). local_lag_s
-    # is still always computed and reported below; only the STALE decision
-    # itself prefers checkin_age_s when it is available.
+    # H-2/D11 (review1-v3197-65ea196), REVERTED by e289cdf — see the longer
+    # comment below (just above the `stale` assignment) for the full story.
+    # webuidb.py stamps a check-in sidecar (see webuidb.SYNCED_AT_SIDECAR's
+    # own comment) every time sync_once() completes a real cycle —
+    # published OR the ordinary "unchanged since last sync" skip — and its
+    # mtime is read here into `checkin_age_s` and reported below as a
+    # genuinely useful diagnostic ("when did the daemon last check in").
+    # An earlier version of this code PREFERRED checkin_age_s over
+    # local_lag_s/age_s when deciding `stale` itself; that was reverted
+    # because it broke test_health_findings.py's real F4 detector
+    # (test_f4_unpublished_activity_after_a_quiet_baseline_still_fires) —
+    # checkin_age_s is equally ~0 right after a genuine sync as it is
+    # right after the boot-time false-alarm case this was meant to fix, so
+    # it cannot tell the two apart. checkin_age_s is computed and reported
+    # here for visibility only; it does not decide `stale`.
     try:
         checkin_mtime = os.path.getmtime(f"{snap}.synced_at")
         checkin_age = time.time() - checkin_mtime
@@ -872,15 +862,17 @@ def probe_snapshot() -> dict:
     # always made — the known idle-time limitation, not a crash and not
     # silently "fixed" for a case this process cannot see into.
     #
-    # SPECIFIED, NOT BUILT HERE (per the brief: do not edit webuidb.py). A
-    # signal that survives even the fallback case needs webuidb.py to stamp
-    # something OTHER than content mtime - e.g. a sibling file such as
-    # `f"{SNAPSHOT_DB}.synced_at"`, written with the WALL-CLOCK time of every
-    # completed sync_once() call (published OR skipped-because-unchanged, so
-    # a live daemon still "checks in" on a quiet night), containing just the
-    # epoch float. If that file starts existing, prefer it outright over
-    # both age_s and local_lag_s; nothing here reads it because it does not
-    # exist yet.
+    # BUILT (H-2/D11, review1-v3197-65ea196): webuidb.py DOES stamp
+    # something other than content mtime for exactly this fallback case —
+    # `SYNCED_AT_SIDECAR` (`f"{SNAPSHOT_DB}.synced_at"`), touched with the
+    # WALL-CLOCK time of every completed sync_once() call (published OR
+    # skipped-because-unchanged, so a live daemon still "checks in" on a
+    # quiet night; see webuidb.py's `_touch_synced_at` and its call
+    # sites). Read into `checkin_age_s` just above and reported below.
+    # NOT preferred over age_s/local_lag_s for the `stale` decision,
+    # though — that was tried and reverted (e289cdf); see the longer
+    # comment just above the `stale` assignment for why. It remains a
+    # useful diagnostic on its own even so.
     local_db = os.environ.get("WEBUI_LOCAL_DB", "/var/lib/openwebui/webui.db")
     local_lag_s: float | None
     try:
@@ -1520,6 +1512,36 @@ def _ledger_state() -> dict:
     return {"available": True, **counts}
 
 
+def _facts_write_state() -> dict:
+    """checks.facts_write: main.facts_write_failure_state() — same
+    call-time, sys.modules-based read `_budget_margin_state()`/
+    `_tokenizer_state()` above use (health.py cannot import main at
+    module scope).
+
+    v3.1.9.8 (reply-wording fix, post round-4): counts distinct
+    conversations whose facts-wipe WRITE (not read — see
+    main._clear_all_memory's `write_failed` vs `unreadable`) has failed
+    at least once since process start. Reported next to `checks.ledger`,
+    same doctrine: visibility only, does not move `status`."""
+    main_mod = sys.modules.get("main")
+    if main_mod is None:
+        return {"available": False,
+                "reason": "main is not loaded in this process"}
+    fn = getattr(main_mod, "facts_write_failure_state", None)
+    if not callable(fn):
+        return {"available": False,
+                "reason": "main.facts_write_failure_state() is not present in this build"}
+    try:
+        st = fn()
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        return {"available": False, "reason": err, "error": err}
+    if not isinstance(st, dict):
+        err = f"main.facts_write_failure_state() returned {type(st).__name__}, not a dict"
+        return {"available": False, "reason": err, "error": err}
+    return {"available": True, **st}
+
+
 async def gather_health_full(
     vllm_url: str, target_tokens: int, tokenize: dict | None = None
 ) -> dict:
@@ -1595,6 +1617,10 @@ async def gather_health_full(
     # v3.1.9.8 round-2 review (item 2): same pattern again, for the wipe
     # ledger's unreadable/write-failed counts.
     ledger = _ledger_state()
+    # v3.1.9.8 (reply-wording fix, post round-4): same pattern again, for
+    # the facts-wipe write-failure count (distinct from the ledger's own
+    # write failures above — this one is the facts FILE itself).
+    facts_write = _facts_write_state()
 
     # Why a reason list and not a bare string: `bg` used to be computed here,
     # placed in the payload, and never read. Sustained shedding — the pool
@@ -2242,6 +2268,11 @@ async def gather_health_full(
             # does not affect `status`, the same doctrine as
             # `tokenizer`/`reuse`/`budget_margin`/`truncated_summaries`.
             "ledger": ledger,
+            # v3.1.9.8 (reply-wording fix, post round-4): main.
+            # facts_write_failure_state(), or {"available": false, ...}.
+            # Visibility only — does not affect `status`, the same
+            # doctrine as `ledger`/`tokenizer`/`reuse`/`budget_margin`.
+            "facts_write": facts_write,
         },
         "stats": stats,
         "backups": backup_info,

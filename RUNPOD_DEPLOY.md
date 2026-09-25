@@ -883,6 +883,23 @@ Override these in your Runpod template if needed:
 | `WEBUI_DB_LOCAL` | `true` (also when set but EMPTY) | **Production: exactly `false`, and it is a hard precondition** — see [WEBUI_DB_LOCAL](#webui_db_local--a-hard-deploy-precondition). `false` keeps `webui.db` on `/data`; `true` moves it to local disk with a sync daemon. From v3.1.9 an unrecognised value refuses to boot, and `1`/`yes`/`True` mean true. |
 | `LOG_DIR` | `/data/logs` | Where every service log is written (on the volume, so logs survive a redeploy) |
 
+**Continuity band / allocator (v3.1.9.8 — NOT deployed; production runs v3.1.9. Staged deploy Stage C — see the `zl-v4lab` repo, branch `feature/v4.0.0.0`, `V4.md` §6; not in this repo):**
+
+| Variable | Default | Description |
+|---|---|---|
+| `COMPACTOR_CONTINUITY_BAND` | `false` | §17.6a continuity band — digests of unsummarized exchanges appended after the summary block. Stays OFF: the design assumes the allocator excludes the digested gap from the verbatim window it also forwards, and that wiring is not done, so turning it on means the model sees the same exchange twice. See OPERATIONS.md "Continuity band (`.15g`)". |
+| `COMPACTOR_DIGEST_LLM` | `true` | Try the LLM digest before the extractive fallback. Only matters once the band above is on. |
+| `COMPACTOR_DIGEST_FULL_TOKENS` | `160` | Per-digest full-size token cap. Only matters once the band is on. |
+| `COMPACTOR_DIGEST_HEADLINE_TOKENS` | `40` | Per-digest headline-size token cap. Only matters once the band is on. |
+| `COMPACTOR_DIGEST_FULL_UNITS` | `10` | How many full-size digests are kept before older ones drop to headline-only. Only matters once the band is on. |
+| `COMPACTOR_CONTROL_ROOT` | `<COMPACTOR_STORAGE_ROOT parent>/compactor-control`, i.e. `/data/openwebui/compactor-control` at the defaults above | Persistent wipe ledger — every `/forget`/`/forget-all`/full wipe records itself here. Must stay outside `COMPACTOR_STORAGE_ROOT` (the compactor refuses to boot otherwise) and is deliberately outside `COMPACTOR_BACKUP_DIR`'s scope (backup.py archives `COMPACTOR_STORAGE_ROOT` and `webui.db`, but not this) — see OPERATIONS.md for what that costs a rebuild from backup alone. |
+| `COMPACTOR_PENDING_ROOT` | `<COMPACTOR_STORAGE_ROOT parent>/compactor-pending`, i.e. `/data/openwebui/compactor-pending` at the defaults above | Pending-intent durability sidecar for a ledger write that could not reach `COMPACTOR_CONTROL_ROOT`. A third sibling of both `COMPACTOR_STORAGE_ROOT` and `COMPACTOR_CONTROL_ROOT`, same "must stay outside `COMPACTOR_STORAGE_ROOT`" rule and same backup-scope exclusion — see OPERATIONS.md. |
+| `COMPACTOR_ALLOCATOR_ENABLED` | `true` | **Currently has NO EFFECT.** `compactor/allocator.py` is a standalone, tested module that will budget recent image turns separately from text, but `main.py` only `import`s it (nothing calls `allocator.allocate()` or reads any other `allocator.*` name at request time — checked with `git grep -n "allocator\."`). Reserved for when the allocator is wired in. |
+| `COMPACTOR_IMAGE_WINDOW_TURNS` | `10` | **Currently has NO EFFECT** (same reason as `COMPACTOR_ALLOCATOR_ENABLED` above). Planned: how many of the most recent turns count as "current" for image placement, once wired. |
+| `COMPACTOR_MAX_CURRENT_IMAGES` | `4` | **Currently has NO EFFECT.** Planned: cap on current-window images the allocator will place at once, once wired. |
+| `COMPACTOR_IMAGE_TOKEN_BUDGET` | `8192` | **Currently has NO EFFECT.** Planned: token budget the allocator will reserve for the image slice, once wired. |
+| `COMPACTOR_MIN_GENERATION_RESERVE` | `4096` | **Currently has NO EFFECT.** Planned: floor the allocator will not shrink `COMPACTOR_GENERATION_RESERVE` below while competing with the image slice for room, once wired. |
+
 ## API Usage
 
 The compactor exposes an OpenAI-compatible API at port 8080:
