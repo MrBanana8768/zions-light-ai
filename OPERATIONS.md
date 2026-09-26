@@ -2663,8 +2663,11 @@ python3 scripts/word-ban-deploy.py status
 ```
 
 This prints the local file's revision/sha and, if the compactor is reachable at `:8080`, its own
-`/health/full` → `word_ban` block: `source` (should be `"file"`), `revision`/`value_sha256` (should match what
-you just deployed), `warmed` and `warm_state`. Expect `warm_state` to move `idle` → `waiting_idle` →
+`/health/full` → `word_ban` block: `source` (should be `"file"` — but only trust this reading after one chat
+message; see step 2 under "During the transition" below for why), `revision`/`value_sha256` (should match what
+you just deployed), `model_matches_pod` (should be `true` — `false` means this file's `model` does not match
+this pod's own `MODEL_REPO`, so real chat traffic here will never actually get this grammar even though the
+file loaded cleanly), `warmed` and `warm_state`. Expect `warm_state` to move `idle` → `waiting_idle` →
 `warming` → `idle` within `COMPACTOR_WORDBAN_IDLE_S` (30s default) of the pod going quiet, and
 `last_warm_compile_s` to show a number once it does — that is the one-time xgrammar compile (measured
 110–175s in `~/zl-ops/word-ban/`'s own release reports) that would otherwise land on her FIRST real reply
@@ -2693,7 +2696,12 @@ else no ban at all): `python3 scripts/word-ban-deploy.py clear --yes`.
 
 1. Deploy the file (above) with the OpenWebUI row **still in place**. The file wins; a conflict (the two
    differ) is logged once, at WARNING, shas only.
-2. Confirm `status` shows `source: "file"` and a completed warm-up.
+2. Send **one chat message** through OpenWebUI first, then confirm `status` shows `source: "file"` and a
+   completed warm-up. `source` reflects only the *last* `/v1/chat/completions` request this compactor process
+   has decided for — right after a fresh boot or restart, with no chat traffic yet, it falls back to what the
+   file's own state alone implies (see `health_snapshot`), which can read `"file"` even before any real
+   request has actually gone through the injection path. Checking `source` before that one message would not
+   prove the file is actually being injected into her replies, only that it parsed.
 3. Only then, delete the `structured_outputs` row from OpenWebUI's Advanced Params — it is the 1.5 MB value
    that was being sent on every single request, chat or task, and no longer needs to be.
 4. **Keep the system-prompt line** ("Seven things…", from `word-ban-prompt-line.vN.txt`) in OpenWebUI for

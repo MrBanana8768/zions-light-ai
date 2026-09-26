@@ -72,6 +72,38 @@ WITHDRAWN_REVISIONS = {
        "the reply cannot end (live 2026-09-23, 5 replies).",
 }
 
+# Hostile review round 2, N2: WITHDRAWN_REVISIONS matches by REVISION LABEL
+# only — a withdrawn value re-released under a different --revision number
+# (rev 4's own bytes, redeployed as "--revision 5") sails straight past it,
+# because nothing here ever looks at the bytes themselves. This is the
+# actual trap-carrying VALUE's sha256 (the same canonicalization
+# `canonical_value_bytes` uses — confirmed by hand against
+# ~/zl-ops/word-ban/word-ban-structured_outputs.value.v4.txt, whose raw
+# bytes are ALREADY in canonical form, so its plain sha256sum and this
+# module's canonical_value_bytes hash agree: 6b052ac1a4aa...), kept in
+# sync BY HAND for the same reason WITHDRAWN_REVISIONS is (no
+# scripts/wordban/ checkout on the pod). Checked in BOTH `cmd_deploy` (by
+# the raw file's own sha256, before any --revision label is trusted) and
+# `_validate_doc_shape` (by previous.json's own value_sha256, before a
+# rollback swap) — a withdrawn value must never load, however it is
+# labelled.
+WITHDRAWN_VALUE_SHA256S = {
+    "6b052ac1a4aa9be2e3c0428f6229a60b83c8f36fc07f06df65dac0da24d5c740":
+        "this is revision 4's released value — it traps the model (see "
+        "WITHDRAWN_REVISIONS[4] for the detail), regardless of what "
+        "--revision label it is deployed or rolled back under.",
+}
+
+
+def _default_model() -> str:
+    """N1: `--model` defaults to `$MODEL_REPO` when that env is set (the
+    same variable the compactor itself reads for its OWN configured model
+    — see compactor/main.py's `MODEL_REPO = os.environ.get("MODEL_REPO")`
+    and wordban_runtime.configured_model()), else DEFAULT_MODEL. Computed
+    fresh at parser-build time (not a module-level constant) so a test — or
+    an operator's env — that sets MODEL_REPO after import still sees it."""
+    return os.environ.get("MODEL_REPO") or DEFAULT_MODEL
+
 
 def say(*a) -> None:
     print(*a, flush=True)
@@ -182,6 +214,19 @@ def cmd_deploy(args) -> int:
         return 1
     raw = value_path.read_bytes()
     computed = sha256_hex(raw)
+
+    # N2: check the VALUE itself against the withdrawn-value set BEFORE
+    # trusting whatever --revision label was passed — this is exactly the
+    # loophole a mislabelled redeploy of rev 4's bytes under "--revision 5"
+    # would otherwise slip through (WITHDRAWN_REVISIONS alone only catches
+    # the label, never the bytes).
+    if computed in WITHDRAWN_VALUE_SHA256S:
+        say(
+            f"REFUSED: {value_path} (sha256 {computed[:16]}…) is a withdrawn "
+            f"value, regardless of --revision {args.revision} — "
+            f"{WITHDRAWN_VALUE_SHA256S[computed]}"
+        )
+        return 1
 
     expected = args.sha
     release_path = None
@@ -341,6 +386,16 @@ def _validate_doc_shape(doc, label: str):
             f"match its own structured_outputs ({computed[:12]}…) — this file was "
             f"corrupted or hand-edited"
         )
+    # N2: the VALUE itself, not just its revision label, must not be a
+    # withdrawn one — a previous.json for revision 5 whose bytes are
+    # actually rev 4's (the same mislabelling this check exists to close in
+    # cmd_deploy) must not be trusted just because the label passed above.
+    if doc["value_sha256"] in WITHDRAWN_VALUE_SHA256S:
+        return (
+            f"{label}'s value (sha256 {str(doc['value_sha256'])[:16]}…) is a "
+            f"withdrawn value, regardless of its revision label "
+            f"({revision}) — {WITHDRAWN_VALUE_SHA256S[doc['value_sha256']]}"
+        )
     return None
 
 
@@ -419,8 +474,9 @@ def main(argv=None) -> int:
     d.add_argument("value", help="path to word-ban-structured_outputs.value.vN.txt")
     d.add_argument("--revision", type=int, required=True)
     d.add_argument("--sha", default=None, help="expected sha256 of the value file")
-    d.add_argument("--model", default=DEFAULT_MODEL,
-                   help=f"the model this grammar applies to (default {DEFAULT_MODEL})")
+    d.add_argument("--model", default=_default_model(),
+                   help=f"the model this grammar applies to (default $MODEL_REPO "
+                        f"if set, else {DEFAULT_MODEL})")
     d.add_argument("--file", default=str(DEFAULT_FILE))
     d.set_defaults(func=cmd_deploy)
 

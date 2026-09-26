@@ -258,6 +258,62 @@ assert_eq(d.structured_outputs, None, "missing model -> no value used (fail-open
 
 clear_active()
 
+# Hostile review round 2, N2: the runtime ALSO refuses to load a withdrawn
+# VALUE sha, fail-open with an ERROR — the last line of defense if a
+# mislabelled redeploy of a withdrawn value somehow got past
+# word-ban-deploy.py's own checks. The real rev-4 sha is never exercised
+# against real content here (no grammar in this repo); this monkeypatches
+# WITHDRAWN_VALUE_SHA256S with a synthetic sha to prove the mechanism.
+withdrawn_grammar = {"grammar": _grammar + "-withdrawn-runtime"}
+withdrawn_sha = wordban_runtime.value_sha256_of(withdrawn_grammar)
+_orig_withdrawn_values = dict(wordban_runtime.WITHDRAWN_VALUE_SHA256S)
+wordban_runtime.WITHDRAWN_VALUE_SHA256S.clear()
+wordban_runtime.WITHDRAWN_VALUE_SHA256S[withdrawn_sha] = "synthetic stand-in for a withdrawn value"
+try:
+    clear_active()
+    write_active(14, withdrawn_grammar)  # an innocent revision label, not 4
+    d = wordban_runtime._load()
+    assert_true(d.error is not None, "a withdrawn VALUE is refused (error set) regardless of its revision label")
+    assert_true("withdrawn" in d.error, "the error names it withdrawn")
+    assert_eq(d.structured_outputs, None, "withdrawn value -> no value used (fail-open)")
+finally:
+    wordban_runtime.WITHDRAWN_VALUE_SHA256S.clear()
+    wordban_runtime.WITHDRAWN_VALUE_SHA256S.update(_orig_withdrawn_values)
+
+clear_active()
+
+# Hostile review round 2, N1: once the file's model no longer matches this
+# compactor's OWN configured model (MODEL_REPO, "test-model" per this
+# test's own os.environ.setdefault at the top), a WARNING is logged once
+# per file change, not per request.
+with capture_logs("compactor.wordban_runtime") as cap:
+    write_active(15, {"grammar": _grammar}, model="not-this-pods-model")
+    wordban_runtime._load()
+assert_true(
+    any("configured for model" in r.getMessage() for r in cap),
+    "a file/pod model mismatch is logged once, at WARNING",
+)
+assert_true(
+    all(r.levelno == logging.WARNING for r in cap if "configured for model" in r.getMessage()),
+    "...at WARNING level",
+)
+with capture_logs("compactor.wordban_runtime") as cap2:
+    wordban_runtime._load()  # nothing changed on disk -> no re-log
+assert_eq(len(cap2), 0, "an unchanged file does not re-log the model mismatch")
+
+# ...and NOT logged when the file's model DOES match this pod's configured
+# model.
+clear_active()
+with capture_logs("compactor.wordban_runtime") as cap3:
+    write_active(16, {"grammar": _grammar}, model="test-model")
+    wordban_runtime._load()
+assert_true(
+    not any("configured for model" in r.getMessage() for r in cap3),
+    "no mismatch warning when the file's model matches this pod's MODEL_REPO",
+)
+
+clear_active()
+
 
 # ===========================================================================
 # [U3] decide_structured_outputs
@@ -342,10 +398,11 @@ print("\n[U4] health_snapshot")
 
 clear_active()
 snap = wordban_runtime.health_snapshot()
-for key in ("source", "revision", "value_sha256", "file_error", "model", "warmed",
-            "warm_state", "last_warm_compile_s", "last_warm_at", "warmups_in_flight"):
+for key in ("source", "revision", "value_sha256", "file_error", "model", "model_matches_pod",
+            "warmed", "warm_state", "last_warm_compile_s", "last_warm_at", "warmups_in_flight"):
     assert_true(key in snap, f"health_snapshot has {key!r}")
 assert_eq(snap["source"], "none", "no file, no decision yet -> none")
+assert_eq(snap["model_matches_pod"], False, "no file at all -> model_matches_pod is False, not None")
 
 write_active(6, {"grammar": _grammar}, model="a-health-test-model")
 wordban_runtime.decide_structured_outputs(None)
@@ -354,6 +411,20 @@ assert_eq(snap["source"], "file", "after a decision using the file -> source=fil
 assert_eq(snap["revision"], 6, "revision reflects the file")
 assert_eq(snap["model"], "a-health-test-model",
           "model reflects the file (F8) — visible to an operator diagnosing a mismatch")
+
+# Hostile review round 2, N1: model_matches_pod against this compactor's
+# OWN configured model (MODEL_REPO="test-model", set at the top of this
+# file) — False when the file targets some OTHER model...
+assert_eq(snap["model_matches_pod"], False,
+          "model_matches_pod is False when the file's model differs from MODEL_REPO")
+clear_active()
+
+# ...True when the file's own model equals MODEL_REPO exactly.
+write_active(17, {"grammar": _grammar}, model="test-model")
+wordban_runtime.decide_structured_outputs(None)
+snap = wordban_runtime.health_snapshot()
+assert_eq(snap["model_matches_pod"], True,
+          "model_matches_pod is True when the file's model equals this pod's MODEL_REPO")
 clear_active()
 
 

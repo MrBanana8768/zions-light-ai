@@ -199,6 +199,43 @@ def value_sha256_of(structured_outputs: Any) -> str:
     return sha256_hex(canonical_value_bytes(structured_outputs))
 
 
+def configured_model() -> str | None:
+    """The compactor's OWN configured model — `MODEL_REPO`, the same env
+    var `main.py` reads at its own module scope (`MODEL_REPO = os.environ.
+    get("MODEL_REPO")`, main.py line ~108) and passes to `wordban_runtime.
+    init(VLLM_URL, MODEL_REPO or "")` at startup. Read directly from the
+    environment here, not from `main.MODEL_REPO` or `worker._model`,
+    because main.py imports wordban_runtime (never the other way around)
+    — importing main from here would be circular, and the env var is the
+    one shared source of truth both modules already read independently.
+    Returns None when unset or blank (never "" — callers treat that as
+    "nothing to compare against", same as an absent file)."""
+    return os.environ.get("MODEL_REPO") or None
+
+
+# Hostile review round 2, N2: a value this module must refuse to load
+# regardless of what `revision` its active.json claims — kept in sync BY
+# HAND with scripts/word-ban-deploy.py's OWN copy of this same set (see
+# that script's module docstring for why it is hardcoded there rather than
+# read from scripts/wordban/ at runtime; the reasoning is identical here:
+# this module ships alone in the compactor image — see Dockerfile's `COPY
+# compactor/wordban_runtime.py` — with no scripts/wordban/ checkout to read
+# a live withdrawn-list from). `word-ban-deploy.py`'s OWN check (matching
+# by revision LABEL only, in WITHDRAWN_REVISIONS) is not enough on its own:
+# a mislabelled redeploy of rev 4's bytes under "--revision 5" would sail
+# straight through label-only matching and land in active.json, at which
+# point THIS is the last line of defense before the compactor loads it.
+# rev 4 traps the model (see word-ban-deploy.py's WITHDRAWN_REVISIONS[4]
+# for the detail) — this is deliberately checked at LOAD time (fail-open,
+# ERROR-logged, same as every other _parse_and_validate refusal) rather
+# than trusted just because it is already on disk.
+WITHDRAWN_VALUE_SHA256S = {
+    "6b052ac1a4aa9be2e3c0428f6229a60b83c8f36fc07f06df65dac0da24d5c740":
+        "revision 4's released value — it traps the model, regardless of "
+        "what revision label active.json claims for it.",
+}
+
+
 def is_grammar_shape(value: Any) -> bool:
     """Hostile review round 1, F7: is `value` the ONE shape this module
     ever produces or accepts — a dict with EXACTLY one key, `"grammar"`,
@@ -289,6 +326,17 @@ def _parse_and_validate(raw: bytes) -> _FileState:
                 f"value_sha256 mismatch: file says {value_sha256[:12]}…, "
                 f"computed {computed[:12]}… over the canonicalized value"
             )
+        if value_sha256 in WITHDRAWN_VALUE_SHA256S:
+            # N2: refuse a withdrawn VALUE regardless of the revision label
+            # active.json claims for it — see WITHDRAWN_VALUE_SHA256S.
+            # Fail-open (same as every other refusal here): the ban is not
+            # enforced from the file until this is fixed, which is strictly
+            # safer than loading a grammar known to trap the model.
+            raise ValueError(
+                f"value_sha256 {value_sha256[:12]}… is a WITHDRAWN value "
+                f"({WITHDRAWN_VALUE_SHA256S[value_sha256]}) — refusing to "
+                f"load it, regardless of revision={revision!r}"
+            )
         new.revision = revision
         new.value_sha256 = value_sha256
         new.structured_outputs = so
@@ -347,6 +395,24 @@ def _load() -> _FileState:
             f"word-ban file loaded: revision={new.revision} "
             f"value_sha256={new.value_sha256[:12]}…"
         )
+        # N1: the file's own model vs THIS POD's configured model
+        # (MODEL_REPO) — distinct from decide_structured_outputs's
+        # per-REQUEST model check (that one compares against
+        # body.get("model") on every chat turn; this one is a static,
+        # once-per-file-change check against what this compactor process
+        # itself is configured to serve). Naturally fires once per file
+        # change: this whole branch only runs when the file's stat()
+        # signature changed (see the guard at the top of this function).
+        pod_model = configured_model()
+        if pod_model is not None and pod_model != new.model:
+            logger.warning(
+                f"word-ban file is deployed for model={new.model!r}, but "
+                f"this compactor is configured for model={pod_model!r} "
+                f"(MODEL_REPO) — real chat traffic on this pod names "
+                f"{pod_model!r}, so decide_structured_outputs's per-request "
+                f"model check (F8) will not inject this file's grammar "
+                f"unless the client itself asks for {new.model!r}"
+            )
     _state = new
     return _state
 
@@ -879,6 +945,14 @@ def health_snapshot() -> dict:
         # model than this request" (this field disagrees with the
         # request's own `model`).
         "model": st.model,
+        # N1: whether the deployed file's model equals THIS pod's own
+        # configured model (MODEL_REPO) — a bool, always present, so an
+        # operator does not have to cross-reference "model" against their
+        # own runpod.env by hand. False both when there is no valid file
+        # (st.model is None — nothing to claim a match) and when
+        # configured_model() itself is unset (nothing to compare against,
+        # so "matches" cannot be asserted true).
+        "model_matches_pod": st.model is not None and st.model == configured_model(),
     }
     if not WARMUP_ENABLED:
         out.update(

@@ -223,6 +223,81 @@ with tempfile.TemporaryDirectory() as td:
 
 
 # ===========================================================================
+# [U2c] Hostile review round 2, N2: a withdrawn VALUE is refused regardless
+# of --revision label. WITHDRAWN_REVISIONS matches by LABEL only, so rev
+# 4's actual bytes redeployed as "--revision 5" would sail past it; the
+# real rev-4 content is never embedded here (no grammar in this repo — see
+# module docstring), so this monkeypatches WITHDRAWN_VALUE_SHA256S with a
+# synthetic stand-in sha to prove the MECHANISM: matching by value sha,
+# independent of whatever revision label is passed.
+# ===========================================================================
+
+print("\n[U2c] N2 fix: a withdrawn VALUE is refused regardless of --revision label")
+
+with tempfile.TemporaryDirectory() as td:
+    tdp = Path(td)
+    active = tdp / "active.json"
+    trap_path, trap_sha = make_value_file(tdp, name="trap.txt", grammar=GRAMMAR + "-trap")
+
+    _orig_withdrawn_values = dict(wbd.WITHDRAWN_VALUE_SHA256S)
+    wbd.WITHDRAWN_VALUE_SHA256S.clear()
+    wbd.WITHDRAWN_VALUE_SHA256S[trap_sha] = "synthetic stand-in for a withdrawn value"
+    try:
+        # Deployed under revision 5 — an innocent label — the withdrawn
+        # VALUE must still be refused.
+        code, out = run(["deploy", str(trap_path), "--revision", "5",
+                          "--sha", trap_sha, "--file", str(active)])
+        assert_eq(code, 1, "a withdrawn VALUE is refused even under an innocent --revision label")
+        assert_true("withdrawn" in out, "the refusal names it withdrawn")
+        assert_true(not active.exists(), "nothing written on refusal")
+        assert_true(GRAMMAR not in out, "the refusal never contains the grammar")
+    finally:
+        wbd.WITHDRAWN_VALUE_SHA256S.clear()
+        wbd.WITHDRAWN_VALUE_SHA256S.update(_orig_withdrawn_values)
+
+
+# ===========================================================================
+# [U2d] Hostile review round 2, N1: --model defaults to $MODEL_REPO when
+# set, else DEFAULT_MODEL.
+# ===========================================================================
+
+print("\n[U2d] N1 fix: --model defaults to $MODEL_REPO when set, else DEFAULT_MODEL")
+
+with tempfile.TemporaryDirectory() as td:
+    tdp = Path(td)
+    active = tdp / "active.json"
+    _saved_model_repo = os.environ.pop("MODEL_REPO", None)
+    try:
+        v, s = make_value_file(tdp, name="md1.txt", grammar=GRAMMAR + "-md1")
+        code, out = run(["deploy", str(v), "--revision", "20", "--sha", s, "--file", str(active)])
+        assert_eq(code, 0, "deploy succeeds with MODEL_REPO unset")
+        doc = json.loads(active.read_text(encoding="utf-8"))
+        assert_eq(doc["model"], wbd.DEFAULT_MODEL,
+                  "MODEL_REPO unset -> --model defaults to DEFAULT_MODEL")
+
+        os.environ["MODEL_REPO"] = "pod-configured-model"
+        v2, s2 = make_value_file(tdp, name="md2.txt", grammar=GRAMMAR + "-md2")
+        code, out = run(["deploy", str(v2), "--revision", "21", "--sha", s2, "--file", str(active)])
+        assert_eq(code, 0, "deploy succeeds with MODEL_REPO set")
+        doc2 = json.loads(active.read_text(encoding="utf-8"))
+        assert_eq(doc2["model"], "pod-configured-model",
+                  "MODEL_REPO set -> --model defaults to it")
+
+        v3, s3 = make_value_file(tdp, name="md3.txt", grammar=GRAMMAR + "-md3")
+        code, out = run(["deploy", str(v3), "--revision", "22", "--sha", s3,
+                          "--model", "explicit-override", "--file", str(active)])
+        assert_eq(code, 0, "deploy succeeds with both MODEL_REPO set and --model given")
+        doc3 = json.loads(active.read_text(encoding="utf-8"))
+        assert_eq(doc3["model"], "explicit-override",
+                  "an explicit --model still overrides $MODEL_REPO")
+    finally:
+        if _saved_model_repo is None:
+            os.environ.pop("MODEL_REPO", None)
+        else:
+            os.environ["MODEL_REPO"] = _saved_model_repo
+
+
+# ===========================================================================
 # [U2b] F3 fix: _sha_from_release_manifest directly against the REAL
 # release.v8.json shape (no grammar bytes needed — the function only
 # reads the manifest and `value_path.name`).
@@ -378,6 +453,46 @@ with tempfile.TemporaryDirectory() as td:
     assert_eq(code, 0, "a well-formed, non-withdrawn previous.json is accepted")
     assert_eq(json.loads(active.read_text(encoding="utf-8"))["revision"], 1,
               "active.json now holds the validated previous revision")
+
+
+print("\n[U4c] N2 fix: rollback refuses a withdrawn VALUE regardless of its revision label")
+
+with tempfile.TemporaryDirectory() as td:
+    tdp = Path(td)
+    active = tdp / "active.json"
+    previous = tdp / "previous.json"
+
+    trap_grammar = {"grammar": GRAMMAR + "-trap-rollback"}
+    trap_sha = hashlib.sha256(
+        json.dumps(trap_grammar, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+    _orig_withdrawn_values = dict(wbd.WITHDRAWN_VALUE_SHA256S)
+    wbd.WITHDRAWN_VALUE_SHA256S.clear()
+    wbd.WITHDRAWN_VALUE_SHA256S[trap_sha] = "synthetic stand-in for a withdrawn value"
+    try:
+        # previous.json is internally consistent (its value_sha256 DOES
+        # match its own structured_outputs) and labelled revision 5 — an
+        # innocent label, not 4 — but its VALUE is the withdrawn one.
+        previous.write_text(json.dumps({
+            "revision": 5, "value_sha256": trap_sha,
+            "structured_outputs": trap_grammar, "model": wbd.DEFAULT_MODEL,
+            "deployed_at": "2026-09-26T00:00:00Z",
+        }), encoding="utf-8")
+        active.write_text(json.dumps({
+            "revision": 6, "value_sha256": hashlib.sha256(
+                json.dumps({"grammar": GRAMMAR + "-6"}, ensure_ascii=True).encode()).hexdigest(),
+            "structured_outputs": {"grammar": GRAMMAR + "-6"}, "model": wbd.DEFAULT_MODEL,
+            "deployed_at": "2026-09-26T00:00:00Z",
+        }), encoding="utf-8")
+        code, out = run(["rollback", "--file", str(active)])
+        assert_eq(code, 1, "rollback refuses a withdrawn VALUE even under an innocent revision label")
+        assert_true("withdrawn" in out, "the refusal names it withdrawn")
+        assert_eq(json.loads(active.read_text(encoding="utf-8"))["revision"], 6,
+                  "active.json was NOT swapped on a refused rollback")
+        assert_true(GRAMMAR not in out, "the refusal never contains the grammar")
+    finally:
+        wbd.WITHDRAWN_VALUE_SHA256S.clear()
+        wbd.WITHDRAWN_VALUE_SHA256S.update(_orig_withdrawn_values)
 
 
 # ===========================================================================
