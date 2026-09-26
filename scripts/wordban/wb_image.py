@@ -15,6 +15,7 @@ import argparse
 import collections
 import json
 import random
+import statistics as _statistics
 import sys
 import time
 import types
@@ -70,6 +71,18 @@ class Stack:
 
     def fresh(self):
         return self.be.compile_grammar(StructuredOutputOptions.GRAMMAR, self.ebnf)
+
+    def cold_compile(self):
+        """Opus re-review (rev 8 fix round 2): `fresh()` alone recompiles on the SAME xgrammar
+        GrammarCompiler, which caches by grammar string (`cache_enabled=True` in vLLM 0.19's
+        XgrammarBackend.__post_init__) - a repeat compile of the byte-identical EBNF is a cache HIT (~0.002s),
+        not a real timing sample. This clears that compiler's cache first (the real handle: `self.be.compiler`,
+        an `xgr.GrammarCompiler`, has `.clear_cache()`), so the timed compile that follows is genuinely cold,
+        and returns the elapsed seconds."""
+        self.be.compiler.clear_cache()
+        t0 = time.time()
+        self.be.compile_grammar(StructuredOutputOptions.GRAMMAR, self.ebnf)
+        return time.time() - t0
 
     def run(self, ids):
         g = self.fresh()
@@ -366,9 +379,9 @@ def cmd_verify(a):
     tests = json.load(open(a.tests, encoding="utf-8"))
     st = Stack(ebnf)
     print(f"  tokenizer: {st.V:,} tokens, EOS {st.EOS}, {len(st.special)} special; xgrammar {XGR_VERSION}, vLLM {VLLM_VERSION}", flush=True)
-    # FIRST_COMPILE_LIMIT_S rationale (rev 7 round 2, confirmed with evidence, not assumed): the first request
-    # after a vLLM restart must not time out while xgrammar compiles this grammar. Both hops in the path have NO
-    # read/total timeout on prod, so a slow compile is slow but never fails there:
+    # FIRST_COMPILE_LIMIT_S rationale (confirmed with evidence, not assumed): the first request after a vLLM
+    # restart must not time out while xgrammar compiles this grammar. Both hops in the path have NO read/total
+    # timeout on prod, so a slow compile is slow but never fails there:
     #   (a) compactor/main.py (v3.1.9):7531-7532 builds its httpx client with
     #       `httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0))`
     #       ("read=None keeps long generations from being cut off"); the non-streaming POST at :7709 and the
@@ -380,12 +393,53 @@ def cmd_verify(a):
     #       of 300. `utils/session_pool.py:43` builds `aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)`, and
     #       `routers/openai.py`'s `/chat/completions` handler (:1486, request at :1658-1667) uses exactly that
     #       session and timeout for both streaming and non-streaming requests - so `total=None` there too.
-    # Since BOTH hops have no timeout, the limit is a quality/UX bar, not a hard cliff. rev 6 measured prod
-    # compiling at ~0.73x local wall time (63s prod vs 86s local); at that ratio the rev-7-round-2 grammar's
-    # ~117-126s local compile is ~85-92s on prod - comfortably under even the raised limit below.
-    FIRST_COMPILE_LIMIT_S = 150
-    add("first compile of the grammar (once per vLLM start)", st.first_compile < FIRST_COMPILE_LIMIT_S,
-        f"{st.first_compile:.1f}s (limit {FIRST_COMPILE_LIMIT_S}s); again from xgrammar's cache {st.second_compile:.3f}s")
+    # Since BOTH hops have no timeout, the limit is a quality/UX bar, not a hard cliff.
+    # OWNER DECISION (2026-09-25): raised 150 -> 180 after rev 8 ("white") measured 147.6s - only ~2s of margin,
+    # given the +-10-20s run-to-run variance seen across earlier rounds on an UNCHANGED grammar, and the owner
+    # chose to keep the FULL "white" coverage (spaced + split), not to trim it. Same evidence as above (still
+    # both hops have no timeout); rev 6 measured prod compiling at ~0.73x local wall time (63s prod vs 86s
+    # local) - at that ratio rev 8's ~147-149s local compile is ~110-130s on prod - well under even the old
+    # 150s bar, let alone 180s. A WARM-UP STEP is planned (compile the grammar once, right after a vLLM
+    # restart, before her first real request reaches it) so she never actually pays this wait herself; until
+    # that lands, this limit is what keeps the tool's own quality bar honest.
+    FIRST_COMPILE_LIMIT_S = 180
+    # rev 8 fix round (hostile-review fix 3): a single first-compile sample was pure noise near the limit (9
+    # compiles of an UNCHANGED grammar measured 144-174s). Gate on the MEDIAN of up to 3 independent compiles
+    # instead of just one: if the first exceeds the limit, compile once more; if those two disagree about which
+    # side of the limit they land on, take a third to break the tie. Decision logic lives in wb_core.py (pure
+    # Python) so it is unit-testable with fake timings, without ever compiling in the test.
+    # rev 8 fix round 2 (Opus re-review, caught the tool cheating its own gate): the extra samples MUST be real
+    # cold compiles, not repeats served from xgrammar's own grammar cache inside this SAME backend/compiler
+    # (`self.be.compiler`, an xgr.GrammarCompiler with cache_enabled=True) - a cache hit returns in ~0.002s
+    # regardless of the real compile time, which would let one genuine slow compile "self-heal" to a fast
+    # median EVERY time, making the gate unable to ever fail. Stack.cold_compile() clears that compiler's cache
+    # before each extra sample (`.clear_cache()`), so each is a genuine cold compile of the same byte-identical
+    # grammar; a hard `assert ... > 10` below is an extra, load-bearing sanity net (not the gate's own PASS/FAIL
+    # logic - that is core.compile_gate_verdict()'s job, which independently rejects an implausibly-fast extra
+    # sample too) that stops the tool outright if clear_cache() were ever silently ineffective.
+    compile_samples = [st.first_compile]
+    if core.compile_gate_need_second_sample(compile_samples[0], FIRST_COMPILE_LIMIT_S):
+        s2 = st.cold_compile()
+        assert s2 > 10, (f"cold-compile sample 2 came back in {s2:.3f}s - suspiciously fast for a real cold "
+                          f"compile of this grammar; is xgrammar's cache actually being cleared?")
+        compile_samples.append(s2)
+        print(f"    compile gate: sample 2 (cold, cache cleared) = {s2:.1f}s", flush=True)
+        if core.compile_gate_need_third_sample(compile_samples[0], compile_samples[1], FIRST_COMPILE_LIMIT_S):
+            s3 = st.cold_compile()
+            assert s3 > 10, (f"cold-compile sample 3 came back in {s3:.3f}s - suspiciously fast for a real cold "
+                              f"compile of this grammar; is xgrammar's cache actually being cleared?")
+            compile_samples.append(s3)
+            print(f"    compile gate: sample 3 (cold, cache cleared, tie-break) = {s3:.1f}s", flush=True)
+    compile_verdict = core.compile_gate_verdict(compile_samples, FIRST_COMPILE_LIMIT_S)
+    implausible = core.compile_gate_implausible_samples(compile_samples)
+    samples_str = ", ".join(f"{s:.1f}s" for s in compile_samples)
+    median_str = f"{_statistics.median(compile_samples):.1f}s"
+    detail = (f"samples: [{samples_str}] (limit {FIRST_COMPILE_LIMIT_S}s); median {median_str}; "
+              f"again from xgrammar's cache (uncleared) {st.second_compile:.3f}s")
+    if implausible:
+        detail += (f"; IMPLAUSIBLE extra sample(s) {[f'{s:.3f}s' for s in implausible]} - look like a cache "
+                   f"hit, not a genuine cold compile; failing rather than silently dropping them")
+    add("first compile of the grammar (once per vLLM start)", compile_verdict, detail)
     # rebuild comparison with the image's Unicode tables
     spec, again = core.build(a.banlist)
     add("artifact = banlist (rebuilt in the image, byte-identical)", again == ebnf,
@@ -474,7 +528,9 @@ def cmd_verify(a):
     n, bad = walks(st, a.walk_steps, ordinary, tests["trap_regressions"])
     add(f"adversarial random walks through the real backend", not bad,
         f"{n:,} decode steps, each with a normal exit ({time.time() - t0:.0f}s)" + (f"; FAILED at {bad[:5]}" if bad else ""))
-    facts = {"first_compile_s": round(st.first_compile, 2), "reachable_states": pr["reach"],
+    facts = {"first_compile_s": round(st.first_compile, 2),
+             "compile_samples_s": [round(s, 2) for s in compile_samples],
+             "compile_median_s": round(_statistics.median(compile_samples), 2), "reachable_states": pr["reach"],
              "xgrammar": XGR_VERSION, "vllm": VLLM_VERSION, "vocab": st.V}
     # corpus
     if a.corpus:

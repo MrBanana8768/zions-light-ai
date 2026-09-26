@@ -1725,6 +1725,57 @@ def corpus_sample_rate(mode, ntok, corpus_sample, floor=CORPUS_SAMPLE_FLOOR):
     return min(1.0, (floor * 1.2) / ntok)
 
 
+# rev 8 fix round (hostile-review fix 3): the first-compile gate was firing on noise, not on a real regression -
+# an UNCHANGED grammar measured 144-174s across 9 compiles against the 180s limit, purely from machine variance.
+# Pure decision logic (unit-testable with fake timings, no real compile) for the median-of-samples redesign:
+#   1. always take one sample (s1). If s1 <= limit, that single sample IS the median - done, PASS.
+#   2. otherwise take a second sample (s2). If s1 and s2 agree on which side of the limit they fall (both over,
+#      since s1 is already over - the only way to "agree" here is s2 also over), the 2-sample median (their
+#      average) is unambiguous - decide from just the two.
+#   3. if s1 and s2 DISAGREE (one over the limit, one not) that is the TIE this gate breaks with a third sample -
+#      compile once more (s3) and use the true (middle-value) median of all three.
+# The limit itself (180s, owner decision) never changes; only how many samples are consulted before comparing to
+# it.
+import statistics as _statistics
+
+
+def compile_gate_need_second_sample(first, limit):
+    """True when the first compile alone cannot decide the gate (it exceeded the limit)."""
+    return first > limit
+
+
+def compile_gate_need_third_sample(first, second, limit):
+    """True when the first two samples land on OPPOSITE sides of the limit - a tie this gate breaks with a
+    third, independent sample rather than falling back to a plain average of two."""
+    return (first <= limit) != (second <= limit)
+
+
+def compile_gate_implausible_samples(samples):
+    """Opus re-review (rev 8 fix round 2): the gate's extra samples MUST be real cold compiles, not a repeat
+    compile served from xgrammar's own grammar cache (which returns in ~0.002s regardless of how slow the real
+    compile is - a cache hit would let a single genuinely slow compile "self-heal" to a fast median every time,
+    making the gate unable to ever fail). Returns the subset of `samples[1:]` (the extra samples only - the
+    first sample has nothing to be implausible relative to) that come back under 10% of the first sample's
+    time: implausibly fast for a real cold compile of the same grammar, and almost certainly a cache hit."""
+    if len(samples) < 2:
+        return []
+    first = samples[0]
+    if first <= 0:
+        return []
+    return [s for s in samples[1:] if s < 0.1 * first]
+
+
+def compile_gate_verdict(samples, limit):
+    """The gate's final PASS/FAIL, given every sample actually taken (1, 2, or 3 of them): FAILS outright (never
+    silently drops the sample and passes on a falsely light median) if any extra sample looks implausible - see
+    compile_gate_implausible_samples(). Otherwise PASS iff the median of `samples` does not exceed `limit`. Fails
+    only if the median exceeds it - one slow outlier among several genuinely fast, cold samples cannot fail the
+    gate by itself."""
+    if compile_gate_implausible_samples(samples):
+        return False
+    return _statistics.median(samples) <= limit
+
+
 # rev 7 FINAL (hostile-review fix 6): chat ids/titles that mark a chat as a TEST fixture, not a real
 # conversation - the e2e/pod-check tooling's own test conversation ids match this (e2e uses "itest-wordban-...",
 # the pod check's control uses "itest-wordban-check"), so "the most recent chat" never accidentally picks one of

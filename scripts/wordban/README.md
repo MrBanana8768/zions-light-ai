@@ -140,7 +140,13 @@ Usually it is one line under `families:` in `banlist.yaml`, then `build`, `verif
 
 **Image: vLLM 0.19's own `XgrammarBackend`, the real tokenizer, CPU.**
 - **Rebuild.** The rebuild in the image is byte-identical.
-- **Timing.** First-compile time, and the cost per decode step.
+- **Timing.** First-compile time (must stay under `FIRST_COMPILE_LIMIT_S` in `wb_image.py`, currently **180s** -
+  raised from 150s by owner decision, 2026-09-25, after rev 8 ("white") measured 147.6s local, leaving too
+  little margin for run-to-run variance; see the code comment there for the full evidence that neither prod hop
+  - compactor v3.1.9 nor OpenWebUI 0.11.4 - enforces a read timeout, so this is a quality bar, not a hard cliff,
+  and for why prod itself compiles faster than the build machine. A warm-up step - compiling the grammar once
+  right after a vLLM restart, before her first real request reaches it - is planned so she never pays this wait
+  herself), and the cost per decode step.
 - **Test lists.** Every list goes through the real tokenizer, plus collateral, gaps, every folded variant of every letter of the `accent_words`, non-canonical token paths, and random Unicode.
 - **Token-level no-trap proof.**
   1. Every vocabulary token is walked from every state. This gives each state's exact allowed-token set, and every state reachable by any token sequence.

@@ -276,6 +276,78 @@ def test_corpus_sample_rate_reaches_the_floor_in_recent_mode():
               "zero tokens: falls back to the given rate rather than dividing by zero")
 
 
+def test_compile_gate_median_logic_with_fake_timings():
+    # rev 8 fix round (hostile-review fix 3): the first-compile gate must not fail on ONE slow outlier - an
+    # unchanged grammar measured 144-174s across 9 real compiles against the 180s limit. These are FAKE timing
+    # numbers only (no real compilation happens here) exercising the pure decision functions in wb_core.py.
+    LIMIT = 180
+
+    # a fast first sample: done after 1 sample, no second/third needed, and it passes.
+    assert_eq(core.compile_gate_need_second_sample(150, LIMIT), False,
+              "a first compile under the limit needs no second sample")
+    assert_true(core.compile_gate_verdict([150], LIMIT), "a single fast sample passes on its own")
+
+    # a slow first sample needs a second.
+    assert_eq(core.compile_gate_need_second_sample(190, LIMIT), True,
+              "a first compile over the limit needs a second sample")
+
+    # two samples that AGREE (both over the limit): no third needed, and the median (their average) still fails.
+    assert_eq(core.compile_gate_need_third_sample(190, 185, LIMIT), False,
+              "two samples on the same side of the limit are not a tie")
+    assert_true(not core.compile_gate_verdict([190, 185], LIMIT),
+                "two samples both over the limit: the gate fails (this is the real regression case)")
+
+    # two samples that DISAGREE (one over, one under the limit): that is the tie a third sample must break.
+    assert_eq(core.compile_gate_need_third_sample(190, 170, LIMIT), True,
+              "one sample over and one under the limit is exactly the tie a third sample breaks")
+
+    # the 9-real-compile scenario this fix is modeled on: a slow first sample (174s, over 180? no - use a
+    # genuinely over-limit outlier at 190s) followed by two fast, in-range samples - the median of all three
+    # must be comfortably under the limit, so the gate passes despite the one slow outlier.
+    samples = [190, 150, 160]
+    assert_true(core.compile_gate_need_second_sample(samples[0], LIMIT), "outlier alone would need a 2nd sample")
+    assert_true(core.compile_gate_need_third_sample(samples[0], samples[1], LIMIT),
+                "190 (over) vs 150 (under) disagree: a third sample is needed to break the tie")
+    assert_true(core.compile_gate_verdict(samples, LIMIT),
+                "median([190,150,160]) = 160, under the 180s limit: PASS despite the 190s outlier")
+
+    # the mirror-image regression case: two genuinely slow samples plus one fast one must still fail, so the
+    # gate cannot be gamed by a single lucky fast compile either.
+    slow_samples = [190, 195, 150]
+    assert_true(not core.compile_gate_verdict(slow_samples, LIMIT),
+                "median([190,195,150]) = 190, over the 180s limit: FAIL - a real regression is still caught")
+
+    # a boundary check: a median exactly AT the limit passes ("exceeds" the limit is a strict greater-than).
+    assert_true(core.compile_gate_verdict([180], LIMIT), "a median exactly at the limit does not 'exceed' it")
+    assert_true(not core.compile_gate_verdict([180.01], LIMIT), "a median a hair over the limit fails")
+
+    # rev 8 fix round 2 (Opus re-review): an extra sample under 10% of the first sample is IMPLAUSIBLE for a
+    # real cold compile of the same grammar - almost certainly a cache hit, not genuine work. This must FAIL
+    # the gate outright, never silently get dropped so the remaining (fast) samples pass on a falsely light
+    # median. [190, 0.002, 0.002] is exactly the bug this closes: a real 190s outlier whose "extra samples"
+    # were actually served from xgrammar's own grammar cache (~0.002s, as measured on the real backend) rather
+    # than a genuine cold recompile - the OLD gate's median([190, 0.002, 0.002]) = 0.002s would have PASSED.
+    cache_hit_samples = [190, 0.002, 0.002]
+    assert_eq(core.compile_gate_implausible_samples(cache_hit_samples), [0.002, 0.002],
+              "both extra samples are under 10% of the first (190s) sample: implausible cache hits")
+    assert_true(not core.compile_gate_verdict(cache_hit_samples, LIMIT),
+                "[190, 0.002, 0.002]: the gate FAILS on the implausible samples, not a falsely light median")
+
+    # the mirror, legitimate case: a genuine slow first compile (over the limit) followed by two REAL cold
+    # compiles that happen to be fast (not cache hits - comfortably over 10% of the first sample) must PASS on
+    # their median, exactly as with `samples` above but restated here against the new implausibility check to
+    # confirm it does not fire on legitimate cold samples.
+    legit_outlier_then_cold = [190, 145, 155]
+    assert_eq(core.compile_gate_implausible_samples(legit_outlier_then_cold), [],
+              "145s and 155s are both well over 10% of the 190s first sample: not implausible")
+    assert_true(core.compile_gate_verdict(legit_outlier_then_cold, LIMIT),
+                "median([190,145,155]) = 155, under the 180s limit, and no sample is implausible: PASS")
+
+    # a single implausible sample (not both) is still enough to fail the gate outright.
+    assert_true(not core.compile_gate_verdict([190, 170, 0.002], LIMIT),
+                "even one implausible extra sample (0.002s) fails the gate, regardless of the others")
+
+
 def test_recent_messages_picks_the_newest_chat_and_last_n():
     # rev 7 round 2 (owner): "I only pull the most recent chat for behavior, so only the most recent replies
     # should be scanned." recent_messages() must (a) pick the chat with the NEWEST message, not the newest chat
@@ -987,6 +1059,7 @@ if __name__ == "__main__":
     test_a_word_added_to_the_yaml_is_tested_and_blocked()
     test_corpus_loader_walks_the_branch_table_first_and_prefers_output()
     test_corpus_sample_rate_reaches_the_floor_in_recent_mode()
+    test_compile_gate_median_logic_with_fake_timings()
     test_recent_messages_picks_the_newest_chat_and_last_n()
     test_recent_messages_skips_test_chats_and_prefers_most_messages()
     test_release_accepts_recent_mode_and_refuses_no_corpus_check()

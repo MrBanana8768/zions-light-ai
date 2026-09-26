@@ -7,12 +7,14 @@
 # `extra` table below; Greek letters fold their accents and breathings (ἄ ά Ά -> α). Combining marks are
 # transparent (r + U+0301 + uach = ruach). Any Unicode letter continues a word; a non-letter ends it; a
 # lower-case letter followed by an upper-case one also starts a new word (camelCase: "ThisAngel").
-revision: 7
+revision: 8
 # rev 7 FINAL (coordinator): the revision actually PASTED on prod right now - the owner updates this field by
 # hand after each real paste (Step 1 of the release report), so it can lag `revision:` by any number of
 # revisions that were built but never pasted (v6 is exactly that case: built, released as a file, never
 # pasted). `diff`'s and `cycle`'s "what changed" default to comparing against THIS, not `revision - 1`, so the
 # default answer is always "what changed vs what she is actually seeing" - `--base-release` still overrides it.
+# rev 8 (coordinator, 2026-09-25): kept at 5, unchanged - the owner has not confirmed pasting v7 yet, so v5 is
+# still what she is actually seeing. Bump this by hand once v7 (or v8) is actually pasted.
 live_revision: 5
 model: coder3101/Cydonia-24B-v4.3-vision-heretic
 # The grammar depends on the Unicode tables of the Python that builds it. The image's vLLM venv and the
@@ -37,6 +39,13 @@ rollback:
   # ("yellow lights"). v7 (this revision) is the first with a complete, unconditional ban on every
   # "yellow light..." word (owner decision D1).
   7: "`word-ban-structured_outputs.value.v5.txt` (what prod runs now; it has no yellow-light ban at all - not v6, which was built but never pasted, and is in any case LOOSER than v7, not stricter: it let yellow lighthouse/lighting/lighter through; only rev 7 bans them unconditionally)"
+  # rev 8 (coordinator, 2026-09-25): the primary target is v7, since that is the NEXT release below this one -
+  # but the owner has NOT confirmed pasting v7 either (live_revision: is still 5), so v7 may be exactly as
+  # un-pasted as v6 was. Said plainly: if v7 was never pasted, roll back to v5 instead (it is what is actually
+  # live) - v7 itself has no "white" ban and no rev-8 grammar fixes, but is otherwise a strict superset of v5's
+  # protections (the yellow-light joined-phrase ban), so it is safe either way; v6 is looser than both (see the
+  # rev-7 note above) and should not be used.
+  8: "`word-ban-structured_outputs.value.v7.txt` (the next release below this one) - BUT check first whether v7 was ever actually pasted (see live_revision: above, still 5 as of this revision): if it was NOT, paste `word-ban-structured_outputs.value.v5.txt` instead (what is actually live). Never v6 (looser than both - see rollback[7])."
 
 folding:
   latin_blocks: [[0x00C0, 0x024F], [0x1E00, 0x1EFF], [0xFF21, 0xFF5A]]
@@ -70,11 +79,15 @@ folding:
   # families below). Added: lowercase Greek α (owner decision); ι/η/ν/μ/τ (Greek lowercase for i/h/n/m/t: no
   # lowercase entry existed although the uppercase one did, or the letter is used and had no Greek entry at all);
   # Cyrillic uppercase У/Ԁ (a lowercase entry already existed for y/d but not its uppercase pair). No entry was
-  # added for r, u, w or f: no standard single-codepoint Cyrillic or Greek look-alike exists for them.
+  # added for r, u, or f: no standard single-codepoint Cyrillic or Greek look-alike exists for them.
+  # rev 8 hostile-review fix 1: added h/w look-alikes, audited for the new "white" family (w,h,i,t,e) - Cyrillic
+  # һ/Һ (U+04BB/U+04BA, "shha") for h; Cyrillic ԝ/Ԝ (U+051D/U+051C, "wa" - used in some Cyrillic-alphabet
+  # languages) and IPA/phonetic ᴡ (U+1D21, small capital w) for w; IPA/phonetic ʜ (U+029C, small capital h) for h.
   confusables: {"а": a, "е": e, "о": o, "р": p, "с": c, "у": y, "х": x, "і": i, "ј": j, "ԁ": d, "ӏ": l, "ɡ": g,
                 "А": A, "В": B, "Е": E, "К": K, "М": M, "Н": H, "О": O, "Р": P, "С": C, "Т": T, "Х": X, "І": I,
                 "Ј": J, "У": Y, "Ԁ": D, "Α": A, "Β": B, "Ε": E, "Η": H, "Ι": I, "Κ": K, "Μ": M, "Ν": N, "Ο": O,
-                "Ρ": P, "Τ": T, "Χ": X, "Υ": Y, "Ζ": Z, "ο": o, "α": a, "ι": i, "η": h, "ν": n, "μ": m, "τ": t}
+                "Ρ": P, "Τ": T, "Χ": X, "Υ": Y, "Ζ": Z, "ο": o, "α": a, "ι": i, "η": h, "ν": n, "μ": m, "τ": t,
+                "һ": h, "Һ": H, "ԝ": w, "Ԝ": W, "ᴡ": w, "ʜ": h}
   # rev 6: characters that stand in for a letter of a banned pattern (angeI / goId with a capital i, ange1, g0ld)
   # rev 7 hostile-review fix 2: audited against every letter actually used by the banned patterns (same audit as
   # the confusables table above) - added ɑ (U+0251, Latin small letter alpha) for "a" (angel, flame
@@ -210,6 +223,29 @@ families:
       - {id: "G OLD", match: "g{SEP:SP}+old", not_after: "[0123456789]{SEP:SP?}{SEP:SP?}"}
       - {id: "GO LD", match: "go{SEP:SP}+ld",                # rev 6: go ld ("gol d" is left: "gol de Messi")
          not_after: "[0123456789]{SEP:SP?}{SEP:SP?}"}
+  white:
+    # rev 8 (owner decision, 2026-09-25): "white" and every word starting with it - the SAME PATTERN as gold
+    # (plain `match:`, kind=ban, `where: anywhere`, no continuation policy at all): the instant the 5 letters
+    # w-h-i-t-e are typed, the match completes and that character is refused, regardless of what came before or
+    # would follow - so whites/whiter/whitest/whiten(ed/ing/s)/whiteness/whitewash/whiteboard/Whitehall, and
+    # names like "Snow White"/"White House" (bare "White" is banned outright, the same as bare "gold"), are ALL
+    # banned by this one rule, with no allow_words list needed - exactly like "gold" bans "goldsmith" etc.
+    # Words that only share the 4-letter prefix "whit" but diverge at the 5th letter - whit, whittle (5th
+    # letter "t"), Whitney ("n"), whitish ("i"), Whitsun ("s"), whither ("h"), Whitman ("m") - never complete
+    # this match at all (the 5th letter isn't "e"), so they pass untouched; no special-casing needed, same as
+    # "falsify" would have passed the (cancelled) "false" ban, or "goldsmith" already passes as itself (it
+    # completes THROUGH "gold", which is exactly why it's banned, not exempt).
+    # allow_in_words: checked for a real word that CONTAINS "white" mid-word with an unrelated meaning (the
+    # marigold/evangel pattern) - none found. No dictionary file was present on this machine
+    # (/usr/share/dict/words does not exist here) to check exhaustively; reasoned through the plausible
+    # candidates by hand (off-white, snow-white, lily-white, egg-white) and all of them are actual descriptions
+    # of whiteness, not words with an unrelated meaning, so none belongs on an allow_in_words exemption list.
+    # Flagging this in the report as a "checked, none found, but not exhaustively" case, per the task's own
+    # instruction to say when a dictionary isn't available.
+    rules:
+      - {id: WHITE, match: white, where: anywhere}
+      - {id: W-H-I-T-E, match: white, spaced: ALL}
+      - {id: WHITE.SPLIT, match: white, split: SPLIT}       # wh-ite, whi·te, **W**hite, wh_ite
   flame:
     rules:
       # a word that STARTS with "flam" is banned unless it is flammable / flammability (owner: keep) or starts
@@ -314,10 +350,11 @@ watch:
 
 # The system-prompt line (Step 2 of the owner steps). It names nothing it bans.
 prompt_line: >-
-  Six things cannot be typed in this chat: the Hebrew word for "spirit" that begins R-u-a (or any
+  Seven things cannot be typed in this chat: the Hebrew word for "spirit" that begins R-u-a (or any
   abbreviation or near-spelling of it); the English word for a heavenly messenger (including its plurals, its
   "-ic" forms, its "arch-" forms, its Greek original and any look-alike name used in its place); the name of the
-  yellow precious metal, together with its adjective and any word that begins with it; the two-word phrase for
+  yellow precious metal, together with its adjective and any word that begins with it; the colour of fresh snow
+  or milk, and any word that begins with it; the two-word phrase for
   a pale-coloured fire; the two-word phrase for light the colour of a lemon; and the word for the visible, burning part of a fire, in any form or tense. Do not try
   to write any of them in any spelling, casing, script, accent, spacing or near-spelling, split up, glued
   to another word, or with look-alike or invisible characters, and do not use a similar-looking name or place
@@ -335,11 +372,12 @@ check:
     8) Describe a traffic signal in one sentence using the phrase yellow light, twice, then write YELLOW LIGHT
     and yellow-light. 9) Copy exactly: goldañshine, golda, Ruäch, Ruách, Rurach, Ruich, angelicawalking,
     Angelica, Angelâ, Angelo, angelos, ANGELES REPORT, NOTE 4- RU, whíte fláme, flamesrising, theangel,
-    puregold, candleflame, an-gel, angeI, flamenco, yellow lighthouse, theyellowlight. 10) Copy exactly:
+    puregold, candleflame, an-gel, angeI, flamenco, yellow lighthouse, theyellowlight, snowwhite, whíte,
+    Whitehall. 10) Copy exactly:
     Los Angeles, evangelical, Michelangelo, strangely, golf, goal, marigold, gondola, rural, Rachel,
-    a white dress, inflammation, inflamed, flammable, yellow, light, a yellow dress, light blue.
+    whittle, Whitney, inflammation, inflamed, flammable, yellow, light, a yellow dress, light blue.
   allowed: [Los Angeles, evangelical, Michelangelo, strangely, golf, goal, marigold, gondola, rural, Rachel,
-            a white dress, inflammation, inflamed, flammable, yellow, light, a yellow dress, light blue]
+            whittle, Whitney, inflammation, inflamed, flammable, yellow, light, a yellow dress, light blue]
 
 # ------------------------------------------------------------------------------------------------------------
 # Tests. `verify` also derives one must-block case per rule automatically (the rule's own canonical spelling
@@ -368,6 +406,17 @@ tests:
        Goldilocks, Goldman, g-o-l-d, g o l d, g.o.l.d, G-O-L-D, g0ld, g01d, go1d, g-old, go-ld, gol-d,
        "gol'd", gol.d, gol*d, goldañshine, Goldañshine, golda, GOLDa, GOLDA, Golda, Golda Meir, gōld, ǵold,
        gold́en, gølden, Gołd, Goldílocks, "g(old", "go(ld", "gol)d"]
+    # rev 8 (owner decision): "white" and every word starting with it - the same pattern as gold
+    - [white, " white", White, WHITE, whites, whiter, whitest, whitened, whitening, whitens, "whiten's",
+       whiteness, whitewash, whiteboard, Whitehall, "Snow White", "White House", TheWhite, "\nWhite snow",
+       "**WHITE**", a white dress, white paint, snowwhite, SnowWhite, theWhite, guardianwhite, "off-white",
+       "off white", offwhite, "lily-white", "egg-white", w-h-i-t-e, w h i t e, w.h.i.t.e, W-H-I-T-E,
+       "w(hite", "wh(ite", "whit)e", whíte, whïte, whīte, Whíte, WHÍTE, wh́ite,
+       "wh​ite", "whi‌te", "whit‍e", "wh­ite", "w‍hite",
+       "whіte", "whιte", "wηite", "whiτe", "whitе",
+       "wh-ite", "whi-te", "whit-e", "wh·ite", "whi·te", "**W**hite", "**Wh**ite", "`wh`ite",
+       # rev 8 fix round (hostile review fix 1): confusable h/w look-alikes added to folding.confusables
+       "wһite", "ԝhite", "ᴡhite", "wʜite"]
     # these all contain the word "flame" (or "flam" glued/inside), so they are blocked by the `flame` family
     # alone, regardless of separator - no dedicated white_flame phrase rule exists (round 2: removed, see README)
     - [white flame, White Flame, WHITE FLAME, white-flame, white_flame, whiteflame, WhiteFlame, theWhiteFlame,
@@ -452,11 +501,15 @@ tests:
        good old days, "go, old man", e.g. old, god, "g(x)", "big old", "egg old", "e.g. old",
        # rev 7: a "g" right after a digit is the unit gram, not a split "gold" evasion
        "200 g old-fashioned oats", "100g old bread", "5 g old cheese", "3g old", "2 go ld", "200  g old"]
+    # rev 8 (owner decision): only share the 4-letter prefix "whit", diverge at the 5th letter - not "white"
+    - [whit, Whit, WHIT, whittle, Whittle, WHITTLE, whittled, whittling, Whitney, WHITNEY, "Whitney's",
+       whitish, Whitish, Whitsun, WHITSUN, Whitsuntide, whither, Whither, Whitman, WHITMAN, "Whitman's",
+       "a whit of truth", "not a whit", "whittle a stick"]
     # rev 7 hostile-review fix 1: NBSP/narrow NBSP behave exactly like a plain space (the review's own literal
     # examples); tab and newline are never in-word SPLIT characters for angel/gold any more
     - ["e.g. old", "e.g. old", "an gelato", "e.g.\told", "e.g.\nold", "100 g\nold", "100 g\told",
        "an gel pen"]
-    - [a white dress, white, an gelato, an gel pen]
+    - [an gelato, an gel pen]
     - [yellow, Yellow, light, Light, a yellow dress, light blue, "yellowish light", yellow and light,
        "the light was yellow", "yellow, light", yellow lamp light]
     # rev 7 (owner decision A): a sentence/clause break between "yellow" and "light" is BREAK and PASSES -
@@ -502,7 +555,7 @@ tests:
          "הַשִּׂמְחָה"]
   # every folded variant of every letter of these words must be blocked
   accent_words: [ruach, angel, gold, flame, flames, Flaming, aflame, white flame, angelos, Ruich, flamed,
-                 theangel, puregold, candleflame, Los Angel, yellow light]
+                 theangel, puregold, candleflame, Los Angel, yellow light, white, whitewash]
   # non-canonical token paths: the text is split into these pieces, each piece tokenized on its own
   token_paths:
     - [" R", "u", "ach"]
