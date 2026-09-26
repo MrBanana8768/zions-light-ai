@@ -461,6 +461,90 @@ What the compactor lines mean:
 
 ---
 
+## Tracing a request (`req=`, v3.1.9.8)
+
+Every compactor log line carries `req=<id>` — the request that was executing
+when the line was emitted. Grep one id and you get the whole life of that
+request, pre-processing through the reply, including any background work it
+kicked off:
+
+```bash
+grep 'req=3f9a2c1e' /data/logs/compactor.log
+```
+
+A background tail (fact extraction, episodic indexing, summary rollup) runs
+AFTER the reply is sent, so its lines are tagged `req=<id>/bg:tail` or
+`req=<id>/bg:rollup` — same id, so the grep above still finds them, and the
+`/bg:` suffix is how you tell "still inside the request" from "the
+post-response cleanup for it" apart on sight.
+
+**The id itself.** OpenWebUI sends `X-Request-Id` on `/v1/chat/completions`
+starting in recent builds; the compactor honours it if it looks like a real
+id (hex/UUID-ish, ≤64 chars) and mints a fresh uuid4 otherwise — so an id you
+see in the compactor's logs is either OpenWebUI's own or one the compactor
+made up on the spot, never something a client fully controls the *shape* of.
+The compactor also returns `X-Request-Id` on its response, so if you have the
+client side (a browser's network tab, an OpenWebUI request log) you can read
+the id straight off the response headers without going to the compactor log
+first at all.
+
+**vLLM's side.** The compactor sends that same `X-Request-Id` on the main
+chat call to vLLM, and a per-purpose CHILD id — `<id>.sum1`, `<id>.facts1`,
+`<id>.dedup1`, `<id>.tok1`, and so on, numbered per purpose within the
+request — on every internal call it makes on that request's behalf
+(compaction/rollup summarization, fact extraction, dedup, `/tokenize`).
+**Correction (hostile review round 2, L2): vLLM does NOT echo
+`X-Request-Id` back in its HTTP response** — that needs vLLM's own
+`--enable-request-id-headers` flag, which this deployment does not set (it
+adds per-request overhead vLLM's own docs warn about). vLLM DOES use
+whatever id you send it internally, with its own generation suffix, so
+grepping `vllm.log` for the id (or the id's stem, e.g. `3f9a2c1e` rather
+than the full `3f9a2c1e.facts1`) still finds the right request there — it
+just does not come back over the wire, so you cannot read it off a vLLM
+response the way you can off the compactor's own.
+
+**Linking to OpenWebUI's own message.** When OpenWebUI's
+`ENABLE_FORWARD_USER_INFO_HEADERS` setting is on, it forwards its own chat id
+(`X-OpenWebUI-Chat-Id`) and, on builds that send it, its message id
+(`X-OpenWebUI-Message-Id`) alongside the chat request. The compactor logs
+these — as opaque ids, `ow_chat=<id>` / `ow_msg=<id>` — on the same
+`conv_id=... source=... msgs=...` line that already names the request's own
+`req=` and `conv=`, so `grep 'ow_chat=<chat-id>'` finds the compactor-side
+request(s) for a specific OpenWebUI conversation, and from there `req=`
+chains to everything else that request did.
+
+**The same setting also forwards `X-OpenWebUI-User-Name` /
+`-User-Email` / `-User-Id` / `-User-Role`. The compactor reads NONE of
+these into a log line, ever** — only the chat/message ids above, which are
+opaque identifiers, not personal data. If you ever see a name or email
+address in a compactor log line, that is a bug: file it, do not treat it as
+routine.
+
+**The summary line.** Exactly one `request done req=<id> ...` line is
+emitted per chat request, on every outcome (success, a vLLM rejection, an
+unhandled error, or the client hanging up mid-stream), with whichever phase
+timings actually got measured on that path:
+
+```
+request done req=3f9a2c1e conv=abc123 msgs=42 status=ok t_images=0.000 t_compact=0.004 t_retrieval=0.002 t_inject=0.001 t_guard=0.002 t_ttft=0.310 t_total=1.204 tokens_out=612 finish=stop
+```
+
+`status` is `ok`, `error`, or `cancelled` (the client disconnected, or the
+process is shutting down). Fields are omitted, not zeroed, when they were
+never measured on that path (e.g. `t_ttft` only exists on a streaming
+request; a request rejected before compaction never got a `t_guard`).
+
+**`/health/full`** reports `request_tracing.requests_in_flight` (chat
+requests currently inside the handler, including the pre-processing phase
+before vLLM is ever called) and `request_tracing.last_request_done_age_s`
+(seconds since the last one finished). A restart that lands while
+`requests_in_flight` is nonzero is killing a live request — the incident
+this fixes: an operator restart once killed a request in its ~100s
+pre-processing phase with nothing anywhere exposing that it was still
+running.
+
+---
+
 ## Failure mode → recovery
 
 ### A service is FATAL (supervisord gave up restarting it)

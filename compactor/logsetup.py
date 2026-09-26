@@ -28,7 +28,39 @@ import logging
 import os
 import sys
 
-_TEXT_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
+import reqctx
+
+_TEXT_FORMAT = "%(asctime)s %(name)s %(levelname)s req=%(req)s %(message)s"
+
+
+class RequestIdFilter(logging.Filter):
+    """Stamps every LogRecord with `record.req` (v3.1.9.8 REQUEST TRACING).
+
+    `req` is `-` outside any request's context (startup, a background job
+    with no originating request, most Tier-1 tests), the bare request id
+    inside a request handler, or `<id>/bg:<tag>` inside a background tail
+    that bgwork.py has tagged (see bgwork.BackgroundPool._run). Reading
+    reqctx's contextvars HERE, in the filter, rather than having callers
+    pass `req=` explicitly on every log call, is what makes this apply to
+    every existing log line with no call-site changes — the same reasoning
+    `log_once`'s call-site-transparent gate above already uses.
+
+    ids and numbers only: this filter never touches message text, and
+    reqctx.current_request_id()/bg_tag_ctx never hold anything but an id
+    string this process minted or validated.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        rid = reqctx.current_request_id()
+        if not rid:
+            record.req = "-"
+        else:
+            tag = reqctx.bg_tag_ctx.get()
+            record.req = f"{rid}/bg:{tag}" if tag else rid
+        return True
+
+
+_REQUEST_ID_FILTER = RequestIdFilter()
 
 
 class JsonFormatter(logging.Formatter):
@@ -42,6 +74,9 @@ class JsonFormatter(logging.Formatter):
             ).isoformat(),
             "level": record.levelname,
             "logger": record.name,
+            # v3.1.9.8 REQUEST TRACING: present on every record via
+            # RequestIdFilter, "-" outside any request's context.
+            "req": getattr(record, "req", "-"),
             "message": record.getMessage(),
         }
         if record.exc_info:
@@ -72,6 +107,12 @@ def configure(level: int = logging.INFO) -> None:
         handler.setFormatter(JsonFormatter())
     else:
         handler.setFormatter(logging.Formatter(_TEXT_FORMAT))
+    # v3.1.9.8 REQUEST TRACING: on the HANDLER, not the root logger — a
+    # Filter added to a Logger only runs for records that logger itself
+    # emits, but every `compactor.*` module logger is a *child* logger
+    # whose records propagate up to this one handler on root, so the
+    # handler is the one place a single Filter sees all of them.
+    handler.addFilter(_REQUEST_ID_FILTER)
     root.addHandler(handler)
     _quiet_third_parties()
 

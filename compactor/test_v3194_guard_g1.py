@@ -112,7 +112,7 @@ class _FakeResp:
         return {"count": self._n}
 
 
-def _fake_post(url, json=None, timeout=None):
+def _fake_post(url, json=None, timeout=None, **kwargs):
     """Answers or fails according to SCHED, one entry per REAL call — so a
     memo hit (no call made) leaves the next scheduled entry for whoever
     calls next, exactly like a live process where a cached list simply never
@@ -274,7 +274,7 @@ check(len(_g1c_memo) == 2, f"[G1c] the memo holds two independent entries (size=
 _activate_memo()
 
 
-def _agp_sensitive_post(url, json=None, timeout=None):
+def _agp_sensitive_post(url, json=None, timeout=None, **kwargs):
     POST_CALLS["n"] += 1
     base = local(json["messages"])
     return _FakeResp(base + (500 if json.get("add_generation_prompt") else 0))
@@ -338,7 +338,7 @@ SCHED[:] = [True]
 _g1f_seen = {}
 
 
-def _g1f_post(url, json=None, timeout=None):
+def _g1f_post(url, json=None, timeout=None, **kwargs):
     _g1f_seen["json"] = json
     return _FakeResp(local(json["messages"]))
 

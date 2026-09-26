@@ -52,6 +52,7 @@ import health
 import logsetup
 import persona
 import portability
+import reqctx
 import retrieval
 import selftest as selftest_module
 import summarizer
@@ -1240,6 +1241,7 @@ def count_text_tokens_exact(text: str) -> int | None:
             f"{VLLM_URL}/tokenize",
             json={"model": MODEL_REPO, "prompt": text},
             timeout=httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0),
+            headers=reqctx.vllm_headers("tok"),
         )
         if r.status_code != 200:
             _note_text_tokenize_failure()
@@ -1607,6 +1609,7 @@ def count_tokens_exact(
                 "continue_final_message": (not _agp),
             },
             timeout=httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0),
+            headers=reqctx.vllm_headers("tok"),
         )
         if r.status_code != 200:
             # A 400 here is usually the template refusing the message shape
@@ -2042,7 +2045,10 @@ async def _summarize_once(client: httpx.AsyncClient, turns: list[dict]) -> str:
             "temperature": 0.2,
             "stream": False,
         }
-        r = await client.post(f"{VLLM_URL}/v1/chat/completions", json=payload, timeout=300.0)
+        r = await client.post(
+            f"{VLLM_URL}/v1/chat/completions", json=payload, timeout=300.0,
+            headers=reqctx.vllm_headers("sum"),
+        )
         r.raise_for_status()
         data = r.json()
         choices = data.get("choices") or []
@@ -9132,6 +9138,12 @@ class SseAccumulator:
         # nothing later in the stream can undo that — see complete()'s
         # docstring and feed()'s handling of the "error" shapes.
         self._errored: bool = False
+        # v3.1.9.8 REQUEST TRACING: the raw finish_reason string last seen
+        # on a choice, for the "request done" summary line's `finish=`
+        # field. Purely observational — nothing else in this class reads
+        # it; complete()/truncated()/errored() are unaffected and remain
+        # the decision-makers they always were.
+        self._finish_reason: str | None = None
 
     def feed(self, chunk: bytes) -> None:
         try:
@@ -9198,6 +9210,8 @@ class SseAccumulator:
                         continue
                     choice = obj.get("choices", [{}])[0]
                     fr = choice.get("finish_reason")
+                    if fr:
+                        self._finish_reason = fr
                     if fr == "error":
                         # The OTHER shape the finding names: a choice
                         # naming its own finish_reason "error" rather than
@@ -9328,6 +9342,15 @@ class SseAccumulator:
         motivation truncated() has next to complete()."""
         return self._errored
 
+    def finish_reason(self) -> str | None:
+        """The raw finish_reason string last seen on a choice ("stop",
+        "length", "error", ...), or None if no choice ever carried one — a
+        client disconnect before vLLM sent any. v3.1.9.8 REQUEST TRACING:
+        purely observational, for the `finish=` field on the "request
+        done" summary line; every actual decision in this class already
+        goes through complete()/truncated()/errored()."""
+        return self._finish_reason
+
     def usable(self) -> bool:
         """Describes the STREAM: the model finished, and it finished because
         it was done rather than because it ran out of room.
@@ -9358,6 +9381,14 @@ def _fire_and_forget(coro, label: str | None = None) -> bool:
     A11 added the parameter to bgwork.pool.submit and nothing passed it, so
     the warning could say that a tail was dropped but not WHOSE — which is
     the entire reason the parameter exists. Pass the conversation.
+
+    v3.1.9.8 REQUEST TRACING reuses `label`'s leading word ("tail", "rollup")
+    as the background task's tag for `req=<id>/bg:<tag>` log lines — see
+    bgwork.BackgroundPool.submit's docstring for why that piggybacks on
+    `label` instead of adding a parameter here (three existing test doubles
+    replace this function wholesale with a fixed `(obj, label=None)`
+    signature, and a new keyword breaks all of them at the call site,
+    before bgwork ever runs).
     """
     # Returns whether the pool ACCEPTED it. The caller needs to know: a
     # shed tail is memory that will never be written, and counting it as a
@@ -10688,7 +10719,19 @@ async def _unsafe_conv_id_handler(request: Request, exc: UnsafeConvId):
     logger.warning(
         f"rejected {request.method} {request.url.path}: unsafe conv_id ({exc})"
     )
-    return JSONResponse(status_code=400, content={"detail": str(exc)})
+    resp = JSONResponse(status_code=400, content={"detail": str(exc)})
+    # Hostile review round 2 (L1): app-wide exception handlers run OUTSIDE
+    # chat_completions' wrapper (an exception here is FastAPI's own
+    # dispatch reacting to a raised UnsafeConvId, never a value the
+    # wrapper's `result.headers["X-Request-Id"] = req_id` line ever saw),
+    # so this response left the client with no X-Request-Id at all — the
+    # one response shape that couldn't be traced back to its own log
+    # lines. Cheap: the id is still in reqctx's ContextVar for as long as
+    # this request's context is alive, which it is here.
+    _rid = reqctx.current_request_id()
+    if _rid:
+        resp.headers["X-Request-Id"] = _rid
+    return resp
 
 
 def _require_localhost(request: Request) -> None:
@@ -11271,8 +11314,198 @@ def _translate_ollama_sampling_params(body: dict, conv_id: str | None) -> None:
             )
 
 
+# ---------------------------------------------------------------------------
+# Hostile review round 2 (B1): structural StreamingResponse tracing backstop.
+#
+# BLOCKER as found: `_chat_completions_impl`'s slash-command short-circuit
+# (search "chat command short-circuit") builds its OWN `cmd_stream()`
+# generator and returns `StreamingResponse(cmd_stream(), ...)` directly —
+# it has never heard of `_trace` at all. The wrapper's own comment ("the
+# ONE path this wrapper does not close out itself is a successful
+# streaming response... event_stream() holds _trace itself") was true of
+# event_stream and false of every OTHER streaming return this function can
+# produce. A reviewer's probe sent four streamed `/list-facts` requests
+# and watched `requests_in_flight` go 0 -> 1 -> 2 -> 3 -> 4: every one an
+# permanent leak, and OpenWebUI always streams, so this was not a corner
+# case.
+#
+# Fixed STRUCTURALLY, in the wrapper, rather than by hunting down every
+# generator that returns a StreamingResponse and teaching it to hold
+# `_trace` (the same one-site-not-the-sibling defect class this codebase
+# keeps finding elsewhere): ANY StreamingResponse coming back from the
+# impl gets BOTH of the following, unconditionally.
+# ---------------------------------------------------------------------------
+
+
+async def _finish_stream_body(body_iterator, trace: "reqctx.RequestTrace"):
+    """(a) Wrap the body iterator itself: `trace.finish()` fires when the
+    body finishes normally, when a client disconnect throws `Cancelled
+    Error`/`GeneratorExit` in at a suspended `yield`, or when the iterator
+    raises for any other reason. `trace.finish` is idempotent, so a
+    generator that ALREADY called it with richer detail — event_stream's
+    own finish_reason and phase timings — simply wins: this backstop only
+    ever does real work when nothing inner already did (the command
+    short-circuit's cmd_stream(), or anything added later that forgets
+    to)."""
+    status = "ok"
+    try:
+        async for chunk in body_iterator:
+            yield chunk
+    except (asyncio.CancelledError, GeneratorExit):
+        status = "cancelled"
+        raise
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        trace.finish(logger, status)
+
+
+class _TracedStreamingResponse(StreamingResponse):
+    """(b) ASGI-level guarantee: even if this response's body is NEVER
+    iterated at all (an exception between construction and the ASGI send
+    loop; some future response type or middleware that doesn't drive
+    `body_iterator` the normal way), `trace.finish()` still fires when
+    `__call__` returns or raises. Built from an ALREADY-CONSTRUCTED
+    StreamingResponse — copies its attributes directly rather than
+    re-running `StreamingResponse.__init__` (which would try to treat
+    `inner` itself as body content, which is wrong) — so it needs no
+    knowledge of how the wrapped response was built, only that it is one.
+
+    `status="cancelled"` unconditionally in the finally, per the review's
+    own spec for this piece: if this ASGI-level backstop is ever the one
+    that actually fires (finish() not already called), the body was never
+    properly drained to completion by any means this codebase currently
+    has, which is closer to "the client never got a full reply" than to
+    "ok" — and `trace.finish` is idempotent, so on the overwhelmingly
+    common path (body drained normally by (a) above, which already called
+    finish with the right status) this is just a free no-op.
+    """
+
+    def __init__(self, inner: StreamingResponse, trace: "reqctx.RequestTrace"):
+        self.body_iterator = inner.body_iterator
+        self.status_code = inner.status_code
+        self.media_type = inner.media_type
+        self.background = inner.background
+        # Copied AFTER the wrapper has set X-Request-Id on `inner.headers`
+        # (see the call site) — raw_headers already reflects it.
+        self.raw_headers = inner.raw_headers
+        self._trace = trace
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._trace.finish(logger, "cancelled")
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Any:
+    """Thin request-tracing wrapper around `_chat_completions_impl`
+    (v3.1.9.8 REQUEST TRACING).
+
+    Everything about WHAT a chat request does lives in the impl function,
+    unchanged apart from the phase timers it now records on `_trace` and
+    the `X-Request-Id` header it now sends to vLLM. What lives HERE is
+    everything about being able to find that request again afterward:
+
+      - mint/honour the request id (owner's ask: an incoming `X-Request-Id`
+        if it is sane, else uuid4) and hold it in `reqctx.request_id_ctx`
+        for the life of this request — every log line anywhere in that
+        context now carries `req=<id>` (see logsetup.RequestIdFilter), and
+        every vLLM call this request makes, directly or through a
+        background tail, can find it via `reqctx.vllm_headers()`;
+      - own `requests_in_flight` (via `RequestTrace.__init__`/`.finish()`
+        calling `reqctx.request_started()`/`request_finished()`) for the
+        WHOLE handler, including the pre-processing phase the impl spends
+        seconds to minutes in before vLLM is ever called — the exact gap
+        the 2026-09-25 restart incident fell into (nothing exposed a
+        request was even running);
+      - guarantee the "request done" summary line fires EXACTLY once
+        (`RequestTrace.finish` is idempotent) on every path: a normal
+        return (inspecting the status code here, since the impl's many
+        early 400 returns are ordinary `return`s this wrapper does not
+        need to touch individually), an uncaught exception, or a
+        cancellation (the client disconnecting mid non-streaming call, or
+        `asyncio.CancelledError` from the server shutting down);
+      - set the `X-Request-Id` RESPONSE header (owner's ask, item 5) on
+        whatever comes back, streaming or not.
+
+    The one path this wrapper does NOT close out itself is a successful
+    streaming response: `StreamingResponse.__call__` iterates the body
+    generator well after this wrapper has already returned it, so
+    `event_stream()` (inside the impl) holds `_trace` itself and calls
+    `_trace.finish()` from its own `finally:` — see that generator's
+    comments for exactly which status each of its exit paths reports.
+    """
+    req_id = reqctx.new_request_id(request.headers.get("x-request-id"))
+    rid_token = reqctx.request_id_ctx.set(req_id)
+    # Hostile review round 2 (L3): eagerly, BEFORE any background task can
+    # be forked from this request — see init_purpose_counters' own
+    # docstring for why lazy creation let two sibling background tasks
+    # (the memory tail, the hierarchy rollup) each restart their purpose
+    # counters at 1 instead of sharing one.
+    reqctx.init_purpose_counters()
+    trace = reqctx.RequestTrace(req_id)
+    try:
+        try:
+            result = await _chat_completions_impl(request, trace)
+        except (asyncio.CancelledError, GeneratorExit):
+            # A client disconnect on the NON-streaming path (await
+            # client.post(...) or anything before it) surfaces as
+            # cancellation of this coroutine, same as a server-shutdown
+            # cancel — both are "the client will never see a reply",
+            # which is what `cancelled` means on the summary line.
+            trace.finish(logger, "cancelled")
+            raise
+        except Exception:
+            trace.finish(logger, "error")
+            raise
+        try:
+            result.headers["X-Request-Id"] = req_id
+        except Exception:
+            # Never let a header-setting quirk on some future response type
+            # cost the client their actual reply.
+            pass
+        if isinstance(result, StreamingResponse):
+            # Structural tracing backstop (hostile review round 2, B1) —
+            # applies to EVERY streamed response this route can produce,
+            # not only event_stream()'s: (a) wrap the body iterator so
+            # trace.finish() fires when it ends, however it ends; (b) wrap
+            # the response itself so trace.finish() fires even if the
+            # body is never iterated at all. Both are no-ops (idempotent)
+            # on the path that already matters most — event_stream()'s
+            # own richer finally, which still runs FIRST and wins.
+            #
+            # No request-id reset here, deliberately, same as before this
+            # fix: Starlette drains the body well after this wrapper
+            # returns (same asyncio Task, but StreamingResponse.__call__
+            # can run the disconnect-listener/stream_response pair in a
+            # SEPARATE task-group task with its own Context copy — see
+            # _TracedStreamingResponse's docstring on why a Token from
+            # THIS context cannot safely reset there). The Context is
+            # discarded with the request's task regardless; nothing leaks
+            # across requests.
+            # `result.headers["X-Request-Id"]` was already set a few lines
+            # up, before this branch — `_TracedStreamingResponse` copies
+            # `result.raw_headers` below, so it must run after that set.
+            result.body_iterator = _finish_stream_body(result.body_iterator, trace)
+            return _TracedStreamingResponse(result, trace)
+        trace.finish(logger, "ok" if getattr(result, "status_code", 200) < 400 else "error")
+        return result
+    finally:
+        # The streaming path defers this reset to event_stream()'s own
+        # finally (see the comment above) — `trace.finished` is False for
+        # as long as that generator has not run its own cleanup yet, so
+        # this is a plain "only if we are the one closing this request
+        # out" guard, not a second attempt at the same work.
+        if trace.finished:
+            reqctx.request_id_ctx.reset(rid_token)
+
+
+async def _chat_completions_impl(
+    request: Request, _trace: "reqctx.RequestTrace"
+) -> Any:
     # PARSE DEFENSIVELY. The careful empty/invalid-messages 400 below is
     # the right answer and it could never be reached by the requests that
     # needed it most: `await request.json()` raises on a body that is not
@@ -11397,7 +11630,45 @@ async def chat_completions(request: Request) -> Any:
         conv_id, source = resolve_conv_id(
             dict(request.headers), messages, body=body
         )
-        logger.info(f"conv_id={conv_id} source={source} msgs={len(messages)}")
+        # v3.1.9.8 REQUEST TRACING (owner's ask, item 3): OpenWebUI 0.11.4
+        # forwards its own chat/message id when ENABLE_FORWARD_USER_INFO_
+        # HEADERS=true (confirmed against the trial image's own open_webui
+        # package: routers/openai.py's get_headers_and_cookies sets
+        # FORWARD_SESSION_INFO_HEADER_CHAT_ID, default header name
+        # "X-OpenWebUI-Chat-Id"; env.py's default for the message id is
+        # "X-OpenWebUI-Message-Id", though the vendored 0.11.4 chat-
+        # completions call site does not currently send it — read
+        # defensively so a future OpenWebUI that does needs no compactor
+        # change). These are OPAQUE ids, logged exactly like our own
+        # conv_id/req id — never the X-OpenWebUI-User-Name/Email/Id/Role
+        # headers the SAME flag forwards, which this line, and every other
+        # line in this codebase, must never log (owner's explicit "NEVER
+        # log message text, user names or emails" — ids and numbers only,
+        # and a user's own name or email is exactly what those headers
+        # carry).
+        #
+        # Hostile review round 2 (M1): these headers are CLIENT-CONTROLLED
+        # and were logged raw and unbounded. A crafted `X-OpenWebUI-Chat-
+        # Id: abc status=ok req=deadbeef` spoofed a second `status=`/
+        # `req=` pair into this exact line — log injection into the one
+        # line an operator's tooling parses for the request's own
+        # outcome. Passed through the SAME sane/hex/UUID-ish/<=64-char
+        # gate the request id itself uses (reqctx.sane_incoming_id): a
+        # value that fails reads as absent (no `ow_chat=`/`ow_msg=` field
+        # at all), same as "no id sent", rather than being force-quoted or
+        # truncated (which would still admit shorter injected fields).
+        _ow_chat_id = reqctx.sane_incoming_id(request.headers.get("x-openwebui-chat-id"))
+        _ow_message_id = reqctx.sane_incoming_id(request.headers.get("x-openwebui-message-id"))
+        _ow_ids = ""
+        if _ow_chat_id:
+            _ow_ids += f" ow_chat={_ow_chat_id}"
+        if _ow_message_id:
+            _ow_ids += f" ow_msg={_ow_message_id}"
+        logger.info(
+            f"conv_id={conv_id} source={source} msgs={len(messages)}{_ow_ids}"
+        )
+        _trace.conv_id = conv_id
+        _trace.msgs = len(messages)
         # Cheap, and it is the only thing standing between a prompt edit and
         # a silently forked memory store. Runs on the request path but only
         # touches disk for LONG hash-derived conversations, which is a rare
@@ -11463,6 +11734,7 @@ async def chat_completions(request: Request) -> Any:
     # the conv_id mid-conversation and orphaned every fact, summary and
     # embedding under the old id. conv_id and the RAG query now derive from what
     # the CLIENT sent; the strip only shapes what we forward.
+    _t_images_start = time.monotonic()
     if not backend_is_multimodal():
         messages, _n_stripped = _strip_image_parts(messages)
         if _n_stripped:
@@ -11482,6 +11754,7 @@ async def chat_completions(request: Request) -> Any:
                 f"image retention: demoted {_n_demoted} older image(s) to text "
                 f"(keeping {MAX_RETAINED_IMAGES} most-recent image turn(s))"
             )
+    _trace.mark("t_images", time.monotonic() - _t_images_start)
 
     # V2.1 Phase 5: chat command short-circuit. If the user typed a
     # recognized slash command (/list-facts, /forget, /remember, etc.),
@@ -11648,6 +11921,7 @@ async def chat_completions(request: Request) -> Any:
     # param convention `stored_turns_out`/`reuse_margin_out` already use,
     # rather than recognising it afterward by what it looks like.
     _standin_hash_out: list[str] = []
+    _t_compact_start = time.monotonic()
     try:
         body["messages"] = await compact_if_needed(
             messages, conv_id,
@@ -11661,6 +11935,7 @@ async def chat_completions(request: Request) -> Any:
             f"compaction failed; falling through with the original messages — "
             f"the hard-budget guard will shed content if they don't fit: {e}"
         )
+    _trace.mark("t_compact", time.monotonic() - _t_compact_start)
     # "never record a hash that is also in the caller's own system set"
     # (round-3 review, item 4): belt-and-braces against the one collision
     # even an out-param cannot rule out — her system message being BYTE-
@@ -11814,6 +12089,7 @@ async def chat_completions(request: Request) -> Any:
         # --- RAG retrieval (Phase 3) ---
         # exclude_turns_from drops retrieved turns that are already present
         # verbatim in the recent window (no point spending budget twice).
+        _t_retrieval_start = time.monotonic()
         try:
             recent_cutoff = max(0, turn_index - (KEEP_RECENT_TURNS * 2))
             hits = retrieval.retrieve(
@@ -11831,6 +12107,8 @@ async def chat_completions(request: Request) -> Any:
             log_parts.append(f"{len(hits)}retr")
         except Exception as e:
             logger.warning(f"conv={conv_id}: retrieval load failed (non-fatal): {e}")
+        finally:
+            _trace.mark("t_retrieval", time.monotonic() - _t_retrieval_start)
 
         # has_history / inject_budget: computed ABOVE, before V1 compaction
         # (search "also moved ahead of V1 compaction") — compact_if_needed
@@ -11969,6 +12247,7 @@ async def chat_completions(request: Request) -> Any:
                 logger.warning(f"conv={conv_id}: continuity band injection failed (non-fatal): {e}")
 
         # Single inject point — preserves Mistral template compatibility.
+        _t_inject_start = time.monotonic()
         if injected_blocks:
             # v3.1 D3: bound the SUM before it is injected, not after.
             #
@@ -12039,6 +12318,7 @@ async def chat_completions(request: Request) -> Any:
                 )
             except Exception as e:
                 logger.warning(f"conv={conv_id}: memory injection failed (non-fatal): {e}")
+        _trace.mark("t_inject", time.monotonic() - _t_inject_start)
 
         # Lazy backfill: if this is an existing V1 conv that has no facts
         # file yet, kick off a background extraction over its full history.
@@ -12190,6 +12470,7 @@ async def chat_completions(request: Request) -> Any:
             f"memory ahead of the previous exchange rather than risk it to "
             f"a decision that no longer holds"
         )
+    _t_guard_start = time.monotonic()
     body["messages"] = await run_in_threadpool(
         _enforce_hard_budget,
         body["messages"],
@@ -12200,6 +12481,7 @@ async def chat_completions(request: Request) -> Any:
         _standin_protected,
         frozenset(_injected_system_hashes),
     )
+    _trace.mark("t_guard", time.monotonic() - _t_guard_start)
     # The limit the FORWARDED payload is held to, REGARDLESS of the line: the
     # guard above shed against `effective_limit - _time_reserve` only to leave
     # the line room, and a rejection this request goes on to take is measured
@@ -12297,12 +12579,26 @@ async def chat_completions(request: Request) -> Any:
     if stream:
         accumulator = SseAccumulator()
 
+        # v3.1.9.8 REQUEST TRACING: read here, before event_stream() is
+        # defined, so the closure below only ever sees a plain value —
+        # nothing about tracing depends on the streaming machinery itself.
+        _stream_send_at = time.monotonic()
+
         async def event_stream():
             vllm_failed = False
+            # v3.1.9.8 REQUEST TRACING (owner's ask, item 6): the status
+            # the "request done" line reports. Starts "ok" and is only ever
+            # downgraded, never upgraded — see the finally: block, which is
+            # the single place this function decides what actually
+            # happened rather than trusting whichever branch happened to
+            # run last.
+            _status = "ok"
+            _ttft_marked = False
             try:
                 try:
                     stream_cm = client.stream(
-                        "POST", f"{VLLM_URL}/v1/chat/completions", json=body
+                        "POST", f"{VLLM_URL}/v1/chat/completions", json=body,
+                        headers=reqctx.vllm_headers(),
                     )
                     async with stream_cm as r:
                         if r.status_code >= 400:
@@ -12324,6 +12620,7 @@ async def chat_completions(request: Request) -> Any:
                             # branch now says what happened at ERROR, and hands
                             # the client an error-typed pair.
                             vllm_failed = True
+                            _status = "error"
                             # Truncate AFTER parsing, not before. vLLM states
                             # the true prompt size mid-sentence, so the old
                             # 300-char cut ran through the one number that
@@ -12377,6 +12674,11 @@ async def chat_completions(request: Request) -> Any:
                             # says nothing about whether the prompt fitted.
                             _note_backend_accepted()
                             async for chunk in r.aiter_raw():
+                                if not _ttft_marked:
+                                    _ttft_marked = True
+                                    _trace.mark(
+                                        "t_ttft", time.monotonic() - _stream_send_at
+                                    )
                                 yield chunk
                                 accumulator.feed(chunk)
                 except httpx.RequestError as e:
@@ -12384,96 +12686,168 @@ async def chat_completions(request: Request) -> Any:
                     # restarting). Degrade visibly — emit the friendly
                     # message as an assistant reply rather than a dead stream.
                     vllm_failed = True
+                    _status = "error"
                     logger.warning(f"vLLM unreachable (stream): {type(e).__name__}: {e}")
                     for chunk in _vllm_unreachable_stream_chunks(
                         body.get("model") or MODEL_REPO or ""
                     ):
                         yield f"data: {json.dumps(chunk)}\n\n".encode()
                     yield b"data: [DONE]\n\n"
+            except (asyncio.CancelledError, GeneratorExit):
+                # The client hung up (or the server is shutting down) while
+                # this generator was suspended at a `yield` — Starlette
+                # calls `.aclose()` on it, which throws one of these in at
+                # that point. This IS "cancelled" for the summary line even
+                # though the reply may have been partly delivered: the
+                # client never got a complete response.
+                _status = "cancelled"
+                raise
+            except Exception:
+                _status = "error"
+                raise
             finally:
-                await client.aclose()
-                # v3.1.7 (R7/R14): flush the incremental decoder before
-                # text()/holed() are read below. Unconditional and cheap —
-                # a no-op when nothing was ever fed(), which is the case on
-                # every path that set vllm_failed without touching
-                # accumulator.
-                accumulator.finalize()
-                # Fire-and-forget post-response work once the stream is done.
-                # Everything about whether, and how much of, this reply enters
-                # memory is decide_memory_tail's call, made through
-                # _run_memory_tail, which the non-streaming path invokes
-                # identically: no line of tail policy or bookkeeping exists at
-                # one site only. Until v3.1.4 this site was three separate
-                # `if`s re-evaluating usable() and its twin was an
-                # if/elif/elif with no complete() analogue at all — the drift
-                # that lost 63 exchanges from memory in one log window, and
-                # the eighteenth "fixed at one site, missed at the other" on
-                # this branch.
-                #
-                # v3.1.7 (R26): `and not vllm_failed` used to sit on this
-                # condition, justified as "there's no real assistant turn to
-                # extract/index from". That is true of the 4xx branch, where
-                # nothing was ever generated — and false of the RequestError
-                # branch, which fires when vLLM drops the connection PART WAY
-                # THROUGH a reply she has already read. The accumulator held
-                # real prose, and decide_memory_tail was never called,
-                # tailhealth.note was never called, and no line containing
-                # "skipping memory tail" was emitted. Measured: 0 decisions, 0
-                # counter movement, an empty grep — on a reply the client
-                # received in full. That is the shape of the defect this
-                # release argues against in its own comment two screens up.
-                #
-                # A connection that dies mid-reply IS a cut reply, so the
-                # existing trim path handles it exactly: keep the prose up to
-                # the last sentence boundary, or skip and SAY SO with a
-                # counted outcome. `finished` stays accumulator.complete() and
-                # is not forced to False — if vLLM sent finish_reason and then
-                # died on the trailing [DONE], the reply really is whole and
-                # trimming it would throw away its last sentence.
-                #
-                # The 4xx branch is safe through here rather than special-
-                # cased: nothing on it feeds the accumulator (the friendly
-                # error chunks are yielded straight to the client, never
-                # accumulator.feed'ed), so text() is "" and the decision is
-                # SKIPPED_EMPTY — the one outcome tailhealth treats as
-                # lossless. The compactor's own apology can never become a
-                # memory.
-                if vllm_failed and conv_id:
-                    # `vllm_failed` no longer decides anything; it is still
-                    # worth ONE line, because "the tail ran on a reply the
-                    # backend cut" and "the tail ran on a whole reply" look
-                    # identical in the log otherwise, and the first is the
-                    # case an operator is grepping for after an outage.
-                    logger.warning(
-                        f"conv={conv_id}: the backend failed during this "
-                        f"stream; the memory tail is deciding on the "
-                        f"{len(accumulator.text())} chars that did arrive"
-                    )
-                if conv_id:
-                    _run_memory_tail(
-                        conv_id,
-                        accumulator.text(),
-                        finished=accumulator.complete(),
-                        truncated=accumulator.truncated(),
-                        holed=accumulator.holed(),
-                        touched_facts=touched_facts,
-                        last_user_text=last_user_text,
-                        turn_index=turn_index,
-                        messages=messages,  # original request messages, for rollup
-                        injected_facts=injected_facts,
-                        # v3.1.9.4 (R5 / P16-8 fix): the generation as of
-                        # this REQUEST's inputs, not as of whenever this
-                        # `finally:` finally runs — see _run_memory_tail's
-                        # own docstring for why that gap matters here.
-                        wipe_generation=_tail_wipe_generation_snapshot,
-                    )
+                try:
+                    await client.aclose()
+                    # v3.1.7 (R7/R14): flush the incremental decoder before
+                    # text()/holed() are read below. Unconditional and cheap —
+                    # a no-op when nothing was ever fed(), which is the case on
+                    # every path that set vllm_failed without touching
+                    # accumulator.
+                    accumulator.finalize()
+                    # Fire-and-forget post-response work once the stream is done.
+                    # Everything about whether, and how much of, this reply enters
+                    # memory is decide_memory_tail's call, made through
+                    # _run_memory_tail, which the non-streaming path invokes
+                    # identically: no line of tail policy or bookkeeping exists at
+                    # one site only. Until v3.1.4 this site was three separate
+                    # `if`s re-evaluating usable() and its twin was an
+                    # if/elif/elif with no complete() analogue at all — the drift
+                    # that lost 63 exchanges from memory in one log window, and
+                    # the eighteenth "fixed at one site, missed at the other" on
+                    # this branch.
+                    #
+                    # v3.1.7 (R26): `and not vllm_failed` used to sit on this
+                    # condition, justified as "there's no real assistant turn to
+                    # extract/index from". That is true of the 4xx branch, where
+                    # nothing was ever generated — and false of the RequestError
+                    # branch, which fires when vLLM drops the connection PART WAY
+                    # THROUGH a reply she has already read. The accumulator held
+                    # real prose, and decide_memory_tail was never called,
+                    # tailhealth.note was never called, and no line containing
+                    # "skipping memory tail" was emitted. Measured: 0 decisions, 0
+                    # counter movement, an empty grep — on a reply the client
+                    # received in full. That is the shape of the defect this
+                    # release argues against in its own comment two screens up.
+                    #
+                    # A connection that dies mid-reply IS a cut reply, so the
+                    # existing trim path handles it exactly: keep the prose up to
+                    # the last sentence boundary, or skip and SAY SO with a
+                    # counted outcome. `finished` stays accumulator.complete() and
+                    # is not forced to False — if vLLM sent finish_reason and then
+                    # died on the trailing [DONE], the reply really is whole and
+                    # trimming it would throw away its last sentence.
+                    #
+                    # The 4xx branch is safe through here rather than special-
+                    # cased: nothing on it feeds the accumulator (the friendly
+                    # error chunks are yielded straight to the client, never
+                    # accumulator.feed'ed), so text() is "" and the decision is
+                    # SKIPPED_EMPTY — the one outcome tailhealth treats as
+                    # lossless. The compactor's own apology can never become a
+                    # memory.
+                    if vllm_failed and conv_id:
+                        # `vllm_failed` no longer decides anything; it is still
+                        # worth ONE line, because "the tail ran on a reply the
+                        # backend cut" and "the tail ran on a whole reply" look
+                        # identical in the log otherwise, and the first is the
+                        # case an operator is grepping for after an outage.
+                        logger.warning(
+                            f"conv={conv_id}: the backend failed during this "
+                            f"stream; the memory tail is deciding on the "
+                            f"{len(accumulator.text())} chars that did arrive"
+                        )
+                    if conv_id:
+                        _run_memory_tail(
+                            conv_id,
+                            accumulator.text(),
+                            finished=accumulator.complete(),
+                            truncated=accumulator.truncated(),
+                            holed=accumulator.holed(),
+                            touched_facts=touched_facts,
+                            last_user_text=last_user_text,
+                            turn_index=turn_index,
+                            messages=messages,  # original request messages, for rollup
+                            injected_facts=injected_facts,
+                            # v3.1.9.4 (R5 / P16-8 fix): the generation as of
+                            # this REQUEST's inputs, not as of whenever this
+                            # `finally:` finally runs — see _run_memory_tail's
+                            # own docstring for why that gap matters here.
+                            wipe_generation=_tail_wipe_generation_snapshot,
+                        )
+                finally:
+                    # H1 (hostile review round 2): trace.finish() used to run
+                    # LAST, after client.aclose()/accumulator.finalize()/
+                    # _run_memory_tail — any of which raising, or a second
+                    # cancellation arriving while they run, skipped it
+                    # entirely and the request-done line, and the in-flight
+                    # release, never happened. Moved to an INNER finally so it
+                    # always runs, and wrapped in its own try/except so a
+                    # failure INSIDE tracing itself can never be the thing that
+                    # cuts off her reply or the tail above it — tracing must be
+                    # allowed to fail without taking anything else down with it.
+                    #
+                    # v3.1.9.8 REQUEST TRACING (owner's ask, item 6): the ONE
+                    # summary line for this request, on every exit path this
+                    # generator has — a clean finish, an in-band vLLM failure,
+                    # a connection error, an unhandled exception, or Starlette
+                    # closing this generator early because the client hung up.
+                    # `_status` was set (never here) by whichever branch above
+                    # actually ran; this is only ever the place it is REPORTED.
+                    try:
+                        _trace.finish(
+                            logger, _status,
+                            finish_reason=accumulator.finish_reason(),
+                        )
+                    except Exception:
+                        logger.exception(
+                            f"conv={conv_id or '?'}: trace.finish failed while "
+                            f"closing out this request; the reply itself already "
+                            f"reached the client and is unaffected"
+                        )
+                    # Deliberately NOT resetting reqctx.request_id_ctx here
+                    # (measured, not merely assumed — a first version that did,
+                    # passing the wrapper's token down to reset from inside
+                    # this generator, broke this file's own [E11]/test_
+                    # disconnect_uvloop.py with an EMPTY response body and no
+                    # visible traceback). Starlette's
+                    # StreamingResponse runs `stream_response` — the coroutine
+                    # that actually drives THIS generator — in a task it starts
+                    # via `anyio` task-group `start_soon`, which snapshots a
+                    # COPY of the current Context at spawn time; that copy
+                    # correctly inherits the id (every log line above proves
+                    # it), but it is a DIFFERENT Context object than the one
+                    # `chat_completions`'s wrapper called `.set()` in, and a
+                    # `contextvars.Token` can only `.reset()` the Context it was
+                    # created in. Calling it here raised ValueError from inside
+                    # this generator's cleanup, which aborted the ASGI send
+                    # mid-stream and silently truncated the response to nothing
+                    # — the exact failure mode this whole feature must never
+                    # cause. No leak results from skipping it: this task's
+                    # Context is discarded with the task once the request ends,
+                    # exactly like every other per-request ContextVar value
+                    # nothing in this codebase bothers to reset (see
+                    # `_tail_wipe_generation`, set and reset in the SAME
+                    # frame — never across a task boundary, which is precisely
+                    # what made that one safe and this one not).
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     # Non-streaming path
     try:
         try:
-            r = await client.post(f"{VLLM_URL}/v1/chat/completions", json=body)
+            r = await client.post(
+                f"{VLLM_URL}/v1/chat/completions", json=body,
+                headers=reqctx.vllm_headers(),
+            )
         except httpx.RequestError as e:
             # V2.3 Theme 2: vLLM unreachable (down / restarting). Clean 503,
             # not an opaque 500. No async tail — there's no assistant turn.
@@ -12603,6 +12977,21 @@ async def chat_completions(request: Request) -> Any:
                 # _run_memory_tail's own docstring.
                 wipe_generation=_tail_wipe_generation_snapshot,
             )
+        # v3.1.9.8 REQUEST TRACING (owner's ask, item 6). Finished HERE,
+        # explicitly, rather than left to chat_completions' generic
+        # status-code fallback — that fallback still fires (harmlessly;
+        # RequestTrace.finish is idempotent) but would only ever know
+        # "ok", with no tokens_out/finish_reason, since it never sees
+        # response_json.
+        _tokens_out = None
+        try:
+            _tokens_out = response_json.get("usage", {}).get("completion_tokens")
+        except AttributeError:
+            _tokens_out = None
+        _trace.finish(
+            logger, "ok", tokens_out=_tokens_out,
+            finish_reason=_finish_reason or None,
+        )
         return JSONResponse(content=response_json, status_code=r.status_code)
     finally:
         await client.aclose()

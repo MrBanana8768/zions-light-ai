@@ -63,6 +63,7 @@ from typing import Any, Callable
 
 import httpx
 
+import reqctx
 import textclean
 import tokens
 from envcfg import env_float, env_int
@@ -1710,7 +1711,8 @@ async def extract_facts_from_exchange(
     }
     try:
         r = await client.post(
-            f"{vllm_url}/v1/chat/completions", json=payload, timeout=timeout
+            f"{vllm_url}/v1/chat/completions", json=payload, timeout=timeout,
+            headers=reqctx.vllm_headers("facts"),
         )
         r.raise_for_status()
         data = r.json()

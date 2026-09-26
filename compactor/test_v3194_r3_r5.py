@@ -188,7 +188,10 @@ def test_select_for_injection_call_site_uses_run_in_threadpool():
     print("\n[test] R5: main.chat_completions' select_for_injection call site "
           "routes through run_in_threadpool, not a bare call")
     import inspect
-    src = inspect.getsource(main.chat_completions)
+    # v3.1.9.8 REQUEST TRACING split the route into a thin tracing wrapper
+    # (chat_completions) and the actual handler (_chat_completions_impl) —
+    # the select_for_injection call site this test pins lives in the impl.
+    src = inspect.getsource(main._chat_completions_impl)
     idx_pool = src.find("run_in_threadpool")
     idx_call = src.find("facts.select_for_injection")
     check(idx_pool != -1 and idx_call != -1, "both names appear in chat_completions' source")

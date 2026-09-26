@@ -79,6 +79,7 @@ import httpx
 from starlette.concurrency import run_in_threadpool
 
 import logsetup
+import reqctx
 import textclean
 import tokens
 import tokenhealth
@@ -2053,6 +2054,7 @@ async def _count_tokens(
             f"{vllm_url}/tokenize",
             json={"model": model, "prompt": text},
             timeout=httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0),
+            headers=reqctx.vllm_headers("tok"),
         )
         if getattr(r, "status_code", 200) == 200:
             n = (r.json() or {}).get("count")
@@ -2562,7 +2564,10 @@ async def _llm_summarize(
             "temperature": 0.2,
             "stream": False,
         }
-        r = await client.post(f"{vllm_url}/v1/chat/completions", json=payload, timeout=timeout)
+        r = await client.post(
+            f"{vllm_url}/v1/chat/completions", json=payload, timeout=timeout,
+            headers=reqctx.vllm_headers("sum"),
+        )
         r.raise_for_status()
         data = r.json() or {}
         choices = data.get("choices") or []

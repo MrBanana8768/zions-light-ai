@@ -314,6 +314,7 @@ COPY compactor/tailhealth.py /opt/compactor/tailhealth.py
 COPY compactor/webuidb.py /opt/compactor/webuidb.py
 COPY compactor/logsetup.py /opt/compactor/logsetup.py
 COPY compactor/alert.py /opt/compactor/alert.py
+COPY compactor/reqctx.py /opt/compactor/reqctx.py
 
 # BUILD GUARD: every compactor module must actually be in the image.
 #

@@ -811,7 +811,12 @@ for fn in ast.walk(tree):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                     and node.func.id == "_inject_time_line"):
                 calls.append(fn.name)
-check(calls == ["chat_completions"],
+# v3.1.9.8 REQUEST TRACING split the route into a thin tracing wrapper
+# (`chat_completions`) and the actual handler (`_chat_completions_impl`) —
+# see main.py's docstring on the wrapper for why. The invariant this check
+# guards is unchanged (exactly one call site, inside the chat request
+# handler, whichever name it currently has); only the name moved.
+check(calls == ["_chat_completions_impl"],
       f"_inject_time_line is called from chat_completions and nowhere else ({calls}) — "
       f"so /admin handlers, backfill, the rollup and summarization never add it")
 _admin = [fn.name for fn in ast.walk(tree)

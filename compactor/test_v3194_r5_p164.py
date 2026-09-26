@@ -76,7 +76,7 @@ class _Client:
         self.n = 0
         self.cut = cut
 
-    async def post(self, url, json=None, timeout=None):
+    async def post(self, url, json=None, timeout=None, **kwargs):
         self.n += 1
         k = self.n
         user = json["messages"][-1]["content"]
@@ -203,7 +203,7 @@ class _ReduceClient:
         self.n = 0
         self.group0_calls = 0
 
-    async def post(self, url, json=None, timeout=None):
+    async def post(self, url, json=None, timeout=None, **kwargs):
         self.n += 1
         user = json["messages"][-1]["content"]
         is_retry = "previous attempt" in json["messages"][0]["content"]

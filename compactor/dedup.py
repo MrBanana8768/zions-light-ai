@@ -102,6 +102,7 @@ import httpx
 from starlette.concurrency import run_in_threadpool
 
 import facts as facts_module
+import reqctx
 import retrieval as retrieval_module
 from envcfg import env_float, env_int
 
@@ -527,7 +528,8 @@ async def llm_merge_candidate(
     }
     try:
         r = await client.post(
-            f"{vllm_url}/v1/chat/completions", json=payload, timeout=LLM_TIMEOUT_S
+            f"{vllm_url}/v1/chat/completions", json=payload, timeout=LLM_TIMEOUT_S,
+            headers=reqctx.vllm_headers("dedup"),
         )
         r.raise_for_status()
         choice = r.json()["choices"][0]

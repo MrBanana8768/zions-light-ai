@@ -2278,6 +2278,16 @@ async def gather_health_full(
         "backups": backup_info,
         "memory_writes": writes,
         "background_work": bg,
+        # v3.1.9.8 REQUEST TRACING (owner's ask, item 7): requests_in_flight
+        # (chat requests currently inside the handler, INCLUDING the
+        # pre-processing phase — the whole point) and how long ago the last
+        # one finished. This fixes a real incident: an operator restart
+        # killed a request in its ~100s pre-processing phase because
+        # nothing exposed it was even running — `background_work` above
+        # only ever covered the POST-response tail, not the request
+        # itself. Read from `reqctx`, like `bg`/`mt` above read from their
+        # own modules directly (main.py cannot be imported from here).
+        "request_tracing": _request_tracing_stats(),
         "memory_tail": mt,
         "config": {
             "vllm_url": vllm_url,
@@ -2294,6 +2304,16 @@ async def gather_health_full(
             "time_injection": _time_injection_config(),
         },
     }
+
+
+def _request_tracing_stats() -> dict:
+    """requests_in_flight / last_request_done_age_s, or an error shape if
+    reqctx is unreachable — never raises into gather_health_full."""
+    try:
+        import reqctx
+        return reqctx.in_flight_stats()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def _time_injection_config() -> dict | None:

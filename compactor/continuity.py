@@ -54,6 +54,7 @@ import httpx
 import alert
 import logsetup
 import memory
+import reqctx
 from envcfg import env_bool, env_int
 
 logger = logging.getLogger("compactor.continuity")
@@ -542,7 +543,10 @@ async def _call_digest_llm(
     owns_client = http_client is None
     client = http_client or httpx.AsyncClient()
     try:
-        r = await client.post(f"{vllm_url}/v1/chat/completions", json=payload, timeout=30)
+        r = await client.post(
+            f"{vllm_url}/v1/chat/completions", json=payload, timeout=30,
+            headers=reqctx.vllm_headers("digest"),
+        )
         r.raise_for_status()
         data = r.json() or {}
         choices = data.get("choices") or []

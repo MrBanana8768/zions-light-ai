@@ -30,6 +30,7 @@ import time
 
 from envcfg import env_int, env_window_s
 import logsetup
+import reqctx
 
 logger = logging.getLogger("compactor.bgwork")
 
@@ -109,8 +110,31 @@ class BackgroundPool:
         out who. Log only, deliberately: /health/full is not localhost-gated
         the way the /admin endpoints are, and conv_ids do not belong in an
         ungated payload. (v3.1 A11.)
-        """
+
+        v3.1.9.8 REQUEST TRACING: the leading word of `label` (its first
+        space-separated token — "tail" from "tail conv=…", "rollup" from
+        "rollup conv=…") doubles as the task NAME `_run` tags this
+        coroutine's log lines with (`req=<id>/bg:<task>`), so every log
+        line the coroutine emits is distinguishable from one still inside
+        the original request. Deliberately NOT a new parameter here: this
+        function's signature is `TypeError`-fragile in exactly the way
+        `_async_tail`'s own docstring (main.py, a few hundred lines up from
+        `_fire_and_forget`) already explains at length — three existing
+        test doubles replace `_fire_and_forget`/`submit` wholesale with a
+        fixed `(obj, label=None)` callable (test_truncated_tail.py's
+        `_spy_fire` among them), and a new keyword TypeErrors every one of
+        them the instant it is called, before bgwork ever sees the
+        coroutine. Reusing `label` — which every call site already passes,
+        content-free (a conv_id, never message text) — costs nothing and
+        breaks nothing. The request id itself needs no separate capture
+        here at all: asyncio.create_task below snapshots the CURRENT
+        context (contextvars propagate to a new Task automatically), so
+        the coroutine already sees whatever request id was in force at the
+        moment `submit` was called — the same mechanism `_tail_wipe_
+        generation` (main.py) relies on, for the same reason, and the same
+        reason its OWN fix could not be a new keyword either."""
         self._submitted += 1
+        task_name = (label or "").split(" ", 1)[0] or None
         if len(self._tasks) >= self._max_outstanding:
             self._shed += 1
             self._last_shed_at = time.monotonic()
@@ -141,14 +165,19 @@ class BackgroundPool:
                     f"under load; chat is unaffected."
                 )
             return False
-        task = asyncio.create_task(self._run(coro))
-        self._tasks.add(task)
-        task.add_done_callback(self._on_done)
+        aio_task = asyncio.create_task(self._run(coro, task_name))
+        self._tasks.add(aio_task)
+        aio_task.add_done_callback(self._on_done)
         return True
 
-    async def _run(self, coro) -> None:
-        async with self._sem:
-            await coro
+    async def _run(self, coro, task_name: str | None = None) -> None:
+        tag_token = reqctx.bg_tag_ctx.set(task_name) if task_name else None
+        try:
+            async with self._sem:
+                await coro
+        finally:
+            if tag_token is not None:
+                reqctx.bg_tag_ctx.reset(tag_token)
 
     def _on_done(self, task: asyncio.Task) -> None:
         self._tasks.discard(task)

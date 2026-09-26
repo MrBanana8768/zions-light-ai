@@ -80,6 +80,28 @@ chain on `/forget`'s durability, are covered below.
   process start, visibility only — never moves `status`) **and
   `checks.facts_write`** (the facts-wipe write-failure count, added
   alongside it — see "Fixed" below).
+- **Request tracing (`compactor/reqctx.py`, new module).** Every chat
+  request gets an id — an incoming `X-Request-Id` if it looks sane
+  (hex/UUID-ish, ≤64 chars), else a fresh uuid4 — held in a `ContextVar`
+  so every log line anywhere in that request's context, including a
+  background tail (`req=<id>/bg:tail`) and a `run_in_threadpool` hop,
+  carries `req=<id>`. The id (and a purpose-tagged child id — `.sum1`,
+  `.facts1`, `.dedup1`, `.tok1`) goes out to vLLM on every call the
+  request makes; the response carries `X-Request-Id` back, streaming and
+  non-streaming. One `request done req=<id> conv=... status=<ok|error|
+  cancelled> t_images=… t_compact=… t_retrieval=… t_inject=… t_guard=…
+  t_ttft=… t_total=… tokens_out=… finish=…` line is emitted per request,
+  on every outcome, with unmeasured fields omitted rather than zeroed.
+  When OpenWebUI forwards `X-OpenWebUI-Chat-Id`/`-Message-Id`
+  (`ENABLE_FORWARD_USER_INFO_HEADERS=true`), they are logged as opaque
+  ids on the existing `conv_id=… source=… msgs=…` line; the same setting
+  also forwards the user's Name/Email/Id/Role headers, which are never
+  logged. `/health/full` gains `request_tracing.requests_in_flight`
+  (chat requests currently inside the handler, including the
+  pre-processing phase) and `request_tracing.last_request_done_age_s` —
+  the incident this fixes: an operator restart once killed a request in
+  its ~100s pre-processing phase with nothing exposing that it was still
+  running. See OPERATIONS.md "Tracing a request".
 
 ### Fixed
 - **Three blockers found in review before this could ship.**
