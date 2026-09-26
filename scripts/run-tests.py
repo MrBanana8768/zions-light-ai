@@ -177,6 +177,7 @@ SLOW_S = {                            # linux (docker)   windows (host)
     "test_backup.py": 18,             #      17.9               26
     "test_summarize_invariant.py": 4,  #       3.6               71
     "test_budget_guard.py": 1,        #       1.1                5
+    "test_wordban_tool.py": 40,       #   21-66 (load-bound; six grammar builds)
 }
 # Lowered from 60 with the platform change. At 60 nothing on Linux qualified
 # as slow, which made --fast a synonym for a full run — a flag that silently
