@@ -218,6 +218,7 @@ NEEDS_DOCKER = {
     "test_real_image_setup_sshd.py",
     "test_real_image_clean_decoration.py",
     "test_real_image_chat_tree.py",
+    "test_real_image_ops_bundle.py",
 }
 
 PASS, FAIL, SKIP, INCONCLUSIVE = "PASS", "FAIL", "SKIP", "INCONCLUSIVE"

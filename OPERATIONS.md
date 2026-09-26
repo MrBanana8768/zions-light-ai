@@ -5,6 +5,12 @@ health, recover from each known failure mode, and roll back a bad release.
 Pairs with [USER_GUIDE.md](USER_GUIDE.md) (using the app) and
 [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md) (standing it up).
 
+**Most procedures below have a `zl` command that wraps them** — one
+repeatable command per action instead of retyping these by hand, with a
+dry-run-by-default/confirm/backup-first/audit-log safety model. See
+[ops/README.md](ops/README.md) for the full command table (each row cites
+the section here it replaces) and how to install `zl` on a pod.
+
 > Convention: commands run from inside the pod (RunPod **Web Terminal**).
 > The compactor listens on `localhost:8080`; admin endpoints are
 > localhost-only by design.

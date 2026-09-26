@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# `zl` -- the pod-ops command shim. Installed to /usr/local/bin/zl by
+# bootstrap.sh (a symlink to THIS file, so a `zl` on PATH always runs the
+# ref's own code, not a stale copy). See ops/README.md for the command list.
+set -euo pipefail
+
+# Resolve our own real location so PYTHONPATH is right no matter the cwd or
+# how we were invoked (a symlink from /usr/local/bin/zl included).
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+    LINK="$(readlink "$SELF")"
+    case "$LINK" in
+        /*) SELF="$LINK" ;;
+        *) SELF="$(dirname "$SELF")/$LINK" ;;
+    esac
+done
+OPS_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+PY="/opt/compactor-venv/bin/python"
+if [ ! -x "$PY" ]; then
+    PY="python3"
+fi
+
+export PYTHONPATH="${OPS_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+exec "$PY" -m zlops "$@"

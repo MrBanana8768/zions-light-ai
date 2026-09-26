@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+# zlpod -- the laptop-side helper for talking to a pod bootstrapped with
+# `zl` (ops/bootstrap.sh). Keeps one `Host zlpod` entry in ~/.ssh/config so
+# every other tool (scp, rsync, a plain `ssh zlpod`) also just works.
+#
+# scp/sftp decision: scripts/setup-sshd.py's hardening never touches the
+# `Subsystem sftp` line or adds a ForceCommand/Match block that would
+# restrict it (checked: no "sftp"/"ForceCommand"/"scp" anywhere in that
+# script), so the distro openssh-server's default sftp subsystem stays
+# usable. This script uses plain `scp` rather than an `ssh ... cat >`
+# streaming fallback.
+set -euo pipefail
+
+CONFIG_DIR="${ZLPOD_CONFIG_DIR:-$HOME/.config/zlpod}"
+CONFIG_FILE="$CONFIG_DIR/config"
+SSH_CONFIG="${ZLPOD_SSH_CONFIG:-$HOME/.ssh/config}"
+_BACKUP_GLOB="zions-backup-*.tar.gz"  # compactor/backup.py:200-201's own archive naming
+MARK_BEGIN="# BEGIN zlpod Host zlpod (zlpod init, idempotent) >>>"
+MARK_END="# <<< END zlpod Host zlpod"
+
+HOST=""
+PORT=""
+# shellcheck disable=SC2034  # loaded from config for transparency; the ssh alias itself carries IdentityFile
+KEY=""
+USER="root"
+
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck source=/dev/null
+        . "$CONFIG_FILE"
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+Usage: zlpod <command> [args...]
+
+  init HOST PORT [KEY]   save the pod's connect info and add a `Host zlpod`
+                          block to ~/.ssh/config (KEY default: ~/.ssh/id_ed25519)
+  ssh                    interactive shell on the pod
+  dash                   ssh -t zlpod zl dash (the live telemetry dashboard)
+  zl ARGS...             run `zl ARGS...` on the pod (safely quoted)
+  status                 zl status on the pod
+  pull bundle            zl bundle --print-path on the pod, scp it down to
+                          ~/pod-exports/<UTC date>/, extract into bundle-<HHMM>Z/
+  pull backup [--latest|NAME]
+                         scp a backup archive from /data/backups down to
+                          ~/pod-exports/<UTC date>/ (not extracted)
+  push wordban [DIR]     copy DIR/word-ban-check.py (default: ~/zl-ops/word-ban)
+                          to the pod's ZL_HOME/word-ban/ (assumes the default
+                          ZL_HOME=/data/zl-ops; a customized ZL_HOME on the pod
+                          is not auto-detected by this command)
+  bootstrap              ssh zlpod bash /data/zl-ops/bootstrap.sh (after a restart)
+  help                   this text
+EOF
+}
+
+require_config() {
+    if [ -z "$HOST" ] || [ -z "$PORT" ]; then
+        echo "zlpod: not configured -- run \`zlpod init HOST PORT [KEY]\` first" >&2
+        exit 1
+    fi
+}
+
+cmd_init() {
+    local host="${1:?zlpod init: HOST required}"
+    local port="${2:?zlpod init: PORT required}"
+    local key="${3:-$HOME/.ssh/id_ed25519}"
+
+    mkdir -p "$CONFIG_DIR"
+    {
+        printf 'HOST=%q\n' "$host"
+        printf 'PORT=%q\n' "$port"
+        printf 'KEY=%q\n' "$key"
+        printf 'USER=%q\n' "root"
+    } > "$CONFIG_FILE"
+    echo "zlpod: saved $CONFIG_FILE"
+
+    mkdir -p "$(dirname "$SSH_CONFIG")"
+    touch "$SSH_CONFIG"
+    local stamp backup
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup="${SSH_CONFIG}.bak-${stamp}"
+    cp -p "$SSH_CONFIG" "$backup"
+    echo "zlpod: backed up $SSH_CONFIG -> $backup"
+
+    # Warn about any OTHER (non-marker) `Host zlpod` stanza, or a leading
+    # `Host *` before ours -- ssh uses first-match-wins per keyword, so an
+    # earlier entry (ours included, if we appended instead of prepending)
+    # can silently win over the one this command just wrote (review
+    # MEDIUM: "an earlier unmarked Host zlpod... wins at first match").
+    if grep -qE '^[[:space:]]*Host[[:space:]]+(\*|zlpod\b)' "$SSH_CONFIG" 2>/dev/null; then
+        if ! grep -qF "$MARK_BEGIN" "$SSH_CONFIG" 2>/dev/null; then
+            echo "zlpod: WARNING: $SSH_CONFIG already has a \`Host zlpod\` or \`Host *\` entry that is NOT" >&2
+            echo "  ours -- ssh uses the FIRST match per keyword, so that earlier entry may win over the" >&2
+            echo "  one this command is about to add. Check $SSH_CONFIG by hand if \`ssh zlpod\` misbehaves." >&2
+        fi
+    fi
+
+    if grep -qF "$MARK_BEGIN" "$SSH_CONFIG" 2>/dev/null; then
+        sed -i "/^${MARK_BEGIN//\//\\/}\$/,/^${MARK_END//\//\\/}\$/d" "$SSH_CONFIG"
+    fi
+    # Insert at the TOP of the file, not appended at the bottom (review
+    # MEDIUM): ssh.config matches the FIRST `Host`/`HostName` etc. it sees
+    # per keyword, so an existing `Host zlpod` (or a catch-all `Host *`)
+    # already in the file would otherwise keep winning over ours forever,
+    # however recently `zlpod init` was run.
+    local block existing
+    block="$(
+        echo "$MARK_BEGIN"
+        echo "Host zlpod"
+        echo "    HostName $host"
+        echo "    Port $port"
+        echo "    User root"
+        echo "    IdentitiesOnly yes"
+        echo "    IdentityFile $key"
+        echo "    ServerAliveInterval 15"
+        echo "    ServerAliveCountMax 4"
+        echo "$MARK_END"
+    )"
+    existing="$(cat "$SSH_CONFIG")"
+    { printf '%s\n' "$block"; [ -n "$existing" ] && printf '%s\n' "$existing"; } > "$SSH_CONFIG"
+    echo "zlpod: added \`Host zlpod\` to the TOP of $SSH_CONFIG ($host:$port, key $key)"
+}
+
+cmd_ssh() {
+    require_config
+    exec ssh zlpod "$@"
+}
+
+cmd_dash() {
+    require_config
+    exec ssh -t zlpod zl dash
+}
+
+cmd_zl() {
+    require_config
+    local quoted=""
+    for a in zl "$@"; do
+        quoted="$quoted $(printf '%q' "$a")"
+    done
+    # shellcheck disable=SC2029  # deliberately expanded client-side: it is
+    # already one safely-quoted string, not raw interpolation of $@.
+    exec ssh zlpod "$quoted"
+}
+
+cmd_status() {
+    require_config
+    ssh zlpod zl status
+}
+
+# Round-4 addendum: the newest local backup on this machine came out ALL
+# ZERO BYTES at full size, pulled across the WSL/Windows filesystem
+# boundary -- `scp` reported success, the size was right, the content was
+# not. Verify every pull the same way, whatever it is (bundle or backup):
+# compare the local file's sha256 against a remote `sha256sum` of the SAME
+# path (one ssh call -- never re-derive the remote path, take exactly what
+# the caller already resolved), run `gzip -t`, and separately flag an
+# all-zero file by name (belt-and-braces: a real gzip stream can never be
+# all zero bytes -- its own magic header alone guarantees that -- but the
+# operator-facing message should say what it actually looks like, not just
+# "gzip -t failed").  On ANY of the three, the bad file is renamed
+# `<path>.corrupt` (kept, never deleted -- evidence for RunPod support/us)
+# and this returns 1; the caller must not report success.
+_looks_all_zero() {  # cheap heuristic: sample the start and end, not the whole file
+    local f="$1" size sample
+    size="$(stat -c '%s' "$f" 2>/dev/null || stat -f '%z' "$f" 2>/dev/null || echo 0)"
+    [ "$size" -gt 0 ] || return 0  # 0 bytes counts as "all zero" too
+    sample=1048576
+    if [ "$size" -lt "$sample" ]; then sample="$size"; fi
+    if [ -z "$(head -c "$sample" "$f" | tr -d '\0')" ] && [ -z "$(tail -c "$sample" "$f" | tr -d '\0')" ]; then
+        return 0
+    fi
+    return 1
+}
+
+_verify_pull() {  # _verify_pull LOCAL_PATH REMOTE_PATH
+    local local_path="$1" remote_path="$2"
+    local reason="" unverifiable=""
+
+    if _looks_all_zero "$local_path"; then
+        reason="the local file is all-zero bytes (a known WSL/Windows-boundary scp failure mode)"
+    fi
+
+    if [ -z "$reason" ]; then
+        local remote_sha local_sha
+        # shellcheck disable=SC2029  # deliberately expanded client-side: remote_path is
+        # OUR OWN already-resolved value, not something to re-resolve on the remote.
+        remote_sha="$(ssh zlpod "sha256sum $(printf '%q' "$remote_path") 2>/dev/null" | awk '{print $1}')"
+        local_sha="$(sha256sum "$local_path" 2>/dev/null | awk '{print $1}')"
+        if [ -z "$remote_sha" ]; then
+            # Round-4 LOW: this is an SSH/sha256sum FAILURE, not evidence
+            # the transfer is bad -- the old code lumped it into the same
+            # `reason` as an actual mismatch, so a good file got renamed
+            # to `.corrupt` and reported "CORRUPT TRANSFER" just because
+            # the pod was briefly unreachable for the verify step. Tracked
+            # separately: no rename, and a message that says what
+            # actually happened ("could not verify"), not "CORRUPT".
+            unverifiable="could not verify $remote_path against the pod's own sha256sum (ssh/sha256sum failed remotely) -- the local file may still be fine, it just could not be checked"
+        elif [ "$local_sha" != "$remote_sha" ]; then
+            reason="sha256 mismatch -- local=$local_sha pod=$remote_sha"
+        fi
+    fi
+
+    if [ -z "$reason" ] && ! gzip -t "$local_path" 2>/dev/null; then
+        reason="gzip -t failed -- not a valid gzip archive"
+    fi
+
+    if [ -n "$reason" ]; then
+        mv -f "$local_path" "$local_path.corrupt"
+        echo "zlpod: CORRUPT TRANSFER -- $reason" >&2
+        echo "zlpod: kept the bad file as $local_path.corrupt (not deleted) -- re-run the pull" >&2
+        return 1
+    fi
+    if [ -n "$unverifiable" ]; then
+        echo "zlpod: $unverifiable" >&2
+        echo "zlpod: kept $local_path as-is (NOT renamed) -- gzip -t passed locally; only the sha256 cross-check itself could not run" >&2
+        return 1
+    fi
+    return 0
+}
+
+cmd_pull_bundle() {
+    require_config
+    local remote_path
+    remote_path="$(ssh zlpod zl bundle --print-path)"
+    if [ -z "$remote_path" ]; then
+        echo "zlpod pull bundle: the pod printed no path" >&2
+        return 1
+    fi
+    local date_dir hhmm out_dir local_tgz
+    date_dir="$(date -u +%Y-%m-%d)"
+    hhmm="$(date -u +%H%M)"
+    out_dir="$HOME/pod-exports/$date_dir"
+    mkdir -p "$out_dir"
+    local_tgz="$out_dir/$(basename "$remote_path")"
+    scp "zlpod:$remote_path" "$local_tgz"
+    if ! _verify_pull "$local_tgz" "$remote_path"; then
+        return 1
+    fi
+    echo "zlpod: pulled $local_tgz"
+    local extract_dir="$out_dir/bundle-${hhmm}Z"
+    mkdir -p "$extract_dir"
+    tar -xzf "$local_tgz" -C "$extract_dir"
+    echo "zlpod: extracted into $extract_dir"
+}
+
+# Review LOW: `zl disk`'s own "backups: N archive(s) in <path>, <size>
+# total" line is the one place the pod already prints podenv.BACKUPS
+# (which resolves COMPACTOR_BACKUP_DIR, then /proc/1/environ, then the
+# /data/backups default -- see ops/zlops/podenv.py) -- ask the pod for
+# that path instead of assuming the default, so a pod with
+# COMPACTOR_BACKUP_DIR set to something else still works. Falls back to
+# /data/backups (with a loud warning, never silently) if `zl disk` is
+# unreachable or its output doesn't parse -- an old zl install without
+# this fix, or a pod that isn't up, must not break `pull backup` outright.
+remote_backup_dir() {
+    local line dir
+    line="$(ssh zlpod "zl disk 2>/dev/null | grep '^backups:'" 2>/dev/null || true)"
+    dir="$(printf '%s\n' "$line" | sed -n 's/^backups: [0-9]* archive(s) in \(.*\), [^,]*$/\1/p')"
+    if [ -z "$dir" ]; then
+        echo "zlpod: warning: could not ask the pod for its COMPACTOR_BACKUP_DIR (zl disk unreachable" \
+             "or its output changed) -- assuming /data/backups" >&2
+        dir="/data/backups"
+    fi
+    printf '%s\n' "$dir"
+}
+
+cmd_pull_backup() {
+    require_config
+    local remote_name backup_dir
+    backup_dir="$(remote_backup_dir)"
+    if [ "${1:-}" = "--latest" ] || [ -z "${1:-}" ]; then
+        # ssh joins EVERY argv word after the hostname with a plain space and
+        # sends that as ONE command line to the remote shell -- it does NOT
+        # preserve local argv boundaries or quoting. Passing `bash -c '...'`
+        # as separate argv words (as this used to) re-splits on the remote
+        # side: the pipe/glob text ends up as bash -c's *positional
+        # parameters*, not part of its command string, and the real command
+        # silently becomes `ls` with no arguments (H4: "lists the remote
+        # home directory instead"). The fix is to hand ssh exactly ONE argv
+        # element containing the whole remote command, quoted correctly
+        # here (locally, once) -- never build it out of several argv words.
+        # shellcheck disable=SC2029  # deliberately expanded client-side: _BACKUP_GLOB and
+        # backup_dir are OUR OWN values, not something that should be resolved on the remote.
+        # Round-4 LOW: `${backup_dir}` itself must be quoted in the remote
+        # command string -- unquoted, a backup dir containing a space
+        # (COMPACTOR_BACKUP_DIR is operator-configured, review LOW) would
+        # be word-split by the REMOTE shell into two arguments to `ls`.
+        # `_BACKUP_GLOB` stays unquoted on purpose: it is a real glob
+        # pattern that must still expand server-side.
+        remote_name="$(ssh zlpod "ls -1t \"${backup_dir}\"/${_BACKUP_GLOB} 2>/dev/null | head -1")"
+        if [ -z "$remote_name" ]; then
+            echo "zlpod pull backup: no archives found in ${backup_dir} on the pod" >&2
+            return 1
+        fi
+    else
+        remote_name="${backup_dir}/$1"
+    fi
+    local date_dir out_dir local_tgz
+    date_dir="$(date -u +%Y-%m-%d)"
+    out_dir="$HOME/pod-exports/$date_dir"
+    mkdir -p "$out_dir"
+    local_tgz="$out_dir/$(basename "$remote_name")"
+    scp "zlpod:$remote_name" "$local_tgz"
+    if ! _verify_pull "$local_tgz" "$remote_name"; then
+        return 1
+    fi
+    echo "zlpod: pulled $local_tgz"
+}
+
+cmd_push_wordban() {
+    require_config
+    local dir="${1:-$HOME/zl-ops/word-ban}"
+    local src="$dir/word-ban-check.py"
+    if [ ! -f "$src" ]; then
+        echo "zlpod push wordban: $src not found (run \`wordban.py release\` first)" >&2
+        return 1
+    fi
+    ssh zlpod "mkdir -p /data/zl-ops/word-ban"
+    scp "$src" "zlpod:/data/zl-ops/word-ban/word-ban-check.py"
+    echo "zlpod: pushed $src -> zlpod:/data/zl-ops/word-ban/word-ban-check.py"
+}
+
+cmd_bootstrap() {
+    require_config
+    ssh zlpod bash /data/zl-ops/bootstrap.sh
+}
+
+load_config
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 2
+fi
+
+cmd="$1"; shift || true
+case "$cmd" in
+    init) cmd_init "$@" ;;
+    ssh) cmd_ssh "$@" ;;
+    dash) cmd_dash ;;
+    zl) cmd_zl "$@" ;;
+    status) cmd_status ;;
+    pull)
+        sub="${1:-}"; shift || true
+        case "$sub" in
+            bundle) cmd_pull_bundle ;;
+            backup) cmd_pull_backup "$@" ;;
+            *) echo "zlpod pull: unknown target ${sub:-<none>} (bundle|backup)" >&2; exit 2 ;;
+        esac
+        ;;
+    push)
+        sub="${1:-}"; shift || true
+        case "$sub" in
+            wordban) cmd_push_wordban "$@" ;;
+            *) echo "zlpod push: unknown target ${sub:-<none>} (wordban)" >&2; exit 2 ;;
+        esac
+        ;;
+    bootstrap) cmd_bootstrap ;;
+    help|-h|--help) usage ;;
+    *) echo "zlpod: unknown command: $cmd" >&2; usage >&2; exit 2 ;;
+esac
