@@ -243,6 +243,7 @@ class RequestTrace:
         *,
         tokens_out: int | None = None,
         finish_reason: str | None = None,
+        wb: str | None = None,
     ) -> None:
         """Emit the summary line and release the in-flight slot. Safe to
         call from any of: the non-streaming return path, the streaming
@@ -278,4 +279,15 @@ class RequestTrace:
             parts.append(f"tokens_out={tokens_out}")
         if finish_reason:
             parts.append(f"finish={finish_reason}")
+        # v3.1.9.8 WORD-BAN FILE DEPLOY: `wb=<revision>:<sha8>` when this
+        # request's her-reply call was made with the DEPLOYED FILE's grammar
+        # (main._chat_completions_impl passes this only when
+        # wordban_runtime.decide_structured_outputs said source=="file").
+        # Absent for a client-sent-only value, no value at all, or a request
+        # that never reaches the her-reply calls (an internal call never
+        # holds a RequestTrace at all, so this can't fire there either) —
+        # never a bare "wb=-", which would claim a decision was made where
+        # none was.
+        if wb:
+            parts.append(f"wb={wb}")
         logger.info(" ".join(parts))

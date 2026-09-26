@@ -71,6 +71,18 @@ MODEL_REPO = os.environ.get("MODEL_REPO", "").strip()
 # traffic, cleaned up at the end of each run.
 SELFTEST_CONV_ID = "__selftest__"
 
+# v3.1.9.8 hostile review round 1, F2 (BLOCKER): the prefix every
+# `_check_chat_round_trip` conv_id is built from (see that function —
+# `f"{ONE_SHOT_CONV_PREFIX}{uuid.uuid4().hex[:8]}__"`). Exported as a
+# named constant, not a literal repeated at the call site, so
+# `main._chat_completions_impl` can recognise this exact traffic and skip
+# the word-ban FILE injection on it — the boot self-test runs on a fixed
+# `ROUND_TRIP_TIMEOUT_S` (180s default) budget that assumed no per-request
+# grammar compile; a cold xgrammar compile (measured 144-174s for revision
+# 8) leaves almost no margin, and every reboot would otherwise race it.
+# See wordban_runtime.py's module docstring / main.py's injection site.
+ONE_SHOT_CONV_PREFIX = "__selftest_oneshot_"
+
 # How long to wait for the compactor's post-response background work to finish
 # before cleaning up the one-shot conversation. The tail is submitted BEFORE
 # the response is returned, so it is already outstanding by the time we read
@@ -314,7 +326,7 @@ async def _check_chat_round_trip(client: httpx.AsyncClient) -> tuple[bool, str]:
     second process must not open it), and the unlink afterwards removes the
     empty facts file the DELETE leaves behind.
     """
-    one_shot_conv = f"__selftest_oneshot_{uuid.uuid4().hex[:8]}__"
+    one_shot_conv = f"{ONE_SHOT_CONV_PREFIX}{uuid.uuid4().hex[:8]}__"
     payload = {
         "model": MODEL_REPO or "default",
         "messages": [{"role": "user", "content": "Reply with exactly one word."}],

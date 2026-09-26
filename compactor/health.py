@@ -1585,6 +1585,18 @@ async def gather_health_full(
     except Exception as e:
         bg = {"error": f"{type(e).__name__}: {e}"}
 
+    # v3.1.9.8 WORD-BAN FILE DEPLOY + IDLE WARM-UP: file state (source/
+    # revision/sha/error) and warm-up state, both pure in-memory reads —
+    # same "local import + try/except" pattern as `bgwork` just above,
+    # for the same reason (health.py cannot import main; wordban_runtime
+    # has no import-time side effects that would make this unsafe at
+    # module scope, but the pattern is kept consistent with its neighbour).
+    try:
+        import wordban_runtime
+        wb = wordban_runtime.health_snapshot()
+    except Exception as e:
+        wb = {"error": f"{type(e).__name__}: {e}"}
+
     # v3.1.4: memory-tail decisions — replies that did NOT enter memory
     # (facts, episodic index, rollup) and why, as counts. Same shape and same
     # reason as the pool above: until v3.1.4 a skipped tail was a WARNING
@@ -2278,6 +2290,13 @@ async def gather_health_full(
         "backups": backup_info,
         "memory_writes": writes,
         "background_work": bg,
+        # v3.1.9.8 WORD-BAN FILE DEPLOY + IDLE WARM-UP: source/revision/
+        # sha/error for the deployed grammar file, plus warm-up progress —
+        # see wordban_runtime.health_snapshot's own docstring. Visibility
+        # only, same doctrine as `bg`/`tokenizer`/`reuse` — a broken or
+        # absent file is fail-open on the request path (the client-sent
+        # value or none is used instead), so this never moves `status`.
+        "word_ban": wb,
         # v3.1.9.8 REQUEST TRACING (owner's ask, item 7): requests_in_flight
         # (chat requests currently inside the handler, INCLUDING the
         # pre-processing phase — the whole point) and how long ago the last

@@ -315,6 +315,7 @@ COPY compactor/webuidb.py /opt/compactor/webuidb.py
 COPY compactor/logsetup.py /opt/compactor/logsetup.py
 COPY compactor/alert.py /opt/compactor/alert.py
 COPY compactor/reqctx.py /opt/compactor/reqctx.py
+COPY compactor/wordban_runtime.py /opt/compactor/wordban_runtime.py
 
 # BUILD GUARD: every compactor module must actually be in the image.
 #

@@ -102,8 +102,49 @@ chain on `/forget`'s durability, are covered below.
   the incident this fixes: an operator restart once killed a request in
   its ~100s pre-processing phase with nothing exposing that it was still
   running. See OPERATIONS.md "Tracing a request".
+- **Word-ban file deploy + idle warm-up (`compactor/wordban_runtime.py`,
+  new module; `scripts/word-ban-deploy.py`, new stdlib-only operator
+  script).** Moves the word-ban grammar off OpenWebUI's Advanced Params
+  (a 1.5 MB `structured_outputs` custom param, pasted by hand and
+  forwarded on every request) onto a FILE the compactor injects instead
+  — `COMPACTOR_WORDBAN_FILE` (default `/data/zl-ops/word-ban/
+  active.json`), loaded lazily with a stat() check at most once per
+  request, sha256-validated against the file's own claim, cached in
+  memory. Injected into the two her-reply vLLM calls only (never an
+  internal call); the file wins over a client-sent value during the
+  transition, with a WARNING (shas only) on any disagreement; a
+  malformed or missing file fails OPEN (falls back to the client-sent
+  value, or none — the ban is simply not enforced from the file until
+  fixed), logged once per file change. The "request done" line gains
+  `wb=<revision>:<sha8>` when the file supplied the grammar. A background
+  warm-up (`COMPACTOR_WORDBAN_WARMUP`, default on) sends a one-token
+  `max_tokens=1` request straight to vLLM, with the byte-identical
+  grammar, whenever the deployed grammar changed OR vLLM restarted (a
+  cold xgrammar cache), gated on genuine idleness — no in-flight chat
+  request, vLLM's own `/metrics` idle, no outstanding background work,
+  and `COMPACTOR_WORDBAN_IDLE_S` (default 30s) since the last activity —
+  so the ~110-175s cold compile lands on nobody's real reply.
+  `word-ban-deploy.py deploy/status/rollback/clear` runs on the pod with
+  `python3`, stdlib only. `/health/full` gains a `word_ban` key (source/
+  revision/sha/error, warm state, last compile time). See OPERATIONS.md
+  "Word-ban file deploy + idle warm-up".
 
 ### Fixed
+- **Tracing-verification review, three LOW findings.** `_unsafe_conv_id_
+  handler` always logged `req=None` on a chat-path rejection — the
+  wrapper resets `reqctx.request_id_ctx` in its own `finally:` before
+  FastAPI's exception-handler dispatch ever runs, so the ContextVar the
+  handler read was already empty by construction, not merely sometimes.
+  Fixed by carrying the id on `request.state.req_id` instead, set by the
+  wrapper before anything can reset it (falls back to the ContextVar for
+  a route that never goes through the wrapper at all). The
+  `chat_completions` wrapper's own docstring had fallen behind hostile
+  review round 2's structural streaming-tracing fix (B1) and still
+  described the OLD, non-structural behaviour — corrected. The
+  non-streaming path logged its "request done" line BEFORE constructing
+  the `JSONResponse` it reports on, rather than after — reordered so
+  every exit path finishes on something that already exists, matching
+  every other path in this file.
 - **Three blockers found in review before this could ship.**
   `continuity.py` called `_ledger_path`, defined nowhere — a `NameError`
   that broke `/forget`, `/forget-all`, `/retire` and the full wipe.

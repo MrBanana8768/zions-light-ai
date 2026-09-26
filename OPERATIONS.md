@@ -2624,3 +2624,76 @@ what `verify` proves.
   (revision 6: "Los Angel|es", "flam|mable"). Keep an exception only if it has real use or a strong reason.
 - **To roll back:** paste the previous `word-ban-structured_outputs.value.vN.txt` into the row, or delete the
   row. Either takes effect on the next reply.
+
+## Word-ban file deploy + idle warm-up (v3.1.9.8)
+
+**Why this exists.** V4 (Matrix) replaces OpenWebUI's Admin Panel entirely, so the grammar can no longer live
+in a custom param pasted through that UI. As of v3.1.9.8 the compactor can instead load the grammar from a
+FILE — `/data/zl-ops/word-ban/active.json` by default (env `COMPACTOR_WORDBAN_FILE`) — and injects it into
+every reply to her (never into an internal call, and never into the streaming/non-streaming call the warm-up
+itself makes). The file always **wins** over a client-sent value, so the OpenWebUI row can stay in place during
+the transition without doing anything: the compactor logs a WARNING (shas only, never content) if the two
+ever disagree, and uses the file regardless.
+
+**Deploying a revision**, from a build produced by `wordban.py release` (unchanged — see the section above):
+
+```bash
+# on the pod, python3 stdlib only
+python3 scripts/word-ban-deploy.py deploy \
+    ~/zl-ops/word-ban/word-ban-structured_outputs.value.vN.txt --revision N
+```
+
+Without `--sha`, it reads the expected sha256 from `release.vN.json` next to the value file (written by
+`wordban.py release`) and refuses if the file doesn't match — pass `--sha` explicitly to check against a
+number you already have instead. It also refuses (exit 1) if the value file is not in **canonical form**
+(`json.dumps(structured_outputs, ensure_ascii=True)` — what `wordban.py cmd_build` itself writes): this is the
+same check the compactor performs on load, so a deploy that passes here is guaranteed to load cleanly, not
+merely to have the right sha256. The previous `active.json` is kept as `previous.json` automatically.
+
+**Checking it went live and warmed up:**
+
+```bash
+python3 scripts/word-ban-deploy.py status
+```
+
+This prints the local file's revision/sha and, if the compactor is reachable at `:8080`, its own
+`/health/full` → `word_ban` block: `source` (should be `"file"`), `revision`/`value_sha256` (should match what
+you just deployed), `warmed` and `warm_state`. Expect `warm_state` to move `idle` → `waiting_idle` →
+`warming` → `idle` within `COMPACTOR_WORDBAN_IDLE_S` (30s default) of the pod going quiet, and
+`last_warm_compile_s` to show a number once it does — that is the one-time xgrammar compile (measured
+110–175s in `~/zl-ops/word-ban/`'s own release reports) that would otherwise land on her FIRST real reply
+with the new grammar. If `warm_state` stays `"disabled"`, `/metrics`'s `process_start_time_seconds` was not
+found on this vLLM build — the warm-up cannot tell a restarted vLLM process from the same one, so it will not
+fire automatically; the grammar is still enforced (fail-open only drops the FILE-injection half, never the
+warm-up entirely — see wordban_runtime.py's own module docstring for this known gap) but every restart needs
+a manual poke (any real chat request pays the cold compile itself, same as before this feature existed).
+`warm_state: "vllm_unreachable"` is different: the compactor could not fetch vLLM's `/metrics` at all. This is
+normal while vLLM is still loading at boot. If it persists, vLLM is down (check `supervisorctl status vllm`).
+
+**Rolling back:**
+
+```bash
+python3 scripts/word-ban-deploy.py rollback   # swaps previous.json back in
+python3 scripts/word-ban-deploy.py status     # confirm the revision moved back
+```
+
+A rollback can itself be rolled back (it swaps, not copies) — running `rollback` twice in a row restores what
+you just rolled back from.
+
+**Removing a revision entirely** (falls back to the client-sent value if the OpenWebUI row is still there,
+else no ban at all): `python3 scripts/word-ban-deploy.py clear --yes`.
+
+**During the transition:**
+
+1. Deploy the file (above) with the OpenWebUI row **still in place**. The file wins; a conflict (the two
+   differ) is logged once, at WARNING, shas only.
+2. Confirm `status` shows `source: "file"` and a completed warm-up.
+3. Only then, delete the `structured_outputs` row from OpenWebUI's Advanced Params — it is the 1.5 MB value
+   that was being sent on every single request, chat or task, and no longer needs to be.
+4. **Keep the system-prompt line** ("Seven things…", from `word-ban-prompt-line.vN.txt`) in OpenWebUI for
+   now — it is a separate, small, hand-maintained setting this change does not touch or replace.
+
+**What still gets the grammar unchanged from before this feature:** OpenWebUI's own background task calls
+(title/tags/follow-ups/autocomplete) run through the exact same two vLLM call sites her real reply does, and
+always have received the pasted custom param — the file keeps that, deliberately, rather than narrowing it
+without being asked.

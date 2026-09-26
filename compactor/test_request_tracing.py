@@ -24,6 +24,13 @@ order:
   [E6] OpenWebUI's chat/message id are logged when present; the
        Name/Email/Id/Role headers the SAME flag forwards are never logged,
        anywhere, even when a malicious value tries to look like a probe
+  [E11] tracing-verification review F1: _unsafe_conv_id_handler reads
+        request.state.req_id (set by the wrapper) rather than
+        reqctx.current_request_id() (already reset to None by the time
+        FastAPI's exception-handler dispatch runs it)
+  [E12] tracing-verification review F3: the non-streaming path's "request
+        done" line fires AFTER the JSONResponse it reports on is built,
+        not before
 
 A real client disconnect (Starlette's TestClient fully drains a streaming
 body and cannot simulate a peer hanging up) is covered separately by
@@ -718,6 +725,107 @@ assert_eq(r.status_code, 200, "200")
 line = _find(recs, "conv_id=")
 assert_true(line is not None and "ow_chat=owui-chat-real-123" in line.getMessage(),
             "a SANE ow_chat value is still logged")
+
+
+# ===========================================================================
+# [E11] tracing-verification review F1: request.state.req_id, not the
+# (already-reset) ContextVar, is what _unsafe_conv_id_handler must read.
+# ===========================================================================
+
+print("\n[E11] F1: _unsafe_conv_id_handler reads request.state.req_id")
+
+
+class _FakeURL:
+    path = "/v1/chat/completions"
+
+
+class _FakeState:
+    pass
+
+
+class _FakeRequest:
+    """Only `.method`, `.url.path` and `.state` are read by the handler —
+    see test_config_dryrun.py's `_FakeRequest` for the same duck-typing
+    approach to a Starlette Request in a pure unit test."""
+    method = "POST"
+    url = _FakeURL()
+
+    def __init__(self):
+        self.state = _FakeState()
+
+
+
+from memory import UnsafeConvId  # noqa: E402
+
+# The wrapper sets request.state.req_id BEFORE anything can reset
+# reqctx's ContextVar — reproduced directly here, with the ContextVar
+# confirmed empty (as it always is by the time FastAPI's own
+# exception-handler dispatch runs, on the chat path: chat_completions'
+# `finally:` resets it once `trace.finished` is True, which it is by then
+# — see the wrapper's own comment for exactly why).
+assert_eq(reqctx.current_request_id(), None, "no ContextVar id set for this test")
+fake_req = _FakeRequest()
+fake_req.state.req_id = "state-carried-id"
+resp = asyncio.run(main._unsafe_conv_id_handler(fake_req, UnsafeConvId("test")))
+assert_eq(resp.status_code, 400, "still a 400")
+assert_eq(resp.headers.get("x-request-id"), "state-carried-id",
+          "X-Request-Id comes from request.state.req_id, not the (empty) ContextVar")
+
+# Fallback: a route that never went through the wrapper (no
+# request.state.req_id at all) still falls back to the ContextVar when
+# THAT happens to be set (unchanged behaviour for non-chat routes).
+fake_req2 = _FakeRequest()
+_tok = reqctx.request_id_ctx.set("ctxvar-id")
+try:
+    resp2 = asyncio.run(main._unsafe_conv_id_handler(fake_req2, UnsafeConvId("test")))
+finally:
+    reqctx.request_id_ctx.reset(_tok)
+assert_eq(resp2.headers.get("x-request-id"), "ctxvar-id",
+          "falls back to the ContextVar when request.state has no req_id")
+
+
+# ===========================================================================
+# [E12] tracing-verification review F3: finish() fires AFTER the
+# JSONResponse it reports on is constructed, not before.
+# ===========================================================================
+
+print("\n[E12] F3: the non-streaming 'request done' line fires after JSONResponse is built")
+
+_orig_json_response = main.JSONResponse
+
+
+class _ExplodingJSONResponse(_orig_json_response):
+    """Raises exactly on the SUCCESS non-streaming construction site
+    (`status_code=200`, the one this fix reordered) — every OTHER
+    JSONResponse this path can build uses a different status code (400/
+    502/503), so this is selective by construction, not by luck."""
+
+    def __init__(self, *a, **k):
+        if k.get("status_code") == 200:
+            raise RuntimeError("simulated JSONResponse construction failure (F3 test)")
+        super().__init__(*a, **k)
+
+
+with patch.object(main, "JSONResponse", _ExplodingJSONResponse), \
+     patch.object(main.httpx, "AsyncClient", _StubVLLM):
+    _StubVLLM.reply = "hello"
+    _StubVLLM.finish_reason = "stop"
+    _StubVLLM.status_code = 200
+    with capture() as cap:
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "stub-model", "messages": [{"role": "user", "content": "hi"}],
+                  "stream": False},
+            headers={"X-Conversation-Id": "rt-e12"},
+        )
+assert_eq(r.status_code, 500, "the simulated construction failure surfaces as a 500, not a 200")
+line = _find(cap.records, "request done req=")
+assert_true(line is not None, "the request done line still fired (via the wrapper's own except Exception)")
+assert_true("status=error" in line.getMessage(),
+            "status=error — proving _trace.finish never ran with status=ok before the "
+            "exploding construction (the OLD, buggy order would have logged status=ok "
+            "here, from the call that used to precede JSONResponse(...))")
+assert_true("status=ok" not in line.getMessage(), "no leftover status=ok line for this request")
 
 
 print("\nAll test_request_tracing.py checks passed.")

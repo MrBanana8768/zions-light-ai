@@ -58,6 +58,7 @@ import selftest as selftest_module
 import summarizer
 import tailhealth
 import tokens
+import wordban_runtime
 from envcfg import env_bool, env_float
 from memory import (
     StoreUnreadable,
@@ -10679,7 +10680,29 @@ async def lifespan(app: FastAPI):
         f"conversation large enough to expose the token undercount will take "
         f"one vLLM 400 before the margin is relearned."
     )
+    # v3.1.9.8 WORD-BAN IDLE WARM-UP: one background task, process-wide,
+    # started here and cancelled at shutdown — the same lifecycle bgwork's
+    # drain() manages for the fire-and-forget tail pool, but this is a
+    # single long-lived polling loop rather than a per-request task, so it
+    # gets its own asyncio.create_task rather than going through bgwork.
+    _wordban_warmup_task: asyncio.Task | None = None
+    if wordban_runtime.WARMUP_ENABLED:
+        wordban_runtime.init(VLLM_URL, MODEL_REPO or "")
+        _wordban_warmup_task = asyncio.create_task(wordban_runtime.worker.run())
+        logger.info(
+            f"word-ban warm-up loop started "
+            f"(idle_s={wordban_runtime.IDLE_S}, file={wordban_runtime.WORDBAN_FILE})"
+        )
+    else:
+        logger.info("word-ban warm-up disabled (COMPACTOR_WORDBAN_WARMUP)")
     yield
+    if _wordban_warmup_task is not None:
+        wordban_runtime.worker.stop()
+        _wordban_warmup_task.cancel()
+        try:
+            await _wordban_warmup_task
+        except (asyncio.CancelledError, Exception):
+            pass
     # Graceful: give in-flight background work (fact extraction, indexing,
     # rollup, backfill) a moment to finish via the bounded pool.
     #
@@ -10726,9 +10749,23 @@ async def _unsafe_conv_id_handler(request: Request, exc: UnsafeConvId):
     # wrapper's `result.headers["X-Request-Id"] = req_id` line ever saw),
     # so this response left the client with no X-Request-Id at all — the
     # one response shape that couldn't be traced back to its own log
-    # lines. Cheap: the id is still in reqctx's ContextVar for as long as
-    # this request's context is alive, which it is here.
-    _rid = reqctx.current_request_id()
+    # lines.
+    #
+    # v3.1.9.8 tracing-verification review, F1 (was: read
+    # `reqctx.current_request_id()` here). On the CHAT path, an
+    # UnsafeConvId raised from inside `_chat_completions_impl` is caught by
+    # chat_completions' own `except Exception:` first, which calls
+    # `trace.finish()` and then, in its `finally:`, resets
+    # `reqctx.request_id_ctx` back to None — BEFORE re-raising propagates
+    # up to THIS handler. So `reqctx.current_request_id()` always read
+    # None here, for every chat request that ever hit this handler; this
+    # never fired on a NON-chat admin route in the first place (those
+    # never set the ContextVar), so it was not merely intermittent, it was
+    # unconditional. `request.state.req_id`, set by the wrapper before
+    # anything can reset it, survives regardless of which path raised —
+    # falling back to the ContextVar only for a route that never went
+    # through that wrapper at all.
+    _rid = getattr(request.state, "req_id", None) or reqctx.current_request_id()
     if _rid:
         resp.headers["X-Request-Id"] = _rid
     return resp
@@ -11431,14 +11468,33 @@ async def chat_completions(request: Request) -> Any:
       - set the `X-Request-Id` RESPONSE header (owner's ask, item 5) on
         whatever comes back, streaming or not.
 
-    The one path this wrapper does NOT close out itself is a successful
-    streaming response: `StreamingResponse.__call__` iterates the body
-    generator well after this wrapper has already returned it, so
-    `event_stream()` (inside the impl) holds `_trace` itself and calls
-    `_trace.finish()` from its own `finally:` — see that generator's
-    comments for exactly which status each of its exit paths reports.
+    A successful streaming response used to be the one path this wrapper
+    did not close out itself — `StreamingResponse.__call__` iterates the
+    body generator well after this wrapper has already returned it, and
+    only `event_stream()` (inside the impl) held `_trace` to call
+    `_trace.finish()` from its own `finally:`. Hostile review round 2 (B1)
+    found the gap that left open — the slash-command short-circuit's own
+    `cmd_stream()` StreamingResponse never went through event_stream() at
+    all — and closed it STRUCTURALLY, here: every StreamingResponse this
+    route can return, not just event_stream()'s, now gets
+    `_finish_stream_body`/`_TracedStreamingResponse` wrapped around it a
+    few lines below, so `trace.finish()` fires no matter which streaming
+    path produced the response. `event_stream()`'s own richer `finally:`
+    (real finish_reason, phase timings, the `wb=` field) still runs FIRST
+    and wins on the common path — this wrapper's structural version is
+    now a backstop, not the ONLY thing failing to run before v3.1.9.8's
+    tracing-verification review (F2) caught this docstring having fallen
+    behind that fix.
     """
     req_id = reqctx.new_request_id(request.headers.get("x-request-id"))
+    # v3.1.9.8 tracing-verification review, F1: `request.state` survives
+    # into FastAPI's own exception-handler dispatch even after this
+    # wrapper's `finally:` has reset `reqctx.request_id_ctx` back to None
+    # (see `_unsafe_conv_id_handler`, which reads this instead of the
+    # ContextVar for exactly that reason) — the Request object itself is
+    # the one thing both this wrapper and that handler are guaranteed to
+    # share.
+    request.state.req_id = req_id
     rid_token = reqctx.request_id_ctx.set(req_id)
     # Hostile review round 2 (L3): eagerly, BEFORE any background task can
     # be forked from this request — see init_purpose_counters' own
@@ -12567,6 +12623,90 @@ async def _chat_completions_impl(
     # already subtracted) was computed right after the guard call above, not
     # here — see that comment for why the timing matters.
 
+    # v3.1.9.8 WORD-BAN FILE DEPLOY: inject the deployed grammar into HER
+    # REPLY calls only — the two vLLM calls this function makes below
+    # (streaming and non-streaming). NEVER touches an internal call
+    # (summarize/facts/dedup/digest/tokenize each build their own httpx
+    # payload elsewhere and never pass through this function), and never
+    # touches the warm-up's own traffic (wordban_runtime.WarmupWorker posts
+    # straight to vLLM, bypassing this endpoint entirely).
+    #
+    # OpenWebUI's background task calls (title/tags/follow-ups/
+    # autocomplete — see `_is_openwebui_task_conv_id`) run through these
+    # SAME two call sites, and get the SAME grammar today (OpenWebUI
+    # attaches its pasted custom param to every request for the model,
+    # task or chat — see wordban_runtime's module docstring for the traced
+    # proof). Kept unchanged here rather than narrowed to "chat only": that
+    # would be a real behaviour change from what is live today, and doing
+    # it silently was exactly the "narrowed an owner request... without
+    # asking" mistake this repo's own log warns against (memory.md,
+    # 2026-09-24).
+    #
+    # The file wins over a client-sent value; conflicts are logged once per
+    # distinct (file_sha, client_sha) pair. See wordban_runtime.
+    # decide_structured_outputs's own docstring for the full decision.
+    #
+    # Hostile review round 1 additions, all guarding this ONE call site:
+    #
+    #   F2 (BLOCKER): never inject into the compactor's OWN boot self-test
+    #      round trip (selftest.ONE_SHOT_CONV_PREFIX). That check runs on
+    #      a fixed `ROUND_TRIP_TIMEOUT_S` budget (180s) that assumed no
+    #      per-request grammar compile; a cold xgrammar compile (measured
+    #      144-174s for revision 8) would eat nearly all of it on every
+    #      single boot.
+    #   F6: `decide_structured_outputs` is new code on the request path of
+    #      EVERY chat turn. Any exception in it must never cost her the
+    #      reply — caught, logged once, and treated exactly like the file
+    #      not existing (today's behaviour: the client's own value, if
+    #      any, passes through untouched; wb=None on the trace line).
+    #   F7: a client that already asked vLLM for structured output of its
+    #      OWN (`response_format`, or a `structured_outputs` value that is
+    #      not our exact `{"grammar": ...}` shape) is never overridden —
+    #      vLLM allows only one guided-decoding mechanism per request and
+    #      refuses ("count>1") when it sees two, which would turn her
+    #      reply into a 400 instead of a ban.
+    #   F8: the file is deployed for ONE model
+    #      (`wordban_runtime._FileState.model`); `decide_structured_
+    #      outputs` itself skips injection when `body["model"]` disagrees
+    #      — passed in here so it has that fact to check against.
+    _wb_client_value = body.get("structured_outputs")
+    _wb_decision = wordban_runtime.WordBanDecision(
+        _wb_client_value, "client" if _wb_client_value is not None else "none"
+    )
+    _wb_skip_reason: str | None = None
+    if conv_id and conv_id.startswith(selftest_module.ONE_SHOT_CONV_PREFIX):
+        _wb_skip_reason = "selftest"
+    elif body.get("response_format") is not None:
+        _wb_skip_reason = "client_response_format"
+    elif _wb_client_value is not None and not wordban_runtime.is_grammar_shape(_wb_client_value):
+        _wb_skip_reason = "client_structured_outputs_other_shape"
+    if _wb_skip_reason is not None:
+        if logsetup.log_once(f"wordban.skip.{_wb_skip_reason}"):
+            logger.info(
+                f"word-ban: skipping file injection this request "
+                f"(reason={_wb_skip_reason}); the client's own "
+                f"structured_outputs (if any) is sent unchanged"
+            )
+    else:
+        try:
+            _wb_decision = wordban_runtime.decide_structured_outputs(
+                _wb_client_value, model=body.get("model")
+            )
+        except Exception as e:
+            if logsetup.log_once("wordban.decide.exception"):
+                logger.error(
+                    f"word-ban: decide_structured_outputs raised "
+                    f"({type(e).__name__}: {e}); leaving structured_outputs "
+                    f"exactly as the client sent it for this and every "
+                    f"later request until this is fixed — the file's ban is "
+                    f"NOT enforced while this persists"
+                )
+            # _wb_decision already defaults to the client's own value —
+            # unchanged from the pre-try assignment above.
+    if _wb_decision.source == "file":
+        body["structured_outputs"] = _wb_decision.value
+    _wb_trace_field = _wb_decision.trace_field
+
     stream = bool(body.get("stream", False))
     # read=None keeps long generations from being cut off, but connect/write/
     # pool stay bounded: an unqualified timeout=None also removes the CONNECT
@@ -12806,6 +12946,7 @@ async def _chat_completions_impl(
                         _trace.finish(
                             logger, _status,
                             finish_reason=accumulator.finish_reason(),
+                            wb=_wb_trace_field,
                         )
                     except Exception:
                         logger.exception(
@@ -12988,11 +13129,21 @@ async def _chat_completions_impl(
             _tokens_out = response_json.get("usage", {}).get("completion_tokens")
         except AttributeError:
             _tokens_out = None
+        # v3.1.9.8 tracing-verification review, F3: this used to fire BEFORE
+        # the JSONResponse below was constructed, so the "request done" line
+        # (and the in-flight release it does) reported before the response
+        # this request actually returns had even been built — harmless in
+        # practice (JSONResponse() cannot fail on a plain dict + int), but
+        # backwards from every other exit path in this file, which all
+        # finish AFTER the thing they're reporting on exists. Construct
+        # first, finish second, return what was already built.
+        _response = JSONResponse(content=response_json, status_code=r.status_code)
         _trace.finish(
             logger, "ok", tokens_out=_tokens_out,
             finish_reason=_finish_reason or None,
+            wb=_wb_trace_field,
         )
-        return JSONResponse(content=response_json, status_code=r.status_code)
+        return _response
     finally:
         await client.aclose()
 
