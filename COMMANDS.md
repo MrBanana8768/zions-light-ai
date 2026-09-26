@@ -53,7 +53,7 @@ docker compose -f docker-compose.tokenizer-contract.yml up --build --exit-code-f
 docker compose -f docker-compose.tokenizer-contract.yml run --rm --build soak-tests
 ```
 
-### Real-image operator-script suites (mandatory, host-run — all five)
+### Real-image operator-script suites (mandatory, host-run — all six)
 
 Not part of the sandboxed `unit-tests` compose service above
 (`network_mode: none`, no docker socket) — these suites need a real Docker
@@ -70,27 +70,32 @@ unmodified, against containers started from
 the exact published digest, and together they are the only suites that
 actually exercise `--apply`/live behaviour against a full copy of the real
 production store — the class of defect a 143-test all-mocked gate already
-missed once (CHANGELOG.md [3.1.9.6]).
+missed once (CHANGELOG.md [3.1.9.6]). `compactor/test_real_image_ops_bundle.py`
+(the `zl`/`zlpod` pod-ops bundle) needs only a real Docker daemon and the
+image already pulled — no export/backup fixtures — and defaults to prod's
+own image (`angreg/zions-light-ai:v3.1.9-cu12`); `ZL_TEST_IMAGE` overrides it
+to re-run against another digest (e.g. `c1295894dd58`).
 
 The mandatory command below runs `--only real_image` — the substring
-`real_image`, with NO trailing `_operator` — which matches ALL FIVE files:
+`real_image`, with NO trailing `_operator` — which matches ALL SIX files:
 `compactor/test_real_image_operator_scripts.py` (`backfill-records.py` and
 `import-history.py`'s dry run), `compactor/test_real_image_import_apply.py`
 (`import-history.py --apply`), `compactor/test_real_image_setup_sshd.py`
 (`setup-sshd.py`), `compactor/test_real_image_clean_decoration.py`
-(`clean-decoration.py`), and `compactor/test_real_image_chat_tree.py`
-(`repair-chat-tree.py` / `fix-encoded-messages.py`). **Do not narrow this
-to `--only real_image_operator`** — that substring only matches the first
-file and silently drops the other four mandatory suites from the run (N9:
-this is exactly the mistake this section used to document as the
-"mandatory" command).
+(`clean-decoration.py`), `compactor/test_real_image_chat_tree.py`
+(`repair-chat-tree.py` / `fix-encoded-messages.py`), and
+`compactor/test_real_image_ops_bundle.py` (the `zl`/`zlpod` pod-ops bundle).
+**Do not narrow this to `--only real_image_operator`** — that substring only
+matches the first file and silently drops the other five mandatory suites
+from the run (N9: this is exactly the mistake this section used to document
+as the "mandatory" command).
 
 ```bash
 python3 scripts/run-tests.py --python /usr/bin/python3 --real-image --only real_image
 ```
 
 Or run each file directly (same checks, no `run-tests.py` wrapper — you
-must invoke all five separately this way):
+must invoke all six separately this way):
 
 ```bash
 python3 compactor/test_real_image_operator_scripts.py
@@ -98,9 +103,10 @@ python3 compactor/test_real_image_import_apply.py
 python3 compactor/test_real_image_setup_sshd.py
 python3 compactor/test_real_image_clean_decoration.py
 python3 compactor/test_real_image_chat_tree.py
+python3 compactor/test_real_image_ops_bundle.py
 ```
 
-A SKIP (exit 3) from any of the five is not evidence of anything — fix
+A SKIP (exit 3) from any of the six is not evidence of anything — fix
 whatever precondition the printed reason names and re-run before shipping;
 do not read a skip as green. (`--only real_image_operator`, matching only
 the first file, is occasionally useful on its own during development of
@@ -232,6 +238,14 @@ replies — the two numbers F2 asked for and could not get from logs.
 ---
 
 ## Pod — health and diagnosis
+
+**Most of what follows in the next two sections has a `zl` command that
+wraps it** (dry run by default, confirms before it changes anything, logs
+every invocation) — `zl health`, `zl status`, `zl disk`, `zl backup`,
+`zl journal`, `zl fix`, `zl sshd`, and more; `zl dash` is a live terminal
+dashboard for the SSH session itself. See [ops/README.md](ops/README.md)
+for the full command table and the manual procedure each one replaces. The
+raw commands below still work directly and are what those wrappers call.
 
 ```bash
 curl -s localhost:8080/health/full | python3 -m json.tool | head -40
