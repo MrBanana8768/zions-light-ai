@@ -129,6 +129,30 @@ GENERATION_RESERVE = _env_int("COMPACTOR_GENERATION_RESERVE", 16384)
 # Clamped to MAX_MODEL_LEN: a bare floor could sit ABOVE the model's own window
 # on a small-context model, which would defeat the entire point of the guard.
 HARD_INPUT_LIMIT = min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - GENERATION_RESERVE))
+
+
+def _effective_limit(req_max_tokens: int = 0) -> int:
+    """The real per-request window ceiling `chat_completions` computes just
+    before compaction/injection — `HARD_INPUT_LIMIT`'s own per-request
+    cousin: MAX_MODEL_LEN minus whichever of GENERATION_RESERVE or the
+    CLIENT's own requested `max_tokens` is larger (a client asking for a big
+    completion needs the reserve to grow to match — see GENERATION_RESERVE's
+    own comment above), floored the same way HARD_INPUT_LIMIT is.
+
+    Factored out (v3.1.9.8 round-2 hostile review, item 6): a test exercising
+    a scenario against production's real budget arithmetic must call this
+    SAME expression, not an independent copy of it that only happens to
+    agree today — the review's own finding was exactly a test (`test_
+    reuse_her_shape.py`) whose hand-rolled `min(MAX_MODEL_LEN, max(256,
+    MAX_MODEL_LEN - GENERATION_RESERVE))` omitted the `req_max_tokens` term
+    entirely, silently correct only because that fixture never sets
+    `max_tokens` — a fixture that started setting it would have drifted from
+    what `chat_completions` actually enforces without either copy ever
+    being wrong on its own terms.
+    """
+    return min(MAX_MODEL_LEN, max(256, MAX_MODEL_LEN - max(GENERATION_RESERVE, req_max_tokens)))
+
+
 # MUST be derived from HARD_INPUT_LIMIT, not from MAX_MODEL_LEN.
 #
 # This is the compaction trigger: exceed it and older turns get summarized.
@@ -951,6 +975,18 @@ def _note_backend_rejection(
 _IMAGE_PLACEHOLDER = (
     "[The user attached {n} here. The current model is text-only and cannot "
     "see {pron} — if the content matters, ask the user to describe {pron}.]"
+)
+
+# v3.1.9.8 round-2 review (item 2): _IMAGE_PLACEHOLDER's "text-only" claim is
+# wrong for `_demote_invalid_image_urls` on a VISION backend — the model can
+# see images fine, this one specific part just carried a URL vLLM would 400
+# on. A model told "I am text-only" about a backend that plainly is not will
+# reason from a false premise every later turn. Separate, honest wording for
+# that one cause; _IMAGE_PLACEHOLDER keeps its original text-only meaning for
+# the callers that are actually a text-only backend (_strip_image_parts).
+_IMAGE_LOAD_FAILED_NOTE = (
+    "[The user attached {n} here, but {subj} could not be loaded — if the "
+    "content matters, ask the user to describe {pron}.]"
 )
 
 
@@ -2198,7 +2234,7 @@ def _chunk_to_budget(
     return batches
 
 
-def _min_possible_batches(turns: list[dict], budget: int) -> int:
+def _min_possible_batches(turns: list[dict], budget: int, cap: int | None = None) -> int:
     """A CERTAIN lower bound on how many `_chunk_to_budget` batches `turns`
     will need — computed from the local tokenizer ALONE, no /tokenize call.
 
@@ -2230,6 +2266,28 @@ def _min_possible_batches(turns: list[dict], budget: int) -> int:
     all, on payloads this refusal exists specifically to spare a full
     tokenization of, so it must not itself do more per-message work than
     proving that count needs.
+
+    `cap`, if given (v3.1.9.8, pipeline-scaling findings 09-27): stop
+    walking `turns` the moment the running count exceeds it, and return
+    that partial count instead of continuing to the end.
+
+    This is still a CERTAIN lower bound, not an approximation: the proof
+    above ("the same greedy packing... can only need MORE bins as item
+    sizes grow, never fewer") does not require having seen every turn —
+    walking further turns can only ADD bins to what has already been
+    counted, never remove one, so a running count that has already passed
+    `cap` stays a valid floor on the true (real, scaled) count whether or
+    not the remaining turns are ever priced. The one thing this gives up is
+    the EXACT minimal batch count once it no longer matters: every caller
+    of this function only ever asks "is the floor already over my cap?",
+    never "what is the floor, exactly?" — see `_refuse_summarization_over_
+    cap`'s own qualifier="at least " wording, which was already written for
+    a floor, not an exact count.
+
+    On her ~4,400-turn backlog, the true count is in the hundreds against a
+    4-call cap — the floor crosses `cap` within the first dozen or so
+    turns, so this turns ~4,400 local tokenizer calls into ~a dozen on
+    exactly the payload this function exists to spare full tokenization of.
     """
     if not turns:
         return 0
@@ -2240,6 +2298,8 @@ def _min_possible_batches(turns: list[dict], budget: int) -> int:
         t = int(count_tokens([m]) / _LOCAL_OVERCOUNT_CEILING)
         if current_has_item and current_tokens + t > budget:
             n_batches += 1
+            if cap is not None and n_batches > cap:
+                return n_batches
             current_tokens = 0
             current_has_item = False
         current_tokens += t
@@ -2337,7 +2397,17 @@ async def _summarize_body(
     # own docstring for why the bound is certain and not a guess. Skip the
     # /tokenize round trip (here AND the one _chunk_to_budget would make
     # sizing real batches) entirely when it cannot change the outcome.
-    _lb_batches = await run_in_threadpool(_min_possible_batches, to_summarize, budget)
+    #
+    # v3.1.9.8: `_min_possible_batches` used to walk EVERY turn even once
+    # the running count had already certainly exceeded the cap — on her
+    # ~4,400-turn backlog, ~4,400 local tokenizer calls to prove something
+    # the first dozen already proved. The cap is now passed in so it can
+    # return the moment the floor crosses it (see the function's own
+    # docstring for why a partial count is still a certain floor).
+    _lb_cap = max(1, MAX_SUMMARY_CALLS_PER_REQUEST)
+    _lb_batches = await run_in_threadpool(
+        _min_possible_batches, to_summarize, budget, _lb_cap
+    )
     if _lb_batches > max(1, MAX_SUMMARY_CALLS_PER_REQUEST):
         return _refuse_summarization_over_cap(
             to_summarize, _lb_batches, qualifier="at least ",
@@ -2353,7 +2423,16 @@ async def _summarize_body(
     # it. One /tokenize call, off the event loop, against many minutes of
     # failed map-reduce when the batches are wrong. Falls back to 1.0 — the
     # pre-v3.1 behaviour — if vLLM cannot answer.
-    _local = count_tokens(to_summarize)
+    #
+    # v3.1.9.8 (pipeline-scaling findings, 09-27): this local count runs over
+    # the WHOLE `to_summarize` backlog — on her chat, thousands of turns — and
+    # used to run directly on the event loop like the /tokenize call beside it
+    # never did: a ~5s CPU-bound tokenizer pass that stalled every OTHER
+    # request (health checks included) for the duration. Wrapped in
+    # run_in_threadpool like its /tokenize sibling on the next line; nothing
+    # downstream depends on which of the two lines finishes first (`_scale`,
+    # a few lines down, waits on both regardless of ordering).
+    _local = await run_in_threadpool(count_tokens, to_summarize)
     _exact = await run_in_threadpool(count_tokens_exact, to_summarize)
     # Falls back PESSIMISTIC, not to 1.0.
     #
@@ -3111,7 +3190,16 @@ async def compact_if_needed(
     # /tokenize call each and agree on the value, since it's the same
     # content either way. No lock needed.
     _COUNT_TOKENS_EXACT_MEMO_CTX.set({})
-    current = count_tokens(messages)
+    # v3.1.9.8 (pipeline-scaling findings, 09-27): this counts the WHOLE
+    # incoming `messages` array — on her chat, ~4,400 turns — with the
+    # process's own tokenizer, a ~5s CPU-bound pass. Run directly on the
+    # event loop this stalled every other request the process was serving
+    # (health checks included) for the duration; every OTHER whole-list
+    # count_tokens call in this function already goes through
+    # run_in_threadpool (see `new_count` below), and this, the first and
+    # largest of them, did not. Nothing between here and its one use two
+    # lines down awaits anything else, so there is no ordering to disturb.
+    current = await run_in_threadpool(count_tokens, messages)
     # G3d (v3.1.9.4, hostile pass #14's "not demonstrated" list, lane
     # v3194-guard): TARGET_TOKENS is a fixed fraction of HARD_INPUT_LIMIT
     # (0.75 by default) — it does not know about `_BUDGET_MARGIN`, the
@@ -3946,30 +4034,86 @@ async def compact_if_needed(
                             # under — and stays exactly as before: a failure
                             # is never cached, so summarize() still makes its
                             # own call and prices whatever it gets.
-                            _fresh_local = await run_in_threadpool(
-                                count_tokens, _fresh_span_preview
-                            )
-                            _fresh_exact = await run_in_threadpool(
-                                count_tokens_exact, _fresh_span_preview
-                            )
-                            _fresh_scale = (
-                                (_fresh_exact / _fresh_local)
-                                if (_fresh_exact is not None and _fresh_local > 0)
-                                else _PESSIMISTIC_SUMMARY_SCALE
-                            )
-                            _fresh_batches = len(await run_in_threadpool(
-                                _chunk_to_budget,
-                                _fresh_span_preview,
-                                min(
-                                    MAX_MODEL_LEN,
-                                    max(
-                                        256,
-                                        MAX_MODEL_LEN - SUMMARY_MAX_TOKENS
-                                        - SUMMARY_INPUT_RESERVE,
-                                    ),
+                            #
+                            # v3.1.9.8 (pipeline-scaling findings, 09-27):
+                            # when `_changed` (and so `_fresh_span_preview`)
+                            # is huge — the steady state on a starved
+                            # conversation, where every stored-summary span
+                            # has drifted — the `count_tokens_exact` call
+                            # just below POSTs a full-size payload to
+                            # /tokenize that can itself hit the 10s read
+                            # timeout this whole check exists to avoid paying
+                            # for elsewhere (see _summarize_body's identical
+                            # `_min_possible_batches` gate a few hundred
+                            # lines up, and its own docstring for why a
+                            # partial/local-only floor is still CERTAIN).
+                            #
+                            # `_fresh_reserve` a few lines down is `min(
+                            # _fresh_batches, MAX_SUMMARY_CALLS_PER_REQUEST)
+                            # * SUMMARY_MAX_TOKENS` — it SATURATES the moment
+                            # `_fresh_batches` reaches the cap. So the
+                            # question this whole block exists to answer
+                            # ("what is `_fresh_reserve`?") already has its
+                            # answer once a CERTAIN lower bound on
+                            # `_fresh_batches` — computed from the local
+                            # tokenizer alone, exactly like
+                            # `_min_possible_batches` computes for
+                            # `_summarize_body` — itself reaches the cap: no
+                            # /tokenize answer, however exact, can raise
+                            # `_fresh_batches` further than the saturating
+                            # reserve already accounts for, or lower it
+                            # below the floor already proven (the same
+                            # "more turns can only need more bins, never
+                            # fewer" proof `_min_possible_batches`'s own
+                            # docstring gives). Skip the exact call and the
+                            # real (`_chunk_to_budget`) count entirely in
+                            # that case; take the CERTAIN floor as
+                            # `_fresh_batches` directly rather than the
+                            # pessimistic-SCALE estimate, since the floor is
+                            # already stronger than a scale-based guess.
+                            _fresh_chunk_budget = min(
+                                MAX_MODEL_LEN,
+                                max(
+                                    256,
+                                    MAX_MODEL_LEN - SUMMARY_MAX_TOKENS
+                                    - SUMMARY_INPUT_RESERVE,
                                 ),
-                                _fresh_scale,
-                            ))
+                            )
+                            _fresh_lb_batches = await run_in_threadpool(
+                                _min_possible_batches,
+                                _fresh_span_preview,
+                                _fresh_chunk_budget,
+                                MAX_SUMMARY_CALLS_PER_REQUEST,
+                            )
+                            if _fresh_lb_batches >= MAX_SUMMARY_CALLS_PER_REQUEST:
+                                logger.info(
+                                    f"conv={conv_id or '?'}: the fresh-span "
+                                    f"reserve is a certain floor "
+                                    f"({_fresh_lb_batches} batch(es), local "
+                                    f"tokenizer only) already at or over the "
+                                    f"{MAX_SUMMARY_CALLS_PER_REQUEST}-call cap "
+                                    f"— skipping the full /tokenize measurement "
+                                    f"vLLM can no longer change the outcome of"
+                                )
+                                _fresh_batches = _fresh_lb_batches
+                            else:
+                                _fresh_local = await run_in_threadpool(
+                                    count_tokens, _fresh_span_preview
+                                )
+                                _fresh_exact = await run_in_threadpool(
+                                    count_tokens_exact, _fresh_span_preview
+                                )
+                                _fresh_scale = (
+                                    (_fresh_exact / _fresh_local)
+                                    if (_fresh_exact is not None and _fresh_local > 0)
+                                    else _PESSIMISTIC_SUMMARY_SCALE
+                                )
+                                _fresh_batches = len(await run_in_threadpool(
+                                    _chunk_to_budget,
+                                    _fresh_span_preview,
+                                    _fresh_chunk_budget,
+                                    _fresh_scale,
+                                ))
                             _fresh_reserve = (
                                 min(_fresh_batches, MAX_SUMMARY_CALLS_PER_REQUEST)
                                 * SUMMARY_MAX_TOKENS
@@ -4235,7 +4379,11 @@ async def compact_if_needed(
     new_messages = (
         system_msgs + summary_blocks + deferred + preserved_images + keep_recent
     )
-    new_count = count_tokens(new_messages)
+    # v3.1.9.8: `deferred` carries the whole backlog verbatim on the steady
+    # state this comment names two lines up (reuse declines / the call cap
+    # refuses), so `new_messages` is the same whole-history size `current`
+    # was above — same fix, same reason: off the event loop.
+    new_count = await run_in_threadpool(count_tokens, new_messages)
     # Count what was SUMMARIZED, not what was offered. len(text_only) counts
     # both, so when the batch count exceeded the call cap - the steady state
     # for this user's long conversations, where summarize() skips entirely and
@@ -7116,6 +7264,215 @@ def _apply_image_retention(messages: list[dict]) -> tuple[list[dict], int]:
         note = f"[{n} image{'s' if n > 1 else ''} shared earlier in this conversation]"
         out.append({**m, "content": f"{txt}\n\n{note}" if txt else note})
         demoted += n
+    return out, demoted
+
+
+# v3.1.9.8 (prod 09-26 07:33Z, 4 consecutive empty replies): a retained image
+# carried a URL scheme vLLM 0.19 rejects outright — `REQUEST REJECTED by vLLM
+# (HTTP 400) ... The URL must be either a HTTP, data or file URL` — and the
+# compactor forwarded it unexamined every one of those four times. vLLM never
+# generated a token; the client just saw four back-to-back empty streams.
+#
+# vLLM 0.19 accepts three schemes for an `image_url` part: `http(s)://`,
+# `data:` (base64-embedded) and, ONLY with `--allowed-local-media-path` set on
+# the vLLM launch command, `file://`. This deployment's VLLM_EXTRA_ARGS
+# (runpod.env.template) does not set that flag, so a `file:` URL 400s here
+# exactly like any other disallowed scheme — treated as invalid below rather
+# than given a pass this server can't actually honor.
+#
+# v3.1.9.8 round-2 (hostile review, item 5): `fullmatch` instead of `match` +
+# `$` — Python's bare `$` matches just BEFORE a trailing newline as well as at
+# the true end of string, so `...QUJD\n` used to pass this regex while vLLM's
+# own `base64.b64decode(..., validate=True)` rejects the same trailing
+# newline outright. `fullmatch` has no such carve-out: every character up to
+# the true end of the string must be consumed. `re.IGNORECASE` accepts
+# `HTTPS:`/`Data:`/mixed-case mime types (vLLM does); it does not weaken the
+# base64-payload character class, since `[A-Za-z0-9+/]` already spans both
+# cases. The mime type is now OPTIONAL (`data:;base64,...` — a bare,
+# untyped payload — is a shape vLLM itself accepts).
+# Case is folded ONLY on the `data:` scheme and the mime type. vLLM 0.19's
+# connector.py:_load_data_url compares the marker with `data_type != "base64"`,
+# case-sensitively, so `;BASE64,` is rejected there and must be here too
+# (checked in the v3.1.9 image). The mime type must be image/* or empty: a
+# pdf/html payload passes vLLM's URL check but fails in PIL, which is the same
+# 400 in a different place.
+_DATA_IMAGE_URL_RE = re.compile(
+    r"(?i:data:)(?:(?i:image)/(?i:[A-Za-z0-9!#$&.+^_-]+))?;base64,[A-Za-z0-9+/]+=*"
+)
+# A bare OpenWebUI-style file id (no scheme at all) — v3.1.9.8 round-2's own
+# probe ("3f2a-uuid-no-scheme") is shaped like this: a client-side reference
+# the compactor was never meant to resolve, not a URL with a bad scheme.
+_UUID36_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+
+
+def _valid_image_url(url: object) -> bool:
+    """Would vLLM 0.19 (as launched here) accept this `image_url.url`?
+
+    http(s):// -- always fine, matched case-insensitively (`HTTPS://` is as
+    valid as `https://`). data: -- only the `data:<mime>;base64,...` shape
+    vLLM actually parses (mime optional, matched case-insensitively, no
+    trailing bytes after the base64 payload — see the module comment above
+    this function for the regex's own history); a data: URL missing the
+    base64 marker or carrying anything after the payload is exactly as
+    unusable to vLLM as a bad scheme, and is refused here for the same
+    reason. file: -- refused: see the module comment above this function for
+    why (`--allowed-local-media-path` is not set). Anything else (bare
+    paths, an OpenWebUI file id with no scheme at all, `blob:`, `ftp:`, or
+    not a string) is refused.
+    """
+    if not isinstance(url, str) or not url:
+        return False
+    # Slicing (not lower()-ing the whole string) keeps the base64 payload's
+    # own case exactly as given -- only the fixed-width SCHEME prefix is
+    # folded, so a case-sensitive payload is never corrupted by this check.
+    if url[:7].lower() == "http://" or url[:8].lower() == "https://":
+        return True
+    if url[:5].lower() == "data:":
+        return bool(_DATA_IMAGE_URL_RE.fullmatch(url))
+    return False
+
+
+def _image_url_shape_class(url: object) -> str:
+    """A coarse, SAFE-TO-LOG shape class for an invalid `image_url.url` --
+    never the raw scheme, never the value. v3.1.9.8 round-2 (hostile review,
+    item 4): the raw scheme this WARNING used to log is itself a fragment of
+    client-controlled data (an attacker- or bug-supplied URL can put
+    whatever it likes before the first `:`), so logging it verbatim was the
+    same category of leak this whole function exists to avoid on the URL
+    body. A closed set of shape names carries the same diagnostic value
+    (which failure mode is this?) without repeating that mistake one level
+    up.
+
+    `uuid36`: a bare OpenWebUI-style file id with no scheme at all (the
+    round-2 probe's own case). `owui-files-path`: an OpenWebUI
+    `/api/v1/files/...` reference forwarded as if it were already a URL vLLM
+    could fetch. `http`: starts with `http`/`https` but was not accepted
+    (a scheme vLLM DOES support, malformed some other way). `data-malformed`:
+    a `data:` URL that fails the shape check (bad mime, missing/broken
+    base64, trailing bytes). `other`: anything else (a different scheme
+    entirely, or not a string).
+    """
+    if not isinstance(url, str) or not url:
+        return "other"
+    if _UUID36_RE.fullmatch(url):
+        return "uuid36"
+    low = url.lower()
+    if low.startswith("/api/v1/files"):
+        return "owui-files-path"
+    if low.startswith("http"):
+        return "http"
+    if low.startswith("data:"):
+        return "data-malformed"
+    return "other"
+
+
+def _demote_invalid_image_urls(
+    messages: list[dict], *, multimodal: bool = True
+) -> tuple[list[dict], int]:
+    """Replace `image_url` parts vLLM will 400 on with an honest placeholder,
+    instead of forwarding a request that can only come back empty.
+
+    Runs on EVERY request, BEFORE `_strip_image_parts`/`_apply_image_retention`
+    (v3.1.9.8 round-2 review, item 3 — see their call site's own comment for
+    why: `_apply_image_retention` decides which image TURNS survive by
+    recency alone, with no idea some of what it is counting is already dead
+    weight vLLM would reject; demoting the broken ones FIRST means retention
+    counts only genuinely usable images, so it can never keep a broken newer
+    image over a good older one at a small `MAX_RETAINED_IMAGES`) and before
+    this request's first /tokenize call or its vLLM POST — the two things a
+    bad URL otherwise poisons: /tokenize would tokenize (and the guard would
+    budget for) an image vLLM was always going to refuse, and the vLLM call
+    itself would 400 and return nothing at all (the 09-26 incident this
+    fixes).
+
+    `multimodal`: which placeholder note applies when a whole message
+    collapses to plain text (see below) — `_IMAGE_LOAD_FAILED_NOTE` on a
+    vision backend (the model CAN see images; this one part just failed to
+    load), `_IMAGE_PLACEHOLDER`'s original text-only wording otherwise
+    (matches `_strip_image_parts`, which this deployment's text-only branch
+    runs right after this function regardless and would overwrite the note
+    on anyway for any message that still carries an image part -- this only
+    matters for a message this function already reduced to pure text).
+
+    v3.1.9.8 round-2 (hostile review, item 1, HIGH): a message with ONE bad
+    image beside ONE GOOD one used to collapse to a plain-text string
+    unconditionally the moment `bad` was nonzero -- silently discarding the
+    valid image too. Her multi-photo turns are exactly this shape. Fixed:
+    the message's `content` stays a LIST (the valid image, and any other
+    surviving non-text part, kept exactly as sent) with the note appended as
+    an extra text part, UNLESS nothing but text parts remain, in which case
+    (as before) collapsing to a plain string is correct -- there is no other
+    part left for a list to preserve.
+
+    Returns (messages, images_demoted); the input list is never mutated. A
+    summary INFO line at the end logs `images_demoted` alongside
+    `images_kept_valid` (images kept in a message that ALSO had at least one
+    invalid image demoted — the shape item 1 is about) so the two counts are
+    always reported together, not just the demoted half.
+    """
+    out: list[dict] = []
+    demoted = 0
+    kept_valid = 0
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            out.append(m)
+            continue
+        bad = 0
+        kept_parts: list[Any] = []
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "image_url":
+                iu = c.get("image_url")
+                url = iu.get("url") if isinstance(iu, dict) else iu
+                if not _valid_image_url(url):
+                    bad += 1
+                    # Never the URL itself (it can carry her data, e.g. a
+                    # base64 image or a signed link) — a closed shape class
+                    # only (item 4: not even the raw scheme, itself
+                    # client-controlled data), plus length.
+                    shape = _image_url_shape_class(url)
+                    length = len(url) if isinstance(url, str) else 0
+                    logger.warning(
+                        f"invalid image_url shape={shape} len={length} — "
+                        f"vLLM would reject this (HTTP 400); demoting to a "
+                        f"placeholder instead of forwarding it"
+                    )
+                    continue
+            kept_parts.append(c)
+        if bad:
+            has_surviving_media = any(
+                isinstance(c, dict) and c.get("type") != "text" for c in kept_parts
+            )
+            note_template = _IMAGE_LOAD_FAILED_NOTE if multimodal else _IMAGE_PLACEHOLDER
+            note = note_template.format(
+                n="an image" if bad == 1 else f"{bad} images",
+                subj="it" if bad == 1 else "they",
+                pron="it" if bad == 1 else "them",
+            )
+            if has_surviving_media:
+                # A valid image (or some other non-text part) survives —
+                # keep the list shape so it still reaches vLLM, and land the
+                # note as its own text part rather than erasing it.
+                out.append({**m, "content": [*kept_parts, {"type": "text", "text": note}]})
+                kept_valid += sum(
+                    1 for c in kept_parts
+                    if isinstance(c, dict) and c.get("type") == "image_url"
+                )
+            else:
+                # Nothing but text remains — collapsing to a plain string
+                # is not a loss, there is no other part left to preserve.
+                txt = _message_text({**m, "content": kept_parts}).strip()
+                out.append({**m, "content": f"{txt}\n\n{note}" if txt else note})
+            demoted += bad
+        else:
+            out.append(m)
+    if demoted:
+        logger.info(
+            f"image url demotion: {demoted} invalid image(s) demoted, "
+            f"{kept_valid} valid image(s) in the same message(s) kept"
+        )
     return out, demoted
 
 
@@ -11791,7 +12148,28 @@ async def _chat_completions_impl(
     # embedding under the old id. conv_id and the RAG query now derive from what
     # the CLIENT sent; the strip only shapes what we forward.
     _t_images_start = time.monotonic()
-    if not backend_is_multimodal():
+    _backend_multimodal_now = backend_is_multimodal()
+    # v3.1.9.8 round-2 (hostile review, item 3): reject URLs vLLM will 400 on
+    # FIRST, before either branch below decides which image TURNS survive.
+    # `_apply_image_retention` picks its `MAX_RETAINED_IMAGES` most-recent
+    # image turns by recency alone — it has no way to know some of what it
+    # is counting is already dead weight. Demoting the broken ones first
+    # means retention counts only genuinely usable images, so a small
+    # `MAX_RETAINED_IMAGES` (1 in production) can never keep a broken NEWER
+    # image over a good OLDER one it would otherwise have evicted.
+    # (the demoted/kept-valid counts are logged inside the function itself,
+    # in one summary line — see its own docstring.)
+    # Only on a vision backend: on a text-only one `_strip_image_parts` below
+    # replaces EVERY image with one note per message, so demoting first would
+    # add a second, separate note for the same message (verification review).
+    _n_invalid_urls = 0
+    if _backend_multimodal_now:
+        messages, _n_invalid_urls = _demote_invalid_image_urls(
+            messages, multimodal=True
+        )
+    if _n_invalid_urls:
+        body["messages"] = messages
+    if not _backend_multimodal_now:
         messages, _n_stripped = _strip_image_parts(messages)
         if _n_stripped:
             body["messages"] = messages
@@ -11910,10 +12288,7 @@ async def _chat_completions_impl(
         # always fits.
         req_max_tokens = MAX_MODEL_LEN // 2
         body["max_tokens"] = req_max_tokens
-    effective_limit = min(
-        MAX_MODEL_LEN,
-        max(256, MAX_MODEL_LEN - max(GENERATION_RESERVE, req_max_tokens)),
-    )
+    effective_limit = _effective_limit(req_max_tokens)
 
     # v3.1.9.1: also moved ahead of V1 compaction, for the same reason —
     # `has_history` only reads `messages` (unchanged, still the client's

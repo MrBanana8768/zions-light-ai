@@ -188,6 +188,83 @@ chain on `/forget`'s durability, are covered below.
   marker write, `backfill.mark_wiped`, and the facts-file write are each
   handled separately now; none of them can raise before the deletions
   they sit beside. Tested under `ENOSPC` on every write in the path.
+- **An invalid `image_url` scheme no longer 400s the whole reply.**
+  Prod 09-26 07:33Z: vLLM rejected 4 consecutive requests
+  (`REQUEST REJECTED by vLLM (HTTP 400) … The URL must be either a HTTP,
+  data or file URL`) because a retained image carried a URL scheme vLLM
+  0.19 does not accept, and the compactor forwarded it unexamined —
+  she got 4 empty replies in a row. Every `image_url` part is now
+  validated (`http://`/`https://` case-insensitively; a well-formed
+  `data:<mime>;base64,…` URL, mime optional, matched case-insensitively,
+  no trailing bytes after the payload; `file:` is refused too — this
+  deployment never sets vLLM's `--allowed-local-media-path`, so vLLM 0.19
+  would 400 on `file:` exactly like any other disallowed scheme) before
+  this request's first `/tokenize` call or its vLLM POST, and runs BEFORE
+  image retention so a small `MAX_RETAINED_IMAGES` never evicts a good
+  OLDER image in favour of a broken NEWER one. An invalid part is demoted
+  to a placeholder; **a valid image (or any other surviving non-text
+  part) sharing the same message is kept, as a list, not silently
+  dropped** — the message only collapses to a plain string when nothing
+  but text remains. The note says the image "could not be loaded" on a
+  vision backend (accurate — the model CAN see images) and keeps the
+  original "text-only" wording on a text-only one. A WARNING logs a
+  closed shape class (`uuid36`/`owui-files-path`/`http`/`data-malformed`/
+  `other`) and the URL's length only — never the raw scheme fragment or
+  the URL itself, both of which are themselves client-controlled data. A
+  summary INFO line reports how many images were demoted alongside how
+  many valid ones survived.
+- **Two whole-history `count_tokens` passes moved off the event loop.**
+  `compact_if_needed`'s `current = count_tokens(messages)` and
+  `new_count = count_tokens(new_messages)`, and `_summarize_body`'s
+  `_local = count_tokens(to_summarize)`, ran a ~5s CPU-bound tokenizer
+  pass directly on the event loop on her ~4,400-turn history — stalling
+  every OTHER request the process was serving (health checks included)
+  for the duration. All three now go through `run_in_threadpool`, like
+  every other whole-list counter call in this file already does.
+- **`_min_possible_batches` now stops as soon as the batch floor is
+  certain to exceed the cap**, instead of walking every remaining turn
+  to compute the exact minimum. On her ~4,400-turn backlog this was
+  ~4,400 per-message local-tokenizer calls to prove something the first
+  dozen turns already proved. The function takes the cap as a parameter
+  and returns the moment the running count passes it; the result is
+  still a CERTAIN lower bound (more turns can only add batches, never
+  remove one), so nothing that depended on "is the floor over the cap"
+  changes — only the walk needed to answer it.
+- **The reuse-fit decision's fresh-span `/tokenize` call is now gated
+  the same way.** `compact_if_needed` used to call
+  `count_tokens_exact(_fresh_span_preview)` unconditionally whenever any
+  turn was `_changed` — on a conversation whose stored spans have
+  drifted, that POSTs a full-size payload that can itself hit the 10s
+  read timeout. `_fresh_reserve` saturates the moment the batch count
+  reaches `MAX_SUMMARY_CALLS_PER_REQUEST`, so once a certain local-only
+  floor (`_min_possible_batches`, the same function as above) already
+  reaches the cap, no `/tokenize` answer can change the outcome; the
+  exact call and the real `_chunk_to_budget` count are skipped and the
+  floor is used directly.
+- **The summary-block-budget WARNING no longer misnames its own
+  budget.** `format_summary_block`'s "dropped N tier item(s)" line
+  always named `COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS` in parentheses, even
+  when the actual budget it used was the CALLER's computed share (the
+  normal production case — both real call sites always pass one) —
+  telling an operator to raise a setting that would not move the number
+  at all. Now says "the caller's block budget" whenever a caller-supplied
+  budget is in effect, and still names the env var when there truly is
+  no caller-supplied figure.
+
+### Reuse path checked on an idealized shape
+- `test_reuse_her_shape.py`: an IDEALIZED synthetic conversation (1 L3
+  theme + 2 L2 chapters + 4 L1 scenes rendering at ~10.7k tokens, ~4,400
+  turns, ~15 turns left uncovered — hand-built to resemble the numbers in
+  her real shape, not extracted from her real data or request path) takes
+  the stand-in reuse path — not the "compaction skipped" decline — under
+  BOTH the RunPod template's active settings
+  (`COMPACTOR_GENERATION_RESERVE=12000`, `COMPACTOR_MAX_RETAINED_
+  IMAGES=1` — the template's real, checked value; not 2) and the owner's
+  live pod settings (`COMPACTOR_GENERATION_RESERVE=8000`,
+  `COMPACTOR_MAX_RETAINED_IMAGES=1`), with no full-history `/tokenize`
+  call made either way. Not a claim that this reproduces production or
+  guards the fixes above — it passes unchanged on pre-fix HEAD too; kept
+  as a separate, additive check.
 
 ### Operator notes
 - **New env vars**, documented in `runpod.env.template`, `OPERATIONS.md`

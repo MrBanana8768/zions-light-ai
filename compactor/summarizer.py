@@ -531,6 +531,20 @@ def format_summary_block(
         if max_tokens is not None
         else SUMMARY_BLOCK_MAX_TOKENS
     )
+    # v3.1.9.8: which knob actually produced `budget`, for the WARNING a few
+    # lines down. When the caller passes `max_tokens` (the comment above —
+    # "the caller passes its real share so the trimming happens HERE" — is
+    # the normal, production case, e.g. compact_if_needed's own share of
+    # inject_budget), `budget` is that caller-computed figure, not
+    # SUMMARY_BLOCK_MAX_TOKENS/COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS — naming
+    # the env var there told an operator to go raise a setting that would
+    # not move this number at all (the caller's own share, computed
+    # upstream of this function, is what would have to change).
+    _budget_source = (
+        "COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS"
+        if max_tokens is None
+        else "the caller's block budget"
+    )
     used = _estimate_block_tokens(_BLOCK_HEADER)
 
     l3_line: tuple[str, str] | None = None
@@ -569,7 +583,7 @@ def format_summary_block(
         logger.warning(
             f"summary block: dropped {dropped_l3 + dropped_l1 + dropped_l2} "
             f"tier item(s) to fit the {budget}-token block budget "
-            f"(COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS) — kept "
+            f"({_budget_source}) — kept "
             f"{'L3, ' if l3_line else ('no L3, ' if has_l3 else '')}"
             f"{len(l2) - dropped_l2}/{len(l2)} chapter(s), "
             f"{len(l1) - dropped_l1}/{len(l1)} scene(s)"
