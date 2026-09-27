@@ -1,0 +1,163 @@
+# v3.1.9.8 — THIN layer on top of local/zla:v3197-rc, itself a thin layer on
+# the exact production base image.
+#
+# BASE CHAIN (verified 2026-09-27):
+#   angreg/zions-light-ai@sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65
+#     (the pinned base Dockerfile.v3197 builds FROM — prod's v3.1.9.4/.5/.6
+#      digest; NOT what prod currently runs — see next line)
+#   --[Dockerfile.v3197]--> local/zla:v3197-rc
+#     verified image ID (docker inspect --format='{{.Id}}' local/zla:v3197-rc):
+#       sha256:052fdaefa23588187071b1cae7a33262de3e27fa6567b1eeed5e0d1774ee7a7c
+#     (same ID as the earlier `zla-v3197-trial` build — `docker images`
+#     confirms both tags resolve to 052fdaefa235; this is a genuine .7 build,
+#     not a stand-in). CONFIRM THIS ID BEFORE BUILDING THIS FILE. If it
+#     differs, rebuild v3197-rc first (recipe just below) and re-verify —
+#     do not build .8 on top of an unknown v3197-rc.
+#   --[THIS FILE, Dockerfile.v3198]--> local/zla:v3198-rc
+#
+# Prod itself runs a DIFFERENT image, angreg/zions-light-ai:v3.1.9-cu12
+# (sha256:f3fafa3e1949…), with OpenWebUI hot-patched to 0.11.4 IN PLACE
+# (overlay only, not baked, and reverted by a pod restart) — see memory.md's
+# "PRODUCTION RUNS v3.1.9" / "PROD'S OPENWEBUI IS 0.11.4" entries. This RC's
+# rollback test (task 4) boots the SAME /data on that prod image directly, so
+# rollback is exercised against what actually runs today, not the c1295894
+# lineage this Dockerfile happens to build on.
+#
+# TO REPRODUCE local/zla:v3197-rc FROM Dockerfile.v3197 (if the ID above does
+# not match `docker images`):
+#   git checkout <the v3.1.9.7 release commit, or this branch's Dockerfile.v3197>
+#   docker build -f Dockerfile.v3197 -t local/zla:v3197-rc .
+# Dockerfile.v3197's own header documents what it changes relative to the
+# c1295894 base (OpenWebUI 0.11.0 -> 0.11.4, the scroll-jump CSS fix, and
+# webuidb.py/backup.py/supervisord.conf/entrypoint.sh) — read it before
+# rebuilding; nothing about that recipe changes here.
+FROM local/zla:v3197-rc
+
+# -----------------------------------------------------------------------
+# Compactor sources — EVERY non-test compactor/*.py module, matching the
+# full from-scratch Dockerfile's own `COPY compactor/` list byte-for-byte
+# (lines ~292-318 there, confirmed identical in shape to this list on
+# 2026-09-27: `ls compactor/*.py | grep -v test_` == the 27 files below).
+# v3197-rc's own /opt/compactor tree predates request tracing and the word
+# ban file-deploy/warm-up runtime entirely (it was built on the c1295894
+# base, patched only for webuidb.py/backup.py), so ALL 27 are new bytes
+# here, not just the two new-in-.8 modules (reqctx.py, wordban_runtime.py)
+# called out below.
+# -----------------------------------------------------------------------
+COPY compactor/main.py /opt/compactor/main.py
+COPY compactor/envcfg.py /opt/compactor/envcfg.py
+COPY compactor/memory.py /opt/compactor/memory.py
+COPY compactor/facts.py /opt/compactor/facts.py
+COPY compactor/allocator.py /opt/compactor/allocator.py
+COPY compactor/continuity.py /opt/compactor/continuity.py
+COPY compactor/backfill.py /opt/compactor/backfill.py
+COPY compactor/retrieval.py /opt/compactor/retrieval.py
+COPY compactor/summarizer.py /opt/compactor/summarizer.py
+COPY compactor/health.py /opt/compactor/health.py
+COPY compactor/selftest.py /opt/compactor/selftest.py
+COPY compactor/portability.py /opt/compactor/portability.py
+COPY compactor/dedup.py /opt/compactor/dedup.py
+COPY compactor/commands.py /opt/compactor/commands.py
+COPY compactor/persona.py /opt/compactor/persona.py
+COPY compactor/backup.py /opt/compactor/backup.py
+COPY compactor/degrade.py /opt/compactor/degrade.py
+COPY compactor/bgwork.py /opt/compactor/bgwork.py
+COPY compactor/textclean.py /opt/compactor/textclean.py
+COPY compactor/tokens.py /opt/compactor/tokens.py
+COPY compactor/tokenhealth.py /opt/compactor/tokenhealth.py
+COPY compactor/tailhealth.py /opt/compactor/tailhealth.py
+COPY compactor/webuidb.py /opt/compactor/webuidb.py
+COPY compactor/logsetup.py /opt/compactor/logsetup.py
+COPY compactor/alert.py /opt/compactor/alert.py
+# New in .8 (request tracing, committed b9b6839):
+COPY compactor/reqctx.py /opt/compactor/reqctx.py
+# New in .8 (word ban from a file, injected by the compactor, committed
+# 04c9f15 / 07d8987):
+COPY compactor/wordban_runtime.py /opt/compactor/wordban_runtime.py
+#
+# compactor/requirements.txt was diffed byte-identical to what v3197-rc
+# already has installed (2026-09-27) — .8's two new modules (reqctx.py,
+# wordban_runtime.py) only import stdlib plus httpx, already present in
+# /opt/compactor-venv from the base install. No `pip install` layer needed
+# here; if that ever stops being true, add one, pinned the same way
+# Dockerfile.v3197 pins its OpenWebUI bump.
+#
+# stt/server.py, tts/server.py, entrypoint.sh were ALSO diffed
+# byte-identical to what v3197-rc already ships (2026-09-27, `docker cp`
+# from a throwaway container of v3197-rc vs. the working tree) — .6/.7/.8
+# did not touch any of them, so none are re-COPYd here. Only
+# supervisord.conf changed (the new [program:zl-ops] stanza, below).
+
+# -----------------------------------------------------------------------
+# ops/ and scripts/ — bakes the operator tooling and every repair script
+# onto the pod at /opt/zl-repo, so no `git clone` is needed for `zl`,
+# `ops/bootstrap.sh`, or any scripts/*.py runbook step (fixes N3 from the
+# word-ban-deploy review: word-ban-deploy.py was not in the image before).
+# COPY preserves the source file's mode bit-for-bit (confirmed against
+# `git ls-files -s`: ops/zl is 100755, ops/bootstrap.sh is 100644 in git —
+# COPY carries BOTH through unchanged; task 4's boot test stats both paths
+# in the built image to confirm this rather than assuming it).
+# .dockerignore already excludes __pycache__/ and *.pyc repo-wide, so
+# these two directory COPYs cannot drag in stale bytecode.
+# -----------------------------------------------------------------------
+COPY ops/ /opt/zl-repo/ops/
+COPY scripts/ /opt/zl-repo/scripts/
+
+# -----------------------------------------------------------------------
+# supervisord.conf — carries the new [program:zl-ops] stanza (task 2) on
+# top of everything v3197-rc's own copy already has (request tracing and
+# word-ban runtime need no supervisord changes; only this one addition
+# does). Diffed against v3197-rc's installed copy before this edit
+# (2026-09-27): identical except for the new stanza.
+# -----------------------------------------------------------------------
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+# -----------------------------------------------------------------------
+# Import guard (mistakes log, 2026-09-24: ".8 was committed with two
+# undefined names and no tests... the missing-symbol class recurred").
+# Explicitly imports EVERY compactor module by the same bare name
+# supervisord's `directory=/opt/compactor` + uvicorn give it at runtime —
+# not just main's transitive closure — so a module that main.py never
+# imports (a future orphaned file, or a typo'd COPY destination above)
+# cannot hide behind "main imported fine". Fails the BUILD, not
+# production, offline and network-free by construction so it cannot
+# flake — same pattern as the full Dockerfile's own build guard (~line
+# 341), extended here to the complete 27-module list rather than the 7
+# direct entrypoints that guard covers.
+# -----------------------------------------------------------------------
+RUN cd /opt/compactor && \
+    MODEL_REPO=buildguard VLLM_URL=http://127.0.0.1:1 \
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    COMPACTOR_STORAGE_ROOT=/tmp/buildguard LOG_DIR=/tmp/buildguard \
+    /opt/compactor-venv/bin/python -c \
+      "import main, envcfg, memory, facts, allocator, continuity, \
+backfill, retrieval, summarizer, health, selftest, portability, dedup, \
+commands, persona, backup, degrade, bgwork, textclean, tokens, \
+tokenhealth, tailhealth, webuidb, logsetup, alert, reqctx, \
+wordban_runtime; \
+       print('v3198 import guard: all 27 compactor modules import from the image')" \
+    && rm -rf /tmp/buildguard /opt/compactor/__pycache__
+
+# -----------------------------------------------------------------------
+# File-identity check: NOT done here at build time. Chose to do it in
+# scripts/rc-boot-test-v3198.sh (task 4) instead, and explain why:
+#
+# A build-time RUN step can only compare bytes that came from THIS SAME
+# build context against other bytes copied from THAT SAME build context —
+# by construction, within one `docker build` invocation, a COPY'd file and
+# the working-tree file it came from are the same read, so a manifest
+# generated and checked inside this one build proves Docker's COPY did not
+# corrupt bytes (already guaranteed) and nothing more. It cannot catch the
+# failure mode that actually matters here: an image built from an OLDER
+# tree being reused/retagged later while the working tree moved on (a
+# stale local/zla:v3198-rc silently answering for a newer commit), or a
+# COPY line whose destination path was hand-edited to something that
+# LOOKS right but no longer matches what ships. Both of those are only
+# detectable by comparing the file INSIDE A RUNNING CONTAINER against the
+# CURRENT git tree, at TEST time, after the image already exists — which
+# is exactly the sha256 check scripts/rc-boot-test-v3198.sh performs
+# against /opt/compactor and the ops/scripts baked paths on the booted
+# container. The import guard above already gives the build-time
+# fast-fail this stage could add (a missing/renamed module breaks the
+# build); the tree-identity property additionally needs is a test-time,
+# not build-time, property.

@@ -44,18 +44,23 @@ replacing this storage model entirely (see `V4_MATRIX_CLIENT.md`).
 
 ## 0. Get the script
 
-Copy this repo onto the pod, matching every other operator script here —
-there is no ssh/scp/rsync in the image, but git is:
+On v3.1.9.8+ the repo is baked at `/opt/zl-repo` — no clone needed; for a
+different ref use `zl update --ref X`. On older images (v3.1.9), clone to a
+different path, e.g. `/tmp/zl-797`, since `/opt/zl-repo` doesn't exist yet
+on those images — there is no ssh/scp/rsync in the image, but git is:
 
 ```bash
 git clone --depth 1 --branch <tag-or-branch> \
-    https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+    https://github.com/MrBanana8768/zions-light-ai.git /tmp/zl-797
 ```
 
-Every command below runs from that clone, not from a lone copied file — the
-script needs nothing from the compactor package (only the Python standard
-library), so `/app/venv/bin/python` (OpenWebUI's own venv, used below since
-this touches `webui.db`) and `/opt/compactor-venv/bin/python` both work.
+Every command below runs from that clone (or the baked `/opt/zl-repo` on
+.8+), not from a lone copied file — the script needs nothing from the
+compactor package (only the Python standard library), so
+`/app/venv/bin/python` (OpenWebUI's own venv, used below since this touches
+`webui.db`) and `/opt/compactor-venv/bin/python` both work. Substitute your
+clone path for `/opt/zl-repo` in the commands below if you are on an older
+image.
 
 ## If this pod places `webui.db` on local disk (`WEBUI_DB_LOCAL=true`)
 

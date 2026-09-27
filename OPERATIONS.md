@@ -1538,15 +1538,21 @@ earlier the installed `compactor/backfill.py` ALSO lacks
 correctly-resolved but too-old package cannot answer this script's
 questions — the script detects that and refuses with an actionable
 message rather than crashing, but the only way to actually RUN it on such
-a pod is a clone, which supplies the whole self-consistent release:
+a pod is a clone, which supplies the whole self-consistent release. On
+v3.1.9.8+ the repo is baked at `/opt/zl-repo` — no clone needed; for a
+different ref use `zl update --ref X`. On older images (v3.1.9), clone to a
+different path, e.g. `/tmp/zl-797` (`/opt/zl-repo` doesn't exist yet on
+those images):
 ```bash
 git clone --depth 1 --branch <tag-or-branch> \
-    https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+    https://github.com/MrBanana8768/zions-light-ai.git /tmp/zl-797
 ```
-(`git` ships in the image.) `/opt` is container-local: nothing lands on
-the network volume, and the clone disappears on the next restart — clone
+(`git` ships in the image.) `/opt`/`/tmp` are container-local: nothing lands
+on the network volume, and a clone disappears on the next restart — clone
 again next time you need it. `--compactor-pkg PATH` overrides package
-auto-detection entirely, if you have a package somewhere else.
+auto-detection entirely, if you have a package somewhere else. The commands
+below use `/opt/zl-repo` (already there on .8+); substitute your clone path
+on older images.
 
 **Dry run first: reports only, writes nothing.**
 ```bash
@@ -1646,15 +1652,21 @@ good.
 `backfill-records.py` above, `HERE.parent / "compactor"` has to resolve
 to a REAL package — copying just the one file to `/data/scripts/` makes
 that resolve to `/data/compactor`, which does not exist, and there is no
-`ssh`/`scp`/`rsync` in the image to copy the rest of a release in anyway:
+`ssh`/`scp`/`rsync` in the image to copy the rest of a release in anyway.
+On v3.1.9.8+ the repo is baked at `/opt/zl-repo` — no clone needed; for a
+different ref use `zl update --ref X`. On older images (v3.1.9), clone to a
+different path, e.g. `/tmp/zl-797` (`/opt/zl-repo` doesn't exist yet on
+those images):
 ```bash
 git clone --depth 1 --branch <tag-or-branch> \
-    https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+    https://github.com/MrBanana8768/zions-light-ai.git /tmp/zl-797
 ```
-(`git` ships in the image.) `/opt` is container-local: nothing lands on
-the network volume, and the clone disappears on the next restart — clone
+(`git` ships in the image.) `/opt`/`/tmp` are container-local: nothing lands
+on the network volume, and a clone disappears on the next restart — clone
 again next time you need it. `--compactor-pkg PATH` overrides package
-auto-detection entirely, if you have a package somewhere else.
+auto-detection entirely, if you have a package somewhere else. The commands
+below use `/opt/zl-repo` (already there on .8+); substitute your clone path
+on older images.
 
 **Get a webui.db export.** Never point this at the live database — it
 refuses outright if a `-journal` or `-wal` file sits beside the path you
@@ -1958,17 +1970,20 @@ happened to use the upload method instead of the clone):
 ```bash
 ls -la /opt/zl-repo/scripts/setup-sshd.py /data/scripts/setup-sshd.py
 ```
-There is no `ssh`/`scp`/`rsync` in the image. If the script is not
-already at either path, get it there by either:
+There is no `ssh`/`scp`/`rsync` in the image. On v3.1.9.8+ the repo is
+already baked at `/opt/zl-repo` — the `ls -la` above will find it there, no
+clone needed; for a different ref use `zl update --ref X`. If the script is
+not already at either path (older images, pre-.8), get it there by either:
 - cloning the repo, same as `backfill-records.py`/`import-history.py`
   below (this script does not import the `compactor` package, so it does
   not strictly need the rest of the clone, but this keeps one consistent
-  method for all three):
+  method for all three) — to a different path, since `/opt/zl-repo` doesn't
+  exist yet on those images, e.g. `/tmp/zl-797`:
   ```bash
   git clone --depth 1 --branch <tag-or-branch> \
-      https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+      https://github.com/MrBanana8768/zions-light-ai.git /tmp/zl-797
   ```
-  — the script then lives at `/opt/zl-repo/scripts/setup-sshd.py`, and
+  — the script then lives at `/tmp/zl-797/scripts/setup-sshd.py`, and
   every command below must use THAT path, not `/data/scripts/...`; or
 - uploading just this one file through the RunPod Web Terminal, or with
   `runpodctl send`/`receive` (RunPod injects `runpodctl` into the pod at
@@ -1978,9 +1993,10 @@ already at either path, get it there by either:
   each one — see above) — every command below must use THAT path in this
   case.
 
-The commands below use the clone path (`/opt/zl-repo/...`) — substitute
-`/data/scripts/setup-sshd.py` throughout if you used the upload method
-instead.
+The commands below use the clone path (`/opt/zl-repo/...`, already baked on
+.8+) — substitute `/data/scripts/setup-sshd.py` throughout if you used the
+upload method instead, or your clone path (e.g. `/tmp/zl-797/...`) on an
+older image.
 
 **Dry run first.** Runs a real `apt-get update` (package lists only,
 nothing installed — Dockerfile prunes them, so this is required every
@@ -2199,11 +2215,14 @@ service reads and writes on every request — the same hazard
 this script refuses the same way. Dry run makes no writes and finishes in
 well under a minute; `--apply` on a store her size is a few seconds of
 I/O plus one CPU embedding pass per changed episodic document — call it
-under two minutes end to end:
+under two minutes end to end. On v3.1.9.8+ the repo is baked at
+`/opt/zl-repo` — no clone needed; for a different ref use
+`zl update --ref X`. On older images (v3.1.9), clone to a different path,
+e.g. `/tmp/zl-797`, and substitute it for `/opt/zl-repo` below:
 
 ```bash
 git clone --depth 1 --branch <tag-or-branch> \
-    https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+    https://github.com/MrBanana8768/zions-light-ai.git /tmp/zl-797  # pre-.8 only
 supervisorctl stop openwebui compactor
 /opt/compactor-venv/bin/python /opt/zl-repo/scripts/clean-decoration.py \
     --webui-db /data/openwebui/webui.db --store /data/openwebui/compactor \
@@ -2389,10 +2408,13 @@ supervisorctl stop openwebui webuidb-sync
 WEBUI_DB_LOCAL=true /opt/compactor-venv/bin/python /opt/compactor/webuidb.py --sync-once --force
 ```
 
-**Procedure (on the pod):**
+**Procedure (on the pod):** On v3.1.9.8+ the repo is baked at
+`/opt/zl-repo` — no clone needed; for a different ref use
+`zl update --ref X`. On older images (v3.1.9), clone to a different path,
+e.g. `/tmp/zl-797`, and substitute it for `/opt/zl-repo` below.
 ```bash
 git clone --depth 1 --branch <tag-or-branch> \
-    https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+    https://github.com/MrBanana8768/zions-light-ai.git /tmp/zl-797  # pre-.8 only
 # 1. Ask her to close every browser tab on this chat.
 supervisorctl stop openwebui backup
 /app/venv/bin/python /opt/zl-repo/scripts/fix-stale-unfinished.py \

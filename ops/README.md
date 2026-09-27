@@ -27,13 +27,22 @@ happened.
 clones over the network; a local, unpushed branch is invisible to it.
 
 1. Open the pod's RunPod **Web Terminal** and run:
-   ```bash
-   git clone --depth 1 --branch <REF> https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
-   bash /opt/zl-repo/ops/bootstrap.sh --ref <REF> --with-sshd
-   ```
-   This installs `/usr/local/bin/zl`, saves the ref under `/data/zl-ops`
-   (so it survives a restart), adds the `zl status --brief` login hook, and
-   (via `--with-sshd`) installs and hardens `openssh-server`
+   - **On v3.1.9.8+:** the repo is already baked at `/opt/zl-repo` -- no
+     clone needed:
+     ```bash
+     bash /opt/zl-repo/ops/bootstrap.sh --from-dir /opt/zl-repo --with-sshd
+     ```
+     For a different ref, use `zl update --ref <REF>` (once `zl` is
+     installed) instead of re-cloning.
+   - **On older images (v3.1.9):** `/opt/zl-repo` doesn't exist yet, so
+     clone it first:
+     ```bash
+     git clone --depth 1 --branch <REF> https://github.com/MrBanana8768/zions-light-ai.git /opt/zl-repo
+     bash /opt/zl-repo/ops/bootstrap.sh --ref <REF> --with-sshd
+     ```
+   Either way, this installs `/usr/local/bin/zl`, saves the ref under
+   `/data/zl-ops` (so it survives a restart), adds the `zl status --brief`
+   login hook, and (via `--with-sshd`) installs and hardens `openssh-server`
    (`scripts/setup-sshd.py`) so you can leave the Web Terminal.
 2. On your laptop:
    ```bash

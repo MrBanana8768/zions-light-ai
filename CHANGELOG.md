@@ -292,6 +292,36 @@ chain on `/forget`'s durability, are covered below.
 - **The continuity band stays OFF** until the allocator is wired to
   exclude the digested gap from the verbatim window it also forwards.
   Do not enable `COMPACTOR_CONTINUITY_BAND` before that wiring lands.
+- **The deploy image bakes the repo at `/opt/zl-repo`.** `Dockerfile.v3198`
+  is a thin layer on `local/zla:v3197-rc` (itself Dockerfile.v3197 on the
+  prod-lineage base image) that `COPY ops/ /opt/zl-repo/ops/` and
+  `COPY scripts/ /opt/zl-repo/scripts/` alongside the compactor module
+  updates, so `zl`, `ops/bootstrap.sh` and every `scripts/*.py` runbook
+  step are on the pod from first boot — **no `git clone` step is needed
+  on v3.1.9.8+.** Runbook one-liners that said `git clone … /opt/zl-repo`
+  (RUNBOOK_CHAT_TREE.md, OPERATIONS.md, ops/README.md) now say so; use
+  `zl update --ref X` for a different ref, or clone to a different path
+  (e.g. `/tmp/zl-797`) on an older, pre-.8 image where `/opt/zl-repo`
+  doesn't exist yet.
+- **New `[program:zl-ops]`** in `supervisord.conf` runs
+  `ops/bootstrap.sh --from-dir /opt/zl-repo --boot` once at container
+  start, `priority=5`. It always exits 0 (its own `EXIT` trap) —
+  `supervisorctl status` will never show it FATAL/BACKOFF — and the truth
+  about what it actually did is the last line of `$LOG_DIR/zl-ops.log`,
+  not the supervisor exit code. It never gates and is never gated by
+  vLLM/compactor/openwebui. **`ops/bootstrap.sh --boot` does not exist in
+  this tree yet** — the ops peer delivers it in a follow-up commit; until
+  then this program prints bootstrap.sh's usage/argument-error output
+  (still exit 0) and goes straight to EXITED, which is expected, not a
+  boot failure.
+- **One-time SSH setup on a freshly baked pod**, now that `ops/` ships in
+  the image:
+  ```bash
+  bash /opt/zl-repo/ops/bootstrap.sh --from-dir /opt/zl-repo --with-sshd
+  ```
+  installs `/usr/local/bin/zl`, saves the ref under `/data/zl-ops` so it
+  survives a restart, and installs/hardens `openssh-server` — see
+  `ops/README.md`.
 
 ### Known LOW follow-ups
 From `f62d08e`'s own commit message (band-on only unless noted):
