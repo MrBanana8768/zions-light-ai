@@ -130,6 +130,7 @@ from the Web Terminal.
 | `zl sshd [--apply]` | OPERATIONS.md "Getting a real shell into a pod" (`scripts/setup-sshd.py`) | no |
 | `zl tools [--apply]` | manually `apt-get install`ing tmux/htop/sqlite3/iproute2/less | no |
 | `zl fix <name> [--apply]` | the individual repair-script procedures in OPERATIONS.md/RUNBOOK_*.md -- `zl fix` lists every entry with its source citation | depends on the entry |
+| `zl hotfix <name> [--apply\|--revert]` | a pod-only, no-image-change patch to a baked `/opt` file -- see "Hotfixes" below | no |
 | `zl shadow up\|status\|logs\|down` | COMMANDS.md "Shadow deploy" | `up`/`down` write |
 | `zl wordban-check` | scripts/wordban/README.md "Steps for the owner", step 3 | yes |
 | `zl models [...]` | `/opt/clean-models.sh` directly (its own dry-run default) | depends on its flags |
@@ -182,6 +183,97 @@ from the Web Terminal.
   --force` (its own `--force` only skips the mtime check -- the same
   liveness/integrity guards apply either way, so this is safe to run with
   services up, per `webuidb.py`'s own module docstring).
+
+## Hotfixes
+
+`zl hotfix <name> [--apply [--yes]] [--revert [--apply [--yes]]]` patches a
+file already BAKED onto the container overlay under `/opt` (reset on every
+restart), for something urgent enough not to wait on a new image build.
+Unlike `zl fix`, which only ever runs an existing repair script unmodified,
+`zl hotfix` edits a file's own source -- so it is deliberately narrower and
+more careful: one exact anchor line, matched verbatim (refuses outright,
+changing nothing, if it is missing or matches more than once), a saved
+`<path>.zl-orig` original (written atomically WITH an fsync, and re-read to
+verify it round-trips back to the intended patched content before it is
+trusted; never overwritten by a later `--apply`), an atomic write that
+preserves the original file's mode, a compile-and-import check with the
+SAME interpreter supervisord itself uses before anything is touched
+(catching a slow/hung check or a missing interpreter, not just a bad
+compile, and restoring the original on any of those), and a restart of
+ONLY the one supervisord program the patch affects -- never
+compactor/openwebui/vllm.
+
+- **`backup-fast`** -- `compactor/backup.py`'s own `create_backup`
+  (v3.1.9, `tarfile.open(partial, "w:gz")`) uses Python's default gzip
+  compresslevel (9). Measured on a real backup: level 9 takes ~49s, level
+  1 ~17s, and the archive itself grows 201->234MB. The pod reports 64-94s
+  per backup, so this is the single biggest lever available without an
+  image change. `zl hotfix backup-fast` (dry run by default; add
+  `--apply`) adds `compresslevel=1` to that one call and restarts `backup`
+  -- but ONLY if it was RUNNING/STARTING before (a stopped `backup` stays
+  stopped; the patch just takes effect the next time it starts on its
+  own), refusing (or waiting, bounded, well short of a minute) if a backup
+  cycle is actually running right now (detected via backup.py's own
+  naming: a fresh `zions-backup-<stamp>-XXXXXXXX/` staging directory, or a
+  `.tar.gz.partial` file, under the backup dir) or if another `zl hotfix`
+  apply/revert is already running (an exclusive lock, `ZL_HOME/locks/
+  change.lock`, falling back to a lock on the container overlay if
+  `ZL_HOME` itself stalls -- this round, only `zl hotfix` takes this lock;
+  it is NOT yet shared with `zl fix`/`zl journal repair`, so one of those
+  running at the exact same moment is not mutually excluded). The whole
+  stop -> start window (and the wait before it) runs inside the same
+  `ProtectedRegion` `zl fix`/`zl journal repair` use: a hangup is ignored,
+  a Ctrl-C/SIGTERM is deferred until the restart is verified, then
+  reflected in the exit code (128+signal) with an audit line, never
+  silently dropped mid-stop. `zl hotfix backup-fast --revert` undoes it
+  and restarts the same way -- but ONLY when the file on disk is
+  byte-for-byte what this hotfix itself would have produced; anything else
+  (an unpatched file -- a no-op, exit 0 -- or one that has drifted some
+  OTHER way) refuses with a unified diff rather than guessing which
+  "original" is right. A dry run (apply or revert) always shows the diff
+  it would make. `--revert` also removes a saved `bootstrap.sh
+  --with-hotfix backup-fast` flag (see below), so a later restart does not
+  silently re-apply what was just reverted.
+
+  Already-patched (a future image that ships this, or a repeat run) is
+  "already fast", exit 0 -- UNLESS the running `backup` daemon's own
+  process started before the file was last written (checked via
+  `/proc/<pid>/stat`): the FILE says level-1 but the daemon is still
+  running the old code, so this restarts it under the exact same rules
+  above rather than reporting a false no-op. `zl version` shows the
+  current state as `backup compression: level 1 (hotfix)` (this wrapper
+  patched it) / `level 1 (native)` (a `.8`+ image that ships the fix
+  baked in, never touched by this wrapper) / `default`, plus, when
+  relevant, `... / daemon started before patch -> restart pending`.
+  Also reports whether the daemon will likely take an immediate
+  boot-time backup once it restarts (backup.py's own daemon loop skips
+  that boot-time cycle only when the newest archive is under half the
+  configured interval old).
+
+  Two notes on staleness this wrapper cannot fix by itself: the
+  compactor's own in-process admin backup endpoint (`main.py`'s
+  `run_once`, triggered without going through supervisord at all) keeps
+  running the OLD (level-9) code until the compactor process itself
+  restarts, even after `backup-fast` has patched the file and restarted
+  the separate `backup` supervisord program -- they are different running
+  processes. And on shutdown, supervisord's own wait for a hung `/data`
+  (MooseFS) applies here exactly as everywhere else: "supervisord shutdown
+  waits for the runtime's SIGKILL if `/data` is hung" -- `zl hotfix`'s own
+  bounded waits do not change that.
+- **Repeatable after restarts, like `--with-sshd`.** `bootstrap.sh
+  --with-hotfix backup-fast` saves the flag the same way `--with-sshd`
+  does; the interactive bootstrap and the manual `bash
+  /data/zl-ops/bootstrap.sh` re-run both re-apply it. Under `--boot` on a
+  v3.1.9.8+ image, this is bounded (60s, deliberately longer than the
+  in-progress wait above so there is real room left for the compile/import
+  check and the stop/start round trip) and fail-soft exactly like
+  `--with-sshd` -- and, since `zl hotfix` itself already detects "already
+  applied" (file AND daemon both current) and returns immediately, a later
+  image that bakes the fix in makes this step a true no-op with nothing
+  further to do. A successful `--revert` removes this saved flag on its
+  own (a small, bounded, best-effort write -- never fails the revert
+  itself), so a later restart never silently re-applies a hotfix the
+  operator just reverted.
 
 ## The dashboard
 

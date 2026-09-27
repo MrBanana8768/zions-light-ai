@@ -1157,6 +1157,409 @@ def test_env_i_backup_now_and_fix_dry_run_see_pid1s_service_env():
                 "this empty shell)", extra=version.stdout + version.stderr)
 
 
+_HOTFIX_BACKUP_CONF = """\
+[unix_http_server]
+file=/var/run/supervisor.sock
+chmod=0700
+
+[supervisord]
+nodaemon=true
+logfile=/tmp/test-supervisord.log
+pidfile=/tmp/test-supervisord.pid
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix:///var/run/supervisor.sock
+
+[program:backup]
+command=/opt/compactor-venv/bin/python /opt/compactor/backup.py --daemon
+directory=/opt/compactor
+priority=40
+autostart=true
+autorestart=true
+startsecs=1
+environment=COMPACTOR_STORAGE_ROOT="/tmp/hf-store",COMPACTOR_BACKUP_DIR="/tmp/hf-backups",COMPACTOR_BACKUP_WEBUI_DB="/tmp/hf-webui.db",COMPACTOR_BACKUP_INTERVAL_HOURS="24"
+stdout_logfile=/tmp/backup.log
+stderr_logfile=/tmp/backup-error.log
+"""
+
+_HOTFIX_ANCHOR_GREP = 'with tarfile.open(partial, "w:gz") as tar:'
+
+_XFL_ONE_LINER = "import sys; d = open(sys.argv[1], 'rb').read(); print(d[8])"
+
+
+def _xfl_byte(archive_path: str) -> str:
+    return _docker_exec(f"python3 -c \"{_XFL_ONE_LINER}\" {archive_path}").stdout.strip()
+
+
+def _wait_for_backup_running(timeout_s: float = 10.0) -> dict[str, str]:
+    """`startsecs=1` in `_HOTFIX_BACKUP_CONF` means supervisord itself
+    reports STARTING for a beat before RUNNING -- polls instead of a
+    fixed sleep so this is never a timing flake on a slower image/host.
+    """
+    deadline = time.monotonic() + timeout_s
+    states: dict[str, str] = {}
+    while time.monotonic() < deadline:
+        states = _parse_supervisorctl_status(_docker_exec("supervisorctl status").stdout)
+        if states.get("backup") == "RUNNING":
+            return states
+        time.sleep(0.5)
+    return states
+
+
+def _run_backup_once() -> str:
+    """Runs the REAL (possibly patched) backup.py --once against the
+    synthetic store/webui.db, asserts it succeeded, and returns the path
+    of the archive it just wrote (newest under COMPACTOR_BACKUP_DIR).
+    """
+    r = _docker_exec(
+        "cd /opt/compactor && COMPACTOR_STORAGE_ROOT=/tmp/hf-store COMPACTOR_BACKUP_DIR=/tmp/hf-backups "
+        "COMPACTOR_BACKUP_WEBUI_DB=/tmp/hf-webui.db /opt/compactor-venv/bin/python backup.py --once"
+    )
+    assert_eq(r.returncode, 0, "the (possibly patched) backup.py --once succeeds against the synthetic store",
+              extra=r.stdout + r.stderr)
+    archive = _docker_exec("ls -t /tmp/hf-backups/*.tar.gz | head -1").stdout.strip()
+    assert_true(archive.endswith(".tar.gz"), "an archive was written", extra=archive)
+    return archive
+
+
+def test_hotfix_backup_fast_against_the_real_prod_backup_py():
+    """The one test that proves `zl hotfix backup-fast` (ops/zlops/
+    commands/hotfix.py) actually works against the REAL, unmodified
+    `/opt/compactor/backup.py` baked into the published image -- not a
+    fake/copy. Starts a real `supervisord` running the EXACT
+    `[program:backup]` command line from the image's own
+    supervisord.conf (`git show` on the image's own /etc/supervisor
+    config, reproduced verbatim above), against a synthetic
+    store/webui.db under /tmp (never /data -- this throwaway container
+    has no volume there).
+
+    Covers, in order:
+      1. dry run changes nothing; --apply restarts ONLY `backup` (proven
+         by a REAL pid change, not just exit code 0).
+      2. `zl version` reports "backup compression: level 1 (hotfix)".
+      3. the patched backup.py --once produces an archive that
+         --verify/--list/read_manifest all accept, AND whose gzip header
+         XFL byte is 4 (fastest) -- proof the compresslevel actually
+         reached zlib, not just proof the text changed.
+      4. a second --apply (nothing new to do) reports "already fast",
+         exits 0, and does NOT restart `backup` again (same pid).
+      5. --revert restores backup.py byte-for-byte identical to the
+         pre-hotfix original, restarts `backup` again, and a fresh
+         --once now produces XFL 2 (default level 9) again.
+
+    Adaptive re "run against a second image too" (review): this image's
+    backup.py might not have the expected, single anchor line at all (a
+    DIFFERENT release) -- checked up front. If so, the whole flow above
+    is skipped in favour of asserting the one thing that must ALWAYS be
+    true regardless of image: `zl hotfix backup-fast --apply --yes`
+    refuses cleanly (exit 1) and changes nothing.
+    """
+    _run(["docker", "rm", "-f", CONTAINER_NAME], timeout=30)
+    r = _run([
+        "docker", "run", "-d", "--rm", "--name", CONTAINER_NAME,
+        "-v", f"{REPO_ROOT}:/work:ro",
+        # Round-9: pid 1's own environ carries the EXACT COMPACTOR_BACKUP_DIR
+        # the `[program:backup]` supervisord config below also uses -- `zl`
+        # (via common.merged_environ(), overlaying pid 1's env on top of its
+        # own) must see the SAME backup dir the daemon writes into, or the
+        # "a backup is in progress" gate (hotfix.py's `_backup_in_progress`,
+        # via podenv.BACKUPS) would silently check the WRONG directory and
+        # never actually be exercised by this test at all.
+        "-e", "COMPACTOR_BACKUP_DIR=/tmp/hf-backups",
+        "--entrypoint", "bash", IMAGE_REF, "-c", "sleep 1800",
+    ], timeout=60)
+    assert_eq(r.returncode, 0, f"started a fresh container ({IMAGE_REF}) for the hotfix real-image test")
+    time.sleep(1)
+    boot = _docker_exec("bash /work/ops/bootstrap.sh --from-dir /work --no-login-hook")
+    assert_eq(boot.returncode, 0, "bootstrap installed zl in the fresh container")
+
+    setup = _docker_exec(
+        "mkdir -p /tmp/hf-store /tmp/hf-backups && "
+        "printf '{\"a\": 1}' > /tmp/hf-store/some_conv.facts.json && "
+        "python3 -c \"import sqlite3; c=sqlite3.connect('/tmp/hf-webui.db'); "
+        "c.execute('create table t (x int)'); c.execute('insert into t values (1)'); c.commit(); c.close()\""
+    )
+    assert_eq(setup.returncode, 0, "synthetic backup source data (store + webui.db) staged under /tmp",
+              extra=setup.stdout + setup.stderr)
+
+    before_hash = _docker_exec("sha256sum /opt/compactor/backup.py").stdout.split()[0]
+    anchor_count = int(_docker_exec(f"grep -c '{_HOTFIX_ANCHOR_GREP}' /opt/compactor/backup.py").stdout.strip() or "0")
+
+    if anchor_count != 1:
+        refuse = _docker_exec("zl hotfix backup-fast --apply --yes")
+        assert_eq(refuse.returncode, 1, f"{IMAGE_REF}: anchor matched {anchor_count} time(s) (not exactly 1) -- "
+                  "hotfix refuses cleanly", extra=refuse.stdout + refuse.stderr)
+        after_hash = _docker_exec("sha256sum /opt/compactor/backup.py").stdout.split()[0]
+        assert_eq(after_hash, before_hash, f"{IMAGE_REF}: backup.py is unchanged when the anchor doesn't match")
+        print(f"  ok   {IMAGE_REF}: anchor did not match a single line -- refused cleanly, "
+              f"nothing further exercised on this image")
+        return
+
+    write_conf = _docker_exec(f"cat > /etc/supervisor/conf.d/supervisord.conf <<'CONFEOF'\n{_HOTFIX_BACKUP_CONF}CONFEOF")
+    assert_eq(write_conf.returncode, 0, "wrote the REAL [program:backup] supervisord.conf (verbatim command line)")
+    start = _run(["docker", "exec", "-d", CONTAINER_NAME, "supervisord", "-c",
+                  "/etc/supervisor/conf.d/supervisord.conf"], timeout=30)
+    assert_eq(start.returncode, 0, "launched a real supervisord with the actual [program:backup] command line")
+    pre_states = _wait_for_backup_running()
+    assert_eq(pre_states.get("backup"), "RUNNING", "backup is RUNNING (autostart, real command line)",
+              extra=str(pre_states))
+    pre_pid = _docker_exec("supervisorctl pid backup").stdout.strip()
+    assert_true(pre_pid.isdigit(), "got backup's real pid before the hotfix", extra=pre_pid)
+
+    # --- 1. dry run changes nothing; --apply restarts ONLY backup -------
+    dry = _docker_exec("zl hotfix backup-fast")
+    assert_eq(dry.returncode, 3, "dry run exits 3 (pending work)", extra=dry.stdout + dry.stderr)
+    assert_true("compresslevel=1" in dry.stdout, "dry run shows the pending one-line patch", extra=dry.stdout)
+    assert_eq(_docker_exec("sha256sum /opt/compactor/backup.py").stdout.split()[0], before_hash,
+              "a dry run changes nothing")
+
+    apply1 = _docker_exec("zl hotfix backup-fast --apply --yes")
+    assert_eq(apply1.returncode, 0, "--apply exits 0", extra=apply1.stdout + apply1.stderr)
+    assert_true("restarted" in apply1.stdout, "says it restarted", extra=apply1.stdout)
+    post_states = _wait_for_backup_running()
+    assert_eq(post_states.get("backup"), "RUNNING", "backup is RUNNING again after the hotfix apply",
+              extra=str(post_states))
+    post_pid = _docker_exec("supervisorctl pid backup").stdout.strip()
+    assert_true(post_pid.isdigit() and post_pid != pre_pid,
+                f"backup's pid changed ({pre_pid} -> {post_pid}) -- proves a REAL restart happened, not just "
+                f"exit 0", extra=f"pre={pre_pid} post={post_pid}")
+
+    # --- 2. zl version reports the hotfix state --------------------------
+    version = _docker_exec("zl version")
+    assert_true("backup compression: level 1 (hotfix)" in version.stdout,
+                "`zl version` shows 'backup compression: level 1 (hotfix)'", extra=version.stdout)
+
+    # --- 3. --once/--verify/--list/read_manifest + the real XFL proof ---
+    archive1 = _run_backup_once()
+    verify1 = _docker_exec(f"cd /opt/compactor && /opt/compactor-venv/bin/python backup.py --verify {archive1}")
+    assert_eq(verify1.returncode, 0, "--verify succeeds on the patched (level-1) archive",
+              extra=verify1.stdout + verify1.stderr)
+    listing1 = _docker_exec(
+        "cd /opt/compactor && COMPACTOR_BACKUP_DIR=/tmp/hf-backups /opt/compactor-venv/bin/python backup.py --list"
+    )
+    assert_eq(listing1.returncode, 0, "--list succeeds", extra=listing1.stdout + listing1.stderr)
+    manifest1 = _docker_exec(
+        f"cd /opt/compactor && /opt/compactor-venv/bin/python -c "
+        f"\"import backup, json, sys; m = backup.read_manifest('{archive1}'); print(json.dumps(bool(m))); "
+        f"sys.exit(0 if m else 1)\""
+    )
+    assert_eq(manifest1.returncode, 0, "read_manifest() reads a real, non-empty manifest from the patched archive",
+              extra=manifest1.stdout + manifest1.stderr)
+    xfl1 = _xfl_byte(archive1)
+    assert_eq(xfl1, "4", "the archive's gzip header XFL byte is 4 (fastest) -- proves compresslevel=1 actually "
+              "reached zlib, not just that the source text changed", extra=xfl1)
+
+    # --- 4. a second --apply is "already fast", exit 0, no restart ------
+    apply2 = _docker_exec("zl hotfix backup-fast --apply --yes")
+    assert_eq(apply2.returncode, 0, "a second --apply exits 0", extra=apply2.stdout + apply2.stderr)
+    assert_true("already fast" in apply2.stdout, "a second --apply reports 'already fast'", extra=apply2.stdout)
+    still_pid = _docker_exec("supervisorctl pid backup").stdout.strip()
+    assert_eq(still_pid, post_pid, "an 'already fast' apply never restarts backup again (same pid)")
+
+    # --- 5. --revert restores byte-for-byte and flips XFL back to 2 -----
+    revert = _docker_exec("zl hotfix backup-fast --revert --apply --yes")
+    assert_eq(revert.returncode, 0, "--revert --apply exits 0", extra=revert.stdout + revert.stderr)
+    assert_eq(_docker_exec("sha256sum /opt/compactor/backup.py").stdout.split()[0], before_hash,
+              "--revert restores backup.py byte-for-byte identical to the pre-hotfix original")
+    reverted_states = _wait_for_backup_running()
+    assert_eq(reverted_states.get("backup"), "RUNNING", "backup is RUNNING again after the revert",
+              extra=str(reverted_states))
+
+    archive2 = _run_backup_once()
+    xfl2 = _xfl_byte(archive2)
+    assert_eq(xfl2, "2", "after --revert, a fresh archive's XFL byte is back to 2 (default level 9)", extra=xfl2)
+
+
+_DRIVE_HOTFIX_APPLY_PY = """\
+import os, sys
+os.environ.setdefault("ZL_HOME", "/tmp/zl-home")
+sys.path.insert(0, "/work/ops")
+from pathlib import Path
+Path("/tmp/wrapper.pid").write_text(str(os.getpid()))
+from zlops import cli
+code = cli.main(["hotfix", "backup-fast", "--apply", "--yes"])
+Path("/tmp/wrapper_exit_code").write_text(str(code))
+sys.exit(code)
+"""
+
+
+def _start_hotfix_backup_supervisord() -> None:
+    """Same real `[program:backup]` supervisord setup as
+    `test_hotfix_backup_fast_against_the_real_prod_backup_py`, factored out
+    for the signal tests below (round-9 HIGH-1) -- each gets its own fresh
+    container. `COMPACTOR_BACKUP_DIR` is set on pid 1 itself (round-9 item
+    7: the same value `[program:backup]`'s own `environment=` line uses) so
+    `zl`'s `common.merged_environ()` (pid 1's env overlaid on this shell's)
+    actually points `podenv.BACKUPS`/hotfix's in-progress gate at the SAME
+    directory the daemon writes into.
+    """
+    _run(["docker", "rm", "-f", CONTAINER_NAME], timeout=30)
+    r = _run([
+        "docker", "run", "-d", "--rm", "--name", CONTAINER_NAME,
+        "-v", f"{REPO_ROOT}:/work:ro",
+        "-e", "COMPACTOR_BACKUP_DIR=/tmp/hf-backups",
+        "--entrypoint", "bash", IMAGE_REF, "-c", "sleep 3600",
+    ], timeout=60)
+    assert_eq(r.returncode, 0, "started a fresh container for the hotfix signal tests")
+    time.sleep(1)
+    boot = _docker_exec("bash /work/ops/bootstrap.sh --from-dir /work --no-login-hook")
+    assert_eq(boot.returncode, 0, "bootstrap installed zl in the fresh container")
+
+    setup = _docker_exec(
+        "mkdir -p /tmp/hf-store /tmp/hf-backups && "
+        "printf '{\"a\": 1}' > /tmp/hf-store/some_conv.facts.json && "
+        "python3 -c \"import sqlite3; c=sqlite3.connect('/tmp/hf-webui.db'); "
+        "c.execute('create table t (x int)'); c.execute('insert into t values (1)'); c.commit(); c.close()\""
+    )
+    assert_eq(setup.returncode, 0, "synthetic backup source data staged", extra=setup.stdout + setup.stderr)
+
+    anchor_count = int(_docker_exec(f"grep -c '{_HOTFIX_ANCHOR_GREP}' /opt/compactor/backup.py").stdout.strip() or "0")
+    if anchor_count != 1:
+        _skip(f"{IMAGE_REF}: backup.py's anchor did not match exactly once -- the hotfix signal tests need "
+              f"the real apply path to actually run")
+
+    write_conf = _docker_exec(f"cat > /etc/supervisor/conf.d/supervisord.conf <<'CONFEOF'\n{_HOTFIX_BACKUP_CONF}CONFEOF")
+    assert_eq(write_conf.returncode, 0, "wrote the real [program:backup] supervisord.conf")
+    start = _run(["docker", "exec", "-d", CONTAINER_NAME, "supervisord", "-c",
+                  "/etc/supervisor/conf.d/supervisord.conf"], timeout=30)
+    assert_eq(start.returncode, 0, "launched a real supervisord with the actual [program:backup] command line")
+    pre_states = _wait_for_backup_running()
+    assert_eq(pre_states.get("backup"), "RUNNING", "backup is RUNNING (autostart) before the signal test",
+              extra=str(pre_states))
+
+
+_HUP_SH_STYLE_SIGNAL_SCRIPT = """\
+set -u
+rm -f /tmp/wrapper.pid /tmp/wrapper_exit_code /tmp/zl-home/audit.log
+python3 /tmp/drive_hotfix.py > /tmp/drive_hotfix.log 2>&1 &
+ZP=$!
+FOUND=no
+for i in $(seq 1 6000); do
+  if pgrep -f 'supervisorctl stop backup' >/dev/null; then FOUND=yes; break; fi
+  sleep 0.005
+done
+kill -{SIG} $ZP 2>/dev/null || true
+echo "FOUND=$FOUND SIGNALLED_PID=$ZP"
+wait $ZP
+echo "WRAPPER_EXIT=$(cat /tmp/wrapper_exit_code 2>/dev/null || echo MISSING)"
+"""
+
+
+def _run_signalled_hotfix_apply(sig: str) -> dict:
+    """hup.sh-style, run ENTIRELY INSIDE the container as one bash script
+    (not a python loop of individual `docker exec` round trips from the
+    host, each carrying tens-to-hundreds of ms of its own latency): the
+    exact same technique as the reviewer's own `hup.sh` probe -- launch
+    the apply in the background, poll tightly (bash's own `pgrep` in a
+    tight loop, no per-iteration `docker exec`) for the exact moment the
+    real `supervisorctl stop backup` child is running, and signal the
+    wrapper right then. A python-loop-from-the-host version of this same
+    idea was flaky under load: with the round trip's own latency added on
+    top, an unusually fast apply (this container's `backup.py` is small
+    and its compile/import check quick) could finish -- or move on to a
+    LATER checkpoint -- before the signal actually landed, catching a
+    DIFFERENT (still entirely safe) deferral point than the one this test
+    means to exercise.
+    """
+    write_driver = _docker_exec(f"cat > /tmp/drive_hotfix.py <<'PYEOF'\n{_DRIVE_HOTFIX_APPLY_PY}PYEOF")
+    assert_eq(write_driver.returncode, 0, "wrote the hotfix signal-test driver script")
+
+    script = _HUP_SH_STYLE_SIGNAL_SCRIPT.replace("{SIG}", sig)
+    write_script = _docker_exec(f"cat > /tmp/hup_style.sh <<'SHEOF'\n{script}SHEOF")
+    assert_eq(write_script.returncode, 0, "wrote the hup.sh-style in-container signal script")
+
+    # Bounded generously: the in-container loop itself is fast (bash +
+    # pgrep, no docker-exec-per-iteration overhead), but the REAL
+    # compile/import check (the real venv interpreter against the real
+    # compactor/backup.py) and the real supervisorctl stop/start round
+    # trip both take real wall-clock time.
+    run = _docker_exec("bash /tmp/hup_style.sh", timeout=60)
+    assert_true("FOUND=yes" in run.stdout,
+                "caught the real `supervisorctl stop backup` actually running", extra=run.stdout + run.stderr)
+    exit_code = None
+    for ln in run.stdout.splitlines():
+        if ln.startswith("WRAPPER_EXIT="):
+            exit_code = ln.split("=", 1)[1].strip()
+    driver_log = _docker_exec("cat /tmp/drive_hotfix.log 2>/dev/null").stdout
+    assert_true(exit_code is not None, "the wrapper finished on its own once the stop/start settled",
+                extra=f"script output:\n{run.stdout}\ndriver log:\n{driver_log}")
+    states = _parse_supervisorctl_status(_docker_exec("supervisorctl status").stdout)
+    audit = _docker_exec("cat /tmp/zl-home/audit.log 2>/dev/null").stdout
+    return {"exit_code": exit_code, "states": states, "audit": audit, "log": driver_log}
+
+
+def test_sighup_during_hotfix_stop_backup_never_kills_it_and_backup_ends_running():
+    """Round-9 HIGH-1, real-image proof (hup.sh): SIGHUP delivered to `zl
+    hotfix backup-fast --apply --yes` at the exact moment `supervisorctl
+    stop backup` is running must never kill it -- `backup` ends up
+    RUNNING and an audit line is written.
+    """
+    _start_hotfix_backup_supervisord()
+    result = _run_signalled_hotfix_apply("HUP")
+    assert_eq(result["states"].get("backup"), "RUNNING",
+              "backup is RUNNING after a SIGHUP mid `supervisorctl stop backup`", extra=str(result))
+    assert_true('"argv": ["hotfix", "backup-fast"' in result["audit"], "an audit line was written",
+                extra=result["audit"])
+
+
+def test_sigterm_during_hotfix_stop_backup_is_deferred_and_backup_ends_running():
+    """Round-9 HIGH-1, real-image proof (hup.sh): SIGTERM delivered at the
+    same exact moment is DEFERRED (not forwarded -- there is no child at
+    that point), `backup` still ends up RUNNING, the wrapper's own exit
+    code reflects the deferred signal (128+15), and an audit line is
+    written.
+    """
+    _start_hotfix_backup_supervisord()
+    result = _run_signalled_hotfix_apply("TERM")
+    assert_eq(result["states"].get("backup"), "RUNNING",
+              "backup is RUNNING after a SIGTERM mid `supervisorctl stop backup`", extra=str(result))
+    assert_eq(result["exit_code"], "143", "the deferred TERM (128+15) is the wrapper's own exit code",
+              extra=str(result))
+    assert_true('"argv": ["hotfix", "backup-fast"' in result["audit"], "an audit line was written",
+                extra=result["audit"])
+
+
+def test_hotfix_waits_then_refuses_against_a_real_staging_dir_under_pid1s_backup_dir():
+    """Round-9 item 7 (closing the real-image test's own gap): a fresh,
+    REAL staging directory (backup.py's own naming) under the EXACT
+    `COMPACTOR_BACKUP_DIR` the `[program:backup]` daemon uses -- and that
+    pid 1's own environ now carries (see `_start_hotfix_backup_supervisord`)
+    -- must actually gate `zl hotfix backup-fast --apply --yes`: it waits,
+    then refuses, rather than silently checking the wrong directory (the
+    default `/data/backups`, which does not even exist in this throwaway
+    container) and sailing straight through.
+    """
+    _start_hotfix_backup_supervisord()
+    staging = "/tmp/hf-backups/zions-backup-20260101T000000Z-deadbeef"
+    _docker_exec(f"mkdir -p {staging}")
+    before_hash = _docker_exec("sha256sum /opt/compactor/backup.py").stdout.split()[0]
+
+    refuse = _docker_exec("zl hotfix backup-fast --apply --yes", timeout=90)
+    assert_eq(refuse.returncode, 1,
+              "refuses (after waiting out its bound) while a REAL staging dir sits under the daemon's own "
+              "backup dir", extra=refuse.stdout + refuse.stderr)
+    assert_true("in progress" in (refuse.stdout + refuse.stderr), "says so", extra=refuse.stdout + refuse.stderr)
+    # The FILE EDIT itself is never gated by "a backup is in progress" (only
+    # the RESTART is -- hotfix.py's own docstring/README: editing the file on
+    # disk never touches an already-loaded running process) -- so the patch
+    # DOES land here; only backup's own restart was refused.
+    after_hash = _docker_exec("sha256sum /opt/compactor/backup.py").stdout.split()[0]
+    assert_true(after_hash != before_hash,
+                "the file itself WAS patched even though the restart was refused (by design)",
+                extra=f"before={before_hash} after={after_hash}")
+    anchor_count = int(_docker_exec(f"grep -c '{_HOTFIX_ANCHOR_GREP}' /opt/compactor/backup.py").stdout.strip()
+                        or "0")
+    assert_eq(anchor_count, 0, "the OLD anchor is gone -- the compresslevel=1 patch really landed on disk")
+
+    _docker_exec(f"rmdir {staging}")
+    proceed = _docker_exec("zl hotfix backup-fast --apply --yes")
+    assert_eq(proceed.returncode, 0, "once the real staging dir is gone, a second apply ('already fast') "
+              "restarts backup and exits 0", extra=proceed.stdout + proceed.stderr)
+
+
 _SUPERVISORCTL_PGID_PROBE_PY = """\
 import os, sys
 sys.path.insert(0, "/work/ops")
@@ -1236,6 +1639,10 @@ if __name__ == "__main__":
         test_pty_close_during_stop_phase_survives_and_restores_and_audits()
         test_pty_close_during_restart_phase_with_real_openwebui_wait_survives_and_audits()
         test_env_i_backup_now_and_fix_dry_run_see_pid1s_service_env()
+        test_hotfix_backup_fast_against_the_real_prod_backup_py()
+        test_sighup_during_hotfix_stop_backup_never_kills_it_and_backup_ends_running()
+        test_sigterm_during_hotfix_stop_backup_is_deferred_and_backup_ends_running()
+        test_hotfix_waits_then_refuses_against_a_real_staging_dir_under_pid1s_backup_dir()
         test_supervisorctl_stop_and_start_run_in_their_own_session_not_the_wrappers()
         print("\nAll real-image ops-bundle tests passed.")
     finally:

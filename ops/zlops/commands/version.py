@@ -12,6 +12,7 @@ import hashlib
 import subprocess
 
 from .. import common, podenv
+from . import hotfix as cmd_hotfix
 
 REF_FILE = podenv.ZL_HOME / "ref"  # written by bootstrap.sh; kept in sync there
 
@@ -74,6 +75,7 @@ def collect() -> dict:
         "webui_db_local": is_local,
         "webui_db_local_reason": why,
         "saved_bootstrap_ref": _saved_bootstrap_ref(),
+        "backup_compression": cmd_hotfix.backup_compression_status(),
     }
 
 
@@ -91,6 +93,7 @@ def render(info: dict) -> str:
         f"vllm: {info['vllm_version']}",
         f"WEBUI_DB_LOCAL: {info['webui_db_local']} ({info['webui_db_local_reason']})",
         f"saved bootstrap ref ({REF_FILE}): {info['saved_bootstrap_ref']}",
+        f"backup compression: {info['backup_compression']}",
     ]
     return "\n".join(lines) + "\n"
 
