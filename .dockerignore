@@ -34,11 +34,17 @@ scout-*.log
 # Throwaway verification scripts (compactor/_verify_*.py)
 compactor/_verify_*.py
 
-# Python caches.
-__pycache__/
-*.pyc
-*.pyo
+# Python caches. A bare `__pycache__/` / `*.pyc` pattern only matches at the
+# CONTEXT ROOT in dockerignore's matcher (unlike gitignore, it is not implicitly
+# recursive) — nested caches under compactor/, ops/, scripts/ etc slipped
+# through. `**/` makes these match at every depth (task: fix .dockerignore so
+# __pycache__ and *.pyc are excluded at every depth).
+**/__pycache__/
+**/__pycache__
+**/*.pyc
+**/*.pyo
 .pytest_cache/
+**/.pytest_cache/
 .mypy_cache/
 .ruff_cache/
 

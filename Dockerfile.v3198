@@ -1,48 +1,165 @@
-# v3.1.9.8 — THIN layer on top of local/zla:v3197-rc, itself a thin layer on
-# the exact production base image.
+# v3.1.9.8 RC — multi-stage build, rebuilt 2026-09-27 on PROD'S ACTUAL RUNNING
+# IMAGE, not on the c1295894 chain the earlier RC used.
 #
-# BASE CHAIN (verified 2026-09-27):
-#   angreg/zions-light-ai@sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65
-#     (the pinned base Dockerfile.v3197 builds FROM — prod's v3.1.9.4/.5/.6
-#      digest; NOT what prod currently runs — see next line)
-#   --[Dockerfile.v3197]--> local/zla:v3197-rc
-#     verified image ID (docker inspect --format='{{.Id}}' local/zla:v3197-rc):
-#       sha256:052fdaefa23588187071b1cae7a33262de3e27fa6567b1eeed5e0d1774ee7a7c
-#     (same ID as the earlier `zla-v3197-trial` build — `docker images`
-#     confirms both tags resolve to 052fdaefa235; this is a genuine .7 build,
-#     not a stand-in). CONFIRM THIS ID BEFORE BUILDING THIS FILE. If it
-#     differs, rebuild v3197-rc first (recipe just below) and re-verify —
-#     do not build .8 on top of an unknown v3197-rc.
-#   --[THIS FILE, Dockerfile.v3198]--> local/zla:v3198-rc
+# BACKGROUND (why this rebuild happened): the earlier Dockerfile.v3198 was a
+# thin layer on local/zla:v3197-rc, itself built FROM
+# angreg/zions-light-ai@sha256:c1295894dd585784611c6833b1d4c396880ac8723e6b9b46531a5aa846cb8a65
+# — v3.1.9.4/.5/.6, tagged but NEVER DEPLOYED (memory.md, "PRODUCTION RUNS
+# v3.1.9"). Prod actually runs angreg/zions-light-ai:v3.1.9-cu12
+# (sha256:f3fafa3e1949115dfd2c1354969b03be8d852fc491b647884ccfe7a23cf998d2),
+# with OpenWebUI hot-patched to 0.11.4 IN THE RUNNING CONTAINER'S OVERLAY
+# ONLY — never baked into any image, and reverted by any pod restart. A
+# hostile review found the old RC's vllm-venv/compactor-venv ship a
+# DIFFERENT package set from what prod's image actually has installed
+# (openai, filelock 4, urllib3, protobuf, huggingface_hub, cuda-pathfinder,
+# opencv-python-headless and others) — a set that has never run vLLM on a
+# real GPU — and shares NO layers with prod, so the pod would pull ~11 GB
+# on deploy instead of the few new-layer MB this rebuild produces. The
+# rollback path also needs to boot an image that is BYTE-FOR-BYTE equal to
+# what a pod running today would fall back to: prod's baked bits
+# (f3fafa3e) plus the SAME OpenWebUI 0.11.4 pip upgrade already live on
+# prod's overlay — not a different lineage that merely happens to also
+# carry 0.11.4.
 #
-# Prod itself runs a DIFFERENT image, angreg/zions-light-ai:v3.1.9-cu12
-# (sha256:f3fafa3e1949…), with OpenWebUI hot-patched to 0.11.4 IN PLACE
-# (overlay only, not baked, and reverted by a pod restart) — see memory.md's
-# "PRODUCTION RUNS v3.1.9" / "PROD'S OPENWEBUI IS 0.11.4" entries. This RC's
-# rollback test (task 4) boots the SAME /data on that prod image directly, so
-# rollback is exercised against what actually runs today, not the c1295894
-# lineage this Dockerfile happens to build on.
+# BASE CHAIN (this file):
+#   angreg/zions-light-ai@sha256:f3fafa3e1949115dfd2c1354969b03be8d852fc491b647884ccfe7a23cf998d2
+#     (prod's actual, currently-running image; `docker images --digests` /
+#     `docker inspect --format='{{json .RepoDigests}}'` on the pulled
+#     `v3.1.9-cu12` tag, confirmed 2026-09-27)
+#   --[stage `rollback`, this file]--> local/zla:v3198-rollback
+#     OpenWebUI bumped 0.11.0 -> 0.11.4 in /app/venv, EXACTLY the same
+#     install/strip/cleanup recipe Dockerfile.v3197 uses against the OLD
+#     base — and NOTHING else. This stage IS the rollback target: it is
+#     defined to equal prod's live state (baked image + the in-place
+#     OpenWebUI patch), so that rolling an .8 deploy back means booting
+#     something that already matches what prod is running right now, not
+#     a step backward to some other lineage.
+#   --[stage `rc`, this file]--> local/zla:v3198-rc
+#     FROM rollback. Adds: the v3197 scroll-jump custom.css append (with
+#     its own idempotency/marker checks, copied verbatim from
+#     Dockerfile.v3197 — needed here too since this stage's OpenWebUI
+#     install is the same upgrade, just on a different base); every
+#     non-test compactor/*.py module (.8's request tracing + word-ban
+#     file-deploy runtime, on top of everything else compactor/ has ever
+#     shipped); ops/ and scripts/ baked to /opt/zl-repo (the operator
+#     tooling, N3 fix); entrypoint.sh and supervisord.conf, which DO differ
+#     from prod's baked copies (confirmed below by extracting prod's own
+#     files and diffing, not by assuming the v3197 diff still applies); and
+#     the 27-module import guard.
 #
-# TO REPRODUCE local/zla:v3197-rc FROM Dockerfile.v3197 (if the ID above does
-# not match `docker images`):
-#   git checkout <the v3.1.9.7 release commit, or this branch's Dockerfile.v3197>
-#   docker build -f Dockerfile.v3197 -t local/zla:v3197-rc .
-# Dockerfile.v3197's own header documents what it changes relative to the
-# c1295894 base (OpenWebUI 0.11.0 -> 0.11.4, the scroll-jump CSS fix, and
-# webuidb.py/backup.py/supervisord.conf/entrypoint.sh) — read it before
-# rebuilding; nothing about that recipe changes here.
-FROM local/zla:v3197-rc
+# stt/server.py, tts/server.py, both venvs' requirements.txt, and
+# clean-models.sh were extracted from a throwaway container of
+# f3fafa3e1949 (`docker cp`) and `cmp`'d BYTE-IDENTICAL to this tree's
+# copies (2026-09-27) — none are COPYd here; the base image's own files are
+# already correct. entrypoint.sh and supervisord.conf were diffed the same
+# way and DO differ (D1/D2/D3/D5/D6/D11/D12/D14 fixes plus the new
+# [program:zl-ops] stanza), so both are COPYd below.
+#
+# COMPACTOR-VENV: ONE PACKAGE ADDED, opencv-python-headless==5.0.0.93 (--no-deps).
+# compactor/requirements.txt has pinned it since v3.1.9.3 (mistral_common's
+# image tokenizer imports cv2). Prod's compactor-venv (f3fafa3e) predates the
+# pin, so an image-bearing request's token count falls back to a rough
+# estimate there. Every .8 test and review ran on images that HAD this
+# package in compactor-venv, so the rc stage installs exactly that pinned
+# version, with --no-deps (numpy 2.3.5 is already present), to ship the
+# tested configuration. The rc stage then runs `pip check`. Nothing else in
+# any venv differs from prod except /app/venv (the OpenWebUI 0.11.4 upgrade).
+#
+# TO BUILD EACH TARGET:
+#   docker build --target rollback -t local/zla:v3198-rollback -f Dockerfile.v3198 .
+#   docker build --target rc       -t local/zla:v3198-rc       -f Dockerfile.v3198 .
+# (both from this repo's root as the build context; .dockerignore keeps
+# tests/, docs, and __pycache__/*.pyc at every depth out of that context)
+
+# =============================================================================
+# Stage: rollback — prod's live state (f3fafa3e baked bits + the same
+# OpenWebUI 0.11.4 pip upgrade already hot-patched onto prod's overlay).
+# Nothing else changes here. Compare against
+# ~/zl-ops/v3198/rc-review-B/hp/Dockerfile (the reviewer's own minimal
+# recipe for this exact stage) — same base tag, same constraint file, same
+# `pip install open-webui==0.11.4 -c <constraints>`; this stage additionally
+# matches Dockerfile.v3197's strip/cleanup steps so the resulting /app/venv
+# is byte-for-byte comparable to that recipe's lineage, not just
+# "some 0.11.4 install".
+# =============================================================================
+FROM angreg/zions-light-ai@sha256:f3fafa3e1949115dfd2c1354969b03be8d852fc491b647884ccfe7a23cf998d2 AS rollback
+
+# Same constraints file Dockerfile.v3197 pins the 0.11.0 -> 0.11.4 bump
+# with (docs/v3197-pip-diff.txt documents what it was derived from). Reused
+# as-is: the OpenWebUI version target is identical here, so the transitive
+# pins that matter are identical too.
+COPY docs/v3197-constraints.txt /tmp/v3197-constraints.txt
+
+# Recipe copied verbatim from Dockerfile.v3197 (M-5, review1-v3197-65ea196):
+# `touch` a marker BEFORE the pip install, then scope the `strip` to files
+# `-newer` than it, so the strip never touches a .so this install did not
+# change the version of. See Dockerfile.v3197's own comment for the
+# measured list of .so files a blanket strip corrupted before this fix.
+RUN touch /tmp/.pre-pip-install && \
+    /app/venv/bin/pip install --no-cache-dir \
+        --constraint /tmp/v3197-constraints.txt \
+        open-webui==0.11.4 && \
+    find /app/venv -type f \( -name "*.so" -o -name "*.so.*" \) -newer /tmp/.pre-pip-install \
+        -exec strip --strip-unneeded {} + 2>/dev/null || true && \
+    find /app/venv -name "*.pyc" -delete && \
+    find /app/venv -name "__pycache__" -type d -exec rm -rf {} + && \
+    rm -rf /root/.cache /tmp/*.txt /tmp/v3197-constraints.txt /tmp/.pre-pip-install /var/tmp/*
+
+# =============================================================================
+# Stage: rc — v3.1.9.8's actual code, on top of the rollback stage above so
+# every layer below this point is IDENTICAL to local/zla:v3198-rollback
+# (and therefore shares layers with any pod that only ever ran the rollback
+# stage — only what's added below is a new pull).
+# =============================================================================
+FROM rollback AS rc
+
+# Scroll-jump CSS fix (Dockerfile.v3197's own step, copied verbatim: same
+# idempotency guard, same "refuse if the target file is missing" checks,
+# same append-not-replace behavior, same final grep assertions). Needed
+# again here because this stage's OpenWebUI install is the SAME pip install
+# as the rollback stage above — `pip install open-webui` always ships both
+# custom.css files empty — so the fix does not carry over from anywhere
+# else; it has to be (re-)applied on this exact venv, same as .7 applied it
+# on its own.
+COPY docker/v3197-custom.css /tmp/v3197-custom.css
+RUN set -eu; \
+    P=/app/venv/lib/python3.12/site-packages/open_webui; \
+    F1="$P/frontend/static/custom.css"; \
+    F2="$P/static/custom.css"; \
+    for f in "$F1" "$F2"; do \
+        if [ ! -f "$f" ]; then \
+            echo "v3198-custom-css: expected target file missing: $f" >&2; \
+            exit 1; \
+        fi; \
+    done; \
+    for f in "$F1" "$F2"; do \
+        if grep -q "overflow-anchor:none !important" "$f"; then \
+            echo "v3198-custom-css: rules already present in $f, not re-appending"; \
+        else \
+            printf '\n' >> "$f"; \
+            cat /tmp/v3197-custom.css >> "$f"; \
+            echo "v3198-custom-css: appended rules to $f"; \
+        fi; \
+    done; \
+    grep -q "overflow-anchor:none !important" "$F1"; \
+    grep -q "overflow-anchor:none !important" "$F2"; \
+    grep -q "content-visibility:visible !important" "$F1"; \
+    grep -q "content-visibility:visible !important" "$F2"; \
+    rm -f /tmp/v3197-custom.css
 
 # -----------------------------------------------------------------------
-# Compactor sources — EVERY non-test compactor/*.py module, matching the
-# full from-scratch Dockerfile's own `COPY compactor/` list byte-for-byte
-# (lines ~292-318 there, confirmed identical in shape to this list on
-# 2026-09-27: `ls compactor/*.py | grep -v test_` == the 27 files below).
-# v3197-rc's own /opt/compactor tree predates request tracing and the word
-# ban file-deploy/warm-up runtime entirely (it was built on the c1295894
-# base, patched only for webuidb.py/backup.py), so ALL 27 are new bytes
-# here, not just the two new-in-.8 modules (reqctx.py, wordban_runtime.py)
-# called out below.
+# Compactor sources — EVERY non-test compactor/*.py module (27 files;
+# `ls compactor/*.py | grep -v test_` confirmed to match this list
+# 2026-09-27). Prod's own /opt/compactor tree (f3fafa3e, plain v3.1.9)
+# predates request tracing and the word-ban file-deploy/warm-up runtime
+# entirely, and has none of the .8-era fixes to the others either, so ALL
+# 27 are new bytes on top of the rollback stage, not just the two new-in-.8
+# modules (reqctx.py, wordban_runtime.py) called out below.
+#
+# compactor/requirements.txt pins opencv-python-headless; see the header comment.
+RUN /opt/compactor-venv/bin/pip install --no-cache-dir --no-deps opencv-python-headless==5.0.0.93 \
+ && /opt/compactor-venv/bin/pip check \
+ && /opt/compactor-venv/bin/python -c "import cv2; print('cv2', cv2.__version__)"
 # -----------------------------------------------------------------------
 COPY compactor/main.py /opt/compactor/main.py
 COPY compactor/envcfg.py /opt/compactor/envcfg.py
@@ -74,42 +191,45 @@ COPY compactor/reqctx.py /opt/compactor/reqctx.py
 # New in .8 (word ban from a file, injected by the compactor, committed
 # 04c9f15 / 07d8987):
 COPY compactor/wordban_runtime.py /opt/compactor/wordban_runtime.py
-#
-# compactor/requirements.txt was diffed byte-identical to what v3197-rc
-# already has installed (2026-09-27) — .8's two new modules (reqctx.py,
-# wordban_runtime.py) only import stdlib plus httpx, already present in
-# /opt/compactor-venv from the base install. No `pip install` layer needed
-# here; if that ever stops being true, add one, pinned the same way
-# Dockerfile.v3197 pins its OpenWebUI bump.
-#
-# stt/server.py, tts/server.py, entrypoint.sh were ALSO diffed
-# byte-identical to what v3197-rc already ships (2026-09-27, `docker cp`
-# from a throwaway container of v3197-rc vs. the working tree) — .6/.7/.8
-# did not touch any of them, so none are re-COPYd here. Only
-# supervisord.conf changed (the new [program:zl-ops] stanza, below).
+
+# -----------------------------------------------------------------------
+# stt/, tts/, clean-models.sh: NOT copied. `docker cp`'d out of a throwaway
+# container of f3fafa3e1949 and `cmp`'d byte-identical against this tree
+# (stt/server.py, stt/requirements.txt, tts/server.py, tts/requirements.txt,
+# clean-models.sh — 2026-09-27); only the *_test.py files under stt/ and
+# tts/ differ, and those never ship in the image (test files aren't COPYd
+# by any Dockerfile in this repo). Prod's own copies are already correct.
+# -----------------------------------------------------------------------
 
 # -----------------------------------------------------------------------
 # ops/ and scripts/ — bakes the operator tooling and every repair script
 # onto the pod at /opt/zl-repo, so no `git clone` is needed for `zl`,
-# `ops/bootstrap.sh`, or any scripts/*.py runbook step (fixes N3 from the
-# word-ban-deploy review: word-ban-deploy.py was not in the image before).
-# COPY preserves the source file's mode bit-for-bit (confirmed against
-# `git ls-files -s`: ops/zl is 100755, ops/bootstrap.sh is 100644 in git —
-# COPY carries BOTH through unchanged; task 4's boot test stats both paths
-# in the built image to confirm this rather than assuming it).
-# .dockerignore already excludes __pycache__/ and *.pyc repo-wide, so
-# these two directory COPYs cannot drag in stale bytecode.
+# `ops/bootstrap.sh --boot`, or any scripts/*.py runbook step (fixes N3
+# from the word-ban-deploy review: word-ban-deploy.py was not in the image
+# before). COPY preserves the source file's mode bit-for-bit (confirmed
+# against `git ls-files -s`). .dockerignore excludes __pycache__/*.pyc at
+# EVERY depth (fixed 2026-09-27 — the old bare `__pycache__/`/`*.pyc`
+# patterns only matched at the build-context root, not recursively, unlike
+# gitignore's implicit recursion), so these two directory COPYs cannot drag
+# in stale bytecode from any nested package under ops/ or scripts/.
 # -----------------------------------------------------------------------
 COPY ops/ /opt/zl-repo/ops/
 COPY scripts/ /opt/zl-repo/scripts/
 
 # -----------------------------------------------------------------------
-# supervisord.conf — carries the new [program:zl-ops] stanza (task 2) on
-# top of everything v3197-rc's own copy already has (request tracing and
-# word-ban runtime need no supervisord changes; only this one addition
-# does). Diffed against v3197-rc's installed copy before this edit
-# (2026-09-27): identical except for the new stanza.
+# entrypoint.sh and supervisord.conf — CONFIRMED TO DIFFER from prod's own
+# copies (docker cp + diff against a throwaway container of f3fafa3e1949,
+# 2026-09-27, not assumed from the old v3197-vs-c1295894 diff): entrypoint.sh
+# carries the D12/M-2 DATABASE_URL gate checks (absent from prod's plain
+# v3.1.9 copy) plus everything else .7 changed; supervisord.conf carries
+# the new [program:zl-ops] stanza (task 2) on top of every other .7/.8
+# change. Both COPYd below. The base Dockerfile's own entrypoint.sh ships
+# checked in at mode 644 (git does not track its execute bit), so COPY
+# alone does not make this fresh copy executable — `chmod +x` is required
+# again here, exactly as Dockerfile.v3197 documents.
 # -----------------------------------------------------------------------
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
 # -----------------------------------------------------------------------
@@ -121,9 +241,7 @@ COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 # imports (a future orphaned file, or a typo'd COPY destination above)
 # cannot hide behind "main imported fine". Fails the BUILD, not
 # production, offline and network-free by construction so it cannot
-# flake — same pattern as the full Dockerfile's own build guard (~line
-# 341), extended here to the complete 27-module list rather than the 7
-# direct entrypoints that guard covers.
+# flake.
 # -----------------------------------------------------------------------
 RUN cd /opt/compactor && \
     MODEL_REPO=buildguard VLLM_URL=http://127.0.0.1:1 \

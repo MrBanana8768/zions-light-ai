@@ -15,28 +15,34 @@
 #      and is not treated as a failure below (see the vllm handling).
 #   3. Asserts, on each boot: supervisord itself is up; compactor,
 #      openwebui and backup reach RUNNING; zl-ops reaches EXITED (never
-#      FATAL/BACKOFF — `ops/bootstrap.sh --boot` does not exist in this
-#      tree yet [SUPERSEDED: --boot merged in 0190911], so zl-ops is EXPECTED to print bootstrap.sh's usage error
-#      and exit, per its own EXIT trap, still exit 0); the compactor tree
-#      under /opt/compactor is byte-identical (sha256) to the CURRENT git
-#      tree (not just to what this one build happened to embed — this is
-#      the test-time check Dockerfile.v3198 explicitly defers to this
-#      script, see its own header comment); /opt/zl-repo/ops/zl is
-#      executable; `import main` succeeds in the compactor venv.
+#      FATAL/BACKOFF) with its log's last line reading
+#      "bootstrap.sh --boot: done" (ops/bootstrap.sh --boot is merged as of
+#      0190911, so this is now a real assertion, not just "didn't crash");
+#      the compactor tree under /opt/compactor is byte-identical (sha256)
+#      to the CURRENT git tree (not just to what this one build happened to
+#      embed — this is the test-time check Dockerfile.v3198 explicitly
+#      defers to this script, see its own header comment); /opt/zl-repo/ops/zl
+#      is executable; `import main` succeeds in the compactor venv.
 #   4. Rollback: the WEBUI_DB_LOCAL=false /data directory (the one shaped
-#      like what prod actually runs today) is then booted on the REAL prod
-#      image, angreg/zions-light-ai:v3.1.9-cu12 (must already be pulled
-#      locally — `docker images`), and checked for fatal errors. The
-#      previously-seen alembic "downgrade" warning is expected and
-#      confirmed non-fatal; its exact message is reported (no content).
+#      like what prod actually runs today) is then booted on BOTH the REAL
+#      prod image, angreg/zions-light-ai:v3.1.9-cu12 (must already be
+#      pulled locally — `docker images`), AND local/zla:v3198-rollback (the
+#      `rollback` stage of this same Dockerfile: prod's image + the 0.11.4
+#      OpenWebUI upgrade, nothing else) — each checked for fatal errors.
+#      The previously-seen alembic "downgrade" warning is expected and
+#      confirmed non-fatal on the plain prod image; its exact message is
+#      reported (no content). local/zla:v3198-rollback already carries
+#      0.11.4's own schema and should show NO alembic revision error.
 #
 # Logs everything under ~/zl-ops/v3198/rc-prep/ (per the owner's rule:
 # build/test artifacts live there, never inside the worktree).
 #
 # Needs: a real Docker daemon, and either the RC build materials in the
-# current directory (a `cp -a` of the repo) or ZLA_SKIP_BUILD=1 plus an
-# already-built local/zla:v3198-rc. SKIPS (exit 3) honestly if Docker is
-# unavailable — never silently "passes" a suite that could not run.
+# current directory (a `cp -a` of the repo) or ZLA_SKIP_BUILD=1 plus
+# already-built local/zla:v3198-rc AND local/zla:v3198-rollback (the
+# Dockerfile is multi-stage now; both targets are built by this script).
+# SKIPS (exit 3) honestly if Docker is unavailable — never silently
+# "passes" a suite that could not run.
 
 set -u
 REPO_COPY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -47,6 +53,7 @@ mkdir -p "${LOG_DIR}"
 MAIN_LOG="${LOG_DIR}/rc-boot-test.log"
 
 RC_IMAGE="local/zla:v3198-rc"
+ROLLBACK_IMAGE="local/zla:v3198-rollback"
 PROD_IMAGE="angreg/zions-light-ai:v3.1.9-cu12"
 FAIL=0
 
@@ -66,24 +73,40 @@ docker version >/dev/null 2>&1 || _skip "docker daemon unreachable"
 # 1. Build
 # -----------------------------------------------------------------------
 if [ "${ZLA_SKIP_BUILD:-0}" != "1" ]; then
-    log "Building ${RC_IMAGE} from Dockerfile.v3198 in ${REPO_COPY_DIR}"
     if [ "${REPO_COPY_DIR}" = "$(cd /home/drew/code/zl-v3198 2>/dev/null && pwd || echo __nope__)" ]; then
         fail "refusing to build: this looks like the git worktree itself, not a cp -a copy. Run from ~/zl-ops/v3198/rc-prep/build."
         exit 1
     fi
-    ( cd "${REPO_COPY_DIR}" && docker build -f Dockerfile.v3198 -t "${RC_IMAGE}" . ) \
+    # Dockerfile.v3198 is multi-stage now (rollback -> rc); build BOTH
+    # targets, since task 5 boots local/zla:v3198-rollback directly, not
+    # just as an intermediate layer of the rc build.
+    log "Building ${ROLLBACK_IMAGE} (--target rollback) from Dockerfile.v3198 in ${REPO_COPY_DIR}"
+    ( cd "${REPO_COPY_DIR}" && docker build --target rollback -f Dockerfile.v3198 -t "${ROLLBACK_IMAGE}" . ) \
+        > "${LOG_DIR}/build-rollback.log" 2>&1
+    if [ $? -ne 0 ]; then
+        fail "docker build --target rollback failed — see ${LOG_DIR}/build-rollback.log"
+        tail -60 "${LOG_DIR}/build-rollback.log" | tee -a "${MAIN_LOG}"
+        exit 1
+    fi
+    ok "image built: ${ROLLBACK_IMAGE}"
+
+    log "Building ${RC_IMAGE} (--target rc) from Dockerfile.v3198 in ${REPO_COPY_DIR}"
+    ( cd "${REPO_COPY_DIR}" && docker build --target rc -f Dockerfile.v3198 -t "${RC_IMAGE}" . ) \
         > "${LOG_DIR}/build.log" 2>&1
     if [ $? -ne 0 ]; then
-        fail "docker build failed — see ${LOG_DIR}/build.log"
+        fail "docker build --target rc failed — see ${LOG_DIR}/build.log"
         tail -60 "${LOG_DIR}/build.log" | tee -a "${MAIN_LOG}"
         exit 1
     fi
     ok "image built: ${RC_IMAGE}"
 else
     docker image inspect "${RC_IMAGE}" >/dev/null 2>&1 || _skip "ZLA_SKIP_BUILD=1 but ${RC_IMAGE} is not built"
+    docker image inspect "${ROLLBACK_IMAGE}" >/dev/null 2>&1 || _skip "ZLA_SKIP_BUILD=1 but ${ROLLBACK_IMAGE} is not built"
 fi
 IMAGE_ID="$(docker inspect --format='{{.Id}}' "${RC_IMAGE}")"
-log "image id: ${IMAGE_ID}"
+ROLLBACK_IMAGE_ID="$(docker inspect --format='{{.Id}}' "${ROLLBACK_IMAGE}")"
+log "rc image id: ${IMAGE_ID}"
+log "rollback image id: ${ROLLBACK_IMAGE_ID}"
 
 FAKE_NVIDIA_SMI='#!/bin/bash
 case "$*" in
@@ -272,48 +295,84 @@ boot_and_check false "${DATA_FALSE}" "db-false"
 boot_and_check true "${DATA_TRUE}" "db-true"
 
 # -----------------------------------------------------------------------
-# 4. Rollback: the WEBUI_DB_LOCAL=false /data on the REAL prod image
+# 4. Rollback: the WEBUI_DB_LOCAL=false /data booted on BOTH the real prod
+#    image and local/zla:v3198-rollback (same base, +0.11.4 OpenWebUI only).
 # -----------------------------------------------------------------------
-log "=== rollback: booting prod image ${PROD_IMAGE} on the WEBUI_DB_LOCAL=false /data ==="
-if ! docker image inspect "${PROD_IMAGE}" >/dev/null 2>&1; then
-    log "SKIPPED rollback: ${PROD_IMAGE} is not pulled locally (docker images)"
-else
-    ROLLBACK_NAME="zla-rc-rollback-$$"
-    _boot_container "${PROD_IMAGE}" "${DATA_FALSE}" "${ROLLBACK_NAME}" "" "rollback"
-    docker exec -d "${ROLLBACK_NAME}" bash -c "
+_rollback_boot_check() {
+    # $1=image $2=tag $3=human label $4=datadir (both rollback boots reuse the
+    # SAME touched /data, sequentially, per task 5 — the point is that each
+    # image boots on the state the OTHER left behind, not on a private copy).
+    # Because both boots share one persistent /data/logs/openwebui-error.log,
+    # a check that just greps "the whole log file" after the SECOND boot
+    # would still see the FIRST boot's traceback sitting there from before —
+    # a false positive, not a new error from this boot. So every log check
+    # below is scoped to the NEW bytes/lines this boot appended, measured
+    # from a line-count snapshot taken (from the HOST side — the bind mount
+    # target is world-readable, confirmed 2026-09-27) immediately before
+    # this boot's entrypoint runs, never from the file's total content.
+    local image="$1" tag="$2" label="$3" datadir="$4"
+    log "=== rollback: booting ${label} (${image}) on the WEBUI_DB_LOCAL=false /data ==="
+    if ! docker image inspect "${image}" >/dev/null 2>&1; then
+        log "SKIPPED rollback (${tag}): ${image} is not pulled/built locally"
+        return
+    fi
+    local err_log="${datadir}/logs/openwebui-error.log"
+    local before_lines=0
+    [ -f "${err_log}" ] && before_lines="$(wc -l < "${err_log}" 2>/dev/null || echo 0)"
+
+    local name="zla-rc-${tag}-$$"
+    _boot_container "${image}" "${datadir}" "${name}" "" "${tag}"
+    docker exec -d "${name}" bash -c "
         export WEBUI_DB_LOCAL=false
         export STT_ENABLED=false TTS_ENABLED=false
         export MAX_MODEL_LEN=2048
-        exec /entrypoint.sh > /tmp/rollback-entrypoint.log 2>&1
+        exec /entrypoint.sh > /tmp/${tag}-entrypoint.log 2>&1
     "
-    if _wait_for_supervisord "${ROLLBACK_NAME}"; then
-        ok "rollback: supervisord came up on the prod image against the touched /data"
-        st="$(_wait_for_state "${ROLLBACK_NAME}" openwebui "RUNNING" 90)"
-        [ "${st}" = "RUNNING" ] && ok "rollback: openwebui RUNNING" || fail "rollback: openwebui did not reach RUNNING, saw ${st}"
-        docker exec "${ROLLBACK_NAME}" bash -c "grep -i -E 'alembic|revision|downgrade' /data/logs/*.log /tmp/*.log 2>/dev/null | tail -20" \
-            > "${LOG_DIR}/rollback-alembic.log" 2>&1
-        log "  alembic-related log lines saved to ${LOG_DIR}/rollback-alembic.log (see report for the exact message shape)"
+    if _wait_for_supervisord "${name}"; then
+        ok "rollback (${tag}): supervisord came up on ${label} against the touched /data"
+        st="$(_wait_for_state "${name}" openwebui "RUNNING" 90)"
+        [ "${st}" = "RUNNING" ] && ok "rollback (${tag}): openwebui RUNNING" || fail "rollback (${tag}): openwebui did not reach RUNNING, saw ${st}"
+
+        # NEW lines only (see the function comment above for why).
+        tail -n "+$((before_lines + 1))" "${err_log}" 2>/dev/null > "${LOG_DIR}/${tag}-new-error-lines.log"
+        grep -i -E 'alembic|revision|downgrade' "${LOG_DIR}/${tag}-new-error-lines.log" 2>/dev/null | tail -20 \
+            > "${LOG_DIR}/${tag}-alembic.log"
+        log "  alembic-related log lines (this boot's NEW lines only) saved to ${LOG_DIR}/${tag}-alembic.log"
         # Split each openwebui-error.log traceback into its own paragraph
         # (blank-line separated by python's own logging, one traceback per
         # exception) and flag only a BLOCK that does not itself mention
         # alembic/revision anywhere in it — a bare per-line grep -v alembic
         # wrongly flags the "Traceback (most recent call last):" header
         # line of the KNOWN alembic downgrade traceback, since that one
-        # line alone never contains the word "alembic".
-        docker exec "${ROLLBACK_NAME}" bash -c "
-            awk 'BEGIN{RS=\"\"} /Traceback/ && !/[Aa]lembic/ && !/revision/ {print; print \"---\"}' \
-                /data/logs/openwebui-error.log 2>/dev/null" \
-            > "${LOG_DIR}/rollback-fatal-scan.log" 2>&1
-        if [ -s "${LOG_DIR}/rollback-fatal-scan.log" ]; then
-            fail "rollback: possible non-alembic fatal errors — see ${LOG_DIR}/rollback-fatal-scan.log"
+        # line alone never contains the word "alembic". Scoped to this
+        # boot's new lines, same reason as above.
+        awk 'BEGIN{RS="\n\n"} /Traceback/ && !/[Aa]lembic/ && !/revision/ {print; print "---"}' \
+            "${LOG_DIR}/${tag}-new-error-lines.log" 2>/dev/null \
+            > "${LOG_DIR}/${tag}-fatal-scan.log"
+        if [ -s "${LOG_DIR}/${tag}-fatal-scan.log" ]; then
+            fail "rollback (${tag}): possible non-alembic fatal errors — see ${LOG_DIR}/${tag}-fatal-scan.log"
         else
-            ok "rollback: no non-alembic fatal tracebacks found in the openwebui log (the alembic ResolutionError above is the only one, and openwebui still reached RUNNING)"
+            ok "rollback (${tag}): no non-alembic fatal tracebacks found in the openwebui log"
+        fi
+        # local/zla:v3198-rollback already ships OpenWebUI 0.11.4, same as
+        # whatever wrote this /data on the RC boot above — its schema
+        # should already match, so unlike the plain (0.11.0) prod image,
+        # NO alembic revision error is expected here (task 5).
+        if [ "${tag}" = "onto-v3198-rollback" ]; then
+            if grep -qi -E "Can't locate revision|CommandError" "${LOG_DIR}/${tag}-new-error-lines.log" 2>/dev/null; then
+                fail "rollback (${tag}): expected NO alembic revision error onto local/zla:v3198-rollback, but found one in this boot's own new log lines — see ${LOG_DIR}/${tag}-new-error-lines.log"
+            else
+                ok "rollback (${tag}): no alembic revision error onto local/zla:v3198-rollback, as expected (same 0.11.4 schema)"
+            fi
         fi
     else
-        fail "rollback: supervisord never came up on the prod image"
+        fail "rollback (${tag}): supervisord never came up on ${label}"
     fi
-    _stop "${ROLLBACK_NAME}"
-fi
+    _stop "${name}"
+}
+
+_rollback_boot_check "${PROD_IMAGE}" "onto-prod-image" "the REAL prod image" "${DATA_FALSE}"
+_rollback_boot_check "${ROLLBACK_IMAGE}" "onto-v3198-rollback" "local/zla:v3198-rollback" "${DATA_FALSE}"
 
 # The containers wrote as root inside these bind-mounted tempdirs, so a
 # plain host `rm -rf` fails on their files; clean up via a throwaway
