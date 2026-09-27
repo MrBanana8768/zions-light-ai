@@ -476,6 +476,15 @@ def test_verification_review_followups():
                 "reads the bytes (RC review A: one of her uploads is labelled this way)")
 
 
+def test_exception_text_never_logs_a_data_url():
+    print("\n[test] _redact_exc: a data URL inside an exception message is never logged")
+    big = "data:application/octet-stream;base64," + "QUJD" * 100000
+    msg = main._redact_exc(ValueError(f"Unsupported image url scheme {big}"))
+    assert_true("QUJDQUJD" not in msg, "no base64 payload survives")
+    assert_true("data:<redacted>" in msg, "the URL is replaced by a marker")
+    assert_true(len(msg) <= 200, "the message is truncated")
+
+
 if __name__ == "__main__":
     test_valid_image_url()
     test_image_url_shape_class()
@@ -488,4 +497,5 @@ if __name__ == "__main__":
     test_valid_image_reaches_stub_vllm_beside_a_demoted_invalid_one()
     test_retention_never_evicts_a_good_image_for_a_broken_newer_one()
     test_verification_review_followups()
+    test_exception_text_never_logs_a_data_url()
     print("\nAll image-url-validation tests passed.")

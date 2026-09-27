@@ -113,6 +113,14 @@ RUN touch /tmp/.pre-pip-install && \
 # =============================================================================
 FROM rollback AS rc
 
+# Memory-budget defaults. The full Dockerfile (lines ~436/486/495) sets these;
+# prod's image predates them and bakes 0.6 / 6230 / unset. All .8 reviews ran with
+# these values. At 6230 the reuse stand-in ceiling sits below her ~9k hierarchy, so
+# the reuse path (and most of .8's speedup) never fires (final RC check).
+ENV COMPACTOR_INJECTION_BUDGET_FRACTION="0.75"
+ENV COMPACTOR_SUMMARY_BLOCK_MAX_TOKENS="15000"
+ENV COMPACTOR_STANDIN_BUDGET_FRACTION="1.0"
+
 # Scroll-jump CSS fix (Dockerfile.v3197's own step, copied verbatim: same
 # idempotency guard, same "refuse if the target file is missing" checks,
 # same append-not-replace behavior, same final grep assertions). Needed

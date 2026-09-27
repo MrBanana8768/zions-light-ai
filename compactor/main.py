@@ -1713,6 +1713,18 @@ warnings.filterwarnings(
 )
 
 
+_DATA_URL_IN_TEXT_RE = re.compile(r"data:\S*")
+
+
+def _redact_exc(e: BaseException, limit: int = 200) -> str:
+    """An exception's message, safe to log: mistral_common's image tokenizer
+    raises `Unsupported image url scheme <the whole URL>` for a data URL that
+    does not start `data:image`, so a raw `{e}` wrote an entire base64 image
+    (27 MB in the RC check) into compactor.log. Data URLs are redacted and the
+    rest is truncated."""
+    return _DATA_URL_IN_TEXT_RE.sub("data:<redacted>", str(e))[:limit]
+
+
 def count_tokens(messages: list[dict]) -> int:
     # V3.1: images cost tokens the text estimate can't see — add a flat
     # per-image estimate so VLM requests don't quietly overflow the budget.
@@ -1806,7 +1818,7 @@ def count_tokens(messages: list[dict]) -> int:
             if logsetup.log_once("count_tokens.chat_template"):
                 logger.warning(
                     f"could not apply the chat template for {MODEL_REPO} "
-                    f"({type(e).__name__}: {e}); using per-message encode()+4 — "
+                    f"({type(e).__name__}: {_redact_exc(e)}); using per-message encode()+4 — "
                     f"every token count from this process UNDERCOUNTS by the "
                     f"template's per-message framing, and every budget decision "
                     f"downstream inherits that error"
