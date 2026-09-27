@@ -130,6 +130,10 @@ chain on `/forget`'s durability, are covered below.
   "Word-ban file deploy + idle warm-up".
 
 ### Fixed
+- **Backups are written at gzip level 1** (owner, 2026-09-26). tarfile's default level 9 took
+  49 s on the real 844 MB payload (64-94 s on the pod); level 1 takes 17 s for a 234 MB archive
+  instead of 201 MB. The format is still .tar.gz, so verify/list/restore are unchanged. `zl hotfix
+  backup-fast` makes the same edit on a running v3.1.9 pod and is a no-op on .8.
 - **Tracing-verification review, three LOW findings.** `_unsafe_conv_id_
   handler` always logged `req=None` on a chat-path rejection — the
   wrapper resets `reqctx.request_id_ctx` in its own `finally:` before

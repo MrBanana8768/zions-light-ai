@@ -217,6 +217,25 @@ def test_create_verify_publish_round_trip():
     assert_true(ok, "published archive independently verifies")
 
 
+def test_archive_is_written_at_gzip_level_1():
+    print("\n[test] run_once: the archive is gzip level 1 (fast), still a plain .tar.gz")
+    _seed_sources()
+    _clean_backups()
+    rep = backup.run_once()
+    assert_true(rep["ok"], "run_once ok")
+    arch = _BACKUPS / rep["archive"]
+    head = arch.read_bytes()[:10]
+    assert_eq(head[:2], b"\x1f\x8b", "gzip magic")
+    # RFC 1952 XFL byte: 4 = fastest (Python's gzip writes it for compresslevel=1),
+    # 2 = best (level 9, the tarfile default that made backups take 64-94 s on the pod).
+    assert_eq(head[8], 4, "XFL says fastest compression (compresslevel=1)")
+    # `zl hotfix backup-fast` (ops/) anchors on this exact call text to see that the
+    # level is already fast. Changing the wording needs a matching change there.
+    src = Path(backup.__file__).read_text()
+    assert_true('tarfile.open(partial, "w:gz", compresslevel=1)' in src,
+                "the exact call text the ops hotfix recognises as already fast")
+
+
 def test_restore_round_trip_recovers_data():
     print("\n[test] restore: wipe sources, restore from archive, data comes back")
     _seed_sources(facts_text="precious memory")
@@ -963,6 +982,7 @@ def test_latest_backup_info_shape():
 def _all():
     return [
         test_create_verify_publish_round_trip,
+        test_archive_is_written_at_gzip_level_1,
         test_restore_round_trip_recovers_data,
         test_backup_without_db_refuses_by_default,
         test_backup_without_db_still_succeeds_with_the_escape_hatch,

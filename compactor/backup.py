@@ -1466,7 +1466,7 @@ def create_backup(
 
         # 3. tar.gz the staging dir to a .partial temp archive
         partial = d / f"{_ARCHIVE_PREFIX}{stamp}{_ARCHIVE_SUFFIX}.partial"
-        with tarfile.open(partial, "w:gz") as tar:
+        with tarfile.open(partial, "w:gz", compresslevel=1) as tar:
             tar.add(staging, arcname=".")
         return partial
     finally:
