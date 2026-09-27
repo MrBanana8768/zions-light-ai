@@ -9,7 +9,10 @@ on Docker Hub.
 
 ---
 
-## [3.1.9.8] — the continuity band (off), the identity guard, and a durable forget ledger
+## [3.1.9.8] — request tracing, the word ban from a file, pre-cut speed fixes, the ops bundle, the forget ledger
+
+**Released 2026-09-27 as tag `v3.1.9.8`.** Build both images from `Dockerfile.v3198` (the `rollback` and `rc` targets,
+both on prod's own image). The deploy steps are in the owner runbook (DEPLOY-v3.1.9.8.md).
 
 **Not deployed. Production runs v3.1.9** (tag `978c6ac`); v3.1.9.1–.5 are
 tagged but not deployed either, and v3.1.9.6/.7 were never tagged as
