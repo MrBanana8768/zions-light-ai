@@ -326,6 +326,37 @@ def _stop_container() -> None:
     _run(["docker", "rm", "-f", CONTAINER_NAME], timeout=30)
 
 
+def test_boot_from_read_only_mount_with_no_network_installs_zl_and_exits_0():
+    """v3.1.9.8 `[program:zl-ops]` (NOTE-ops-bundle-boot.md): a container
+    started with NO network at all (`--network none` -- there is no
+    `apt-get update`/git clone this can possibly reach) still runs
+    `ops/bootstrap.sh --from-dir <baked ops/> --boot` to completion,
+    installs `zl`, and exits 0. A SEPARATE, throwaway container (not the
+    shared one the rest of this file drives) -- `--network none` cannot be
+    toggled on an already-running container, and no other test in this
+    file needs network isolation.
+    """
+    name = f"zl-test-boot-no-network-{uuid.uuid4().hex[:10]}"
+    _run(["docker", "rm", "-f", name], timeout=30)
+    try:
+        r = _run(
+            [
+                "docker", "run", "--rm", "--network", "none", "--name", name,
+                "-v", f"{REPO_ROOT}:/work:ro",
+                "--entrypoint", "bash", IMAGE_REF,
+                "-c", "bash /work/ops/bootstrap.sh --from-dir /work --boot --no-login-hook "
+                      "&& command -v zl && echo BOOT_OK",
+            ],
+            timeout=60,
+        )
+        assert_eq(r.returncode, 0, "--boot from a read-only mount with --network none exits 0",
+                  r.stdout + r.stderr)
+        assert_true("BOOT_OK" in r.stdout, "zl really is on PATH after --boot with no network at all",
+                    r.stdout + r.stderr)
+    finally:
+        _run(["docker", "rm", "-f", name], timeout=30)
+
+
 def test_bootstrap_from_dir_installs_zl():
     r = _docker_exec("bash /work/ops/bootstrap.sh --from-dir /work --no-login-hook")
     assert_eq(r.returncode, 0, "bootstrap.sh --from-dir /work exits 0")
@@ -1188,6 +1219,7 @@ def test_supervisorctl_stop_and_start_run_in_their_own_session_not_the_wrappers(
 
 if __name__ == "__main__":
     _preflight()
+    test_boot_from_read_only_mount_with_no_network_installs_zl_and_exits_0()
     try:
         _start_container()
         test_bootstrap_from_dir_installs_zl()

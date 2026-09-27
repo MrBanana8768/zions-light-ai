@@ -520,8 +520,9 @@ class ProtectedRegion:
         if self._old_sighup is not None:
             signal.signal(signal.SIGHUP, self._old_sighup)
 
-    def finish(self, child_code: int = 0, *, restored: bool = True, applied: bool = False,
-               label: str = "the fix") -> None:
+    def finish(self, child_code: int = 0, *, restored: bool | None = True, applied: bool = False,
+               label: str = "the fix", real_child_code: int | None = None,
+               down_services: list[str] | None = None) -> None:
         """Call once the whole protected region (stop, run, restart-or-
         leave-stopped) is over. Review H2: this USED to take no arguments
         and simply raise `SystemExit(128+signal)` whenever a signal had
@@ -545,7 +546,22 @@ class ProtectedRegion:
         `restored=False` on a path that deliberately left services
         stopped (`zl journal repair`'s leave-stopped path, RUNBOOK_DB_
         JOURNAL.md section 6) so the printed message never claims
-        "restored" when it did the opposite.
+        "restored" when it did the opposite. Pass `restored=None` (F4,
+        review follow-up) from an abort path where NOTHING was ever
+        stopped in the first place (the in-flight waits and the backup
+        phase, before the first `stop_for_apply`) -- `restored=True`
+        there used to print "services are restored", which implies
+        something was stopped and put back, when in fact nothing was
+        ever touched.
+
+        `real_child_code`/`down_services` (F4): when a wrapped script
+        itself exited 0 but the caller forced `child_code` nonzero
+        because a service failed to come back afterward (round-6 HIGH's
+        `report_restart_failures`), pass the ORIGINAL (real) exit code
+        as `real_child_code` and the list of services that did not come
+        back as `down_services` so the message says plainly "the fix
+        ran and exited 0 (applied); exit 1 because <service> did not
+        come back" instead of implying the fix itself exited nonzero.
 
         `applied` (round-6): pass `True` only from the call site reached
         AFTER the wrapped script/repair has actually run to completion
@@ -569,7 +585,10 @@ class ProtectedRegion:
         if self.deferred_signal is None:
             return
         sig = self.deferred_signal
-        state = "restored" if restored else "left stopped (see the message above)"
+        if restored is None:
+            state = "left untouched (nothing was stopped)"
+        else:
+            state = "restored" if restored else "left stopped (see the message above)"
         hup_note = " (the terminal connection was lost partway through this)" if self.hungup else ""
         if child_code != 0:
             # Round-7: a nonzero code is not necessarily a plain failure --
@@ -579,7 +598,16 @@ class ProtectedRegion:
             # the script's own documented exit-code meaning. Report only
             # the fact ("the fix ran and exited N") and let EXIT_MEANINGS'S
             # own explanation of N stand on its own, unqualified either way.
-            ran_note = f" -- {label} ran and exited {child_code}" if applied else ""
+            # F4: unless `child_code` was itself FORCED nonzero after a
+            # real exit of 0 because a service failed to come back -- then
+            # say so plainly rather than implying the fix itself failed.
+            if down_services and real_child_code == 0 and child_code != 0:
+                ran_note = (
+                    f" -- {label} ran and exited 0 (applied); exit {child_code} because "
+                    f"{', '.join(down_services)} did not come back"
+                )
+            else:
+                ran_note = f" -- {label} ran and exited {child_code}" if applied else ""
             safe_print(
                 f"zl: signal {sig} received earlier -- keeping the underlying command's own exit "
                 f"code {child_code} rather than the signal (services are {state}); "

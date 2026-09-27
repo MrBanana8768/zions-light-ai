@@ -86,14 +86,36 @@ def _read_history_file(path: Path, tag: str, pattern) -> tuple[int, int | None]:
     stat()'s size but never actually read as history, so the live
     follower -- starting from that later offset -- would never show them
     either. Taking both from the handle that did the actual reading
-    closes that window to zero.
+    closes that window to zero. (F1, review follow-up: this is exactly
+    the mutation `offset = f.tell()` -> `offset = path.stat().st_size`
+    would reintroduce -- see `test_ops_logs.py`'s
+    `test_mutation_replacing_tell_with_stat_size_creates_a_history_follow_gap`.)
+
+    F3 (review follow-up): a TRAILING PARTIAL line (the writer flushed up
+    to some point inside the last line but not its trailing newline yet)
+    must not be emitted here even if it happens to match `pattern` -- it
+    is not a complete record yet. Read line-by-line with `readline()`
+    (not `for line in f`, which gives no per-line boundary to roll back
+    to) and keep `offset` at the position right BEFORE any such partial
+    line, so the live follower re-reads it in full, from scratch, once it
+    (and its newline) actually land -- never printed twice, never printed
+    as an incomplete fragment.
     """
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
+            offset = f.tell()
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                if not line.endswith("\n"):
+                    # Trailing partial line: leave `offset` at the position
+                    # before it (recorded on the previous iteration) and
+                    # stop -- do not emit it, do not advance past it.
+                    break
                 if pattern.search(line):
                     _emit(tag, line)
-            offset = f.tell()
+                offset = f.tell()
             try:
                 inode = os.fstat(f.fileno()).st_ino
             except OSError:

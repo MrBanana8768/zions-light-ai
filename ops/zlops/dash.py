@@ -248,6 +248,21 @@ def _panel_health(entry: dict, now: float) -> list[tuple[str, str]]:
     if isinstance(inflight, int):
         status_line += f"   in_flight={inflight}"
     lines.append((status_line, status if status in ("ok", "warn", "crit") else "normal"))
+    # Boot-time word-ban warm-up (coordinator addendum, v3.1.9.8): shown
+    # only when the field is present at all (v3.1.9/pre-warm-up compactors
+    # never report it -- must never be shown as some default). Read
+    # tolerantly (`doc.get("word_ban", {})`, the shape is not committed
+    # yet): `warm_state` is one of `idle | waiting_idle | warming |
+    # backoff | disabled | vllm_unreachable`, marked warn for the two
+    # failure-shaped states and neutral for everything else -- an
+    # UNKNOWN future value is shown raw rather than crashing or being
+    # hidden.
+    word_ban = doc.get("word_ban")
+    if isinstance(word_ban, dict):
+        warm_state = word_ban.get("warm_state")
+        if warm_state is not None:
+            attr = "warn" if warm_state in ("backoff", "vllm_unreachable") else "normal"
+            lines.append((f"  word_ban.warm_state: {warm_state}", attr))
     findings = list(interp.get("findings") or [])
     # crit > warn > info/ok, before truncating - a low-priority finding
     # must never push a crit one off the shown list (the review's own
@@ -348,7 +363,24 @@ def _panel_gpu(entry: dict, now: float, history: dict, ascii_only: bool) -> list
     return lines
 
 
-def _panel_vllm(entry: dict, now: float, history: dict, ascii_only: bool) -> list[tuple[str, str]]:
+def _is_word_ban_warming(word_ban: dict | None) -> bool:
+    """True when the boot-time word-ban warm-up request (coordinator
+    addendum, v3.1.9.8) is plausibly the reason vLLM shows running/waiting
+    activity -- `warm_state == "warming"`, or `warmups_in_flight > 0` (the
+    warm-up is NOT counted in `request_tracing.requests_in_flight`, only
+    here). Read tolerantly: the shape is not committed yet.
+    """
+    if not isinstance(word_ban, dict):
+        return False
+    if word_ban.get("warm_state") == "warming":
+        return True
+    n = word_ban.get("warmups_in_flight")
+    return isinstance(n, (int, float)) and n > 0
+
+
+def _panel_vllm(
+    entry: dict, now: float, history: dict, ascii_only: bool, word_ban: dict | None = None,
+) -> list[tuple[str, str]]:
     age = _age_s(entry, now)
     stale = _is_stale(age, telemetry.CADENCE_S["vllm"])
     stalled = _stalled_s(entry, now, telemetry.CADENCE_S["vllm"])
@@ -360,6 +392,7 @@ def _panel_vllm(entry: dict, now: float, history: dict, ascii_only: bool) -> lis
     if not data:
         lines.append(("  (no data yet)", "dim"))
         return lines
+    warmup_note = " (word-ban warm-up)" if _is_word_ban_warming(word_ban) else ""
     if data.get("source") == "log":
         log = data.get("log") or {}
         # The log fallback's numbers are only as fresh as the LINE they came
@@ -375,7 +408,7 @@ def _panel_vllm(entry: dict, now: float, history: dict, ascii_only: bool) -> lis
         row_attr = "stale" if is_stale else "normal"
         lines.append(
             (
-                f"  running={log.get('running')} waiting={log.get('waiting')}"
+                f"  running={log.get('running')} waiting={log.get('waiting')}{warmup_note}"
                 f" prompt={_fmt_rate(log.get('prompt_tokens_per_s'))} gen={_fmt_rate(log.get('generation_tokens_per_s'))}",
                 row_attr,
             )
@@ -392,7 +425,7 @@ def _panel_vllm(entry: dict, now: float, history: dict, ascii_only: bool) -> lis
     metrics = data.get("metrics") or {}
     lines.append(
         (
-            f"  running={metrics.get('running')} waiting={metrics.get('waiting')}"
+            f"  running={metrics.get('running')} waiting={metrics.get('waiting')}{warmup_note}"
             f" kv_cache={_fmt_pct(metrics.get('kv_cache_usage_pct'))}",
             "normal",
         )
@@ -666,7 +699,13 @@ def render_frame(snapshot: dict, history: dict, width: int, now: float, opts: di
     hostdata = _panel_host_data_backups(
         snapshot.get("host", {}), snapshot.get("data_usage", {}), snapshot.get("backups", {}), now
     )
-    vllm = _panel_vllm(snapshot.get("vllm", {}), now, history, ascii_only)
+    # word_ban lives under /health/full's own doc (the Health panel's data
+    # source), not vLLM's -- pulled out here, tolerantly, so the vLLM panel
+    # can label a running/waiting count as the boot-time warm-up rather
+    # than her real traffic.
+    _health_doc = ((snapshot.get("health", {}) or {}).get("data") or {}).get("doc") or {}
+    word_ban = _health_doc.get("word_ban") if isinstance(_health_doc, dict) else None
+    vllm = _panel_vllm(snapshot.get("vllm", {}), now, history, ascii_only, word_ban)
     ssh = _panel_ssh(snapshot.get("ssh", {}), now, history, ascii_only, no_rtt)
     log = _panel_log(snapshot.get("log", {}), now, bool(opts.get("show_log", True)))
 

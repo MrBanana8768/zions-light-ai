@@ -91,6 +91,11 @@ def _write_meta(meta_dir: Path) -> None:
     disk_lines.append(f"NOTE: df {podenv.DATA} reports the whole shared MooseFS cluster, not this volume's quota.")
     count, total = cmd_disk.dir_count_and_size(podenv.BACKUPS)
     disk_lines.append(f"backups: {count} archive(s) in {podenv.BACKUPS}, {common.human_bytes(total)} total")
+    # compactor's own control/pending roots -- reported only if present,
+    # same `du` (time-bounded) as everything else in this file.
+    for label, root in (("control root", podenv.CONTROL_ROOT), ("pending root", podenv.PENDING_ROOT)):
+        if root.is_dir():
+            disk_lines.append(f"{label} ({root}): {cmd_disk.du(root)}")
     (meta_dir / "disk.txt").write_text("\n".join(disk_lines) + "\n", encoding="utf-8")
 
     redacted = common.redact_env(common.merged_environ())

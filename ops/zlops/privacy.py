@@ -144,14 +144,31 @@ def _scrub_dedup_merge(line: str) -> str:
 
 
 def _scrub_repetition_token(line: str) -> str:
+    """F2 (review follow-up): the OLD version found the closing quote with
+    a plain `line.find(quote, ...)` -- exactly the bug already fixed once
+    for `_scrub_dedup_merge`/`_scrub_long_quoted_spans` above (see the
+    block comment on `_SAFE_REPR_RE`): it does not know about Python
+    `repr()`'s own backslash escapes, so a token containing an ESCAPED
+    copy of its own quote character (e.g. `repr("a\"b'c")` picks single
+    quotes and would embed `\\'` nowhere here, but `repr("it's \"ok\"")`
+    picks single quotes with an escaped `'`, or the reverse: a token
+    embedding the OTHER quote character unescaped) can close the scrub
+    span too early, leaking the rest of the token verbatim. Match the
+    closing quote escape-aware, same idiom as `_QUOTED_SPAN_RE`:
+    `(?:\\.|(?!q).)*` -- at each position, consume a backslash-escape
+    pair as one unit, or one character that is not the (unescaped)
+    opening quote.
+    """
     m = _REPETITION_TOKEN_RE.search(line)
     if not m:
         return line
     quote = m.group(2)
     prefix_end = m.end(1)
-    close_quote_at = line.find(quote, prefix_end + 1)
-    if close_quote_at < 0:
+    close_re = re.compile(r"(?:\\.|(?!" + re.escape(quote) + r").)*" + re.escape(quote))
+    close_m = close_re.match(line, prefix_end + 1)
+    if close_m is None:
         return line
+    close_quote_at = close_m.end() - 1
     token_span = line[prefix_end : close_quote_at + 1]
     return line[:prefix_end] + f"<scrubbed:{len(token_span)} chars>" + line[close_quote_at + 1 :]
 
