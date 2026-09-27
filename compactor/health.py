@@ -1004,9 +1004,25 @@ def _gather_blocking() -> dict:
         restore_marker = {"present": None, "marker": None,
                            "error": f"{type(e).__name__}: {e}"}
 
+    # v3.1.9.8 UPLOADS BACKUP, moved here in hostile-review round 2 finding
+    # 3: uploads_backup.health_snapshot() reads one small manifest.json —
+    # cheap on its own — but the FIRST draft called it directly from
+    # gather_health_full, on the event loop, with a comment that (wrongly)
+    # called that safe. It is real disk I/O (a JSON read, occasionally a
+    # one-time reconciliation walk of objects/ for an old-format manifest —
+    # see load_manifest), which is exactly what _gather_blocking exists to
+    # keep off the loop; every other probe in this function already follows
+    # that rule.
+    try:
+        import uploads_backup
+        uploads = uploads_backup.health_snapshot()
+    except Exception as e:
+        uploads = {"error": f"{type(e).__name__}: {e}"}
+
     return {"storage": storage, "stats": stats, "writes": writes,
             "backups": backups, "sqlite_journal": sqlite_journal,
-            "snapshot": snapshot, "restore_marker": restore_marker}
+            "snapshot": snapshot, "restore_marker": restore_marker,
+            "uploads_backup": uploads}
 
 
 # ---------------------------------------------------------------------------
@@ -1576,6 +1592,7 @@ async def gather_health_full(
     stats = blocking["stats"]
     writes = blocking["writes"]
     backup_info = blocking["backups"]
+    ub = blocking["uploads_backup"]
 
     # V2.3 Theme 3: bounded-background-work pool stats (outstanding/shed).
     # Pure in-memory counters, so this one stays on the loop thread.
@@ -1596,6 +1613,12 @@ async def gather_health_full(
         wb = wordban_runtime.health_snapshot()
     except Exception as e:
         wb = {"error": f"{type(e).__name__}: {e}"}
+
+    # v3.1.9.8 UPLOADS BACKUP: `ub` is already unpacked from `blocking`
+    # above — unlike `bg`/`wb` (pure in-memory counters, safe on the loop),
+    # this one does real disk I/O, so it runs inside _gather_blocking, off
+    # the event loop, same as storage/stats/writes/backups. See finding 3
+    # of hostile-review round 2 and _gather_blocking's own comment.
 
     # v3.1.4: memory-tail decisions — replies that did NOT enter memory
     # (facts, episodic index, rollup) and why, as counts. Same shape and same
@@ -2297,6 +2320,11 @@ async def gather_health_full(
         # absent file is fail-open on the request path (the client-sent
         # value or none is used instead), so this never moves `status`.
         "word_ban": wb,
+        # v3.1.9.8 UPLOADS BACKUP: objects/bytes/files_tracked/
+        # deleted_tracked/last_run_at/last_run_s/suspect/
+        # suspect_content_count/last_error — see uploads_backup.
+        # health_snapshot's own docstring. Visibility only.
+        "uploads_backup": ub,
         # v3.1.9.8 REQUEST TRACING (owner's ask, item 7): requests_in_flight
         # (chat requests currently inside the handler, INCLUDING the
         # pre-processing phase — the whole point) and how long ago the last

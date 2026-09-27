@@ -1450,6 +1450,203 @@ created, which is what you want.
 > the lost volume, there's nothing to restore. Until off-volume DR ships,
 > periodically copy `/data/backups/`'s newest archive somewhere off the pod.
 
+### Uploads backup (her photos) — a SEPARATE, incremental mirror
+
+**Why this exists (the 2026-09-26 uploads incident).** OpenWebUI stores every
+uploaded file under `/data/openwebui/uploads/<id>_<name>`, and the `file`
+table records that literal path. The backup above does **not** cover this
+directory — uploads are write-once and only grow (~270 MB and climbing), so
+tar-ing the whole tree into every nightly archive would make each archive's
+cost scale with a folder that almost never changes. On 2026-09-26 the owner
+ran `gzip` over the directory in place while trying to make a manual copy:
+every one of 338 files became `<name>.gz`, and every photo vanished from
+OpenWebUI until it was fixed by hand. The owner asked for a **separate,
+incremental** backup of uploads — never folded into the main archive.
+
+**What it protects against:** in-place damage to an uploaded file (a bad
+script, an accidental `gzip`/`mv`/edit) and accidental deletion. **What it
+does NOT protect against:** loss of the `/data` volume itself — the mirror
+(`compactor/uploads_backup.py`) lives on the same MooseFS mount as the
+uploads it protects, by default at `COMPACTOR_UPLOADS_BACKUP_DIR`
+(`/data/backups/uploads`). Pulling a copy off-pod is a follow-up, same as
+off-volume DR for the main archive above.
+
+**Design, briefly.** A content-addressed object store
+(`objects/<sha256[:2]>/<sha256>`, each object a plain **copy**, never a
+hardlink — a hardlink would mean an in-place edit of the live upload
+corrupts the backup's copy too, since they'd share an inode) plus
+`manifest.json`, mapping each upload's relative name to `{sha256, size,
+mtime, first_seen, last_seen, deleted_at}` (the CANONICAL, original-good
+values — never overwritten once set) plus, once a file's content has ever
+drifted, a `cur_*` set of the same shape tracking what was last actually
+observed. Hashing and copying an object happen in **one read pass**
+(`_hash_and_copy_object`) — never hash first and copy second as two
+separate reads of the same live file, which could otherwise capture a file
+that finished changing in between under the wrong (stale) hash. A file
+whose mtime is within `COMPACTOR_UPLOADS_BACKUP_SETTLE_S` (default 300s) of
+"now" is skipped entirely that run — it may still be mid-write — and picked
+up cleanly once it settles. Each run only re-hashes files whose stat
+signature moved since it was last observed — that is the whole of
+"incremental" here. It runs automatically once per daemon cycle
+(`backup.py`'s `run_daemon`, right after that cycle's own `run_once`, same
+cadence as `COMPACTOR_BACKUP_INTERVAL_HOURS` — **not** on `backup.py
+--once`, `zl backup now`, or zl fix's pre-repair backup, which call
+`run_once` directly and never trigger this) and only when the compactor
+looks idle (`request_tracing.requests_in_flight == 0` via `/health/full` —
+checked again every `COMPACTOR_UPLOADS_BACKUP_RECHECK_FILES` files or
+`COMPACTOR_UPLOADS_BACKUP_RECHECK_BYTES` bytes copied mid-run, so a pod that becomes busy partway
+through a large cycle is noticed, not just at the start; a busy/newly-busy
+result skips or cleanly pauses the cycle — never delayed forever, and
+retried/resumed next cycle); a failure here is logged and never affects the
+main backup's own report. The endpoint being genuinely unreachable
+(connection refused, DNS) still fails OPEN (proceeds) — nothing there to be
+busy — but a health check that ACCEPTS the connection and then never
+answers within its own timeout fails CLOSED (skips), the same direction as
+an HTTP error response: both look like an overloaded process, unlike a
+refused connection.
+
+`_hash_and_copy_object` also fstats the file it is reading before and
+after that one read pass; if size or mtime moved during it (an in-place
+rewrite landing inside the read, not just around it), the tmp copy is
+discarded and the file is skipped this run — same treatment as the settle
+window, picked up cleanly once it stops moving — rather than risk a
+self-consistent-but-meaningless object (hash and bytes agree with each
+other, but with no single true state of the file). A filename that cannot
+round-trip through UTF-8 is skipped and counted (never logged by name)
+instead of raising out of the whole cycle's manifest write, and the last
+run's `ok`/error type/timing are persisted to a small `status.json` next to
+the manifest so `/health/full` — served by a different OS process than the
+one running these cycles — can see them too.
+
+**Detecting damage instead of quietly backing it up.** If an
+already-mirrored file's CONTENT changes (its hash no longer matches what
+was last observed), the manifest's CANONICAL sha256/size/mtime/mtime_ns/
+inode fields are **never** overwritten — the new hash is recorded under
+that entry's `changed` list and as its own object in the store (recoverable
+for forensics), the OLD (good) object stays canonical, and a WARNING is
+logged. The `cur_*` fields DO update to the new observed state, so the
+SAME still-drifted file is only ever counted once — not flagged again on
+every subsequent run just because it still differs from the ORIGINAL.
+
+If more than `COMPACTOR_UPLOADS_BACKUP_MASS_CHANGE_PCT` (default 20%) of
+tracked uploads vanish or change content in one run — exactly the shape the
+gzip incident had: 338 tracked names gone, 338 unrelated new names present —
+the run freezes the per-file records of every vanished/changed name (the
+last good state for each stays exactly as it was) and writes a
+`last_suspect_run` marker; an ERROR is logged, a best-effort alert fires
+(same webhook path as a failed main backup, counts only), and
+`/health/full`'s `uploads_backup.suspect` becomes `true`. **Once tripped,
+the mirror STAYS suspect on every later cycle — never auto-clears itself —
+until an operator runs `accept`** (hostile-review round 3: a purely
+per-run percentage recompute let new, legitimately-mirrored uploads inflate
+the tracked-file count enough that the SAME still-vanished names quietly
+dropped back under threshold and got marked deleted on their own, one cycle
+after the guard first tripped). **New uploads are still mirrored even while
+suspect** — objects are add-only, so backing up a genuinely new photo is
+safe regardless, and withholding it would just be more to lose while it's
+investigated. A new file's magic bytes are also checked against its
+extension (a `.jpg` that is actually gzip, say); a mismatch is recorded
+under `suspect_content` but the file is still backed up.
+
+**Recovering from a suspect run.** First look — `status` (which prints the
+marker's own vanished/changed/baseline/pct numbers) and a listing of the
+live uploads directory tell you whether the vanished/changed names are real
+damage or a legitimate bulk operation (the owner moved/reorganized photos,
+deleted a batch, edited a batch of files in place, ...). If it's legitimate:
+```bash
+python3 scripts/uploads-backup.py accept               # dry run: what would change
+python3 scripts/uploads-backup.py accept --yes         # applies it (see below)
+python3 scripts/uploads-backup.py accept --yes --force-large  # only if >50% of tracked
+                                                                # files would be affected
+```
+`accept` does two things, both required to actually clear a mass-change:
+marks every still-vanished tracked name `deleted_at=now` (their objects are
+kept, same as any ordinary delete), **and** rolls the CANONICAL-vs-observed
+`cur_*` fields of every still-`changed` tracked name forward to match its
+current live content (recording the new content as an object too, if it
+somehow isn't one already) — skipping this second part was the round-3
+finding: a legitimate mass content-edit `accept`ed without it stayed
+"changed" forever, since nothing had ever advanced what the mirror
+considered "last observed", and the very next cycle re-tripped the guard on
+the exact same files. Either way `last_suspect_run` is cleared. `accept`
+refuses outright (exit 2, nothing changed) if `--uploads-dir` doesn't exist
+or contains zero regular files — the shape a wrong path or an unmounted
+volume produces, which would otherwise look like "everything vanished" —
+and refuses (exit 1) if more than 50% of tracked files would be affected
+unless `--force-large` confirms that's really intended. If instead it looks
+like real damage, restore from the mirror (below) and/or treat it as an
+incident.
+
+**Manual run / status / verify:**
+```bash
+/opt/compactor-venv/bin/python /opt/compactor/uploads_backup.py --once
+curl -s http://localhost:8080/health/full | python3 -c "import json,sys; print(json.load(sys.stdin)['uploads_backup'])"
+```
+
+**Operator script** (`scripts/uploads-backup.py`, stdlib only — run from a
+cloned `/opt/zl-repo` checkout, same as `backfill-records.py`/
+`clean-decoration.py`, not baked into the image):
+```bash
+python3 scripts/uploads-backup.py status
+python3 scripts/uploads-backup.py verify [--deep]
+python3 scripts/uploads-backup.py check-db --db /data/openwebui/webui.db
+python3 scripts/uploads-backup.py check-db --db /path/to/extracted/webui.db --db-is-copy
+python3 scripts/uploads-backup.py restore                 # dry run (default)
+python3 scripts/uploads-backup.py restore --apply
+python3 scripts/uploads-backup.py restore --apply --also-mismatched
+python3 scripts/uploads-backup.py restore --apply --include-deleted           # bring back an
+python3 scripts/uploads-backup.py restore --apply --include-deleted \        # accidental delete —
+    --deleted-since 2026-09-20T00:00:00+00:00                                # this is what makes
+                                                                              # "kept 90 days so
+                                                                              # recoverable" literal
+python3 scripts/uploads-backup.py accept --yes             # see "Recovering from a suspect run" above
+```
+`restore` never restores a record with `deleted_at` set unless
+`--include-deleted` is passed (it is a deliberate delete otherwise, not
+damage); `--deleted-since` narrows that to records deleted at or after a
+given ISO-8601 timestamp, for when only some of the deleted names should
+come back. `accept` and every `run_once` cycle share ONE advisory lock file
+in the mirror root, so a manual `accept` and a concurrently-running daemon
+cycle can't interleave two read-modify-write manifest saves.
+`status` prints counts, bytes, the last run, and whether a suspect run is
+recorded. `verify` confirms every manifest entry has a backing object
+(`--deep` re-hashes each one). `check-db` reads `webui.db`'s `file` table
+**read-only** — plain `mode=ro` by default, which is the SAFE choice
+against the live database (sqlite may create `-shm`/`-wal` sidecar files
+next to it as a normal side effect of that; harmless); pass `--db-is-copy`
+only when `--db` is already a static extracted copy (e.g. from an archive),
+which opens with `immutable=1` for a faster, still-safe read — never pass
+it against the live db, since `immutable=1` assumes the file will not
+change while open. Reports, as counts only, how many rows are on disk,
+missing, mirrored, hash-mismatched, or outside the uploads directory
+entirely (a different install's path — not evaluated against this mirror,
+reported separately rather than folded into "not mirrored"); `--list-ids`
+adds the numeric OpenWebUI file ids with a problem, on request — never file
+names. `restore` defaults to a dry run; `--apply` restores files missing
+from disk (never overwrites an existing file otherwise) after verifying
+each backed-up OBJECT's own hash first (a damaged object is refused, never
+written over a live file); `--also-mismatched` additionally restores files
+whose live content no longer matches the mirror, moving the existing file
+aside to `uploads-quarantine-<stamp>/` first — it is never deleted. A
+manifest entry whose name would resolve outside the uploads directory (a
+`../` traversal or an absolute path — only possible via a hand-edited or
+corrupted manifest.json) is rejected and counted, never followed. Exit
+codes: `0` ok, `1` a problem was found or a destructive action was refused,
+`2` a usage error. **Every command reports counts, never file names or
+content — tests exercise this script only against synthetic data.**
+
+**Mirror size.** The mirror is a full copy of every distinct upload ever
+seen, plus one extra object per content drift — expect it to roughly track,
+and over time (as edits accumulate) somewhat exceed, the live uploads
+directory's own size. `COMPACTOR_UPLOADS_BACKUP_MAX_MB` (default 2048)
+refuses new copies once `objects_bytes` is already at or over the cap
+(surfaced at `/health/full`'s `uploads_backup.over_mirror_size_cap`);
+existing objects are never touched by this. The separate free-space check
+against the backup volume is a much weaker signal here than on a normal
+disk — MooseFS (this volume) reports CLUSTER-wide free space, not any
+quota this mount actually has — so the size cap is the guard that actually
+means something day to day.
+
 ---
 
 ## Logs: text vs JSON

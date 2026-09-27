@@ -128,6 +128,122 @@ chain on `/forget`'s durability, are covered below.
   `python3`, stdlib only. `/health/full` gains a `word_ban` key (source/
   revision/sha/error, warm state, last compile time). See OPERATIONS.md
   "Word-ban file deploy + idle warm-up".
+- **Uploads backup (`compactor/uploads_backup.py`, new module;
+  `scripts/uploads-backup.py`, new stdlib-only operator script) —
+  a SEPARATE, incremental mirror of `/data/openwebui/uploads` (her
+  photos), never folded into the main archive.** Built after the
+  2026-09-26 UPLOADS INCIDENT: the owner ran `gzip` over the uploads
+  directory in place while making a manual copy, turning all 338 files
+  into `<name>.gz` and wiping every photo out of OpenWebUI until it was
+  fixed by hand. The main backup does not cover this directory at all
+  (uploads are write-once and only grow, ~270 MB and climbing — tar-ing
+  the whole tree nightly would make every archive's cost scale with a
+  folder that never shrinks). A content-addressed object store
+  (`objects/<sha256[:2]>/<sha256>`, always a plain copy, never a
+  hardlink) plus `manifest.json` (name → sha256/size/mtime/first_seen/
+  last_seen/deleted_at); only files whose `(size, mtime_ns, inode)`
+  changed since the last manifest are re-hashed. **Detects damage instead
+  of quietly backing it up:** an already-mirrored file whose content
+  changes never has its manifest sha overwritten — the new hash is
+  recorded under `changed`, the old (good) object is kept, and a WARNING
+  is logged; a deleted upload is kept (object and record) for
+  `COMPACTOR_UPLOADS_BACKUP_KEEP_DELETED_DAYS` (default 90) before being
+  swept; and a **mass-change guard**
+  (`COMPACTOR_UPLOADS_BACKUP_MASS_CHANGE_PCT`, default 20%) — the exact
+  shape the gzip incident had — writes nothing to the manifest's
+  per-file records at all (only a `last_suspect_run` marker) when more
+  than that share of tracked uploads vanish or change content in one
+  run, leaving the last good manifest untouched. A new file's magic
+  bytes are checked against its extension (`suspect_content`, still
+  backed up either way). Runs right after every main backup cycle (same
+  cadence), gated on the compactor looking idle
+  (`request_tracing.requests_in_flight == 0` via `/health/full` — the
+  daemon is a separate OS process from the one that increments that
+  counter, so this polls loopback HTTP rather than importing the counter
+  directly), paced for a shared MooseFS mount (chunked copies, a sleep
+  between files); a failure here is caught and logged and never affects
+  the main backup's own report. `scripts/uploads-backup.py status/
+  verify/check-db/restore` runs on the pod, stdlib only, from a cloned
+  checkout like `backfill-records.py`; `restore` defaults to a dry run,
+  `--also-mismatched` quarantines the existing file aside first rather
+  than overwriting it. `/health/full` gains an `uploads_backup` key
+  (objects/bytes/files_tracked/deleted_tracked/last_run_at/last_run_s/
+  suspect/suspect_content_count/last_error). **Does not protect against
+  loss of the `/data` volume itself** — the mirror lives on the same
+  mount as the uploads it protects; pulling it off-pod is a follow-up.
+  See OPERATIONS.md "Uploads backup (her photos)".
+
+  **Hostile review round 2 (same day), FIX FIRST, all closed before this
+  entry:** two working attack scripts against the first draft found (1) a
+  TOCTOU race — hash and copy were two separate reads of the same live
+  file, so a file that finished changing in between could be captured
+  under the wrong, stale hash forever; fixed with a single read pass
+  (`_hash_and_copy_object`), a settle window
+  (`COMPACTOR_UPLOADS_BACKUP_SETTLE_S`, default 300s) that skips a
+  possibly-still-writing file entirely, and `cur_*` manifest fields so a
+  drifted file is only ever counted once, not re-flagged every subsequent
+  run; (2) the mass-change guard was all-or-nothing — a REAL mass deletion
+  froze the mirror with no way back except hand-editing the manifest;
+  fixed by still mirroring new uploads while suspect (objects are
+  add-only, safe) and adding `scripts/uploads-backup.py accept --yes` to
+  confirm a legitimate deletion and clear the flag, plus routing a suspect
+  run through the same alert webhook a failed main backup uses; (3)
+  `health_snapshot()` walked the entire `objects/` tree on every call,
+  including from the request-serving event loop — fixed by keeping
+  running `objects_count`/`objects_bytes` counters IN the manifest and
+  moving the call into `health.py`'s existing `_gather_blocking` (off the
+  loop, same as every other filesystem probe there). Also fixed: the idle
+  gate now re-polls mid-run (every 20 files/50MB) and fails CLOSED on an
+  HTTP error response with a nonzero/unparseable `requests_in_flight`
+  (previously only the connection-refused case was tested); `scripts/
+  uploads-backup.py restore` rejects a manifest entry whose name would
+  resolve outside the uploads directory (`../` or an absolute path) and
+  verifies a backed-up object's own hash before ever writing it over a
+  live file; symlinks and non-regular files are never mirrored (`os.walk
+  followlinks=False` + `lstat`/`S_ISREG`, not a symlink-following
+  `is_file()` glob); every except block now logs/records only the
+  exception TYPE, never `str(e)` (which can embed the path that
+  triggered it — an upload's own name); and a hard mirror-size cap
+  (`COMPACTOR_UPLOADS_BACKUP_MAX_MB`, default 2048) backstops the
+  existing free-space check, which means little on MooseFS's cluster-wide
+  `statvfs`. The uploads step also moved from an unconditional call
+  inside `backup.run_once` to `backup.run_daemon` only, after `run_once`
+  returns — so `backup.py --once`, `zl backup now`, and zl fix's
+  pre-repair backup are untouched, and `run_once` is byte-identical to
+  its pre-uploads-backup form again.
+
+  **Hostile review round 3 (same day), FIX FIRST:** a probe showed the
+  mass-change guard could clear ITSELF — copying new (safe) files while
+  suspect inflated the tracked-file baseline enough that the SAME
+  still-vanished names dropped back under threshold and got marked
+  deleted on the very next cycle, with no operator action at all; fixed
+  by making suspect STICKY (recomputed for visibility, never re-decided)
+  until `accept`, which itself gained a missing/empty-`--uploads-dir`
+  refusal, a `--force-large`-gated >50%-affected refusal, printing the
+  marker's own numbers before requiring `--yes`, rolling a legitimately-
+  accepted content change's `cur_*` fields forward (else the same edit
+  re-tripped the guard immediately after being accepted), and a shared
+  `flock` with the daemon's own cycle. `restore` gained `--include-deleted`
+  / `--deleted-since`, making the "kept 90 days so recoverable" claim
+  literally true for the first time. `_hash_and_copy_object` now fstats
+  the file before and after its one read pass, discarding the tmp copy and
+  skipping the file this run if size/mtime moved mid-read (a narrower race
+  than round 2's fix closed, inside rather than around the read); the
+  pre-read stat is recorded as the file's signature. A non-UTF-8 filename
+  is skipped and counted (never logged) instead of taking the whole
+  cycle's manifest write down with a `UnicodeEncodeError`, forever; a
+  small `status.json` next to the manifest persists `ok`/last-error-
+  type/timing so `/health/full` (a different OS process) can see the last
+  run's own outcome, and a run that fails now alerts too. The daemon
+  loop's own uploads-step call site now catches `BaseException` (re-
+  raising only `KeyboardInterrupt`/`SystemExit`) — `except Exception` had
+  missed `asyncio.CancelledError`, which is a `BaseException` since Python
+  3.8, and a probe showed it killing the whole daemon loop. Also: a health
+  check that TIMES OUT now fails closed (a refused connection still fails
+  open); re-hashing a changed file now respects the free-space/mirror-cap
+  check too (previously only new files did); and an old-format manifest's
+  one-time `objects_count`/`objects_bytes` reconciliation walk is now
+  written back immediately, so it truly only ever happens once globally.
 
 ### Fixed
 - **Tracing-verification review, three LOW findings.** `_unsafe_conv_id_
