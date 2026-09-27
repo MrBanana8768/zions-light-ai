@@ -164,7 +164,7 @@ def run(argv: list[str]) -> int:
         region.clear_message()
         if not proceed:
             common.safe_print(f"zl journal repair: refusing -- {note}", file=sys.stderr)
-            region.finish(1, restored=True)
+            region.finish(1, restored=None)
             return 1
         # Round-4 blocker #3: a signal deferred DURING the wait must abort
         # here -- nothing has been stopped, so applying anyway (as the old
@@ -176,7 +176,7 @@ def run(argv: list[str]) -> int:
                 "aborting without repairing",
                 file=sys.stderr,
             )
-            region.finish(1, restored=True)
+            region.finish(1, restored=None)
             return 1
         try:
             was_running = common.stop_for_apply(writers)
@@ -303,6 +303,11 @@ def run(argv: list[str]) -> int:
         # code nonzero when one didn't, even though recover-webui-db.py's
         # own exit code was 0/2/3/5 (none of which are in
         # _LEAVE_STOPPED_EXIT_CODES).
+        # (the `_LEAVE_STOPPED_EXIT_CODES` branch above always returns before
+        # here, so this point is only reached via the `else` branch just
+        # above, which always sets `came_back`.)
+        real_code = code
+        down_services = sorted(svc for svc, ok in came_back.items() if not ok)
         if not restored and code == 0:
             code = 1
         if "webuidb-sync" in writers:
@@ -321,5 +326,8 @@ def run(argv: list[str]) -> int:
                 "--sync-once --force (safe with services up -- --force only skips the mtime check; "
                 "the same liveness/integrity guards still apply)."
             )
-        region.finish(code, restored=restored, applied=True, label="the repair")
+        region.finish(
+            code, restored=restored, applied=True, label="the repair",
+            real_child_code=real_code, down_services=down_services,
+        )
     return code

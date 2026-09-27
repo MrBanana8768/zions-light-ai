@@ -967,6 +967,108 @@ def test_mutation_forgetting_to_check_force_busy_flag_is_caught():
         assert_true(any("--apply" in ln for ln in fx.marker_lines()), "the target actually ran")
 
 
+def test_signal_during_a_failing_backup_says_left_untouched_not_restored():
+    """F4 regression (mut.py M3: `region.finish(common.EXIT_BACKUP_FAILED,
+    restored=None)` mutated to `restored=True`). `region.finish()` is a
+    no-op unless a signal was actually deferred at that exact call site,
+    so this must combine a FAILING backup.py with a SIGTERM to zl's own
+    pid delivered while it runs (same technique as
+    test_backup_window_blocker_aborts_on_sigterm_during_the_backup) --
+    nothing was ever stopped at this point, so the printed message must
+    say "left untouched", never "restored".
+    """
+    import io
+    import signal
+    import threading
+    import time
+
+    server = _FakeHealthServer(initial_n=0)
+    try:
+        with _Fixture({"compactor": "RUNNING", "backup": "RUNNING"}) as fx, \
+             mock.patch.object(fix.podenv, "COMPACTOR_PY", Path(sys.executable)), \
+             mock.patch.object(fix.podenv, "COMPACTOR_PKG", fx.script.parent), \
+             mock.patch.object(fix.common.podenv, "COMPACTOR_URL", server.url):
+            failing_backup = """#!/usr/bin/env python3
+import time, sys
+time.sleep(1.0)
+sys.exit(1)
+"""
+            (fx.script.parent / "backup.py").write_text(failing_backup, encoding="utf-8")
+
+            def _sigterm_during_backup():
+                time.sleep(0.3)
+                os.kill(os.getpid(), signal.SIGTERM)
+
+            t = threading.Thread(target=_sigterm_during_backup)
+            t.start()
+            printed = io.StringIO()
+            try:
+                with mock.patch.object(sys, "stderr", printed):
+                    code = fix.run(["test-entry", "--apply", "--yes"])
+            except SystemExit as e:
+                code = e.code
+            t.join()
+            assert_eq(code, fix.common.EXIT_BACKUP_FAILED,
+                      "the backup's own failure code wins over the deferred signal")
+            out = printed.getvalue()
+            assert_true("left untouched" in out,
+                         "nothing was ever stopped at this call site -- must say so, not 'restored'", extra=out)
+            assert_true("services are restored" not in out, "never claims 'restored' here", extra=out)
+    finally:
+        server.close()
+
+
+def test_deferred_signal_with_a_down_service_names_it_not_the_generic_message():
+    """F4 regression (mut.py M5: dropping `real_child_code=real_code,
+    down_services=down_services` from the final `region.finish()` call).
+    Only reachable when BOTH a service fails to come back (forcing
+    code=1 despite the wrapped script's own exit 0) AND a signal is
+    deferred during the restart phase -- otherwise `region.finish()` is a
+    no-op and the dropped kwargs are never missed. Without them, the
+    printed message falls back to the generic "ran and exited 1" instead
+    of naming the real (0) exit code and the down service.
+    """
+    import io
+    import signal
+    import threading
+    import time
+
+    with _Fixture({"compactor": "RUNNING", "backup": "RUNNING"}) as fx:
+        with mock.patch.dict(os.environ, {"FAKE_SCRIPT_EXIT": "0"}):
+            entered_restart = threading.Event()
+
+            def slow_restart_down(names, **kw):
+                entered_restart.set()
+                time.sleep(1.2)
+                return {"compactor": True, "backup": False}
+
+            def _send_sigint_once_inside_restart():
+                entered_restart.wait(timeout=5.0)
+                time.sleep(0.3)
+                os.kill(os.getpid(), signal.SIGINT)
+
+            printed = io.StringIO()
+            with mock.patch.object(sys, "stderr", printed):
+                with mock.patch.object(fix.common, "restart_after_apply", side_effect=slow_restart_down):
+                    timer = threading.Thread(target=_send_sigint_once_inside_restart)
+                    timer.start()
+                    try:
+                        fix.run(["test-entry", "--apply", "--yes", "--skip-backup"])
+                    except SystemExit as e:
+                        assert_eq(e.code, 1, "the down-service-forced exit code (1) wins over the deferred signal")
+                    else:
+                        print("FAIL fix.run did not exit")
+                        sys.exit(1)
+                    finally:
+                        timer.join()
+        out = printed.getvalue()
+        assert_true(
+            "ran and exited 0 (applied)" in out and "backup" in out and "did not come back" in out,
+            "the message names the down service and the real (0) exit code -- only possible when "
+            "real_child_code/down_services actually reach region.finish()", extra=out,
+        )
+
+
 def test_unknown_entry_lists_registry_and_exits_2():
     with _Fixture({}):
         code = fix.run(["not-a-real-entry"])
@@ -1099,6 +1201,8 @@ if __name__ == "__main__":
     test_inflight_guard_called_exactly_once_with_skip_backup()
     test_force_busy_flag_reaches_the_inflight_guard()
     test_mutation_forgetting_to_check_force_busy_flag_is_caught()
+    test_signal_during_a_failing_backup_says_left_untouched_not_restored()
+    test_deferred_signal_with_a_down_service_names_it_not_the_generic_message()
     test_unknown_entry_lists_registry_and_exits_2()
     test_real_registry_entries_are_well_formed()
     test_registry_all_flags_match_each_wrapped_scripts_real_argparse()

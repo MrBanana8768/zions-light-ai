@@ -25,7 +25,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ops"))
 
 from zlops import common, telemetry  # noqa: E402  (telemetry: B's module, only monkeypatched, never edited)
-from zlops.commands import bundle  # noqa: E402
+from zlops.commands import bundle, disk as cmd_disk  # noqa: E402
 
 
 def assert_eq(actual, expected, label):
@@ -70,6 +70,8 @@ class _PodLayout:
         self.zl_home = root / "zl-ops"
         self.bundles = self.zl_home / "bundles"
         self.out_dir = root / "out"
+        self.control_root = self.data / "openwebui" / "compactor-control"
+        self.pending_root = self.data / "openwebui" / "compactor-pending"
 
         for d in (self.log_dir, self.backups, self.hf_home, self.store, self.ssh_persist, self.out_dir):
             d.mkdir(parents=True)
@@ -95,6 +97,8 @@ class _PodLayout:
             mock.patch.object(bundle.podenv, "SSH_PERSIST", self.ssh_persist),
             mock.patch.object(bundle.podenv, "ZL_HOME", self.zl_home),
             mock.patch.object(bundle.podenv, "BUNDLES", self.bundles),
+            mock.patch.object(bundle.podenv, "CONTROL_ROOT", self.control_root),
+            mock.patch.object(bundle.podenv, "PENDING_ROOT", self.pending_root),
             mock.patch.object(common, "http_get_json", side_effect=self._fake_http),
             mock.patch.object(common, "merged_environ", return_value=dict(_PLANTED_SECRETS, PATH="/usr/bin:/bin")),
             mock.patch.object(telemetry, "collect_snapshot", return_value={"fake": "snapshot"}),
@@ -145,6 +149,52 @@ def test_bundle_layout_matches_the_real_bundle():
         for log_name in ("logs/zla/compactor.log", "logs/zla/vllm.log", "logs/zla/compactor-error.log"):
             assert_true(log_name in names, f"{log_name} is in the bundle", extra=str(sorted(names)))
         assert_true("logs/zla/not-a-log.txt" not in names, "a non-.log file under LOG_DIR is never bundled")
+
+
+def test_disk_txt_reports_control_and_pending_roots_when_present():
+    """compactor's own CONTROL_ROOT/PENDING_ROOT (continuity.py's ledger
+    and durability sidecar, siblings of STORAGE_ROOT -- podenv.py's own
+    comment) get their own `du`-based size line in `meta/disk.txt`, same
+    as backups/HF cache already do -- but ONLY when they actually exist,
+    same "if present" convention as the rest of this file.
+    """
+    with _PodLayout() as fx:
+        fx.control_root.mkdir(parents=True)
+        (fx.control_root / "ledger.json").write_text("{}", encoding="utf-8")
+        # pending_root deliberately left absent.
+        with mock.patch.object(sys, "stdout", io.StringIO()):
+            code = bundle.run(["--out", str(fx.out_dir), "--print-path"])
+        assert_eq(code, 0, "bundle.run exits 0")
+        archive_path = sorted(fx.out_dir.glob("zla-bundle-*.tar.gz"))[-1]
+        extracted = _extract_all(archive_path, fx.out_dir / "extracted")
+        disk_txt = (extracted / "meta" / "disk.txt").read_text(encoding="utf-8")
+        assert_true("control root" in disk_txt and str(fx.control_root) in disk_txt,
+                    "the present control root gets its own line", extra=disk_txt)
+        assert_true("pending root" not in disk_txt,
+                    "the absent pending root is not mentioned at all", extra=disk_txt)
+
+
+def test_zl_disk_reports_control_and_pending_roots_when_present():
+    """L1/mut.py M10 regression: `zl disk` itself (`disk.py`'s own
+    `run()`) has a SEPARATE copy of this same control/pending-root
+    reporting logic from bundle.py's (already covered above by
+    test_disk_txt_reports_control_and_pending_roots_when_present) --
+    each must be tested independently, or a mutation that only guts
+    disk.py's own copy survives unnoticed.
+    """
+    with _PodLayout() as fx:
+        fx.control_root.mkdir(parents=True)
+        (fx.control_root / "ledger.json").write_text("{}", encoding="utf-8")
+        # pending_root deliberately left absent.
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", buf):
+            code = cmd_disk.run([])
+        assert_eq(code, 0, "zl disk exits 0")
+        out = buf.getvalue()
+        assert_true("control root" in out and str(fx.control_root) in out,
+                    "the present control root gets its own line in `zl disk`'s own output", extra=out)
+        assert_true("pending root" not in out,
+                    "the absent pending root is not mentioned at all", extra=out)
 
 
 def test_bundle_redacts_env_and_never_leaks_secrets_anywhere_in_the_tree():
@@ -311,6 +361,8 @@ def test_prune_keeps_only_the_newest_N_of_our_own_bundles():
 
 if __name__ == "__main__":
     test_bundle_layout_matches_the_real_bundle()
+    test_disk_txt_reports_control_and_pending_roots_when_present()
+    test_zl_disk_reports_control_and_pending_roots_when_present()
     test_bundle_redacts_env_and_never_leaks_secrets_anywhere_in_the_tree()
     test_bundle_never_includes_forbidden_paths()
     test_req_filter_keeps_only_the_matching_requests_lines()

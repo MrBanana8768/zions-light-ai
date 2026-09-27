@@ -90,11 +90,32 @@ LOCAL_WEBUI_DB = Path("/var/lib/openwebui/webui.db")
 SNAPSHOT_WEBUI_DB = WEBUI_DIR / "webui.db"
 
 # --- supervisord programs (supervisord.conf) -----------------------------------
-SERVICES = ("vllm", "compactor", "webuidb-sync", "openwebui", "stt", "tts", "selftest", "backup")
+# v3.1.9.8+: `zl-ops` (ops/bootstrap.sh --boot, priority 5, autostart=true,
+# autorestart=false, startsecs=0 -- see NOTE-ops-bundle-boot.md) is a
+# one-shot boot-time installer, not a long-running service; it is expected
+# to run once and EXIT, same shape as `selftest`.
+SERVICES = ("vllm", "compactor", "webuidb-sync", "openwebui", "stt", "tts", "selftest", "backup", "zl-ops")
 # Programs that are expected to be not RUNNING and are not a fault when so:
-# selftest runs once at boot and exits; webuidb-sync only runs when
-# WEBUI_DB_LOCAL=true.
-ONE_SHOT_OR_OPTIONAL = frozenset({"selftest", "webuidb-sync"})
+# selftest and zl-ops both run once at boot and exit; webuidb-sync only
+# runs when WEBUI_DB_LOCAL=true.
+ONE_SHOT_OR_OPTIONAL = frozenset({"selftest", "webuidb-sync", "zl-ops"})
+
+# --- compactor's own control/pending roots (continuity.py) --------------------
+# Cited here, never re-derived: `compactor/continuity.py`'s own
+# `_default_control_root()`/`_default_pending_root()` (v3.1.9.8,
+# continuity.py:88-96) resolve to `STORAGE_ROOT.parent / "compactor-control"`
+# and `STORAGE_ROOT.parent / "compactor-pending"` -- SIBLINGS of
+# STORAGE_ROOT (`memory.STORAGE_ROOT`, this module's own `STORE`), never
+# nested inside it, deliberately: continuity.py's own module docstring
+# (line 27) says the ledger lives "OUTSIDE STORAGE_ROOT and outside" any
+# backup of it, so a restore of STORAGE_ROOT alone can never resurrect a
+# stale ledger. Read straight from the same env vars continuity.py reads
+# (`COMPACTOR_CONTROL_ROOT`/`COMPACTOR_PENDING_ROOT`), with the SAME
+# fallback shape, so this bundle can never drift from what the compactor
+# actually resolved on this pod -- never hard-code a path continuity.py
+# itself computes.
+CONTROL_ROOT = Path(_env("COMPACTOR_CONTROL_ROOT", str(STORE.parent / "compactor-control")))
+PENDING_ROOT = Path(_env("COMPACTOR_PENDING_ROOT", str(STORE.parent / "compactor-pending")))
 
 # The her-chat default the repair scripts themselves use (--chat/--conv).
 # Kept here only so help text can name it; each script owns its own default.

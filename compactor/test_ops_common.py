@@ -564,6 +564,90 @@ def test_protected_region_finish_never_says_restored_when_restored_is_false():
                 "finish(restored=False) says they were left stopped instead", extra=printed.getvalue())
 
 
+def test_protected_region_finish_restored_none_says_nothing_was_stopped():
+    """F4 (review follow-up): a backup-phase (or in-flight-wait) abort --
+    where NOTHING has been stopped yet -- must not say "services are
+    restored" (that implies something was stopped and put back). Passing
+    `restored=None` says plainly that nothing was ever touched.
+    """
+    printed = io.StringIO()
+    with mock.patch.object(sys, "stderr", printed):
+        with common.ProtectedRegion() as region:
+            region._handle(common.signal.SIGTERM, None)
+            try:
+                region.finish(common.EXIT_BACKUP_FAILED, restored=None)
+            except SystemExit:
+                pass
+    out = printed.getvalue()
+    assert_true("services are restored" not in out,
+                "finish(restored=None) never claims services were restored", extra=out)
+    assert_true("nothing was stopped" in out,
+                "finish(restored=None) says nothing was stopped instead", extra=out)
+
+
+def test_mutation_hardcoding_restored_true_on_backup_abort_leaks_the_bad_claim():
+    """Prove the test above bites: the OLD call sites (`region.finish(...,
+    restored=True)` on every early abort, before anything was stopped)
+    would print exactly the misleading claim this test guards against.
+    """
+    printed = io.StringIO()
+    with mock.patch.object(sys, "stderr", printed):
+        with common.ProtectedRegion() as region:
+            region._handle(common.signal.SIGTERM, None)
+            try:
+                region.finish(common.EXIT_BACKUP_FAILED, restored=True)  # the OLD (buggy) call
+            except SystemExit:
+                pass
+    assert_true("services are restored" in printed.getvalue(),
+                "sanity: restored=True really does print the misleading claim", extra=printed.getvalue())
+
+
+def test_protected_region_finish_reports_forced_exit_after_a_clean_child():
+    """F4 (review follow-up): when a wrapped script itself exited 0 but
+    the caller forced the final exit code nonzero because a service
+    failed to come back afterward (`report_restart_failures`), the
+    message must say the fix ran and exited 0 (applied), and name WHY
+    the final exit code differs -- never imply the fix itself failed.
+    """
+    printed = io.StringIO()
+    with mock.patch.object(sys, "stderr", printed):
+        with common.ProtectedRegion() as region:
+            region._handle(common.signal.SIGINT, None)
+            try:
+                region.finish(
+                    1, restored=False, applied=True, label="the fix",
+                    real_child_code=0, down_services=["openwebui"],
+                )
+            except SystemExit as e:
+                assert_eq(e.code, 1, "finish() keeps the forced exit code")
+    out = printed.getvalue()
+    assert_true("the fix ran and exited 0 (applied)" in out,
+                "the message says the fix itself exited 0", extra=out)
+    assert_true("exit 1 because openwebui did not come back" in out,
+                "the message names the forcing reason", extra=out)
+
+
+def test_mutation_omitting_real_child_code_misreports_a_clean_fix_as_failed():
+    """Prove the test above bites: without `real_child_code`/
+    `down_services`, `finish()` falls back to reporting the FORCED code
+    (1) as if it were the fix's own exit code -- "the fix ran and exited
+    1" -- which is simply false (the fix exited 0; a restart failure
+    forced the overall code to 1).
+    """
+    printed = io.StringIO()
+    with mock.patch.object(sys, "stderr", printed):
+        with common.ProtectedRegion() as region:
+            region._handle(common.signal.SIGINT, None)
+            try:
+                region.finish(1, restored=False, applied=True, label="the fix")  # no real_child_code/down_services
+            except SystemExit:
+                pass
+    out = printed.getvalue()
+    assert_true("the fix ran and exited 1" in out,
+                "sanity: omitting the new args really does misreport the fix's own exit code", extra=out)
+    assert_true("ran and exited 0 (applied)" not in out, "and never says the (true) 0 without the new args", extra=out)
+
+
 def test_protected_region_finish_applied_note_only_says_do_not_rerun_on_exit_zero():
     """Round-7: `applied=True` with a NONZERO child code must say "ran and
     exited N", never "WAS APPLIED ... do not re-run it" -- some wrapped
@@ -810,6 +894,19 @@ def test_mutation_write_audit_without_deferral_loses_the_line_to_the_signal():
     deferral at all) and confirm a SIGINT arriving mid-write can propagate
     as a bare KeyboardInterrupt with no guarantee the line landed first --
     i.e. there was nothing here holding it off.
+
+    Round-9 LOW: this relies on Python's DEFAULT SIGINT disposition
+    (raise KeyboardInterrupt) at the moment `os.kill` fires below -- but a
+    test harness that runs this file as a background/non-foreground
+    process (no controlling terminal, or launched via some `Popen`
+    chains) can inherit SIGINT already set to `SIG_IGN`, in which case
+    `os.kill(self, SIGINT)` does nothing at all and this test would fail
+    for a reason that has nothing to do with `write_audit` itself. The
+    default handler is force-installed for the duration of this one test
+    (and the previous SIGINT disposition -- whatever it was -- restored
+    in a `finally`, so this cannot leak into any other test) so the
+    fixture's own behaviour never depends on how this process happened to
+    inherit SIGINT.
     """
     import tempfile
 
@@ -819,16 +916,20 @@ def test_mutation_write_audit_without_deferral_loses_the_line_to_the_signal():
             os.kill(os.getpid(), common.signal.SIGINT)  # not deferred -- Python raises KeyboardInterrupt here
             f.write("{}\n")
 
-    with tempfile.TemporaryDirectory() as td:
-        audit_log = Path(td) / "audit.log"
-        try:
-            _old_write_audit_body(audit_log)
-        except KeyboardInterrupt:
-            print("  ok   mutated (old, non-deferring) write path raises KeyboardInterrupt mid-write -- "
-                  "confirms the bite (no guarantee the write above it even started flushing)")
-        else:
-            print("FAIL mutated write path did not raise -- the fixture itself is broken")
-            sys.exit(1)
+    old_handler = common.signal.signal(common.signal.SIGINT, common.signal.default_int_handler)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            audit_log = Path(td) / "audit.log"
+            try:
+                _old_write_audit_body(audit_log)
+            except KeyboardInterrupt:
+                print("  ok   mutated (old, non-deferring) write path raises KeyboardInterrupt mid-write -- "
+                      "confirms the bite (no guarantee the write above it even started flushing)")
+            else:
+                print("FAIL mutated write path did not raise -- the fixture itself is broken")
+                sys.exit(1)
+    finally:
+        common.signal.signal(common.signal.SIGINT, old_handler)
 
 
 def test_protected_region_custom_message_used_when_no_forward():
@@ -1723,6 +1824,10 @@ if __name__ == "__main__":
     test_protected_region_finish_keeps_nonzero_child_code_over_deferred_signal()
     test_protected_region_finish_uses_128_plus_signal_when_child_code_is_zero()
     test_protected_region_finish_never_says_restored_when_restored_is_false()
+    test_protected_region_finish_restored_none_says_nothing_was_stopped()
+    test_mutation_hardcoding_restored_true_on_backup_abort_leaks_the_bad_claim()
+    test_protected_region_finish_reports_forced_exit_after_a_clean_child()
+    test_mutation_omitting_real_child_code_misreports_a_clean_fix_as_failed()
     test_protected_region_finish_applied_note_only_says_do_not_rerun_on_exit_zero()
     test_protected_region_finish_applied_note_says_was_applied_on_exit_zero()
     test_protected_region_finish_no_applied_note_when_not_applied()

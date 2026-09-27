@@ -23,6 +23,13 @@ happened.
 
 ## First-time setup
 
+**On image v3.1.9.8 and later, this clone-and-bootstrap one-liner is NOT
+needed at all** -- the image already bakes `ops/`/`scripts/` into
+`/opt/zl-repo` and boots `zl` automatically (see "After any restart"
+below); just wait for the pod to come up, then skip straight to step 2.
+The steps below are for an image OLDER than v3.1.9.8, which starts with
+nothing at `/opt/zl-repo` at all.
+
 **The ref you want on the pod must already be pushed to GitHub** -- the pod
 clones over the network; a local, unpushed branch is invisible to it.
 
@@ -46,10 +53,51 @@ clones over the network; a local, unpushed branch is invisible to it.
 
 ## After any restart
 
-The container overlay (and `/opt`) resets on every pod restart; `/data`
-(and everything `zl` saved there) survives. **`openssh-server` is part of
-that overlay too, so it is gone immediately after a restart -- ONLY the
-RunPod Web Terminal works until this command has re-installed it.** Run it
+**On image v3.1.9.8 and later: nothing to do, PROVIDED `--with-sshd` was
+already saved once.** The image itself bakes `ops/`/`scripts/` into
+`/opt/zl-repo` (Dockerfile) and supervisord runs a one-shot
+`[program:zl-ops]` (`ops/bootstrap.sh --from-dir /opt/zl-repo --boot`,
+priority 5, no dependency on vllm/compactor/openwebui) on every container
+start, including after a restart. It never prompts, never reads stdin,
+and does NO ref pinning at all -- it always uses the baked copy exactly
+as the image ships it, no clone, ever, even if `/data/zl-ops/ref` names a
+different ref from an earlier interactive install (that is only reported
+as one informational log line -- "saved ref '...' not applied at boot" --
+update the image, or run `zl update` by hand, to actually move to it). It
+honours whatever FLAGS were saved from the first install (`--with-sshd`
+re-installs/hardens `openssh-server`, bounded and fail-soft if the network
+or apt isn't ready yet; `--with-tools` only runs at boot if `--tools-at-boot`
+was also saved, and always last) but never rewrites them -- --boot only
+ever READS $ZL_HOME/ref and $ZL_HOME/bootstrap-flags, time-bounded, and
+leaves both untouched either way -- all within a fixed wall-clock budget,
+after which it gives up and exits 0 regardless (never blocks vllm/
+compactor/openwebui coming up; `supervisorctl status` shows `zl-ops` as
+`EXITED`, never `FATAL`/`BACKOFF` -- `zl status`/`zl dash` already treat
+that as normal, same as `selftest`). Its own log is
+`$LOG_DIR/zl-ops.log`, including the exit code and last ~5 lines of any
+`zl sshd`/`zl tools` step's own output, and (on a genuine mid-script
+failure) the line and command where it aborted. If `--with-sshd` was
+saved, `zlpod ssh`/`zlpod dash` work again once that log shows a fresh
+`connect: ssh ...` line; if it wasn't, run `zl sshd --apply` by hand from
+the Web Terminal as below.
+
+**Saving `--with-sshd` for the FIRST time on a fresh v3.1.9.8+ pod** still
+needs one manual, interactive run from the Web Terminal (there being no
+flags yet for `--boot` to read back) -- the baked image is already at
+`/opt/zl-repo`, so this is just:
+```bash
+bash /opt/zl-repo/ops/bootstrap.sh --from-dir /opt/zl-repo --with-sshd
+```
+run once, interactively (it will prompt/confirm as usual). From then on,
+every `--boot` on this pod's `/data` volume re-applies `--with-sshd`
+automatically, as described above.
+
+**On an image OLDER than v3.1.9.8** (no baked `/opt/zl-repo`, no
+`[program:zl-ops]`), the manual one-liner below still applies. The
+container overlay (and `/opt`) resets on every pod restart; `/data` (and
+everything `zl` saved there) survives. **`openssh-server` is part of that
+overlay too, so it is gone immediately after a restart -- ONLY the RunPod
+Web Terminal works until this command has re-installed it.** Run it
 there, not over `zlpod ssh` (which cannot connect yet):
 ```bash
 bash /data/zl-ops/bootstrap.sh

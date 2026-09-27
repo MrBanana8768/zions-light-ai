@@ -301,6 +301,147 @@ def test_mutation_reading_top_level_key_misses_the_real_shape():
     assert_true("in_flight" not in text, "the real (restored) code hides the absent field instead")
 
 
+# =============================================================================
+# Boot-time word-ban warm-up (coordinator addendum, v3.1.9.8) -- committed
+# `warm_state` values: idle | waiting_idle | warming | backoff | disabled |
+# vllm_unreachable, plus a `model` field. Read tolerantly
+# (`doc.get("word_ban", {})`); an unknown future value must render raw,
+# never crash.
+# =============================================================================
+
+_WARM_STATE_ATTR = {
+    "idle": "normal", "waiting_idle": "normal", "warming": "normal", "disabled": "normal",
+    "backoff": "warn", "vllm_unreachable": "warn",
+}
+
+
+def _health_entry_with_word_ban(word_ban: dict) -> dict:
+    return {
+        "data": {
+            "doc": {"status": "ok", "word_ban": word_ban},
+            "interpreted": {"status": "ok", "reasons": [], "findings": []},
+        },
+        "error": None,
+        "collected_at": time.time(),
+    }
+
+
+def test_health_panel_hides_word_ban_when_absent():
+    entry = {
+        "data": {"doc": {"status": "ok"}, "interpreted": {"status": "ok", "reasons": [], "findings": []}},
+        "error": None, "collected_at": time.time(),
+    }
+    lines = dash._panel_health(entry, time.time())
+    text = "\n".join(t for t, _a in lines)
+    assert_true("warm_state" not in text, "warm_state is hidden entirely when word_ban is absent")
+
+
+def test_health_panel_shows_each_committed_warm_state_with_the_right_attr():
+    for state, expected_attr in _WARM_STATE_ATTR.items():
+        entry = _health_entry_with_word_ban({"warm_state": state, "model": "qwen-test"})
+        lines = dash._panel_health(entry, time.time())
+        matches = [(t, a) for t, a in lines if "warm_state" in t]
+        assert_true(len(matches) == 1, f"exactly one warm_state line for state={state!r}")
+        text, attr = matches[0]
+        assert_true(state in text, f"warm_state value {state!r} appears in the line", )
+        assert_eq(attr, expected_attr, f"warm_state={state!r} gets attr={expected_attr!r}")
+
+
+def test_health_panel_shows_an_unknown_warm_state_raw_without_crashing():
+    entry = _health_entry_with_word_ban({"warm_state": "some_future_state_nobody_documented_yet"})
+    lines = dash._panel_health(entry, time.time())  # must not raise
+    text = "\n".join(t for t, _a in lines)
+    assert_true("some_future_state_nobody_documented_yet" in text, "an unknown value is shown raw")
+
+
+def test_vllm_panel_labels_running_waiting_as_warmup_when_warm_state_is_warming():
+    vllm_entry = {
+        "data": {"metrics": {"running": 1, "waiting": 0, "kv_cache_usage_pct": 5.0}, "rates": {}},
+        "error": None, "collected_at": time.time(),
+    }
+    lines = dash._panel_vllm(vllm_entry, time.time(), {}, False, {"warm_state": "warming"})
+    text = "\n".join(t for t, _a in lines)
+    assert_true("(word-ban warm-up)" in text, "the running/waiting line is labelled as the warm-up")
+
+
+def test_vllm_panel_labels_running_waiting_as_warmup_when_warmups_in_flight_positive():
+    """Even outside `warm_state == "warming"` (e.g. `idle` with a stray
+    in-flight counter still draining), a nonzero `warmups_in_flight` alone
+    must still label the panel -- it, not `requests_in_flight`, is what
+    actually counts this request.
+    """
+    vllm_entry = {
+        "data": {"metrics": {"running": 1, "waiting": 0, "kv_cache_usage_pct": 5.0}, "rates": {}},
+        "error": None, "collected_at": time.time(),
+    }
+    lines = dash._panel_vllm(vllm_entry, time.time(), {}, False, {"warm_state": "idle", "warmups_in_flight": 1})
+    text = "\n".join(t for t, _a in lines)
+    assert_true("(word-ban warm-up)" in text, "warmups_in_flight > 0 alone is enough to label it")
+
+
+def test_vllm_panel_no_warmup_label_for_other_warm_states():
+    for state in ("idle", "waiting_idle", "backoff", "disabled", "vllm_unreachable"):
+        vllm_entry = {
+            "data": {"metrics": {"running": 1, "waiting": 0, "kv_cache_usage_pct": 5.0}, "rates": {}},
+            "error": None, "collected_at": time.time(),
+        }
+        lines = dash._panel_vllm(vllm_entry, time.time(), {}, False, {"warm_state": state, "warmups_in_flight": 0})
+        text = "\n".join(t for t, _a in lines)
+        assert_true("(word-ban warm-up)" not in text, f"state={state!r} with 0 in flight is not labelled warm-up")
+
+
+def test_vllm_panel_no_warmup_label_when_word_ban_absent():
+    vllm_entry = {
+        "data": {"metrics": {"running": 1, "waiting": 0, "kv_cache_usage_pct": 5.0}, "rates": {}},
+        "error": None, "collected_at": time.time(),
+    }
+    lines = dash._panel_vllm(vllm_entry, time.time(), {}, False, None)
+    text = "\n".join(t for t, _a in lines)
+    assert_true("(word-ban warm-up)" not in text, "no word_ban data at all -- never labelled")
+
+
+def test_render_frame_wires_word_ban_from_health_doc_into_the_vllm_panel():
+    """End-to-end: `render_frame` must itself pull `word_ban` out of the
+    HEALTH snapshot's doc (word_ban is not part of the vLLM collector's
+    own payload) and pass it to the vLLM panel.
+    """
+    now = time.time()
+    snap = {
+        "health": _health_entry_with_word_ban({"warm_state": "warming"}),
+        "vllm": {
+            "data": {"metrics": {"running": 2, "waiting": 0, "kv_cache_usage_pct": 5.0}, "rates": {}},
+            "error": None, "collected_at": now,
+        },
+    }
+    lines = dash.render_frame(snap, {}, 140, now, dict(_BASE_OPTS))
+    text = "\n".join(t for t, _a in lines)
+    assert_true("(word-ban warm-up)" in text, "render_frame threads word_ban from health into the vLLM panel")
+
+
+def test_mutation_vllm_panel_never_checking_word_ban_hides_the_warmup_label():
+    """Prove the tests above bite: a version of `_panel_vllm` that ignores
+    its `word_ban` argument entirely never shows the label, even during a
+    real warm-up -- exactly what an operator watching the dashboard must
+    NOT see (it would read as her own traffic).
+    """
+    vllm_entry = {
+        "data": {"metrics": {"running": 1, "waiting": 0, "kv_cache_usage_pct": 5.0}, "rates": {}},
+        "error": None, "collected_at": time.time(),
+    }
+    original = dash._panel_vllm
+
+    def _mutated(entry, now, history, ascii_only, word_ban=None):
+        return original(entry, now, history, ascii_only, None)  # drops word_ban -- the bug
+
+    mutated_lines = _mutated(vllm_entry, time.time(), {}, False, {"warm_state": "warming"})
+    mutated_text = "\n".join(t for t, _a in mutated_lines)
+    assert_true("(word-ban warm-up)" not in mutated_text, "mutated (ignores word_ban) never labels it -- confirms the bite")
+
+    real_lines = dash._panel_vllm(vllm_entry, time.time(), {}, False, {"warm_state": "warming"})
+    real_text = "\n".join(t for t, _a in real_lines)
+    assert_true("(word-ban warm-up)" in real_text, "the real (restored) panel labels it")
+
+
 def test_render_frame_all_errored_at_80_and_140_no_line_exceeds_width():
     now = time.time()
     snap = _all_errored_snapshot(now)

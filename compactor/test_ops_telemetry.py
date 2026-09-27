@@ -379,6 +379,7 @@ def test_collect_services_flags_unexpected_and_tolerates_one_shot():
         "vllm FATAL Exited too quickly\n"
         "selftest EXITED Sep 24 03:00 PM\n"
         "webuidb-sync STOPPED Not started\n"
+        "zl-ops EXITED Sep 26 07:00 AM\n"
     )
 
     def fake_run(cmd, **kwargs):
@@ -391,6 +392,18 @@ def test_collect_services_flags_unexpected_and_tolerates_one_shot():
     assert_true(not by_name["selftest"]["unexpected"], "selftest EXITED is tolerated (ONE_SHOT_OR_OPTIONAL)")
     assert_true(not by_name["webuidb-sync"]["unexpected"], "webuidb-sync STOPPED is tolerated")
     assert_true(not by_name["compactor"]["unexpected"], "compactor RUNNING is not unexpected")
+    assert_true(not by_name["zl-ops"]["unexpected"],
+                "zl-ops EXITED is tolerated (v3.1.9.8+ one-shot boot installer, ONE_SHOT_OR_OPTIONAL)")
+
+
+def test_mutation_zl_ops_missing_from_one_shot_or_optional_would_flag_it():
+    """Prove the test above bites: WITHOUT `zl-ops` in
+    `podenv.ONE_SHOT_OR_OPTIONAL`, its own EXITED state would be flagged
+    unexpected exactly like a real crash -- confirms the set membership
+    (not some other code path) is what makes it tolerated.
+    """
+    assert_true("zl-ops" in telemetry.podenv.ONE_SHOT_OR_OPTIONAL,
+                "zl-ops really is in ONE_SHOT_OR_OPTIONAL (sanity: removing it would un-fix this)")
 
 
 def test_collect_services_missing_binary_raises():

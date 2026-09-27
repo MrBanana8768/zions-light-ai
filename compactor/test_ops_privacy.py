@@ -107,6 +107,62 @@ def test_repetition_loop_token_is_scrubbed():
     assert_in("conv=abc123", out, "the conversation id survives (not content)")
 
 
+def test_repetition_token_with_both_quote_types_is_fully_scrubbed():
+    """F2 (review follow-up): a token containing BOTH a single quote and a
+    double quote -- Python's `repr()` then picks single quotes for the
+    outer delimiter and escapes only the embedded single quote
+    (`repr("Mom's \"garden\"")` -> `'Mom\\'s "garden"'`) -- must not let
+    the embedded escaped quote (or the unescaped double quote) end the
+    scrub span early. The old `_scrub_repetition_token` used a plain
+    `line.find(quote, ...)`, which is not escape-aware and would close
+    the span at the FIRST embedded `'`, whatever precedes it, leaking the
+    rest of the token (here, "garden") verbatim.
+    """
+    tok = "Mom's \"garden\""
+    r = repr(tok)
+    assert r == "'Mom\\'s \"garden\"'", f"unexpected repr shape: {r!r}"
+    line = (
+        "conv=abc123: reply looks like a repetition loop "
+        f"(the token {r} repeated for 42 characters (limit 40))"
+    )
+    out = privacy.scrub_log_line(line, "compactor.log")
+    assert_not_in("Mom", out, "the first part of the token is scrubbed")
+    assert_not_in("garden", out, "the second part of the token (past the escaped quote) is also scrubbed")
+    assert_in("repeated for 42 characters (limit 40)", out, "the diagnostic numbers survive")
+    assert_in("conv=abc123", out, "the conversation id survives")
+
+
+def test_mutation_reverting_repetition_token_escape_handling_leaks_the_rest():
+    """Mutation guard for F2: simulates the OLD, non-escape-aware
+    `_scrub_repetition_token` (a plain `line.find(quote, ...)`) and proves
+    it actually leaks -- i.e. this test would FAIL against the buggy
+    implementation, so it bites if that regression is ever reintroduced.
+    """
+
+    def _old_scrub_repetition_token(line: str) -> str:
+        m = privacy._REPETITION_TOKEN_RE.search(line)
+        if not m:
+            return line
+        quote = m.group(2)
+        prefix_end = m.end(1)
+        close_quote_at = line.find(quote, prefix_end + 1)
+        if close_quote_at < 0:
+            return line
+        token_span = line[prefix_end : close_quote_at + 1]
+        return line[:prefix_end] + f"<scrubbed:{len(token_span)} chars>" + line[close_quote_at + 1 :]
+
+    tok = "Mom's \"garden\""
+    r = repr(tok)
+    line = (
+        "conv=abc123: reply looks like a repetition loop "
+        f"(the token {r} repeated for 42 characters (limit 40))"
+    )
+    old_out = _old_scrub_repetition_token(line)
+    assert_in("garden", old_out, "sanity: the OLD implementation really does leak 'garden' here")
+    new_out = privacy._scrub_repetition_token(line)
+    assert_not_in("garden", new_out, "the FIXED implementation does not leak it")
+
+
 # =============================================================================
 # OpenWebUI / SQLAlchemy: [SQL: ...] and [parameters: (...)]
 # =============================================================================
@@ -929,6 +985,26 @@ def test_v3198_lines_survive_scrub_log_text_byte_for_byte():
     )
     out = privacy.scrub_log_text(text, "compactor.log")
     assert_eq(out, text, "a whole v3.1.9.8 request's lines survive scrub_log_text byte for byte")
+
+
+def test_invalid_image_demoted_shape_line_survives_for_every_shape_value():
+    """.8 thread: a new compactor log line, `N invalid image(s) demoted …
+    shape=<uuid36|owui-files-path|http|data-malformed|other> len=N` --
+    carries no URL content (the brief's own description), only a small,
+    fixed vocabulary of shape labels and integers. Every declared shape
+    value must survive both `scrub_log_line` and `scrub_log_text` byte
+    for byte -- this is diagnostic telemetry, not something scrubbed.
+    """
+    for shape in ("uuid36", "owui-files-path", "http", "data-malformed", "other"):
+        line = (
+            f"2026-09-27 00:00:00,000 compactor INFO 3 invalid image(s) demoted "
+            f"… shape={shape} len=128"
+        )
+        out = privacy.scrub_log_line(line, "compactor.log")
+        assert_eq(out, line, f"scrub_log_line leaves the {shape!r}-shaped demotion line untouched")
+        text = line + "\n"
+        out_text = privacy.scrub_log_text(text, "compactor.log")
+        assert_eq(out_text, text, f"scrub_log_text leaves the {shape!r}-shaped demotion line untouched")
 
 
 def test_v3198_wordban_warmup_does_not_mask_a_real_quoted_secret_on_the_same_line():

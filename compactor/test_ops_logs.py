@@ -468,6 +468,97 @@ def test_progressed_not_set_before_a_successful_open():
                                         "(progressed never wrongly claims otherwise)")
 
 
+def test_history_never_emits_a_trailing_partial_line():
+    """F3 (review follow-up): a log file ending mid-line (no trailing
+    newline yet -- the writer has not flushed the rest) must not have
+    that partial line printed by HISTORY, even if what's there so far
+    matches the `--req` pattern -- it is not a complete record. The
+    follower must pick it up whole, once its newline actually arrives.
+    """
+    with _Fixture() as fx:
+        path = fx.log_dir / "compactor.log"
+        path.write_text("req=aaa111 line 00\nreq=aaa111 line 01 not yet fin", encoding="utf-8")
+        boundaries, pattern, history_out = _run_history_capturing("aaa111")
+        assert_true("line 00" in history_out, "the complete first line is printed by history", extra=history_out)
+        assert_true("not yet fin" not in history_out,
+                    "the trailing partial line is NOT emitted by history", extra=history_out)
+
+        # The rest of the line (and its newline) arrives later, in a
+        # SEPARATE write -- a split write across the history/follow
+        # boundary, exactly what F3 is about.
+        with path.open("a", encoding="utf-8") as f:
+            f.write("ished writing\n")
+
+        follow_out = _run_follow_until_idle(pattern, boundaries)
+        assert_true("req=aaa111 line 01 not yet finished writing" in follow_out,
+                     "the follower emits the completed line WHOLE, exactly once", extra=follow_out)
+        assert_eq(follow_out.count("line 01"), 1, "the split line is not duplicated or fragmented")
+
+
+def test_mutation_replacing_tell_with_stat_size_creates_a_history_follow_gap():
+    """F1 (review follow-up): deterministic mutation guard for
+    `ops/zlops/commands/logs.py:96-101` (`_read_history_file`) -- if
+    `offset = f.tell()` were replaced with a separate `path.stat().st_size`
+    call made after the history handle has already read everything it is
+    going to read, a FAST WRITER that appends more bytes in the narrow
+    window between "history stopped reading" and "the stat() call" would
+    have those extra bytes counted in the offset by the mutant (since
+    stat() reads the CURRENT on-disk size) but never actually printed as
+    history -- creating exactly the gap round-6/round-7 already closed
+    once. This hooks `os.fstat` (called immediately after the offset line
+    in the real function, for the inode) to append new content to the
+    file at that exact point -- simulating the fast writer -- then proves:
+    the REAL implementation's offset does not include the new bytes (the
+    follower still sees them, no gap), while a `path.stat().st_size`-based
+    mutant's offset WOULD already include them (the follower would then
+    see nothing new -- a silent gap).
+    """
+    with _Fixture() as fx:
+        path = fx.log_dir / "compactor.log"
+        fx.write_log("compactor.log", [f"req=aaa111 line {i:02d}" for i in range(3)])
+        pattern = logs.common.req_filter_pattern("aaa111")
+
+        appended = {"done": False}
+        real_fstat = os.fstat
+
+        def _fstat_hook(fd):
+            # Fires exactly once, right after the real function computes
+            # `offset = f.tell()` and right before it stats the inode --
+            # simulates a fast writer landing in that narrow window.
+            if not appended["done"]:
+                appended["done"] = True
+                with path.open("a", encoding="utf-8") as g:
+                    g.write("req=aaa111 line 99 (appended mid-history-read)\n")
+            return real_fstat(fd)
+
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", buf), mock.patch.object(logs.os, "fstat", side_effect=_fstat_hook):
+            offset, _inode = logs._read_history_file(path, "cmp", pattern)
+        history_out = buf.getvalue()
+        assert_true("line 99" not in history_out,
+                     "the appended line was not yet on disk when history actually read the file, "
+                     "so it is correctly not printed as history", extra=history_out)
+
+        # The REAL (f.tell()-based) offset must NOT already be past the
+        # appended bytes -- the follower, seeked there, must still find them.
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(offset)
+            remainder = f.read()
+        assert_true("line 99" in remainder,
+                     "the real offset leaves the appended bytes for the follower to find (no gap)",
+                     extra=remainder)
+
+        # Now confirm the MUTANT really would create the gap this test is
+        # about: a `path.stat().st_size` offset, taken AFTER the append
+        # above has already landed, is past those bytes entirely.
+        mutant_offset = path.stat().st_size
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(mutant_offset)
+            mutant_remainder = f.read()
+        assert_eq(mutant_remainder, "", "sanity: the stat()-based mutant offset really is past the appended "
+                                          "bytes -- the follower would see nothing (the gap this test catches)")
+
+
 if __name__ == "__main__":
     test_no_req_flag_runs_tail_logs_unfiltered()
     test_req_history_keeps_only_matching_lines()
@@ -484,5 +575,7 @@ if __name__ == "__main__":
     test_rotation_mid_follow_drains_the_old_files_unread_tail()
     test_fast_writer_no_missing_no_duplicate_lines()
     test_progressed_not_set_before_a_successful_open()
+    test_history_never_emits_a_trailing_partial_line()
+    test_mutation_replacing_tell_with_stat_size_creates_a_history_follow_gap()
 
     print("\nAll ops/commands/logs.py tests passed.")

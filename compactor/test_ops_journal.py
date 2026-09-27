@@ -598,6 +598,38 @@ def test_signal_during_inflight_wait_aborts_without_repairing():
                   "nothing was stopped -- the signal landed before the first stop")
 
 
+def test_deferred_signal_during_a_busy_refusal_says_left_untouched_not_restored():
+    """F4 regression (mut.py M4: the FIRST abort call site in `zl journal
+    repair --apply` -- `if not proceed: ... region.finish(1,
+    restored=None)` -- mutated to `restored=True`). `region.finish()` is a
+    no-op unless a signal was actually deferred at that exact point, so
+    this combines a BUSY (not-proceed) in-flight guard with a SIGTERM
+    delivered from inside the guard itself -- nothing was ever stopped
+    here, so the message must say "left untouched", never "restored".
+    """
+    import io
+    import signal
+
+    with _Fixture({"compactor": "RUNNING", "backup": "RUNNING"}) as fx:
+        def fake_guard(*, force, health_url=None):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return False, "still 2 after 300s"
+
+        printed = io.StringIO()
+        with mock.patch.object(journal.common, "wait_for_no_inflight_requests", side_effect=fake_guard):
+            with mock.patch.object(sys, "stderr", printed):
+                try:
+                    code = journal.run(["repair", "--apply", "--yes"])
+                except SystemExit as e:
+                    code = e.code
+        assert_eq(code, 1, "a refused (busy) in-flight guard with a deferred signal still exits 1")
+        assert_eq(fx.marker_lines(), [], "recover-webui-db.py never ran")
+        out = printed.getvalue()
+        assert_true("left untouched" in out,
+                     "nothing was ever stopped here -- must say so, not 'restored'", extra=out)
+        assert_true("services are restored" not in out, "never claims 'restored' here", extra=out)
+
+
 def test_force_busy_flag_reaches_the_inflight_guard_and_is_not_forwarded():
     with _Fixture({"compactor": "RUNNING", "backup": "RUNNING"}) as fx:
         seen = {}
@@ -634,6 +666,7 @@ if __name__ == "__main__":
     test_help_flag_prints_usage_and_exits_0()
     test_inflight_guard_refuses_before_any_stop()
     test_signal_during_inflight_wait_aborts_without_repairing()
+    test_deferred_signal_during_a_busy_refusal_says_left_untouched_not_restored()
     test_force_busy_flag_reaches_the_inflight_guard_and_is_not_forwarded()
 
     print("\nAll ops/commands/journal.py tests passed.")

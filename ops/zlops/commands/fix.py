@@ -343,7 +343,7 @@ def run(argv: list[str]) -> int:
         region.clear_message()
         if not proceed:
             common.safe_print(f"zl fix {name}: refusing -- {note}", file=sys.stderr)
-            region.finish(1, restored=True)
+            region.finish(1, restored=None)
             return 1
         # Round-4 blocker #3: a signal deferred DURING the wait above (the
         # guard itself returned proceed=True on its own next reading, but
@@ -357,7 +357,7 @@ def run(argv: list[str]) -> int:
                 "aborting without applying",
                 file=sys.stderr,
             )
-            region.finish(1, restored=True)
+            region.finish(1, restored=None)
             return 1
 
         if not skip_backup:
@@ -383,7 +383,7 @@ def run(argv: list[str]) -> int:
             if bcode != 0:
                 common.safe_print(f"zl fix {name}: backup.py --once exited {bcode}; refusing to apply "
                                    "(pass --skip-backup to override)")
-                region.finish(common.EXIT_BACKUP_FAILED, restored=True)
+                region.finish(common.EXIT_BACKUP_FAILED, restored=None)
                 return common.EXIT_BACKUP_FAILED
 
         # Round-6 BLOCKER: the backup itself can run for a while (compactor/
@@ -406,7 +406,7 @@ def run(argv: list[str]) -> int:
             region.clear_message()
             if not proceed:
                 common.safe_print(f"zl fix {name}: refusing -- {note}", file=sys.stderr)
-                region.finish(1, restored=True)
+                region.finish(1, restored=None)
                 return 1
             if region.deferred_signal is not None:
                 common.safe_print(
@@ -414,7 +414,7 @@ def run(argv: list[str]) -> int:
                     "nothing was stopped; aborting without applying",
                     file=sys.stderr,
                 )
-                region.finish(1, restored=True)
+                region.finish(1, restored=None)
                 return 1
 
         try:
@@ -476,7 +476,12 @@ def run(argv: list[str]) -> int:
         # "restored" when one didn't, and forced into the exit code below
         # so a run that applied cleanly (child exit 0) but left a service
         # down still exits nonzero instead of a silent 0.
+        real_code = code
+        down_services = sorted(svc for svc, ok in came_back.items() if not ok)
         if not restored and code == 0:
             code = 1
-        region.finish(code, restored=restored, applied=True)
+        region.finish(
+            code, restored=restored, applied=True,
+            real_child_code=real_code, down_services=down_services,
+        )
     return code

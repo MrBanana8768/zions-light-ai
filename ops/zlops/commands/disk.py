@@ -69,6 +69,13 @@ def run(argv: list[str]) -> int:
     count, total = dir_count_and_size(podenv.BACKUPS)
     print(f"backups: {count} archive(s) in {podenv.BACKUPS}, {common.human_bytes(total)} total")
 
+    # compactor's own control/pending roots (podenv.CONTROL_ROOT/PENDING_ROOT
+    # -- siblings of STORAGE_ROOT, never nested inside it, see podenv.py's
+    # own comment) -- reported only if present, same `du` (time-bounded).
+    for label, root in (("control root", podenv.CONTROL_ROOT), ("pending root", podenv.PENDING_ROOT)):
+        if root.is_dir():
+            print(f"{label} ({root}): {du(root)}")
+
     if podenv.HF_HOME.is_dir():
         print(f"HF cache ({podenv.HF_HOME}): {du(podenv.HF_HOME)}")
     else:
