@@ -471,6 +471,9 @@ def test_verification_review_followups():
                 "a non-image mime is refused (PIL would fail on it inside vLLM)")
     assert_true(not main._valid_image_url("data:text/html;base64,QUJD"), "text/html refused")
     assert_true(main._valid_image_url("data:;base64,QUJD"), "an empty mime is still accepted")
+    assert_true(main._valid_image_url("data:application/octet-stream;base64,QUJD"),
+                "application/octet-stream is accepted: vLLM ignores the mime for images and PIL "
+                "reads the bytes (RC review A: one of her uploads is labelled this way)")
 
 
 if __name__ == "__main__":

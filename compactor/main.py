@@ -7293,11 +7293,15 @@ def _apply_image_retention(messages: list[dict]) -> tuple[list[dict], int]:
 # Case is folded ONLY on the `data:` scheme and the mime type. vLLM 0.19's
 # connector.py:_load_data_url compares the marker with `data_type != "base64"`,
 # case-sensitively, so `;BASE64,` is rejected there and must be here too
-# (checked in the v3.1.9 image). The mime type must be image/* or empty: a
+# (checked in the v3.1.9 image). The mime type must be image/*, empty, or
+# application/octet-stream: vLLM's ImageMediaIO.load_base64 ignores the mime and
+# lets PIL decide from the bytes, so a real photo that the browser labelled
+# octet-stream loads fine (1 of her 339 uploads is one; RC review A). A
 # pdf/html payload passes vLLM's URL check but fails in PIL, which is the same
 # 400 in a different place.
 _DATA_IMAGE_URL_RE = re.compile(
-    r"(?i:data:)(?:(?i:image)/(?i:[A-Za-z0-9!#$&.+^_-]+))?;base64,[A-Za-z0-9+/]+=*"
+    r"(?i:data:)(?:(?i:image)/(?i:[A-Za-z0-9!#$&.+^_-]+)|(?i:application/octet-stream))?"
+    r";base64,[A-Za-z0-9+/]+=*"
 )
 # A bare OpenWebUI-style file id (no scheme at all) — v3.1.9.8 round-2's own
 # probe ("3f2a-uuid-no-scheme") is shaped like this: a client-side reference
