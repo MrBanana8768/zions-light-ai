@@ -16,7 +16,7 @@
 #   3. Asserts, on each boot: supervisord itself is up; compactor,
 #      openwebui and backup reach RUNNING; zl-ops reaches EXITED (never
 #      FATAL/BACKOFF — `ops/bootstrap.sh --boot` does not exist in this
-#      tree yet, so zl-ops is EXPECTED to print bootstrap.sh's usage error
+#      tree yet [SUPERSEDED: --boot merged in 0190911], so zl-ops is EXPECTED to print bootstrap.sh's usage error
 #      and exit, per its own EXIT trap, still exit 0); the compactor tree
 #      under /opt/compactor is byte-identical (sha256) to the CURRENT git
 #      tree (not just to what this one build happened to embed — this is
@@ -228,11 +228,22 @@ boot_and_check() {
     st="$(_wait_for_state "${name}" backup "RUNNING" 60)"
     [ "${st}" = "RUNNING" ] && ok "backup RUNNING (${tag})" || fail "backup did not reach RUNNING (${tag}), saw ${st}"
 
-    st="$(_wait_for_state "${name}" zl-ops "EXITED" 30)"
+    st="$(_wait_for_state "${name}" zl-ops "EXITED" 200)"
     if [ "${st}" = "EXITED" ]; then
-        ok "zl-ops EXITED, not FATAL/BACKOFF (${tag}) — expected: --boot doesn't exist yet"
+        ok "zl-ops EXITED, not FATAL/BACKOFF (${tag})"
     else
         fail "zl-ops in unexpected state ${st} (${tag}); expected EXITED"
+    fi
+    # --boot always exits 0; whether it did its job is on the log's final line.
+    last="$(docker exec "${name}" bash -c 'tail -1 "${LOG_DIR:-/data/logs}/zl-ops.log" 2>/dev/null' || true)"
+    case "${last}" in
+        *"bootstrap.sh --boot: done"*) ok "zl-ops.log ends with 'bootstrap.sh --boot: done' (${tag})" ;;
+        *) fail "zl-ops.log's final line is not the --boot 'done' line (${tag}): ${last:0:200}" ;;
+    esac
+    if docker exec "${name}" bash -c '[ -L /usr/local/bin/zl ] && [ "$(readlink /usr/local/bin/zl)" = /opt/zl-repo/ops/zl ] && zl --help >/dev/null 2>&1'; then
+        ok "/usr/local/bin/zl -> /opt/zl-repo/ops/zl and runs (${tag})"
+    else
+        fail "the zl symlink is missing or zl does not run (${tag})"
     fi
     docker exec "${name}" bash -c "tail -20 \${LOG_DIR:-/data/logs}/zl-ops.log 2>/dev/null || true; tail -20 \${LOG_DIR:-/data/logs}/zl-ops-supervisord.log 2>/dev/null || true" \
         > "${LOG_DIR}/${tag}-zl-ops.log" 2>&1
