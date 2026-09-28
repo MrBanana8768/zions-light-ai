@@ -27,7 +27,7 @@ usage() {
     cat <<'EOF'
 Usage: bootstrap.sh [--ref REF] [--repo-url URL] [--from-dir DIR]
                      [--with-sshd] [--with-tools] [--tools-at-boot]
-                     [--no-login-hook] [--boot]
+                     [--with-hotfix NAME] [--no-login-hook] [--boot]
 
   --ref REF          branch or TAG to install (required the first time;
                       after that, saved under $ZL_HOME/ref and reused). A
@@ -51,6 +51,14 @@ Usage: bootstrap.sh [--ref REF] [--repo-url URL] [--from-dir DIR]
                       this says --boot itself should also run `zl tools
                       --apply --yes`, bounded and LAST. No effect outside
                       `--boot`.
+  --with-hotfix NAME also run `zl hotfix NAME --apply --yes` once
+                      installed (currently just `backup-fast` -- see `zl
+                      hotfix backup-fast --help`). Saved like --with-sshd;
+                      runs LAST (after --with-tools/--tools-at-boot).
+                      Under --boot this is bounded and fail-soft exactly
+                      like --with-sshd -- `zl hotfix` itself already
+                      detects "already applied" and returns fast, so a
+                      .8+ image that ships the fix is simply a no-op here.
   --no-login-hook    remove (or skip adding) the /root/.bashrc login hook
                       that runs `zl status --brief` on every interactive
                       SSH login.
@@ -176,6 +184,7 @@ WITH_SSHD=0
 WITH_TOOLS=0
 TOOLS_AT_BOOT=0
 NO_LOGIN_HOOK=0
+WITH_HOTFIX=""
 
 REF_FILE="$ZL_HOME/ref"
 FLAGS_FILE="$ZL_HOME/bootstrap-flags"
@@ -217,6 +226,7 @@ if [ "$BOOT" = 1 ]; then
                 --with-tools) WITH_TOOLS=1 ;;
                 --tools-at-boot) TOOLS_AT_BOOT=1 ;;
                 --no-login-hook) NO_LOGIN_HOOK=1 ;;
+                --with-hotfix=*) WITH_HOTFIX="${tok#--with-hotfix=}" ;;
             esac
         done <<<"$FLAGS_READ"
     elif [ "$_flags_rc" -eq 124 ] || [ "$_flags_rc" -eq 137 ]; then
@@ -236,6 +246,7 @@ else
                 --with-tools) WITH_TOOLS=1 ;;
                 --tools-at-boot) TOOLS_AT_BOOT=1 ;;
                 --no-login-hook) NO_LOGIN_HOOK=1 ;;
+                --with-hotfix=*) WITH_HOTFIX="${tok#--with-hotfix=}" ;;
             esac
         done < "$FLAGS_FILE"
     fi
@@ -264,6 +275,8 @@ while [ $# -gt 0 ]; do
         --with-tools) WITH_TOOLS=1; shift ;;
         --tools-at-boot) TOOLS_AT_BOOT=1; shift ;;
         --no-login-hook) NO_LOGIN_HOOK=1; shift ;;
+        --with-hotfix) _require_value "$@"; WITH_HOTFIX="$2"; shift 2 ;;
+        --with-hotfix=*) WITH_HOTFIX="${1#--with-hotfix=}"; shift ;;
         --boot) BOOT=1; shift ;;  # already scanned for above; accepted here too so it is not "unknown"
         -h|--help) usage; exit 0 ;;
         *) echo "bootstrap.sh: unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -290,6 +303,7 @@ if [ "$SELF" = "$ZL_HOME_COPY" ] && [ "${ZL_BOOTSTRAP_REEXEC:-0}" != "1" ] && [ 
         [ "$WITH_TOOLS" = 1 ] && ARGS+=(--with-tools)
         [ "$TOOLS_AT_BOOT" = 1 ] && ARGS+=(--tools-at-boot)
         [ "$NO_LOGIN_HOOK" = 1 ] && ARGS+=(--no-login-hook)
+        [ -n "$WITH_HOTFIX" ] && ARGS+=(--with-hotfix "$WITH_HOTFIX")
         echo "bootstrap.sh: $REPO is a baked image copy (no .git) -- using it as-is, no clone"
         echo "bootstrap.sh: handing off to $REPO/ops/bootstrap.sh (the baked copy)"
         export ZL_BOOTSTRAP_REEXEC=1
@@ -326,6 +340,7 @@ if [ "$SELF" = "$ZL_HOME_COPY" ] && [ "${ZL_BOOTSTRAP_REEXEC:-0}" != "1" ] && [ 
     [ "$WITH_TOOLS" = 1 ] && ARGS+=(--with-tools)
     [ "$TOOLS_AT_BOOT" = 1 ] && ARGS+=(--tools-at-boot)
     [ "$NO_LOGIN_HOOK" = 1 ] && ARGS+=(--no-login-hook)
+    [ -n "$WITH_HOTFIX" ] && ARGS+=(--with-hotfix "$WITH_HOTFIX")
     echo "bootstrap.sh: handing off to $REPO/ops/bootstrap.sh (the ref's own, possibly newer, copy)"
     export ZL_BOOTSTRAP_REEXEC=1
     exec bash "$REPO/ops/bootstrap.sh" "${ARGS[@]}"
@@ -385,6 +400,7 @@ else
         [ "$WITH_TOOLS" = 1 ] && printf '%s\n' "--with-tools"
         [ "$TOOLS_AT_BOOT" = 1 ] && printf '%s\n' "--tools-at-boot"
         [ "$NO_LOGIN_HOOK" = 1 ] && printf '%s\n' "--no-login-hook"
+        [ -n "$WITH_HOTFIX" ] && printf -- "--with-hotfix=%s\n" "$WITH_HOTFIX"
     } > "$FLAGS_FILE"
     echo "bootstrap.sh: saved ref/flags/self under $ZL_HOME"
 fi
@@ -524,6 +540,31 @@ if [ "$_RUN_TOOLS_NOW" = 1 ]; then
     else
         echo "bootstrap.sh: --with-tools -> zl tools --apply --yes"
         "$ZL_BIN" tools --apply --yes || echo "bootstrap.sh: zl tools --apply failed (see above) -- continuing"
+    fi
+fi
+
+# --with-hotfix NAME: a pod-only, no-image-change patch (`zl hotfix NAME
+# --apply --yes` -- see ops/zlops/commands/hotfix.py). Runs LAST, same as
+# --tools-at-boot, and is just as bounded/fail-soft at boot: `zl hotfix`
+# itself already detects "already applied" and returns fast (a genuine
+# .8+ image that ships the fix already is a no-op here), so no special
+# case is needed for that -- only the generic bound/fail-soft wrapping is.
+_HOTFIX_BOOT_TIMEOUT_S=60
+if [ -n "$WITH_HOTFIX" ]; then
+    if [ "$BOOT" = 1 ]; then
+        _left=$(_boot_budget_left)
+        if [ "$_left" -gt "$_BOOT_STEP_MIN_S" ]; then
+            _step_t=$_HOTFIX_BOOT_TIMEOUT_S
+            [ "$_left" -lt "$_step_t" ] && _step_t=$_left
+            _boot_log "bootstrap.sh --boot: --with-hotfix $WITH_HOTFIX -> zl hotfix $WITH_HOTFIX --apply --yes (bounded ${_step_t}s, last)"
+            _boot_run_bounded_step "hotfix" "$_step_t" hotfix "$WITH_HOTFIX" --apply --yes || true
+        else
+            _boot_log "bootstrap.sh --boot: only ${_left}s left of the boot budget -- skipping --with-hotfix this run"
+        fi
+    else
+        echo "bootstrap.sh: --with-hotfix $WITH_HOTFIX -> zl hotfix $WITH_HOTFIX --apply --yes"
+        "$ZL_BIN" hotfix "$WITH_HOTFIX" --apply --yes || \
+            echo "bootstrap.sh: zl hotfix $WITH_HOTFIX --apply failed (see above) -- continuing"
     fi
 fi
 

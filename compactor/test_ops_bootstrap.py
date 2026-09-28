@@ -554,6 +554,47 @@ def test_boot_runs_tools_last_when_tools_at_boot_saved():
         assert_true(tools_idx > sshd_idx, "tools ran AFTER sshd (tools always runs last)", extra=str(calls))
 
 
+def test_with_hotfix_is_saved_and_replayed_bounded_and_last():
+    """`--with-hotfix NAME` is saved like --with-sshd/--with-tools, and
+    replayed under --boot bounded and fail-soft, running after both the
+    sshd and tools steps.
+    """
+    with tempfile.TemporaryDirectory() as tdstr:
+        td = Path(tdstr)
+        env = _base_env(td)
+        r = _run(["--ref", "test-ref", "--from-dir", str(REPO_ROOT), "--with-hotfix", "backup-fast",
+                   "--no-login-hook"], env)
+        assert_eq(r.returncode, 0, "an interactive --with-hotfix install exits 0")
+        flags = (Path(env["ZL_HOME"]) / "bootstrap-flags").read_text(encoding="utf-8")
+        assert_true("--with-hotfix=backup-fast" in flags, "--with-hotfix was saved to bootstrap-flags", extra=flags)
+
+    with tempfile.TemporaryDirectory() as tdstr:
+        td = Path(tdstr)
+        env = _boot_env(td)
+        checkout = _fake_checkout(td)
+        fake_zl_log = td / "fake-zl-calls.log"
+        env["FAKE_ZL_LOG"] = str(fake_zl_log)
+        zl_home = Path(env["ZL_HOME"])
+        zl_home.mkdir(parents=True)
+        (zl_home / "bootstrap-flags").write_text(
+            "__REPO_URL__=https://example.invalid/x.git\n--with-sshd\n--tools-at-boot\n"
+            "--with-hotfix=backup-fast\n--no-login-hook\n",
+            encoding="utf-8",
+        )
+        r = _run(["--from-dir", str(checkout), "--boot"], env)
+        assert_eq(r.returncode, 0, "--boot exits 0")
+        calls = fake_zl_log.read_text(encoding="utf-8").splitlines()
+        call_cmds = [c.split(":", 1)[1].strip() if ":" in c else c for c in calls]
+        assert_true(any(c.startswith("hotfix backup-fast") for c in call_cmds),
+                    "zl hotfix backup-fast --apply --yes was called", extra=str(calls))
+        tools_idx = next(i for i, c in enumerate(call_cmds) if c.startswith("tools"))
+        hotfix_idx = next(i for i, c in enumerate(call_cmds) if c.startswith("hotfix"))
+        assert_true(hotfix_idx > tools_idx, "hotfix ran AFTER tools (hotfix always runs last)", extra=str(calls))
+        log = _read_boot_log(env)
+        assert_true("--with-hotfix backup-fast -> zl hotfix backup-fast --apply --yes" in log,
+                    "the step was logged", extra=log)
+
+
 def test_boot_data_unwritable_still_installs_zl_and_exits_0():
     with tempfile.TemporaryDirectory() as tdstr:
         td = Path(tdstr)
@@ -829,6 +870,7 @@ if __name__ == "__main__":
     test_boot_honours_saved_with_sshd_flag_bounded_and_fails_soft()
     test_boot_skips_with_tools_unless_tools_at_boot_was_saved()
     test_boot_runs_tools_last_when_tools_at_boot_saved()
+    test_with_hotfix_is_saved_and_replayed_bounded_and_last()
     test_boot_data_unwritable_still_installs_zl_and_exits_0()
     test_boot_log_dir_missing_falls_back_to_stderr()
     test_boot_set_e_style_failure_mid_script_still_exits_0()

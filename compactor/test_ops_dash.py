@@ -442,6 +442,230 @@ def test_mutation_vllm_panel_never_checking_word_ban_hides_the_warmup_label():
     assert_true("(word-ban warm-up)" in real_text, "the real (restored) panel labels it")
 
 
+# =============================================================================
+# v3.1.9.9 Cloudflare Tunnel: Health panel's `tunnel:` line, Services panel's
+# cloudflared-configured-but-down warning.
+# =============================================================================
+
+
+def _health_entry_with_tunnel_status(tunnel_status) -> dict:
+    return {
+        "data": {
+            "doc": {"status": "ok"},
+            "interpreted": {"status": "ok", "reasons": [], "findings": []},
+            "tunnel_status": tunnel_status,
+        },
+        "error": None,
+        "collected_at": time.time(),
+    }
+
+
+def test_health_panel_shows_tunnel_status_when_present():
+    for word in ("ready", "not ready", "unknown", "disabled"):
+        entry = _health_entry_with_tunnel_status(word)
+        lines = dash._panel_health(entry, time.time())
+        matches = [(t, a) for t, a in lines if "tunnel:" in t]
+        assert_true(len(matches) == 1, f"exactly one tunnel line for tunnel_status={word!r}")
+        text, attr = matches[0]
+        assert_true(word in text, f"tunnel_status value {word!r} appears in the line")
+        expected_attr = "warn" if word == "not ready" else "normal"
+        assert_eq(attr, expected_attr, f"tunnel_status={word!r} gets attr={expected_attr!r}")
+
+
+def test_health_panel_hides_tunnel_status_when_absent():
+    entry = _health_entry_with_tunnel_status(None)
+    lines = dash._panel_health(entry, time.time())
+    text = "\n".join(t for t, _a in lines)
+    assert_true("tunnel:" not in text, "tunnel line is hidden entirely when tunnel_status is None (older compactor)")
+
+
+def _health_entry_with_tunnel_error(error) -> dict:
+    return {
+        "data": {
+            "doc": {"status": "ok", "tunnel": {"configured": True, "ready": None, "error": error}},
+            "interpreted": {"status": "ok", "reasons": [], "findings": []},
+            "tunnel_status": "unknown",
+        },
+        "error": None,
+        "collected_at": time.time(),
+    }
+
+
+def test_health_panel_shows_tunnel_error_next_to_unknown():
+    """Round-11 review (LOW): "unknown" alone doesn't say WHY - the
+    compactor's own probe error text (`tunnel.error`) must appear right
+    next to it, truncated, so an operator sees "ConnectError: refused"
+    instead of just a bare "unknown".
+    """
+    entry = _health_entry_with_tunnel_error("ConnectError: [Errno 111] Connection refused")
+    lines = dash._panel_health(entry, time.time())
+    matches = [(t, a) for t, a in lines if "tunnel:" in t]
+    assert_true(len(matches) == 1, "exactly one tunnel line")
+    text, attr = matches[0]
+    assert_true("unknown" in text, "the tunnel_status word is still shown")
+    assert_true("ConnectError: [Errno 111] Connection refused" in text, "the probe error text is shown")
+    assert_eq(attr, "normal", "unknown (with an error) is not itself a warn attr")
+
+
+def test_health_panel_truncates_a_long_tunnel_error():
+    long_error = "x" * 500
+    entry = _health_entry_with_tunnel_error(long_error)
+    lines = dash._panel_health(entry, time.time())
+    text = "\n".join(t for t, _a in lines)
+    assert_true(long_error not in text, "the full 500-char error text is not dumped verbatim")
+    assert_true("x" * 160 in text, "a bounded prefix of the error text survives")
+
+
+def test_health_panel_no_error_suffix_when_tunnel_error_absent():
+    entry = _health_entry_with_tunnel_error(None)
+    lines = dash._panel_health(entry, time.time())
+    matches = [t for t, _a in lines if "tunnel:" in t]
+    assert_eq(matches, ["  tunnel: unknown"], "no trailing '()' when there is no error text at all")
+
+
+def test_health_panel_no_error_suffix_when_tunnel_status_is_not_unknown():
+    """`tunnel.error` is only ever shown alongside "unknown" - a "not
+    ready"/"ready"/"disabled" state must never grow a stray error suffix
+    even if a stale `tunnel.error` field happens to still be present.
+    """
+    entry = {
+        "data": {
+            "doc": {"status": "ok", "tunnel": {"configured": True, "ready": False, "error": "stale text"}},
+            "interpreted": {"status": "ok", "reasons": [], "findings": []},
+            "tunnel_status": "not ready",
+        },
+        "error": None,
+        "collected_at": time.time(),
+    }
+    lines = dash._panel_health(entry, time.time())
+    text = "\n".join(t for t, _a in lines)
+    assert_true("stale text" not in text, "error text is only ever shown for tunnel_status == 'unknown'")
+
+
+def test_mutation_dropping_tunnel_error_suffix_is_caught():
+    """Prove the tests above bite: a version of the tunnel line that never
+    looks at `doc['tunnel']['error']` at all would show a bare "unknown"
+    with no diagnostic text, exactly the round-11 review's complaint.
+    """
+    entry = _health_entry_with_tunnel_error("ConnectError: refused")
+
+    def _mutated(entry, now):
+        data = entry.get("data") or {}
+        tunnel_status = data.get("tunnel_status")
+        return [(f"  tunnel: {tunnel_status}", "normal")] if tunnel_status is not None else []
+
+    mutated_lines = _mutated(entry, time.time())
+    mutated_text = "\n".join(t for t, _a in mutated_lines)
+    assert_true("ConnectError" not in mutated_text, "mutated (error-blind) version shows no diagnostic text")
+
+    real_lines = dash._panel_health(entry, time.time())
+    real_text = "\n".join(t for t, _a in real_lines)
+    assert_true("ConnectError: refused" in real_text, "the real code shows the probe error")
+
+
+def test_mutation_tunnel_status_defaulting_instead_of_hiding_is_caught():
+    """Prove the hidden-when-absent test above bites: a broken version that
+    defaults a missing tunnel_status to "disabled" (instead of hiding the
+    line) would fabricate a state that /health/full never actually
+    reported.
+    """
+    data = {"tunnel_status": None}
+    mutated_word = data.get("tunnel_status") or "disabled"  # the bug: fabricates a default
+    assert_eq(mutated_word, "disabled", "mutated (defaults to disabled) fabricates a state -- confirms the bite")
+
+
+def _services_entry(services: list[dict]) -> dict:
+    return {"data": {"services": services}, "error": None, "collected_at": time.time()}
+
+
+def test_services_panel_flags_cloudflared_configured_but_down():
+    entry = _services_entry([{"name": "cloudflared", "state": "EXITED", "unexpected": False, "pid": None, "uptime": None}])
+    health_doc = {"tunnel": {"configured": True, "ready": None}}
+    lines = dash._panel_services(entry, time.time(), health_doc)
+    matches = [(t, a) for t, a in lines if "cloudflared" in t]
+    assert_true(len(matches) == 1, "exactly one cloudflared row")
+    text, attr = matches[0]
+    assert_true("tunnel configured but cloudflared is EXITED" in text, "the warning text names the actual state")
+    assert_eq(attr, "warn", "configured-but-down cloudflared gets attr=warn, not crit")
+
+
+def test_services_panel_does_not_flag_cloudflared_disabled_by_config():
+    entry = _services_entry([{"name": "cloudflared", "state": "EXITED", "unexpected": False, "pid": None, "uptime": None}])
+    health_doc = {"tunnel": {"configured": False, "ready": None}}
+    lines = dash._panel_services(entry, time.time(), health_doc)
+    matches = [(t, a) for t, a in lines if "cloudflared" in t]
+    text, attr = matches[0]
+    assert_true("tunnel configured but cloudflared is" not in text, "not configured -> EXITED is fine, no warning")
+    assert_eq(attr, "dim", "a tolerated non-RUNNING one-shot/optional service stays attr=dim")
+
+
+def test_services_panel_no_flag_when_health_doc_absent():
+    """An unreachable /health/full (health_doc defaults to None/{}) must
+    never be treated as "tunnel configured" -- that would spuriously flag
+    every pod that has never even set up the tunnel the moment /health/full
+    itself is briefly unreachable.
+    """
+    entry = _services_entry([{"name": "cloudflared", "state": "EXITED", "unexpected": False, "pid": None, "uptime": None}])
+    lines = dash._panel_services(entry, time.time(), None)
+    matches = [(t, a) for t, a in lines if "cloudflared" in t]
+    text, attr = matches[0]
+    assert_true("tunnel configured but cloudflared is" not in text, "no health doc -> no spurious warning")
+    assert_eq(attr, "dim", "still reads as a tolerated one-shot/optional service")
+
+
+def test_render_frame_wires_health_doc_tunnel_into_the_services_panel():
+    """End-to-end: `render_frame` must itself pull the health doc's `tunnel`
+    key out of the HEALTH snapshot (not the services collector's own
+    payload, which has no /health/full access at all) and pass it to the
+    Services panel.
+    """
+    now = time.time()
+    snap = {
+        "health": {
+            "data": {"doc": {"status": "ok", "tunnel": {"configured": True, "ready": False}},
+                      "interpreted": {"status": "ok", "reasons": [], "findings": []},
+                      "tunnel_status": "not ready"},
+            "error": None, "collected_at": now,
+        },
+        "services": _services_entry(
+            [{"name": "cloudflared", "state": "EXITED", "unexpected": False, "pid": None, "uptime": None}]
+        ),
+    }
+    snap["services"]["collected_at"] = now
+    # Single-column layout (width < TWO_COLUMN_MIN_WIDTH): a two-column
+    # frame clips each column to roughly half the width, which would cut
+    # this warning's text off mid-sentence and make this an assertion
+    # about clipping rather than about the wiring this test exists to
+    # check - see `_panel_services`'s own direct tests above for the
+    # exact-text checks.
+    lines = dash.render_frame(snap, {}, 100, now, dict(_BASE_OPTS))
+    text = "\n".join(t for t, _a in lines)
+    assert_true("tunnel configured but cloudflared is EXITED" in text,
+                "render_frame threads the health doc's tunnel key into the Services panel")
+
+
+def test_mutation_services_panel_never_checking_health_doc_hides_the_warning():
+    """Prove the tests above bite: a version of `_panel_services` that
+    ignores its `health_doc` argument entirely never shows the warning,
+    even when a token IS configured and cloudflared really is down --
+    exactly what an operator must NOT miss.
+    """
+    entry = _services_entry([{"name": "cloudflared", "state": "EXITED", "unexpected": False, "pid": None, "uptime": None}])
+    original = dash._panel_services
+
+    def _mutated(entry, now, health_doc=None):
+        return original(entry, now, None)  # drops health_doc -- the bug
+
+    mutated_lines = _mutated(entry, time.time(), {"tunnel": {"configured": True, "ready": None}})
+    mutated_text = "\n".join(t for t, _a in mutated_lines)
+    assert_true("tunnel configured but cloudflared is" not in mutated_text,
+                "mutated (ignores health_doc) never warns -- confirms the bite")
+
+    real_lines = dash._panel_services(entry, time.time(), {"tunnel": {"configured": True, "ready": None}})
+    real_text = "\n".join(t for t, _a in real_lines)
+    assert_true("tunnel configured but cloudflared is EXITED" in real_text, "the real (restored) panel warns")
+
+
 def test_render_frame_all_errored_at_80_and_140_no_line_exceeds_width():
     now = time.time()
     snap = _all_errored_snapshot(now)

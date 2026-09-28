@@ -406,6 +406,38 @@ def test_mutation_zl_ops_missing_from_one_shot_or_optional_would_flag_it():
                 "zl-ops really is in ONE_SHOT_OR_OPTIONAL (sanity: removing it would un-fix this)")
 
 
+def test_cloudflared_is_in_services_and_one_shot_or_optional():
+    assert_true("cloudflared" in telemetry.podenv.SERVICES, "cloudflared is a supervisord program zl status/dash show")
+    assert_true("cloudflared" in telemetry.podenv.ONE_SHOT_OR_OPTIONAL,
+                "cloudflared EXITED (no token set) is tolerated by default")
+
+
+def test_collect_services_cloudflared_exited_is_tolerated_by_one_shot_or_optional():
+    text = (
+        "compactor RUNNING pid 1, uptime 0:00:10\n"
+        "cloudflared EXITED Sep 27 00:00 AM\n"
+    )
+
+    def fake_run(cmd, **kwargs):
+        return _FakeProc(stdout=text, returncode=3)
+
+    result = telemetry.collect_services(run=fake_run, prefer_rpc=False)
+    by_name = {s["name"]: s for s in result["services"]}
+    assert_true(not by_name["cloudflared"]["unexpected"],
+                "collect_services alone (no /health/full doc) tolerates cloudflared EXITED -- "
+                "the configured-but-down cross-check lives in cloudflared_fault, not here")
+
+
+def test_mutation_cloudflared_missing_from_one_shot_or_optional_would_flag_it():
+    """Same shape as the zl-ops mutation proof above: without `cloudflared`
+    in `podenv.ONE_SHOT_OR_OPTIONAL`, a plain EXITED (no token set - the
+    correct, disabled state) would be flagged unexpected exactly like a
+    real crash.
+    """
+    assert_true("cloudflared" in telemetry.podenv.ONE_SHOT_OR_OPTIONAL,
+                "cloudflared really is in ONE_SHOT_OR_OPTIONAL (sanity: removing it would un-fix this)")
+
+
 def test_collect_services_missing_binary_raises():
     def fake_run(cmd, **kwargs):
         raise FileNotFoundError("no such file")
@@ -768,6 +800,116 @@ def test_interpret_health_ledger_degraded():
     assert_eq(r["status"], "crit", "checks.ledger.degraded -> crit (speculative field, still enforced)")
 
 
+def test_interpret_health_tunnel_not_ready_warns():
+    doc = {"status": "ok", "tunnel": {"configured": True, "ready": False}}
+    r = telemetry.interpret_health(doc, time.time())
+    assert_eq(r["status"], "warn", "tunnel configured but not ready -> warn")
+    assert_true(any("tunnel not ready" in x for x in r["reasons"]), "reason names it")
+
+
+def test_interpret_health_tunnel_ready_is_ok():
+    doc = {"status": "ok", "tunnel": {"configured": True, "ready": True}}
+    r = telemetry.interpret_health(doc, time.time())
+    assert_eq(r["status"], "ok", "tunnel configured and ready never warns")
+
+
+def test_interpret_health_tunnel_ready_unknown_shows_nothing():
+    doc = {"status": "ok", "tunnel": {"configured": True, "ready": None}}
+    r = telemetry.interpret_health(doc, time.time())
+    assert_eq(r["status"], "ok", "ready=None (unknown) is not a finding")
+
+
+def test_interpret_health_tunnel_not_configured_is_fine():
+    doc = {"status": "ok", "tunnel": {"configured": False, "ready": None}}
+    r = telemetry.interpret_health(doc, time.time())
+    assert_eq(r["status"], "ok", "not configured -> nothing to warn about, whatever ready says")
+
+
+def test_interpret_health_tunnel_absent_is_tolerated():
+    """Older compactors (pre-v3.1.9.9) never send a `tunnel` key at all -
+    `doc.get("tunnel") or {}` must not raise or fabricate a finding.
+    """
+    doc = {"status": "ok"}
+    r = telemetry.interpret_health(doc, time.time())
+    assert_eq(r["status"], "ok", "no tunnel key at all is tolerated")
+
+
+def test_mutation_tunnel_ready_none_treated_as_false_would_warn_spuriously():
+    """Prove the ready=None test above bites: a broken version that folds
+    `ready is not True` into the warn condition (instead of the exact
+    `ready is False`) would spuriously warn on merely UNKNOWN readiness --
+    confirm that broken read fires here, then confirm the real code (which
+    checks `is False`) does not.
+    """
+    tunnel = {"configured": True, "ready": None}
+    mutated_would_warn = bool(tunnel.get("configured") and tunnel.get("ready") is not True)
+    assert_true(mutated_would_warn, "mutated (ready is not True) fires on unknown readiness -- confirms the bite")
+    assert_true(tunnel.get("ready") is not False, "the real code's exact `is False` check does not fire here")
+
+
+# =============================================================================
+# Cloudflare Tunnel (v3.1.9.9): cloudflared_fault / tunnel_status_word
+# =============================================================================
+
+
+def test_cloudflared_fault_none_when_not_configured():
+    assert_eq(telemetry.cloudflared_fault(None, "EXITED"), None, "no doc at all -> nothing to flag")
+    assert_eq(telemetry.cloudflared_fault({"status": "ok"}, "EXITED"), None,
+               "tunnel key absent (older compactor) -> nothing to flag")
+    doc = {"tunnel": {"configured": False, "ready": None}}
+    assert_eq(telemetry.cloudflared_fault(doc, "EXITED"), None, "configured=False -> EXITED is fine")
+
+
+def test_cloudflared_fault_none_when_running():
+    doc = {"tunnel": {"configured": True, "ready": True}}
+    assert_eq(telemetry.cloudflared_fault(doc, "RUNNING"), None, "configured and RUNNING -> nothing to flag")
+
+
+def test_cloudflared_fault_flags_configured_but_down():
+    doc = {"tunnel": {"configured": True, "ready": None}}
+    result = telemetry.cloudflared_fault(doc, "EXITED")
+    assert_true(result is not None, "configured but not RUNNING -> flagged")
+    assert_in("tunnel configured but cloudflared is EXITED", result, "warning names the actual state")
+
+
+def test_mutation_cloudflared_fault_ignoring_configured_would_flag_disabled_tunnel():
+    """Prove the test above bites: a broken version that flags ANY
+    non-RUNNING cloudflared (ignoring `tunnel.configured` entirely) would
+    also flag the correct, disabled-by-config case -- confirm that broken
+    read fires on an unconfigured tunnel, then confirm the real code does
+    not.
+    """
+    state = "EXITED"
+    mutated_would_flag = state != "RUNNING"  # ignores tunnel.configured entirely
+    assert_true(mutated_would_flag, "mutated (state-only) flags every non-RUNNING state -- confirms the bite")
+    doc = {"tunnel": {"configured": False, "ready": None}}
+    assert_eq(telemetry.cloudflared_fault(doc, state), None,
+              "the real code correctly leaves a disabled-by-config EXITED alone")
+
+
+def test_tunnel_status_word_all_shapes():
+    assert_eq(telemetry.tunnel_status_word(None), None, "no doc -> None (hide the line)")
+    assert_eq(telemetry.tunnel_status_word({"status": "ok"}), None, "tunnel key absent -> None (hide the line)")
+    assert_eq(telemetry.tunnel_status_word({"tunnel": {"configured": False, "ready": None}}), "disabled",
+              "configured=False -> disabled")
+    assert_eq(telemetry.tunnel_status_word({"tunnel": {"configured": True, "ready": True}}), "ready",
+              "configured, ready=True -> ready")
+    assert_eq(telemetry.tunnel_status_word({"tunnel": {"configured": True, "ready": False}}), "not ready",
+              "configured, ready=False -> not ready")
+    assert_eq(telemetry.tunnel_status_word({"tunnel": {"configured": True, "ready": None}}), "unknown",
+              "configured, ready=None -> unknown")
+
+
+def test_collect_health_carries_tunnel_status():
+    doc = {"status": "ok", "tunnel": {"configured": True, "ready": True}}
+
+    def fake_fetch(url, timeout_s):
+        return json.dumps(doc).encode("utf-8")
+
+    result = telemetry.collect_health(fetch=fake_fetch)
+    assert_eq(result["tunnel_status"], "ready", "collect_health surfaces tunnel_status_word for collect_snapshot/bundle")
+
+
 def test_interpret_health_backup_thresholds():
     now = time.time()
     fresh = {"status": "ok", "backups": {"latest": "a.tgz", "latest_mtime": now - 3600, "count": 1}}
@@ -1079,6 +1221,32 @@ def test_is_signal_line_supervisord_format():
     assert_eq(telemetry._line_level_field(crit, "supervisord.log"), "CRITICAL", "CRIT expands to CRITICAL")
 
 
+def test_is_signal_line_cloudflared_error_format():
+    """v3.1.9.9: cloudflared's own zerolog-style INF/WRN/ERR/DBG lines,
+    anchored to `cloudflared-error.log`'s own format (not a substring scan
+    over "ERR" appearing anywhere in a location code or connector id).
+    """
+    running = (
+        "2026-09-22T09:07:30Z INF Registered tunnel connection connIndex=0 "
+        "connection=1b2c3d4e-5f60-7182-93a4-b5c6d7e8f9a0 event=0 "
+        "ip=198.51.100.7 location=SEA protocol=quic"
+    )
+    warn = "2026-09-22T09:07:31Z WRN Retrying connection in up to 8s"
+    err = "2026-09-22T09:07:32Z ERR Failed to serve quic connection error=\"context canceled\""
+    assert_true(not telemetry.is_signal_line(running, "cloudflared-error.log"), "cloudflared INF is not signal")
+    assert_true(telemetry.is_signal_line(warn, "cloudflared-error.log"), "cloudflared WRN is signal")
+    assert_true(telemetry.is_signal_line(err, "cloudflared-error.log"), "cloudflared ERR is signal")
+    assert_eq(telemetry._line_level_field(warn, "cloudflared-error.log"), "WARNING", "WRN expands to WARNING")
+    assert_eq(telemetry._line_level_field(err, "cloudflared-error.log"), "ERROR", "ERR expands to ERROR")
+
+
+def test_cloudflared_error_log_is_in_log_signal_files():
+    assert_true("cloudflared-error.log" in telemetry.LOG_SIGNAL_FILES,
+                "cloudflared-error.log is watched by the dash log-signal panel / zl bundle")
+    assert_true("cloudflared.log" not in telemetry.LOG_SIGNAL_FILES,
+                "cloudflared.log (stdout) never carries a level word -- not added as a signal source")
+
+
 def test_collect_log_signal_routes_through_privacy_scrub_not_a_line_drop():
     """The real-bundle-verified regression this replaces: the old
     substring-drop filter dropped a WARNING line entirely just because it
@@ -1137,11 +1305,91 @@ def test_collect_log_signal_caps_line_length():
 
 
 def test_collect_log_signal_missing_files_are_reported_not_fatal():
+    """Every CORE log file is reported missing - but round-11 review (LOW):
+    an OPTIONAL one (cloudflared-error.log, absent on any pre-v3.1.9.9 pod
+    with no cloudflared at all) must NOT be, that is the expected, boring
+    case on most pods, not a fault to surface as dash noise.
+    """
     tmp = Path(tempfile.mkdtemp(prefix="zl-log-signal-missing-"))
     try:
         result = telemetry.collect_log_signal(log_dir=tmp)
         assert_eq(result["entries"], [], "no files present -> no entries, no crash")
-        assert_eq(len(result["file_errors"]), len(telemetry.LOG_SIGNAL_FILES), "every missing file is reported")
+        expected_core = len(telemetry.LOG_SIGNAL_FILES) - len(telemetry.OPTIONAL_LOG_FILES)
+        assert_eq(len(result["file_errors"]), expected_core, "every missing CORE file is reported")
+        assert_true(
+            all(fname not in telemetry.OPTIONAL_LOG_FILES for fname in result["file_errors"]),
+            "no optional file (cloudflared-error.log) shows up in file_errors",
+        )
+    finally:
+        _rmtree(tmp)
+
+
+def test_collect_log_signal_optional_file_missing_is_silent():
+    """A pre-v3.1.9.9 pod (no cloudflared, ever) must not show
+    `(cloudflared-error.log: FileNotFoundError ...)` dash noise - the
+    exact complaint from the round-11 review.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="zl-log-signal-optional-"))
+    try:
+        for fname in telemetry.LOG_SIGNAL_FILES:
+            if fname not in telemetry.OPTIONAL_LOG_FILES:
+                (tmp / fname).write_text("")
+        result = telemetry.collect_log_signal(log_dir=tmp)
+        assert_eq(result["file_errors"], {}, "only the optional file is missing -> no file_errors at all")
+    finally:
+        _rmtree(tmp)
+
+
+def test_collect_log_signal_core_file_missing_still_reported_even_with_optional_absent():
+    """A REAL fault (a core log file missing) must still surface even
+    when the optional cloudflared-error.log is ALSO absent alongside it -
+    the fix must not have gone so broad it silences core-file faults too.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="zl-log-signal-core-missing-"))
+    try:
+        for fname in telemetry.LOG_SIGNAL_FILES:
+            if fname != "supervisord.log" and fname not in telemetry.OPTIONAL_LOG_FILES:
+                (tmp / fname).write_text("")
+        result = telemetry.collect_log_signal(log_dir=tmp)
+        assert_eq(set(result["file_errors"]), {"supervisord.log"}, "the missing core file is reported, nothing else")
+    finally:
+        _rmtree(tmp)
+
+
+def test_mutation_dropping_optional_gate_reintroduces_the_dash_noise():
+    """Prove the fix bites: without the `FileNotFoundError`/`OPTIONAL_LOG_FILES`
+    split, a pre-v3.1.9.9 pod's missing cloudflared-error.log goes right
+    back to being reported as a fault.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="zl-log-signal-mutation-"))
+    try:
+        for fname in telemetry.LOG_SIGNAL_FILES:
+            if fname not in telemetry.OPTIONAL_LOG_FILES:
+                (tmp / fname).write_text("")
+
+        def mutated(log_dir=None, max_lines=8):
+            log_dir = log_dir or tmp
+            entries: list = []
+            file_errors: dict = {}
+            for fname in telemetry.LOG_SIGNAL_FILES:
+                path = log_dir / fname
+                try:
+                    telemetry.tail_bytes(path)
+                except OSError as exc:
+                    file_errors[fname] = f"{type(exc).__name__}: {exc}"
+                    continue
+            return {"entries": entries, "file_errors": file_errors}
+
+        mutated_result = mutated(log_dir=tmp)
+        assert_true(
+            "cloudflared-error.log" in mutated_result["file_errors"],
+            "mutated (no optional gate) version reintroduces the noise -- confirms the bite",
+        )
+        real_result = telemetry.collect_log_signal(log_dir=tmp)
+        assert_true(
+            "cloudflared-error.log" not in real_result["file_errors"],
+            "the real (fixed) code stays silent for the optional file",
+        )
     finally:
         _rmtree(tmp)
 

@@ -151,6 +151,58 @@ def test_bundle_layout_matches_the_real_bundle():
         assert_true("logs/zla/not-a-log.txt" not in names, "a non-.log file under LOG_DIR is never bundled")
 
 
+def test_bundle_picks_up_cloudflared_logs():
+    """v3.1.9.9: `_copy_logs` globs `podenv.LOG_DIR.glob("*.log")` with no
+    per-service allowlist, so cloudflared.log/cloudflared-error.log (the
+    supervisord.conf stdout/stderr targets for `[program:cloudflared]`)
+    are picked up automatically, the same as any other `*.log` file --
+    confirmed explicitly here rather than just assumed from the glob.
+    """
+    with _PodLayout() as fx:
+        (fx.log_dir / "cloudflared.log").write_text(
+            "2026-09-27T00:00:00Z [cloudflared-run] CLOUDFLARE_TUNNEL_TOKEN is set; starting cloudflared\n",
+            encoding="utf-8",
+        )
+        (fx.log_dir / "cloudflared-error.log").write_text(
+            "2026-09-27T00:00:01Z INF Registered tunnel connection connIndex=0 ip=198.51.100.7 location=SEA\n",
+            encoding="utf-8",
+        )
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", buf):
+            code = bundle.run(["--out", str(fx.out_dir), "--print-path"])
+        assert_eq(code, 0, "bundle.run exits 0")
+        archive_path = Path(buf.getvalue().strip())
+        with tarfile.open(archive_path, "r:gz") as tf:
+            names = {n.split("/", 1)[1] for n in tf.getnames() if "/" in n}
+        for log_name in ("logs/zla/cloudflared.log", "logs/zla/cloudflared-error.log"):
+            assert_true(log_name in names, f"{log_name} is in the bundle", extra=str(sorted(names)))
+
+
+def test_mutation_a_per_service_log_allowlist_would_have_missed_cloudflared():
+    """Prove the test above bites: simulate the design this repo did NOT
+    take -- a hard-coded allowlist of known log basenames -- and confirm it
+    would have missed cloudflared.log/cloudflared-error.log entirely (a
+    v3.1.9.9 addition this allowlist predates), then confirm the real glob-
+    based `_copy_logs` picks them up regardless.
+    """
+    hardcoded_allowlist = {
+        "compactor.log", "compactor-error.log", "vllm.log", "vllm-error.log",
+        "openwebui.log", "openwebui-error.log", "supervisord.log",
+    }
+    assert_true("cloudflared.log" not in hardcoded_allowlist,
+                "mutated (hard-coded allowlist) would miss cloudflared.log -- confirms the bite")
+    with _PodLayout() as fx:
+        (fx.log_dir / "cloudflared.log").write_text("disabled\n", encoding="utf-8")
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", buf):
+            bundle.run(["--out", str(fx.out_dir), "--print-path"])
+        archive_path = Path(buf.getvalue().strip())
+        with tarfile.open(archive_path, "r:gz") as tf:
+            names = {n.split("/", 1)[1] for n in tf.getnames() if "/" in n}
+        assert_true("logs/zla/cloudflared.log" in names,
+                     "the real glob-based _copy_logs picks it up with no allowlist to update")
+
+
 def test_disk_txt_reports_control_and_pending_roots_when_present():
     """compactor's own CONTROL_ROOT/PENDING_ROOT (continuity.py's ledger
     and durability sidecar, siblings of STORAGE_ROOT -- podenv.py's own

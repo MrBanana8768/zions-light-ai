@@ -184,6 +184,16 @@ def interpret_health(doc: dict | None, now: float) -> dict:
       7. `checks.ledger.degraded` (no such field exists in the codebase
          today - grep-confirmed; kept because the brief pins the rule and a
          future release may add it) - crit.
+      8. v3.1.9.9 Cloudflare Tunnel: `tunnel.configured` true and
+         `tunnel.ready` explicitly False - warn ("tunnel not ready"). `tunnel`
+         absent (older compactors, `doc.get("tunnel") or {}`), `configured`
+         false, or `ready` None (unknown - cloudflared's own metrics probe
+         was unreachable, not necessarily broken) all show nothing here -
+         visibility only, same doctrine as every other `tunnel`/`word_ban`
+         field: never moves `status` on its own beyond the one warn level.
+         The "configured but cloudflared is not RUNNING" case is a SEPARATE
+         check (`cloudflared_fault`, below) - this function has no
+         supervisord state to compare against.
 
     `checks.reuse`/`checks.budget_margin`/`checks.truncated_summaries` are
     visibility-only in the compactor's own doctrine (OPERATIONS.md says so
@@ -267,6 +277,15 @@ def interpret_health(doc: dict | None, now: float) -> dict:
     if isinstance(ledger, dict) and ledger.get("degraded"):
         add("crit", f"ledger degraded: {ledger.get('reason') or ledger}")
 
+    # Rule 8: v3.1.9.9 Cloudflare Tunnel - configured but not ready.
+    # `doc.get("tunnel") or {}` per the brief: tolerant of an absent key
+    # (older compactors) and of a present-but-null value alike.
+    tunnel = doc.get("tunnel") or {}
+    if isinstance(tunnel, dict) and tunnel.get("configured") and tunnel.get("ready") is False:
+        add("warn", "tunnel not ready")
+    # ready is None (unknown) or True, or configured is false/absent:
+    # nothing to show - see rule 8's docstring note above.
+
     # Rule 2: newest backup age.
     backups = doc.get("backups")
     if isinstance(backups, dict):
@@ -319,7 +338,68 @@ def collect_health(url: str | None = None, timeout_s: float = 5.0, fetch=None) -
     straight from `doc`, none of which interpret_health folds into status).
     """
     doc = fetch_health_full(url or podenv.COMPACTOR_URL, timeout_s, fetch=fetch)
-    return {"doc": doc, "interpreted": interpret_health(doc, time.time())}
+    return {"doc": doc, "interpreted": interpret_health(doc, time.time()), "tunnel_status": tunnel_status_word(doc)}
+
+
+# =============================================================================
+# v3.1.9.9 Cloudflare Tunnel - shared between `zl status`, the dashboard's
+# Services/Health panels, and `zl bundle`'s meta/telemetry.json, so all three
+# read exactly one implementation of "what does `tunnel` mean" (memory.md's
+# rule against two copies of one derived value drifting apart).
+# =============================================================================
+
+
+def tunnel_status_word(doc: dict | None) -> str | None:
+    """"ready" / "not ready" / "unknown" / "disabled" for /health/full's
+    `tunnel` key, or None if the key itself is absent (an older compactor
+    that predates v3.1.9.9, or the endpoint was unreachable) - callers MUST
+    hide the line entirely on None, never show a default in its place.
+    Tolerant of a present-but-non-dict `tunnel` (`doc.get("tunnel") or {}`
+    would coerce it to `{}`; here that same shape reads as "absent").
+    """
+    doc = doc if isinstance(doc, dict) else {}
+    tunnel = doc.get("tunnel")
+    if not isinstance(tunnel, dict):
+        return None
+    if not tunnel.get("configured"):
+        return "disabled"
+    ready = tunnel.get("ready")
+    if ready is True:
+        return "ready"
+    if ready is False:
+        return "not ready"
+    return "unknown"  # ready is None: cloudflared's own /ready probe was unreachable/not yet answered
+
+
+def cloudflared_fault(doc: dict | None, cloudflared_state: str | None) -> str | None:
+    """The warning text `zl status`/the dash Services panel should show for
+    the `cloudflared` supervisord program, or None when there is nothing to
+    flag.
+
+    `cloudflared` sits in `podenv.ONE_SHOT_OR_OPTIONAL` because an EXITED
+    cloudflared is the CORRECT, expected state whenever no
+    CLOUDFLARE_TUNNEL_TOKEN is set (docker/cloudflared-run.sh's own exit-0
+    disabled path) - but that membership alone cannot tell "disabled by
+    config" apart from "a token IS set and cloudflared crashed/stopped
+    anyway", which the operator very much needs to see. This cross-checks
+    supervisord's own state against /health/full's `tunnel.configured` (the
+    ONE place that actually knows whether a token is present) to recover
+    that distinction:
+
+      - `tunnel` absent (older compactor) or `configured` false: EXITED (or
+        any other non-RUNNING state) is fine - returns None.
+      - `configured` true and `cloudflared_state` is anything but RUNNING:
+        returns "tunnel configured but cloudflared is <STATE>".
+
+    Read tolerantly with `doc.get("tunnel") or {}`, per the brief.
+    """
+    doc = doc if isinstance(doc, dict) else {}
+    tunnel = doc.get("tunnel") or {}
+    if not isinstance(tunnel, dict) or not tunnel.get("configured"):
+        return None
+    if cloudflared_state == "RUNNING":
+        return None
+    return f"tunnel configured but cloudflared is {cloudflared_state or 'UNKNOWN'}"
 
 
 # =============================================================================
@@ -1529,7 +1609,24 @@ LOG_SIGNAL_FILES = (
     "openwebui.log",
     "openwebui-error.log",
     "supervisord.log",
+    # v3.1.9.9: cloudflared's own stderr (supervisord.conf:294,
+    # `stderr_logfile=%(ENV_LOG_DIR)s/cloudflared-error.log`) - where
+    # cloudflared's own zerolog-style INF/WRN/ERR/DBG lines land.
+    # cloudflared.log (its stdout) is deliberately NOT added here: it only
+    # ever carries cloudflared-run.sh's own plain "set"/"unset"/"disabled"
+    # info lines (never a level word), nothing WARNING/ERROR-shaped to
+    # surface as signal.
+    "cloudflared-error.log",
 )
+
+# Round-11 review (LOW): a pod running a pre-v3.1.9.9 build has no
+# cloudflared at all, so `cloudflared-error.log` never exists there -- that
+# is the expected, boring case, not a fault, and must never show up as
+# `file_errors` noise in the dash's Log signal panel on every single such
+# pod. The other files in `LOG_SIGNAL_FILES` are core: vllm/compactor/
+# openwebui/supervisord are all always-present programs on every pod, so a
+# missing one there is a real problem and must keep surfacing.
+OPTIONAL_LOG_FILES = frozenset({"cloudflared-error.log"})
 
 _LOG_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?")
 _LOG_TRACEBACK_RE = re.compile(r"Traceback \(most recent call last\)")
@@ -1554,6 +1651,11 @@ _SIGNAL_LEVELS = ("WARNING", "ERROR", "CRITICAL")
 #   openwebui*.log      "TS.mmm | LEVEL    | logger:func:line - message"  (loguru)
 #   supervisord.log     "TS,mmm LEVEL message" with LEVEL truncated to 4
 #                        chars (CRIT/WARN/ERRO/INFO/DEBU)
+#   cloudflared-error.log "TS INF|WRN|ERR|DBG message"                 (cloudflared's
+#                        own zerolog-style output, e.g. "2024-01-15T12:34:56Z
+#                        INF Registered tunnel connection connIndex=0
+#                        connection=<id> event=0 ip=<edge ip> location=<iata>
+#                        protocol=quic")
 
 _LEVEL_COMPACTOR_APP_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[.,]\d+\s+\S+\s+(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b"
@@ -1567,6 +1669,8 @@ _LEVEL_SUPERVISORD_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2},\d+\s+(CRIT|ERRO|WARN|INFO|DEBU)\b"
 )
 _SUPERVISORD_LEVEL_MAP = {"CRIT": "CRITICAL", "ERRO": "ERROR", "WARN": "WARNING", "INFO": "INFO", "DEBU": "DEBUG"}
+_LEVEL_CLOUDFLARED_RE = re.compile(r"^\S+\s+(INF|WRN|ERR|DBG)\b")
+_CLOUDFLARED_LEVEL_MAP = {"INF": "INFO", "WRN": "WARNING", "ERR": "ERROR", "DBG": "DEBUG"}
 
 
 def _line_level_field(line: str, fname: str) -> str | None:
@@ -1592,6 +1696,9 @@ def _line_level_field(line: str, fname: str) -> str | None:
     if fname == "supervisord.log":
         m = _LEVEL_SUPERVISORD_RE.match(line)
         return _SUPERVISORD_LEVEL_MAP[m.group(1)] if m else None
+    if fname == "cloudflared-error.log":
+        m = _LEVEL_CLOUDFLARED_RE.match(line)
+        return _CLOUDFLARED_LEVEL_MAP[m.group(1)] if m else None
     # Unknown source: try every anchor rather than falling back to a
     # substring scan.
     for fn in (_LEVEL_COMPACTOR_APP_RE, _LEVEL_COLON_RE, _LEVEL_VLLM_RE, _LEVEL_LOGURU_RE):
@@ -1599,7 +1706,10 @@ def _line_level_field(line: str, fname: str) -> str | None:
         if m:
             return m.group(1)
     m = _LEVEL_SUPERVISORD_RE.match(line)
-    return _SUPERVISORD_LEVEL_MAP[m.group(1)] if m else None
+    if m:
+        return _SUPERVISORD_LEVEL_MAP[m.group(1)]
+    m = _LEVEL_CLOUDFLARED_RE.match(line)
+    return _CLOUDFLARED_LEVEL_MAP[m.group(1)] if m else None
 
 
 def is_signal_line(line: str, fname: str = "") -> bool:
@@ -1653,6 +1763,15 @@ def collect_log_signal(log_dir: Path | None = None, max_lines: int = 8) -> dict:
         path = log_dir / fname
         try:
             text = tail_bytes(path)
+        except FileNotFoundError as exc:
+            # An OPTIONAL log file simply not existing (pre-v3.1.9.9:
+            # no cloudflared, ever) is silent - not a fault to report.
+            # Any OTHER OSError (permission denied, a directory where a
+            # file was expected, ...) still surfaces even for an optional
+            # file - only "it's not there" is expected/boring.
+            if fname not in OPTIONAL_LOG_FILES:
+                file_errors[fname] = f"{type(exc).__name__}: {exc}"
+            continue
         except OSError as exc:
             file_errors[fname] = f"{type(exc).__name__}: {exc}"
             continue
