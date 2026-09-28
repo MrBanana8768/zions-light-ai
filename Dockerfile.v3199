@@ -211,6 +211,11 @@ COPY compactor/reqctx.py /opt/compactor/reqctx.py
 # New in .8 (word ban from a file, injected by the compactor, committed
 # 04c9f15 / 07d8987):
 COPY compactor/wordban_runtime.py /opt/compactor/wordban_runtime.py
+# New in .9 (uploads backup, merged from feature/v3.1.9.8-uploads d586fc7):
+# the separate, incremental mirror of /data/openwebui/uploads (her
+# photos) — see CHANGELOG.md [3.1.9.9]. scripts/uploads-backup.py (the
+# operator CLI) is already baked by the `COPY scripts/` line below.
+COPY compactor/uploads_backup.py /opt/compactor/uploads_backup.py
 
 # -----------------------------------------------------------------------
 # stt/, tts/, clean-models.sh: NOT copied. `docker cp`'d out of a throwaway
@@ -272,8 +277,8 @@ RUN cd /opt/compactor && \
 backfill, retrieval, summarizer, health, selftest, portability, dedup, \
 commands, persona, backup, degrade, bgwork, textclean, tokens, \
 tokenhealth, tailhealth, webuidb, logsetup, alert, reqctx, \
-wordban_runtime; \
-       print('v3199 import guard: all 27 compactor modules import from the image')" \
+wordban_runtime, uploads_backup; \
+       print('v3199 import guard: all 28 compactor modules import from the image')" \
     && rm -rf /tmp/buildguard /opt/compactor/__pycache__
 
 # -----------------------------------------------------------------------

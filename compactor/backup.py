@@ -3118,6 +3118,59 @@ def _newest_archive_age_s(backup_dir: Path | None = None) -> float | None:
     return max(0.0, time.time() - archives[0]["mtime"])
 
 
+def _run_daemon_uploads_step(
+    *, uploads_dir=None, backup_root=None, idle_check=None,
+) -> dict | None:
+    """The separate, incremental uploads-photos mirror (v3.1.9.8 UPLOADS
+    INCIDENT follow-up) — called ONCE per daemon cycle, from run_daemon
+    ONLY, always AFTER run_once() has already returned (so this always
+    runs outside whatever lock run_once's own create_backup briefly held;
+    that lock is released well before run_once returns).
+
+    hostile-review round 2, finding 7: this used to be inlined into
+    run_once itself, which meant `backup.py --once`, `zl backup now`, and
+    zl fix's pre-repair backup — every OTHER caller of run_once, none of
+    which asked for or expected a second, unrelated durability feature to
+    piggyback on their call — silently ran it too. run_once is back to
+    doing exactly one thing (byte-identical to HEAD before this module
+    existed; diffed as part of this fix). Only the daemon loop, which is
+    the one caller actually running on a schedule, drives this.
+
+    It protects a different, unrelated risk (in-place damage/deletion of
+    `/data/openwebui/uploads`, never covered by the archive) and must
+    never fail, alter, or delay run_once's own report — the caller wraps
+    this in its own try/except for exactly that reason (an exception this
+    function's own author did not anticipate must not be allowed to
+    interrupt the daemon loop either).
+
+    `uploads_dir`/`backup_root`/`idle_check`, when given, are forwarded to
+    uploads_backup.run_after_main_backup — this is how a TEST drives this
+    exact function without ever touching the real /data/openwebui/uploads
+    directory or the real /health/full endpoint on :8080; the real daemon
+    calls this with no arguments, getting run_once's own real defaults.
+    """
+    import uploads_backup
+    kwargs: dict = {}
+    if uploads_dir is not None:
+        kwargs["uploads_dir"] = uploads_dir
+    if backup_root is not None:
+        kwargs["backup_root"] = backup_root
+    if idle_check is not None:
+        kwargs["idle_check"] = idle_check
+    _t0 = time.monotonic()
+    ureport = uploads_backup.run_after_main_backup(**kwargs)
+    uploads_backup.note_run(ureport, round(time.monotonic() - _t0, 1))
+    if not ureport.get("ok"):
+        logger.error(f"uploads backup step failed: {ureport.get('detail')}")
+    elif ureport.get("suspect"):
+        logger.error(f"uploads backup step: {ureport.get('detail')}")
+    elif ureport.get("skipped"):
+        logger.info(f"uploads backup step skipped: {ureport.get('detail')}")
+    else:
+        logger.info(f"uploads backup step ok: {ureport.get('detail')}")
+    return ureport
+
+
 def run_daemon(interval_hours: float | None = None) -> None:
     """Periodic loop for the supervisord sidecar. Backs up every
     `interval_hours`, forever. Each cycle is wrapped so a single failure
@@ -3160,6 +3213,26 @@ def run_daemon(interval_hours: float | None = None) -> None:
                 time.sleep(max(60.0, interval - age))
                 continue
         report = run_once()
+        # hostile-review round 2, finding 7: the uploads mirror runs here,
+        # once per daemon cycle, AFTER run_once has returned (its own lock
+        # already released) — never inside run_once itself. See
+        # _run_daemon_uploads_step's own docstring. A failure here is
+        # caught and logged and must never affect `report` or this loop.
+        try:
+            _run_daemon_uploads_step()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:
+            # hostile-review round 3, finding 7: `except Exception` missed
+            # anything deriving from BaseException directly — notably
+            # asyncio.CancelledError (a BaseException since Python 3.8),
+            # which a probe showed DOES escape from here and kill this
+            # whole daemon loop, taking the MAIN backup down with it over
+            # a failure in the unrelated uploads step. Catch everything
+            # except the two signals that must always propagate (a real
+            # KeyboardInterrupt/SystemExit — this loop must not swallow an
+            # actual shutdown request).
+            logger.error(f"uploads backup step raised (daemon loop unaffected): {type(e).__name__}")
         if not report["ok"]:
             # v3.1.9 (hostile317-c F3). This used to fall through to the
             # same `time.sleep(interval)` a SUCCESSFUL cycle takes — up to
