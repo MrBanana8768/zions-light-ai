@@ -40,44 +40,72 @@ def _gpu_line(timeout: float) -> str:
     return " | ".join(parts)
 
 
-def _health_verdict(timeout: float) -> dict:
+def _fetch_health_doc(timeout: float) -> dict | None:
+    _status_code, doc, error = common.http_get_json(f"{podenv.COMPACTOR_URL}/health/full", timeout=timeout)
+    return None if error is not None else doc
+
+
+def _service_table(status: dict[str, str], doc: dict | None) -> tuple[list[str], bool, str | None, frozenset[str]]:
     from .. import telemetry  # lazy: B's module, not needed by other commands
 
-    _status_code, doc, error = common.http_get_json(f"{podenv.COMPACTOR_URL}/health/full", timeout=timeout)
-    if error is not None:
-        doc = None
-    return telemetry.interpret_health(doc, time.time())
-
-
-def _service_table(status: dict[str, str]) -> tuple[list[str], bool]:
     lines = []
     any_unexpected = False
+    tunnel_warn: str | None = None
+    hidden: set[str] = set()
     width = max((len(s) for s in podenv.SERVICES), default=8)
     for name in podenv.SERVICES:
         state = status.get(name, "UNKNOWN")
+        # v3.1.9.9: `cloudflared` is in ONE_SHOT_OR_OPTIONAL (EXITED with no
+        # token set is correct), but "a token IS set and cloudflared isn't
+        # RUNNING anyway" is a real fault that membership alone would hide
+        # -- cross-checked against /health/full's own `tunnel.configured`.
+        warn_text = telemetry.cloudflared_fault(doc, state) if name == "cloudflared" else None
+        # Pre-v3.1.9.9 pod: supervisord has no [program:cloudflared] at all
+        # (state defaults to "UNKNOWN") AND the compactor's /health/full
+        # predates the `tunnel` key entirely (`tunnel_status_word` is None).
+        # There is nothing real to report -- showing "cloudflared UNKNOWN"
+        # is pure noise, and it must not count against the "N/10" total
+        # either. The warning above still fires (and this branch is not
+        # taken) whenever `tunnel.configured` is true but the program is
+        # missing -- that IS a real fault, never hidden.
+        if name == "cloudflared" and state == "UNKNOWN" and warn_text is None and telemetry.tunnel_status_word(doc) is None:
+            hidden.add(name)
+            continue
         expected_running = name not in podenv.ONE_SHOT_OR_OPTIONAL
         unexpected = state != "RUNNING" and expected_running
         if unexpected:
             any_unexpected = True
-        flag = " <-- unexpected" if unexpected else ""
+        if warn_text:
+            tunnel_warn = warn_text
+            flag = f" <-- warn: {warn_text}"
+        elif unexpected:
+            flag = " <-- unexpected"
+        else:
+            flag = ""
         lines.append(f"  {name.ljust(width)}  {state}{flag}")
-    return lines, any_unexpected
+    return lines, any_unexpected, tunnel_warn, frozenset(hidden)
 
 
 def run(argv: list[str]) -> int:
     brief = "--brief" in argv
     timeout = 1.0 if brief else 3.0
 
+    from .. import telemetry  # lazy: B's module, not needed by other commands
+
     status = common.supervisorctl_status()
-    lines, any_unexpected = _service_table(status)
-    verdict = _health_verdict(timeout)
+    doc = _fetch_health_doc(timeout)
+    verdict = telemetry.interpret_health(doc, time.time())
+    lines, any_unexpected, tunnel_warn, hidden = _service_table(status, doc)
     gpu = _gpu_line(timeout)
 
     if brief:
-        n_running = sum(1 for s in status.values() if s == "RUNNING")
-        bad = ", ".join(n for n in podenv.SERVICES if status.get(n) != "RUNNING" and n not in podenv.ONE_SHOT_OR_OPTIONAL)
+        counted = [n for n in podenv.SERVICES if n not in hidden]
+        n_running = sum(1 for n in counted if status.get(n) == "RUNNING")
+        bad = ", ".join(n for n in counted if status.get(n) != "RUNNING" and n not in podenv.ONE_SHOT_OR_OPTIONAL)
         bad_note = f" ({bad} NOT running)" if bad else ""
-        print(f"zl status: {n_running}/{len(podenv.SERVICES)} services RUNNING{bad_note}")
+        if tunnel_warn:
+            bad_note += f"; {tunnel_warn}"
+        print(f"zl status: {n_running}/{len(counted)} services RUNNING{bad_note}")
         print(f"health: {verdict['status']}" + (f" -- {'; '.join(verdict['reasons'])}" if verdict["reasons"] else ""))
         print(gpu)
         print("zl dash for live telemetry", file=sys.stderr)
@@ -94,6 +122,6 @@ def run(argv: list[str]) -> int:
 
     if verdict["status"] == "crit" or any_unexpected:
         return 1
-    if verdict["status"] == "warn":
+    if verdict["status"] == "warn" or tunnel_warn:
         return 3
     return 0

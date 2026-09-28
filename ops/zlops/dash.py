@@ -304,10 +304,32 @@ def _panel_health(entry: dict, now: float) -> list[tuple[str, str]]:
     nonzero = {k: v for k, v in deltas.items() if v}
     if nonzero:
         lines.append((f"  memory_tail since dash start: {nonzero}", "warn"))
+    # v3.1.9.9 Cloudflare Tunnel: "ready"/"not ready"/"unknown"/"disabled"
+    # when /health/full reports a `tunnel` key at all - HIDDEN entirely on
+    # an older compactor that predates it (telemetry.tunnel_status_word
+    # returns None there), never shown as some default.
+    tunnel_status = data.get("tunnel_status")
+    if tunnel_status is not None:
+        attr = "warn" if tunnel_status == "not ready" else "normal"
+        line = f"  tunnel: {tunnel_status}"
+        # Round-11 review (LOW): "unknown" alone (cloudflared's own /ready
+        # probe was unreachable/not yet answered) tells the operator
+        # nothing about WHY - the compactor's probe error text (e.g. a
+        # ConnectError) is right there on `tunnel.error` and is safe to
+        # show (it's connector/network diagnostic text, never her chat
+        # content) - truncated the same way `_gpu_line`'s own nvidia-smi
+        # failure text is, so one runaway error string can't blow up the
+        # panel.
+        if tunnel_status == "unknown":
+            tunnel_doc = doc.get("tunnel")
+            error = tunnel_doc.get("error") if isinstance(tunnel_doc, dict) else None
+            if error:
+                line += f"  ({str(error)[:160]})"
+        lines.append((line, attr))
     return lines
 
 
-def _panel_services(entry: dict, now: float) -> list[tuple[str, str]]:
+def _panel_services(entry: dict, now: float, health_doc: dict | None = None) -> list[tuple[str, str]]:
     age = _age_s(entry, now)
     stale = _is_stale(age, telemetry.CADENCE_S["services"])
     stalled = _stalled_s(entry, now, telemetry.CADENCE_S["services"])
@@ -319,15 +341,23 @@ def _panel_services(entry: dict, now: float) -> list[tuple[str, str]]:
     if not services:
         lines.append(("  (no data yet)", "dim"))
     for s in services:
-        attr = "crit" if s.get("unexpected") else ("ok" if s.get("state") == "RUNNING" else "dim")
-        marker = "!" if s.get("unexpected") else " "
-        lines.append(
-            (
-                f" {marker} {s.get('name', '?'):<16} {s.get('state', '?'):<9}"
-                f" pid={s.get('pid')} uptime={s.get('uptime')}",
-                attr,
-            )
-        )
+        name = s.get("name", "?")
+        state = s.get("state", "?")
+        # v3.1.9.9: `cloudflared` sits in ONE_SHOT_OR_OPTIONAL (an EXITED
+        # cloudflared with no token set is correct), but a token IS set
+        # (tunnel.configured) and cloudflared isn't RUNNING anyway is a
+        # real fault ONE_SHOT_OR_OPTIONAL membership alone would hide -
+        # see telemetry.cloudflared_fault's own docstring.
+        tunnel_warn = telemetry.cloudflared_fault(health_doc, state) if name == "cloudflared" else None
+        if tunnel_warn:
+            attr, marker = "warn", "!"
+        else:
+            attr = "crit" if s.get("unexpected") else ("ok" if state == "RUNNING" else "dim")
+            marker = "!" if s.get("unexpected") else " "
+        line = f" {marker} {name:<16} {state:<9} pid={s.get('pid')} uptime={s.get('uptime')}"
+        if tunnel_warn:
+            line += f"  <-- {tunnel_warn}"
+        lines.append((line, attr))
     return lines
 
 
@@ -693,18 +723,22 @@ def render_frame(snapshot: dict, history: dict, width: int, now: float, opts: di
     lines.extend(_header(now, opts))
     lines.append(("", "normal"))
 
+    # word_ban/tunnel both live under /health/full's own doc - pulled out
+    # here, tolerantly, once, so the vLLM panel can label a running/waiting
+    # count as the boot-time warm-up rather than her real traffic, and the
+    # Services panel can tell "cloudflared disabled by config" apart from
+    # "tunnel configured but cloudflared is down" (telemetry.cloudflared_fault).
+    _health_doc = ((snapshot.get("health", {}) or {}).get("data") or {}).get("doc") or {}
+    if not isinstance(_health_doc, dict):
+        _health_doc = {}
+    word_ban = _health_doc.get("word_ban")
+
     health = _panel_health(snapshot.get("health", {}), now)
-    services = _panel_services(snapshot.get("services", {}), now)
+    services = _panel_services(snapshot.get("services", {}), now, _health_doc)
     gpu = _panel_gpu(snapshot.get("gpu", {}), now, history, ascii_only)
     hostdata = _panel_host_data_backups(
         snapshot.get("host", {}), snapshot.get("data_usage", {}), snapshot.get("backups", {}), now
     )
-    # word_ban lives under /health/full's own doc (the Health panel's data
-    # source), not vLLM's -- pulled out here, tolerantly, so the vLLM panel
-    # can label a running/waiting count as the boot-time warm-up rather
-    # than her real traffic.
-    _health_doc = ((snapshot.get("health", {}) or {}).get("data") or {}).get("doc") or {}
-    word_ban = _health_doc.get("word_ban") if isinstance(_health_doc, dict) else None
     vllm = _panel_vllm(snapshot.get("vllm", {}), now, history, ascii_only, word_ban)
     ssh = _panel_ssh(snapshot.get("ssh", {}), now, history, ascii_only, no_rtt)
     log = _panel_log(snapshot.get("log", {}), now, bool(opts.get("show_log", True)))

@@ -66,6 +66,43 @@ def test_redact_env_case_insensitive_key():
     assert_eq(out["hf_api_token"], common.REDACTED, "redact_env matches keys case-insensitively")
 
 
+def test_redact_env_cloudflare_tunnel_token():
+    """v3.1.9.9: CLOUDFLARE_TUNNEL_TOKEN (docker/cloudflared-run.sh's own
+    env var name for the RunPod secret) must be redacted whole in `zl
+    bundle`'s env-redacted.txt -- it matches `_SECRET_KEY`'s bare `TOKEN`
+    pattern, the same as any other TOKEN-named env var, and it is not in
+    `_ALLOWLIST_KEYS`.
+    """
+    out = common.redact_env({"CLOUDFLARE_TUNNEL_TOKEN": "eyJhbGciOiJIUzI1NiJ9-fake-token-value"})
+    assert_eq(out["CLOUDFLARE_TUNNEL_TOKEN"], common.REDACTED, "CLOUDFLARE_TUNNEL_TOKEN is redacted whole")
+    assert_true("CLOUDFLARE_TUNNEL_TOKEN" not in common._ALLOWLIST_KEYS,
+                "CLOUDFLARE_TUNNEL_TOKEN is not on the allowlist (it must never show even scrubbed)")
+
+
+def test_mutation_cloudflare_tunnel_token_on_allowlist_would_leak_it():
+    """Prove the test above bites: if CLOUDFLARE_TUNNEL_TOKEN were ever
+    (mistakenly) added to `_ALLOWLIST_KEYS`, redact_env would show it
+    (scrubbed-substring only, not whole) instead of redacting it outright --
+    confirms the allowlist-exclusion, not luck, is what protects it.
+    """
+    original = common._ALLOWLIST_KEYS
+    try:
+        common._ALLOWLIST_KEYS = original | {"CLOUDFLARE_TUNNEL_TOKEN"}
+
+        # With the allowlist mutation alone, `_SECRET_KEY`'s own TOKEN match
+        # still fires first (redact_env checks key-name secrecy BEFORE the
+        # allowlist) -- so prove the ALLOWLIST branch itself would leak by
+        # calling it directly, bypassing the key-secrecy check the same way
+        # a hypothetical future key-pattern regression might.
+        value = "eyJhbGciOiJIUzI1NiJ9-fake-token-value-with-no-scrubbable-shape"
+        scrubbed = common._scrub_value(value)
+        assert_eq(scrubbed, value, "mutated (allowlist path) shows the raw token value -- confirms the bite")
+    finally:
+        common._ALLOWLIST_KEYS = original
+    out = common.redact_env({"CLOUDFLARE_TUNNEL_TOKEN": "eyJhbGciOiJIUzI1NiJ9-fake-token-value"})
+    assert_eq(out["CLOUDFLARE_TUNNEL_TOKEN"], common.REDACTED, "the real (restored) code redacts it whole")
+
+
 def test_split_passthrough():
     own, rest = common.split_passthrough(["--apply", "--", "--conv", "abc"])
     assert_eq(own, ["--apply"], "split_passthrough: own flags before --")

@@ -94,11 +94,23 @@ SNAPSHOT_WEBUI_DB = WEBUI_DIR / "webui.db"
 # autorestart=false, startsecs=0 -- see NOTE-ops-bundle-boot.md) is a
 # one-shot boot-time installer, not a long-running service; it is expected
 # to run once and EXIT, same shape as `selftest`.
-SERVICES = ("vllm", "compactor", "webuidb-sync", "openwebui", "stt", "tts", "selftest", "backup", "zl-ops")
+# v3.1.9.9: `cloudflared` (zl-v3199 supervisord.conf:283-303, priority=21,
+# autorestart=unexpected, exitcodes=0, startsecs=0) runs /opt/
+# cloudflared-run.sh. With no CLOUDFLARE_TUNNEL_TOKEN it logs "no
+# CLOUDFLARE_TUNNEL_TOKEN; tunnel disabled" and exits 0 -- an EXPECTED
+# exit, so it settles into EXITED and stays there, same shape as
+# `selftest`/`zl-ops`. With a token it runs cloudflared and is expected to
+# stay RUNNING -- see telemetry.cloudflared_fault() for the case where a
+# token IS set but cloudflared is not RUNNING anyway, which this frozenset
+# alone cannot distinguish from "disabled by config" and must not hide.
+SERVICES = ("vllm", "compactor", "webuidb-sync", "openwebui", "stt", "tts", "selftest", "backup", "zl-ops", "cloudflared")
 # Programs that are expected to be not RUNNING and are not a fault when so:
 # selftest and zl-ops both run once at boot and exit; webuidb-sync only
-# runs when WEBUI_DB_LOCAL=true.
-ONE_SHOT_OR_OPTIONAL = frozenset({"selftest", "webuidb-sync", "zl-ops"})
+# runs when WEBUI_DB_LOCAL=true; cloudflared exits 0 (by design) whenever
+# CLOUDFLARE_TUNNEL_TOKEN is unset -- see the SERVICES comment above for why
+# a configured-but-down cloudflared still needs a SEPARATE check
+# (telemetry.cloudflared_fault), not membership here.
+ONE_SHOT_OR_OPTIONAL = frozenset({"selftest", "webuidb-sync", "zl-ops", "cloudflared"})
 
 # --- compactor's own control/pending roots (continuity.py) --------------------
 # Cited here, never re-derived: `compactor/continuity.py`'s own

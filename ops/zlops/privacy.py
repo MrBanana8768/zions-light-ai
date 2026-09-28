@@ -457,6 +457,97 @@ def _scrub_long_quoted_spans(line: str) -> str:
     return _QUOTED_SPAN_RE.sub(_sub, line)
 
 
+# =============================================================================
+# v3.1.9.9 Cloudflare Tunnel: defense-in-depth for CLOUDFLARE_TUNNEL_TOKEN /
+# TUNNEL_TOKEN never appearing in ANY log line. By construction it never
+# should -- docker/cloudflared-run.sh's own docstring: the token goes to
+# cloudflared via environment ONLY, never on argv, and "this script never
+# echoes the token itself, only ever 'set'/'unset'/'disabled'". This pass
+# exists for the case that assumption is ever violated (a future change to
+# cloudflared-run.sh, or cloudflared itself echoing its own invocation) --
+# unlike `_scrub_long_quoted_spans` above, it is NOT gated by `source ==
+# "compactor*"`: cloudflared.log/cloudflared-error.log are not
+# compactor-prefixed, and a leaked token is just as bad from any log file.
+# Same default-DENY posture as common.redact_env's `_SECRET_KEY` match on
+# any TOKEN-named env var.
+#
+# Round-11 review (MEDIUM): the original pair here only ever caught
+# `--token[= ]X` and `(CLOUDFLARE_)?TUNNEL_TOKEN=X` -- a single space, a
+# single separator, argv/env-assignment shaped ONLY. Real cloudflared/Go
+# tooling echoes a token in several other shapes this module must ALSO
+# catch:
+#   - `--token` with a run of spaces (`--token  X`), not just one;
+#   - cloudflared's own `Environmental variables map[...]` /
+#     `Settings: map[...]` startup-log lines (logClientOptions), where the
+#     key is `TUNNEL_TOKEN:X` or a bare `token:X`, `:`-separated, inside a
+#     `map[...]`, terminated by a space or the closing `]`;
+#   - JSON (`"token":"X"`) and Python-repr-ish (`'TUNNEL_TOKEN': 'X'`) key/
+#     value pairs, `:`-separated, optionally quoted on either side;
+#   - YAML/plain `TUNNEL_TOKEN: X` and spaced `TUNNEL_TOKEN = X`;
+#   - a lowercase env-style `tunnel_token=X` (case-insensitive key match);
+#   - a raw query string `?token=X` (bounded by `&`, not just whitespace);
+#   - a BARE token value with no recognizable key in front of it at all
+#     (e.g. dropped mid-sentence into an error message) -- cloudflared
+#     tokens are base64 of a JSON blob and always start with `eyJ`
+#     (base64 of `{"`), so that literal, case-SENSITIVE prefix plus a long
+#     run of base64 characters is treated as the token shape itself, no
+#     key required.
+# None of this ever touches cloudflared's own `*****`-masked output (the
+# value char classes below deliberately exclude `*`, so a value that is
+# ALREADY masked has nothing left to match) or its ordinary
+# id/IP/location-shaped fields (`connIndex=`, `ip=`, `location=`,
+# `tunnelID=`/`connection=` UUIDs) -- none of those are `token`-keyed, so
+# neither pattern below ever looks at them. A CLI flag that merely
+# *contains* "token" as part of a longer flag name (`--tokenizer`,
+# `--token-file`, `--hf-token`) is excluded too: the arg pattern requires
+# the literal, unhyphenated `--token` immediately followed by `=`/space
+# (never `-file`/`izer`), and the bare-key pattern's `(?<!-)` refuses to
+# start a match right after a hyphen (so it never fires inside
+# `...-token`).
+# =============================================================================
+_CF_TOKEN_STOP = r"\s\"'\]},&*"
+# `(?!<scrubbed:)` after each prefix guards against double-scrubbing an
+# already-redacted span -- this pass runs LAST (see `scrub_log_line`,
+# below), after the access-log/SQL/quoted-span passes have had their turn,
+# specifically so a `?token=...` inside a uvicorn access-log request line
+# gets identified as such (method/path preserved, only the value scrubbed)
+# BEFORE this pass ever sees it; running this pass first used to inject a
+# space-bearing `<scrubbed:N chars>` marker into the request target,
+# breaking `_ACCESS_LOG_RE`'s own `\S+` match and making the whole quoted
+# request line fall through to the far more destructive generic
+# long-quoted-span scrub (losing method/path too). Running last, this
+# pass would otherwise try to re-wrap that marker as if it were a token
+# value -- the lookahead stops that.
+_CF_TOKEN_ARG_RE = re.compile(r"(--token[= ]+)(?!<scrubbed:)(\S+)")
+_CF_TOKEN_KEY_RE = re.compile(
+    r"(?i)(\b(?:CLOUDFLARE_)?TUNNEL_TOKEN[\"']?\s*[:=]\s*[\"']?)(?!<scrubbed:)([^" + _CF_TOKEN_STOP + r"]+)"
+)
+# Bare `token` key (no `TUNNEL_`/`CLOUDFLARE_` prefix): cloudflared's
+# `map[... token:X]` startup line, JSON `"token":"X"`, a raw `?token=X`
+# query string. `(?<!-)` keeps this off the end of `--hf-token`/anything
+# else ending in `-token`; requiring an immediate `:`/`=` (only whitespace
+# allowed in between, no free text) keeps it off ordinary prose like
+# "Provided Tunnel token is not valid.".
+_CF_TOKEN_BARE_KEY_RE = re.compile(
+    r"(?i)((?<!-)\btoken[\"']?\s*[:=]\s*[\"']?)(?!<scrubbed:)([^" + _CF_TOKEN_STOP + r"]+)"
+)
+# Case-SENSITIVE: a coincidentally-cased "EYJ..." or "Eyj..." run is not
+# this shape -- real cloudflared/Cloudflare Access tokens are base64 of a
+# JSON object and always start with the lowercase `eyJ` (base64 of `{"`).
+_CF_TOKEN_SHAPE_RE = re.compile(r"eyJ[A-Za-z0-9+/_-]{60,}={0,2}")
+
+
+def _scrub_cloudflare_tokens(line: str) -> str:
+    def _sub(m: re.Match) -> str:
+        return f"{m.group(1)}<scrubbed:{len(m.group(2))} chars>"
+
+    line = _CF_TOKEN_ARG_RE.sub(_sub, line)
+    line = _CF_TOKEN_KEY_RE.sub(_sub, line)
+    line = _CF_TOKEN_BARE_KEY_RE.sub(_sub, line)
+    line = _CF_TOKEN_SHAPE_RE.sub(lambda m: f"<scrubbed:{len(m.group(0))} chars>", line)
+    return line
+
+
 def scrub_log_line(line: str, source: str = "generic") -> str | None:
     """Scrub one already-split line (no trailing newline expected, but one
     is tolerated). Returns the (possibly modified) line, or None if the
@@ -488,6 +579,11 @@ def scrub_log_line(line: str, source: str = "generic") -> str | None:
     # reprs in an f-string).
     if source.startswith("compactor"):
         result = _scrub_long_quoted_spans(result)
+
+    # Cloudflare Tunnel token defense-in-depth runs LAST -- see the block
+    # comment above `_CF_TOKEN_STOP` for why (must not break the
+    # access-log allowlist's own `\S+` match on the request target).
+    result = _scrub_cloudflare_tokens(result)
 
     return result
 

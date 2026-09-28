@@ -16,6 +16,9 @@ Run: python test_ops_privacy.py
 
 from __future__ import annotations
 
+import base64
+import json
+import re
 import sys
 # LOW (round 3): never write ops/**/__pycache__ from a test run --
 # this file's own `from zlops import ...` below would otherwise create
@@ -1023,6 +1026,370 @@ def test_v3198_wordban_warmup_does_not_mask_a_real_quoted_secret_on_the_same_lin
     out = privacy.scrub_log_line(line, "compactor.log")
     assert_not_in(secret, out, "an unrelated risky quoted span on the same line is still scrubbed")
     assert_true("vllm_identity='vllm-0:pid-48213'" in out, "the id-shaped quoted field still survives")
+
+
+# =============================================================================
+# v3.1.9.9 Cloudflare Tunnel: cloudflared.log/cloudflared-error.log's own
+# real-shaped lines (SYNTHETIC connector ids/edge IPs/locations, never real
+# ones) must survive the scrubber untouched -- they carry no user content
+# at all, just connector/network metadata. A CLOUDFLARE_TUNNEL_TOKEN/
+# TUNNEL_TOKEN-shaped span, if one ever appeared in a log line despite
+# docker/cloudflared-run.sh's own doctrine that it never should (env-only,
+# never argv, never echoed), must be redacted -- defense in depth.
+# =============================================================================
+
+
+def test_cloudflared_registered_connection_line_survives():
+    line = (
+        "2026-09-27T00:00:00Z INF Registered tunnel connection connIndex=0 "
+        "connection=1b2c3d4e-5f60-7182-93a4-b5c6d7e8f9a0 event=0 "
+        "ip=198.51.100.7 location=SEA protocol=quic"
+    )
+    assert_eq(privacy.scrub_log_line(line, "cloudflared-error.log"), line,
+              "a real-shaped cloudflared connection line is untouched")
+    assert_eq(privacy.scrub_log_text(line + "\n", "cloudflared-error.log"), line + "\n",
+              "same, through scrub_log_text")
+
+
+def test_cloudflared_starting_tunnel_line_survives():
+    line = "2026-09-27T00:00:00Z INF Starting tunnel tunnelID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    assert_eq(privacy.scrub_log_line(line, "cloudflared.log"), line,
+              "the tunnel-id startup line is untouched (an id, not user content)")
+
+
+def test_cloudflared_retry_warning_line_survives():
+    line = "2026-09-27T00:00:01Z WRN Retrying connection in up to 8s connIndex=0 event=0"
+    assert_eq(privacy.scrub_log_line(line, "cloudflared-error.log"), line,
+              "a retry warning line (no quoted spans at all) is untouched")
+
+
+def test_cloudflared_error_line_with_quoted_go_error_survives():
+    """cloudflared wraps some Go errors in a quoted `error="..."` field --
+    not gated by any risky verb this module's generic quoted-span rule
+    looks for (`into`/`removed`/`content`/`text`/`reply`/`message`/`fact`/
+    `facts`/`summary`/`prompt`), and `cloudflared-error.log` is not
+    `compactor*` so the compactor-only allowlist pass never runs on it
+    either -- confirms this source is not accidentally caught by either.
+    """
+    line = '2026-09-27T00:00:02Z ERR Failed to serve quic connection error="context canceled" connIndex=0'
+    assert_eq(privacy.scrub_log_line(line, "cloudflared-error.log"), line,
+              "a Go-error-shaped quoted span in a non-compactor log source is left alone")
+
+
+def test_mutation_compactor_only_gate_removed_would_scrub_the_cloudflared_error_line():
+    """Prove the test above bites: if the compactor-only gate on
+    `_scrub_long_quoted_spans` were ever widened to apply everywhere, this
+    cloudflared error line's quoted `error="context canceled"` (has
+    whitespace) would get scrubbed -- confirms the gate, not luck, is what
+    keeps it intact.
+    """
+    line = '2026-09-27T00:00:02Z ERR Failed to serve quic connection error="context canceled" connIndex=0'
+    mutated = privacy._scrub_long_quoted_spans(line)
+    assert_true(mutated != line, "applying the compactor-only pass unconditionally WOULD scrub this line")
+    assert_eq(privacy.scrub_log_line(line, "cloudflared-error.log"), line,
+              "the real (gated) code leaves it alone")
+
+
+def test_cloudflared_token_arg_shaped_span_is_redacted():
+    """cloudflared's own `--token` flag is deliberately never used by this
+    repo's cloudflared-run.sh (env-only), but if one ever showed up in a
+    log line anyway (an argv dump, a future regression), it must be
+    redacted, not shown verbatim.
+    """
+    line = "invoked: cloudflared tunnel --no-autoupdate --token eyJhbGciOiJIUzI1NiJ9.fake.payload run"
+    out = privacy.scrub_log_line(line, "cloudflared-error.log")
+    assert_not_in("eyJhbGciOiJIUzI1NiJ9", out, "the token value itself is redacted")
+    assert_true("--token <scrubbed:" in out, "replaced with a scrubbed-span marker, not silently dropped")
+    assert_true("--no-autoupdate" in out and " run" in out, "the surrounding, non-secret argv survives")
+
+
+def test_cloudflared_tunnel_token_env_shaped_span_is_redacted():
+    line = "debug: env dump TUNNEL_TOKEN=abcdefghijklmnopqrstuvwxyz0123456789 LOG_DIR=/data/logs"
+    out = privacy.scrub_log_line(line, "cloudflared.log")
+    assert_not_in("abcdefghijklmnopqrstuvwxyz0123456789", out, "the token value is redacted")
+    assert_true("TUNNEL_TOKEN=<scrubbed:" in out, "replaced with a scrubbed-span marker")
+    assert_true("LOG_DIR=/data/logs" in out, "an unrelated, non-secret env var on the same line survives")
+
+
+def test_cloudflare_tunnel_token_env_shaped_span_is_redacted():
+    line = "debug: env dump CLOUDFLARE_TUNNEL_TOKEN=abcdefghijklmnopqrstuvwxyz0123456789"
+    out = privacy.scrub_log_line(line, "generic")
+    assert_not_in("abcdefghijklmnopqrstuvwxyz0123456789", out, "the CLOUDFLARE_TUNNEL_TOKEN value is redacted too")
+    assert_true("CLOUDFLARE_TUNNEL_TOKEN=<scrubbed:" in out, "replaced with a scrubbed-span marker")
+
+
+def test_mutation_disabling_cloudflare_token_scrub_leaks_the_token():
+    """Prove the two tests above bite: with `_scrub_cloudflare_tokens`
+    skipped entirely, the token value survives verbatim.
+    """
+    line = "debug: env dump TUNNEL_TOKEN=abcdefghijklmnopqrstuvwxyz0123456789"
+    original = privacy._scrub_cloudflare_tokens
+    try:
+        privacy._scrub_cloudflare_tokens = lambda line: line  # the bug: no-op
+        out = privacy.scrub_log_line(line, "cloudflared.log")
+        assert_true("abcdefghijklmnopqrstuvwxyz0123456789" in out,
+                    "mutated (no-op scrub) leaks the token verbatim -- confirms the bite")
+    finally:
+        privacy._scrub_cloudflare_tokens = original
+    out = privacy.scrub_log_line(line, "cloudflared.log")
+    assert_not_in("abcdefghijklmnopqrstuvwxyz0123456789", out, "the real (restored) code redacts it again")
+
+
+# =============================================================================
+# Round-11 review (MEDIUM): `_scrub_cloudflare_tokens` widened past
+# `--token[= ]X` / `(CLOUDFLARE_)?TUNNEL_TOKEN=X`. All cases below use ONE
+# realistic, SYNTHETIC cloudflared-shaped token: cloudflared tokens are
+# base64 of a JSON blob and always start with `eyJ` (base64 of `{"`) --
+# built here from fake ids/a fake "secret", never a real credential.
+# =============================================================================
+
+
+def _synthetic_cf_token() -> str:
+    payload = {
+        "a": "0123456789abcdef0123456789abcdef",
+        "t": "6ff42ae2-765d-4adf-8112-31c55c1551ef",
+        "s": "YjNkMmE0ZTEtZmFrZS1zZWNyZXQtdmFsdWUtaGVyZQ==",
+    }
+    return base64.b64encode(json.dumps(payload).encode()).decode()
+
+
+_CF_TOK = _synthetic_cf_token()
+assert _CF_TOK.startswith("eyJ") and len(_CF_TOK) > 63, "the synthetic token must actually be eyJ-shaped"
+
+# A fake secret that is NOT `eyJ...`-shaped -- used only to isolate a
+# SPECIFIC key-matching regex's own contribution from `_CF_TOKEN_SHAPE_RE`'s
+# separate bare-shape catch-all (a real cloudflared token, being eyJ-shaped,
+# would otherwise still get caught by the shape rule even with the
+# key-matching regex under test disabled, hiding the very regression the
+# mutation is meant to prove).
+_FAKE_SECRET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP0123456789"
+
+
+def test_cloudflared_settings_map_bare_token_key_is_redacted():
+    """cloudflared's own `Settings: map[...]` startup log line
+    (logClientOptions) uses a bare, colon-separated `token:` key inside
+    `map[...]`, terminated by the closing `]` -- not `=`, no quotes."""
+    line = f"2026-09-27T10:00:00Z INF Settings: map[metrics:127.0.0.1:8082 no-autoupdate:true token:{_CF_TOK}]"
+    out = privacy.scrub_log_line(line, "cloudflared-error.log")
+    assert_not_in(_CF_TOK, out, "the token value is redacted")
+    assert_true("token:<scrubbed:" in out, "replaced with a scrubbed-span marker")
+    assert_true("map[metrics:127.0.0.1:8082 no-autoupdate:true" in out and out.endswith("]"),
+                "the surrounding map[...] fields and closing bracket survive")
+
+
+def test_mutation_dropping_bare_key_scrub_leaks_the_map_token():
+    line = f"INF Settings: map[metrics:127.0.0.1:8082 token:{_FAKE_SECRET}]"
+    original = privacy._CF_TOKEN_BARE_KEY_RE
+    try:
+        privacy._CF_TOKEN_BARE_KEY_RE = re.compile(r"$^")  # the bug: never matches
+        out = privacy.scrub_log_line(line, "cloudflared-error.log")
+        assert_true(_FAKE_SECRET in out, "mutated (disabled bare-key scrub) leaks the token -- confirms the bite")
+    finally:
+        privacy._CF_TOKEN_BARE_KEY_RE = original
+    out = privacy.scrub_log_line(line, "cloudflared-error.log")
+    assert_not_in(_FAKE_SECRET, out, "the real (restored) code redacts it again")
+
+
+def test_cloudflared_environmental_variables_map_tunnel_token_key_is_redacted():
+    """cloudflared's `Environmental variables map[...]` startup line names
+    the env var directly: `TUNNEL_TOKEN:X` (or `CLOUDFLARE_TUNNEL_TOKEN:X`),
+    same `map[...]`-bracket-terminated shape as the bare-key case."""
+    line = f"2026-09-27T10:00:00Z INF Environmental variables map[CLOUDFLARE_TUNNEL_TOKEN:{_CF_TOK}]"
+    out = privacy.scrub_log_line(line, "cloudflared-error.log")
+    assert_not_in(_CF_TOK, out, "the token value is redacted")
+    assert_true("CLOUDFLARE_TUNNEL_TOKEN:<scrubbed:" in out, "replaced with a scrubbed-span marker")
+
+
+def test_mutation_dropping_key_scrub_leaks_the_env_map_token():
+    line = f"INF Environmental variables map[CLOUDFLARE_TUNNEL_TOKEN:{_FAKE_SECRET}]"
+    original = privacy._CF_TOKEN_KEY_RE
+    try:
+        privacy._CF_TOKEN_KEY_RE = re.compile(r"$^")  # the bug: never matches
+        out = privacy.scrub_log_line(line, "cloudflared-error.log")
+        assert_true(_FAKE_SECRET in out, "mutated (disabled key scrub) leaks the token -- confirms the bite")
+    finally:
+        privacy._CF_TOKEN_KEY_RE = original
+    out = privacy.scrub_log_line(line, "cloudflared-error.log")
+    assert_not_in(_FAKE_SECRET, out, "the real (restored) code redacts it again")
+
+
+def test_json_token_key_value_pair_is_redacted():
+    line = f'{{"level":"info","token":"{_CF_TOK}","message":"x"}}'
+    out = privacy.scrub_log_line(line, "cloudflared-error.log")
+    assert_not_in(_CF_TOK, out, "the token value is redacted")
+    assert_true('"token":"<scrubbed:' in out, "the key survives, only the value is gone")
+    assert_true('"level":"info"' in out and '"message":"x"' in out, "the rest of the JSON object survives")
+
+
+def test_python_repr_quoted_tunnel_token_key_value_pair_is_redacted():
+    line = f"debug: {{'TUNNEL_TOKEN': '{_CF_TOK}'}}"
+    out = privacy.scrub_log_line(line, "generic")
+    assert_not_in(_CF_TOK, out, "the token value is redacted")
+    assert_true("'TUNNEL_TOKEN':" in out, "the quoted key survives")
+
+
+def test_tunnel_token_colon_separated_is_redacted():
+    line = f"env: TUNNEL_TOKEN: {_CF_TOK}"
+    out = privacy.scrub_log_line(line, "cloudflared.log")
+    assert_not_in(_CF_TOK, out, "the token value is redacted")
+    assert_true("TUNNEL_TOKEN: <scrubbed:" in out, "replaced with a scrubbed-span marker")
+
+
+def test_tunnel_token_spaced_equals_is_redacted():
+    line = f"TUNNEL_TOKEN = {_CF_TOK}"
+    out = privacy.scrub_log_line(line, "cloudflared.log")
+    assert_not_in(_CF_TOK, out, "the token value is redacted")
+    assert_true("TUNNEL_TOKEN = <scrubbed:" in out, "replaced with a scrubbed-span marker")
+
+
+def test_lowercase_tunnel_token_env_key_is_redacted():
+    line = f"tunnel_token={_CF_TOK}"
+    out = privacy.scrub_log_line(line, "generic")
+    assert_not_in(_CF_TOK, out, "the lowercase-keyed token value is redacted too")
+    assert_true("tunnel_token=<scrubbed:" in out, "replaced with a scrubbed-span marker, case preserved")
+
+
+def test_mutation_case_sensitive_key_match_would_miss_lowercase_tunnel_token():
+    """Prove the test above bites: a case-SENSITIVE version of the key
+    regex (matching only the literal upper-case `TUNNEL_TOKEN`) would miss
+    a lowercase `tunnel_token=` env dump entirely."""
+    line = f"tunnel_token={_CF_TOK}"
+    case_sensitive = re.compile(r"(\b(?:CLOUDFLARE_)?TUNNEL_TOKEN[\"']?\s*[:=]\s*[\"']?)([^\s\"'\]},*]+)")
+    mutated = case_sensitive.sub(lambda m: f"{m.group(1)}<scrubbed:{len(m.group(2))} chars>", line)
+    assert_true(_CF_TOK in mutated, "the case-sensitive-only version misses lowercase tunnel_token= -- confirms the bite")
+    out = privacy.scrub_log_line(line, "generic")
+    assert_not_in(_CF_TOK, out, "the real (case-insensitive) code redacts it")
+
+
+def test_query_string_token_param_is_redacted():
+    line = f"GET https://x.example/connect?token={_CF_TOK}&a=1"
+    out = privacy.scrub_log_line(line, "generic")
+    assert_not_in(_CF_TOK, out, "the token value is redacted")
+    assert_true("?token=<scrubbed:" in out, "replaced with a scrubbed-span marker")
+    assert_true("&a=1" in out, "the unrelated trailing query param survives")
+
+
+def test_arg_multiple_spaces_after_token_flag_is_redacted():
+    line = f"cloudflared tunnel run --token  {_CF_TOK}"  # two spaces
+    out = privacy.scrub_log_line(line, "cloudflared-error.log")
+    assert_not_in(_CF_TOK, out, "the token value is redacted")
+    assert_true("--token" in out and "<scrubbed:" in out, "replaced with a scrubbed-span marker")
+
+
+def test_mutation_single_space_only_arg_regex_would_miss_multiple_spaces():
+    """Prove the test above bites: the OLD `--token[= ]` (no `+`) only ever
+    consumes exactly one separator char, so with two spaces the value
+    capture starts on the SECOND space itself, not the token -- the token
+    text after it survives untouched."""
+    line = f"cloudflared tunnel run --token  {_CF_TOK}"
+    old_arg_re = re.compile(r"(--token[= ])(\S+)")
+    mutated = old_arg_re.sub(lambda m: f"{m.group(1)}<scrubbed:{len(m.group(2))} chars>", line)
+    assert_true(_CF_TOK in mutated, "the old single-separator regex leaves the token untouched -- confirms the bite")
+    out = privacy.scrub_log_line(line, "cloudflared-error.log")
+    assert_not_in(_CF_TOK, out, "the real (`+`-widened) code redacts it")
+
+
+def test_bare_token_with_no_key_at_all_is_redacted_by_shape():
+    """A token dropped mid-sentence with no recognizable key in front of
+    it at all still gets caught, purely by its `eyJ...` base64-JSON shape."""
+    line = f"ERR bad token {_CF_TOK}"
+    out = privacy.scrub_log_line(line, "cloudflared-error.log")
+    assert_not_in(_CF_TOK, out, "the bare token value is redacted")
+    assert_true("<scrubbed:" in out, "replaced with a scrubbed-span marker")
+    assert_true(out.startswith("ERR bad token "), "the surrounding prose survives")
+
+
+def test_mutation_dropping_shape_rule_leaks_a_bare_token():
+    line = f"ERR bad token {_CF_TOK}"
+    original = privacy._CF_TOKEN_SHAPE_RE
+    try:
+        privacy._CF_TOKEN_SHAPE_RE = re.compile(r"$^")  # the bug: never matches
+        out = privacy.scrub_log_line(line, "cloudflared-error.log")
+        assert_true(_CF_TOK in out, "mutated (disabled shape rule) leaks the bare token -- confirms the bite")
+    finally:
+        privacy._CF_TOKEN_SHAPE_RE = original
+    out = privacy.scrub_log_line(line, "cloudflared-error.log")
+    assert_not_in(_CF_TOK, out, "the real (restored) code redacts it again")
+
+
+def test_masked_settings_map_token_line_survives_untouched():
+    """cloudflared's own `*****`-masked token in its `Settings: map[...]`
+    line must survive byte-for-byte -- there is no secret left to catch,
+    and re-touching it would be pure noise."""
+    line = "2026-09-27T10:00:00Z INF Settings: map[metrics:127.0.0.1:8082 no-autoupdate:true token:*****]"
+    assert_eq(privacy.scrub_log_line(line, "cloudflared-error.log"), line,
+              "the already-masked line is untouched")
+
+
+def test_masked_environmental_variables_map_tunnel_token_survives_untouched():
+    line = "2026-09-27T10:00:00Z INF Environmental variables map[TUNNEL_TOKEN:*****]"
+    assert_eq(privacy.scrub_log_line(line, "cloudflared-error.log"), line,
+              "the already-masked line is untouched")
+
+
+def test_provided_tunnel_token_prose_line_survives_untouched():
+    """cloudflared's own "Provided Tunnel token is not valid." carries the
+    word "token" with no colon/equals after it at all -- must never be
+    mistaken for a key/value pair."""
+    line = "2026-09-27T10:00:03Z ERR Provided Tunnel token is not valid."
+    assert_eq(privacy.scrub_log_line(line, "cloudflared-error.log"), line,
+              "prose containing the bare word 'token' is untouched")
+
+
+def test_tokenizer_flag_is_not_matched():
+    line = "vllm serve --tokenizer /data/models/tok --max-model-len 8192"
+    assert_eq(privacy.scrub_log_line(line, "generic"), line, "--tokenizer is not mistaken for --token")
+
+
+def test_token_file_flag_is_not_matched():
+    line = "cloudflared tunnel run --token-file /etc/cloudflared/token"
+    assert_eq(privacy.scrub_log_line(line, "cloudflared-error.log"), line,
+              "--token-file is not mistaken for --token")
+
+
+def test_hf_token_flag_is_not_matched():
+    line = "vllm serve --hf-token hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --model foo"
+    assert_eq(privacy.scrub_log_line(line, "generic"), line, "--hf-token is not mistaken for a cloudflare token key")
+
+
+def test_uuid_and_connector_metadata_fields_survive_untouched():
+    line = (
+        "2026-09-27T00:00:01Z INF Registered tunnel connection connIndex=0 "
+        "connection=1b2c3d4e-5f60-7182-93a4-b5c6d7e8f9a0 event=0 "
+        "ip=198.51.100.7 location=SEA protocol=quic"
+    )
+    assert_eq(privacy.scrub_log_line(line, "cloudflared-error.log"), line,
+              "connIndex=/ip=/location=/a UUID id are all untouched -- none of them are token-keyed")
+
+
+def test_jwt_shaped_value_elsewhere_is_not_double_scrubbed():
+    """A real three-segment `header.payload.signature` JWT is a DIFFERENT
+    shape from a cloudflare tunnel token (dot-separated, not one
+    contiguous base64 blob) -- `_CF_TOKEN_SHAPE_RE` deliberately does not
+    match it (dots are not in its char class), so it is left for whatever
+    OTHER scrubber already covers it (here: the compactor-only
+    whitespace-free quoted-span rule, which leaves an identifier-shaped
+    quoted value alone). Confirms the new pass does not reach in and
+    double-mangle a span it was never meant to own."""
+    line = 'level=info msg="token refresh" jwt="eyJhbGciOiJIUzI1NiJ9.e30.signature-part-padding-abcdefgh"'
+    out = privacy.scrub_log_line(line, "compactor.log")
+    assert_true("<scrubbed:<scrubbed:" not in out, "never a nested scrub marker")
+    assert_true('jwt="eyJhbGciOiJIUzI1NiJ9.e30.signature-part-padding-abcdefgh"' in out,
+                "the dotted JWT (a different shape from a cloudflare token) is left to its own scrubber untouched")
+
+
+def test_double_scrub_guard_no_nested_marker_on_already_scrubbed_query_value():
+    """The uvicorn access-log query-string scrubber and the cloudflare
+    token scrubber must never compound: a `token=` query PARAM in an
+    ordinary (non-cloudflare) access-log request line is scrubbed once by
+    the access-log allowlist (method/path preserved), and the cloudflare
+    pass (running after, per its own docstring) must not then re-wrap that
+    already-`<scrubbed:...>` marker."""
+    line = 'INFO:     127.0.0.1:54321 - "GET /v1/models?token=abcdef123456 HTTP/1.1" 200 OK'
+    out = privacy.scrub_log_line(line, "compactor.log")
+    assert_true("GET /v1/models?token=<scrubbed:" in out, "method/path survive, only the query value is scrubbed")
+    assert_true("<scrubbed:<scrubbed:" not in out, "never a nested scrub marker")
+    assert_true('HTTP/1.1" 200 OK' in out, "the rest of the access-log line survives")
 
 
 # =============================================================================
