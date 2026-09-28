@@ -601,6 +601,53 @@ def _remove_object(root: Path, sha256: str) -> int:
         return 0
 
 
+_STALE_HASHCOPY_TMP_S = 3600.0  # 1h — see _cleanup_stale_hashcopy_tmp
+
+
+def _cleanup_stale_hashcopy_tmp(root: Path) -> int:
+    """rc-review fix, LOW: `_hash_and_copy_object` writes its tmp file
+    (`objects/.hashcopy.<rand>.tmp`) then either `os.replace`s it to its
+    final object path or `os.unlink`s it — on every code path, including
+    every `except BaseException` — so under normal operation none should
+    ever survive a call. A process that dies harder than that (SIGKILL,
+    an OOM kill, a pod crash mid-copy) can still leave one behind: never
+    counted against objects_count/objects_bytes (only a real replace does
+    that), so it is not a correctness problem, just accumulating disk
+    usage on MooseFS forever with nothing to ever clean it up. Called once
+    at the START of every run_once cycle, before anything else touches
+    `objects/`; only removes files whose mtime is older than
+    `_STALE_HASHCOPY_TMP_S` (1h) — comfortably longer than any real copy
+    could still be in flight — so an in-progress copy from a CONCURRENT
+    run (the advisory lock normally prevents this, but this check costs
+    nothing extra to keep conservative) is never touched. Returns the
+    count removed; never raises (a cleanup step must not be able to take
+    a whole cycle down)."""
+    objects_dir = root / OBJECTS_DIRNAME
+    removed = 0
+    try:
+        if not objects_dir.is_dir():
+            return 0
+        cutoff = time.time() - _STALE_HASHCOPY_TMP_S
+        for entry in objects_dir.iterdir():
+            name = entry.name
+            if not (name.startswith(".hashcopy.") and name.endswith(".tmp")):
+                continue
+            try:
+                if not entry.is_file():
+                    continue
+                if entry.stat().st_mtime >= cutoff:
+                    continue
+                entry.unlink()
+                removed += 1
+            except OSError:
+                continue
+    except OSError:
+        return removed
+    if removed:
+        logger.info(f"uploads backup: removed {removed} stale .hashcopy.*.tmp file(s) older than {_STALE_HASHCOPY_TMP_S:.0f}s")
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # Magic-byte / extension sanity check (v3.1.9.8 item 2's "suspect_content")
 # ---------------------------------------------------------------------------
@@ -654,6 +701,41 @@ class _Refusal(RuntimeError):
     uploads dir's contents). run_once's own except block (finding 8) keeps
     THIS exception's str(e), unlike an arbitrary Exception, precisely
     because it is constructed only from those safe values below."""
+
+
+class _RootWalkUnreadable(_Refusal):
+    """rc-review fix, LOW-MED: raised by `_iter_uploads`' own `onerror`
+    callback when the uploads directory ROOT ITSELF (not a subdirectory)
+    could not be scanned — e.g. `chmod` leaves the directory enterable
+    (execute bit, so `Path.is_dir()` above still succeeds) but not
+    listable (no read bit), a transient EACCES/EIO, or any other error
+    `os.walk`'s own top-level `scandir(top)` call can raise.
+
+    Before this fix, that case was folded into the ordinary
+    unreadable-subdirectory list: `Path(exc.filename).relative_to(
+    uploads_dir)` for the root itself is exactly `"."`, so the vanished-
+    exclusion prefix built from it was `"./"` — which matches NO tracked
+    name (they are plain relative names like `"ab/cd.jpg"`, never
+    `"./ab/cd.jpg"`). Every previously-tracked file therefore looked
+    vanished, every run, for as long as the root stayed unlistable, which
+    either tripped the mass-change guard on a transient permissions
+    glitch or (once already suspect) kept it frozen forever with a
+    steadily growing, entirely wrong "vanished" count.
+
+    Subclassing `_Refusal` reuses run_once's existing `_Refusal` handling
+    for free: `ok=False`, `last_error=type(e).__name__`, an alert, and —
+    the whole point — NO vanished/deleted accounting happens at all this
+    run (the abort happens before any of that code runs), so nothing in
+    the manifest is touched. The manifest and every object on disk are
+    exactly as they were; the next cycle simply tries again."""
+
+    def __init__(self, os_error_type: str) -> None:
+        super().__init__(
+            f"the uploads directory root itself could not be listed "
+            f"({os_error_type}); aborting this run with NO vanished/deleted "
+            f"accounting rather than risk treating every tracked upload as "
+            f"gone. The manifest is untouched. Will retry next cycle."
+        )
 
 
 def _require_free_space(root: Path, needed_bytes: int) -> None:
@@ -730,8 +812,16 @@ def _iter_uploads(uploads_dir: Path) -> tuple[list[Path], list[str]]:
         return [], []
     out: list[Path] = []
     unreadable: list[str] = []
+    root_str = str(uploads_dir)
 
     def _onerror(exc: OSError) -> None:
+        # rc-review fix, LOW-MED: the ROOT itself (os.walk's own top-level
+        # scandir(uploads_dir) call, not a subdirectory found while
+        # walking) failing is NOT just another unreadable-subdirectory
+        # entry — see _RootWalkUnreadable's own docstring for why treating
+        # it as one used to be a permanent false-vanished trap.
+        if exc.filename is not None and str(exc.filename) == root_str:
+            raise _RootWalkUnreadable(type(exc).__name__) from exc
         try:
             rel = str(Path(exc.filename).relative_to(uploads_dir))
         except (ValueError, TypeError):
@@ -901,6 +991,7 @@ def run_once(
         # script — see `locked()`'s own docstring for why (two writers of
         # the same manifest.json that are not the same process).
         with locked(root):
+            _cleanup_stale_hashcopy_tmp(root)
             manifest = load_manifest(root)
             files = manifest["files"]
             now = time.time()
@@ -993,6 +1084,59 @@ def run_once(
                 sig = _stat_sig(st)
                 if _cur_sig(rec) != sig:
                     need_rehash.append(rel)
+
+            # --- sweep: expire long-deleted records + orphaned objects ---
+            # rc-review fix, LOW: this used to run at the very END of the
+            # cycle (after new-file copying), which meant a mirror already
+            # AT or OVER COMPACTOR_UPLOADS_BACKUP_MAX_MB never reached it —
+            # `_require_mirror_size_cap` below raises _Refusal (caught by
+            # run_once's own except block, well before this point) on
+            # EVERY cycle once over cap, so the one thing that could bring
+            # it back under the cap (expiring records already >
+            # COMPACTOR_UPLOADS_BACKUP_KEEP_DELETED_DAYS old and freeing
+            # their now-orphaned objects) could never run either: a
+            # once-over-cap mirror was stuck over cap FOREVER, even as more
+            # of its own tracked-deleted entries aged past the keep
+            # window. Moved here, before the cap check, so an aged-out
+            # backlog can shrink the mirror enough for THIS SAME cycle's
+            # cap check just below to pass.
+            #
+            # Gated on `suspect_before` (known coming INTO this run), not
+            # `suspect_active` (this run's own freshly-computed verdict,
+            # not decided until the mass-change guard further down) —
+            # sweeping only ever removes objects already recorded as
+            # deleted_at more than KEEP_DELETED_DAYS ago by a PRIOR run,
+            # nothing this run's own vanished/changed classification has
+            # touched, so it carries no more risk here than it did in its
+            # old position. No `busy_stop` gate is needed here either — at
+            # this point in the function no copying has started yet, so
+            # busy_stop cannot yet be true.
+            if not suspect_before:
+                keep_cutoff = now - KEEP_DELETED_DAYS * 86400.0
+                expired_names = [
+                    rel for rel, rec in files.items()
+                    if rec.get("deleted_at") and _parse_iso(rec["deleted_at"]) is not None
+                    and _parse_iso(rec["deleted_at"]) < keep_cutoff
+                ]
+                referenced_shas = set()
+                for rel, rec in files.items():
+                    if rel in expired_names:
+                        continue
+                    referenced_shas.add(rec.get("sha256"))
+                    referenced_shas.add(rec.get("cur_sha256"))
+                    for c in rec.get("changed", []):
+                        referenced_shas.add(c.get("sha256"))
+                for rel in expired_names:
+                    rec = files.pop(rel)
+                    candidate_shas = {rec.get("sha256"), rec.get("cur_sha256")}
+                    candidate_shas.update(c.get("sha256") for c in rec.get("changed", []))
+                    for sha in candidate_shas:
+                        if sha and sha not in referenced_shas:
+                            freed = _remove_object(root, sha)
+                            manifest["objects_bytes"] = max(0, manifest.get("objects_bytes", 0) - freed)
+                            if freed:
+                                manifest["objects_count"] = max(0, manifest.get("objects_count", 0) - 1)
+                    report["expired"] += 1
 
             # --- free-space / mirror-size checks, BEFORE any copying ---
             # hostile-review round 3, LOW: this used to run only against
@@ -1222,38 +1366,6 @@ def run_once(
                 sleep(FILE_SLEEP_S)
                 _tick(size)
 
-            # --- sweep: expire long-deleted records + orphaned objects ---
-            # Skipped entirely while suspect (and while paused for idle)
-            # — the sweep only ever removes an object, and this run is
-            # not the moment to do anything destructive beyond what was
-            # already decided above.
-            if not suspect_active and not busy_stop:
-                keep_cutoff = now - KEEP_DELETED_DAYS * 86400.0
-                expired_names = [
-                    rel for rel, rec in files.items()
-                    if rec.get("deleted_at") and _parse_iso(rec["deleted_at"]) is not None
-                    and _parse_iso(rec["deleted_at"]) < keep_cutoff
-                ]
-                referenced_shas = set()
-                for rel, rec in files.items():
-                    if rel in expired_names:
-                        continue
-                    referenced_shas.add(rec.get("sha256"))
-                    referenced_shas.add(rec.get("cur_sha256"))
-                    for c in rec.get("changed", []):
-                        referenced_shas.add(c.get("sha256"))
-                for rel in expired_names:
-                    rec = files.pop(rel)
-                    candidate_shas = {rec.get("sha256"), rec.get("cur_sha256")}
-                    candidate_shas.update(c.get("sha256") for c in rec.get("changed", []))
-                    for sha in candidate_shas:
-                        if sha and sha not in referenced_shas:
-                            freed = _remove_object(root, sha)
-                            manifest["objects_bytes"] = max(0, manifest.get("objects_bytes", 0) - freed)
-                            if freed:
-                                manifest["objects_count"] = max(0, manifest.get("objects_count", 0) - 1)
-                    report["expired"] += 1
-
             manifest["generation"] = manifest.get("generation", 0) + 1
             manifest["last_run_at"] = now_iso
             save_manifest(root, manifest)
@@ -1301,6 +1413,7 @@ def run_once(
                 error_type=(None if report["ok"] else ("WalkErrors" if report["walk_errors"] else "CopyErrors")),
                 run_at=now_iso, run_s=report["elapsed_s"],
                 skipped_undecodable=report["skipped_undecodable"], skipped_race=report["skipped_race"],
+                copy_errors=report["copy_errors"],
             )
             if not report["ok"]:
                 # finding 3 / LOW: a nonzero copy_errors or walk_errors is
@@ -1317,6 +1430,7 @@ def run_once(
         _write_status(
             root, ok=False, error_type=type(e).__name__, run_at=_iso(time.time()), run_s=round(time.monotonic() - t0, 1),
             skipped_undecodable=report["skipped_undecodable"], skipped_race=report["skipped_race"],
+            copy_errors=report["copy_errors"],
         )
         _alert_uploads_failure(type(e).__name__)
         return report
@@ -1332,6 +1446,7 @@ def run_once(
         _write_status(
             root, ok=False, error_type=type(e).__name__, run_at=_iso(time.time()), run_s=round(time.monotonic() - t0, 1),
             skipped_undecodable=report["skipped_undecodable"], skipped_race=report["skipped_race"],
+            copy_errors=report["copy_errors"],
         )
         _alert_uploads_failure(type(e).__name__)
         return report
@@ -1402,7 +1517,7 @@ def _status_path(root: Path) -> Path:
 
 def _write_status(
     root: Path, *, ok: bool, error_type: str | None, run_at: str, run_s: float,
-    skipped_undecodable: int = 0, skipped_race: int = 0,
+    skipped_undecodable: int = 0, skipped_race: int = 0, copy_errors: int = 0,
 ) -> None:
     """hostile-review round 3, finding 6: `note_run` below only ever
     updates THIS process's own module globals — fine for the daemon
@@ -1436,6 +1551,7 @@ def _write_status(
         _atomic_write_json(_status_path(root), {
             "ok": ok, "last_error": error_type, "last_run_at": run_at, "last_run_s": run_s,
             "skipped_undecodable": skipped_undecodable, "skipped_race": skipped_race,
+            "copy_errors": copy_errors,
             "degraded": degraded,
         })
     except OSError as e:

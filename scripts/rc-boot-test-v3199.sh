@@ -236,6 +236,57 @@ _sha256_tree_check() {
     fi
 }
 
+_assert_spawn_throttle() {
+    # rc-fix, MEDIUM finding (task 1): cloudflared-run.sh's own log line
+    # ("... CLOUDFLARE_TUNNEL_TOKEN is set; starting cloudflared") is
+    # printed exactly once per spawn attempt, before either the shape
+    # check's fixed sleep or throttle_if_hot's exponential backoff. Counts
+    # how many such lines appear within 60s of the FIRST one (by the
+    # timestamps the script itself writes, not this test's own wall
+    # clock, so it doesn't matter how long everything ELSE in this boot
+    # took) and fails if that count is 5 or more — pre-fix, the reviewer
+    # measured 61 spawns in 40s; the throttle's whole job is to keep that
+    # number small (30s, 60s, 120s, ... capped at 300s of backoff between
+    # hot respawns).
+    local name="$1" tag="$2"
+    local log ts_list
+    log="$(_dexec "${name}" 'cat "${LOG_DIR:-/data/logs}/cloudflared.log" 2>/dev/null' || true)"
+    ts_list="$(printf '%s\n' "${log}" | grep 'is set; starting cloudflared' | awk '{print $1}')"
+    if [ -z "${ts_list}" ]; then
+        # A shape-invalid token (validate_tunnel_token_shape) is refused
+        # BEFORE the "is set; starting cloudflared" line is ever logged —
+        # zero real spawns is the strongest possible form of "< 5 in 60s",
+        # not a failure to assess. Only fail here if cloudflared.log shows
+        # neither that refusal NOR any spawn at all (something else is
+        # wrong).
+        case "${log}" in
+            *"does not look like a tunnel token"*)
+                ok "cloudflared spawned 0 times (refused at the shape-validation step before ever exec'ing) (${tag}) — the restart throttle is trivially satisfied"
+                return
+                ;;
+            *)
+                fail "no 'starting cloudflared' lines AND no shape-refusal line found in cloudflared.log (${tag}) — cannot assess the restart throttle"
+                return
+                ;;
+        esac
+    fi
+    local first_epoch="" count=0 ts epoch
+    while IFS= read -r ts; do
+        [ -z "${ts}" ] && continue
+        epoch="$(date -u -d "${ts}" +%s 2>/dev/null || true)"
+        [ -z "${epoch}" ] && continue
+        [ -z "${first_epoch}" ] && first_epoch="${epoch}"
+        if [ $(( epoch - first_epoch )) -lt 60 ]; then
+            count=$((count + 1))
+        fi
+    done <<< "${ts_list}"
+    if [ "${count}" -lt 5 ]; then
+        ok "cloudflared spawned only ${count} time(s) within 60s of its first spawn (${tag}) — the restart throttle is working"
+    else
+        fail "cloudflared spawned ${count} times within 60s of its first spawn (${tag}) — the restart throttle is NOT working (expected < 5)"
+    fi
+}
+
 # -----------------------------------------------------------------------
 # 2/3. Boot + assert, for each WEBUI_DB_LOCAL setting
 # -----------------------------------------------------------------------
@@ -302,6 +353,7 @@ boot_and_check() {
         st="$(_wait_for_state "${name}" openwebui "RUNNING" 30)"
         [ "${st}" = "RUNNING" ] && ok "openwebui still RUNNING regardless of cloudflared (${tag})" \
             || fail "openwebui was affected by cloudflared's bad-token retries (${tag}), saw ${st}"
+        _assert_spawn_throttle "${name}" "${tag}"
     else
         st="$(_wait_for_state "${name}" cloudflared "EXITED" 30)"
         if [ "${st}" = "EXITED" ]; then
@@ -369,6 +421,22 @@ chmod 777 "${DATA_CF}"
 boot_and_check false "${DATA_CF}" "cloudflared-fake-token" "FAKE-BOOT-TEST-TOKEN-NOT-REAL-9876543210"
 docker run --rm -v "${DATA_CF}:/d" --entrypoint bash "${RC_IMAGE}" -c 'rm -rf /d/*' >/dev/null 2>&1
 rm -rf "${DATA_CF}" 2>/dev/null || true
+
+# rc-fix, MEDIUM finding (task 1): a SECOND enabled-path boot with a
+# well-FORMED (base64 of {"a":...,"t":...,"s":...}) but still entirely
+# synthetic token — never a real one. The malformed token above is caught
+# by validate_tunnel_token_shape's own fixed 300s sleep before it ever
+# execs cloudflared at all, which trivially satisfies "< 5 spawns in 60s"
+# on its own; this second boot is the one that actually exercises
+# throttle_if_hot (a shape-VALID token cloudflared's own edge rejects in
+# well under a second, since this sandbox has no route to a real
+# Cloudflare account either way).
+CF_WELLFORMED_TOKEN='eyJhIjogImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwgInQiOiAiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwgInMiOiAic3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3MifQ=='
+DATA_CF2="$(mktemp -d /tmp/zla-rc-data-cf2.XXXXXX)"
+chmod 777 "${DATA_CF2}"
+boot_and_check false "${DATA_CF2}" "cloudflared-wellformed-fake-token" "${CF_WELLFORMED_TOKEN}"
+docker run --rm -v "${DATA_CF2}:/d" --entrypoint bash "${RC_IMAGE}" -c 'rm -rf /d/*' >/dev/null 2>&1
+rm -rf "${DATA_CF2}" 2>/dev/null || true
 
 # -----------------------------------------------------------------------
 # 4. Rollback: the WEBUI_DB_LOCAL=false /data booted on BOTH the real prod

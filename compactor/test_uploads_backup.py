@@ -1139,6 +1139,347 @@ def test_uploads_step_is_wired_into_the_daemon_loop_only():
         uploads_backup.run_after_main_backup = saved_hook
 
 
+def test_root_walk_unreadable_aborts_with_no_vanished_accounting():
+    """rc-review fix, LOW-MED (probe rootwalk.sh): before this fix, the
+    uploads directory ROOT itself failing to list (distinct from a
+    SUBDIRECTORY failing — see `_RootWalkUnreadable`'s own docstring)
+    produced an exclusion prefix of `"./"`, which matched no tracked name
+    at all, so every previously-tracked file looked vanished and (at
+    20%+) tripped the mass-change guard on what both this test and the
+    real probe simulate as a transient permissions glitch (`chmod 311`:
+    enterable, not listable). This run must instead ABORT — `ok: False`,
+    a `_RootWalkUnreadable` detail, no vanished/deleted accounting at
+    all, and the manifest untouched.
+
+    MUTATION CHECK: reverting `_iter_uploads`'s onerror callback to treat
+    the root the same as any other unreadable subdirectory (no
+    `_RootWalkUnreadable` raise) makes this test fail — `deleted` would
+    become 30 and `suspect` would become True instead of the run
+    aborting."""
+    uploads, root = _new_dirs("t23")
+    for i in range(30):
+        _write(uploads / f"r{i}.jpg", b"\xff\xd8\xff" + f"r{i}".encode() * 10, mtime=1_700_020_000 + i)
+    r1 = uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+    assert_true(r1["ok"], "run 1 (normal) mirrors everything cleanly")
+    assert_eq(r1["new"], 30, "all 30 files mirrored on run 1")
+
+    manifest_before = uploads_backup.load_manifest(root)
+    tracked_before = sum(1 for rec in manifest_before["files"].values() if rec.get("deleted_at") is None)
+    assert_eq(tracked_before, 30, "CONTROL: 30 tracked before the unreadable-root run")
+
+    # `chmod 311` (enterable, not listable — the real reviewer probe,
+    # rootwalk.sh, uses exactly this) only actually blocks a scandir when
+    # the test runs as a non-root user; this suite also runs inside a
+    # root gate container (docker-compose.tests.yml), where root bypasses
+    # DAC permission bits entirely and os.walk would just succeed. Rather
+    # than have this test's behavior depend on which UID happens to run
+    # it, monkeypatch `os.walk` (as `uploads_backup` itself imports and
+    # calls it) to simulate the EXACT top-level scandir failure
+    # `_iter_uploads`'s own `onerror` callback has to detect — a
+    # PermissionError whose `.filename` is the uploads dir itself — the
+    # same shape `chmod 311` produces for a non-root caller, deterministic
+    # regardless of UID.
+    real_walk = uploads_backup.os.walk
+
+    def _walk_with_root_permission_denied(top, *a, **k):
+        onerror = k.get("onerror")
+        if onerror is not None and Path(top) == uploads:
+            onerror(PermissionError(13, "Permission denied", str(uploads)))
+            return iter(())
+        return real_walk(top, *a, **k)
+
+    uploads_backup.os.walk = _walk_with_root_permission_denied
+    try:
+        r2 = uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+    finally:
+        uploads_backup.os.walk = real_walk
+
+    assert_true(not r2["ok"], "the run reports ok=False when the root itself can't be listed")
+    assert_eq(r2["deleted"], 0, "NO files are marked deleted this run")
+    assert_eq(r2["walk_errors"], 0, "walk_errors stays 0 — this is a hard abort, not the per-subdirectory path")
+    assert_true("_RootWalkUnreadable" in r2["detail"] or "root itself could not be listed" in r2["detail"],
+                "the detail names the root-unreadable condition")
+
+    manifest_after = uploads_backup.load_manifest(root)
+    tracked_after = sum(1 for rec in manifest_after["files"].values() if rec.get("deleted_at") is None)
+    assert_eq(tracked_after, 30, "all 30 files are STILL tracked (none falsely marked vanished)")
+    assert_true(manifest_after["last_suspect_run"] is None, "the guard did NOT trip on a transient permissions glitch")
+
+    status = uploads_backup._read_status(root)
+    assert_true(status is not None and status["ok"] is False, "status.json reflects the abort")
+    assert_eq(status.get("last_error"), "_RootWalkUnreadable", "status.json's last_error names the exception type")
+
+    # And once the root is readable again, a normal cycle resumes cleanly.
+    r3 = uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+    assert_true(r3["ok"], "the very next cycle, once the root is listable again, is a normal clean run")
+    assert_eq(r3["deleted"], 0, "still nothing vanished")
+
+
+def test_expiry_sweep_runs_before_mirror_cap_refusal():
+    """rc-review fix, LOW (task 6a): the expiry sweep used to run at the
+    very END of the cycle, AFTER the free-space/mirror-size cap check —
+    so once a mirror was at or over
+    COMPACTOR_UPLOADS_BACKUP_MAX_MB, `_require_mirror_size_cap` raised
+    `_Refusal` (caught well before the sweep's old position) on EVERY
+    subsequent cycle, and the one thing that could shrink the mirror back
+    under the cap (expiring records already past
+    COMPACTOR_UPLOADS_BACKUP_KEEP_DELETED_DAYS and freeing their now-
+    orphaned objects) could never run either. Moving the sweep before the
+    cap check lets an aged-out backlog free enough bytes, in the SAME
+    cycle, for that cycle's own cap check to then pass.
+
+    MUTATION CHECK: moving the sweep back to its old (post-copy) position
+    makes this test fail — the cap-triggering run would refuse (`ok:
+    False`, `MB cap` in detail) with `expired: 0`, instead of expiring the
+    old records and accepting the new file.
+    """
+    uploads, root = _new_dirs("t24")
+    for i in range(10):
+        _write(uploads / f"c{i}.jpg", b"\xff\xd8\xff" + os.urandom(5000), mtime=1_700_021_000 + i)
+    r1 = uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+    assert_true(r1["ok"] and r1["new"] == 10, "CONTROL: 10 files mirrored")
+
+    for p in list(uploads.iterdir()):
+        p.unlink()
+    r2 = uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+    assert_true(r2["suspect"], "100% vanished trips the guard (deleted_at is NOT applied yet — frozen)")
+
+    # Simulate an operator having already `accept`ed this deletion (real
+    # deleted_at timestamps, marker cleared) and those records having
+    # since aged past KEEP_DELETED_DAYS, so the sweep below is free to
+    # expire them.
+    manifest = uploads_backup.load_manifest(root)
+    old_iso = uploads_backup._iso(time.time() - (uploads_backup.KEEP_DELETED_DAYS + 1) * 86400.0)
+    for rec in manifest["files"].values():
+        rec["deleted_at"] = old_iso
+    manifest["last_suspect_run"] = None
+    uploads_backup.save_manifest(root, manifest)
+    objects_bytes_before = manifest["objects_bytes"]
+    assert_true(objects_bytes_before > 0, "CONTROL: the mirror holds real bytes before the sweep")
+
+    saved_cap = uploads_backup.MAX_MIRROR_MB
+    # A cap comfortably BELOW the current (soon-to-be-expired) usage, but
+    # ABOVE what a single new file needs once the sweep frees the old
+    # objects.
+    uploads_backup.MAX_MIRROR_MB = max(1, int((objects_bytes_before - 2000) / (1024 * 1024)) or 1)
+    # MAX_MIRROR_MB is measured in whole MB by env_int in real use, but
+    # the module-level constant itself is just an int the check multiplies
+    # by 1024*1024 — force a byte-precise cap here via a direct monkeypatch
+    # of the check instead, so this test doesn't depend on the mirror
+    # being megabytes in size.
+    try:
+        import types
+        orig_check = uploads_backup._require_mirror_size_cap
+
+        def _byte_precise_cap(manifest_arg):
+            have = manifest_arg.get("objects_bytes", 0)
+            cap = objects_bytes_before - 2000
+            if have >= cap:
+                raise uploads_backup._Refusal(f"refusing to copy new objects: over the test's byte-precise cap ({have} >= {cap} MB cap)")
+
+        uploads_backup._require_mirror_size_cap = _byte_precise_cap
+        try:
+            _write(uploads / "new1.jpg", b"\xff\xd8\xff" + os.urandom(500), mtime=time.time() - 1000)
+            r3 = uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+        finally:
+            uploads_backup._require_mirror_size_cap = orig_check
+    finally:
+        uploads_backup.MAX_MIRROR_MB = saved_cap
+
+    assert_true(r3["ok"], "the cap-triggering cycle succeeds because the sweep already freed enough bytes")
+    assert_eq(r3["expired"], 10, "the sweep expired all 10 aged-out deleted records THIS cycle")
+    assert_eq(r3["new"], 1, "the new file was still copied — the cap check passed AFTER the sweep freed space")
+    manifest_after = uploads_backup.load_manifest(root)
+    assert_true(manifest_after["objects_bytes"] < objects_bytes_before,
+                "objects_bytes dropped — the mirror actually shrank")
+
+
+def test_stale_hashcopy_tmp_cleaned_up_at_run_start():
+    """rc-review fix, LOW (task 6, bullet 2): a `.hashcopy.*.tmp` file
+    left behind by a hard kill mid-copy (every normal exit path already
+    either os.replace()s or os.unlink()s it) must be swept up the next
+    time run_once starts, once it's older than 1h — never touched while
+    it could still be a genuinely in-flight copy."""
+    uploads, root = _new_dirs("t25")
+    objects_dir = root / uploads_backup.OBJECTS_DIRNAME
+    objects_dir.mkdir(parents=True)
+    stale = objects_dir / ".hashcopy.deadbeef.tmp"
+    stale.write_bytes(b"orphaned" * 10)
+    os.utime(stale, (time.time() - 7200, time.time() - 7200))
+    fresh = objects_dir / ".hashcopy.cafef00d.tmp"
+    fresh.write_bytes(b"in-flight" * 10)
+
+    uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+    assert_true(not stale.exists(), "the stale (>1h) .hashcopy.*.tmp file was removed at run start")
+    assert_true(fresh.exists(), "a fresh (<1h) .hashcopy.*.tmp file is left alone (could be genuinely in-flight)")
+
+
+def test_status_json_carries_copy_errors():
+    """rc-review fix, LOW (task 5's status.json shape): status.json must
+    include `copy_errors` (a new field this fix round added) so the
+    operator-facing `status` command in scripts/uploads-backup.py can
+    show it. Induces a real copy_errors > 0 (an unreadable NEW file) and
+    checks the persisted status.json directly."""
+    uploads, root = _new_dirs("t26")
+    good = uploads / "good.jpg"
+    bad = uploads / "bad.jpg"
+    _write(good, b"\xff\xd8\xff" + b"ok" * 20, mtime=1_700_022_000)
+    _write(bad, b"\xff\xd8\xff" + b"bad" * 20, mtime=1_700_022_100)
+    # `chmod 000` only actually blocks reads for a non-root caller; this
+    # suite also runs inside a root gate container, where root bypasses
+    # DAC bits entirely. Monkeypatch `_hash_and_copy_object` itself (as
+    # `run_once` calls it) to raise OSError for exactly the "bad" path,
+    # deterministic regardless of UID, real behavior for every other path.
+    real_copy = uploads_backup._hash_and_copy_object
+
+    def _copy_bad_fails(path, *a, **k):
+        if Path(path) == bad:
+            raise PermissionError(13, "Permission denied", str(bad))
+        return real_copy(path, *a, **k)
+
+    uploads_backup._hash_and_copy_object = _copy_bad_fails
+    try:
+        r = uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+    finally:
+        uploads_backup._hash_and_copy_object = real_copy
+    assert_true(r["copy_errors"] >= 1, "CONTROL: at least one copy_errors was induced")
+    status = uploads_backup._read_status(root)
+    assert_true(status is not None, "status.json was written")
+    assert_eq(status.get("copy_errors"), r["copy_errors"], "status.json's copy_errors matches the report")
+
+
+def test_cli_accept_flags_listing_unreadable_files_as_failed_roll_forward():
+    """rc-review fix, LOW (task 4, probe accunread.sh): a tracked, CURRENT
+    (not vanished) file that `accept` cannot READ during its own LISTING
+    pass (permission denied right then, e.g.) used to just be silently
+    dropped — absent from `to_roll_forward`, absent from any count,
+    `accept` could clear `last_suspect_run` and exit 0 as if everything
+    had actually been rolled forward. It must instead be folded into
+    `failed_roll_forward`: `accept` exits 1 and leaves the suspect marker
+    set.
+
+    MUTATION CHECK: reverting the listing loop's `except OSError:
+    continue` to drop the name (not append to unreadable_at_listing)
+    makes this test fail — `accept --yes` would exit 0 and clear
+    last_suspect_run despite the unreadable file.
+    """
+    uploads, root = _new_dirs("t27")
+    for i in range(20):
+        _write(uploads / f"u{i}.jpg", b"\xff\xd8\xff" + f"u{i}".encode() * 20, mtime=1_700_023_000 + i)
+    uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+
+    # A legitimate mass content edit (settled, old mtimes) trips the guard.
+    edited_names = [f"u{i}.jpg" for i in range(10)]
+    for name in edited_names:
+        p = uploads / name
+        with open(p, "ab") as f:
+            f.write(b"EDITED")
+        os.utime(p, (time.time() - 86400, time.time() - 86400))
+    r = uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+    assert_true(r["suspect"], "the 50% content edit trips the guard")
+
+    blocked = uploads / edited_names[0]
+    # Same root-vs-non-root concern as test_status_json_carries_copy_errors
+    # above: monkeypatch the script's own `_sha256_file` (what `accept`'s
+    # listing loop actually calls) to raise for exactly the "blocked" path,
+    # rather than relying on `chmod 000` actually being enforced.
+    script_ns = _load_script()
+    real_sha256_file = script_ns._sha256_file
+
+    def _sha256_file_blocked(path, *a, **k):
+        if Path(path) == blocked:
+            raise PermissionError(13, "Permission denied", str(blocked))
+        return real_sha256_file(path, *a, **k)
+
+    script_ns._sha256_file = _sha256_file_blocked
+    try:
+        args = script_ns.build_parser().parse_args(
+            ["--backup-root", str(root), "--uploads-dir", str(uploads), "accept", "--yes", "--force-large"]
+        )
+        rc = script_ns.cmd_accept(args)
+    finally:
+        script_ns._sha256_file = real_sha256_file
+
+    assert_eq(rc, 1, "accept exits 1 — one changed file was unreadable during listing")
+    manifest_after = uploads_backup.load_manifest(root)
+    assert_true(manifest_after["last_suspect_run"] is not None,
+                "last_suspect_run stays set — accept did NOT fully do what was asked")
+    # The other 9 readable, genuinely-changed files DID roll forward.
+    rolled = sum(
+        1 for name in edited_names[1:]
+        if manifest_after["files"][name].get("cur_sha256") != uploads_backup.load_manifest(root)["files"][name].get("sha256")
+    )
+    assert_eq(rolled, 9, "the 9 readable changed files WERE rolled forward despite the 1 unreadable one")
+
+
+def test_cli_accept_roll_forward_repairs_a_damaged_existing_object():
+    """rc-review fix, LOW (task 6, bullet 3, scripts/uploads-backup.py
+    :586): `_hash_and_copy_single_pass`'s old `created = not
+    dest.is_file()` treated ANY existing file at the object path as
+    already-good, with no size check — a truncated/damaged object at that
+    path (this test damages it directly) would be silently accepted as
+    correct forever, unlike compactor/uploads_backup.py's own
+    `has_object(..., size=...)`, which this fix mirrors."""
+    script_ns = _load_script()
+    tmp = _TMP / "t28-standalone"
+    tmp.mkdir(parents=True, exist_ok=True)
+    root = tmp / "bk"
+    root.mkdir()
+    src = tmp / "f.jpg"
+    _write(src, b"A" * 200, mtime=time.time() - 1000)
+
+    result = script_ns._hash_and_copy_single_pass(src, root, settle_cutoff=time.time() - 300)
+    assert_true(result is not None, "CONTROL: the first pass writes the object")
+    sha, size, created, *_ = result
+    assert_true(created, "CONTROL: first write is genuinely new")
+    dest = script_ns._object_path(root, sha)
+    assert_eq(dest.stat().st_size, 200, "CONTROL: the object is the right size")
+
+    # Damage it (truncate) as if it had been corrupted on disk.
+    dest.write_bytes(b"A" * 50)
+
+    result2 = script_ns._hash_and_copy_single_pass(src, root, settle_cutoff=time.time() - 300)
+    sha2, size2, created2, *_ = result2
+    assert_eq(sha2, sha, "same source, same hash")
+    assert_true(not created2, "not double-counted as a new object (it already existed, even if damaged)")
+    assert_eq(dest.stat().st_size, 200, "the damaged object was REPAIRED (overwritten with the correct bytes)")
+
+
+def test_cli_status_reads_status_json_ok_last_error_and_stale():
+    """rc-review fix, LOW (task 5): the `status` CLI command must read
+    status.json (not just manifest.json) and expose ok/last_error/
+    copy_errors/skipped counts/degraded/stale, with rc=1 when the run
+    was not ok OR degraded OR stale — not only when suspect."""
+    script_ns = _load_script()
+    uploads, root = _new_dirs("t29")
+    _write(uploads / "s.jpg", b"\xff\xd8\xff" + b"s" * 20, mtime=1_700_024_000)
+    r = uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+    assert_true(r["ok"], "CONTROL: a clean run")
+
+    args = script_ns.build_parser().parse_args(["--backup-root", str(root), "--uploads-dir", str(uploads), "status"])
+    rc_ok = script_ns.cmd_status(args)
+    assert_eq(rc_ok, 0, "status exits 0 after a clean, non-suspect, non-stale run")
+
+    # Force a failed status.json (never mutate the manifest for this —
+    # status.json is what `status` must actually read).
+    manifest = uploads_backup.load_manifest(root)
+    uploads_backup._write_status(
+        root, ok=False, error_type="SyntheticTestFailure",
+        run_at=uploads_backup._iso(time.time()), run_s=0.1,
+        copy_errors=3,
+    )
+    rc_bad = script_ns.cmd_status(args)
+    assert_eq(rc_bad, 1, "status exits 1 once status.json itself says ok=False, even though nothing is suspect")
+
+    # And a STALE (very old last_run_at), otherwise-ok status.
+    uploads_backup._write_status(
+        root, ok=True, error_type=None,
+        run_at=uploads_backup._iso(time.time() - 999_999_999), run_s=0.1,
+    )
+    rc_stale = script_ns.cmd_status(args)
+    assert_eq(rc_stale, 1, "status exits 1 once the last run is stale")
+
+
 _SCRIPT_MODULE = None
 
 
@@ -1182,6 +1523,13 @@ def _all():
         test_hash_and_copy_detects_inplace_rewrite_race,
         test_daemon_uploads_step_survives_base_exception,
         test_uploads_step_is_wired_into_the_daemon_loop_only,
+        test_root_walk_unreadable_aborts_with_no_vanished_accounting,
+        test_expiry_sweep_runs_before_mirror_cap_refusal,
+        test_stale_hashcopy_tmp_cleaned_up_at_run_start,
+        test_status_json_carries_copy_errors,
+        test_cli_accept_flags_listing_unreadable_files_as_failed_roll_forward,
+        test_cli_accept_roll_forward_repairs_a_damaged_existing_object,
+        test_cli_status_reads_status_json_ok_last_error_and_stale,
     ]
 
 

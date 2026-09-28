@@ -43,8 +43,19 @@ DEFAULT_UPLOADS_DIR = "/data/openwebui/uploads"
 DEFAULT_BACKUP_ROOT = "/data/backups/uploads"
 DEFAULT_DB = "/data/openwebui/webui.db"
 MANIFEST_NAME = "manifest.json"
+# Same name/shape as compactor/uploads_backup.py's own STATUS_NAME/
+# _write_status — an independent copy here (this script must not import
+# the compactor package; see the module docstring above) read-only: this
+# script never writes status.json itself, only the daemon (run_once) does.
+STATUS_NAME = "status.json"
 OBJECTS_DIRNAME = "objects"
 CHUNK_BYTES = 4 * 1024 * 1024
+# Same default/env-var name as compactor/uploads_backup.py's own
+# BACKUP_INTERVAL_HOURS, read independently here (same stdlib-only
+# doctrine) purely to compute the same "stale" verdict `health_snapshot()`
+# does, for an operator running this by hand instead of hitting
+# /health/full.
+BACKUP_INTERVAL_HOURS = float(os.environ.get("COMPACTOR_BACKUP_INTERVAL_HOURS", "24.0"))
 # Same default and same env var as compactor/uploads_backup.py's own
 # SETTLE_S — read independently here (this script must not import the
 # compactor package; see the module docstring) so `accept`'s roll-forward
@@ -86,6 +97,20 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _load_status(root: Path) -> dict | None:
+    """rc-review fix, LOW: read-only counterpart of compactor/
+    uploads_backup.py's own `_read_status` — returns None (never raises)
+    on a missing or unreadable/malformed file, exactly like that one."""
+    try:
+        with open(root / STATUS_NAME, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return None
+
+
 def _now_iso() -> str:
     import datetime
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -93,6 +118,17 @@ def _now_iso() -> str:
 
 def _stamp() -> str:
     return time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+
+
+def _parse_iso(s: str) -> float | None:
+    """Independent copy of compactor/uploads_backup.py's own `_parse_iso`
+    (stdlib-only doctrine, see the module docstring) — used only to
+    compute `stale` for `status` below."""
+    import datetime
+    try:
+        return datetime.datetime.fromisoformat(s).timestamp()
+    except (ValueError, TypeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -126,11 +162,45 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"suspect content:    {suspect_content}")
     print(f"objects on disk:    {n_objects}")
     print(f"bytes on disk:      {total_bytes}")
+
+    # rc-review fix, LOW: this command used to report ONLY manifest.json's
+    # own numbers — it never looked at status.json at all, so an operator
+    # running it by hand had no way to see ok/last_error/copy_errors/
+    # skipped_undecodable/skipped_race/degraded/stale (the exact set
+    # health_snapshot() surfaces on /health/full), and — the sharper gap —
+    # `status`'s own exit code never reflected a failed or degraded run
+    # unless it ALSO happened to be suspect. A run that failed outright
+    # (a nonzero copy_errors/walk_errors, or an exception) with no
+    # suspect trip used to exit 0 here.
+    status = _load_status(root)
+    run_ok = bool(status.get("ok")) if status is not None else None
+    last_error = status.get("last_error") if status is not None else None
+    copy_errors = status.get("copy_errors", 0) if status is not None else 0
+    skipped_undecodable = status.get("skipped_undecodable", 0) if status is not None else 0
+    skipped_race = status.get("skipped_race", 0) if status is not None else 0
+    degraded = bool(status.get("degraded", False)) if status is not None else False
+    last_run_at = status.get("last_run_at") if status is not None else None
+    stale = None
+    if last_run_at:
+        last_ts = _parse_iso(last_run_at)
+        if last_ts is not None:
+            stale = (time.time() - last_ts) > (2 * BACKUP_INTERVAL_HOURS * 3600.0)
+
+    print(f"status.json ok:     {run_ok if status is not None else 'unknown (no status.json yet)'}")
+    print(f"last error:         {last_error}")
+    print(f"copy errors:        {copy_errors}")
+    print(f"skipped undecodable: {skipped_undecodable}")
+    print(f"skipped race:       {skipped_race}")
+    print(f"degraded:           {degraded}")
+    print(f"stale:              {stale if stale is not None else 'unknown (no last_run_at)'}")
+
     if suspect_run:
         print(f"SUSPECT RUN:        {suspect_run}")
         print("recover with: uploads-backup.py accept --yes   (after you've confirmed it's legitimate)")
         return 1
     print("suspect run:        none")
+    if run_ok is False or degraded or stale:
+        return 1
     return 0
 
 
@@ -536,6 +606,42 @@ def _cur_sha(rec: dict) -> str | None:
     return rec.get("cur_sha256", rec.get("sha256"))
 
 
+_STALE_HASHCOPY_TMP_S = 3600.0  # 1h — see compactor/uploads_backup.py's own copy
+
+
+def _cleanup_stale_hashcopy_tmp(root: Path) -> int:
+    """Independent copy of compactor/uploads_backup.py's own
+    `_cleanup_stale_hashcopy_tmp` (stdlib-only doctrine; see the module
+    docstring above) — `accept`'s own roll-forward
+    (`_hash_and_copy_single_pass`) writes the exact same
+    `objects/.hashcopy.<rand>.tmp` shape, so it can leave the same kind of
+    orphan behind if this script is killed mid-accept. Called once at the
+    start of `accept`, before anything else touches `objects/`. Never
+    raises; returns the count removed."""
+    objects_dir = root / OBJECTS_DIRNAME
+    removed = 0
+    try:
+        if not objects_dir.is_dir():
+            return 0
+        cutoff = time.time() - _STALE_HASHCOPY_TMP_S
+        for entry in objects_dir.iterdir():
+            name = entry.name
+            if not (name.startswith(".hashcopy.") and name.endswith(".tmp")):
+                continue
+            try:
+                if not entry.is_file():
+                    continue
+                if entry.stat().st_mtime >= cutoff:
+                    continue
+                entry.unlink()
+                removed += 1
+            except OSError:
+                continue
+    except OSError:
+        return removed
+    return removed
+
+
 def _hash_and_copy_single_pass(path: Path, root: Path, *, settle_cutoff: float):
     """hostile-review round 4, finding 5: `accept`'s roll-forward used to
     hash a file during the (read-only, dry-run-safe) listing pass, then
@@ -583,11 +689,30 @@ def _hash_and_copy_single_pass(path: Path, root: Path, *, settle_cutoff: float):
         sha = h.hexdigest()
         dest = _object_path(root, sha)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        created = not dest.is_file()
-        if created:
-            os.replace(tmp_path, dest)
-        else:
+        # rc-review fix, LOW: `not dest.is_file()` alone only checks that
+        # SOMETHING is at that path — an existing object there that was
+        # truncated or otherwise damaged (its size no longer matches this
+        # sha's real content) would look "already have it" and get
+        # skipped forever, same class of bug compactor/uploads_backup.py's
+        # own `has_object(..., size=...)` exists to close on the daemon
+        # side. `existing_ok` mirrors that: exists AND the right size.
+        existed_before = dest.is_file()
+        existing_ok = existed_before
+        if existing_ok:
+            try:
+                existing_ok = dest.stat().st_size == size
+            except OSError:
+                existing_ok = False
+        # `created` still only means "genuinely new to the store" for the
+        # caller's objects_count/objects_bytes accounting — repairing a
+        # damaged existing object (existing_ok False but the path already
+        # existed) replaces the file but must not double-count it, since
+        # some earlier run already counted it once.
+        created = not existed_before
+        if existing_ok:
             os.unlink(tmp_path)
+        else:
+            os.replace(tmp_path, dest)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -625,6 +750,7 @@ def cmd_accept(args: argparse.Namespace) -> int:
         return 2
 
     with _locked(root):
+        _cleanup_stale_hashcopy_tmp(root)
         manifest = _load_manifest(root)
         files = manifest.get("files", {})
 
@@ -638,16 +764,30 @@ def cmd_accept(args: argparse.Namespace) -> int:
         # frozen (see run_once: changed_content is computed every run but
         # only APPLIED to `files` when not suspect).
         to_roll_forward: list[tuple[str, str, int, float, int, int]] = []  # (name, sha, size, mtime, mtime_ns, inode)
+        # rc-review fix, LOW: a name that IS still present (so it's never
+        # "vanished") but can't be READ right now (permission denied
+        # mid-listing, e.g.) used to just `continue` here — silently
+        # dropped from `to_roll_forward` with no record anywhere that
+        # accept never actually got to look at it. If its content really
+        # had drifted, `accept` would then clear last_suspect_run and exit
+        # 0 while that file's cur_sha256 was never actually rolled
+        # forward — the operator is told "accepted" for a file that
+        # wasn't. Track these by name and fold them into
+        # `failed_roll_forward` below (same handling as an apply-time
+        # read failure): the marker stays set and accept exits 1.
+        unreadable_at_listing: list[str] = []
         for n in sorted(current_names & set(tracked)):
             rec = tracked[n]
             live_path = uploads_dir / n
             try:
                 live_st = live_path.stat()
             except OSError:
+                unreadable_at_listing.append(n)
                 continue
             try:
                 live_sha = _sha256_file(live_path)
             except OSError:
+                unreadable_at_listing.append(n)
                 continue
             if live_sha != _cur_sha(rec):
                 to_roll_forward.append((n, live_sha, live_st.st_size, live_st.st_mtime, int(live_st.st_mtime_ns), live_st.st_ino))
@@ -679,6 +819,7 @@ def cmd_accept(args: argparse.Namespace) -> int:
 
         print(f"currently vanished tracked files:      {len(vanished)}")
         print(f"changed files to roll forward:         {len(to_roll_forward)}")
+        print(f"unreadable while listing (unresolved): {len(unreadable_at_listing)}")
         print(f"suspect flag set:                      {bool(suspect_run)}")
         if suspect_run:
             # hostile-review round 3, finding 4: print the marker's own
@@ -690,7 +831,7 @@ def cmd_accept(args: argparse.Namespace) -> int:
             print(f"  last_suspect_run.baseline:            {suspect_run.get('baseline')}")
             print(f"  last_suspect_run.pct:                 {suspect_run.get('pct')}")
             print(f"  last_suspect_run.detected_at:         {suspect_run.get('detected_at')}")
-        if not vanished and not to_roll_forward and not suspect_run:
+        if not vanished and not to_roll_forward and not suspect_run and not unreadable_at_listing:
             print("nothing to accept")
             return 0
 
@@ -720,7 +861,13 @@ def cmd_accept(args: argparse.Namespace) -> int:
         # captured half-written).
         settle_cutoff = time.time() - SETTLE_S
         rolled_forward = 0
-        failed_roll_forward = []
+        # rc-review fix, LOW: seed failed_roll_forward with names that were
+        # already unreadable during the earlier LISTING pass (see
+        # unreadable_at_listing above) — they never had a chance to become
+        # a to_roll_forward candidate at all, but accept still did not
+        # fully do what the operator asked for those names, so they must
+        # gate the same way an apply-time failure does below.
+        failed_roll_forward = list(unreadable_at_listing)
         for n, _stale_sha, _stale_size, _stale_mtime, _stale_mtime_ns, _stale_inode in to_roll_forward:
             live_path = uploads_dir / n
             try:

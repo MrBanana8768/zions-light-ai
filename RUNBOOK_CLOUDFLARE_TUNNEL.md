@@ -148,7 +148,7 @@ tree, `docker cp`'d out of `local/zla:v3198-rc` for reading (a throwaway contain
 
 | Var | File:line (default) | Recommendation for the RunPod template |
 |---|---|---|
-| `WEBUI_URL` | `config.py:1661` (`os.getenv('WEBUI_URL', '')`, stored as `webui.url`, `config.py:3082`) | `https://ai.revelationsaints.com` |
+| `WEBUI_URL` | `config.py:1661` (`os.getenv('WEBUI_URL', '')`, stored as `webui.url`, `config.py:3082`) | `https://ai.revelationsaints.com` — **but see the note right below the table; on 0.11.4 the env var alone is not enough if a DB row already exists.** |
 | `CORS_ALLOW_ORIGIN` | `config.py:2134` (`os.getenv('CORS_ALLOW_ORIGIN', '*')`) | Leave at the default `*` unless you have a reason to lock it down — the tunnel does not require narrowing this. |
 | `WEBUI_SESSION_COOKIE_SECURE` | `env.py:770` (default `false`) | Leave as-is or set `true` — `https://ai.revelationsaints.com` is HTTPS end-to-end (Cloudflare terminates TLS at its edge; the tunnel and the loopback hop to `localhost:3000` are both trusted paths), so a `Secure` cookie works fine over it. Not required to change for the tunnel to function. |
 | `WEBUI_SESSION_COOKIE_SAME_SITE` | `env.py:769` (default `lax`) | No change needed — `lax` is fine for a single-origin app like this. |
@@ -164,6 +164,19 @@ OpenWebUI serves for browser "add as search engine" integration). None of these 
 unset means any of those generated links point at whatever host happened to serve that particular request,
 which is exactly the kind of thing that gets confusing once there are two live origins (tunnel + RunPod
 proxy) during the transition.
+
+**IMPORTANT — the RunPod template env var alone may not be enough (rc-fix, after the RC hostile review):**
+`WEBUI_URL` is a `PersistentConfig` value (`config.py:1661`/`:3082`): `os.getenv('WEBUI_URL', '')` only
+seeds the `webui.url` row in `webui.db` the FIRST time OpenWebUI ever boots with no such row present. Once
+that row exists — which it already does on prod's DB, carried forward from before this tunnel existed —
+**the stored DB value wins on every later boot, and changing the RunPod template's `WEBUI_URL` env var does
+nothing by itself.** Before relying on any of the links above pointing at
+`https://ai.revelationsaints.com`, either:
+- set it in the UI instead (**Admin → Settings → General → WebUI URL**, which writes straight to the same
+  `webui.url` row), or
+- verify what the row already holds (`SELECT data FROM config WHERE ...` — see the same PersistentConfig
+  shape `OPERATIONS.md` already documents for other settings — or simply open Admin → Settings → General
+  and read the field) before assuming the env var took effect.
 
 **Do NOT change the image's own defaults for any of these** — this table is RunPod-template guidance, not a
 `Dockerfile.v3199` change. Nothing above required touching the image.
@@ -182,27 +195,52 @@ proxy) during the transition.
    (`get_event_emitter`, `socket/main.py:1134`) — i.e., **the actual token-by-token content the user sees
    arrives over the WebSocket, not the HTTP response body.**
 
-   BUT the original HTTP request is not returned early either: `utils/middleware.py:6642` is
-   `return await response_handler(response, events)` — an `await`, not a fire-and-forget background task.
-   The coroutine handling `POST /api/chat/completions` stays suspended, holding that HTTP connection open,
-   for the ENTIRE generation, and only returns (a small completion-status JSON, not the reply text) once
-   generation finishes. Nothing in this path sends periodic keep-alive bytes on that HTTP response while
-   waiting.
+   **CORRECTED (rc-fix, after the RC hostile review): the initiating POST does NOT normally stay open for
+   the whole generation.** `main.py:1803-1880` (0.11.4's `/api/chat/completions` route) backgrounds the
+   actual generation — `process_chat(...)` is launched as an `asyncio` background task and the route
+   returns `task_ids` (or `task_id`) right away, **as long as both `session_id` and `chat_id` are present
+   on the request body.** The frontend always sends both: `Chat.svelte` (~line 3610) sets
+   `session_id: $socket?.id` on every chat-completion POST, and `chat_id: _chatId || undefined` right next
+   to it — for an existing chat `_chatId` is always set, and for a brand-new chat OpenWebUI creates the
+   chat row (and so its id) before the very first completion request, so `chat_id` is present on the
+   normal path too. So in the real, browser-driven flow, `POST /api/chat/completions` returns almost
+   immediately with `task_ids`/`chat_id`, well inside any timeout — the earlier draft of this runbook's
+   "stays suspended for the entire generation" reading of `utils/middleware.py:6642` describes the
+   **synchronous fallback** path (`session_id`/`chat_id` absent — a non-browser API caller, or a socket
+   that dropped before the POST was sent), not the normal case.
 
-   **Conclusion: a `524` on the initiating `POST /api/chat/completions` CAN happen** for any generation
-   that runs past Cloudflare's ~100s idle-origin timeout (Free plan) — which her cold-compile case (up to
-   ~175s) exceeds. It does **not** mean her reply is lost: the content itself is already flowing to her
-   browser over the separate, independent WebSocket connection as it's generated, and that connection is
-   not subject to the same per-request HTTP timeout (Cloudflare Tunnel proxies WebSocket traffic as a single
-   long-lived stream, not as a request/response pair with its own 100s clock — see the websockets finding
-   below). **What is NOT fully verified from source alone:** whether OpenWebUI's frontend treats that
-   specific POST's failure (a `524`, which the browser sees as the fetch erroring or timing out) as a
-   user-visible error/retry prompt even though the message is actually still arriving via the socket. No
-   compiled frontend source shipped in this package to check that directly (`open_webui/frontend/static`
-   in the image is the built app, not readable TypeScript source). **Recommendation:** treat this as a
-   residual risk to watch for after cutover, not a blocker — worth one deliberate test of a real cold-start
-   reply through the tunnel, watching the browser console/network tab for how it reacts to the POST outcome.
-   If it does surface a spurious error toast while the reply arrives fine underneath, the practical
+   **What happens if that POST *does* fail (`524` or otherwise) in the normal, backgrounded case:**
+   `Chat.svelte`'s own `.catch(async (error) => {...})` on the completions call (same block as above,
+   right after the `background_tasks` object) shows `toast.error(...)` and marks that message
+   `responseMessage.error = { content: error }` / `responseMessage.done = true` — i.e. **the UI DOES
+   surface a visible error/toast on a failed POST**, contradicting the earlier draft's "not fully verified"
+   hedge on this point; it is verified, directly from `Chat.svelte`'s own source (see
+   `~/zl-ops/v3199/rc-review/owui/Chat.svelte.txt` for the exact excerpt this was read from). Because the
+   POST returns almost immediately in the normal case, this toast path is very unlikely to actually fire
+   from a slow *generation* — a slow generation happens entirely inside the backgrounded task, well after
+   the POST that could 524 has already returned.
+
+   **Where the residual risk actually is, narrowed down:**
+   - **The Socket.IO connection is disconnected at the moment she sends the message** (page just loaded,
+     a network blip, mobile backgrounding the tab) — `session_id: $socket?.id` would then be missing/stale,
+     which routes through the synchronous fallback the earlier draft described, and THAT path can still
+     hold the POST open for the full generation and hit Cloudflare's ~100s idle-origin timeout on a cold
+     compile (up to ~175s).
+   - **Pre-task DB work exceeds ~100s before the background task is even launched.** `main.py:1803-1880`
+     still does some synchronous work (chat/message lookups and writes against `webui.db`) before handing
+     off to the background task and returning — on her particular chat, that row is **62.8 MB**
+     (`chat.chat` for her conversation), so if that lookup/write itself is ever slow enough to exceed
+     ~100s on its own (independent of generation time entirely), the POST could still 524 before task_ids
+     are even returned. Not measured directly against the real DB in this pass; flagging it as the one
+     scenario the "returns almost immediately" claim doesn't cover.
+
+   **Recommendation, updated:** the previous "residual risk to watch for, worth a deliberate test" stands,
+   but narrowed to those two cases rather than every cold-start reply. **Do the DevTools check** after
+   cutover: open the browser's Network tab, send a message that forces a cold grammar compile, and confirm
+   the `/api/chat/completions` POST completes (near-instantly, with `task_ids` in the response) well before
+   the reply finishes generating — if it instead hangs for the whole generation, that's a sign `session_id`/
+   `chat_id` were not both present (check the socket's connection state at send time) and the synchronous
+   fallback path is what actually ran. If a `524`/error toast does show up despite that, the practical
    workaround is upgrading past Cloudflare's Free-plan proxied timeout (a paid plan setting) or keeping the
    compactor's own idle warm-up (`wordban_runtime.py`'s warm-up path, OPERATIONS.md) doing its job so a cold
    compile is rare in practice, not eliminating the timeout risk at the protocol level.

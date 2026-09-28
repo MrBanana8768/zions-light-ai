@@ -176,6 +176,88 @@ steps, the RunPod secret, verification commands, and rollback/disabling.
   enabled-but-bad-token path (kept retrying, never FATAL, no other program affected) now land where the
   design intended.
 
+### Fixed (RC hostile-review round, rc-fix — before this candidate is cut)
+- **`docker/cloudflared-run.sh`: a bad-but-well-formed `CLOUDFLARE_TUNNEL_TOKEN` no longer causes a hot
+  restart loop.** The reviewer measured 61 spawns in 40s against a bad token (~10% of a core plus heavy log
+  churn on MooseFS, and `supervisorctl status` still read RUNNING throughout, since `startsecs=0` — kept, on
+  purpose, for the disabled path — counts every one of those instant spawns as a "successful" start). Two
+  independent fixes, both before `exec cloudflared`, `startsecs=0`/`autorestart=unexpected`/`exitcodes=0`
+  otherwise untouched: (1) `validate_tunnel_token_shape` — a local, no-network check (base64 of a JSON
+  object with keys `a`/`t`/`s`) that refuses an obviously-wrong value outright (a fixed 300s sleep before
+  exiting 1, so a shape that's wrong on every attempt spawns at most once per five minutes); it tolerates
+  padding, surrounding quotes/whitespace, and whitespace pasted inside the value, and if the WHOLE `cloudflared
+  service install eyJ...` line got pasted instead of just the token, extracts and uses the `eyJ...` part
+  rather than refusing outright. The failure log line names only one of a fixed, closed set of reason words
+  (`not base64` / `not JSON` / `missing keys` / `looks like a pasted install command`) — never the token's
+  length, a prefix/suffix, a character class, or any other substring of the value. (2) `throttle_if_hot` — a
+  small on-disk stamp (`CLOUDFLARED_RUN_STATE_DIR`, default `/run`) recording the last spawn time and the
+  current backoff; a respawn within `CLOUDFLARED_RUN_THROTTLE_WINDOW_S` (default 60s) of the last one sleeps
+  first, for an exponentially growing, capped delay (30s, 60s, 120s, ... capped at 300s) — this is what
+  actually protects against a shape-VALID token Cloudflare's own edge rejects in well under a second, which
+  (1) has no way to see coming. Every timing knob is env-overridable purely so the test suite never has to
+  wait out a real 30-300s sleep; production sets none of them. `compactor/test_cloudflared_run.py` extended
+  (14 cases: shape validation incl. the pasted-install-line and whitespace-in-decoded-JSON cases, a
+  no-substring-leaks check against a distinctive fake token, and the throttle timing against short
+  env-overridden intervals); `scripts/rc-boot-test-v3199.sh`'s fake-token cases now assert fewer than 5
+  spawns in 60s for both a malformed and a well-formed-but-fake token.
+- **`RUNBOOK_CLOUDFLARE_TUNNEL.md`'s 524 section, corrected.** The earlier draft read `utils/middleware.py:
+  6642`'s `await response_handler(...)` as meaning the initiating `POST /api/chat/completions` stays open for
+  the entire generation. On 0.11.4 it normally does not: `main.py:1803-1880` backgrounds the actual
+  generation and returns `task_ids` right away whenever both `session_id` and `chat_id` are present on the
+  request — and the UI always sends both (`Chat.svelte` ~3610). The earlier "not fully verified from source
+  alone" hedge on whether the frontend shows an error on a failed POST is now verified: `Chat.svelte`'s own
+  `.catch(...)` on that call shows `toast.error(...)` and marks the message errored. The residual risk is
+  narrowed to two cases: the Socket.IO connection being disconnected right when she sends (routes through the
+  synchronous fallback the earlier draft described), or pre-task DB work against her 62.8 MB chat row itself
+  exceeding ~100s before the background task is even launched. Added the DevTools check (confirm the POST
+  returns near-instantly with `task_ids`, well before the reply finishes generating) as the after-cutover
+  verification step.
+- **`RUNBOOK_CLOUDFLARE_TUNNEL.md`: `WEBUI_URL` is a `PersistentConfig` value — the RunPod template env var
+  alone may not take effect.** `config.py:1661`/`:3082`: the env var only seeds the `webui.url` DB row the
+  FIRST time OpenWebUI ever boots with no such row present; once the row exists (as it already does on
+  prod), the stored value wins on every later boot regardless of the env var. Added: set it via
+  **Admin → Settings → General → WebUI URL** instead (writes the same row), or verify what the row already
+  holds before assuming the template change took effect.
+- **`compactor/uploads_backup.py`: an unreadable uploads ROOT no longer permanently trips the mass-change
+  guard.** When the uploads directory itself (not a subdirectory) couldn't be listed (`chmod 311`: enterable,
+  not readable — a real EACCES/EIO shape, reproduced by the reviewer's `rootwalk.sh` probe), the vanished-
+  exclusion prefix built from that failure was `"./"`, which matches no tracked name at all (they're plain
+  relative names like `"ab/cd.jpg"`) — so every previously-tracked file looked vanished, tripping (or, once
+  already suspect, permanently re-feeding) the guard on what was often just a transient permissions glitch.
+  `_iter_uploads`'s `onerror` callback now raises a dedicated `_RootWalkUnreadable` (a `_Refusal` subclass)
+  when the ROOT itself is what failed to scan — `run_once` aborts that cycle outright (`ok: false`,
+  `last_error: "_RootWalkUnreadable"`, an alert, the manifest completely untouched, no vanished/deleted
+  accounting at all) rather than doing any accounting on an incomplete listing. Re-verified against the
+  reviewer's own `rootwalk.sh` probe (quoted in the rc-fix report): the run aborts cleanly, all previously-
+  tracked files stay tracked, and a normal cycle resumes on its own once the root is listable again.
+- **`scripts/uploads-backup.py accept`: a file unreadable during LISTING (not applying) is no longer silently
+  dropped.** A tracked, still-present file `accept` couldn't read while deciding what changed (permission
+  denied right then, e.g.) used to just be skipped with no record anywhere — `accept` could then clear
+  `last_suspect_run` and exit 0 as if every roll-forward had actually happened. These names now feed the same
+  `failed_roll_forward` accounting an apply-time failure already used: `accept` exits 1 and leaves the
+  suspect marker set. Re-verified against the reviewer's own `accunread.sh` probe.
+- **`scripts/uploads-backup.py status` now reads `status.json`, not just `manifest.json`.** It previously
+  reported only manifest-derived counts, so a run that failed outright (nonzero `copy_errors`/`walk_errors`,
+  or an exception) with no mass-change trip exited 0 — an operator running it by hand had no way to see that.
+  Now also prints `status.json`'s `ok`/`last_error`/`copy_errors`/`skipped_undecodable`/`skipped_race`/
+  `degraded`, plus a freshly-computed `stale` (last run older than twice the backup interval), and exits 1
+  when the run was not ok, degraded, or stale (in addition to the existing suspect-run case). `status.json`
+  itself gained one new field, `copy_errors` (int, default 0) — the only shape change; `/health/full`'s
+  existing `uploads_backup` key (`health_snapshot()` in `compactor/uploads_backup.py`) is unchanged.
+- **`compactor/uploads_backup.py`: the expiry sweep now runs BEFORE the mirror-size-cap refusal, not after.**
+  Previously, once a mirror was at or over `COMPACTOR_UPLOADS_BACKUP_MAX_MB`, the cap check refused every
+  cycle before the sweep (which runs at the end) ever got a chance to run — so the one thing that could
+  shrink the mirror back under the cap (expiring long-deleted records past
+  `COMPACTOR_UPLOADS_BACKUP_KEEP_DELETED_DAYS` and freeing their orphaned objects) could never run either,
+  and an over-cap mirror was stuck over cap permanently. Moved earlier so an aged-out backlog can free enough
+  bytes, in the SAME cycle, for that cycle's own cap check to then pass. Also: stale `.hashcopy.*.tmp` files
+  (left behind only by a hard kill mid-copy — every normal exit path already cleans its own up) older than
+  1h are now swept at the start of every `run_once` cycle and every `accept` call, in both
+  `compactor/uploads_backup.py` and `scripts/uploads-backup.py`; and `accept`'s own roll-forward
+  (`_hash_and_copy_single_pass`) now checks an existing object's SIZE, not just its presence, before treating
+  it as already-good — mirroring `has_object(..., size=...)` on the daemon side — so a truncated/damaged
+  object at that path gets repaired instead of silently trusted forever.
+
 ### Not changed
 - OpenWebUI's own defaults (`WEBUI_URL`, `CORS_ALLOW_ORIGIN`, session-cookie settings,
   `forwarded_allow_ips`) are left as shipped. Recommended RunPod-template values for the new origin are in
