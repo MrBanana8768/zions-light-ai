@@ -222,6 +222,42 @@ async def probe_vllm(vllm_url: str) -> dict:
         }
 
 
+async def probe_tunnel() -> dict:
+    """v3.1.9.9: visibility-only `tunnel` block for /health/full (task 7).
+
+    `configured` is derived ONLY from whether CLOUDFLARE_TUNNEL_TOKEN is
+    present in this process's own environment — NEVER its value, which
+    this function never reads past `in os.environ`/truthiness. Same
+    doctrine as `bg`/`mt`/`word_ban` elsewhere in gather_health_full:
+    visibility only, never moves `status` — an operator who has not set up
+    the tunnel yet is not "degraded", and a broken cloudflared does not
+    take OpenWebUI down (compactor and cloudflared are independent
+    supervisord children).
+
+    `ready` probes cloudflared's own loopback-only metrics endpoint
+    (--metrics 127.0.0.1:8082, docker/cloudflared-run.sh) at /ready, which
+    cloudflared answers 200 once it has at least one active connection to
+    Cloudflare's edge. Cheap (loopback, same short probe timeout as vLLM's
+    own probe above) and best-effort: unreachable just means
+    ready=False/None with a reason, never an exception into
+    gather_health_full.
+    """
+    configured = bool(os.environ.get("CLOUDFLARE_TUNNEL_TOKEN", "").strip())
+    out: dict[str, Any] = {"configured": configured, "ready": None}
+    if not configured:
+        return out
+    try:
+        async with httpx.AsyncClient(timeout=_VLLM_PROBE_TIMEOUT_S) as c:
+            r = await c.get("http://127.0.0.1:8082/ready")
+        out["ready"] = r.status_code == 200
+        if r.status_code != 200:
+            out["error"] = f"HTTP {r.status_code}"
+    except Exception as e:
+        out["ready"] = None
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def probe_storage() -> dict:
     """Verify the persistent volume is mounted and writable. We touch a
     sentinel file rather than just checking st_mode — read-only mounts
@@ -1568,9 +1604,10 @@ async def gather_health_full(
     # Run them concurrently — serialized, the probe's up-to-3 s timeout sat in
     # front of the store scan for no reason. They share no state: the probe is
     # an httpx call, the scan reads files under a different directory.
-    vllm, blocking = await asyncio.gather(
+    vllm, blocking, tunnel = await asyncio.gather(
         probe_vllm(vllm_url),
         asyncio.to_thread(_gather_blocking),
+        probe_tunnel(),
     )
     storage = blocking["storage"]
     stats = blocking["stats"]
@@ -2297,6 +2334,11 @@ async def gather_health_full(
         # absent file is fail-open on the request path (the client-sent
         # value or none is used instead), so this never moves `status`.
         "word_ban": wb,
+        # v3.1.9.9 (Cloudflare Tunnel, task 7): {"configured": bool, "ready":
+        # bool|None, ["error": str]} — see probe_tunnel's own docstring.
+        # Visibility only, same doctrine as `word_ban`/`bg`/`tokenizer` —
+        # never moves `status`.
+        "tunnel": tunnel,
         # v3.1.9.8 REQUEST TRACING (owner's ask, item 7): requests_in_flight
         # (chat requests currently inside the handler, INCLUDING the
         # pre-processing phase — the whole point) and how long ago the last

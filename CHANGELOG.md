@@ -9,6 +9,67 @@ on Docker Hub.
 
 ---
 
+## [3.1.9.9] — Cloudflare Tunnel: `https://ai.revelationsaints.com` instead of the RunPod proxy URL
+
+**Not yet released/tagged.** Built from `Dockerfile.v3199` (the `rollback` and `rc` targets, both on prod's
+own image, same base chain as `Dockerfile.v3198` — only the `rc` stage differs, by one addition). Branch
+`feature/v3.1.9.9`, created from tag `v3.1.9.8`. See **RUNBOOK_CLOUDFLARE_TUNNEL.md** for the owner's setup
+steps, the RunPod secret, verification commands, and rollback/disabling.
+
+### Added
+- **`cloudflared` baked into the image** (`Dockerfile.v3199`, `rc` stage only — NOT `rollback`, so rolling
+  back also rolls back the tunnel): official GitHub release, pinned by version (`2026.9.3`) AND sha256
+  (`77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2` for `cloudflared-linux-amd64`),
+  downloaded with `curl`, verified with `sha256sum -c` before anything trusts the bytes, installed to
+  `/usr/local/bin/cloudflared` mode 755, `cloudflared --version` run as a build check. The digest was taken
+  from GitHub's release API AND independently reproduced by downloading the asset and hashing it directly.
+- **`docker/cloudflared-run.sh`** (baked to `/opt/cloudflared-run.sh`) — the `[program:cloudflared]` command.
+  With no `CLOUDFLARE_TUNNEL_TOKEN` (a RunPod secret): logs one line ("no CLOUDFLARE_TUNNEL_TOKEN; tunnel
+  disabled") and exits 0 — never `sleep infinity`, so `supervisorctl status` reads "EXITED" for a disabled
+  tunnel rather than a `RUNNING` that is secretly doing nothing. With a token: moves it from
+  `CLOUDFLARE_TUNNEL_TOKEN` to cloudflared's own `TUNNEL_TOKEN` env var and `exec`s
+  `cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:8082 run` — the token goes via environment ONLY,
+  never on argv (which `ps`/supervisord's own logging would show).
+- **`[program:cloudflared]`** (`supervisord.conf`, priority 21, after `openwebui`=20): `autostart=true`,
+  `autorestart=unexpected` + `exitcodes=0` (a clean exit — disabled — is expected and is not restarted;
+  anything else is), `startsecs=0` (**not** a positive value — see the section below), `startretries=5`,
+  `stopwaitsecs=10`. No `environment=` line references `CLOUDFLARE_TUNNEL_TOKEN`; the script inherits it from
+  the container environment the same way `[program:compactor]` inherits its own `COMPACTOR_*` vars.
+- **`/health/full`'s `tunnel` block** (`compactor/health.py`, `probe_tunnel`): `{"configured": bool, "ready":
+  bool|None}` — `configured` is derived only from whether the env var is present, never its value; `ready`
+  probes cloudflared's own loopback-only metrics endpoint (`--metrics 127.0.0.1:8082`) at `/ready`.
+  Visibility only, same doctrine as `word_ban`/`bg`/`tokenizer` elsewhere in that function — never moves
+  `status`. No existing `/health/full` key changed.
+- Tests: `compactor/test_cloudflared_run.py` (runs the real script under `bash` with a stub `cloudflared` on
+  `PATH` that records its own argv/env — proves the token is in env only, never argv, in both the
+  disabled and enabled paths), `compactor/test_supervisord_cloudflared.py` (static parse test on the shipped
+  `[program:cloudflared]` section), five new cases in `compactor/test_health.py` for `probe_tunnel` and the
+  new `/health/full` key, and `scripts/rc-boot-test-v3199.sh` (a copy of `rc-boot-test-v3198.sh` plus a third
+  boot with a fake token and cloudflared-specific assertions on both boots).
+
+### Fixed (found by actually booting the RC, not by reasoning about supervisord alone)
+- **`startsecs` for `[program:cloudflared]` MUST be 0, not any positive value.** A first draft used
+  `startsecs=1` on the theory that the disabled path's near-instant `exit 0` would still land inside
+  `startsecs` and read as a normal, expected start-and-stop. It does not: supervisord only judges an exit
+  against `exitcodes`/`autorestart` for a process that has *survived* `startsecs`; one that exits before then
+  — however cleanly — is instead scored as a **start failure**, which ignores `exitcodes` entirely and,
+  after `startretries`, lands on **FATAL**. `rc-boot-test-v3199.sh`'s first real run against
+  `local/zla:v3199-rc` (no token) showed exactly this: `cloudflared` went FATAL, not EXITED. Fixed to
+  `startsecs=0` (the same value `[program:zl-ops]`/`[program:selftest]` already use for the identical
+  reason) and re-verified by re-running the same boot test: both the disabled path (EXITED) and the
+  enabled-but-bad-token path (kept retrying, never FATAL, no other program affected) now land where the
+  design intended.
+
+### Not changed
+- OpenWebUI's own defaults (`WEBUI_URL`, `CORS_ALLOW_ORIGIN`, session-cookie settings,
+  `forwarded_allow_ips`) are left as shipped. Recommended RunPod-template values for the new origin are in
+  RUNBOOK_CLOUDFLARE_TUNNEL.md, not baked into the image.
+- `ops/` — the ops tooling is owned by a separate session; this release only lists what `zl`/`podenv` would
+  need to know about the new program (see RUNBOOK_CLOUDFLARE_TUNNEL.md's "ops asks" section) rather than
+  editing `ops/` directly.
+
+---
+
 ## [3.1.9.8] — request tracing, the word ban from a file, pre-cut speed fixes, the ops bundle, the forget ledger
 
 **Released 2026-09-27 as tag `v3.1.9.8`.** Build both images from `Dockerfile.v3198` (the `rollback` and `rc` targets,

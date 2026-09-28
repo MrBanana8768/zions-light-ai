@@ -2733,3 +2733,14 @@ else no ban at all): `python3 scripts/word-ban-deploy.py clear --yes`.
 (title/tags/follow-ups/autocomplete) run through the exact same two vLLM call sites her real reply does, and
 always have received the pasted custom param — the file keeps that, deliberately, rather than narrowing it
 without being asked.
+
+## Cloudflare Tunnel (v3.1.9.9)
+
+Her OpenWebUI is reachable at `https://ai.revelationsaints.com` via a Cloudflare Tunnel
+(`[program:cloudflared]`, `docker/cloudflared-run.sh`), alongside the RunPod proxy URL during the transition.
+One-time dashboard setup, the RunPod secret, verification commands, rollback/disabling, and the
+Cloudflare-limits findings (proxied-origin timeout vs her cold-boot reply time, upload size, websockets) are
+all in **RUNBOOK_CLOUDFLARE_TUNNEL.md** — read that file first for anything tunnel-related; this file does
+not duplicate it. Quick status check: `supervisorctl status cloudflared` (EXITED = disabled/no token,
+RUNNING = tunnel up, FATAL = investigate — see the runbook if you ever see FATAL, it should not happen by
+design) and `/health/full`'s `tunnel` block (`configured`, `ready`).

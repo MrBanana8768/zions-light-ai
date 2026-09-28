@@ -121,6 +121,92 @@ def test_probe_vllm_empty_model_list():
 
 
 # ---------------------------------------------------------------------------
+# probe_tunnel (v3.1.9.9, task 7)
+# ---------------------------------------------------------------------------
+
+def test_probe_tunnel_not_configured():
+    print("\n[test] probe_tunnel: configured=False, ready=None, no probe made, when the env var is unset/empty")
+
+    async def go():
+        with patch.dict(os.environ, {"CLOUDFLARE_TUNNEL_TOKEN": ""}, clear=False):
+            with patch("health.httpx.AsyncClient") as MockClient:
+                r = await health.probe_tunnel()
+                assert_eq(MockClient.called, False, "no HTTP probe attempted when unconfigured")
+                return r
+
+    r = asyncio.run(go())
+    assert_eq(r["configured"], False, "configured=False")
+    assert_eq(r["ready"], None, "ready=None")
+    assert_true("error" not in r, "no error key when simply unconfigured")
+
+
+def test_probe_tunnel_configured_and_ready():
+    print("\n[test] probe_tunnel: configured=True, ready=True when cloudflared's /ready answers 200")
+
+    async def go():
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        with patch.dict(os.environ, {"CLOUDFLARE_TUNNEL_TOKEN": "fake-token-not-real"}, clear=False):
+            with patch("health.httpx.AsyncClient") as MockClient:
+                instance = MockClient.return_value.__aenter__.return_value
+                instance.get = AsyncMock(return_value=mock_resp)
+                r = await health.probe_tunnel()
+                called_url = instance.get.call_args[0][0]
+                assert_eq(called_url, "http://127.0.0.1:8082/ready", "probes cloudflared's own loopback metrics port")
+                return r
+
+    r = asyncio.run(go())
+    assert_eq(r["configured"], True, "configured=True")
+    assert_eq(r["ready"], True, "ready=True")
+
+
+def test_probe_tunnel_configured_but_unreachable():
+    print("\n[test] probe_tunnel: configured=True, ready=None with an error, when cloudflared's metrics port is unreachable")
+
+    async def go():
+        with patch.dict(os.environ, {"CLOUDFLARE_TUNNEL_TOKEN": "fake-token-not-real"}, clear=False):
+            with patch("health.httpx.AsyncClient") as MockClient:
+                instance = MockClient.return_value.__aenter__.return_value
+                instance.get = AsyncMock(side_effect=ConnectionError("refused"))
+                return await health.probe_tunnel()
+
+    r = asyncio.run(go())
+    assert_eq(r["configured"], True, "configured=True even though unreachable")
+    assert_eq(r["ready"], None, "ready=None, not False — unreachable is unknown, not 'not ready'")
+    assert_true("error" in r, "error key present")
+
+
+def test_probe_tunnel_never_logs_the_token_value():
+    print("\n[test] probe_tunnel's return value never contains the token string itself")
+
+    async def go():
+        with patch.dict(os.environ, {"CLOUDFLARE_TUNNEL_TOKEN": "SUPER-SECRET-FAKE-VALUE"}, clear=False):
+            with patch("health.httpx.AsyncClient") as MockClient:
+                instance = MockClient.return_value.__aenter__.return_value
+                instance.get = AsyncMock(side_effect=ConnectionError("refused"))
+                return await health.probe_tunnel()
+
+    r = asyncio.run(go())
+    assert_true("SUPER-SECRET-FAKE-VALUE" not in repr(r), "token value is not present anywhere in the returned dict")
+
+
+def test_gather_health_full_includes_tunnel_block_and_does_not_move_status():
+    print("\n[test] gather_health_full: 'tunnel' key present, visibility-only (unconfigured => status unaffected)")
+
+    async def go():
+        with patch.dict(os.environ, {"CLOUDFLARE_TUNNEL_TOKEN": ""}, clear=False):
+            with patch("health.probe_vllm", new=AsyncMock(return_value={
+                "ok": True, "latency_ms": 10.0, "models": ["m"], "error": None,
+            })):
+                return await health.gather_health_full("http://fake", 4096)
+
+    r = asyncio.run(go())
+    assert_true("tunnel" in r, "'tunnel' key present in gather_health_full's return")
+    assert_eq(r["tunnel"]["configured"], False, "tunnel.configured=False with no token")
+    assert_eq(r["status"], "ok", "an unconfigured tunnel does not degrade status")
+
+
+# ---------------------------------------------------------------------------
 # probe_storage
 # ---------------------------------------------------------------------------
 
@@ -871,6 +957,11 @@ def _all_tests():
         test_probe_vllm_4xx,
         test_probe_vllm_network_error,
         test_probe_vllm_empty_model_list,
+        test_probe_tunnel_not_configured,
+        test_probe_tunnel_configured_and_ready,
+        test_probe_tunnel_configured_but_unreachable,
+        test_probe_tunnel_never_logs_the_token_value,
+        test_gather_health_full_includes_tunnel_block_and_does_not_move_status,
         test_probe_storage_writable,
         test_probe_storage_reports_disk_usage,
         test_gather_memory_stats_empty,
