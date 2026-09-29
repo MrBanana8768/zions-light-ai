@@ -66,13 +66,17 @@ WEBUI_DIR = Path(_env("DATA_DIR", "/data/openwebui"))
 STORE = Path(_env("COMPACTOR_STORAGE_ROOT", str(WEBUI_DIR / "compactor")))
 BACKUPS = Path(_env("COMPACTOR_BACKUP_DIR", "/data/backups"))
 LOG_DIR = Path(_env("LOG_DIR", "/data/logs"))
-FORENSICS = DATA / "forensics"
-SSH_PERSIST = DATA / "ssh"  # private host keys: never bundle, never print
+# v3.1.9.10: the three /data siblings below follow the SAME env vars the
+# programs that own them read (webuidb.py WEBUI_DB_QUARANTINE, setup-sshd.py
+# SETUP_SSHD_HOST_KEY_STORE), default unchanged, so a pod whose data is not the
+# volume's /data root never points `zl` at another pod's directories.
+FORENSICS = Path(_env("WEBUI_DB_QUARANTINE", str(DATA / "forensics")))
+SSH_PERSIST = Path(_env("SETUP_SSHD_HOST_KEY_STORE", str(DATA / "ssh")))  # private host keys: never bundle, never print
 HF_HOME = Path(_env("HF_HOME", "/data/models"))  # Dockerfile:378; clean-models.sh's own default
 # `zl shadow`'s storage root (COMMANDS.md "Shadow deploy"). Never STORE itself
 # (that would point a shadow compactor at her live memory) -- callers must
 # refuse if this resolves equal to STORE.
-SHADOW_STORE = DATA / "shadow-compactor"
+SHADOW_STORE = Path(_env("ZL_SHADOW_STORE", str(DATA / "shadow-compactor")))
 
 # The bundle's own persistent home: the saved bootstrap, the pinned ref,
 # the audit log, generated log bundles, uploaded wordban checks.

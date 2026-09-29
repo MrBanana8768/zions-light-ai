@@ -45,9 +45,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-DEFAULT_FILE = Path(
-    os.environ.get("COMPACTOR_WORDBAN_FILE", "") or "/data/zl-ops/word-ban/active.json"
-)
+# v3.1.9.10: this pod's path, not another pod's (scripts/_podpaths.py: own env,
+# then supervisord's, then the ZL_HOME-derived default compactor/wordban_runtime.py
+# uses).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _podpaths  # noqa: E402
+
+DEFAULT_FILE = Path(_podpaths.wordban_file())
 
 # scripts/wordban/banlist.yaml's own `model:` line (v8: coder3101/
 # Cydonia-24B-v4.3-vision-heretic) — hostile review round 1, F8: the file

@@ -26,7 +26,13 @@ rm -f /data/.write-test
 echo "      /data is writable"
 
 # Create persistent subdirs on the volume (empty on first attach).
-mkdir -p "${HF_HOME}" "${DATA_DIR}" /data/vllm-compile-cache
+# v3.1.9.10: the torch.compile cache directory is overridable. Default
+# unchanged (/data/vllm-compile-cache). A second pod on the SAME network volume
+# should point this at its own directory: the cache is written on a miss, and
+# two live pods writing one content-addressed cache is the only place they could
+# otherwise collide (RUNBOOK_POD_MIGRATION.md).
+export VLLM_COMPILE_CACHE="${VLLM_COMPILE_CACHE:-/data/vllm-compile-cache}"
+mkdir -p "${HF_HOME}" "${DATA_DIR}" "${VLLM_COMPILE_CACHE}"
 
 # Logs live on the volume, not in the container. A container-local log dies
 # with the container, so every redeploy, OOM-kill or pod recreate destroyed
@@ -94,8 +100,8 @@ echo "      driver ${DRIVER} OK for ${CUDA_LABEL} (needs >= ${MIN_DRIVER})"
 if [ ! -L /root/.cache/vllm ]; then
     mkdir -p /root/.cache
     rm -rf /root/.cache/vllm
-    ln -s /data/vllm-compile-cache /root/.cache/vllm
-    echo "      torch.compile cache linked to /data/vllm-compile-cache"
+    ln -s "${VLLM_COMPILE_CACHE}" /root/.cache/vllm
+    echo "      torch.compile cache linked to ${VLLM_COMPILE_CACHE}"
 fi
 
 echo ""
@@ -677,7 +683,7 @@ echo ""
 echo "      Note: vLLM downloads model weights on first run; first startup"
 echo "      may take 5-15 minutes depending on model size and network speed."
 echo "      Weights are cached to ${HF_HOME} (persist via volume mount)."
-echo "      torch.compile cache lives at /data/vllm-compile-cache — second"
+echo "      torch.compile cache lives at ${VLLM_COMPILE_CACHE} — second"
 echo "      and later cold starts skip the 60-120s CUDA graph capture."
 echo "=============================================="
 

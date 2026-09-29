@@ -47,6 +47,9 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _podpaths  # noqa: E402  (v3.1.9.10: this pod's paths, not another pod's)
+
 
 def say(m=""):
     print(m, flush=True)
@@ -129,9 +132,9 @@ def compactor_state(root: Path) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--backup", help="archive path (default: newest in --backup-dir)")
-    ap.add_argument("--backup-dir", default="/data/backups")
-    ap.add_argument("--live-db", default="/data/openwebui/webui.db")
-    ap.add_argument("--live-compactor", default="/data/openwebui/compactor")
+    ap.add_argument("--backup-dir", default=_podpaths.backups())
+    ap.add_argument("--live-db", default=_podpaths.snapshot_db())
+    ap.add_argument("--live-compactor", default=_podpaths.store())
     args = ap.parse_args()
 
     archive = args.backup or newest_backup(args.backup_dir)

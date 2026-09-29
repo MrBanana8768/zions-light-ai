@@ -198,7 +198,10 @@ import _webui_live_path as _live  # noqa: E402
 
 TOOL_NAME = "clean-decoration.py"
 
-DEFAULT_STORE = "/data/openwebui/compactor"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _podpaths  # noqa: E402  (v3.1.9.10: this pod's paths, not another pod's)
+
+DEFAULT_STORE = _podpaths.store()
 DEFAULT_HEALTH_URL = "http://127.0.0.1:8080/health"
 DEFAULT_OPENWEBUI_PORT = 8080
 HEALTH_PROBE_TIMEOUT_S = 3

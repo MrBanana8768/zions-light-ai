@@ -34,6 +34,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _podpaths  # noqa: E402  (v3.1.9.10: this pod's paths, not another pod's)
+
 SUPERVISOR_CONF = Path(
     os.environ.get("SUPERVISOR_CONF", "/etc/supervisor/conf.d/supervisord.conf")
 )
@@ -46,10 +49,10 @@ SUPERVISOR_CONF = Path(
 # older one this hot-patch form was actually written for.
 ENTRYPOINT_SH = Path(os.environ.get("ENTRYPOINT_SH", "/entrypoint.sh"))
 LOCAL_DB = Path(os.environ.get("WEBUI_LOCAL_DB", "/var/lib/openwebui/webui.db"))
-SNAPSHOT_DB = Path(os.environ.get("WEBUI_SNAPSHOT_DB", "/data/openwebui/webui.db"))
+SNAPSHOT_DB = Path(_podpaths.snapshot_db())
 COMPACTOR_DIR = Path(os.environ.get("COMPACTOR_DIR", "/opt/compactor"))
 VENV_PY = os.environ.get("VENV_PY", "/opt/compactor-venv/bin/python")
-LOG_DIR = os.environ.get("LOG_DIR", "/data/logs")
+LOG_DIR = _podpaths.log_dir()
 SYNC_INTERVAL = os.environ.get("WEBUI_DB_SYNC_INTERVAL_S", "300")
 
 MARKER = "; --- webuidb local-disk hot-patch ---"

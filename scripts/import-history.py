@@ -204,7 +204,10 @@ HERE = Path(__file__).resolve().parent
 # module global rather than computed fresh inside every function.
 OPT_COMPACTOR = Path("/opt/compactor")
 
-DEFAULT_STORE = "/data/openwebui/compactor"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _podpaths  # noqa: E402  (v3.1.9.10: this pod's paths, not another pod's)
+
+DEFAULT_STORE = _podpaths.store()
 DEFAULT_VLLM_URL = "http://127.0.0.1:8000"
 DEFAULT_HEALTH_URL = "http://127.0.0.1:8080/health"
 DEFAULT_MAX_CALLS = 200

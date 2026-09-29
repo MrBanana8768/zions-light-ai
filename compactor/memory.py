@@ -27,12 +27,25 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
+import envcfg  # noqa: F401  (side effect: adopt_pod_env(), before any path is read)
+
 logger = logging.getLogger("compactor.memory")
 
 # Storage root on the persistent volume. Subdirs: facts/, summaries/,
 # chromadb/. Configurable for tests; default matches V2_PLAN.md.
+#
+# v3.1.9.10: the default FOLLOWS DATA_DIR (as backup.py's own STORAGE_ROOT
+# always did). It used to be the literal /data/openwebui/compactor, so a pod
+# whose DATA_DIR pointed elsewhere but that forgot COMPACTOR_STORAGE_ROOT wrote
+# its memory into ANOTHER pod's store while backup.py (which followed DATA_DIR)
+# refused to back up an empty directory. With DATA_DIR unset the value is
+# unchanged. `import envcfg` first: it adopts the pod's path environment in an
+# operator shell that lacks it.
 STORAGE_ROOT = Path(
-    os.environ.get("COMPACTOR_STORAGE_ROOT", "/data/openwebui/compactor")
+    os.environ.get(
+        "COMPACTOR_STORAGE_ROOT",
+        str(Path(os.environ.get("DATA_DIR") or "/data/openwebui") / "compactor"),
+    )
 )
 
 # Conv-id sanitization: filesystem-safe charset, length-capped to prevent

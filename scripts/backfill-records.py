@@ -217,7 +217,10 @@ HERE = Path(__file__).resolve().parent
 # module global rather than computed fresh inside every function.
 OPT_COMPACTOR = Path("/opt/compactor")
 
-DEFAULT_STORE = "/data/openwebui/compactor"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _podpaths  # noqa: E402  (v3.1.9.10: this pod's paths, not another pod's)
+
+DEFAULT_STORE = _podpaths.store()
 # M3: a module-level name, like HERE/OPT_COMPACTOR above — main() reassigns
 # it from --health-url before any liveness probe runs, and
 # _compactor_is_alive() reads it fresh rather than via a default-parameter
