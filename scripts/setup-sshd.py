@@ -275,6 +275,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _podpaths  # noqa: E402  (v3.1.9.10: this pod's paths, not another pod's)
+
 # ---------------------------------------------------------------------------
 # Injectable roots. Defaults are the real pod paths; every one is
 # overridable via an env var so compactor/test_setup_sshd_script.py can
@@ -293,7 +296,7 @@ ROOT_HOME_DIR = Path(os.environ.get("SETUP_SSHD_ROOT_HOME", "/root"))
 ROOT_SSH_DIR = ROOT_HOME_DIR / ".ssh"
 AUTHORIZED_KEYS = ROOT_SSH_DIR / "authorized_keys"
 
-HOST_KEY_STORE = Path(os.environ.get("SETUP_SSHD_HOST_KEY_STORE", "/data/ssh"))
+HOST_KEY_STORE = Path(_podpaths.get("SETUP_SSHD_HOST_KEY_STORE", "/data/ssh"))
 
 SUPERVISOR_CONF = Path(os.environ.get(
     "SETUP_SSHD_SUPERVISOR_CONF", "/etc/supervisor/conf.d/supervisord.conf"
@@ -307,7 +310,7 @@ MARKER_VENV = Path(os.environ.get("SETUP_SSHD_MARKER_VENV", "/opt/compactor-venv
 MARKER_MAIN = Path(os.environ.get("SETUP_SSHD_MARKER_MAIN", "/opt/compactor/main.py"))
 
 HOST_KEY_TYPES = ("rsa", "ecdsa", "ed25519")
-DEFAULT_LOG_DIR = os.environ.get("LOG_DIR", "/data/logs")
+DEFAULT_LOG_DIR = _podpaths.log_dir()
 
 # /proc/net/tcp[6] and /proc itself are kernel-global truth, never
 # something a test should redirect to a fake tree — H6's listening check,

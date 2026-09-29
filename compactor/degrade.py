@@ -48,7 +48,8 @@ _CHECK_TTL_S = env_float("COMPACTOR_DEGRADE_CHECK_TTL_S", 10)
 
 # What volume to watch. Defaults to the storage root's filesystem.
 _WATCH_PATH = os.environ.get(
-    "COMPACTOR_STORAGE_ROOT", "/data/openwebui/compactor"
+    "COMPACTOR_STORAGE_ROOT",
+    str(Path(os.environ.get("DATA_DIR") or "/data/openwebui") / "compactor"),
 )
 
 # Cache: (monotonic_expiry, allowed, free_mb)

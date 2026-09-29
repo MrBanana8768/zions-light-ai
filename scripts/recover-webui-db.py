@@ -47,12 +47,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _webui_live_path as _live  # noqa: E402
+import _podpaths  # noqa: E402  (v3.1.9.10)
 
 TOOL_NAME = "recover-webui-db.py"
 
-DB = Path(os.environ.get("WEBUI_DB", "/data/openwebui/webui.db"))
+DB = Path(os.environ.get("WEBUI_DB") or _podpaths.snapshot_db())
 RESCUE = Path("/tmp/rescue")
-FORENSICS = Path(os.environ.get("WEBUI_DB_FORENSICS", "/data/forensics"))
+FORENSICS = Path(_podpaths.forensics())
 # Journals SQLite may leave beside the database. -journal is the rollback
 # journal (the one seen in production); -wal/-shm appear in WAL mode.
 SIDECARS = ("-journal", "-wal", "-shm")

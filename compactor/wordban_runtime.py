@@ -144,7 +144,11 @@ def _default_file() -> Path:
     # restore machinery owns and this file must stay outside of for the
     # same reason CONTROL_ROOT/PENDING_ROOT do (a restore must not silently
     # roll the deployed grammar back).
-    return Path("/data/zl-ops/word-ban/active.json")
+    #
+    # v3.1.9.10: follows ZL_HOME (the same env var ops/zlops/podenv.py and
+    # ops/bootstrap.sh read, default /data/zl-ops), so a pod whose ZL_HOME is
+    # elsewhere cannot read or warm from another pod's deployed grammar.
+    return Path(os.environ.get("ZL_HOME") or "/data/zl-ops") / "word-ban" / "active.json"
 
 
 WORDBAN_FILE = Path(os.environ.get("COMPACTOR_WORDBAN_FILE", "") or _default_file())

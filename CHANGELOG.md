@@ -9,6 +9,34 @@ on Docker Hub.
 
 ---
 
+## [3.1.9.10, part B] — old pod to new pod: path audit and migration tooling
+
+Two pods now share one network volume for a while (the old prod pod, then a new pod on `WEBUI_DB_LOCAL=true` with
+its data under `/data/v10`). This part makes sure the new pod cannot touch the old pod's files, and moves the data.
+Owner runbook: **RUNBOOK_POD_MIGRATION.md**. The audit and the exact env block: **docs/PATHS-v31910.md**.
+
+### Added
+- **`scripts/pod-migrate.py`** (stdlib only, shipped in the image via `COPY scripts/`): `seed` / `cutover` / `verify`,
+  dry run by default, exit 0/1/2, counts-only output. SQLite backup API on a read-only source; the old tree is never
+  written (except by the explicit `cutover --reverse` rollback). `cutover` refuses unless the old pod is confirmed
+  stopped (`--old-pod-stopped`, no journal beside the old DB, tree quiet for 60 s) and this pod's own writers are stopped,
+  and it REPLACES the local live DB (a healthy stale local DB would otherwise win at the next boot and be published
+  over the fresh snapshot). `file.path` rows are rewritten to the new pod's uploads. Tests: `compactor/test_pod_migrate.py`.
+- **`envcfg.adopt_pod_env()`**: an operator shell without the pod's environment (RunPod Web Terminal) adopts the pod's
+  PATH and DB-gate variables from supervisord (never secrets, never `WEBUI_DB_ALLOW_*`), so `backup.py --once` and
+  `webuidb.py --sync-once --force` resolve to THIS pod's paths. **`scripts/_podpaths.py`**: the same for the operator scripts.
+- **`VLLM_COMPILE_CACHE`** (entrypoint; default unchanged), `ZL_SHADOW_STORE` (`zl shadow`).
+- `compactor/test_path_isolation.py`: defaults, adoption, and a static sweep that fails on any new hardcoded `/data` path.
+
+### Fixed
+- The compactor store default (`memory.py`, `degrade.py`) followed a hardcoded `/data/openwebui/compactor`, not `DATA_DIR`:
+  a pod with `DATA_DIR` redirected wrote its memory into another pod's store. Now follows `DATA_DIR`.
+- The uploads-mirror default (`/data/backups/uploads`) now follows `COMPACTOR_BACKUP_DIR`; the word-ban file default follows
+  `ZL_HOME`; the snapshot default (`webuidb.py`, `health.py`) follows `DATA_DIR`; `podenv.py` forensics/ssh/shadow paths and
+  ten operator scripts follow the pod's environment. Every default is unchanged when the environment is unset.
+
+---
+
 ## [3.1.9.9] — Cloudflare Tunnel: `https://ai.revelationsaints.com` instead of the RunPod proxy URL
 
 **Released 2026-09-29 as tag `v3.1.9.9`.** Build both images from `Dockerfile.v3199` (targets `rollback` and `rc`). Deploy on top of a running v3.1.9.8; the steps are in the owner runbook (DEPLOY-v3.1.9.9.md).

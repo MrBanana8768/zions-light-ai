@@ -179,3 +179,92 @@ def env_window_s(name: str, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return v if math.isfinite(v) and v > 0 else default
+
+
+# ---------------------------------------------------------------------------
+# v3.1.9.10: adopt the pod's PATH environment in operator shells.
+#
+# THE HAZARD. Every supervised program inherits the pod's full environment
+# (the RunPod template rows plus what entrypoint.sh exports). A RunPod Web
+# Terminal shell, or a `docker exec`, may NOT: it can start with only the image
+# ENV defaults. A compactor CLI run from such a shell (`backup.py --once`,
+# `webuidb.py --sync-once --force`, anything importing memory.py) then resolves
+# every path to its built-in default, /data/openwebui, /data/backups,
+# /data/forensics ... On a pod whose data lives elsewhere (the v3.1.9.10 new
+# pod, DATA_DIR=/data/v10/openwebui, beside a still-live old pod that owns
+# /data/openwebui on the same network volume) that silently aims a WRITER at
+# the OTHER pod's files. `webuidb.py --sync-once --force` from such a shell
+# would publish the new pod's local database over the old pod's live one.
+#
+# THE FIX, deliberately narrow: when this process is NOT supervisord's child
+# and the pod's supervisord (pid 1 in this image) is readable, copy the names
+# in POD_PATH_ENV that are ABSENT from this process's own environment out of
+# /proc/1/environ. Only paths and the DB placement gate: never a secret, never
+# a one-shot override flag (WEBUI_DB_ALLOW_* must never be adopted), never a
+# tuning knob. A value already in this process's environment always wins, so
+# `DATA_DIR=/x python backup.py` still means /x. On anything that is not a pod
+# (a test container, a laptop: pid 1 is not supervisord) this does nothing.
+# ---------------------------------------------------------------------------
+
+POD_PATH_ENV = (
+    "DATA_DIR",
+    "LOG_DIR",
+    "ZL_HOME",
+    "HF_HOME",
+    "WEBUI_DB_LOCAL",
+    "WEBUI_LOCAL_DB",
+    "WEBUI_SNAPSHOT_DB",
+    "WEBUI_DB_QUARANTINE",
+    "WEBUI_DB_FORENSICS",
+    "WEBUI_DB_EMPTY_START_MARKER",
+    "DATABASE_URL",
+    "VLLM_COMPILE_CACHE",
+    "ZL_SHADOW_STORE",
+    "SETUP_SSHD_HOST_KEY_STORE",
+    "COMPACTOR_STORAGE_ROOT",
+    "COMPACTOR_CONTROL_ROOT",
+    "COMPACTOR_PENDING_ROOT",
+    "COMPACTOR_BACKUP_DIR",
+    "COMPACTOR_BACKUP_WEBUI_DB",
+    "COMPACTOR_BACKUP_LOCAL_STAGING_DIR",
+    "COMPACTOR_UPLOADS_DIR",
+    "COMPACTOR_UPLOADS_BACKUP_DIR",
+    "COMPACTOR_WORDBAN_FILE",
+    "COMPACTOR_DATA_VOLUME_ROOT",
+)
+
+_PROC1_COMM = "/proc/1/comm"
+_PROC1_ENVIRON = "/proc/1/environ"
+
+
+def adopt_pod_env(comm_path: str = _PROC1_COMM, environ_path: str = _PROC1_ENVIRON) -> list[str]:
+    """Fill absent POD_PATH_ENV names from supervisord's environment.
+
+    Returns the names adopted (for tests; nothing is logged this early).
+    Never raises. Does nothing unless pid 1 is supervisord.
+    """
+    try:
+        with open(comm_path, "r", encoding="utf-8", errors="replace") as fh:
+            if not fh.read().strip().startswith("supervisord"):
+                return []
+        with open(environ_path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return []
+    adopted: list[str] = []
+    for part in raw.split(b"\0"):
+        key, sep, value = part.partition(b"=")
+        if not sep:
+            continue
+        name = key.decode("utf-8", "replace")
+        if name not in POD_PATH_ENV or name in os.environ:
+            continue
+        text = value.decode("utf-8", "replace")
+        if not text.strip():
+            continue
+        os.environ[name] = text
+        adopted.append(name)
+    return adopted
+
+
+adopt_pod_env()

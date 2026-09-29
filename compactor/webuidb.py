@@ -60,8 +60,16 @@ logger = logging.getLogger("compactor.webuidb")
 LOCAL_DB = Path(os.environ.get("WEBUI_LOCAL_DB", "/var/lib/openwebui/webui.db"))
 # The durable snapshot: OpenWebUI's original path, so a rollback is just
 # unsetting DATABASE_URL.
+#
+# v3.1.9.10: the default follows DATA_DIR (it was the literal
+# /data/openwebui/webui.db). entrypoint.sh always exports WEBUI_SNAPSHOT_DB
+# derived from DATA_DIR, so the supervised daemon never used the default; an
+# operator shell that lacked WEBUI_SNAPSHOT_DB, on a pod whose DATA_DIR is not
+# /data/openwebui, would have aimed `--sync-once --force` at ANOTHER pod's live
+# database. (envcfg's adopt_pod_env() also fills the name from supervisord.)
 SNAPSHOT_DB = Path(
-    os.environ.get("WEBUI_SNAPSHOT_DB", "/data/openwebui/webui.db")
+    os.environ.get("WEBUI_SNAPSHOT_DB")
+    or str(Path(os.environ.get("DATA_DIR") or "/data/openwebui") / "webui.db")
 )
 SYNC_INTERVAL_S = env_float("WEBUI_DB_SYNC_INTERVAL_S", 300)
 # H-2/D11 (review1-v3197-65ea196). health.py's probe_snapshot() used to

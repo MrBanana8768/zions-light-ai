@@ -493,7 +493,7 @@ def probe_sqlite_journal() -> dict:
     """
     live_db, live_err = _resolve_live_webui_db()
     live_path = str(live_db) if live_db is not None else None
-    snap = os.environ.get("WEBUI_SNAPSHOT_DB", "/data/openwebui/webui.db")
+    snap = (os.environ.get("WEBUI_SNAPSHOT_DB") or os.path.join(os.environ.get("DATA_DIR") or "/data/openwebui", "webui.db"))
 
     checked: dict[str, dict] = {}
     if live_path is not None:
@@ -773,7 +773,7 @@ def probe_snapshot() -> dict:
     coming back on its own.
     """
     enabled = os.environ.get("WEBUIDB_SYNC_ENABLED", "").strip().lower() == "true"
-    snap = os.environ.get("WEBUI_SNAPSHOT_DB", "/data/openwebui/webui.db")
+    snap = (os.environ.get("WEBUI_SNAPSHOT_DB") or os.path.join(os.environ.get("DATA_DIR") or "/data/openwebui", "webui.db"))
     # RANGED HERE, because envcfg does not range anything (its own docstring
     # says so) and this value is arithmetic, not a label (v3.1.9, hostile pass
     # 2 H-4). Measured before this: `inf` - reachable from a typo, `1e400`

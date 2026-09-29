@@ -50,9 +50,17 @@ from pathlib import Path
 # Same defaults and same override env vars as compactor/webuidb.py, so a
 # test (or an operator) pointing that module somewhere else via
 # WEBUI_LOCAL_DB/WEBUI_SNAPSHOT_DB is automatically in sync with this one.
+#
+# v3.1.9.10: defaults come from scripts/_podpaths.py (own env, then supervisord's,
+# then the built-in default), so a pod whose data is not under /data/openwebui
+# never has a tool default to another pod's files. WEBUI_DB_FORENSICS falls back
+# to WEBUI_DB_QUARANTINE (webuidb.py's own name for the same directory).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _podpaths  # noqa: E402
+
 LOCAL_DB = Path(os.environ.get("WEBUI_LOCAL_DB", "/var/lib/openwebui/webui.db"))
-SNAPSHOT_DB = Path(os.environ.get("WEBUI_SNAPSHOT_DB", "/data/openwebui/webui.db"))
-FORENSICS_ROOT = Path(os.environ.get("WEBUI_DB_FORENSICS", "/data/forensics"))
+SNAPSHOT_DB = Path(_podpaths.snapshot_db())
+FORENSICS_ROOT = Path(_podpaths.forensics())
 
 # D1/the rehearsal's own "Final sync" recipe — the ONLY documented way to
 # force a local-mode write to reach the durable snapshot immediately,

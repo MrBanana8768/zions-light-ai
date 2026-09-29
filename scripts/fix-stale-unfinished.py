@@ -197,6 +197,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _podpaths  # noqa: E402  (v3.1.9.10: this pod's paths, not another pod's)
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _webui_live_path as _live  # noqa: E402
 
 DEFAULT_CHAT_ID = "ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"
@@ -207,7 +210,7 @@ TOOL_NAME = "fix-stale-unfinished.py"
 
 
 def forensics_base():
-    return Path(os.environ.get("FSU_FORENSICS_DIR", "/data/forensics"))
+    return Path(os.environ.get("FSU_FORENSICS_DIR") or _podpaths.forensics())
 
 
 def utc_stamp():

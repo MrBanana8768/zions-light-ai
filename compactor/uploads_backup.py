@@ -91,8 +91,15 @@ UPLOADS_DIR = Path(os.environ.get("COMPACTOR_UPLOADS_DIR", str(DATA_DIR / "uploa
 # Where the mirror lives. A sibling of backup.py's own COMPACTOR_BACKUP_DIR
 # default, but a SEPARATE tree (the owner's ask: not inside the main
 # archive).
+#
+# v3.1.9.10: the default follows COMPACTOR_BACKUP_DIR (was the literal
+# /data/backups/uploads), so a pod that redirects its backups but forgets this
+# row cannot mirror uploads into, or expire files from, another pod's mirror.
 UPLOADS_BACKUP_DIR = Path(
-    os.environ.get("COMPACTOR_UPLOADS_BACKUP_DIR", "/data/backups/uploads")
+    os.environ.get(
+        "COMPACTOR_UPLOADS_BACKUP_DIR",
+        str(Path(os.environ.get("COMPACTOR_BACKUP_DIR") or "/data/backups") / "uploads"),
+    )
 )
 
 MANIFEST_NAME = "manifest.json"

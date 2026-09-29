@@ -39,9 +39,12 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_UPLOADS_DIR = "/data/openwebui/uploads"
-DEFAULT_BACKUP_ROOT = "/data/backups/uploads"
-DEFAULT_DB = "/data/openwebui/webui.db"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _podpaths  # noqa: E402  (v3.1.9.10: this pod's paths, not another pod's)
+
+DEFAULT_UPLOADS_DIR = _podpaths.uploads()
+DEFAULT_BACKUP_ROOT = _podpaths.uploads_backup()
+DEFAULT_DB = _podpaths.snapshot_db()
 MANIFEST_NAME = "manifest.json"
 # Same name/shape as compactor/uploads_backup.py's own STATUS_NAME/
 # _write_status — an independent copy here (this script must not import
