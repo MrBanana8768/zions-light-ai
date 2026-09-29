@@ -373,9 +373,13 @@ def test_local_db_replacement():
     r = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, env=env, cwd=str(_HERE))
     assert_true('"kept_local"' in r.stdout, "CONTROL: the boot restore keeps a healthy stale local file (this is the hazard)")
     assert_eq(scalar(local, "select count(*) from chat where id='test-only-chat'"), 1, "CONTROL: the stale local DB is still the live one")
-    # the fix under test
+    # the fix under test. The stale local DB is a WRITTEN one now, so the tool insists on being told
     rc, out = run(w, "cutover", "--old-pod-stopped", "--apply")
-    assert_eq(rc, 0, "cutover exits 0")
+    assert_eq(rc, 2, "cutover REFUSES while the new pod's local DB has writes the tool did not install")
+    assert_eq(scalar(local, "select count(*) from chat where id='test-only-chat'"), 1, "... and changed nothing")
+    rc, out = run(w, "cutover", "--old-pod-stopped", "--apply", "--discard-new-pod-writes")
+    assert_eq(rc, 0, "cutover exits 0 with --discard-new-pod-writes")
+    assert_true("MOVED ASIDE" in out, "and it printed what it moves aside")
     assert_eq(scalar(local, "select count(*) from chat where id='test-only-chat'"), 0, "the stale local database is GONE from the live path")
     assert_eq(sha(local), sha(w["new"] / "webui.db"), "the local DB is byte-identical to the fresh snapshot")
     assert_eq(scalar(local, "select count(*) from chat_message where chat_id=?", HER), 24, "and it holds the source's newest messages")
@@ -578,14 +582,33 @@ def test_path_map_and_other_prefixes():
     assert_true("other=1" in out, "verify reports the unmapped legacy path as a count")
 
 
-def test_reverse_cutover_rollback():
-    w = build_world("reverse")
-    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
-    # the new pod went live and wrote
-    add_messages(w["new"] / "webui.db", HER, 20, 5)
+def reverse(w: dict, *extra: str, frm=None, to=None, defaults_zl: bool = False, keep_stopped: bool = True) -> tuple[int, str]:
+    """`cutover --reverse` as the rollback runbook runs it, on the new pod (--from the new tree)."""
+    argv = ["cutover", "--reverse", "--from", str(frm or w["new"]), "--to", str(to or w["old"]),
+            "--local-data-dir", str(w["new"]), "--no-supervisor-check", "--quiet-seconds", "0",
+            "--tmp-dir", str(w["local"] / "scratch"), "--retry-wait", "0.1", "--local-db", str(w["local"] / "webui.db")]
+    if keep_stopped:
+        argv.append("--old-pod-stopped")
+    if not defaults_zl:
+        argv += ["--zl-from", str(w["root"] / "v10" / "zl-ops"), "--zl-to", str(w["zl"])]
+    argv += list(extra)
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        try:
+            rc = pm.main(argv)
+        except SystemExit as e:
+            rc = int(e.code or 0)
+    return rc, out.getvalue() + err.getvalue()
+
+
+def new_pod_writes(w: dict) -> None:
+    """She (or a test) wrote on the new pod: the LIVE LOCAL database, the store and an upload.
+    The snapshot on the volume is NOT updated (the sync has not run): that is the H2 hazard."""
+    local = w["local"] / "webui.db"
+    add_messages(local, HER, 20, 5)
     (w["new"] / "compactor" / "facts" / "written-on-new-pod.json").write_text('{"facts":[{"text":"x"}]}')
     (w["new"] / "uploads" / f"idN_{PRIVATE}N.png").write_bytes(b"made on the new pod")
-    c = sqlite3.connect(str(w["new"] / "webui.db"))
+    c = sqlite3.connect(str(local))
     c.execute("INSERT INTO file VALUES ('idN','u1',?,'{}')", (str(w["new"]) + f"/uploads/idN_{PRIVATE}N.png",))
     c.commit()
     c.close()
@@ -593,27 +616,399 @@ def test_reverse_cutover_rollback():
     for dp, dns, fns in os.walk(w["new"]):
         for n in fns:
             os.utime(os.path.join(dp, n), (old_t, old_t))
-    # rollback: this pod's tree (--from) back into the OLD tree (--to); the old pod stays stopped
-    argv = ["cutover", "--reverse", "--from", str(w["new"]), "--to", str(w["old"]), "--local-data-dir", str(w["new"]),
-            "--zl-from", str(w["root"] / "v10" / "zl-ops"), "--zl-to", str(w["zl"]), "--no-supervisor-check",
-            "--old-pod-stopped", "--quiet-seconds", "0", "--tmp-dir", str(w["local"] / "scratch"), "--retry-wait", "0.1"]
-    out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        rc = pm.main([a for a in argv if a != "--old-pod-stopped"] + ["--apply"])
+
+
+def test_reverse_cutover_rollback():
+    """R2 H2: the rollback copies the new pod's LIVE LOCAL database, not the snapshot."""
+    w = build_world("reverse")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    new_pod_writes(w)
+    snap = w["new"] / "webui.db"
+    assert_eq(scalar(snap, "select count(*) from chat_message where chat_id=?", HER), 20, "the snapshot on the volume is STALE (20)")
+    assert_eq(scalar(w["local"] / "webui.db", "select count(*) from chat_message where chat_id=?", HER), 25, "the local live DB has 25")
+    rc, out = reverse(w, "--apply", keep_stopped=False)
     assert_eq(rc, 2, "a reverse cutover also needs --old-pod-stopped")
-    out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        rc = pm.main(argv + ["--apply"])
+    rc, out = reverse(w, "--apply")
     if rc != 0:
-        print(out.getvalue()[-1500:], err.getvalue()[-500:])
-    assert_eq(rc, 0, "reverse cutover exits 0")
-    assert_eq(scalar(w["old"] / "webui.db", "select count(*) from chat_message where chat_id=?", HER), 25, "the old tree has what was written on the new pod")
+        print(out[-1500:])
+    assert_eq(rc, 0, "reverse cutover exits 0 (its verify compares the LOCAL database with the old tree)")
+    assert_true("DIFFERS from the snapshot" in out, "it says the local DB differs from the snapshot and that LOCAL is copied")
+    assert_eq(scalar(w["old"] / "webui.db", "select count(*) from chat_message where chat_id=?", HER), 25,
+              "the old tree has ALL 25 messages, including the ones only the local DB had")
     assert_eq(scalar(w["old"] / "webui.db", "select count(*) from file where path like ?", str(w["old"]) + "/uploads/%"), 6,
               "its file.path rows point at the OLD tree again")
     assert_eq(scalar(w["old"] / "webui.db", "select count(*) from file where path like ?", str(w["new"]) + "/%"), 0, "none point at the new tree")
     assert_true((w["old"] / "compactor/facts/written-on-new-pod.json").is_file(), "the new pod's facts came back")
     assert_true((w["old"] / f"uploads/idN_{PRIVATE}N.png").is_file(), "and its upload")
     assert_true(not (w["local"] / "webui.db.migrate-tmp").exists(), "no temp file left on the local disk")
+    assert_eq(sha(w["local"] / "webui.db") != sha(snap), True, "the new pod's own files were only READ")
+    assert_eq(scalar(w["local"] / "webui.db", "select count(*) from chat_message where chat_id=?", HER), 25, "the local DB is untouched")
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = pm.main(["status", "--to", str(w["old"]), "--require", "cutover"])
+    assert_eq(rc, 0, "status --to <old tree> --require cutover: COMPLETE after the reverse cutover (the rollback gate)")
+
+
+def test_reverse_refuses_without_the_local_db_and_reads_the_snapshot_only_in_snapshot_mode():
+    w = build_world("revlocal")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    new_pod_writes(w)
+    (w["local"] / "webui.db").rename(w["local"] / "webui.db.gone")
+    before = tree_fingerprint(w["old"])
+    rc, out = reverse(w, "--apply")
+    assert_eq(rc, 2, "no local DB: the rollback REFUSES instead of quietly using the (older) snapshot")
+    assert_true("local live database does not exist" in out, "and says so")
+    assert_eq(tree_fingerprint(w["old"]), before, "the old tree is untouched")
+    rc, out = reverse(w, "--apply", "--db-mode", "snapshot")
+    assert_eq(rc, 0, "--db-mode snapshot is the explicit way to use the snapshot")
+    assert_eq(scalar(w["old"] / "webui.db", "select count(*) from chat_message where chat_id=?", HER), 20, "and it holds the snapshot's 20")
+    (w["local"] / "webui.db.gone").rename(w["local"] / "webui.db")
+    (w["local"] / "webui.db-journal").write_bytes(b"x")
+    rc, out = reverse(w, "--apply")
+    assert_eq(rc, 2, "a hot journal beside the local DB refuses the rollback")
+    (w["local"] / "webui.db-journal").unlink()
+
+
+def test_reverse_from_must_be_this_pods_own_tree():
+    """R2 M7: `--reverse --from` that is not THIS pod's DATA_DIR (the arguments swapped) is refused."""
+    w = build_world("revfrom")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    before_old, before_new = tree_fingerprint(w["old"]), tree_fingerprint(w["new"])
+    rc, out = reverse(w, "--apply", frm=w["old"], to=w["new"])
+    assert_eq(rc, 2, "--reverse --from <the OLD tree> --to <this pod's tree> is refused")
+    assert_true("--reverse: --from must be THIS pod's DATA_DIR" in out, "with the reason")
+    assert_eq((tree_fingerprint(w["old"]), tree_fingerprint(w["new"])), (before_old, before_new), "and nothing changed on either side")
+
+
+def test_reverse_does_not_copy_the_wordban_dir_onto_itself():
+    """R2 L9: a reverse with default ZL paths maps this pod's word-ban to the OLD pod's, and never onto itself."""
+    w = build_world("revzl")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    new_pod_writes(w)
+    zl_new = w["root"] / "v10" / "zl-ops"
+    (zl_new / "word-ban").mkdir(parents=True, exist_ok=True)
+    (zl_new / "word-ban" / "active.json").write_text('{"rev": 8}')
+    old_env = os.environ.get("ZL_HOME")
+    os.environ["ZL_HOME"] = str(zl_new)
+    try:
+        rc, out = reverse(w, "--apply", defaults_zl=True)
+        assert_eq(rc, 0, "reverse with default zl paths exits 0")
+        assert_eq((w["zl"] / "word-ban" / "active.json").read_text(), '{"rev": 8}', "the new pod's word ban replaced the old pod's (mapped correctly)")
+        assert_true(not any(zl_new.glob("**/*.migrate-tmp")) and not (zl_new / ".migrate").exists(), "and this pod's own dir got nothing")
+        rc, out = reverse(w, "--apply", "--zl-from", str(zl_new), "--zl-to", str(zl_new))
+        assert_true("same on both sides" in out, "identical source and target are recognised and skipped")
+        assert_eq((zl_new / "word-ban" / "active.json").read_text(), '{"rev": 8}', "and this pod's word-ban file is unchanged")
+    finally:
+        if old_env is None:
+            os.environ.pop("ZL_HOME", None)
+        else:
+            os.environ["ZL_HOME"] = old_env
+
+
+def test_new_pod_writes_block_a_second_cutover_or_seed():
+    """R2 H3: after go-live, re-running cutover/seed must not silently roll the new pod back."""
+    w = build_world("recut")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    assert_eq(run(w, "cutover", "--old-pod-stopped", "--apply")[0], 0, "cutover")
+    m = json.loads((w["new"] / ".migrate" / "seed.json").read_text())
+    assert_eq(m["db"]["local_path"], str(w["local"] / "webui.db"), "the manifest records the local path it installed")
+    assert_eq(m["db"]["local_sha256"], sha(w["local"] / "webui.db"), "and the installed database's sha256")
+    assert_eq(run(w, "cutover", "--old-pod-stopped", "--apply")[0], 0, "a re-cutover with NO writes on the new pod is fine")
+    local = w["local"] / "webui.db"
+    add_messages(local, HER, 20, 5)            # a day of her messages on the new pod
+    before = (sha(local), tree_fingerprint(w["new"]))
+    for cmd, extra in (("cutover", ("--old-pod-stopped",)), ("seed", ())):
+        rc, out = run(w, cmd, "--apply", *extra)
+        assert_eq(rc, 2, f"a second {cmd} after the new pod wrote is REFUSED")
+        assert_true("ALREADY COMPLETED" in out and "chat_message" in out, "with the row counts and the reason")
+        rc, out = run(w, cmd, *extra)
+        assert_eq(rc, 2, f"even the {cmd} dry run says so")
+    assert_eq((sha(local), tree_fingerprint(w["new"])), before, "nothing changed")
+    assert_eq(scalar(local, "select count(*) from chat_message where chat_id=?", HER), 25, "her 25 messages are still the live ones")
+    rc, out = run(w, "cutover", "--old-pod-stopped", "--apply", "--discard-new-pod-writes")
+    assert_eq(rc, 0, "--discard-new-pod-writes lets it through")
+    assert_true("MOVED ASIDE" in out and "chat_message 23 -> 28" in out, "after printing what it moves aside")
+    aside = [d for d in w["local"].glob(".migrate-aside-*") if (d / "webui.db").is_file()
+             and scalar(d / "webui.db", "select count(*) from chat_message where chat_id=?", HER) == 25]
+    assert_eq(len(aside), 1, "the written database (all 25 of her messages) was moved aside, not deleted")
+    assert_eq(scalar(local, "select count(*) from chat_message where chat_id=?", HER), 20, "the live one is the old pod's again")
+
+
+def test_same_size_same_second_change_is_caught_at_cutover():
+    """R2 M4: MooseFS has 1 s mtimes. A same-size rewrite with an unchanged mtime must still be copied."""
+    w = build_world("racy")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    cdb = w["old"] / "compactor" / "chromadb" / "chroma.sqlite3"
+    st2 = cdb.stat()
+    c = sqlite3.connect(str(cdb))
+    c.execute("UPDATE embeddings SET doc='dX' WHERE id=1")
+    c.commit()
+    c.close()
+    os.utime(cdb, ns=(st2.st_atime_ns, st2.st_mtime_ns))
+    assert_eq(cdb.stat().st_size, st2.st_size, "the chroma change is the same size too")
+    rc_only, out_only = run(w, "verify")
+    assert_true(rc_only == 1 and "tree 'compactor'" in out_only and "DIFFERENT" in out_only,
+                "verify catches a same-size, same-mtime change to a SQLite file ALONE (the tree digest covers sqlite content)")
+    f = w["old"] / "compactor" / "facts" / "conv1.json"
+    st = f.stat()
+    data = f.read_bytes()
+    new = data.replace(b'"f0"', b'"F0"')
+    assert_true(new != data and len(new) == len(data), "the change is the same size")
+    f.write_bytes(new)
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+    seg = w["old"] / "compactor" / "chromadb" / "seg1" / "data_level0.bin"
+    st3 = seg.stat()
+    seg.write_bytes(b"\x02" * 512)
+    os.utime(seg, ns=(st3.st_atime_ns, st3.st_mtime_ns))
+    assert_true(run(w, "verify")[0] == 1, "verify already sees it (content hashes, including the sqlite logical hash)")
+    rc, out = run(w, "cutover", "--old-pod-stopped", "--apply")
+    assert_eq(rc, 0, "cutover exits 0, its own verify included")
+    assert_eq((w["new"] / "compactor/facts/conv1.json").read_bytes(), new, "the same-size JSON rewrite was copied")
+    assert_eq(scalar(w["new"] / "compactor/chromadb/chroma.sqlite3", "select doc from embeddings where id=1"), "dX",
+              "the same-size chroma rewrite was re-copied through the backup API")
+    assert_eq((w["new"] / "compactor/chromadb/seg1/data_level0.bin").read_bytes(), b"\x02" * 512, "and a same-size binary")
+    assert_eq(run(w, "verify")[0], 0, "verify passes")
+    a, b = pm.sqlite_logical_hash(w["old"] / "compactor/chromadb/chroma.sqlite3"), pm.sqlite_logical_hash(w["new"] / "compactor/chromadb/chroma.sqlite3")
+    assert_eq(a, b, "the logical hash of a backup-API copy equals its source")
+    c = sqlite3.connect(str(w["old"] / "compactor/chromadb/chroma.sqlite3"))
+    c.execute("UPDATE embeddings SET doc='dY' WHERE id=1")
+    c.commit()
+    c.close()
+    assert_true(pm.sqlite_logical_hash(w["old"] / "compactor/chromadb/chroma.sqlite3") != b, "and any content change changes it")
+
+
+def test_snapshot_sidecars_are_moved_aside():
+    """R2 M3: a stale -journal / .sync-tmp beside the snapshot must not survive next to the new snapshot."""
+    w = build_world("sidecar")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    for n in ("webui.db-journal", "webui.db-wal", "webui.db.sync-tmp", "webui.db.sync.lock"):
+        (w["new"] / n).write_bytes(b"stale " + n.encode())
+    (w["local"] / "webui.db-journal").write_bytes(b"stale local journal")
+    rc, out = run(w, "cutover", "--old-pod-stopped", "--apply", "--discard-new-pod-writes")
+    assert_eq(rc, 0, "cutover")
+    for n in ("webui.db-journal", "webui.db-wal", "webui.db.sync-tmp", "webui.db.sync.lock"):
+        assert_true(not (w["new"] / n).exists(), f"no stale {n} beside the new snapshot")
+    kept = sorted(p.name for p in (w["new"] / ".migrate").glob("removed-*/snapshot-db/*"))
+    assert_eq(kept, ["webui.db", "webui.db-journal", "webui.db-wal", "webui.db.sync-tmp", "webui.db.sync.lock"],
+              "they were moved aside with the old snapshot (never deleted)")
+    assert_true(not (w["local"] / "webui.db-journal").exists(), "and the local one too")
+    assert_eq(run(w, "verify", "--strict-local")[0], 0, "verify")
+
+
+def test_source_changing_during_the_cutover_fails_it():
+    """R2 M1: the source is checked again after the copy; a change means it was not frozen."""
+    w = build_world("m1")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    orig = pm.apply_tree_plan
+
+    def moving(*a, **k):
+        r = orig(*a, **k)
+        (w["old"] / "compactor" / "facts" / "written-mid-cutover.json").write_text('{"facts":[]}')
+        return r
+
+    pm.apply_tree_plan = moving
+    try:
+        rc, out = run(w, "cutover", "--old-pod-stopped", "--apply")
+    finally:
+        pm.apply_tree_plan = orig
+    assert_eq(rc, 1, "a source that changed while the cutover ran fails it (exit 1)")
+    assert_true("not frozen" in out, "and says the old pod is not frozen")
+    m = json.loads((w["new"] / ".migrate" / "seed.json").read_text())
+    assert_eq(m["complete"], False, "the manifest is NOT complete")
+    assert_eq(pm.run_status(argparse_ns(dst=str(w["new"]), require=None)), 1, "status says INCOMPLETE")
+    assert_true(not (w["new"] / ".migrate" / "lock").exists(), "the lock was released")
+
+
+def argparse_ns(**kw):
+    import argparse
+    return argparse.Namespace(**kw)
+
+
+def test_status_subcommand():
+    w = build_world("status")
+    assert_eq(run_status_rc(w), 2, "no manifest: exit 2")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    assert_eq(run_status_rc(w), 0, "after a seed: COMPLETE (exit 0)")
+    assert_eq(run_status_rc(w, "--require", "cutover"), 1, "--require cutover: a seed is not enough")
+    m = json.loads((w["new"] / ".migrate" / "seed.json").read_text())
+    m["complete"] = False
+    m["step"] = "syncing the trees"
+    (w["new"] / ".migrate" / "seed.json").write_text(json.dumps(m))
+    rc, out = status(w)
+    assert_eq(rc, 1, "complete=false: INCOMPLETE (exit 1)")
+    assert_true("syncing the trees" in out and "Do NOT start services" in out, "it shows the last step and says not to start services")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "a re-run repairs it")
+    assert_eq(run(w, "cutover", "--old-pod-stopped", "--apply")[0], 0, "cutover")
+    assert_eq(run_status_rc(w, "--require", "cutover"), 0, "after a cutover with a passing verify: COMPLETE")
+    m = json.loads((w["new"] / ".migrate" / "seed.json").read_text())
+    m["verified"] = False
+    (w["new"] / ".migrate" / "seed.json").write_text(json.dumps(m))
+    rc, out = status(w)
+    assert_eq(rc, 1, "a cutover whose verify did not pass is INCOMPLETE")
+    m["verified"] = True
+    (w["new"] / ".migrate" / "seed.json").write_text(json.dumps(m))
+    (w["new"] / ".migrate" / "lock").write_text("1 now")
+    assert_eq(run_status_rc(w), 1, "a held lock: INCOMPLETE")
+    (w["new"] / ".migrate" / "lock").unlink()
+    assert_eq(run_status_rc(w), 0, "and COMPLETE again")
+
+
+def status(w, *extra):
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = pm.main(["status", "--to", str(w["new"]), *extra])
+    return rc, out.getvalue()
+
+
+def run_status_rc(w, *extra):
+    return status(w, *extra)[0]
+
+
+def test_signals():
+    """R2 M6: SIGHUP is ignored; SIGINT/SIGTERM stop cleanly and leave complete=false."""
+    import signal
+    before_handlers = {s: signal.getsignal(s) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)}
+    w = build_world("sig")
+    orig = pm.apply_tree_plan
+
+    def hup(*a, **k):
+        os.kill(os.getpid(), signal.SIGHUP)
+        return orig(*a, **k)
+
+    pm.apply_tree_plan = hup
+    try:
+        rc, out = run(w, "seed", "--apply")
+    finally:
+        pm.apply_tree_plan = orig
+    assert_eq(rc, 0, "SIGHUP mid-run does not kill the run")
+    assert_eq(json.loads((w["new"] / ".migrate" / "seed.json").read_text())["complete"], True, "and it completed")
+    assert_eq({s: signal.getsignal(s) for s in before_handlers}, before_handlers, "the signal handlers are restored afterwards")
+
+    for signame in ("SIGTERM", "SIGINT"):
+        w = build_world("sig" + signame)
+        assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+        add_messages(w["old"] / "webui.db", HER, 20, 2)
+        local = w["local"] / "webui.db"
+        local_before = sha(local)
+        signum = getattr(signal, signame)
+
+        def kill_in_trees(*a, **k):
+            os.kill(os.getpid(), signum)
+            return orig(*a, **k)
+
+        pm.apply_tree_plan = kill_in_trees
+        try:
+            rc, out = run(w, "cutover", "--old-pod-stopped", "--apply")
+        finally:
+            pm.apply_tree_plan = orig
+        assert_eq(rc, 1, f"{signame} during the tree sync: exit 1")
+        assert_true("INTERRUPTED" in out, "it says it was interrupted")
+        m = json.loads((w["new"] / ".migrate" / "seed.json").read_text())
+        assert_eq((m["complete"], m.get("interrupted")), (False, signame), "manifest complete=false, with the signal recorded")
+        assert_eq(sha(local), local_before, "the live database was not touched")
+        assert_true(not (w["new"] / ".migrate" / "lock").exists(), "the lock was released")
+        assert_eq(run_status_rc(w), 1, "status says INCOMPLETE")
+        assert_eq(run(w, "cutover", "--old-pod-stopped", "--apply")[0], 0, "and the same command, re-run, completes it")
+        assert_eq(run_status_rc(w, "--require", "cutover"), 0, "status: COMPLETE")
+
+    # a SIGTERM inside the database install is deferred until the install has finished: never a half-installed pair
+    w = build_world("sigcrit")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    add_messages(w["old"] / "webui.db", HER, 20, 2)
+    orig_fsync = pm.fsync_dir
+    fired = []
+
+    def fsync_and_kill(path):
+        if not fired and Path(path) == w["local"]:
+            fired.append(1)
+            os.kill(os.getpid(), signal.SIGTERM)
+        return orig_fsync(path)
+
+    pm.fsync_dir = fsync_and_kill
+    try:
+        rc, out = run(w, "cutover", "--old-pod-stopped", "--apply")
+    finally:
+        pm.fsync_dir = orig_fsync
+    assert_true(bool(fired), "the signal really arrived inside install_db")
+    assert_eq(rc, 1, "the run still stops (exit 1)")
+    assert_eq(sha(w["local"] / "webui.db"), sha(w["new"] / "webui.db"), "but the local DB and the snapshot were BOTH fully installed first")
+    assert_eq(scalar(w["local"] / "webui.db", "select count(*) from chat_message where chat_id=?", HER), 22, "with the newest data")
+    assert_eq(json.loads((w["new"] / ".migrate" / "seed.json").read_text())["complete"], False, "and the manifest still says complete=false")
+
+    # a SIGTERM that lands while the manifest is being marked complete: the run reports INTERRUPTED, so the manifest must not claim complete
+    w = build_world("sigsave")
+    orig_save = pm.save_manifest
+    hit = []
+
+    def save_and_kill(to, m):
+        orig_save(to, m)
+        if m.get("complete") and not hit:
+            hit.append(1)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    pm.save_manifest = save_and_kill
+    try:
+        rc, out = run(w, "seed", "--apply")
+    finally:
+        pm.save_manifest = orig_save
+    assert_true(bool(hit), "the signal arrived while the manifest was marked complete")
+    assert_eq(rc, 1, "the run reports the interruption (exit 1)")
+    assert_eq(json.loads((w["new"] / ".migrate" / "seed.json").read_text())["complete"], False,
+              "and the manifest is rewritten complete=false: an interrupted run is never COMPLETE")
+    assert_eq(run_status_rc(w), 1, "status: INCOMPLETE")
+
+
+def test_seed_on_a_live_source_is_gentle_and_retries_bad_copies():
+    """R2 L8: small steps with pauses, bounded retry on an integrity_check failure, total-time report."""
+    w = build_world("live")
+    ns = argparse_ns(busy_timeout=1.0, retries=3, retry_wait=0.0, step_pages=None, step_sleep=None)
+    kw = pm.backup_kwargs(ns, "seed")
+    assert_eq((kw["step_pages"], kw["step_sleep_s"]), (256, 0.2), "a seed reads a live source in 256-page steps with a 0.2 s pause")
+    kw = pm.backup_kwargs(ns, "cutover")
+    assert_eq((kw["step_pages"], kw["step_sleep_s"]), (4096, 0.0), "a cutover (source frozen) is fast")
+    # the pause really happens between steps
+    slept = []
+    real_sleep = pm.time.sleep
+    pm.time.sleep = lambda x: slept.append(x) or real_sleep(0)
+    try:
+        rc, out = run(w, "seed", "--apply", "--step-pages", "1", "--step-sleep", "0.123")
+    finally:
+        pm.time.sleep = real_sleep
+    assert_eq(rc, 0, "seed with 1-page steps")
+    assert_true(slept.count(0.123) >= 3, f"it paused between steps ({slept.count(0.123)} pauses)")
+    assert_true("database copy: 1 attempt(s)" in out and " s in total" in out, "and reports the attempts and the total time")
+    assert_true("she may be chatting" in out or "only while she is idle" in out, "and reminds that a seed needs her idle")
+    # integrity_check failing twice, then passing: retried
+    bad = {"n": 2}
+    real_connect = sqlite3.connect
+
+    class Flaky(sqlite3.Connection):
+        def execute(self, sql, *a):
+            if sql == "PRAGMA integrity_check" and bad["n"] > 0:
+                bad["n"] -= 1
+                return super().execute("SELECT 'corrupt'")
+            return super().execute(sql, *a)
+
+    sqlite3.connect = lambda *a, **k: real_connect(*a, factory=Flaky, **k)
+    try:
+        w2 = build_world("live2")
+        rc, out = run(w2, "seed", "--apply", "--retries", "3")
+    finally:
+        sqlite3.connect = real_connect
+    assert_eq(rc, 0, "a copy that fails integrity_check twice is retried and the third attempt is used")
+    assert_true(out.count("failed (the copy failed integrity_check)") == 2 and "3 attempt(s)" in out, "two retries reported, three attempts in total")
+    assert_eq(run(w2, "verify")[0], 0, "and the result verifies")
+    # it never passes: bounded, and nothing is installed
+    bad["n"] = 999
+    sqlite3.connect = lambda *a, **k: real_connect(*a, factory=Flaky, **k)
+    try:
+        w3 = build_world("live3")
+        rc, out = run(w3, "seed", "--apply")
+    finally:
+        sqlite3.connect = real_connect
+    assert_eq(rc, 1, "an integrity_check that never passes fails the seed after the bounded retries (exit 1)")
+    assert_true("failed integrity_check on all 2 attempts" in out, "and says so")
+    assert_true(not (w3["local"] / "webui.db").exists() and not (w3["new"] / "webui.db").exists(), "nothing was installed")
 
 
 def test_interrupted_seed_is_resumable():
@@ -698,6 +1093,16 @@ def _all():
         test_backup_api_copy_is_consistent_under_a_writer,
         test_path_map_and_other_prefixes,
         test_reverse_cutover_rollback,
+        test_reverse_refuses_without_the_local_db_and_reads_the_snapshot_only_in_snapshot_mode,
+        test_reverse_from_must_be_this_pods_own_tree,
+        test_reverse_does_not_copy_the_wordban_dir_onto_itself,
+        test_new_pod_writes_block_a_second_cutover_or_seed,
+        test_same_size_same_second_change_is_caught_at_cutover,
+        test_snapshot_sidecars_are_moved_aside,
+        test_source_changing_during_the_cutover_fails_it,
+        test_status_subcommand,
+        test_signals,
+        test_seed_on_a_live_source_is_gentle_and_retries_bad_copies,
         test_interrupted_seed_is_resumable,
         test_lock_prevents_concurrent_runs,
         test_supervisor_status_parser,
