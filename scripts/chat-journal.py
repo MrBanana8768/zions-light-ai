@@ -43,10 +43,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import sqlite3
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _podpaths  # noqa: E402  (v3.1.9.10: this pod's paths, not another pod's)
 
 HER_CONV = "ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"
 REQUIRED = ("v", "conv_id", "ts", "epoch", "user", "assistant", "finish_reason", "partial", "sha256")
@@ -63,7 +65,9 @@ def norm_sha(user: str, assistant: str) -> str:
 
 
 def default_store() -> Path:
-    return Path(os.environ.get("COMPACTOR_STORAGE_ROOT", "/data/openwebui/compactor"))
+    # This pod's store (DATA_DIR / COMPACTOR_STORAGE_ROOT, adopted from PID 1 in a bare
+    # shell), never a hardcoded /data path: two pods can share the volume (v3.1.9.10).
+    return Path(_podpaths.store())
 
 
 def journal_files(store: Path, conv: str | None) -> list[Path]:
@@ -286,7 +290,7 @@ def main(argv=None) -> int:
     for name in ("stats", "verify", "compare"):
         sp = sub.add_parser(name)
         sp.add_argument("--store", default=str(default_store()),
-                        help="compactor STORAGE_ROOT (default $COMPACTOR_STORAGE_ROOT or /data/openwebui/compactor)")
+                        help="compactor STORAGE_ROOT (default: this pod's store, from $COMPACTOR_STORAGE_ROOT or $DATA_DIR)")
         sp.add_argument("--conv", default=None, help="conversation id (compare defaults to hers)")
         if name == "compare":
             sp.add_argument("--db", required=True, help="OpenWebUI webui.db (opened read-only; use a copy)")
