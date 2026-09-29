@@ -5,6 +5,12 @@ served through a Cloudflare Tunnel (`cloudflared`) that dials OUT from the pod t
 inbound port needs to be opened on the pod itself. The RunPod proxy URL **keeps working** alongside this
 during the transition — nothing about it is disabled by adding the tunnel.
 
+> **v3.1.9.10 NEW POD: the exception.** On the new pod the RunPod proxy URL is deliberately DEAD: ports `3000` and
+> `8080` are removed from the template's exposed HTTP ports (an empty OpenWebUI makes the first sign-up an admin, and an
+> admin can run code as root). The tunnel is then the only way in, and it needs no exposed port (it reaches
+> `localhost:3000` from inside the pod). See `RUNBOOK_POD_MIGRATION.md` sections 1.1 and 3.6. Wherever this file says
+> the proxy URL "keeps working", that does not apply to the new pod.
+
 This is the only place the tunnel design is documented. OPERATIONS.md has a one-paragraph pointer to this
 file and nothing else; CHANGELOG.md's `[3.1.9.9]` entry lists what shipped and where.
 

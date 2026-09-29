@@ -1,5 +1,12 @@
 # Moving her chat database to the pod's local disk (v3.1.9.7)
 
+> **FOR THE IN-PLACE MOVE ON THE OLD POD LAYOUT ONLY (`/data/openwebui`, `/data/logs`, `/data/backups`, `/data/forensics`).
+> For a v10 pod (`DATA_DIR=/data/v10/openwebui`, the v3.1.9.10 new pod) use `RUNBOOK_DB_LOCAL_V10.md`** (repo root): its paths are
+> `/data/v10/...`, and it carries the corrected final sync, recovery after a pod loss and the incidents. Every command
+> below that names `/data/openwebui/...` would aim at the OLD pod's live tree if typed on a v10 pod. Getting to the v10 pod
+> at all is `RUNBOOK_POD_MIGRATION.md`.
+
+
 **Status: current for v3.1.9.7.** This is the rehearsal runbook
 (`/home/drew/zl-ops/dbmove/DB-MOVE-RUNBOOK.md`) brought into the repo and
 refreshed against this release's actual code (review1-v3197-65ea196, B-2).
@@ -452,8 +459,25 @@ $PY /opt/compactor/backup.py --once; echo "BACKUP EXIT=$?"
 | `… are OLDER than the same conversation in the snapshot` | The snapshot has something newer than the live file. | If you restored or undid something **on purpose**: `WEBUI_DB_ALLOW_OLDER_GENERATION=1 WEBUI_DB_LOCAL=true $PY /opt/compactor/webuidb.py --sync-once --force`. If **not**, something wrote to `/data/openwebui/webui.db`, most likely a tool run on the old path. Run `cp /data/openwebui/webui.db /data/forensics/snapshot-newer-$(date -u +%Y%m%dT%H%M%SZ).db`, compare `dbcounts.py`/`uibranch.py` on both paths, and ask for help before overriding. |
 | `… lost more than 1.0 MB of stored content each` | More than 1 MB of one conversation disappeared. | If she really deleted a long stretch: `WEBUI_DB_ALLOW_ROW_LOSS=1 WEBUI_DB_LOCAL=true $PY /opt/compactor/webuidb.py --sync-once --force`. If not, stop and ask. |
 | `… (chat count tripped it)` or `(stored content tripped it)` | Half the conversations or half the content vanished. A copy of the live file was saved to `/data/forensics`. | Do **not** override. Ask. |
-| `… failed quick_check` or `… could not be confirmed` (about `/data/openwebui/webui.db`) | The snapshot on `/data` is damaged. | Move it aside: `mv /data/openwebui/webui.db /data/forensics/webui.db.bad-$(date -u +%Y%m%dT%H%M%SZ)`. Move any `-journal` beside it the same way. Then run `WEBUI_DB_LOCAL=true $PY /opt/compactor/webuidb.py --sync-once --force`, which writes a fresh snapshot. |
+| `… failed quick_check` or `… could not be confirmed` (about the snapshot on `/data`) | The snapshot on `/data` is damaged. | **Follow "Moving a damaged snapshot aside" just below this table; do not type an `mv` from memory.** Then run `WEBUI_DB_LOCAL=true $PY /opt/compactor/webuidb.py --sync-once --force`, which writes a fresh snapshot. |
 | `Read-only file system`, `Input/output error`, `cannot stat` | `/data` itself is misbehaving. | Nothing to do on the database. It retries every cycle. Keep the pod running until a `published` line appears. |
+
+**Moving a damaged snapshot aside** (the only `mv` of a database in this runbook). It must never move a file that is the pod's LIVE database.
+First look at which pod this is:
+
+```bash
+tr '\0' '\n' < /proc/1/environ | grep -E '^(WEBUI_DB_LOCAL|DATA_DIR|WEBUI_SNAPSHOT_DB)='
+```
+
+- **`DATA_DIR=/data/v10/openwebui`: wrong runbook. Stop; use `RUNBOOK_DB_LOCAL_V10.md`.**
+- **`WEBUI_DB_LOCAL=false` (or unset): `/data/openwebui/webui.db` IS the live database. Do NOT move it.** Go to `RUNBOOK_DB_JOURNAL.md`.
+- **`WEBUI_DB_LOCAL=true` and `WEBUI_SNAPSHOT_DB=/data/openwebui/webui.db`** (this document's own layout): the file is only the snapshot, so:
+
+```bash
+SNAP=/data/openwebui/webui.db
+mkdir -p /data/forensics && mv "$SNAP" /data/forensics/webui.db.bad-$(date -u +%Y%m%dT%H%M%SZ)
+for s in -journal -wal -shm; do [ -e "$SNAP$s" ] && mv "$SNAP$s" /data/forensics/; done
+```
 
 **Never** put any `WEBUI_DB_ALLOW_…` row on the template. They are for one command, in one shell.
 
