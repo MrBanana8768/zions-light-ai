@@ -27,13 +27,33 @@ needle, never an image reference.
            lines only.
   compare  for one chat (default: her conversation), which journal exchanges
            are missing from OpenWebUI's chat JSON (`chat.chat` history) and
-           from the `chat_message` table. An exchange matches by message id
-           (its own id, or its parent id) first, else by content hash: the
-           exact pair hash, then a whitespace-normalised pair hash, taken over
-           every user->assistant pair OpenWebUI holds. Tombstoned exchanges
-           can only match by id. Counts only; --ids lists the ids of the
-           missing ones (journal message ids where the journal has them, else
-           the first 12 hex of the pair hash).
+           from the `chat_message` table.
+
+           MATCHING IS BY CONTENT HASH IN PRACTICE. An exchange matches by
+           message id (its own id, or its parent id) when the journal has one,
+           else by the exact pair hash, then a whitespace-normalised pair hash,
+           taken over every user->assistant pair OpenWebUI holds. But the
+           deployed OpenWebUI (0.11.4) forwards no message ids (it strips
+           metadata, and ENABLE_FORWARD_USER_INFO_HEADERS is off on purpose),
+           so the journal's ids are ALWAYS null there and the hash is the only
+           key.
+
+           Three kinds of exchange cannot be judged and are NOT reported as
+           "missing":
+             - REDACTED tombstones (`/forget <text>` emptied them; nothing is
+               left to hash and there is no id): counted on their own line;
+             - image-only turns are recognised: the journal holds the
+               `[shared N image]` marker the compactor's memory uses, while
+               OpenWebUI holds an empty user text, so the marker is compared
+               as the empty text;
+             - RAG / file-attachment turns can still show as unmatched: the
+               text the compactor saw (retrieved context, extracted file
+               content) can differ from the user message OpenWebUI stored. A
+               small unmatched count is therefore expected; only a large or
+               growing one means missing chat.
+           Counts only; --ids lists the ids of the unmatched ones (journal
+           message ids where the journal has them, which on 0.11.4 is never,
+           else the first 12 hex of the pair hash).
 
 Stdlib only.
 """
@@ -43,6 +63,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -222,6 +243,12 @@ def pair_index(msgs: dict[str, dict]) -> tuple[set[str], set[str]]:
     return exact, norm
 
 
+# The marker main._memorable_user_text gives an image-only user turn (twin of
+# summarizer._image_only_marker). OpenWebUI stores such a turn with an EMPTY
+# text, so the journal's marker is compared as "".
+_IMAGE_ONLY_RE = re.compile(r"^\[shared \d+ images?\]$")
+
+
 def _present(rec: dict, msgs: dict, exact: set, norm: set) -> bool:
     for k in ("message_id", "parent_id"):
         v = rec.get(k)
@@ -230,6 +257,8 @@ def _present(rec: dict, msgs: dict, exact: set, norm: set) -> bool:
     if rec.get("redacted"):
         return False
     u, a = rec.get("user") or "", rec.get("assistant") or ""
+    if _IMAGE_ONLY_RE.match(u.strip()):
+        u = ""
     if pair_sha(u, a) in exact or norm_sha(u, a) in norm:
         return True
     if rec.get("truncated"):
@@ -260,7 +289,13 @@ def cmd_compare(a) -> int:
     jx, jn = pair_index(jm)
     tx, tn = pair_index(tm)
     miss_json, miss_table, miss_both = [], [], []
+    redacted = 0
     for r in recs:
+        if r.get("redacted"):
+            # A /forget tombstone: no words and no hash left, and no id on
+            # 0.11.4. It cannot be judged either way, so it is not "missing".
+            redacted += 1
+            continue
         in_j = _present(r, jm, jx, jn)
         in_t = _present(r, tm, tx, tn)
         label = r.get("message_id") or r.get("parent_id") or (
@@ -272,12 +307,17 @@ def cmd_compare(a) -> int:
         if not in_j and not in_t:
             miss_both.append(label)
     print(f"journal exchanges: {len(recs)} "
-          f"({sum(1 for r in recs if r.get('redacted'))} redacted, "
+          f"({redacted} redacted, "
           f"{sum(1 for r in recs if r.get('partial'))} partial)")
     print(f"openwebui chat JSON messages: {len(jm)} | chat_message rows: {len(tm)}")
+    print(f"redacted (/forget tombstones, not compared): {redacted}")
+    print(f"compared: {len(recs) - redacted}")
     print(f"missing from chat JSON: {len(miss_json)}")
     print(f"missing from chat_message table: {len(miss_table)}")
     print(f"missing from both: {len(miss_both)}")
+    if miss_both or miss_json or miss_table:
+        print("note: matching is by content hash (0.11.4 sends no message ids); "
+              "RAG / file-attachment turns can show as unmatched")
     if a.ids:
         for name, lst in (("chat JSON", miss_json), ("chat_message", miss_table), ("both", miss_both)):
             print(f"ids missing from {name}: {' '.join(lst)}")

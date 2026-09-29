@@ -236,6 +236,47 @@ removed = backup.prune_old_backups(d, retain=0, now=NOW)
 eq(removed, [], "retain=0 cannot remove anything below the 3-archive floor either")
 
 # ---------------------------------------------------------------------------
+print("\n[R9] tiers key on the timestamp in the archive NAME, not the file mtime (R3 L6)")
+# The same 20-day hourly timeline as real zions-backup-YYYYMMDD-HHMMSS files,
+# every one given the SAME mtime, as `cp` without -p / rsync / a tar restore
+# leaves them. mtime-keyed tiers would call them all "just written" and keep
+# all 480.
+d9 = _TMP / "backups-r9"
+shutil.rmtree(d9, ignore_errors=True)
+d9.mkdir(parents=True)
+same_mtime = NOW - 60
+for i in range(480):
+    t = NEWEST - i * 3600
+    st = datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    f = d9 / f"zions-backup-{st}.tar.gz"
+    f.write_bytes(b"x")
+    os.utime(f, (same_mtime, same_mtime))
+listed = backup.list_backups(d9)
+eq(len(listed), 480, "480 archives listed")
+eq(listed[0]["name"], "zions-backup-20260929-121000.tar.gz", "newest-first order comes from the NAME (all mtimes equal)")
+eq(listed[0]["when"], NEWEST, "`when` is the name's UTC timestamp")
+removed9 = backup.prune_old_backups(d9, retain=3, now=NOW)
+left9 = sorted(f.name for f in d9.glob("*.tar.gz"))
+eq(len(left9), 12, "same tiering as the mtime timeline: 12 of 480 survive (3 hourly + 7 daily + 2 weekly)")
+check("zions-backup-20260929-121000.tar.gz" in left9 and "zions-backup-20260928-231000.tar.gz" in left9
+      and "zions-backup-20260913-231000.tar.gz" in left9, "and they are the right ones (hourly newest, daily 09-28, weekly 09-13)")
+eq(len(removed9), 468, "468 removed")
+
+# a name that does not parse falls back to the mtime
+d10 = _TMP / "backups-r9b"
+shutil.rmtree(d10, ignore_errors=True)
+d10.mkdir(parents=True)
+for nm, age_h in (("zions-backup-manual.tar.gz", 1), ("zions-backup-20261399-999999.tar.gz", 2), ("zions-backup-20260929-121000.tar.gz", 0)):
+    f = d10 / nm
+    f.write_bytes(b"x")
+    os.utime(f, (NOW - age_h * 3600, NOW - age_h * 3600))
+l10 = {e["name"]: e for e in backup.list_backups(d10)}
+eq(l10["zions-backup-manual.tar.gz"]["when"], NOW - 3600, "an unparseable name falls back to mtime")
+eq(l10["zions-backup-20261399-999999.tar.gz"]["when"], NOW - 7200, "an impossible date (month 13) falls back to mtime")
+shutil.rmtree(d9, ignore_errors=True)
+shutil.rmtree(d10, ignore_errors=True)
+
+# ---------------------------------------------------------------------------
 print("\n[R8] the run_daemon banner reflects the tiers")
 import inspect
 

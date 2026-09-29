@@ -115,10 +115,15 @@ print("[D6] CONTROL: --sync-once (with no local database yet) is a "
       "VALID invocation that exits promptly and cleanly - the fix must "
       "not turn every argument into a rejection")
 rc, out = run(["--sync-once"])
+# v3.1.9.10 (R3 H1): this used to be exit 0 ("an ordinary skip"). It is NOT a
+# success any more: nothing was published and nothing verified, and the
+# runbook's manual final sync reads this exit code. Prompt and clean (no
+# hang, no traceback), but non-zero.
 check(
-    rc == 0,
-    f"exit code is 0 (got {rc!r}, output: {out[-300:]!r}) - 'no local "
-    f"database yet' is an ordinary skip, not a usage error",
+    rc == 1 and "Traceback" not in out,
+    f"exit code is 1, promptly and without a traceback (got {rc!r}, output: "
+    f"{out[-300:]!r}) - 'no local database yet' publishes nothing, so it is "
+    f"not success (v3.1.9.10 R3 H1), and it is not a usage error (2) either",
 )
 check("'skipped': 'no local database yet'" in out, f"and says why (got: {out!r})")
 
@@ -126,7 +131,10 @@ print("[D6] CONTROL: --sync-once --force (the DB-MOVE-RUNBOOK's own "
       "documented final-sync command) is accepted, not rejected by the "
       "W11 guard")
 rc, out = run(["--sync-once", "--force"])
-check(rc == 0, f"exit code is 0 (got {rc!r}, output: {out[-300:]!r})")
+# v3.1.9.10 (R3 H1): accepted (not the usage error 2), and with no local
+# database it publishes nothing, so it exits 1 rather than pretending.
+check(rc == 1 and "unrecognized" not in out and "only meaningful" not in out,
+      f"accepted (not a usage error); nothing to publish so exit 1 (got {rc!r}, output: {out[-300:]!r})")
 
 print("[D6] CONTROL: --status (no local database, no snapshot) is a "
       "valid, prompt invocation")

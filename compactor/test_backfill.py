@@ -267,6 +267,50 @@ def test_needs_backfill_stale_in_progress_returns_true():
     assert_eq(backfill.needs_backfill(cid, msgs), True, "stale in_progress -> retry")
 
 
+def _v319_record(kind, age_s):
+    """The EXACT dict v3.1.9's writer produced, plus the two stamps its
+    `_write_state` adds (`conv_id`, `updated_at`). Derived from
+    `git show v3.1.9:compactor/backfill.py`: the in_progress write at
+    ~L320/349 (state, started_at, exchanges_done, exchanges_total, error) and
+    the failed write at ~L511 (same keys, exchanges_done 0). NO `attempts`
+    key: no release before v3.1.9.4 writes one (v3.1.9.10 R4 H1)."""
+    ts = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat()
+    rec = {"state": kind, "started_at": ts,
+           "exchanges_done": 6 if kind == "in_progress" else 0,
+           "exchanges_total": 1908,
+           "error": None if kind == "in_progress" else "boom",
+           "conv_id": "v319", "updated_at": ts}
+    assert "attempts" not in rec
+    return rec
+
+
+def test_v319_record_without_attempts_honours_max_attempts_1():
+    print("\n[test] v3.1.9-shaped stale in_progress / failed record (NO attempts "
+          "key): MAX_ATTEMPTS=1 stops the resume, the default 3 still resumes")
+    msgs = [{"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}] * 3
+    saved = backfill._MAX_BACKFILL_ATTEMPTS
+    try:
+        for kind, age in (("in_progress", 10 * 86400), ("failed", 10 * 86400)):
+            _wipe_storage()
+            cid = "v319"
+            facts.save_facts(cid, [{"text": "x", "added_turn": 1, "last_used": 1}])
+            backfill._backfill_state_path(cid).write_text(
+                json.dumps(_v319_record(kind, age)))
+            backfill._MAX_BACKFILL_ATTEMPTS = 1
+            assert_eq(backfill.needs_backfill(cid, msgs), False,
+                      f"{kind}, no attempts key, MAX=1 -> NO resume")
+            backfill._MAX_BACKFILL_ATTEMPTS = 3
+            assert_eq(backfill.needs_backfill(cid, msgs), True,
+                      f"{kind}, no attempts key, MAX=3 -> resumes (counting still sane)")
+            # A record that DOES carry attempts keeps its own count.
+            rec = _v319_record(kind, age); rec["attempts"] = 3
+            backfill._backfill_state_path(cid).write_text(json.dumps(rec))
+            assert_eq(backfill.needs_backfill(cid, msgs), False,
+                      f"{kind}, attempts=3, MAX=3 -> no resume")
+    finally:
+        backfill._MAX_BACKFILL_ATTEMPTS = saved
+
+
 def test_needs_backfill_failed_state_returns_true_once_the_backoff_elapses():
     print("\n[test] needs_backfill=True when previous backfill failed AND the "
           "backoff since its last update has elapsed")
@@ -689,6 +733,7 @@ if __name__ == "__main__":
         test_needs_backfill_no_state_and_long_history_returns_true()
         test_needs_backfill_complete_state_returns_false()
         test_needs_backfill_stale_in_progress_returns_true()
+        test_v319_record_without_attempts_honours_max_attempts_1()
         test_needs_backfill_failed_state_returns_true_once_the_backoff_elapses()
         test_needs_backfill_failed_state_returns_false_before_the_backoff_elapses()
 

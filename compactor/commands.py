@@ -717,17 +717,19 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
             # journal (matching exchanges become tombstones: ids kept, words
             # gone). Also BEFORE the "No facts matched" return, for the same
             # reason as the band: a needle can live only in the journal. On
-            # the writer thread's file lock via the threadpool so the event
-            # loop never waits on the volume. A failed rewrite leaves the
+            # the journal's writer thread so the event loop never waits on the
+            # volume. A failed rewrite leaves the
             # journal unchanged; the needle is in the ledger already, so the
             # next boot re-applies it, and the reply says so.
             journal_redacted = 0
             journal_failed = False
             try:
-                from starlette.concurrency import run_in_threadpool
-
-                journal_redacted = await run_in_threadpool(
-                    chatjournal.redact_needle, conv_id, arg
+                # v3.1.9.10 (R1 M1): on the journal's SINGLE writer thread,
+                # FIFO behind every queued append (as wipe_async), so a reply
+                # queued before this forget cannot land after the redaction
+                # with the words intact. Not the general threadpool.
+                journal_redacted = await chatjournal.redact_needle_async(
+                    conv_id, arg
                 )
             except Exception as e:
                 journal_failed = True

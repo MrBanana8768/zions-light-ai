@@ -237,7 +237,14 @@ def capture_logs():
             t.setLevel(lv)
 
 
+# IDS: the DEPLOYED OpenWebUI (0.11.4) sends NONE of these: the headers exist
+# only under ENABLE_FORWARD_USER_INFO_HEADERS (kept off) and there is no
+# message-id header at all; it also strips `metadata`. So real journal lines have
+# null ids. HEADERS below is the shape of a FUTURE OpenWebUI that does forward
+# ids; it exercises the "ids present" code path only. The 0.11.4 shape is
+# NO_IDS ([J1b]/[J2b]/[S2] below).
 HEADERS = {"X-OpenWebUI-Chat-Id": "chat-0001", "X-OpenWebUI-Message-Id": "msg-asst-1"}
+NO_IDS: dict = {}
 
 
 def _messages(user_text, *, image=False):
@@ -330,7 +337,7 @@ def restart_reapply():
 REPLY = "The garden gate was painted blue in the spring, and the tea was warm."
 
 # ===========================================================================
-print("\n[J1] non-streaming: one line, every field, references only")
+print("\n[J1] non-streaming, WHEN the request carries ids (NOT the 0.11.4 shape, see NO_IDS): one line, every field, references only")
 reset()
 conv = "conv-j1"
 with capture_logs() as logs:
@@ -346,9 +353,9 @@ eq(len(ls), 1, "exactly one line")
 rec = ls[0] if ls else {}
 eq(rec.get("v"), 1, "schema version 1")
 eq(rec.get("conv_id"), conv, "conv_id")
-eq(rec.get("chat_id"), "chat-0001", "OpenWebUI chat id")
-eq(rec.get("message_id"), "msg-asst-1", "OpenWebUI message id")
-eq(rec.get("parent_id"), "msg-user-1", "parent message id from the payload")
+eq(rec.get("chat_id"), "chat-0001", "chat id, when the header is present")
+eq(rec.get("message_id"), "msg-asst-1", "message id, when the header is present (0.11.4 sends none)")
+eq(rec.get("parent_id"), "msg-user-1", "parent message id, when the payload carries it (0.11.4 strips metadata)")
 check(bool(rec.get("request_id")), "request id present")
 check(str(rec.get("ts", "")).endswith("Z") and "T" in rec.get("ts", ""), "UTC ISO timestamp")
 eq(rec.get("epoch"), 0, "ledger epoch stamped")
@@ -369,7 +376,7 @@ check(not any("what colour" in t or "gate was painted" in t for t in logs.text),
       "no journal text in any log line")
 
 # ===========================================================================
-print("\n[J2] streaming path, and cut replies")
+print("\n[J2] streaming path, and cut replies (ids-present shape; the 0.11.4 no-id shape is [J2b])")
 reset()
 conv = "conv-j2"
 r = post_stream(conv, "tell me about the gate", [_content("The gate is "), _content("blue. "),
@@ -381,7 +388,7 @@ eq(len(ls), 1, "streaming: exactly one line")
 eq(ls[0]["assistant"] if ls else None, "The gate is blue. It was painted in spring.", "assembled reply")
 eq((ls[0]["finish_reason"], ls[0]["partial"]) if ls else None, ("stop", False), "finish stop, not partial")
 eq((ls[0]["chat_id"], ls[0]["message_id"]) if ls else None, ("chat-0001", "msg-asst-1"),
-   "ids reach the streaming tail (contextvar survives the generator)")
+   "request meta reaches the streaming tail (contextvar survives the generator; ids only when sent)")
 # Stop pressed: no finish_reason, no [DONE]
 reset()
 post_stream(conv, "and the fence?", [_content("The fence is white and it was cut off mid-wo")])
@@ -894,6 +901,196 @@ check(sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select count(*) f
 run_cmd("forget", "gamma", conv)
 code, out3 = run_cli("compare", "--store", str(STORE), "--db", str(db))
 check("redacted" in out3 and "missing from chat JSON:" in out3, "compare still runs with tombstones")
+
+# ===========================================================================
+print("\n[J1b] the REAL 0.11.4 shape: no id headers, no metadata -> still journals correctly, ids null")
+reset()
+conv = "conv-j1b"
+r = post_nonstream(conv, "what colour is the gate?", REPLY, headers=NO_IDS)
+eq(r.status_code, 200, "the reply is 200")
+ls = lines(conv)
+eq(len(ls), 1, "exactly one line")
+rec = ls[0] if ls else {}
+eq((rec.get("chat_id"), rec.get("message_id"), rec.get("parent_id")), (None, None, None),
+   "chat_id / message_id / parent_id are all null (0.11.4 forwards none)")
+eq(rec.get("assistant"), REPLY, "assistant text")
+eq((rec.get("user") or "").strip(), "what colour is the gate?", "user text")
+eq(rec.get("sha256"), chatjournal.pair_sha(rec.get("user", ""), rec.get("assistant", "")), "sha256 of the pair")
+check(bool(rec.get("ts")) and rec.get("epoch") == 0, "ts and epoch present")
+
+print("\n[J2b] the same on the streaming path with no ids")
+reset()
+post_stream(conv, "tell me about the gate", [_content("The gate is blue."), _finish("stop"), DONE], headers=NO_IDS)
+ls = lines(conv)
+eq(len(ls), 1, "one line")
+eq((ls[0]["chat_id"], ls[0]["message_id"]) if ls else None, (None, None), "ids null")
+eq(ls[0]["assistant"] if ls else None, "The gate is blue.", "reply text intact")
+
+# ===========================================================================
+print("\n[T1] R1 L3: a torn last line does not swallow the next exchange")
+reset()
+conv = "conv-t1"
+post_nonstream(conv, "first q", "first a", headers=NO_IDS)
+with open(jfile(conv), "ab") as f:
+    f.write(b'{"v":1,"conv_id":"conv-t1","user":"torn')  # crash mid-write: no newline
+post_nonstream(conv, "second q", "second a", headers=NO_IDS)
+good = []
+for ln in raw(conv).splitlines():
+    try:
+        good.append(json.loads(ln))
+    except Exception:
+        pass
+eq([g["user"] for g in good], ["first q", "second q"], "the exchange after the torn line parses")
+post_nonstream(conv, "third q", "third a", headers=NO_IDS)
+check(raw(conv).count("\n\n") == 0, "no blank line added when the file already ends in a newline")
+eq(len([1 for ln in raw(conv).splitlines() if ln.startswith('{"v":1') and ln.endswith("}")]), 3,
+   "three whole lines")
+
+# ===========================================================================
+print("\n[T2] R1 M2: <conv>.jsonl.*.tmp leftovers are found by wipe / has_content / reapply")
+reset()
+conv = "conv-t2"
+post_nonstream(conv, "zebrafish here", "noted", headers=NO_IDS)
+tmpf = jfile(conv).with_name(jfile(conv).name + ".abc123.tmp")
+tmpf.write_text(raw(conv), encoding="utf-8")   # what a killed _rewrite leaves
+check(chatjournal.tmp_leftovers(conv) == [tmpf], "tmp_leftovers finds it")
+jfile(conv).unlink()
+check(chatjournal.has_content(conv), "has_content is True with ONLY a tmp leftover (her words are on disk)")
+n = chatjournal.wipe(conv)
+check(n >= 1 and not tmpf.exists(), f"wipe removes the leftover and reports its lines ({n})")
+check(not chatjournal.has_content(conv), "and has_content is False afterwards")
+# wipe with journal + leftover
+post_nonstream(conv, "zebrafish again", "noted", headers=NO_IDS)
+tmpf.write_text("x\n", encoding="utf-8")
+chatjournal.wipe(conv)
+check(not jfile(conv).exists() and not tmpf.exists(), "wipe removes both the journal and the leftover")
+# reapply removes a leftover even with no ledger entries and no journal file
+tmpf.write_text("zebrafish\n", encoding="utf-8")
+res = chatjournal.reapply(conv, {"targeted": [], "wipe_epoch": None, "wipe_at": None})
+check(not tmpf.exists() and res.get("stray_tmp_removed") == 1, f"reapply removes a leftover ({res})")
+# and through the real /forget path
+post_nonstream(conv, "zebrafish once more", "noted", headers=NO_IDS)
+tmpf.write_text("zebrafish\n", encoding="utf-8")
+asyncio.run(chatjournal.wipe_async(conv))
+check(not tmpf.exists(), "wipe_async (the /forget path) removes it")
+
+print("\n[T3] R1 M2: reapply scans first and writes NO temp copy when nothing changes")
+reset()
+conv = "conv-t3"
+post_nonstream(conv, "an ordinary q", "an ordinary a", headers=NO_IDS)
+created = []
+real_mkstemp = chatjournal.tempfile.mkstemp
+def _spy(*a, **k):
+    created.append(1)
+    return real_mkstemp(*a, **k)
+before = raw(conv)
+with patch.object(chatjournal.tempfile, "mkstemp", _spy):
+    res = chatjournal.reapply(conv, {"targeted": [{"needle": "nomatch", "epoch": 0, "cutoff": "2999-01-01T00:00:00.000Z"}],
+                                     "wipe_epoch": None, "wipe_at": None})
+eq(created, [], "no temp file is created when no line changes (no copy at every boot)")
+eq(raw(conv), before, "file untouched")
+with patch.object(chatjournal.tempfile, "mkstemp", _spy):
+    res = chatjournal.reapply(conv, {"targeted": [{"needle": "ordinary", "epoch": 0, "cutoff": "2999-01-01T00:00:00.000Z"}],
+                                     "wipe_epoch": None, "wipe_at": None})
+eq(len(created), 1, "one temp file when a line really changes")
+eq(res.get("redacted"), 1, "and the line was redacted")
+eq(res.get("purged"), 0, "purge counter not double counted by the scan pass")
+
+# ===========================================================================
+print("\n[T4] R1 M1: /forget <text> redacts on the writer thread, FIFO with queued appends")
+import threading, time as _time  # noqa: E402
+lost = 0
+for trial in range(5):
+    reset()
+    conv = f"conv-t4-{trial}"
+    gate = threading.Event()
+    orig = chatjournal._append_line
+    first = [True]
+    def slow(path, line, _o=orig, _f=first, _g=gate):
+        if _f[0]:
+            _f[0] = False
+            _g.wait(5)
+        return _o(path, line)
+    with patch.object(chatjournal, "_append_line", slow):
+        chatjournal.set_request_meta({"images": {"count": 0, "refs": []}})
+        chatjournal.submit(conv, "unrelated", "x", finished=True, truncated=False, holed=False,
+                           finish_reason="stop", wipe_generation=None)
+        chatjournal.submit(conv, "zebrafish said here", "y", finished=True, truncated=False, holed=False,
+                           finish_reason="stop", wipe_generation=None)
+        _time.sleep(0.05)
+        out = {}
+        def _forget():
+            out["r"] = asyncio.run(commands.handle_command(
+                "forget", "zebrafish", conv,
+                ctx={"clear_all_memory": lambda cid: None, "turn_index": 1, "persona_text": ""}))
+        t = threading.Thread(target=_forget)
+        t.start(); _time.sleep(0.1); gate.set(); t.join(15); chatjournal.drain(5)
+    if "zebrafish" in raw(conv).lower():
+        lost += 1
+eq(lost, 0, "5/5 trials: a reply queued BEFORE the forget does not keep its words after the redaction")
+check(asyncio.iscoroutinefunction(chatjournal.redact_needle_async), "redact_needle_async exists")
+import inspect as _inspect
+check("redact_needle_async" in _inspect.getsource(commands) and "run_in_threadpool(\n                    chatjournal.redact_needle" not in _inspect.getsource(commands),
+      "commands.py uses the async writer-thread variant")
+
+# ===========================================================================
+print("\n[T5] R1 L5: shutdown drains the journal BEFORE bgwork.drain (and once after)")
+import bgwork  # noqa: E402
+import re  # noqa: E402
+order = []
+o_jd, o_bd = chatjournal.drain, bgwork.pool.drain
+async def _bd(*a, **k):
+    order.append("bgwork")
+    return await o_bd(*a, **k)
+def _jd(*a, **k):
+    order.append("journal")
+    return o_jd(*a, **k)
+async def _boot():
+    async with main.lifespan(main.app):
+        pass
+with patch.object(chatjournal, "drain", _jd), patch.object(bgwork.pool, "drain", _bd):
+    asyncio.run(_boot())
+eq(order, ["journal", "bgwork", "journal"], "journal drain, then bgwork drain, then a second short journal drain")
+_sv = (Path(__file__).resolve().parent.parent / "supervisord.conf").read_text(encoding="utf-8")
+_blk = _sv.split("[program:compactor]")[1].split("[program:")[0]
+check(re.search(r"^stopwaitsecs=20$", _blk, re.M) is not None, "[program:compactor] has stopwaitsecs=20")
+
+print("\n[T6] R1 L6: degrade.guard skips are counted")
+reset()
+eq(chatjournal.health_snapshot()["skipped_disk_pressure"], 0, "starts at 0")
+with patch.object(degrade, "guard", lambda *a, **k: False):
+    post_nonstream("conv-t6", "a question", REPLY, headers=NO_IDS)
+    post_nonstream("conv-t6", "another", REPLY, headers=NO_IDS)
+check(not jfile("conv-t6").exists(), "nothing journaled under pressure")
+eq(chatjournal.health_snapshot()["skipped_disk_pressure"], 2, "two skips counted in health")
+eq(health._chat_journal_snapshot()["skipped_disk_pressure"], 2, "and /health/full's block carries it")
+
+# ===========================================================================
+print("\n[S2] compare on the REAL 0.11.4 shape (null ids): hash matching, redacted counted apart, image-only marker")
+reset()
+conv = "conv-s2"
+post_nonstream(conv, "alpha question", "alpha answer", headers=NO_IDS)
+post_nonstream(conv, "secret zebrafish", "ok zebrafish", headers=NO_IDS)
+post_nonstream(conv, "[shared 1 image]", "a picture of a gate", headers=NO_IDS)
+post_nonstream(conv, "lost question", "lost answer", headers=NO_IDS)
+run_cmd("forget", "zebrafish", conv)
+db2 = _TMP / "owui2.db"
+con = sqlite3.connect(str(db2))
+con.execute("create table chat (id text primary key, chat text, current_message_id text, updated_at integer)")
+h2 = {
+    "u1": {"role": "user", "content": "alpha question", "parentId": None},
+    "a1": {"role": "assistant", "content": "alpha answer", "parentId": "u1"},
+    "u3": {"role": "user", "content": "", "parentId": "a1"},          # OpenWebUI holds image-only turns as empty text
+    "a3": {"role": "assistant", "content": "a picture of a gate", "parentId": "u3"},
+}
+con.execute("insert into chat values (?,?,?,?)", (conv, json.dumps({"history": {"messages": h2}}), "a3", 1))
+con.commit(); con.close()
+code, out = run_cli("compare", "--store", str(STORE), "--db", str(db2), "--conv", conv)
+eq(code, 0, "compare exits 0")
+check(all(l.get("message_id") is None for l in lines(conv)), "fixture: every journal id is null")
+check("redacted (/forget tombstones, not compared): 1" in out, f"the tombstone is counted on its own line: {out!r}")
+check("missing from chat JSON: 1" in out, "only the genuinely missing exchange is 'missing' (redacted and image-only are not)")
+check("RAG / file-attachment turns can show as unmatched" in out, "the RAG caveat is printed")
 
 # ===========================================================================
 print("\n[D1] the images COPY the journal module and the guard lists it")

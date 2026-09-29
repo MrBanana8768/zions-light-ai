@@ -653,7 +653,7 @@ def _classify(record: dict, backfill_mod) -> tuple[str, str]:
                 "in_progress and not yet stale — may be a backfill genuinely "
                 "running right now; re-check rather than close it",
             )
-        attempts = int(record.get("attempts") or 0)
+        attempts = max(1, int(record.get("attempts") or 0))  # v3.1.9.10 (R4 H1): no key = one attempt, as needs_backfill()
         if attempts >= max_attempts:
             return (
                 "needs-review",
@@ -666,12 +666,12 @@ def _classify(record: dict, backfill_mod) -> tuple[str, str]:
             "would-resume",
             f"stale in_progress ({record.get('exchanges_done', 0)}/"
             f"{record.get('exchanges_total', 0)} exchanges, attempt "
-            f"{attempts or 1}) — needs_backfill() resumes this on the next "
+            f"{attempts}) — needs_backfill() resumes this on the next "
             f"eligible request",
         )
 
     if state == "failed":
-        attempts = int(record.get("attempts") or 0)
+        attempts = max(1, int(record.get("attempts") or 0))  # v3.1.9.10 (R4 H1): no key = one attempt, as needs_backfill()
         if attempts >= max_attempts:
             return (
                 "needs-review",

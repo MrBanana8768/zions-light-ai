@@ -1120,7 +1120,7 @@ def _drive_with_sigterm(results, *, raise_on_call: int):
     calls: list[dict] = []
     n = [0]
 
-    def fake_sync_once(force=False):
+    def fake_sync_once(force=False, lock_wait_s=0.0):
         n[0] += 1
         calls.append({"n": n[0], "force": force})
         if n[0] == raise_on_call:
@@ -1201,7 +1201,7 @@ print("    CONTROL (H-1, review1-v3197-65ea196): the final sync does NOT "
 CAP.records.clear()
 _forced = []
 _orig_sync_once = webuidb.sync_once
-webuidb.sync_once = lambda force=False: (_forced.append(force), _SYNCED)[1]
+webuidb.sync_once = lambda force=False, lock_wait_s=0.0: (_forced.append(force), _SYNCED)[1]
 try:
     webuidb._final_sync_on_shutdown()
 finally:
@@ -1246,7 +1246,7 @@ check(
 
 print("    CONTROL: _final_sync_on_shutdown never raises, even when "
       "sync_once itself blows up - the process is exiting either way")
-webuidb.sync_once = lambda force=False: (_ for _ in ()).throw(RuntimeError("boom"))
+webuidb.sync_once = lambda force=False, lock_wait_s=0.0: (_ for _ in ()).throw(RuntimeError("boom"))
 try:
     webuidb._final_sync_on_shutdown()
     _raised = False
@@ -1264,7 +1264,7 @@ print("    CONTROL (P1, review1-v3197-65ea196): a re-entrancy skip ('another "
       "sync is in progress', meaning NO final publish happened) is logged "
       "at WARNING, not INFO - it must not read like an ordinary success")
 CAP.records.clear()
-webuidb.sync_once = lambda force=False: {
+webuidb.sync_once = lambda force=False, lock_wait_s=0.0: {
     "synced": False, "skipped": "another sync is in progress", "error": None, "bytes": 0,
 }
 try:
@@ -1282,7 +1282,7 @@ print("    CONTROL: the ordinary 'unchanged since last sync' skip (nothing "
       "to publish, not a re-entrancy problem) still logs at plain INFO, "
       "not WARNING - the P1 fix must not over-fire on the harmless case")
 CAP.records.clear()
-webuidb.sync_once = lambda force=False: dict(_UNCHANGED)
+webuidb.sync_once = lambda force=False, lock_wait_s=0.0: dict(_UNCHANGED)
 try:
     webuidb._final_sync_on_shutdown()
 finally:
@@ -1345,7 +1345,7 @@ _installed = []
 _orig_signal = signal.signal
 signal.signal = lambda signum, handler: _installed.append((signum, handler))
 try:
-    webuidb.sync_once = lambda force=False: (_ for _ in ()).throw(_StopLoop())
+    webuidb.sync_once = lambda force=False, lock_wait_s=0.0: (_ for _ in ()).throw(_StopLoop())
     try:
         webuidb.sync_loop()
     except _StopLoop:

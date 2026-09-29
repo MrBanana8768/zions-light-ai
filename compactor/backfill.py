@@ -691,7 +691,14 @@ def needs_backfill(conv_id: str, messages: list[dict]) -> bool:
         if s == "in_progress":
             if not is_stale(state):
                 return False  # someone else is on it
-            if int(state.get("attempts") or 0) >= _MAX_BACKFILL_ATTEMPTS:
+            # v3.1.9.10 (R4 H1). A record with NO `attempts` key is the
+            # shape EVERY release before v3.1.9.4 writes (her v3.1.9
+            # in_progress record among them). It exists, so at least one
+            # attempt has run: count it as 1, never 0, or
+            # COMPACTOR_BACKFILL_MAX_ATTEMPTS=1 would not stop the resume
+            # (same floor `_backoff_ready` applies).
+            attempts = max(1, int(state.get("attempts") or 0))
+            if attempts >= _MAX_BACKFILL_ATTEMPTS:
                 # Crashed on an attempt that was already at the cap. This
                 # record stays in_progress/stale forever — see this
                 # function's own docstring for why nothing rewrites it —
@@ -700,7 +707,7 @@ def needs_backfill(conv_id: str, messages: list[dict]) -> bool:
                 if logsetup.log_once(f"backfill.cap_on_crash.{conv_id}"):
                     logger.warning(
                         f"conv={conv_id}: backfill's last attempt "
-                        f"({state.get('attempts')}) crashed rather than "
+                        f"({attempts}) crashed rather than "
                         f"failing cleanly, and it was already at the "
                         f"{_MAX_BACKFILL_ATTEMPTS}-attempt cap — not "
                         f"retrying again for this conversation"
@@ -715,7 +722,9 @@ def needs_backfill(conv_id: str, messages: list[dict]) -> bool:
                 return False
             return True  # stale, and under the cap — retry
         if s == "failed":
-            attempts = int(state.get("attempts") or 0)
+            # v3.1.9.10 (R4 H1): a `failed` record with no `attempts` key
+            # (v3.1.9 and earlier) has had one attempt, not zero.
+            attempts = max(1, int(state.get("attempts") or 0))
             if attempts >= _MAX_BACKFILL_ATTEMPTS:
                 # Reachable only for a record written before this fix
                 # shipped (_run_backfill now writes "abandoned" instead of

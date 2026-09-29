@@ -116,6 +116,42 @@ Owner runbook: **RUNBOOK_POD_MIGRATION.md**. The audit and the exact env block: 
   `ZL_HOME`; the snapshot default (`webuidb.py`, `health.py`) follows `DATA_DIR`; `podenv.py` forensics/ssh/shadow paths and
   ten operator scripts follow the pod's environment. Every default is unchanged when the environment is unset.
 
+### Fixed (hostile gauntlet round 1, compactor)
+- **`COMPACTOR_BACKFILL_MAX_ATTEMPTS=1` now stops her backfill (R4 H1).** `needs_backfill` read a record with no
+  `attempts` key (what EVERY release before v3.1.9.4 writes, hers included) as 0 attempts, so a stale
+  `in_progress` or `failed` v3.1.9 record resumed even at a cap of 1. It now counts as at least 1
+  (`max(1, attempts)`, as `_backoff_ready` already did). `scripts/backfill-records.py` classifies the same way.
+  Tests build the record from v3.1.9's real writer shape.
+- **`webuidb.py --sync-once` no longer reports success it did not achieve (R3 H1).** It waits for the sync lock
+  (polls up to `WEBUI_DB_SYNC_ONCE_LOCK_WAIT_S`, default 180 s; backup holds it across its slow copy) and then
+  publishes. Exit 0 only for `synced: True` or an "unchanged" that is verified (local and snapshot have equal
+  chats / content bytes / newest_update, the values `--status` prints); a busy lock after the wait, a missing local
+  database, or an unverifiable skip now exit 1 with a message. The SIGTERM final sync also waits for the lock
+  (`WEBUI_DB_SHUTDOWN_LOCK_WAIT_S`, default 45 s, inside the 120 s stopwaitsecs).
+- **A local-mode `backup.py --restore` publishes the restored DB to the snapshot in the same call (R3 H2)**, forced,
+  with the shrink / row-loss / older-generation guards opened for that one call only (the unreadable-snapshot guard
+  stays). If the snapshot does not end up equal to the restored DB the restore raises a clear error naming the
+  recovery command.
+- **Backup retention keys on the timestamp in the archive NAME (R3 L6)** (`zions-backup-YYYYMMDD-HHMMSS`), falling
+  back to file mtime only when the name does not parse. Archives copied without `cp -p` (all one mtime) are tiered
+  and ordered correctly.
+- **`/forget <text>` redacts the chat journal on the journal's own writer thread (R1 M1)**, FIFO with queued appends,
+  so a reply queued just before the forget cannot land after the redaction with the words intact.
+- **Journal rewrite leftovers (R1 M2).** `wipe()`, `has_content()` and the boot `reapply()` find and remove
+  `<conv>.jsonl.*.tmp` files a killed rewrite leaves with her words in them. `reapply` scans first and writes a
+  temp copy only when a line changes (no full copy of every journal at every boot).
+- **A torn last journal line no longer swallows the next exchange (R1 L3)**: a leading newline is written when the
+  file does not end in one.
+- **Journal ids are documented as always null on OpenWebUI 0.11.4 (R1 L4)** (no message-id header, metadata
+  stripped; `ENABLE_FORWARD_USER_INFO_HEADERS` stays off). `scripts/chat-journal.py compare` counts redacted
+  tombstones on their own line (not "missing"), recognises the image-only `[shared N image]` marker, and says RAG /
+  file turns can show as unmatched. Tests J1/J2 no longer pretend 0.11.4 sends ids; a real no-id case was added.
+- **Shutdown drains the chat journal before `bgwork.drain` (R1 L5)** (and briefly again after it), and
+  `[program:compactor]` has `stopwaitsecs=20` (was the default 10).
+- **`/health/full` `chat_journal.skipped_disk_pressure` (R1 L6)** counts journal writes skipped by disk pressure.
+- New tests kill the four mutants R1 left alive: the journal `ts < wipe_at` purge, the `pre_dates` tie, the
+  `_upgrade_legacy` call on the ledger write path, and a null-epoch line that pre-dates a wipe.
+
 ---
 
 ## [3.1.9.9] — Cloudflare Tunnel: `https://ai.revelationsaints.com` instead of the RunPod proxy URL

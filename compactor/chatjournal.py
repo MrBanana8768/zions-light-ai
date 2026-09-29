@@ -18,10 +18,18 @@ LINE FORMAT (schema v=1), one JSON object per line, UTF-8, ensure_ascii off:
     [truncated: ["user"|"assistant"]]   only when a field hit MAX_FIELD_CHARS
     [redacted: true]                    a /forget tombstone, see below
 
-`chat_id` / `message_id` are the sanitised X-OpenWebUI-Chat-Id / -Message-Id
-(same gate as the request-tracing `ow_chat=` / `ow_msg=`), falling back to the
-body's `metadata`; `parent_id` is `metadata.parent_message_id` when the
-payload carries it. `images` are REFERENCES only (a count, plus file ids or
+IDS ARE NULL ON THE DEPLOYED OPENWEBUI (0.11.4). `chat_id` / `message_id` /
+`parent_id` are recorded WHEN THE REQUEST CARRIES THEM: the sanitised
+X-OpenWebUI-Chat-Id / -Message-Id headers (same gate as the request-tracing
+`ow_chat=` / `ow_msg=`), falling back to the body's `metadata`. OpenWebUI
+0.11.4 sends neither: those headers exist only under
+ENABLE_FORWARD_USER_INFO_HEADERS (kept OFF here, deliberately) and even then
+there is no message-id header, and 0.11.4 strips `metadata` from the
+forwarded body. So on prod every journal line has chat_id, message_id and
+parent_id = null, and `scripts/chat-journal.py compare` matches on the
+sha256 of the pair (user + assistant text) alone. The fields stay in the
+schema for a future OpenWebUI that forwards them; nothing may rely on them.
+`images` are REFERENCES only (a count, plus file ids or
 names when present); bytes and data URLs are never stored. `sha256` is
 `pair_sha(user, assistant)`, over the STORED texts.
 
@@ -104,6 +112,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextvars
 import datetime
+import glob
 import hashlib
 import json
 import logging
@@ -150,6 +159,7 @@ _stats: dict[str, Any] = {
     "skipped": 0,
     "dropped": 0,
     "redacted_lines": 0,
+    "skipped_disk_pressure": 0,
 }
 _pending: set = set()
 
@@ -367,9 +377,17 @@ def _append_line(path: Path, line: str) -> None:
     can make it fail (monkeypatch, never chmod: the gate runs as root)."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     existed = path.exists()
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    # O_RDWR (not O_WRONLY) only so the last byte can be read: see below.
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         data = (line + "\n").encode("utf-8")
+        # v3.1.9.10 (R1 L3). A crash mid-write leaves a last line with no
+        # newline; appending straight after it would glue THIS exchange onto
+        # the torn one and lose both. Start on a fresh line instead: the torn
+        # fragment stays an unparseable line of its own, this one parses.
+        size = os.fstat(fd).st_size
+        if size > 0 and os.pread(fd, 1, size - 1) != b"\n":
+            data = b"\n" + data
         view = memoryview(data)
         while view:
             n = os.write(fd, view)
@@ -487,6 +505,13 @@ def submit(
         return "error"
 
 
+def note_skipped_disk_pressure() -> None:
+    """main._run_memory_tail calls this when degrade.guard refused the
+    journal write (disk pressure): counted in /health/full so a paused
+    journal is visible (v3.1.9.10, R1 L6)."""
+    _bump("skipped_disk_pressure")
+
+
 def _discard(fut) -> None:
     with _stats_lock:
         _pending.discard(fut)
@@ -512,19 +537,42 @@ def _count_lines(path: Path) -> int:
     return n
 
 
+def tmp_leftovers(conv_id: str) -> list[Path]:
+    """`<conv>.jsonl.*.tmp` files: the temp copy `_rewrite` streams into. A
+    kill between its first write and the os.replace leaves one behind, and it
+    holds her words (v3.1.9.10, R1 M2). journal_path validates the conv_id
+    (it is a plain name: [A-Za-z0-9_-]), so the glob cannot leave the dir."""
+    p = journal_path(conv_id)
+    try:
+        return sorted(q for q in p.parent.glob(glob.escape(p.name) + ".*.tmp") if q.is_file())
+    except OSError:
+        return []
+
+
 def wipe(conv_id: str) -> int:
-    """Delete the conversation's journal. Returns the number of lines removed
-    (0 when there was none). Raises OSError if the unlink fails (the caller
-    reports it; /forget's residue check also sees the file)."""
+    """Delete the conversation's journal AND any `.tmp` rewrite leftovers.
+    Returns the number of lines removed (0 when there was none). Raises OSError
+    if an unlink fails (the caller reports it; /forget's residue check also
+    sees the file)."""
     p = journal_path(conv_id)
     with _LOCK:
-        if not p.is_file():
+        leftovers = tmp_leftovers(conv_id)
+        if not p.is_file() and not leftovers:
             return 0
-        try:
-            n = _count_lines(p)
-        except OSError:
-            n = 0
-        p.unlink()
+        n = 0
+        if p.is_file():
+            try:
+                n = _count_lines(p)
+            except OSError:
+                n = 0
+            p.unlink()
+        for q in leftovers:
+            if not n:
+                try:
+                    n = _count_lines(q)
+                except OSError:
+                    pass
+            q.unlink()
         _fsync_dir(p.parent)
         return n
 
@@ -537,20 +585,60 @@ async def wipe_async(conv_id: str) -> int:
     return await asyncio.get_running_loop().run_in_executor(_EXEC, wipe, conv_id)
 
 
+async def redact_needle_async(conv_id: str, needle: str) -> int:
+    """`redact_needle` on the writer thread, FIFO behind every queued append
+    (as `wipe_async` does). v3.1.9.10, R1 M1: /forget <text> used to run it on
+    the general threadpool, so a reply queued BEFORE the forget could land
+    AFTER the redaction with the forgotten words intact (20 of 20 trials with
+    a stalled writer). On the single writer thread, everything queued earlier
+    is on disk before the redaction reads the file."""
+    import asyncio
+
+    return await asyncio.get_running_loop().run_in_executor(_EXEC, redact_needle, conv_id, needle)
+
+
 def has_content(conv_id: str) -> bool:
-    """True if a journal file with at least one byte exists (for /forget's
-    post-wipe residue check)."""
+    """True if a journal file (or a `.tmp` rewrite leftover) with at least one
+    byte exists (for /forget's post-wipe residue check)."""
     try:
         p = journal_path(conv_id)
-        return p.is_file() and p.stat().st_size > 0
+        if p.is_file() and p.stat().st_size > 0:
+            return True
+        return any(q.stat().st_size > 0 for q in tmp_leftovers(conv_id))
     except Exception:
         return False
 
 
-def _rewrite(path: Path, transform) -> tuple[int, int]:
+def _scan_would_change(path: Path, transform) -> bool:
+    """True if `transform` would change or drop any line of `path`. Reads
+    only: no temp file. (Blank lines never count: `_rewrite` skips them and
+    replaces the file only when a real line changed or was dropped.)"""
+    with open(path, "r", encoding="utf-8", errors="replace", newline="\n") as src:
+        for raw in src:
+            line = raw.rstrip("\n")
+            if not line:
+                continue
+            new = transform(line)
+            if new is None or new != line:
+                return True
+    return False
+
+
+def _rewrite(path: Path, transform, on_write_pass=None) -> tuple[int, int]:
     """Stream `path` through `transform(line:str) -> str|None` (None drops the
     line, an equal string keeps it) into a temp file, fsync, os.replace.
-    Returns (changed, dropped). Nothing is replaced when nothing changed."""
+    Returns (changed, dropped).
+
+    SCANS FIRST (v3.1.9.10, R1 M2): when nothing would change, NO temp copy is
+    made at all (the boot-time reapply used to write a full copy of every
+    journal on every boot, each a window for a kill to leave her words in a
+    stray .tmp). `on_write_pass`, if given, runs just before the second
+    (writing) pass so a caller's counters that `transform` bumps are not
+    counted twice."""
+    if not _scan_would_change(path, transform):
+        return 0, 0
+    if on_write_pass is not None:
+        on_write_pass()
     changed = dropped = 0
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     try:
@@ -635,8 +723,21 @@ def reapply(conv_id: str, ledger: dict) -> dict:
     wipe_at = continuity._parse_ts(ledger.get("wipe_at"))
     p = journal_path(conv_id)
     with _LOCK:
+        # v3.1.9.10 (R1 M2): a killed rewrite leaves `<conv>.jsonl.*.tmp`
+        # with her words in it. The real file is intact (os.replace never
+        # ran), so the leftover is only ever a stray copy: remove it here,
+        # whether or not the journal itself still exists.
+        stray = 0
+        for q in tmp_leftovers(conv_id):
+            try:
+                q.unlink()
+                stray += 1
+            except OSError as e:
+                logger.error(f"chat journal: could not remove a rewrite leftover ({type(e).__name__})")
+        if stray:
+            _fsync_dir(p.parent)
         if not p.is_file():
-            return {"purged": 0, "redacted": 0}
+            return {"purged": 0, "redacted": 0, "stray_tmp_removed": stray}
         purged = [0]
 
         def tf(line: str):
@@ -663,13 +764,14 @@ def reapply(conv_id: str, ledger: dict) -> dict:
                     return _dumps(_tombstone(rec))
             return line
 
-        changed, dropped = _rewrite(p, tf)
+        changed, dropped = _rewrite(p, tf, on_write_pass=lambda: purged.__setitem__(0, 0))
         if p.is_file() and p.stat().st_size == 0:
             try:
                 p.unlink()
             except OSError:
                 pass
-        return {"purged": purged[0], "redacted": changed, "dropped": dropped}
+        return {"purged": purged[0], "redacted": changed, "dropped": dropped,
+                "stray_tmp_removed": stray}
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +791,7 @@ def health_snapshot() -> dict:
         "errors": s["errors"],
         "skipped": s["skipped"],
         "dropped": s["dropped"],
+        "skipped_disk_pressure": s["skipped_disk_pressure"],
         "pending": pending,
     }
 
@@ -697,4 +800,4 @@ def _reset_for_tests() -> None:
     drain(5.0)
     with _stats_lock:
         _stats.update(lines_written=0, errors=0, last_write_at=None, skipped=0,
-                      dropped=0, redacted_lines=0)
+                      dropped=0, redacted_lines=0, skipped_disk_pressure=0)

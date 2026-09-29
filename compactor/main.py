@@ -10827,14 +10827,18 @@ def _run_memory_tail(
             and chatjournal.request_meta_ctx.get() is not None
             and not _task_traffic
             and _has_pairable_user_text(last_user_text)
-            and degrade.guard("chat journal")
         ):
-            chatjournal.submit(
-                conv_id, last_user_text, text,
-                finished=finished, truncated=truncated, holed=holed,
-                finish_reason=(chatjournal.request_meta_ctx.get() or {}).get("finish_reason"),
-                wipe_generation=wipe_generation,
-            )
+            if degrade.guard("chat journal"):
+                chatjournal.submit(
+                    conv_id, last_user_text, text,
+                    finished=finished, truncated=truncated, holed=holed,
+                    finish_reason=(chatjournal.request_meta_ctx.get() or {}).get("finish_reason"),
+                    wipe_generation=wipe_generation,
+                )
+            else:
+                # v3.1.9.10 (R1 L6): a disk-pressure skip is counted
+                # (/health/full chat_journal.skipped_disk_pressure), not silent.
+                chatjournal.note_skipped_disk_pressure()
     except Exception as e:
         logger.error(f"conv={conv_id}: chat journal hand-off failed ({type(e).__name__})")
     if decision.store and _task_traffic:
@@ -11104,6 +11108,15 @@ async def lifespan(app: FastAPI):
             await _wordban_warmup_task
         except (asyncio.CancelledError, Exception):
             pass
+    # v3.1.9.10 (R1 L5). Chat-journal lines queued so far reach disk FIRST.
+    # bgwork's drain below can spend its whole 10 s, and supervisord's
+    # stopwaitsecs used to be exactly 10 (now 20): with the journal drain
+    # AFTER it, the last replies' lines were the ones a SIGKILL cut. A second,
+    # short drain after the bg work picks up any line a finishing tail queued.
+    try:
+        await run_in_threadpool(chatjournal.drain, 5.0)
+    except Exception as e:
+        logger.warning(f"chat journal drain at shutdown failed ({type(e).__name__})")
     # Graceful: give in-flight background work (fact extraction, indexing,
     # rollup, backfill) a moment to finish via the bounded pool.
     #
@@ -11119,11 +11132,11 @@ async def lifespan(app: FastAPI):
     # own "Exact change needed at main.py:8367" section, not applied there
     # because main.py was another lane's file at the time.
     await bgwork.pool.drain(timeout=10.0, cancel_on_timeout=True)
-    # v3.1.9.10: let queued chat-journal lines reach disk before the process
-    # exits (a few ms normally; bounded so a stalled volume cannot hang the
-    # shutdown). In a worker thread: drain() blocks.
+    # v3.1.9.10: and once more after the bg work (see the first drain above):
+    # a few ms normally; bounded so a stalled volume cannot hang the
+    # shutdown. In a worker thread: drain() blocks.
     try:
-        await run_in_threadpool(chatjournal.drain, 5.0)
+        await run_in_threadpool(chatjournal.drain, 2.0)
     except Exception as e:
         logger.warning(f"chat journal drain at shutdown failed ({type(e).__name__})")
 

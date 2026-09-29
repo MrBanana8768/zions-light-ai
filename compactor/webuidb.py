@@ -1427,8 +1427,8 @@ def _sync_lock_path() -> Path:
     return LOCAL_DB.with_name(LOCAL_DB.name + ".sync.lock")
 
 
-def _acquire_sync_lock():
-    """Take an exclusive, non-blocking flock so two sync_once calls never
+def _acquire_sync_lock(wait_s: float = 0.0):
+    """Take an exclusive flock so two sync_once calls never
     overlap (F4: a manual `webuidb.py --sync-once` can run while the
     webuidb-sync daemon's own loop is mid-cycle).
 
@@ -1451,6 +1451,14 @@ def _acquire_sync_lock():
     would be strictly worse than the race it prevents — which is why this
     is LOCK_EX | LOCK_NB, never a blocking flock, even on the platform
     where it is real.
+
+    `wait_s` (v3.1.9.10, R3 H1): 0 (the default, and what the daemon's
+    periodic cycle uses) is the single non-blocking attempt above. A
+    positive value POLLS that same LOCK_NB every 0.25 s until the deadline,
+    so it still never hangs in the kernel: the one-shot `--sync-once` CLI and
+    the SIGTERM final sync use it, because a skip there means "her last
+    writes were not published" (backup.py holds this lock across its slow
+    MooseFS copy).
     """
     try:
         import fcntl
@@ -1475,12 +1483,16 @@ def _acquire_sync_lock():
         )
         return _LOCK_DEGRADED
 
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        fh.close()
-        return None  # another sync_once holds it right now
-    return fh
+    deadline = time.monotonic() + max(0.0, float(wait_s or 0.0))
+    while True:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if time.monotonic() >= deadline:
+                fh.close()
+                return None  # another sync_once holds it right now
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
 
 
 def _release_sync_lock(lock) -> None:
@@ -1628,7 +1640,7 @@ def _fsync_file_and_dir(path: Path) -> None:
         pass  # best-effort; matches write_restore_marker's own directory fsync
 
 
-def sync_once(force: bool = False) -> dict:
+def sync_once(force: bool = False, lock_wait_s: float = 0.0) -> dict:
     """Publish LOCAL_DB to SNAPSHOT_DB, safely, while OpenWebUI is running.
 
     TWO STAGES, and the SOURCE's lock never crosses into the slow one
@@ -1709,7 +1721,7 @@ def sync_once(force: bool = False) -> dict:
         out["skipped"] = "no local database yet"
         return out
 
-    lock = _acquire_sync_lock()
+    lock = _acquire_sync_lock(lock_wait_s)
     if lock is None:
         # F4: the other sync_once is doing the same job right now - this is
         # not a failure, so it is a skip (out["error"] stays None), the same
@@ -2386,6 +2398,89 @@ def _sigterm_handler(signum, frame) -> None:
     raise _ShutdownRequested()
 
 
+def _shutdown_lock_wait_s() -> float:
+    """How long the SIGTERM final sync waits for the sync lock (default 45 s,
+    env WEBUI_DB_SHUTDOWN_LOCK_WAIT_S). The publish itself takes 13-23 s warm
+    and supervisord gives this program 120 s (stopwaitsecs)."""
+    return max(0.0, env_float("WEBUI_DB_SHUTDOWN_LOCK_WAIT_S", 45))
+
+
+def _cli_lock_wait_s() -> float:
+    """How long `--sync-once` waits for the sync lock (default 180 s, env
+    WEBUI_DB_SYNC_ONCE_LOCK_WAIT_S; tests set it small)."""
+    return max(0.0, env_float("WEBUI_DB_SYNC_ONCE_LOCK_WAIT_S", 180))
+
+
+def content_fingerprint(path: Path) -> tuple | None:
+    """(chats, content bytes, newest updated_at) of a webui.db: the three
+    values `--status` prints for each file. None if the file is absent or
+    unreadable. Two databases with equal fingerprints hold the same history
+    for the purpose of "is the snapshot current"."""
+    try:
+        if not path.exists():
+            return None
+        scan = _scan_chat(path)
+        if scan is None:
+            return None
+        return (_has_rows(path), scan["total"], scan["newest"])
+    except Exception:
+        return None
+
+
+def sync_once_cli_exit(r: dict) -> tuple[int, str]:
+    """Decide the exit status of `--sync-once` from sync_once()'s result.
+
+    v3.1.9.10 (R3 H1). Exit 0 ONLY when the snapshot demonstrably holds what
+    LOCAL holds: `synced: True`, or a skip whose claim ("unchanged since last
+    sync") this VERIFIES by comparing the content fingerprint of local and
+    snapshot (the values `--status` prints). "another sync is in progress"
+    (after the wait) and "no local database yet" are NOT success: nothing was
+    published and nothing was verified.
+    """
+    if r.get("error"):
+        return 1, f"NOT PUBLISHED: {r['error']}"
+    if r.get("synced"):
+        return 0, "published"
+    skipped = r.get("skipped")
+    if skipped == "unchanged since last sync":
+        a, b = content_fingerprint(LOCAL_DB), content_fingerprint(SNAPSHOT_DB)
+        if a is not None and a == b:
+            return 0, f"snapshot verified equal to local (chats/content/newest_update = {a})"
+        return 1, (f"NOT VERIFIED: sync said 'unchanged' but local {a} != "
+                   f"snapshot {b} (chats, content bytes, newest_update)")
+    return 1, f"NOT PUBLISHED: {skipped or 'unknown result'}"
+
+
+def publish_after_restore(lock_wait_s: float = 60.0) -> dict:
+    """Publish LOCAL_DB to the snapshot right after backup.py restored an
+    archive into LOCAL_DB (v3.1.9.10, R3 H2).
+
+    A local-mode restore used to leave the snapshot as it was: the daemon's
+    mtime skip, then the row-loss / generation / shrink guards (a restore is
+    exactly an older, smaller database), meant the restored DB was never
+    published, and the next boot's snapshot-vs-local choice could bring the
+    pre-restore data back. The operator asked for this content, from a
+    verified archive, so the shrink, row-loss and older-generation guards are
+    opened for THIS ONE CALL only (NOT the unreadable-snapshot one: that protects
+    a durable copy this restore has said nothing about) (the module globals are restored in a finally; the daemon and the
+    env are untouched) and the publish is forced (no mtime skip).
+
+    Returns the sync_once() dict plus `verified` (content fingerprints of
+    LOCAL_DB and SNAPSHOT_DB are equal). Never raises for a refused publish:
+    the caller decides (backup.restore_backup raises a clear error).
+    """
+    global ALLOW_SHRINK, ALLOW_ROW_LOSS, ALLOW_OLDER_GENERATION
+    saved = (ALLOW_SHRINK, ALLOW_ROW_LOSS, ALLOW_OLDER_GENERATION)
+    ALLOW_SHRINK = ALLOW_ROW_LOSS = ALLOW_OLDER_GENERATION = True
+    try:
+        r = sync_once(force=True, lock_wait_s=lock_wait_s)
+    finally:
+        ALLOW_SHRINK, ALLOW_ROW_LOSS, ALLOW_OLDER_GENERATION = saved
+    a, b = content_fingerprint(LOCAL_DB), content_fingerprint(SNAPSHOT_DB)
+    r["verified"] = bool(r.get("synced")) and a is not None and a == b
+    return r
+
+
 def _final_sync_on_shutdown() -> None:
     """D1 (findings.md). Runs the same publish the DB-MOVE-RUNBOOK's manual
     "final sync" step performs by hand (`sync_once(force=True)`), so a
@@ -2416,7 +2511,12 @@ def _final_sync_on_shutdown() -> None:
     -- see _sigterm_handler's own SIG_IGN fix.
     """
     try:
-        r = sync_once()
+        # v3.1.9.10 (R3 H1). WAIT briefly for the lock instead of skipping:
+        # backup.py holds it across its MooseFS copy, and a skip here is a
+        # lost final publish. Bounded well under supervisord's
+        # stopwaitsecs=120 (this program), so a stuck holder can not turn a
+        # stop into a SIGKILL.
+        r = sync_once(lock_wait_s=_shutdown_lock_wait_s())
     except Exception as e:
         logger.error(f"final sync on SIGTERM raised: {type(e).__name__}: {e}")
         return
@@ -2704,7 +2804,10 @@ if __name__ == "__main__":
         # each cycle would otherwise rewrite the whole database onto /data
         # even when nothing changed - this is only about the explicit,
         # one-shot CLI action, which has no "next cycle" to catch up on.
-        r = sync_once(force=True)
+        # v3.1.9.10 (R3 H1): WAIT for the sync lock (backup.py holds it
+        # across its slow copy; it used to exit 0 on "skipped: another sync
+        # is in progress", a lie to whoever runs this as the final sync).
+        r = sync_once(force=True, lock_wait_s=_cli_lock_wait_s())
         print(r)
         # The sibling, fixed at the same time and for the same reason. A
         # refused publish is the guard working, and it still must not report
@@ -2713,7 +2816,12 @@ if __name__ == "__main__":
         # otherwise read "refused to publish, her history is exposed" as
         # "done". A skip (unchanged, or no local database yet) IS success:
         # nothing needed doing.
-        sys.exit(1 if r["error"] else 0)
+        # v3.1.9.10 (R3 H1): exit 0 ONLY for synced:True or an "unchanged"
+        # that is verified by fingerprint. A lock still busy after the wait,
+        # or an unverifiable skip, exits 1.
+        _code, _msg = sync_once_cli_exit(r)
+        print(f"sync-once: {_msg}", file=sys.stderr if _code else sys.stdout)
+        sys.exit(_code)
     elif _args.status:
         # --status stays exit 0 even when it reports an unhealthy database,
         # deliberately: it is a report, not a gate, and the WARNING text in

@@ -787,6 +787,32 @@ def test_not_yet_stale_in_progress_record_is_needs_review_and_untouched_by_apply
               "the record was never touched, even with --force")
 
 
+def test_v319_record_without_attempts_script_agrees_with_needs_backfill():
+    print("\n[test] v3.1.9.10 R4 H1: a v3.1.9-shaped record (NO attempts key) is "
+          "classified exactly as needs_backfill() treats it, at MAX=1 and MAX=3")
+    old_ts = _iso(datetime.now(timezone.utc) - timedelta(days=10))
+    saved = backfill._MAX_BACKFILL_ATTEMPTS
+    try:
+        for kind in ("in_progress", "failed"):
+            _wipe_storage()
+            # v3.1.9's writer shape (git show v3.1.9:compactor/backfill.py):
+            # no `attempts` key.
+            _write_record("v319", state=kind, started_at=old_ts, updated_at=old_ts,
+                          exchanges_done=6, exchanges_total=1908, error=None)
+            _write_facts("v319")
+            rec = json.loads(_record_path("v319").read_text())
+            assert_true("attempts" not in rec, f"{kind}: fixture has no attempts key")
+            for mx, want_resume in ((1, False), (3, True)):
+                backfill._MAX_BACKFILL_ATTEMPTS = mx
+                verdict, _why = _script._classify(rec, backfill)
+                assert_eq(backfill.needs_backfill("v319", LONG_MESSAGES), want_resume,
+                          f"{kind} MAX={mx}: needs_backfill() resume={want_resume}")
+                assert_eq(verdict == "would-resume", want_resume,
+                          f"{kind} MAX={mx}: script verdict agrees ({verdict})")
+    finally:
+        backfill._MAX_BACKFILL_ATTEMPTS = saved
+
+
 def test_terminal_records_are_classified_leave_not_needs_review():
     print("\n[test] BR8: complete/abandoned/wiped records classify leave, never needs-review")
     _wipe_storage()
@@ -1110,6 +1136,7 @@ if __name__ == "__main__":
 
         test_not_yet_stale_in_progress_record_is_needs_review_and_untouched_by_apply()
         test_terminal_records_are_classified_leave_not_needs_review()
+        test_v319_record_without_attempts_script_agrees_with_needs_backfill()
 
         test_all_conv_values_rejected_exits_1_not_0()
 

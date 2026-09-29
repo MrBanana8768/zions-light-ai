@@ -50,10 +50,12 @@ will need a migration. The `upload_hook` below is the designed-in seam.
 from __future__ import annotations
 
 import argparse
+import calendar
 import datetime
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -1255,8 +1257,33 @@ def read_manifest(archive_path: Path) -> dict | None:
     return None
 
 
+_ARCHIVE_NAME_TS = re.compile(r"^" + re.escape(_ARCHIVE_PREFIX) + r"(\d{8})-(\d{6})(?=[.\-_]|$)")
+
+
+def archive_name_time(name: str) -> float | None:
+    """The creation time (epoch seconds, UTC) embedded in an archive NAME
+    (`zions-backup-YYYYMMDD-HHMMSS...`, written by _now_stamp), or None when
+    the name does not carry a valid one."""
+    m = _ARCHIVE_NAME_TS.match(name)
+    if not m:
+        return None
+    try:
+        t = time.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    return float(calendar.timegm(t))
+
+
 def list_backups(backup_dir: Path | None = None) -> list[dict]:
-    """Return existing archives, newest first: [{name, path, size_bytes, mtime}]."""
+    """Return existing archives, newest first:
+    [{name, path, size_bytes, mtime, when}].
+
+    `when` (v3.1.9.10, R3 L6) is the archive's creation time: the timestamp
+    embedded in its NAME, falling back to the file mtime only if the name does
+    not parse. Retention and the newest-first order key on `when`, not mtime:
+    a `cp` without -p, a restore from a tar, or an rsync gives every archive
+    the same mtime, and mtime-keyed tiers then keep or delete the wrong ones.
+    """
     d = backup_dir or BACKUP_DIR
     if not d.exists():
         return []
@@ -1269,10 +1296,11 @@ def list_backups(backup_dir: Path | None = None) -> list[dict]:
                 "path": str(f),
                 "size_bytes": st.st_size,
                 "mtime": int(st.st_mtime),
+                "when": archive_name_time(f.name) or int(st.st_mtime),
             })
         except OSError:
             continue
-    out.sort(key=lambda r: r["mtime"], reverse=True)
+    out.sort(key=lambda r: (r["when"], r["mtime"], r["name"]), reverse=True)
     return out
 
 
@@ -1687,11 +1715,13 @@ def _keep_set(
     days_seen: set[tuple] = set()
     weeks_seen: set[tuple] = set()
     for entry in archives:
-        age_s = now - entry["mtime"]
+        # v3.1.9.10 (R3 L6): the tiers key on the NAME's timestamp
+        # (list_backups' `when`), not the file mtime. A hand-built entry
+        # without `when` falls back to its mtime.
+        stamp = entry.get("when", entry["mtime"])
+        age_s = now - stamp
         age_days = age_s / 86400.0
-        when = datetime.datetime.fromtimestamp(
-            entry["mtime"], datetime.timezone.utc
-        )
+        when = datetime.datetime.fromtimestamp(stamp, datetime.timezone.utc)
         if HOURLY_HOURS > 0 and age_s < HOURLY_HOURS * 3600.0:
             keep.add(entry["name"])
         if RETAIN_DAYS > 0 and age_days <= RETAIN_DAYS:
@@ -2581,14 +2611,49 @@ def restore_backup(
             f"restored {restored} from {archive_path.name} — restart the "
             f"services that read it: `{restart_cmd}`"
         )
+        # v3.1.9.10 (R3 H2). On a WEBUI_DB_LOCAL=true pod the restore landed
+        # in the LOCAL database only. The snapshot on /data still held the
+        # pre-restore history: the daemon's mtime skip and the row-loss /
+        # generation / shrink guards (a restore is an older, smaller database
+        # by construction) would never publish it, and the next boot could
+        # bring the old data back. So publish here, in the same call, forced,
+        # with those guards opened for this one call only; and if that does
+        # not produce a snapshot equal to the restored DB, REFUSE TO FINISH.
+        published = None
+        publish_problem = None
+        if have_db and target == webuidb.LOCAL_DB and webuidb.live_webui_db() == webuidb.LOCAL_DB:
+            try:
+                published = webuidb.publish_after_restore()
+            except Exception as e:  # sync_once does not raise, belt and braces
+                published = {"synced": False, "error": f"{type(e).__name__}: {e}"}
+            if not published.get("verified"):
+                publish_problem = (
+                    published.get("error") or published.get("skipped")
+                    or "the snapshot does not match the restored database"
+                )
         # p3-b F4/F9: every live move this run planned has now landed —
         # the ONLY point in this function that removes the marker.
         webuidb.remove_restore_marker(stamp)
+        if publish_problem is not None:
+            raise RuntimeError(
+                f"the restore of {archive_path.name} landed in the LOCAL "
+                f"database {target}, but publishing it to the snapshot "
+                f"{webuidb.SNAPSHOT_DB} FAILED: {publish_problem}. The "
+                f"snapshot still holds the PRE-restore data, so a redeploy or "
+                f"the next boot could bring it back. Do not restart services "
+                f"yet: fix the cause, then run "
+                f"`WEBUI_DB_ALLOW_SHRINK=1 WEBUI_DB_ALLOW_ROW_LOSS=1 "
+                f"WEBUI_DB_ALLOW_OLDER_GENERATION=1 /opt/compactor-venv/bin/python "
+                f"/opt/compactor/webuidb.py --sync-once` and confirm "
+                f"`webuidb.py --status` shows equal chats/content/newest_update "
+                f"on the local and snapshot rows."
+            )
         return {
             "ok": True,
             "restored": restored,
             "archive": archive_path.name,
             "restart": restart_cmd,
+            "snapshot_published": bool(published and published.get("verified")),
         }
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
