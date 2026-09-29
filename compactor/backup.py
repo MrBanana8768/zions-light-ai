@@ -176,11 +176,33 @@ LOCAL_STAGING_DIR = Path(
 # restarts left seven copies of the damaged state and nothing older.
 RETAIN = env_int("COMPACTOR_BACKUP_RETAIN", 7)
 
-# Retention tiers (v3.1 F7 / D9). Keep everything younger than RETAIN_DAYS,
-# plus one archive per UTC day inside that window, plus one per ISO week for
-# GFS_WEEKS. Anything no tier claims is prunable.
-RETAIN_DAYS = env_float("COMPACTOR_BACKUP_RETAIN_DAYS", 14)
+# Retention tiers (v3.1 F7 / D9; reworked in v3.1.9.10). An archive survives
+# if ANY tier claims it; anything no tier claims is prunable:
+#
+#   floor    the newest max(MIN_KEEP, RETAIN) archives, always (see below).
+#   hourly   every archive younger than HOURLY_HOURS (default 3): "the last
+#            3 hours of hourly backups". 0 turns the tier off.
+#   daily    the newest archive of each UTC day inside DAILY_DAYS (default 7).
+#   weekly   the newest archive of each ISO week inside GFS_WEEKS (default 8).
+#   age      LEGACY, OFF unless the operator sets it: every archive younger
+#            than RETAIN_DAYS. Before v3.1.9.10 this defaulted to 14 and the
+#            daily tier sat inside the same window, so at one backup an hour
+#            it kept ~117 archives (>20 GB). An operator who still sets
+#            COMPACTOR_BACKUP_RETAIN_DAYS explicitly gets exactly the old
+#            "keep everything younger than N days", on top of the tiers above.
+#
+# THE FLOOR IS THE TRAP. runpod.env.template ships COMPACTOR_BACKUP_RETAIN=28
+# (an interim value from when the interval was 6h). At one backup an hour that
+# is the newest 28 archives = 28 hours, which swallows the 3-hour tier. The
+# code defaults are NOT changed for it (RETAIN stays 7, MIN_KEEP 3); the
+# template is what should change (RETAIN=3, no RETAIN_DAYS). See OPERATIONS.md,
+# "Backup retention tiers".
+HOURLY_HOURS = env_float("COMPACTOR_BACKUP_HOURLY_HOURS", 3)
+DAILY_DAYS = env_float("COMPACTOR_BACKUP_DAILY_DAYS", 7)
 GFS_WEEKS = env_int("COMPACTOR_BACKUP_GFS_WEEKS", 8)
+# 0.0 = no age tier. Only an explicit positive COMPACTOR_BACKUP_RETAIN_DAYS
+# turns it on (unset, blank, unparseable and non-positive all mean off).
+RETAIN_DAYS = max(0.0, env_float("COMPACTOR_BACKUP_RETAIN_DAYS", 0.0))
 
 # The hard floor. Never leave fewer than this many archives on disk, whatever
 # their age and whatever the tiers say. Floored at 3 in code rather than in
@@ -1635,31 +1657,46 @@ def _keep_set(
     """Names of the archives retention claims. `archives` is newest-first, as
     list_backups returns it.
 
-    Four tiers, unioned — an archive survives if *any* of them wants it:
+    Five tiers, unioned; an archive survives if *any* of them wants it:
 
-      1. Floor.  The newest `floor` archives, whatever their age. Nothing
-         below this line is prunable by any code path. Floored at 3.
-      2. Age.    Everything younger than RETAIN_DAYS.
-      3. Daily.  The newest archive of each UTC day inside RETAIN_DAYS.
-      4. Weekly. The newest archive of each ISO week inside GFS_WEEKS.
+      1. Floor.   The newest `floor` archives, whatever their age. Nothing
+         below this line is prunable by any code path. Floored at 3, and the
+         newest archive is claimed explicitly as well, so it can never be
+         pruned even if a caller passes a nonsense floor.
+      2. Hourly.  Every archive younger than HOURLY_HOURS (default 3).
+      3. Daily.   The newest archive of each UTC day inside DAILY_DAYS
+                  (default 7).
+      4. Weekly.  The newest archive of each ISO week inside GFS_WEEKS
+                  (default 8).
+      5. Age.     Legacy: everything younger than RETAIN_DAYS, ONLY when the
+                  operator set COMPACTOR_BACKUP_RETAIN_DAYS explicitly (off by
+                  default since v3.1.9.10).
 
-    Tier 3 is redundant while tier 2 keeps everything in the same window, and
-    that is deliberate: it is what the window shrinking to a day still leaves
-    behind. (v3.1 F7 / D9.)
+    "In progress" archives are never in this list at all: create_backup
+    writes `*.tar.gz.partial` and only os.replace publishes it as
+    `*.tar.gz` after verification, and list_backups globs the published
+    suffix only. So everything here is a published, verified archive, and the
+    newest of them is always kept.
     """
     now = time.time() if now is None else now
     floor = MIN_KEEP if floor is None else max(MIN_KEEP, int(floor))
     keep: set[str] = {e["name"] for e in archives[:floor]}
+    if archives:
+        keep.add(archives[0]["name"])
 
     days_seen: set[tuple] = set()
     weeks_seen: set[tuple] = set()
     for entry in archives:
-        age_days = (now - entry["mtime"]) / 86400.0
+        age_s = now - entry["mtime"]
+        age_days = age_s / 86400.0
         when = datetime.datetime.fromtimestamp(
             entry["mtime"], datetime.timezone.utc
         )
-        if age_days <= RETAIN_DAYS:
+        if HOURLY_HOURS > 0 and age_s < HOURLY_HOURS * 3600.0:
             keep.add(entry["name"])
+        if RETAIN_DAYS > 0 and age_days <= RETAIN_DAYS:
+            keep.add(entry["name"])
+        if DAILY_DAYS > 0 and age_days <= DAILY_DAYS:
             day = (when.year, when.month, when.day)
             if day not in days_seen:
                 days_seen.add(day)
@@ -3178,8 +3215,10 @@ def run_daemon(interval_hours: float | None = None) -> None:
     interval = (INTERVAL_HOURS if interval_hours is None else interval_hours) * 3600.0
     logger.info(
         f"backup daemon started: every {interval/3600:.1f}h → {BACKUP_DIR} "
-        f"(keep {RETAIN_DAYS:.0f}d + {GFS_WEEKS}w GFS, never below "
-        f"{max(MIN_KEEP, RETAIN)})"
+        f"(keep {HOURLY_HOURS:g}h hourly + {DAILY_DAYS:g}d daily + "
+        f"{GFS_WEEKS}w weekly"
+        + (f" + everything under {RETAIN_DAYS:g}d (explicit RETAIN_DAYS)" if RETAIN_DAYS > 0 else "")
+        + f", never below {max(MIN_KEEP, RETAIN)})"
     )
     first = True
     # p3-b F10. consecutive_failures backs off the RETRY, not run_once's

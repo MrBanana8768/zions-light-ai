@@ -317,6 +317,7 @@ COPY compactor/alert.py /opt/compactor/alert.py
 COPY compactor/reqctx.py /opt/compactor/reqctx.py
 COPY compactor/wordban_runtime.py /opt/compactor/wordban_runtime.py
 COPY compactor/uploads_backup.py /opt/compactor/uploads_backup.py
+COPY compactor/chatjournal.py /opt/compactor/chatjournal.py
 
 # BUILD GUARD: every compactor module must actually be in the image.
 #

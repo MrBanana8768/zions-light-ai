@@ -1392,7 +1392,36 @@ def reapply_ledger(conv_id: str) -> dict:
     memory.atomic_write_json(
         memory.wipe_marker_path(conv_id), {"epoch": epoch, "boundary": ledger.get("boundary")}
     )
-    return {"purged": purged, "suppressed_reapplied": suppressed, "epoch": epoch, "failed_closed": False}
+    # v3.1.9.10: the per-message chat journal (STORAGE_ROOT/journal) is a
+    # transcript store that a restore can bring back from before a /forget.
+    # Same ledger, same rules as the digests above: lines older than the
+    # epoch go, every needle is re-applied. A failure here must not stop the
+    # boot-time pass for the other conversations. Type only in the log: the
+    # journal holds her words.
+    journal = {"purged": 0, "redacted": 0}
+    try:
+        import chatjournal
+
+        journal = chatjournal.reapply(conv_id, epoch, needles)
+    except Exception as e:
+        logger.error(f"conv={conv_id}: chat journal re-apply failed ({type(e).__name__})")
+    return {
+        "purged": purged, "suppressed_reapplied": suppressed, "epoch": epoch,
+        "failed_closed": False,
+        "journal_purged": int(journal.get("purged", 0)),
+        "journal_redacted": int(journal.get("redacted", 0)),
+    }
+
+
+def journal_ledger(conv_id: str) -> tuple[int, list[dict]] | None:
+    """(epoch, targeted needles) for the chat journal writer, or None when the
+    ledger is unreadable or a forget/wipe of this conversation is pending
+    persistence (the same fail-closed contract as `visible`): the journal then
+    writes nothing rather than guess an epoch or miss a needle."""
+    ledger = _read_ledger_failing_closed(conv_id, on_fail_context="chat_journal")
+    if ledger is None:
+        return None
+    return int(ledger.get("epoch", 0)), list(ledger.get("targeted", []))
 
 
 def reapply_all_ledgers() -> dict:

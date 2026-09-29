@@ -43,6 +43,7 @@ import allocator
 import backfill
 import backup as backup_module
 import bgwork
+import chatjournal
 import commands
 import continuity
 import dedup
@@ -10809,6 +10810,33 @@ def _run_memory_tail(
     # a tidy-up. (_has_conversational_history short-circuits before the disk
     # read, so an ongoing conversation pays nothing for the extra call.)
     _task_traffic = _is_repeat_task_traffic(conv_id, messages)
+    # v3.1.9.10 chat journal. Independent of the memory decision on purpose:
+    # the journal mirrors what the client received (a Stop-cut reply, a
+    # degenerate one), not what the memory policy chose to memorize. It is a
+    # hand-off to a dedicated writer thread and never raises or blocks the
+    # reply. Not for OpenWebUI background task traffic (not a chat turn), an
+    # exchange with no user text, or under disk pressure (new writes paused).
+    try:
+        # Only for a reply that came through chat_completions, which sets the
+        # request meta (ids, image references) before either call site runs.
+        # A direct call of this function with no request behind it (the
+        # unit suites do that) has nothing to journal, and would otherwise
+        # leave a writer-thread write racing the caller's temp-dir cleanup.
+        if (
+            chatjournal.ENABLED
+            and chatjournal.request_meta_ctx.get() is not None
+            and not _task_traffic
+            and _has_pairable_user_text(last_user_text)
+            and degrade.guard("chat journal")
+        ):
+            chatjournal.submit(
+                conv_id, last_user_text, text,
+                finished=finished, truncated=truncated, holed=holed,
+                finish_reason=(chatjournal.request_meta_ctx.get() or {}).get("finish_reason"),
+                wipe_generation=wipe_generation,
+            )
+    except Exception as e:
+        logger.error(f"conv={conv_id}: chat journal hand-off failed ({type(e).__name__})")
     if decision.store and _task_traffic:
         decision = TailDecision(
             False,
@@ -11091,6 +11119,13 @@ async def lifespan(app: FastAPI):
     # own "Exact change needed at main.py:8367" section, not applied there
     # because main.py was another lane's file at the time.
     await bgwork.pool.drain(timeout=10.0, cancel_on_timeout=True)
+    # v3.1.9.10: let queued chat-journal lines reach disk before the process
+    # exits (a few ms normally; bounded so a stalled volume cannot hang the
+    # shutdown). In a worker thread: drain() blocks.
+    try:
+        await run_in_threadpool(chatjournal.drain, 5.0)
+    except Exception as e:
+        logger.warning(f"chat journal drain at shutdown failed ({type(e).__name__})")
 
 
 app = FastAPI(title="context-compactor", lifespan=lifespan)
@@ -12147,6 +12182,15 @@ async def _chat_completions_impl(
     turn_index = len(messages) + 1
 
     last_user_text = _memorable_user_text(messages, last_user_text)
+
+    # v3.1.9.10 chat journal: chat/message/parent ids and image REFERENCES of
+    # this request, captured here (before image stripping rewrites `messages`)
+    # and read by _run_memory_tail through a contextvar, because that function
+    # is replaced wholesale, with a fixed signature, by test doubles. The
+    # streaming generator and the non-streaming path share this dict, so each
+    # call site can add the finish_reason it saw. Never raises.
+    _journal_meta = chatjournal.capture_request_meta(request.headers, body, messages)
+    chatjournal.set_request_meta(_journal_meta)
 
     # v3.0.1: a text-only backend must never receive image parts — vLLM 400s
     # the whole request, and because clients re-send full history, a single
@@ -13297,6 +13341,8 @@ async def _chat_completions_impl(
                             f"{len(accumulator.text())} chars that did arrive"
                         )
                     if conv_id:
+                        _journal_meta["finish_reason"] = accumulator.finish_reason()
+                        chatjournal.set_request_meta(_journal_meta)
                         _run_memory_tail(
                             conv_id,
                             accumulator.text(),
@@ -13483,6 +13529,8 @@ async def _chat_completions_impl(
         except (IndexError, KeyError, TypeError):
             _finish_reason = ""
         if conv_id:
+            _journal_meta["finish_reason"] = _finish_reason or None
+            chatjournal.set_request_meta(_journal_meta)
             _run_memory_tail(
                 conv_id,
                 assistant_text,
@@ -13919,7 +13967,24 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
                 chapters_deleted = True
         except Exception as e:
             logger.warning(f"conv={conv_id}: chapter archive delete failed: {e}")
-        if n_facts or n_episodic or summary_deleted or persona_deleted or chapters_deleted:
+        # v3.1.9.10: the per-message chat journal is a transcript store of
+        # her words; a full forget removes it like every other layer, inside
+        # this same conv_lock section and after the generation bump above, so
+        # a reply that was in flight when the wipe ran is discarded by the
+        # generation check in chatjournal.append_record instead of writing
+        # the file back. A failed unlink is a `write_failed` layer (read
+        # fine, could not remove); commands._memory_residue also sees the
+        # file and the /forget pass retries once.
+        journal_lines = 0
+        try:
+            journal_lines = await chatjournal.wipe_async(conv_id)
+        except Exception as e:
+            write_failed.append("chat journal")
+            logger.error(
+                f"conv={conv_id}: {source} forget could not remove the chat "
+                f"journal ({type(e).__name__})"
+            )
+        if n_facts or n_episodic or summary_deleted or persona_deleted or chapters_deleted or journal_lines:
             logger.info(
                 f"conv={conv_id}: {source} forgot {n_facts} fact(s) "
                 f"+ {n_episodic} indexed exchange(s) "
@@ -13934,6 +13999,8 @@ async def _clear_all_memory(conv_id: str, *, source: str = "admin") -> dict:
         "forgotten_summary": summary_deleted,
         "forgotten_chapters": chapters_deleted,
         "forgotten_persona": persona_deleted,
+        # v3.1.9.10: lines removed from the chat journal (additive).
+        "forgotten_journal": journal_lines,
         # Present only when a layer could not be read. Callers must not
         # report a clean wipe when this is non-empty.
         "unreadable": unreadable,

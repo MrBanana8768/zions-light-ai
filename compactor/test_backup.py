@@ -865,7 +865,7 @@ def test_prune_keeps_everything_inside_the_age_window():
         names.append(rep["archive"])
     kept = {r["name"] for r in backup.list_backups()}
     # Under the old "keep the newest RETAIN=3" cap two of these were deleted
-    # minutes after being written. All five are inside RETAIN_DAYS.
+    # minutes after being written. All five are inside the hourly tier (v3.1.9.10).
     assert_eq(kept, set(names), "all five survive — RETAIN is a floor, not a cap")
 
 
@@ -887,14 +887,17 @@ def _fake_archives(ages_days):
 
 
 def test_prune_age_and_gfs_tiers():
-    print("\n[test] prune: age tier keeps 14d, GFS keeps one per week for 8w")
-    # 1d and 10d are inside the age window; 20d/34d are in distinct ISO weeks
-    # inside the 8-week GFS window; 200d is claimed by no tier.
+    print("\n[test] prune: daily tier keeps one per day for 7d, GFS one per week for 8w (v3.1.9.10)")
+    # 1d and 2d are in distinct UTC days inside the 7-day daily window; 10d,
+    # 20d and 34d are in distinct ISO weeks inside the 8-week GFS window;
+    # 200d is claimed by no tier. (Before v3.1.9.10 a 14-day age tier kept
+    # 10d; it is off by default now, and the weekly tier keeps it instead.
+    # test_backup_retention_tiers.py covers the tiers exactly.)
     now, names = _fake_archives([1, 2, 10, 20, 34, 200])
     removed = backup.prune_old_backups(now=now)
     kept = {r["name"] for r in backup.list_backups()}
     assert_true(names[0] in kept and names[1] in kept and names[2] in kept,
-                "everything younger than 14d is kept")
+                "the recent archives (1d, 2d daily; 10d weekly) are kept")
     assert_true(names[3] in kept and names[4] in kept,
                 "20d and 34d kept by the weekly GFS tier")
     assert_true(names[5] not in kept, "the 200d archive is pruned")

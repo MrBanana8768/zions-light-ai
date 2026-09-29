@@ -98,6 +98,7 @@ from typing import Any, Callable, Awaitable
 
 import backfill
 import bgwork
+import chatjournal
 import continuity
 import facts as facts_module
 import memory
@@ -497,6 +498,13 @@ def _memory_residue(conv_id: str) -> tuple[list[str], list[str]]:
             f"({type(e).__name__}: {e})"
         )
 
+    # v3.1.9.10: the per-message chat journal (her words, one JSON line per
+    # exchange). Wiped by main._clear_all_memory; a file still there after a
+    # wipe (a failed unlink, a write that slipped past) is reported and
+    # retried like every other layer.
+    if chatjournal.has_content(conv_id):
+        still.append("chat journal")
+
     return still, unreadable
 
 
@@ -625,6 +633,8 @@ async def _wipe_all_layers(conv_id: str, clear_all) -> dict:
         # way forgotten_summary/forgotten_persona already are.
         "forgotten_chapters": bool(result.get("forgotten_chapters")),
         "forgotten_persona": bool(result.get("forgotten_persona")),
+        # v3.1.9.10: chat journal lines removed (additive; stubs omit it).
+        "forgotten_journal": int(result.get("forgotten_journal") or 0),
         "archived": n_archived,
         "unreadable": unreadable,
         "write_failed": write_failed,
@@ -698,6 +708,40 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
             # inside an exchange (never extracted as a fact) reported
             # success on nothing and left the digest untouched.
             band_suppressed = continuity.suppress_needle(conv_id, arg)
+            # v3.1.9.10: the same needle, applied to the per-message chat
+            # journal (matching exchanges become tombstones: ids kept, words
+            # gone). Also BEFORE the "No facts matched" return, for the same
+            # reason as the band: a needle can live only in the journal. On
+            # the writer thread's file lock via the threadpool so the event
+            # loop never waits on the volume. A failed rewrite leaves the
+            # journal unchanged; the needle is in the ledger already, so the
+            # next boot re-applies it, and the reply says so.
+            journal_redacted = 0
+            journal_failed = False
+            try:
+                from starlette.concurrency import run_in_threadpool
+
+                journal_redacted = await run_in_threadpool(
+                    chatjournal.redact_needle, conv_id, arg
+                )
+            except Exception as e:
+                journal_failed = True
+                chatjournal._bump("errors")
+                logger.error(
+                    f"conv={conv_id}: /forget could not redact the chat "
+                    f"journal ({type(e).__name__})"
+                )
+            _jnote = ""
+            if journal_redacted:
+                _jnote = (
+                    f" Also removed it from {journal_redacted} chat-journal "
+                    f"{'entry' if journal_redacted == 1 else 'entries'}."
+                )
+            if journal_failed:
+                _jnote += (
+                    " I could not rewrite the chat journal just now; it will "
+                    "be cleared of this the next time I start."
+                )
             # v3.1.9.8 round-2/round-3 review (item 1/3): suppress_needle
             # just tried to record this needle in the wipe ledger — that
             # write can fail (an unwritable CONTROL_ROOT) without raising
@@ -718,13 +762,13 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
                     )
                 else:
                     reply = f"No facts matched {arg!r}."
-                return reply + _note
+                return reply + _jnote + _note
             facts_module.save_facts(conv_id, to_keep)
         reply = f"Forgot {removed} fact(s) matching {arg!r}. {len(to_keep)} remaining."
         if band_suppressed:
             noun = "summary" if band_suppressed == 1 else "summaries"
             reply += f" Also removed it from {band_suppressed} remembered exchange {noun}."
-        return reply + _note
+        return reply + _jnote + _note
 
     # No arg: full wipe — call into the shared clear-all-memory helper
     # provided via ctx (avoids import cycles with main.py).
@@ -768,7 +812,7 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
             f"after the first pass; wiping again before answering"
         )
         retry = await _wipe_all_layers(conv_id, clear_all)
-        for key in ("forgotten_facts", "forgotten_episodic", "archived"):
+        for key in ("forgotten_facts", "forgotten_episodic", "archived", "forgotten_journal"):
             totals[key] += retry[key]
         for key in ("forgotten_summary", "forgotten_chapters", "forgotten_persona"):
             totals[key] = totals[key] or retry[key]
@@ -823,6 +867,10 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
     # sentence does not describe what happened.
     if totals["forgotten_persona"]:
         parts.append("persona")
+    # v3.1.9.10: same rule for the chat journal: a /forget that emptied only
+    # the journal says so instead of "nothing to forget".
+    if totals["forgotten_journal"]:
+        parts.append(f"{totals['forgotten_journal']} chat-journal line(s)")
 
     lines: list[str] = []
     if parts:
@@ -2539,6 +2587,16 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
                     _dp.unlink()
             except Exception as e:
                 logger.warning(f"conv={source_id}: could not delete digest cache during retire: {e}")
+            # v3.1.9.10: retire empties source_id like a wipe (and bumps the
+            # ledger epoch, which would purge older journal lines at the next
+            # boot anyway), so its chat journal goes with it, now.
+            try:
+                await chatjournal.wipe_async(source_id)
+            except Exception as e:
+                logger.error(
+                    f"conv={source_id}: could not delete the chat journal "
+                    f"during retire ({type(e).__name__})"
+                )
             facts_module.save_archive(source_id, [])
             # An EMPTY facts file, not an unlinked one — /forget's tombstone,
             # for its reason: backfill.needs_backfill gates on

@@ -1594,6 +1594,15 @@ def _facts_write_state() -> dict:
     return {"available": True, **st}
 
 
+def _chat_journal_snapshot() -> dict:
+    try:
+        import chatjournal
+
+        return chatjournal.health_snapshot()
+    except Exception as e:
+        return {"enabled": None, "error": type(e).__name__}
+
+
 async def gather_health_full(
     vllm_url: str, target_tokens: int, tokenize: dict | None = None
 ) -> dict:
@@ -2367,6 +2376,12 @@ async def gather_health_full(
         # suspect_content_count/last_error — see uploads_backup.
         # health_snapshot's own docstring. Visibility only.
         "uploads_backup": ub,
+        # v3.1.9.10 CHAT JOURNAL: {enabled, last_write_at, lines_written,
+        # errors, skipped, dropped, pending} — per-process counters of the
+        # per-message journal (chatjournal.health_snapshot). In-memory only
+        # (no disk read), no conv ids, no text. Visibility only: it never
+        # moves `status`, the same doctrine as `uploads_backup`/`word_ban`.
+        "chat_journal": _chat_journal_snapshot(),
         # v3.1.9.8 REQUEST TRACING (owner's ask, item 7): requests_in_flight
         # (chat requests currently inside the handler, INCLUDING the
         # pre-processing phase — the whole point) and how long ago the last

@@ -9,6 +9,53 @@ on Docker Hub.
 
 ---
 
+## [3.1.9.10] — Part A: backup retention tiers, and a per-message chat journal
+
+**Not yet released/tagged.** Branch `feature/v3.1.9.10`, from tag `v3.1.9.9`. Built from `Dockerfile.v31910`
+(a copy of `Dockerfile.v3199` plus `compactor/chatjournal.py` and a 29-module import guard). Other parts of
+.10 (migration tooling) are tracked separately.
+
+### Changed
+- **Backup retention** (`compactor/backup.py`): the hourly backups no longer keep ~117 archives (>20 GB). An
+  archive is kept if any tier wants it: the floor (newest `max(3, COMPACTOR_BACKUP_RETAIN)`), **hourly**
+  (younger than `COMPACTOR_BACKUP_HOURLY_HOURS`, default 3), **daily** (newest per UTC day for
+  `COMPACTOR_BACKUP_DAILY_DAYS`, default 7, now its own window), **weekly** (`COMPACTOR_BACKUP_GFS_WEEKS`,
+  default 8). The old age tier is now **off unless `COMPACTOR_BACKUP_RETAIN_DAYS` is set explicitly**; set it
+  and it behaves exactly as before (everything younger than N days), on top of the tiers. The newest archive
+  is claimed explicitly as well as by the floor, and an in-progress `.partial` archive is never listed, so
+  never pruned. Example (hourly for 20 days, `RETAIN=3`): 12 of 480 kept (3 hourly, 7 daily, 2 weekly).
+- **Not changed, on purpose:** the code defaults `RETAIN=7`, `MIN_KEEP=3`, and the **template's
+  `COMPACTOR_BACKUP_RETAIN=28`**. With hourly backups 28 is a 28-hour floor that swallows the 3-hour tier
+  (the same example keeps 36, not 12). Recommended template change: `COMPACTOR_BACKUP_RETAIN=3`, leave
+  `COMPACTOR_BACKUP_RETAIN_DAYS` unset. See OPERATIONS.md, "Backup retention tiers".
+
+### Added
+- **Chat journal** (`compactor/chatjournal.py`, `COMPACTOR_CHAT_JOURNAL`, default on): after every completed
+  reply, one fsynced JSON line in `<STORAGE_ROOT>/journal/<conv_id>.jsonl` (schema v1: conv/chat/message/parent
+  ids, request id, UTC ts, ledger epoch, user text, reply text, finish_reason, partial flag, image references
+  only, sha256 of the pair). Written by a dedicated writer thread from `_run_memory_tail`, independent of the
+  memory policy (a stopped or ceiling-cut reply is written with `partial: true`; empty/failed replies, the
+  self-test conversations, slash commands, task traffic, disk-pressure pauses are skipped). Never blocks or
+  fails the reply; errors are logged by type and counted; the text is never logged.
+- **`/forget` covers the journal**, same semantics as the other stores: `/forget` and the admin wipe delete the
+  file under the wipe-generation guard (an in-flight reply cannot write it back), `/forget <text>` tombstones
+  matching exchanges (even when no fact matched), `/retire` deletes the retired conversation's journal, and the
+  boot-time ledger re-apply drops lines older than the ledger epoch and re-applies every needle, so a restored
+  older backup does not bring forgotten words back. Fails closed on an unreadable ledger or a pending forget.
+- `/health/full` gains `chat_journal` (`enabled`, `last_write_at`, `lines_written`, `errors`, plus `skipped`,
+  `dropped`, `pending`). Additive; never moves `status`.
+- **`scripts/chat-journal.py`** (read-only, stdlib, never prints message text): `stats`, `verify`, and
+  `compare --db webui.db` (which journal exchanges are missing from OpenWebUI's chat JSON and `chat_message`
+  table). No write-back into OpenWebUI in this release; the rebuild design is in `chatjournal.py`.
+- `Dockerfile.v31910`, and a `COPY` of `chatjournal.py` in the base `Dockerfile`.
+- Tests: `test_backup_retention_tiers.py`, `test_chat_journal.py`.
+
+### Privacy
+The journal holds her words like the facts store. It is inside the daily backups (STORAGE_ROOT is archived
+whole) and outside `zl bundle` (bundle forbids the compactor store outright; confirmed, no ops change).
+
+---
+
 ## [3.1.9.9] — Cloudflare Tunnel: `https://ai.revelationsaints.com` instead of the RunPod proxy URL
 
 **Released 2026-09-29 as tag `v3.1.9.9`.** Build both images from `Dockerfile.v3199` (targets `rollback` and `rc`). Deploy on top of a running v3.1.9.8; the steps are in the owner runbook (DEPLOY-v3.1.9.9.md).

@@ -776,7 +776,7 @@ import backup as b
 a = b.list_backups(); keep = b._keep_set(a, floor=max(b.MIN_KEEP, b.RETAIN))
 gone = [e for e in a if e['name'] not in keep]
 print('archives:', len(a), '| keep:', len(keep), '| would delete:', len(gone), '|', round(sum(e['size_bytes'] for e in gone)/1e9, 1), 'GB')
-print('rules: keep everything newer than', b.RETAIN_DAYS, 'days, one per week for', b.GFS_WEEKS, 'weeks, never fewer than', max(b.MIN_KEEP, b.RETAIN))
+print('rules: hourly', b.HOURLY_HOURS, 'h, daily', b.DAILY_DAYS, 'd, weekly', b.GFS_WEEKS, 'w, age tier', b.RETAIN_DAYS, 'd (0 = off), never fewer than', max(b.MIN_KEEP, b.RETAIN))
 [print('  would delete', e['name']) for e in gone]"
 ```
 
@@ -1149,6 +1149,62 @@ tail -20 /data/logs/backup.log
 and verified; `[FAIL] …` and exit 1 when not (see "Backups stopped or failing"
 above). `--verify` prints `[OK] db=ok, …` for a good archive.
 
+### Backup retention tiers (v3.1.9.10)
+
+Backups run hourly (`COMPACTOR_BACKUP_INTERVAL_HOURS=1`). What is KEPT is the
+union of these tiers; anything no tier claims is pruned at the end of each
+successful cycle:
+
+| tier | rule | env (default) |
+|---|---|---|
+| floor | the newest `max(MIN_KEEP, RETAIN)` archives, always | `COMPACTOR_BACKUP_RETAIN` (7 in code, **28 in `runpod.env.template`**), `COMPACTOR_BACKUP_MIN_KEEP` (3, and never below 3) |
+| hourly | every archive younger than N hours | `COMPACTOR_BACKUP_HOURLY_HOURS` (3; 0 = off) |
+| daily | the newest archive of each UTC day, for N days | `COMPACTOR_BACKUP_DAILY_DAYS` (7; 0 = off) |
+| weekly | the newest archive of each ISO week, for N weeks | `COMPACTOR_BACKUP_GFS_WEEKS` (8) |
+| age (legacy) | every archive younger than N days | `COMPACTOR_BACKUP_RETAIN_DAYS` (**unset = off**; set explicitly and it behaves exactly as before) |
+
+**What changed.** Before v3.1.9.10 the age tier defaulted to 14 days and the
+daily tier sat inside that same window, so at one backup an hour retention
+kept about 117 archives (over 20 GB). The age tier is now off unless you set
+`COMPACTOR_BACKUP_RETAIN_DAYS` yourself; the daily window is its own knob.
+
+**The newest archive is never pruned, and neither is anything in progress.**
+The floor is at least 3 and the newest archive is claimed explicitly as well.
+A backup in progress is a `*.tar.gz.partial` file (or a staging directory);
+it is published as `*.tar.gz` only after it verifies, and prune only ever
+looks at published archives.
+
+**Worked example** (one archive per hour for 20 days, last one at 12:10 UTC
+Tue 2026-09-29, with `RETAIN=3`): 12 of 480 are kept, three hourly
+(09-29 12:10, 11:10, 10:10), seven daily (09-28 to 09-22, each at 23:10), two
+weekly (09-20 and 09-13, each at 23:10).
+
+**THE TEMPLATE'S FLOOR IS THE TRAP.** `runpod.env.template` ships
+`COMPACTOR_BACKUP_RETAIN=28`, an interim value from when backups ran every 6
+hours. It is a *floor*, so at one backup an hour it keeps the newest 28
+archives (28 hours) whatever the tiers say: the same example keeps 36, not
+12. The code defaults were NOT changed for this (a code default change would
+surprise every operator who set it on purpose); change the template/RunPod
+env instead:
+
+```
+COMPACTOR_BACKUP_RETAIN=3          # the floor; the tiers do the rest
+# remove COMPACTOR_BACKUP_RETAIN_DAYS if it is set
+```
+
+A RunPod template change needs a pod restart (which reverts the hot-patched
+OpenWebUI 0.11.4; see memory.md), so make it with the next planned redeploy.
+In place, without a restart: add `COMPACTOR_BACKUP_RETAIN="3"` to the
+`environment=` block of `[program:backup]` in
+`/etc/supervisor/conf.d/supervisord.conf` (that block lists only `DATA_DIR`;
+the daemon otherwise inherits the container environment), then
+`supervisorctl reread && supervisorctl update backup`; a pod restart reverts it
+unless the template is changed too. The first
+cycle after the change logs `backup ok: ...; pruned N`; the startup line
+`backup daemon started: ... (keep 3h hourly + 7d daily + 8w weekly, never
+below 3)` shows the tiers in force. Dry run (deletes nothing) is the
+"Safe manual prune" command above, which now prints the new rule line.
+
 ### `COMPACTOR_BACKUP_ALLOW_NO_WEBUI_DB`: a one-time bootstrap setting
 
 The backup daemon refuses a cycle outright (holds the prune) when it cannot
@@ -1449,6 +1505,103 @@ created, which is what you want.
 > This is exactly why off-volume backups matter — if the only copy was on
 > the lost volume, there's nothing to restore. Until off-volume DR ships,
 > periodically copy `/data/backups/`'s newest archive somewhere off the pod.
+
+### The chat journal (v3.1.9.10): a per-message safety copy of her chat
+
+OpenWebUI keeps a whole conversation in ONE JSON row (`chat.chat`; 63 MB for
+her chat) and rewrites it whole on every save. On the network volume that has
+broken three times. So the compactor also appends one JSON line per completed
+reply to `<STORAGE_ROOT>/journal/<conv_id>.jsonl` (`/data/openwebui/compactor/
+journal/`), fsynced, right after the reply. Nothing reads it back into a
+prompt: it is only for recovery. Rebuilding into OpenWebUI is NOT implemented
+yet (design at the foot of `compactor/chatjournal.py`); this release only
+writes it and can compare it.
+
+**Each line** (schema `v=1`): `conv_id`, `chat_id` / `message_id` (the
+sanitised `X-OpenWebUI-Chat-Id` / `-Message-Id`, else the payload's
+`metadata`), `parent_id` (`metadata.parent_message_id`), `request_id`, `ts`
+(UTC), `epoch` (the wipe-ledger epoch), `user`, `assistant`, `finish_reason`,
+`partial`, `images {count, refs}` (references only: ids, names, URL paths;
+never bytes, data URLs or query strings), `sha256` of the pair.
+
+**Which replies.** Every reply that carried text, including one she stopped,
+one cut at the generation ceiling, one whose stream died, and one the memory
+tail declines to memorize (a repetition loop): those are written with
+`partial: true` (Stop, ceiling, error, dropped stream) and the `finish_reason`
+seen (`length`, `error`, `incomplete` when the stream ended with none). The
+journal mirrors what the client received. Not written: empty or failed
+replies, the self-test conversations, slash commands, OpenWebUI background
+task traffic (title/tag generation), an exchange with no user text, and
+anything while disk pressure has paused new-memory writes.
+
+**Never blocks the reply.** A dedicated writer thread does the open, write and
+fsync; a stalled volume stalls the journal, not the reply. A failure is logged
+by exception type only and counted. The journal text is never logged.
+
+**Settings.** `COMPACTOR_CHAT_JOURNAL` (default `true`),
+`COMPACTOR_CHAT_JOURNAL_MAX_CHARS` (200000; a longer user or reply text is
+clipped and the line says `truncated`), `COMPACTOR_CHAT_JOURNAL_MAX_PENDING`
+(512 queued writes; more are dropped and counted).
+
+**Growth.** About the size of the exchange plus ~400 bytes of envelope, so a
+few KB per message for prose (her 4,200-message chat: tens of MB at most). One
+file per conversation, no rotation.
+
+**Health.** `/health/full` has `chat_journal`: `enabled`, `last_write_at`,
+`lines_written`, `errors` (per process), plus `skipped`, `dropped`, `pending`.
+It never changes `status`. `errors` above 0 means a write or a forget-rewrite
+failed; read `compactor.log` for `chat journal:` lines (types only).
+
+**`/forget` covers it, with the same semantics as the other stores.**
+
+- `/forget` (full) and `DELETE /admin/conversations/<id>/facts` delete the
+  file (inside the same locked section as every other layer, after the wipe
+  generation bump, so a reply that was in flight when you typed `/forget`
+  cannot write it back). The reply counts the lines. `/retire <src>` deletes
+  the retired conversation's journal too. (Open question for the owner: retire
+  is not a forget of her words, and this removes the only independent copy of
+  a chat OpenWebUI still has. It is done because retire bumps the ledger epoch,
+  which would purge those lines at the next boot anyway.)
+- `/forget <text>` turns every matching exchange (text found, case-insensitive,
+  in her message, the reply or an image reference) into a **tombstone**: ids,
+  ts, epoch and finish_reason stay; user/assistant are emptied; the hash is
+  cleared (a hash of forgotten text would confirm a guess); `redacted: true`.
+  This is the digest layer's rule: the unit stays, the words go. It runs even
+  when no fact matched.
+- A **restart** re-applies the wipe ledger (`continuity.reapply_ledger`, which
+  lives in `COMPACTOR_CONTROL_ROOT`, outside backup scope): journal lines older
+  than the ledger epoch are dropped and every recorded needle is re-applied.
+  So restoring an older backup (which carries an older journal) does not bring
+  forgotten words back once the compactor next starts. A new exchange that
+  contains a forgotten needle is tombstoned when it is written.
+- **Fails closed.** An unreadable ledger, or a forget whose ledger write has
+  not been persisted yet (a pending intent), journals nothing (counted under
+  `skipped`). If the rewrite for `/forget <text>` fails (disk full), the
+  reply says so, the needle is already in the ledger, and the next boot
+  clears it.
+- Not covered, same as every other store: OpenWebUI's own database still holds
+  the chat text. `/forget` never touched it.
+
+**Privacy.** It holds her words, like the facts store. It is in the daily
+backups (STORAGE_ROOT is archived whole; `verify_backup` reads JSON files and
+does not choke on `.jsonl`; tested). It is NOT in `zl bundle`: that command
+only reads the log directory and forbids `podenv.STORE` (the compactor store)
+outright, so `journal/` can never be bundled (confirmed in
+`ops/zlops/commands/bundle.py`; no ops change needed). Files are mode 0600.
+
+**The read-only tool** `scripts/chat-journal.py` (baked to
+`/opt/zl-repo/scripts/`; stdlib only; never prints message text):
+
+```bash
+python3 /opt/zl-repo/scripts/chat-journal.py stats                  # lines, redacted, partial, first/last ts per conversation
+python3 /opt/zl-repo/scripts/chat-journal.py verify                 # every line parses and its sha256 matches; exit 1 otherwise
+# compare against a COPY of webui.db (opened read-only). Default: her chat.
+python3 /opt/zl-repo/scripts/chat-journal.py compare --db /tmp/webui-copy.db [--ids]
+```
+
+`compare` says how many journal exchanges are missing from OpenWebUI's chat
+JSON and from its `chat_message` table (matched by message id, else by the
+pair's content hash). Counts only; `--ids` lists the ids.
 
 ### Uploads backup (her photos) — a SEPARATE, incremental mirror
 
