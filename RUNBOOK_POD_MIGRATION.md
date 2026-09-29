@@ -93,7 +93,8 @@ CLOUDFLARE_TUNNEL_TOKEN=<the tunnel secret>   # add it AFTER the seed, see step 
 **`COMPACTOR_INJECTION_BUDGET_FRACTION`** (delete a `.6` row: it pins the fraction below the image's 0.75).
 `COMPACTOR_BACKFILL_MAX_ATTEMPTS=1` keeps her open backfill record (attempts=1) from restarting a
 full backfill on the new image. Keep the old pod's other rows (backup interval, `COMPACTOR_MAX_RETAINED_IMAGES`,
-`COMPACTOR_GENERATION_RESERVE`, ...) as they are.
+`COMPACTOR_GENERATION_RESERVE`, ...) as they are, **except** `COMPACTOR_BACKUP_RETAIN`: set it to `3` on the new pod
+(the old `28` is a 28-hour floor that swallows the 3-hour tier).
 
 Then check the pod's boot log (RunPod Logs tab) and, in the Web Terminal:
 
