@@ -90,6 +90,7 @@ passes through to vLLM untouched.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -728,8 +729,11 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
                 # FIFO behind every queued append (as wipe_async), so a reply
                 # queued before this forget cannot land after the redaction
                 # with the words intact. Not the general threadpool.
-                journal_redacted = await chatjournal.redact_needle_async(
-                    conv_id, arg
+                # Bounded: a stalled volume must not hang her /forget reply (vA).
+                # On a timeout the redaction still runs when the writer frees up,
+                # and the ledger re-applies it at the next boot.
+                journal_redacted = await asyncio.wait_for(
+                    chatjournal.redact_needle_async(conv_id, arg), timeout=30
                 )
             except Exception as e:
                 journal_failed = True

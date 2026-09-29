@@ -856,7 +856,13 @@ async def _run_backfill(
         # that already shows which attempt it was), and what
         # _write_failed_or_abandoned compares against _MAX_BACKFILL_
         # ATTEMPTS. A fresh backfill (no prior record) is attempt 1.
-        this_attempt = int((prior_state or {}).get("attempts") or 0) + 1
+        # v3.1.9.10 (vA): a resumed record with NO `attempts` key was written by a
+        # pre-v3.1.9.4 release and has already used one attempt (needs_backfill floors
+        # it the same way). Counting it as 0 here made the cap arrive one run late.
+        _prior_attempts = int((prior_state or {}).get("attempts") or 0)
+        if resuming:
+            _prior_attempts = max(1, _prior_attempts)
+        this_attempt = _prior_attempts + 1
         async with conv_lock(conv_id):
             try:
                 existing = facts_module.load_facts(conv_id)

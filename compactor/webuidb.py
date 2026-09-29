@@ -2414,8 +2414,10 @@ def _cli_lock_wait_s() -> float:
 def content_fingerprint(path: Path) -> tuple | None:
     """(chats, content bytes, newest updated_at) of a webui.db: the three
     values `--status` prints for each file. None if the file is absent or
-    unreadable. Two databases with equal fingerprints hold the same history
-    for the purpose of "is the snapshot current"."""
+    unreadable. A SANITY CHECK, not proof of identical content: edits that don't
+    bump chat.updated_at (read marks, tags, folders, archive, other tables) or a
+    same-size change leave it equal (vA). `--sync-once` always forces a publish,
+    so this only guards the "unchanged" branch."""
     try:
         if not path.exists():
             return None

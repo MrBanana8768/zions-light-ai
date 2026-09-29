@@ -311,6 +311,49 @@ def test_v319_record_without_attempts_honours_max_attempts_1():
         backfill._MAX_BACKFILL_ATTEMPTS = saved
 
 
+def test_v319_record_resume_chain_stops_at_the_cap():
+    print("\n[test] v3.1.9-shaped record (no attempts key) at MAX=3: exactly two "
+          "resumes, then stop (the pre-v3.1.9.4 run counts as attempt 1)")
+    msgs = [{"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}] * 3
+    saved_max = backfill._MAX_BACKFILL_ATTEMPTS
+    saved_extract = facts.extract_facts_from_exchange
+
+    class _Crash(BaseException):
+        pass
+
+    async def _crash(*a, **k):
+        raise _Crash()
+
+    def _age(cid):
+        p = backfill._backfill_state_path(cid)
+        d = json.loads(p.read_text())
+        d["updated_at"] = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        p.write_text(json.dumps(d))
+
+    try:
+        backfill._MAX_BACKFILL_ATTEMPTS = 3
+        facts.extract_facts_from_exchange = _crash
+        _wipe_storage()
+        cid = "v319"
+        facts.save_facts(cid, [{"text": "x", "added_turn": 1, "last_used": 1}])
+        backfill._backfill_state_path(cid).write_text(
+            json.dumps(_v319_record("in_progress", 10 * 86400)))
+        resumes = 0
+        for _ in range(6):
+            if not backfill.needs_backfill(cid, msgs):
+                break
+            resumes += 1
+            try:
+                asyncio.run(backfill._run_backfill(cid, msgs, "http://fake", "fake-model"))
+            except _Crash:
+                pass
+            _age(cid)
+        assert_eq(resumes, 2, "the v3.1.9 run was attempt 1, so MAX=3 allows two resumes")
+    finally:
+        backfill._MAX_BACKFILL_ATTEMPTS = saved_max
+        facts.extract_facts_from_exchange = saved_extract
+
+
 def test_needs_backfill_failed_state_returns_true_once_the_backoff_elapses():
     print("\n[test] needs_backfill=True when previous backfill failed AND the "
           "backoff since its last update has elapsed")
@@ -734,6 +777,7 @@ if __name__ == "__main__":
         test_needs_backfill_complete_state_returns_false()
         test_needs_backfill_stale_in_progress_returns_true()
         test_v319_record_without_attempts_honours_max_attempts_1()
+        test_v319_record_resume_chain_stops_at_the_cap()
         test_needs_backfill_failed_state_returns_true_once_the_backoff_elapses()
         test_needs_backfill_failed_state_returns_false_before_the_backoff_elapses()
 

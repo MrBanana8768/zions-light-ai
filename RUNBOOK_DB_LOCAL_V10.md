@@ -92,7 +92,7 @@ S=$($PY /opt/compactor/webuidb.py --status | grep -E '^(local|snapshot) ' | sed 
 **Go ahead only if ALL THREE hold** (exit 0 alone is not enough):
 
 1. `SYNC EXIT=0`. This build of `--sync-once --force` **waits for the sync lock** and exits non-zero unless it really
-   synced, or verified the snapshot already identical. A run that prints "another sync is in progress" and exits 0 was the
+   synced (the CLI always forces a publish, so expect `'synced': True`). A run that prints "another sync is in progress" and exits 0 was the
    old (`v3.1.9.9`) behaviour: if you ever see that, it published nothing.
 2. The printed dict says `'synced': True`, or says plainly that the snapshot was verified unchanged.
 3. The two `--status` rows (`local`, `snapshot`) show the same `chats=`, `content=` **and** `newest_update=`

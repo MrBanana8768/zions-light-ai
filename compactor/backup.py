@@ -2090,6 +2090,7 @@ def latest_backup_info(backup_dir: Path | None = None) -> dict:
         "count": len(archives),
         "latest": archives[0]["name"] if archives else None,
         "latest_mtime": archives[0]["mtime"] if archives else None,
+        "latest_when": archives[0].get("when", archives[0]["mtime"]) if archives else None,
         "dir": str(backup_dir or BACKUP_DIR),
     }
 
@@ -3217,7 +3218,9 @@ def _newest_archive_age_s(backup_dir: Path | None = None) -> float | None:
     archives = list_backups(backup_dir)
     if not archives:
         return None
-    return max(0.0, time.time() - archives[0]["mtime"])
+    # Name-derived time (`when`), like the retention tiers: an archive copied without -p
+    # must not look brand new and skip the first backup at boot (vA).
+    return max(0.0, time.time() - archives[0].get("when", archives[0]["mtime"]))
 
 
 def _run_daemon_uploads_step(
