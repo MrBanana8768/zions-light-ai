@@ -435,3 +435,18 @@ back to `/usr/bin/python3`), so the plain invocation just works with no
 ```bash
 python3 scripts/run-tests.py --real-image --only real_image
 ```
+
+---
+
+## `/forget`, `/retire` and the chat journal (v3.1.9.10)
+
+`/forget` is **point-in-time**: it wipes what exists now and never blocks the
+words afterwards. The boot-time ledger re-apply removes only content older than
+the forget (a restored old backup), never newer content. `/retire <src>` keeps
+the retired conversation's chat journal as an archive. Details:
+[OPERATIONS.md](OPERATIONS.md), "The wipe ledger".
+
+```bash
+# the journal per conversation, INCLUDING retired ones (it reads the journal directory)
+python3 /opt/zl-repo/scripts/chat-journal.py stats
+```

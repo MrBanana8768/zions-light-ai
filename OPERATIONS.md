@@ -965,6 +965,15 @@ See [USER_GUIDE.md](USER_GUIDE.md). Quick: `/why` in the chat,
 `/list-facts`, `/forget <substring>`, or full reset
 `curl -X DELETE localhost:8080/admin/conversations/<id>/facts`.
 
+**`/forget` is POINT-IN-TIME (v3.1.9.10).** It wipes what exists at that
+moment; it does not ban the words. `/forget <text>` removes the matching facts,
+digests and chat-journal exchanges that exist now (the full `/forget` wipes
+every layer); anything she says or the model learns afterwards, including the
+same words, is remembered normally, in every store. The boot-time ledger
+re-apply (below) only removes content that PRE-DATES the forget, so a restored
+older backup does not bring forgotten words back, and new content is never
+removed. Details, per store, in "The wipe ledger" below.
+
 **`/forget` (or the DELETE above) only permanently protects the facts
 layer.** It leaves an empty facts store behind specifically so the lazy
 backfill cannot reconstruct facts from that conversation's history again
@@ -1032,6 +1041,55 @@ exactly the failure mode §17.6a r10 A3 closes. The deletion itself is
 never gated on the ledger (a wipe deletes regardless of whether it can
 record that it did), so a lost or never-restored `COMPACTOR_CONTROL_ROOT`
 / `COMPACTOR_PENDING_ROOT` does not bring back anything she asked forgotten.
+
+**The wipe ledger (format 2, v3.1.9.10) and how "pre-dates" is judged.**
+`<CONTROL_ROOT>/wipes/<conv>.json` holds `epoch`, `boundary`, `format: 2`,
+`targeted` (one `{needle, epoch, cutoff}` per `/forget <text>`, `cutoff` = UTC
+time of the forget), `wipe_at` / `wipe_epoch` (the last FULL wipe) and
+`retired_at`. At boot the re-apply removes only content older than the entry:
+
+| Store | Wiped at `/forget` time | Boot re-apply removes | How age is judged |
+|---|---|---|---|
+| Facts | yes (`/forget <text>`: matching facts; full: all) | nothing (not re-applied, as in .8) | facts have no creation time; a restored older facts file is NOT re-checked |
+| Summaries / hierarchy, chapters, persona | full `/forget` only (as before) | nothing | not re-applied |
+| Episodic (Chroma) | full `/forget` only (as before) | nothing | chroma rows carry no creation time (the id is a content hash); not re-applied |
+| Continuity digests | matching units are suppressed (`/forget <text>`); full wipe deletes the store | a digest of another epoch (full wipe); a matching digest that pre-dates the cutoff | the digest's own `created` (UTC, stamped at write) against the cutoff, and its `epoch` stamp; a digest with no `created` (pre-.10) is of unknown age and counts as pre-dating |
+| Chat journal | matching lines tombstoned / file deleted | lines with `ts` before `wipe_at` or `epoch` below `wipe_epoch`; matching lines with `ts` before a needle's `cutoff` | the line's own `ts` (UTC, stamped when handed to the writer) and its `epoch` stamp |
+
+Why a restored old copy and a new identical sentence tell apart: the old copy
+was created before the cutoff, so its own timestamp (or epoch) is earlier; the
+same words said afterwards carry a later timestamp (and a later epoch after a
+full wipe). Nothing is matched by content alone. A same-millisecond tie counts
+as post-dating. Facts, summaries and episodic rows have no reliable creation
+time, so the ledger does not re-apply to them (that gap is the same as in .8;
+a restore of a pre-forget backup restores those layers as they were, and the
+operator should `/forget` again if that matters).
+
+**.8-format ledgers.** A ledger with no `format` and needles without a `cutoff`
+is read safely: at the first boot on .10 every such needle is stamped with THAT
+boot's time and `legacy: true`, and the ledger is rewritten as format 2. Reading
+"no later than now" over-deletes the window between the real forget and that
+boot (the safe side for a forget) and remembers everything from then on. A
+`.8` ledger's `wipe_epoch` is taken to be its epoch, except when its boundary is
+`"all"` (only `/retire` writes that), where there is no purge floor: a retire
+keeps the journal. If the stamped write fails it is logged and retried at the
+next boot (a LATER stamp, so it can only remove more).
+
+**What "fails closed" means now.** The ledger no longer gates NEW memory
+writes: journal appends and (now that there is no write-time needle check) the
+memory stores never look at it. It still gates what depends on the epoch stamp
+and can be rebuilt: the digest writer (`generate_digest`) and the opt-in band
+(`visible`, `apply_needles`) return nothing or a suppressed marker while the
+ledger is unreadable or a wipe/forget is pending persistence, and the boot
+re-apply simply does not run for an unreadable ledger (it is left for repair,
+alerted, and shown at `/health/full` `checks.ledger`).
+
+**Known limits.** (1) A reply that was still streaming when `/forget <text>`
+ran (no wipe generation bump for a selective forget) is journaled after it, with
+a later `ts`, and is therefore kept. (2) With the opt-in band on, an old
+exchange that matches a forgotten needle, is still in the client's resent
+history and was never digested can show in the band's fallback text; the same
+text is in the transcript the client sends anyway.
 
 **What this costs a rebuild from `COMPACTOR_STORAGE_ROOT` backups alone**
 (a fresh volume, or these two directories simply never having been backed
@@ -1552,33 +1610,42 @@ file per conversation, no rotation.
 It never changes `status`. `errors` above 0 means a write or a forget-rewrite
 failed; read `compactor.log` for `chat journal:` lines (types only).
 
-**`/forget` covers it, with the same semantics as the other stores.**
+**`/forget` is point-in-time; `/retire` keeps the journal (v3.1.9.10).**
 
 - `/forget` (full) and `DELETE /admin/conversations/<id>/facts` delete the
   file (inside the same locked section as every other layer, after the wipe
   generation bump, so a reply that was in flight when you typed `/forget`
-  cannot write it back). The reply counts the lines. `/retire <src>` deletes
-  the retired conversation's journal too. (Open question for the owner: retire
-  is not a forget of her words, and this removes the only independent copy of
-  a chat OpenWebUI still has. It is done because retire bumps the ledger epoch,
-  which would purge those lines at the next boot anyway.)
-- `/forget <text>` turns every matching exchange (text found, case-insensitive,
-  in her message, the reply or an image reference) into a **tombstone**: ids,
-  ts, epoch and finish_reason stay; user/assistant are emptied; the hash is
-  cleared (a hash of forgotten text would confirm a guess); `redacted: true`.
-  This is the digest layer's rule: the unit stays, the words go. It runs even
-  when no fact matched.
+  cannot write it back). The reply counts the lines.
+- `/forget <text>` turns every EXISTING matching exchange (text found,
+  case-insensitive, in her message, the reply or an image reference) into a
+  **tombstone**: ids, ts, epoch and finish_reason stay; user/assistant are
+  emptied; the hash is cleared (a hash of forgotten text would confirm a guess);
+  `redacted: true`. This is the digest layer's rule: the unit stays, the words
+  go. It runs even when no fact matched. **Anything she says afterwards,
+  including the same words, is journaled normally** (there is no write-time
+  filter).
 - A **restart** re-applies the wipe ledger (`continuity.reapply_ledger`, which
-  lives in `COMPACTOR_CONTROL_ROOT`, outside backup scope): journal lines older
-  than the ledger epoch are dropped and every recorded needle is re-applied.
-  So restoring an older backup (which carries an older journal) does not bring
-  forgotten words back once the compactor next starts. A new exchange that
-  contains a forgotten needle is tombstoned when it is written.
-- **Fails closed.** An unreadable ledger, or a forget whose ledger write has
-  not been persisted yet (a pending intent), journals nothing (counted under
-  `skipped`). If the rewrite for `/forget <text>` fails (disk full), the
-  reply says so, the needle is already in the ledger, and the next boot
-  clears it.
+  lives in `COMPACTOR_CONTROL_ROOT`, outside backup scope) and removes only what
+  **pre-dates** the forget: a matching line whose `ts` is before the needle's
+  recorded `cutoff` is tombstoned; a line whose `ts` is before the last full
+  wipe's `wipe_at` (or whose `epoch` is below `wipe_epoch`) is dropped. So
+  restoring an older backup does not bring forgotten words back once the
+  compactor next starts, while a line written after the forget (a later `ts`)
+  is left alone.
+- **`/retire <src>` does NOT delete the journal.** It is the archive of the
+  retired chat. The retire's epoch bump does not purge it at the next boot
+  (`wipe_epoch` is not moved by a retire), and the retire keeps the ledger's
+  needles, so a restored older copy of the archive is still redacted for what
+  she forgot before retiring. `scripts/chat-journal.py stats` lists retired
+  conversations too (it reads the journal directory). Retire's effects on every
+  other memory store are unchanged.
+- **The ledger is not needed to write.** An unreadable ledger, or a forget
+  whose ledger write has not been persisted yet (a pending intent), no longer
+  stops a journal write (it used to, because a write-time needle check needed
+  the needles). The line's `epoch` is then `null`, and the boot re-apply judges
+  it by its `ts`. If the rewrite for `/forget <text>` fails (disk full), the
+  reply says so, the needle is already in the ledger, and the next boot clears
+  it.
 - Not covered, same as every other store: OpenWebUI's own database still holds
   the chat text. `/forget` never touched it.
 

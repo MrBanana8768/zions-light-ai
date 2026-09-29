@@ -59,8 +59,9 @@ they never go to the model, so they cost nothing and reply immediately.
 | `/list-facts` | `/facts` | Show everything currently remembered for this conversation |
 | `/list-archive` | `/archive` | Show facts that have been moved to cold storage |
 | `/remember <text>` | | Manually add a fact (max 500 characters) |
-| `/forget` | | **Wipe all memory** for this conversation — facts, episodic, summaries, persona. Facts stay gone; if you keep chatting in the SAME conversation, the summary hierarchy rebuilds itself from the history your client resends (see the FAQ below) |
-| `/forget <substring>` | | Remove only facts whose text contains the substring (case-insensitive) |
+| `/forget` | | **Wipe all memory** for this conversation as it is right now — facts, episodic, summaries, persona, the chat journal. What you say afterwards is remembered normally; if you keep chatting in the SAME conversation, the summary hierarchy rebuilds itself from the history your client resends (see the FAQ below) |
+| `/forget <substring>` | | Remove what is remembered NOW that contains the substring (case-insensitive): matching facts, remembered exchange summaries, and chat-journal entries. It does not ban the words: if you say them again later they are remembered like anything else |
+| `/retire <old-conversation>` | | Move an old conversation's facts into this one and clear the old one's memory. Its chat journal (the per-message archive of that chat) is **kept**, not deleted |
 | `/why` | `/why-did-you-say-that` | Show what's in memory right now — your window into what the model is being told |
 
 ### Examples
@@ -245,6 +246,13 @@ ones but you control the wording.
 
 **How do I start fresh without losing my other conversations?**
 `/forget` wipes only the current conversation. Other chats are untouched.
+
+**Does `/forget` stop me from ever talking about that again?**
+No. `/forget` is a one-time wipe of what is remembered at that moment. It
+never blocks a phrase: if you mention the same thing later, it is remembered
+normally. Restoring an older backup will not bring the wiped content back
+(the compactor removes only what is older than the `/forget` when it starts),
+and it will not remove what you said after.
 
 **I ran `/forget` and kept chatting in the same conversation — why did the
 model start referencing old context again?**

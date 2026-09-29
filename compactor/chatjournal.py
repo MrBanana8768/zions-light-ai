@@ -13,7 +13,7 @@ not a memory layer: nothing in the compactor ever reads it back into a prompt.
 LINE FORMAT (schema v=1), one JSON object per line, UTF-8, ensure_ascii off:
 
     v, conv_id, chat_id, message_id, parent_id, request_id, ts (UTC, ms, Z),
-    epoch (the wipe-ledger epoch at write time), user, assistant,
+    epoch (the wipe-ledger epoch at write time; null when it could not be read), user, assistant,
     finish_reason, partial (bool), images {count, refs}, sha256,
     [truncated: ["user"|"assistant"]]   only when a field hit MAX_FIELD_CHARS
     [redacted: true]                    a /forget tombstone, see below
@@ -46,25 +46,39 @@ does open(O_APPEND) + write + fsync. A stalled volume therefore stalls the
 journal, not a reply. Failures are logged by exception TYPE only and counted
 (`/health/full` `chat_journal.errors`). The journal text is NEVER logged.
 
-/FORGET (see main._clear_all_memory, commands._handle_forget, continuity):
+/FORGET and /RETIRE (see main._clear_all_memory, commands._handle_forget,
+continuity). POINT-IN-TIME (v3.1.9.10, owner decision): /forget wipes what
+exists NOW; what she says afterwards, even the same words, is journaled
+normally. There is NO write-time filter.
   - `/forget` (full wipe) and the admin wipe: `wipe()` deletes the file,
     inside the same conv_lock section as every other layer, after the wipe
     generation bump, so a reply that was in flight is discarded by the
     generation check in `append_record` and cannot resurrect the file.
-  - `/forget <text>`: `redact_needle()` turns every matching exchange (needle
-    found case-insensitively in the user text, the reply or an image ref)
-    into a TOMBSTONE: ids, ts, epoch, finish_reason kept; user/assistant
-    emptied; sha256 nulled (a hash of forgotten text would confirm a guess);
-    refs dropped; `redacted: true`. The digest layer's semantics: the unit
-    stays, its words go.
+  - `/forget <text>`: `redact_needle()` turns every EXISTING matching
+    exchange (needle found case-insensitively in the user text, the reply or
+    an image ref) into a TOMBSTONE: ids, ts, epoch, finish_reason kept;
+    user/assistant emptied; sha256 nulled (a hash of forgotten text would
+    confirm a guess); refs dropped; `redacted: true`. The digest layer's
+    semantics: the unit stays, its words go. The ledger entry records the
+    forget's cutoff (UTC).
   - a restart, restore or import: the wipe ledger lives OUTSIDE STORAGE_ROOT
     (continuity.CONTROL_ROOT), so a restored older journal can carry forgotten
     words. `continuity.reapply_ledger` (run for every ledger at boot) calls
-    `reapply()`: lines older than the ledger epoch are dropped, and every
-    ledger needle is re-applied. A line WRITTEN after a needle was recorded
-    is tombstoned at write time too.
-  - a ledger that cannot be read (or a pending forget intent) fails CLOSED:
-    the append is skipped and counted, never written on a guess.
+    `reapply()`, which removes only what PRE-DATES the forget: a line whose
+    `ts` is before a needle's cutoff and that matches it is tombstoned;
+    a line whose `ts` is before the last full wipe's `wipe_at`, or whose
+    `epoch` stamp is below `wipe_epoch`, is dropped. A line written after the
+    forget has a later `ts` and is left alone, so the same words said again
+    later are remembered, and a restored old copy of the same words is not.
+  - /retire does NOT delete the journal: it is the archive of the chat. Its
+    epoch bump does not purge it either (`wipe_epoch` is not moved by a
+    retire) and the needles are kept, so a restored older copy of the archive
+    is still redacted. `scripts/chat-journal.py stats` lists retired
+    conversations too.
+  - the ledger is NOT needed to write: an unreadable ledger or a pending
+    forget only leaves the line's epoch null (the `ts` rule still judges it).
+    Nothing here can block a journal write on a ledger problem any more: the
+    old reason (a write-time needle check needed the needles) is gone.
 
 PRIVACY. The journal holds her words like the facts store does: STORAGE_ROOT
 is inside the backups (intended) and outside `zl bundle` (ops/zlops/commands/
@@ -284,7 +298,7 @@ def _finish_reason(finished: bool, truncated: bool, holed: bool, seen: str | Non
 
 def build_record(
     *, conv_id: str, user: str, assistant: str, meta: dict | None, request_id: str | None,
-    ts: str, epoch: int, finish_reason: str, partial: bool,
+    ts: str, epoch: "int | None", finish_reason: str, partial: bool,
 ) -> dict:
     meta = meta or {}
     u, ut = _clip(user)
@@ -298,7 +312,7 @@ def build_record(
         "parent_id": meta.get("parent_id"),
         "request_id": request_id,
         "ts": ts,
-        "epoch": int(epoch),
+        "epoch": None if epoch is None else int(epoch),
         "user": u,
         "assistant": a,
         "finish_reason": finish_reason,
@@ -372,11 +386,12 @@ def _bump(key: str, n: int = 1) -> None:
         _stats[key] += n
 
 
-def _read_ledger(conv_id: str):
-    """(epoch, needles) or None when the ledger cannot be trusted."""
+def _epoch_for(conv_id: str):
+    """The ledger epoch to stamp on a new line, or None when it cannot be
+    known (never blocks the write; see the module docstring)."""
     import continuity  # lazy: continuity.reapply_ledger lazily imports us
 
-    return continuity.journal_ledger(conv_id)
+    return continuity.journal_epoch(conv_id)
 
 
 def _needle_list(needles) -> list[str]:
@@ -406,15 +421,9 @@ def append_record(job: dict, wipe_generation: int | None) -> str:
     with _LOCK:
         if wipe_generation is not None and wipe_generation != memory.current_wipe_generation(conv_id):
             return "skipped_wipe"
-        led = _read_ledger(conv_id)
-        if led is None:
-            return "skipped_ledger"
-        epoch, needles = led
+        epoch = _epoch_for(conv_id)
         rec = build_record(epoch=epoch, **{k: job[k] for k in (
             "conv_id", "user", "assistant", "meta", "request_id", "ts", "finish_reason", "partial")})
-        nl = _needle_list(needles)
-        if _hits(rec, nl):
-            rec = _tombstone(rec)
         _append_line(journal_path(conv_id), _dumps(rec))
         return "written"
 
@@ -432,8 +441,6 @@ def _run_job(job: dict, wipe_generation: int | None) -> None:
             _stats["last_write_at"] = _utc_now_iso()
     else:
         _bump("skipped")
-        if outcome == "skipped_ledger":
-            logger.warning("chat journal: wipe ledger not readable or a forget is pending; exchange not journaled")
 
 
 # ---------------------------------------------------------------------------
@@ -605,11 +612,27 @@ def redact_needle(conv_id: str, needle: str) -> int:
         return changed + dropped
 
 
-def reapply(conv_id: str, epoch: int, needles) -> dict:
-    """Boot-time re-apply of the wipe ledger (continuity.reapply_ledger):
-    drop lines older than `epoch`, tombstone every ledger-needle hit. Same
-    rules as the digest layer. Idempotent."""
-    nl = _needle_list(needles)
+def reapply(conv_id: str, ledger: dict) -> dict:
+    """Boot-time re-apply of the wipe ledger (continuity.reapply_ledger),
+    POINT-IN-TIME: it removes only content that PRE-DATES a forget.
+
+      - full wipe: drop a line with ts < ledger.wipe_at, or with an epoch
+        stamp below ledger.wipe_epoch. A /retire moves neither (the journal
+        is the retired chat's archive);
+      - targeted forget: tombstone a line that matches a needle AND pre-dates
+        that needle's cutoff (continuity.pre_dates: ts < cutoff, and not
+        stamped with a later epoch). A line with no readable ts counts as
+        pre-dating (unknown age, safe side);
+      - an unparseable line containing any needle is dropped.
+
+    Idempotent. `ledger` is the normalized ledger dict."""
+    import continuity
+
+    entries = [n for n in (ledger.get("targeted") or [])
+               if isinstance(n, dict) and (n.get("needle") or "").strip()]
+    all_nl = _needle_list(entries)
+    wipe_epoch = ledger.get("wipe_epoch")
+    wipe_at = continuity._parse_ts(ledger.get("wipe_at"))
     p = journal_path(conv_id)
     with _LOCK:
         if not p.is_file():
@@ -622,16 +645,22 @@ def reapply(conv_id: str, epoch: int, needles) -> dict:
                 if not isinstance(rec, dict):
                     raise ValueError
             except Exception:
-                return None if any(n in line.lower() for n in nl) else line
+                return None if any(n in line.lower() for n in all_nl) else line
             try:
-                ep = int(rec.get("epoch", 0))
+                ep = None if rec.get("epoch") is None else int(rec.get("epoch"))
             except Exception:
-                ep = 0
-            if ep < int(epoch):
+                ep = None
+            ts = rec.get("ts")
+            t = continuity._parse_ts(ts)
+            if (wipe_epoch is not None and ep is not None and ep < int(wipe_epoch)) or (
+                wipe_at is not None and t is not None and t < wipe_at
+            ):
                 purged[0] += 1
                 return None
-            if _hits(rec, nl):
-                return _dumps(_tombstone(rec))
+            for n in entries:
+                nl = _needle_list([n])
+                if nl and _hits(rec, nl) and continuity.pre_dates(ts, ep, n):
+                    return _dumps(_tombstone(rec))
             return line
 
         changed, dropped = _rewrite(p, tf)

@@ -16,16 +16,20 @@ What is pinned, and by which section:
         no user text, disabled, disk pressure
   [J5]  a journal failure never touches the reply, is counted, and no text is
         logged; the file is opened O_APPEND and fsynced
-  [F1]  /forget <text>: the text is gone from the journal (tombstones), also
-        when NO fact matched; a restart (ledger re-apply) keeps it gone; a
-        RESTORED old journal is re-redacted; a later reply that contains the
-        needle is tombstoned at write time
-  [F2]  /forget (full): the file is removed; a restored old journal is purged
-        by the epoch; an in-flight reply from before the wipe is discarded
-  [F3]  admin DELETE .../facts and /retire also remove the journal
-  [F4]  fail closed: an unreadable ledger, or a forget whose ledger write
-        failed, journals nothing; a failed rewrite is reported and healed at
-        the next boot
+  [F1]  /forget <text> is POINT-IN-TIME: the text is gone from the journal
+        (tombstones), also when NO fact matched; what she says AFTER the forget
+        is journaled normally (no write-time filter); a restart keeps the new
+        lines; a RESTORED old copy of the journal is re-redacted at boot while
+        a post-forget line in the same file is not
+  [F2]  /forget (full): the file is removed; a restored pre-wipe journal is
+        purged; a line written after the wipe (even the same words) survives a
+        reboot; an in-flight reply from before the wipe is discarded
+  [F3]  admin DELETE .../facts removes the journal; /retire KEEPS it (the
+        archive of the chat), a reboot keeps it too, stats lists it
+  [F4]  the ledger is not needed to write: an unreadable ledger or a pending
+        forget still journals; a failed rewrite is reported and healed at the
+        next boot
+  [F5]  .8-format ledger migration on the journal
   [H1]  /health/full carries chat_journal {enabled,last_write_at,lines_written,errors}
   [B1]  backup archives the journal and verify_backup accepts a .jsonl store
   [S1]  scripts/chat-journal.py: stats / verify / compare against a synthetic
@@ -542,26 +546,38 @@ check(NEEDLE not in raw(conv).lower(), "facts path: needle gone from the journal
 snapshot_after_forget = raw(conv)
 res = restart_reapply()
 eq(raw(conv), snapshot_after_forget, "a restart (ledger re-apply) changes nothing further")
-# a RESTORED older journal (backup from before the /forget) is re-redacted at boot
-jfile(conv).write_text(json.dumps({
+# POINT-IN-TIME: a reply that mentions the needle AFTER the forget is journaled as-is
+post_nonstream(conv, "more zebrafruit please", "Sure, zebrafruit it is.")
+newline = lines(conv)[-1]
+check(not newline.get("redacted") and "zebrafruit" in newline["assistant"].lower(),
+      "a NEW exchange containing the forgotten text is journaled normally (no write-time filter)")
+restart_reapply()
+check(not lines(conv)[-1].get("redacted") and "zebrafruit" in raw(conv).lower(),
+      "and it survives a reboot")
+# a RESTORED older journal (backup from before the /forget) is re-redacted at boot,
+# while the post-forget line in the SAME file is left alone: told apart by ts
+old_rec = {
     "v": 1, "conv_id": conv, "chat_id": None, "message_id": "old-1", "parent_id": None,
-    "request_id": "r", "ts": "2026-09-01T00:00:00.000Z", "epoch": 0,
+    "request_id": "r", "ts": "2000-01-01T00:00:00.000Z", "epoch": 0,
     "user": "I planted a zebrafruit tree", "assistant": "ok", "finish_reason": "stop", "partial": False,
     "images": {"count": 0, "refs": []},
-    "sha256": chatjournal.pair_sha("I planted a zebrafruit tree", "ok")}) + "\n", encoding="utf-8")
-check(NEEDLE in raw(conv), "fixture: the restored journal has the forgotten text again")
+    "sha256": chatjournal.pair_sha("I planted a zebrafruit tree", "ok")}
+with open(jfile(conv), "a", encoding="utf-8") as f:
+    f.write(json.dumps(old_rec) + "\n")
+check("I planted a zebrafruit tree" in raw(conv), "fixture: the restored copy has the forgotten text again")
 restart_reapply()
-check(NEEDLE not in raw(conv).lower(), "restart after a restore: the forgotten text does not come back")
-eq(lines(conv)[0].get("redacted"), True, "...it is a tombstone")
-# a later reply that contains the needle is tombstoned AT WRITE TIME
-post_nonstream(conv, "more zebrafruit please", "Sure, zebrafruit it is.")
-check(NEEDLE not in raw(conv).lower(), "a NEW exchange containing the forgotten text is tombstoned when written")
-eq(lines(conv)[-1].get("redacted"), True, "...as a tombstone, not dropped")
+ls = lines(conv)
+old_after = [x for x in ls if x["message_id"] == "old-1"][0]
+eq(old_after.get("redacted"), True, "restart after a restore: the OLD copy is a tombstone")
+check("I planted a zebrafruit tree" not in raw(conv), "...its words are gone")
+new_after = [x for x in ls if x.get("user") == "more zebrafruit please"][0]
+check(not new_after.get("redacted") and "zebrafruit" in new_after["assistant"].lower(),
+      "the post-forget line with the same word is NOT redacted by the same reboot")
 # an unparseable line holding the needle is dropped, other junk kept
 with open(jfile(conv), "a", encoding="utf-8") as f:
     f.write("garbage with zebrafruit inside\nother garbage\n")
 restart_reapply()
-check("zebrafruit" not in raw(conv).lower() and "other garbage" in raw(conv),
+check("garbage with zebrafruit inside" not in raw(conv) and "other garbage" in raw(conv),
       "an unparseable line with the needle is dropped; others are left alone")
 
 # ===========================================================================
@@ -577,8 +593,9 @@ check(not jfile(conv).exists(), "the journal file is gone")
 restart_reapply()
 check(not jfile(conv).exists(), "and a restart does not bring it back")
 # the ledger epoch moved; a restored older journal is purged by epoch at boot
-led = continuity.journal_ledger(conv)
-check(led is not None and led[0] >= 1, "the wipe bumped the ledger epoch")
+led = continuity._read_ledger(conv)
+check(led["epoch"] >= 1 and led["wipe_at"] and led["wipe_epoch"] == led["epoch"],
+      "the wipe bumped the ledger epoch and recorded its cutoff")
 jfile(conv).parent.mkdir(parents=True, exist_ok=True)
 jfile(conv).write_text(old_copy, encoding="utf-8")
 post_nonstream(conv, "third thing", "third answer " + REPLY)   # written after the wipe, epoch >= 1
@@ -586,6 +603,11 @@ restart_reapply()
 ls = lines(conv)
 eq([x["user"] for x in ls], ["third thing"], "restored pre-wipe lines are purged; the post-wipe line survives")
 check("first thing" not in raw(conv) and "second thing" not in raw(conv), "old words not in the file")
+# POINT-IN-TIME for the full wipe: the same words said AFTER the wipe are journaled and survive a reboot
+post_nonstream(conv, "first thing", "first answer " + REPLY)
+restart_reapply()
+eq([x["user"] for x in lines(conv)], ["third thing", "first thing"],
+   "the words she said again after the wipe survive the reboot; only the restored copy was removed")
 # an in-flight reply: generation captured BEFORE the wipe, write attempted AFTER
 reset()
 conv = "conv-f2b"
@@ -624,20 +646,63 @@ check(marker in dry, "retire dry run offers a code")
 code = dry.split(marker, 1)[1].split()[0] if marker in dry else "x"
 asyncio.run(commands.handle_command("retire", f"{src} apply {code}", dst, ctx={}))
 chatjournal.drain(5)
-check(not jfile(src).exists(), "/retire removed the retired conversation's journal")
+# CHANGED in v3.1.9.10 (was: "/retire removed the retired conversation's journal").
+# Owner: "retire should retain the journal as an archive of the chat."
+check(jfile(src).is_file() and len(lines(src)) == 1, "/retire KEEPS the retired conversation's journal")
+check("retire me" in raw(src), "...with her words intact (it is the archive)")
+led = continuity._read_ledger(src)
+check(led["epoch"] >= 1 and led["boundary"] == "all" and led["wipe_epoch"] is None,
+      "retire bumped the epoch but is not a wipe (no journal purge floor)")
+res = restart_reapply()
+check(jfile(src).is_file() and "retire me" in raw(src), "a reboot (boot re-apply) keeps it: no epoch purge")
+eq(lines(src)[0]["epoch"], 0, "fixture: the line is older than the retire's epoch bump (that is what used to purge it)")
+# a restored older copy of the archive is still redacted for what she forgot BEFORE the retire
+reset()
+src = "conv-f3-src2"
+post_nonstream(src, "we talked about kiwi", REPLY)
+run_cmd("forget", "kiwi", src)
+old_copy = raw(src)
+post_nonstream(src, "and after that, kiwi again", REPLY)
+facts.save_facts(src, [{"text": "She likes pears"}])
+dry = asyncio.run(commands.handle_command("retire", src, dst, ctx={}))
+check(f"/retire {src} apply " in dry, f"retire dry run offers a code: {dry[:200]!r}")
+code = dry.split(f"/retire {src} apply ", 1)[1].split()[0] if f"/retire {src} apply " in dry else "x"
+out = asyncio.run(commands.handle_command("retire", f"{src} apply {code}", dst, ctx={}))
+check("chat journal" in out and "kept" in out, f"the retire reply says the journal is kept: {out!r}")
+check("and after that, kiwi again" in raw(src), "the post-forget line survived the retire")
+with open(jfile(src), "a", encoding="utf-8") as f:
+    f.write(json.dumps({**json.loads(old_copy.splitlines()[0]), "message_id": "restored-old",
+                        "ts": "2000-01-01T00:00:00.000Z", "redacted": None, "user": "we talked about kiwi",
+                        "assistant": "yes"}) + "\n")
+restart_reapply()
+check("we talked about kiwi" not in raw(src) and "and after that, kiwi again" in raw(src),
+      "after retire, a restored old copy is redacted (needles kept) and the new line is not")
+# stats lists a retired conversation
+cli_spec = importlib.util.spec_from_file_location(
+    "chat_journal_cli_f3", str(Path(__file__).resolve().parent.parent / "scripts" / "chat-journal.py"))
+cli_f3 = importlib.util.module_from_spec(cli_spec)
+cli_spec.loader.exec_module(cli_f3)
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    cli_f3.main(["stats", "--store", str(STORE)])
+check(src in _buf.getvalue(), "scripts/chat-journal.py stats lists the retired conversation")
 
 # ===========================================================================
-print("\n[F4] fail closed; failed rewrite")
+print("\n[F4] the ledger is not needed to write; failed rewrite")
 reset()
 conv = "conv-f4"
 post_nonstream(conv, "one", REPLY)
 with patch.object(continuity, "_read_ledger", side_effect=continuity.LedgerUnreadable("test")):
     post_nonstream(conv, "two, ledger unreadable", REPLY)
-eq(len(lines(conv)), 1, "unreadable ledger: the exchange is NOT journaled (fail closed)")
-eq(chatjournal.health_snapshot()["skipped"], 1, "...and counted as skipped")
+# CHANGED in v3.1.9.10 (was: "NOT journaled (fail closed)" and "counted as skipped").
+# The old reason to skip (a write-time needle check needed the needles) is gone;
+# the journal is a safety copy and must not lose an exchange to a ledger problem.
+eq(len(lines(conv)), 2, "unreadable ledger: the exchange IS journaled")
+eq(lines(conv)[1]["epoch"], None, "...with a null epoch (unknown), judged by its ts")
+eq(chatjournal.health_snapshot()["skipped"], 0, "...and nothing counted as skipped")
 post_nonstream(conv, "three", REPLY)
-eq(len(lines(conv)), 2, "the ledger back: journaling resumes")
-# a forget whose ledger write fails leaves a pending intent: journaling stays closed
+eq(lines(conv)[2]["epoch"], 0, "the ledger back: the epoch is stamped again")
+# a forget whose ledger write fails leaves a pending intent: journaling continues
 reset()
 conv = "conv-f4b"
 post_nonstream(conv, "before the forget, mentions kiwi", REPLY)
@@ -645,8 +710,12 @@ with patch.object(continuity, "_write_ledger", side_effect=OSError(13, "denied")
     out = run_cmd("forget", "kiwi", conv)
 check("kiwi" not in raw(conv).lower(), "the journal was redacted even though the ledger write failed")
 post_nonstream(conv, "after, mentions kiwi again", REPLY)
-check("kiwi" not in raw(conv).lower() and len(lines(conv)) == 1,
-      "pending forget: the next exchange is not journaled (no needle can slip in)")
+# CHANGED in v3.1.9.10 (was: "the next exchange is not journaled (no needle can slip in)").
+eq(len(lines(conv)), 2, "pending forget: the next exchange IS journaled")
+check("kiwi again" in raw(conv).lower() and lines(conv)[1]["epoch"] is None,
+      "...as written, with a null epoch while the intent is pending")
+restart_reapply()   # the pending intent merges into the ledger
+check("kiwi again" in raw(conv).lower(), "and it survives the reboot that lands the pending forget")
 # failed rewrite: reported, unchanged, healed at boot
 reset()
 conv = "conv-f4c"
@@ -658,6 +727,44 @@ check("mango" in raw(conv), "fixture: the rewrite failed, so the words are still
 eq(chatjournal.health_snapshot()["errors"], 1, "counted as an error")
 restart_reapply()
 check("mango" not in raw(conv), "the next boot's re-apply clears it (the needle is in the ledger)")
+
+# ===========================================================================
+print("\n[F5] a .8-format ledger against the journal")
+reset()
+conv = "conv-f5"
+post_nonstream(conv, "old talk about papaya", REPLY)         # epoch 0, before the "forget"
+led_p = continuity._ledger_path(conv)
+led_p.parent.mkdir(parents=True, exist_ok=True)
+# exactly the .8 shape: no format, no cutoff, no wipe_at
+led_p.write_text(json.dumps({"epoch": 0, "boundary": None,
+                             "targeted": [{"needle": "papaya", "epoch": 0}]}), encoding="utf-8")
+restart_reapply()
+eq(json.loads(led_p.read_text())["format"], 2, "the ledger is rewritten as format 2")
+check("papaya" not in raw(conv).lower(), "the existing matching line is redacted (what .8 promised)")
+post_nonstream(conv, "new talk about papaya", REPLY)
+restart_reapply()
+check("new talk about papaya" in raw(conv), "a line written after the migration stamp is remembered")
+# a .8 ledger for a retired conversation: epoch bumped, boundary "all": the journal stays
+reset()
+conv = "conv-f5r"
+post_nonstream(conv, "archive me", REPLY)
+led_p = continuity._ledger_path(conv)
+led_p.parent.mkdir(parents=True, exist_ok=True)
+led_p.write_text(json.dumps({"epoch": 1, "boundary": "all", "targeted": []}), encoding="utf-8")
+restart_reapply()
+check("archive me" in raw(conv), "a .8 retire tombstone does not purge the journal")
+# a .8 full-wipe ledger (epoch 1, boundary null): older-epoch lines are purged, as in .8
+reset()
+conv = "conv-f5w"
+post_nonstream(conv, "pre wipe line", REPLY)                 # epoch 0
+led_p = continuity._ledger_path(conv)
+led_p.parent.mkdir(parents=True, exist_ok=True)
+led_p.write_text(json.dumps({"epoch": 1, "boundary": None, "targeted": []}), encoding="utf-8")
+restart_reapply()
+check(not jfile(conv).exists(), "a .8 wipe ledger purges the pre-wipe (epoch 0) lines")
+post_nonstream(conv, "post wipe line", REPLY)                # epoch 1
+restart_reapply()
+check("post wipe line" in raw(conv), "and keeps the line written after it")
 
 # ===========================================================================
 print("\n[H1] /health/full")

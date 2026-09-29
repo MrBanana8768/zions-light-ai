@@ -46,6 +46,7 @@ import os
 import re
 import tempfile
 import unicodedata
+import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -600,7 +601,100 @@ class LedgerUnreadable(RuntimeError):
     trusted with what a /forget already promised her)."""
 
 
-_ABSENT_LEDGER = {"epoch": 0, "boundary": None, "targeted": []}
+# ---------------------------------------------------------------------------
+# v3.1.9.10: /forget is POINT-IN-TIME (owner decision, 2026-09-29).
+#
+#   "/forget should never allow things that meet a regex phrase to never be
+#    remembered again, rather it should wipe it from existing memory and
+#    then allow new information to be remembered instead."
+#
+# Ledger format 2. Every entry records WHEN it was made, so the boot re-apply
+# (a restored backup or an in-flight write must not bring forgotten content
+# back, the .8 purpose) removes only content that PRE-DATES the forget:
+#
+#   targeted[i] = {"needle", "epoch", "cutoff"}   cutoff = UTC ms ISO at forget
+#   wipe_at / wipe_epoch  the last FULL wipe: UTC time and the epoch it set
+#   retired_at            the last /retire (its epoch bump is NOT a wipe: the
+#                         chat journal is kept as an archive, so retire does
+#                         not move wipe_epoch)
+#   format                2
+#
+# Per store, how "pre-dates" is judged (details in each function):
+#   digests   entry.created (UTC, stamped at write) vs cutoff; the epoch stamp
+#             for a full wipe (entry.epoch != ledger epoch => pre-wipe)
+#   journal   line.ts (UTC, stamped at submit) vs cutoff / wipe_at; the line's
+#             epoch stamp vs wipe_epoch as a second witness
+#   facts, summaries/hierarchy, episodic (chroma): NOT re-applied at boot (as
+#             in .8): wiped at forget time only, and nothing filters what is
+#             written afterwards.
+#
+# A missing cutoff (a .8-format entry) is read as "+infinity" (everything
+# that exists matches) until the boot re-apply stamps it with the boot time,
+# see `_stamp_legacy_ledger`.
+# ---------------------------------------------------------------------------
+
+LEDGER_FORMAT = 2
+
+
+def _now_iso() -> str:
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _parse_ts(v) -> "datetime.datetime | None":
+    """Parse an ISO-8601 UTC string (the `Z` form this codebase writes).
+    None for anything unparseable: callers then treat the item's age as
+    UNKNOWN and, on every path, as pre-dating (the privacy-safe direction)."""
+    if not isinstance(v, str) or not v:
+        return None
+    try:
+        d = datetime.datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=datetime.timezone.utc)
+    return d
+
+
+def pre_dates(created, item_epoch, entry: dict) -> bool:
+    """Does an item created at `created` (ISO UTC or None) under ledger epoch
+    `item_epoch` (int or None) PRE-DATE the forget recorded in needle entry
+    `entry`? True means the re-apply may remove it if it matches.
+
+    - an item stamped with a LATER epoch than the entry's was written after a
+      full wipe that came after this forget: post-dates it;
+    - no cutoff on the entry (.8 format): everything existing pre-dates it;
+    - no/unparseable `created` on the item: unknown age, pre-dates (safe);
+    - otherwise created < cutoff. A same-millisecond tie counts as
+      post-dating: the forget runs under conv_lock and takes far longer than a
+      millisecond, so a tie means the item is the one that came AFTER."""
+    try:
+        ne = entry.get("epoch")
+        if item_epoch is not None and ne is not None and int(item_epoch) > int(ne):
+            return False
+    except (TypeError, ValueError):
+        pass
+    cutoff = _parse_ts(entry.get("cutoff"))
+    if cutoff is None:
+        return True
+    c = _parse_ts(created)
+    if c is None:
+        return True
+    return c < cutoff
+
+
+_ABSENT_LEDGER = {
+    "epoch": 0, "boundary": None, "targeted": [],
+    "wipe_at": None, "wipe_epoch": None, "retired_at": None, "format": LEDGER_FORMAT,
+}
+
+# conv_id -> boot-time stamp for a legacy ledger whose stamped copy could not
+# be written (see `_stamp_legacy_ledger`). Process-local; only ever narrows
+# "+infinity" to "the boot time".
+_legacy_stamp: dict[str, str] = {}
 
 # v3.1.9.8 `.15p`/Task-B round-2 review (item 1, HIGH), REVISED round-3
 # (the owner's "fix it fully" directive — round 2's fix was incomplete):
@@ -782,11 +876,12 @@ def _delete_pending_sidecar(conv_id: str) -> None:
 
 
 def _fold_needles(dst: list[dict], src: list[dict]) -> list[dict]:
-    """Union of two needle lists, deduped by (needle, epoch)."""
-    existing = {(n.get("needle"), n.get("epoch")) for n in dst}
+    """Union of two needle lists, deduped by (needle, epoch, cutoff): the same
+    words forgotten twice at different times are two entries (v3.1.9.10)."""
+    existing = {(n.get("needle"), n.get("epoch"), n.get("cutoff")) for n in dst}
     out = list(dst)
     for n in src:
-        key = (n.get("needle"), n.get("epoch"))
+        key = (n.get("needle"), n.get("epoch"), n.get("cutoff"))
         if key not in existing:
             out.append(n)
             existing.add(key)
@@ -811,6 +906,23 @@ def _fold_epoch_boundary(dst: dict, src_epoch, src_boundary) -> None:
         dst["boundary"] = src_boundary
     elif src_epoch == cur and src_boundary == "all" and dst.get("boundary") != "all":
         dst["boundary"] = "all"
+
+
+_WIPE_FIELDS = ("wipe_at", "wipe_epoch", "retired_at")
+
+
+def _fold_wipe_fields(dst: dict, src: dict) -> None:
+    """v3.1.9.10: the point-in-time fields a failed write could not persist
+    (last full wipe time/epoch, last retire time) fold as a MAX, exactly like
+    the epoch: a pending intent only ever moves a cutoff LATER, which can
+    only remove more pre-dating content, never resurrect any."""
+    for k in _WIPE_FIELDS:
+        v = src.get(k)
+        if v is None:
+            continue
+        cur = dst.get(k)
+        if cur is None or v > cur:
+            dst[k] = v
 
 
 def _merge_pending_intent(conv_id: str, data: dict) -> "tuple[dict, bool]":
@@ -850,9 +962,14 @@ def _merge_pending_intent(conv_id: str, data: dict) -> "tuple[dict, bool]":
     if disk_pending:
         _fold_epoch_boundary(pending, disk_pending.get("epoch"), disk_pending.get("boundary"))
         pending["needles"] = _fold_needles(pending.get("needles", []), disk_pending.get("needles", []))
-    if pending.get("epoch") is not None or pending.get("needles"):
+        _fold_wipe_fields(pending, disk_pending)
+    if (
+        pending.get("epoch") is not None or pending.get("needles")
+        or any(pending.get(k) for k in _WIPE_FIELDS)
+    ):
         _fold_epoch_boundary(data, pending.get("epoch"), pending.get("boundary"))
         data["targeted"] = _fold_needles(data.get("targeted", []), pending.get("needles", []))
+        _fold_wipe_fields(data, pending)
     return data, sidecar_unreadable
 
 
@@ -875,6 +992,7 @@ def _record_pending_intent(conv_id: str, attempted: dict) -> bool:
     )
     _fold_epoch_boundary(pending, attempted.get("epoch"), attempted.get("boundary"))
     pending["needles"] = _fold_needles(pending.get("needles", []), attempted.get("targeted", []))
+    _fold_wipe_fields(pending, attempted)
     sidecar_ok = _persist_pending_sidecar(conv_id, pending)
     _ledger_write_failed.add(conv_id)
     _ledger_write_failed_ever.add(conv_id)
@@ -981,9 +1099,42 @@ def _read_ledger(conv_id: str) -> dict:
             raise ValueError("wipe ledger is not a JSON object")
     except Exception as e:
         raise LedgerUnreadable(f"{p}: {type(e).__name__}: {e}") from e
+    return _normalize_ledger(conv_id, data)
+
+
+def _is_legacy(data: dict) -> bool:
+    return data.get("format") != LEDGER_FORMAT
+
+
+def _normalize_ledger(conv_id: str, data: dict) -> dict:
+    """Fill defaults; read a .8-format ledger (no `format`, needles without a
+    `cutoff`) SAFELY, in memory only (`_stamp_legacy_ledger` persists it).
+
+    - a needle without a cutoff takes this boot's stamp when one exists
+      (`_legacy_stamp`), else stays cutoff-less = "+infinity": everything
+      that exists matches, which is exactly what .8 did;
+    - `wipe_epoch` (the journal's purge floor) is derived: the ledger epoch,
+      unless boundary == "all", which only `retire_tombstone` writes, and a
+      retire is not a wipe (its journal is kept), so no floor. Ambiguous only
+      for a wipe followed by a retire on the same conversation; the reading
+      that keeps her archive wins."""
     data.setdefault("epoch", 0)
     data.setdefault("boundary", None)
     data.setdefault("targeted", [])
+    data.setdefault("wipe_at", None)
+    data.setdefault("retired_at", None)
+    if _is_legacy(data):
+        stamp = _legacy_stamp.get(conv_id)
+        fixed = []
+        for n in data["targeted"]:
+            if isinstance(n, dict) and not n.get("cutoff") and stamp:
+                n = {**n, "cutoff": stamp, "legacy": True}
+            fixed.append(n)
+        data["targeted"] = fixed
+        if "wipe_epoch" not in data:
+            ep = int(data.get("epoch", 0))
+            data["wipe_epoch"] = ep if (ep > 0 and data.get("boundary") != "all") else None
+    data.setdefault("wipe_epoch", None)
     return data
 
 
@@ -1078,6 +1229,28 @@ def current_ledger_epoch(conv_id: str) -> int | None:
     return int(ledger["epoch"]) if ledger is not None else None
 
 
+def _upgrade_legacy(conv_id: str, data: dict) -> None:
+    """Every ledger write is format 2. A legacy (.8) ledger being rewritten
+    gets its cutoff-less needles stamped first (boot stamp if one exists,
+    else now), so writing the new format can never turn "unknown" into
+    "forever"."""
+    if data.get("format") == LEDGER_FORMAT and all(
+        not isinstance(n, dict) or n.get("cutoff") for n in data.get("targeted", [])
+    ):
+        return
+    stamp = _legacy_stamp.get(conv_id) or _now_iso()
+    data["targeted"] = [
+        {**n, "cutoff": stamp, "legacy": True} if isinstance(n, dict) and not n.get("cutoff") else n
+        for n in data.get("targeted", [])
+    ]
+    if "wipe_epoch" not in data:
+        ep = int(data.get("epoch", 0))
+        data["wipe_epoch"] = ep if (ep > 0 and data.get("boundary") != "all") else None
+    data.setdefault("wipe_at", None)
+    data.setdefault("retired_at", None)
+    data["format"] = LEDGER_FORMAT
+
+
 def _write_ledger_best_effort(conv_id: str, data: dict, *, op: str) -> bool:
     """v3.1.9.8 (Task B): an OSError out of `_write_ledger` — an unwritable
     CONTROL_ROOT, a full disk, anything — must never block the deletion the
@@ -1116,6 +1289,7 @@ def _write_ledger_best_effort(conv_id: str, data: dict, *, op: str) -> bool:
     cannot confirm it either way) and the conv is kept marked degraded,
     so the band stays failed closed until the sidecar is repaired or
     replaced by a later, readable one."""
+    _upgrade_legacy(conv_id, data)
     data, sidecar_unreadable = _merge_pending_intent(conv_id, data)
     try:
         _write_ledger(conv_id, data)
@@ -1261,6 +1435,11 @@ def record_wipe(conv_id: str, *, boundary: dict | None = None) -> int | None:
         data = dict(_ABSENT_LEDGER)
     data["epoch"] = int(data.get("epoch", 0)) + 1
     data["boundary"] = boundary
+    # v3.1.9.10: the full wipe's own cutoff. Content stamped later than this
+    # (or under a later epoch) survives a reboot; only a restored pre-wipe
+    # copy is removed.
+    data["wipe_at"] = _now_iso()
+    data["wipe_epoch"] = data["epoch"]
     # _write_ledger_best_effort merges any PENDING intent into `data` in
     # place (round-3 review) — a higher pending epoch (from an earlier
     # failed wipe/retire for this same conv) can raise `data["epoch"]`
@@ -1281,11 +1460,14 @@ def retire_tombstone(conv_id: str) -> int | None:
     would have unlinked `control/wipes/<src>.json` entirely. A later
     restore of a pre-retire archive would then see an ABSENT ledger
     (epoch 0) and bring back every digest with a stamp >= 1, needles and
-    all. Instead: bump the epoch (hides every existing digest), set
-    boundary="all", and clear the needle list (the needles' job — hiding
-    her words — is already done by the epoch bump; keeping them around
-    for a retired, about-to-be-inaccessible conversation buys nothing).
-    The file itself is never unlinked.
+    all. Instead: bump the epoch (hides every existing digest) and set
+    boundary="all". The file itself is never unlinked.
+
+    v3.1.9.10: the needle list is now KEPT (it used to be cleared) and
+    `wipe_epoch` / `wipe_at` are left alone. Owner: "retire should retain
+    the journal as an archive of the chat." The journal survives, so the
+    boot re-apply must neither purge it because of this epoch bump nor lose
+    the needles that protect a restored older copy of it.
 
     v3.1.9.8 round-2 review (item 4, LOW): returns the epoch actually
     persisted, or None if the write failed — same reasoning as
@@ -1301,7 +1483,13 @@ def retire_tombstone(conv_id: str) -> int | None:
         data = dict(_ABSENT_LEDGER)
     data["epoch"] = int(data.get("epoch", 0)) + 1
     data["boundary"] = "all"
-    data["targeted"] = []
+    # v3.1.9.10: /retire keeps the chat journal as an archive of the chat, so
+    # (a) the epoch bump must not purge it (`wipe_epoch` / `wipe_at` are left
+    # exactly as they were: a retire is not a wipe) and (b) the needles are
+    # KEPT (they used to be cleared here because nothing survived a retire):
+    # a restored older copy of the retired journal must still lose what she
+    # forgot before retiring.
+    data["retired_at"] = _now_iso()
     # Same reasoning as record_wipe's own comment just above: the merge
     # inside _write_ledger_best_effort can change `data["boundary"]` (and
     # re-add pending needles to `data["targeted"]` — harmless, see that
@@ -1336,15 +1524,54 @@ def record_targeted_forget(conv_id: str, needle: str) -> int:
         data = dict(_ABSENT_LEDGER)
     epoch = int(data.get("epoch", 0))
     targeted = list(data.get("targeted", []))
-    targeted.append({"needle": needle, "epoch": epoch})
+    # v3.1.9.10: `cutoff` = the moment of the forget (UTC ms). Content that
+    # pre-dates it is what the boot re-apply may remove; content made later
+    # is remembered normally.
+    targeted.append({"needle": needle, "epoch": epoch, "cutoff": _now_iso()})
     data["targeted"] = targeted
     _write_ledger_best_effort(conv_id, data, op="record_targeted_forget")
     return epoch
 
 
-def _needle_hit(text: str, needles: list[dict]) -> bool:
+def _needle_hit(text: str, needles: list[dict], *, created=None, epoch=None) -> bool:
+    """True if `text` contains a forgotten needle AND the item PRE-DATES that
+    needle's forget (`pre_dates`). Called with no `created`/`epoch` the item's
+    age is unknown, which `pre_dates` reads as pre-dating (the safe side)."""
     t = (text or "").lower()
-    return any((n.get("needle") or "").strip().lower() in t for n in needles if n.get("needle"))
+    return any(
+        (n.get("needle") or "").strip().lower() in t and pre_dates(created, epoch, n)
+        for n in needles if n.get("needle")
+    )
+
+
+def _stamp_legacy_ledger(conv_id: str, ledger: dict) -> dict:
+    """.8 -> .10 ledger migration, run by `reapply_ledger` at boot.
+
+    A .8 needle has no time. The only honest reading of "when was this
+    forgotten" is "no later than now", so every cutoff-less needle is stamped
+    with THIS boot's time and marked `legacy: true`: everything that exists
+    now and matches goes (what .8 promised), and everything written from now
+    on is remembered normally. The window between the real forget and this
+    boot is over-deleted, on purpose: it is the safe side for a forget, and .8
+    (never deployed to prod) has no ledger in the field anyway. The stamped
+    ledger is written back (format 2); if that write fails the stamp is kept
+    in `_legacy_stamp` for this process and the next boot stamps again, a
+    LATER time, which only ever over-deletes more, never resurrects."""
+    if not _is_legacy(ledger):
+        return ledger
+    _legacy_stamp.setdefault(conv_id, _now_iso())
+    ledger = _normalize_ledger(conv_id, dict(ledger))
+    payload = dict(ledger)
+    _upgrade_legacy(conv_id, payload)
+    try:
+        # Direct write, not `_write_ledger_best_effort`: a failed STAMP must
+        # not raise a pending intent and close the band; nothing here is
+        # lost, the stamp is simply retried at the next boot.
+        _write_ledger(conv_id, payload)
+        ledger = payload
+    except Exception as e:
+        logger.warning(f"conv={conv_id}: could not persist the .8 ledger stamp ({type(e).__name__})")
+    return ledger
 
 
 def reapply_ledger(conv_id: str) -> dict:
@@ -1368,12 +1595,16 @@ def reapply_ledger(conv_id: str) -> dict:
     ledger = _read_ledger_failing_closed(conv_id, on_fail_context="reapply_ledger")
     if ledger is None:
         return {"purged": 0, "suppressed_reapplied": 0, "epoch": None, "failed_closed": True}
+    ledger = _stamp_legacy_ledger(conv_id, ledger)
     epoch = int(ledger.get("epoch", 0))
     needles = ledger.get("targeted", [])
     store = _read_digest_store(conv_id)
     kept: dict[str, dict] = {}
     purged = 0
     for uid, entry in store.items():
+        # Full wipe: an entry stamped with any other epoch pre-dates the last
+        # ledger change (a restored old store) and goes. A digest made after
+        # the wipe carries the new epoch and stays.
         if int(entry.get("epoch", -1)) != epoch:
             purged += 1
             continue
@@ -1382,7 +1613,12 @@ def reapply_ledger(conv_id: str) -> dict:
     for entry in kept.values():
         if entry.get("suppressed"):
             continue
-        if _needle_hit(entry.get("headline", ""), needles) or _needle_hit(entry.get("full", ""), needles):
+        # Targeted forget: only an entry that PRE-DATES the needle's forget.
+        # An entry with no `created` (written before v3.1.9.10) has unknown
+        # age and counts as pre-dating.
+        _c, _e = entry.get("created"), entry.get("epoch")
+        if _needle_hit(entry.get("headline", ""), needles, created=_c, epoch=_e) or \
+                _needle_hit(entry.get("full", ""), needles, created=_c, epoch=_e):
             entry["headline"] = SUPPRESSED_MARKER
             entry["full"] = SUPPRESSED_MARKER
             entry["suppressed"] = True
@@ -1394,15 +1630,15 @@ def reapply_ledger(conv_id: str) -> dict:
     )
     # v3.1.9.10: the per-message chat journal (STORAGE_ROOT/journal) is a
     # transcript store that a restore can bring back from before a /forget.
-    # Same ledger, same rules as the digests above: lines older than the
-    # epoch go, every needle is re-applied. A failure here must not stop the
-    # boot-time pass for the other conversations. Type only in the log: the
-    # journal holds her words.
+    # Same ledger, same point-in-time rules as the digests above (see
+    # chatjournal.reapply). A failure here must not stop the boot-time pass
+    # for the other conversations. Type only in the log: the journal holds
+    # her words.
     journal = {"purged": 0, "redacted": 0}
     try:
         import chatjournal
 
-        journal = chatjournal.reapply(conv_id, epoch, needles)
+        journal = chatjournal.reapply(conv_id, ledger)
     except Exception as e:
         logger.error(f"conv={conv_id}: chat journal re-apply failed ({type(e).__name__})")
     return {
@@ -1413,15 +1649,20 @@ def reapply_ledger(conv_id: str) -> dict:
     }
 
 
-def journal_ledger(conv_id: str) -> tuple[int, list[dict]] | None:
-    """(epoch, targeted needles) for the chat journal writer, or None when the
-    ledger is unreadable or a forget/wipe of this conversation is pending
-    persistence (the same fail-closed contract as `visible`): the journal then
-    writes nothing rather than guess an epoch or miss a needle."""
-    ledger = _read_ledger_failing_closed(conv_id, on_fail_context="chat_journal")
-    if ledger is None:
+def journal_epoch(conv_id: str) -> int | None:
+    """The epoch to stamp on a new chat-journal line, or None when it cannot
+    be known right now (an unreadable ledger, or a wipe/forget whose ledger
+    write is still pending). NEVER blocks the journal write (v3.1.9.10, the
+    point-in-time change): the old design skipped the append here because a
+    write-time needle check needed the needles; there is none any more. An
+    unstamped line (epoch null) is kept by the epoch rule and judged by its
+    own ts, which is the primary witness anyway."""
+    try:
+        if _has_pending_intent(conv_id):
+            return None
+        return int(_read_ledger(conv_id).get("epoch", 0))
+    except Exception:
         return None
-    return int(ledger.get("epoch", 0)), list(ledger.get("targeted", []))
 
 
 def reapply_all_ledgers() -> dict:
@@ -1525,6 +1766,7 @@ def reapply_all_ledgers() -> dict:
                 "epoch": pending.get("epoch"),
                 "boundary": pending.get("boundary"),
                 "needles": list(pending.get("needles") or []),
+                **{k: pending.get(k) for k in _WIPE_FIELDS if pending.get(k)},
             }
             try:
                 data = _read_ledger(conv_id)
@@ -1620,30 +1862,22 @@ async def generate_digest(
             )
             return False
         store = _read_digest_store(conv_id)
-        existing = store.get(key)
-        if existing and existing.get("suppressed"):
-            # §17.6a r9: "it is never re-digested" once a targeted forget
-            # has suppressed it.
-            return False
-        # r10 review R10-B1: "the digest writer applies [the needle
-        # check] before storing" — a targeted forget that landed for a
-        # DIFFERENT unit could still name a word that also appears in
-        # THIS one; check the full ledger needle list, not just this
-        # unit's own prior state.
-        if _needle_hit(headline, ledger.get("targeted", [])) or _needle_hit(full, ledger.get("targeted", [])):
-            headline = full = SUPPRESSED_MARKER
-            store[key] = {
-                "headline": headline, "full": full, "epoch": epoch_now,
-                "unit_number": unit_number, "suppressed": True,
-            }
-            _write_digest_store(conv_id, store)
-            return False
+        # v3.1.9.10, point-in-time /forget: there is NO write-time needle
+        # filter here any more (there used to be two: "never re-digested"
+        # for a suppressed unit, and a check of the new text against every
+        # ledger needle). A digest is made for an exchange that has just
+        # been answered, so it post-dates every forget already on the
+        # ledger, and it is remembered normally, even if it repeats what she
+        # once forgot. It overwrites a suppressed placeholder for the same
+        # unit key (same words, said again later). `created` is what the
+        # boot re-apply reads to tell it from a restored older copy.
         store[key] = {
             "headline": headline,
             "full": full,
             "epoch": epoch_now,
             "unit_number": unit_number,
             "suppressed": False,
+            "created": _now_iso(),
         }
         _write_digest_store(conv_id, store)
         return True
@@ -1659,8 +1893,14 @@ def suppress_needle(conv_id: str, needle: str) -> int:
     Records the needle in the ledger (r10 A3) so a later restore/import
     re-applies it, even to units that get no digest until after the
     restore. Returns the number of units suppressed just now (0 is not
-    an error: the needle is recorded in the ledger regardless, so a unit
-    digested later still comes out suppressed)."""
+    an error: the needle is recorded in the ledger regardless, with its
+    cutoff, so a restored OLDER copy of a unit is suppressed at the next
+    boot).
+
+    v3.1.9.10, point-in-time: this wipes what EXISTS NOW. A unit digested
+    LATER (its `created` is after the cutoff recorded above) that repeats
+    the words is remembered normally; the old sentence "a unit digested
+    later still comes out suppressed" is exactly what the owner removed."""
     needle_l = needle.strip().lower()
     if not needle_l:
         return 0
@@ -1714,9 +1954,10 @@ def visible(conv_id: str) -> dict[str, dict]:
         if int(entry.get("epoch", -1)) != epoch:
             continue
         rendered = dict(entry)
+        _c, _e = rendered.get("created"), rendered.get("epoch")
         if not rendered.get("suppressed") and (
-            _needle_hit(rendered.get("headline", ""), needles)
-            or _needle_hit(rendered.get("full", ""), needles)
+            _needle_hit(rendered.get("headline", ""), needles, created=_c, epoch=_e)
+            or _needle_hit(rendered.get("full", ""), needles, created=_c, epoch=_e)
         ):
             rendered["headline"] = SUPPRESSED_MARKER
             rendered["full"] = SUPPRESSED_MARKER
@@ -1726,16 +1967,22 @@ def visible(conv_id: str) -> dict[str, dict]:
 
 
 def apply_needles(conv_id: str, text: str) -> str:
-    """r10 review R10-B1: 'the allocator applies the same [needle] check
-    to fallback entries it builds.' For an extractive-fallback entry
-    built OUTSIDE the digest store (no digest exists yet for this unit),
-    this is what a caller must run the rendered text through before
-    injecting it. Fails closed the same way `visible()` does: if the
-    ledger cannot be read, the text is suppressed rather than risked."""
+    """The band's extractive-fallback gate (a unit with no digest yet).
+
+    v3.1.9.10, point-in-time /forget: this no longer filters by needle. The
+    text is built from an exchange in the client's resent history, whose age
+    this function cannot know, and filtering it by a needle forever is
+    exactly the "never remembered again" behaviour the owner removed (new
+    things she says about a forgotten word must reach the band). What is
+    left is the FAIL-CLOSED half: when the ledger cannot be read, or a
+    wipe/forget is pending persistence, the fallback is suppressed, because
+    the band cannot then say which epoch it is speaking for. (Known limit,
+    stated in OPERATIONS.md: an old exchange that matches a forgotten
+    needle, still in the resent history and never digested, can still show
+    in the fallback of the OPT-IN band. Its raw text is in the client's
+    history the model reads anyway.)"""
     ledger = _read_ledger_failing_closed(conv_id, on_fail_context="apply_needles")
     if ledger is None:
-        return SUPPRESSED_MARKER
-    if _needle_hit(text, ledger.get("targeted", [])):
         return SUPPRESSED_MARKER
     return text
 

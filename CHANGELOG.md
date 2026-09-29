@@ -29,6 +29,42 @@ on Docker Hub.
   (the same example keeps 36, not 12). Recommended template change: `COMPACTOR_BACKUP_RETAIN=3`, leave
   `COMPACTOR_BACKUP_RETAIN_DAYS` unset. See OPERATIONS.md, "Backup retention tiers".
 
+### Changed: `/forget` is point-in-time, `/retire` keeps the journal (owner decisions, 2026-09-29)
+- **`/forget` no longer bans a phrase.** Owner: "/forget should never allow things that meet a regex phrase to
+  never be remembered again, rather it should wipe it from existing memory and then allow new information to be
+  remembered instead." `/forget <text>` wipes what EXISTS NOW (matching facts, continuity digests, chat-journal
+  exchanges; the full `/forget` wipes every layer), and anything said afterwards, including the same words, is
+  remembered normally in every store. **This reverses .8's "`/forget` never un-forgets" for new content**; the
+  guarantee that a restored backup or an in-flight write cannot bring forgotten content back is kept, and now
+  covers only content that pre-dates the forget.
+  - Removed: the chat journal's write-time tombstoning of new matching exchanges; `generate_digest`'s needle
+    check and its "never re-digested" rule for a suppressed unit; `apply_needles`' needle filter (it keeps its
+    fail-closed half). There was no such filter in the facts, summary or episodic write paths (a new test pins
+    that).
+  - Ledger format 2 (`<CONTROL_ROOT>/wipes/<conv>.json`): every needle entry records a UTC `cutoff`; the ledger
+    records `wipe_at` / `wipe_epoch` (last full wipe) and `retired_at`. The boot re-apply removes a digest or a
+    journal line only if it pre-dates the entry: the item's own `created` / `ts` against the cutoff, and its
+    `epoch` stamp (an item stamped with a later epoch post-dates an earlier forget). New digests carry a
+    `created` stamp. An item of unknown age counts as pre-dating. Facts, summaries and episodic rows have no
+    creation time and are not re-applied by the ledger (unchanged from .8).
+  - **.8-format ledgers** (no `format`, needles without a cutoff) are read safely: the first boot stamps every
+    such needle with that boot's time and rewrites the ledger; existing matches are removed (what .8
+    promised), later content is remembered. A stamp write failure is logged and retried next boot.
+  - "Fails closed" now means only: the boot re-apply cannot run on an unreadable ledger, and the digest writer
+    and the opt-in band withhold output while the ledger is unreadable or a wipe/forget is pending. The
+    journal write is never blocked by the ledger (an unstamped line has `epoch: null` and is judged by its
+    `ts`).
+- **`/retire` keeps the conversation's chat journal** as an archive of the chat (it used to delete it). The
+  retire's epoch bump no longer purges it at boot (`wipe_epoch` is not moved by a retire), and the retire keeps
+  the ledger's needles (it used to clear them) so a restored older copy of the archive is still redacted.
+  `scripts/chat-journal.py stats` lists retired conversations too. Retire's effects on the other stores are
+  unchanged.
+- Tests changed on purpose: `test_chat_journal.py` F1 (a new exchange with the forgotten text is now journaled
+  as is), F3 (`/retire` keeps the journal), F4 (the ledger no longer gates the journal), and F5 (new: .8 ledger);
+  `test_continuity.py`: retire keeps the needle list, `apply_needles` no longer needle-filters, and the stale
+  pending-sidecar test uses a needle of the digest's own epoch. New: `test_forget_point_in_time.py`, plus
+  point-in-time and .8-migration tests in `test_continuity.py`.
+
 ### Added
 - **Chat journal** (`compactor/chatjournal.py`, `COMPACTOR_CHAT_JOURNAL`, default on): after every completed
   reply, one fsynced JSON line in `<STORAGE_ROOT>/journal/<conv_id>.jsonl` (schema v1: conv/chat/message/parent
@@ -37,18 +73,18 @@ on Docker Hub.
   memory policy (a stopped or ceiling-cut reply is written with `partial: true`; empty/failed replies, the
   self-test conversations, slash commands, task traffic, disk-pressure pauses are skipped). Never blocks or
   fails the reply; errors are logged by type and counted; the text is never logged.
-- **`/forget` covers the journal**, same semantics as the other stores: `/forget` and the admin wipe delete the
-  file under the wipe-generation guard (an in-flight reply cannot write it back), `/forget <text>` tombstones
-  matching exchanges (even when no fact matched), `/retire` deletes the retired conversation's journal, and the
-  boot-time ledger re-apply drops lines older than the ledger epoch and re-applies every needle, so a restored
-  older backup does not bring forgotten words back. Fails closed on an unreadable ledger or a pending forget.
+- **`/forget` covers the journal**, point-in-time (see "Changed", below): `/forget` and the admin wipe delete
+  the file under the wipe-generation guard (an in-flight reply cannot write it back), `/forget <text>`
+  tombstones the existing matching exchanges (even when no fact matched), and the boot-time ledger re-apply
+  removes only what pre-dates the forget, so a restored older backup does not bring forgotten words back and a
+  line written after the forget is never removed.
 - `/health/full` gains `chat_journal` (`enabled`, `last_write_at`, `lines_written`, `errors`, plus `skipped`,
   `dropped`, `pending`). Additive; never moves `status`.
 - **`scripts/chat-journal.py`** (read-only, stdlib, never prints message text): `stats`, `verify`, and
   `compare --db webui.db` (which journal exchanges are missing from OpenWebUI's chat JSON and `chat_message`
   table). No write-back into OpenWebUI in this release; the rebuild design is in `chatjournal.py`.
 - `Dockerfile.v31910`, and a `COPY` of `chatjournal.py` in the base `Dockerfile`.
-- Tests: `test_backup_retention_tiers.py`, `test_chat_journal.py`.
+- Tests: `test_backup_retention_tiers.py`, `test_chat_journal.py`, `test_forget_point_in_time.py`.
 
 ### Privacy
 The journal holds her words like the facts store. It is inside the daily backups (STORAGE_ROOT is archived

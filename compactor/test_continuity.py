@@ -156,7 +156,7 @@ def test_record_targeted_forget_appends_a_needle():
     assert_eq([n["needle"] for n in on_disk["targeted"]], ["Lyra"], "needle stored")
 
 
-def test_retire_tombstone_bumps_epoch_sets_boundary_all_clears_needles():
+def test_retire_tombstone_bumps_epoch_sets_boundary_all_keeps_needles():
     print("\n[test] retire_tombstone — the third NameError regression")
     _wipe_storage()
     cid = "retire-conv"
@@ -165,7 +165,12 @@ def test_retire_tombstone_bumps_epoch_sets_boundary_all_clears_needles():
     assert_eq(epoch, 1, "epoch bumped")
     on_disk = json.loads(continuity._ledger_path(cid).read_text(encoding="utf-8"))
     assert_eq(on_disk["boundary"], "all", "boundary set to 'all'")
-    assert_eq(on_disk["targeted"], [], "needle list cleared")
+    # CHANGED in v3.1.9.10 (was: "needle list cleared"). /retire now keeps the
+    # chat journal as an archive of the chat, so the needles that protect a
+    # restored older copy of that journal must survive the retire.
+    assert_eq([n["needle"] for n in on_disk["targeted"]], ["secret"], "needle list KEPT (the journal archive stays)")
+    assert_eq(on_disk["wipe_epoch"], None, "a retire is not a wipe: no journal purge floor")
+    assert_true(bool(on_disk["retired_at"]), "retire time recorded")
     assert_true(continuity._ledger_path(cid).is_file(), "ledger file itself is NOT unlinked (R10-B3)")
 
 
@@ -557,7 +562,13 @@ def test_restoring_an_old_pending_sidecar_only_hides_more():
     # match the current digest's text ("post-wipe").
     stale_pending = {
         "epoch": 1, "boundary": None,
-        "needles": [{"needle": "post-wipe", "epoch": 0}],
+        # CHANGED in v3.1.9.10 (was epoch 0). Point-in-time: a needle recorded
+        # under epoch 0 no longer reaches a digest of epoch 2 (it was written
+        # after two later wipes, so it post-dates that forget; see
+        # test_a_later_epoch_postdates_an_earlier_needle). The property this
+        # test pins, "a stale sidecar can only hide MORE", is kept by giving
+        # the stale needle the digest's own epoch (no cutoff = a .8 needle).
+        "needles": [{"needle": "post-wipe", "epoch": 2}],
     }
     continuity._persist_pending_sidecar(cid, stale_pending)
     continuity._pending_intents[cid] = dict(stale_pending)
@@ -633,10 +644,15 @@ def test_sidecar_only_pending_survives_an_unrelated_successful_write():
         "dropped when its sidecar was deleted",
     )
     assert_true(not continuity.ledger_degraded(cid), "fully recovered")
-    assert_true(
-        continuity.apply_needles(cid, "her sister Maren's diagnosis") == continuity.SUPPRESSED_MARKER,
-        "and the needle is actually applied",
-    )
+    # CHANGED in v3.1.9.10 (was: apply_needles(...) == SUPPRESSED_MARKER).
+    # A fallback text has no age, so a needle no longer suppresses it (that
+    # was the "never remembered again" behaviour). The needle is still applied
+    # to what PRE-DATES it: the digest entry, which has no `created`.
+    assert_eq(continuity.apply_needles(cid, "her sister Maren's diagnosis"),
+              "her sister Maren's diagnosis",
+              "apply_needles passes a fallback text through (fail-closed only)")
+    assert_true(continuity.visible(cid)["u1"]["suppressed"],
+                "and the needle is applied to the pre-dating digest entry")
 
 
 def test_transiently_unreadable_sidecar_at_startup_still_recovers_later():
@@ -892,6 +908,173 @@ def test_quarantine_excludes_digests():
     assert_true("digests" not in bundle.get("quarantine", {}), "no 'digests' key under quarantine either")
 
 
+# ---------------------------------------------------------------------------
+# v3.1.9.10: /forget is POINT-IN-TIME. The ledger records a cutoff per entry
+# and the boot re-apply removes only what pre-dates it.
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+import datetime  # noqa: E402
+
+
+def _iso(delta_s):
+    d = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delta_s)
+    return d.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def test_targeted_forget_records_a_cutoff():
+    print("\n[test] v3.1.9.10: a targeted forget records its own UTC cutoff")
+    _wipe_storage()
+    cid = "pit-cutoff"
+    continuity.record_targeted_forget(cid, "Lyra")
+    led = json.loads(continuity._ledger_path(cid).read_text(encoding="utf-8"))
+    assert_eq(led["format"], 2, "ledger format 2")
+    n = led["targeted"][0]
+    assert_true(n["cutoff"].endswith("Z") and "T" in n["cutoff"], "cutoff is a UTC ISO timestamp")
+    assert_eq(n["epoch"], 0, "and the epoch it was recorded at")
+
+
+def test_reapply_removes_only_what_predates_the_forget():
+    print("\n[test] v3.1.9.10: boot re-apply suppresses the OLD digest, keeps the NEW one")
+    _wipe_storage()
+    cid = "pit-digest"
+    continuity._write_digest_store(cid, {
+        "old": {"headline": "about Maren", "full": "Maren said hello", "epoch": 0, "unit_number": 1,
+                "suppressed": False, "created": _iso(-3600)},
+        "legacy": {"headline": "about Maren", "full": "Maren, no created stamp", "epoch": 0,
+                   "unit_number": 2, "suppressed": False},
+    })
+    continuity.record_targeted_forget(cid, "Maren")
+    # written AFTER the forget, repeating the forgotten word
+    continuity._write_digest_store(cid, {
+        **continuity._read_digest_store(cid),
+        "new": {"headline": "Maren again", "full": "Maren again, said later", "epoch": 0,
+                "unit_number": 3, "suppressed": False, "created": _iso(+60)},
+    })
+    continuity.reapply_all_ledgers()   # a reboot
+    v = continuity.visible(cid)
+    assert_true(v["old"]["suppressed"], "a pre-forget digest is suppressed")
+    assert_true(v["legacy"]["suppressed"], "a digest with no `created` (age unknown) counts as pre-dating")
+    assert_true(not v["new"]["suppressed"], "a post-forget digest with the same word is KEPT")
+    assert_eq(v["new"]["full"], "Maren again, said later", "and its text is intact")
+    continuity.reapply_all_ledgers()   # idempotent
+    assert_true(not continuity.visible(cid)["new"]["suppressed"], "still kept after a second boot")
+
+
+def test_generate_digest_has_no_write_time_needle_filter():
+    print("\n[test] v3.1.9.10: a digest written after the forget is remembered normally")
+    _wipe_storage()
+    cid = "pit-gen"
+    continuity._write_digest_store(cid, {
+        "k1": {"headline": SUPP, "full": SUPP, "epoch": 0, "unit_number": 1,
+               "suppressed": True, "created": _iso(-60)},
+    })
+    continuity.record_targeted_forget(cid, "Maren")
+    ok = asyncio.run(continuity.generate_digest(
+        cid, tok=None, her_text="I want to talk about Maren again today.",
+        reply_text="Of course, Maren sounds important to you and we can talk about her.",
+        unit_number=1, key="k1", epoch_at_submit=0, vllm_url=None, model=None))
+    assert_true(ok, "the digest is written (returns True), not suppressed")
+    e = continuity._read_digest_store(cid)["k1"]
+    assert_true(not e["suppressed"] and "Maren" in e["full"], "stored with the word in it")
+    assert_true(bool(e.get("created")), "and stamped with a creation time")
+    continuity.reapply_all_ledgers()
+    assert_true(not continuity.visible(cid)["k1"]["suppressed"], "it survives a reboot")
+
+
+SUPP = continuity.SUPPRESSED_MARKER
+
+
+def test_a_later_epoch_postdates_an_earlier_needle():
+    print("\n[test] v3.1.9.10: an item of a later epoch post-dates an earlier needle")
+    n = {"needle": "x", "epoch": 1, "cutoff": _iso(0)}
+    assert_true(continuity.pre_dates(_iso(-10), 1, n), "same epoch, earlier ts: pre-dates")
+    assert_true(not continuity.pre_dates(_iso(-10), 2, n), "a later epoch: post-dates whatever its ts")
+    assert_true(not continuity.pre_dates(_iso(+10), 1, n), "same epoch, later ts: post-dates")
+    assert_true(continuity.pre_dates(None, None, n), "unknown age: pre-dates (safe)")
+    assert_true(continuity.pre_dates("garbage", 1, n), "unparseable age: pre-dates (safe)")
+    assert_true(continuity.pre_dates(_iso(+10), 1, {"needle": "x", "epoch": 1}), "no cutoff (.8): everything pre-dates")
+
+
+def test_full_wipe_records_a_cutoff_and_a_post_wipe_digest_survives_reboot():
+    print("\n[test] v3.1.9.10: full wipe = point-in-time too")
+    _wipe_storage()
+    cid = "pit-wipe"
+    continuity._write_digest_store(cid, {
+        "pre": {"headline": "a", "full": "b", "epoch": 0, "unit_number": 1, "suppressed": False},
+    })
+    epoch = continuity.record_wipe(cid)
+    led = json.loads(continuity._ledger_path(cid).read_text(encoding="utf-8"))
+    assert_eq((led["wipe_epoch"], bool(led["wipe_at"])), (epoch, True), "wipe_epoch and wipe_at recorded")
+    # the wipe deletes the store; a RESTORED pre-wipe store comes back with epoch 0
+    continuity._write_digest_store(cid, {
+        "pre": {"headline": "a", "full": "b", "epoch": 0, "unit_number": 1, "suppressed": False},
+        "post": {"headline": "c", "full": "d", "epoch": epoch, "unit_number": 2, "suppressed": False,
+                 "created": _iso(+5)},
+    })
+    continuity.reapply_all_ledgers()
+    v = continuity.visible(cid)
+    assert_eq(sorted(v), ["post"], "the restored pre-wipe digest is purged; the post-wipe one survives the reboot")
+
+
+def test_legacy_v8_ledger_is_migrated_safely():
+    print("\n[test] v3.1.9.10: a .8-format ledger (no cutoff, no format) migrates on boot")
+    _wipe_storage()
+    cid = "legacy-8"
+    p = continuity._ledger_path(cid)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # exactly the .8 shape
+    p.write_text(json.dumps({"epoch": 2, "boundary": None,
+                             "targeted": [{"needle": "Maren", "epoch": 2}]}), encoding="utf-8")
+    continuity._write_digest_store(cid, {
+        "old": {"headline": "Maren", "full": "Maren", "epoch": 2, "unit_number": 1, "suppressed": False,
+                "created": _iso(-3600)},
+        "older_epoch": {"headline": "x", "full": "y", "epoch": 1, "unit_number": 2, "suppressed": False},
+    })
+    # before the boot stamp: a cutoff-less needle reads as "+infinity" (.8 behaviour)
+    led0 = continuity._read_ledger(cid)
+    assert_eq(led0["targeted"][0].get("cutoff"), None, "read in memory: still no cutoff before the stamp")
+    assert_eq(led0["wipe_epoch"], 2, "journal purge floor derived from the .8 epoch")
+    before = _iso(0)
+    res = continuity.reapply_all_ledgers()
+    after = _iso(0)
+    led = json.loads(p.read_text(encoding="utf-8"))
+    assert_eq(led["format"], 2, "rewritten as format 2")
+    n = led["targeted"][0]
+    assert_true(n.get("legacy") is True and before <= n["cutoff"] <= after,
+                f"the needle is stamped with the BOOT time and marked legacy: {n}")
+    v = continuity.visible(cid)
+    assert_true("older_epoch" not in v, "an older-epoch digest is purged (as in .8)")
+    assert_true(v["old"]["suppressed"], "the pre-boot matching digest is suppressed (what .8 promised)")
+    # ... and from now on it is point-in-time: a digest made after the stamp is kept
+    continuity._write_digest_store(cid, {**continuity._read_digest_store(cid), "new": {
+        "headline": "Maren", "full": "Maren again", "epoch": 2, "unit_number": 3, "suppressed": False,
+        "created": _iso(+30)}})
+    continuity.reapply_all_ledgers()
+    assert_true(not continuity.visible(cid)["new"]["suppressed"], "post-migration content is remembered normally")
+    # a retired .8 ledger (boundary "all") derives NO purge floor: retire keeps the journal
+    cid2 = "legacy-8-retired"
+    p2 = continuity._ledger_path(cid2)
+    p2.write_text(json.dumps({"epoch": 3, "boundary": "all", "targeted": []}), encoding="utf-8")
+    assert_eq(continuity._read_ledger(cid2)["wipe_epoch"], None, "a .8 retire tombstone does not purge the journal")
+
+
+def test_legacy_ledger_stamp_write_failure_never_closes_the_band():
+    print("\n[test] v3.1.9.10: a failed migration stamp write is logged, retried next boot, no pending intent")
+    _wipe_storage()
+    cid = "legacy-fail"
+    p = continuity._ledger_path(cid)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"epoch": 0, "boundary": None, "targeted": [{"needle": "Maren", "epoch": 0}]}),
+                 encoding="utf-8")
+    with patch.object(continuity, "_write_ledger", side_effect=OSError(28, "full")):
+        continuity.reapply_ledger(cid)
+    assert_true(not continuity.ledger_degraded(cid), "no pending intent was raised for a stamp failure")
+    assert_true(continuity._read_ledger(cid)["targeted"][0].get("cutoff"),
+                "the in-process stamp keeps it point-in-time until the next boot")
+    continuity._legacy_stamp.clear()
+
+
 if __name__ == "__main__":
     try:
         test_ledger_path_matches_the_documented_convention()
@@ -901,7 +1084,7 @@ if __name__ == "__main__":
         test_ledger_round_trip_absent_file_reads_as_epoch_zero()
         test_record_wipe_bumps_and_persists_the_epoch()
         test_record_targeted_forget_appends_a_needle()
-        test_retire_tombstone_bumps_epoch_sets_boundary_all_clears_needles()
+        test_retire_tombstone_bumps_epoch_sets_boundary_all_keeps_needles()
         test_reapply_all_ledgers_finds_files_written_via_ledger_path()
 
         test_corrupt_ledger_fails_closed_not_epoch_zero()
@@ -931,6 +1114,14 @@ if __name__ == "__main__":
 
         test_format_band_numbers_entries_exactly_once()
         test_quarantine_excludes_digests()
+
+        test_targeted_forget_records_a_cutoff()
+        test_reapply_removes_only_what_predates_the_forget()
+        test_generate_digest_has_no_write_time_needle_filter()
+        test_a_later_epoch_postdates_an_earlier_needle()
+        test_full_wipe_records_a_cutoff_and_a_post_wipe_digest_survives_reboot()
+        test_legacy_v8_ledger_is_migrated_safely()
+        test_legacy_ledger_stamp_write_failure_never_closes_the_band()
 
         print("\nAll continuity tests passed.")
     finally:

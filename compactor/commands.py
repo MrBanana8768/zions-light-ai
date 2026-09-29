@@ -687,7 +687,12 @@ def _ledger_pending_note(conv_id: str) -> str:
 async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
     if arg:
         # Selective: remove facts whose text contains the substring
-        # (case-insensitive). Other layers untouched.
+        # (case-insensitive), and the digest units / chat-journal exchanges
+        # that contain it. POINT-IN-TIME (v3.1.9.10): this wipes what EXISTS
+        # NOW. Nothing is filtered on write afterwards: the same words said
+        # later are remembered normally. The ledger entry it records carries
+        # a cutoff so the boot re-apply removes only what pre-dates it.
+        # Other layers untouched.
         #
         # v3.1 F22: same load-modify-write hazard as /remember, running the
         # other way — unlocked, a tail holding a snapshot taken before this
@@ -2587,16 +2592,14 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
                     _dp.unlink()
             except Exception as e:
                 logger.warning(f"conv={source_id}: could not delete digest cache during retire: {e}")
-            # v3.1.9.10: retire empties source_id like a wipe (and bumps the
-            # ledger epoch, which would purge older journal lines at the next
-            # boot anyway), so its chat journal goes with it, now.
-            try:
-                await chatjournal.wipe_async(source_id)
-            except Exception as e:
-                logger.error(
-                    f"conv={source_id}: could not delete the chat journal "
-                    f"during retire ({type(e).__name__})"
-                )
+            # v3.1.9.10 (owner: "retire should retain the journal as an
+            # archive of the chat."): the chat journal is NOT deleted here.
+            # It stays under STORAGE_ROOT/journal as the archive of the
+            # retired conversation. Retire's ledger epoch bump does not purge
+            # it at the next boot either (continuity.retire_tombstone leaves
+            # wipe_epoch alone), and the ledger's needles are kept so a
+            # restored older copy of the archive is still redacted.
+            # scripts/chat-journal.py stats lists it.
             facts_module.save_archive(source_id, [])
             # An EMPTY facts file, not an unlinked one — /forget's tombstone,
             # for its reason: backfill.needs_backfill gates on
@@ -2657,6 +2660,11 @@ async def _handle_retire(arg: str, conv_id: str, ctx: dict) -> str:
         lines.append("Every fact in that conversation was worth moving.")
     if cleared:
         lines.append(f"Cleared from {source_id}: {', '.join(cleared)}.")
+    if chatjournal.has_content(source_id):
+        lines.append(
+            "Its chat journal (the per-message archive of that chat) is kept, "
+            "not deleted."
+        )
     lines.append(
         f"A complete snapshot of {source_id} as it was a moment ago is at "
         f"{snap['path']} ({snap['facts']} active fact(s), {snap['archive']} "
