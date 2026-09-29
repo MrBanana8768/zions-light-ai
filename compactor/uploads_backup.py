@@ -776,8 +776,8 @@ def _require_mirror_size_cap(manifest: dict) -> None:
             f"refusing to copy new objects: the mirror is already "
             f"{have / 1048576:.0f} MB, at or over its "
             f"COMPACTOR_UPLOADS_BACKUP_MAX_MB cap of {MAX_MIRROR_MB} MB. "
-            f"Existing objects are untouched; raise the cap or prune "
-            f"expired/deleted entries to continue."
+            f"Nothing new was copied (entries past the keep window were already expired "
+            f"this cycle); raise the cap or wait for more deleted entries to age out."
         )
 
 
@@ -1113,9 +1113,14 @@ def run_once(
             # busy_stop cannot yet be true.
             if not suspect_before:
                 keep_cutoff = now - KEEP_DELETED_DAYS * 86400.0
+                # Never expire a name that is live on disk this cycle (e.g. brought back
+                # by `restore --include-deleted` after a long suspect period): the
+                # rehash below does files[rel] for it, and popping it here raised
+                # KeyError on every later cycle (rc-fix verification, finding 1).
                 expired_names = [
                     rel for rel, rec in files.items()
-                    if rec.get("deleted_at") and _parse_iso(rec["deleted_at"]) is not None
+                    if rel not in current_names
+                    and rec.get("deleted_at") and _parse_iso(rec["deleted_at"]) is not None
                     and _parse_iso(rec["deleted_at"]) < keep_cutoff
                 ]
                 referenced_shas = set()
@@ -1137,6 +1142,12 @@ def run_once(
                             if freed:
                                 manifest["objects_count"] = max(0, manifest.get("objects_count", 0) - 1)
                     report["expired"] += 1
+                if expired_names:
+                    # Persist the sweep now. The checks just below can still refuse,
+                    # and the _Refusal path saves nothing, which left expired records
+                    # pointing at deleted objects and objects_bytes too high for good
+                    # (rc-fix verification, finding 2).
+                    save_manifest(root, manifest)
 
             # --- free-space / mirror-size checks, BEFORE any copying ---
             # hostile-review round 3, LOW: this used to run only against

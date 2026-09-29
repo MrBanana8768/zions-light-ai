@@ -11,6 +11,8 @@ on Docker Hub.
 
 ## [3.1.9.9] — Cloudflare Tunnel: `https://ai.revelationsaints.com` instead of the RunPod proxy URL
 
+**Released 2026-09-29 as tag `v3.1.9.9`.** Build both images from `Dockerfile.v3199` (targets `rollback` and `rc`). Deploy on top of a running v3.1.9.8; the steps are in the owner runbook (DEPLOY-v3.1.9.9.md).
+
 **Not yet released/tagged.** Built from `Dockerfile.v3199` (the `rollback` and `rc` targets, both on prod's
 own image, same base chain as `Dockerfile.v3198` — only the `rc` stage differs, by one addition). Branch
 `feature/v3.1.9.9`, created from tag `v3.1.9.8`. See **RUNBOOK_CLOUDFLARE_TUNNEL.md** for the owner's setup
@@ -177,6 +179,14 @@ steps, the RunPod secret, verification commands, and rollback/disabling.
   design intended.
 
 ### Fixed (RC hostile-review round, rc-fix — before this candidate is cut)
+- **Uploads sweep regressions from moving it before the cap check (fix-round verification).** A live
+  file whose record was past the keep window (restored after a long suspect period) was expired by the
+  sweep, then the rehash raised KeyError on every later cycle; the sweep now skips names live on disk.
+  The sweep is saved to the manifest immediately, so a cap refusal right after it no longer leaves
+  expired records pointing at deleted objects or `objects_bytes` too high. Two tests, each mutation-checked.
+- **Tunnel throttle:** a backwards clock step no longer counts as a hot restart. The run script notes that
+  its /run stamp survives `docker restart`. RUNBOOK_CLOUDFLARE_TUNNEL's WEBUI_URL query is
+  `SELECT value FROM config WHERE key='webui.url'`.
 - **`docker/cloudflared-run.sh`: a bad-but-well-formed `CLOUDFLARE_TUNNEL_TOKEN` no longer causes a hot
   restart loop.** The reviewer measured 61 spawns in 40s against a bad token (~10% of a core plus heavy log
   churn on MooseFS, and `supervisorctl status` still read RUNNING throughout, since `startsecs=0` — kept, on

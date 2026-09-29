@@ -90,6 +90,8 @@ BACKOFF_CAP_S="${CLOUDFLARED_RUN_BACKOFF_CAP_S:-300}"
 # unusable); production sets none of these, so the documented defaults are
 # what ships.
 INVALID_TOKEN_SLEEP_S="${CLOUDFLARED_RUN_INVALID_TOKEN_SLEEP_S:-300}"
+# /run is NOT a tmpfs in this image, so the stamp survives `docker restart`: a container
+# restart within the window can wait one backoff (at most 300 s) before the tunnel starts.
 STATE_DIR="${CLOUDFLARED_RUN_STATE_DIR:-/run}"
 if [ ! -d "$STATE_DIR" ] || [ ! -w "$STATE_DIR" ]; then
     STATE_DIR=/tmp
@@ -121,7 +123,8 @@ throttle_if_hot() {
         elapsed=$THROTTLE_WINDOW_S  # never started before -> never "hot"
     fi
 
-    if [ "$elapsed" -lt "$THROTTLE_WINDOW_S" ]; then
+    # A clock step backwards makes elapsed negative: treat that as "not hot".
+    if [ "$elapsed" -ge 0 ] && [ "$elapsed" -lt "$THROTTLE_WINDOW_S" ]; then
         log "restarted ${elapsed}s after the last start (< ${THROTTLE_WINDOW_S}s window); backing off ${backoff}s before starting cloudflared"
         sleep "$backoff"
         next=$(( backoff * 2 ))

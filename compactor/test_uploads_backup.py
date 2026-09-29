@@ -1496,10 +1496,82 @@ def _load_script():
     return mod
 
 
+def test_sweep_never_expires_a_live_resurrected_name():
+    """rc-fix verification, finding 1: a record whose deleted_at is past the keep
+    window but whose file is LIVE again (restored after a long suspect period,
+    when the sweep was blocked) must not be expired by the sweep. The old code
+    popped it, then the rehash did files[rel], raised KeyError and saved nothing,
+    so every later cycle failed the same way.
+
+    MUTATION CHECK: dropping `rel not in current_names` from the sweep makes the
+    run raise or report not-ok here.
+    """
+    uploads, root = _new_dirs("t40")
+    target = uploads / "long_gone.jpg"
+    original = b"\xff\xd8\xff" + b"long-gone-content"
+    _write(target, original, mtime=1_700_030_000)
+    for i in range(8):
+        _write(uploads / f"keep_{i}.jpg", b"\xff\xd8\xff" + f"k{i}".encode(), mtime=1_700_030_010 + i)
+    uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+    target.unlink()
+    uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+    manifest = uploads_backup.load_manifest(root)
+    manifest["files"]["long_gone.jpg"]["deleted_at"] = uploads_backup._iso(
+        time.time() - (uploads_backup.KEEP_DELETED_DAYS + 1) * 86400.0)
+    uploads_backup.save_manifest(root, manifest)
+    _write(target, original, mtime=1_700_030_100)
+    for _ in range(2):
+        r = uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+        assert_true(r["ok"], "the run stays ok (no KeyError loop)")
+    rec = uploads_backup.load_manifest(root)["files"].get("long_gone.jpg")
+    assert_true(rec is not None and rec["deleted_at"] is None, "the live file is tracked again, not expired")
+    assert_true(uploads_backup._object_path(root, rec["sha256"]).is_file(), "its object is still there")
+
+
+def test_sweep_is_saved_even_when_the_cap_still_refuses():
+    """rc-fix verification, finding 2: the sweep deletes objects on disk. If the
+    size cap still refuses afterwards, the manifest must already reflect the
+    sweep, or the expired records point at deleted objects and objects_bytes
+    stays too high for good.
+
+    MUTATION CHECK: removing the save after the sweep makes objects_bytes
+    disagree with the bytes on disk here.
+    """
+    uploads, root = _new_dirs("t41")
+    for i in range(6):
+        _write(uploads / f"d{i}.jpg", b"\xff\xd8\xff" + os.urandom(4000), mtime=1_700_031_000 + i)
+    uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+    for i in range(3):
+        (uploads / f"d{i}.jpg").unlink()
+    manifest = uploads_backup.load_manifest(root)
+    old_iso = uploads_backup._iso(time.time() - (uploads_backup.KEEP_DELETED_DAYS + 1) * 86400.0)
+    for i in range(3):
+        manifest["files"][f"d{i}.jpg"]["deleted_at"] = old_iso
+    uploads_backup.save_manifest(root, manifest)
+    _write(uploads / "new.jpg", b"\xff\xd8\xff" + os.urandom(4000), mtime=1_700_031_100)
+
+    saved = uploads_backup._require_mirror_size_cap
+    def _always_refuse(*a, **k):
+        raise uploads_backup._Refusal("test: cap refuses")
+    uploads_backup._require_mirror_size_cap = _always_refuse
+    try:
+        r = uploads_backup.run_once(uploads, root, idle_check=_idle_ok, sleep=lambda s: None)
+    finally:
+        uploads_backup._require_mirror_size_cap = saved
+    assert_true(not r["ok"], "CONTROL: the cap refused this run")
+    m = uploads_backup.load_manifest(root)
+    for i in range(3):
+        assert_true(f"d{i}.jpg" not in m["files"], "the expired records are gone from the saved manifest")
+    on_disk = sum(p.stat().st_size for p in (root / "objects").rglob("*") if p.is_file() and not p.name.startswith("."))
+    assert_eq(m["objects_bytes"], on_disk, "objects_bytes matches the bytes on disk")
+
+
 def _all():
     return [
         test_first_run_mirrors_everything_second_run_copies_nothing,
         test_new_file_gets_copied,
+        test_sweep_never_expires_a_live_resurrected_name,
+        test_sweep_is_saved_even_when_the_cap_still_refuses,
         test_content_change_below_threshold_never_overwrites_sha,
         test_deleted_file_kept_then_expired,
         test_gzip_incident_guard_trips_and_restore_recovers_byte_identical,

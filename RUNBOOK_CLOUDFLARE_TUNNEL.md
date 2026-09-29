@@ -174,8 +174,8 @@ nothing by itself.** Before relying on any of the links above pointing at
 `https://ai.revelationsaints.com`, either:
 - set it in the UI instead (**Admin → Settings → General → WebUI URL**, which writes straight to the same
   `webui.url` row), or
-- verify what the row already holds (`SELECT data FROM config WHERE ...` — see the same PersistentConfig
-  shape `OPERATIONS.md` already documents for other settings — or simply open Admin → Settings → General
+- verify what the row already holds (`SELECT value FROM config WHERE key='webui.url'` in webui.db,
+  opened read-only — or simply open Admin → Settings → General
   and read the field) before assuming the env var took effect.
 
 **Do NOT change the image's own defaults for any of these** — this table is RunPod-template guidance, not a
