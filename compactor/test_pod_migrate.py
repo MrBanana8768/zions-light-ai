@@ -23,6 +23,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -648,6 +649,50 @@ def test_reverse_cutover_rollback():
     assert_eq(rc, 0, "status --to <old tree> --require cutover: COMPLETE after the reverse cutover (the rollback gate)")
 
 
+def test_a_second_reverse_after_the_old_pod_wrote_is_refused():
+    """Final review round 3 (8): --reverse twice would copy the new pod's older database over her newer messages."""
+    w = build_world("revtwice")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    new_pod_writes(w)
+    assert_eq(reverse(w, "--apply")[0], 0, "the first reverse")
+    m = json.loads((w["old"] / ".migrate" / "seed.json").read_text())
+    assert_true(m.get("reverse") is True, "the old tree's manifest records that a reverse completed")
+    assert_eq(reverse(w, "--apply")[0], 0, "a repeat with NOTHING written on the old pod since is harmless and allowed")
+    add_messages(w["old"] / "webui.db", HER, 60, 4)            # the old pod ran, she chatted
+    before = (sha(w["old"] / "webui.db"), tree_fingerprint(w["old"]))
+    for extra in ((), ("--force",)):
+        rc, out = reverse(w, "--apply", *extra)
+        assert_true(rc == 2 and "already completed" in out and "has written" in out, f"the second reverse is REFUSED {extra}")
+    rc, out = reverse(w)
+    assert_eq(rc, 2, "and the dry run says so too")
+    assert_eq((sha(w["old"] / "webui.db"), tree_fingerprint(w["old"])), before, "the old pod's newer messages are intact")
+    # a genuine second rollback after migrating forward again: the marker is moved aside by hand (runbook section 8)
+    shutil.move(str(w["old"] / ".migrate"), str(w["old"] / ".migrate-prev"))
+    assert_eq(reverse(w, "--apply")[0], 0, "with the old tree's marker moved aside a reverse is allowed")
+
+
+def test_migrating_forward_again_after_a_rollback():
+    """Final review round 3 (8): runbook 8.1: move the markers aside, re-seed into the same DATA_DIR with --force, cut over again."""
+    w = build_world("fwdagain")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    assert_eq(run(w, "cutover", "--old-pod-stopped", "--apply")[0], 0, "cutover")
+    add_messages(w["local"] / "webui.db", HER, 20, 5)               # she used the new pod
+    assert_eq(reverse(w, "--apply")[0], 0, "rollback")
+    add_messages(w["old"] / "webui.db", HER, 40, 3)                 # then the old pod ran
+    rc, out = run(w, "seed", "--apply", "--force")
+    assert_true(rc == 2 and "ALREADY COMPLETED" in out, "seeding straight into the old directory is refused (the manifest says a cutover completed)")
+    shutil.move(str(w["new"] / ".migrate"), str(w["new"] / ".migrate-first"))
+    shutil.move(str(w["old"] / ".migrate"), str(w["old"] / ".migrate-prev"))
+    rc, out = run(w, "seed", "--apply")
+    assert_eq(rc, 2, "without --force the (now unknown) data in the directory is not merged into")
+    rc, out = run(w, "seed", "--apply", "--force")
+    assert_eq(rc, 0, f"seed --force into the SAME DATA_DIR works: {out[-300:]!r}")
+    assert_eq(scalar(w["local"] / "webui.db", "select count(*) from chat_message where chat_id=?", HER), 28, "it carries the old pod's newest messages (20 + 5 rolled back + 3)")
+    assert_eq(run(w, "cutover", "--old-pod-stopped", "--apply")[0], 0, "and the second cutover completes")
+    assert_eq(run_status_rc(w, "--require", "cutover"), 0, "status: COMPLETE")
+    assert_eq(reverse(w, "--apply")[0], 0, "and a genuine second rollback works (both markers were moved aside)")
+
+
 def test_reverse_refuses_without_the_local_db_and_reads_the_snapshot_only_in_snapshot_mode():
     w = build_world("revlocal")
     assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
@@ -771,19 +816,187 @@ def test_after_go_live_no_flag_reaches_past_the_guard():
 
 
 def test_manual_recovery_after_a_cutover_whose_verify_failed():
-    """Runbook 6.4: the hand step (move .migrate aside, seed --force, cutover) works, and the tool alone never lets it happen."""
+    """Runbook 6.4: when a service HAS written to the new local DB the tool refuses to re-run (the hand step works)."""
     w = _live_target("recov")
     mp = w["new"] / ".migrate" / "seed.json"
     m = json.loads(mp.read_text())
     m["verified"], m["step"] = False, "verify FAILED"
     mp.write_text(json.dumps(m))
+    add_messages(w["local"] / "webui.db", HER, 20, 3)          # a service ran on the new local DB after the install
     rc, out = status(w, "--require", "cutover")
-    assert_true(rc == 1 and "A cutover completed here" in out and "NEW" in out, "status: INCOMPLETE, and it says not to re-run into this directory")
-    assert_eq(run(w, "cutover", "--old-pod-stopped", "--apply")[0], 2, "the tool refuses the re-run")
+    assert_true(rc == 1 and "A cutover completed here" in out and "section 6.4" in out, "status: INCOMPLETE, and it points at the manual recovery")
+    assert_true("seed a NEW" not in out and "NEW --to" not in out, "and no longer advises a NEW --to directory (the tool refuses that)")
+    rc, out = run(w, "cutover", "--old-pod-stopped", "--apply")
+    assert_true(rc == 2 and "ALREADY COMPLETED" in out and "section 6.4" in out, "the tool refuses the re-run once a service wrote")
+    assert_true("NEW --to" not in out and "fresh --to" not in out, "without the refused 'new --to directory' advice")
     shutil.move(str(w["new"] / ".migrate"), str(w["new"] / ".migrate-failed-x"))
-    assert_eq(run(w, "seed", "--apply", "--force")[0], 0, "after the hand step, seed --force works")
+    assert_eq(run(w, "seed", "--apply", "--force", "--discard-new-pod-writes")[0], 0, "after the hand step, seed --force works")
     assert_eq(run(w, "cutover", "--old-pod-stopped", "--apply")[0], 0, "and so does a fresh cutover")
     assert_eq(run_status_rc(w, "--require", "cutover"), 0, "status: COMPLETE")
+
+
+_KILL_VERIFY_CHILD = (
+    "import importlib.util, os, signal, sys, json\n"
+    "spec = importlib.util.spec_from_file_location('pod_migrate', sys.argv[1]); pm = importlib.util.module_from_spec(spec)\n"
+    "sys.modules['pod_migrate'] = pm; spec.loader.exec_module(pm); pm.GUARDED_PORTS = ()\n"
+    "def verify(a): os.kill(os.getpid(), signal.SIGKILL)\n"
+    "pm.run_verify = verify\n"
+    "sys.exit(pm.main(json.loads(sys.argv[2])))\n")
+
+
+def test_a_cutover_killed_during_its_verify_can_be_rerun_until_a_service_writes():
+    """Final review round 3 (2): SIGKILL during verify, then a re-run SUCCEEDS; a re-run after a service wrote is refused."""
+    w = build_world("killverify")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    add_messages(w["old"] / "webui.db", HER, 20, 4)
+    local = w["local"] / "webui.db"
+
+    def cut_argv(x):
+        return ["cutover", "--from", str(x["old"]), "--to", str(x["new"]), "--local-data-dir", str(x["new"]),
+                "--zl-from", str(x["zl"]), "--zl-to", str(x["root"] / "v10" / "zl-ops"), "--tmp-dir", str(x["local"] / "scratch"),
+                "--retries", "2", "--retry-wait", "0.1", "--db-mode", "local", "--local-db", str(x["local"] / "webui.db"),
+                "--supervisorctl", str(x["sup"]), "--supervisor-conf", "x.conf", "--quiet-seconds", "0", "--old-pod-stopped", "--apply"]
+    argv = cut_argv(w)
+    r = subprocess.run([sys.executable, "-c", _KILL_VERIFY_CHILD, str(_SCRIPT), json.dumps(argv)], capture_output=True, text=True)
+    assert_eq(r.returncode, -9, "the child really died of SIGKILL during verify")
+    m = json.loads((w["new"] / ".migrate" / "seed.json").read_text())
+    assert_true(m["complete"] is True and m["verified"] is False and m.get("cutover_utc"),
+                "fixture: the install committed, verified=false, a cutover is recorded (the go-live guard would trip)")
+    (w["new"] / ".migrate" / "lock").unlink()
+    rc, out = status(w, "--require", "cutover")
+    assert_true(rc == 1 and "re-run `cutover`" in out and "section 6.4" in out and "NEW --to" not in out,
+                "status: INCOMPLETE, says a cutover re-run is allowed, and points at 6.4 otherwise")
+    rc, out = run(w, "cutover", "--old-pod-stopped", "--apply")
+    assert_eq(rc, 0, f"the re-run SUCCEEDS (before this fix: REFUSED 'a CUTOVER ALREADY COMPLETED'): {out[-300:]!r}")
+    assert_true("re-running the cutover" in out, "and says why it was allowed")
+    assert_eq(run_status_rc(w, "--require", "cutover"), 0, "status: COMPLETE and verified")
+    # the same kill, then a SERVICE writes to the new local DB: the re-run is REFUSED and nothing changes
+    w2 = build_world("killverify2")
+    assert_eq(run(w2, "seed", "--apply")[0], 0, "seed (second world)")
+    add_messages(w2["old"] / "webui.db", HER, 20, 4)
+    local2 = w2["local"] / "webui.db"
+    argv2 = cut_argv(w2)
+    r = subprocess.run([sys.executable, "-c", _KILL_VERIFY_CHILD, str(_SCRIPT), json.dumps(argv2)], capture_output=True, text=True)
+    assert_eq(r.returncode, -9, "second child killed too: " + r.stderr[-600:].replace("\n", " / "))
+    (w2["new"] / ".migrate" / "lock").unlink()
+    add_messages(local2, HER, 40, 3)                   # a service ran on the new local DB
+    before = (sha(local2), tree_fingerprint(w2["new"]))
+    rc, out = run(w2, "cutover", "--old-pod-stopped", "--apply")
+    assert_true(rc == 2 and "ALREADY COMPLETED" in out and "section 6.4" in out, "a re-run after a service wrote is REFUSED, pointing at 6.4")
+    assert_eq((sha(local2), tree_fingerprint(w2["new"])), before, "and nothing changed (her new messages are intact)")
+    rc, out = run(w2, "cutover", "--old-pod-stopped", "--apply", "--force", "--discard-new-pod-writes")
+    assert_eq(rc, 2, "no flag overrides it")
+    # a cutover whose verify PASSED is never re-run, even with an unchanged local DB
+    w3 = _live_target("rerun-verified")
+    rc, out = run(w3, "cutover", "--old-pod-stopped", "--apply")
+    assert_eq(rc, 2, "a verified cutover is live: the re-run is refused")
+
+
+def test_step_pages_is_clamped_and_snapshot_mode_is_refused_forward_on_a_local_pod():
+    """Final review round 3 (1, 3)."""
+    w = build_world("clamp")
+    for bad in ("-1", "0", "4097", "1000000"):
+        rc, out = run(w, "seed", "--apply", "--step-pages", bad)
+        assert_true(rc == 2 and "--step-pages must be between 1 and 4096" in out, f"--step-pages {bad} is REFUSED")
+        assert_true(not (w["new"] / "webui.db").exists(), f"--step-pages {bad}: nothing was written")
+    for ok in ("1", "4096"):
+        assert_eq(run(w, "seed", "--step-pages", ok)[0], 0, f"--step-pages {ok} is accepted (dry run)")
+    # forward --db-mode snapshot with WEBUI_DB_LOCAL=true (the test env sets it): refused, seed and cutover
+    assert_true(os.environ.get("WEBUI_DB_LOCAL") == "true", "fixture: local mode is on")
+    for cmd, more in (("seed", ()), ("cutover", ("--old-pod-stopped",))):
+        for apply in (("--apply",), ()):
+            rc, out = run(w, cmd, *apply, *more, local_db=False)
+            assert_true(rc == 2 and "--db-mode snapshot is refused" in out, f"{cmd}{' --apply' if apply else ''} --db-mode snapshot is refused on a local pod")
+    assert_true(not (w["new"] / "webui.db").exists(), "nothing was written")
+    # WEBUI_DB_LOCAL=false, but the manifest records a local path: still refused
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed (local mode)")
+    old_env = os.environ["WEBUI_DB_LOCAL"]
+    os.environ["WEBUI_DB_LOCAL"] = "false"
+    try:
+        rc, out = run(w, "seed", "--apply", local_db=False)
+        assert_true(rc == 2 and "manifest records a local database" in out, "the manifest's recorded local path refuses it too")
+        # and where neither says local (a pod that really keeps its DB on /data) it is still allowed
+        w2 = build_world("clamp-snap")
+        rc, out = run(w2, "seed", "--apply", local_db=False)
+        assert_eq(rc, 0, f"--db-mode snapshot on a WEBUI_DB_LOCAL=false pod with no local path recorded is allowed: {out[-200:]!r}")
+    finally:
+        os.environ["WEBUI_DB_LOCAL"] = old_env
+    # --reverse keeps --db-mode snapshot (its own test above)
+
+
+def test_verify_strict_local_failure_reads_as_a_failure():
+    """Final review round 3 (3): the 'differ (fine once the new pod has been writing)' hint must not appear on a failing --strict-local."""
+    w = _live_target("strictmsg")
+    add_messages(w["local"] / "webui.db", HER, 20, 3)
+    rc, out = run(w, "verify")
+    assert_true(rc == 0 and "differ (fine once the new pod has been writing)" in out, "plain verify: INFO, fine")
+    rc, out = run(w, "verify", "--strict-local")
+    assert_eq(rc, 1, "--strict-local fails")
+    assert_true("FAIL local live DB row counts equal the snapshot" in out and "DIFFER" in out and "fine once" not in out,
+                "and reads as a real failure, with no 'fine' hint")
+
+
+def test_the_single_rung_projection_counts_only_pre_restart_reads_and_the_slowest_attempt():
+    """Final review round 3 (1): a fake clock. Post-restart re-reads (page cache) must not raise the rate; the slowest attempt wins."""
+    real_connect, real_mono, real_fast = sqlite3.connect, pm.time.monotonic, pm.FAST_PAGES
+    clock = {"t": 1000.0}
+    plan = {"n": 0, "k": 0, "dt": None, "err_first": False, "src": None}
+
+    class Fake(sqlite3.Connection):
+        def backup(self, target, *, pages=-1, progress=None, name="main", sleep=0.250):
+            plan["n"] += 1
+            plan["k"] = 0
+            def wrapped(status, remaining, total):
+                plan["k"] += 1
+                if plan["k"] in (3, 5):                         # written under the copy (restart on the NEXT step)
+                    c = real_connect(plan["src"], timeout=5)
+                    c.execute("UPDATE chat SET updated_at=updated_at+1 WHERE id=?", (HER,))
+                    c.commit(); c.close()
+                clock["t"] += plan["dt"](plan["n"], plan["k"])
+                progress(status, remaining, total)
+            return super().backup(target, pages=pages, progress=wrapped, name=name, sleep=sleep)
+
+    def ro_only(*a, **k):
+        if a and isinstance(a[0], str) and a[0].startswith("file:") and "mode=ro" in a[0]:
+            if plan["err_first"] and not plan.get("erred"):
+                plan["erred"] = True
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_connect(*a, factory=Fake, **k)
+        return real_connect(*a, **k)
+
+    def projected_for(dt, err_first):
+        w = build_world("rate-" + str(err_first) + str(id(dt)))
+        src = w["old"] / "webui.db"
+        plan.update(n=0, k=0, dt=dt, err_first=err_first, erred=False, src=str(src))
+        pages = real_connect(f"file:{src}?mode=ro", uri=True).execute("pragma page_count").fetchone()[0]
+        notes = io.StringIO()
+        try:
+            with redirect_stderr(notes), redirect_stdout(notes):
+                pm.sqlite_backup_copy(src, w["local"] / "c.db", retries=3, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.0,
+                                      single_max_s=1e-9)
+        except pm.Failed:
+            pass
+        m = re.search(r"read lock for about ([0-9.]+) s", notes.getvalue())
+        assert_true(m is not None, f"the single rung was skipped with a projection: {notes.getvalue()[-300:]!r}")
+        return float(m.group(1)), pages * pm.SINGLE_SAFETY          # the projection includes the safety factor
+
+    assert_true(pm.SINGLE_SAFETY >= 1.25, "the projection carries a safety factor (a real hold ran up to 1.3x the raw projection)")
+    assert_true(pm.SINGLE_MAX_S <= 2.0, "the single rung's default limit is 2 s (was 3): margin under the old pod's 5 s busy_timeout")
+    pm.time.monotonic = lambda: clock["t"]
+    pm.FAST_PAGES = 1
+    sqlite3.connect = ro_only
+    try:
+        # A: attempt 1 fails with an I/O error (no rate). Attempt 2 (fast): pre-restart steps take 1 s per page,
+        # AFTER the first restart they are instant (cache). One page/s => projected = the page count in seconds.
+        proj, pages = projected_for(lambda n, k: 1.0 if k <= 3 else 1e-4, True)
+        assert_true(abs(proj - pages) <= 0.06 * pages + 0.2, f"only the pre-restart reads count: {proj:.1f} s for {pages} pages at 1 page/s")
+        # B: attempt 1 (gentle) reads at 1 page/s, attempt 2 (fast) at 10 000 pages/s: the SLOWEST attempt's rate is used
+        proj, pages = projected_for(lambda n, k: 1.0 if n == 1 else 1e-4, False)
+        assert_true(abs(proj - pages) <= 0.06 * pages + 0.2, f"the slowest attempt's rate is used: {proj:.1f} s for {pages} pages")
+    finally:
+        sqlite3.connect = real_connect
+        pm.time.monotonic = real_mono
+        pm.FAST_PAGES = real_fast
 
 
 def test_an_older_or_damaged_manifest_is_refused_whatever_the_flags():
@@ -879,6 +1092,9 @@ def test_live_source_written_under_the_copy_still_finishes():
     def ro_only(*a, **k):
         # only the SOURCE connection (mode=ro URI) gets the writing subclass
         if a and isinstance(a[0], str) and a[0].startswith("file:") and "mode=ro" in a[0]:
+            if state.get("fail_connect", 0) > 0:
+                state["fail_connect"] -= 1
+                raise sqlite3.OperationalError("disk I/O error")
             return real_connect(*a, factory=WriteOnStep, **k)
         return real_connect(*a, **k)
 
@@ -899,8 +1115,11 @@ def test_live_source_written_under_the_copy_still_finishes():
         assert_eq(scalar(dst, "pragma integrity_check"), "ok", "and the copy is consistent")
         # (b) written under EVERY step, gentle and fast (fast steps forced to 1 page): only the single copy can finish
         pm.FAST_PAGES = 1
-        state["writes"], state["limit"] = 0, 10 ** 9
+        # (the source is written on every 3rd step: a clean stretch first, so a throughput is MEASURED before the restart;
+        # with no measurement the single rung is skipped, see (b3))
+        state["writes"], state["limit"], state["every"], state["calls"] = 0, 10 ** 9, 3, 0
         st = pm.sqlite_backup_copy(src, dst, retries=3, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.01)
+        state["every"] = 1
         assert_eq((st["mode"], st["attempts"]), ("single", 3), "written under every step: gentle and fast both restart, the last resort (one full copy) finishes")
         assert_true(st["restarts"] >= 2, f"and the restarts were counted ({st['restarts']})")
         assert_eq(scalar(dst, "pragma integrity_check"), "ok", "the single copy is consistent")
@@ -915,8 +1134,21 @@ def test_live_source_written_under_the_copy_still_finishes():
             skipped = True
         state["every"] = 1
         assert_true(skipped and "not trying the single full copy" in notes.getvalue(), "the single copy is skipped when its projected lock hold exceeds the limit")
+        # (b3) the earlier attempts FAILED before any step (a transient I/O error): no throughput was measured, so the
+        # single rung is SKIPPED (not run blind) and the copy fails
+        state["writes"], state["limit"], state["every"], state["calls"], state["fail_connect"] = 0, 0, 1, 0, 2
+        notes = io.StringIO()
+        try:
+            with redirect_stderr(notes), redirect_stdout(notes):
+                pm.sqlite_backup_copy(src, dst, retries=3, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.01)
+            ran_blind = True
+        except pm.Failed:
+            ran_blind = False
+        state["fail_connect"] = 0
+        assert_true(not ran_blind and "no read throughput was measured" in notes.getvalue(),
+                    "no measured rate: the single rung is skipped, and the note says why")
         # (c) the same but retries=2 (no single rung): fails with the actionable message, bounded
-        state["writes"] = 0
+        state["writes"], state["limit"] = 0, 10 ** 9
         try:
             pm.sqlite_backup_copy(src, dst, retries=2, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.01)
             failed = False
@@ -1321,6 +1553,12 @@ def _all():
         test_new_pod_writes_block_a_second_seed_before_go_live,
         test_after_go_live_no_flag_reaches_past_the_guard,
         test_manual_recovery_after_a_cutover_whose_verify_failed,
+        test_a_cutover_killed_during_its_verify_can_be_rerun_until_a_service_writes,
+        test_a_second_reverse_after_the_old_pod_wrote_is_refused,
+        test_migrating_forward_again_after_a_rollback,
+        test_step_pages_is_clamped_and_snapshot_mode_is_refused_forward_on_a_local_pod,
+        test_verify_strict_local_failure_reads_as_a_failure,
+        test_the_single_rung_projection_counts_only_pre_restart_reads_and_the_slowest_attempt,
         test_an_older_or_damaged_manifest_is_refused_whatever_the_flags,
         test_a_kill_during_the_db_install_does_not_cause_a_false_refusal,
         test_live_source_written_under_the_copy_still_finishes,

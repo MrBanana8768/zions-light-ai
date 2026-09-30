@@ -1,4 +1,4 @@
-# RUNBOOK: Cloudflare Tunnel for OpenWebUI (v3.1.9.9)
+# RUNBOOK: Cloudflare Tunnel for OpenWebUI (v3.1.9.9 and v3.1.9.10)
 
 Gives her OpenWebUI a stable URL, `https://ai.revelationsaints.com`, instead of the RunPod proxy URL —
 served through a Cloudflare Tunnel (`cloudflared`) that dials OUT from the pod to Cloudflare's edge, so no
@@ -80,18 +80,21 @@ for what that tooling still needs to know about this program.)
 
 ```bash
 supervisorctl status cloudflared
+# The log directory. A bare Web Terminal does not have the pod's environment, so read it from PID 1
+# (v3.1.9.10's new pod: /data/v10/logs; v3.1.9.9: /data/logs):
+LOG_DIR=$(tr '\0' '\n' </proc/1/environ | sed -n 's/^LOG_DIR=//p'); LOG_DIR=${LOG_DIR:-/data/logs}; echo "$LOG_DIR"
 ```
 
 - `EXITED` (expected, not FATAL) — the token is not set, or is empty. The tunnel is disabled by design; this
   is not an error state. Check the log to confirm why:
   ```bash
-  tail -5 ${LOG_DIR:-/data/logs}/cloudflared.log
+  tail -5 "$LOG_DIR"/cloudflared.log
   # should end with: ... [cloudflared-run] no CLOUDFLARE_TUNNEL_TOKEN; tunnel disabled
   ```
 - `RUNNING` — the tunnel is up and dialed out to Cloudflare's edge.
 - `FATAL` — should not happen by design (see the CHANGELOG's `[3.1.9.9]` entry on why `startsecs=0` is
   required for this). If you ever see it, `cloudflared` itself failed to even spawn (e.g. the binary is
-  missing/corrupted) — check `${LOG_DIR}/cloudflared-error.log`.
+  missing/corrupted) — check `$LOG_DIR/cloudflared-error.log` (set `LOG_DIR` as above).
 
 Then, from anywhere (not just the pod):
 
@@ -132,7 +135,13 @@ active connection to Cloudflare's edge. Visibility only — this never changes `
   restart the `cloudflared` program (`supervisorctl restart cloudflared`) or redeploy — `docker/
   cloudflared-run.sh` sees no token, logs "tunnel disabled", and exits 0 (`EXITED`, not a crash). Nothing
   else on the pod is affected; OpenWebUI keeps serving the RunPod proxy URL exactly as before.
-- **Roll back the image itself:** the `rollback` build target (`local/zla:v3199-rollback` /
+- **v3.1.9.10 (the new pod): the rollback is NOT "boot the rollback image".** It is
+  `RUNBOOK_POD_MIGRATION.md` section 7: start the old pod on the rollback image `v3.1.9.10-rollback-cu12` with
+  `pod-migrate.py cutover --reverse` (the data has moved to the new pod's local database and must be copied back first).
+  Booting an image alone would bring back the OLD database and lose everything said since the cutover. The tunnel's
+  own part of that rollback is only to remove the `CLOUDFLARE_TUNNEL_TOKEN` from the new pod (or stop the pod) so the
+  hostname does not point at two pods.
+- **v3.1.9.9 (the old pod only): roll back the image itself:** the `rollback` build target (`local/zla:v3199-rollback` /
   `Dockerfile.v3199 --target rollback`) has **no** `cloudflared` binary and **no** `[program:cloudflared]`
   stanza at all — it is defined as "what a pod running today would fall back to", and today's pod has no
   tunnel. Booting the rollback target is itself the full rollback; there is no separate tunnel-specific

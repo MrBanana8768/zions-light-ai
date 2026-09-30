@@ -29,9 +29,11 @@ new pod.
 1. **Start no service on the new pod until the cutover has reported complete AND `verify` has exited 0** (section 6.4). A
    service started early on a half-copied tree is how data gets overwritten.
 2. **Seed only while she is idle.** The seed reads the OLD pod's LIVE database.
-3. **Once a cutover has completed, never re-run `seed` or `cutover` into the same directory.** The tool refuses, and
-   NO flag (`--force`, `--discard-new-pod-writes`, `--db-mode`) overrides that: after go-live the only ways forward are the
-   rollback (section 7, `--reverse`) or a fresh target directory. Before go-live, testing on the new pod is discarded with
+3. **Once a cutover has completed AND verified, never re-run `seed` or `cutover` into the same directory.** The tool refuses, and
+   NO flag (`--force`, `--discard-new-pod-writes`, `--db-mode`) overrides that: after go-live the way forward is the
+   rollback (section 7, `--reverse`). (The tool refuses a "fresh target directory" too: `--to` must be this pod's own
+   `DATA_DIR`.) The one exception is a cutover whose OWN verify failed or was killed: it can be re-run while the new local
+   database is still exactly the copy the tool installed (step 6.4). Before go-live, testing on the new pod is discarded with
    `--discard-new-pod-writes` (step 6.2).
 
 Start every Web Terminal session on the new pod with (the same variables are used everywhere below):
@@ -180,6 +182,16 @@ When the pod is up, in its Web Terminal:
 ```bash
 tr '\0' '\n' < /proc/1/environ | grep -E '^(DATA_DIR|LOG_DIR|COMPACTOR_BACKUP_DIR|COMPACTOR_STORAGE_ROOT|WEBUI_DB_LOCAL|WEBUI_SNAPSHOT_DB|COMPACTOR_MAX_RETAINED_IMAGES|COMPACTOR_GENERATION_RESERVE|COMPACTOR_BACKUP_RETAIN|COMPACTOR_BACKFILL_MAX_ATTEMPTS|ENABLE_LOGIN_FORM)='
 ```
+
+**Also check that the must-NOT-exist rows are ABSENT** (section 1's list); it must print only its last line:
+
+```bash
+tr '\0' '\n' < /proc/1/environ | grep -E '^(COMPACTOR_INJECTION_BUDGET_FRACTION|DATABASE_URL|WEBUI_LOCAL_DB|WEBUI_DB_ALLOW_[A-Z_]*)=' | sed 's/=.*/=<present>/'; echo "MUST-NOT-EXIST CHECK DONE"
+```
+
+**Expect** only `MUST-NOT-EXIST CHECK DONE`. Any other line names a row that must be deleted from the template (then restart the
+pod): `COMPACTOR_INJECTION_BUDGET_FRACTION` pins the fraction below the image's 0.75, `DATABASE_URL` or `WEBUI_LOCAL_DB` can point
+OpenWebUI at another database, and a `WEBUI_DB_ALLOW_*` row disarms a safety guard.
 
 **Expect** exactly these values: the five `/data/v10/...` paths, `WEBUI_DB_LOCAL=true`, `COMPACTOR_MAX_RETAINED_IMAGES=1`,
 `COMPACTOR_GENERATION_RESERVE=8000`, `COMPACTOR_BACKUP_RETAIN=3`, `COMPACTOR_BACKFILL_MAX_ATTEMPTS=1`, and
@@ -411,10 +423,12 @@ and times).
      Then add `--discard-new-pod-writes` in step 3.
    * **`REFUSED: a CUTOVER ALREADY COMPLETED into this directory ...`**: **STOP.** Someone already switched her over, and the new pod
      may have served her since. No flag overrides this (not `--discard-new-pod-writes`, not `--force`, not `--db-mode`): the tool
-     will not move her new messages aside. Go to section 7 (rollback) or `RUNBOOK_DB_LOCAL_V10.md` (recovery) and ask.
+     will not move her new messages aside. (The one case it re-runs by itself is a cutover whose verify failed or was killed while
+     the local database is still exactly what the tool installed: step 6.4.) Otherwise go to section 7 (rollback) or
+     `RUNBOOK_DB_LOCAL_V10.md` (recovery) and ask.
    * **`REFUSED: <to>/.migrate/seed.json exists but this tool cannot use it`**: the manifest was written by an older tool
-     (format 1) or is damaged, and it may record a completed cutover. There is deliberately no override. Seed into a fresh
-     target directory instead, or roll back (section 7).
+     (format 1) or is damaged, and it may record a completed cutover. There is deliberately no override. Recover by hand
+     (step 6.4's manual recovery, only if no service has ever run on this pod's database), or roll back (section 7).
    * Any other `REFUSED`: the failure table (section 10).
 3. **Apply it, detached, so a closed terminal cannot kill it**, and watch the log:
 
@@ -436,13 +450,21 @@ and times).
    ```
 
    `STATUS EXIT=0` means the last run was a cutover, it finished, and its own verify passed. **Anything else (INCOMPLETE, exit 1
-   or 2) means: start nothing.** If the run was interrupted or failed BEFORE the database was installed, repeat the same
-   `cutover ... --apply` command; it is safe to repeat (the failure table has the causes). **If `status` says `A cutover completed
-   here ... but its verify did not pass`, the tool will refuse a second cutover into this directory (by design, after go-live).**
-   Nothing has served her (no service was started, rule 1), so the recovery is a deliberate hand step: move the manifest aside
-   with `mv $NEW/.migrate $NEW/.migrate-failed-$(date -u +%Y%m%dT%H%M%SZ)`, then `seed ... --force --apply` and a fresh
-   `cutover ... --apply` (the tool treats the tree as unknown data and moves unknown files aside, never deletes). Do this ONLY if
-   no service on this pod has been started since the cutover; if any was, use the rollback (section 7) and ask.
+   or 2) means: start nothing.** Then:
+
+   * The run was interrupted or failed BEFORE the database was installed: repeat the same `cutover ... --apply` command; it is
+     safe to repeat (the failure table has the causes).
+   * **`status` says `A cutover completed here ... but its verify did not pass`** (the verify failed, or the run was killed
+     during it): the same `cutover ... --apply` command is ALLOWED again, and works, **as long as no service has run on the new
+     pod's local database since the install** (the tool hashes it: it must equal the copy the tool installed). Fix the cause
+     (the failing check is in `$V/cutover.log`), stop `openwebui compactor webuidb-sync backup` if you started any, and re-run
+     it. It prints `re-running the cutover ...` and then runs the whole cutover and its verify again. If the local database
+     DIFFERS (a service wrote to it), the tool refuses: that is the **manual recovery**, and only if nothing has served her:
+     move the manifest aside with `mv $NEW/.migrate $NEW/.migrate-failed-$(date -u +%Y%m%dT%H%M%SZ)`, then
+     `seed ... --force --discard-new-pod-writes --apply` and a fresh `cutover ... --apply` (the tool treats the tree as unknown
+     data and moves unknown files aside, never deletes; `--discard-new-pod-writes` moves the written database aside, never
+     deletes). If a service HAS served her since the cutover, do NOT do this: use the rollback (section 7) and ask.
+
    Then check the databases:
 
    ```bash
@@ -572,7 +594,21 @@ file is missing.
    (`~/zl-ops/word-ban/word-ban-structured_outputs.value.vN.txt`; the revision number is in
    `$PY /opt/zl-repo/scripts/word-ban-deploy.py status` run on the new pod before you stop it), Save & Update. Check that the
    system-prompt paragraph is still there.
-5. Check her chat as in step 6.7. Get back onto the new pod's line of releases as soon as the reason for the rollback is fixed.
+5. Check her chat as in step 6.7. Get back onto the new pod's line of releases as soon as the reason for the rollback is fixed
+   (section 8: migrating forward again).
+
+**Never run `--reverse` twice.** A second reverse copies the new pod's database (older now) over the old pod's, which has been
+running since the first one: her newest messages would be rolled back. The tool checks: after a completed reverse it records the
+installed database's hash in the OLD tree's `$OLD/.migrate/seed.json` (`"reverse": true`), and a later `--reverse` REFUSES
+(`a --reverse into this directory already completed ... the old pod's database has CHANGED since`) if the old database no longer
+matches. A repeat with nothing written on the old pod since is harmless and allowed. Before ANY rollback, if you are unsure
+whether one was already done, look first (read-only, on the new pod):
+
+```bash
+$T status --to $OLD; python3 -c "import json;m=json.load(open('$OLD/.migrate/seed.json'));print('reverse:',m.get('reverse'),'complete:',m.get('complete'),m.get('updated_utc'))" 2>&1 | tail -1
+```
+
+(no `.migrate` directory under `$OLD`, or `reverse: None`, means no reverse ever ran).
 
 ## 8. If the new pod is lost later
 
@@ -581,6 +617,26 @@ a damaged snapshot, restoring an archive) is in **`RUNBOOK_DB_LOCAL_V10.md`, sec
 pod's disk and is gone; the snapshot on `/data/v10` is at most about 2.5 minutes behind (a verified final sync makes it
 identical); the chat journal on the volume holds every completed reply, so `chat-journal.py compare` tells you which exchanges
 are missing; never restore an archive to get those minutes back.
+
+### 8.1 Migrating forward again after a rollback
+
+After a rollback the old pod is live again and the new pod's directory still holds the FIRST migration's manifest (a completed
+cutover) and its `--reverse` marker sits in the old tree. The tool refuses to seed or cut over into a directory whose manifest
+records a completed cutover, so start clean. On the NEW pod (its services stopped: `supervisorctl stop openwebui compactor
+webuidb-sync backup`), with the same `$OLD`, `$NEW`, `$T` variables:
+
+1. **Move the new pod's marker aside** (never delete it): `mv $NEW/.migrate $NEW/.migrate-first-$(date -u +%Y%m%dT%H%M%SZ)`.
+2. **Move the OLD tree's reverse marker aside too**, or a later rollback will refuse on it (section 7): this is a change to the
+   old tree's tool metadata only, never to her data. `mv $OLD/.migrate $OLD/.migrate-prev-$(date -u +%Y%m%dT%H%M%SZ)` (skip if it does
+   not exist).
+3. **Re-seed into the SAME `DATA_DIR`, with `--force`** (the directory holds the first migration's data, which the tool treats as
+   unknown data and moves aside, never deletes; the local database it finds is moved aside as `.migrate-aside-<stamp>`):
+   `$T seed --from $OLD --to $NEW --force` (dry run, read the plan), then `--apply` while she is idle. With the new manifest gone the tool has no
+   record of what it installed, so it does not ask for `--discard-new-pod-writes`; the old local database is moved aside as
+   `/var/lib/openwebui/.migrate-aside-<stamp>` (it was rolled back onto the old pod by the reverse, so it is not the only copy
+   of anything). Keep it until the second migration is verified.
+4. Then the normal flow: verify the seed (section 3), test (4), the cutover window (5), the cutover (6). The old pod's database
+   is the source again, exactly as the first time.
 
 ## 9. Cleanup later (weeks, once you are sure)
 
@@ -606,20 +662,25 @@ found no manifest). **Whatever the code: start no service unless section 6.4 pas
 | `REFUSED: the source webui.db has a -journal` | 2 | the pod that owns it did not stop cleanly | `RUNBOOK_DB_JOURNAL.md` |
 | `REFUSED: --to exists, is not a previous seed and holds data` | 2 | something wrote real data under `/data/v10` | find out what; `--force` moves unknown files aside, never deletes |
 | `REFUSED: The new pod has written to its local database since this tool installed it` | 2 | testing changed the new pod's database (or she used it) | after testing only: `--discard-new-pod-writes` (6.2). If she has used the pod: do not; section 7 |
-| `REFUSED: a CUTOVER ALREADY COMPLETED into this directory` | 2 | a seed/cutover after a completed cutover (no flag overrides it) | **STOP.** Section 7 (`--reverse`) or a fresh target directory; `RUNBOOK_DB_LOCAL_V10.md` |
-| `REFUSED: <to>/.migrate/seed.json exists but this tool cannot use it` | 2 | an older-format or damaged manifest (may hide a completed cutover) | no override: a fresh target directory, or section 7 |
+| `REFUSED: a CUTOVER ALREADY COMPLETED into this directory` | 2 | a seed/cutover after a completed and verified cutover, OR a re-run of a cutover whose verify failed after a service wrote to the local database (no flag overrides it) | **STOP.** Section 7 (`--reverse`), or (nothing has served her) 6.4's manual recovery; `RUNBOOK_DB_LOCAL_V10.md` |
+| `re-running the cutover of ...: its verify did not pass ... no service has written to it` | (info) | the cutover's own verify failed or was killed and the local database is unchanged: the re-run is allowed | let it run; fix the cause first (6.4) |
+| `REFUSED: <to>/.migrate/seed.json exists but this tool cannot use it` | 2 | an older-format or damaged manifest (may hide a completed cutover) | no override: 6.4's manual recovery if nothing has served her, or section 7 |
+| `REFUSED: a --reverse into this directory already completed ... has CHANGED since` | 2 | a SECOND rollback after the old pod ran | do NOT roll back again; if this really is a second rollback after migrating forward again, section 8.1 step 2 |
+| `REFUSED: --db-mode snapshot is refused on a forward seed/cutover` | 2 | this pod is `WEBUI_DB_LOCAL=true` (or the manifest records a local path) | drop the flag (`--db-mode local`, or leave the default) |
+| `REFUSED: --step-pages must be between 1 and 4096` | 2 | a step size that would hold the old pod's read lock for the whole copy | use 1..4096 (the default is 4096) |
 | `REFUSED: this pod's local live database does not exist` (reverse) | 2 | the local DB is gone (pod restarted onto a fresh disk) | the snapshot is then the only copy: `RUNBOOK_DB_LOCAL_V10.md` E2, or (only if you accept that) `--db-mode snapshot` |
 | `REFUSED: another run holds .../.migrate/lock` | 2 | a run is live or died | `pgrep -af pod-migrate`; if nothing runs, `rm $NEW/.migrate/lock`, then `status` |
 | `REFUSED: --old-pod-stopped is required` | 2 | you did not confirm the freeze | freeze the old pod (5.3), add the flag |
 | `FAILED: the source tree changed while the cutover ran` | 1 | the old pod was not frozen | stop it properly and re-run `cutover --apply` |
-| `INTERRUPTED by SIGTERM/SIGINT` | 1 | the run was killed; the manifest says incomplete | start nothing; re-run the same command |
+| `INTERRUPTED by SIGTERM/SIGINT` | 1 | the run was killed; the manifest says incomplete | start nothing; re-run the same command (a cutover whose install finished is re-run too, while the local database is unchanged; if the tool refuses, 6.4's manual recovery) |
 | `database copy attempt N/5 failed (...)` | (retries) | the old pod (or the volume) had the database busy, or the copy failed its integrity check | it retries; if it gives up (`failed integrity_check on all N attempts`, exit 1), retry when she is not chatting |
 | `database copy attempt N/5 (gentle): the source was written under the copy` | (retries) | someone is using the old pod: every write restarts the copy | it retries with fast steps, then a single copy; if it gives up (`the source database kept changing under the copy`, exit 1), have her close the app on EVERY device and run it again |
-| `not trying the single full copy: it would hold the old pod's read lock for about N s` | (retries) | the database is too big to copy in one lock hold under the old pod's 5 s busy_timeout | the app must be closed everywhere; then re-run the seed |
+| `not trying the single full copy: it would hold the old pod's read lock for about N s` (limit 2 s) | (retries) | the database is too big to copy in one lock hold under the old pod's 5 s busy_timeout | the app must be closed everywhere; then re-run the seed |
+| `not trying the single full copy: no read throughput was measured` | (retries) | the earlier attempts failed before a step completed (sqlite errors), so the hold cannot be projected | fix the cause shown on the earlier `attempt N/5 failed` lines (the volume), then re-run the seed |
 | a killed run left `.migrate/lock` | | SIGKILL or a power cut during the run | `pgrep -af pod-migrate`; if nothing runs, `rm $NEW/.migrate/lock`, run `status`, re-run the same command (a kill mid-install is recognised: no false "new pod has written" refusal) |
 | `verify` FAIL on `file rows in the target` | 1 | a path prefix the tool did not know | `--path-map OLD=NEW` (repeatable), then re-run |
 | `verify` FAIL on a `tree '...'` digest | 1 | a file differs between the trees | re-run `cutover --apply` (it re-hashes and re-copies); if it persists, do not switch her over |
-| `status`: INCOMPLETE | 1 | a run did not finish, its verify failed, or a run holds the lock | start nothing; re-run the same cutover command |
+| `status`: INCOMPLETE | 1 | a run did not finish, its verify failed, or a run holds the lock | start nothing; re-run the same cutover command (if it refuses after a completed install: 6.4's manual recovery) |
 | `status`: NO MANIFEST | 2 | nothing was seeded here | wrong `--to`, or step 3 never ran |
 | `webuidb.py --sync-once --force` exits non-zero | non-0 | it could not sync (it WAITS for the lock, then gives up) | do not stop the pod: `RUNBOOK_DB_LOCAL_V10.md` E1 |
 | `backfill-records.py` exit 3 (dry run) | 3 | a record would resume: expected once | `--apply` (6.5) |

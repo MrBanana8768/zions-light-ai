@@ -9,11 +9,13 @@ on Docker Hub.
 
 ---
 
-## [3.1.9.10] — Part A: backup retention tiers, and a per-message chat journal
+## [3.1.9.10] — backup retention tiers, a per-message chat journal, point-in-time `/forget`, and the move to a new pod
 
-**Not yet released/tagged.** Branch `feature/v3.1.9.10`, from tag `v3.1.9.9`. Built from `Dockerfile.v31910`
-(a copy of `Dockerfile.v3199` plus `compactor/chatjournal.py` and a 29-module import guard). Other parts of
-.10 (migration tooling) are tracked separately.
+**Not yet released/tagged.** Branch `feature/v3.1.9.10`, from tag `v3.1.9.9`. ONE release: the compactor changes
+(retention tiers, the chat journal, `/forget`), the path isolation and `scripts/pod-migrate.py` that move her to a new pod
+on `WEBUI_DB_LOCAL=true`, and the runbooks. Built from `Dockerfile.v31910` (a copy of `Dockerfile.v3199` plus
+`compactor/chatjournal.py` and a 29-module import guard; it also has the `rollback` target, image
+`v3.1.9.10-rollback-cu12`). Read in this order: the sections below; the owner runbook is **RUNBOOK_POD_MIGRATION.md**.
 
 ### Changed
 - **Backup retention** (`compactor/backup.py`): the hourly backups no longer keep ~117 archives (>20 GB). An
@@ -24,10 +26,10 @@ on Docker Hub.
   and it behaves exactly as before (everything younger than N days), on top of the tiers. The newest archive
   is claimed explicitly as well as by the floor, and an in-progress `.partial` archive is never listed, so
   never pruned. Example (hourly for 20 days, `RETAIN=3`): 12 of 480 kept (3 hourly, 7 daily, 2 weekly).
-- **Not changed, on purpose:** the code defaults `RETAIN=7`, `MIN_KEEP=3`, and the **template's
-  `COMPACTOR_BACKUP_RETAIN=28`**. With hourly backups 28 is a 28-hour floor that swallows the 3-hour tier
-  (the same example keeps 36, not 12). Recommended template change: `COMPACTOR_BACKUP_RETAIN=3`, leave
-  `COMPACTOR_BACKUP_RETAIN_DAYS` unset. See OPERATIONS.md, "Backup retention tiers".
+- **Code defaults not changed:** `RETAIN=7`, `MIN_KEEP=3`. **The template's `COMPACTOR_BACKUP_RETAIN` IS changed:
+  28 -> 3** (owner decision, `98cdd49`; `runpod.env.template` and RUNBOOK_POD_MIGRATION.md). With hourly backups 28
+  was a 28-hour floor that swallowed the 3-hour tier (the example above would keep 36, not 12).
+  `COMPACTOR_BACKUP_RETAIN_DAYS` stays unset. See OPERATIONS.md, "Backup retention tiers".
 
 ### Changed: `/forget` is point-in-time, `/retire` keeps the journal (owner decisions, 2026-09-29)
 - **`/forget` no longer bans a phrase.** Owner: "/forget should never allow things that meet a regex phrase to
@@ -90,7 +92,7 @@ on Docker Hub.
 The journal holds her words like the facts store. It is inside the daily backups (STORAGE_ROOT is archived
 whole) and outside `zl bundle` (bundle forbids the compactor store outright; confirmed, no ops change).
 
-### Part B: path isolation and pod migration
+### Path isolation and pod migration
 
 Two pods now share one network volume for a while (the old prod pod, then a new pod on `WEBUI_DB_LOCAL=true` with
 its data under `/data/v10`). This part makes sure the new pod cannot touch the old pod's files, and moves the data.
@@ -135,7 +137,7 @@ From Opus verification vB (a literal runbook walk on real images). `scripts/pod-
   the committed hash. A real SIGKILL test (subprocess) then a successful re-run; a real write after the kill is still refused.
 - **MEDIUM: `--discard-new-pod-writes`, `--db-mode snapshot` and `--force` bypassed the guard after go-live.** When
   the manifest shows a completed cutover (`cutover_utc` or a `cutover` in `runs`), `seed` and `cutover` REFUSE whatever
-  the flags (dry runs too). The only ways forward are `--reverse` or a fresh target directory. `MANIFEST_FORMAT` is now 2;
+  the flags (dry runs too). The way forward is `--reverse` (a fresh target directory is refused too: `--to` must be this pod's own `DATA_DIR`; a cutover whose verify failed can be re-run, see fix round 3). `MANIFEST_FORMAT` is now 2;
   a manifest of any other format (or an unreadable one) is refused with no override flag at all: it may hide a
   completed cutover, and a flag would be exactly the shortcut that overwrites her live database. `status` reports it.
 - **MEDIUM (runbook 5.2, old pod v3.1.9):** no `ss` on that image: the connection count reads `/proc/net/tcp*` (state `01`,
@@ -151,6 +153,80 @@ From Opus verification vB (a literal runbook walk on real images). `scripts/pod-
   `docs/DB-MOVE-RUNBOOK.md` E1's `mv` has a real `if` guard; runbook 0.1's EXISTS check now aborts the build and push (one
   `if` block); wording: em dash in the quoted backfill output, 6.7's grep only shows lines after a timestamp taken
   before the services start, 3.8 notes `.migrate-aside` vanishes on a RunPod restart.
+
+### Fixed (hostile gauntlet round 1, migration tool and runbooks; `8638f70`)
+From the Opus reviewers R2 (migration and paths) and R3 (the DB move); merged as `1e1d326`.
+- **No public ports on the new pod (R2 H1).** The first-boot OpenWebUI is empty and the first sign-up becomes admin
+  even with `ENABLE_SIGNUP=false`; an admin can run Functions as root. The runbook no longer exposes 3000/8080 (the
+  Cloudflare tunnel reaches `localhost`), and the first boot runs with `ENABLE_LOGIN_FORM=false` (verified 403) as a
+  PERSISTED setting that is removed before her DB first runs, with a check of `ui.enable_login_form`. Pre-tunnel testing
+  goes through the tunnel itself.
+- **`--reverse` copies the live LOCAL database (R2 H2)**, not the snapshot (which can be minutes behind), via the backup
+  API; it refuses if the local DB is missing or hot. `--db-mode snapshot` is the explicit opt-out.
+- **The new-pod-writes guard (R2 H3).** The manifest records the installed database's sha256; a `seed` or `cutover`
+  refuses when the local DB no longer matches (the new pod has written), unless `--discard-new-pod-writes`
+  (which moves the database aside, never deletes it).
+- **Hashing at cutover (R2 M4).** The delta no longer trusts size+mtime (MooseFS has 1 s mtimes): a cutover hashes every
+  non-sqlite file and recopies every sqlite file; `verify`'s digest includes SQLite logical content.
+- **Signal safety (R2 M6).** SIGHUP is ignored, SIGINT/SIGTERM are deferred through the critical steps, and an
+  interruption leaves `complete=false`. The runbook says `setsid`/`nohup` and never to start services before exit 0.
+- **`pod-migrate.py status`** (new subcommand, read-only): COMPLETE or INCOMPLETE from the manifest alone.
+- The seed's first paced steps and integrity retries (R2 L8; replaced by the ladder in round 2 below); reverse no longer
+  copies the word-ban directory onto itself (R2 L9); the secret-key check no longer always prints 1 (R2 L7).
+- **RUNBOOK_POD_MIGRATION.md rewritten** (no public ports, the first-boot login form, the post-cutover backfill-records
+  close, rollback on `v3.1.9.10-rollback-cu12`, literal `images=1` / `reserve=8000` / `RETAIN=3` rows, waiting for vLLM
+  idle before the freeze, the final sync gated on `--status` rows, pre-cutover archives moved aside, a status/verify
+  gate before any service starts, and a failure table). **New RUNBOOK_DB_LOCAL_V10.md**: DB-local operations and recovery
+  on the v10 paths. `docs/DB-MOVE-RUNBOOK.md` has a banner and a guarded E1.
+- Tests kill all 20 mutants of the tool, including the earlier survivors.
+
+### Fixed (verification round A follow-ups; `0f9fb8d`)
+- **Backfill resuming floor.** A resumed record with no `attempts` key (pre-v3.1.9.4, hers) counts as attempt 1 when
+  computing this run's attempt number, so the `COMPACTOR_BACKFILL_MAX_ATTEMPTS` cap no longer arrives one run late
+  (MAX=3 gave 3 resumes, now 2). A chain test on v3.1.9's exact record shape.
+- **Backup boot-skip and `latest_backup_info` use the time in the archive NAME**, like the retention tiers.
+- **`/forget <text>` bounds the journal redaction at 30 s** so a stalled volume cannot hang her reply (superseded in
+  part by the shield below: the redaction is no longer cancelled).
+- The content fingerprint of the local/snapshot DB is documented as a sanity check, not proof of identical content;
+  the runbook expects `'synced': True` from the forced CLI.
+
+### Changed (perf audit, `35d4d60`)
+- **The degenerate-verdict cache default is 65,536 (was 4,096)** (`COMPACTOR_DEGENERATE_VERDICT_CACHE_SIZE`). She has ~2,400
+  assistant replies and every request re-judges all of them; past 4,096 an LRU that size misses on every entry of every scan
+  (a 16-20 s cold cost per request, roughly 1,700 exchanges from now). Memory: ~21 MB measured at 65,536 entries (worst
+  case; the code comment used to say ~13 MB). The test caches 5,000 verdicts with no eviction and fails at 4,096.
+
+### Fixed (integration finding; `9de9fe1`)
+- **`scripts/chat-journal.py compare` exits 3 when exchanges are missing** (it exited 0, which the recovery runbook
+  relies on). 0 = none missing, 3 = some missing, 1 or 2 = error. Tests for both the 3 and the 0 (all present) cases.
+
+### Fixed (final sign-off review, fix round 3)
+From the last Opus review. `scripts/pod-migrate.py`, `compactor/commands.py`, docs.
+- **The seed's single-copy rung projected too low.** After a restart the re-read comes from the page cache, so the measured
+  throughput was too high (a real 4.41 s hold against a projected under 3 s on a 120 MB/s-throttled disk). Now each
+  attempt counts only the bytes read BEFORE its first restart (its first step included, so a tiny database is measured),
+  the projection uses the SLOWEST attempt and a 1.3x safety factor, and the limit is **2 s** (was 3; the old pod's
+  `busy_timeout` is 5 s). **With no measured throughput (earlier attempts failed with sqlite errors) the rung is
+  skipped**, with the reason printed. The projection is printed when the rung runs. `--step-pages` must be 1..4096 (`-1`
+  or a huge step holds the read lock for the whole copy) and is refused otherwise.
+- **A cutover whose own verify failed or was killed can be re-run** while the new local database still hashes to exactly
+  what the tool installed (no service has run on it since). Otherwise it is refused and points to RUNBOOK_POD_MIGRATION.md
+  section 6.4 (the manual recovery). The INTERRUPTED message, `status` and the runbook's failure table now say the same;
+  the "seed a NEW --to directory" advice (which the tool refuses) is gone.
+- **`--db-mode snapshot` is refused on a forward `seed`/`cutover`** when this pod runs `WEBUI_DB_LOCAL=true` or the manifest
+  records a local database path (a stale local DB would win over the fresh copy). A failing `verify --strict-local` no longer
+  prints "differ (fine once the new pod has been writing)".
+- **`/forget <text>`: a timeout no longer cancels the queued journal redaction.** `asyncio.wait_for` cancelled the still
+  queued executor job; the redaction is now `asyncio.shield`ed, so it runs when the writer frees up, and the reply says the
+  journal timed out (and that the next start re-applies it in any case).
+- **`--reverse` twice is refused** when the old pod has written since the first one (the first records `"reverse": true` and
+  the installed database's hash in the OLD tree's manifest; a repeat with nothing written since is harmless). A genuine second
+  rollback after migrating forward again moves that marker aside first (RUNBOOK_POD_MIGRATION.md 8.1).
+- Docs: this entry; `runpod.env.template` (image `v3.1.9.10-cu12`, no exposed ports, `GENERATION_RESERVE=8000`,
+  `MAX_RETAINED_IMAGES=1`, `BACKFILL_MAX_ATTEMPTS=1`, `RETAIN=3`, no `INJECTION_BUDGET_FRACTION`; it matches the runbook's new-pod env
+  block); RUNBOOK_CLOUDFLARE_TUNNEL.md (covers .9 and .10; the .10 rollback is RUNBOOK_POD_MIGRATION.md section 7);
+  RUNBOOK_POD_MIGRATION.md (1.2 checks the must-NOT-exist rows; a guard against `--reverse` twice; "migrating forward again
+  after a rollback"); OPERATIONS.md's stale `RETAIN=28` lines.
 
 ### Fixed (hostile gauntlet round 1, compactor)
 - **`COMPACTOR_BACKFILL_MAX_ATTEMPTS=1` now stops her backfill (R4 H1).** `needs_backfill` read a record with no

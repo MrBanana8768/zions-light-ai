@@ -1093,6 +1093,74 @@ check("missing from chat JSON: 1" in out, "only the genuinely missing exchange i
 check("RAG / file-attachment turns can show as unmatched" in out, "the RAG caveat is printed")
 
 # ===========================================================================
+print("\n[S3] compare exits 0 when EVERY exchange is present in the chat JSON (the all-present case)")
+reset()
+conv = "conv-s3"
+post_nonstream(conv, "first question", "first answer", headers=NO_IDS)
+post_nonstream(conv, "second question", "second answer", headers=NO_IDS)
+db3 = _TMP / "owui3.db"
+con = sqlite3.connect(str(db3))
+con.execute("create table chat (id text primary key, chat text, current_message_id text, updated_at integer)")
+h3 = {
+    "u1": {"role": "user", "content": "first question", "parentId": None},
+    "a1": {"role": "assistant", "content": "first answer", "parentId": "u1"},
+    "u2": {"role": "user", "content": "second question", "parentId": "a1"},
+    "a2": {"role": "assistant", "content": "second answer", "parentId": "u2"},
+}
+con.execute("insert into chat values (?,?,?,?)", (conv, json.dumps({"history": {"messages": h3}}), "a2", 1))
+con.execute("create table chat_message (id text primary key, chat_id text, parent_id text, role text, content text, done integer, created_at integer, updated_at integer)")
+for _mid, _par, _role in (("u1", None, "user"), ("a1", "u1", "assistant"), ("u2", "a1", "user"), ("a2", "u2", "assistant")):
+    con.execute("insert into chat_message values (?,?,?,?,?,?,?,?)",
+                (f"{conv}-{_mid}", conv, f"{conv}-{_par}" if _par else None, _role, json.dumps(h3[_mid]["content"]), 1, 1, 1))
+con.commit(); con.close()
+code, out = run_cli("compare", "--store", str(STORE), "--db", str(db3), "--conv", conv)
+eq(code, 0, f"compare exits 0 when nothing is missing: {out!r}")
+check("missing from chat JSON: 0" in out, "and says so")
+
+# ===========================================================================
+print("\n[F6] /forget timeout: a stalled writer past the timeout does NOT cancel the queued redaction")
+import threading  # noqa: E402
+import time as _time  # noqa: E402
+
+reset()
+conv = "conv-f6"
+post_nonstream(conv, "I love durian", REPLY)
+check("durian" in raw(conv), "fixture: the words are on disk")
+_gate = threading.Event()
+chatjournal._EXEC.submit(_gate.wait, 30)                 # the writer thread is stalled
+_old_to = commands._JOURNAL_REDACT_TIMEOUT_S
+commands._JOURNAL_REDACT_TIMEOUT_S = 0.4
+_f6 = {}
+
+
+async def _f6_main():
+    # ONE event loop for the whole scenario (asyncio.run would cancel a still-pending task on exit; the
+    # server's loop lives on)
+    _ctx = {"clear_all_memory": lambda cid: main._clear_all_memory(cid, source="test"), "turn_index": 1, "persona_text": ""}
+    _t0 = _time.monotonic()
+    _f6["out"] = await commands.handle_command("forget", "durian", conv, ctx=_ctx)
+    _f6["elapsed"] = _time.monotonic() - _t0
+    _f6["still_there"] = "durian" in raw(conv)
+    _gate.set()                                          # the writer frees up
+    for _ in range(100):
+        await asyncio.sleep(0.05)
+        if "durian" not in raw(conv):
+            break
+
+
+try:
+    asyncio.run(_f6_main())
+finally:
+    commands._JOURNAL_REDACT_TIMEOUT_S = _old_to
+    _gate.set()
+out = _f6["out"]
+check(_f6["elapsed"] < 5, "the reply came back at the timeout, it did not hang on the writer")
+check("timed out" in out, f"the reply says it timed out: {out!r}")
+check(_f6["still_there"], "fixture: the redaction had not run yet (the writer was still stalled)")
+chatjournal.drain(10)
+check("durian" not in raw(conv), "the queued redaction STILL RAN once the writer freed up (it was not cancelled)")
+
+# ===========================================================================
 print("\n[D1] the images COPY the journal module and the guard lists it")
 import re  # noqa: E402
 

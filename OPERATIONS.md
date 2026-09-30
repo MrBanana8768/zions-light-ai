@@ -1215,7 +1215,7 @@ successful cycle:
 
 | tier | rule | env (default) |
 |---|---|---|
-| floor | the newest `max(MIN_KEEP, RETAIN)` archives, always | `COMPACTOR_BACKUP_RETAIN` (7 in code, **28 in `runpod.env.template`**), `COMPACTOR_BACKUP_MIN_KEEP` (3, and never below 3) |
+| floor | the newest `max(MIN_KEEP, RETAIN)` archives, always | `COMPACTOR_BACKUP_RETAIN` (7 in code, **3 in `runpod.env.template` since `98cdd49`**), `COMPACTOR_BACKUP_MIN_KEEP` (3, and never below 3) |
 | hourly | every archive younger than N hours | `COMPACTOR_BACKUP_HOURLY_HOURS` (3; 0 = off) |
 | daily | the newest archive of each UTC day, for N days | `COMPACTOR_BACKUP_DAILY_DAYS` (7; 0 = off) |
 | weekly | the newest archive of each ISO week, for N weeks | `COMPACTOR_BACKUP_GFS_WEEKS` (8) |
@@ -1237,13 +1237,14 @@ Tue 2026-09-29, with `RETAIN=3`): 12 of 480 are kept, three hourly
 (09-29 12:10, 11:10, 10:10), seven daily (09-28 to 09-22, each at 23:10), two
 weekly (09-20 and 09-13, each at 23:10).
 
-**THE TEMPLATE'S FLOOR IS THE TRAP.** `runpod.env.template` ships
+**THE FLOOR IS THE TRAP (fixed in the template).** `runpod.env.template` used to ship
 `COMPACTOR_BACKUP_RETAIN=28`, an interim value from when backups ran every 6
-hours. It is a *floor*, so at one backup an hour it keeps the newest 28
-archives (28 hours) whatever the tiers say: the same example keeps 36, not
-12. The code defaults were NOT changed for this (a code default change would
-surprise every operator who set it on purpose); change the template/RunPod
-env instead:
+hours. It is a *floor*, so at one backup an hour it kept the newest 28
+archives (28 hours) whatever the tiers said: the worked example keeps 36, not
+12. The template now says `COMPACTOR_BACKUP_RETAIN=3` (owner decision, `98cdd49`), and so does the new-pod
+env block in RUNBOOK_POD_MIGRATION.md. The CODE default (7) was not changed (a code default change would
+surprise every operator who set it on purpose). A pod still running with the OLD template's 28
+(the v3.1.9.9 pod) keeps the 28-hour floor until its environment is changed:
 
 ```
 COMPACTOR_BACKUP_RETAIN=3          # the floor; the tiers do the rest

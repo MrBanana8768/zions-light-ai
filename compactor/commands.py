@@ -109,6 +109,10 @@ from memory import StoreUnreadable, bump_wipe_generation, conv_lock, storage_roo
 
 logger = logging.getLogger("compactor.commands")
 
+# /forget waits at most this long for the chat journal's writer thread (a stalled volume must
+# not hang her reply); the redaction itself is shielded and still runs (see cmd_forget).
+_JOURNAL_REDACT_TIMEOUT_S = 30.0
+
 # v3.1 A3: how long /forget waits for in-flight background tails to finish
 # before it wipes. Bounded, and the reply says so when the wait expires —
 # a /forget that hangs is worse than one that admits it cannot promise
@@ -724,19 +728,26 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
             # next boot re-applies it, and the reply says so.
             journal_redacted = 0
             journal_failed = False
+            journal_timed_out = False
             try:
                 # v3.1.9.10 (R1 M1): on the journal's SINGLE writer thread,
                 # FIFO behind every queued append (as wipe_async), so a reply
                 # queued before this forget cannot land after the redaction
                 # with the words intact. Not the general threadpool.
                 # Bounded: a stalled volume must not hang her /forget reply (vA).
-                # On a timeout the redaction still runs when the writer frees up,
-                # and the ledger re-applies it at the next boot.
+                # asyncio.shield: wait_for cancels what it awaits on a timeout, and
+                # cancelling an executor future that is still QUEUED drops the job
+                # (the redaction would never run). Shielded, the timeout only stops
+                # this reply from waiting: the redaction runs when the writer frees
+                # up, and the ledger re-applies it at the next boot either way.
+                _red = asyncio.ensure_future(chatjournal.redact_needle_async(conv_id, arg))
+                _red.add_done_callback(lambda f: f.cancelled() or f.exception())  # never "exception was never retrieved"
                 journal_redacted = await asyncio.wait_for(
-                    chatjournal.redact_needle_async(conv_id, arg), timeout=30
+                    asyncio.shield(_red), timeout=_JOURNAL_REDACT_TIMEOUT_S
                 )
             except Exception as e:
                 journal_failed = True
+                journal_timed_out = isinstance(e, asyncio.TimeoutError)
                 chatjournal._bump("errors")
                 logger.error(
                     f"conv={conv_id}: /forget could not redact the chat "
@@ -748,7 +759,15 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
                     f" Also removed it from {journal_redacted} chat-journal "
                     f"{'entry' if journal_redacted == 1 else 'entries'}."
                 )
-            if journal_failed:
+            if journal_timed_out:
+                _jnote += (
+                    " The chat journal did not answer within "
+                    f"{_JOURNAL_REDACT_TIMEOUT_S:.0f} seconds (its storage may be "
+                    "stalled) so this timed out; the rewrite is queued and runs as "
+                    "soon as it frees up, and it is re-applied the next time I "
+                    "start in any case."
+                )
+            elif journal_failed:
                 _jnote += (
                     " I could not rewrite the chat journal just now; it will "
                     "be cleared of this the next time I start."
