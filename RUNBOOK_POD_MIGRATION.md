@@ -29,8 +29,10 @@ new pod.
 1. **Start no service on the new pod until the cutover has reported complete AND `verify` has exited 0** (section 6.4). A
    service started early on a half-copied tree is how data gets overwritten.
 2. **Seed only while she is idle.** The seed reads the OLD pod's LIVE database.
-3. **Once she has used the new pod, never re-run `seed` or `cutover`** (the tool refuses; do not work around it). Roll back
-   with section 7.
+3. **Once a cutover has completed, never re-run `seed` or `cutover` into the same directory.** The tool refuses, and
+   NO flag (`--force`, `--discard-new-pod-writes`, `--db-mode`) overrides that: after go-live the only ways forward are the
+   rollback (section 7, `--reverse`) or a fresh target directory. Before go-live, testing on the new pod is discarded with
+   `--discard-new-pod-writes` (step 6.2).
 
 Start every Web Terminal session on the new pod with (the same variables are used everywhere below):
 
@@ -53,16 +55,22 @@ write any tree that is not this pod's own** (so a swapped `--from`/`--to` cannot
    ```bash
    git clone --depth 1 --branch v3.1.9.10 https://github.com/MrBanana8768/zions-light-ai.git zl-v3.1.9.10 && cd zl-v3.1.9.10
    git log -1 --format='%H %s'                                         # note the commit
+   taken=0
    for t in v3.1.9.10-cu12 v3.1.9.10-rollback-cu12; do
-     docker manifest inspect angreg/zions-light-ai:$t >/dev/null 2>&1 && echo "EXISTS: $t (stop, never overwrite a tag)" || echo "free: $t"
+     if docker manifest inspect angreg/zions-light-ai:$t >/dev/null 2>&1; then echo "EXISTS: $t"; taken=1; else echo "free: $t"; fi
    done
-   docker build --platform linux/amd64 --target rc       -t angreg/zions-light-ai:v3.1.9.10-cu12          -f Dockerfile.v31910 .
-   docker build --platform linux/amd64 --target rollback -t angreg/zions-light-ai:v3.1.9.10-rollback-cu12 -f Dockerfile.v31910 .
-   docker run --rm --entrypoint /app/venv/bin/pip angreg/zions-light-ai:v3.1.9.10-rollback-cu12 show open-webui | grep ^Version   # 0.11.4
-   docker run --rm --entrypoint /app/venv/bin/pip angreg/zions-light-ai:v3.1.9.10-cu12          show open-webui | grep ^Version   # 0.11.4
-   docker push angreg/zions-light-ai:v3.1.9.10-cu12
-   docker push angreg/zions-light-ai:v3.1.9.10-rollback-cu12
+   if [ "$taken" = 1 ]; then echo "STOP: a tag already exists; never overwrite one. Nothing was built or pushed."; else
+     docker build --platform linux/amd64 --target rc       -t angreg/zions-light-ai:v3.1.9.10-cu12          -f Dockerfile.v31910 . \
+     && docker build --platform linux/amd64 --target rollback -t angreg/zions-light-ai:v3.1.9.10-rollback-cu12 -f Dockerfile.v31910 . \
+     && docker run --rm --entrypoint /app/venv/bin/pip angreg/zions-light-ai:v3.1.9.10-rollback-cu12 show open-webui | grep ^Version \
+     && docker run --rm --entrypoint /app/venv/bin/pip angreg/zions-light-ai:v3.1.9.10-cu12          show open-webui | grep ^Version \
+     && docker push angreg/zions-light-ai:v3.1.9.10-cu12 \
+     && docker push angreg/zions-light-ai:v3.1.9.10-rollback-cu12
+   fi
    ```
+
+   (Both `Version` lines must say `0.11.4`. The `if` block is one unit: if either tag exists, nothing is built or pushed, and
+   a failing build stops the chain before any push. Paste the whole block, not line by line.)
 
    The `rollback` target of `Dockerfile.v31910` is **prod as it runs today**: the `v3.1.9-cu12` base with OpenWebUI 0.11.4
    installed (prod's OpenWebUI is 0.11.4 only through a hot patch in the running container's overlay, which a pod restart
@@ -178,7 +186,15 @@ tr '\0' '\n' < /proc/1/environ | grep -E '^(DATA_DIR|LOG_DIR|COMPACTOR_BACKUP_DI
 `ENABLE_LOGIN_FORM=false`. If ANY is missing or different, **stop and fix the row before going on**: a missing path row is the one
 way the new pod could aim at the old pod's files.
 
-**Check that 3000 and 8080 are not public** (from your laptop; the pod id is `echo $RUNPOD_POD_ID` in the pod's terminal):
+**Check that 3000 and 8080 are not public.** First prove the check can mean something: OpenWebUI must be UP inside the pod. In
+the pod's terminal:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' 127.0.0.1:3000/health        # expect 200; if not, wait a minute and repeat
+```
+
+Only when that says `200`, run the external check from your laptop (the pod id is `echo $RUNPOD_POD_ID` in the pod's terminal;
+a "not exposed" answer while OpenWebUI was still booting would prove nothing):
 
 ```bash
 for p in 3000 8080; do curl -s -o /dev/null -w "$p -> HTTP %{http_code}\n" --max-time 20 https://<POD_ID>-$p.proxy.runpod.net/; done
@@ -211,10 +227,15 @@ supervisorctl status openwebui compactor webuidb-sync backup    # all STOPPED
 
 ## 3. Seed, verify (the old pod stays live; nothing on it changes)
 
-1. **She is idle, and stays idle: REQUIRED.** The seed reads the OLD pod's live database. Ask her not to open the app
-   until it has finished (it takes a few minutes). The tool copies in small steps (256 pages) with a short pause between
-   them, retries a copy whose integrity check fails, prints how many attempts it needed and the total time, and warns when
-   the old database was written in the last 5 minutes. If it warns, wait and run it again.
+1. **She closes the app on EVERY device, and stays away until the seed has finished: REQUIRED.** The seed reads the OLD pod's
+   live database. An idle open OpenWebUI tab is enough to write it: it stores `last_active_at` about once a minute, and every
+   write to the source restarts the SQLite backup from page 1. Ask her to close the app on every device (phone, tablet, laptop:
+   all tabs). The tool copies in 4096-page steps with a short pause (the total pause is capped), and if the source keeps
+   being written it retries with fast steps, then (only when the copy is projected to hold the lock for at most 3 s) as a
+   single full copy. It prints the mode, the restarts, the attempts, the total time and the **longest time it held the old
+   pod's read lock**; the old pod's own `busy_timeout` is 5 s, so a hold near that would make one of her writes fail.
+   It warns when the old database was written in the last 5 minutes (measured against the volume's clock, not the pod's). If it
+   warns, or says `the source database kept changing under the copy`, make sure the app is closed everywhere, wait, and run it again.
 2. Dry run, then apply:
 
    ```bash
@@ -235,7 +256,7 @@ supervisorctl status openwebui compactor webuidb-sync backup    # all STOPPED
 3. While the old pod is live and she keeps chatting, `verify` will show differences after a while. That is normal; the
    cutover closes them. Re-running `seed --apply` is a safe incremental refresh (only while she is idle). If you have tested on the
    new pod since the last seed, the re-seed refuses like the cutover does (its local database has writes) and needs
-   `--discard-new-pod-writes` too.
+   `--discard-new-pod-writes` too (allowed only BEFORE the cutover: after a completed cutover no flag lets a seed run).
 4. If `seed` says the target "holds data and is not a seed", something already wrote real data into `/data/v10`: find out
    what before using `--force` (with `--force` nothing is deleted either; unknown files are moved aside).
 5. **Not copied on purpose** (counts only in the output): OpenWebUI's `cache/`, old `webui.db.bak-*` files, its audit log. If
@@ -270,7 +291,9 @@ supervisorctl status openwebui compactor webuidb-sync backup    # all STOPPED
 
    (`ui.enable_signup true` is how prod already behaves: a new sign-up is a pending user until you approve it. Set it to
    off in the Admin Panel if you want.)
-8. Reclaim local disk once you are happy: the tool moved the empty first-boot DB aside.
+8. Reclaim local disk once you are happy: the tool moved the empty first-boot DB aside. (`.migrate-aside-*` lives on the
+   pod's LOCAL disk: it vanishes on any RunPod restart or stop-start, so if you restarted the pod in step 6 it is already
+   gone, and the `ls` below simply prints nothing. That is fine: it was only the empty schema.)
 
    ```bash
    ls -d /var/lib/openwebui/.migrate-aside-*        # the empty first-boot database and its lock file
@@ -316,7 +339,9 @@ and times).
 
 1. **She closes the app on every device.**
 2. **Is the OLD pod idle? Run this on the OLD pod's terminal.** Freezing the old pod while it is mid-reply cuts her last
-   reply. The old pod (v3.1.9) has no request tracing, so use vLLM's own metrics plus the compactor's log timing:
+   reply. The old pod (v3.1.9) has no request tracing, and **its access log is not proof of an idle pod: uvicorn logs
+   `POST /v1/chat/completions ... 200` when a reply STARTS to stream, not when it ends.** So the proof is vLLM's own metrics
+   (two samples, 30 s apart); the compactor log and the open-connection count only add to it:
 
    ```bash
    L=/data/logs; VP=$(tr '\0' '\n' < /proc/1/environ | sed -n 's/^VLLM_PORT=//p'); VP=${VP:-8000}
@@ -324,17 +349,24 @@ and times).
    M; sleep 30; M
    ```
 
-   **Expect** all four numbers to be `0.0` (two samples, 30 s apart). Then:
+   **Expect** all four numbers to be `0.0` (running and waiting, both samples), i.e. running + waiting is 0 twice, 30 s apart.
+   A stream in progress shows as `running` above 0. Then two extra checks. **Both `conv_id=` and `POST` lines are in
+   `compactor.log`** (that one file; `compactor-error.log` is the wrong place to look):
 
    ```bash
-   for f in $L/compactor-error.log $L/compactor.log; do echo "== $f"; tail -n 300 $f | grep -E 'conv_id=|"POST /v1/chat/completions' | tail -3; done
-   ss -tn state established '( sport = :8080 )' | tail -n +2        # open client connections to the compactor
+   tail -n 300 $L/compactor.log | grep -E 'conv_id=|"POST /v1/chat/completions' | tail -3
+   awk '$4=="01" && $2 ~ /:1F90$/' /proc/net/tcp /proc/net/tcp6 | wc -l      # established connections whose local port is 8080
    ```
 
-   **Expect** the newest of those lines to be the `"POST /v1/chat/completions ... 200` line (the request finished), NOT a
-   `conv_id=` line (a request that started and has no completion line yet), and no established connection on `:8080` other than
-   a short health poll (repeat it a few times). If any of it says a request is in flight, or you are not sure (`ss` missing,
-   a log you cannot read): **wait until 5 minutes after her last reply**, then continue. When in doubt, wait the 5 minutes.
+   (Port 8080 in hex is `1F90`: `0x1F90` = 1*4096 + 15*256 + 9*16 + 0 = 8080. `ss` is not installed on v3.1.9, which is why this
+   reads `/proc/net/tcp*`, where state `01` is ESTABLISHED. The image ships `awk`.)
+
+   **Expect** the newest of the log lines to be a `"POST /v1/chat/completions ... 200` line, NOT a `conv_id=` line (a `conv_id=`
+   line with no POST line after it means a request is in its ~100 s pre-processing phase, when vLLM shows nothing at all), and a
+   count of `0`, or `1` that is gone when you repeat it (a health poll or OpenWebUI's idle keep-alive is short-lived; run it three
+   times, a few seconds apart). **The metrics decide; these two can only add a reason to wait.** If any of it says a request may
+   be in flight, or you are not sure (a log you cannot read): **wait until 5 minutes after her last reply**, then check again. When
+   in doubt, wait the 5 minutes.
 3. **Freeze the OLD pod.** On the OLD pod's terminal:
 
    ```bash
@@ -367,11 +399,22 @@ and times).
 2. **Read what it says, and take the branch:**
    * `DRY EXIT=0`: go on to step 3 without the extra flag.
    * **`REFUSED: The new pod has written to its local database since this tool installed it ...`** with row counts: this is what
-     testing (section 4) does. It is expected here, and only here. Add `--discard-new-pod-writes` in step 3. The dry run
-     prints what will be moved aside (never deleted).
-   * **`REFUSED: ... A CUTOVER ALREADY COMPLETED ...`**: **STOP.** Someone already switched her over, and the new pod may
-     have served her since. Re-running the cutover would move her new messages aside. Do not add the flag. Go to
-     section 7 (rollback) or `RUNBOOK_DB_LOCAL_V10.md` (recovery) and ask.
+     testing (section 4) does. It is expected here, and only here. **A refused dry run stops at the preconditions: it printed no
+     plan and did not run the 60 s quiet check of the old tree.** So run the dry run AGAIN with the flag (allowed before go-live
+     only), so that the plan and the quiet check really run before you apply:
+
+     ```bash
+     $T cutover --from $OLD --to $NEW --old-pod-stopped --discard-new-pod-writes
+     echo "DRY EXIT=$?"        # 0, and it prints what will be moved aside (never deleted)
+     ```
+
+     Then add `--discard-new-pod-writes` in step 3.
+   * **`REFUSED: a CUTOVER ALREADY COMPLETED into this directory ...`**: **STOP.** Someone already switched her over, and the new pod
+     may have served her since. No flag overrides this (not `--discard-new-pod-writes`, not `--force`, not `--db-mode`): the tool
+     will not move her new messages aside. Go to section 7 (rollback) or `RUNBOOK_DB_LOCAL_V10.md` (recovery) and ask.
+   * **`REFUSED: <to>/.migrate/seed.json exists but this tool cannot use it`**: the manifest was written by an older tool
+     (format 1) or is damaged, and it may record a completed cutover. There is deliberately no override. Seed into a fresh
+     target directory instead, or roll back (section 7).
    * Any other `REFUSED`: the failure table (section 10).
 3. **Apply it, detached, so a closed terminal cannot kill it**, and watch the log:
 
@@ -380,7 +423,8 @@ and times).
    sleep 3; tail -f $V/cutover.log       # Ctrl+C stops only the tail, never the cutover
    ```
 
-   (Type `--discard-new-pod-writes` only if step 2 told you to, and without the brackets.) The run ends with
+   (Type `--discard-new-pod-writes` only if step 2 told you to, and without the brackets. If it is on the line but no testing
+   happened, it changes nothing.) The run ends with
    `pod-migrate verify: all checks passed (0 failing)`. If the terminal or pod session drops, the run continues (SIGHUP is
    ignored); `tail -n 30 $V/cutover.log` when you are back. If it is killed (Ctrl+C, `kill`, SIGTERM) it finishes the one step
    that must not be torn (installing the database), stops, and leaves the manifest marked incomplete.
@@ -392,17 +436,24 @@ and times).
    ```
 
    `STATUS EXIT=0` means the last run was a cutover, it finished, and its own verify passed. **Anything else (INCOMPLETE, exit 1
-   or 2) means: start nothing.** Repeat the same `cutover ... --apply` command; it is safe to repeat (the failure table has
-   the causes). Then check the databases:
+   or 2) means: start nothing.** If the run was interrupted or failed BEFORE the database was installed, repeat the same
+   `cutover ... --apply` command; it is safe to repeat (the failure table has the causes). **If `status` says `A cutover completed
+   here ... but its verify did not pass`, the tool will refuse a second cutover into this directory (by design, after go-live).**
+   Nothing has served her (no service was started, rule 1), so the recovery is a deliberate hand step: move the manifest aside
+   with `mv $NEW/.migrate $NEW/.migrate-failed-$(date -u +%Y%m%dT%H%M%SZ)`, then `seed ... --force --apply` and a fresh
+   `cutover ... --apply` (the tool treats the tree as unknown data and moves unknown files aside, never deletes). Do this ONLY if
+   no service on this pod has been started since the cutover; if any was, use the rollback (section 7) and ask.
+   Then check the databases:
 
    ```bash
    $PY /opt/compactor/webuidb.py --status
-   S=$($PY /opt/compactor/webuidb.py --status | grep -E '^(local|snapshot) ' | sed -E 's/.*chats=/chats=/' | sort -u | wc -l)
-   [ "$S" = 1 ] && echo "STATUS ROWS MATCH" || echo "STATUS ROWS DIFFER: stop"
+   R=$($PY /opt/compactor/webuidb.py --status | grep -E '^(local|snapshot) ' | sed -E 's/.*quick_check=/quick_check=/')
+   [ "$(echo "$R" | grep -c .)" = 2 ] && [ "$(echo "$R" | sort -u | wc -l)" = 1 ] && [ "$(echo "$R" | grep -c '^quick_check=ok ')" = 2 ] \
+     && echo "STATUS ROWS MATCH" || echo "STATUS ROWS DIFFER: stop"
    ```
 
    **Expect** `local` and `snapshot` rows with the same `chats=`, `content=` and `newest_update=`, both `quick_check=ok`, and
-   `STATUS ROWS MATCH`.
+   `STATUS ROWS MATCH` (the one-liner keeps `quick_check` in the compared text, and needs exactly two rows, both `ok`).
 
    What the cutover does, for reference: a fresh, consistent copy of `webui.db` (its `file.path` rows rewritten to the new pod),
    then a delta of the store, uploads, `vector_db` and word-ban. For the delta it **hashes every non-SQLite file on both sides
@@ -424,7 +475,7 @@ and times).
    ```
 
    **Expect** the first (dry run) to list her record as `would-resume` (exit `3`, informational), the second to print
-   `closed -> state=abandoned` and exit `0`, and the third to print `DRY RUN - nothing was written, and nothing would
+   `closed -> state=abandoned` and exit `0`, and the third to print `DRY RUN — nothing was written, and nothing would
    resume.` and exit `0`. If the first already exits `0` with `nothing would resume`, there was nothing to close: fine. Exit
    `1` means a record needs a human (`needs-review`, a refused `--apply`): read the reason line and ask. **The template row
    `COMPACTOR_BACKFILL_MAX_ATTEMPTS=1` stays** as a second layer; it is not what protects her record (a record without an
@@ -443,11 +494,15 @@ and times).
 7. **Start the new pod's services and check**:
 
    ```bash
+   T0=$(date -u +'%Y-%m-%d %H:%M:%S')          # the pod's clock is UTC; used below to skip lines from before the cutover
    supervisorctl start compactor webuidb-sync openwebui backup
    sleep 60; supervisorctl status compactor webuidb-sync openwebui backup     # all RUNNING
    curl -s http://127.0.0.1:8080/health/full | $PY -c 'import json,sys; c=json.load(sys.stdin)["checks"]; print(json.dumps(c["snapshot"]))'
-   grep -E "published|REFUSING|refus|failed" $L/webuidb-sync-error.log | tail -3
+   awk -v t0="$T0" '($1" "$2) >= t0' $L/webuidb-sync-error.log | grep -E "published|REFUSING|refus|failed" | tail -3
    ```
+
+   (The `awk` keeps only log lines from after `T0`: the log also holds `published` lines from your testing before the cutover,
+   which would look like a healthy sync when it has not run yet.)
 
    Open `https://ai.revelationsaints.com` yourself: her newest message is there, her images show, a reply comes back. The first sync
    log line after her first message should be `published local -> snapshot`; any `REFUSING` line: **stop and do not continue**
@@ -461,7 +516,7 @@ and times).
 11. Watch her first day: `$L`, `zl status`, and one `backup.py --once` plus `--verify` (step 4.5). **From this moment the new pod
     follows `RUNBOOK_DB_LOCAL_V10.md`**, starting with the **final sync before any planned stop or restart** (section 4 there:
     stop `openwebui webuidb-sync backup`, `webuidb.py --sync-once --force`, and gate on the exit code AND the matching `--status`
-    rows). A RunPod stop without it loses up to about 2.5 minutes of chat. **Never re-run `seed` or `cutover` from here on.**
+    rows). A RunPod stop without it loses up to about 2.5 minutes of chat. **Never re-run `seed` or `cutover` into this directory from here on** (the tool refuses).
 
 ## 7. Rollback
 
@@ -551,13 +606,17 @@ found no manifest). **Whatever the code: start no service unless section 6.4 pas
 | `REFUSED: the source webui.db has a -journal` | 2 | the pod that owns it did not stop cleanly | `RUNBOOK_DB_JOURNAL.md` |
 | `REFUSED: --to exists, is not a previous seed and holds data` | 2 | something wrote real data under `/data/v10` | find out what; `--force` moves unknown files aside, never deletes |
 | `REFUSED: The new pod has written to its local database since this tool installed it` | 2 | testing changed the new pod's database (or she used it) | after testing only: `--discard-new-pod-writes` (6.2). If she has used the pod: do not; section 7 |
-| `REFUSED: ... A CUTOVER ALREADY COMPLETED` | 2 | a re-run after go-live | **STOP.** Do not add the flag. Section 7 or `RUNBOOK_DB_LOCAL_V10.md` |
+| `REFUSED: a CUTOVER ALREADY COMPLETED into this directory` | 2 | a seed/cutover after a completed cutover (no flag overrides it) | **STOP.** Section 7 (`--reverse`) or a fresh target directory; `RUNBOOK_DB_LOCAL_V10.md` |
+| `REFUSED: <to>/.migrate/seed.json exists but this tool cannot use it` | 2 | an older-format or damaged manifest (may hide a completed cutover) | no override: a fresh target directory, or section 7 |
 | `REFUSED: this pod's local live database does not exist` (reverse) | 2 | the local DB is gone (pod restarted onto a fresh disk) | the snapshot is then the only copy: `RUNBOOK_DB_LOCAL_V10.md` E2, or (only if you accept that) `--db-mode snapshot` |
 | `REFUSED: another run holds .../.migrate/lock` | 2 | a run is live or died | `pgrep -af pod-migrate`; if nothing runs, `rm $NEW/.migrate/lock`, then `status` |
 | `REFUSED: --old-pod-stopped is required` | 2 | you did not confirm the freeze | freeze the old pod (5.3), add the flag |
 | `FAILED: the source tree changed while the cutover ran` | 1 | the old pod was not frozen | stop it properly and re-run `cutover --apply` |
 | `INTERRUPTED by SIGTERM/SIGINT` | 1 | the run was killed; the manifest says incomplete | start nothing; re-run the same command |
 | `database copy attempt N/5 failed (...)` | (retries) | the old pod (or the volume) had the database busy, or the copy failed its integrity check | it retries; if it gives up (`failed integrity_check on all N attempts`, exit 1), retry when she is not chatting |
+| `database copy attempt N/5 (gentle): the source was written under the copy` | (retries) | someone is using the old pod: every write restarts the copy | it retries with fast steps, then a single copy; if it gives up (`the source database kept changing under the copy`, exit 1), have her close the app on EVERY device and run it again |
+| `not trying the single full copy: it would hold the old pod's read lock for about N s` | (retries) | the database is too big to copy in one lock hold under the old pod's 5 s busy_timeout | the app must be closed everywhere; then re-run the seed |
+| a killed run left `.migrate/lock` | | SIGKILL or a power cut during the run | `pgrep -af pod-migrate`; if nothing runs, `rm $NEW/.migrate/lock`, run `status`, re-run the same command (a kill mid-install is recognised: no false "new pod has written" refusal) |
 | `verify` FAIL on `file rows in the target` | 1 | a path prefix the tool did not know | `--path-map OLD=NEW` (repeatable), then re-run |
 | `verify` FAIL on a `tree '...'` digest | 1 | a file differs between the trees | re-run `cutover --apply` (it re-hashes and re-copies); if it persists, do not switch her over |
 | `status`: INCOMPLETE | 1 | a run did not finish, its verify failed, or a run holds the lock | start nothing; re-run the same cutover command |

@@ -44,8 +44,11 @@ SAFETY RAILS (v3.1.9.10 fix round B; each is a hostile-review finding)
     minutes behind. It refuses if the local DB is missing.
   * cutover does not trust size+mtime: every non-SQLite file is hashed on both sides,
     every SQLite file (chroma, vector_db) is re-copied through the backup API.
-  * A live seed copies in small steps (256 pages) with a pause between them, retries a
-    copy whose integrity_check fails (bounded), and reports the total time.
+  * A live seed copies in 4096-page steps with a short pause (total pause capped), retries
+    a copy whose integrity_check fails (bounded), and when the source is written under the
+    copy (every write restarts the backup API) escalates: fast steps with no pause, then
+    one single full copy (one short read lock; the old pod's busy_timeout is 5 s). It
+    reports the mode, the restarts and the longest read-lock hold.
   * SIGHUP is ignored; SIGINT/SIGTERM finish the step that must not be torn (the database
     install), stop, leave the manifest complete=false and exit 1.
 
@@ -94,7 +97,7 @@ TOOL = "pod-migrate"
 MANIFEST_DIR = ".migrate"
 MANIFEST_NAME = "seed.json"
 LOCK_NAME = "lock"
-MANIFEST_FORMAT = 1
+MANIFEST_FORMAT = 2   # 2 (fix round 2): pending_install + the go-live guard. An older manifest is REFUSED, never adopted
 
 HER_CONV_ID = "ea1494ea-e9d7-46fb-8b7c-3a50d685d00e"
 
@@ -299,41 +302,117 @@ class _BadCopy(Exception):
     """The copy finished but failed integrity_check: retried like a busy error."""
 
 
+class _Restarting(Exception):
+    """The source was written under the copy, again and again: every write restarts the
+    backup API from page 1. Not an error: the next attempt is a faster one."""
+
+
+FAST_PAGES = 4096          # 16 MB per step at 4 KiB pages: a step that takes tens of ms
+PAUSE_BUDGET_S = 20.0      # the most a gentle attempt may spend pausing between steps, in total
+SINGLE_MAX_S = 3.0         # the single full copy is only tried if its read lock is projected to be held <= this.
+                           # The old pod's busy_timeout is 5 s: a longer hold makes HER write fail with "database is locked"
+
+
+def _mode_for(attempt: int, retries: int) -> str:
+    """gentle (paced) first; then fast steps with no pause; the LAST attempt is a single
+    full copy (pages=-1: one read lock, no restart is possible, held for the whole copy)."""
+    if attempt == 1:
+        return "gentle"
+    if attempt == retries and retries >= 3:
+        return "single"
+    return "fast"
+
+
 def sqlite_backup_copy(src: Path, dst: Path, *, busy_s: float = 60.0, retries: int = 5,
-                       retry_wait_s: float = 5.0, step_pages: int = 2048, step_sleep_s: float = 0.0,
-                       max_s: float = 3600.0) -> dict:
+                       retry_wait_s: float = 5.0, step_pages: int = FAST_PAGES, step_sleep_s: float = 0.0,
+                       max_s: float = 3600.0, pause_budget_s: float = PAUSE_BUDGET_S,
+                       single_max_s: float = SINGLE_MAX_S) -> dict:
     """A consistent copy of a live or frozen SQLite database via the backup API.
     The source is opened read-only (`mode=ro`); the destination is a private file
     (callers pass a LOCAL temp path, never the network volume). Retried (bounded by
-    `retries`) on busy/locked/IO errors AND when the finished copy fails
-    integrity_check (a live source that moved under the copy). The pause between
-    steps (`step_sleep_s`) is taken in the progress callback: sqlite3's own `sleep`
-    argument only applies to BUSY/LOCKED results. Returns {"attempts", "seconds"}."""
+    `retries`) on busy/locked/IO errors, when the finished copy fails integrity_check,
+    and when the source keeps being written under the copy.
+
+    WHY THE LADDER (v3.1.9.10 fix round 2). Every write to the source restarts the backup
+    API from page 1. A paced copy of a 560 MB database takes ~2 minutes, and an idle open
+    OpenWebUI tab writes last_active_at once a minute, so a paced copy NEVER finished. So:
+      attempt 1  "gentle": `step_pages` per step (>= 4096 by default) with `step_sleep_s`
+                 between steps, the total pause bounded by `pause_budget_s`;
+      middle     "fast": 4096+ pages per step, NO pause. A step is tens of ms, so the copy
+                 is short and rarely meets a write; 2 restarts in one attempt end it;
+      last       "single": pages=-1, one step, one read lock for the whole copy (a few
+                 seconds for 560 MB): nothing can restart it. The old pod's busy_timeout is 5 s, so it
+                 is only tried when the throughput measured on the earlier attempts projects a hold of
+                 at most `single_max_s` (3 s); otherwise the copy fails and says to close the app.
+    The pause between steps is taken in the progress callback: sqlite3's own `sleep`
+    argument only applies to BUSY/LOCKED results.
+    Returns {"attempts", "seconds", "mode", "restarts", "max_step_s"} where max_step_s is the
+    longest time the source's read lock was held in one step (the callback gaps, an upper bound)."""
     last: BaseException | None = None
     t_all = time.monotonic()
+    restarts_total = 0
+    meas = {"bytes": 0.0, "secs": 0.0, "total_bytes": 0.0}   # throughput of the steps seen so far
     for attempt in range(1, retries + 1):
         dst.unlink(missing_ok=True)
         started = time.monotonic()
+        mode = _mode_for(attempt, retries)
+        pages = -1 if mode == "single" else (step_pages if mode == "gentle" else max(step_pages, FAST_PAGES))
+        sleep_s = step_sleep_s if mode == "gentle" else 0.0
+        restart_limit = 1 if mode == "gentle" else 2
+        st = {"restarts": 0, "last_remaining": None, "paused": 0.0, "max_step": 0.0, "mark": time.monotonic()}
         s = d = None
         try:
             s = sqlite3.connect(ro_uri(src), uri=True, timeout=busy_s)
             s.execute(f"PRAGMA busy_timeout={int(busy_s * 1000)}")
             d = sqlite3.connect(str(dst), timeout=busy_s)
+            psize = s.execute("PRAGMA page_size").fetchone()[0]
+            if mode == "single" and meas["secs"] > 0 and meas["bytes"] > 0:
+                projected = meas["total_bytes"] / (meas["bytes"] / meas["secs"])
+                if projected > single_max_s:
+                    note(f"not trying the single full copy: it would hold the old pod's read lock for about "
+                         f"{projected:.1f} s (limit {single_max_s:.0f} s; its busy_timeout is 5 s)")
+                    last = _Restarting()
+                    continue
 
-            def progress(status, remaining, total, _t0=started):
-                if time.monotonic() - _t0 > max_s:
+            def progress(status, remaining, total, _t0=started, _st=st, _sleep=sleep_s, _limit=restart_limit):
+                now = time.monotonic()
+                _st["max_step"] = max(_st["max_step"], now - _st["mark"])
+                meas["total_bytes"] = float(total) * psize
+                if _st["last_remaining"] is not None and remaining < _st["last_remaining"] and now - _st["mark"] > 0:
+                    meas["bytes"] += (_st["last_remaining"] - remaining) * psize
+                    meas["secs"] += now - _st["mark"]
+                if now - _t0 > max_s:
                     raise Failed("the database copy took too long")
-                if step_sleep_s > 0:
-                    time.sleep(step_sleep_s)
+                if _st["last_remaining"] is not None and remaining >= _st["last_remaining"]:
+                    _st["restarts"] += 1     # the source was written: sqlite started over from page 1
+                    if _st["restarts"] >= _limit:
+                        raise _Restarting()
+                _st["last_remaining"] = remaining
+                if _sleep > 0 and _st["paused"] < pause_budget_s:
+                    dt = min(_sleep, pause_budget_s - _st["paused"])
+                    time.sleep(dt)
+                    _st["paused"] += dt
+                _st["mark"] = time.monotonic()
 
-            s.backup(d, pages=step_pages, progress=progress, sleep=0.05)
+            if pages == -1:
+                s.backup(d)
+                st["max_step"] = time.monotonic() - started
+            else:
+                s.backup(d, pages=pages, progress=progress, sleep=0.05)
             d.commit()
             ok = [r[0] for r in d.execute("PRAGMA integrity_check")]
             if ok != ["ok"]:
                 raise _BadCopy()
-            return {"attempts": attempt, "seconds": time.monotonic() - t_all}
+            return {"attempts": attempt, "seconds": time.monotonic() - t_all, "mode": mode,
+                    "restarts": restarts_total + st["restarts"], "max_step_s": st["max_step"]}
         except Failed:
             raise
+        except _Restarting as e:
+            last = e
+            restarts_total += st["restarts"]
+            note(f"database copy attempt {attempt}/{retries} ({mode}): the source was written under the copy "
+                 f"{st['restarts']}x (someone is using the old pod); "
+                 f"{'retrying with ' + _mode_for(attempt + 1, retries) + ' steps' if attempt < retries else 'giving up'}")
         except (sqlite3.Error, _BadCopy) as e:
             last = e
             what = "the copy failed integrity_check" if isinstance(e, _BadCopy) else type(e).__name__
@@ -352,6 +431,9 @@ def sqlite_backup_copy(src: Path, dst: Path, *, busy_s: float = 60.0, retries: i
     if isinstance(last, _BadCopy):
         raise Failed(f"the copied database failed integrity_check on all {retries} attempts "
                      f"({time.monotonic() - t_all:.0f} s): is her chat active on the source? retry when she is idle")
+    if isinstance(last, _Restarting):
+        raise Failed(f"the source database kept changing under the copy on all {retries} attempts "
+                     f"({time.monotonic() - t_all:.0f} s): she is using the old pod. Have her close the app on every device")
     raise Failed(f"could not copy the database ({type(last).__name__ if last else 'error'})")
 
 
@@ -574,6 +656,40 @@ def load_manifest(to: Path) -> dict | None:
     except (OSError, ValueError):
         return None
     return m if isinstance(m, dict) and m.get("format") == MANIFEST_FORMAT else None
+
+
+def unusable_manifest(to: Path) -> str | None:
+    """A manifest file exists but this tool cannot read it as its own format (an older
+    tool's, or damaged). Returns a description, else None. Such a manifest could hide a
+    completed cutover, so seed/cutover REFUSE on it whatever flags are given (--force
+    included): the safe ways forward are a fresh --to directory (re-seed: cheap, and
+    nothing is lost) or --reverse. There is deliberately NO override flag: an override is
+    exactly what would let a tired operator overwrite her live database."""
+    p = manifest_path(to)
+    if not p.is_file():
+        return None
+    try:
+        m = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return "it is unreadable"
+    if not isinstance(m, dict):
+        return "it is not a manifest"
+    if m.get("format") != MANIFEST_FORMAT:
+        return f"it is format {m.get('format')!r}, this tool writes format {MANIFEST_FORMAT}"
+    return None
+
+
+def cutover_completed(m: dict | None) -> str | None:
+    """The UTC time of a completed cutover recorded in the manifest, else None. After that
+    the new pod may have served her: the target directory is live."""
+    if not m:
+        return None
+    if m.get("cutover_utc"):
+        return str(m["cutover_utc"])
+    for r in m.get("runs") or []:
+        if isinstance(r, dict) and r.get("cmd") == "cutover":
+            return str(r.get("utc") or "?")
+    return None
 
 
 def save_manifest(to: Path, m: dict) -> None:
@@ -945,9 +1061,9 @@ def add_apply_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("--retries", type=int, default=5)
     p.add_argument("--retry-wait", type=float, default=5.0)
     p.add_argument("--step-pages", type=int, default=None,
-                   help="SQLite backup-API pages per step (default: 256 for a seed on a live source, 4096 for a cutover)")
+                   help="SQLite backup-API pages per step (default 4096)")
     p.add_argument("--step-sleep", type=float, default=None,
-                   help="seconds to pause between steps (default: 0.2 for a seed, 0 for a cutover)")
+                   help="seconds to pause between steps (default: 0.1 for a seed, 0 for a cutover; the total pause is capped at 20 s)")
     p.add_argument("--discard-new-pod-writes", action="store_true",
                    help="allow a seed/cutover to MOVE ASIDE (never delete) a local database that no longer matches the "
                         "one this tool installed, because the new pod has written to it. Prints what is moved aside")
@@ -1010,6 +1126,27 @@ def path_maps(args, src: Path, dst: Path) -> list[tuple[str, str]]:
     return maps
 
 
+def volume_age_s(path: Path) -> float | None:
+    """Seconds since `path` was last written, measured against the VOLUME's clock, not this
+    host's: a file is created next to the source's directory and its mtime compared with the
+    path's. (The old pod's clock or this pod's may be minutes off; a wrong `age` either hides
+    that she is active or cries wolf.) Falls back to this host's clock if the volume is not writable."""
+    try:
+        mt = path.stat().st_mtime
+    except OSError:
+        return None
+    probe = path.parent.parent / f".pod-migrate-clock-{os.getpid()}"
+    try:
+        fd = os.open(str(probe), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        try:
+            return os.stat(probe).st_mtime - mt
+        finally:
+            probe.unlink(missing_ok=True)
+    except OSError:
+        return time.time() - mt
+
+
 def free_bytes(path: Path) -> int:
     p = path
     while not p.exists() and p != p.parent:
@@ -1018,11 +1155,12 @@ def free_bytes(path: Path) -> int:
 
 
 def backup_kwargs(args, kind: str) -> dict:
-    """Backup-API pacing. A seed reads a LIVE database: small steps with a pause, so it
-    never holds the source's lock for long. A cutover reads a frozen one: fast."""
+    """Backup-API pacing. A seed reads a LIVE database: 4096-page steps (tens of ms each) with a
+    short pause, the total pause bounded, escalating to fast and then single-copy attempts if
+    the source keeps being written (see sqlite_backup_copy). A cutover reads a frozen one: fast."""
     live = kind == "seed"
-    pages = args.step_pages if args.step_pages else (256 if live else 4096)
-    sleep = args.step_sleep if args.step_sleep is not None else (0.2 if live else 0.0)
+    pages = args.step_pages if args.step_pages else FAST_PAGES
+    sleep = args.step_sleep if args.step_sleep is not None else (0.1 if live else 0.0)
     return {"busy_s": args.busy_timeout, "retries": args.retries, "retry_wait_s": args.retry_wait,
             "step_pages": pages, "step_sleep_s": sleep}
 
@@ -1031,7 +1169,11 @@ def prepare_db_copy(args, srcdb: Path, tmp_dir: Path, maps, kind: str = "cutover
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp = tmp_dir / "webui.db.migrate-copy"
     st = sqlite_backup_copy(srcdb, tmp, **backup_kwargs(args, kind))
-    note(f"database copy: {st['attempts']} attempt(s), {st['seconds']:.1f} s in total")
+    note(f"database copy: {st['attempts']} attempt(s), {st['seconds']:.1f} s in total, mode {st['mode']}, "
+         f"{st['restarts']} restart(s), longest source read-lock hold {st['max_step_s']:.2f} s")
+    if st["max_step_s"] > 3.0:
+        note("WARNING: the source's read lock was held for more than 3 s in one step; the old pod's busy_timeout is 5 s. "
+             "Have her close the app on every device before a seed")
     rep = rewrite_file_paths(tmp, maps)
     return tmp, rep
 
@@ -1059,23 +1201,25 @@ def new_pod_writes_problem(manifest: dict | None, local_db: Path | None, kind: s
         return []
     rec = manifest.get("db") or {}
     want = rec.get("local_sha256")
-    if not want or rec.get("local_path") not in (None, str(local_db)):
+    pend = manifest.get("pending_install") or {}
+    # A run killed (SIGKILL, power) between placing the new local DB and committing the manifest
+    # leaves the manifest at the PREVIOUS hash. The install is recorded as pending BEFORE it starts,
+    # so either hash is this tool's own file, not a write by the new pod.
+    wants = {h for h in (want, pend.get("sha256") if pend.get("local_path") in (None, str(local_db)) else None) if h}
+    if not wants or (want and rec.get("local_path") not in (None, str(local_db))):
         return []
-    if sha256_file(local_db) == want:
+    if sha256_file(local_db) in wants:
         return []
     now, was = db_counts(local_db), rec.get("counts") or {}
     delta = ", ".join(f"{k} {was.get(k, '?')} -> {(now or {}).get(k, '?')}" for k in COUNT_TABLES)
-    done = bool(manifest.get("cutover_utc"))
-    where = ("A CUTOVER ALREADY COMPLETED (" + manifest["cutover_utc"] + "): the new pod may have served her since. "
-             if done else "The new pod has written to its local database since this tool installed it "
-                          "(a test login is enough). ")
+    where = "The new pod has written to its local database since this tool installed it (a test login is enough). "
     if discard:
         note(f"--discard-new-pod-writes: {where}The local database ({local_db.stat().st_size / 1e6:.1f} MB; rows: {delta}) "
              f"will be MOVED ASIDE to a .migrate-aside-<stamp> directory beside it (never deleted) and replaced.")
         return []
     return [where + f"Rows now vs when installed: {delta}. Running {kind} would move that database aside and replace it "
             "with the old pod's. If you only tested on the new pod, add --discard-new-pod-writes. If she has been using "
-            "the new pod, do NOT: publish and roll back instead (RUNBOOK_POD_MIGRATION.md section 8)"]
+            "the new pod, do NOT: publish and roll back instead (RUNBOOK_POD_MIGRATION.md section 7)"]
 
 
 # --------------------------------------------------------------------------------
@@ -1115,6 +1259,19 @@ def run_sync(args, *, kind: str) -> int:
             problems.append(f"--to is not a seed (state: {state}); run `seed` first (--force overrides)")
     manifest = load_manifest(dst) if dst.exists() else None
     if not reverse:
+        # GO-LIVE GUARD (fix round 2). Neither --force, --discard-new-pod-writes nor --db-mode
+        # snapshot may reach past this: once a cutover completed here the new pod may have served her.
+        bad = unusable_manifest(dst)
+        if bad:
+            problems.append(f"<to>/.migrate/seed.json exists but this tool cannot use it ({bad}). It may record a completed "
+                            "cutover, so no flag overrides this. Seed into a NEW --to directory instead (re-seeding is cheap "
+                            "and changes nothing on the old pod), or use --reverse to roll back (RUNBOOK_POD_MIGRATION.md section 7)")
+        live = cutover_completed(manifest)
+        if live:
+            problems.append(f"a CUTOVER ALREADY COMPLETED into this directory ({live}): the new pod may have served her since. "
+                            f"{kind} here is refused, and NO flag (--force, --discard-new-pod-writes, --db-mode) overrides that. "
+                            "The only ways forward are --reverse (rollback, RUNBOOK_POD_MIGRATION.md section 7) or a fresh "
+                            "--to directory")
         problems += new_pod_writes_problem(manifest, local_db, kind, args.discard_new_pod_writes)
     if kind == "cutover" and not problems:
         problems += check_quiescent(other, args.quiet_seconds, args.poll_interval) if (other / "webui.db").is_file() else []
@@ -1146,8 +1303,10 @@ def run_sync(args, *, kind: str) -> int:
          f"scratch free {have / 1e6:.0f} MB (need about {need / 1e6:.0f} MB)")
     if reverse and read_db != srcdb:
         try:
-            same = sha256_file(read_db) == sha256_file(srcdb) if srcdb.is_file() else False
-        except OSError:
+            # LOGICAL hash: the local file and the snapshot are different files with different
+            # page layouts and change counters even when they hold the same rows.
+            same = sqlite_logical_hash(read_db) == sqlite_logical_hash(srcdb) if srcdb.is_file() else False
+        except (OSError, sqlite3.Error):
             same = False
         note("the local live DB " + ("equals" if same else "DIFFERS from") + " the snapshot on the volume; "
              "the LOCAL one is what is copied back" + ("" if same else " (the snapshot is behind: expected if the last "
@@ -1160,11 +1319,7 @@ def run_sync(args, *, kind: str) -> int:
     note(f"database placement: {'local ' + str(install_local) + ' + snapshot' if install_local else 'snapshot only'}; "
          f"file.path rewrite: {len(maps)} prefix map(s)")
     if kind == "seed":
-        age = None
-        try:
-            age = time.time() - srcdb.stat().st_mtime
-        except OSError:
-            pass
+        age = volume_age_s(srcdb)
         note("the seed reads the OLD pod's LIVE database: run it only while she is idle"
              + (f" (its webui.db was last written {age:.0f} s ago)" if age is not None else ""))
         if age is not None and age < 300:
@@ -1243,6 +1398,12 @@ def run_sync(args, *, kind: str) -> int:
                 raise Failed(f"{done['errors']} file(s) could not be copied; the database was NOT installed")
 
             step("installing the database")
+            # Recorded BEFORE the install so a SIGKILL between the local placement and the
+            # manifest commit leaves a manifest that already knows the hash it is about to install.
+            manifest["pending_install"] = {"sha256": sha256_file(tmp_db),
+                                           "local_path": str(install_local) if install_local else None,
+                                           "utc": utc_iso()}
+            save_manifest(dst, manifest)
             note("installing the database ...")
             inst = install_db(tmp_db, dst / "webui.db", install_local,
                               (install_local.parent / f".migrate-aside-{stamp}") if install_local else mdir / f"aside-{stamp}",
@@ -1257,6 +1418,7 @@ def run_sync(args, *, kind: str) -> int:
                                  "The target now holds a partial mix; stop the old pod and re-run cutover")
             with critical():
                 manifest["complete"] = True
+                manifest.pop("pending_install", None)
                 manifest["step"] = "installed"
                 manifest["db"] = {"sha256": inst["sha256"], "src_size": db_size, "rewritten": rep["rewritten"],
                                   "local_path": str(install_local) if install_local else None,
@@ -1318,6 +1480,12 @@ def run_status(args) -> int:
     holds the lock), 2 when there is no manifest."""
     dst = norm(args.dst)
     m = load_manifest(dst)
+    bad = unusable_manifest(dst)
+    if m is None and bad:
+        say(f"{TOOL} status: INCOMPLETE")
+        say(f"  the manifest under {dst}/{MANIFEST_DIR} cannot be used: {bad}. Do NOT start services from it; "
+            "seed into a NEW --to directory (or --reverse to roll back).")
+        return EXIT_FAIL
     if m is None:
         say(f"{TOOL} status: NO MANIFEST under {dst}/{MANIFEST_DIR} (nothing was seeded here). Do NOT start services.")
         return EXIT_REFUSED
@@ -1346,7 +1514,12 @@ def run_status(args) -> int:
         say(f"  installed database: sha256={str(db.get('sha256'))[:12]}... rows={db.get('counts')} at {db.get('installed_utc')}")
     for r in reasons:
         say(f"  NOT COMPLETE: {r}")
-    if not ok:
+    live = cutover_completed(m)
+    if not ok and live:
+        say(f"  A cutover completed here ({live}) but its verify did not pass. Do NOT re-run seed/cutover into this "
+            "directory (they refuse after a completed cutover). Do NOT start services: fix the cause, then seed a NEW "
+            "--to directory and cut over again, or --reverse to roll back.")
+    elif not ok:
         say("  Do NOT start services. Re-run the same command; it is safe to repeat.")
     return EXIT_OK if ok else EXIT_FAIL
 

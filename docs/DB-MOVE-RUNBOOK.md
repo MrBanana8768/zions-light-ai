@@ -474,10 +474,20 @@ tr '\0' '\n' < /proc/1/environ | grep -E '^(WEBUI_DB_LOCAL|DATA_DIR|WEBUI_SNAPSH
 - **`WEBUI_DB_LOCAL=true` and `WEBUI_SNAPSHOT_DB=/data/openwebui/webui.db`** (this document's own layout): the file is only the snapshot, so:
 
 ```bash
-SNAP=/data/openwebui/webui.db
-mkdir -p /data/forensics && mv "$SNAP" /data/forensics/webui.db.bad-$(date -u +%Y%m%dT%H%M%SZ)
-for s in -journal -wal -shm; do [ -e "$SNAP$s" ] && mv "$SNAP$s" /data/forensics/; done
+SNAP=/data/openwebui/webui.db; E=$(tr '\0' '\n' < /proc/1/environ); LIVE=$(echo "$E" | sed -n 's/^WEBUI_LOCAL_DB=//p'); LIVE=${LIVE:-/var/lib/openwebui/webui.db}
+if echo "$E" | grep -qx 'WEBUI_DB_LOCAL=true' \
+   && echo "$E" | grep -qx "WEBUI_SNAPSHOT_DB=$SNAP" \
+   && ! echo "$E" | grep -q '^DATA_DIR=/data/v10' \
+   && [ "$(readlink -f "$SNAP")" != "$(readlink -f "$LIVE")" ]; then
+  mkdir -p /data/forensics && mv "$SNAP" /data/forensics/webui.db.bad-$(date -u +%Y%m%dT%H%M%SZ) \
+  && for s in -journal -wal -shm; do [ -e "$SNAP$s" ] && mv "$SNAP$s" /data/forensics/; done; echo MOVED
+else
+  echo "REFUSED: this is not the WEBUI_DB_LOCAL=true layout with $SNAP as the snapshot, or it is the live file. Nothing was moved."
+fi
 ```
+
+`MOVED` (and no `REFUSED`) means it worked. The `if` is the guard: it moves nothing unless local mode is on, the snapshot
+path is exactly this file, this is not the `/data/v10` pod, and this file is not the pod's live database. Nothing is deleted.
 
 **Never** put any `WEBUI_DB_ALLOW_…` row on the template. They are for one command, in one shell.
 

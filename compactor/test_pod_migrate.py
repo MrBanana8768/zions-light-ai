@@ -348,9 +348,8 @@ def test_source_change_then_cutover_then_verify():
     m = json.loads((w["new"] / ".migrate" / "seed.json").read_text())
     assert_eq([r["cmd"] for r in m["runs"]], ["seed", "cutover"], "the manifest records both runs")
     rc, out = run(w, "seed", "--apply", "--json")
-    assert_eq(rc, 0, "a re-seed after a cutover is a no-op refresh")
-    plan = json.loads(out.strip().splitlines()[-1])["plan"]
-    assert_eq((plan["new"], plan["changed"], plan["deleted_in_source"]), (0, 0, 0), "nothing left to copy (stat-trusted)")
+    assert_eq(rc, 2, "a re-seed after a cutover is REFUSED (the target is live; fix round 2)")
+    assert_true("ALREADY COMPLETED" in out, "and says a cutover already completed")
 
 
 def test_local_db_replacement():
@@ -705,33 +704,256 @@ def test_reverse_does_not_copy_the_wordban_dir_onto_itself():
             os.environ["ZL_HOME"] = old_env
 
 
-def test_new_pod_writes_block_a_second_cutover_or_seed():
-    """R2 H3: after go-live, re-running cutover/seed must not silently roll the new pod back."""
+def test_new_pod_writes_block_a_second_seed_before_go_live():
+    """R2 H3: before go-live, re-running seed must not silently roll back a new pod that was only tested."""
     w = build_world("recut")
     assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
-    assert_eq(run(w, "cutover", "--old-pod-stopped", "--apply")[0], 0, "cutover")
     m = json.loads((w["new"] / ".migrate" / "seed.json").read_text())
+    assert_eq(m["format"], 2, "the manifest is format 2")
     assert_eq(m["db"]["local_path"], str(w["local"] / "webui.db"), "the manifest records the local path it installed")
     assert_eq(m["db"]["local_sha256"], sha(w["local"] / "webui.db"), "and the installed database's sha256")
-    assert_eq(run(w, "cutover", "--old-pod-stopped", "--apply")[0], 0, "a re-cutover with NO writes on the new pod is fine")
+    assert_true("pending_install" not in m, "and no pending install remains once the install is committed")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "a re-seed with NO writes on the new pod is fine")
     local = w["local"] / "webui.db"
-    add_messages(local, HER, 20, 5)            # a day of her messages on the new pod
+    add_messages(local, HER, 20, 5)            # a test login on the new pod
     before = (sha(local), tree_fingerprint(w["new"]))
     for cmd, extra in (("cutover", ("--old-pod-stopped",)), ("seed", ())):
         rc, out = run(w, cmd, "--apply", *extra)
-        assert_eq(rc, 2, f"a second {cmd} after the new pod wrote is REFUSED")
-        assert_true("ALREADY COMPLETED" in out and "chat_message" in out, "with the row counts and the reason")
+        assert_eq(rc, 2, f"a {cmd} after the new pod wrote is REFUSED")
+        assert_true("has written" in out and "chat_message" in out and "section 7" in out, "with the row counts and the rollback section (7)")
         rc, out = run(w, cmd, *extra)
         assert_eq(rc, 2, f"even the {cmd} dry run says so")
     assert_eq((sha(local), tree_fingerprint(w["new"])), before, "nothing changed")
-    assert_eq(scalar(local, "select count(*) from chat_message where chat_id=?", HER), 25, "her 25 messages are still the live ones")
     rc, out = run(w, "cutover", "--old-pod-stopped", "--apply", "--discard-new-pod-writes")
-    assert_eq(rc, 0, "--discard-new-pod-writes lets it through")
+    assert_eq(rc, 0, "--discard-new-pod-writes lets a PRE-go-live cutover through")
     assert_true("MOVED ASIDE" in out and "chat_message 23 -> 28" in out, "after printing what it moves aside")
     aside = [d for d in w["local"].glob(".migrate-aside-*") if (d / "webui.db").is_file()
              and scalar(d / "webui.db", "select count(*) from chat_message where chat_id=?", HER) == 25]
     assert_eq(len(aside), 1, "the written database (all 25 of her messages) was moved aside, not deleted")
     assert_eq(scalar(local, "select count(*) from chat_message where chat_id=?", HER), 20, "the live one is the old pod's again")
+
+
+def _live_target(tag: str):
+    """A world with a completed cutover, and the new pod having taken 5 more of her messages."""
+    w = build_world(tag)
+    assert_eq(run(w, "seed", "--apply")[0], 0, f"{tag}: seed")
+    assert_eq(run(w, "cutover", "--old-pod-stopped", "--apply")[0], 0, f"{tag}: cutover")
+    return w
+
+
+def test_after_go_live_no_flag_reaches_past_the_guard():
+    """Fix round 2 (3): a completed cutover makes seed/cutover refuse, whatever the flags."""
+    w = _live_target("golive")
+    local = w["local"] / "webui.db"
+    add_messages(local, HER, 20, 5)
+    before = (sha(local), sha(w["new"] / "webui.db"), tree_fingerprint(w["new"]), tree_fingerprint(w["old"]))
+    combos = [("no flag", (), True), ("--discard-new-pod-writes", ("--discard-new-pod-writes",), True),
+              ("--force", ("--force",), True), ("--force --discard", ("--force", "--discard-new-pod-writes"), True),
+              ("--db-mode snapshot", (), False), ("--db-mode snapshot --discard --force", ("--discard-new-pod-writes", "--force"), False)]
+    for label, extra, local_db in combos:
+        for cmd, more in (("cutover", ("--old-pod-stopped",)), ("seed", ())):
+            for apply in (("--apply",), ()):
+                rc, out = run(w, cmd, *apply, *more, *extra, local_db=local_db)
+                assert_true(rc == 2 and "ALREADY COMPLETED" in out, f"{cmd}{' --apply' if apply else ''} with {label} is REFUSED after go-live")
+    assert_eq((sha(local), sha(w["new"] / "webui.db"), tree_fingerprint(w["new"]), tree_fingerprint(w["old"])), before,
+              "and nothing changed anywhere (her 25 messages are the live ones)")
+    # with NO writes on the new pod it is refused too: the target is live either way
+    w2 = _live_target("golive2")
+    rc, out = run(w2, "cutover", "--old-pod-stopped", "--apply")
+    assert_eq(rc, 2, "a re-cutover into a live target is refused even when the new pod has not written")
+    # the way forward: --reverse works, and so does a fresh --to
+    rc, out = reverse(w, "--apply")
+    assert_eq(rc, 0, "--reverse (the rollback) is still allowed after go-live")
+    assert_eq(scalar(w["old"] / "webui.db", "select count(*) from chat_message where chat_id=?", HER), 25, "and brings her 25 messages back")
+    w3 = build_world("golive3")
+    shutil.rmtree(w3["new"], ignore_errors=True)
+    assert_eq(run(w3, "seed", "--apply")[0], 0, "a fresh --to directory seeds fine")
+
+
+def test_manual_recovery_after_a_cutover_whose_verify_failed():
+    """Runbook 6.4: the hand step (move .migrate aside, seed --force, cutover) works, and the tool alone never lets it happen."""
+    w = _live_target("recov")
+    mp = w["new"] / ".migrate" / "seed.json"
+    m = json.loads(mp.read_text())
+    m["verified"], m["step"] = False, "verify FAILED"
+    mp.write_text(json.dumps(m))
+    rc, out = status(w, "--require", "cutover")
+    assert_true(rc == 1 and "A cutover completed here" in out and "NEW" in out, "status: INCOMPLETE, and it says not to re-run into this directory")
+    assert_eq(run(w, "cutover", "--old-pod-stopped", "--apply")[0], 2, "the tool refuses the re-run")
+    shutil.move(str(w["new"] / ".migrate"), str(w["new"] / ".migrate-failed-x"))
+    assert_eq(run(w, "seed", "--apply", "--force")[0], 0, "after the hand step, seed --force works")
+    assert_eq(run(w, "cutover", "--old-pod-stopped", "--apply")[0], 0, "and so does a fresh cutover")
+    assert_eq(run_status_rc(w, "--require", "cutover"), 0, "status: COMPLETE")
+
+
+def test_an_older_or_damaged_manifest_is_refused_whatever_the_flags():
+    """Fix round 2 (3): MANIFEST_FORMAT 2. A format-1 (or unreadable) manifest may hide a completed cutover."""
+    for label, mutate in (("format 1", lambda m: {**m, "format": 1}), ("no format", lambda m: {k: v for k, v in m.items() if k != "format"}),
+                          ("unreadable", None)):
+        w = _live_target("oldman-" + label.replace(" ", ""))
+        mp = w["new"] / ".migrate" / "seed.json"
+        m = json.loads(mp.read_text())
+        mp.write_text(json.dumps(mutate(m)) if mutate else "{not json")
+        before = (sha(w["local"] / "webui.db"), tree_fingerprint(w["new"]))
+        for extra, local_db in (((), True), (("--force",), True), (("--discard-new-pod-writes", "--force"), True), ((), False)):
+            for cmd, more in (("cutover", ("--old-pod-stopped",)), ("seed", ())):
+                rc, out = run(w, cmd, "--apply", *more, *extra, local_db=local_db)
+                assert_true(rc == 2 and "cannot use it" in out, f"{label}: {cmd} {' '.join(extra) or '(no flag)'}{' snapshot' if not local_db else ''} is refused")
+        assert_eq((sha(w["local"] / "webui.db"), tree_fingerprint(w["new"])), before, f"{label}: nothing changed")
+        rc, out = status(w)
+        assert_true(rc == 1 and "cannot be used" in out, f"{label}: status says INCOMPLETE and why (exit 1)")
+    w = build_world("oldman-fresh")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "a fresh --to directory works")
+
+
+def test_a_kill_during_the_db_install_does_not_cause_a_false_refusal():
+    """Fix round 2 (2): a REAL SIGKILL between placing the new local DB and the manifest commit."""
+    w = build_world("kill9")
+    assert_eq(run(w, "seed", "--apply")[0], 0, "seed")
+    add_messages(w["old"] / "webui.db", HER, 20, 4)      # so the cutover's database differs from the seed's
+    local = w["local"] / "webui.db"
+    seed_sha = sha(local)
+    child = (
+        "import importlib.util, os, signal, sys, json\n"
+        "spec = importlib.util.spec_from_file_location('pod_migrate', sys.argv[1]); pm = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['pod_migrate'] = pm; spec.loader.exec_module(pm); pm.GUARDED_PORTS = ()\n"
+        "real = os.replace\n"
+        "def replace(a, b, *x, **k):\n"
+        "    r = real(a, b, *x, **k)\n"
+        "    if str(b) == sys.argv[2]: os.kill(os.getpid(), signal.SIGKILL)\n"
+        "    return r\n"
+        "pm.os.replace = replace\n"
+        "sys.exit(pm.main(json.loads(sys.argv[3])))\n")
+    argv = ["cutover", "--from", str(w["old"]), "--to", str(w["new"]), "--local-data-dir", str(w["new"]),
+            "--zl-from", str(w["zl"]), "--zl-to", str(w["root"] / "v10" / "zl-ops"), "--tmp-dir", str(w["local"] / "scratch"),
+            "--retries", "2", "--retry-wait", "0.1", "--db-mode", "local", "--local-db", str(local),
+            "--supervisorctl", str(w["sup"]), "--supervisor-conf", "x.conf", "--quiet-seconds", "0", "--old-pod-stopped", "--apply"]
+    r = subprocess.run([sys.executable, "-c", child, str(_SCRIPT), str(local), json.dumps(argv)], capture_output=True, text=True)
+    assert_eq(r.returncode, -9, "the child really died of SIGKILL")
+    assert_true(sha(local) != seed_sha, "the new local database had been placed (the manifest still records the seed's hash)")
+    m = json.loads((w["new"] / ".migrate" / "seed.json").read_text())
+    assert_eq(m["db"]["local_sha256"], seed_sha, "the manifest's committed hash is the OLD one")
+    assert_eq(m["pending_install"]["sha256"], sha(local), "but the pending install hash is the one on disk")
+    assert_true((w["new"] / ".migrate" / "lock").exists(), "the killed run left its lock (the runbook says to remove it by hand)")
+    (w["new"] / ".migrate" / "lock").unlink()
+    assert_eq(run_status_rc(w), 1, "status: INCOMPLETE")
+    rc, out = run(w, "cutover", "--old-pod-stopped", "--apply")
+    assert_eq(rc, 0, "the re-run SUCCEEDS (before this fix: REFUSED 'the new pod has written')")
+    assert_true("has written" not in out, "with no false refusal")
+    assert_eq(run_status_rc(w, "--require", "cutover"), 0, "status: COMPLETE")
+    assert_eq(sha(local), sha(w["new"] / "webui.db"), "the local DB equals the snapshot")
+    # and a REAL write by the new pod after the kill is still caught
+    w2 = build_world("second")
+    assert_eq(run(w2, "seed", "--apply")[0], 0, "seed (second world)")
+    add_messages(w2["old"] / "webui.db", HER, 20, 4)
+    local2 = w2["local"] / "webui.db"
+    argv2 = [a.replace(str(w["old"]), str(w2["old"])).replace(str(w["new"]), str(w2["new"])).replace(str(w["root"]), str(w2["root"]))
+             .replace(str(local), str(local2)) for a in argv]
+    r = subprocess.run([sys.executable, "-c", child, str(_SCRIPT), str(local2), json.dumps(argv2)], capture_output=True, text=True)
+    assert_eq(r.returncode, -9, "second child killed too")
+    (w2["new"] / ".migrate" / "lock").unlink()
+    add_messages(local2, HER, 30, 3)
+    rc, out = run(w2, "cutover", "--old-pod-stopped", "--apply")
+    assert_eq(rc, 2, "a write by the new pod after the kill is still refused (pending is not a blanket pass)")
+
+
+def test_live_source_written_under_the_copy_still_finishes():
+    """Fix round 2 (1): every write restarts the backup API. Gentle -> fast -> single ladder."""
+    real_connect = sqlite3.connect
+    state = {"writes": 0, "limit": 10 ** 9}
+
+    class WriteOnStep(sqlite3.Connection):
+        def backup(self, target, *, pages=-1, progress=None, name="main", sleep=0.250):
+            def wrapped(status, remaining, total):
+                state["calls"] = state.get("calls", 0) + 1
+                if state["writes"] < state["limit"] and state["calls"] % state.get("every", 1) == 0:
+                    state["writes"] += 1
+                    c = real_connect(state["src"], timeout=5)
+                    c.execute("UPDATE chat SET updated_at=updated_at+1 WHERE id=?", (HER,))
+                    c.commit()
+                    c.close()
+                if progress:
+                    progress(status, remaining, total)
+            return super().backup(target, pages=pages, progress=wrapped if progress else None, name=name, sleep=sleep)
+
+    def ro_only(*a, **k):
+        # only the SOURCE connection (mode=ro URI) gets the writing subclass
+        if a and isinstance(a[0], str) and a[0].startswith("file:") and "mode=ro" in a[0]:
+            return real_connect(*a, factory=WriteOnStep, **k)
+        return real_connect(*a, **k)
+
+    w = build_world("ladder")
+    src = w["old"] / "webui.db"
+    state["src"] = str(src)
+    dst = w["local"] / "copy.db"
+    real_fast = pm.FAST_PAGES
+    slept = []
+    real_sleep = pm.time.sleep
+    pm.time.sleep = lambda x: slept.append(x) or real_sleep(0)
+    sqlite3.connect = ro_only
+    try:
+        # (a) the source is written at every pause of the gentle attempt; the fast attempt has no pause and no write
+        state["writes"], state["limit"] = 0, 1
+        st = pm.sqlite_backup_copy(src, dst, retries=5, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.01)
+        assert_eq((st["mode"], st["attempts"]), ("fast", 2), "one write under a paced copy: the second attempt (fast, no pause) finishes")
+        assert_eq(scalar(dst, "pragma integrity_check"), "ok", "and the copy is consistent")
+        # (b) written under EVERY step, gentle and fast (fast steps forced to 1 page): only the single copy can finish
+        pm.FAST_PAGES = 1
+        state["writes"], state["limit"] = 0, 10 ** 9
+        st = pm.sqlite_backup_copy(src, dst, retries=3, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.01)
+        assert_eq((st["mode"], st["attempts"]), ("single", 3), "written under every step: gentle and fast both restart, the last resort (one full copy) finishes")
+        assert_true(st["restarts"] >= 2, f"and the restarts were counted ({st['restarts']})")
+        assert_eq(scalar(dst, "pragma integrity_check"), "ok", "the single copy is consistent")
+        # (b2) if the single copy is projected to hold the old pod's lock too long it is NOT tried
+        state["writes"], state["every"], state["calls"] = 0, 3, 0     # steps 1 and 2 run clean (throughput is measured), step 3 is written under
+        notes = io.StringIO()
+        try:
+            with redirect_stderr(notes), redirect_stdout(notes):
+                pm.sqlite_backup_copy(src, dst, retries=3, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.01, single_max_s=1e-9)
+            skipped = False
+        except pm.Failed:
+            skipped = True
+        state["every"] = 1
+        assert_true(skipped and "not trying the single full copy" in notes.getvalue(), "the single copy is skipped when its projected lock hold exceeds the limit")
+        # (c) the same but retries=2 (no single rung): fails with the actionable message, bounded
+        state["writes"] = 0
+        try:
+            pm.sqlite_backup_copy(src, dst, retries=2, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.01)
+            failed = False
+        except pm.Failed as e:
+            failed = "close the app on every device" in str(e)
+        assert_true(failed, "without the last rung it fails, telling her to close the app")
+        assert_true(not dst.exists(), "and leaves no partial copy")
+        # (d) the total pause of a gentle attempt is bounded
+        pm.FAST_PAGES = real_fast
+        slept.clear()
+        state["writes"], state["limit"] = 0, 0
+        pm.sqlite_backup_copy(src, dst, retries=2, retry_wait_s=0.0, step_pages=1, step_sleep_s=1.0, pause_budget_s=3.0)
+        assert_true(abs(sum(slept) - 3.0) < 1e-6 and len(slept) == 3, f"the pause budget caps the total pause ({sum(slept):.1f} s of 1 s pauses)")
+    finally:
+        sqlite3.connect = real_connect
+        pm.time.sleep = real_sleep
+        pm.FAST_PAGES = real_fast
+    assert_eq(pm._mode_for(1, 5), "gentle", "ladder: attempt 1 is gentle")
+    assert_eq([pm._mode_for(i, 5) for i in range(2, 6)], ["fast", "fast", "fast", "single"], "then fast, and the last is the single copy")
+
+
+def test_status_reports_and_clock_skew():
+    w = build_world("skew")
+    # the age of the source DB is measured against a file stamped ON THE VOLUME, not this host's clock
+    real_time = pm.time.time
+    old_t = time.time()
+    os.utime(w["old"] / "webui.db", (old_t - 7, old_t - 7))
+    pm.time.time = lambda: real_time() + 3600          # this host's clock is an hour AHEAD of the volume's
+    try:
+        age = pm.volume_age_s(w["old"] / "webui.db")
+        rc, out = run(w, "seed")
+    finally:
+        pm.time.time = real_time
+    assert_true(6 < age < 12, f"the volume's clock says the DB was written {age:.0f} s ago, not 3600 s")
+    assert_true("last written 7 s ago" in out or "last written 8 s ago" in out or "last written 6 s ago" in out, "and the plan prints that")
+    assert_true("she may be chatting" in out, "so the recent-write warning fires despite the skewed host clock")
+    assert_true(not list(w["root"].glob(".pod-migrate-clock-*")), "the clock probe file is removed")
 
 
 def test_same_size_same_second_change_is_caught_at_cutover():
@@ -963,7 +1185,7 @@ def test_seed_on_a_live_source_is_gentle_and_retries_bad_copies():
     w = build_world("live")
     ns = argparse_ns(busy_timeout=1.0, retries=3, retry_wait=0.0, step_pages=None, step_sleep=None)
     kw = pm.backup_kwargs(ns, "seed")
-    assert_eq((kw["step_pages"], kw["step_sleep_s"]), (256, 0.2), "a seed reads a live source in 256-page steps with a 0.2 s pause")
+    assert_eq((kw["step_pages"], kw["step_sleep_s"]), (4096, 0.1), "a seed reads a live source in 4096-page steps with a 0.1 s pause (total pause capped at 20 s)")
     kw = pm.backup_kwargs(ns, "cutover")
     assert_eq((kw["step_pages"], kw["step_sleep_s"]), (4096, 0.0), "a cutover (source frozen) is fast")
     # the pause really happens between steps
@@ -1096,7 +1318,13 @@ def _all():
         test_reverse_refuses_without_the_local_db_and_reads_the_snapshot_only_in_snapshot_mode,
         test_reverse_from_must_be_this_pods_own_tree,
         test_reverse_does_not_copy_the_wordban_dir_onto_itself,
-        test_new_pod_writes_block_a_second_cutover_or_seed,
+        test_new_pod_writes_block_a_second_seed_before_go_live,
+        test_after_go_live_no_flag_reaches_past_the_guard,
+        test_manual_recovery_after_a_cutover_whose_verify_failed,
+        test_an_older_or_damaged_manifest_is_refused_whatever_the_flags,
+        test_a_kill_during_the_db_install_does_not_cause_a_false_refusal,
+        test_live_source_written_under_the_copy_still_finishes,
+        test_status_reports_and_clock_skew,
         test_same_size_same_second_change_is_caught_at_cutover,
         test_snapshot_sidecars_are_moved_aside,
         test_source_changing_during_the_cutover_fails_it,

@@ -116,6 +116,42 @@ Owner runbook: **RUNBOOK_POD_MIGRATION.md**. The audit and the exact env block: 
   `ZL_HOME`; the snapshot default (`webuidb.py`, `health.py`) follows `DATA_DIR`; `podenv.py` forensics/ssh/shadow paths and
   ten operator scripts follow the pod's environment. Every default is unchanged when the environment is unset.
 
+### Fixed (verification round 2, migration tool and runbooks)
+From Opus verification vB (a literal runbook walk on real images). `scripts/pod-migrate.py`, `RUNBOOK_POD_MIGRATION.md`,
+`RUNBOOK_DB_LOCAL_V10.md`, `docs/DB-MOVE-RUNBOOK.md`.
+- **HIGH: the seed never finished on a source written even once a minute.** An open, idle OpenWebUI tab writes
+  `last_active_at` every 60 s, and every write to the source restarts the SQLite backup-API copy from page 1; a
+  256-page, 0.2 s-paced copy of a 560 MB database took 111 s quiet and never finished (400 s cap) at one write per 60 s.
+  Now `sqlite_backup_copy` climbs a ladder: attempt 1 "gentle" (4096-page steps, 0.1 s pause, total pause capped at
+  20 s), then "fast" (4096-page steps, no pause) as soon as a write restarts it, and last a "single" full copy
+  (`pages=-1`) only when the throughput measured on the earlier attempts projects a read-lock hold of at most 3 s (the
+  old pod's `busy_timeout` is 5 s; a 620 MB copy measured 3 to 8.7 s held, so it is refused for a DB that big). It
+  prints the mode, the restarts and the longest read-lock hold. Measured (620 MB synthetic DB, writer in another
+  process with a 5 s timeout): quiet 16 s; a write every 60 s and every 10 s: finished in 12 to 15 s; the old code:
+  FAILED after 300 s; longest step hold 0.5 to 1.2 s and the writer's worst commit wait 0.65 s. The runbook (3.1) now
+  says she closes the app on EVERY device before the seed and the cutover.
+- **MEDIUM: a SIGKILL/SIGTERM during the DB install gave a false "new pod has written" refusal on re-run.** The pending
+  install hash is recorded in the manifest (`pending_install`) BEFORE `_install_db`; the guard accepts the pending or
+  the committed hash. A real SIGKILL test (subprocess) then a successful re-run; a real write after the kill is still refused.
+- **MEDIUM: `--discard-new-pod-writes`, `--db-mode snapshot` and `--force` bypassed the guard after go-live.** When
+  the manifest shows a completed cutover (`cutover_utc` or a `cutover` in `runs`), `seed` and `cutover` REFUSE whatever
+  the flags (dry runs too). The only ways forward are `--reverse` or a fresh target directory. `MANIFEST_FORMAT` is now 2;
+  a manifest of any other format (or an unreadable one) is refused with no override flag at all: it may hide a
+  completed cutover, and a flag would be exactly the shortcut that overwrites her live database. `status` reports it.
+- **MEDIUM (runbook 5.2, old pod v3.1.9):** no `ss` on that image: the connection count reads `/proc/net/tcp*` (state `01`,
+  port `1F90` = 8080); `conv_id=` and `POST` lines are both in `compactor.log`; uvicorn logs `POST ... 200` when a stream STARTS, so
+  the idle proof is vLLM's running + waiting == 0 on two samples 30 s apart.
+- **MEDIUM (runbook 6.2):** after a "REFUSED ... new pod has written" dry run, re-run the dry run with
+  `--discard-new-pod-writes` (before go-live only) so the plan and the 60 s quiet check actually run before the apply.
+  6.4 explains the manual recovery after a cutover whose verify failed (the tool now refuses a second cutover).
+- LOW: the `STATUS ROWS` one-liner (here and in `RUNBOOK_DB_LOCAL_V10.md`) compares from `quick_check=` on (it used to drop
+  it), needs exactly two rows, both `ok`; 1.2 confirms `127.0.0.1:3000/health` is 200 in the pod before the external port
+  check; the refusal text points at section 7 (rollback), not 8; `--reverse` compares the local DB with the snapshot by
+  LOGICAL hash; the source DB's write age is measured against a file stamped on the volume, not this host's clock;
+  `docs/DB-MOVE-RUNBOOK.md` E1's `mv` has a real `if` guard; runbook 0.1's EXISTS check now aborts the build and push (one
+  `if` block); wording: em dash in the quoted backfill output, 6.7's grep only shows lines after a timestamp taken
+  before the services start, 3.8 notes `.migrate-aside` vanishes on a RunPod restart.
+
 ### Fixed (hostile gauntlet round 1, compactor)
 - **`COMPACTOR_BACKFILL_MAX_ATTEMPTS=1` now stops her backfill (R4 H1).** `needs_backfill` read a record with no
   `attempts` key (what EVERY release before v3.1.9.4 writes, hers included) as 0 attempts, so a stale

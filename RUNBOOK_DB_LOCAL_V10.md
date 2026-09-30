@@ -85,8 +85,9 @@ She closes the app on every device. Then, in this order:
 supervisorctl stop openwebui webuidb-sync backup     # backup too: a running backup holds the sync lock
 WEBUI_DB_LOCAL=true $PY /opt/compactor/webuidb.py --sync-once --force; echo "SYNC EXIT=$?"
 $PY /opt/compactor/webuidb.py --status
-S=$($PY /opt/compactor/webuidb.py --status | grep -E '^(local|snapshot) ' | sed -E 's/.*chats=/chats=/' | sort -u | wc -l)
-[ "$S" = 1 ] && echo "STATUS ROWS MATCH" || echo "STATUS ROWS DIFFER: DO NOT STOP THE POD"
+R=$($PY /opt/compactor/webuidb.py --status | grep -E '^(local|snapshot) ' | sed -E 's/.*quick_check=/quick_check=/')
+[ "$(echo "$R" | grep -c .)" = 2 ] && [ "$(echo "$R" | sort -u | wc -l)" = 1 ] && [ "$(echo "$R" | grep -c '^quick_check=ok ')" = 2 ] \
+  && echo "STATUS ROWS MATCH" || echo "STATUS ROWS DIFFER: DO NOT STOP THE POD"
 ```
 
 **Go ahead only if ALL THREE hold** (exit 0 alone is not enough):
