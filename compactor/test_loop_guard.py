@@ -1234,5 +1234,19 @@ assert_true(
     "not about what gets cut",
 )
 
+# v3.1.9.10 perf audit, rank 2: the verdict cache must hold more replies than she has,
+# or every request re-judges all of them (16-20 s on the pod). 5,000 distinct replies
+# (past the old 4,096 limit) must all still be cached after one pass.
+print("\n[test] verdict cache holds >4,096 replies (the old cliff)")
+assert_true(main._DEGENERATE_VERDICT_CACHE_SIZE >= 16384,
+            "default verdict cache is well above her reply count")
+main._DEGENERATE_VERDICT_CACHE.clear()
+_vc_texts = [f"a perfectly ordinary reply number {i}, nothing repeated here." for i in range(5000)]
+for _t in _vc_texts:
+    main._reply_degenerate_verdict(_t)
+assert_true(len(main._DEGENERATE_VERDICT_CACHE) == 5000,
+            "all 5,000 verdicts are still cached (none evicted)")
+main._DEGENERATE_VERDICT_CACHE.clear()
+
 print()
 print("ALL TESTS PASSED")

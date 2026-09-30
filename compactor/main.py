@@ -5019,8 +5019,12 @@ def _trailing_ends_in_real_sentence(text: str) -> bool:
 # and a 128-bit collision is not a practical risk, so this still only skips
 # RECOMPUTING a verdict for text already judged; it cannot skip a turn that
 # reaches vLLM. A lock guards the dict: callers run in the threadpool.
+# v3.1.9.10 (perf audit, rank 2): 4096 was a cliff. She has ~2,400 assistant replies
+# and every request re-judges all of them, so past 4,096 an LRU this size would miss on
+# every entry of every scan (16-20 s per request on the pod). Entries are a 16-byte
+# digest plus a small tuple (a few hundred bytes), so 65,536 is ~13 MB.
 _DEGENERATE_VERDICT_CACHE_SIZE = _env_int(
-    "COMPACTOR_DEGENERATE_VERDICT_CACHE_SIZE", 4096
+    "COMPACTOR_DEGENERATE_VERDICT_CACHE_SIZE", 65536
 )
 
 
