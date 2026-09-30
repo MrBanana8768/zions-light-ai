@@ -27,7 +27,8 @@ needle, never an image reference.
            lines only.
   compare  for one chat (default: her conversation), which journal exchanges
            are missing from OpenWebUI's chat JSON (`chat.chat` history) and
-           from the `chat_message` table.
+           from the `chat_message` table. Exit 0 none missing, 3 some missing,
+           1/2 on error.
 
            MATCHING IS BY CONTENT HASH IN PRACTICE. An exchange matches by
            message id (its own id, or its parent id) when the journal has one,
@@ -321,7 +322,10 @@ def cmd_compare(a) -> int:
     if a.ids:
         for name, lst in (("chat JSON", miss_json), ("chat_message", miss_table), ("both", miss_both)):
             print(f"ids missing from {name}: {' '.join(lst)}")
-    return 0
+    # Exit 3 = the comparison ran and found missing exchanges, so a script or runbook step
+    # can tell "all present" (0) from "something is missing" without parsing the output
+    # (integration run, 403bcf1). 1/2 stay reserved for errors and usage.
+    return 3 if (miss_both or miss_json or miss_table) else 0
 
 
 def main(argv=None) -> int:

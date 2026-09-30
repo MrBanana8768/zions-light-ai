@@ -222,6 +222,9 @@ case "$SNAP" in /data/v10/*) ;; *) echo "REFUSED: SNAP is not under /data/v10"; 
    rm /tmp/webui-check.db
    ```
 
+   **Exit code:** `0` = every journaled exchange is in the database; `3` = some are missing (the counts above say how
+   many); `1`/`2` = the check itself failed.
+
    **The limits of `compare`, so you read it correctly:**
    - It prints **counts** (and, with `--ids`, ids or the first 12 hex of a hash). Never message text.
    - It matches by **content hash**. OpenWebUI 0.11.4 does not send the message id to the compactor, so journal ids are
