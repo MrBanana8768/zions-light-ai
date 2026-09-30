@@ -884,8 +884,12 @@ def test_a_cutover_killed_during_its_verify_can_be_rerun_until_a_service_writes(
     rc, out = run(w2, "cutover", "--old-pod-stopped", "--apply")
     assert_true(rc == 2 and "ALREADY COMPLETED" in out and "section 6.4" in out, "a re-run after a service wrote is REFUSED, pointing at 6.4")
     assert_eq((sha(local2), tree_fingerprint(w2["new"])), before, "and nothing changed (her new messages are intact)")
+    assert_true("add --discard-new-pod-writes" not in out and "MOVED ASIDE" not in out and "Running cutover would move" not in out,
+                f"the refusal is not contradicted by a suggestion to discard the new pod's writes: {out[-700:]!r}")
     rc, out = run(w2, "cutover", "--old-pod-stopped", "--apply", "--force", "--discard-new-pod-writes")
     assert_eq(rc, 2, "no flag overrides it")
+    assert_true("MOVED ASIDE" not in out and "add --discard-new-pod-writes" not in out,
+                "with --discard-new-pod-writes the refusal does not print 'will be MOVED ASIDE' before refusing")
     # a cutover whose verify PASSED is never re-run, even with an unchanged local DB
     w3 = _live_target("rerun-verified")
     rc, out = run(w3, "cutover", "--old-pod-stopped", "--apply")
@@ -934,69 +938,6 @@ def test_verify_strict_local_failure_reads_as_a_failure():
     assert_eq(rc, 1, "--strict-local fails")
     assert_true("FAIL local live DB row counts equal the snapshot" in out and "DIFFER" in out and "fine once" not in out,
                 "and reads as a real failure, with no 'fine' hint")
-
-
-def test_the_single_rung_projection_counts_only_pre_restart_reads_and_the_slowest_attempt():
-    """Final review round 3 (1): a fake clock. Post-restart re-reads (page cache) must not raise the rate; the slowest attempt wins."""
-    real_connect, real_mono, real_fast = sqlite3.connect, pm.time.monotonic, pm.FAST_PAGES
-    clock = {"t": 1000.0}
-    plan = {"n": 0, "k": 0, "dt": None, "err_first": False, "src": None}
-
-    class Fake(sqlite3.Connection):
-        def backup(self, target, *, pages=-1, progress=None, name="main", sleep=0.250):
-            plan["n"] += 1
-            plan["k"] = 0
-            def wrapped(status, remaining, total):
-                plan["k"] += 1
-                if plan["k"] in (3, 5):                         # written under the copy (restart on the NEXT step)
-                    c = real_connect(plan["src"], timeout=5)
-                    c.execute("UPDATE chat SET updated_at=updated_at+1 WHERE id=?", (HER,))
-                    c.commit(); c.close()
-                clock["t"] += plan["dt"](plan["n"], plan["k"])
-                progress(status, remaining, total)
-            return super().backup(target, pages=pages, progress=wrapped, name=name, sleep=sleep)
-
-    def ro_only(*a, **k):
-        if a and isinstance(a[0], str) and a[0].startswith("file:") and "mode=ro" in a[0]:
-            if plan["err_first"] and not plan.get("erred"):
-                plan["erred"] = True
-                raise sqlite3.OperationalError("disk I/O error")
-            return real_connect(*a, factory=Fake, **k)
-        return real_connect(*a, **k)
-
-    def projected_for(dt, err_first):
-        w = build_world("rate-" + str(err_first) + str(id(dt)))
-        src = w["old"] / "webui.db"
-        plan.update(n=0, k=0, dt=dt, err_first=err_first, erred=False, src=str(src))
-        pages = real_connect(f"file:{src}?mode=ro", uri=True).execute("pragma page_count").fetchone()[0]
-        notes = io.StringIO()
-        try:
-            with redirect_stderr(notes), redirect_stdout(notes):
-                pm.sqlite_backup_copy(src, w["local"] / "c.db", retries=3, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.0,
-                                      single_max_s=1e-9)
-        except pm.Failed:
-            pass
-        m = re.search(r"read lock for about ([0-9.]+) s", notes.getvalue())
-        assert_true(m is not None, f"the single rung was skipped with a projection: {notes.getvalue()[-300:]!r}")
-        return float(m.group(1)), pages * pm.SINGLE_SAFETY          # the projection includes the safety factor
-
-    assert_true(pm.SINGLE_SAFETY >= 1.25, "the projection carries a safety factor (a real hold ran up to 1.3x the raw projection)")
-    assert_true(pm.SINGLE_MAX_S <= 2.0, "the single rung's default limit is 2 s (was 3): margin under the old pod's 5 s busy_timeout")
-    pm.time.monotonic = lambda: clock["t"]
-    pm.FAST_PAGES = 1
-    sqlite3.connect = ro_only
-    try:
-        # A: attempt 1 fails with an I/O error (no rate). Attempt 2 (fast): pre-restart steps take 1 s per page,
-        # AFTER the first restart they are instant (cache). One page/s => projected = the page count in seconds.
-        proj, pages = projected_for(lambda n, k: 1.0 if k <= 3 else 1e-4, True)
-        assert_true(abs(proj - pages) <= 0.06 * pages + 0.2, f"only the pre-restart reads count: {proj:.1f} s for {pages} pages at 1 page/s")
-        # B: attempt 1 (gentle) reads at 1 page/s, attempt 2 (fast) at 10 000 pages/s: the SLOWEST attempt's rate is used
-        proj, pages = projected_for(lambda n, k: 1.0 if n == 1 else 1e-4, False)
-        assert_true(abs(proj - pages) <= 0.06 * pages + 0.2, f"the slowest attempt's rate is used: {proj:.1f} s for {pages} pages")
-    finally:
-        sqlite3.connect = real_connect
-        pm.time.monotonic = real_mono
-        pm.FAST_PAGES = real_fast
 
 
 def test_an_older_or_damaged_manifest_is_refused_whatever_the_flags():
@@ -1071,12 +1012,13 @@ def test_a_kill_during_the_db_install_does_not_cause_a_false_refusal():
 
 
 def test_live_source_written_under_the_copy_still_finishes():
-    """Fix round 2 (1): every write restarts the backup API. Gentle -> fast -> single ladder."""
+    """Fix round 2 (1): every write restarts the backup API. Gentle -> fast ladder; a single full copy is never attempted."""
     real_connect = sqlite3.connect
     state = {"writes": 0, "limit": 10 ** 9}
 
     class WriteOnStep(sqlite3.Connection):
         def backup(self, target, *, pages=-1, progress=None, name="main", sleep=0.250):
+            state.setdefault("pages_seen", []).append(pages)      # the spy: every backup() call on the SOURCE
             def wrapped(status, remaining, total):
                 state["calls"] = state.get("calls", 0) + 1
                 if state["writes"] < state["limit"] and state["calls"] % state.get("every", 1) == 0:
@@ -1113,49 +1055,40 @@ def test_live_source_written_under_the_copy_still_finishes():
         st = pm.sqlite_backup_copy(src, dst, retries=5, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.01)
         assert_eq((st["mode"], st["attempts"]), ("fast", 2), "one write under a paced copy: the second attempt (fast, no pause) finishes")
         assert_eq(scalar(dst, "pragma integrity_check"), "ok", "and the copy is consistent")
-        # (b) written under EVERY step, gentle and fast (fast steps forced to 1 page): only the single copy can finish
+        # (b) written under EVERY step (fast steps forced to 1 page): every attempt restarts. It must FAIL with the
+        # close-the-app message, within a bounded time, and NEVER call backup with pages <= 0 (a full copy).
         pm.FAST_PAGES = 1
-        # (the source is written on every 3rd step: a clean stretch first, so a throughput is MEASURED before the restart;
-        # with no measurement the single rung is skipped, see (b3))
-        state["writes"], state["limit"], state["every"], state["calls"] = 0, 10 ** 9, 3, 0
+        for retries in (2, 3, 5):
+            state["writes"], state["limit"], state["every"], state["calls"], state["pages_seen"] = 0, 10 ** 9, 1, 0, []
+            t0 = time.monotonic()
+            msg = None
+            try:
+                pm.sqlite_backup_copy(src, dst, retries=retries, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.01)
+            except pm.Failed as e:
+                msg = str(e)
+            assert_true(msg is not None and "close the app on every device" in msg and "she is using the old pod" in msg,
+                        f"retries={retries}: written under every step fails with the close-the-app message: {msg!r}")
+            assert_true(time.monotonic() - t0 < 30, f"retries={retries}: and within a bounded time")
+            assert_eq(len(state["pages_seen"]), retries, f"retries={retries}: one backup call per attempt, no extra rung")
+            assert_true(all(p >= 1 for p in state["pages_seen"]),
+                        f"retries={retries}: backup was never called with pages <= 0: {state['pages_seen']}")
+            assert_true(not dst.exists(), "and leaves no partial copy")
+        state["every"] = 1
+        # (b3) sqlite errors on the first attempts, then a quiet source: still finishes (no rung depends on a measurement)
+        state["writes"], state["limit"], state["every"], state["calls"], state["fail_connect"], state["pages_seen"] = 0, 0, 1, 0, 2, []
         st = pm.sqlite_backup_copy(src, dst, retries=3, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.01)
-        state["every"] = 1
-        assert_eq((st["mode"], st["attempts"]), ("single", 3), "written under every step: gentle and fast both restart, the last resort (one full copy) finishes")
-        assert_true(st["restarts"] >= 2, f"and the restarts were counted ({st['restarts']})")
-        assert_eq(scalar(dst, "pragma integrity_check"), "ok", "the single copy is consistent")
-        # (b2) if the single copy is projected to hold the old pod's lock too long it is NOT tried
-        state["writes"], state["every"], state["calls"] = 0, 3, 0     # steps 1 and 2 run clean (throughput is measured), step 3 is written under
-        notes = io.StringIO()
-        try:
-            with redirect_stderr(notes), redirect_stdout(notes):
-                pm.sqlite_backup_copy(src, dst, retries=3, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.01, single_max_s=1e-9)
-            skipped = False
-        except pm.Failed:
-            skipped = True
-        state["every"] = 1
-        assert_true(skipped and "not trying the single full copy" in notes.getvalue(), "the single copy is skipped when its projected lock hold exceeds the limit")
-        # (b3) the earlier attempts FAILED before any step (a transient I/O error): no throughput was measured, so the
-        # single rung is SKIPPED (not run blind) and the copy fails
-        state["writes"], state["limit"], state["every"], state["calls"], state["fail_connect"] = 0, 0, 1, 0, 2
-        notes = io.StringIO()
-        try:
-            with redirect_stderr(notes), redirect_stdout(notes):
-                pm.sqlite_backup_copy(src, dst, retries=3, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.01)
-            ran_blind = True
-        except pm.Failed:
-            ran_blind = False
         state["fail_connect"] = 0
-        assert_true(not ran_blind and "no read throughput was measured" in notes.getvalue(),
-                    "no measured rate: the single rung is skipped, and the note says why")
-        # (c) the same but retries=2 (no single rung): fails with the actionable message, bounded
-        state["writes"], state["limit"] = 0, 10 ** 9
-        try:
-            pm.sqlite_backup_copy(src, dst, retries=2, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.01)
-            failed = False
-        except pm.Failed as e:
-            failed = "close the app on every device" in str(e)
-        assert_true(failed, "without the last rung it fails, telling her to close the app")
-        assert_true(not dst.exists(), "and leaves no partial copy")
+        assert_eq((st["mode"], st["attempts"]), ("fast", 3), "two transient I/O errors then a quiet source: the copy finishes")
+        assert_eq(scalar(dst, "pragma integrity_check"), "ok", "and is consistent")
+        # (c) a quiet source finishes on the first (gentle) attempt; a source written once every few steps finishes on the fast attempt
+        pm.FAST_PAGES = real_fast
+        state["writes"], state["limit"], state["every"], state["calls"], state["pages_seen"] = 0, 0, 1, 0, []
+        st = pm.sqlite_backup_copy(src, dst, retries=5, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.0)
+        assert_eq((st["mode"], st["attempts"]), ("gentle", 1), "a quiet source finishes on the first attempt")
+        state["writes"], state["limit"], state["every"], state["calls"], state["pages_seen"] = 0, 1, 1, 0, []
+        st = pm.sqlite_backup_copy(src, dst, retries=5, retry_wait_s=0.0, step_pages=1, step_sleep_s=0.0)
+        assert_eq((st["mode"], st["attempts"]), ("fast", 2), "a write under the first attempt: the fast attempt finishes")
+        assert_true(all(p >= 1 for p in state["pages_seen"]), "and no full copy was called")
         # (d) the total pause of a gentle attempt is bounded
         pm.FAST_PAGES = real_fast
         slept.clear()
@@ -1167,7 +1100,17 @@ def test_live_source_written_under_the_copy_still_finishes():
         pm.time.sleep = real_sleep
         pm.FAST_PAGES = real_fast
     assert_eq(pm._mode_for(1, 5), "gentle", "ladder: attempt 1 is gentle")
-    assert_eq([pm._mode_for(i, 5) for i in range(2, 6)], ["fast", "fast", "fast", "single"], "then fast, and the last is the single copy")
+    assert_eq([pm._mode_for(i, 5) for i in range(2, 6)], ["fast"] * 4, "then fast, always: no last-resort single copy")
+    assert_true(not hasattr(pm, "SINGLE_MAX_S") and not hasattr(pm, "SINGLE_SAFETY"), "the single-rung constants are gone")
+
+
+def test_mode_for_is_only_gentle_or_fast():
+    """A single full copy (pages=-1) is never a mode: for ANY attempt and retries, gentle or fast."""
+    for retries in range(0, 12):
+        for attempt in range(0, 15):
+            assert_true(pm._mode_for(attempt, retries) in ("gentle", "fast"), f"_mode_for({attempt}, {retries})")
+    assert_eq(pm._mode_for(1, 1), "gentle", "attempt 1 is gentle even with one retry")
+    assert_eq(pm._mode_for(3, 3), "fast", "the last attempt is fast, not a full copy")
 
 
 def test_status_reports_and_clock_skew():
@@ -1558,10 +1501,10 @@ def _all():
         test_migrating_forward_again_after_a_rollback,
         test_step_pages_is_clamped_and_snapshot_mode_is_refused_forward_on_a_local_pod,
         test_verify_strict_local_failure_reads_as_a_failure,
-        test_the_single_rung_projection_counts_only_pre_restart_reads_and_the_slowest_attempt,
         test_an_older_or_damaged_manifest_is_refused_whatever_the_flags,
         test_a_kill_during_the_db_install_does_not_cause_a_false_refusal,
         test_live_source_written_under_the_copy_still_finishes,
+        test_mode_for_is_only_gentle_or_fast,
         test_status_reports_and_clock_skew,
         test_same_size_same_second_change_is_caught_at_cutover,
         test_snapshot_sidecars_are_moved_aside,

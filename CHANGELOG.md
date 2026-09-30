@@ -125,9 +125,7 @@ From Opus verification vB (a literal runbook walk on real images). `scripts/pod-
   `last_active_at` every 60 s, and every write to the source restarts the SQLite backup-API copy from page 1; a
   256-page, 0.2 s-paced copy of a 560 MB database took 111 s quiet and never finished (400 s cap) at one write per 60 s.
   Now `sqlite_backup_copy` climbs a ladder: attempt 1 "gentle" (4096-page steps, 0.1 s pause, total pause capped at
-  20 s), then "fast" (4096-page steps, no pause) as soon as a write restarts it, and last a "single" full copy
-  (`pages=-1`) only when the throughput measured on the earlier attempts projects a read-lock hold of at most 3 s (the
-  old pod's `busy_timeout` is 5 s; a 620 MB copy measured 3 to 8.7 s held, so it is refused for a DB that big). It
+  20 s), then "fast" (4096-page steps, no pause) as soon as a write restarts it; a single full copy is never attempted on a live source. It
   prints the mode, the restarts and the longest read-lock hold. Measured (620 MB synthetic DB, writer in another
   process with a 5 s timeout): quiet 16 s; a write every 60 s and every 10 s: finished in 12 to 15 s; the old code:
   FAILED after 300 s; longest step hold 0.5 to 1.2 s and the writer's worst commit wait 0.65 s. The runbook (3.1) now
@@ -202,13 +200,17 @@ From the Opus reviewers R2 (migration and paths) and R3 (the DB move); merged as
 
 ### Fixed (final sign-off review, fix round 3)
 From the last Opus review. `scripts/pod-migrate.py`, `compactor/commands.py`, docs.
-- **The seed's single-copy rung projected too low.** After a restart the re-read comes from the page cache, so the measured
-  throughput was too high (a real 4.41 s hold against a projected under 3 s on a 120 MB/s-throttled disk). Now each
-  attempt counts only the bytes read BEFORE its first restart (its first step included, so a tiny database is measured),
-  the projection uses the SLOWEST attempt and a 1.3x safety factor, and the limit is **2 s** (was 3; the old pod's
-  `busy_timeout` is 5 s). **With no measured throughput (earlier attempts failed with sqlite errors) the rung is
-  skipped**, with the reason printed. The projection is printed when the rung runs. `--step-pages` must be 1..4096 (`-1`
-  or a huge step holds the read lock for the whole copy) and is refused otherwise.
+- **The seed's single full-copy rung is removed (final sign-off decision).** Two verification rounds showed its lock-hold
+  projection could be broken 2 to 3x by the page cache, putting her live DB's writer near the old pod's 5 s `busy_timeout`.
+  A single full copy is never attempted on a live source: the ladder is "gentle" then "fast", and when every attempt
+  restarts the seed fails with "close the app on every device". `--step-pages` must be 1..4096 (`-1` or a huge step
+  holds the read lock for the whole copy) and is refused otherwise.
+- **The refusal after a refused cutover re-run no longer contradicts itself.** It suggested `--discard-new-pod-writes`
+  (and printed "will be MOVED ASIDE") while the go-live refusal said no flag overrides it.
+- **`runpod.env.template`: no `WEBUI_SECRET_KEY` placeholder that invites generating a new key** (the same RunPod Secret as
+  the old pod, or leave the row out).
+- **`/forget`: an error from the journal redaction after the reply timed out is now logged (type only) and counted in
+  the journal's `errors` counter** instead of being swallowed.
 - **A cutover whose own verify failed or was killed can be re-run** while the new local database still hashes to exactly
   what the tool installed (no service has run on it since). Otherwise it is refused and points to RUNBOOK_POD_MIGRATION.md
   section 6.4 (the manual recovery). The INTERRUPTED message, `status` and the runbook's failure table now say the same;

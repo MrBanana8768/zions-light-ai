@@ -243,8 +243,7 @@ supervisorctl status openwebui compactor webuidb-sync backup    # all STOPPED
    live database. An idle open OpenWebUI tab is enough to write it: it stores `last_active_at` about once a minute, and every
    write to the source restarts the SQLite backup from page 1. Ask her to close the app on every device (phone, tablet, laptop:
    all tabs). The tool copies in 4096-page steps with a short pause (the total pause is capped), and if the source keeps
-   being written it retries with fast steps, then (only when the copy is projected to hold the lock for at most 3 s) as a
-   single full copy. It prints the mode, the restarts, the attempts, the total time and the **longest time it held the old
+   being written it retries with fast steps (a single full copy is never attempted on a live source). It prints the mode, the restarts, the attempts, the total time and the **longest time it held the old
    pod's read lock**; the old pod's own `busy_timeout` is 5 s, so a hold near that would make one of her writes fail.
    It warns when the old database was written in the last 5 minutes (measured against the volume's clock, not the pod's). If it
    warns, or says `the source database kept changing under the copy`, make sure the app is closed everywhere, wait, and run it again.
@@ -674,9 +673,7 @@ found no manifest). **Whatever the code: start no service unless section 6.4 pas
 | `FAILED: the source tree changed while the cutover ran` | 1 | the old pod was not frozen | stop it properly and re-run `cutover --apply` |
 | `INTERRUPTED by SIGTERM/SIGINT` | 1 | the run was killed; the manifest says incomplete | start nothing; re-run the same command (a cutover whose install finished is re-run too, while the local database is unchanged; if the tool refuses, 6.4's manual recovery) |
 | `database copy attempt N/5 failed (...)` | (retries) | the old pod (or the volume) had the database busy, or the copy failed its integrity check | it retries; if it gives up (`failed integrity_check on all N attempts`, exit 1), retry when she is not chatting |
-| `database copy attempt N/5 (gentle): the source was written under the copy` | (retries) | someone is using the old pod: every write restarts the copy | it retries with fast steps, then a single copy; if it gives up (`the source database kept changing under the copy`, exit 1), have her close the app on EVERY device and run it again |
-| `not trying the single full copy: it would hold the old pod's read lock for about N s` (limit 2 s) | (retries) | the database is too big to copy in one lock hold under the old pod's 5 s busy_timeout | the app must be closed everywhere; then re-run the seed |
-| `not trying the single full copy: no read throughput was measured` | (retries) | the earlier attempts failed before a step completed (sqlite errors), so the hold cannot be projected | fix the cause shown on the earlier `attempt N/5 failed` lines (the volume), then re-run the seed |
+| `database copy attempt N/5 (gentle): the source was written under the copy` | (retries) | someone is using the old pod: every write restarts the copy | it retries with fast steps; if it gives up (`the source database kept changing under the copy`, exit 1), have her close the app on EVERY device and run it again |
 | a killed run left `.migrate/lock` | | SIGKILL or a power cut during the run | `pgrep -af pod-migrate`; if nothing runs, `rm $NEW/.migrate/lock`, run `status`, re-run the same command (a kill mid-install is recognised: no false "new pod has written" refusal) |
 | `verify` FAIL on `file rows in the target` | 1 | a path prefix the tool did not know | `--path-map OLD=NEW` (repeatable), then re-run |
 | `verify` FAIL on a `tree '...'` digest | 1 | a file differs between the trees | re-run `cutover --apply` (it re-hashes and re-copies); if it persists, do not switch her over |

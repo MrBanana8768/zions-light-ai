@@ -46,8 +46,9 @@ SAFETY RAILS (v3.1.9.10 fix round B; each is a hostile-review finding)
     every SQLite file (chroma, vector_db) is re-copied through the backup API.
   * A live seed copies in 4096-page steps with a short pause (total pause capped), retries
     a copy whose integrity_check fails (bounded), and when the source is written under the
-    copy (every write restarts the backup API) escalates: fast steps with no pause, then
-    one single full copy (one short read lock; the old pod's busy_timeout is 5 s). It
+    copy (every write restarts the backup API) escalates to fast steps with no pause (a step holds the
+    read lock for tens of ms). A single full copy is never attempted on a live source: it
+    would hold the read lock for the whole copy and the old pod's busy_timeout is 5 s. It
     reports the mode, the restarts and the longest read-lock hold.
   * SIGHUP is ignored; SIGINT/SIGTERM finish the step that must not be torn (the database
     install), stop, leave the manifest complete=false and exit 1.
@@ -309,27 +310,18 @@ class _Restarting(Exception):
 
 FAST_PAGES = 4096          # 16 MB per step at 4 KiB pages: a step that takes tens of ms
 PAUSE_BUDGET_S = 20.0      # the most a gentle attempt may spend pausing between steps, in total
-SINGLE_MAX_S = 2.0         # the single full copy is only tried if its read lock is projected to be held <= this.
-                           # The old pod's busy_timeout is 5 s: a longer hold makes HER write fail with "database is locked".
-                           # 2 s (not 3) leaves margin for a projection that is still optimistic.
-SINGLE_SAFETY = 1.3        # multiplier on the projected single-copy hold (see sqlite_backup_copy)
 MAX_STEP_PAGES = 4096      # --step-pages is clamped to 1..this: a bigger step holds the read lock longer
 
 
 def _mode_for(attempt: int, retries: int) -> str:
-    """gentle (paced) first; then fast steps with no pause; the LAST attempt is a single
-    full copy (pages=-1: one read lock, no restart is possible, held for the whole copy)."""
-    if attempt == 1:
-        return "gentle"
-    if attempt == retries and retries >= 3:
-        return "single"
-    return "fast"
+    """gentle (paced) first, then fast steps with no pause. Never anything else: a single
+    full copy (backup with pages=-1) would hold the source's read lock for the whole copy."""
+    return "gentle" if attempt == 1 else "fast"
 
 
 def sqlite_backup_copy(src: Path, dst: Path, *, busy_s: float = 60.0, retries: int = 5,
                        retry_wait_s: float = 5.0, step_pages: int = FAST_PAGES, step_sleep_s: float = 0.0,
-                       max_s: float = 3600.0, pause_budget_s: float = PAUSE_BUDGET_S,
-                       single_max_s: float = SINGLE_MAX_S) -> dict:
+                       max_s: float = 3600.0, pause_budget_s: float = PAUSE_BUDGET_S) -> dict:
     """A consistent copy of a live or frozen SQLite database via the backup API.
     The source is opened read-only (`mode=ro`); the destination is a private file
     (callers pass a LOCAL temp path, never the network volume). Retried (bounded by
@@ -341,15 +333,11 @@ def sqlite_backup_copy(src: Path, dst: Path, *, busy_s: float = 60.0, retries: i
     OpenWebUI tab writes last_active_at once a minute, so a paced copy NEVER finished. So:
       attempt 1  "gentle": `step_pages` per step (>= 4096 by default) with `step_sleep_s`
                  between steps, the total pause bounded by `pause_budget_s`;
-      middle     "fast": 4096+ pages per step, NO pause. A step is tens of ms, so the copy
-                 is short and rarely meets a write; 2 restarts in one attempt end it;
-      last       "single": pages=-1, one step, one read lock for the whole copy (a few
-                 seconds for 560 MB): nothing can restart it. The old pod's busy_timeout is 5 s, so it
-                 is only tried when the throughput measured on the earlier attempts projects a hold of
-                 at most `single_max_s` (2 s); otherwise the copy fails and says to close the app.
-                 The projection uses the SLOWEST attempt's rate, and each attempt counts only the bytes
-                 read BEFORE its first restart (after a restart the same pages come from the page
-                 cache, which would make the disk look fast). With no measured rate the rung is skipped.
+      later      "fast": 4096 pages per step, NO pause. A step is tens of ms, so the copy
+                 is short and rarely meets a write; 2 restarts in one attempt end it.
+    A single full copy (pages=-1) is NEVER attempted: it would hold the source's read lock for the
+    whole copy, and the old pod's busy_timeout is 5 s (the page cache can break any projection of
+    that hold). If every attempt restarts, the copy fails and says to close the app everywhere.
     The pause between steps is taken in the progress callback: sqlite3's own `sleep`
     argument only applies to BUSY/LOCKED results.
     Returns {"attempts", "seconds", "mode", "restarts", "max_step_s"} where max_step_s is the
@@ -357,53 +345,23 @@ def sqlite_backup_copy(src: Path, dst: Path, *, busy_s: float = 60.0, retries: i
     last: BaseException | None = None
     t_all = time.monotonic()
     restarts_total = 0
-    meas = {"rates": [], "total_bytes": 0.0}   # bytes/s per attempt, from pre-restart steps only; the slowest is used
     for attempt in range(1, retries + 1):
         dst.unlink(missing_ok=True)
         started = time.monotonic()
         mode = _mode_for(attempt, retries)
-        pages = -1 if mode == "single" else (step_pages if mode == "gentle" else max(step_pages, FAST_PAGES))
+        pages = step_pages if mode == "gentle" else max(step_pages, FAST_PAGES)
+        pages = max(1, min(pages, MAX_STEP_PAGES))   # never <= 0 (a full copy) and never a huge step
         sleep_s = step_sleep_s if mode == "gentle" else 0.0
         restart_limit = 1 if mode == "gentle" else 2
-        st = {"restarts": 0, "last_remaining": None, "paused": 0.0, "max_step": 0.0, "mark": time.monotonic(),
-              "m_bytes": 0.0, "m_secs": 0.0, "m_stopped": False}
+        st = {"restarts": 0, "last_remaining": None, "paused": 0.0, "max_step": 0.0, "mark": time.monotonic()}
         s = d = None
         try:
             s = sqlite3.connect(ro_uri(src), uri=True, timeout=busy_s)
             s.execute(f"PRAGMA busy_timeout={int(busy_s * 1000)}")
             d = sqlite3.connect(str(dst), timeout=busy_s)
-            psize = s.execute("PRAGMA page_size").fetchone()[0]
-            if mode == "single":
-                if not meas["rates"] or meas["total_bytes"] <= 0:
-                    note("not trying the single full copy: no read throughput was measured on the earlier attempts "
-                         "(they failed before a step completed), so its lock hold cannot be projected")
-                    last = last if last is not None else _Restarting()
-                    continue
-                # x SINGLE_SAFETY: the single copy also pays the open/setup and a step's fixed cost (measured on a
-                # throttled disk: the real hold ran up to 1.3x the raw bytes/rate projection)
-                projected = SINGLE_SAFETY * meas["total_bytes"] / min(meas["rates"])
-                if projected > single_max_s:
-                    note(f"not trying the single full copy: it would hold the old pod's read lock for about "
-                         f"{projected:.1f} s (limit {single_max_s:.1f} s; its busy_timeout is 5 s)")
-                    last = _Restarting()
-                    continue
-                note(f"trying the single full copy: projected read-lock hold about {projected:.1f} s (limit {single_max_s:.1f} s)")
-
             def progress(status, remaining, total, _t0=started, _st=st, _sleep=sleep_s, _limit=restart_limit):
                 now = time.monotonic()
                 _st["max_step"] = max(_st["max_step"], now - _st["mark"])
-                meas["total_bytes"] = float(total) * psize
-                if _st["last_remaining"] is None:
-                    # the first step of the attempt (measured from the attempt's start; a tiny database is ONE step)
-                    if total > remaining and now - _st["mark"] > 0:
-                        _st["m_bytes"] += (total - remaining) * psize
-                        _st["m_secs"] += now - _st["mark"]
-                elif not _st["m_stopped"]:
-                    if remaining >= _st["last_remaining"]:
-                        _st["m_stopped"] = True      # a restart: what follows is re-read from the page cache
-                    elif now - _st["mark"] > 0:
-                        _st["m_bytes"] += (_st["last_remaining"] - remaining) * psize
-                        _st["m_secs"] += now - _st["mark"]
                 if now - _t0 > max_s:
                     raise Failed("the database copy took too long")
                 if _st["last_remaining"] is not None and remaining >= _st["last_remaining"]:
@@ -417,11 +375,7 @@ def sqlite_backup_copy(src: Path, dst: Path, *, busy_s: float = 60.0, retries: i
                     _st["paused"] += dt
                 _st["mark"] = time.monotonic()
 
-            if pages == -1:
-                s.backup(d)
-                st["max_step"] = time.monotonic() - started
-            else:
-                s.backup(d, pages=pages, progress=progress, sleep=0.05)
+            s.backup(d, pages=pages, progress=progress, sleep=0.05)
             d.commit()
             ok = [r[0] for r in d.execute("PRAGMA integrity_check")]
             if ok != ["ok"]:
@@ -444,8 +398,6 @@ def sqlite_backup_copy(src: Path, dst: Path, *, busy_s: float = 60.0, retries: i
             if attempt < retries:
                 time.sleep(retry_wait_s)
         finally:
-            if st["m_secs"] > 0 and st["m_bytes"] > 0:
-                meas["rates"].append(st["m_bytes"] / st["m_secs"])
             for c in (d, s):
                 try:
                     if c is not None:
@@ -1203,7 +1155,7 @@ def check_step_pages(pages: int) -> None:
 
 def backup_kwargs(args, kind: str) -> dict:
     """Backup-API pacing. A seed reads a LIVE database: 4096-page steps (tens of ms each) with a
-    short pause, the total pause bounded, escalating to fast and then single-copy attempts if
+    short pause, the total pause bounded, escalating to fast attempts (never a single full copy) if
     the source keeps being written (see sqlite_backup_copy). A cutover reads a frozen one: fast."""
     live = kind == "seed"
     pages = args.step_pages if args.step_pages is not None else FAST_PAGES
@@ -1324,7 +1276,8 @@ def run_sync(args, *, kind: str) -> int:
                             "cutover, so no flag overrides this. Recover by hand (RUNBOOK_POD_MIGRATION.md section 6.4), or use "
                             "--reverse to roll back (section 7)")
         live = cutover_completed(manifest)
-        if live and kind == "cutover" and cutover_rerun_ok(manifest, local_db):
+        rerun = bool(live) and kind == "cutover" and cutover_rerun_ok(manifest, local_db)
+        if rerun:
             note(f"re-running the cutover of {live}: its verify did not pass (verified={manifest.get('verified')}) and the "
                  "local database is still exactly the copy this tool installed, so no service has written to it")
         elif live:
@@ -1334,7 +1287,8 @@ def run_sync(args, *, kind: str) -> int:
                             "A cutover whose verify failed can be re-run only while the local database is unchanged since the "
                             "install. Otherwise: --reverse (rollback, RUNBOOK_POD_MIGRATION.md section 7) or the manual "
                             "recovery in section 6.4")
-        problems += new_pod_writes_problem(manifest, local_db, kind, args.discard_new_pod_writes)
+        if not live or rerun:
+            problems += new_pod_writes_problem(manifest, local_db, kind, args.discard_new_pod_writes)
     if reverse and manifest and manifest.get("reverse") and (dst / "webui.db").is_file():
         # A SECOND --reverse (final review round 3): the first one put the new pod's database into the old tree and the
         # old pod has probably run on it since. Copying the new pod's (older) database over it again would roll her back.

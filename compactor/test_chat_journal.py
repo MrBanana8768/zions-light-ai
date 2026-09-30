@@ -1161,6 +1161,62 @@ chatjournal.drain(10)
 check("durian" not in raw(conv), "the queued redaction STILL RAN once the writer freed up (it was not cancelled)")
 
 # ===========================================================================
+print("\n[F6b] /forget: an OSError from the shielded redaction AFTER the timeout is logged (type only) and counted")
+import logging as _logging  # noqa: E402
+
+reset()
+conv = "conv-f6b"
+_gate2 = threading.Event()
+chatjournal._EXEC.submit(_gate2.wait, 30)                # the writer thread is stalled
+_real_redact = chatjournal.redact_needle
+_SECRET_TEXT = "durian-secret-words-in-the-error"
+
+
+def _boom(*a, **k):
+    raise OSError(_SECRET_TEXT)
+
+
+chatjournal.redact_needle = _boom
+_old_to = commands._JOURNAL_REDACT_TIMEOUT_S
+commands._JOURNAL_REDACT_TIMEOUT_S = 0.3
+_f6b = {"logs": []}
+
+
+class _Cap(_logging.Handler):
+    def emit(self, record):
+        _f6b["logs"].append(record.getMessage())
+
+
+_cap = _Cap()
+commands.logger.addHandler(_cap)
+_errs_before = chatjournal._stats["errors"]
+
+
+async def _f6b_main():
+    _ctx = {"clear_all_memory": lambda cid: main._clear_all_memory(cid, source="test"), "turn_index": 1, "persona_text": ""}
+    _f6b["out"] = await commands.handle_command("forget", "durian", conv, ctx=_ctx)
+    _f6b["mid_logs"] = list(_f6b["logs"])
+    _gate2.set()                                         # the writer frees up, the redaction runs and raises OSError
+    for _ in range(100):
+        await asyncio.sleep(0.05)
+        if any("after the reply timed out" in m for m in _f6b["logs"]):
+            break
+
+
+try:
+    asyncio.run(_f6b_main())
+finally:
+    commands._JOURNAL_REDACT_TIMEOUT_S = _old_to
+    chatjournal.redact_needle = _real_redact
+    commands.logger.removeHandler(_cap)
+    _gate2.set()
+check("timed out" in _f6b["out"], "the reply said it timed out")
+_late = [m for m in _f6b["logs"] if "after the reply timed out" in m]
+check(len(_late) == 1 and "OSError" in _late[0], f"the late failure is logged with its TYPE: {_f6b['logs']!r}")
+check(not any(_SECRET_TEXT in m for m in _f6b["logs"]), "and never its text")
+check(chatjournal._stats["errors"] == _errs_before + 2, f"and the errors counter was bumped (timeout + the late failure): {chatjournal._stats['errors'] - _errs_before}")
+
+# ===========================================================================
 print("\n[D1] the images COPY the journal module and the guard lists it")
 import re  # noqa: E402
 

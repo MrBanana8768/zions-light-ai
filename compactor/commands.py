@@ -741,13 +741,31 @@ async def _handle_forget(arg: str, conv_id: str, ctx: dict) -> str:
                 # this reply from waiting: the redaction runs when the writer frees
                 # up, and the ledger re-applies it at the next boot either way.
                 _red = asyncio.ensure_future(chatjournal.redact_needle_async(conv_id, arg))
-                _red.add_done_callback(lambda f: f.cancelled() or f.exception())  # never "exception was never retrieved"
+                _late = {"timed_out": False}
+
+                def _red_done(f, _late=_late, _conv=conv_id):
+                    # Always retrieves the exception (never "exception was never retrieved"). When the
+                    # redaction fails AFTER this reply gave up waiting (the shield keeps it running), nobody
+                    # else sees it: log the type (never the text) and count it. A failure inside the wait is
+                    # reported by the except below, so it is not counted twice.
+                    if f.cancelled():
+                        return
+                    exc = f.exception()
+                    if exc is not None and _late["timed_out"]:
+                        chatjournal._bump("errors")
+                        logger.error(
+                            f"conv={_conv}: /forget's chat-journal redaction failed after the "
+                            f"reply timed out ({type(exc).__name__})"
+                        )
+
+                _red.add_done_callback(_red_done)
                 journal_redacted = await asyncio.wait_for(
                     asyncio.shield(_red), timeout=_JOURNAL_REDACT_TIMEOUT_S
                 )
             except Exception as e:
                 journal_failed = True
                 journal_timed_out = isinstance(e, asyncio.TimeoutError)
+                _late["timed_out"] = journal_timed_out
                 chatjournal._bump("errors")
                 logger.error(
                     f"conv={conv_id}: /forget could not redact the chat "
